@@ -557,17 +557,22 @@ fn f16_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 /// Run a single-`Op::MoeFfn` graph on `be` and return the downloaded f32 output `[rows, ne]`.
-/// `router` is F32 `[n_expert, ne]`; the gate/up/down expert banks are F16 (gate/up are
-/// `[n_expert, n_ff_exp, ne]`, down is `[n_expert, ne, n_ff_exp]`, row-major). `router_x` is
-/// bound to the SAME handle as `x` (the qwen3moe convention).
+/// `router` is F32 `[n_expert, ne]`; the gate/up/down expert banks upload as their raw `gate_dt`/
+/// `up_dt`/`down_dt` bytes (gate/up are `[n_expert, n_ff_exp, ne]`, down is
+/// `[n_expert, ne, n_ff_exp]`, row-major). `router_x` is bound to the SAME handle as `x` (the
+/// qwen3moe convention). Passing F16 banks exercises the dequant→f16 fallback; passing a covered
+/// quant (Q4_K/Q6_K/Q8_0, optionally mixed like Q4_K_M's Q6_K down) exercises the native path.
 #[allow(clippy::too_many_arguments)]
 fn run_moe(
     be: &dyn Backend,
     x: &[f32],
     router_f32: &[f32],
-    gate_f16: &[u8],
-    up_f16: &[u8],
-    down_f16: &[u8],
+    gate_bytes: &[u8],
+    up_bytes: &[u8],
+    down_bytes: &[u8],
+    gate_dt: DType,
+    up_dt: DType,
+    down_dt: DType,
     rows: usize,
     ne: usize,
     n_expert: usize,
@@ -579,9 +584,9 @@ fn run_moe(
     let mut g = Graph::new();
     let xid = g.input(f32d(rows * ne));
     let rid = g.weight(TensorDesc::new(vec![n_expert * ne], DType::F32));
-    let gid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], DType::F16));
-    let uid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], DType::F16));
-    let did = g.weight(TensorDesc::new(vec![n_expert * ne * n_ff_exp], DType::F16));
+    let gid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], gate_dt));
+    let uid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], up_dt));
+    let did = g.weight(TensorDesc::new(vec![n_expert * ne * n_ff_exp], down_dt));
     let dst = g.output(f32d(rows * ne));
     g.push(Op::MoeFfn {
         x: xid,
@@ -613,9 +618,9 @@ fn run_moe(
     };
     let xb = up(bytemuck::cast_slice(x), BufferUsage::Activations);
     let rb = up(bytemuck::cast_slice(router_f32), BufferUsage::Weights);
-    let gb = up(gate_f16, BufferUsage::Weights);
-    let ub = up(up_f16, BufferUsage::Weights);
-    let db = up(down_f16, BufferUsage::Weights);
+    let gb = up(gate_bytes, BufferUsage::Weights);
+    let ub = up(up_bytes, BufferUsage::Weights);
+    let db = up(down_bytes, BufferUsage::Weights);
     let ob = be.alloc(rows * ne * 4, BufferUsage::Readback).expect("out");
 
     let mut b = Bindings::new();
@@ -657,11 +662,39 @@ fn moe_ffn_matches_cpu() {
         (MoeGating::Sigmoid, false, "sigmoid+no-renorm"),
     ] {
         let c = run_moe(
-            &cpu, &x, &router, &gate, &up, &down, rows, ne, n_expert, n_used, n_ff_exp, gating,
+            &cpu,
+            &x,
+            &router,
+            &gate,
+            &up,
+            &down,
+            DType::F16,
+            DType::F16,
+            DType::F16,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            gating,
             norm_w,
         );
         let r = run_moe(
-            &be, &x, &router, &gate, &up, &down, rows, ne, n_expert, n_used, n_ff_exp, gating,
+            &be,
+            &x,
+            &router,
+            &gate,
+            &up,
+            &down,
+            DType::F16,
+            DType::F16,
+            DType::F16,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            gating,
             norm_w,
         );
         let e = maxerr(&c, &r);
@@ -682,6 +715,83 @@ fn moe_ffn_matches_cpu() {
             e / ref_mag
         );
     }
+}
+
+/// Quantized MoE experts (Slice 18): gate/up as Q4_K + down as Q6_K — the Q4_K_M expert-bank
+/// layout. The native `moe_ffn_expert_q4k_q6k` kernel decodes the RAW quant bytes per-block
+/// (NO f16 cache is materialized, which is what lets a big quantized MoE fit in VRAM), so it must
+/// match the CPU reference (`dequant_block` + f32 FFN) within a two-format quant tolerance. Uses
+/// the qwen3moe softmax+renorm gating path. Blocks are built by the same `q4k_blocks`/`q6k_blocks`
+/// helpers the dense native-decode GEMV tests use, so both f16-scale slots stay finite.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_quant_experts_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    // ne and n_ff_exp are multiples of 256 → one whole number of super-blocks per expert row,
+    // so every per-expert byte offset lands on a block boundary (the native path's requirement).
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (2usize, 256usize, 4usize, 2usize, 256usize);
+
+    let x = gen(rows * ne, 3);
+    let router = gen(n_expert * ne, 9);
+    // gate/up: Q4_K [n_expert, n_ff_exp, ne]; down: Q6_K [n_expert, ne, n_ff_exp].
+    let gate = q4k_blocks(n_expert * n_ff_exp * ne / 256);
+    let up = q4k_blocks(n_expert * n_ff_exp * ne / 256);
+    let down = q6k_blocks(n_expert * ne * n_ff_exp / 256);
+
+    let c = run_moe(
+        &cpu,
+        &x,
+        &router,
+        &gate,
+        &up,
+        &down,
+        DType::Q4K,
+        DType::Q4K,
+        DType::Q6K,
+        rows,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        MoeGating::Softmax,
+        true,
+    );
+    let r = run_moe(
+        &be,
+        &x,
+        &router,
+        &gate,
+        &up,
+        &down,
+        DType::Q4K,
+        DType::Q4K,
+        DType::Q6K,
+        rows,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        MoeGating::Softmax,
+        true,
+    );
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-6);
+    println!(
+        "MoeFfn [Q4_K/Q4_K/Q6_K experts] max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "MoeFfn [quant experts] reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 3e-2,
+        "MoeFfn [quant experts] diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
 }
 
 // ── Rope (ggml NORM interleaved RoPE, packed + strided) vs CPU ────────────────

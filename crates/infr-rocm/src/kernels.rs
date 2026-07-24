@@ -57,6 +57,7 @@ const HIP_PARTS: &[&str] = &[
     DELTANET,
     MOE_SHARED_EXPERT_ADD,
     NATIVE_DECODE,
+    MOE_FFN_NATIVE,
     INT8_DECODE,
     WMMA_PREFILL,
 ];
@@ -1082,6 +1083,77 @@ GEN_LINEAR(q6k)
 GEN_EMBED(q80)
 GEN_EMBED(q4k)
 GEN_EMBED(q6k)
+"#;
+
+// ── Native-decode MoE expert FFN (Phase-3 for MoE) ───────────────────────────
+//
+// Twin of `moe_ffn_expert`, but the gate/up/down expert banks are the RAW quant bytes decoded
+// in-kernel via `deq_*` (defined in NATIVE_DECODE, assembled before this part) — NO f16 cache
+// is materialized, so a big quantized MoE fits in VRAM (footprint ≈ quant size). Bit-faithful to
+// the old f16-cache path (each `deq_*` rounds through f16, same as the cache did), so it tracks
+// `moe_ffn_expert` within f16 rounding.
+//
+// Gate & up share ONE format (`GU`) — they are the same tensor when fused, and every GGUF stores
+// ffn_gate_exps / ffn_up_exps at the same quant type. The down bank has its OWN format (`DN`):
+// Q4_K_M packs gate/up as Q4_K but ffn_down_exps as Q6_K, so the two suffixes must be independent.
+// The 9 (GU × DN) combos over {q80, q4k, q6k} cover every mixed-precision MoE the covered formats
+// produce; uncovered formats keep the dequant→f16 `moe_ffn_expert` fallback in exec.rs.
+//
+// Pointers are pre-advanced HOST-SIDE to this expert's block-aligned byte offset (see the MoeFfn
+// arm), so the in-kernel element index is relative to the expert's own bank — identical geometry
+// to the f16 kernel, just a quant-byte decode instead of an `__half2float` load.
+const MOE_FFN_NATIVE: &str = r#"
+#define GEN_MOE_FFN(GU, DN) \
+extern "C" __global__ void moe_ffn_expert_##GU##_##DN( \
+    const float* __restrict__ x,             /* [ne] — input row */ \
+    const unsigned char* __restrict__ gate_w,/* raw GU bytes, [n_ff_exp, ne] (pre-advanced) */ \
+    const unsigned char* __restrict__ up_w,  /* raw GU bytes, [n_ff_exp, ne] (pre-advanced) */ \
+    const unsigned char* __restrict__ down_w,/* raw DN bytes, [ne, n_ff_exp] (pre-advanced) */ \
+    float* __restrict__ dst,                 /* [ne] — accumulated * weight */ \
+    int ne, \
+    int n_ff_exp, \
+    int act_type,   /* 0=SiLU, 1=GeLU, 2=Sigmoid */ \
+    float weight,   /* routing weight for this expert */ \
+    float down_scale, /* per-expert down-projection output scale (1 = no scale) */ \
+    int weight_before /* 1 = apply `weight` to the gate/up inputs (llama4); 0 = to the output */ \
+) { \
+    int i = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i < (int)n_ff_exp) { \
+        float wg = weight_before ? weight : 1.0f; \
+        float wo = weight_before ? 1.0f : weight; \
+        float g = 0.0f, u = 0.0f; \
+        for (int j = 0; j < (int)ne; j++) { \
+            long idx = (long)i * ne + j; \
+            g += x[j] * deq_##GU(gate_w, idx); \
+            u += x[j] * deq_##GU(up_w, idx); \
+        } \
+        g *= wg; \
+        u *= wg; \
+        float a; \
+        if (act_type == 0) { \
+            a = g / (1.0f + expf(-g)); \
+        } else if (act_type == 1) { \
+            float x3 = g * g * g; \
+            a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); \
+        } else { \
+            a = 1.0f / (1.0f + expf(-g)); \
+        } \
+        float h = a * u * wo * down_scale; \
+        for (int d = 0; d < (int)ne; d++) { \
+            atomicAdd(&dst[d], h * deq_##DN(down_w, (long)d * n_ff_exp + i)); \
+        } \
+    } \
+}
+
+GEN_MOE_FFN(q80, q80)
+GEN_MOE_FFN(q80, q4k)
+GEN_MOE_FFN(q80, q6k)
+GEN_MOE_FFN(q4k, q80)
+GEN_MOE_FFN(q4k, q4k)
+GEN_MOE_FFN(q4k, q6k)
+GEN_MOE_FFN(q6k, q80)
+GEN_MOE_FFN(q6k, q4k)
+GEN_MOE_FFN(q6k, q6k)
 "#;
 
 // ── Int8-activation dp4a decode GEMV (Phase 4) ───────────────────────────────

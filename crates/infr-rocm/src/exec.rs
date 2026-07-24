@@ -126,6 +126,37 @@ fn native_wmma_fmt(dt: DType) -> Option<&'static str> {
     }
 }
 
+/// Native in-kernel decode for a MoE expert weight bank (Phase-3 for MoE). Returns
+/// `(suffix, elems_per_block, bytes_per_block)` for a covered dtype — the suffix names the
+/// `deq_*` decoder baked into the `moe_ffn_expert_<gu>_<dn>` kernel and the block geometry gives
+/// the per-expert byte offset. `None` for uncovered formats (they keep the dequant→f16 fallback).
+fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
+    match dt {
+        DType::Q8_0 => Some(("q80", 32, 34)),
+        DType::Q4K => Some(("q4k", 256, 144)),
+        DType::Q6K => Some(("q6k", 256, 210)),
+        _ => None,
+    }
+}
+
+/// Static kernel name for the `(gate/up format, down format)` combo — the 9 covered pairs over
+/// {q80, q4k, q6k} (e.g. Q4_K_M is `("q4k", "q6k")`). Both suffixes come from `moe_native_fmt`, so
+/// the `_` arm is unreachable.
+fn moe_expert_kernel(gu: &str, dn: &str) -> &'static str {
+    match (gu, dn) {
+        ("q80", "q80") => "moe_ffn_expert_q80_q80",
+        ("q80", "q4k") => "moe_ffn_expert_q80_q4k",
+        ("q80", "q6k") => "moe_ffn_expert_q80_q6k",
+        ("q4k", "q80") => "moe_ffn_expert_q4k_q80",
+        ("q4k", "q4k") => "moe_ffn_expert_q4k_q4k",
+        ("q4k", "q6k") => "moe_ffn_expert_q4k_q6k",
+        ("q6k", "q80") => "moe_ffn_expert_q6k_q80",
+        ("q6k", "q4k") => "moe_ffn_expert_q6k_q4k",
+        ("q6k", "q6k") => "moe_ffn_expert_q6k_q6k",
+        _ => unreachable!("moe_expert_kernel: uncovered ({gu}, {dn})"),
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -1378,13 +1409,41 @@ fn run_op(
             // fed to the GEMV below; the previous code discarded it and softmaxed the raw
             // router_x row, selecting bogus "expert" indices out past the expert banks).
             let rw = ctx.dequant_weight_or_cache(router, g, bindings)?;
-            let gw_ptr = ctx.dequant_weight_or_cache(gate_exps, g, bindings)?;
-            let uw_ptr = if fused_gate_up {
-                gw_ptr
+
+            // Native in-kernel expert decode (Phase-3 for MoE): when the gate/up/down banks are
+            // covered quant formats, feed the RAW quant bytes to `moe_ffn_expert_<gu>_<dn>` and
+            // decode per-block on the fly — NO f16 cache is materialized, so a big quantized MoE
+            // fits in VRAM (footprint ≈ quant size, vs ~3.5× that as an f16 cache). Gate & up must
+            // share a format (same tensor when fused; every GGUF stores them at the same type);
+            // down may differ (Q4_K_M packs down as Q6_K). Any uncovered bank → the whole expert
+            // falls back to the dequant→f16 `moe_ffn_expert` path so nothing breaks.
+            let gate_dt = g.desc(gate_exps).dtype;
+            let up_dt = g.desc(up_exps).dtype;
+            let down_dt = g.desc(down_exps).dtype;
+            let native = moe_native_fmt(gate_dt)
+                .zip(moe_native_fmt(down_dt))
+                .filter(|_| fused_gate_up || up_dt == gate_dt);
+
+            let (gw_ptr, uw_ptr, dw_ptr) = if native.is_some() {
+                // Raw quant device pointers (the bound buffers) — no dequant, no f16 cache.
+                let gw = ctx.ensure_device(gate_exps, g, bindings)?;
+                let uw = if fused_gate_up {
+                    gw
+                } else {
+                    ctx.ensure_device(up_exps, g, bindings)?
+                };
+                let dw = ctx.ensure_device(down_exps, g, bindings)?;
+                (gw, uw, dw)
             } else {
-                ctx.dequant_weight_or_cache(up_exps, g, bindings)?
+                let gw = ctx.dequant_weight_or_cache(gate_exps, g, bindings)?;
+                let uw = if fused_gate_up {
+                    gw
+                } else {
+                    ctx.dequant_weight_or_cache(up_exps, g, bindings)?
+                };
+                let dw = ctx.dequant_weight_or_cache(down_exps, g, bindings)?;
+                (gw, uw, dw)
             };
-            let dw_ptr = ctx.dequant_weight_or_cache(down_exps, g, bindings)?;
 
             let neu = ne as usize;
             let nexp = n_expert as usize;
@@ -1480,20 +1539,58 @@ fn run_op(
                 let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
                 for &ei in &idx {
                     let w = probs[ei] / wsum * scale;
-                    let gs = unsafe { (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void };
-                    let us = if fused_gate_up {
-                        unsafe {
-                            (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2) as *mut c_void
-                        }
-                    } else {
-                        unsafe { (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void }
-                    };
-                    let ds = unsafe { (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void };
+                    // Per-expert pointers. Native path: byte offset = (element_offset / qpb) * bpb
+                    // into the RAW quant bank (every element offset is a multiple of the block size,
+                    // since the per-expert stride is a whole number of `ne`-wide rows and `ne` is a
+                    // multiple of the block elem count). Fallback path: element_offset * 2 into the
+                    // f16 cache. Gate/up share the `gu` format+geometry; down carries the `dn` one.
+                    let (gs, us, ds, kname) =
+                        if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
+                            let gs = unsafe {
+                                (gw_ptr as *mut u8).add((ei * ge_stride / gu_qpb) * gu_bpb)
+                                    as *mut c_void
+                            };
+                            let us = if fused_gate_up {
+                                unsafe {
+                                    (gw_ptr as *mut u8)
+                                        .add(((ei * ge_stride + nfu * neu) / gu_qpb) * gu_bpb)
+                                        as *mut c_void
+                                }
+                            } else {
+                                unsafe {
+                                    (uw_ptr as *mut u8).add((ei * nfu * neu / gu_qpb) * gu_bpb)
+                                        as *mut c_void
+                                }
+                            };
+                            let ds = unsafe {
+                                (dw_ptr as *mut u8).add((ei * neu * nfu / dn_qpb) * dn_bpb)
+                                    as *mut c_void
+                            };
+                            (gs, us, ds, moe_expert_kernel(gu, dn))
+                        } else {
+                            let gs = unsafe {
+                                (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void
+                            };
+                            let us = if fused_gate_up {
+                                unsafe {
+                                    (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2)
+                                        as *mut c_void
+                                }
+                            } else {
+                                unsafe {
+                                    (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void
+                                }
+                            };
+                            let ds = unsafe {
+                                (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void
+                            };
+                            (gs, us, ds, "moe_ffn_expert")
+                        };
                     let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
                     dispatch_1d(
                         pipelines,
                         ctx.stream,
-                        "moe_ffn_expert",
+                        kname,
                         n_ff_exp,
                         256,
                         args![
