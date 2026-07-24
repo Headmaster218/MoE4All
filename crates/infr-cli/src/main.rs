@@ -1866,12 +1866,22 @@ fn cmd_bench(
             json,
         );
     }
-    // ROCm: Phase 0 — the backend scaffold exists but kernels aren't written yet.
-    if matches!(backend, Backend::Rocm(_)) {
-        anyhow::bail!(
-            "ROCm bench not yet implemented — the ROCm/HIP backend is under construction \
-             (docs/rocm-plan.md Phase 0); bench is available via Vulkan, Metal, or CPU"
-        );
+    // ROCm (set by `--dev rocm[:N]` / `INFR_DEV=rocm`): bench the dense/MoE forward on the AMD
+    // GPU through the ROCm seam — same pp/tg/pg + depth methodology as the Vulkan/Metal/CPU arms,
+    // directly comparable to `llama-bench` on a HIP build. Device index parsed from the spec.
+    if let Backend::Rocm(rocm_spec) = &backend {
+        let dev_idx = rocm_spec.as_deref().map(parse_rocm_device).unwrap_or(0);
+        let model = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let samples = model.bench_rocm(n_prompt, n_gen, depth, pg, reps, dev_idx)?;
+        let label = if let Some((p, g)) = pg {
+            format!("pg{p}+{g}")
+        } else if n_gen > 0 {
+            format!("tg{n_gen}")
+        } else {
+            format!("pp{n_prompt}")
+        };
+        print_bench_avg(&samples, &label, depth, "", reps, json);
+        return Ok(());
     }
     // `--dev VulkanN` was already published to the backend as INFR_DEV=VulkanN by `DeviceOpts::resolve`;
     // `VulkanBackend::new()` reads it when picking the physical device, and the prefill chunk

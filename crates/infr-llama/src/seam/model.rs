@@ -1239,6 +1239,104 @@ impl SeamModel {
         Ok(samples)
     }
 
+    /// The AMD-GPU twin of [`bench_vulkan`](Self::bench_vulkan): same pp/tg/pg + depth
+    /// methodology (dummy token ids, fixed-count `INFR_IGNORE_EOS` semantics, untimed
+    /// warmup + depth-warm, `-p`/`-n`/`-d`/`-r` honored), routed through the ROCm seam's
+    /// persistent session so the timed reps hit the resident weight upload / KV cache. Weights
+    /// upload once (the untimed warmup); each rep resets the KV, warms it back to `depth`
+    /// untimed, then times exactly the requested pp / tg / pg shape.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn bench_rocm(
+        &self,
+        n_prompt: usize,
+        n_gen: usize,
+        depth: usize,
+        pg: Option<(usize, usize)>,
+        reps: usize,
+        dev_idx: u32,
+    ) -> Result<Vec<f64>> {
+        let rocm =
+            infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
+        let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
+        // +16: identical rationale to `bench_vulkan` — the untimed 8+2 warmup turn shares the
+        // session, so size the KV for it even when the measured shape is tiny.
+        let want = depth + p_eff.max(1) + g_eff + 16;
+        let dummy = |n: usize| -> Vec<u32> { (0..n.max(1)).map(|i| (i % 100) as u32).collect() };
+        let mut state: Option<crate::seam::SeamKv> = None;
+        let run = |prompt_len: usize,
+                   gen: usize,
+                   state: &mut Option<crate::seam::SeamKv>|
+         -> Result<crate::GenStats> {
+            let (_, stats) = crate::seam::generate_dense_rocm_session(
+                &rocm,
+                &self.gguf,
+                &self.cfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                &dummy(prompt_len),
+                gen,
+                |_| {},
+                state,
+                want,
+                None, // constraint
+                None, // req: bench is a sole sequence — env sampling, no gate
+            )?;
+            Ok(stats)
+        };
+        // Untimed work stays out of the INFR_PROF2 profile (same reasoning as `bench_vulkan`).
+        let unprofiled = |prompt_len: usize,
+                          gen: usize,
+                          state: &mut Option<crate::seam::SeamKv>|
+         -> Result<crate::GenStats> {
+            crate::with_prof2_suppressed(|| run(prompt_len, gen, state))
+        };
+        // Untimed warmup: uploads the weights and compiles every kernel the timed reps hit.
+        unprofiled(8, 2, &mut state)?;
+        infr_prof_rt::gpu_reset();
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps.max(1) {
+            if let Some(st) = state.as_mut() {
+                st.reset();
+            }
+            if depth > 0 {
+                unprofiled(depth, 0, &mut state)?; // warm the cache to `depth` (untimed)
+            }
+            if let Some((p, g)) = pg {
+                // coding-agent turn: prompt ingest + reply generation timed together.
+                let s = run(depth + p, g, &mut state)?;
+                samples.push((p + g) as f64 / (s.prompt_secs + s.decode_secs).max(1e-9));
+            } else if n_gen > 0 {
+                // decode at depth: 1-token suffix feeds the loop, the timed part is the decode.
+                let s = run(depth + 1, n_gen, &mut state)?;
+                samples.push(n_gen as f64 / s.decode_secs.max(1e-9));
+            } else {
+                // +1: same suffix-accounting as `bench_vulkan` — exactly `n_prompt` rows
+                // batch-prefill (positions depth..depth+n_prompt), matching `llama-bench -p N`.
+                let s = run(depth + n_prompt + 1, 0, &mut state)?;
+                samples.push(n_prompt as f64 / s.prompt_secs.max(1e-9));
+            }
+        }
+        Ok(samples)
+    }
+
+    /// ROCm bench placeholder — errors when the `rocm` feature is not active so the CLI can
+    /// surface it as a build-time feature gate.
+    #[cfg(not(all(target_os = "linux", feature = "rocm")))]
+    pub fn bench_rocm(
+        &self,
+        _n_prompt: usize,
+        _n_gen: usize,
+        _depth: usize,
+        _pg: Option<(usize, usize)>,
+        _reps: usize,
+        _dev_idx: u32,
+    ) -> Result<Vec<f64>> {
+        anyhow::bail!(
+            "ROCm backend not compiled — build with `cargo build --features rocm` \
+             on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md)"
+        )
+    }
+
     /// Open a persistent Metal seam session (the Apple-GPU twin of
     /// [`vulkan_session`](Self::vulkan_session)): weights uploaded ONCE, KV sized to `max_ctx`,
     /// later calls prefill only the un-cached suffix.
