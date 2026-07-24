@@ -37,3 +37,10 @@ required-features = ["rocm"]
 name = "wmma_probe"
 path = "examples/wmma_probe.rs"
 required-features = ["rocm"]
+
+# Gated: constructs the ROCm backend (feature-gated `RocmBackend`) to time the int8
+# WMMA prefill GEMM in isolation for the Slice-25 tile sweep.
+[[example]]
+name = "wmma_bench"
+path = "examples/wmma_bench.rs"
+required-features = ["rocm"]

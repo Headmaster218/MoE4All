@@ -109,24 +109,68 @@ fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
     }
 }
 
-/// Matrix-core (WMMA) int8 prefill GEMM kernel (Phase 5) for a covered dtype. Routed only for
-/// `m > 1` (prefill); decode (`m == 1`) stays on the `linear_i8_*` GEMV, which WMMA can't help.
-/// Same int8 precision as `native_i8_fmt` (identical activation quant + weight codes), so it is the
-/// closest possible to the Phase-4 blessed goldens. `INFR_ROCM_NO_WMMA` forces the GEMV path for
-/// A/B benchmarking. Returns `None` when the int8 path itself is disabled (`INFR_ROCM_NO_I8`).
-fn native_wmma_fmt(dt: DType) -> Option<&'static str> {
+/// Explicit tile override for A/B benchmarking (`INFR_ROCM_WMMA_TILE=RxC`, one of 1x1/2x1/2x2).
+/// `None` when unset → the shape-driven auto tier in [`wmma_tile`] is used.
+fn wmma_tile_forced() -> Option<(u32, u32)> {
+    match std::env::var("INFR_ROCM_WMMA_TILE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("1x1") => Some((1, 1)),
+        Some("2x1") => Some((2, 1)),
+        Some("2x2") => Some((2, 2)),
+        _ => None,
+    }
+}
+
+/// Register tile `(RM, CN)` for the WMMA prefill GEMM (Slice 25): each wave computes an RM×CN grid of
+/// 16×16 output tiles, reusing every loaded A fragment across the CN weight-column tiles and every
+/// decoded weight tile across the RM row tiles. Measured on gfx1100 (isolated-GEMM GFLOP/s sweep, see
+/// `examples/wmma_bench`): blocking M (`2x1`) strictly beats the un-blocked Slice-15 tile (`1x1`) on
+/// every shape (+2..16%); the wider `2x2` additionally wins the wide-N shapes (out_f ≥ 2048: up/gate,
+/// wide projections) but loses ~11-14% on the square/narrow ones (qkv, down). So the auto tier is
+/// `2x2` for wide-N GEMMs and `2x1` otherwise. `INFR_ROCM_WMMA_TILE` overrides for benchmarking.
+fn wmma_tile(out_f: u32) -> (u32, u32) {
+    if let Some(t) = wmma_tile_forced() {
+        return t;
+    }
+    if out_f >= 2048 {
+        (2, 2)
+    } else {
+        (2, 1)
+    }
+}
+
+/// Matrix-core (WMMA) int8 prefill GEMM kernel (Phase 5, Slice-25 RM×CN-tiled) for a covered dtype.
+/// Routed only for `m > 1` (prefill); decode (`m == 1`) stays on the `linear_i8_*` GEMV, which WMMA
+/// can't help. Same int8 precision as `native_i8_fmt` (identical activation quant + weight codes),
+/// and bit-identical f32 accumulation order to the Slice-15 kernel, so it holds the blessed goldens.
+/// `INFR_ROCM_NO_WMMA` forces the GEMV path for A/B benchmarking. Returns `(kernel_name, RM, CN)`, or
+/// `None` when the int8 path itself is disabled (`INFR_ROCM_NO_I8`).
+fn native_wmma_fmt(dt: DType, out_f: u32) -> Option<(&'static str, u32, u32)> {
     if std::env::var_os("INFR_ROCM_NO_WMMA").is_some()
         || std::env::var_os("INFR_ROCM_NO_I8").is_some()
     {
         return None;
     }
-    match dt {
-        DType::Q8_0 => Some("wmma_i8_q80"),
-        DType::Q4K => Some("wmma_i8_q4k"),
-        DType::Q6K => Some("wmma_i8_q6k"),
-        DType::Q5_0 => Some("wmma_i8_q50"),
-        _ => None,
-    }
+    let (rm, cn) = wmma_tile(out_f);
+    let name = match (dt, rm, cn) {
+        (DType::Q8_0, 1, 1) => "wmma_i8_q80_1x1",
+        (DType::Q8_0, 2, 2) => "wmma_i8_q80_2x2",
+        (DType::Q8_0, _, _) => "wmma_i8_q80_2x1",
+        (DType::Q4K, 1, 1) => "wmma_i8_q4k_1x1",
+        (DType::Q4K, 2, 2) => "wmma_i8_q4k_2x2",
+        (DType::Q4K, _, _) => "wmma_i8_q4k_2x1",
+        (DType::Q6K, 1, 1) => "wmma_i8_q6k_1x1",
+        (DType::Q6K, 2, 2) => "wmma_i8_q6k_2x2",
+        (DType::Q6K, _, _) => "wmma_i8_q6k_2x1",
+        (DType::Q5_0, 1, 1) => "wmma_i8_q50_1x1",
+        (DType::Q5_0, 2, 2) => "wmma_i8_q50_2x2",
+        (DType::Q5_0, _, _) => "wmma_i8_q50_2x1",
+        _ => return None,
+    };
+    Some((name, rm, cn))
 }
 
 /// Native in-kernel decode for a MoE expert weight bank (Phase-3 for MoE). Returns
@@ -724,18 +768,20 @@ fn run_op(
                 let dd = ctx.zero_dev(mu * ou);
                 let blk_off = (w_off as usize / qpb) * bpb;
                 let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
-                match (m > 1).then(|| native_wmma_fmt(wdt)).flatten() {
-                    Some(wmma_kernel) => {
-                        // Prefill (m>1): matrix-core int8 GEMM. Grid = (ceil(out_f/16), ceil(m/16)),
-                        // one wave32 block per 16×16 output tile — a weight column is decoded once
-                        // per 16 rows (vs once per row in the GEMV). Same int8 codes/scales, so the
-                        // numerics track the Phase-4 GEMV to within f32 accumulation order.
+                match (m > 1).then(|| native_wmma_fmt(wdt, out_f)).flatten() {
+                    Some((wmma_kernel, rm, cn)) => {
+                        // Prefill (m>1): matrix-core int8 GEMM. Grid = (ceil(out_f/(16*CN)),
+                        // ceil(m/(16*RM))), one wave32 block per 16*RM × 16*CN output tile — each wave
+                        // reuses every loaded A fragment across the CN weight-column tiles and every
+                        // decoded weight tile across the RM row tiles. Same int8 codes/scales and the
+                        // same per-element f32 accumulation order, so the numerics are bit-identical to
+                        // the un-blocked Slice-15 kernel.
                         dispatch_grid(
                             pipelines,
                             ctx.stream,
                             wmma_kernel,
-                            out_f.div_ceil(16),
-                            m.div_ceil(16),
+                            out_f.div_ceil(16 * cn),
+                            m.div_ceil(16 * rm),
                             32,
                             args![
                                 arg_ptr(qx.ptr),
