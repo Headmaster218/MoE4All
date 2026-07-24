@@ -717,12 +717,14 @@ fn moe_ffn_matches_cpu() {
     }
 }
 
-/// Quantized MoE experts (Slice 18): gate/up as Q4_K + down as Q6_K — the Q4_K_M expert-bank
-/// layout. The native `moe_ffn_expert_q4k_q6k` kernel decodes the RAW quant bytes per-block
-/// (NO f16 cache is materialized, which is what lets a big quantized MoE fit in VRAM), so it must
-/// match the CPU reference (`dequant_block` + f32 FFN) within a two-format quant tolerance. Uses
-/// the qwen3moe softmax+renorm gating path. Blocks are built by the same `q4k_blocks`/`q6k_blocks`
-/// helpers the dense native-decode GEMV tests use, so both f16-scale slots stay finite.
+/// Quantized MoE experts (Slice 18 / Slice 20): gate/up as Q4_K + down as Q6_K — the Q4_K_M
+/// expert-bank layout. By default this now exercises the Slice-20 int8-activation dp4a expert path
+/// (`moe_gate_up_act_i8_q4k` + `moe_down_i8_q6k`): the token input is int8-quantized once, the
+/// activation `h` int8-quantized per expert, and each projection is an integer dot with scale-after
+/// — TWO lossy int8 stages, so the tolerance is widened past the dense single-stage int8 GEMV
+/// (which is 3e-2 for Q4_K/Q6_K). It must still match the CPU reference (`dequant_block` + f32 FFN).
+/// Uses the qwen3moe softmax+renorm gating path. Blocks are built by the same `q4k_blocks`/
+/// `q6k_blocks` helpers the dense native-decode GEMV tests use, so both f16-scale slots stay finite.
 #[test]
 #[ignore = "requires a ROCm GPU"]
 fn moe_ffn_quant_experts_matches_cpu() {
@@ -788,7 +790,7 @@ fn moe_ffn_quant_experts_matches_cpu() {
         "MoeFfn [quant experts] reference is all-zero — test is vacuous"
     );
     assert!(
-        e / ref_mag < 3e-2,
+        e / ref_mag < 6e-2,
         "MoeFfn [quant experts] diverges from CPU reference: abs={e:e} rel={:e}",
         e / ref_mag
     );

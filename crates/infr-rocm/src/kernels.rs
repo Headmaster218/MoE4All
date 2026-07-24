@@ -60,6 +60,7 @@ const HIP_PARTS: &[&str] = &[
     NATIVE_DECODE,
     MOE_FFN_NATIVE,
     INT8_DECODE,
+    MOE_FFN_INT8,
     WMMA_PREFILL,
 ];
 
@@ -1552,6 +1553,211 @@ extern "C" __global__ void linear_i8_q6k(
     acc = wave_sum32(acc);
     if (tid == 0) dst[(long)row * out_f + o] = acc;
 }
+"#;
+
+// ── Int8-activation dp4a MoE expert FFN (Slice 20) ───────────────────────────
+//
+// The Phase-3 `moe_ffn_expert_<gu>_<dn>` kernel (MOE_FFN_NATIVE) decodes every expert weight
+// element to f16 and re-parses its block header PER ELEMENT, one thread per `nff` row — the same
+// per-element f16 round-trip that made small-model dense decode ALU-bound, but paid THREE times
+// (gate + up + down) per element AND at a grid of only `nff` threads (one per row → wave underfill).
+//
+// This path applies the SAME int8 dp4a scheme the dense `linear_i8_*` GEMV uses (INT8_DECODE) to the
+// three expert projections. An expert FFN is exactly three GEMVs:
+//   gate:  g = x[ne]           · gate_w[nff, ne]ᵀ        (out = nff)
+//   up:    u = x[ne]           · up_w[nff, ne]ᵀ          (out = nff)
+//   down:  y = h[nff]          · down_w[ne, nff]ᵀ        (out = ne, accumulated over experts)
+// with the elementwise activation h = act(g·wg)·(u·wg)·wo·down_scale between them. The gate/up GEMVs
+// integer-dot the int8-quantized INPUT row `x` (quantized ONCE per token via `quant_i8_32`, reused
+// across every expert AND both gate & up) against the raw expert quant codes; the down GEMV
+// integer-dots the int8-quantized activation `h` (quantized per expert). The per-block weight scale
+// (+ Q4_K/Q6_K min term) is applied to the int32 accumulator AFTER the dot — the mmq "scale-after is
+// free" principle — reusing the exact `i8acc_*` decode+dot the dense path is parity-tested on.
+//
+// Grid: one wave32 block per OUTPUT ROW (gate/up → nff blocks, down → ne blocks), the 32 lanes
+// striding over the input's 32-elem blocks then a `wave_sum32` reduce to lane 0 — the SAME grid the
+// dense `linear_i8_*` GEMV uses, so decode parallelizes across nff/ne instead of the one-thread-per-
+// row underfill of the Phase-3 fused kernel.
+//
+// SANCTIONED PRECISION FLIP: int8 activation quant is lossy in BOTH stages (x and h), so the output
+// differs (within tolerance) from the bit-faithful f16 expert path — parity is checked vs the CPU
+// reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q4_K, Q6_K
+// (the Q4_K_M expert-bank set); uncovered formats keep the Phase-3 `moe_ffn_expert_*` fallback.
+//
+// `rf16b`/`k4` (NATIVE_DECODE) and `idot4`/`wave_sum32` (INT8_DECODE) are defined in the parts
+// assembled before this one.
+const MOE_FFN_INT8: &str = r#"
+// Per-lane int8 dp4a accumulation for one output row `o` of a Q8_0 weight bank: mirrors the
+// `linear_i8_q80` inner loop (bit-identical decode + dot), returning this lane's partial (pre-wave-
+// reduce). `w` is pre-advanced to the expert's bank; row `o` spans `nb = in_f/32` 32-blocks.
+__device__ __forceinline__ float i8acc_q80(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 34;
+        float d = rf16b(b);
+        const unsigned char* wq = b + 2;
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0;
+        for (int k = 0; k < 8; k++) {
+            const unsigned char* q = wq + k * 4;
+            int wpack = (int)q[0] | ((int)q[1] << 8) | ((int)q[2] << 16) | ((int)q[3] << 24);
+            idot = idot4(xp[k], wpack, idot);
+        }
+        acc += d * xsr[blk] * (float)idot;
+    }
+    return acc;
+}
+
+// Q4_K per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q4k`.
+__device__ __forceinline__ float i8acc_q4k(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    int spr = nb >> 3;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int s = blk & 7;
+        const unsigned char* b = w + (long)super * 144;
+        float d = rf16b(b);
+        float dmin = rf16b(b + 2);
+        const unsigned char* scales = b + 4;
+        const unsigned char* qs = b + 16;
+        int sc, mm; k4(scales, s, &sc, &mm);
+        const unsigned char* qbase = qs + (s >> 1) * 32;
+        int hi = s & 1;
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const unsigned char* q = qbase + k * 4;
+            int wpack;
+            if (hi) {
+                wpack = (int)(q[0] >> 4) | ((int)(q[1] >> 4) << 8)
+                      | ((int)(q[2] >> 4) << 16) | ((int)(q[3] >> 4) << 24);
+            } else {
+                wpack = (int)(q[0] & 0xF) | ((int)(q[1] & 0xF) << 8)
+                      | ((int)(q[2] & 0xF) << 16) | ((int)(q[3] & 0xF) << 24);
+            }
+            idot = idot4(xp[k], wpack, idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+    }
+    return acc;
+}
+
+// Q6_K per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q6k`.
+__device__ __forceinline__ float i8acc_q6k(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    int spr = nb >> 3;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int w32 = blk & 7;
+        const unsigned char* b = w + (long)super * 210;
+        const unsigned char* ql = b;
+        const unsigned char* qh = b + 128;
+        const signed char* scales = (const signed char*)(b + 192);
+        float d = rf16b(b + 208);
+        float sx = xsr[blk];
+        for (int hh = 0; hh < 2; hh++) {
+            int sub16 = w32 * 2 + hh;
+            int sc = (int)scales[sub16];
+            int within0 = sub16 * 16;
+            int half = within0 >> 7;
+            int o127 = within0 & 127;
+            int region = o127 >> 5;
+            int l0 = o127 & 31;
+            int qlo = half * 64;
+            int qho = half * 32;
+            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int idot = 0, isum = 0;
+            for (int k = 0; k < 4; k++) {
+                int code[4];
+                for (int r = 0; r < 4; r++) {
+                    int l = l0 + k * 4 + r;
+                    int c;
+                    if (region == 0)      c = (ql[qlo + l] & 0x0F)       | ((qh[qho + l] & 3) << 4);
+                    else if (region == 1) c = (ql[qlo + 32 + l] & 0x0F)  | (((qh[qho + l] >> 2) & 3) << 4);
+                    else if (region == 2) c = (ql[qlo + l] >> 4)         | (((qh[qho + l] >> 4) & 3) << 4);
+                    else                  c = (ql[qlo + 32 + l] >> 4)    | (((qh[qho + l] >> 6) & 3) << 4);
+                    code[r] = c;
+                }
+                int wpack = code[0] | (code[1] << 8) | (code[2] << 16) | (code[3] << 24);
+                idot = idot4(xp[k], wpack, idot);
+                isum = idot4(xp[k], 0x01010101, isum);
+            }
+            acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-32 * sc)) * sx * (float)isum;
+        }
+    }
+    return acc;
+}
+
+// Gate+up+activation for one expert: block `o` (0..nff) computes h_out[o] = act(g·wg)·(u·wg)·wo·dsc.
+// `qx`/`xs` are the int8 quantization of the token's input row x[ne] (produced ONCE per token, reused
+// across experts + both gate & up). gate_w/up_w are pre-advanced to this expert's banks (fused gate/up
+// simply passes up_w = gate_w + nff*ne offset). One wave32 block per nff output row.
+#define GEN_MOE_GATE_UP(GU) \
+extern "C" __global__ void moe_gate_up_act_i8_##GU( \
+    const signed char* __restrict__ qx,       /* int8(x)  [ne] */ \
+    const float* __restrict__ xs,             /* x scales [ne/32] */ \
+    const unsigned char* __restrict__ gate_w, /* raw GU bytes [nff, ne] (pre-advanced) */ \
+    const unsigned char* __restrict__ up_w,   /* raw GU bytes [nff, ne] (pre-advanced) */ \
+    float* __restrict__ h_out,                /* [nff] */ \
+    int ne, int nff, int act_type, float wg, float wo, float down_scale) { \
+    int o = blockIdx.x; \
+    int tid = threadIdx.x; \
+    if (o >= nff) return; \
+    int nb = ne >> 5; \
+    float g = i8acc_##GU(qx, xs, gate_w, o, nb, tid); \
+    float u = i8acc_##GU(qx, xs, up_w, o, nb, tid); \
+    g = wave_sum32(g); \
+    u = wave_sum32(u); \
+    if (tid == 0) { \
+        g *= wg; \
+        u *= wg; \
+        float a; \
+        if (act_type == 0) { \
+            a = g / (1.0f + expf(-g)); \
+        } else if (act_type == 1) { \
+            float x3 = g * g * g; \
+            a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); \
+        } else { \
+            a = 1.0f / (1.0f + expf(-g)); \
+        } \
+        h_out[o] = a * u * wo * down_scale; \
+    } \
+}
+
+// Down projection for one expert: block `d` (0..ne) computes y_d = h[nff] · down_w[d, :] and
+// atomicAdds it into dst[d] (accumulating across the selected experts; the routing weight is already
+// folded into h by the gate/up kernel). `hq`/`hs` are the int8 quantization of h[nff]. One wave32
+// block per ne output row.
+#define GEN_MOE_DOWN(DN) \
+extern "C" __global__ void moe_down_i8_##DN( \
+    const signed char* __restrict__ hq,       /* int8(h)  [nff] */ \
+    const float* __restrict__ hs,             /* h scales [nff/32] */ \
+    const unsigned char* __restrict__ down_w, /* raw DN bytes [ne, nff] (pre-advanced) */ \
+    float* __restrict__ dst,                  /* [ne] — accumulated */ \
+    int ne, int nff) { \
+    int d = blockIdx.x; \
+    int tid = threadIdx.x; \
+    if (d >= ne) return; \
+    int nb = nff >> 5; \
+    float acc = i8acc_##DN(hq, hs, down_w, d, nb, tid); \
+    acc = wave_sum32(acc); \
+    if (tid == 0) atomicAdd(&dst[d], acc); \
+}
+
+GEN_MOE_GATE_UP(q80)
+GEN_MOE_GATE_UP(q4k)
+GEN_MOE_GATE_UP(q6k)
+GEN_MOE_DOWN(q80)
+GEN_MOE_DOWN(q4k)
+GEN_MOE_DOWN(q6k)
 "#;
 
 // ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5) ───────────────────────────

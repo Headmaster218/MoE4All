@@ -157,6 +157,33 @@ fn moe_expert_kernel(gu: &str, dn: &str) -> &'static str {
     }
 }
 
+/// Whether the int8-activation dp4a MoE expert path (Slice 20) is enabled. Reuses the dense
+/// `INFR_ROCM_NO_I8` A/B switch: when set, MoE falls back to the Phase-3 f16-decode expert kernel.
+fn moe_i8_enabled() -> bool {
+    std::env::var_os("INFR_ROCM_NO_I8").is_none()
+}
+
+/// Static gate/up int8 kernel name for the gate/up format suffix (`moe_gate_up_act_i8_<gu>`). The
+/// suffix comes from `moe_native_fmt`, so the `_` arm is unreachable.
+fn moe_gate_up_i8_kernel(gu: &str) -> &'static str {
+    match gu {
+        "q80" => "moe_gate_up_act_i8_q80",
+        "q4k" => "moe_gate_up_act_i8_q4k",
+        "q6k" => "moe_gate_up_act_i8_q6k",
+        _ => unreachable!("moe_gate_up_i8_kernel: uncovered ({gu})"),
+    }
+}
+
+/// Static down int8 kernel name for the down format suffix (`moe_down_i8_<dn>`).
+fn moe_down_i8_kernel(dn: &str) -> &'static str {
+    match dn {
+        "q80" => "moe_down_i8_q80",
+        "q4k" => "moe_down_i8_q4k",
+        "q6k" => "moe_down_i8_q6k",
+        _ => unreachable!("moe_down_i8_kernel: uncovered ({dn})"),
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -1574,6 +1601,27 @@ fn run_op(
                 nfu * neu
             };
 
+            // Int8-activation dp4a expert path (Slice 20): when the gate/up/down banks are covered
+            // quant formats, decode+dot them via the int8 machinery (`quant_i8_32` + the `i8acc_*`
+            // GEMVs) instead of the Phase-3 per-element f16 round-trip, parallelized across nff/ne
+            // output rows. Scratch is drawn ONCE from the pool: the token's int8 input `qx_x`/`xs_x`
+            // (re-quantized per token, reused across every expert + both gate & up) and the per-expert
+            // activation `h_buf` → `hq`/`hs` (overwritten each expert; the stream serializes the
+            // gate_up → quant_h → down chain so the reuse never races). All fully written before read,
+            // so `zero = false`.
+            let use_i8 = native.is_some() && moe_i8_enabled();
+            let (qx_x, xs_x, h_buf, hq, hs) = if use_i8 {
+                (
+                    Some(ctx.pool_buf(neu.max(1), false)),
+                    Some(ctx.pool_buf((neu / 32 * 4).max(1), false)),
+                    Some(ctx.pool_buf((nfu * 4).max(1), false)),
+                    Some(ctx.pool_buf(nfu.max(1), false)),
+                    Some(ctx.pool_buf((nfu / 32 * 4).max(1), false)),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
             let dd = ctx.zero_dev(rows * neu);
             for row in 0..rows {
                 let logits = &logits_all[row * nexp..row * nexp + nexp];
@@ -1605,6 +1653,23 @@ fn run_op(
                 };
                 let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
                 let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                // Int8 path: quantize this token's input row ONCE (reused across all experts).
+                if use_i8 {
+                    dispatch_1d(
+                        pipelines,
+                        ctx.stream,
+                        "quant_i8_32",
+                        (neu / 32) as u32,
+                        256,
+                        args![
+                            arg_ptr(x_row),
+                            arg_ptr(qx_x.as_ref().unwrap().ptr),
+                            arg_ptr(xs_x.as_ref().unwrap().ptr),
+                            arg_i32(1),
+                            arg_i32(ne as i32),
+                        ],
+                    )?;
+                }
                 for &ei in &idx {
                     let w = probs[ei] / wsum * scale;
                     // Per-expert pointers. Native path: byte offset = (element_offset / qpb) * bpb
@@ -1655,26 +1720,86 @@ fn run_op(
                             (gs, us, ds, "moe_ffn_expert")
                         };
                     let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
-                    dispatch_1d(
-                        pipelines,
-                        ctx.stream,
-                        kname,
-                        n_ff_exp,
-                        256,
-                        args![
-                            arg_ptr(x_row),
-                            arg_ptr(gs),
-                            arg_ptr(us),
-                            arg_ptr(ds),
-                            arg_ptr(dst_row),
-                            arg_i32(ne as i32),
-                            arg_i32(n_ff_exp as i32),
-                            arg_i32(at),
-                            arg_f32(w),
-                            arg_f32(dsc),
-                            arg_i32(wb_flag),
-                        ],
-                    )?;
+                    if let (true, Some(((gu, _, _), (dn, _, _)))) = (use_i8, native) {
+                        // int8 dp4a: gate+up+activation (→ h_buf), quant h, then down (accumulate).
+                        // The routing weight is folded into h via wg/wo (same split as the fused
+                        // f16 kernel: `weight_before` applies it to the gate/up inputs, else output).
+                        let wg = if weight_before { w } else { 1.0 };
+                        let wo = if weight_before { 1.0 } else { w };
+                        let h_ptr = h_buf.as_ref().unwrap().ptr;
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            moe_gate_up_i8_kernel(gu),
+                            n_ff_exp,
+                            1,
+                            32,
+                            args![
+                                arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                arg_ptr(xs_x.as_ref().unwrap().ptr),
+                                arg_ptr(gs),
+                                arg_ptr(us),
+                                arg_ptr(h_ptr),
+                                arg_i32(ne as i32),
+                                arg_i32(n_ff_exp as i32),
+                                arg_i32(at),
+                                arg_f32(wg),
+                                arg_f32(wo),
+                                arg_f32(dsc),
+                            ],
+                        )?;
+                        dispatch_1d(
+                            pipelines,
+                            ctx.stream,
+                            "quant_i8_32",
+                            (nfu / 32) as u32,
+                            256,
+                            args![
+                                arg_ptr(h_ptr),
+                                arg_ptr(hq.as_ref().unwrap().ptr),
+                                arg_ptr(hs.as_ref().unwrap().ptr),
+                                arg_i32(1),
+                                arg_i32(n_ff_exp as i32),
+                            ],
+                        )?;
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            moe_down_i8_kernel(dn),
+                            ne,
+                            1,
+                            32,
+                            args![
+                                arg_ptr(hq.as_ref().unwrap().ptr),
+                                arg_ptr(hs.as_ref().unwrap().ptr),
+                                arg_ptr(ds),
+                                arg_ptr(dst_row),
+                                arg_i32(ne as i32),
+                                arg_i32(n_ff_exp as i32),
+                            ],
+                        )?;
+                    } else {
+                        dispatch_1d(
+                            pipelines,
+                            ctx.stream,
+                            kname,
+                            n_ff_exp,
+                            256,
+                            args![
+                                arg_ptr(x_row),
+                                arg_ptr(gs),
+                                arg_ptr(us),
+                                arg_ptr(ds),
+                                arg_ptr(dst_row),
+                                arg_i32(ne as i32),
+                                arg_i32(n_ff_exp as i32),
+                                arg_i32(at),
+                                arg_f32(w),
+                                arg_f32(dsc),
+                                arg_i32(wb_flag),
+                            ],
+                        )?;
+                    }
                 }
             }
             ctx.dev[dst.0 as usize] = Some(dd);
