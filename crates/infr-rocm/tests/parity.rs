@@ -131,6 +131,99 @@ fn run_linear(
     o
 }
 
+/// Run a 2-op `RmsNorm → Linear` graph (m=1 decode) on `be`. Exercises the Slice-32 decode
+/// norm-fusion peephole (RmsNorm elided, fused into the int8 GEMV's quant) on the ROCm path;
+/// the CPU runs the split ops. Returns the downloaded f32 output.
+#[allow(clippy::too_many_arguments)]
+fn run_rmsnorm_linear(
+    be: &dyn Backend,
+    x: &[f32],
+    norm_w: &[f32],
+    w_bytes: &[u8],
+    w_dtype: DType,
+    in_f: usize,
+    out_f: usize,
+) -> Vec<f32> {
+    let m = 1usize;
+    let mut g = Graph::new();
+    let xid = g.input(f32d(m * in_f));
+    let nwid = g.weight(TensorDesc::new(vec![in_f], DType::F32));
+    let normed = g.internal(f32d(m * in_f));
+    let wid = g.weight(TensorDesc::new(vec![out_f * in_f], w_dtype));
+    let dst = g.output(f32d(m * out_f));
+    g.push(Op::RmsNorm {
+        x: xid,
+        weight: nwid,
+        dst: normed,
+        rows: m as u32,
+        dim: in_f as u32,
+        eps: 1e-6,
+    });
+    g.push(Op::Linear {
+        x: normed,
+        weight: wid,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+    let nwb = be
+        .alloc(norm_w.len() * 4, BufferUsage::Weights)
+        .expect("nw");
+    be.upload(nwb.as_ref(), bytemuck::cast_slice(norm_w))
+        .unwrap();
+    let wb = be.alloc(w_bytes.len(), BufferUsage::Weights).expect("w");
+    be.upload(wb.as_ref(), w_bytes).unwrap();
+    let ob = be.alloc(m * out_f * 4, BufferUsage::Readback).expect("out");
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(nwid, nwb.as_ref());
+    b.bind(wid, wb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; m * out_f];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// Slice-32 decode norm-fusion: `RmsNorm → Linear` (Q8_0, m=1) on ROCm (fused) vs the CPU split
+/// ops. Within the int8 activation tolerance (only the activation is int8-quantized; Q8_0 weight
+/// is near-lossless).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn rmsnorm_linear_i8_q80_fused_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (in_f, out_f) = (256usize, 8usize);
+    let x = gen(in_f, 5);
+    let norm_w = gen(in_f, 9);
+    let w_bytes = q80_blocks((out_f * in_f) / 32);
+    let c = run_rmsnorm_linear(&cpu, &x, &norm_w, &w_bytes, DType::Q8_0, in_f, out_f);
+    let r = run_rmsnorm_linear(&be, &x, &norm_w, &w_bytes, DType::Q8_0, in_f, out_f);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "RmsNorm→Linear-i8 Q8_0 fused max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "fused RmsNorm→Linear reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 1.5e-2,
+        "fused RmsNorm→Linear diverges from CPU: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
 /// F16 weight: the CPU reference dequants f16→f32 exactly, ROCm reads f16 as-is, so parity
 /// is near bit-exact.
 #[test]

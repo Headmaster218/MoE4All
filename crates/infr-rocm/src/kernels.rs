@@ -63,6 +63,7 @@ const HIP_PARTS: &[&str] = &[
     DEQUANT_F16,
     MOE_FFN_NATIVE,
     INT8_DECODE,
+    RMSNORM_QUANT_I8,
     MOE_FFN_INT8,
     WMMA_PREFILL,
 ];
@@ -1774,6 +1775,7 @@ extern "C" __global__ void linear_i8_q80(
     const float* __restrict__ xs,          // [m, in_f/32]
     const unsigned char* __restrict__ w,   // raw Q8_0 weight bytes (pre-advanced past w_off)
     float* __restrict__ dst,               // [m, out_f]
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
     int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
@@ -1795,7 +1797,13 @@ extern "C" __global__ void linear_i8_q80(
         acc += d * xsr[blk] * (float)idot;
     }
     acc = wave_sum32(acc);
-    if (tid == 0) dst[(long)row * out_f + o] = acc;
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
 }
 
 // ── Q4_K: 256 elems / 144 bytes; sub-block 32; code 0..15; value = d·sc·code + dmin·(−mm). ──
@@ -1804,6 +1812,7 @@ extern "C" __global__ void linear_i8_q4k(
     const float* __restrict__ xs,
     const unsigned char* __restrict__ w,
     float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
     int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
@@ -1842,7 +1851,13 @@ extern "C" __global__ void linear_i8_q4k(
         acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
     }
     acc = wave_sum32(acc);
-    if (tid == 0) dst[(long)row * out_f + o] = acc;
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
 }
 
 // ── Q6_K: 256 elems / 210 bytes; sub-block 16 (int8 scale); code 0..63; value = d·s·code + d·(−32s). ──
@@ -1851,6 +1866,7 @@ extern "C" __global__ void linear_i8_q6k(
     const float* __restrict__ xs,
     const unsigned char* __restrict__ w,
     float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
     int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
@@ -1900,7 +1916,13 @@ extern "C" __global__ void linear_i8_q6k(
         }
     }
     acc = wave_sum32(acc);
-    if (tid == 0) dst[(long)row * out_f + o] = acc;
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
 }
 
 // ── Q5_0: 32 elems / 22 bytes; single scale d, offset −16; code 0..31. value = d·(code − 16). ──
@@ -1911,6 +1933,7 @@ extern "C" __global__ void linear_i8_q50(
     const float* __restrict__ xs,
     const unsigned char* __restrict__ w,
     float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
     int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
@@ -1942,7 +1965,81 @@ extern "C" __global__ void linear_i8_q50(
         acc += d * sx * (float)idot + (d * (float)(-16)) * sx * (float)isum;
     }
     acc = wave_sum32(acc);
-    if (tid == 0) dst[(long)row * out_f + o] = acc;
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+"#;
+
+// ── Fused RMSNorm → int8 activation quant (Slice 32) ──────────────────────────
+//
+// Decode fuses the `RmsNorm → Linear` boundary (input_norm→qkv, post_attn_norm→gate/up: 2 per
+// decoder layer). Instead of the standalone `rmsnorm` kernel writing the normalized row to global
+// memory and `quant_i8_32` reading it straight back, this ONE kernel reads the RAW pre-norm row,
+// computes the rmsnorm scale, and int8-quantizes the normalized row in registers — the normalized
+// activation never round-trips through DRAM and the `rmsnorm` launch is gone. The dp4a GEMV that
+// consumes `qx`/`xs` is unchanged.
+//
+// Bit-faithful to `rmsnorm` THEN `quant_i8_32`: same block layout (grid.x = rows, blockDim = 256),
+// the SAME shared-mem tree reduce for the sum-of-squares (identical float reassociation → identical
+// `rms`), and the normalized value `xr*rms*half2float(weight)` is recomputed with the identical
+// expression — an f32 store/load round-trip is exact, so the register value equals what
+// `quant_i8_32` would have read. The int8 codes + per-32-block scales are therefore bit-identical
+// and the golden hash does not move.
+const RMSNORM_QUANT_I8: &str = r#"
+extern "C" __global__ void rmsnorm_quant_i8_32(
+    const float* __restrict__ x,       // [rows, dim] — RAW pre-norm F32 activation
+    const __half* __restrict__ weight, // [dim] — dequantized F16 norm weight
+    signed char* __restrict__ qx,      // [rows, dim] — int8 codes
+    float* __restrict__ xs,            // [rows, dim/32] — per-32-block scales
+    int rows,
+    int dim,
+    float eps
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+    const float* xr = x + (long)row * dim;
+    float local = 0.0f;
+    for (int i = tid; i < dim; i += nt) {
+        float v = xr[i];
+        local += v * v;
+    }
+    __shared__ float sdata[256];
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float ss = sdata[0] / (float)dim;
+    float rms = 1.0f / sqrtf(ss + eps);
+    int nblk = dim >> 5;
+    for (int blk = tid; blk < nblk; blk += nt) {
+        int base = blk * 32;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float nv = xr[base + j] * rms * __half2float(weight[base + j]);
+            float a = fabsf(nv);
+            if (a > amax) amax = a;
+        }
+        float s = amax / 127.0f;
+        float inv = (s > 0.0f) ? (1.0f / s) : 0.0f;
+        signed char* qr = qx + (long)(row * nblk + blk) * 32;
+        for (int j = 0; j < 32; j++) {
+            float nv = xr[base + j] * rms * __half2float(weight[base + j]);
+            float v = roundf(nv * inv);
+            if (v > 127.0f) v = 127.0f;
+            if (v < -127.0f) v = -127.0f;
+            qr[j] = (signed char)v;
+        }
+        xs[(long)row * nblk + blk] = s;
+    }
 }
 "#;
 

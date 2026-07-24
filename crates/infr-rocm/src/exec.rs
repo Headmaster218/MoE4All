@@ -14,7 +14,7 @@ use infr_core::error::{Error, Result};
 use infr_core::graph::{AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -663,8 +663,22 @@ pub fn execute_graph(
     // barrier below, before the cross-stream writeback DtoD + the final checked sync. With the
     // allocation churn gone (buffer pool), those per-op `hipMalloc`/`hipFree`/`hipStreamSynchronize`
     // device syncs — the real decode bottleneck — are all off the hot path.
-    for op in g.ops.iter() {
-        run_op(op, g, bindings, pipelines, &mut ctx)?;
+    let fusion = decode_fusion(g);
+    for (i, op) in g.ops.iter().enumerate() {
+        if fusion.skip.contains(&i) {
+            // Elided by a Slice-32 peephole (the RmsNorm folded into a following Linear, or the
+            // residual Add folded into a preceding Linear's GEMV epilogue).
+            continue;
+        }
+        run_op(
+            op,
+            g,
+            bindings,
+            pipelines,
+            &mut ctx,
+            fusion.norm.get(&i).copied(),
+            fusion.add.get(&i).copied(),
+        )?;
     }
 
     // Barrier all queued op work before the writeback: the writeback `hipMemcpyDtoD` runs on the
@@ -713,16 +727,169 @@ pub fn execute_graph(
     Ok(())
 }
 
+// ── Decode op-fusion peephole (Slice 32) ─────────────────────────────────────
+//
+// Two adjacent-op merges the backend detects on the AGNOSTIC graph (so they apply to every arch),
+// each with a scalar fallback when the pattern doesn't match:
+//
+//   1. `RmsNorm → Linear` (input_norm→qkv, post_attn_norm→gate/up): elide the standalone `rmsnorm`
+//      kernel + its normalized-activation DRAM round-trip; every consuming decode GEMV normalizes
+//      and int8-quantizes its RAW input row in one `rmsnorm_quant_i8_32` pass (bit-faithful).
+//   2. `Linear → Add(residual)` (o_proj, down_proj): fold the residual Add into the GEMV epilogue
+//      (`dst = gemv + residual`), killing the standalone `add` kernel + its round-trip.
+//
+// Both are gated to decode (`m == 1`) int8 GEMVs — the shipping default path (Q8_0/Q4_K/Q6_K/Q5_0).
+// Prefill (m>1, WMMA/rocBLAS) and uncovered formats keep the split ops. Escape hatches:
+// `INFR_ROCM_NO_FUSE_NORM` / `INFR_ROCM_NO_FUSE_ADD`.
+#[derive(Default)]
+struct DecodeFusion {
+    /// Linear op idx → (raw pre-norm x, norm weight, eps): run `rmsnorm_quant_i8_32` on the raw row
+    /// instead of `quant_i8_32` on the (elided) normalized input.
+    norm: HashMap<usize, (TensorId, TensorId, f32)>,
+    /// Linear op idx → (residual operand, add dst): fold the following `Add` into the GEMV epilogue.
+    add: HashMap<usize, (TensorId, TensorId)>,
+    /// Op indices to elide entirely (the fused-away `RmsNorm` / `Add`).
+    skip: HashSet<usize>,
+}
+
+fn decode_fusion(g: &Graph) -> DecodeFusion {
+    let mut f = DecodeFusion::default();
+    let no_norm = std::env::var_os("INFR_ROCM_NO_FUSE_NORM").is_some();
+    let no_add = std::env::var_os("INFR_ROCM_NO_FUSE_ADD").is_some();
+
+    // Fusion 1: RmsNorm → int8 decode Linear(s).
+    if !no_norm {
+        for (i, op) in g.ops.iter().enumerate() {
+            let Op::RmsNorm {
+                x,
+                weight,
+                dst,
+                dim,
+                eps,
+                ..
+            } = *op
+            else {
+                continue;
+            };
+            if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
+                continue;
+            }
+            // The normalized-output tensor is a scratch handle RECYCLED across layers, so a
+            // whole-graph reader scan would wrongly match every layer's q/k/v against ONE norm.
+            // Only readers in THIS norm's live range — from here until the next op that rewrites
+            // `dst` — are its consumers. Each must be a fusable int8 decode GEMV whose `in_f`
+            // matches the norm `dim` (the fused reduction spans exactly the normalized row).
+            let mut consumers: Vec<usize> = Vec::new();
+            let mut ok = true;
+            for j in (i + 1)..g.ops.len() {
+                let (ins, outs) = g.ops[j].io();
+                if ins.contains(&dst) {
+                    match &g.ops[j] {
+                        Op::Linear {
+                            x: lx,
+                            weight: lw,
+                            m: 1,
+                            in_f,
+                            ..
+                        } if *lx == dst
+                            && *in_f == dim
+                            && native_i8_fmt(g.desc(*lw).dtype).is_some() =>
+                        {
+                            consumers.push(j);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if outs.contains(&dst) {
+                    break; // `dst` rewritten — live range ends (a fusable Linear never writes it).
+                }
+            }
+            if ok && !consumers.is_empty() {
+                f.skip.insert(i);
+                for j in consumers {
+                    f.norm.insert(j, (x, weight, eps));
+                }
+            }
+        }
+    }
+
+    // Fusion 2: int8 decode Linear → Add(residual).
+    if !no_add {
+        for (i, op) in g.ops.iter().enumerate() {
+            let Op::Linear {
+                dst,
+                weight,
+                m: 1,
+                out_f,
+                ..
+            } = *op
+            else {
+                continue;
+            };
+            if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal)
+                || native_i8_fmt(g.desc(weight).dtype).is_none()
+            {
+                continue;
+            }
+            let Some(Op::Add {
+                a,
+                b,
+                dst: add_dst,
+                n,
+            }) = g.ops.get(i + 1)
+            else {
+                continue;
+            };
+            if *n != out_f {
+                continue;
+            }
+            let residual = if *b == dst && *a != dst {
+                *a
+            } else if *a == dst && *b != dst {
+                *b
+            } else {
+                continue;
+            };
+            // The Linear's dst must be consumed ONLY by this Add before it is next rewritten —
+            // eliding the standalone write is unsafe if anything else reads the un-added projection.
+            // (Bounded to the live range: the dst scratch may be recycled by a later layer.)
+            let mut only_add = true;
+            for j in (i + 2)..g.ops.len() {
+                let (ins, outs) = g.ops[j].io();
+                if ins.contains(&dst) {
+                    only_add = false;
+                    break;
+                }
+                if outs.contains(&dst) {
+                    break;
+                }
+            }
+            if !only_add {
+                continue;
+            }
+            f.add.insert(i, (residual, *add_dst));
+            f.skip.insert(i + 1);
+        }
+    }
+    f
+}
+
 // ── Per-op dispatch ──────────────────────────────────────────────────────────
 
 macro_rules! args { ($($e:expr),* $(,)?) => { vec![$($e),*] }; }
 
+#[allow(clippy::too_many_arguments)]
 fn run_op(
     op: &Op,
     g: &Graph,
     bindings: &Bindings,
     pipelines: &Pipelines,
     ctx: &mut ExecCtx,
+    norm_fuse: Option<(TensorId, TensorId, f32)>,
+    add_fuse: Option<(TensorId, TensorId)>,
 ) -> Result<()> {
     match *op {
         Op::RmsNorm {
@@ -808,13 +975,20 @@ fn run_op(
                 // rows × `in_f` (a multiple of `qpb`), so `(w_off/qpb)*bpb` is exact.
                 debug_assert_eq!(bpb, bpb_i8);
                 let wptr = ctx.ensure_device(weight, g, bindings)?;
-                ctx.ensure_device(x, g, bindings)?;
-                let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
                 let mu = m as usize;
                 let inu = in_f as usize;
                 let ou = out_f as usize;
                 let blk_off = (w_off as usize / qpb) * bpb;
                 let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
+                // The plain int8 quant reads the (already-normalized) `x`; the RmsNorm→Linear fusion
+                // instead reads the RAW pre-norm row inside `rmsnorm_quant_i8_32`, so `x` (the elided
+                // norm's output) is never materialized on device.
+                let bx_ptr = if norm_fuse.is_none() {
+                    ctx.ensure_device(x, g, bindings)?;
+                    ctx.dev[x.0 as usize].as_ref().unwrap().ptr
+                } else {
+                    std::ptr::null_mut()
+                };
                 match (m > 1 && !ctx.rocblas.is_null())
                     .then(|| deqf16_fmt(wdt))
                     .flatten()
@@ -905,21 +1079,66 @@ fn run_op(
                         let nb = inu / 32; // in_f is 32-aligned for every covered format
                         let qx = ctx.pool_buf((mu * inu).max(1), false);
                         let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
-                        dispatch_1d(
-                            pipelines,
-                            ctx.stream,
-                            "quant_i8_32",
-                            (mu * nb) as u32,
-                            256,
-                            args![
-                                arg_ptr(bx_ptr),
-                                arg_ptr(qx.ptr),
-                                arg_ptr(xs.ptr),
-                                arg_i32(m as i32),
-                                arg_i32(in_f as i32),
-                            ],
-                        )?;
-                        let dd = ctx.zero_dev(mu * ou);
+                        if let Some((x_raw, norm_w, eps)) = norm_fuse {
+                            // Slice-32 RmsNorm→Linear: one block per row reduces the sum-of-squares
+                            // over the RAW row, then int8-quantizes the normalized row in registers
+                            // (bit-identical to `rmsnorm` then `quant_i8_32`), killing the `rmsnorm`
+                            // launch + the normalized-activation DRAM round-trip.
+                            let wnptr = ctx.dequant_weight_or_cache(norm_w, g, bindings)?;
+                            let xrp = ctx.ensure_device(x_raw, g, bindings)?;
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                "rmsnorm_quant_i8_32",
+                                m,
+                                1,
+                                256,
+                                args![
+                                    arg_ptr(xrp),
+                                    arg_ptr(wnptr),
+                                    arg_ptr(qx.ptr),
+                                    arg_ptr(xs.ptr),
+                                    arg_i32(m as i32),
+                                    arg_i32(in_f as i32),
+                                    arg_f32(eps),
+                                ],
+                            )?;
+                        } else {
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "quant_i8_32",
+                                (mu * nb) as u32,
+                                256,
+                                args![
+                                    arg_ptr(bx_ptr),
+                                    arg_ptr(qx.ptr),
+                                    arg_ptr(xs.ptr),
+                                    arg_i32(m as i32),
+                                    arg_i32(in_f as i32),
+                                ],
+                            )?;
+                        }
+                        // Slice-32 Linear→Add: when the following residual Add is fused in, the GEMV
+                        // writes (and adds) straight into the residual stream's live buffer — no
+                        // fresh zeroed dst, no standalone `add`. `resid_ptr` is null otherwise, so
+                        // the GEMV epilogue is bit-identical to the pre-fusion write.
+                        let resid_ptr = match add_fuse {
+                            Some((resid, _)) => ctx.ensure_device(resid, g, bindings)?,
+                            None => std::ptr::null_mut(),
+                        };
+                        let dd = match add_fuse {
+                            Some((_, add_dst)) => {
+                                ctx.ensure_device(add_dst, g, bindings)?;
+                                let b = ctx.dev[add_dst.0 as usize].as_ref().unwrap();
+                                crate::RocmBuffer {
+                                    ptr: b.ptr,
+                                    len: b.len,
+                                    owned: false,
+                                }
+                            }
+                            None => ctx.zero_dev(mu * ou),
+                        };
                         // Slice-28: Q4_K prefill (m>1) can OPT IN (`INFR_ROCM_COOP=1`) to the
                         // cooperative decode-once GEMM (multi-warp threadblock, LDS-shared weight
                         // tile). It is bit-faithful to `wmma_i8_q4k_2x1` (goldens hold) but measured
@@ -981,7 +1200,9 @@ fn run_op(
                                 }
                                 None => {
                                     // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m):
-                                    // one wave32 block per (output row, activation row).
+                                    // one wave32 block per (output row, activation row). `resid_ptr`
+                                    // (null unless the Slice-32 residual Add is fused) folds the add
+                                    // into the epilogue.
                                     dispatch_grid(
                                         pipelines,
                                         ctx.stream,
@@ -994,6 +1215,7 @@ fn run_op(
                                             arg_ptr(xs.ptr),
                                             arg_ptr(wptr_off),
                                             arg_ptr(dd.ptr),
+                                            arg_ptr(resid_ptr),
                                             arg_i32(m as i32),
                                             arg_i32(in_f as i32),
                                             arg_i32(out_f as i32),
@@ -1002,7 +1224,12 @@ fn run_op(
                                 }
                             },
                         }
-                        ctx.dev[dst.0 as usize] = Some(dd);
+                        // When the residual Add is fused, `dd` aliases the residual stream buffer
+                        // (already mapped in `ctx.dev` via `ensure_device(add_dst)`) and the result
+                        // is written in place — nothing to remap. Otherwise publish the fresh dst.
+                        if add_fuse.is_none() {
+                            ctx.dev[dst.0 as usize] = Some(dd);
+                        }
                     }
                 }
             } else if let Some((qpb, bpb, kname, _)) = native_decode_fmt(wdt) {
