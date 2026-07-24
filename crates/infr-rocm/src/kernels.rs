@@ -61,6 +61,11 @@ const HIP_PARTS: &[&str] = &[
     WMMA_PREFILL,
 ];
 
+// One BLOCK per row (grid.x = rows, blockDim.x = RMS_BLOCK). The sum-of-squares is a strided
+// partial per thread then a shared-mem tree reduce, so at m=1 (decode) the `dim` reduction spreads
+// across a full wave instead of one serial thread. The tree reduce reorders the float adds vs the
+// reference serial sum (sub-ULP); greedy decode absorbs it and the golden hash is verified unmoved.
+// blockDim.x MUST be a power of two ≤ 256 (shared-mem `sdata[256]` bound + the tree-reduce step).
 const RMSNORM: &str = r#"
 extern "C" __global__ void rmsnorm(
     const float* __restrict__ x,     // [rows, dim] — F32 activation
@@ -70,18 +75,27 @@ extern "C" __global__ void rmsnorm(
     int dim,
     float eps
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     if (row >= rows) return;
-    float ss = 0.0f;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
     const float* xr = x + row * dim;
-    for (int i = 0; i < dim; i++) {
+    float local = 0.0f;
+    for (int i = tid; i < dim; i += nt) {
         float v = xr[i];
-        ss += v * v;
+        local += v * v;
     }
-    ss /= (float)dim;
+    __shared__ float sdata[256];
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float ss = sdata[0] / (float)dim;
     float rms = 1.0f / sqrtf(ss + eps);
     float* d = dst + row * dim;
-    for (int i = 0; i < dim; i++) {
+    for (int i = tid; i < dim; i += nt) {
         d[i] = xr[i] * rms * __half2float(weight[i]);
     }
 }
@@ -96,18 +110,27 @@ extern "C" __global__ void rmsnorm_add(
     int dim,
     float eps
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     if (row >= rows) return;
-    float ss = 0.0f;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
     const float* xr = x + row * dim;
-    for (int i = 0; i < dim; i++) {
+    float local = 0.0f;
+    for (int i = tid; i < dim; i += nt) {
         float v = xr[i];
-        ss += v * v;
+        local += v * v;
     }
-    ss /= (float)dim;
+    __shared__ float sdata[256];
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float ss = sdata[0] / (float)dim;
     float rms = 1.0f / sqrtf(ss + eps);
     float* d = dst + row * dim;
-    for (int i = 0; i < dim; i++) {
+    for (int i = tid; i < dim; i += nt) {
         d[i] += xr[i] * rms * __half2float(weight[i]);
     }
 }
@@ -347,42 +370,47 @@ extern "C" __global__ void gated_act(
     int gate_stride,    // 0 = packed
     int gate_block_width // 0 = no interleave
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
+    // One thread per OUTPUT element (row, i). Each dst[i] = act(gate[i]) * up[i] is fully
+    // independent (no reduction) → bit-exact vs the old per-row serial loop, but at m=1 (decode)
+    // this fans the `nff` outputs across `ceil(rows*nff/block)` blocks instead of stranding the
+    // whole loop on one thread of one CU.
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * nff;
+    if (tid >= total) return;
+    int row = tid / nff;
+    int i = tid % nff;
     int effective_gate_stride = (gate_stride > 0) ? gate_stride : nff;
     int effective_up_stride = (up_stride > 0) ? up_stride : nff;
     int gate_off = row * effective_gate_stride;
     int up_off_base = up_off + row * effective_up_stride;
-    for (int i = 0; i < nff; i++) {
-        float g;
-        if (gate_block_width > 0) {
-            // Interleaved qg row: per head a [query(headw) | gate(headw)] block, so the full
-            // per-head block is `gate_block_width` wide and the gate half starts at `headw`.
-            // Output index `i` addresses the PACKED gate (headw per head); map it to the strided
-            // gate half. Matches infr-cpu's GatedAct (headw = gate_block_width / 2).
-            int headw = gate_block_width / 2;
-            int head = i / headw;
-            int off = i % headw;
-            g = gate[gate_off + head * gate_block_width + headw + off];
-        } else {
-            g = gate[gate_off + i];
-        }
-        float u = up[up_off_base + i];
-        float a;
-        if (act_type == 0) {
-            // SiLU: x * sigmoid(x)
-            a = g / (1.0f + expf(-g));
-        } else if (act_type == 1) {
-            // GeLU (tanh approx)
-            float x3 = g * g * g;
-            float c = 0.044715f;
-            a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + c * x3)));
-        } else {
-            // Sigmoid
-            a = 1.0f / (1.0f + expf(-g));
-        }
-        dst[row * nff + i] = a * u;
+    float g;
+    if (gate_block_width > 0) {
+        // Interleaved qg row: per head a [query(headw) | gate(headw)] block, so the full
+        // per-head block is `gate_block_width` wide and the gate half starts at `headw`.
+        // Output index `i` addresses the PACKED gate (headw per head); map it to the strided
+        // gate half. Matches infr-cpu's GatedAct (headw = gate_block_width / 2).
+        int headw = gate_block_width / 2;
+        int head = i / headw;
+        int off = i % headw;
+        g = gate[gate_off + head * gate_block_width + headw + off];
+    } else {
+        g = gate[gate_off + i];
     }
+    float u = up[up_off_base + i];
+    float a;
+    if (act_type == 0) {
+        // SiLU: x * sigmoid(x)
+        a = g / (1.0f + expf(-g));
+    } else if (act_type == 1) {
+        // GeLU (tanh approx)
+        float x3 = g * g * g;
+        float c = 0.044715f;
+        a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + c * x3)));
+    } else {
+        // Sigmoid
+        a = 1.0f / (1.0f + expf(-g));
+    }
+    dst[row * nff + i] = a * u;
 }
 "#;
 
@@ -516,6 +544,11 @@ extern "C" __global__ void embed_gather(
 }
 "#;
 
+// One BLOCK per row (grid.x = rows). Each thread scans a strided slice of the vocab tracking its
+// best (strict `>`, ascending scan ⇒ lowest index on ties), then a shared-mem tree reduce keeps the
+// lower index on equal values. That reproduces the reference serial first-max tie rule EXACTLY, so
+// the argmax index is bit-identical — only the CU occupancy changes (at m=1 the vocab reduction
+// spreads across a wave instead of one serial thread over 151936 elements).
 const ARGMAX: &str = r#"
 extern "C" __global__ void argmax(
     const float* __restrict__ x, // [rows, n]
@@ -523,19 +556,43 @@ extern "C" __global__ void argmax(
     int rows,
     int n
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     if (row >= rows) return;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
     const float* xr = x + row * n;
-    float best_val = xr[0];
+    // Sentinel below any real logit; threads whose strided slice is empty (n < blockDim.x) keep it,
+    // and it loses every reduction step against a real candidate. (hiprtc has no INFINITY macro.)
+    float best_val = -3.402823466e+38f;
     int best_idx = 0;
-    for (int i = 1; i < n; i++) {
-        if (xr[i] > best_val) {
-            best_val = xr[i];
+    for (int i = tid; i < n; i += nt) {
+        float v = xr[i];
+        if (v > best_val) {
+            best_val = v;
             best_idx = i;
         }
     }
-    // Store u32 bit-pattern in an f32 slot (the runner reads as u32)
-    dst[row] = __int_as_float(best_idx);
+    __shared__ float sval[256];
+    __shared__ int sidx[256];
+    sval[tid] = best_val;
+    sidx[tid] = best_idx;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s];
+            int oi = sidx[tid + s];
+            // Keep the strictly-greater value; on a tie keep the LOWER index (first-max rule).
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
+                sval[tid] = ov;
+                sidx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        // Store u32 bit-pattern in an f32 slot (the runner reads as u32)
+        dst[row] = __int_as_float(sidx[0]);
+    }
 }
 "#;
 

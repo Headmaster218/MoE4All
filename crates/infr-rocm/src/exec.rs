@@ -521,11 +521,13 @@ fn run_op(
             ctx.ensure_device(x, g, bindings)?;
             let dd = ctx.zero_dev(rows as usize * dim as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            dispatch_1d(
+            // One block per row; the block reduces the sum-of-squares across a wave.
+            dispatch_grid(
                 pipelines,
                 ctx.stream,
                 "rmsnorm",
                 rows,
+                1,
                 256,
                 args![
                     arg_ptr(bx.ptr),
@@ -551,11 +553,13 @@ fn run_op(
             ctx.ensure_device(dst, g, bindings)?;
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let dd = ctx.dev[dst.0 as usize].as_ref().unwrap();
-            dispatch_1d(
+            // One block per row; the block reduces the sum-of-squares across a wave.
+            dispatch_grid(
                 pipelines,
                 ctx.stream,
                 "rmsnorm_add",
                 rows,
+                1,
                 256,
                 args![
                     arg_ptr(bx.ptr),
@@ -1042,7 +1046,7 @@ fn run_op(
                 pipelines,
                 ctx.stream,
                 "gated_act",
-                rows,
+                rows * nff,
                 256,
                 args![
                     arg_ptr(bg.ptr),
@@ -1078,7 +1082,7 @@ fn run_op(
                 pipelines,
                 ctx.stream,
                 "gated_act",
-                rows,
+                rows * nff,
                 256,
                 args![
                     arg_ptr(bgu.ptr),
@@ -1329,11 +1333,13 @@ fn run_op(
             ctx.ensure_device(x, g, bindings)?;
             let dd = ctx.zero_dev(rows as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            dispatch_1d(
+            // One block per row; the block reduces the vocab argmax across a wave.
+            dispatch_grid(
                 pipelines,
                 ctx.stream,
                 "argmax",
                 rows,
+                1,
                 256,
                 args![
                     arg_ptr(bx.ptr),
