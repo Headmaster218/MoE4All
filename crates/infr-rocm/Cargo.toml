@@ -51,3 +51,10 @@ required-features = ["rocm"]
 name = "blas_probe"
 path = "examples/blas_probe.rs"
 required-features = ["rocm"]
+
+# Gated: Slice-31 probe. Self-contained HIP FFI (incl. graph API) to measure whether
+# HIP-graph replay cuts the ~10 µs per-dispatch launch floor vs individual launches.
+[[example]]
+name = "graph_probe"
+path = "examples/graph_probe.rs"
+required-features = ["rocm"]
