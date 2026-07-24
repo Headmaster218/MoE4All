@@ -1990,8 +1990,11 @@ fn run_op(
             // Chunked/parallel prefill: DN_CHUNK=16, shared holds 2·C·kd + 2·C·C + 2·C floats
             // (≈18 KiB at kd=128). Use it for rows>1 when that footprint fits the 32 KiB dynamic-LDS
             // ceiling this GPU allows a launch without the MaxDynamicSharedMemorySize opt-in (an
-            // over-budget launch silently corrupts LDS rather than erroring); otherwise (and always
-            // for decode, rows==1) fall back to the sequential per-head scan.
+            // over-budget launch silently corrupts LDS rather than erroring). Decode (rows==1) goes to
+            // the column-parallel `deltanet_decode` (one block per value head, one thread per value
+            // dim — bit-identical to the sequential scan, just spread over n_vhead·head_v threads
+            // instead of n_vhead). The sequential per-head scan is the last-resort fallback (rows>1
+            // that overflows LDS, or head_v==0).
             const DN_CHUNK: usize = 16;
             let smem_bytes =
                 (2 * DN_CHUNK * head_k as usize + 2 * DN_CHUNK * DN_CHUNK + 2 * DN_CHUNK) * 4;
@@ -2006,6 +2009,18 @@ fn run_op(
                     n_vhead,
                     block,
                     smem_bytes as u32,
+                    dn_args,
+                )?;
+            } else if rows == 1 && head_v > 0 {
+                // Column-parallel decode: grid.x = n_vhead blocks (via total = n_vhead·block), one
+                // thread per value dim d (grid-stride covers head_v > block).
+                let block = head_v.clamp(1, 256);
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "deltanet_decode",
+                    n_vhead * block,
+                    block,
                     dn_args,
                 )?;
             } else {

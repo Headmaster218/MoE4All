@@ -56,6 +56,7 @@ const HIP_PARTS: &[&str] = &[
     MOE_FFN,
     CONV1D_SILU,
     DELTANET,
+    DELTANET_DECODE,
     DELTANET_CHUNKED,
     MOE_SHARED_EXPERT_ADD,
     NATIVE_DECODE,
@@ -1092,6 +1093,93 @@ extern "C" __global__ void deltanet(
             }
             dr[d] = o;
         }
+    }
+}
+"#;
+
+// ── Column-parallel single-token gated-DeltaNet DECODE (qwen35, rows==1) ───────
+//
+// The sequential `deltanet` kernel runs ONE thread per value head, and its inner `for d` loop walks
+// every value column of that head serially — fine for correctness but at decode (rows==1) it leaves
+// only n_vhead (~16) threads live on a 96-CU GPU, each grinding a head_v×head_k state update + readout.
+// This kernel keeps the recurrence step BYTE-FOR-BYTE identical to that inner loop but spreads the
+// value columns across the machine: one BLOCK per value head (grid.x = n_vhead), one THREAD per value
+// dim `d` (grid-stride if head_v > blockDim). Column S[:,d] is owned wholly by thread d — the delta-rule
+// coupling is the per-head SCALARS (beta, decay, the L2 norms qn/kn), which every thread recomputes
+// from the same q/k rows in the same order — so the per-column arithmetic AND its float-reduction order
+// match the sequential kernel exactly, and decode output/state are bit-identical to the pre-slice path
+// (the qwen35 token-for-token seam gate holds without a re-bless). The token scan is a single step, so
+// there is no sequential dependence to carry: `S = S·decay + k̂ ⊗ (β(v − k̂ᵀ(S·decay)))`, `o = q̂ᵀS_new`.
+// Preserves GQA (`vh % n_khead`), the fused `src_stride>0` q|k|v layout, the stable softplus decay, and
+// the caller's `eps`. exec.rs routes decode (rows==1) here; prefill (rows>1) stays on `deltanet_chunked`.
+const DELTANET_DECODE: &str = r#"
+extern "C" __global__ void deltanet_decode(
+    const float* __restrict__ q,         // [1, n_khead*head_k] (or fused src when src_stride>0)
+    const float* __restrict__ k,         // [1, n_khead*head_k]
+    const float* __restrict__ v,         // [1, n_vhead*head_v]
+    const float* __restrict__ b,         // [1, n_vhead]
+    const float* __restrict__ a,         // [1, n_vhead]
+    const __half* __restrict__ a_coef,   // [n_vhead]
+    const __half* __restrict__ dt_bias,  // [n_vhead]
+    float* __restrict__ state,           // [n_vhead, head_k, head_v] — mutated in-place
+    float* __restrict__ dst,             // [1, n_vhead*head_v]
+    int rows,                            // always 1 on this path (single token)
+    int n_khead,
+    int n_vhead,
+    int head_k,
+    int head_v,
+    float eps,
+    int src_stride                       // >0: q/k/v are slices of one buffer with this row stride
+) {
+    int vh = blockIdx.x;                 // one block == one value head
+    if (vh >= n_vhead) return;
+    int kh = vh % n_khead;               // GQA: interleaved value→key head map (matches CPU/Metal)
+    float ac = __half2float(a_coef[vh]);
+    float dtb = __half2float(dt_bias[vh]);
+    float qscale = rsqrtf((float)head_k);
+
+    // Fused (src_stride>0) vs packed (==0) row offsets — same layout as `deltanet` (row 0 only).
+    int koff = (src_stride > 0) ? n_khead * head_k : 0;
+    int voff = (src_stride > 0) ? 2 * n_khead * head_k : 0;
+    const float* qbase = q;
+    const float* kbase = (src_stride > 0) ? q : k;   // fused: k shares q's buffer
+    const float* vbase = (src_stride > 0) ? q : v;
+    const float* qr = qbase + kh * head_k;
+    const float* kr = kbase + koff + kh * head_k;
+    const float* vr = vbase + voff + vh * head_v;
+
+    // Per-head scalars — recomputed per thread from the same rows in the same order as `deltanet`
+    // (a single token's head_k reductions are cheaper than a shared-mem sync), so column math is
+    // bit-identical to the sequential inner loop.
+    float qsum = 0.0f, ksum = 0.0f;
+    for (int i = 0; i < head_k; i++) { qsum += qr[i] * qr[i]; ksum += kr[i] * kr[i]; }
+    float qn = 1.0f / sqrtf(qsum + eps);
+    float kn = 1.0f / sqrtf(ksum + eps);
+    float beta = 1.0f / (1.0f + expf(-b[vh]));
+    // decay = exp(a_coef * softplus(a + dt_bias)); STABLE softplus (no overflow).
+    float z = a[vh] + dtb;
+    float sp = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+    float decay = expf(ac * sp);
+
+    float* S = state + (long)vh * head_k * head_v;
+    float* dr = dst + (long)vh * head_v;
+    // Each thread owns value column d (grid-stride covers head_v > blockDim): decay → kv → delta →
+    // update → out — identical to the sequential kernel's per-column body.
+    for (int d = threadIdx.x; d < head_v; d += blockDim.x) {
+        float kv = 0.0f;
+        for (int kk = 0; kk < head_k; kk++) {
+            float s = S[kk * head_v + d] * decay;   // S *= decay
+            S[kk * head_v + d] = s;
+            kv += s * (kr[kk] * kn);                // kv[d] = k_normᵀ (S·decay)[:,d]
+        }
+        float delta = (vr[d] - kv) * beta;
+        float o = 0.0f;
+        for (int kk = 0; kk < head_k; kk++) {
+            float s = S[kk * head_v + d] + (kr[kk] * kn) * delta;  // S += k_norm ⊗ delta
+            S[kk * head_v + d] = s;
+            o += s * (qr[kk] * qn * qscale);        // out[d] = q_normᵀ S[:,d]
+        }
+        dr[d] = o;
     }
 }
 "#;
