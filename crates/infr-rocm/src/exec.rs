@@ -195,6 +195,48 @@ fn native_wmma_fmt(dt: DType, out_f: u32) -> Option<(&'static str, u32, u32)> {
     Some((name, rm, cn))
 }
 
+/// Cooperative decode-once Q4_K prefill GEMM kernel (Phase 5, Slice-28). A multi-warp threadblock
+/// decodes the BN-column weight tile into LDS int8 ONCE per K-step and reuses it across all BM rows,
+/// killing the ~m/32× redundant weight decode of the single-wave `wmma_i8_q4k_*` kernels. Returns
+/// `(kernel_name, BM, BN, threads)`; the launch grid is `(ceil(out_f/BN), ceil(m/BM))`.
+///
+/// OPT-IN (`INFR_ROCM_COOP=1`), NOT the default: the Slice-28 sweep measured this single-buffered
+/// cooperative form as a REGRESSION vs the Slice-27 pipe on gfx1100 (isolated GEMM ~0.6×, pp512
+/// ~0.90×). Root cause (docs/perf.md, `-Rpass-analysis` + micro-bench): the RX 7900 XTX Q4_K GEMM at
+/// m=512 is NOT decode-bound — the baseline's barrier-free single-wave design already hides the
+/// redundant decode behind full occupancy (thousands of 1-wave blocks). Cooperative trades that away:
+/// the wide-tile variants are VGPR-starved (7 waves/SIMD vs 9-10), and even the occupancy-matched
+/// `128x32` tile (10 waves/SIMD) loses, because the 2× `__syncthreads`/K-step and the serialized
+/// cooperative-decode phase (only BN of the block's threads active) cost more than decode-once saves.
+/// Removing the min-term ones-dot WMMA (`_rs` tiles) does not recover it → not matrix-core bound.
+/// Closing the ~5.6× gap to llama.cpp needs the double-buffered async LDS pipeline (overlap
+/// load+decode with WMMA so the barriers don't stall) — a larger change left for the next slice. The
+/// kernels are kept (bit-faithful, parity-green) as that pipeline's foundation. `INFR_ROCM_COOP_TILE`
+/// selects the tile for A/B benchmarking (`examples/wmma_bench`). Bit-identical math to
+/// `wmma_i8_q4k_2x1` (same int8 codes + per-block scale-after order), so the blessed goldens hold.
+fn q4k_coop_kernel() -> Option<(&'static str, u32, u32, u32)> {
+    // Opt-in gate: absent env → `None` (fall through to the default pipe path).
+    std::env::var_os("INFR_ROCM_COOP")?;
+    Some(
+        match std::env::var("INFR_ROCM_COOP_TILE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("128x32") => ("wmma_i8_q4k_coop_128x32_w8", 128, 32, 256),
+            Some("64x64") => ("wmma_i8_q4k_coop_64x64_w4", 64, 64, 128),
+            Some("64x32") => ("wmma_i8_q4k_coop_64x32_w8", 64, 32, 256),
+            Some("128x128") => ("wmma_i8_q4k_coop_128x128_w8", 128, 128, 256),
+            Some("256x64") => ("wmma_i8_q4k_coop_256x64_w16", 256, 64, 512),
+            Some("rs_128x64") => ("wmma_i8_q4k_coop_rs_128x64_w8", 128, 64, 256),
+            Some("rs_128x32") => ("wmma_i8_q4k_coop_rs_128x32_w8", 128, 32, 256),
+            Some("rs_64x64") => ("wmma_i8_q4k_coop_rs_64x64_w4", 64, 64, 128),
+            Some("rs_64x32") => ("wmma_i8_q4k_coop_rs_64x32_w8", 64, 32, 256),
+            _ => ("wmma_i8_q4k_coop_128x64_w8", 128, 64, 256),
+        },
+    )
+}
+
 /// Native in-kernel decode for a MoE expert weight bank (Phase-3 for MoE). Returns
 /// `(suffix, elems_per_block, bytes_per_block)` for a covered dtype — the suffix names the
 /// `deq_*` decoder baked into the `moe_ffn_expert_<gu>_<dn>` kernel and the block geometry gives
@@ -878,20 +920,29 @@ fn run_op(
                             ],
                         )?;
                         let dd = ctx.zero_dev(mu * ou);
-                        match (m > 1).then(|| native_wmma_fmt(wdt, out_f)).flatten() {
-                            Some((wmma_kernel, rm, cn)) => {
-                                // Prefill (m>1), BLAS disabled: matrix-core int8 GEMM. Grid =
-                                // (ceil(out_f/(16*CN)), ceil(m/(16*RM))), one wave32 block per
-                                // 16*RM × 16*CN output tile — reuses each A fragment across the CN
-                                // weight-column tiles and each decoded weight tile across the RM row
-                                // tiles. Bit-identical f32 accumulation to the Slice-15 kernel.
+                        // Slice-28: Q4_K prefill (m>1) can OPT IN (`INFR_ROCM_COOP=1`) to the
+                        // cooperative decode-once GEMM (multi-warp threadblock, LDS-shared weight
+                        // tile). It is bit-faithful to `wmma_i8_q4k_2x1` (goldens hold) but measured
+                        // a regression on gfx1100 (see `q4k_coop_kernel`), so the DEFAULT stays the
+                        // Slice-27 pipe. When not opted in, this falls through to the pipe / GEMV.
+                        let coop = (m > 1
+                            && wdt == DType::Q4K
+                            && std::env::var_os("INFR_ROCM_NO_WMMA").is_none()
+                            && std::env::var_os("INFR_ROCM_NO_I8").is_none())
+                        .then(q4k_coop_kernel)
+                        .flatten();
+                        match coop {
+                            Some((coop_kernel, bm, bn, threads)) => {
+                                // Grid = (ceil(out_f/BN), ceil(m/BM)); one multi-warp threadblock per
+                                // BM×BN output tile decodes its BN-column weight tile into LDS once and
+                                // reuses it across all BM rows. m/out_f edges are masked in-kernel.
                                 dispatch_grid(
                                     pipelines,
                                     ctx.stream,
-                                    wmma_kernel,
-                                    out_f.div_ceil(16 * cn),
-                                    m.div_ceil(16 * rm),
-                                    32,
+                                    coop_kernel,
+                                    out_f.div_ceil(bn),
+                                    m.div_ceil(bm),
+                                    threads,
                                     args![
                                         arg_ptr(qx.ptr),
                                         arg_ptr(xs.ptr),
@@ -903,27 +954,53 @@ fn run_op(
                                     ],
                                 )?;
                             }
-                            None => {
-                                // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m):
-                                // one wave32 block per (output row, activation row).
-                                dispatch_grid(
-                                    pipelines,
-                                    ctx.stream,
-                                    i8_kernel,
-                                    out_f,
-                                    m,
-                                    32,
-                                    args![
-                                        arg_ptr(qx.ptr),
-                                        arg_ptr(xs.ptr),
-                                        arg_ptr(wptr_off),
-                                        arg_ptr(dd.ptr),
-                                        arg_i32(m as i32),
-                                        arg_i32(in_f as i32),
-                                        arg_i32(out_f as i32),
-                                    ],
-                                )?;
-                            }
+                            None => match (m > 1).then(|| native_wmma_fmt(wdt, out_f)).flatten() {
+                                Some((wmma_kernel, rm, cn)) => {
+                                    // Prefill (m>1), BLAS disabled: matrix-core int8 GEMM. Grid =
+                                    // (ceil(out_f/(16*CN)), ceil(m/(16*RM))), one wave32 block per
+                                    // 16*RM × 16*CN output tile — reuses each A fragment across the CN
+                                    // weight-column tiles and each decoded weight tile across the RM row
+                                    // tiles. Bit-identical f32 accumulation to the Slice-15 kernel.
+                                    dispatch_grid(
+                                        pipelines,
+                                        ctx.stream,
+                                        wmma_kernel,
+                                        out_f.div_ceil(16 * cn),
+                                        m.div_ceil(16 * rm),
+                                        32,
+                                        args![
+                                            arg_ptr(qx.ptr),
+                                            arg_ptr(xs.ptr),
+                                            arg_ptr(wptr_off),
+                                            arg_ptr(dd.ptr),
+                                            arg_i32(m as i32),
+                                            arg_i32(in_f as i32),
+                                            arg_i32(out_f as i32),
+                                        ],
+                                    )?;
+                                }
+                                None => {
+                                    // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m):
+                                    // one wave32 block per (output row, activation row).
+                                    dispatch_grid(
+                                        pipelines,
+                                        ctx.stream,
+                                        i8_kernel,
+                                        out_f,
+                                        m,
+                                        32,
+                                        args![
+                                            arg_ptr(qx.ptr),
+                                            arg_ptr(xs.ptr),
+                                            arg_ptr(wptr_off),
+                                            arg_ptr(dd.ptr),
+                                            arg_i32(m as i32),
+                                            arg_i32(in_f as i32),
+                                            arg_i32(out_f as i32),
+                                        ],
+                                    )?;
+                                }
+                            },
                         }
                         ctx.dev[dst.0 as usize] = Some(dd);
                     }

@@ -2535,6 +2535,195 @@ extern "C" __global__ void NAME( \
     } \
 }
 
+// ── Q4_K COOPERATIVE decode-once GEMM (Slice 28): multi-warp threadblock, LDS-shared weight tile. ──
+// The single-wave GEN_WMMA_Q4K* / _PIPE kernels re-decode each Q4_K weight column once per output-row
+// BLOCK: for m=512 that is ~m/32 ≈ 16 redundant decodes of the SAME nibbles (Slice-27 diagnosis). Here
+// a threadblock of WM*WN wave32s cooperatively owns a BM×BN output tile (BM = 16*WM*RM rows, BN =
+// 16*WN*RN cols) and decodes the BN-column weight tile into LDS int8 exactly ONCE per BK=32 K-step —
+// then every warp reuses it (decode-once-reuse, the llama.cpp MMQ threadblock pattern adapted to RDNA3
+// wave32). Activation int8 is staged into LDS the same way (shared across the BN columns).
+//
+// Per K-step (blk = one Q4_K 32-elem sub-block, so wsc/wmn are constant across BK for a column):
+//   1. threads 0..BN cooperatively decode column `col_base+cl`'s sub-block into wLDS[cl][32] + wscL/wmnL
+//   2. all threads cooperatively stage the BM×32 int8 activation tile into aLDS
+//   3. __syncthreads
+//   4. each warp runs the RM×RN WMMA sub-tile over the shared LDS tiles, min-term ones-dot per row-tile
+//   5. __syncthreads before the next K-step overwrites LDS (single-buffered — decode-once is the win,
+//      not the pipeline; Slice-27 already covered intra-wave load/decode overlap)
+//
+// Bit-faithful (goldens MUST NOT move): identical int8 weight codes (same k4/nibble math as
+// GEN_WMMA_Q4K), identical int8 activation codes (same `quant_i8_32` qx), and identical per-output
+// f32 accumulation — every dst[re,col] is Σ_blk axs·(wsc·dot + wmn·sum) summed in the SAME block order
+// 0..nblk, dot = int32 over the SAME 32 K-codes (2 WMMA of 16). The cooperative staging changes only
+// WHERE the operands are read from (LDS vs global), never the arithmetic or its order — pure scheduling.
+// LDS reads are 4-byte-aligned (tile rows are 32-wide → offsets are ×32/×16). Tile buffers live in LDS
+// (compile-time-sized __shared__) and the per-warp accumulators in registers (compile-time-indexed) —
+// no dynamically-indexed local array (Slice-27 lesson: those lower to scratch and tank throughput).
+#define GEN_WMMA_Q4K_COOP(NAME, WM, WN, RM, RN) \
+extern "C" __global__ void __launch_bounds__((WM)*(WN)*32) NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    const int BM = 16*(WM)*(RM), BN = 16*(WN)*(RN); \
+    __shared__ signed char aLDS[16*(WM)*(RM) * 32]; \
+    __shared__ signed char wLDS[16*(WN)*(RN) * 32]; \
+    __shared__ float wscL[16*(WN)*(RN)]; \
+    __shared__ float wmnL[16*(WN)*(RN)]; \
+    int tid = threadIdx.x, nthreads = (WM)*(WN)*32; \
+    int warp = tid >> 5, lane = tid & 31, half = lane >> 4; \
+    int warp_m = warp / (WN), warp_n = warp % (WN); \
+    int col_base = blockIdx.x * BN, row_base = blockIdx.y * BM; \
+    int nblk = in_f >> 5, spr = nblk >> 3; \
+    float acc[RM][RN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (RN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
+    for (int blk = 0; blk < nblk; blk++) { \
+        for (int cl = tid; cl < BN; cl += nthreads) { \
+            int col = col_base + cl; \
+            if (col < out_f) { \
+                long super = (long)col * spr + (blk >> 3); \
+                int s = blk & 7; \
+                const unsigned char* b = w + super * 144; \
+                float d = rf16b(b), dmin = rf16b(b + 2); \
+                int sc, mm; k4(b + 4, s, &sc, &mm); \
+                wscL[cl] = d * (float)sc; \
+                wmnL[cl] = dmin * (float)(-mm); \
+                const unsigned char* qbase = (b + 16) + (s >> 1) * 32; \
+                int hi = s & 1; \
+                for (int p = 0; p < 32; p++) wLDS[cl * 32 + p] = (signed char)(hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)); \
+            } else { wscL[cl] = 0.0f; wmnL[cl] = 0.0f; for (int p = 0; p < 32; p++) wLDS[cl * 32 + p] = 0; } \
+        } \
+        for (int idx = tid; idx < BM * 32; idx += nthreads) { \
+            int rl = idx >> 5, kk = idx & 31; \
+            int row = row_base + rl; \
+            aLDS[idx] = (row < m) ? qx[(long)row * in_f + (long)blk * 32 + kk] : 0; \
+        } \
+        __syncthreads(); \
+        for (int r = 0; r < (RM); r++) { \
+            int rl = warp_m * 16 * (RM) + r * 16 + (lane & 15); \
+            i4v a0 = pack16(aLDS + rl * 32), a1 = pack16(aLDS + rl * 32 + 16); \
+            i8v sumacc = {0,0,0,0,0,0,0,0}; \
+            sumacc = wmma_dot(a0, ones, sumacc); sumacc = wmma_dot(a1, ones, sumacc); \
+            for (int c = 0; c < (RN); c++) { \
+                int cl = warp_n * 16 * (RN) + c * 16 + (lane & 15); \
+                i4v b0 = pack16(wLDS + cl * 32), b1 = pack16(wLDS + cl * 32 + 16); \
+                i8v dotacc = {0,0,0,0,0,0,0,0}; \
+                dotacc = wmma_dot(a0, b0, dotacc); dotacc = wmma_dot(a1, b1, dotacc); \
+                float wsc = wscL[cl], wmn = wmnL[cl]; \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + warp_m * 16 * (RM) + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc * (float)dotacc[e] + wmn * (float)sumacc[e]); \
+                } \
+            } \
+        } \
+        __syncthreads(); \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (RN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + warp_m * 16 * (RM) + r * 16 + 2 * e + half; \
+        int col = col_base + warp_n * 16 * (RN) + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+
+// ── Q4_K COOPERATIVE, min-term via LDS row-sum (Slice 28, `_rs`). ──────────────────────────────────
+// The single-wave WMMA kernels spend HALF their matrix-core ops on the Q4_K min term: `sumacc =
+// wmma_dot(a, ones)` is a full 16×16×16 matmul against an all-ones B just to get Σ_k a[row,k]. On
+// gfx1100 the isolated GEMM is matrix-core-bound, so that doubles the WMMA cost. Here the per-row,
+// per-block activation sum is instead reduced ONCE into LDS (`rsLDS[row]`, a plain int add over the
+// 32 int8 codes — order-independent, so bit-identical to the ones-dot int32 result), and the min
+// contribution becomes `wmn * rsLDS[row]` — no WMMA. That halves the matrix-core ops (only the real
+// a·w dot stays on WMMA). Combined with the decode-once weight tile, this is the llama.cpp MMQ shape.
+// Bit-faithful: same int8 codes, same Σ_blk axs·(wsc·dot + wmn·rowsum) per-output accumulation order.
+#define GEN_WMMA_Q4K_COOP_RS(NAME, WM, WN, RM, RN) \
+extern "C" __global__ void __launch_bounds__((WM)*(WN)*32) NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    const int BM = 16*(WM)*(RM), BN = 16*(WN)*(RN); \
+    __shared__ signed char aLDS[16*(WM)*(RM) * 32]; \
+    __shared__ signed char wLDS[16*(WN)*(RN) * 32]; \
+    __shared__ int rsLDS[16*(WM)*(RM)]; \
+    __shared__ float wscL[16*(WN)*(RN)]; \
+    __shared__ float wmnL[16*(WN)*(RN)]; \
+    int tid = threadIdx.x, nthreads = (WM)*(WN)*32; \
+    int warp = tid >> 5, lane = tid & 31, half = lane >> 4; \
+    int warp_m = warp / (WN), warp_n = warp % (WN); \
+    int col_base = blockIdx.x * BN, row_base = blockIdx.y * BM; \
+    int nblk = in_f >> 5, spr = nblk >> 3; \
+    float acc[RM][RN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (RN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    for (int blk = 0; blk < nblk; blk++) { \
+        for (int cl = tid; cl < BN; cl += nthreads) { \
+            int col = col_base + cl; \
+            if (col < out_f) { \
+                long super = (long)col * spr + (blk >> 3); \
+                int s = blk & 7; \
+                const unsigned char* b = w + super * 144; \
+                float d = rf16b(b), dmin = rf16b(b + 2); \
+                int sc, mm; k4(b + 4, s, &sc, &mm); \
+                wscL[cl] = d * (float)sc; \
+                wmnL[cl] = dmin * (float)(-mm); \
+                const unsigned char* qbase = (b + 16) + (s >> 1) * 32; \
+                int hi = s & 1; \
+                for (int p = 0; p < 32; p++) wLDS[cl * 32 + p] = (signed char)(hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)); \
+            } else { wscL[cl] = 0.0f; wmnL[cl] = 0.0f; for (int p = 0; p < 32; p++) wLDS[cl * 32 + p] = 0; } \
+        } \
+        for (int idx = tid; idx < BM * 32; idx += nthreads) { \
+            int rl = idx >> 5, kk = idx & 31; \
+            int row = row_base + rl; \
+            aLDS[idx] = (row < m) ? qx[(long)row * in_f + (long)blk * 32 + kk] : 0; \
+        } \
+        for (int rl = tid; rl < BM; rl += nthreads) { \
+            int row = row_base + rl; \
+            int s = 0; \
+            if (row < m) { const signed char* ar = qx + (long)row * in_f + (long)blk * 32; for (int k = 0; k < 32; k++) s += (int)ar[k]; } \
+            rsLDS[rl] = s; \
+        } \
+        __syncthreads(); \
+        for (int r = 0; r < (RM); r++) { \
+            int rl = warp_m * 16 * (RM) + r * 16 + (lane & 15); \
+            i4v a0 = pack16(aLDS + rl * 32), a1 = pack16(aLDS + rl * 32 + 16); \
+            for (int c = 0; c < (RN); c++) { \
+                int cl = warp_n * 16 * (RN) + c * 16 + (lane & 15); \
+                i4v b0 = pack16(wLDS + cl * 32), b1 = pack16(wLDS + cl * 32 + 16); \
+                i8v dotacc = {0,0,0,0,0,0,0,0}; \
+                dotacc = wmma_dot(a0, b0, dotacc); dotacc = wmma_dot(a1, b1, dotacc); \
+                float wsc = wscL[cl], wmn = wmnL[cl]; \
+                for (int e = 0; e < 8; e++) { \
+                    int rr = warp_m * 16 * (RM) + r * 16 + 2 * e + half; \
+                    int re = row_base + rr; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc * (float)dotacc[e] + wmn * (float)rsLDS[rr]); \
+                } \
+            } \
+        } \
+        __syncthreads(); \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (RN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + warp_m * 16 * (RM) + r * 16 + 2 * e + half; \
+        int col = col_base + warp_n * 16 * (RN) + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+
+// Cooperative tile instances swept on the isolated-GEMM micro-bench (`examples/wmma_bench`, Q4_K).
+// OPT-IN via `INFR_ROCM_COOP=1`; `INFR_ROCM_COOP_TILE=<name>` picks the tile (default `128x64`). This
+// family MEASURED A REGRESSION on gfx1100 (occupancy/barrier-bound, not decode-bound — see exec.rs
+// `q4k_coop_kernel` and docs/perf.md), so the shipped Q4_K prefill default remains the Slice-27 pipe.
+// Naming: `<BM>x<BN>_w<NWARPS>`. LDS/single-buffer = BM*32 + BN*32 + (BN*8) bytes; the wide RM=RN=2
+// tiles are VGPR-bound to 7 waves/SIMD (`-Rpass-analysis`), which is a chunk of the regression.
+GEN_WMMA_Q4K_COOP_RS(wmma_i8_q4k_coop_rs_128x64_w8, 4, 2, 2, 2)
+GEN_WMMA_Q4K_COOP_RS(wmma_i8_q4k_coop_rs_128x32_w8, 8, 1, 1, 2)
+GEN_WMMA_Q4K_COOP_RS(wmma_i8_q4k_coop_rs_64x64_w4,  2, 2, 2, 2)
+GEN_WMMA_Q4K_COOP_RS(wmma_i8_q4k_coop_rs_64x32_w8,  4, 2, 1, 1)
+GEN_WMMA_Q4K_COOP(wmma_i8_q4k_coop_128x64_w8,  4, 2, 2, 2)
+GEN_WMMA_Q4K_COOP(wmma_i8_q4k_coop_128x32_w8,  8, 1, 1, 2)
+GEN_WMMA_Q4K_COOP(wmma_i8_q4k_coop_64x64_w4,   2, 2, 2, 2)
+GEN_WMMA_Q4K_COOP(wmma_i8_q4k_coop_64x32_w8,   4, 2, 1, 1)
+GEN_WMMA_Q4K_COOP(wmma_i8_q4k_coop_128x128_w8, 4, 2, 2, 4)
+GEN_WMMA_Q4K_COOP(wmma_i8_q4k_coop_256x64_w16, 8, 2, 2, 2)
+
 // Tile instances kept after the Slice-25 sweep: `_2x1` (block M) and `_2x2` (block M+N) are the two
 // shipped by the auto tier; `_1x1` is the un-blocked Slice-15 tiling, retained as the A/B reference
 // for `INFR_ROCM_WMMA_TILE=1x1`. The pure-N tiles (`1x2`/`1x4`) measured strictly worse on every
