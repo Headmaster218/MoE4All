@@ -274,6 +274,17 @@ extern "C" __global__ void rope(
 "#;
 
 const QK_NORM_ROPE: &str = r#"
+// One WAVE (32 lanes) per (row, head), vs the old one THREAD per head. At decode (rows==1) the old
+// grid launched rows*n_head=n_head threads → ~16 threads on ONE CU each serially running a head_dim
+// RMSNorm sum-of-squares reduction + the per-pair RoPE transcendentals (measured ~17% of decode).
+// The dominant cost is the RoPE loop's per-pair powf/cosf/sinf, so THAT is what we fan across the
+// wave: the pass-through norm-scale and the NEOX split-half RoPE pairs are partitioned across the 32
+// lanes (each output element written by exactly ONE lane, no cross-lane reduction). The cheap
+// sum-of-squares stays a full sequential 0..head_dim loop run redundantly on every lane (128 broadcast
+// loads + FMA) — deliberately NOT a butterfly reduce, so `rms` is BIT-IDENTICAL to the old kernel and
+// each output element reproduces the old arithmetic exactly (Qwen3 golden hash held unmoved). For
+// rows>1 (prefill) the grid is a strict superset — one wave per (row,head) instead of one thread —
+// so the strided q+g layout, freq_factors, and (i,i+half) rotation are byte-for-byte the same math.
 extern "C" __global__ void qk_norm_rope(
     const float* __restrict__ x,        // input: [rows, x_stride] strided OR [rows, n_head*head_dim] packed
     const __half* __restrict__ weight,  // [head_dim]
@@ -288,9 +299,10 @@ extern "C" __global__ void qk_norm_rope(
     float theta,
     int x_stride       // per-row stride in elements; 0 = packed (n_head * head_dim)
 ) {
-    int head = blockIdx.x * blockDim.x + threadIdx.x;
+    int head = blockIdx.x;             // one block == one wave == one (row, head)
     int total_heads = rows * n_head;
     if (head >= total_heads) return;
+    int tid = threadIdx.x;             // lane 0..31
     int r = head / n_head;
     int h = head % n_head;
     int pos = positions[r];
@@ -301,7 +313,9 @@ extern "C" __global__ void qk_norm_rope(
     int head_stride = (x_stride > 0) ? (x_stride / n_head) : head_dim;
     int xoff = (x_stride > 0) ? (r * x_stride + h * head_stride) : (head * head_dim);
     int doff = head * head_dim;
-    // rmsnorm over the head_dim query slice
+    // rmsnorm over the head_dim query slice. Run the FULL sequential 0..head_dim sum on every lane
+    // (redundant, but bit-identical to the old single-thread sum → `rms` unchanged; the sum is cheap
+    // vs the RoPE transcendentals, and the reads broadcast across the wave).
     float ss = 0.0f;
     for (int i = 0; i < head_dim; i++) {
         float v = x[xoff + i];
@@ -309,13 +323,14 @@ extern "C" __global__ void qk_norm_rope(
     }
     ss /= (float)head_dim;
     float rms = 1.0f / sqrtf(ss + eps);
-    // Pass-through dims [rope_dim, head_dim): normed (× weight), no rotation.
-    for (int i = rope_dim; i < head_dim; i++) {
+    // Pass-through dims [rope_dim, head_dim): normed (× weight), no rotation. Strided across lanes.
+    for (int i = rope_dim + tid; i < head_dim; i += 32) {
         dst[doff + i] = x[xoff + i] * rms * __half2float(weight[i]);
     }
     // rope (NEOX split-half pairs (i, i+half)) on the first rope_dim elements, from normed values.
+    // Each lane owns pairs i = tid, tid+32, … < half and writes BOTH the (i) and (i+half) slot.
     int half = rope_dim / 2;
-    for (int i = 0; i < half; i++) {
+    for (int i = tid; i < half; i += 32) {
         float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
         if (freq_factors != nullptr) {
             freq /= freq_factors[i]; // proportional RoPE divides the per-pair angle (matches CPU/Metal)

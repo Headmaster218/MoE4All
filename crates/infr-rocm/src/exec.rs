@@ -1277,7 +1277,16 @@ fn run_op(
                 arg_f32(theta),
                 arg_i32(x_stride as i32),
             ];
-            dispatch_1d(pipelines, ctx.stream, "qk_norm_rope", total, 256, qnr_args)?;
+            // One 32-lane WAVE per (row, head): grid = rows*n_head blocks of 32 threads. The kernel
+            // reads `blockIdx.x` as the head index, so pass total*32 with block=32.
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "qk_norm_rope",
+                total * 32,
+                32,
+                qnr_args,
+            )?;
             ctx.dev[dst.0 as usize] = Some(dd);
         }
         Op::WriteKv {
