@@ -52,6 +52,7 @@ const HIP_PARTS: &[&str] = &[
     ARGMAX,
     WRITE_KV,
     ATTENTION,
+    ATTENTION_SPLIT,
     MOE_FFN,
     CONV1D_SILU,
     DELTANET,
@@ -725,6 +726,185 @@ extern "C" __global__ void attention(
     for (int c = 0; c < npl; c++) {
         int d = (c << 5) + tid;
         if (d < head_dim) dr[d] = acc[c] * inv;
+    }
+}
+"#;
+
+// ── Split-KV (flash-decoding) decode attention ───────────────────────────────
+// The single-wave `attention` kernel scans ALL kv serially on ONE wave per (row, head): great at
+// low depth (~n_head waves fill enough CUs when kv is short), but at DEPTH one wave crawls a long
+// serial kv loop while 95 CUs sit idle — the measured decode-at-depth bottleneck. Split-KV
+// PARALLELIZES the kv dimension: partition kv into `n_chunks` contiguous chunks and launch one wave
+// per (row, head, chunk). Each wave computes its chunk's online-softmax partials (chunk-local max m,
+// denom l, weighted-V accumulator over that chunk only), then a tiny combine kernel merges the
+// per-chunk partials with the standard flash rescale. This fills the grid at depth
+// (n_head × n_chunks waves instead of n_head). Cross-checked against the Vulkan
+// attn_partial.comp / attn_combine.comp split-K pair. Decode-only (rows==1); exec routes rows>1
+// (prefill) to the plain `attention` kernel, and short-context decode where n_chunks==1 too.
+const ATTENTION_SPLIT: &str = r#"
+#define ATTN_SPLIT_MAX_PER_LANE 16
+
+static __device__ __forceinline__ float attn_split_allreduce32(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+    return v;
+}
+
+// PASS 1 of split-KV: one WAVE (32 lanes) per (row, head, chunk). Computes this chunk's partial
+// online-softmax over its kv sub-range [j0, j1): chunk-local max `m`, denom `l = Σ exp(s-m)`, and
+// un-normalized weighted-V accumulator `acc = Σ exp(s-m)·v`. The q·k dot uses the SAME lane-owns-
+// strided-hd-slice butterfly all-reduce as the single-wave kernel, so the per-key reduction order is
+// unchanged; only the softmax is now chunk-local (the combine re-references to the global max). The
+// per-chunk max/denom are identical on all 32 lanes (each runs the same sequential scan over the
+// chunk); acc is partitioned across lanes (each lane owns its output dims — no cross-lane reduce).
+extern "C" __global__ void attention_split_partial(
+    const float* __restrict__ q,        // [rows, n_head, head_dim]
+    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim]
+    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim]
+    float* __restrict__ pm,             // [rows*n_head, n_chunks] chunk-local max
+    float* __restrict__ pl,             // [rows*n_head, n_chunks] chunk denom
+    float* __restrict__ pacc,           // [rows*n_head, n_chunks, head_dim] weighted-V
+    int rows,
+    int kv_len,
+    int n_head,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int pos,            // absolute position of first query row
+    int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
+    int swa_window,     // window size for SlidingWindow / lo for Canvas
+    int chunk_size,     // kv keys per chunk
+    int n_chunks
+) {
+    int gidx = blockIdx.x;              // one block == one wave == one (row, head, chunk)
+    int total_heads = rows * n_head;
+    int chunk = gidx % n_chunks;
+    int head = gidx / n_chunks;
+    if (head >= total_heads) return;
+    int tid = threadIdx.x;              // lane 0..31
+    int r = head / n_head;
+    int h = head % n_head;
+    int kv_h = h * n_kv / n_head;       // GQA head mapping
+    int q_off = head * head_dim;
+    int npl = (head_dim + 31) >> 5;
+
+    float qreg[ATTN_SPLIT_MAX_PER_LANE];
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        qreg[c] = (d < head_dim) ? q[q_off + d] : 0.0f;
+    }
+
+    int j0 = chunk * chunk_size;
+    int j1 = j0 + chunk_size;
+    if (j1 > kv_len) j1 = kv_len;
+
+    int pbase = gidx * head_dim;
+
+    // Pass 1: chunk-local max over unmasked keys.
+    float max_score = -1e30f;
+    for (int j = j0; j < j1; j++) {
+        const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+        float part = 0.0f;
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + tid;
+            if (d < head_dim) part += qreg[c] * __half2float(kr[d]);
+        }
+        float s = attn_split_allreduce32(part) * scale;
+        bool masked = false;
+        if (mask_type == 0) {
+            masked = (j > pos + r);
+        } else if (mask_type == 1) {
+            int q_pos = pos + r;
+            masked = (j > q_pos || j < q_pos - swa_window + 1);
+        } else if (mask_type == 2) {
+            masked = (j < swa_window);
+        }
+        if (!masked && s > max_score) max_score = s;
+    }
+
+    // Pass 2: chunk denom + weighted-V accumulator, referenced to the chunk-local max.
+    float sum = 0.0f;
+    float acc[ATTN_SPLIT_MAX_PER_LANE];
+    for (int c = 0; c < npl; c++) acc[c] = 0.0f;
+    for (int j = j0; j < j1; j++) {
+        const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+        float part = 0.0f;
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + tid;
+            if (d < head_dim) part += qreg[c] * __half2float(kr[d]);
+        }
+        float s = attn_split_allreduce32(part) * scale;
+        bool masked = false;
+        if (mask_type == 0) {
+            masked = (j > pos + r);
+        } else if (mask_type == 1) {
+            int q_pos = pos + r;
+            masked = (j > q_pos || j < q_pos - swa_window + 1);
+        } else if (mask_type == 2) {
+            masked = (j < swa_window);
+        }
+        if (masked) continue;
+        float w = expf(s - max_score);
+        sum += w;
+        const __half* vr = v_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + tid;
+            if (d < head_dim) acc[c] += w * __half2float(vr[d]);
+        }
+    }
+
+    if (tid == 0) {
+        // A fully-masked/empty chunk leaves max_score = -1e30, sum = 0; the combine's exp(pm-mm)
+        // weight test then skips it (pacc for such a chunk is all-zero, written below).
+        pm[gidx] = max_score;
+        pl[gidx] = sum;
+    }
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        if (d < head_dim) pacc[pbase + d] = acc[c];
+    }
+}
+
+// COMBINE of split-KV: one WAVE (32 lanes) per (row, head). Merges the `n_chunks` partials via the
+// standard online-softmax rescale — mm = max_c pm[c]; l = Σ_c pl[c]·exp(pm[c]-mm);
+// out[d] = (Σ_c pacc[c,d]·exp(pm[c]-mm)) / l. The chunk sum runs in FIXED order c = 0..n_chunks so
+// the float reduction is deterministic → goldens stable. Each lane owns the same strided hd slice
+// the partial wrote, so no cross-lane reduction is needed.
+extern "C" __global__ void attention_split_combine(
+    const float* __restrict__ pm,   // [rows*n_head, n_chunks]
+    const float* __restrict__ pl,   // [rows*n_head, n_chunks]
+    const float* __restrict__ pacc, // [rows*n_head, n_chunks, head_dim]
+    float* __restrict__ dst,        // [rows, n_head, head_dim]
+    int rows,
+    int n_head,
+    int head_dim,
+    int n_chunks
+) {
+    int head = blockIdx.x;
+    int total_heads = rows * n_head;
+    if (head >= total_heads) return;
+    int tid = threadIdx.x;
+    int base = head * n_chunks;
+    int npl = (head_dim + 31) >> 5;
+
+    float mm = -1e30f;
+    for (int c = 0; c < n_chunks; c++) mm = fmaxf(mm, pm[base + c]);
+
+    float l = 0.0f;
+    for (int c = 0; c < n_chunks; c++) {
+        l += pl[base + c] * expf(pm[base + c] - mm);
+    }
+    float inv = 1.0f / l;
+
+    int q_off = head * head_dim;
+    for (int cc = 0; cc < npl; cc++) {
+        int d = (cc << 5) + tid;
+        if (d >= head_dim) continue;
+        float acc = 0.0f;
+        for (int c = 0; c < n_chunks; c++) {
+            float w = expf(pm[base + c] - mm);
+            if (w != 0.0f) acc += pacc[(base + c) * head_dim + d] * w;
+        }
+        dst[q_off + d] = acc * inv;
     }
 }
 "#;

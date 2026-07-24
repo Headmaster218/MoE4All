@@ -1017,38 +1017,106 @@ fn run_op(
         } => {
             ctx.ensure_device(q, g, bindings)?;
             let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
-            let bq = ctx.dev[q.0 as usize].as_ref().unwrap();
             let bk = rocm_buf(bindings.get(k_cache).expect("rocm: unbound K cache"));
             let bv = rocm_buf(bindings.get(v_cache).expect("rocm: unbound V cache"));
+            let (bk_ptr, bv_ptr) = (bk.ptr, bv.ptr);
+            let bq_ptr = ctx.dev[q.0 as usize].as_ref().unwrap().ptr;
+            let dd_ptr = dd.ptr;
             let (mt, swa): (i32, i32) = match mask {
                 AttnMask::Causal => (0, 0),
                 AttnMask::SlidingWindow(w) => (1, w as i32),
                 AttnMask::Canvas { lo } => (2, lo as i32),
             };
-            // One 32-lane WAVE per (row, head): grid = rows*n_head blocks of 32 threads. The kernel
-            // reads `blockIdx.x` as the head index, so pass total_threads = heads*32 with block=32.
-            dispatch_1d(
-                pipelines,
-                ctx.stream,
-                "attention",
-                rows * n_head * 32,
-                32,
-                args![
-                    arg_ptr(bq.ptr),
-                    arg_ptr(bk.ptr),
-                    arg_ptr(bv.ptr),
-                    arg_ptr(dd.ptr),
-                    arg_i32(rows as i32),
-                    arg_i32(kv_len as i32),
-                    arg_i32(n_head as i32),
-                    arg_i32(n_kv as i32),
-                    arg_i32(head_dim as i32),
-                    arg_f32(scale),
-                    arg_i32(pos as i32),
-                    arg_i32(mt),
-                    arg_i32(swa),
-                ],
-            )?;
+
+            // Split-KV (flash-decoding) for DECODE (rows==1). The single-wave `attention` kernel runs
+            // ONE wave per (row, head) that scans ALL kv serially — fine at low depth, but at long
+            // context that one wave crawls while ~95 CUs idle. Split-KV partitions kv into `n_chunks`
+            // contiguous chunks, launches one wave per (row, head, chunk) to compute per-chunk
+            // online-softmax partials, then a combine wave merges them. Adaptive chunking (mirrors the
+            // Vulkan attn_partial policy): aim ~32 chunks/head, each 64..512 keys. Only worth it when
+            // rows==1 AND the derived n_chunks>1 (short-context decode → n_chunks==1 → plain kernel,
+            // no scratch, no combine). Prefill (rows>1) already fills the grid with rows*n_head waves
+            // and stays on the plain kernel.
+            let heads = rows as usize * n_head as usize;
+            let kvl = kv_len as usize;
+            let chunk_size = kvl.div_ceil(32).clamp(64, 512);
+            let n_chunks = kvl.div_ceil(chunk_size).max(1);
+            if rows == 1 && n_chunks > 1 {
+                let hd = head_dim as usize;
+                let pm = ctx.pool_buf(heads * n_chunks * 4, false);
+                let pl = ctx.pool_buf(heads * n_chunks * 4, false);
+                let pacc = ctx.pool_buf(heads * n_chunks * hd * 4, false);
+                // Pass 1: one wave per (row, head, chunk).
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "attention_split_partial",
+                    (heads * n_chunks) as u32 * 32,
+                    32,
+                    args![
+                        arg_ptr(bq_ptr),
+                        arg_ptr(bk_ptr),
+                        arg_ptr(bv_ptr),
+                        arg_ptr(pm.ptr),
+                        arg_ptr(pl.ptr),
+                        arg_ptr(pacc.ptr),
+                        arg_i32(rows as i32),
+                        arg_i32(kv_len as i32),
+                        arg_i32(n_head as i32),
+                        arg_i32(n_kv as i32),
+                        arg_i32(head_dim as i32),
+                        arg_f32(scale),
+                        arg_i32(pos as i32),
+                        arg_i32(mt),
+                        arg_i32(swa),
+                        arg_i32(chunk_size as i32),
+                        arg_i32(n_chunks as i32),
+                    ],
+                )?;
+                // Combine: one wave per (row, head), fixed chunk order → deterministic reduction.
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "attention_split_combine",
+                    heads as u32 * 32,
+                    32,
+                    args![
+                        arg_ptr(pm.ptr),
+                        arg_ptr(pl.ptr),
+                        arg_ptr(pacc.ptr),
+                        arg_ptr(dd_ptr),
+                        arg_i32(rows as i32),
+                        arg_i32(n_head as i32),
+                        arg_i32(head_dim as i32),
+                        arg_i32(n_chunks as i32),
+                    ],
+                )?;
+            } else {
+                // One 32-lane WAVE per (row, head): grid = rows*n_head blocks of 32 threads. The
+                // kernel reads `blockIdx.x` as the head index, so pass heads*32 with block=32.
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "attention",
+                    rows * n_head * 32,
+                    32,
+                    args![
+                        arg_ptr(bq_ptr),
+                        arg_ptr(bk_ptr),
+                        arg_ptr(bv_ptr),
+                        arg_ptr(dd_ptr),
+                        arg_i32(rows as i32),
+                        arg_i32(kv_len as i32),
+                        arg_i32(n_head as i32),
+                        arg_i32(n_kv as i32),
+                        arg_i32(head_dim as i32),
+                        arg_f32(scale),
+                        arg_i32(pos as i32),
+                        arg_i32(mt),
+                        arg_i32(swa),
+                    ],
+                )?;
+            }
             ctx.dev[dst.0 as usize] = Some(dd);
         }
         Op::GatedAct {
