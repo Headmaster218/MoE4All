@@ -561,6 +561,23 @@ extern "C" __global__ void write_kv(
 "#;
 
 const ATTENTION: &str = r#"
+// Max head_dim/32 dims a single lane owns (runner gates decode to head_dim <= 512 → 16).
+#define ATTN_MAX_PER_LANE 16
+
+// Butterfly all-reduce of an f32 across a 32-lane wave: every lane ends with the full sum.
+static __device__ __forceinline__ float attn_wave_allreduce32(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+    return v;
+}
+
+// One WAVE (32 lanes) per (row, head), vs the old one THREAD per head. For decode (rows==1) the
+// old grid launched rows*n_head=n_head threads → a handful of threads on ONE CU ran the whole
+// two-pass softmax serially (the measured #1 decode cost). Here each lane owns the strided head-dim
+// slice d = tid, tid+32, … : the q·k dot is a coalesced partial + a butterfly wave all-reduce, and
+// the weighted-V output vector is partitioned across lanes (each lane owns its output dims, no
+// cross-lane reduction). The softmax `max` and denominator `sum` are still accumulated sequentially
+// over kv on every lane (identical order → bit-exact); ONLY the per-key q·k dot reduction order
+// changes (butterfly vs sequential), a sub-ulp perturbation that greedy decode is robust to.
 extern "C" __global__ void attention(
     const float* __restrict__ q,       // [rows, n_head, head_dim]
     const __half* __restrict__ k_cache,// [kv_len, n_kv, head_dim]
@@ -576,24 +593,33 @@ extern "C" __global__ void attention(
     int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
     int swa_window      // window size for SlidingWindow
 ) {
-    int head = blockIdx.x * blockDim.x + threadIdx.x;
+    int head = blockIdx.x;             // one block == one wave == one (row, head)
     int total_heads = rows * n_head;
     if (head >= total_heads) return;
+    int tid = threadIdx.x;             // lane 0..31
     int r = head / n_head;
     int h = head % n_head;
-    int kv_h = h * n_kv / n_head; // GQA head mapping
+    int kv_h = h * n_kv / n_head;      // GQA head mapping
     int q_off = head * head_dim;
+    int npl = (head_dim + 31) >> 5;    // dims this lane owns (strided by 32)
 
-    // Two-pass online softmax: pass 1 finds max, pass 2 computes weighted sum
+    // Preload this lane's owned q dims.
+    float qreg[ATTN_MAX_PER_LANE];
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        qreg[c] = (d < head_dim) ? q[q_off + d] : 0.0f;
+    }
+
+    // Pass 1: max over unmasked keys (sequential over j on every lane → identical result).
     float max_score = -1e30f;
     for (int j = 0; j < kv_len; j++) {
-        const __half* kr = k_cache + j * n_kv * head_dim + kv_h * head_dim;
-        float s = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
-            s += q[q_off + d] * __half2float(kr[d]);
+        const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+        float part = 0.0f;
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + tid;
+            if (d < head_dim) part += qreg[c] * __half2float(kr[d]);
         }
-        s *= scale;
-        // masking
+        float s = attn_wave_allreduce32(part) * scale;
         bool masked = false;
         if (mask_type == 0) {
             masked = (j > pos + r);
@@ -605,17 +631,19 @@ extern "C" __global__ void attention(
         }
         if (!masked && s > max_score) max_score = s;
     }
-    // Pass 2: exp sum and weighted value sum
+
+    // Pass 2: exp sum + weighted value sum. Each lane owns disjoint output dims → no reduction.
     float sum = 0.0f;
-    float* dr = dst + q_off;
-    for (int d = 0; d < head_dim; d++) { dr[d] = 0.0f; }
+    float acc[ATTN_MAX_PER_LANE];
+    for (int c = 0; c < npl; c++) acc[c] = 0.0f;
     for (int j = 0; j < kv_len; j++) {
-        const __half* kr = k_cache + j * n_kv * head_dim + kv_h * head_dim;
-        float s = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
-            s += q[q_off + d] * __half2float(kr[d]);
+        const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+        float part = 0.0f;
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + tid;
+            if (d < head_dim) part += qreg[c] * __half2float(kr[d]);
         }
-        s *= scale;
+        float s = attn_wave_allreduce32(part) * scale;
         bool masked = false;
         if (mask_type == 0) {
             masked = (j > pos + r);
@@ -628,11 +656,18 @@ extern "C" __global__ void attention(
         if (masked) continue;
         float w = expf(s - max_score);
         sum += w;
-        const __half* vr = v_cache + j * n_kv * head_dim + kv_h * head_dim;
-        for (int d = 0; d < head_dim; d++) { dr[d] += w * __half2float(vr[d]); }
+        const __half* vr = v_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + tid;
+            if (d < head_dim) acc[c] += w * __half2float(vr[d]);
+        }
     }
     float inv = 1.0f / sum;
-    for (int d = 0; d < head_dim; d++) { dr[d] *= inv; }
+    float* dr = dst + q_off;
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        if (d < head_dim) dr[d] = acc[c] * inv;
+    }
 }
 "#;
 

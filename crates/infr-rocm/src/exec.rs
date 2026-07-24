@@ -990,12 +990,14 @@ fn run_op(
                 AttnMask::SlidingWindow(w) => (1, w as i32),
                 AttnMask::Canvas { lo } => (2, lo as i32),
             };
+            // One 32-lane WAVE per (row, head): grid = rows*n_head blocks of 32 threads. The kernel
+            // reads `blockIdx.x` as the head index, so pass total_threads = heads*32 with block=32.
             dispatch_1d(
                 pipelines,
                 ctx.stream,
                 "attention",
-                rows * n_head,
-                256,
+                rows * n_head * 32,
+                32,
                 args![
                     arg_ptr(bq.ptr),
                     arg_ptr(bk.ptr),
