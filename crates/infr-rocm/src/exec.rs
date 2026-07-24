@@ -1294,7 +1294,7 @@ fn run_op(
                 pipelines,
                 ctx.stream,
                 "write_kv",
-                rows,
+                rows * row_stride, // one thread per (row, element): decode fans across CUs
                 256,
                 args![
                     arg_ptr(bs.ptr),

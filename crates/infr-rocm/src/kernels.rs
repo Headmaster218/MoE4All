@@ -611,15 +611,19 @@ extern "C" __global__ void write_kv(
     int cache_stride,               // per-row elements in cache (= n_kv * head_dim)
     int src_stride                  // per-row stride in src (0 = packed = cache_stride)
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
+    // One thread per OUTPUT element (row, i). Each cache slot is an independent float→half cast (no
+    // reduction) → bit-identical to the old per-row serial loop, but at decode (rows==1) this fans
+    // the `cache_stride` (n_kv*head_dim) casts across `ceil(cache_stride/block)` blocks instead of
+    // stranding all of them on ONE thread of one CU — the measured #1 decode cost (Slice 29).
+    long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * cache_stride;
+    if (tid >= total) return;
+    int row = (int)(tid / cache_stride);
+    int i = (int)(tid % cache_stride);
     int effective_src_stride = (src_stride > 0) ? src_stride : cache_stride;
     int cache_row = row_offset + row;
-    const float* sr = src + row * effective_src_stride;
-    __half* cr = cache + cache_row * cache_stride;
-    for (int i = 0; i < cache_stride; i++) {
-        cr[i] = __float2half(sr[i]);
-    }
+    cache[(long)cache_row * cache_stride + i] =
+        __float2half(src[(long)row * effective_src_stride + i]);
 }
 "#;
 
