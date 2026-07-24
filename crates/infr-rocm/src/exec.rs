@@ -167,6 +167,15 @@ fn native_wmma_fmt(dt: DType, out_f: u32) -> Option<(&'static str, u32, u32)> {
     {
         return None;
     }
+    // Slice-27: Q4_K prefill defaults to the software-pipelined (prefetched double-buffered nibble)
+    // 2x1 kernel — its overlapped load/decode/WMMA schedule beats the Slice-25 auto-tier on EVERY
+    // representative shape in the isolated-GEMM micro-bench (`examples/wmma_bench`), including the
+    // wide-N GEMMs where the un-pipelined 2x2 previously won, so it supersedes the 2x1/2x2 split for
+    // Q4_K. Bit-identical math to `wmma_i8_q4k_2x1` (goldens unmoved). `INFR_ROCM_NO_PIPE=1` falls
+    // back to the Slice-25 auto-tier for A/B benchmarking.
+    if dt == DType::Q4K && std::env::var_os("INFR_ROCM_NO_PIPE").is_none() {
+        return Some(("wmma_i8_q4k_pipe_2x1", 2, 1));
+    }
     let (rm, cn) = wmma_tile(out_f);
     let name = match (dt, rm, cn) {
         (DType::Q8_0, 1, 1) => "wmma_i8_q80_1x1",

@@ -2441,10 +2441,105 @@ extern "C" __global__ void NAME( \
     } \
 }
 
+// ── Q4_K PIPELINED (Slice 27): software-prefetched double-buffered weight nibbles. ──
+// Same math / accumulation order as GEN_WMMA_Q4K (bit-faithful, goldens unmoved) — the ONLY change is
+// scheduling: the 32 packed nibble bytes for weight-block blk+1 are issued as global `buffer_load`s
+// into a second register buffer BEFORE the decode+WMMA of block blk consumes the first, so the load
+// latency of blk+1 overlaps the matrix math of blk instead of serializing in front of it (the
+// decode→WMMA dependency chain that ceilings Slice-25). Header/scale reads (d,dmin,k4) stay inline —
+// 16 B/super, L2-hot across the 8 sub-blocks — and are cheap relative to the 128 B/super of nibbles.
+//
+// The ping-pong buffers `qA`/`qB` are COMPILE-TIME NAMED (the K-loop is unrolled by 2 so each stage
+// names its buffer statically). A runtime-indexed `qbuf[cur]` measured 3.5× SLOWER: HIP lowers a
+// dynamically-indexed local array to scratch (private memory), turning every nibble access into a
+// global round-trip. With named buffers the prefetch schedule wins +7..13% GFLOP/s (2x1) on gfx1100.
+// Only the 2x1 tile is shipped: the 2x2 variant (already 192 VGPR in Slice-25) plus the qA/qB
+// prefetch buffers exceeds the register file and page-faults on launch, and 2x1-pipe already beats
+// un-pipelined 2x2 on the wide-N shapes where 2x2 used to win — so 2x1-pipe supersedes both.
+#define LD_Q4K_NIB(DST, COL, BLK) \
+    do { \
+        if ((COL) < out_f) { \
+            long super = (long)(COL) * spr + ((BLK) >> 3); \
+            int s_ = (BLK) & 7; \
+            const unsigned int* qp = (const unsigned int*)(w + super * 144 + 16 + (s_ >> 1) * 32); \
+            for (int i = 0; i < 8; i++) (DST)[i] = qp[i]; \
+        } else { for (int i = 0; i < 8; i++) (DST)[i] = 0; } \
+    } while (0)
+// One K-block step: decode the prefetched nibble buffer QB for block BLK, then the RM×CN WMMA +
+// bit-faithful f32 accumulation. QB is a compile-time-named buffer (qA/qB), so it stays in VGPRs —
+// a runtime-indexed `qbuf[cur]` would spill the array to scratch and tank throughput.
+#define Q4K_STEP(QB, BLK, RM, CN) \
+    do { \
+        int kblk = (BLK); \
+        for (int c = 0; c < (CN); c++) { \
+            int col = col_base + c * 16 + (lane & 15); \
+            if (col < out_f) { \
+                long super = (long)col * spr + (kblk >> 3); \
+                int s = kblk & 7; \
+                const unsigned char* b = w + super * 144; \
+                float d = rf16b(b), dmin = rf16b(b + 2); \
+                int sc, mm; k4(b + 4, s, &sc, &mm); \
+                wsc[c] = d * (float)sc; \
+                wmn[c] = dmin * (float)(-mm); \
+                const unsigned char* qb = (const unsigned char*)(QB)[c]; \
+                int hi = s & 1; \
+                for (int p = 0; p < 32; p++) wc[c][p] = (signed char)(hi ? (qb[p] >> 4) : (qb[p] & 0x0F)); \
+            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int p = 0; p < 32; p++) wc[c][p] = 0; } \
+        } \
+        for (int r = 0; r < (RM); r++) { \
+            int row_in = row_base + r * 16 + (lane & 15); \
+            long arow = (long)row_in * in_f + (long)kblk * 32; \
+            i4v a0 = load_a(qx, row_in, m, arow), a1 = load_a(qx, row_in, m, arow + 16); \
+            i8v sumacc = {0,0,0,0,0,0,0,0}; \
+            sumacc = wmma_dot(a0, ones, sumacc); sumacc = wmma_dot(a1, ones, sumacc); \
+            for (int c = 0; c < (CN); c++) { \
+                i8v dotacc = {0,0,0,0,0,0,0,0}; \
+                dotacc = wmma_dot(a0, pack16(wc[c]),      dotacc); \
+                dotacc = wmma_dot(a1, pack16(wc[c] + 16), dotacc); \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + kblk] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc[c] * (float)dotacc[e] + wmn[c] * (float)sumacc[e]); \
+                } \
+            } \
+        } \
+    } while (0)
+#define GEN_WMMA_Q4K_PIPE(NAME, RM, CN) \
+extern "C" __global__ void NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int lane = threadIdx.x; \
+    int half = lane >> 4; \
+    int col_base = blockIdx.x * (16 * (CN)); \
+    int row_base = blockIdx.y * (16 * (RM)); \
+    int nblk = in_f >> 5; \
+    int spr = nblk >> 3; \
+    float acc[RM][CN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    unsigned int qA[CN][8], qB[CN][8]; \
+    signed char wc[CN][32]; \
+    float wsc[CN], wmn[CN]; \
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
+    for (int c = 0; c < (CN); c++) { int col = col_base + c * 16 + (lane & 15); LD_Q4K_NIB(qA[c], col, 0); } \
+    for (int blk = 0; blk < nblk; blk += 2) { \
+        if (blk + 1 < nblk) { for (int c = 0; c < (CN); c++) { int col = col_base + c * 16 + (lane & 15); LD_Q4K_NIB(qB[c], col, blk + 1); } } \
+        Q4K_STEP(qA, blk, RM, CN); \
+        if (blk + 2 < nblk) { for (int c = 0; c < (CN); c++) { int col = col_base + c * 16 + (lane & 15); LD_Q4K_NIB(qA[c], col, blk + 2); } } \
+        if (blk + 1 < nblk) Q4K_STEP(qB, blk + 1, RM, CN); \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + r * 16 + 2 * e + half; \
+        int col = col_base + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+
 // Tile instances kept after the Slice-25 sweep: `_2x1` (block M) and `_2x2` (block M+N) are the two
 // shipped by the auto tier; `_1x1` is the un-blocked Slice-15 tiling, retained as the A/B reference
 // for `INFR_ROCM_WMMA_TILE=1x1`. The pure-N tiles (`1x2`/`1x4`) measured strictly worse on every
 // shape and were dropped. `INFR_ROCM_WMMA_TILE=RxC` selects at dispatch.
+GEN_WMMA_Q4K_PIPE(wmma_i8_q4k_pipe_2x1, 2, 1)
 GEN_WMMA_Q80(wmma_i8_q80_1x1, 1, 1)
 GEN_WMMA_Q80(wmma_i8_q80_2x1, 2, 1)
 GEN_WMMA_Q80(wmma_i8_q80_2x2, 2, 2)
