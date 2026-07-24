@@ -56,6 +56,7 @@ const HIP_PARTS: &[&str] = &[
     MOE_FFN,
     CONV1D_SILU,
     DELTANET,
+    DELTANET_CHUNKED,
     MOE_SHARED_EXPERT_ADD,
     NATIVE_DECODE,
     MOE_FFN_NATIVE,
@@ -1091,6 +1092,192 @@ extern "C" __global__ void deltanet(
             }
             dr[d] = o;
         }
+    }
+}
+"#;
+
+// ── Chunked / parallel gated-DeltaNet PREFILL (qwen35) ────────────────────────
+//
+// The sequential `deltanet` kernel runs ONE thread per value head over all `rows` tokens: fine at
+// decode (rows==1) but a catastrophic serial scan for prefill (n_vhead≈16 threads on 96 CUs). This
+// kernel reformulates the delta-rule recurrence into the standard CHUNKED linear-attention form so
+// the per-chunk work is a set of small matrix products done in PARALLEL, and only the chunk-level
+// state S carries sequentially (rows/CHUNK steps, not `rows`).
+//
+// Math (per value head, chunk size C, state S₀ = state at chunk start, log-decay g_t = a_coef·
+// softplus(a+dt_bias), inclusive prefix G_j = Σ_{l≤j} g_l; k̂/q̂ L2-normalized, q̂ also ×1/√kd) —
+// a byte-for-byte port of the CPU oracle `chunk_delta` (infr-vulkan/tests/chunked_delta_math.rs),
+// itself validated equal to the sequential recurrence `deltanet_scan`:
+//   R_j     = β_j v_j − β_j e^{G_j}(k̂_jᵀ S₀)                 (initial Δ)
+//   A[j][l] = β_j e^{G_j−G_l}(k̂_j·k̂_l)   (l<j, strict lower)
+//   Δ_j     = R_j − Σ_{l<j} A[j][l] Δ_l    (unit-lower-triangular forward-substitution)
+//   o_i     = e^{G_i}(q̂_iᵀ S₀) + Σ_{j≤i} e^{G_i−G_j}(q̂_i·k̂_j) Δ_j
+//   S_C     = e^{G_{C−1}} S₀ + Σ_j e^{G_{C−1}−G_j} k̂_j ⊗ Δ_j
+//
+// PARALLELIZATION: one BLOCK per value head (grid.x = n_vhead), one THREAD per value dim `d`
+// (blockDim.x = max(head_v, DN_CHUNK)). The value columns S[:,d] are INDEPENDENT throughout — the
+// A/Δ coupling is via scalars A[j][l] shared by every d — so each thread carries its own column's
+// Δ[0..C] in REGISTERS and never needs a cross-thread Δ exchange. Shared memory holds the
+// d-independent per-chunk tensors: normalized k̂/q̂ (C×kd), the K̂K̂ᵀ / Q̂K̂ᵀ dot matrices (C×C), and
+// the gates (β, G). GQA is the qwen35 INTERLEAVED `kh = vh % n_khead` tiling; `src_stride>0` fuses
+// q|k|v into one buffer (same layout as the sequential kernel). Because the chunked form re-orders
+// the float reductions vs the sequential scan, outputs match to ~1e-4 (not bit-exact); greedy decode
+// and the 2e-2-rel parity gate absorb it. State S is mutated IN PLACE (persistent across calls).
+//
+// DN_CHUNK is fixed at 16: Δ lives in a `float[DN_CHUNK]` register array, and the shared footprint
+// (2·C·kd + 2·C·C + 2·C floats ≈ 18 KB at kd=128) stays under the 32 KB dynamic-LDS ceiling this GPU
+// permits a launch to request without the MaxDynamicSharedMemorySize opt-in (an over-budget launch
+// silently corrupts LDS instead of erroring — validated: a 41 KB DN_CHUNK=32 build diverged at
+// kd=128 while an 18 KB DN_CHUNK=16 build matched the CPU oracle to ~1e-7). exec.rs routes here only
+// for rows>1 with head_v≥1 and the footprint within budget; otherwise (and always for decode) it
+// uses the sequential `deltanet` kernel.
+const DELTANET_CHUNKED: &str = r#"
+#define DN_CHUNK 16
+
+extern "C" __global__ void deltanet_chunked(
+    const float* __restrict__ q,         // [rows, n_khead*head_k] (or fused src when src_stride>0)
+    const float* __restrict__ k,         // [rows, n_khead*head_k]
+    const float* __restrict__ v,         // [rows, n_vhead*head_v]
+    const float* __restrict__ b,         // [rows, n_vhead]
+    const float* __restrict__ a,         // [rows, n_vhead]
+    const __half* __restrict__ a_coef,   // [n_vhead]
+    const __half* __restrict__ dt_bias,  // [n_vhead]
+    float* __restrict__ state,           // [n_vhead, head_k, head_v] — mutated in-place
+    float* __restrict__ dst,             // [rows, n_vhead*head_v]
+    int rows,
+    int n_khead,
+    int n_vhead,
+    int head_k,
+    int head_v,
+    float eps,
+    int src_stride                       // >0: q/k/v are slices of one buffer with this row stride
+) {
+    int vh = blockIdx.x;                 // one block == one value head
+    if (vh >= n_vhead) return;
+    int d = threadIdx.x;                 // one thread == one value dim (column of S)
+    int nt = blockDim.x;
+    int kh = vh % n_khead;               // GQA: interleaved value→key head map (matches CPU/Metal)
+    int kd = head_k, vd = head_v;
+    float ac = __half2float(a_coef[vh]);
+    float dtb = __half2float(dt_bias[vh]);
+    float qscale = rsqrtf((float)kd);
+
+    // Fused (src_stride>0) vs packed (==0) row strides + within-row offsets — same as `deltanet`.
+    int qrow = (src_stride > 0) ? src_stride : n_khead * kd;
+    int krow = (src_stride > 0) ? src_stride : n_khead * kd;
+    int vrow = (src_stride > 0) ? src_stride : n_vhead * vd;
+    int koff = (src_stride > 0) ? n_khead * kd : 0;
+    int voff = (src_stride > 0) ? 2 * n_khead * kd : 0;
+    const float* qbase = q;
+    const float* kbase = (src_stride > 0) ? q : k;
+    const float* vbase = (src_stride > 0) ? q : v;
+
+    float* S = state + (long)vh * kd * vd;   // [kd, vd] this head's state column-owned by thread d
+
+    // Dynamic shared: d-independent per-chunk tensors.
+    extern __shared__ float smem[];
+    float* s_kn = smem;                              // [DN_CHUNK, kd]  normalized k̂
+    float* s_qn = s_kn + DN_CHUNK * kd;              // [DN_CHUNK, kd]  normalized q̂ (×qscale)
+    float* s_KK = s_qn + DN_CHUNK * kd;              // [DN_CHUNK, DN_CHUNK]  k̂_i·k̂_j
+    float* s_QK = s_KK + DN_CHUNK * DN_CHUNK;        // [DN_CHUNK, DN_CHUNK]  q̂_i·k̂_j
+    float* s_gg = s_QK + DN_CHUNK * DN_CHUNK;        // [DN_CHUNK]  inclusive prefix log-decay G
+    float* s_beta = s_gg + DN_CHUNK;                 // [DN_CHUNK]  β
+
+    float delta[DN_CHUNK];                           // this thread's column Δ[0..c) (registers)
+
+    for (int base = 0; base < rows; base += DN_CHUNK) {
+        int c = rows - base;
+        if (c > DN_CHUNK) c = DN_CHUNK;
+
+        // ── Phase 1: per-token norms, gates, k̂/q̂. Thread j (j<c) owns token j. ──
+        if (d < c) {
+            int j = d;
+            int t = base + j;
+            const float* qr = qbase + (long)t * qrow + kh * kd;
+            const float* kr = kbase + (long)t * krow + koff + kh * kd;
+            float qsum = 0.0f, ksum = 0.0f;
+            for (int i = 0; i < kd; i++) { qsum += qr[i] * qr[i]; ksum += kr[i] * kr[i]; }
+            float qn = 1.0f / sqrtf(qsum + eps);
+            float kn = 1.0f / sqrtf(ksum + eps);
+            for (int i = 0; i < kd; i++) {
+                s_qn[j * kd + i] = qr[i] * qn * qscale;
+                s_kn[j * kd + i] = kr[i] * kn;
+            }
+            s_beta[j] = 1.0f / (1.0f + expf(-b[t * n_vhead + vh]));
+            // Per-token log-decay g_t = a_coef·softplus(a+dt_bias); STABLE softplus (no overflow).
+            float z = a[t * n_vhead + vh] + dtb;
+            float sp = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+            s_gg[j] = ac * sp;
+        }
+        __syncthreads();
+
+        // Inclusive prefix sum → G_j (serial, ≤32 adds; one thread keeps the order deterministic).
+        if (d == 0) {
+            float run = 0.0f;
+            for (int j = 0; j < c; j++) { run += s_gg[j]; s_gg[j] = run; }
+        }
+        __syncthreads();
+
+        // ── Phase 2: dot matrices K̂K̂ᵀ and Q̂K̂ᵀ (C×C), computed cooperatively over all threads. ──
+        for (int idx = d; idx < c * c; idx += nt) {
+            int i = idx / c, j = idx % c;
+            float dkk = 0.0f, dqk = 0.0f;
+            for (int kk = 0; kk < kd; kk++) {
+                dkk += s_kn[i * kd + kk] * s_kn[j * kd + kk];
+                dqk += s_qn[i * kd + kk] * s_kn[j * kd + kk];
+            }
+            s_KK[i * DN_CHUNK + j] = dkk;
+            s_QK[i * DN_CHUNK + j] = dqk;
+        }
+        __syncthreads();
+
+        // ── Phase 3: per-column pipeline. Thread d owns state column S[:,d] (columns independent). ──
+        if (d < vd) {
+            // R: Δ_j ← β_j (v_j[d] − e^{G_j}(k̂_jᵀ S₀[:,d])).
+            for (int j = 0; j < c; j++) {
+                int t = base + j;
+                const float* vr = vbase + (long)t * vrow + voff + vh * vd;
+                float ks0 = 0.0f;
+                for (int kk = 0; kk < kd; kk++) ks0 += s_kn[j * kd + kk] * S[kk * vd + d];
+                float eg = expf(s_gg[j]);
+                delta[j] = s_beta[j] * (vr[d] - eg * ks0);
+            }
+            // Forward substitution: Δ_j −= Σ_{l<j} A[j][l] Δ_l  (Δ_l already finalized, l<j).
+            for (int j = 1; j < c; j++) {
+                float acc = delta[j];
+                for (int l = 0; l < j; l++) {
+                    float A = s_beta[j] * expf(s_gg[j] - s_gg[l]) * s_KK[j * DN_CHUNK + l];
+                    acc -= A * delta[l];
+                }
+                delta[j] = acc;
+            }
+            // O: o_i[d] = e^{G_i}(q̂_iᵀ S₀[:,d]) + Σ_{j≤i} e^{G_i−G_j}(q̂_i·k̂_j) Δ_j[d].
+            for (int i = 0; i < c; i++) {
+                int t = base + i;
+                float qs0 = 0.0f;
+                for (int kk = 0; kk < kd; kk++) qs0 += s_qn[i * kd + kk] * S[kk * vd + d];
+                float o = expf(s_gg[i]) * qs0;
+                for (int j = 0; j <= i; j++) {
+                    float w = expf(s_gg[i] - s_gg[j]) * s_QK[i * DN_CHUNK + j];
+                    o += w * delta[j];
+                }
+                dst[(long)t * n_vhead * vd + (long)vh * vd + d] = o;
+            }
+            // State update: S[kk,d] ← e^{G_{c−1}} S₀[kk,d] + Σ_j e^{G_{c−1}−G_j} k̂_j[kk] Δ_j[d].
+            // Reads S₀ (original), writes new S — the O/R reads above already consumed S₀, and no
+            // other thread touches column d, so the in-place overwrite is safe.
+            float gl = s_gg[c - 1];
+            float egl = expf(gl);
+            for (int kk = 0; kk < kd; kk++) {
+                float acc = egl * S[kk * vd + d];
+                for (int j = 0; j < c; j++) {
+                    acc += expf(gl - s_gg[j]) * s_kn[j * kd + kk] * delta[j];
+                }
+                S[kk * vd + d] = acc;
+            }
+        }
+        // Barrier before the next chunk overwrites the shared per-chunk tensors.
+        __syncthreads();
     }
 }
 "#;

@@ -230,9 +230,12 @@ pub struct RocmBackend {
     stream: ffi::hipStream_t,
     /// Compiled kernel module + function cache.
     pipelines: Pipelines,
-    /// Dequantized-weight cache: bound-buffer device address → f16 device buffer.
-    /// Single-generation lifetime (one backend per generation); keys are stable.
-    pub(crate) weight_cache: Mutex<std::collections::HashMap<usize, RocmBuffer>>,
+    /// Dequantized-weight cache: (bound-buffer device address, byte length) → f16 device buffer.
+    /// Single-generation lifetime (one backend per generation); keys are stable. The byte length
+    /// is part of the key so a freed weight buffer whose device address is later RECYCLED for a
+    /// DIFFERENTLY-SIZED weight cannot collide (address alone aliases the stale dequant — the
+    /// classic "wrong scalar for a later head" corruption when two DeltaNet shapes share a backend).
+    pub(crate) weight_cache: Mutex<std::collections::HashMap<(usize, usize), RocmBuffer>>,
     /// Reusable op-scratch pool (see [`BufferPool`]). Persists across `execute` calls so the
     /// decode replay loop draws from the free-list instead of `hipMalloc`/`hipFree` per op.
     pub(crate) pool: Mutex<BufferPool>,

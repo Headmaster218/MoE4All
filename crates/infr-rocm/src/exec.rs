@@ -269,6 +269,45 @@ fn dispatch_grid(
     Ok(())
 }
 
+/// Launch `kernel_name` with an explicit block count (`grid_x` blocks of `block_size` threads) and a
+/// dynamic shared-memory allocation of `smem_bytes`. Used by the chunked DeltaNet prefill kernel,
+/// which runs one block per value head and stashes its per-chunk tensors in dynamic LDS.
+fn dispatch_blocks_smem(
+    pipelines: &Pipelines,
+    stream: ffi::hipStream_t,
+    kernel_name: &'static str,
+    grid_x: u32,
+    block_size: u32,
+    smem_bytes: u32,
+    args: Vec<Vec<u8>>,
+) -> Result<()> {
+    let func = pipelines.get(kernel_name)?;
+    let mut storage = args;
+    let mut arg_ptrs: Vec<*mut c_void> = Vec::with_capacity(storage.len());
+    for ab in storage.iter_mut() {
+        arg_ptrs.push(ab.as_mut_ptr() as *mut c_void);
+    }
+    let rc = unsafe {
+        ffi::hipModuleLaunchKernel(
+            func,
+            grid_x,
+            1,
+            1,
+            block_size,
+            1,
+            1,
+            smem_bytes,
+            stream,
+            arg_ptrs.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != HIP_SUCCESS {
+        return Err(be(format!("hipModuleLaunchKernel({kernel_name}): rc={rc}")));
+    }
+    Ok(())
+}
+
 fn arg_ptr(p: *mut c_void) -> Vec<u8> {
     (p as u64).to_le_bytes().to_vec()
 }
@@ -284,7 +323,7 @@ fn arg_f32(v: f32) -> Vec<u8> {
 struct ExecCtx<'a> {
     dev: Vec<Option<crate::RocmBuffer>>,
     vals: Vec<Option<Vec<f32>>>,
-    weight_cache: &'a Mutex<HashMap<usize, crate::RocmBuffer>>,
+    weight_cache: &'a Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
     /// Reusable device-scratch pool (persists across `execute` calls on the backend).
     pool: &'a Mutex<BufferPool>,
     /// Pool draws made this forward pass: `(ptr, bucket_bytes)`, returned to `pool` on `Drop`
@@ -423,7 +462,9 @@ impl<'a> ExecCtx<'a> {
     ) -> Result<*mut c_void> {
         let i = id.0 as usize;
         let b = rocm_buf(bindings.get(id).expect("rocm: unbound Weight"));
-        let key = b.ptr as usize;
+        // Key on (address, byte length): a recycled device address that now backs a differently-
+        // sized weight must MISS (its stale dequant has the wrong length), forcing a re-dequant.
+        let key = (b.ptr as usize, b.len);
         {
             let cache = self.weight_cache.lock().unwrap();
             if let Some(cached) = cache.get(&key) {
@@ -478,7 +519,7 @@ impl Drop for ExecCtx<'_> {
 
 pub fn execute_graph(
     pipelines: &Pipelines,
-    weight_cache: &Mutex<HashMap<usize, crate::RocmBuffer>>,
+    weight_cache: &Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
     pool: &Mutex<BufferPool>,
     stream: ffi::hipStream_t,
     plan: &dyn Plan,
@@ -1925,31 +1966,48 @@ fn run_op(
             let bb = ctx.dev[b.0 as usize].as_ref().unwrap();
             let ba = ctx.dev[a.0 as usize].as_ref().unwrap();
             let bst = ctx.dev[state.0 as usize].as_ref().unwrap();
-            dispatch_1d(
-                pipelines,
-                ctx.stream,
-                "deltanet",
-                n_vhead,
-                256,
-                args![
-                    arg_ptr(bq.ptr),
-                    arg_ptr(bk.ptr),
-                    arg_ptr(bv.ptr),
-                    arg_ptr(bb.ptr),
-                    arg_ptr(ba.ptr),
-                    arg_ptr(ac),
-                    arg_ptr(dt),
-                    arg_ptr(bst.ptr),
-                    arg_ptr(dd.ptr),
-                    arg_i32(rows as i32),
-                    arg_i32(n_khead as i32),
-                    arg_i32(n_vhead as i32),
-                    arg_i32(head_k as i32),
-                    arg_i32(head_v as i32),
-                    arg_f32(eps),
-                    arg_i32(src_stride as i32),
-                ],
-            )?;
+            let dn_args = args![
+                arg_ptr(bq.ptr),
+                arg_ptr(bk.ptr),
+                arg_ptr(bv.ptr),
+                arg_ptr(bb.ptr),
+                arg_ptr(ba.ptr),
+                arg_ptr(ac),
+                arg_ptr(dt),
+                arg_ptr(bst.ptr),
+                arg_ptr(dd.ptr),
+                arg_i32(rows as i32),
+                arg_i32(n_khead as i32),
+                arg_i32(n_vhead as i32),
+                arg_i32(head_k as i32),
+                arg_i32(head_v as i32),
+                arg_f32(eps),
+                arg_i32(src_stride as i32),
+            ];
+            // Chunked/parallel prefill: DN_CHUNK=16, shared holds 2·C·kd + 2·C·C + 2·C floats
+            // (≈18 KiB at kd=128). Use it for rows>1 when that footprint fits the 32 KiB dynamic-LDS
+            // ceiling this GPU allows a launch without the MaxDynamicSharedMemorySize opt-in (an
+            // over-budget launch silently corrupts LDS rather than erroring); otherwise (and always
+            // for decode, rows==1) fall back to the sequential per-head scan.
+            const DN_CHUNK: usize = 16;
+            let smem_bytes =
+                (2 * DN_CHUNK * head_k as usize + 2 * DN_CHUNK * DN_CHUNK + 2 * DN_CHUNK) * 4;
+            if rows > 1 && head_v > 0 && smem_bytes <= 32 * 1024 {
+                // One block per value head; one thread per value dim (≥ DN_CHUNK so Phase-1's
+                // per-token threads and Phase-3's per-column threads are both covered).
+                let block = head_v.max(DN_CHUNK as u32);
+                dispatch_blocks_smem(
+                    pipelines,
+                    ctx.stream,
+                    "deltanet_chunked",
+                    n_vhead,
+                    block,
+                    smem_bytes as u32,
+                    dn_args,
+                )?;
+            } else {
+                dispatch_1d(pipelines, ctx.stream, "deltanet", n_vhead, 256, dn_args)?;
+            }
             ctx.dev[dst.0 as usize] = Some(dd);
         }
 

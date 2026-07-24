@@ -1343,9 +1343,9 @@ fn run_deltanet(
 #[test]
 #[ignore = "requires a ROCm GPU"]
 fn deltanet_matches_cpu() {
-    let Some(be) = rocm() else {
+    if rocm().is_none() {
         return;
-    };
+    }
     let cpu = infr_cpu::CpuBackend::new();
     let eps = 1e-6f32;
     // Two shapes: a small GQA case (nk=2 < nv=4 — exercises the interleaved value→key head map),
@@ -1402,6 +1402,13 @@ fn deltanet_matches_cpu() {
                     eps,
                 )
             };
+            // Fresh backend per case: `run_deltanet` allocates then frees its a_coef/dt_bias weight
+            // buffers each call, and the dequant cache is keyed by (device-address, byte length).
+            // Reusing one backend across the shapes/rows lets a freed address recycle into a
+            // SAME-SIZE sibling weight (a_coef ↔ dt_bias are both `[n_vhead]` f16), aliasing the
+            // stale dequant — the source of the historical rows=1 decode nondeterminism. A fresh
+            // backend keeps each case to a single execute with no cross-execute buffer churn.
+            let be = rocm().expect("rocm backend");
             let (r_out, r_state) = run_deltanet(
                 &be,
                 &q,
@@ -1449,6 +1456,112 @@ fn deltanet_matches_cpu() {
             es / st_mag
         );
         }
+    }
+}
+
+/// The CHUNKED DeltaNet PREFILL kernel (rows>1) must match the CPU reference across CHUNK BOUNDARIES:
+/// the chunked reformulation carries the recurrent state `S` sequentially at chunk (not token)
+/// granularity, so a mis-carried `S₀`, a wrong partial-tail length, or an off-by-one in the inclusive
+/// prefix log-decay only shows up once `rows` spans several chunks (DN_CHUNK = 16 on ROCm) plus a
+/// partial. Runs the real qwen35-0.8B shape (nv=nk=16, kd=vd=128) at `rows` ∈ {130, 96, 33} — 130 =
+/// 8 full chunks + a 2-token tail, 96 = 6 exact full chunks, 33 = 2 full chunks + a 1-token tail —
+/// and asserts BOTH the output and the mutated `S` match `infr_cpu` `deltanet_scan` (which itself is
+/// bit-identical to the naive serial recurrence). A FRESH backend per `rows` keeps each case to a
+/// single execute, so the run never depends on cross-execute weight-buffer recycling.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn deltanet_prefill_chunk_boundary_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let eps = 1e-6f32;
+    let (n_vhead, n_khead, head_k, head_v) = (16usize, 16usize, 128usize, 128usize);
+    let acoef_f32: Vec<f32> = (0..n_vhead).map(|h| -0.02 * (1.0 + h as f32)).collect();
+    let dtbias_f32: Vec<f32> = gen(n_vhead, 71);
+    let a_coef_f16: Vec<u8> = acoef_f32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let dt_bias_f16: Vec<u8> = dtbias_f32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+
+    for &rows in &[130usize, 96usize, 33usize] {
+        // Fresh backend → exactly one execute on this device, no weight-buffer churn to alias.
+        let be = rocm().expect("rocm backend");
+        let q = gen(rows * n_khead * head_k, 6);
+        let k = gen(rows * n_khead * head_k, 9);
+        let v = gen(rows * n_vhead * head_v, 12);
+        let bcoef = gen(rows * n_vhead, 15);
+        // A couple of large-z entries so the decay's softplus is pushed into its overflow regime.
+        let mut acoef_in = gen(rows * n_vhead, 18);
+        acoef_in[0] = 100.0;
+        acoef_in[n_vhead] = 100.0;
+        let state_init = gen(n_vhead * head_k * head_v, 21);
+
+        let (c_out, c_state) = run_deltanet(
+            &cpu,
+            &q,
+            &k,
+            &v,
+            &bcoef,
+            &acoef_in,
+            &a_coef_f16,
+            &dt_bias_f16,
+            &state_init,
+            rows,
+            n_vhead,
+            n_khead,
+            head_k,
+            head_v,
+            eps,
+        );
+        let (r_out, r_state) = run_deltanet(
+            &be,
+            &q,
+            &k,
+            &v,
+            &bcoef,
+            &acoef_in,
+            &a_coef_f16,
+            &dt_bias_f16,
+            &state_init,
+            rows,
+            n_vhead,
+            n_khead,
+            head_k,
+            head_v,
+            eps,
+        );
+        let eo = maxerr(&c_out, &r_out);
+        let out_mag = maxabs(&c_out).max(1e-6);
+        let es = maxerr(&c_state, &r_state);
+        let st_mag = maxabs(&c_state).max(1e-6);
+        println!(
+            "DeltaNet chunked-prefill rows={rows} out max_err={eo:e} rel={:e} | state max_err={es:e} rel={:e}",
+            eo / out_mag,
+            es / st_mag
+        );
+        assert!(
+            out_mag > 1e-3,
+            "rows={rows} output reference all-zero — vacuous"
+        );
+        assert!(
+            st_mag > 1e-3,
+            "rows={rows} state reference all-zero — vacuous"
+        );
+        assert!(
+            eo / out_mag < 2e-2,
+            "chunked-prefill rows={rows} output diverges from CPU (chunk carry / prefix-decay?): rel={:e}",
+            eo / out_mag
+        );
+        assert!(
+            es / st_mag < 2e-2,
+            "chunked-prefill rows={rows} state diverges from CPU (S₀ carry across chunks?): rel={:e}",
+            es / st_mag
+        );
     }
 }
 
