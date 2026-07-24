@@ -369,20 +369,21 @@ fn linear_i8_q6k_matches_cpu() {
     );
 }
 
-// ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5) vs the CPU f32 reference ──
+// ── Prefill GEMM (m > 1) vs the CPU f32 reference ────────────────────────────
 //
-// For `m > 1` (prefill) the default `Op::Linear` path for Q4_K/Q6_K/Q8_0 routes to the RDNA3 wave32
-// int8 matrix core (`wmma_i8_*`, one 16×16 output tile per wave). The activation quant and weight
-// codes are IDENTICAL to the Phase-4 GEMV, so parity is the same int8 tolerance vs the CPU f32
-// reference. Shapes deliberately break the 16-tile alignment on BOTH edges: `m` is NOT a multiple of
-// 16 (row-edge masking) and `out_f` is NOT a multiple of 16 (column-edge masking + guarded weight
-// decode). `in_f = 512` gives 2 super-blocks / output row (Q4_K/Q6_K) — exercises the per-super
-// offset AND the multi-block scale-after accumulation. Every case carries a vacuity guard. Setting
-// `INFR_ROCM_NO_WMMA` would route the Phase-4 dp4a GEMV instead.
+// For `m > 1` (prefill) the DEFAULT `Op::Linear` path for Q4_K/Q6_K/Q8_0/Q5_0 routes to the RDNA3
+// wave32 int8 matrix core (`wmma_i8_*`, one 16×16 output tile per wave); `INFR_ROCM_NO_WMMA` drops it
+// to the Phase-4 dp4a GEMV, and `INFR_ROCM_BLAS=1` opts into the Slice-26 rocBLAS f16 GEMM — all land
+// within the same int8 tolerance vs the CPU f32 reference (f16 is strictly MORE accurate than the
+// int8 codes, so BLAS clears the int8 bound comfortably). Shapes deliberately break the 16-tile
+// alignment on BOTH edges: `m` is NOT a multiple of 16 (row-edge masking) and `out_f` is NOT a
+// multiple of 16 (column-edge masking + guarded weight decode). `in_f = 512` gives 2 super-blocks /
+// output row (Q4_K/Q6_K) — exercises the per-super offset AND the multi-block scale-after
+// accumulation. Every case carries a vacuity guard.
 
-/// Shared WMMA prefill parity check: ROCm int8 `Linear` (m>1 → WMMA) vs the CPU f32 reference.
-/// `m = 18` (16 + 2 → two row tiles, last partially masked); `out_f = 40` (32 + 8 → three column
-/// tiles, last partially masked).
+/// Shared prefill parity check: ROCm `Linear` (m>1 → int8 WMMA by default, or the rocBLAS f16 GEMM
+/// under `INFR_ROCM_BLAS=1`) vs the CPU f32 reference. `m = 18` (16 + 2 → two row tiles, last
+/// partially masked); `out_f = 40` (32 + 8 → three column tiles, last partially masked).
 fn check_wmma_linear(
     w_bytes_for: impl Fn(usize) -> Vec<u8>,
     dt: DType,

@@ -109,6 +109,19 @@ fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
     }
 }
 
+/// Dequant-to-f16 kernel name (`deqf16_*`, kernels.rs `DEQUANT_F16`) for a covered dtype — the
+/// weight decoder feeding the Slice-26 rocBLAS f16 prefill GEMM. Same covered set as
+/// [`native_decode_fmt`] (Q8_0/Q4_K/Q6_K/Q5_0); `None` keeps a format on the WMMA/GEMV path.
+fn deqf16_fmt(dt: DType) -> Option<&'static str> {
+    match dt {
+        DType::Q8_0 => Some("deqf16_q80"),
+        DType::Q4K => Some("deqf16_q4k"),
+        DType::Q6K => Some("deqf16_q6k"),
+        DType::Q5_0 => Some("deqf16_q50"),
+        _ => None,
+    }
+}
+
 /// Explicit tile override for A/B benchmarking (`INFR_ROCM_WMMA_TILE=RxC`, one of 1x1/2x1/2x2).
 /// `None` when unset → the shape-driven auto tier in [`wmma_tile`] is used.
 fn wmma_tile_forced() -> Option<(u32, u32)> {
@@ -377,6 +390,9 @@ struct ExecCtx<'a> {
     /// (both the success path and any early-error return) so nothing is `hipFree`'d per op.
     pooled: Vec<(*mut c_void, usize)>,
     stream: ffi::hipStream_t,
+    /// rocBLAS handle bound to `stream` for the OPT-IN Slice-26 f16 prefill GEMM (`INFR_ROCM_BLAS=1`),
+    /// or `null` (the default) — in which case the prefill path uses the int8 WMMA kernel.
+    rocblas: ffi::rocblas_handle,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -564,11 +580,13 @@ impl Drop for ExecCtx<'_> {
 
 // ── Main execute walk ────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_graph(
     pipelines: &Pipelines,
     weight_cache: &Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
     pool: &Mutex<BufferPool>,
     stream: ffi::hipStream_t,
+    rocblas: ffi::rocblas_handle,
     plan: &dyn Plan,
     bindings: &Bindings,
 ) -> Result<()> {
@@ -585,6 +603,7 @@ pub fn execute_graph(
         pool,
         pooled: Vec::new(),
         stream,
+        rocblas,
     };
 
     // No per-op sync: the whole op list queues on ONE stream, which serializes device work, so
@@ -743,80 +762,163 @@ fn run_op(
                 let mu = m as usize;
                 let inu = in_f as usize;
                 let ou = out_f as usize;
-                let nb = inu / 32; // in_f is 32-aligned for every covered format
-                                   // int8 activation codes + per-32-block scales, drawn from the
-                                   // scratch pool (no per-op malloc/free). Both are fully written by
-                                   // `quant_i8_32` before the GEMV reads them → un-cleared (`out`).
-                                   // They stay live in the pool until end-of-forward, so the async
-                                   // GEMV that reads them is never racing a reuse.
-                let qx = ctx.pool_buf((mu * inu).max(1), false);
-                let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
-                dispatch_1d(
-                    pipelines,
-                    ctx.stream,
-                    "quant_i8_32",
-                    (mu * nb) as u32,
-                    256,
-                    args![
-                        arg_ptr(bx_ptr),
-                        arg_ptr(qx.ptr),
-                        arg_ptr(xs.ptr),
-                        arg_i32(m as i32),
-                        arg_i32(in_f as i32),
-                    ],
-                )?;
-                let dd = ctx.zero_dev(mu * ou);
                 let blk_off = (w_off as usize / qpb) * bpb;
                 let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
-                match (m > 1).then(|| native_wmma_fmt(wdt, out_f)).flatten() {
-                    Some((wmma_kernel, rm, cn)) => {
-                        // Prefill (m>1): matrix-core int8 GEMM. Grid = (ceil(out_f/(16*CN)),
-                        // ceil(m/(16*RM))), one wave32 block per 16*RM × 16*CN output tile — each wave
-                        // reuses every loaded A fragment across the CN weight-column tiles and every
-                        // decoded weight tile across the RM row tiles. Same int8 codes/scales and the
-                        // same per-element f32 accumulation order, so the numerics are bit-identical to
-                        // the un-blocked Slice-15 kernel.
-                        dispatch_grid(
+                match (m > 1 && !ctx.rocblas.is_null())
+                    .then(|| deqf16_fmt(wdt))
+                    .flatten()
+                {
+                    Some(deq_kernel) => {
+                        // Prefill (m>1), OPT-IN (`INFR_ROCM_BLAS=1` → handle live): Slice-26 rocBLAS
+                        // f16 GEMM. Dequantize the weight to a POOLED transient f16 buffer and cast the
+                        // activation to f16, then `dst[m,out_f] = x[m,in_f] · Wᵀ` via `rocblas_gemm_ex`
+                        // (f16 in, f32 out, f32 accumulate). The library GEMM peaks 3.6-5.9× over the
+                        // hand int8 WMMA kernel on the ISOLATED GEMM (examples/blas_probe) — but the
+                        // per-forward dequant→f16 tax makes it a NET LOSS end-to-end (~0.88× pp512) and
+                        // the transient f16 pool buffers OOM at 8B, so it is OFF by default (the WMMA
+                        // arm below is the shipping path). All three buffers live on `ctx.stream`, to
+                        // which the handle is bound, so the dequant/cast → GEMM ordering holds sync-free.
+                        let wf16 = ctx.pool_buf((ou * inu * 2).max(1), false);
+                        dispatch_1d(
                             pipelines,
                             ctx.stream,
-                            wmma_kernel,
-                            out_f.div_ceil(16 * cn),
-                            m.div_ceil(16 * rm),
-                            32,
+                            deq_kernel,
+                            (ou * inu) as u32,
+                            256,
                             args![
-                                arg_ptr(qx.ptr),
-                                arg_ptr(xs.ptr),
                                 arg_ptr(wptr_off),
-                                arg_ptr(dd.ptr),
-                                arg_i32(m as i32),
-                                arg_i32(in_f as i32),
-                                arg_i32(out_f as i32),
+                                arg_ptr(wf16.ptr),
+                                arg_i32((ou * inu) as i32),
                             ],
                         )?;
+                        let xf16 = ctx.pool_buf((mu * inu * 2).max(1), false);
+                        dispatch_1d(
+                            pipelines,
+                            ctx.stream,
+                            "cast_f32_f16",
+                            (mu * inu) as u32,
+                            256,
+                            args![
+                                arg_ptr(bx_ptr),
+                                arg_ptr(xf16.ptr),
+                                arg_i32((mu * inu) as i32),
+                            ],
+                        )?;
+                        let dd = ctx.zero_dev(mu * ou);
+                        // Column-major rocBLAS: computing Cᵀ[out_f,m] = W[out_f,in_f]·Xᵀ[in_f,m] with
+                        // A=W transposed, B=X none yields exactly the row-major dst[m,out_f]. Weight
+                        // row-major [out_f,in_f] == col-major [in_f,out_f] (lda=in_f); activation
+                        // row-major [m,in_f] == col-major [in_f,m] (ldb=in_f); output ldc=out_f.
+                        let alpha: f32 = 1.0;
+                        let beta: f32 = 0.0;
+                        let rc = unsafe {
+                            ffi::rocblas_gemm_ex(
+                                ctx.rocblas,
+                                ffi::ROCBLAS_OPERATION_TRANSPOSE,
+                                ffi::ROCBLAS_OPERATION_NONE,
+                                out_f as i32,
+                                m as i32,
+                                in_f as i32,
+                                &alpha as *const f32 as *const c_void,
+                                wf16.ptr,
+                                ffi::ROCBLAS_DATATYPE_F16_R,
+                                in_f as i32,
+                                xf16.ptr,
+                                ffi::ROCBLAS_DATATYPE_F16_R,
+                                in_f as i32,
+                                &beta as *const f32 as *const c_void,
+                                dd.ptr,
+                                ffi::ROCBLAS_DATATYPE_F32_R,
+                                out_f as i32,
+                                dd.ptr,
+                                ffi::ROCBLAS_DATATYPE_F32_R,
+                                out_f as i32,
+                                ffi::ROCBLAS_DATATYPE_F32_R,
+                                ffi::ROCBLAS_GEMM_ALGO_STANDARD,
+                                0,
+                                0,
+                            )
+                        };
+                        if rc != ffi::ROCBLAS_STATUS_SUCCESS {
+                            return Err(be(format!("rocblas_gemm_ex: rc={rc}")));
+                        }
+                        ctx.dev[dst.0 as usize] = Some(dd);
                     }
                     None => {
-                        // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m): one
-                        // wave32 block per (output row, activation row).
-                        dispatch_grid(
+                        // Int8-activation dp4a path: quantize the `m×in_f` activation to int8 ONCE
+                        // (`quant_i8_32`, per-32-block scale), then integer-dot against the decoded
+                        // weight codes (scale-after). `bpb == bpb_i8` (same layout). The int8 codes /
+                        // scales are drawn from the scratch pool (fully written before any read → `out`,
+                        // un-cleared) and stay live until end-of-forward, so the async GEMM/GEMV that
+                        // reads them never races a pool reuse.
+                        let nb = inu / 32; // in_f is 32-aligned for every covered format
+                        let qx = ctx.pool_buf((mu * inu).max(1), false);
+                        let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
+                        dispatch_1d(
                             pipelines,
                             ctx.stream,
-                            i8_kernel,
-                            out_f,
-                            m,
-                            32,
+                            "quant_i8_32",
+                            (mu * nb) as u32,
+                            256,
                             args![
+                                arg_ptr(bx_ptr),
                                 arg_ptr(qx.ptr),
                                 arg_ptr(xs.ptr),
-                                arg_ptr(wptr_off),
-                                arg_ptr(dd.ptr),
                                 arg_i32(m as i32),
                                 arg_i32(in_f as i32),
-                                arg_i32(out_f as i32),
                             ],
                         )?;
+                        let dd = ctx.zero_dev(mu * ou);
+                        match (m > 1).then(|| native_wmma_fmt(wdt, out_f)).flatten() {
+                            Some((wmma_kernel, rm, cn)) => {
+                                // Prefill (m>1), BLAS disabled: matrix-core int8 GEMM. Grid =
+                                // (ceil(out_f/(16*CN)), ceil(m/(16*RM))), one wave32 block per
+                                // 16*RM × 16*CN output tile — reuses each A fragment across the CN
+                                // weight-column tiles and each decoded weight tile across the RM row
+                                // tiles. Bit-identical f32 accumulation to the Slice-15 kernel.
+                                dispatch_grid(
+                                    pipelines,
+                                    ctx.stream,
+                                    wmma_kernel,
+                                    out_f.div_ceil(16 * cn),
+                                    m.div_ceil(16 * rm),
+                                    32,
+                                    args![
+                                        arg_ptr(qx.ptr),
+                                        arg_ptr(xs.ptr),
+                                        arg_ptr(wptr_off),
+                                        arg_ptr(dd.ptr),
+                                        arg_i32(m as i32),
+                                        arg_i32(in_f as i32),
+                                        arg_i32(out_f as i32),
+                                    ],
+                                )?;
+                            }
+                            None => {
+                                // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m):
+                                // one wave32 block per (output row, activation row).
+                                dispatch_grid(
+                                    pipelines,
+                                    ctx.stream,
+                                    i8_kernel,
+                                    out_f,
+                                    m,
+                                    32,
+                                    args![
+                                        arg_ptr(qx.ptr),
+                                        arg_ptr(xs.ptr),
+                                        arg_ptr(wptr_off),
+                                        arg_ptr(dd.ptr),
+                                        arg_i32(m as i32),
+                                        arg_i32(in_f as i32),
+                                        arg_i32(out_f as i32),
+                                    ],
+                                )?;
+                            }
+                        }
+                        ctx.dev[dst.0 as usize] = Some(dd);
                     }
                 }
-                ctx.dev[dst.0 as usize] = Some(dd);
             } else if let Some((qpb, bpb, kname, _)) = native_decode_fmt(wdt) {
                 // Native in-kernel decode: read the RAW quant bytes (no f16 cache → VRAM drops).
                 // The bound quant buffer is pre-advanced past `w_off`; `w_off` is always a whole

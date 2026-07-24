@@ -239,6 +239,9 @@ pub struct RocmBackend {
     /// Reusable op-scratch pool (see [`BufferPool`]). Persists across `execute` calls so the
     /// decode replay loop draws from the free-list instead of `hipMalloc`/`hipFree` per op.
     pub(crate) pool: Mutex<BufferPool>,
+    /// rocBLAS handle for the OPT-IN Slice-26 f16 prefill GEMM (`INFR_ROCM_BLAS=1`). `null` by
+    /// default (and if `rocblas_create_handle` fails), so the prefill path uses the int8 WMMA kernel.
+    rocblas: ffi::rocblas_handle,
     /// Active weight-load progress bar.
     weight_pb: Arc<Mutex<Option<indicatif::ProgressBar>>>,
 }
@@ -278,12 +281,29 @@ impl RocmBackend {
 
         let pipelines = Pipelines::build(device)?;
 
+        // rocBLAS handle for the OPT-IN f16 prefill GEMM (Slice 26), bound once to our work stream.
+        // OFF by default: the isolated GEMM wins 3.6-5.9× (examples/blas_probe), but the per-forward
+        // dequant→f16 tax makes it a NET LOSS end-to-end (~0.88× pp512 on 0.6B-8B) AND its transient
+        // f16 pool buffers reintroduce the Phase-3 VRAM blowup (OOM on 8B). So the default prefill
+        // path stays on the hand int8 WMMA kernel; `INFR_ROCM_BLAS=1` opts into the library GEMM for
+        // experimentation. A create failure is non-fatal — the handle stays null and WMMA is used.
+        let mut rocblas: ffi::rocblas_handle = std::ptr::null_mut();
+        if std::env::var_os("INFR_ROCM_BLAS").is_some() {
+            let rc = unsafe { ffi::rocblas_create_handle(&mut rocblas) };
+            if rc == ffi::ROCBLAS_STATUS_SUCCESS {
+                unsafe { ffi::rocblas_set_stream(rocblas, stream) };
+            } else {
+                rocblas = std::ptr::null_mut();
+            }
+        }
+
         Ok(Self {
             device,
             stream,
             pipelines,
             weight_cache: Mutex::new(std::collections::HashMap::new()),
             pool: Mutex::new(BufferPool::new()),
+            rocblas,
             weight_pb: Arc::new(Mutex::new(None)),
         })
     }
@@ -423,6 +443,7 @@ impl Backend for RocmBackend {
             &self.weight_cache,
             &self.pool,
             self.stream,
+            self.rocblas,
             plan,
             bindings,
         )
@@ -486,6 +507,9 @@ impl Backend for RocmBackend {
 
 impl Drop for RocmBackend {
     fn drop(&mut self) {
+        if !self.rocblas.is_null() {
+            unsafe { ffi::rocblas_destroy_handle(self.rocblas) };
+        }
         if !self.stream.is_null() {
             unsafe {
                 ffi::hipStreamSynchronize(self.stream);

@@ -44,3 +44,10 @@ required-features = ["rocm"]
 name = "wmma_bench"
 path = "examples/wmma_bench.rs"
 required-features = ["rocm"]
+
+# Gated: Slice-26 probe. Self-contained HIP + rocBLAS FFI to time a library f16 GEMM
+# in isolation vs the hand int8 WMMA kernel. Links `librocblas`.
+[[example]]
+name = "blas_probe"
+path = "examples/blas_probe.rs"
+required-features = ["rocm"]

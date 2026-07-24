@@ -107,6 +107,65 @@ extern "C" {
     pub fn hiprtcDestroyProgram(prog: *mut hiprtcProgram) -> c_int;
 }
 
+// ── librocblas ───────────────────────────────────────────────────────────────
+//
+// Slice 26: the dequant→f16→library-GEMM prefill path. `rocblas_gemm_ex` runs the
+// f16 (fp32-accumulate) GEMM that beats the hand int8 WMMA kernel 3.6-5.9× on the
+// isolated GEMM (see `examples/blas_probe`). Only the four entry points the prefill
+// path calls are declared; the search path is emitted by `build.rs` (rocm feature).
+
+#[link(name = "rocblas")]
+extern "C" {
+    /// Create a rocBLAS library handle (device context + workspace).
+    pub fn rocblas_create_handle(handle: *mut rocblas_handle) -> c_int;
+    /// Destroy a rocBLAS handle.
+    pub fn rocblas_destroy_handle(handle: rocblas_handle) -> c_int;
+    /// Bind all subsequent rocBLAS calls on `handle` to `stream`.
+    pub fn rocblas_set_stream(handle: rocblas_handle, stream: hipStream_t) -> c_int;
+    /// General mixed-precision GEMM: `D = alpha·op(A)·op(B) + beta·C` (column-major).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rocblas_gemm_ex(
+        handle: rocblas_handle,
+        trans_a: c_int,
+        trans_b: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const c_void,
+        a: *const c_void,
+        a_type: c_int,
+        lda: c_int,
+        b: *const c_void,
+        b_type: c_int,
+        ldb: c_int,
+        beta: *const c_void,
+        c: *const c_void,
+        c_type: c_int,
+        ldc: c_int,
+        d: *mut c_void,
+        d_type: c_int,
+        ldd: c_int,
+        compute_type: c_int,
+        algo: c_int,
+        solution_index: i32,
+        flags: u32,
+    ) -> c_int;
+}
+
+/// An opaque rocBLAS library handle.
+pub type rocblas_handle = *mut c_void;
+
+/// rocBLAS success return code.
+pub const ROCBLAS_STATUS_SUCCESS: c_int = 0;
+// rocblas_operation
+pub const ROCBLAS_OPERATION_NONE: c_int = 111;
+pub const ROCBLAS_OPERATION_TRANSPOSE: c_int = 112;
+// rocblas_datatype (real)
+pub const ROCBLAS_DATATYPE_F16_R: c_int = 150;
+pub const ROCBLAS_DATATYPE_F32_R: c_int = 151;
+// rocblas_gemm_algo
+pub const ROCBLAS_GEMM_ALGO_STANDARD: c_int = 0;
+
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
 /// An opaque HIP stream.

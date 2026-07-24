@@ -60,6 +60,7 @@ const HIP_PARTS: &[&str] = &[
     DELTANET_CHUNKED,
     MOE_SHARED_EXPERT_ADD,
     NATIVE_DECODE,
+    DEQUANT_F16,
     MOE_FFN_NATIVE,
     INT8_DECODE,
     MOE_FFN_INT8,
@@ -1565,6 +1566,34 @@ GEN_EMBED(q80)
 GEN_EMBED(q4k)
 GEN_EMBED(q6k)
 GEN_EMBED(q50)
+"#;
+
+// ── Dequant-to-f16 + activation cast (Slice 26, rocBLAS f16 prefill GEMM) ─────
+//
+// The library f16 GEMM needs both operands materialized as f16: the quant weight is dequantized
+// to a transient f16 buffer (`deqf16_*`) and the f32 activation is cast to f16 (`cast_f32_f16`),
+// both drawn from the exec scratch pool (freed after the GEMM — NOT a permanent per-model cache).
+// `deq_*` (NATIVE_DECODE, assembled before this part) already rounds through f16, so the stored
+// __half is the exact value the retired dequant→f16 weight cache produced.
+const DEQUANT_F16: &str = r#"
+#define GEN_DEQF16(SUFFIX) \
+extern "C" __global__ void deqf16_##SUFFIX( \
+    const unsigned char* __restrict__ w, \
+    __half* __restrict__ out, \
+    int n) { \
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i < (long)n) out[i] = __float2half(deq_##SUFFIX(w, i)); \
+}
+GEN_DEQF16(q80)
+GEN_DEQF16(q4k)
+GEN_DEQF16(q6k)
+GEN_DEQF16(q50)
+
+extern "C" __global__ void cast_f32_f16(
+    const float* __restrict__ x, __half* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(x[i]);
+}
 "#;
 
 // ── Native-decode MoE expert FFN (Phase-3 for MoE) ───────────────────────────
