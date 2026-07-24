@@ -1308,8 +1308,9 @@ extern "C" __global__ void moe_shared_expert_add(
 // These kernels read the RAW quantized weight bytes and decode each block ON THE FLY,
 // so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
-// lever, docs/cpu-perf.md). Covered formats: Q4_K, Q6_K, Q8_0 (the set a Q4_K_M GGUF
-// uses; F16 is already native via `linear_f16`).
+// lever, docs/cpu-perf.md). Covered formats: Q4_K, Q6_K, Q8_0, Q5_0 (the set a Q4_K_M GGUF
+// uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already native
+// via `linear_f16`).
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -1346,6 +1347,29 @@ __device__ __forceinline__ float deq_q80(const unsigned char* w, long i) {
     float d = rf16b(b);
     int code = (int)((signed char)b[2 + within]) + 128; // biased +128 (dequant_block)
     return fin(d, code, d * (float)(-128));             // sc = d*1, mn = d*(-128)
+}
+
+// ── Q5_0: 32 elems / 22 bytes = [half d][u8 qh[4]][u8 qs[16]]; y = d*(q5 − 16), q5 ∈ 0..31. ──
+// The 5th bit of element `within` comes from bit `within` of the 32-bit `qh` (low nibbles are the
+// first 16, high nibbles the last 16). scale = d, min = d·(−16) — mirrors dequant_row_q5_0.
+__device__ __forceinline__ float deq_q50(const unsigned char* w, long i) {
+    long blk = i >> 5;             // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 22;
+    float d = rf16b(b);
+    unsigned int qh = (unsigned int)b[2] | ((unsigned int)b[3] << 8)
+                    | ((unsigned int)b[4] << 16) | ((unsigned int)b[5] << 24);
+    const unsigned char* qs = b + 6;
+    int code;
+    if (within < 16) {
+        int xh = (int)(((qh >> within) << 4) & 0x10);
+        code = (qs[within] & 0x0F) | xh;
+    } else {
+        int j = within - 16;
+        int xh = (int)((qh >> (j + 12)) & 0x10);
+        code = (qs[j] >> 4) | xh;
+    }
+    return fin(d, code, d * (float)(-16));   // sc = d, mn = d·(−16)
 }
 
 // get_scale_min_k4: 6-bit scale `sc` + min `mm` for sub-block s (0..8) of a Q4_K block.
@@ -1448,9 +1472,11 @@ extern "C" __global__ void embed_##SUFFIX( \
 GEN_LINEAR(q80)
 GEN_LINEAR(q4k)
 GEN_LINEAR(q6k)
+GEN_LINEAR(q50)
 GEN_EMBED(q80)
 GEN_EMBED(q4k)
 GEN_EMBED(q6k)
+GEN_EMBED(q50)
 "#;
 
 // ── Native-decode MoE expert FFN (Phase-3 for MoE) ───────────────────────────
@@ -1545,7 +1571,7 @@ GEN_MOE_FFN(q6k, q6k)
 // REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
 // covers every row, so the activation quant cost amortizes over the whole GEMV.
 //
-// Covered formats: Q8_0, Q4_K, Q6_K (the Q4_K_M set). `rf16b`/`k4` are defined in NATIVE_DECODE
+// Covered formats: Q8_0, Q4_K, Q6_K, Q5_0 (the Q4_K_M set). `rf16b`/`k4` are defined in NATIVE_DECODE
 // (this part is assembled after it). Uncovered formats keep the Phase-3 / dequant→f16 fallback.
 const INT8_DECODE: &str = r#"
 // Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
@@ -1736,6 +1762,48 @@ extern "C" __global__ void linear_i8_q6k(
             }
             acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-32 * sc)) * sx * (float)isum;
         }
+    }
+    acc = wave_sum32(acc);
+    if (tid == 0) dst[(long)row * out_f + o] = acc;
+}
+
+// ── Q5_0: 32 elems / 22 bytes; single scale d, offset −16; code 0..31. value = d·(code − 16). ──
+// Per 32-block: acc += d·xs·(idot − 16·isum), where idot = Σ qx·code, isum = Σ qx. Same structure as
+// the Q4_K min term with sc=1, mn=−16.
+extern "C" __global__ void linear_i8_q50(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 22;
+        float d = rf16b(b);
+        unsigned int qh = (unsigned int)b[2] | ((unsigned int)b[3] << 8)
+                        | ((unsigned int)b[4] << 16) | ((unsigned int)b[5] << 24);
+        const unsigned char* qs = b + 6;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            int xh0 = (int)(((qh >> p) << 4) & 0x10);
+            int xh1 = (int)((qh >> (p + 12)) & 0x10);
+            code[p]      = (signed char)((qs[p] & 0x0F) | xh0);
+            code[p + 16] = (signed char)((qs[p] >> 4) | xh1);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + (d * (float)(-16)) * sx * (float)isum;
     }
     acc = wave_sum32(acc);
     if (tid == 0) dst[(long)row * out_f + o] = acc;
@@ -2159,6 +2227,64 @@ extern "C" __global__ void wmma_i8_q6k(
         for (int e = 0; e < 8; e++) {
             int re = blockIdx.y * 16 + 2 * e + half;
             float axs = (re < m) ? xs[(long)re * nblk + blk32] : 0.0f;
+            acc[e] += axs * (wsc * (float)dotacc[e] + wmn * (float)sumacc[e]);
+        }
+    }
+    for (int e = 0; e < 8; e++) {
+        int re = blockIdx.y * 16 + 2 * e + half;
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[e];
+    }
+}
+
+// ── Q5_0 prefill: 32 elems/block = 2 K-tiles, scale d, min d·(−16), code 0..31. ──
+// Structurally Q8_0 (single per-32-block scale) plus a Q4_K-style min term produced by a second
+// WMMA against an all-ones B fragment (`Σ qx`), scaled by `d·(−16)` after.
+extern "C" __global__ void wmma_i8_q50(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    int m, int in_f, int out_f
+) {
+    int lane = threadIdx.x;
+    int half = lane >> 4;
+    int col = blockIdx.x * 16 + (lane & 15);
+    int row_in = blockIdx.y * 16 + (lane & 15);
+    int nblk = in_f >> 5;
+    float acc[8]; for (int e = 0; e < 8; e++) acc[e] = 0.0f;
+    signed char wc[32];
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101};
+    for (int blk = 0; blk < nblk; blk++) {
+        float wsc = 0.0f, wmn = 0.0f;
+        if (col < out_f) {
+            const unsigned char* b = w + ((long)col * nblk + blk) * 22;
+            float d = rf16b(b);
+            wsc = d;
+            wmn = d * (float)(-16);
+            unsigned int qh = (unsigned int)b[2] | ((unsigned int)b[3] << 8)
+                            | ((unsigned int)b[4] << 16) | ((unsigned int)b[5] << 24);
+            const unsigned char* qs = b + 6;
+            for (int p = 0; p < 16; p++) {
+                int xh0 = (int)(((qh >> p) << 4) & 0x10);
+                int xh1 = (int)((qh >> (p + 12)) & 0x10);
+                wc[p]      = (signed char)((qs[p] & 0x0F) | xh0);
+                wc[p + 16] = (signed char)((qs[p] >> 4) | xh1);
+            }
+        } else {
+            for (int p = 0; p < 32; p++) wc[p] = 0;
+        }
+        long arow = (long)row_in * in_f + (long)blk * 32;
+        i8v dotacc = {0,0,0,0,0,0,0,0};
+        i8v sumacc = {0,0,0,0,0,0,0,0};
+        for (int kt = 0; kt < 2; kt++) {
+            i4v a = load_a(qx, row_in, m, arow + kt * 16);
+            i4v b = pack16(wc + kt * 16);
+            dotacc = wmma_dot(a, b, dotacc);
+            sumacc = wmma_dot(a, ones, sumacc);
+        }
+        for (int e = 0; e < 8; e++) {
+            int re = blockIdx.y * 16 + 2 * e + half;
+            float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f;
             acc[e] += axs * (wsc * (float)dotacc[e] + wmn * (float)sumacc[e]);
         }
     }

@@ -226,6 +226,23 @@ fn q80_blocks(blocks: usize) -> Vec<u8> {
     w
 }
 
+/// Build `blocks` valid Q5_0 blocks (22 B = [f16 d][u8 qh[4]][u8 qs[16]]) with a finite small scale
+/// and patterned 5-bit codes (4 low bits in `qs` + the 5th bit in the 32-bit `qh` bitfield).
+fn q50_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 22];
+    for blk in 0..blocks {
+        let base = blk * 22;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes());
+        // qh: 4 bytes → one high bit per element; a patterned bitfield exercises both nibble halves.
+        let qh = (blk as u32).wrapping_mul(2654435761);
+        w[base + 2..base + 6].copy_from_slice(&qh.to_le_bytes());
+        for j in 0..16 {
+            w[base + 6 + j] = ((blk * 7 + j * 11) & 0xFF) as u8;
+        }
+    }
+    w
+}
+
 /// Build `blocks` valid Q6_K blocks (210 B = [ql 128][qh 64][int8 scales 16][f16 d]) with a finite
 /// small `d`, a benign in-range int8 sub-block scale, and patterned ql/qh.
 fn q6k_blocks(blocks: usize) -> Vec<u8> {
@@ -304,6 +321,21 @@ fn linear_i8_q80_matches_cpu() {
         I8_OUT_F,
         1.5e-2,
         "Q8_0",
+    );
+}
+
+/// Q5_0 int8 GEMV: 5-bit weight (single per-32-block scale + `−16` offset) + int8 activation.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q50_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &q50_blocks(blocks),
+        DType::Q5_0,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "Q5_0",
     );
 }
 
@@ -390,6 +422,13 @@ fn check_wmma_linear(
 #[ignore = "requires a ROCm GPU"]
 fn wmma_q80_matches_cpu() {
     check_wmma_linear(q80_blocks, DType::Q8_0, 32, 1.5e-2, "Q8_0");
+}
+
+/// Q5_0 WMMA prefill GEMM (5-bit weight, single per-32-block scale + `−16` offset via ones-dot).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q50_matches_cpu() {
+    check_wmma_linear(q50_blocks, DType::Q5_0, 32, 1.5e-2, "Q5_0");
 }
 
 /// Q4_K WMMA prefill GEMM (4-bit weight + int8 activation, per-32 sub-block scale + min).

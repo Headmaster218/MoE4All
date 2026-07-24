@@ -86,6 +86,7 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
         DType::Q8_0 => Some((32, 34, "linear_q80", "embed_q80")),
         DType::Q4K => Some((256, 144, "linear_q4k", "embed_q4k")),
         DType::Q6K => Some((256, 210, "linear_q6k", "embed_q6k")),
+        DType::Q5_0 => Some((32, 22, "linear_q50", "embed_q50")),
         _ => None,
     }
 }
@@ -103,6 +104,7 @@ fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
         DType::Q8_0 => Some((34, "linear_i8_q80")),
         DType::Q4K => Some((144, "linear_i8_q4k")),
         DType::Q6K => Some((210, "linear_i8_q6k")),
+        DType::Q5_0 => Some((22, "linear_i8_q50")),
         _ => None,
     }
 }
@@ -122,6 +124,7 @@ fn native_wmma_fmt(dt: DType) -> Option<&'static str> {
         DType::Q8_0 => Some("wmma_i8_q80"),
         DType::Q4K => Some("wmma_i8_q4k"),
         DType::Q6K => Some("wmma_i8_q6k"),
+        DType::Q5_0 => Some("wmma_i8_q50"),
         _ => None,
     }
 }
