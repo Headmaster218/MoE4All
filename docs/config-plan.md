@@ -1,16 +1,21 @@
 # config-plan.md — replace the `INFR_*` env gates with a layered `Config`
 
-**Status: S0 (the scaffold) has LANDED; S1 onward are still plan.** Every
-section below is prescriptive: follow it literally. Where a decision is still
-open it is marked **[DECIDE]** and must be answered by the repo owner before the
-slice that needs it starts.
+**Status: this document holds only PENDING work.** Landed slices are pruned out
+after review; the ledger below is the trail. Every section is prescriptive:
+follow it literally. All eight decisions are settled (§11) — do not re-open
+them.
 
-**Facts in this document were verified against `6573fb3` and RE-VERIFIED against
-`2dd0c5a` while landing S0.** Line numbers drift; every read site is quoted with
-enough source text to be re-found by string search. The knob inventory (§6) is
-NOT hand-maintained truth — §6.0 gives the commands that re-derive it, and
-`crates/infr-core/src/config/manifest.rs` now holds the checked-in table so the
-compiler, not this file, is the authority.
+## Ledger
+
+| Slice | What                                                                                                                                         | Commit    |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests | `a0bff9c` |
+
+**Authority:** `crates/infr-core/src/config/manifest.rs` is the knob inventory —
+177 keys, their config paths, grammars, and a `migrated` flag — and the tests
+enforce it against the tree. This document does NOT duplicate it. Line numbers
+quoted below drift; each read site carries enough source text to re-find by
+string search.
 
 ## 1. The problem
 
@@ -348,428 +353,21 @@ inverts where needed.
 behaviour change. Write the truth table in the PR description before changing
 the code.**
 
-### 6.0 Re-derive this inventory before you trust it
-
-These tables are a starting point, not an oracle. Run this first; if the count
-differs from 177 the tree has moved and the tables below are stale. The
-equivalent check now also runs as a `#[test]`
-(`config::tests::manifest_matches_the_tree`), which fails when a new `INFR_*`
-literal appears with no `manifest.rs` entry:
-
-```bash
-# 1. every INFR_* literal in shipped code (this is the S0 manifest seed)
-grep -rhoE '"INFR_[A-Z_0-9]*"' crates/*/src crates/*/build.rs | tr -d '"' | sort -u \
-  | grep -vE '_TEST_|^INFR_(TP|EP|CPU|METAL)$'
-# → 177 keys at 2dd0c5a = manifest::KEYS (174) + manifest::NOT_MIGRATED (3)
-
-# 2. the subset a naive grep finds (do NOT stop here — see §1.6)
-grep -rn 'env::var\(_os\)\?("INFR_' crates/*/src crates/*/build.rs
-# → 205 sites / 153 keys (150 real + INFR_TEST_GGUF/INFR_TEST_MODEL/INFR_METAL)
-
-# 3. the ~30 reads a helper hides
-grep -rn 'env_flag(\|env_mib(\|overflow_vram_reserve(\|EnvRows {\|disable_env:\|parse_device_list(\|cap_from_env(\|GemvKnobs::resolve' crates/*/src
-```
-
-Excluded by the filter above and deliberately so:
-
-- `INFR_BUDGET_TEST_*`, `INFR_TIER_TEST_*`, `INFR_TEST_ENV_GUARD_*` — fixtures
-  inside `#[cfg(test)]` modules that exist only to prove a wrapper reads its own
-  variable.
-- `INFR_TP` / `INFR_EP` — not keys. They are `label` strings passed to
-  `parse_device_spec(spec, min, label)` in `seam/mod.rs`'s unit tests for error
-  messages. The real keys are `INFR_TENSOR_PARALLEL` / `INFR_EXPERT_PARALLEL`
-  (§6.11).
-- `INFR_CPU` / `INFR_METAL` — **dead**. Removed as backend selectors; the only
-  remaining references are `cli/main.rs`'s
-  `legacy_metal_cpu_flags_are_no_longer_read` regression test and doc comments.
-  Nothing reads them. Do not add them to `Config`; do not remove the test.
-
-### 6.1 `device` — `DeviceCfg`
-
-| Env                      | Grammar                                | Config path                               | Default                                                       | Read sites                                                                               |
-| ------------------------ | -------------------------------------- | ----------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `INFR_DEV`               | string, TWO parsers — see §6.12        | `device.dev: Option<String>`              | `None`                                                        | `cli/main.rs:91` (→ `parse_dev_spec`); `vulkan/lib.rs:1043` (→ `resolve_infr_dev_index`) |
-| `INFR_CTX`               | size (`parse_size`)                    | `device.ctx: Option<SizeSpec>`            | `None`                                                        | `cli/main.rs:3481`; `llama/chat/mod.rs:164`; `llama/chat/diffusion.rs:140`               |
-| `INFR_UBATCH`            | int `>0`, ALSO presence — see §6.12    | `device.ubatch: Option<usize>`            | `1024` / iGPU-adaptive                                        | value: `llama/seam/mod.rs:577` (`ubatch_rows`); presence: `mod.rs:1254,1292,1354`        |
-| `INFR_UBATCH_PARALLEL`   | int `>0`, default 256                  | `device.ubatch_parallel: usize`           | `256`                                                         | `llama/seam/mod.rs:613` (`ubatch_rows_parallel`)                                         |
-| `INFR_SUBMIT_DISPATCHES` | int; unparseable = HARD ERROR; `0`=off | `device.submit_dispatches: Option<usize>` | `initial_submit_dispatch_cap(integrated)`                     | `vulkan/lib.rs:1980`                                                                     |
-| `INFR_SG`                | exactly `"16"` or `"32"`; else ERROR   | `device.subgroup_pref: Option<u32>`       | vendor-derived (16 on Intel with `subgroup_min<=16`, else 32) | `vulkan/lib.rs:1852`                                                                     |
-| `RAYON_NUM_THREADS`      | int (NOT `INFR_*`)                     | `device.threads: Option<usize>`           | `None`                                                        | set by cli; read by rayon                                                                |
-
-`RAYON_NUM_THREADS` is third-party: keep publishing it as an env var from the
-CLI (rayon has no other input), but source the value from `cfg.device.threads`.
-
-**`INFR_UBATCH` default is not `None`.** `ubatch_rows()` falls back to the
-placement-pin, then to `default_ubatch_rows()` = 1024 on a discrete device / on
-CPU+Metal, and `infr_core::integrated_ubatch_rows(cu)` on an integrated GPU
-(`seam/mod.rs:577-600`). `Option<usize>` in the config means "user pinned it";
-the fallback chain stays where it is (R5).
-
-**`INFR_SG` and `INFR_SUBMIT_DISPATCHES` reject bad values loudly today.** The
-env layer must keep erroring, not silently fall back — that is a `Result` out of
-`ConfigLayer::env()`, not an `unwrap_or`.
-
-### 6.2 `sampling` — `SamplingCfg`
-
-| Env               | Grammar                       | Config path                  | Default             | Read sites                                                                                                                 |
-| ----------------- | ----------------------------- | ---------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `INFR_TEMP`       | f32, default 0.0              | `sampling.temp: f32`         | `0.0` (greedy)      | `llama/sampling.rs:44` (`from_env`); presence-probed at `cli/main.rs:3359`, printed at `:3447`                             |
-| `INFR_TOP_K`      | usize, default 20             | `sampling.top_k: usize`      | `20`                | `llama/sampling.rs:45`; `cli/main.rs:3362,3448`                                                                            |
-| `INFR_TOP_P`      | f32, default 0.95             | `sampling.top_p: f32`        | `0.95`              | `llama/sampling.rs:46`; `cli/main.rs:3365,3449`                                                                            |
-| `INFR_SEED`       | u64, TWO defaults — see §6.12 | `sampling.seed: Option<u64>` | `None` ⇒ wall-clock | `llama/sampling.rs:383` (`seed_rng`, default = nanos); `cli/main.rs:2306` and `llama/chat/diffusion.rs:268` (default `42`) |
-| `INFR_MAX_NEW`    | usize, default 2048           | `sampling.max_new: usize`    | `2048`              | `cli/main.rs:1657`                                                                                                         |
-| `INFR_IGNORE_EOS` | presence                      | `sampling.ignore_eos: bool`  | `false`             | `cli/main.rs:2301`; `llama/seam/runner.rs:3938`; `llama/seam/model.rs:1593`; `llama/mtp/mod.rs:2380`                       |
-| `INFR_NO_THINK`   | set AND `!= "0"`              | `sampling.no_think: bool`    | `false`             | `chat/template.rs:220`                                                                                                     |
-
-`Sampler::from_env()` (llama/sampling.rs) becomes
-`Sampler::from_cfg(&SamplingCfg)`. Its per-request override path
-(`Sampler::resolve(req)`) is unchanged — `RequestCtx` still wins over config,
-exactly as it wins over env today (§5.1).
-
-**`INFR_SEED` has no single default** — see §6.12. Model it as `Option<u64>` and
-keep BOTH fallbacks at their call sites (R5): `seed_rng()` keeps its wall-clock
-branch, the two `unwrap_or(42)` sites keep the 42. A `sampling.seed: u64 = 42`
-would make every `infr run` deterministic and is a behaviour change.
-
-`cli/main.rs:3359-3366` reads `INFR_TEMP`/`TOP_K`/`TOP_P` with `.is_err()` to
-decide whether to publish the flag value — that whole block disappears in S1
-(the flags fill `ConfigOverrides` instead), so it needs no config field.
-
-### 6.3 `kv` — `KvCfg`
-
-| Env                           | Grammar                      | Config path                           | Default                            | Read sites                                                                                                                              |
-| ----------------------------- | ---------------------------- | ------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `INFR_KV_TYPE_K`              | dtype name; ALSO presence    | `kv.type_k: Option<DType>`            | `None`                             | value: `llama/seam/runner.rs:451,476` (`parse_kv_fmt`) AND `seam/mod.rs:820` (`kv_ring_wanted`'s `fmt_ok`); presence: `seam/mod.rs:725` |
-| `INFR_KV_TYPE_V`              | dtype name; ALSO presence    | `kv.type_v: Option<DType>`            | `None`                             | value: `llama/seam/runner.rs:451,477` AND `seam/mod.rs:821`; presence: `seam/mod.rs:726`                                                |
-| `INFR_KV_Q8`                  | presence                     | `kv.force_q8: bool`                   | `false`                            | `seam/mod.rs:727`; `seam/model.rs:341`; `seam/runner.rs:464`                                                                            |
-| `INFR_KV_SLOTS`               | usize, default 4             | `kv.slots: usize`                     | `4`                                | `llama/seam/model.rs:200`                                                                                                               |
-| `INFR_NO_KV_RING`             | presence-inv                 | `kv.ring: bool`                       | `true`                             | `llama/seam/mod.rs:828`                                                                                                                 |
-| `INFR_KV_INLINE`              | presence                     | `kv.inline_decode: bool`              | `false`                            | `vulkan/adapter.rs:2746`                                                                                                                |
-| `INFR_KV_COOPMAT_BDA`         | presence                     | `kv.coopmat_bda: bool`                | `false`                            | `vulkan/adapter.rs:2883`                                                                                                                |
-| `INFR_KV_OVERFLOW`            | flag (`budget::flag_from`)   | `kv.overflow: bool`                   | `false`                            | `llama/seam/mod.rs:720`; `vulkan/lib.rs:587`; `rocm/backend.rs:44`                                                                      |
-| `INFR_KV_OVERFLOW_VRAM_MB`    | MiB (`budget::mib_from`)     | `kv.overflow_vram_mb: Option<u64>`    | `None`                             | `vulkan/lib.rs:609`; `rocm/backend.rs:72`                                                                                               |
-| `INFR_KV_OVERFLOW_RESERVE_MB` | MiB (`budget::reserve_from`) | `kv.overflow_reserve_mb: Option<u64>` | `None` ⇒ `max(12% of VRAM, 2 GiB)` | `rocm/backend.rs:37`                                                                                                                    |
-
-The K/V dtype parser already exists twice (`seam/runner.rs::parse_kv_fmt`,
-`budget::parse_kv_dtype`); the config layer uses
-`infr_core::budget::parse_kv_dtype` (`budget.rs:51`) — do not write a third.
-Note `parse_kv_fmt` is a **gated** parse: the requested dtype is silently
-downgraded to f16 unless the backend/alignment gates pass (`runner.rs:453-473`).
-That gating is policy and stays at the call site (R5); the config carries only
-the requested `DType`.
-
-**There is a THIRD read of `INFR_KV_TYPE_K` / `_V` that an earlier draft
-missed** — `kv_ring_wanted`'s `fmt_ok` closure (`seam/mod.rs:820-826`) reads the
-VALUE and requires it to parse to f16 or q8 for the SWA ring to stay eligible.
-It is covered by the [DECIDE-8] model without extra fields: unset ⇒ `!specified`
-⇒ eligible; a garbage name ⇒ `specified && type_k.is_none()` ⇒ NOT eligible,
-which is what `parse_kv_dtype(&v)` returning `None` does today.
-
-`flag_from` grammar (`budget.rs:122`): `Some(v)` with `v` neither `""` nor `"0"`
-⇒ on. This is NOT the same as `is_ok()` — see §10.5.
-
-### 6.4 `paging` — `PagingCfg`
-
-| Env                                     | Grammar                        | Config path                                       | Default                         | Read sites                                                               |
-| --------------------------------------- | ------------------------------ | ------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------ |
-| `INFR_CACHE`                            | size (`parse_size`)            | `paging.cache: Option<SizeSpec>`                  | `None`                          | `llama/seam/mod.rs:907`                                                  |
-| `INFR_PAGER_RING`                       | size, `>0`                     | `paging.ring: Option<SizeSpec>`                   | `None` ⇒ budget-fraction policy | `core/pager.rs:276` (`ring_bytes_policy`; pure half = `ring_bytes_from`) |
-| `INFR_PAGER_STATS`                      | presence                       | `paging.stats: bool`                              | `false`                         | `vulkan/pager.rs:489`; `rocm/pager.rs:225`                               |
-| `INFR_ROCM_EXPERT_BUDGET`               | size (`parse_size`)            | `paging.rocm_expert_budget: Option<SizeSpec>`     | `None`                          | `llama/seam/mod.rs:173`                                                  |
-| `INFR_ROCM_WEIGHT_PREFETCH_SLOTS`       | usize, default 4, floored at 2 | `paging.rocm_prefetch_slots: Option<usize>`       | `4` (`DEFAULT_N_SLOTS`)         | `rocm/weight_pager.rs:92`                                                |
-| `INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB` | usize MiB, default 256         | `paging.rocm_prefetch_max_bank_mb: Option<usize>` | `256` (`DEFAULT_MAX_BANK_MB`)   | `rocm/weight_pager.rs:81`                                                |
-| `INFR_ROCM_WEIGHT_PREFETCH_OFF`         | presence                       | `paging.rocm_prefetch_off: bool`                  | `false`                         | `rocm/weight_pager.rs:156`                                               |
-| `INFR_ROCM_WEIGHT_PREFETCH_STATS`       | presence                       | `paging.rocm_prefetch_stats: bool`                | `false`                         | `rocm/weight_pager.rs:210`                                               |
-| `INFR_ROCM_WEIGHT_OVERFLOW`             | flag (`budget::flag_from`)     | `paging.rocm_weight_overflow: bool`               | `false`                         | `rocm/backend.rs:84`                                                     |
-| `INFR_ROCM_WEIGHT_VRAM_MB`              | MiB (`budget::mib_from`)       | `paging.rocm_weight_vram_mb: Option<u64>`         | `None`                          | `rocm/backend.rs:94`                                                     |
-| `INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB`  | MiB (`budget::reserve_from`)   | `paging.rocm_weight_reserve_mb: Option<u64>`      | `None` ⇒ `max(12%, 2 GiB)`      | `rocm/backend.rs:108`                                                    |
-| `INFR_ROCM_PAGER_NOOVERLAP`             | presence                       | `paging.rocm_no_overlap: bool`                    | `false`                         | `rocm/pager.rs:376`                                                      |
-
-The two prefetch defaults are **not `None`** — an earlier draft of this table
-said they were. `max_bank_bytes()` returns `DEFAULT_MAX_BANK_MB * 1024 * 1024`
-when unset and `n_slots()` returns `DEFAULT_N_SLOTS.max(2)`
-(`weight_pager.rs:69,74`).
-
-### 6.5 `kernels.vulkan` — `VulkanCfg` (the biggest group)
-
-Coopmat / tier selection (all read once in `VulkanBackend::new`, §5.2):
-
-| Env                 | Grammar      | Config path          | Default | Site              |
-| ------------------- | ------------ | -------------------- | ------- | ----------------- |
-| `INFR_NO_COOPMAT`   | presence-inv | `coopmat: bool`      | `true`  | `lib.rs:1585`     |
-| `INFR_CM_8X8`       | presence     | `coopmat_8x8: bool`  | `false` | `lib.rs:1520`     |
-| `INFR_BF16_COOPMAT` | presence     | `bf16_coopmat: bool` | `false` | `adapter.rs:1558` |
-| `INFR_F8_COOPMAT`   | presence     | `f8_coopmat: bool`   | `false` | `adapter.rs:1535` |
-| `INFR_F8_PREPACK`   | presence     | `f8_prepack: bool`   | `false` | `adapter.rs:1587` |
-| `INFR_I8_COOPMAT`   | presence     | `i8_coopmat: bool`   | `false` | `adapter.rs:1538` |
-| `INFR_I8_ROW_SCALE` | presence     | `i8_row_scale: bool` | `false` | `adapter.rs:1618` |
-| `INFR_NO_F16`       | presence-inv | `f16: bool`          | `true`  | `lib.rs:1583`     |
-| `INFR_NO_I8DOT`     | presence-inv | `i8_dot: bool`       | `true`  | `lib.rs:1615`     |
-
-GEMM / GEMV tiers:
-
-| Env                                   | Grammar           | Config path                   | Default                 | Sites                                               |
-| ------------------------------------- | ----------------- | ----------------------------- | ----------------------- | --------------------------------------------------- |
-| `INFR_NO_GEMM_WARP`                   | presence-inv      | `gemm_warp: bool`             | `true`                  | `recorder.rs:2018`; `adapter.rs:960,1503,1725,4993` |
-| `INFR_GEMM_WIDE_TILE`                 | presence          | `gemm_wide_tile: bool`        | `false`                 | `recorder.rs:2165`                                  |
-| `INFR_NO_SMALL_BM`                    | presence-inv      | `small_bm: bool`              | `true`                  | `recorder.rs:2172`                                  |
-| `INFR_NO_BM16`                        | presence-inv      | `bm16: bool`                  | `true`                  | `recorder.rs:2180`                                  |
-| `INFR_NO_MMQ`                         | presence-inv      | `mmq: bool`                   | `true`                  | `adapter.rs:1667,4997`                              |
-| `INFR_NO_MMQ_FALLBACK`                | presence-inv      | `mmq_fallback: bool`          | `true`                  | `adapter.rs:1471`                                   |
-| `INFR_NO_MMV`                         | **presence-inv**  | `mmv: bool`                   | `true`                  | `adapter.rs:409,1341`                               |
-| `INFR_MMV_DECODE`                     | presence          | `mmv_decode: bool`            | `false`                 | `adapter.rs:409`                                    |
-| `INFR_NO_MMV_M4` / `INFR_NO_MMV_O4`   | presence-inv      | `mmv_m4` / `mmv_o4: bool`     | `true`                  | `recorder.rs:3386` / `:3385`                        |
-| `INFR_MMV_MW`                         | `"0"`/other/unset | `mmv_mw: Option<bool>`        | `None` (vendor default) | `adapter.rs:509`                                    |
-| `INFR_MMV_MW_WARPS`                   | int               | `mmv_mw_warps: Option<usize>` | `None`                  | `adapter.rs:740`                                    |
-| `INFR_NO_MROW` / `INFR_NO_MROW16`     | presence-inv      | `mrow` / `mrow16: bool`       | `true`                  | `adapter.rs:1360` / `:1356`                         |
-| `INFR_NO_F32_MROW` / `INFR_NO_F32_V4` | presence-inv      | `f32_mrow` / `f32_v4: bool`   | `true`                  | `recorder.rs:1769` / `:1770`                        |
-| `INFR_MOE_SMALL_M`                    | int, clamp 0..=64 | `moe_small_m: usize`          | `8` (`tier::EnvRows`)   | `adapter.rs:159` (`MOE_SMALL_M`)                    |
-| `INFR_CANVAS_CHUNK_N`                 | int, clamp 1..    | `canvas_chunk_n: usize`       | `3` (`tier::EnvRows`)   | `adapter.rs:905` (`CANVAS_CHUNK_N`)                 |
-
-**`INFR_NO_MMV` is `presence-inv`, not `presence`** — an earlier draft had this
-backwards. Both sites are `std::env::var("INFR_NO_MMV").is_err()`. The field is
-`mmv: bool` defaulting to `true`. Getting this wrong disables the mmv tier for
-everyone. `adapter.rs:409` is
-`env::var("INFR_MMV_DECODE").is_ok() && env::var("INFR_NO_MMV").is_err()` — i.e.
-`cfg.mmv_decode && cfg.mmv`.
-
-Attention:
-
-| Env                                      | Grammar                 | Config path                   | Default                            | Sites                        |
-| ---------------------------------------- | ----------------------- | ----------------------------- | ---------------------------------- | ---------------------------- |
-| `INFR_FLASH_SPLITS`                      | int                     | `flash_splits: Option<usize>` | `None`                             | `recorder.rs:4437,4689`      |
-| `INFR_FLASH_BM`                          | exact string `"32"`     | `flash_bm32: bool`            | `false`                            | `recorder.rs:4463`           |
-| `INFR_FLASH_MIN_ROWS`                    | usize, default 24       | `flash_min_rows: usize`       | `24`                               | `adapter.rs:2756`            |
-| `INFR_FLASH_STAGE`                       | presence                | `flash_stage: bool`           | `false`                            | `adapter.rs:2872`            |
-| `INFR_FLASH_DEQUANT`                     | presence                | `flash_dequant: bool`         | `false`                            | `adapter.rs:2788`            |
-| `INFR_NO_FLASH_WARP`                     | presence-inv            | `flash_warp: bool`            | `true`                             | `recorder.rs:4484`           |
-| `INFR_NO_NC_FA`                          | presence-inv            | `nc_fa: bool`                 | `true`                             | `adapter.rs:2934`            |
-| `INFR_NO_QK_WARP` / `INFR_NO_PV_WARP`    | presence-inv            | `qk_warp` / `pv_warp: bool`   | `true`                             | `recorder.rs:4283` / `:4344` |
-| `INFR_PV_SPLITS`                         | int                     | `pv_splits: Option<usize>`    | `None`                             | `recorder.rs:4325`           |
-| `INFR_NO_ATTN_HD`                        | presence                | `no_attn_hd_spec: bool`       | `false` (de-memoized in `b9069a3`) | `gemm.rs:2865`               |
-| `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN` | presence-inv / presence | `mrows_attn: Option<bool>`    | `None` ⇒ heuristic                 | `adapter.rs:2957` / `:2958`  |
-
-**The mrows-attn pair is not a symmetric tri-state.** The site is
-`… && env::var("INFR_NO_MROWS_ATTN").is_err() && ((rows >= 12 && kv_len >= 8192) || env::var("INFR_MROWS_ATTN").is_ok())`.
-So: `NO_` set ⇒ off unconditionally (wins); `MROWS_ATTN` set ⇒ bypasses the
-`rows`/`kv_len` heuristic; neither ⇒ heuristic decides. `Option<bool>` models it
-only if `Some(false)` wins over `Some(true)` when both env vars are set. Encode
-that in the env layer and test it.
-
-DeltaNet + misc:
-
-| Env                                     | Grammar      | Config path                   | Default | Sites                                                         |
-| --------------------------------------- | ------------ | ----------------------------- | ------- | ------------------------------------------------------------- |
-| `INFR_DN_CHUNK_SCAN`                    | presence-inv | `dn_chunk_scan: bool`         | `true`  | `adapter.rs:3447`                                             |
-| `INFR_NO_DN_CHUNK` / `INFR_NO_DN_SPLIT` | presence-inv | `dn_chunk` / `dn_split: bool` | `true`  | `adapter.rs:3426` / `:3447,3487`                              |
-| `INFR_DELTA_STRIDED`                    | presence     | `delta_strided: bool`         | `false` | `adapter.rs:3529`; ALSO `llama/seam/runner.rs:1911`           |
-| `INFR_NO_PUSH_DESC`                     | presence-inv | `push_desc: bool`             | `true`  | `lib.rs:1357`                                                 |
-| `INFR_NO_PIPELINE_CACHE`                | presence-inv | `pipeline_cache_disk: bool`   | `true`  | `pcache.rs:153`                                               |
-| `INFR_NO_VRAM_GUARD`                    | presence     | `no_vram_guard: bool`         | `false` | `lib.rs:2297`                                                 |
-| `INFR_NO_MOE_SM_POOL`                   | presence     | `no_moe_sm_pool: bool`        | `false` | `adapter.rs:4115`                                             |
-| `INFR_SEAM_NO_REPLAY`                   | presence     | `no_replay: bool`             | `false` | `adapter.rs:175`; ALSO `llama/seam/runner.rs:3865` (`is_err`) |
-| `INFR_NO_GPU_POS`                       | presence-inv | `gpu_pos: bool`               | `true`  | `adapter.rs:4473`; ALSO `llama/seam/runner.rs:3961`           |
-| `INFR_NO_FUSE_ADD`                      | presence-inv | `fuse_add: bool`              | `true`  | `adapter.rs:869` → `core/fusion.rs:83`                        |
-
-`INFR_DN_CHUNK_SCAN` is spelled POSITIVELY but read with `.is_err()` — setting
-it **disables** the chunked scan. This is the one knob whose name lies about its
-polarity; do not "fix" the name (R2).
-
-`INFR_NO_FUSE_ADD` is not read in `adapter.rs` at all — it is a `&'static str`
-in `fusion_cfg()`'s `FusionCfg.disable_env`, consumed by
-`infr_core::fusion::env_disabled` (`fusion.rs:82-83`, `var_os(name).is_some()`).
-Migrating it means changing `FusionCfg`'s field from
-`disable_env: Option<&'static str>` to a resolved `enabled: bool`, which touches
-all three backends at once (Vulkan + the two ROCm hatches, §6.7) — do it as one
-change in whichever of S5/S6 lands first, and note it in the other's commit.
-
-### 6.5b `kernels.vulkan` — the GEMV family (11 keys, currently `OnceLock`-memoized)
-
-`recorder.rs:143-179` already has the exact shape this plan wants:
-`GemvKnobs::resolve(get: impl Fn(&str) -> Option<String>)` is a **pure**
-resolver over an injected reader, and `gemv_knobs()` is the impure `OnceLock`
-wrapper that feeds it `std::env::var`. Migration = delete the wrapper, call
-`resolve` from the config layer, store `GemvKnobs` in `VulkanCfg`. This is the
-cheapest whole group in the campaign and should be done FIRST inside S5b as the
-pattern-setter.
-
-| Env                   | Grammar                      | Config path (`kernels.vulkan.gemv.*`) | Default       |
-| --------------------- | ---------------------------- | ------------------------------------- | ------------- |
-| `INFR_NO_GEMV_RM`     | presence                     | `no_rm: bool`                         | `false`       |
-| `INFR_GEMV_RM`        | u32, default 2               | `rm: u32`                             | `2`           |
-| `INFR_GEMV_RM_MAXOUT` | usize, default `usize::MAX`  | `rm_maxout: usize`                    | `usize::MAX`  |
-| `INFR_GEMV_RM_MINOUT` | usize, default 2048          | `rm_minout: usize`                    | `2048`        |
-| `INFR_NO_GEMV_SG`     | presence                     | `no_sg: bool`                         | `false`       |
-| `INFR_NO_GEMV_ID_SG`  | presence                     | `no_id_sg: bool`                      | `false`       |
-| `INFR_GEMV_SG_MINOUT` | usize, default 2048          | `sg_minout: usize`                    | `2048`        |
-| `INFR_GEMV_SG_MAXOUT` | usize, default 8192          | `sg_maxout: usize`                    | `8192`        |
-| `INFR_GEMV_SG_NR`     | u32, default 2               | `sg_nr: u32`                          | `2`           |
-| `INFR_NO_GEMV_REG`    | presence; overrides the next | (folds into `variant`)                | —             |
-| `INFR_GEMV_VARIANT`   | string                       | `variant: Option<String>`             | `Some("reg")` |
-
-`variant` is computed, not read:
-`if NO_GEMV_REG set { None } else { GEMV_VARIANT.or(Some("reg")) }`
-(`recorder.rs:156-160`). Keep that expression verbatim; the config field holds
-the RESULT, and the two env keys both feed it.
-
-`recorder.rs:9423` (`gemv_knobs_resolve_matches_env_reads`) already unit-tests
-`GemvKnobs::resolve` against a `HashMap` of synthetic env states — that test
-survives the migration unchanged and is the template for §8.8.
-
-### 6.5c `kernels.vulkan` — BDA chunk caps (2 keys, atomic-memoized)
-
-| Env                    | Grammar                         | Config path                    | Default              |
-| ---------------------- | ------------------------------- | ------------------------------ | -------------------- |
-| `INFR_BDA_CHUNK_ELEMS` | u64, trimmed, `>= 2` else unset | `bda_chunk_elems: Option<u64>` | `BDA_CHUNK_UNIT_MAX` |
-| `INFR_BDA_CHUNK_BYTES` | u64, trimmed, `>= 2` else unset | `bda_chunk_bytes: Option<u64>` | `BDA_CHUNK_UNIT_MAX` |
-
-`recorder.rs:679-694` (`cap_from_env`) seeds an `AtomicU64` once per process; a
-value below 2 is treated as unset. Note `bda_chunk_elem_cap()` /
-`bda_chunk_byte_cap()` already have a `#[cfg(test)]` thread-local override
-(`TEST_CHUNK_CAP`, `recorder.rs:715-725`) — once the knob is on `Config`, DELETE
-that override and the `cfg(test)` branch; the parity test builds a `Config`
-instead. That deletion is the exit criterion for this pair.
-
-### 6.6 `kernels.metal` — `MetalCfg`
-
-15 `presence-inv` disable-switches. Config fields are POSITIVE (`f16_cmm: bool`,
-default `true`); the env layer inverts:
-
-`INFR_METAL_NO_F16_NATIVE` (`exec.rs:2967`), `INFR_METAL_NO_F32_NATIVE`
-(`:2969`), `INFR_METAL_NO_BF16_NATIVE` (`:2971`), `INFR_METAL_NO_F16_CMM`
-(`:2978`), `INFR_METAL_NO_BF16_CMM` (`:2987`), `INFR_METAL_NO_F32_CMM`
-(`:2996`), `INFR_METAL_NO_F16_RT` (`:3019`), `INFR_METAL_NO_BF16_RT` (`:3021`),
-`INFR_METAL_NO_F32_RT` (`:3024`), `INFR_METAL_NO_KQUANT_NATIVE` (`:2127`),
-`INFR_METAL_NO_Q5K_RT` (`:2634`), `INFR_METAL_NO_RMSNORM_VEC4` (`:2310`),
-`INFR_METAL_NO_CONV1D_PAR` (`:4711`), `INFR_METAL_NO_DN_GATE_PREP` (`:4825`),
-`INFR_METAL_NO_DN_NORM_PREP` (`:4828`).
-
-Plus five that are NOT plain disable-switches:
-
-| Env                     | Grammar                                                                         | Config path                          | Default |
-| ----------------------- | ------------------------------------------------------------------------------- | ------------------------------------ | ------- |
-| `INFR_METAL_LMHEAD_MRV` | presence ⇒ LIFTS the mrv `out_f` ceiling; read as `.is_err()` at `exec.rs:2678` | `metal.lmhead_mrv_uncapped: bool`    | `false` |
-| `INFR_METAL_NODELTA`    | BOTH grammars — see §6.12                                                       | `metal.deltanet: bool`               | `true`  |
-| `INFR_METAL_NOMOE`      | BOTH grammars — see §6.12                                                       | `metal.moe: bool`                    | `true`  |
-| `INFR_METAL_PROFILE`    | presence ⇒ on; exact `"2"` ⇒ `prof_ops`; exact `"3"` ⇒ counter set              | `prof.metal_profile: Option<String>` | `None`  |
-| `INFR_METAL_PROF_DEBUG` | presence                                                                        | `prof.metal_prof_debug: bool`        | `false` |
-
-`INFR_METAL_PROFILE` is **not** an integer level: `lib.rs:184` is `is_ok()`,
-`lib.rs:185` is `== Ok("2")`, `lib.rs:149` is `== Ok("3")`.
-`INFR_METAL_PROFILE=1` enables profiling but neither op-profiling nor counters.
-Model it as `Option<String>` and derive the three booleans in the accessor (R5),
-or the levels will not compose the way they do today.
-
-**Metal cannot be run on the dev box.** Its slice is compile-checked with
-`cargo check -p infr-metal --all-targets --target x86_64-apple-darwin` and
-validated by the macOS CI job. Do not guess at behaviour: keep the polarity
-table in the commit message.
-
-### 6.7 `kernels.rocm` / `kernels.cpu`
-
-ROCm has **13 keys**, not 4 (an earlier draft undercounted badly). The paging
-and overflow half lives in §6.4; the kernel half is:
-
-| Env                      | Grammar                           | Config path                              | Default | Sites                                    |
-| ------------------------ | --------------------------------- | ---------------------------------------- | ------- | ---------------------------------------- |
-| `INFR_ROCM_WMMA_TILE`    | exact `"1x1"`/`"2x1"`/`"2x2"`     | `kernels.rocm.wmma_tile: Option<String>` | `None`  | `rocm/exec.rs:133`                       |
-| `INFR_ROCM_NO_WMMA`      | presence                          | `kernels.rocm.no_wmma: bool`             | `false` | `rocm/exec.rs:182,1266`                  |
-| `INFR_ROCM_NO_I8`        | **presence-inv**                  | `kernels.rocm.i8: bool`                  | `true`  | `rocm/exec.rs:104,183,293,1267`          |
-| `INFR_ROCM_NO_PIPE`      | presence-inv                      | `kernels.rocm.pipe: bool`                | `true`  | `rocm/exec.rs:193`                       |
-| `INFR_ROCM_COOP`         | presence (OPT-IN)                 | `kernels.rocm.coop: bool`                | `false` | `rocm/exec.rs:236`                       |
-| `INFR_ROCM_COOP_TILE`    | string, default `"128x64"`        | `kernels.rocm.coop_tile: Option<String>` | `None`  | `rocm/exec.rs:238`                       |
-| `INFR_ROCM_BLAS`         | presence (OPT-IN rocBLAS prefill) | `kernels.rocm.blas: bool`                | `false` | `rocm/backend.rs:480`                    |
-| `INFR_ROCM_NO_FUSE_ADD`  | presence-inv, via `FusionCfg`     | `kernels.rocm.fuse_add: bool`            | `true`  | `rocm/exec.rs:947` → `core/fusion.rs:83` |
-| `INFR_ROCM_NO_FUSE_NORM` | presence-inv, via `FusionCfg`     | `kernels.rocm.fuse_norm: bool`           | `true`  | `rocm/exec.rs:951` → `core/fusion.rs:83` |
-
-CPU:
-
-| Env                    | Grammar                | Config path                    | Default | Sites                       |
-| ---------------------- | ---------------------- | ------------------------------ | ------- | --------------------------- |
-| `INFR_CPU_SPIN`        | u32, default `1 << 15` | `kernels.cpu.spin: u32`        | `32768` | `cpu/pool.rs:77` (MEMOIZED) |
-| `INFR_CPU_NO_SPINPOOL` | set AND `!= "0"`       | `kernels.cpu.spinpool: bool`   | `true`  | `cpu/pool.rs:167`           |
-| `INFR_CPU_REPACK_MB`   | usize, default 4096    | `kernels.cpu.repack_mb: usize` | `4096`  | `cpu/lib.rs:244` AND `:262` |
-
-`INFR_CPU_SPIN` is behind `SPIN_LIMIT.get_or_init` — it is memoized today and is
-therefore unsettable from a second test in the same process. Migrating it
-removes the `OnceLock`; `spin_limit()` becomes a field read.
-
-`CpuBackend::reference()` (`cpu/lib.rs:223`, landed `a1aed9e`) becomes
-`kernels.cpu.reference: bool` in the same slice — it is already a private struct
-field (`cpu/lib.rs:202`), `false` under `new()`/`Default`, set to `true` only by
-the `reference()` constructor. **This is the model the rest of the campaign
-should follow**: a knob that is a typed field on the owning struct, chosen by
-the caller, with no env and no ambient state anywhere.
-
-### 6.8 `spec` — `SpecCfg` (MTP / speculative decode)
-
-| Env                       | Grammar                | Config path                   | Default | Site                                     |
-| ------------------------- | ---------------------- | ----------------------------- | ------- | ---------------------------------------- |
-| `INFR_MTP`                | **exact string `"1"`** | `spec.mtp: bool`              | `false` | `llama/mtp/mod.rs:106`                   |
-| `INFR_MTP_TIME`           | presence               | `prof.mtp_time: bool`         | `false` | `mtp/mod.rs:2352`; `seam/runner.rs:3477` |
-| `INFR_NO_MTP_CKPT`        | presence-inv           | `spec.mtp_ckpt: bool`         | `true`  | `mtp/mod.rs:2361`                        |
-| `INFR_NO_MTP_REPRIME`     | **presence-inv**       | `spec.mtp_reprime: bool`      | `true`  | `mtp/mod.rs:2378`                        |
-| `INFR_NO_MTP_DRAFT_CHAIN` | presence-inv           | `spec.mtp_draft_chain: bool`  | `true`  | `mtp/mod.rs:2507`                        |
-| `INFR_SPEC_DRAFT`         | string path            | `spec.draft: Option<PathBuf>` | `None`  | `cli/main.rs:1421`                       |
-| `INFR_SPEC_K`             | usize, default 6       | `spec.k: usize`               | `6`     | `cli/main.rs:1427`                       |
-| `INFR_SPEC_DEBUG`         | presence               | `spec.debug: bool`            | `false` | `seam/model.rs:1660`                     |
-| `INFR_DECODE_CHAIN`       | usize, default 8       | `spec.decode_chain: usize`    | `8`     | `seam/runner.rs:3944`                    |
-| `INFR_NO_GPU_DRAFT_PROB`  | presence-inv           | `spec.gpu_draft_prob: bool`   | `true`  | `mtp/mod.rs:1749`                        |
-| `INFR_NO_GPU_MTP_ACCEPT`  | presence-inv           | `spec.gpu_mtp_accept: bool`   | `true`  | `seam/runner.rs:3488`                    |
-| `INFR_NO_GPU_ARGMAX`      | presence-inv           | `spec.gpu_argmax: bool`       | `true`  | `seam/runner.rs:1141,3487`               |
-| `INFR_NO_GPU_SAMPLE`      | presence-inv           | `spec.gpu_sample: bool`       | `true`  | `seam/runner.rs:1153`                    |
-| `INFR_NO_GPU_EMBED`       | presence-inv           | `spec.gpu_embed: bool`        | `true`  | `seam/runner.rs:406`                     |
-
-Two corrections against an earlier draft: `INFR_NO_MTP_REPRIME` is
-`presence-inv` (`mtp_ckpt && env::var("INFR_NO_MTP_REPRIME").is_err()`), NOT
-`presence`; and `INFR_MTP` is not a free string — `mtp/mod.rs:106` is
-`if std::env::var("INFR_MTP").ok().as_deref() != Some("1") { return … }`, so
-`INFR_MTP=true` does nothing today. `spec.mtp: bool` with the env layer doing
-`== Some("1")` is the behaviour-preserving mapping.
-
-`spec.mtp_reprime` is ANDed with `spec.mtp_ckpt` at the site; keep the AND
-there, not in the config (R5).
-
-### 6.9 `prof` / `debug` / `serve`
-
-`prof` (all presence unless noted): `INFR_PROF` (`vulkan/recorder.rs:981`,
-`llama/seam/runner.rs:3637`), `INFR_PROF2` (`recorder.rs:952`),
-`INFR_PROF2_SHAPES` (`recorder.rs:953`, ANDed with `prof2`), `INFR_PROF_DEC`
-(`runner.rs:4206,4329`), `INFR_PROF_OPS` (`cpu/lib.rs:533`), `INFR_PROF_PF`
-(`runner.rs:3819`), `INFR_PROFILE_OUT` (string path, `prof-rt/lib.rs:441`),
-`INFR_VRAM_LOG` (`vulkan/lib.rs:982`), `INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`
-(`runner.rs:3019`), `INFR_EB_TRACE` (`llama/diffusion.rs:314`),
-`INFR_METAL_PROFILE`, `INFR_METAL_PROF_DEBUG`.
-
-`debug` (all presence): `INFR_DEBUG_BDA_CHUNK` (`recorder.rs:1523,3646`),
-`INFR_DEBUG_COOPMAT` (`vulkan/lib.rs:1494,1638`), `INFR_DEBUG_WIDE_DISPATCH`
-(`recorder.rs:1244`), `INFR_DEBUG_CHAT` (`chat/template.rs:231,237`),
-`INFR_MOE_COUNTS_DEBUG` (`cpu/lib.rs:2081`), `INFR_MOE_COUNTS_DUMP`
-(`cpu/lib.rs:2139`), `INFR_POISON_UNINIT` (`vulkan/lib.rs:3161`),
-`INFR_NOBARRIER` (`recorder.rs:979`), `INFR_FULLBARRIER` (`recorder.rs:980`).
-
-**Two knobs an earlier draft filed under `debug` are graph-shape knobs and are
-`presence-inv`, not `presence`** — they must default to ENABLED:
-
-| Env                     | Grammar      | Config path                   | Default | Site                                                         |
-| ----------------------- | ------------ | ----------------------------- | ------- | ------------------------------------------------------------ |
-| `INFR_NO_QKV_FUSE`      | presence-inv | `kernels.qkv_fuse: bool`      | `true`  | `llama/seam/runner.rs:50`                                    |
-| `INFR_NO_GATED_RMSNORM` | presence-inv | `kernels.gated_rmsnorm: bool` | `true`  | `llama/seam/runner.rs:391` (ANDed with `caps.gated_rmsnorm`) |
-
-They live in `infr-llama`, not `infr-vulkan`, so they migrate in **S4**, not S5.
-
-`serve`:
-
-| Env                   | Grammar                        | Config path                     | Default                              | Site                 |
-| --------------------- | ------------------------------ | ------------------------------- | ------------------------------------ | -------------------- |
-| `INFR_API_KEY`        | string, EMPTY = unset          | `serve.api_key: Option<String>` | `None`                               | `server/lib.rs:1192` |
-| `INFR_MAX_TOKENS_CAP` | u32, must be `>0` else default | `serve.max_tokens_cap: u32`     | `131_072` (`DEFAULT_MAX_TOKENS_CAP`) | `server/lib.rs:1159` |
-
-`INFR_API_KEY` uses `.filter(|k| !k.is_empty())` — an empty string means NO
-auth, which is the opposite of the `is_ok()` presence grammar. Do not unify
-them. `max_tokens_cap()` is deliberately read per-request (the doc comment says
-so); after migration it reads `cfg.serve.max_tokens_cap`, still per-request,
-still cheap.
+### 6.0 The inventory lives in code, not here
+
+`crates/infr-core/src/config/manifest.rs` (landed in S0) is the AUTHORITY: every
+`INFR_*` key, its config path, its grammar, whether a bad value errors, and a
+`migrated` flag. Three tests read it — `env_layer_reads_every_key` (every key
+reaches its field), `presence_inverted_knobs_have_the_right_polarity` (the
+`""`/`"0"`/`"1"` truth table), and `manifest_matches_the_tree` (a new `INFR_*`
+literal anywhere in `crates/*/src` fails the build's tests until it is in the
+manifest). The per-knob tables that used to live here were a stale second copy
+and are deleted; read the manifest.
+
+Per-slice: find your knobs with
+`rg 'migrated: false' crates/infr-core/src/config/manifest.rs` filtered by the
+`path` prefix your slice owns, and flip each to `migrated: true` as you move its
+read site.
 
 ### 6.10 Explicitly NOT migrated
 
@@ -951,33 +549,6 @@ Note row 3: for an `is_err()` knob, `INFR_NO_GEMM_WARP=0` turns the feature
 keep it. Contrast the four `budget::env_flag` knobs (§6.12 last row) where `"0"`
 means off.
 
-### S0 — scaffold (no behaviour change, no migration) — **LANDED**
-
-Landed as
-`crates/infr-core/src/config/{mod,partial,env,file,cli,manifest,tests}.rs`.
-`manifest::KEYS` holds 174 knobs (+3 in `NOT_MIGRATED`), all `migrated: false`;
-`Config`/`PartialConfig` and the dotted-path accessors are generated by ONE
-macro (`partial::cfg_struct!`) so the resolved struct, the partial, the TOML
-schema and `--set`'s path set cannot drift apart. No read site was touched.
-
-1. Create `crates/infr-core/src/config/` per §4 with: `Config` + all section
-   structs, all fields, `impl Default` reproducing today's defaults,
-   `PartialConfig` + `merge`, `ConfigLayer::{file, env, cli}`, `Config::load`.
-2. Generate `manifest.rs` with the §6.0 command; annotate every entry with
-   section, field, grammar, default, `migrated: false`.
-3. `env.rs` reads ALL keys from the manifest, but nothing consumes the result
-   yet. `env.rs` takes an injected `get: &dyn Fn(&str) -> Option<String>` from
-   day one (§8.8) — retrofitting that later is wasted work.
-4. Add the `toml` crate to `infr-core`'s dependencies (workspace-pinned).
-5. Tests in `config/tests.rs`: §8's precedence tests, plus a test asserting
-   `Config::default() == Config::load_from_layers(&[])`.
-6. **Do not touch any read site.** After S0 the tree behaves identically and
-   every env read is still where it was.
-
-**Exit:** `cargo test -p infr-core` green; §8.1–8.8 all present and passing;
-`manifest.rs` key count matches the §6.0 command's output; zero lines changed
-outside `crates/infr-core/`.
-
 ### S1 — CLI produces a `Config`
 
 1. `infr-cli/src/main.rs`: add `--config <PATH>`; build `Config` in `main()`
@@ -1099,59 +670,17 @@ precedence rules. Add `docs/config.md` (user-facing) and a commented
 `infr.example.toml`. Mark this plan `LANDED` and link the commits, matching how
 `docs/backend-unification-plan.md` records its landed candidates.
 
-## 8. Required tests
+## 8. Test obligations
 
-In `config/tests.rs` (these are the acceptance criteria for S0):
+The scaffold's own acceptance tests (precedence, polarity, manifest drift,
+`--set` typos, bespoke-flag-beats-`--set`) landed with S0 in
+`crates/infr-core/src/config/tests.rs`; they are not repeated here.
 
-1. `default_config_matches_documented_defaults` — every field's `Default` equals
-   the value in `manifest.rs` (which §6 documents).
-2. `env_overrides_file` — file says `flash_splits = 2`, env says `4` ⇒ `4`.
-3. `cli_overrides_env` — env says `4`, CLI says `8` ⇒ `8`.
-4. `absent_layer_does_not_clobber` — a file setting only `[kv]` leaves
-   `[kernels.vulkan]` at its env/default value.
-5. `unknown_toml_key_warns_and_is_ignored` — typo detection WITHOUT a hard
-   failure, per the decided **[DECIDE-5]**; the sibling case
-   `unknown_set_path_is_an_error` covers `--set`. Original note: do not write
-   this test until that decision is answered.
-6. `bad_value_is_an_error_not_a_silent_default` — table-driven over both
-   classes, with the class recorded in `manifest.rs` (`KnobKey::bad_value`). The
-   two layers differ, and an earlier draft conflated them:
-   - **Environment layer.** Only the keys that error TODAY may error: `INFR_SG`,
-     `INFR_SUBMIT_DISPATCHES` and the three `multi` device lists. **`SizeSpec`
-     keys are NOT in that set** — `INFR_CTX=banana` is `.and_then(parse_size)` ⇒
-     `None` ⇒ the default, at every site (`cli/main.rs:3481`, `chat/mod.rs:164`,
-     `seam/mod.rs:907`, `pager.rs:276`), and R1 says keep it.
-   - **File layer.** `ctx = "banana"` DOES fail to load: a value of the wrong
-     type for a known key is a hard error there per the decided [DECIDE-5]. That
-     is the case this test's name comes from.
-7. `presence_inverted_knobs_have_the_right_polarity` — table-driven over every
-   `presence-inv` entry in `manifest.rs`: env set to `""`, `"0"` and `"1"` ⇒
-   field `false` in all three; env unset ⇒ field `true`. The `"0"` case is the
-   one that catches a wrong-grammar migration (§7.0).
-8. `env_layer_reads_every_key` — iterate `manifest::KEYS`, set each one through
-   the INJECTED reader (a `HashMap<String, String>`, never the real
-   environment), assert the corresponding field changed. This is what stops a
-   knob being silently dropped during migration. `recorder.rs:9425`
-   (`GemvKnobs::resolve` against a `HashMap`) is the working precedent — copy
-   its shape.
-9. `manifest_matches_the_tree` — a test that re-runs the §6.0 grep (via
-   `include_str!` of a checked-in list, or `std::process::Command` gated behind
-   `#[ignore]`) and fails when a new `INFR_*` literal appears in `crates/*/src`
-   without a manifest entry. Without this, the next feature branch silently
-   re-introduces an ungoverned knob.
-10. `dotted_path_setter_rejects_unknown_paths` — REQUIRED (`--set` ships, §11
-    [DECIDE-3]): `--set kernels.vulkan.flash_splt=2` must error with a
-    suggestion, not be ignored. Implement by matching against `manifest::KEYS`'
-    field paths — the same table, so it cannot drift from the TOML schema.
-    **[DECIDE-6]**: does `--set` take the CONFIG path
-    (`kernels.vulkan.flash_splits`) or the ENV name (`INFR_FLASH_SPLITS`)? They
-    are not 1:1 — `INFR_NO_GEMM_WARP` maps to `gemm_warp=false`, and
-    `INFR_NO_GEMV_REG` + `INFR_GEMV_VARIANT` both map to one `variant` field.
-
-Per-slice: every knob a slice migrates must gain (or keep) a test that sets it
-via `Config` and asserts the behaviour it gates. If a knob has no observable
-behaviour to test, say so explicitly in the commit message rather than skipping
-silently.
+**Every later slice owes, per knob it migrates:** one test that sets the knob
+through a `Config` (never through the environment) and asserts the behaviour it
+gates. If a knob has no observable behaviour to assert, say so explicitly in the
+commit message rather than skipping silently. A slice that migrates a knob whose
+test still drives it via `EnvGuard` is incomplete (R7).
 
 ## 9. Verification block (run for EVERY slice)
 
@@ -1233,55 +762,31 @@ steady-state pairs.
     over `INFR_GEMV_VARIANT`; `INFR_METAL_NODELTA` is read both ways. All of
     these are R1-frozen. Fix them in a follow-up plan, not here.
 
-## 11. Open decisions
+## 11. Decisions of record
 
-- **[DECIDE-1] — DECIDED (repo owner, 2026-07-26): YES.** TOML, with the 3-step
-  lookup `--config <PATH>` → `./infr.toml` → `~/.config/infr/config.toml`, first
-  existing file wins, no merging across files. §4 is now normative, not a
-  proposal.
-- **[DECIDE-2] — DECIDED (repo owner, 2026-07-26): thread `Arc<Config>`.** The
-  `OnceLock` + test-override alternative is REJECTED — do not reintroduce it in
-  any slice, and do not use it as a shortcut for a site that is awkward to
-  thread (that is a blocked site, §10.10). §5 is normative.
-- **[DECIDE-3] — DECIDED (repo owner, 2026-07-26): ship `--set`, AND keep every
-  bespoke flag.** `--set <config.path>=<value>` is ADDITIVE: every flag that
-  exists today (`--dev`, `--ctx`, `--ubatch`, `--threads`, `--temp`, `--top-k`,
-  `--top-p`, `--seed`, `--max-new`, `--no-think`, …) stays exactly as it is,
-  with its current name and semantics. `--set` exists so the ~150 knobs that
-  have no dedicated flag are reachable without inventing ~150 flags. Precedence
-  WITHIN the CLI layer when both target the same field: **the bespoke flag
-  wins** over `--set`, and passing both must print a warning naming the field,
-  so a user who typed `--ctx 32k --set device.ctx=8k` is told which one applied.
-  Two `--set`s for the same path is an error, not a silent last-wins.
-- **[DECIDE-4] — DECIDED (repo owner, 2026-07-26): delegate slices to opus
-  subagents**, one slice at a time; lead reviews + fixes + merges + pushes each,
-  and PRUNES this document after each stage so it holds only PENDING work.
-- **[DECIDE-5] — DECIDED (lead, 2026-07-26, owner may override): WARN, do not
-  fail.** An unknown key in the TOML file prints one
-  `[infr] config: unknown key \`kernels.vulkan.flash_splt\`
-  (ignored)`line to stderr and is skipped, so an older binary can read a newer file and removing a knob is not a breaking change. Typo protection comes from the message, not from a hard failure.`--set`
-  is the OPPOSITE: an unknown path there IS a hard error (§8.10), because it was
-  typed on the command line for this run and silently ignoring it would give a
-  wrong result with no second chance to notice. A malformed FILE (invalid TOML
-  syntax, or a value of the wrong type for a known key) stays a hard error.
-- **[DECIDE-6] — DECIDED (lead, 2026-07-26, owner may override): `--set` takes
-  the CONFIG path**, identical to the TOML key path
-  (`--set kernels.vulkan.flash_splits=2`), so there is ONE grammar to learn and
-  `--set` ⇔ file entries are copy-pasteable in both directions. Env NAMES are
-  not accepted as `--set` paths (they are not 1:1 with fields — `INFR_NO_*`
-  inverts, `INFR_MMV_MW` is tri-state). An unknown path errors with a
-  did-you-mean suggestion computed against `manifest::KEYS`.
-- **[DECIDE-7] — DECIDED (lead, 2026-07-26, owner may override): YES, the file
-  may set the diagnostic knobs** — they are ordinary fields and carving out an
-  exception costs more than it saves. Mitigation for the "why is my server
-  printing timings" failure mode: when any `prof.*` or `debug.*` field is
-  non-default AND its value came from the FILE layer (not env, not CLI), print
-  one line at startup naming the file and the fields it enabled.
-- **[DECIDE-8] — DECIDED (lead, 2026-07-26, owner may override): preserve
-  today's behaviour exactly (R1).** `KvCfg` keeps BOTH the parsed dtype
-  (`type_k: Option<DType>`) and whether the knob was SPECIFIED at all
-  (`type_k_specified: bool`, set by any layer that supplied a value, parseable
-  or not). `kv_env_unset()`'s successor tests `type_k_specified`, so
-  `INFR_KV_TYPE_K=nonsense` keeps suppressing auto-q8 and still falls through to
-  f16 for the dtype — exactly as today. Do not "fix" this asymmetry in this
-  campaign; it is a behaviour change and belongs in its own commit.
+All eight are DECIDED; they are binding on every remaining slice.
+
+1. **File format** — TOML; lookup `--config <PATH>` → `./infr.toml` →
+   `$XDG_CONFIG_HOME/infr/config.toml` (else `~/.config/infr/config.toml`);
+   first existing file wins, no cross-file merging.
+2. **Delivery** — thread `Arc<Config>`. A global/`OnceLock` is rejected, also as
+   a shortcut for an awkward site: that is a blocked site (§10.10).
+3. **`--set`** — ships, ADDITIVE to every existing bespoke flag (all keep their
+   names and semantics). Same field from both ⇒ the bespoke flag wins and a
+   warning names the field; two `--set`s for one path ⇒ error.
+4. **Execution** — one slice per opus subagent; lead reviews, fixes, merges,
+   pushes, and prunes this document after each stage so it holds only PENDING
+   work.
+5. **Unknown TOML key** — warn to stderr and ignore (an older binary must read a
+   newer file). Malformed TOML, or a wrong-typed value for a KNOWN key, is still
+   a hard error. `--set` with an unknown path is a hard error with a
+   did-you-mean.
+6. **`--set` grammar** — the CONFIG path (`kernels.vulkan.flash_splits=2`),
+   identical to the TOML key path. Env NAMES are not accepted (not 1:1 with
+   fields).
+7. **Diagnostics from the file layer** — allowed; when a `prof.*`/`debug.*`
+   field is non-default AND came from the FILE layer, print one startup line
+   naming the file and the fields.
+8. **KV dtype presence** — `KvCfg` keeps the parsed dtype AND a `*_specified`
+   flag, so `INFR_KV_TYPE_K=nonsense` still suppresses auto-q8 and still falls
+   through to f16, exactly as today.
