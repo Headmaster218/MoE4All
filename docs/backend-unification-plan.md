@@ -81,7 +81,7 @@ RmsNorm→Linear are further backend-agnostic rewrites.
   `INFR_ROCM_NO_FUSE_*`) into one policy. Pure host logic over the IR, no device
   types. Cleanest high-value win.
 
-### B. Graph-executor skeleton (residency + op-walk) — HIGH / MED ⭐ ⚠️ PARTLY LANDED
+### B. Graph-executor skeleton (residency + op-walk) — HIGH / MED ⭐ ⚠️ PARTLY LANDED (`ce45447`)
 
 **Done — the residency CONTRACT and the WALK; not the container, not the per-op
 bodies.** `infr-core/src/exec.rs` now hosts the device-agnostic half of the
