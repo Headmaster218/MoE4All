@@ -414,6 +414,12 @@ pub struct RocmBackend {
     /// `None` (the common case) means every expert is resident, zero change. `Backend::moe_paged`
     /// reads this.
     pub(crate) moe_pager: Mutex<Option<crate::pager::RocmMoePager>>,
+    /// Dense-weight prefetch ring (Slice 37 — see `crate::weight_pager`). Lazily built on the first
+    /// `execute` that sees a spilled-native dense Linear bank under `INFR_ROCM_WEIGHT_OVERFLOW`;
+    /// `None` (the common case) means no dense bank is spilled, zero change. Streams the NEXT
+    /// spilled bank into a VRAM staging slot on a copy stream while the current layer computes, so
+    /// the Linear GEMV reads a resident slot instead of the bank over PCIe.
+    pub(crate) weight_ring: Mutex<Option<crate::weight_pager::RocmWeightRing>>,
     /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
     /// buffers (and how many bytes) landed in device-local VRAM vs spilled to host RAM. Fed by the
     /// `alloc` KvCache branch, drained once by `kv_overflow_report`. Zero unless the flag is on.
@@ -494,6 +500,7 @@ impl RocmBackend {
             rocblas,
             weight_pb: Arc::new(Mutex::new(None)),
             moe_pager: Mutex::new(None),
+            weight_ring: Mutex::new(None),
             kv_vram_bufs: AtomicU64::new(0),
             kv_vram_bytes: AtomicU64::new(0),
             kv_host_bufs: AtomicU64::new(0),
@@ -809,6 +816,7 @@ impl Backend for RocmBackend {
             &self.weight_cache,
             &self.pool,
             &self.moe_pager,
+            &self.weight_ring,
             self.stream,
             self.rocblas,
             plan,

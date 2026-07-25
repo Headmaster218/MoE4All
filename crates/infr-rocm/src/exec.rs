@@ -443,6 +443,18 @@ struct ExecCtx<'a> {
     /// Pool draws made this forward pass: `(ptr, bucket_bytes)`, returned to `pool` on `Drop`
     /// (both the success path and any early-error return) so nothing is `hipFree`'d per op.
     pooled: Vec<(*mut c_void, usize)>,
+    /// Dense-weight prefetch ring (Slice 37 — `crate::weight_pager`), `None` for a model with no
+    /// spilled dense bank. The `Op::Linear` arm routes a spilled-native weight through it (staged
+    /// VRAM slot) instead of reading the Slice-35 host alias over PCIe.
+    weight_ring: &'a Mutex<Option<crate::weight_pager::RocmWeightRing>>,
+    /// `true` once the ring is built AND primed for this forward (a non-empty spilled schedule).
+    /// The Linear arm checks it before consulting the ring; `false` ⇒ every weight uses the
+    /// resident / Slice-35 host-alias path unchanged.
+    weight_ring_active: bool,
+    /// Per-bank size cap for staging (`weight_pager::max_bank_bytes`): a spilled-native Linear bank
+    /// is staged only when `len <= cap`. The SINGLE predicate the schedule build and the per-op
+    /// staged decision share so the ring's cursor stays in lockstep with the op walk.
+    weight_prefetch_cap: usize,
     stream: ffi::hipStream_t,
     /// rocBLAS handle bound to `stream` for the OPT-IN Slice-26 f16 prefill GEMM (`INFR_ROCM_BLAS=1`),
     /// or `null` (the default) — in which case the prefill path uses the int8 WMMA kernel.
@@ -638,12 +650,89 @@ impl Drop for ExecCtx<'_> {
 
 // ── Main execute walk ────────────────────────────────────────────────────────
 
+/// The staged VRAM slot pointer to feed a spilled-native Linear GEMV, or `None` when this weight is
+/// NOT prefetched (resident, or an oversized bank kept on the Slice-35 host-alias read). Consults
+/// the prefetch ring under the SAME predicate [`build_spilled_schedule`] used, so the ring's cursor
+/// tracks the op walk exactly. On the staged path the compute stream is made to wait on the bank's
+/// fill; the caller MUST call [`weight_staged_done`] after dispatching the GEMV.
+fn weight_staged_ptr(
+    ctx: &ExecCtx,
+    weight: TensorId,
+    bindings: &Bindings,
+) -> Result<Option<*mut c_void>> {
+    if !ctx.weight_ring_active {
+        return Ok(None);
+    }
+    let wb = rocm_buf(bindings.get(weight).expect("rocm: unbound Weight"));
+    // Spilled (host_ptr set) AND within the staging cap ⇒ prefetched; else fall through to the
+    // resident / Slice-35 host-alias read.
+    if wb.host_ptr.is_null() || wb.len > ctx.weight_prefetch_cap {
+        return Ok(None);
+    }
+    let mut guard = ctx.weight_ring.lock().unwrap();
+    let ring = guard
+        .as_mut()
+        .expect("weight_ring_active implies a live ring");
+    Ok(Some(ring.stage(wb.ptr)?))
+}
+
+/// Record that a staged Linear's GEMV was dispatched: record the slot's `free` event + kick off the
+/// next bank's prefetch, advancing the ring cursor. Call once, after the GEMV, iff
+/// [`weight_staged_ptr`] returned `Some`.
+fn weight_staged_done(ctx: &ExecCtx) -> Result<()> {
+    let mut guard = ctx.weight_ring.lock().unwrap();
+    guard
+        .as_mut()
+        .expect("weight_staged_done without a live ring")
+        .consumed()
+}
+
+/// The ordered list of spilled dense Linear banks this graph will read that are eligible for the
+/// prefetch ring: `Op::Linear`s (in the same walk order the executor dispatches, skip-set applied)
+/// whose weight is a NATIVE-decode format, is spilled to host under Slice 35 (`host_ptr` set), and
+/// is `<= cap` bytes. The uncovered (dequant→f16) formats are excluded (their host bank is read once
+/// into a VRAM f16 cache, not per-token), as are oversized banks (the lm_head / token_embd, kept on
+/// the host-alias read). Empty ⇒ no ring is built.
+fn build_spilled_schedule(
+    g: &Graph,
+    bindings: &Bindings,
+    skip: &HashSet<usize>,
+    cap: usize,
+) -> Vec<crate::weight_pager::SpilledBank> {
+    let mut sched = Vec::new();
+    for (i, op) in g.ops.iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        let Op::Linear { weight, .. } = *op else {
+            continue;
+        };
+        if native_decode_fmt(g.desc(weight).dtype).is_none() {
+            continue;
+        }
+        let Some(b) = bindings.get(weight) else {
+            continue;
+        };
+        let wb = rocm_buf(b);
+        if wb.host_ptr.is_null() || wb.len > cap {
+            continue;
+        }
+        sched.push(crate::weight_pager::SpilledBank {
+            host_src: wb.host_ptr,
+            dev_alias: wb.ptr,
+            len: wb.len,
+        });
+    }
+    sched
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn execute_graph(
     pipelines: &Pipelines,
     weight_cache: &Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
     pool: &Mutex<BufferPool>,
     moe_pager: &Mutex<Option<crate::pager::RocmMoePager>>,
+    weight_ring: &Mutex<Option<crate::weight_pager::RocmWeightRing>>,
     stream: ffi::hipStream_t,
     rocblas: ffi::rocblas_handle,
     plan: &dyn Plan,
@@ -655,12 +744,42 @@ pub fn execute_graph(
         .expect("rocm backend: plan is not a GraphPlan")
         .graph;
     let n = g.tensors.len();
+
+    // Slice 37: build this forward's spilled-dense-Linear prefetch schedule (needs the fusion skip
+    // set so it walks the exact ops the executor dispatches). Lazily build / resize the ring, then
+    // prime it. Any failure leaves the ring `None` ⇒ the Linear arm falls back to the Slice-35
+    // host-alias read (correct, un-overlapped).
+    let fusion = decode_fusion(g);
+    let prefetch_cap = crate::weight_pager::max_bank_bytes();
+    let schedule = build_spilled_schedule(g, bindings, &fusion.skip, prefetch_cap);
+    let weight_ring_active = if schedule.is_empty() {
+        false
+    } else {
+        let max_bank = schedule.iter().map(|s| s.len).max().unwrap_or(0);
+        let mut guard = weight_ring.lock().unwrap();
+        // (Re)build the ring if absent or if a bank now exceeds its slot (a fixed weight set never
+        // grows, but the guard keeps the slot arithmetic sound if it ever did).
+        if guard.as_ref().is_none_or(|r| r.slot_bytes() < max_bank) {
+            *guard = crate::weight_pager::RocmWeightRing::try_new(max_bank, stream);
+        }
+        match guard.as_mut() {
+            Some(ring) => {
+                ring.begin_execute(schedule)?;
+                true
+            }
+            None => false, // ring build failed → Slice-35 fallback
+        }
+    };
+
     let mut ctx = ExecCtx {
         dev: (0..n).map(|_| None).collect(),
         vals: (0..n).map(|_| None).collect(),
         weight_cache,
         pool,
         moe_pager,
+        weight_ring,
+        weight_ring_active,
+        weight_prefetch_cap: prefetch_cap,
         pooled: Vec::new(),
         stream,
         rocblas,
@@ -671,8 +790,8 @@ pub fn execute_graph(
     // (a) inside `read_bytes`/`host_vals`, immediately before a host readback, and (b) the single
     // barrier below, before the cross-stream writeback DtoD + the final checked sync. With the
     // allocation churn gone (buffer pool), those per-op `hipMalloc`/`hipFree`/`hipStreamSynchronize`
-    // device syncs — the real decode bottleneck — are all off the hot path.
-    let fusion = decode_fusion(g);
+    // device syncs — the real decode bottleneck — are all off the hot path. `fusion` was computed
+    // above (it also drives the Slice-37 prefetch schedule).
     for (i, op) in g.ops.iter().enumerate() {
         if fusion.skip.contains(&i) {
             // Elided by a Slice-32 peephole (the RmsNorm folded into a following Linear, or the
@@ -983,7 +1102,13 @@ fn run_op(
                 // the bound quant buffer is pre-advanced past `w_off`, a whole number of output
                 // rows × `in_f` (a multiple of `qpb`), so `(w_off/qpb)*bpb` is exact.
                 debug_assert_eq!(bpb, bpb_i8);
-                let wptr = ctx.ensure_device(weight, g, bindings)?;
+                // Slice 37: a spilled bank is streamed into a resident VRAM staging slot ahead of
+                // this GEMV (the compute stream already waits on its fill inside `weight_staged_ptr`);
+                // otherwise `wptr` is the resident VRAM / Slice-35 host-alias pointer as before.
+                let (wptr, wt_staged) = match weight_staged_ptr(ctx, weight, bindings)? {
+                    Some(p) => (p, true),
+                    None => (ctx.ensure_device(weight, g, bindings)?, false),
+                };
                 let mu = m as usize;
                 let inu = in_f as usize;
                 let ou = out_f as usize;
@@ -1242,12 +1367,21 @@ fn run_op(
                         }
                     }
                 }
+                // Slice 37: GEMV dispatched — record the slot free + prefetch the next spilled bank.
+                if wt_staged {
+                    weight_staged_done(ctx)?;
+                }
             } else if let Some((qpb, bpb, kname, _)) = native_decode_fmt(wdt) {
                 // Native in-kernel decode: read the RAW quant bytes (no f16 cache → VRAM drops).
                 // The bound quant buffer is pre-advanced past `w_off`; `w_off` is always a whole
                 // number of output rows × `in_f`, hence a multiple of `qpb`, so the block offset
                 // `(w_off / qpb) * bpb` is exact.
-                let wptr = ctx.ensure_device(weight, g, bindings)?;
+                // Slice 37: same staging seam as the int8 path — a spilled bank is read from a
+                // resident VRAM slot prefetched on the copy stream, not over PCIe in-kernel.
+                let (wptr, wt_staged) = match weight_staged_ptr(ctx, weight, bindings)? {
+                    Some(p) => (p, true),
+                    None => (ctx.ensure_device(weight, g, bindings)?, false),
+                };
                 ctx.ensure_device(x, g, bindings)?;
                 let dd = ctx.zero_dev(m as usize * out_f as usize);
                 let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
@@ -1269,6 +1403,9 @@ fn run_op(
                     ],
                 )?;
                 ctx.dev[dst.0 as usize] = Some(dd);
+                if wt_staged {
+                    weight_staged_done(ctx)?;
+                }
             } else {
                 let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
                 ctx.ensure_device(x, g, bindings)?;

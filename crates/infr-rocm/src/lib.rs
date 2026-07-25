@@ -18,6 +18,8 @@ mod ffi;
 mod kernels;
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 pub mod pager;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+mod weight_pager;
 
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 pub use backend::{RocmBackend, RocmBuffer};
