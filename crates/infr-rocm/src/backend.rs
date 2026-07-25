@@ -61,6 +61,53 @@ fn kv_overflow_vram_cap() -> Option<u64> {
         .map(|mb| mb * 1024 * 1024)
 }
 
+/// `INFR_ROCM_WEIGHT_OVERFLOW=1` opt-in (Slice 35): spill dense weight banks to page-locked,
+/// device-mapped HOST RAM (read by the native Linear/EmbedGather GEMV over PCIe) when they would not
+/// fit VRAM. Empty / `0` = off (unchanged VRAM-only weights). The ROCm twin of the Vulkan
+/// `dense_paged` capability, but via the same zero-copy host-visible trick as the KV path — no
+/// prefetch ring, no per-slot weight offsets, no kernel changes: a covered-format (Q4_K/Q6_K/Q8_0/
+/// Q5_0) weight in host RAM is decoded in place exactly like a resident one. The uncovered formats
+/// that dequant→f16 into a VRAM cache do NOT benefit (the f16 copy re-lands in VRAM), so spilling
+/// them saves nothing — this path is meaningful for the native-decode formats.
+fn weight_overflow_enabled() -> bool {
+    std::env::var("INFR_ROCM_WEIGHT_OVERFLOW")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Cumulative cap (MiB) on weight-in-VRAM bytes before spilling the rest to host under
+/// `INFR_ROCM_WEIGHT_OVERFLOW`: `INFR_ROCM_WEIGHT_VRAM_MB`. Unset ⇒ no cap (VRAM-first up to the
+/// real headroom minus the reserve). At 0 it forces the WHOLE weight set to host — makes the spill
+/// path reproducible on a model that would otherwise fit (the sanctioned way to demonstrate the
+/// capability on a card big enough for the weights). Ignored when the flag is off. Twin of
+/// `INFR_KV_OVERFLOW_VRAM_MB`.
+fn weight_overflow_vram_cap() -> Option<u64> {
+    std::env::var("INFR_ROCM_WEIGHT_VRAM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+}
+
+/// VRAM headroom (bytes) kept free when placing weights in VRAM under `INFR_ROCM_WEIGHT_OVERFLOW`.
+/// Weights load FIRST (before the KV cache and before any per-forward activation scratch), so this
+/// reserve is what leaves room for those later consumers: the KV cache (which may itself spill under
+/// `INFR_KV_OVERFLOW`, but wants VRAM first), the paged-MoE expert arena, and the pooled
+/// GEMV/attention/FFN scratch whose peak scales with the prefill ubatch + the token_embd/uncovered
+/// dequant→f16 cache. Once `free - reserve < bytes` the bank (and every later one, as the budget
+/// only shrinks) spills to host RAM. Default: 12% of total VRAM floored at 2 GiB, same as the KV
+/// reserve; `INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB` overrides it (raise it to keep more headroom for
+/// a big KV context / MoE arena, lower it to keep more weights resident on a weight-dominated dense
+/// model).
+fn weight_overflow_vram_reserve(total_vram: u64) -> u64 {
+    if let Some(mb) = std::env::var("INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return mb * 1024 * 1024;
+    }
+    (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+}
+
 /// Human-readable byte count for the KV-overflow placement banner.
 fn fmt_bytes(n: u64) -> String {
     const U: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
@@ -91,7 +138,8 @@ pub struct RocmBuffer {
     /// Whether `drop` should call `hipFree` (false for a slice/view into another buffer, and for a
     /// host-spilled buffer which is freed via `hipHostFree(host_ptr)` instead).
     pub(crate) owned: bool,
-    /// Non-null only for a `hipHostMalloc`'d KV-overflow buffer: the HOST pointer, freed with
+    /// Non-null only for a `hipHostMalloc`'d spilled buffer (KV cache under `INFR_KV_OVERFLOW`, or a
+    /// dense weight bank under `INFR_ROCM_WEIGHT_OVERFLOW`): the HOST pointer, freed with
     /// `hipHostFree` in `drop` (which takes the host pointer, not the device alias in `ptr`).
     pub(crate) host_ptr: *mut c_void,
 }
@@ -147,13 +195,18 @@ impl RocmBuffer {
         })
     }
 
-    /// Allocate one KV-cache buffer in HOST memory (page-locked, device-mapped) — the opt-in
-    /// `INFR_KV_OVERFLOW` spill path. Returns `Err` on `hipHostMalloc` failure so overflow mode
-    /// degrades gracefully rather than aborting. Zero-initialized (calloc contract: KV padding rows
-    /// are read before written) via a plain host `write_bytes` — the memory is CPU-addressable, so
-    /// no device memset/sync is needed. The device alias (`ptr`) is what the WriteKv/Attention
-    /// kernels bind; the device reads/writes it directly over PCIe with no explicit per-token copy.
-    pub fn try_alloc_kv_host(bytes: usize) -> Result<Self> {
+    /// Allocate one buffer in HOST memory (page-locked, device-mapped) — the shared spill path for
+    /// both `INFR_KV_OVERFLOW` (KV cache, Slice 34) and `INFR_ROCM_WEIGHT_OVERFLOW` (dense weight
+    /// banks, Slice 35). Returns `Err` on `hipHostMalloc` failure so overflow mode degrades
+    /// gracefully rather than aborting. The device alias (`ptr`, from `hipHostGetDevicePointer`) is
+    /// what the WriteKv/Attention or native Linear/EmbedGather GEMV kernels bind; the device
+    /// reads/writes it directly over PCIe with NO explicit per-token copy and NO kernel changes.
+    ///
+    /// `zero_init` honors the calloc contract for buffers read before written (KV padding rows):
+    /// a plain host `write_bytes` — CPU-addressable, no device memset/sync. Weight banks are
+    /// overwritten in full by the immediate `upload`, so they pass `false` and skip the memset of a
+    /// multi-GiB region.
+    pub fn try_alloc_host(bytes: usize, zero_init: bool) -> Result<Self> {
         let mut host_ptr: *mut c_void = std::ptr::null_mut();
         let mut dev_ptr: *mut c_void = std::ptr::null_mut();
         if bytes > 0 {
@@ -167,8 +220,10 @@ impl RocmBuffer {
             if rc != HIP_SUCCESS {
                 return Err(be(format!("hipHostMalloc({bytes}): rc={rc}")));
             }
-            // Zero-init on the host side (calloc contract) — CPU-addressable, no device sync.
-            unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, bytes) };
+            if zero_init {
+                // Zero-init on the host side (calloc contract) — CPU-addressable, no device sync.
+                unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, bytes) };
+            }
             let rc = unsafe { ffi::hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
             if rc != HIP_SUCCESS {
                 unsafe { ffi::hipHostFree(host_ptr) };
@@ -366,6 +421,17 @@ pub struct RocmBackend {
     kv_vram_bytes: AtomicU64,
     kv_host_bufs: AtomicU64,
     kv_host_bytes: AtomicU64,
+    /// VRAM-first WEIGHT-overflow placement tally (`INFR_ROCM_WEIGHT_OVERFLOW`, Slice 35): how many
+    /// `BufferUsage::Weights`/`HostWeights` banks (and how many bytes) landed in device-local VRAM
+    /// vs spilled to page-locked host RAM. Fed by the `alloc`/`alloc_uninit` weight branch, drained
+    /// once by `weight_overflow_report` (printed on the first `execute`). Zero unless the flag is on.
+    wt_vram_bufs: AtomicU64,
+    wt_vram_bytes: AtomicU64,
+    wt_host_bufs: AtomicU64,
+    wt_host_bytes: AtomicU64,
+    /// One-shot latch so the weight-overflow banner prints exactly once, on the first `execute`
+    /// (after the whole weight-load walk has run). `false` until printed.
+    wt_reported: std::sync::atomic::AtomicBool,
 }
 
 // The backend owns streams and device handles which are Send/Sync.
@@ -432,6 +498,11 @@ impl RocmBackend {
             kv_vram_bytes: AtomicU64::new(0),
             kv_host_bufs: AtomicU64::new(0),
             kv_host_bytes: AtomicU64::new(0),
+            wt_vram_bufs: AtomicU64::new(0),
+            wt_vram_bytes: AtomicU64::new(0),
+            wt_host_bufs: AtomicU64::new(0),
+            wt_host_bytes: AtomicU64::new(0),
+            wt_reported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -456,11 +527,79 @@ impl RocmBackend {
                 return Ok(Box::new(buf));
             }
         }
-        let buf = RocmBuffer::try_alloc_kv_host(bytes)?;
+        let buf = RocmBuffer::try_alloc_host(bytes, true)?;
         self.kv_host_bufs.fetch_add(1, Ordering::Relaxed);
         self.kv_host_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(Box::new(buf))
+    }
+
+    /// Allocate one dense weight bank under `INFR_ROCM_WEIGHT_OVERFLOW`, VRAM-first: keep it
+    /// resident in device-local VRAM while the live free budget (minus
+    /// [`weight_overflow_vram_reserve`], and under the diagnostic `INFR_ROCM_WEIGHT_VRAM_MB`
+    /// cumulative cap) still fits it; otherwise — and for every later bank, since the budget only
+    /// shrinks — place it in page-locked, device-mapped HOST RAM read by the native Linear/
+    /// EmbedGather GEMV over PCIe. A VRAM `hipMalloc` failure at the budget edge ALSO spills rather
+    /// than propagating: overflow mode degrades to host, never hard-errors (mirrors the KV path).
+    /// Weight banks are overwritten in full by the immediate `upload`, so VRAM placement uses the
+    /// UNINIT alloc and the host placement skips the calloc memset. Bumps the resident/spilled tally
+    /// for the one-shot `weight_overflow_report` banner.
+    fn alloc_weight_overflow(&self, bytes: usize) -> Result<Box<dyn Buffer>> {
+        let cap_ok = weight_overflow_vram_cap()
+            .is_none_or(|cap| self.wt_vram_bytes.load(Ordering::Relaxed) + bytes as u64 <= cap);
+        let (free, total) = self.vram_info();
+        let reserve = weight_overflow_vram_reserve(total as u64);
+        let budget_ok = (free as u64) >= bytes as u64 + reserve;
+        if cap_ok && budget_ok {
+            if let Ok(buf) = RocmBuffer::try_alloc_uninit(bytes, self.stream) {
+                self.wt_vram_bufs.fetch_add(1, Ordering::Relaxed);
+                self.wt_vram_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                return Ok(Box::new(buf));
+            }
+        }
+        let buf = RocmBuffer::try_alloc_host(bytes, false)?;
+        self.wt_host_bufs.fetch_add(1, Ordering::Relaxed);
+        self.wt_host_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(Box::new(buf))
+    }
+
+    /// One-shot weight-placement summary for the `INFR_ROCM_WEIGHT_OVERFLOW` VRAM-first spill
+    /// (mirrors the KV banner): how many weight banks stayed resident in VRAM vs spilled to host
+    /// RAM. Printed lazily on the FIRST `execute`, by which point the whole weight-load walk has
+    /// run. No-op with the flag off (nothing was tallied) so normal runs print nothing.
+    fn weight_overflow_report(&self) {
+        if !weight_overflow_enabled() {
+            return;
+        }
+        if self.wt_reported.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let vram_bufs = self.wt_vram_bufs.load(Ordering::Relaxed);
+        let host_bufs = self.wt_host_bufs.load(Ordering::Relaxed);
+        let total = vram_bufs + host_bufs;
+        if total == 0 {
+            return;
+        }
+        let vram_bytes = self.wt_vram_bytes.load(Ordering::Relaxed);
+        let host_bytes = self.wt_host_bytes.load(Ordering::Relaxed);
+        if host_bufs == 0 {
+            eprintln!(
+                "[infr] INFR_ROCM_WEIGHT_OVERFLOW: all {total} weight banks ({}) fit in VRAM — none \
+                 spilled; no PCIe weight reads.",
+                fmt_bytes(vram_bytes),
+            );
+        } else {
+            eprintln!(
+                "[infr] INFR_ROCM_WEIGHT_OVERFLOW: {vram_bufs} of {total} weight banks ({} resident) \
+                 in VRAM, the remaining {host_bufs} ({}) in page-locked SYSTEM RAM — the native \
+                 Linear/EmbedGather GEMV reads those over PCIe (PCIe-bound on the spilled banks). \
+                 Spilled weights are exempt from VRAM.",
+                fmt_bytes(vram_bytes),
+                fmt_bytes(host_bytes),
+            );
+        }
     }
 
     /// Read a device property field.
@@ -568,10 +707,22 @@ impl Backend for RocmBackend {
         if matches!(_usage, BufferUsage::KvCache) && kv_overflow_enabled() {
             return self.alloc_kv_overflow(bytes);
         }
-        // Zero-init (calloc contract); OOM or a failed zero-fill returns Err (recoverable).
-        let buf = RocmBuffer::try_alloc(bytes, self.stream)?;
+        let is_weight = matches!(_usage, BufferUsage::Weights | BufferUsage::HostWeights);
+        // Opt-in dense WEIGHT overflow (`INFR_ROCM_WEIGHT_OVERFLOW`, Slice 35): place weight banks
+        // VRAM-first, spilling the tail to host RAM read by the native GEMV over PCIe. Off by
+        // default ⇒ unchanged VRAM-only weights below.
+        let buf = if is_weight && weight_overflow_enabled() {
+            let b = self.alloc_weight_overflow(bytes)?;
+            if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+            return Ok(b);
+        } else {
+            // Zero-init (calloc contract); OOM or a failed zero-fill returns Err (recoverable).
+            RocmBuffer::try_alloc(bytes, self.stream)?
+        };
         // Advance weight progress bar for weight/host-weight allocations
-        if matches!(_usage, BufferUsage::Weights | BufferUsage::HostWeights) {
+        if is_weight {
             if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }
@@ -580,9 +731,17 @@ impl Backend for RocmBackend {
     }
 
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        let is_weight = matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights);
+        if is_weight && weight_overflow_enabled() {
+            let b = self.alloc_weight_overflow(bytes)?;
+            if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+            return Ok(b);
+        }
         // Skip zero-init for weight buffers (they get uploaded immediately); OOM returns Err.
         let buf = RocmBuffer::try_alloc_uninit(bytes, self.stream)?;
-        if matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights) {
+        if is_weight {
             if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }
@@ -643,6 +802,8 @@ impl Backend for RocmBackend {
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        // One-shot weight-overflow banner: the whole weight-load walk has run by the first execute.
+        self.weight_overflow_report();
         exec::execute_graph(
             &self.pipelines,
             &self.weight_cache,
