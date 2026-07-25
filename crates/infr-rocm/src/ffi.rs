@@ -53,6 +53,20 @@ extern "C" {
     ) -> c_int;
     /// Free and total device memory in bytes (the paged-MoE budget + peak-VRAM report).
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
+    /// Allocate `size` bytes of HOST memory that is page-locked and (with `HIP_HOST_MALLOC_MAPPED`)
+    /// mapped into the device address space — the `INFR_KV_OVERFLOW` spill path. The device reads
+    /// this memory over PCIe through the device pointer from `hipHostGetDevicePointer`; no explicit
+    /// per-token copy is needed. `flags` = OR of the `HIP_HOST_MALLOC_*` bits below.
+    pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> c_int;
+    /// Return the DEVICE-side pointer that aliases a `hipHostMalloc(..MAPPED)` host allocation, so a
+    /// kernel binding this pointer reads/writes the host buffer directly over PCIe. `flags` is 0.
+    pub fn hipHostGetDevicePointer(
+        dev_ptr: *mut *mut c_void,
+        host_ptr: *mut c_void,
+        flags: u32,
+    ) -> c_int;
+    /// Free a `hipHostMalloc` allocation (takes the HOST pointer, not the device alias).
+    pub fn hipHostFree(ptr: *mut c_void) -> c_int;
     /// Create a non-blocking stream.
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> c_int;
     /// Block until all work on `stream` finishes.
@@ -201,6 +215,14 @@ pub type hipMemcpyKind = c_int;
 pub const HIP_MEMCPY_HOST_TO_DEVICE: hipMemcpyKind = 1;
 pub const HIP_MEMCPY_DEVICE_TO_HOST: hipMemcpyKind = 2;
 pub const HIP_MEMCPY_DEVICE_TO_DEVICE: hipMemcpyKind = 3;
+
+// ── hipHostMalloc flags ──────────────────────────────────────────────────────
+
+/// The allocation is usable by all HIP contexts (safe default).
+pub const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;
+/// Map the allocation into the device address space so a device pointer aliases it
+/// (`hipHostGetDevicePointer`) — required for the KV-overflow read-over-PCIe path.
+pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
 
 // ── hipDeviceProp_t (subset we need) ─────────────────────────────────────────
 

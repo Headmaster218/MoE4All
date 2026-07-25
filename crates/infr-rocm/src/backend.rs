@@ -13,22 +13,87 @@ use infr_core::backend::{
 use infr_core::error::{Error, Result};
 use infr_core::graph::Graph;
 use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn be(msg: impl std::fmt::Display) -> Error {
     Error::backend(msg)
 }
 
+/// VRAM headroom (bytes) kept free when placing KV in VRAM under `INFR_KV_OVERFLOW`: the spill
+/// decision reserves this much so the per-forward activation scratch (the pooled GEMV/attention/FFN
+/// buffers, whose peak scales with the prefill ubatch), the weight-dequant cache, and the rocBLAS
+/// workspace all still have room after the KV cache lands. Once `free - reserve < bytes` the buffer
+/// (and every later one, as the budget only shrinks) spills to host RAM; a VRAM `hipMalloc` failure
+/// ALSO spills, so the reserve just moves the spill *before* the card is bone dry — otherwise those
+/// scratch allocations OOM mid-forward (the exec pool panics, it is infallible by contract).
+///
+/// Default: 12% of total VRAM, floored at 2 GiB — enough for a several-hundred-row prefill on a
+/// large-vocab model. `INFR_KV_OVERFLOW_RESERVE_MB` overrides it (raise it if a big prefill ubatch
+/// still OOMs the scratch pool; lower it to keep more KV resident when the model's scratch is small).
+fn kv_overflow_vram_reserve(total_vram: u64) -> u64 {
+    if let Some(mb) = std::env::var("INFR_KV_OVERFLOW_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return mb * 1024 * 1024;
+    }
+    (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+}
+
+/// `INFR_KV_OVERFLOW=1` opt-in: spill the KV cache to host RAM (read by attention over PCIe) when
+/// it would not fit VRAM. Empty / `0` = off (unchanged VRAM-only KV). Mirrors the Vulkan backend's
+/// own local `kv_overflow_enabled`.
+fn kv_overflow_enabled() -> bool {
+    std::env::var("INFR_KV_OVERFLOW")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Diagnostic cumulative cap (MiB) on KV-in-VRAM bytes before spilling the rest to host:
+/// `INFR_KV_OVERFLOW_VRAM_MB`. Unset ⇒ no cap (VRAM-first up to the real headroom). At 0 it forces
+/// the whole KV cache to host — makes the spill path reproducible on models that would otherwise
+/// fit. Ignored when `INFR_KV_OVERFLOW` is off. Mirrors the Vulkan backend's `kv_overflow_vram_cap`.
+fn kv_overflow_vram_cap() -> Option<u64> {
+    std::env::var("INFR_KV_OVERFLOW_VRAM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+}
+
+/// Human-readable byte count for the KV-overflow placement banner.
+fn fmt_bytes(n: u64) -> String {
+    const U: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.2} {}", U[i])
+    }
+}
+
 // ── RocmBuffer ───────────────────────────────────────────────────────────────
 
-/// A device buffer allocated with `hipMalloc`.
+/// A device buffer. Normally `hipMalloc`'d VRAM; for the `INFR_KV_OVERFLOW` spill path it is a
+/// `hipHostMalloc`'d, page-locked, device-mapped HOST allocation (`host_ptr` set), whose device
+/// alias (`ptr`, from `hipHostGetDevicePointer`) the KV kernels bind and read/write over PCIe.
 pub struct RocmBuffer {
-    /// Device pointer (null if len == 0).
+    /// Device pointer (null if len == 0). For a host-spilled KV buffer this is the device alias of
+    /// `host_ptr`, so `WriteKv`/`Attention` bind it exactly like a VRAM pointer.
     pub(crate) ptr: *mut c_void,
     /// Byte length.
     pub(crate) len: usize,
-    /// Whether `drop` should call `hipFree` (false for a slice/view into another buffer).
+    /// Whether `drop` should call `hipFree` (false for a slice/view into another buffer, and for a
+    /// host-spilled buffer which is freed via `hipHostFree(host_ptr)` instead).
     pub(crate) owned: bool,
+    /// Non-null only for a `hipHostMalloc`'d KV-overflow buffer: the HOST pointer, freed with
+    /// `hipHostFree` in `drop` (which takes the host pointer, not the device alias in `ptr`).
+    pub(crate) host_ptr: *mut c_void,
 }
 
 // Raw device pointers are Send/Sync (they identify a VRAM region, not a CPU address).
@@ -59,6 +124,7 @@ impl RocmBuffer {
             ptr,
             len: bytes,
             owned: true,
+            host_ptr: std::ptr::null_mut(),
         })
     }
 
@@ -77,6 +143,43 @@ impl RocmBuffer {
             ptr,
             len: bytes,
             owned: true,
+            host_ptr: std::ptr::null_mut(),
+        })
+    }
+
+    /// Allocate one KV-cache buffer in HOST memory (page-locked, device-mapped) — the opt-in
+    /// `INFR_KV_OVERFLOW` spill path. Returns `Err` on `hipHostMalloc` failure so overflow mode
+    /// degrades gracefully rather than aborting. Zero-initialized (calloc contract: KV padding rows
+    /// are read before written) via a plain host `write_bytes` — the memory is CPU-addressable, so
+    /// no device memset/sync is needed. The device alias (`ptr`) is what the WriteKv/Attention
+    /// kernels bind; the device reads/writes it directly over PCIe with no explicit per-token copy.
+    pub fn try_alloc_kv_host(bytes: usize) -> Result<Self> {
+        let mut host_ptr: *mut c_void = std::ptr::null_mut();
+        let mut dev_ptr: *mut c_void = std::ptr::null_mut();
+        if bytes > 0 {
+            let rc = unsafe {
+                ffi::hipHostMalloc(
+                    &mut host_ptr,
+                    bytes,
+                    ffi::HIP_HOST_MALLOC_PORTABLE | ffi::HIP_HOST_MALLOC_MAPPED,
+                )
+            };
+            if rc != HIP_SUCCESS {
+                return Err(be(format!("hipHostMalloc({bytes}): rc={rc}")));
+            }
+            // Zero-init on the host side (calloc contract) — CPU-addressable, no device sync.
+            unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, bytes) };
+            let rc = unsafe { ffi::hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+            if rc != HIP_SUCCESS {
+                unsafe { ffi::hipHostFree(host_ptr) };
+                return Err(be(format!("hipHostGetDevicePointer: rc={rc}")));
+            }
+        }
+        Ok(Self {
+            ptr: dev_ptr,
+            len: bytes,
+            owned: true,
+            host_ptr,
         })
     }
 
@@ -214,7 +317,14 @@ impl Drop for BufferPool {
 
 impl Drop for RocmBuffer {
     fn drop(&mut self) {
-        if self.owned && !self.ptr.is_null() {
+        if !self.owned {
+            return;
+        }
+        // A host-spilled KV buffer (KV overflow): free the HOST allocation via `hipHostFree`; its
+        // device alias in `ptr` is NOT separately `hipFree`d (it is not an independent allocation).
+        if !self.host_ptr.is_null() {
+            unsafe { ffi::hipHostFree(self.host_ptr) };
+        } else if !self.ptr.is_null() {
             unsafe { ffi::hipFree(self.ptr) };
         }
     }
@@ -249,6 +359,13 @@ pub struct RocmBackend {
     /// `None` (the common case) means every expert is resident, zero change. `Backend::moe_paged`
     /// reads this.
     pub(crate) moe_pager: Mutex<Option<crate::pager::RocmMoePager>>,
+    /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
+    /// buffers (and how many bytes) landed in device-local VRAM vs spilled to host RAM. Fed by the
+    /// `alloc` KvCache branch, drained once by `kv_overflow_report`. Zero unless the flag is on.
+    kv_vram_bufs: AtomicU64,
+    kv_vram_bytes: AtomicU64,
+    kv_host_bufs: AtomicU64,
+    kv_host_bytes: AtomicU64,
 }
 
 // The backend owns streams and device handles which are Send/Sync.
@@ -311,7 +428,39 @@ impl RocmBackend {
             rocblas,
             weight_pb: Arc::new(Mutex::new(None)),
             moe_pager: Mutex::new(None),
+            kv_vram_bufs: AtomicU64::new(0),
+            kv_vram_bytes: AtomicU64::new(0),
+            kv_host_bufs: AtomicU64::new(0),
+            kv_host_bytes: AtomicU64::new(0),
         })
+    }
+
+    /// Allocate one KV-cache buffer under `INFR_KV_OVERFLOW`, VRAM-first: keep it resident in VRAM
+    /// while the live free budget (minus [`KV_OVERFLOW_VRAM_RESERVE`], and under the diagnostic
+    /// `INFR_KV_OVERFLOW_VRAM_MB` cumulative cap) still fits it; otherwise — and for every later
+    /// buffer, since the budget only shrinks — place it in page-locked, device-mapped HOST RAM read
+    /// by attention over PCIe. A VRAM `hipMalloc` failure at the exact budget edge ALSO spills
+    /// rather than propagating: overflow mode degrades to host, never hard-errors. Bumps the
+    /// resident/spilled tally for the one-shot `kv_overflow_report` banner.
+    fn alloc_kv_overflow(&self, bytes: usize) -> Result<Box<dyn Buffer>> {
+        let cap_ok = kv_overflow_vram_cap()
+            .is_none_or(|cap| self.kv_vram_bytes.load(Ordering::Relaxed) + bytes as u64 <= cap);
+        let (free, total) = self.vram_info();
+        let reserve = kv_overflow_vram_reserve(total as u64);
+        let budget_ok = (free as u64) >= bytes as u64 + reserve;
+        if cap_ok && budget_ok {
+            if let Ok(buf) = RocmBuffer::try_alloc(bytes, self.stream) {
+                self.kv_vram_bufs.fetch_add(1, Ordering::Relaxed);
+                self.kv_vram_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                return Ok(Box::new(buf));
+            }
+        }
+        let buf = RocmBuffer::try_alloc_kv_host(bytes)?;
+        self.kv_host_bufs.fetch_add(1, Ordering::Relaxed);
+        self.kv_host_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(Box::new(buf))
     }
 
     /// Read a device property field.
@@ -413,6 +562,12 @@ impl Backend for RocmBackend {
     }
 
     fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // Opt-in KV overflow (`INFR_KV_OVERFLOW`): place KV VRAM-first, spilling the tail to host
+        // RAM read by attention over PCIe. Off by default ⇒ unchanged VRAM-only KV below. Only KV
+        // buffers are eligible; weights/activations always stay device-local.
+        if matches!(_usage, BufferUsage::KvCache) && kv_overflow_enabled() {
+            return self.alloc_kv_overflow(bytes);
+        }
         // Zero-init (calloc contract); OOM or a failed zero-fill returns Err (recoverable).
         let buf = RocmBuffer::try_alloc(bytes, self.stream)?;
         // Advance weight progress bar for weight/host-weight allocations
@@ -505,6 +660,39 @@ impl Backend for RocmBackend {
     /// installed; `false` for every resident model (the common case, zero change).
     fn moe_paged(&self) -> bool {
         self.moe_pager.lock().unwrap().is_some()
+    }
+
+    /// One-shot KV placement summary for the `INFR_KV_OVERFLOW` VRAM-first spill (mirrors the
+    /// Vulkan backend): how many KV buffers stayed resident in VRAM vs spilled to host RAM. The
+    /// runner calls this once, right after the per-layer KV allocation loop. No-op with the flag off
+    /// (nothing was tallied) so normal runs print nothing.
+    fn kv_overflow_report(&self) {
+        if !kv_overflow_enabled() {
+            return;
+        }
+        let vram_bufs = self.kv_vram_bufs.load(Ordering::Relaxed);
+        let host_bufs = self.kv_host_bufs.load(Ordering::Relaxed);
+        let total = vram_bufs + host_bufs;
+        if total == 0 {
+            return;
+        }
+        let vram_bytes = self.kv_vram_bytes.load(Ordering::Relaxed);
+        let host_bytes = self.kv_host_bytes.load(Ordering::Relaxed);
+        if host_bufs == 0 {
+            eprintln!(
+                "[infr] INFR_KV_OVERFLOW: all {total} KV buffers ({}) fit in VRAM — none spilled; \
+                 no PCIe KV reads.",
+                fmt_bytes(vram_bytes),
+            );
+        } else {
+            eprintln!(
+                "[infr] INFR_KV_OVERFLOW: {vram_bufs} of {total} KV buffers ({} resident) in VRAM, \
+                 the remaining {host_bufs} ({}) in page-locked SYSTEM RAM — attention reads those \
+                 K/V over PCIe (PCIe-bound on the spilled layers). Spilled KV is exempt from VRAM.",
+                fmt_bytes(vram_bytes),
+                fmt_bytes(host_bytes),
+            );
+        }
     }
 
     fn sync(&self) -> Result<()> {

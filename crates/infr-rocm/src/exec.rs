@@ -478,6 +478,7 @@ impl<'a> ExecCtx<'a> {
             ptr,
             len,
             owned: false,
+            host_ptr: std::ptr::null_mut(),
         }
     }
 
@@ -535,6 +536,7 @@ impl<'a> ExecCtx<'a> {
                     ptr: p,
                     len: b.len,
                     owned: false,
+                    host_ptr: std::ptr::null_mut(),
                 });
                 p
             }
@@ -604,6 +606,7 @@ impl<'a> ExecCtx<'a> {
                     ptr: dq.ptr,
                     len: dq.len,
                     owned: true,
+                    host_ptr: std::ptr::null_mut(),
                 },
             );
         }
@@ -614,6 +617,7 @@ impl<'a> ExecCtx<'a> {
             ptr,
             len,
             owned: false,
+            host_ptr: std::ptr::null_mut(),
         });
         Ok(ptr)
     }
@@ -1140,6 +1144,7 @@ fn run_op(
                                     ptr: b.ptr,
                                     len: b.len,
                                     owned: false,
+                                    host_ptr: std::ptr::null_mut(),
                                 }
                             }
                             None => ctx.zero_dev(mu * ou),
