@@ -223,8 +223,9 @@ multiple files):**
 2. `./infr.toml`
 3. `$XDG_CONFIG_HOME/infr/config.toml`, else `~/.config/infr/config.toml`
 
-**[DECIDE-1]** Confirm TOML + this 3-step lookup. Alternative considered: global
-path only (one fewer precedence rung to explain).
+**[DECIDE-1] — DECIDED (repo owner, 2026-07-26): this section is normative.**
+TOML, exactly this 3-step lookup, first existing file wins, no cross-file
+merging. The global-path-only alternative is rejected.
 
 **[DECIDE-5]** `deny_unknown_fields` (§8.5) makes a typo an error — but it also
 makes a config file written for a NEWER infr fail hard on an OLDER binary, and
@@ -319,10 +320,13 @@ That is fine and expected — do NOT introduce a global to bridge them. If a sli
 finds a read site with no plausible owner in scope, STOP and record it in §10.10
 "blocked sites" rather than inventing a global.
 
-**[DECIDE-2]** Confirm the threading approach over the cheaper alternative (a
-single `OnceLock<Config>` + a thread-local test override). Threading is more
-work (~206 sites plus constructors) but is the only version that makes
-configuration a value rather than ambient state.
+**[DECIDE-2] — DECIDED (repo owner, 2026-07-26): thread `Arc<Config>`, as
+described above.** The cheaper alternative (a single `OnceLock<Config>` + a
+thread-local test override) is REJECTED. It is more work — ~206 sites plus
+constructors — and that cost is accepted deliberately: it is the only version
+that makes configuration a value rather than ambient state, which is the point
+of the campaign. Do not fall back to a global for an awkward site; that is a
+blocked site (§10.10).
 
 ## 6. Knob inventory
 
@@ -970,8 +974,12 @@ outside `crates/infr-core/`.
    `INFR_IGNORE_EOS`) so behaviour is unchanged. Delete that re-publication in
    S8. Note this re-publication is what `cmd_bench` relies on at `main.rs:1799`.
 4. Convert `cli/main.rs`'s `mod tests` off its hand-rolled `ENV_LOCK` (R7).
-5. Add `--set <path>=<value>` **[DECIDE-3]** (generic override for knobs with no
-   dedicated flag), or drop it if the owner prefers file+env only.
+5. Add `--set <config.path>=<value>` — DECIDED, ship it (§11 [DECIDE-3]).
+   ADDITIVE to the existing flags: every current flag keeps its name and
+   semantics, `--set` only reaches the knobs that have no dedicated flag. A
+   bespoke flag and a `--set` targeting the SAME field ⇒ the bespoke flag wins
+   and a warning names the field; two `--set`s for the same path ⇒ error. Path
+   grammar is still **[DECIDE-6]** (config path vs env name).
 
 **Exit:** `grep -n 'set_var' crates/infr-cli/src/main.rs` shows only the S1
 re-publication block and `RAYON_NUM_THREADS`; `infr run` / `infr bench` /
@@ -1104,14 +1112,14 @@ In `config/tests.rs` (these are the acceptance criteria for S0):
    `#[ignore]`) and fails when a new `INFR_*` literal appears in `crates/*/src`
    without a manifest entry. Without this, the next feature branch silently
    re-introduces an ungoverned knob.
-10. `dotted_path_setter_rejects_unknown_paths` — only if **[DECIDE-3]** says
-    yes: `--set kernels.vulkan.flash_splt=2` must error with a suggestion, not
-    be ignored. Implement by matching against `manifest::KEYS`' field paths —
-    the same table, so it cannot drift from the TOML schema. **[DECIDE-6]**:
-    does `--set` take the CONFIG path (`kernels.vulkan.flash_splits`) or the ENV
-    name (`INFR_FLASH_SPLITS`)? They are not 1:1 — `INFR_NO_GEMM_WARP` maps to
-    `gemm_warp=false`, and `INFR_NO_GEMV_REG` + `INFR_GEMV_VARIANT` both map to
-    one `variant` field.
+10. `dotted_path_setter_rejects_unknown_paths` — REQUIRED (`--set` ships, §11
+    [DECIDE-3]): `--set kernels.vulkan.flash_splt=2` must error with a
+    suggestion, not be ignored. Implement by matching against `manifest::KEYS`'
+    field paths — the same table, so it cannot drift from the TOML schema.
+    **[DECIDE-6]**: does `--set` take the CONFIG path
+    (`kernels.vulkan.flash_splits`) or the ENV name (`INFR_FLASH_SPLITS`)? They
+    are not 1:1 — `INFR_NO_GEMM_WARP` maps to `gemm_warp=false`, and
+    `INFR_NO_GEMV_REG` + `INFR_GEMV_VARIANT` both map to one `variant` field.
 
 Per-slice: every knob a slice migrates must gain (or keep) a test that sets it
 via `Config` and asserts the behaviour it gates. If a knob has no observable
@@ -1200,13 +1208,24 @@ steady-state pairs.
 
 ## 11. Open decisions
 
-- **[DECIDE-1]** TOML + 3-step lookup (`--config`, `./infr.toml`,
-  `~/.config/infr/config.toml`)?
-- **[DECIDE-2]** Thread `Arc<Config>` through backends (this plan), or a single
-  `OnceLock` + test override (much smaller diff, keeps ambient state)?
-- **[DECIDE-3]** Ship a generic `--set kernels.vulkan.flash_splits=2` escape
-  hatch, so the ~150 tuning knobs stay reachable from the command line without
-  ~150 flags?
+- **[DECIDE-1] — DECIDED (repo owner, 2026-07-26): YES.** TOML, with the 3-step
+  lookup `--config <PATH>` → `./infr.toml` → `~/.config/infr/config.toml`, first
+  existing file wins, no merging across files. §4 is now normative, not a
+  proposal.
+- **[DECIDE-2] — DECIDED (repo owner, 2026-07-26): thread `Arc<Config>`.** The
+  `OnceLock` + test-override alternative is REJECTED — do not reintroduce it in
+  any slice, and do not use it as a shortcut for a site that is awkward to
+  thread (that is a blocked site, §10.10). §5 is normative.
+- **[DECIDE-3] — DECIDED (repo owner, 2026-07-26): ship `--set`, AND keep every
+  bespoke flag.** `--set <config.path>=<value>` is ADDITIVE: every flag that
+  exists today (`--dev`, `--ctx`, `--ubatch`, `--threads`, `--temp`, `--top-k`,
+  `--top-p`, `--seed`, `--max-new`, `--no-think`, …) stays exactly as it is,
+  with its current name and semantics. `--set` exists so the ~150 knobs that
+  have no dedicated flag are reachable without inventing ~150 flags. Precedence
+  WITHIN the CLI layer when both target the same field: **the bespoke flag
+  wins** over `--set`, and passing both must print a warning naming the field,
+  so a user who typed `--ctx 32k --set device.ctx=8k` is told which one applied.
+  Two `--set`s for the same path is an error, not a silent last-wins.
 - **[DECIDE-4]** Execution: delegate slices to subagents (the flow that landed
   the backend-unification campaign, `docs/backend-unification-plan.md`), or
   inline?
