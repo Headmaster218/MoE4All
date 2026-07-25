@@ -227,11 +227,12 @@ multiple files):**
 TOML, exactly this 3-step lookup, first existing file wins, no cross-file
 merging. The global-path-only alternative is rejected.
 
-**[DECIDE-5]** `deny_unknown_fields` (§8.5) makes a typo an error — but it also
-makes a config file written for a NEWER infr fail hard on an OLDER binary, and
-makes deleting a knob a breaking change for anyone with it in their file. Pick
-one: (a) hard error, (b) warn-to-stderr and ignore, (c) hard error on unknown
-keys inside a known section, warn on an unknown section. This blocks S0 — the
+**[DECIDE-5] — DECIDED: warn-and-ignore for unknown keys (§11).** Original note:
+`deny_unknown_fields` (§8.5) makes a typo an error — but it also makes a config
+file written for a NEWER infr fail hard on an OLDER binary, and makes deleting a
+knob a breaking change for anyone with it in their file. Pick one: (a) hard
+error, (b) warn-to-stderr and ignore, (c) hard error on unknown keys inside a
+known section, warn on an unknown section. This blocks S0 — the
 `unknown_toml_key_is_an_error` test encodes the answer.
 
 ## 5. How `Config` reaches the reader
@@ -1088,8 +1089,10 @@ In `config/tests.rs` (these are the acceptance criteria for S0):
 3. `cli_overrides_env` — env says `4`, CLI says `8` ⇒ `8`.
 4. `absent_layer_does_not_clobber` — a file setting only `[kv]` leaves
    `[kernels.vulkan]` at its env/default value.
-5. `unknown_toml_key_is_an_error` — typo detection. Encodes **[DECIDE-5]**; do
-   not write this test until that decision is answered.
+5. `unknown_toml_key_warns_and_is_ignored` — typo detection WITHOUT a hard
+   failure, per the decided **[DECIDE-5]**; the sibling case
+   `unknown_set_path_is_an_error` covers `--set`. Original note: do not write
+   this test until that decision is answered.
 6. `bad_value_is_an_error_not_a_silent_default` — `ctx = "banana"` fails to
    load. **But only for the keys that error TODAY** (`INFR_SG`,
    `INFR_SUBMIT_DISPATCHES`, the three `multi` device lists, and any `SizeSpec`
@@ -1226,24 +1229,35 @@ steady-state pairs.
   wins** over `--set`, and passing both must print a warning naming the field,
   so a user who typed `--ctx 32k --set device.ctx=8k` is told which one applied.
   Two `--set`s for the same path is an error, not a silent last-wins.
-- **[DECIDE-4]** Execution: delegate slices to subagents (the flow that landed
-  the backend-unification campaign, `docs/backend-unification-plan.md`), or
-  inline?
-- **[DECIDE-5]** Unknown-key policy for the TOML layer: hard error
-  (`deny_unknown_fields`), warn-and-ignore, or error-inside-known-section /
-  warn-on-unknown-section? Hard error breaks an older binary reading a newer
-  file and makes knob removal a breaking change. Blocks S0 (§8.5).
-- **[DECIDE-6]** If `--set` ships: does its path grammar use the CONFIG field
-  path or the ENV name? They are not 1:1 (§8.10).
-- **[DECIDE-7]** Does the TOML file get to set the ~40 pure-diagnostic knobs
-  (`INFR_PROF*`, `INFR_DEBUG_*`, `INFR_*_STATS`, `INFR_POISON_UNINIT`)? They are
-  in `Config` either way; the question is whether a stale
-  `~/.config/infr/config.toml` should be able to turn on profiling output for
-  every run. Cheapest answer: yes, they are just fields — but say so, because
-  "why is my server printing timings" is the failure mode.
-- **[DECIDE-8]** `kv_env_unset()` (`seam/mod.rs:724`) is true when the vars are
-  ABSENT, including when they are present-but-garbage. After migration,
-  `cfg.kv.type_k` is `None` for both "absent" and "garbage" if the env layer
-  parses eagerly, which would change auto-q8's behaviour for
-  `INFR_KV_TYPE_K=nonsense`. Store the raw string too, parse lazily, or accept
-  the (tiny) behaviour change? R1 says it must be a deliberate choice.
+- **[DECIDE-4] — DECIDED (repo owner, 2026-07-26): delegate slices to opus
+  subagents**, one slice at a time; lead reviews + fixes + merges + pushes each,
+  and PRUNES this document after each stage so it holds only PENDING work.
+- **[DECIDE-5] — DECIDED (lead, 2026-07-26, owner may override): WARN, do not
+  fail.** An unknown key in the TOML file prints one
+  `[infr] config: unknown key \`kernels.vulkan.flash_splt\`
+  (ignored)`line to stderr and is skipped, so an older binary can read a newer file and removing a knob is not a breaking change. Typo protection comes from the message, not from a hard failure.`--set`
+  is the OPPOSITE: an unknown path there IS a hard error (§8.10), because it was
+  typed on the command line for this run and silently ignoring it would give a
+  wrong result with no second chance to notice. A malformed FILE (invalid TOML
+  syntax, or a value of the wrong type for a known key) stays a hard error.
+- **[DECIDE-6] — DECIDED (lead, 2026-07-26, owner may override): `--set` takes
+  the CONFIG path**, identical to the TOML key path
+  (`--set kernels.vulkan.flash_splits=2`), so there is ONE grammar to learn and
+  `--set` ⇔ file entries are copy-pasteable in both directions. Env NAMES are
+  not accepted as `--set` paths (they are not 1:1 with fields — `INFR_NO_*`
+  inverts, `INFR_MMV_MW` is tri-state). An unknown path errors with a
+  did-you-mean suggestion computed against `manifest::KEYS`.
+- **[DECIDE-7] — DECIDED (lead, 2026-07-26, owner may override): YES, the file
+  may set the diagnostic knobs** — they are ordinary fields and carving out an
+  exception costs more than it saves. Mitigation for the "why is my server
+  printing timings" failure mode: when any `prof.*` or `debug.*` field is
+  non-default AND its value came from the FILE layer (not env, not CLI), print
+  one line at startup naming the file and the fields it enabled.
+- **[DECIDE-8] — DECIDED (lead, 2026-07-26, owner may override): preserve
+  today's behaviour exactly (R1).** `KvCfg` keeps BOTH the parsed dtype
+  (`type_k: Option<DType>`) and whether the knob was SPECIFIED at all
+  (`type_k_specified: bool`, set by any layer that supplied a value, parseable
+  or not). `kv_env_unset()`'s successor tests `type_k_specified`, so
+  `INFR_KV_TYPE_K=nonsense` keeps suppressing auto-q8 and still falls through to
+  f16 for the dtype — exactly as today. Do not "fix" this asymmetry in this
+  campaign; it is a behaviour change and belongs in its own commit.
