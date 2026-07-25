@@ -362,9 +362,39 @@ pub(crate) fn generate_dense_cpu(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_cpu_mode(
+        CpuBackend::new(),
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        req,
+        on_token,
+    )
+}
+
+/// [`generate_dense_cpu`] on a caller-supplied `CpuBackend`, so a comparison can pick the
+/// REFERENCE backend ([`CpuBackend::reference`]) instead of the production int8-activation
+/// kernels. The distinction matters at low bit-widths: the int8 activation quant carries ~4e-3
+/// relative error on every quant dtype, which is invisible at Q4_K but flips greedy tokens at
+/// Q2_K — so a backend-vs-backend token comparison must be scored against the reference mode.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_cpu_mode(
+    cpu_be: CpuBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    req: Option<&crate::sampling::RequestCtx>,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a zero-copy weight binder
     // (maps each tensor straight from the GGUF mmap — no alloc, no memcpy).
-    let cpu_be = CpuBackend::new();
     let bind = cpu_upload_bind(&cpu_be);
     generate_dense_backend(
         &cpu_be,

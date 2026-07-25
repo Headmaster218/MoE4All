@@ -9628,4 +9628,436 @@ mod kernel_tests {
             }
         }
     }
+
+    // ── SIMD tier agreement ────────────────────────────────────────────────────────────────────
+    //
+    // Every `vec_dot_*` is a runtime dispatch (avx512vnni → avx512bw → avx2 → scalar), so a plain
+    // `cargo test` only ever exercises the TOP tier the test box happens to have — on this repo's
+    // AMD dev box that is avx512vnni, which means the avx2 and scalar kernels ship untested and a
+    // format decoded wrongly in one of them surfaces only on a user's older machine.
+    //
+    // These tests call each tier DIRECTLY on identical inputs and hold it to the scalar kernel,
+    // which is the readable port of llama.cpp's `ggml_vec_dot_*` (and the only tier the non-x86
+    // build uses). They are the per-kernel counterpart of `CpuBackend::reference` vs production:
+    // that pair bounds the int8-activation error at the BACKEND level, this one proves the tiers
+    // implement the same arithmetic at the KERNEL level.
+    //
+    // Bound: the tiers accumulate the same integer products and differ only in the ORDER of the
+    // per-block f32 accumulation, so agreement is near-exact. `TIER_TOL` is relative to the
+    // scalar result's magnitude — a mis-decoded format lands at O(1) relative and cannot hide.
+
+    /// Relative bound for a SIMD tier against the scalar kernel — f32 accumulation order only.
+    ///
+    /// Measured worst on the dev box (Zen5, all of avx2 / avx512bw / avx512vnni present, so every
+    /// tier below actually ran): single-row `9.7e-8`, batch `2.3e-7`, and the native-32-block
+    /// family `0.0` — those kernels are BIT-IDENTICAL to their scalar twins. `1e-5` is ~40x
+    /// headroom over the worst, and mutation-checked: at `1e-9` the avx512bw arms fail, and
+    /// scoring one format against another format's scalar kernel fails outright.
+    const TIER_TOL: f32 = 1e-5;
+
+    #[cfg(target_arch = "x86_64")]
+    fn tier_rel(got: f32, want: f32) -> f32 {
+        (got - want).abs() / want.abs().max(1e-3)
+    }
+
+    /// Single-row (`m=1`, Q8 super-block activation) int8 dots: avx2 + avx512bw vs scalar.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_tiers_match_the_scalar_kernel() {
+        type Dot = fn(&[u8], &Q8, usize) -> f32;
+        let has2 = is_x86_feature_detected!("avx2");
+        let has5 = is_x86_feature_detected!("avx512bw");
+        let in_f = 512usize; // 2 super-blocks: exercises the per-block accumulation, not just one
+        let q8 = quantize_q8(&det_x(in_f, 0xA11CE));
+        // (label, dtype, scalar, avx2, avx512bw)
+        let cases: &[(&str, DType, Dot, Dot, Dot)] = &[
+            (
+                "q4k",
+                DType::Q4K,
+                vec_dot_q4k_scalar,
+                |r, q, n| unsafe { vec_dot_q4k_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_q4k_avx512bw(r, q, n) },
+            ),
+            (
+                "q2k",
+                DType::Q2K,
+                vec_dot_q2k_scalar,
+                |r, q, n| unsafe { vec_dot_q2k_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_q2k_avx512bw(r, q, n) },
+            ),
+            (
+                "q3k",
+                DType::Q3K,
+                vec_dot_q3k_scalar,
+                |r, q, n| unsafe { vec_dot_q3k_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_q3k_avx512bw(r, q, n) },
+            ),
+            (
+                "q5k",
+                DType::Q5K,
+                vec_dot_q5k_scalar,
+                |r, q, n| unsafe { vec_dot_q5k_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_q5k_avx512bw(r, q, n) },
+            ),
+            (
+                "q6k",
+                DType::Q6K,
+                vec_dot_q6k_scalar,
+                |r, q, n| unsafe { vec_dot_q6k_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_q6k_avx512bw(r, q, n) },
+            ),
+            (
+                "q8_0",
+                DType::Q8_0,
+                vec_dot_q8_0_scalar,
+                |r, q, n| unsafe { vec_dot_q8_0_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_q8_0_avx512bw(r, q, n) },
+            ),
+            (
+                "iq4xs",
+                DType::Iq4Xs,
+                vec_dot_iq4xs_scalar,
+                |r, q, n| unsafe { vec_dot_iq4xs_avx2(r, q, n) },
+                |r, q, n| unsafe { vec_dot_iq4xs_avx512bw(r, q, n) },
+            ),
+        ];
+        let mut worst = 0f32;
+        for &(name, dtype, scalar, avx2, avx512) in cases {
+            let w = infr_testkit::synth_weight(dtype, in_f, 0x5EED);
+            let want = scalar(&w, &q8, in_f);
+            assert!(
+                want.abs() > 1e-3,
+                "{name}: scalar result is ~0, case is vacuous"
+            );
+            for (tier, on, f) in [("avx2", has2, avx2), ("avx512bw", has5, avx512)] {
+                if !on {
+                    eprintln!("skip {name} {tier}: not supported by this CPU");
+                    continue;
+                }
+                let got = f(&w, &q8, in_f);
+                let rel = tier_rel(got, want);
+                worst = worst.max(rel);
+                assert!(
+                    rel < TIER_TOL,
+                    "{name} {tier}: {got} vs scalar {want} (rel {rel:.3e} > {TIER_TOL:.0e})"
+                );
+            }
+        }
+        eprintln!("simd tier worst relative deviation from scalar: {worst:.3e}");
+    }
+
+    /// Multi-row (`_batch`, Q8 super-block activation) int8 dots: same tiers, plus the AVX-512
+    /// VNNI kernels, which are SEPARATE implementations the dispatch prefers when available.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_batch_tiers_match_the_scalar_kernel() {
+        type Bat = fn(&[u8], &[Q8], usize, &mut [f32]);
+        /// (tier label, supported by this CPU, kernel).
+        type Tier<'a> = (&'a str, bool, Bat);
+        /// (label, weight dtype, scalar kernel, the SIMD tiers to hold to it).
+        type Case<'a> = (&'a str, DType, Bat, &'a [Tier<'a>]);
+        let has2 = is_x86_feature_detected!("avx2");
+        let has5 = is_x86_feature_detected!("avx512bw");
+        let hasv = has5 && is_x86_feature_detected!("avx512vnni");
+        let in_f = 512usize;
+        // m = 3: odd, so the row-pair/row-8 groupings inside the batch kernels hit their tails.
+        let q8s: Vec<Q8> = (0..3)
+            .map(|r| quantize_q8(&det_x(in_f, 0xB0B + r as u64)))
+            .collect();
+        // (label, dtype, scalar, [(tier, supported, kernel)])
+        let cases: &[Case] = &[
+            (
+                "q4k_batch",
+                DType::Q4K,
+                vec_dot_q4k_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q4k_batch_avx2(r, q, n, o)
+                    }),
+                    ("avx512bw", has5, |r, q, n, o| unsafe {
+                        vec_dot_q4k_batch_avx512bw(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q4k_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q2k_batch",
+                DType::Q2K,
+                vec_dot_q2k_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q2k_batch_avx2(r, q, n, o)
+                    }),
+                    ("avx512bw", has5, |r, q, n, o| unsafe {
+                        vec_dot_q2k_batch_avx512bw(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q2k_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q3k_batch",
+                DType::Q3K,
+                vec_dot_q3k_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q3k_batch_avx2(r, q, n, o)
+                    }),
+                    ("avx512bw", has5, |r, q, n, o| unsafe {
+                        vec_dot_q3k_batch_avx512bw(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q3k_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q5k_batch",
+                DType::Q5K,
+                vec_dot_q5k_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q5k_batch_avx2(r, q, n, o)
+                    }),
+                    ("avx512bw", has5, |r, q, n, o| unsafe {
+                        vec_dot_q5k_batch_avx512bw(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q6k_batch",
+                DType::Q6K,
+                vec_dot_q6k_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q6k_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q6k_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q8_0_batch",
+                DType::Q8_0,
+                vec_dot_q8_0_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q8_0_batch_avx2(r, q, n, o)
+                    }),
+                    ("avx512bw", has5, |r, q, n, o| unsafe {
+                        vec_dot_q8_0_batch_avx512bw(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "iq4xs_batch",
+                DType::Iq4Xs,
+                vec_dot_iq4xs_batch_scalar,
+                &[("avx2", has2, |r, q, n, o| unsafe {
+                    vec_dot_iq4xs_batch_avx2(r, q, n, o)
+                })],
+            ),
+        ];
+        let m = q8s.len();
+        let mut worst = 0f32;
+        for &(name, dtype, scalar, tiers) in cases {
+            let w = infr_testkit::synth_weight(dtype, in_f, 0x5EED);
+            let mut want = vec![0f32; m];
+            scalar(&w, &q8s, in_f, &mut want);
+            assert!(
+                want.iter().any(|v| v.abs() > 1e-3),
+                "{name}: scalar result is ~0, case is vacuous"
+            );
+            for &(tier, on, f) in tiers {
+                if !on {
+                    eprintln!("skip {name} {tier}: not supported by this CPU");
+                    continue;
+                }
+                let mut got = vec![0f32; m];
+                f(&w, &q8s, in_f, &mut got);
+                for (r, (&g, &v)) in got.iter().zip(&want).enumerate() {
+                    let rel = tier_rel(g, v);
+                    worst = worst.max(rel);
+                    assert!(
+                        rel < TIER_TOL,
+                        "{name} {tier} row {r}: {g} vs scalar {v} (rel {rel:.3e} > {TIER_TOL:.0e})"
+                    );
+                }
+            }
+        }
+        eprintln!("simd batch tier worst relative deviation from scalar: {worst:.3e}");
+    }
+
+    /// The NATIVE 32-block family (`_32_batch` / `Q8x32` activations): the legacy round quants and
+    /// the 4-bit float formats, whose only SIMD tiers are avx2 and VNNI.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_blk32_tiers_match_the_scalar_kernel() {
+        type Bat32 = fn(&[u8], &[Q8x32], usize, &mut [f32]);
+        /// (tier label, supported by this CPU, kernel).
+        type Tier32<'a> = (&'a str, bool, Bat32);
+        /// (label, weight dtype, scalar kernel, the SIMD tiers to hold to it).
+        type Case32<'a> = (&'a str, DType, Bat32, &'a [Tier32<'a>]);
+        let has2 = is_x86_feature_detected!("avx2");
+        let hasv = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni");
+        let has5 = is_x86_feature_detected!("avx512bw");
+        let in_f = 512usize;
+        let q8s: Vec<Q8x32> = (0..3)
+            .map(|r| quantize_q8_32(&det_x(in_f, 0xC0DE + r as u64)))
+            .collect();
+        let cases: &[Case32] = &[
+            (
+                "q8_0_32",
+                DType::Q8_0,
+                vec_dot_q8_0_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q8_0_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("avx512bw", has5, |r, q, n, o| unsafe {
+                        vec_dot_q8_0_32_batch_avx512bw(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q8_0_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q5_0_32",
+                DType::Q5_0,
+                vec_dot_q5_0_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q5_0_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q5_0_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q4_0_32",
+                DType::Q4_0,
+                vec_dot_q4_0_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q4_0_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q4_0_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q4_1_32",
+                DType::Q4_1,
+                vec_dot_q4_1_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q4_1_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q4_1_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q5_1_32",
+                DType::Q5_1,
+                vec_dot_q5_1_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q5_1_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q5_1_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "q2_0",
+                DType::Q2_0,
+                vec_dot_q2_0_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_q2_0_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_q2_0_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "iq4nl_32",
+                DType::Iq4Nl,
+                vec_dot_iq4nl_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_iq4nl_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_iq4nl_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "mxfp4_32",
+                DType::Mxfp4,
+                vec_dot_mxfp4_32_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_mxfp4_32_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_mxfp4_32_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+            (
+                "nvfp4",
+                DType::Nvfp4,
+                vec_dot_nvfp4_batch_scalar,
+                &[
+                    ("avx2", has2, |r, q, n, o| unsafe {
+                        vec_dot_nvfp4_batch_avx2(r, q, n, o)
+                    }),
+                    ("vnni", hasv, |r, q, n, o| unsafe {
+                        vec_dot_nvfp4_batch_vnni(r, q, n, o)
+                    }),
+                ],
+            ),
+        ];
+        let m = q8s.len();
+        let mut worst = 0f32;
+        for &(name, dtype, scalar, tiers) in cases {
+            let w = infr_testkit::synth_weight(dtype, in_f, 0x5EED);
+            let mut want = vec![0f32; m];
+            scalar(&w, &q8s, in_f, &mut want);
+            assert!(
+                want.iter().any(|v| v.abs() > 1e-3),
+                "{name}: scalar result is ~0, case is vacuous"
+            );
+            for &(tier, on, f) in tiers {
+                if !on {
+                    eprintln!("skip {name} {tier}: not supported by this CPU");
+                    continue;
+                }
+                let mut got = vec![0f32; m];
+                f(&w, &q8s, in_f, &mut got);
+                for (r, (&g, &v)) in got.iter().zip(&want).enumerate() {
+                    let rel = tier_rel(g, v);
+                    worst = worst.max(rel);
+                    assert!(
+                        rel < TIER_TOL,
+                        "{name} {tier} row {r}: {g} vs scalar {v} (rel {rel:.3e} > {TIER_TOL:.0e})"
+                    );
+                }
+            }
+        }
+        eprintln!("simd blk32 tier worst relative deviation from scalar: {worst:.3e}");
+    }
 }

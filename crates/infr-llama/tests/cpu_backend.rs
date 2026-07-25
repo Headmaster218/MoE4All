@@ -391,6 +391,12 @@ fn gpu_seam_matches_cpu_qwen3_iq4xs() {
 /// the word-parallel `dqblk`; the A_GLOBAL/split-K variants are bit-identical to the f32 staging
 /// path (same dqblk, same MMA order), so this guards that the added pipelines stay token-faithful
 /// to the f32 CPU reference.
+///
+/// HISTORY: this test failed for a long stretch, and the GPU was NOT at fault. The oracle was the
+/// production CPU path, which quantizes activations to int8 (~4e-3 relative error, measured
+/// 4.5e-3 for Q2_K against the host decode) while the Vulkan f32 dequant GEMV sits at ~1e-7. At
+/// 2 bits that gap flips a greedy token. The oracle is now `CpuBackend::reference` (weights
+/// decoded to f32, f32 dot), against which the Vulkan seam matches token-for-token.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q2k() {
@@ -437,7 +443,8 @@ fn gpu_seam_flash_matches_cpu() {
         sentence why this process is essential for life on Earth.";
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(long, 24, None, |p| cpu_txt.push_str(p))
+        // REFERENCE oracle — see `seam_vulkan_matches_cpu`'s doc.
+        .generate_cpu_reference(long, 24, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model.generate_dense_vulkan(long, 24).expect("seam gen");
     // The f16 GPU flash/GEMM kernels and the f32 CPU oracle accumulate in different precision, so a
@@ -464,13 +471,19 @@ fn gpu_seam_flash_matches_cpu() {
 /// lower correctly through the Vulkan adapter — the CPU seam runs the IDENTICAL Graph. A near-tie
 /// argmax split (f16 GPU kernels vs f32 CPU) would show here as an early divergence; none of the
 /// covered models exhibit one on these prompts today, so keep the strict compare until it flakes.
+///
+/// The oracle is the REFERENCE CPU backend (`CpuBackend::reference`: weights decoded to f32, f32
+/// dot), NOT the production int8-activation kernels. Those carry ~4e-3 relative error on every
+/// quant dtype — measured against the host decode: CPU 3.4e-3..4.7e-3 vs Vulkan ~1e-7 — which is
+/// invisible at Q4_K+ but flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg
+/// therefore failed the more accurate implementation; the reference mode is the honest oracle.
 fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(path, None).expect("cpu load");
     let rendered = model.render_chat(prompt).expect("render chat");
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(&rendered, n, None, |p| cpu_txt.push_str(p))
+        .generate_cpu_reference(&rendered, n, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model
         .generate_dense_vulkan(&rendered, n)
@@ -898,7 +911,9 @@ fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
         .expect("render chat");
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(&rendered, 16, None, |p| cpu_txt.push_str(p))
+        // REFERENCE oracle — see `seam_vulkan_matches_cpu`'s doc: at Q2_K the production CPU
+        // kernels' int8-activation error is what moves tokens, not the GPU.
+        .generate_cpu_reference(&rendered, 16, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model
         .generate_dense_vulkan(&rendered, 16)
@@ -3534,7 +3549,8 @@ mod rocm_seam_gate {
 
         let mut cpu_txt = String::new();
         model
-            .generate_cpu(&rendered, n, None, |p| cpu_txt.push_str(p))
+            // REFERENCE oracle — see `seam_vulkan_matches_cpu`'s doc.
+            .generate_cpu_reference(&rendered, n, None, |p| cpu_txt.push_str(p))
             .expect("cpu gen");
 
         let mut rocm_txt = String::new();

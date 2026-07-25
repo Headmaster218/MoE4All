@@ -196,12 +196,35 @@ pub struct CpuBackend {
     /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
     /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
     pool: std::sync::OnceLock<pool::SpinPool>,
+    /// REFERENCE mode (see [`CpuBackend::reference`]): decode every quantized weight to f32 and
+    /// take an f32 dot, instead of the production int8-quantized-activation kernels. Off by
+    /// default — production CPU inference keeps the fast (and llama.cpp-equivalent) int8 path.
+    reference: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A backend in REFERENCE mode: every quantized `Op::Linear` (dense and MoE-expert) decodes
+    /// its weight to f32 and takes a plain f32 dot, so the only error left is the weight's own
+    /// quantization. The production path instead quantizes the ACTIVATIONS to int8 (the
+    /// llama.cpp `vec_dot_*_q8_K` regime) — same arithmetic ggml uses, and ~2-3 orders of
+    /// magnitude cheaper, but it carries ~4e-3 relative error on every dtype. That error is
+    /// invisible at Q4_K+ yet flips greedy tokens at Q2_K, which is why a GPU-vs-CPU token
+    /// comparison must use THIS mode as its oracle rather than the production kernels (see
+    /// `gpu_seam_matches_cpu_qwen3_q2k`): the GPU's f32 dequant GEMV is ~1e-7 against the host
+    /// decode, so the int8 CPU leg was the drifting one.
+    ///
+    /// Reference mode is for oracles and triage only — it is far slower and it is NOT what the
+    /// CPU goldens pin (`cpu_golden_qwen3` = the production int8 path).
+    pub fn reference() -> Self {
+        Self {
+            reference: true,
+            ..Self::default()
+        }
     }
 
     fn pool(&self) -> &pool::SpinPool {
@@ -685,6 +708,28 @@ impl Backend for CpuBackend {
                     let row0 = w_off as usize / in_f;
                     let wbytes: &[u8] = &bytes[row0 * bpr..(row0 + out_f) * bpr];
                     let mut out = vec![0f32; m * out_f];
+                    // REFERENCE mode (see `CpuBackend::reference`): decode the weight row to f32 and
+                    // take a plain f32 dot, so the ONLY error is the weight's own quantization —
+                    // the int8-activation kernels below carry ~4e-3 relative error, which flips
+                    // greedy tokens at Q2_K. The float dtypes already take an exact dot, so they
+                    // stay on their (identical, faster) production arms.
+                    if self.reference && !matches!(dt, DType::F32 | DType::F16 | DType::Bf16) {
+                        let mut out_t = vec![0f32; out_f * m];
+                        self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                            let row = &wbytes[o * bpr..o * bpr + bpr];
+                            let wf = bytes_to_f32(row, dt);
+                            for r in 0..m {
+                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                            }
+                        });
+                        self.pool().for_chunks_mut(&mut out, out_f, 1, &|r, orow| {
+                            for (o, dst) in orow.iter_mut().enumerate() {
+                                *dst = out_t[o * m + r];
+                            }
+                        });
+                        vals[dst.0 as usize] = out;
+                        continue;
+                    }
                     // One token (decode) is the hot path. Dispatch on the weight dtype to the fastest
                     // per-row kernel: integer Q8×Q4_K/Q6_K dots (quantize the activation once), direct
                     // f16/bf16/f32 dots, else fall back to dequant-to-f32 + dot. All fan out over rows.
@@ -1896,7 +1941,11 @@ impl Backend for CpuBackend {
                     // — so this alone replaces what used to be `rows` separate re-dequants of it),
                     // then a per-row softmax + top-`n_used` selection (independent per row, so
                     // parallel over rows is safe).
-                    let int8_ok = rows >= 2; // whole-call gate — see expert_matvec_batch's param doc
+                    // Whole-call gate — see expert_matvec_batch's param doc. REFERENCE mode
+                    // (`CpuBackend::reference`) forces every bank onto `ActsKind::Raw`, i.e. the
+                    // f32-activation path decode (rows == 1) already takes, so an oracle run has
+                    // no int8-activation error anywhere.
+                    let int8_ok = rows >= 2 && !self.reference;
                     let pool = self.pool();
                     // Router GEMM on the pool: serial it was 12-20ms/layer at 512 rows (134M MAC)
                     // — long enough that spinning pool workers SMT-throttled it, which is where

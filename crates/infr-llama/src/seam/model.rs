@@ -1797,6 +1797,36 @@ impl SeamModel {
         Ok(stats)
     }
 
+    /// [`Self::generate_cpu`] on the REFERENCE CPU backend ([`infr_cpu::CpuBackend::reference`]):
+    /// quantized weights are decoded to f32 and dotted in f32, so the run carries the weight's own
+    /// quantization error and nothing else. The production path quantizes ACTIVATIONS to int8
+    /// (llama.cpp's `vec_dot_*_q8_K` regime) at ~4e-3 relative error, which is invisible at Q4_K+
+    /// but flips greedy tokens at Q2_K — so this, not `generate_cpu`, is the oracle a GPU-vs-CPU
+    /// token comparison must be scored against. Slower; not what the CPU goldens pin.
+    pub fn generate_cpu_reference(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
+            infr_cpu::CpuBackend::reference(),
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            req,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+        )?;
+        Ok(stats)
+    }
+
     /// Token-level CPU greedy generation: prefill the given prompt token ids and stream each
     /// GENERATED token id through `on_id` (BOS/template handling is entirely the caller's — nothing
     /// is prepended). Returns the generated ids. The id-exact counterpart to [`Self::generate_cpu`],

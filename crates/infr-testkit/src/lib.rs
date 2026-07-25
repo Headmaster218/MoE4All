@@ -280,7 +280,10 @@ impl CaseReport {
 /// The oracle is deliberately the HOST DECODE, not another backend: comparing two backends only
 /// proves they agree, while comparing to `dequant_block` proves the device decoder implements the
 /// format. `tol` is a RELATIVE bound against `max|oracle|` — see each call site for its rationale.
-pub fn check_linear(be: &dyn Backend, case: LinearCase, tol: f32) -> CaseReport {
+/// The synthetic `(weight bytes, activations)` a [`LinearCase`] stands for — the same pair
+/// [`check_linear`] scores, exposed so a caller can drive TWO backends (or two modes of one
+/// backend) on identical inputs and compare them to each other instead of to the oracle.
+pub fn case_inputs(case: LinearCase) -> (Vec<u8>, Vec<f32>) {
     let LinearCase {
         dtype,
         m,
@@ -296,7 +299,52 @@ pub fn check_linear(be: &dyn Backend, case: LinearCase, tol: f32) -> CaseReport 
     } else {
         synth_weight(dtype, n, seed)
     };
-    let x = gen_f32(m * in_f, seed as usize ^ 0x9e37);
+    (w_bytes, gen_f32(m * in_f, seed as usize ^ 0x9e37))
+}
+
+/// Run one [`LinearCase`] on `be` and return the backend's raw output — [`check_linear`] without
+/// the scoring. Use it to compare two backends (e.g. `CpuBackend::new()` vs
+/// `CpuBackend::reference()`) on byte-identical inputs.
+pub fn run_linear(be: &dyn Backend, case: LinearCase) -> Vec<f32> {
+    let LinearCase {
+        dtype,
+        m,
+        in_f,
+        out_f,
+        ..
+    } = case;
+    let (w_bytes, x) = case_inputs(case);
+    let mut g = Graph::new();
+    let xid = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+    let wid = g.weight(TensorDesc::new(vec![out_f, in_f], dtype));
+    let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+    g.push(Op::Linear {
+        x: xid,
+        weight: wid,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    run_graph(
+        be,
+        &g,
+        &[(xid, f32_bytes(&x)), (wid, w_bytes)],
+        dst,
+        m * out_f,
+    )
+}
+
+pub fn check_linear(be: &dyn Backend, case: LinearCase, tol: f32) -> CaseReport {
+    let LinearCase {
+        dtype,
+        m,
+        in_f,
+        out_f,
+        ..
+    } = case;
+    let (w_bytes, x) = case_inputs(case);
     let w_ref = dequant_oracle(dtype, &w_bytes);
     let want = ref_linear(&x, &w_ref, m, in_f, out_f);
 

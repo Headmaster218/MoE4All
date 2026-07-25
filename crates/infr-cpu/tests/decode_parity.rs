@@ -53,6 +53,65 @@ fn cpu_linear_all_weight_quants_match_the_host_oracle_at_m1() {
     sweep_linear_on("cpu Linear m=1", &be, &cases, |_| CPU_INT8_ACT_TOL).assert_ok();
 }
 
+/// The REFERENCE backend ([`infr_cpu::CpuBackend::reference`]) on the SAME sweep: it decodes the
+/// weight to f32 and takes an f32 dot, so the int8-activation term above is gone entirely and only
+/// summation order is left. That is what makes it usable as the oracle a GPU-vs-CPU token
+/// comparison is scored against (`gpu_seam_matches_cpu_qwen3_q2k` failed for exactly this reason:
+/// the production CPU leg's ~4e-3 moved a greedy token at Q2_K while the GPU sat at ~1e-7).
+///
+/// The `1e-5` bound is ~3 orders tighter than [`CPU_INT8_ACT_TOL`] — if reference mode ever silently
+/// falls back to an int8 kernel, this test fails while the production sweeps stay green.
+#[test]
+fn cpu_reference_mode_is_exact_for_every_weight_quant() {
+    let be = infr_cpu::CpuBackend::reference();
+    for m in [1usize, 2] {
+        let cases = weight_quant_cases(m, 256, 8);
+        sweep_linear_on(&format!("cpu REFERENCE Linear m={m}"), &be, &cases, |_| {
+            1e-5
+        })
+        .assert_ok();
+    }
+}
+
+/// PRODUCTION vs REFERENCE, in-engine: the same `Op::Linear` graph run on `CpuBackend::new()` and
+/// on `CpuBackend::reference()`, scored against each other rather than against the host oracle.
+///
+/// The two sweeps above each pin one backend mode to `dequant_block`; this pins the two modes to
+/// EACH OTHER, which is what the GPU-vs-CPU seam comparison actually depends on. The reference is
+/// the slow-but-accurate implementation (~1e-5 vs the oracle); production is the fast int8-activation
+/// one (~4e-3). So this test states the production path's error BUDGET against the accurate path:
+/// inside `CPU_INT8_ACT_TOL` is rounding, outside it is a kernel bug — including a SIMD kernel that
+/// decodes a format wrongly on one machine's tier and not another's (see
+/// `kernels::kernel_tests::simd_tiers_match_the_scalar_kernel` for the per-tier version).
+#[test]
+fn cpu_production_matches_the_reference_backend() {
+    let prod = infr_cpu::CpuBackend::new();
+    let refb = infr_cpu::CpuBackend::reference();
+    for m in [1usize, 2] {
+        for case in weight_quant_cases(m, 256, 8) {
+            let got = infr_testkit::run_linear(&prod, case);
+            let want = infr_testkit::run_linear(&refb, case);
+            let mag = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+            assert!(
+                mag > 1e-3,
+                "{:?} m={m}: reference output is all-zero",
+                case.dtype
+            );
+            let rel = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |a, (g, w)| a.max((g - w).abs()))
+                / mag;
+            assert!(
+                rel < CPU_INT8_ACT_TOL,
+                "{:?} m={m}: production deviates {rel:.3e} from the reference backend \
+                 (budget {CPU_INT8_ACT_TOL:.1e})",
+                case.dtype
+            );
+        }
+    }
+}
+
 /// The dense float weight paths, which take no int8 activation quantization at all — so the bound
 /// is the f16 weight rounding (F16) or bit-exactness modulo f32 reassociation (F32).
 #[test]
