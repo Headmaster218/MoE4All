@@ -751,10 +751,9 @@ fn build_spilled_schedule(
     cap: usize,
 ) -> Vec<crate::weight_pager::SpilledBank> {
     let mut sched = Vec::new();
-    for (i, op) in g.ops.iter().enumerate() {
-        if skip.contains(&i) {
-            continue;
-        }
+    // The SAME walk the executor dispatches (`infr_core::exec::live_ops` — graph order, fused-away
+    // indices elided), so the ring's cursor can't drift from the op loop below.
+    for (_, op) in infr_core::exec::live_ops(&g.ops, skip) {
         let Op::Linear { weight, .. } = *op else {
             continue;
         };
@@ -842,38 +841,29 @@ pub fn execute_graph(
     // barrier below, before the cross-stream writeback DtoD + the final checked sync. With the
     // allocation churn gone (buffer pool), those per-op `hipMalloc`/`hipFree`/`hipStreamSynchronize`
     // device syncs — the real decode bottleneck — are all off the hot path. `fusion` was computed
-    // above (it also drives the Slice-37 prefetch schedule).
-    for (i, op) in g.ops.iter().enumerate() {
-        if fusion.skip.contains(&i) {
-            // Elided by a Slice-32 peephole (the RmsNorm folded into a following Linear, or the
-            // residual Add folded into a preceding Linear's GEMV epilogue).
-            continue;
-        }
-        run_op(
-            op,
+    // above (it also drives the Slice-37 prefetch schedule). The walk itself (graph order, the
+    // Slice-32-elided indices skipped) is the shared `infr_core::exec` skeleton; only `run_op`'s
+    // body is per-backend.
+    infr_core::exec::run_ops(
+        &g.ops,
+        &fusion.skip,
+        &mut RocmDispatch {
             g,
             bindings,
             pipelines,
-            &mut ctx,
-            fusion.norm.get(&i).copied(),
-            fusion.add.get(&i).copied(),
-        )?;
-    }
+            fusion: &fusion,
+            ctx: &mut ctx,
+        },
+    )?;
 
     // Barrier all queued op work before the writeback: the writeback `hipMemcpyDtoD` runs on the
     // NULL stream, which is NOT ordered against our non-default work stream, so it must observe a
     // completed stream first.
     unsafe { ffi::hipStreamSynchronize(stream) };
-    let direct = g.in_place_inputs();
-    for (i, decl) in g.tensors.iter().enumerate() {
-        let id = TensorId(i as u32);
-        let wb = matches!(decl.kind, TensorKind::Output)
-            || (decl.kind == TensorKind::Input
-                && decl.desc.dtype == DType::F32
-                && !direct.contains(&id));
-        if !wb {
-            continue;
-        }
+    // Outputs + mutated f32 Inputs; the in-place KV caches are already current in their bound
+    // buffers (shared predicate — `infr_core::exec::writes_back`, same set cpu/metal copy back).
+    for id in infr_core::exec::write_back_targets(g) {
+        let i = id.0 as usize;
         if let Some(b) = bindings.get(id) {
             let dst = rocm_buf(b);
             if let Some(ref dev_buf) = ctx.dev[i] {
@@ -963,6 +953,33 @@ fn decode_fusion(g: &Graph) -> DecodeFusion {
 }
 
 // ── Per-op dispatch ──────────────────────────────────────────────────────────
+
+/// This backend's hook into the shared op walk ([`infr_core::exec::run_ops`]): the ambient state
+/// [`run_op`] needs, plus the per-op fusion payload lookup the walk used to do inline. One method
+/// over the whole `&Op` — the `match Op::` and every HIP decision inside it stay below, in
+/// [`run_op`]. Monomorphized by `run_ops`, so the per-op call is the same direct call the
+/// hand-written loop made.
+struct RocmDispatch<'a, 'b, 'c> {
+    g: &'a Graph,
+    bindings: &'a Bindings<'b>,
+    pipelines: &'a Pipelines,
+    fusion: &'a DecodeFusion,
+    ctx: &'a mut ExecCtx<'c>,
+}
+
+impl infr_core::exec::OpDispatch for RocmDispatch<'_, '_, '_> {
+    fn dispatch(&mut self, i: usize, op: &Op) -> Result<()> {
+        run_op(
+            op,
+            self.g,
+            self.bindings,
+            self.pipelines,
+            self.ctx,
+            self.fusion.norm.get(&i).copied(),
+            self.fusion.add.get(&i).copied(),
+        )
+    }
+}
 
 macro_rules! args { ($($e:expr),* $(,)?) => { vec![$($e),*] }; }
 

@@ -4707,10 +4707,13 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // happens before any of them drop.
     let mut segments: std::collections::VecDeque<crate::recorder::PendingSegment> =
         std::collections::VecDeque::new();
-    for (op_idx, op) in graph.ops.iter().enumerate() {
-        if skip_op.contains(&op_idx) {
-            continue;
-        }
+    // Graph order with the fused-away indices elided — the shared walk definition
+    // (`infr_core::exec::live_ops`). Only the WALK is shared: everything between ops below (the
+    // submit splitter, the shutdown poll, the paged-MoE hand-off, the dense-streaming stage) is
+    // device-specific and stays here, so this path keeps its own loop body rather than an
+    // `OpDispatch`. `record_decode_replay` can't even use this much — its skip set is MUTATED
+    // mid-walk by the E2B `Linear`+`GatedAct` peephole.
+    for (op_idx, op) in infr_core::exec::live_ops(&graph.ops, &skip_op) {
         // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
         // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
         // tokens, because on the devices that split (§ the splitter above) a single forward is

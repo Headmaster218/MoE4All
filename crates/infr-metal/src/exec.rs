@@ -4,6 +4,7 @@
 use crate::{metal_buf, MetalBackend};
 use infr_core::backend::{Bindings, Plan};
 use infr_core::error::Error;
+use infr_core::exec::Provision;
 use infr_core::graph::{Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_core::Result;
@@ -718,10 +719,10 @@ struct Resident {
     enc: Option<ComputeCommandEncoder>,
     tape: Option<Vec<TapeEntry>>,
     posbuf: Option<MtlBuffer>,
-    /// Linear→Add residual fusion (see `linear_add_peephole`): Linear op index → (residual
-    /// tensor, final dst); the absorbed Adds are in `skip`.
+    /// Linear→Add residual fusion (see [`fusion_cfg`]): Linear op index → (residual tensor, final
+    /// dst). The absorbed `Add`s are in the walk's skip set, which lives with the walk (`run_graph`'s
+    /// local, handed to `infr_core::exec::run_ops`) rather than here — only `run_op` reads `fused`.
     fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
-    skip: std::collections::HashSet<usize>,
     /// GPU-counter sampling state (`INFR_METAL_PROFILE=3`): the timestamp sample buffer, the
     /// next free sample slot, the (op name, start-sample) log for this batch, and the op the
     /// walk is currently encoding (sub-dispatches attribute to their parent op).
@@ -758,6 +759,65 @@ fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
         }),
         rmsnorm_linear: None,
         kv_write: false,
+    }
+}
+
+/// This backend's hook into the shared op walk ([`infr_core::exec::run_ops`]): the ambient state
+/// [`MetalBackend::run_op`] needs, plus the per-op profiling and the seal-the-encoder-before-
+/// unwinding cleanup that used to sit in `run_graph`'s two loops. One method over the whole `&Op` —
+/// the `match Op::` and every Metal decision inside it stay in `run_op`.
+///
+/// `PROF` is a CONST parameter, not a field: `run_graph` picks the instantiation once from
+/// `profiling_enabled()` and `run_ops` monomorphizes, so the profiling half is compiled out of the
+/// hot walk exactly as the two separate loops it replaces kept it out — no per-op branch added.
+struct MetalDispatch<'a, 'b, const PROF: bool> {
+    be: &'a MetalBackend,
+    g: &'a infr_core::graph::Graph,
+    bindings: &'a Bindings<'b>,
+    r: &'a mut Resident,
+}
+
+impl<const PROF: bool> infr_core::exec::OpDispatch for MetalDispatch<'_, '_, PROF> {
+    fn dispatch(&mut self, idx: usize, op: &Op) -> Result<()> {
+        let t0 = PROF.then(std::time::Instant::now);
+        if PROF {
+            self.r.cur_op = op_name(op);
+        }
+        if let Err(e) = self.be.run_op(op, idx, self.g, self.bindings, self.r) {
+            // Seal the open encoder before unwinding — dropping it un-ended is a Metal
+            // assertion failure that masks the real error.
+            self.be.flush(self.r);
+            return Err(e);
+        }
+        if PROF {
+            // Counter mode: seal this op's encoder (the command buffer stays open) so the
+            // next op's dispatches land in their own sampled encoder.
+            if self.be.active_counter_set().is_some() {
+                if let Some(e) = self.r.enc.take() {
+                    e.end_encoding();
+                }
+            }
+            let enc = t0.expect("PROF ⇒ t0 taken").elapsed();
+            // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
+            let gpu = if self.be.prof_ops {
+                let tg = std::time::Instant::now();
+                self.be.flush(self.r);
+                Some(tg.elapsed())
+            } else {
+                None
+            };
+            let mut pr = self.be.prof.lock().unwrap();
+            let name = if self.be.active_counter_set().is_some() {
+                self.r.cur_op
+            } else {
+                op_name(op)
+            };
+            pr.add_op(name, enc);
+            if let Some(gpu) = gpu {
+                pr.add_op_gpu(op_name(op), gpu);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1834,7 +1894,6 @@ impl MetalBackend {
             tape: record.then(Vec::new),
             posbuf: None,
             fused: std::collections::HashMap::new(),
-            skip: std::collections::HashSet::new(),
             csb: None,
             csb_idx: 0,
             op_samples: Vec::new(),
@@ -1866,11 +1925,11 @@ impl MetalBackend {
                 }
             }
         }
-        {
+        let skip = {
             let plan = infr_core::fusion::plan_fusions(g, &fusion_cfg());
             r.fused = plan.linear_add;
-            r.skip = plan.skip;
-        }
+            plan.skip
+        };
         if record {
             // Recording (`replay_shape` held): the tape must read/write the BOUND buffers, not
             // per-execute host-mirror copies — the engine mutates the bound hidden/positions
@@ -1907,99 +1966,67 @@ impl MetalBackend {
                 .expect("replay_shape checked QkNormRope/Rope");
             r.posbuf = Some(metal_buf(bindings.get(positions).unwrap()).raw.clone());
         }
-        for (i, decl) in g.tensors.iter().enumerate() {
-            match decl.kind {
-                TensorKind::Internal | TensorKind::Output => {
-                    r.vals[i] = vec![0f32; decl.desc.numel()]
-                }
-                TensorKind::Input if direct.contains(&TensorId(i as u32)) => {}
-                TensorKind::Input if record && decl.desc.dtype == DType::F32 => {}
-                TensorKind::Input => {
-                    let buf = metal_buf(
-                        bindings
-                            .get(TensorId(i as u32))
-                            .expect("metal backend: unbound Input"),
-                    );
+        // Per-kind working-store setup, classified by the shared `infr_core::exec::Provision` (the
+        // cpu interpreter makes the identical calls) — the one Metal-specific arm is the recording
+        // case, whose f32 Inputs were direct-BOUND above and so need no host mirror.
+        for (id, decl, p) in infr_core::exec::provisions(g) {
+            let i = id.0 as usize;
+            match p {
+                Provision::Zero => r.vals[i] = vec![0f32; decl.desc.numel()],
+                Provision::Load if record && decl.desc.dtype == DType::F32 => {}
+                Provision::Load => {
+                    let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Input"));
                     let bytes = Self::read_bytes(buf);
                     r.vals[i] = bytes_to_f32(&bytes, decl.desc.dtype);
                 }
-                TensorKind::Weight => {}
+                // A Weight (dequantized at its use site) or an in-place KV Input.
+                Provision::Skip => {}
             }
         }
 
+        // The walk (graph order, fused-away indices elided) is the shared `infr_core::exec`
+        // skeleton; the per-op body — and the profiling/encoder-sealing that wraps it — stays here,
+        // in `MetalDispatch`. `profiling_enabled()` picks the instantiation ONCE, outside the walk,
+        // exactly as the two separate loops it replaces did.
         if self.profiling_enabled() {
-            for (idx, op) in g.ops.iter().enumerate() {
-                if r.skip.contains(&idx) {
-                    continue;
-                }
-                let t0 = std::time::Instant::now();
-                r.cur_op = op_name(op);
-                if let Err(e) = self.run_op(op, idx, g, bindings, &mut r) {
-                    // Seal the open encoder before unwinding — dropping it un-ended is a Metal
-                    // assertion failure that masks the real error.
-                    self.flush(&mut r);
-                    return Err(e);
-                }
-                // Counter mode: seal this op's encoder (the command buffer stays open) so the
-                // next op's dispatches land in their own sampled encoder.
-                if self.active_counter_set().is_some() {
-                    if let Some(e) = r.enc.take() {
-                        e.end_encoding();
-                    }
-                }
-                let enc = t0.elapsed();
-                // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
-                let gpu = if self.prof_ops {
-                    let tg = std::time::Instant::now();
-                    self.flush(&mut r);
-                    Some(tg.elapsed())
-                } else {
-                    None
-                };
-                let mut pr = self.prof.lock().unwrap();
-                let name = if self.active_counter_set().is_some() {
-                    r.cur_op
-                } else {
-                    op_name(op)
-                };
-                pr.add_op(name, enc);
-                if let Some(gpu) = gpu {
-                    pr.add_op_gpu(op_name(op), gpu);
-                }
-            }
+            infr_core::exec::run_ops(
+                &g.ops,
+                &skip,
+                &mut MetalDispatch::<true> {
+                    be: self,
+                    g,
+                    bindings,
+                    r: &mut r,
+                },
+            )?;
             self.prof.lock().unwrap().add_forward();
         } else {
-            for (idx, op) in g.ops.iter().enumerate() {
-                if r.skip.contains(&idx) {
-                    continue;
-                }
-                if let Err(e) = self.run_op(op, idx, g, bindings, &mut r) {
-                    // Seal the open encoder before unwinding — dropping it un-ended is a Metal
-                    // assertion failure that masks the real error.
-                    self.flush(&mut r);
-                    return Err(e);
-                }
-            }
+            infr_core::exec::run_ops(
+                &g.ops,
+                &skip,
+                &mut MetalDispatch::<false> {
+                    be: self,
+                    g,
+                    bindings,
+                    r: &mut r,
+                },
+            )?;
         }
 
-        // Write back Outputs (and mutated f32 Inputs, e.g. recurrent state) to their bound buffers.
-        for (i, decl) in g.tensors.iter().enumerate() {
-            let write_back = matches!(decl.kind, TensorKind::Output)
-                || (decl.kind == TensorKind::Input
-                    && decl.desc.dtype == DType::F32
-                    && !direct.contains(&TensorId(i as u32)));
-            if !write_back {
-                continue;
-            }
-            if bindings.get(TensorId(i as u32)).is_some() {
-                let b = metal_buf(bindings.get(TensorId(i as u32)).unwrap());
+        // Write back Outputs (and mutated f32 Inputs, e.g. recurrent state) to their bound buffers;
+        // the in-place KV caches are already current. Shared predicate — `infr_core::exec::
+        // writes_back`, the same set cpu/rocm copy back.
+        for id in infr_core::exec::write_back_targets(g) {
+            let i = id.0 as usize;
+            if bindings.get(id).is_some() {
+                let b = metal_buf(bindings.get(id).unwrap());
                 // Direct-bound (recording): the GPU already wrote the bound buffer — nothing to
                 // copy, the trailing flush below makes it visible.
                 if matches!(&r.dev[i], Some(d) if d.contents() == b.raw.contents()) {
                     continue;
                 }
                 // Pull the value back to the host mirror (flushes the batch if it's still on-device).
-                self.ensure_host(&mut r, g, TensorId(i as u32));
+                self.ensure_host(&mut r, g, id);
                 let src: &[u8] = bytemuck::cast_slice(&r.vals[i]);
                 unsafe {
                     std::ptr::copy_nonoverlapping(

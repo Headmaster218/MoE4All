@@ -20,7 +20,8 @@ mod repack;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::error::Result;
-use infr_core::graph::{AttnMask, Graph, MoeGating, Op, TensorKind};
+use infr_core::exec::Provision;
+use infr_core::graph::{AttnMask, Graph, MoeGating, Op};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -477,22 +478,20 @@ impl Backend for CpuBackend {
         // `kv_len` rows. They're sized for the WHOLE context (`max_ctx`), so loading them into `vals`
         // (and writing them back) each token would cost O(max_ctx) memory traffic per token instead of
         // O(kv_len) — catastrophic at a large `max_new`. Skip the round-trip for them. Which tensors
-        // are written in place is graph semantics, computed once by `Graph::in_place_inputs`.
-        let direct = g.in_place_inputs();
-        for (i, decl) in g.tensors.iter().enumerate() {
-            match decl.kind {
-                TensorKind::Internal | TensorKind::Output => {
-                    vals[i] = vec![0f32; decl.desc.numel()]
-                }
-                TensorKind::Input if direct.contains(&TensorId(i as u32)) => {} // read/written in place
-                TensorKind::Input => {
-                    let buf = bindings
-                        .get(TensorId(i as u32))
-                        .expect("cpu backend: unbound Input");
+        // are written in place is graph semantics, computed once by `Graph::in_place_inputs`; the
+        // per-kind classification is the shared `infr_core::exec::Provision` (metal's interpreter
+        // makes the identical calls).
+        for (id, decl, p) in infr_core::exec::provisions(g) {
+            let i = id.0 as usize;
+            match p {
+                Provision::Zero => vals[i] = vec![0f32; decl.desc.numel()],
+                Provision::Load => {
+                    let buf = bindings.get(id).expect("cpu backend: unbound Input");
                     let bytes = cpu_buf(buf).read();
                     vals[i] = bytes_to_f32(&bytes, decl.desc.dtype);
                 }
-                TensorKind::Weight => {} // lazily dequantized in `weight()`
+                // A Weight (lazily dequantized in `weight()`) or an in-place KV Input.
+                Provision::Skip => {}
             }
         }
 
@@ -2547,19 +2546,13 @@ impl Backend for CpuBackend {
         }
 
         // Write back the buffers the model reads after execute: Outputs (logits) and mutated f32
-        // Inputs (conv/recurrent state). KV caches (`direct`) were written in place by `WriteKv`, so
-        // they're skipped — no full-cache copy. Weights are read-only; positions are I32, unchanged.
-        for (i, decl) in g.tensors.iter().enumerate() {
-            let write_back = matches!(decl.kind, TensorKind::Output)
-                || (decl.kind == TensorKind::Input
-                    && decl.desc.dtype == DType::F32
-                    && !direct.contains(&TensorId(i as u32)));
-            if !write_back {
-                continue;
-            }
-            if let Some(buf) = bindings.get(TensorId(i as u32)) {
+        // Inputs (conv/recurrent state). KV caches were written in place by `WriteKv`, so they're
+        // skipped — no full-cache copy. Weights are read-only; positions are I32, unchanged. The
+        // predicate is the shared `infr_core::exec::writes_back` (metal/rocm select the same set).
+        for id in infr_core::exec::write_back_targets(g) {
+            if let Some(buf) = bindings.get(id) {
                 let mut d = cpu_buf(buf).owned();
-                d.copy_from_slice(bytemuck::cast_slice(&vals[i]));
+                d.copy_from_slice(bytemuck::cast_slice(&vals[id.0 as usize]));
             }
         }
         Ok(())

@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod error;
+pub mod exec;
 pub mod fusion;
 pub mod graph;
 pub mod iquant_grids;

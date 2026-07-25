@@ -81,7 +81,78 @@ RmsNorm→Linear are further backend-agnostic rewrites.
   `INFR_ROCM_NO_FUSE_*`) into one policy. Pure host logic over the IR, no device
   types. Cleanest high-value win.
 
-### B. Graph-executor skeleton (residency + op-walk) — HIGH / MED ⭐
+### B. Graph-executor skeleton (residency + op-walk) — HIGH / MED ⭐ ⚠️ PARTLY LANDED
+
+**Done — the residency CONTRACT and the WALK; not the container, not the per-op
+bodies.** `infr-core/src/exec.rs` now hosts the device-agnostic half of the
+skeleton, and every backend that can consume a given piece does:
+
+- **`Provision` / `provisions(graph)`** — the pre-walk per-handle action (`Zero`
+  an `Internal`/`Output`, `Load` a bound `Input`, `Skip` a `Weight` or an
+  in-place KV `Input` per `Graph::in_place_inputs`). The cpu and Metal
+  interpreters' setup loops were the same `match decl.kind` + `direct.contains`
+  ladder; both now classify through it. Metal's one genuine extra arm (recording
+  binds f32 `Input`s directly, so they need no host mirror) stays a guard inside
+  its `Load` arm.
+- **`writes_back` / `write_back_targets(graph)`** — the post-walk predicate
+  `Output || (Input && F32 && !in_place)`, which was **byte-identical in three**
+  executors (cpu, Metal, ROCm) and is the one that silently corrupts if it
+  drifts. All three now select the same set; the copy itself (host memcpy /
+  `hipMemcpyDtoD` / unified-memory store) stays per-backend.
+- **`live_ops(ops, skip)`** — THE definition of the walk: graph order with the
+  fusion-elided indices skipped. Four call sites: ROCm's executor (via
+  `run_ops`), ROCm's **dense-weight prefetch schedule** (a separate pass whose
+  cursor must track the op walk exactly or a staged bank goes to the wrong
+  `Linear` — it now iterates the same function instead of re-spelling the
+  filter), Metal's executor (via `run_ops`), and Vulkan's `execute_static`.
+- **`OpDispatch` + `run_ops`** — the walk as a driver, generic
+  (`impl OpDispatch`, never `&dyn`), adopted by the two backends whose per-op
+  body is already one function: ROCm (`RocmDispatch`, which also does the per-op
+  fusion payload lookup) and Metal (`MetalDispatch<const PROF: bool>`). Metal's
+  two loops — profiled and not — collapse into one walk plus a
+  **const**-parameter instantiation chosen once outside it, so the profiling
+  half is still compiled out of the hot path rather than becoming a per-op
+  branch.
+
+**NOT done — the residency CONTAINER.** The four disagree for real reasons, not
+drift: cpu keeps a host-only `Vec<Vec<f32>>`; ROCm keeps
+`dev: Vec<Option<RocmBuffer>>` + a lazily-filled `vals: Vec<Option<Vec<f32>>>`;
+Metal keeps both **plus** a `loc: Vec<Loc>` host/device tracker (43 sites) with
+no ROCm analogue — because Metal's `ensure_device` uploads the host mirror and
+ROCm's never does (it binds the bound buffer, or allocates zeroed pool scratch).
+Vulkan has no per-op residency at all: its `Internal` scratch is allocated up
+front by `alloc_scratch` and the walk only records. A common `Residency<D>`
+would be either the LCD (drop `loc`) or the union (a dead `loc` on ROCm), and
+either way all ~240 `vals`/`dev`/`loc` accesses **inside the per-op bodies**
+would be rewritten — behavior-neutral in principle, a rewrite in fact.
+
+**NOT done — a per-op trait method (`fn rms_norm(...)`, one per variant).** The
+`match Op::` arm sets are parallel, but the arms need wildly different ambient
+state: Vulkan's `lower_op` threads 15 extra parameters (recorder, scratch, pool,
+dyn-attn contexts, mmv memo, streamed-weight substitution), ROCm's takes the two
+per-op fusion payloads, Metal's the `Resident` + tape. A 27-method trait would
+move ~10k lines of op bodies, save no lines (a `Op::X { a, b } =>` header
+becomes an `fn x(&mut self, a: .., b: ..)` header), and still have to carry each
+backend's ambient state in its `Self`. That is a rewrite, and the goldens are
+the only thing that would catch a slip.
+
+**NOT done — Vulkan on the shared skeleton.** It is a **recorder**, not an
+interpreter: no host values, no residency transitions, and its loop carries five
+device concerns between ops (submit splitter, shutdown poll, paged-MoE hand-off,
+dense-streaming stage, and an E2B `Linear`+`GatedAct` peephole that **mutates**
+the skip set mid-walk). `execute_static` takes `live_ops` and keeps its own
+body; `record_decode_replay` can't take even that, because `live_ops` borrows
+the skip set immutably. Hooks for all five would be LCD flattening, not
+unification.
+
+**NOT done — cpu on the walk.** Its ~2000 lines of op bodies are inline in the
+`for op in &g.ops` loop, not a `run_op` function, so `OpDispatch` would mean
+moving all of them into a trait method; and cpu runs **no** fusion pass, so a
+shared `skip`-checking walk would add a per-op `HashSet::contains` the current
+loop does not pay. cpu takes the residency contract only.
+
+Behavior: same ops, same order, same host/device sync points, same error text,
+same env vars; no golden moved. Original audit notes below (historical).
 
 Every backend runs the same skeleton: a per-`TensorId` residency array
 (`dev: Vec<Option<DeviceBuf>>` + `vals: Vec<Option<Vec<f32>>>`), a walk over
@@ -318,7 +389,11 @@ arithmetic (`ring_bytes_policy` `pager.rs:606`). Also: vulkan's
    prefill-GEMM split-K formulas that stayed per-backend and why.
 4. **B. GraphExecutor skeleton** — the biggest structural prize, but it touches
    every backend's hot loop; do it only after A/F prove the shared-IR-pass
-   pattern and with the full per-backend test suites as the guardrail.
+   pattern and with the full per-backend test suites as the guardrail. **Landed
+   in part** — the residency contract (`Provision`/`writes_back`) and the walk
+   (`live_ops`/`OpDispatch`) are shared; see its entry for why the residency
+   container, the per-op bodies, Vulkan's recorder and cpu's inline walk stayed
+   where they are.
 5. **H** shared decode-spec + parity harness and **I** KV/budget math —
    spec/test and math hoists (not runtime dedup); H also closes the rocm/metal
    parity-test gap.
