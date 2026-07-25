@@ -597,24 +597,11 @@ pub struct MoePagerLayout {
     pub ring_bytes: usize,
 }
 
-/// Upload-ring sizing policy: `INFR_PAGER_RING` (shared size grammar) wins; otherwise an eighth
-/// of the pager budget, clamped to [256 MiB, 2 GiB]. Bigger halves = fewer pipeline rotations,
-/// and each rotation stalls the CPU on the other half's fence — measured on Scout pp512 (miss-
-/// heavy steady state, ~22 GB staged/rep): 256 MiB → 224 t/s, 1 GiB → 324, 2 GiB → 404, flat
-/// beyond. The budget fraction keeps small explicit `INFR_CACHE` runs from spending most of
-/// their grant on staging instead of arena slots.
-pub fn ring_bytes_policy(pager_budget: u64) -> usize {
-    const MIB: u64 = 1024 * 1024;
-    if let Some(b) = std::env::var("INFR_PAGER_RING")
-        .ok()
-        .and_then(|v| infr_core::parse_size(&v))
-        .map(|s| s.resolve(0) as usize)
-        .filter(|&b| b > 0)
-    {
-        return b;
-    }
-    (pager_budget / 8).clamp(256 * MIB, 2048 * MIB) as usize
-}
+/// Upload-ring sizing policy — pure budget arithmetic, so it lives in the shared seam
+/// ([`infr_core::pager::ring_bytes_policy`], which owns the doc and the boundary tests). Re-exported
+/// under this crate's old path because the ring it sizes is a Vulkan buffer pair and every call
+/// site here reads better next to them.
+pub use infr_core::pager::ring_bytes_policy;
 
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {

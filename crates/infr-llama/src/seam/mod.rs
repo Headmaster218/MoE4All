@@ -687,9 +687,7 @@ pub(crate) fn pin_kv_auto_q8() {
 /// (KV in host) rather than clamping/erroring when it doesn't fit VRAM. Must match the backend's
 /// own `kv_overflow_enabled` (empty or `0` = off). Off by default.
 pub(crate) fn kv_overflow_enabled() -> bool {
-    std::env::var("INFR_KV_OVERFLOW")
-        .ok()
-        .is_some_and(|v| !v.is_empty() && v != "0")
+    infr_core::budget::env_flag("INFR_KV_OVERFLOW")
 }
 
 /// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
@@ -764,11 +762,10 @@ pub(crate) fn kv_bytes_estimate(
 /// `q8`, else both f16 (2 B/elem). The pure per-layer core of [`kv_bytes_estimate`], honoring the
 /// q8 flag so the dense sweep and the MoE budget price a pinned auto-q8 cache at ~half the bytes.
 fn kv_pair_bytes(elems: u64, q8: bool) -> u64 {
-    if q8 {
-        2 * (elems / 32 * 34).next_multiple_of(4)
-    } else {
-        2 * 2 * elems
-    }
+    let side = if q8 { DType::Q8_0 } else { DType::F16 };
+    // Priced through the SAME sizer the runner allocates with, so "mirrors `kv_fmt_bytes`" is
+    // now a call rather than a comment.
+    2 * kv_fmt_bytes(side, elems as usize) as u64
 }
 
 /// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
@@ -786,11 +783,15 @@ fn kv_pair_bytes(elems: u64, q8: bool) -> u64 {
 ///     never learned the ring split — they keep full-context caches, documented scope gate);
 ///   - INFR_NO_KV_RING=1 (A/B and escape hatch).
 pub(crate) fn kv_ring_wanted(cfg: &Config) -> bool {
-    let fmt_ok = |var: &str| {
-        matches!(
-            std::env::var(var).ok().as_deref(),
-            None | Some("f16") | Some("F16") | Some("q8_0") | Some("q8") | Some("Q8_0")
-        )
+    // Unset = the f16 default = ring-capable; otherwise the requested format must PARSE to f16 or
+    // q8 (a name the runner would not recognize either is not ring-capable). Spellings come from
+    // the one shared table, so adding an alias cannot make this gate and the runner disagree.
+    let fmt_ok = |var: &str| match std::env::var(var).ok() {
+        None => true,
+        Some(v) => matches!(
+            infr_core::budget::parse_kv_dtype(&v),
+            Some(DType::F16 | DType::Q8_0)
+        ),
     };
     cfg.swa_window > 0
         && !cfg.diffusion_gemma
@@ -1031,7 +1032,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // `MoePagerSession`'s `ring` doc) lives in the same VRAM the arenas do: subtract it
             // from the budget BEFORE splitting arena shares so the paged footprint stays within
             // what the caller granted (INFR_CACHE) / what the auto tier measured as free.
-            let ring_bytes = infr_vulkan::pager::ring_bytes_policy(pager_budget_bytes);
+            let ring_bytes = infr_core::pager::ring_bytes_policy(pager_budget_bytes);
             pager_budget_bytes = pager_budget_bytes.saturating_sub(ring_bytes as u64);
             let total_bytes: u64 = pool_blocks
                 .iter()
@@ -1327,7 +1328,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         .sum();
                     // "Covers": the budget minus its own upload-ring share holds every block.
                     let covers = |b: u64| {
-                        b.saturating_sub(infr_vulkan::pager::ring_bytes_policy(b) as u64) >= need
+                        b.saturating_sub(infr_core::pager::ring_bytes_policy(b) as u64) >= need
                     };
                     let ub_now = ubatch_rows();
                     let mut cands = vec![ub_now];
@@ -1362,7 +1363,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 planned.push((comps.clone(), pool, block_id));
             }
             // The pinned upload ring lives in the same VRAM the arenas do — subtract it first.
-            let ring_bytes = infr_vulkan::pager::ring_bytes_policy(budget);
+            let ring_bytes = infr_core::pager::ring_bytes_policy(budget);
             budget = budget.saturating_sub(ring_bytes as u64);
             let total_bytes: u64 = pools
                 .iter()
@@ -2551,23 +2552,11 @@ fn kv_forces_static(dt: DType) -> bool {
     )
 }
 
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
-    match dt {
-        DType::Q8_0 => (elems / 32 * 34).next_multiple_of(4),
-        // TurboQuant 128-elem blocks: turbo2 = 34 B, turbo3 = 50 B, turbo4 = 66 B.
-        DType::Turbo2 => elems / 128 * 34,
-        DType::Turbo3 => elems / 128 * 50,
-        DType::Turbo4 => elems / 128 * 66,
-        // Mainline low-bit KV quants (32-elem blocks) + bf16.
-        DType::Q4_0 | DType::Iq4Nl => elems / 32 * 18,
-        DType::Q4_1 => elems / 32 * 20,
-        DType::Q5_0 => elems / 32 * 22,
-        DType::Q5_1 => elems / 32 * 24,
-        DType::F16 | DType::Bf16 => elems * 2,
-        _ => elems * 4, // F32
-    }
-}
+/// Exact KV buffer size for a format — pure format arithmetic, so it lives in the shared seam
+/// ([`infr_core::budget::kv_fmt_bytes`], which owns the doc and the pinning tests) next to the
+/// per-element rate the placement estimates use. Re-exported under the old crate-private name
+/// because every call site here is a `Backend::alloc` argument.
+pub(crate) use infr_core::budget::kv_fmt_bytes;
 
 /// gemma4 E2B: gather + dequant this chunk's per-layer TOKEN embedding rows on the host — the ONLY
 /// part llama.cpp keeps host-side ("very little benefit to offloading the input layer"); the

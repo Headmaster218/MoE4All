@@ -467,14 +467,82 @@ oracle informally.
   Closes the rocm/metal parity-test gap. Not a runtime dedup — a _spec + test_
   seam.
 
-### I. KV/paging budget math — MED / MIXED
+### I. KV/paging budget math — MED / MIXED ✅ LANDED
 
-The paging _policy_ is shared (`Pager`); the _device wiring_ stays per-backend.
-Shareable slices: the KV-format→bytes math (partly hoisted: `kv_bytes_per_elem`
-`seam/model.rs:330`, `INFR_KV_TYPE_K/V` parsing) and the ring-size budget
-arithmetic (`ring_bytes_policy` `pager.rs:606`). Also: vulkan's
-`kv_overflow_report` is itself duplicated 4× internally (`lib.rs:3319`,
-`tp.rs:783`, `ep.rs:498`, `pipeline.rs:644`).
+**Done — every device-independent piece; the placement DECISIONS stay per
+backend.** `infr-core/src/budget.rs` is the new home, plus one function moved
+into `infr-core/src/pager.rs`:
+
+- **`parse_kv_dtype(name)`** — the `INFR_KV_TYPE_K`/`_V` name grammar (llama's
+  `--cache-type-k`/`-v`), now the ONE spelling table. It was written twice with
+  the same 15 names: the runner's `parse_kv_fmt` (→ an allocated `DType`) and
+  `seam/model.rs`'s `kv_bytes_per_elem` (→ a priced rate), i.e. the two places
+  that had to agree or the ctx clamp would price a format the runner never
+  allocated. A third partial copy (`kv_ring_wanted`'s `fmt_ok`, the f16/q8
+  spellings) now goes through it too. The per-format **gates** — `kv_align_ok`,
+  which backends have a Q8 KV kernel, TurboQuant's `head_dim % 128` — stay in
+  the runner, so a gated-out or unrecognized request falls through to the same
+  default ladder as before.
+- **`kv_fmt_bytes(dt, elems)` / `kv_bytes_per_elem(dt)`** — the exact allocation
+  size and the fractional per-element rate the fit estimates divide by. The rate
+  is now read off `decode_spec::block_layout` instead of a second hand-written
+  table of ratios, and `kv_pair_bytes`'s `2 * (elems/32*34).next_multiple_of(4)`
+  (whose comment said "mirrors `kv_fmt_bytes`") is a call to it. `infr-metal`'s
+  parity suite had a fourth copy of the sizer — one that had already silently
+  lost its `Q8_0` arm — and now imports the shared one.
+- **`SpillTally` / `SpillCounts` / `spill_report_line` / `SpillNouns`** — the
+  VRAM-first placement bookkeeping and its banner. The `kv_overflow_report`
+  count-4 in the audit below was really **two** bodies (Vulkan `lib.rs`, ROCm
+  `backend.rs` — the audit missed ROCm's) plus **three** three-line fan-outs
+  (`tp`/`ep`/`pipeline`, now `infr_core::backend::kv_overflow_report_each`) —
+  and a **fifth** body nobody had counted, ROCm's `weight_overflow_report`,
+  which is the identical skeleton for `INFR_ROCM_WEIGHT_OVERFLOW`. All three
+  bodies now share the counters, the cumulative-cap gate (`SpillTally::admits`)
+  and the message skeleton; each supplies its own nouns. Backend-parameterized
+  twice over: the spill clause is passed in (ROCm's host pages are page-locked,
+  Vulkan reads its by device address) and so is the byte formatter, because
+  Vulkan prints MiB to one decimal and ROCm to two and the banner is
+  user-visible text.
+- **`env_flag` / `env_mib` / `overflow_vram_reserve`** — the `INFR_*` grammars
+  the spill knobs share: the `empty`/`0` = off flag (4 copies: Vulkan, ROCm ×2,
+  the seam's `kv_overflow_enabled`), the MiB→bytes cap parse (3 copies), and the
+  12%-of-VRAM-floored-at-2-GiB reserve (2 copies).
+- **`infr_core::pager::ring_bytes_policy`** — moved out of `infr-vulkan` (which
+  re-exports it under the old path). Pure budget arithmetic with an
+  `INFR_PAGER_RING` override, and the seam's placement math was already reaching
+  into a backend crate for it.
+
+**NOT done — the placement decisions themselves.** "Does VRAM have room for this
+buffer" is Vulkan's `vram_budget_fits` (live `VK_EXT_memory_budget` heap probe
+minus a 256 MiB guard headroom, shared with the hard guard so probe and guard
+agree to the byte) vs ROCm's `hipMemGetInfo` free minus a percentage reserve.
+Different questions, different answers, both device facts. Only the cumulative
+_cap_ gate — arithmetic over the tally — is shared. Device alloc/arena/staging
+is untouched, as are the two `fmt_bytes` helpers.
+
+**Tests:** 10 new unit tests in `infr-core` (9 in `budget`, 1 in `pager`), all
+pinning the pre-hoist inline expressions verbatim — every KV name→dtype pair and
+every rejected spelling, the per-element rates as literal ratios, the exact
+sizer incl. Q8_0's odd-block-count `u32` rounding, a cross-check that sizer and
+rate agree on whole blocks, both env grammars, the reserve's floor/crossover,
+the cap boundaries, the ring clamp's edges, and **all four banner strings
+byte-for-byte**.
+
+**Behavior:** unchanged. Goldens unmoved (cpu 23/23 incl. qwen3
+`0xfd63781ea3bfa785`; gpu_seam 26/27, the one failure
+`gpu_seam_matches_cpu_qwen3_q2k` being the pre-existing one; Vulkan full suite
+green; ROCm 30/30 + 3). The banner was compared LIVE against `main` on all three
+shapes (all-resident, partial spill, whole-host via
+`INFR_KV_OVERFLOW_VRAM_MB=0`) — byte-identical text AND identical buffer/byte
+counts, i.e. the placement and ctx-clamp math produced the same numbers. ROCm's
+KV and weight banners were run too.
+
+Original audit below (historical). The paging _policy_ is shared (`Pager`); the
+_device wiring_ stays per-backend. Shareable slices: the KV-format→bytes math
+(partly hoisted: `kv_bytes_per_elem` `seam/model.rs:330`, `INFR_KV_TYPE_K/V`
+parsing) and the ring-size budget arithmetic (`ring_bytes_policy`
+`pager.rs:606`). Also: vulkan's `kv_overflow_report` is itself duplicated 4×
+internally (`lib.rs:3319`, `tp.rs:783`, `ep.rs:498`, `pipeline.rs:644`).
 
 - **Extract:** hoist the remaining KV bytes/budget math + `INFR_*` parsing to
   shared helpers; de-dup vulkan's internal `kv_overflow_report`. Leave device
@@ -489,31 +557,47 @@ arithmetic (`ring_bytes_policy` `pager.rs:606`). Also: vulkan's
 - **L. Device enumeration** is vulkan-internal-only duplication (multi-device
   backends); low cross-backend value.
 
-## Recommended extraction order
+## Extraction order — as executed
+
+Every candidate has now been attempted; the order below is the one that was
+followed, with what each actually landed. Three (**B**, **D**, **F**) are
+deliberately partial — their entries name what was left and why, and each "not
+done" is a scoping decision to re-open on its own merits, not a TODO.
 
 1. **A. Peephole fusion → shared Graph-rewrite pass** (+ **G** dtype predicates
    as its parameter) — cleanest high-value win; three near-identical copies
-   collapse to one.
+   collapsed to one. **Landed** (`e6d9c25`), and **G** with it.
 2. **C** `be()` helper + **E** `DenseSession<B>` + **D** `SessionChat<S>` —
-   cheap, mechanical; removes ~7+3+3 copies and rocm's feature-stub doubling.
-   **C and E landed; D landed only in part** — see its entry for what a
-   `SessionChat<S>` blanket impl would have had to break, and re-scope before
-   re-attempting.
-3. **F. tiering policy module** — moderate, high leverage; makes the existing
+   cheap, mechanical; removed ~7+3 copies. **C and E landed; D landed only in
+   part** — see its entry for what a `SessionChat<S>` blanket impl would have
+   had to break, and re-scope before re-attempting.
+3. **F. tiering policy module** — moderate, high leverage; made the existing
    cross-tier assertions structural. **Landed in part** — see its entry for the
    prefill-GEMM split-K formulas that stayed per-backend and why.
 4. **B. GraphExecutor skeleton** — the biggest structural prize, but it touches
-   every backend's hot loop; do it only after A/F prove the shared-IR-pass
-   pattern and with the full per-backend test suites as the guardrail. **Landed
-   in part** — the residency contract (`Provision`/`writes_back`) and the walk
+   every backend's hot loop; done after A/F proved the shared-IR-pass pattern,
+   with the full per-backend test suites as the guardrail. **Landed in part** —
+   the residency contract (`Provision`/`writes_back`) and the walk
    (`live_ops`/`OpDispatch`) are shared; see its entry for why the residency
    container, the per-op bodies, Vulkan's recorder and cpu's inline walk stayed
    where they are.
 5. **H** shared decode-spec + parity harness and **I** KV/budget math —
-   spec/test and math hoists (not runtime dedup). **H landed** —
+   spec/test and math hoists (not runtime dedup). **Both landed.** **H** is
    `infr_core::decode_spec` + the `infr-testkit` harness, with cpu/rocm/metal/
-   vulkan parity sweeps built from it; see its entry for the Metal numbers that
-   still need a Mac and the Vulkan tests that stayed put. **I** is open.
+   vulkan parity sweeps built from it — see its entry for the Metal numbers that
+   still need a Mac and the Vulkan tests that stayed put. **I** is
+   `infr_core::budget` + `pager::ring_bytes_policy`: one KV format table, one
+   spill tally/banner across Vulkan KV, ROCm KV and ROCm weights, and one copy
+   of each `INFR_*` spill grammar.
+
+Where the seam stands after all six: a backend now supplies **device facts** —
+kernels, recording, allocation, its own capability sets and its own measured
+numbers — and consumes shared **host logic** for the graph rewrite, the
+residency contract and op walk, the tier arithmetic, the block spec, the
+KV/budget math, sessions, chat warmup, and errors. The remaining per-backend
+duplication is catalogued in the "NOT done" notes above; the honest summary is
+that what is left is either a genuine device difference or a rewrite of the
+per-op bodies, and neither is a drift risk the way the six extractions were.
 
 ## Guardrails
 

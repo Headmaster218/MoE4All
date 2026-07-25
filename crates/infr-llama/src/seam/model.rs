@@ -4,6 +4,7 @@ use crate::*;
 use anyhow::{anyhow, Result};
 use infr_chat::{render_chat_jinja, render_chat_user};
 use infr_core::backend::Backend;
+use infr_core::DType;
 use infr_cpu::CpuBackend;
 use infr_gguf::Gguf;
 use std::path::Path;
@@ -329,21 +330,18 @@ impl DenseRocmSession {
 /// before pinning it, as `clamp_default_ctx` does).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn kv_bytes_per_elem(var: &str, auto_q8: bool) -> f64 {
+    // Format spellings and their per-element rates both come from the shared seam — the same
+    // table the runner turns into an actual allocation — so this estimate can no longer price a
+    // format the runner would allocate differently. Only the DEFAULT ladder (the legacy
+    // `INFR_KV_Q8` alias, then the placement-pinned auto-q8, then f16) is local; it is env policy,
+    // not format arithmetic.
     let side = std::env::var(var).ok();
-    match side.as_deref() {
-        Some("f32") => 4.0,
-        Some("bf16") | Some("f16") | Some("F16") => 2.0,
-        Some("q8_0") | Some("q8") | Some("Q8_0") => 34.0 / 32.0,
-        Some("q4_0") | Some("iq4_nl") => 18.0 / 32.0,
-        Some("q4_1") => 20.0 / 32.0,
-        Some("q5_0") => 22.0 / 32.0,
-        Some("q5_1") => 24.0 / 32.0,
-        Some("turbo2") => 34.0 / 128.0,
-        Some("turbo3") => 50.0 / 128.0,
-        Some("turbo4") => 66.0 / 128.0,
-        _ if std::env::var("INFR_KV_Q8").is_ok() => 34.0 / 32.0,
-        _ if auto_q8 => 34.0 / 32.0,
-        _ => 2.0,
+    match side.as_deref().and_then(infr_core::budget::parse_kv_dtype) {
+        Some(dt) => infr_core::budget::kv_bytes_per_elem(dt),
+        None if std::env::var("INFR_KV_Q8").is_ok() || auto_q8 => {
+            infr_core::budget::kv_bytes_per_elem(DType::Q8_0)
+        }
+        None => infr_core::budget::kv_bytes_per_elem(DType::F16),
     }
 }
 

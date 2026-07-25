@@ -427,8 +427,10 @@ pub(crate) fn generate_dense_backend(
     // 128-elem blocks = head_dim slices — CPU-only, needs head_dim%128. The mainline low-bit quants
     // (q4_0/q4_1/q5_0/q5_1/iq4_nl) + f32/bf16 are CPU-only too (no GPU KV kernel yet); the block
     // quants need 32-alignment. All of these are footprint knobs (quantized KV is slower on CPU).
-    let kv_align_ok =
-        (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
+    // The SAME 32-block gate the placement estimator applies before pinning an auto-q8 cache
+    // (`crate::seam::kv_q8_layout_ok`) — one function, so a pinned q8 can never be gated back to
+    // f16 here against an estimate that priced it at q8.
+    let kv_align_ok = crate::seam::kv_q8_layout_ok(c);
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
     // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
@@ -440,22 +442,25 @@ pub(crate) fn generate_dense_backend(
     // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
     // own f32 attention), bf16 reads via a cast→f16 prepass.
     let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");
+    // The requested format's NAME is parsed by the shared grammar (`infr_core::budget`, the same
+    // table the placement estimator prices with); only the per-format CAPABILITY gates below are
+    // the runner's, since they turn on this backend and this model's layout. A request that fails
+    // its gate — or a name nothing recognizes — falls through to the default ladder exactly as
+    // the old inline match did.
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
-        match side.as_deref() {
-            Some("turbo2") if kv_turbo_ok => DType::Turbo2,
-            Some("turbo3") if kv_turbo_ok => DType::Turbo3,
-            Some("turbo4") if kv_turbo_ok => DType::Turbo4,
-            Some("q8_0") | Some("q8") | Some("Q8_0") if kv_align_ok && kv_q8_backend => DType::Q8_0,
-            Some("q4_0") if blk_ok => DType::Q4_0,
-            Some("q4_1") if blk_ok => DType::Q4_1,
-            Some("q5_0") if blk_ok => DType::Q5_0,
-            Some("q5_1") if blk_ok => DType::Q5_1,
-            Some("iq4_nl") if blk_ok => DType::Iq4Nl,
-            Some("bf16") if dense_ok => DType::Bf16,
-            Some("f32") if dense_ok => DType::F32,
-            Some("f16") | Some("F16") => DType::F16,
-            // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.
+        let want = side.as_deref().and_then(infr_core::budget::parse_kv_dtype);
+        match want {
+            Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
+            Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
+            Some(dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl))
+                if blk_ok =>
+            {
+                dt
+            }
+            Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
+            Some(DType::F16) => DType::F16,
+            // unset/unknown/gated-out → legacy INFR_KV_Q8 alias (both sides q8) or f16.
             _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,
             // Placement-pinned auto-q8 (see `crate::seam::PlacementPins`): the Vulkan placement
             // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin

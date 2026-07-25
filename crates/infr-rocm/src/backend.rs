@@ -10,10 +10,13 @@ use infr_core::backend::{
     Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, ProgressScope,
     COOPMAT_TILE_16,
 };
+use infr_core::budget::{
+    env_flag, env_mib, overflow_vram_reserve, spill_report_line, SpillNouns, SpillTally,
+};
 use infr_core::error::Result;
 use infr_core::graph::Graph;
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 /// Terse local shorthand for the shared backend-error constructor.
@@ -31,33 +34,42 @@ use infr_core::error::backend as be;
 /// large-vocab model. `INFR_KV_OVERFLOW_RESERVE_MB` overrides it (raise it if a big prefill ubatch
 /// still OOMs the scratch pool; lower it to keep more KV resident when the model's scratch is small).
 fn kv_overflow_vram_reserve(total_vram: u64) -> u64 {
-    if let Some(mb) = std::env::var("INFR_KV_OVERFLOW_RESERVE_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        return mb * 1024 * 1024;
-    }
-    (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+    overflow_vram_reserve(total_vram, "INFR_KV_OVERFLOW_RESERVE_MB")
 }
 
 /// `INFR_KV_OVERFLOW=1` opt-in: spill the KV cache to host RAM (read by attention over PCIe) when
 /// it would not fit VRAM. Empty / `0` = off (unchanged VRAM-only KV). Mirrors the Vulkan backend's
 /// own local `kv_overflow_enabled`.
 fn kv_overflow_enabled() -> bool {
-    std::env::var("INFR_KV_OVERFLOW")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    env_flag("INFR_KV_OVERFLOW")
 }
+
+/// Nouns for the KV placement banner (see [`spill_report_line`], which owns the skeleton every
+/// spill class shares). ROCm's host allocations are `hipHostMalloc`'d page-locked pages, which the
+/// wording names because the pinning is what makes the PCIe read possible.
+const KV_SPILL: SpillNouns<'static> = SpillNouns {
+    env: "INFR_KV_OVERFLOW",
+    noun: "KV buffers",
+    resident_note: "no PCIe KV reads.",
+    spill_note: "page-locked SYSTEM RAM — attention reads those K/V over PCIe (PCIe-bound on the \
+                 spilled layers). Spilled KV is exempt from VRAM.",
+};
+
+/// Nouns for the dense-weight placement banner — the same skeleton, a different class.
+const WEIGHT_SPILL: SpillNouns<'static> = SpillNouns {
+    env: "INFR_ROCM_WEIGHT_OVERFLOW",
+    noun: "weight banks",
+    resident_note: "no PCIe weight reads.",
+    spill_note: "page-locked SYSTEM RAM — the native Linear/EmbedGather GEMV reads those over \
+                 PCIe (PCIe-bound on the spilled banks). Spilled weights are exempt from VRAM.",
+};
 
 /// Diagnostic cumulative cap (MiB) on KV-in-VRAM bytes before spilling the rest to host:
 /// `INFR_KV_OVERFLOW_VRAM_MB`. Unset ⇒ no cap (VRAM-first up to the real headroom). At 0 it forces
 /// the whole KV cache to host — makes the spill path reproducible on models that would otherwise
 /// fit. Ignored when `INFR_KV_OVERFLOW` is off. Mirrors the Vulkan backend's `kv_overflow_vram_cap`.
 fn kv_overflow_vram_cap() -> Option<u64> {
-    std::env::var("INFR_KV_OVERFLOW_VRAM_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
+    env_mib("INFR_KV_OVERFLOW_VRAM_MB")
 }
 
 /// `INFR_ROCM_WEIGHT_OVERFLOW=1` opt-in (Slice 35): spill dense weight banks to page-locked,
@@ -69,9 +81,7 @@ fn kv_overflow_vram_cap() -> Option<u64> {
 /// that dequant→f16 into a VRAM cache do NOT benefit (the f16 copy re-lands in VRAM), so spilling
 /// them saves nothing — this path is meaningful for the native-decode formats.
 fn weight_overflow_enabled() -> bool {
-    std::env::var("INFR_ROCM_WEIGHT_OVERFLOW")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    env_flag("INFR_ROCM_WEIGHT_OVERFLOW")
 }
 
 /// Cumulative cap (MiB) on weight-in-VRAM bytes before spilling the rest to host under
@@ -81,10 +91,7 @@ fn weight_overflow_enabled() -> bool {
 /// capability on a card big enough for the weights). Ignored when the flag is off. Twin of
 /// `INFR_KV_OVERFLOW_VRAM_MB`.
 fn weight_overflow_vram_cap() -> Option<u64> {
-    std::env::var("INFR_ROCM_WEIGHT_VRAM_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
+    env_mib("INFR_ROCM_WEIGHT_VRAM_MB")
 }
 
 /// VRAM headroom (bytes) kept free when placing weights in VRAM under `INFR_ROCM_WEIGHT_OVERFLOW`.
@@ -98,13 +105,7 @@ fn weight_overflow_vram_cap() -> Option<u64> {
 /// a big KV context / MoE arena, lower it to keep more weights resident on a weight-dominated dense
 /// model).
 fn weight_overflow_vram_reserve(total_vram: u64) -> u64 {
-    if let Some(mb) = std::env::var("INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        return mb * 1024 * 1024;
-    }
-    (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+    overflow_vram_reserve(total_vram, "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB")
 }
 
 /// Human-readable byte count for the KV-overflow placement banner.
@@ -422,18 +423,13 @@ pub struct RocmBackend {
     /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
     /// buffers (and how many bytes) landed in device-local VRAM vs spilled to host RAM. Fed by the
     /// `alloc` KvCache branch, drained once by `kv_overflow_report`. Zero unless the flag is on.
-    kv_vram_bufs: AtomicU64,
-    kv_vram_bytes: AtomicU64,
-    kv_host_bufs: AtomicU64,
-    kv_host_bytes: AtomicU64,
+    /// The bookkeeping (and the cumulative-cap gate) is the shared [`SpillTally`].
+    kv_spill: SpillTally,
     /// VRAM-first WEIGHT-overflow placement tally (`INFR_ROCM_WEIGHT_OVERFLOW`, Slice 35): how many
     /// `BufferUsage::Weights`/`HostWeights` banks (and how many bytes) landed in device-local VRAM
     /// vs spilled to page-locked host RAM. Fed by the `alloc`/`alloc_uninit` weight branch, drained
     /// once by `weight_overflow_report` (printed on the first `execute`). Zero unless the flag is on.
-    wt_vram_bufs: AtomicU64,
-    wt_vram_bytes: AtomicU64,
-    wt_host_bufs: AtomicU64,
-    wt_host_bytes: AtomicU64,
+    wt_spill: SpillTally,
     /// One-shot latch so the weight-overflow banner prints exactly once, on the first `execute`
     /// (after the whole weight-load walk has run). `false` until printed.
     wt_reported: std::sync::atomic::AtomicBool,
@@ -500,14 +496,8 @@ impl RocmBackend {
             weight_pb: Arc::new(Mutex::new(None)),
             moe_pager: Mutex::new(None),
             weight_ring: Mutex::new(None),
-            kv_vram_bufs: AtomicU64::new(0),
-            kv_vram_bytes: AtomicU64::new(0),
-            kv_host_bufs: AtomicU64::new(0),
-            kv_host_bytes: AtomicU64::new(0),
-            wt_vram_bufs: AtomicU64::new(0),
-            wt_vram_bytes: AtomicU64::new(0),
-            wt_host_bufs: AtomicU64::new(0),
-            wt_host_bytes: AtomicU64::new(0),
+            kv_spill: SpillTally::default(),
+            wt_spill: SpillTally::default(),
             wt_reported: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -520,23 +510,18 @@ impl RocmBackend {
     /// rather than propagating: overflow mode degrades to host, never hard-errors. Bumps the
     /// resident/spilled tally for the one-shot `kv_overflow_report` banner.
     fn alloc_kv_overflow(&self, bytes: usize) -> Result<Box<dyn Buffer>> {
-        let cap_ok = kv_overflow_vram_cap()
-            .is_none_or(|cap| self.kv_vram_bytes.load(Ordering::Relaxed) + bytes as u64 <= cap);
+        let cap_ok = self.kv_spill.admits(kv_overflow_vram_cap(), bytes as u64);
         let (free, total) = self.vram_info();
         let reserve = kv_overflow_vram_reserve(total as u64);
         let budget_ok = (free as u64) >= bytes as u64 + reserve;
         if cap_ok && budget_ok {
             if let Ok(buf) = RocmBuffer::try_alloc(bytes, self.stream) {
-                self.kv_vram_bufs.fetch_add(1, Ordering::Relaxed);
-                self.kv_vram_bytes
-                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                self.kv_spill.record_vram(bytes as u64);
                 return Ok(Box::new(buf));
             }
         }
         let buf = RocmBuffer::try_alloc_host(bytes, true)?;
-        self.kv_host_bufs.fetch_add(1, Ordering::Relaxed);
-        self.kv_host_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.kv_spill.record_host(bytes as u64);
         Ok(Box::new(buf))
     }
 
@@ -551,23 +536,20 @@ impl RocmBackend {
     /// UNINIT alloc and the host placement skips the calloc memset. Bumps the resident/spilled tally
     /// for the one-shot `weight_overflow_report` banner.
     fn alloc_weight_overflow(&self, bytes: usize) -> Result<Box<dyn Buffer>> {
-        let cap_ok = weight_overflow_vram_cap()
-            .is_none_or(|cap| self.wt_vram_bytes.load(Ordering::Relaxed) + bytes as u64 <= cap);
+        let cap_ok = self
+            .wt_spill
+            .admits(weight_overflow_vram_cap(), bytes as u64);
         let (free, total) = self.vram_info();
         let reserve = weight_overflow_vram_reserve(total as u64);
         let budget_ok = (free as u64) >= bytes as u64 + reserve;
         if cap_ok && budget_ok {
             if let Ok(buf) = RocmBuffer::try_alloc_uninit(bytes, self.stream) {
-                self.wt_vram_bufs.fetch_add(1, Ordering::Relaxed);
-                self.wt_vram_bytes
-                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                self.wt_spill.record_vram(bytes as u64);
                 return Ok(Box::new(buf));
             }
         }
         let buf = RocmBuffer::try_alloc_host(bytes, false)?;
-        self.wt_host_bufs.fetch_add(1, Ordering::Relaxed);
-        self.wt_host_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.wt_spill.record_host(bytes as u64);
         Ok(Box::new(buf))
     }
 
@@ -582,29 +564,8 @@ impl RocmBackend {
         if self.wt_reported.swap(true, Ordering::Relaxed) {
             return;
         }
-        let vram_bufs = self.wt_vram_bufs.load(Ordering::Relaxed);
-        let host_bufs = self.wt_host_bufs.load(Ordering::Relaxed);
-        let total = vram_bufs + host_bufs;
-        if total == 0 {
-            return;
-        }
-        let vram_bytes = self.wt_vram_bytes.load(Ordering::Relaxed);
-        let host_bytes = self.wt_host_bytes.load(Ordering::Relaxed);
-        if host_bufs == 0 {
-            eprintln!(
-                "[infr] INFR_ROCM_WEIGHT_OVERFLOW: all {total} weight banks ({}) fit in VRAM — none \
-                 spilled; no PCIe weight reads.",
-                fmt_bytes(vram_bytes),
-            );
-        } else {
-            eprintln!(
-                "[infr] INFR_ROCM_WEIGHT_OVERFLOW: {vram_bufs} of {total} weight banks ({} resident) \
-                 in VRAM, the remaining {host_bufs} ({}) in page-locked SYSTEM RAM — the native \
-                 Linear/EmbedGather GEMV reads those over PCIe (PCIe-bound on the spilled banks). \
-                 Spilled weights are exempt from VRAM.",
-                fmt_bytes(vram_bytes),
-                fmt_bytes(host_bytes),
-            );
+        if let Some(line) = spill_report_line(self.wt_spill.counts(), &WEIGHT_SPILL, fmt_bytes) {
+            eprintln!("{line}");
         }
     }
 
@@ -838,28 +799,8 @@ impl Backend for RocmBackend {
         if !kv_overflow_enabled() {
             return;
         }
-        let vram_bufs = self.kv_vram_bufs.load(Ordering::Relaxed);
-        let host_bufs = self.kv_host_bufs.load(Ordering::Relaxed);
-        let total = vram_bufs + host_bufs;
-        if total == 0 {
-            return;
-        }
-        let vram_bytes = self.kv_vram_bytes.load(Ordering::Relaxed);
-        let host_bytes = self.kv_host_bytes.load(Ordering::Relaxed);
-        if host_bufs == 0 {
-            eprintln!(
-                "[infr] INFR_KV_OVERFLOW: all {total} KV buffers ({}) fit in VRAM — none spilled; \
-                 no PCIe KV reads.",
-                fmt_bytes(vram_bytes),
-            );
-        } else {
-            eprintln!(
-                "[infr] INFR_KV_OVERFLOW: {vram_bufs} of {total} KV buffers ({} resident) in VRAM, \
-                 the remaining {host_bufs} ({}) in page-locked SYSTEM RAM — attention reads those \
-                 K/V over PCIe (PCIe-bound on the spilled layers). Spilled KV is exempt from VRAM.",
-                fmt_bytes(vram_bytes),
-                fmt_bytes(host_bytes),
-            );
+        if let Some(line) = spill_report_line(self.kv_spill.counts(), &KV_SPILL, fmt_bytes) {
+            eprintln!("{line}");
         }
     }
 

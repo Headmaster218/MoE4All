@@ -2490,19 +2490,10 @@ fn attention_q8_vec_hd256_parity() {
 // differs, not the stored quant values. K stays f16 in the common decoupled shape (high-precision K,
 // quantized V — llama's guidance); coupled quant/quant is also covered.
 
-fn kv_bytes(dt: DType, elems: usize) -> usize {
-    match dt {
-        DType::Q4_0 | DType::Iq4Nl => elems / 32 * 18,
-        DType::Q4_1 => elems / 32 * 20,
-        DType::Q5_0 => elems / 32 * 22,
-        DType::Q5_1 => elems / 32 * 24,
-        DType::Turbo2 => elems / 128 * 34,
-        DType::Turbo3 => elems / 128 * 50,
-        DType::Turbo4 => elems / 128 * 66,
-        DType::F16 | DType::Bf16 => elems * 2,
-        _ => elems * 4, // F32
-    }
-}
+/// KV cache sizing — the SEAM's sizer, not a local restatement of it, so a cache this suite
+/// allocates is exactly the cache the runner would (this used to be a hand-copied table that had
+/// already lost the Q8_0 arm).
+use infr_core::budget::kv_fmt_bytes as kv_bytes;
 
 #[allow(clippy::too_many_arguments)]
 fn kvquant_attention_test(

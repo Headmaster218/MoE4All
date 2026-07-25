@@ -642,9 +642,7 @@ impl Backend for PipelineBackend {
     }
 
     fn kv_overflow_report(&self) {
-        for b in &self.backends {
-            b.kv_overflow_report();
-        }
+        infr_core::backend::kv_overflow_report_each(&self.backends);
     }
 }
 

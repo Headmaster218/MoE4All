@@ -5,6 +5,7 @@
 //! Nothing here is GPU- or model-specific. See docs/plan.md.
 
 pub mod backend;
+pub mod budget;
 pub mod decode_spec;
 pub mod error;
 pub mod exec;

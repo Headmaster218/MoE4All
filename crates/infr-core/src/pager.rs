@@ -258,9 +258,78 @@ impl Pager {
     }
 }
 
+/// Upload-ring sizing policy: `INFR_PAGER_RING` (the shared size grammar, [`crate::parse_size`])
+/// wins; otherwise an eighth of the pager budget, clamped to [256 MiB, 2 GiB].
+///
+/// Bigger halves = fewer pipeline rotations, and each rotation stalls the CPU on the other half's
+/// fence — measured on Scout pp512 (miss-heavy steady state, ~22 GB staged/rep): 256 MiB →
+/// 224 t/s, 1 GiB → 324, 2 GiB → 404, flat beyond. The budget fraction keeps small explicit
+/// `INFR_CACHE` runs from spending most of their grant on staging instead of arena slots.
+///
+/// Pure budget arithmetic — no device types — so the seam's placement math can price the ring
+/// without reaching into a backend crate, and a second paging backend gets the same policy rather
+/// than a fourth copy of the clamp. The staging ring ITSELF (the buffers, the fences, the half
+/// rotation) stays per-backend.
+pub fn ring_bytes_policy(pager_budget: u64) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    if let Some(b) = std::env::var("INFR_PAGER_RING")
+        .ok()
+        .and_then(|v| crate::parse_size(&v))
+        .map(|s| s.resolve(0) as usize)
+        .filter(|&b| b > 0)
+    {
+        return b;
+    }
+    (pager_budget / 8).clamp(256 * MIB, 2048 * MIB) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ring clamp's boundaries, pinning the pre-hoist inline expression
+    /// `(budget / 8).clamp(256 MiB, 2048 MiB)` — the seam subtracts this from the pager budget
+    /// before splitting arena shares, so a moved edge silently re-sizes every MoE arena — plus the
+    /// `INFR_PAGER_RING` override. ONE test: unlike the tier knobs, this env var's name is fixed,
+    /// so two tests toggling it would race in the shared test process.
+    #[test]
+    fn ring_bytes_policy_clamp_boundaries_and_env_override() {
+        const MIB: u64 = 1024 * 1024;
+        std::env::remove_var("INFR_PAGER_RING");
+        // Below the floor's crossover (8 x 256 MiB = 2 GiB of budget) the floor wins — including
+        // the `0` budget the pager passes when it has no budget figure at all.
+        assert_eq!(ring_bytes_policy(0), 256 * MIB as usize);
+        assert_eq!(ring_bytes_policy(2048 * MIB), 256 * MIB as usize);
+        // Exactly at the crossover, and just past it, the eighth wins.
+        assert_eq!(ring_bytes_policy(2048 * MIB + 8), (256 * MIB + 1) as usize);
+        assert_eq!(ring_bytes_policy(8 * 1024 * MIB), (1024 * MIB) as usize);
+        // The 2 GiB ceiling (8 x 2 GiB = 16 GiB of budget) and beyond.
+        assert_eq!(ring_bytes_policy(16 * 1024 * MIB), (2048 * MIB) as usize);
+        assert_eq!(ring_bytes_policy(64 * 1024 * MIB), (2048 * MIB) as usize);
+
+        // `INFR_PAGER_RING` overrides the budget fraction outright, through the shared size
+        // grammar; an unparseable or zero value falls back to the policy (a 0-byte ring could
+        // never stage a slot).
+        for (raw, want) in [
+            ("1g", Some(1024 * MIB as usize)),
+            ("512m", Some(512 * MIB as usize)),
+            ("3221225472", Some(3 * 1024 * MIB as usize)), // plain bytes
+            ("0", None),
+            ("", None),
+            ("banana", None),
+            ("1GiB", None), // not the shared grammar's spelling — treated as unset
+        ] {
+            std::env::set_var("INFR_PAGER_RING", raw);
+            let got = ring_bytes_policy(64 * 1024 * MIB);
+            match want {
+                Some(w) => assert_eq!(got, w, "INFR_PAGER_RING={raw:?}"),
+                // Falls through to the policy, which caps at 2 GiB on this budget.
+                None => assert_eq!(got, (2048 * MIB) as usize, "INFR_PAGER_RING={raw:?}"),
+            }
+        }
+        std::env::remove_var("INFR_PAGER_RING");
+        assert_eq!(ring_bytes_policy(64 * 1024 * MIB), (2048 * MIB) as usize);
+    }
 
     #[test]
     fn fresh_pager_is_all_misses_until_full() {

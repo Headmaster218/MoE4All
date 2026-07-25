@@ -617,6 +617,19 @@ pub trait Backend: Send + Sync {
     }
 }
 
+/// Fan [`Backend::kv_overflow_report`] out over the per-device backends a multi-device wrapper
+/// owns. Each rank made its OWN placement decision against its OWN card's budget, so each prints
+/// its own banner — the wrapper has nothing to add and nothing to merge.
+///
+/// A three-line loop, but it was the three-line loop written three times (`TensorParallelBackend`,
+/// `ExpertParallelBackend`, `PipelineBackend`), which is how the report gained a fourth spelling
+/// while the body it forwards to had two.
+pub fn kv_overflow_report_each<B: Backend>(backends: &[B]) {
+    for b in backends {
+        b.kv_overflow_report();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

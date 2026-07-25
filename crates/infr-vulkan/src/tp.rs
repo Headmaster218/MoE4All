@@ -781,8 +781,6 @@ impl Backend for TensorParallelBackend {
     }
 
     fn kv_overflow_report(&self) {
-        for b in &self.ranks {
-            b.kv_overflow_report();
-        }
+        infr_core::backend::kv_overflow_report_each(&self.ranks);
     }
 }
