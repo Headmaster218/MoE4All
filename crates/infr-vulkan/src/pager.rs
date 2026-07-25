@@ -481,12 +481,12 @@ fn expert_bytes(arc: &Arc<dyn AsRef<[u8]> + Send + Sync>) -> &[u8] {
     inner.as_ref()
 }
 
-/// `INFR_PAGER_STATS` gate, read from the environment exactly ONCE per process (both pager
-/// sessions share this) rather than re-`getenv`-ing in each `new`.
+/// `INFR_PAGER_STATS` gate. Read on every `new` — NOT memoized: a process-wide `OnceLock` latches
+/// whatever the FIRST pager session saw, which makes a test that sets the knob later silently
+/// measure nothing (and un-settable once any earlier test has read it). The two call sites are
+/// pager-session construction, i.e. twice per model load, so a `getenv` there is free.
 fn pager_stats_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("INFR_PAGER_STATS").is_ok())
+    std::env::var("INFR_PAGER_STATS").is_ok()
 }
 
 /// The shared `hits/misses/evictions/hit_rate` fragment of both sessions' `INFR_PAGER_STATS` lines

@@ -10073,12 +10073,12 @@ mod tests {
         run_attn_prefill_nonfa(70, 400, 16, 8, 256, 64, 1.0); // SWA, non-64-aligned q
                                                               // force the split-K PV path (n_splits>1) and verify the partial-sum reduce is correct, incl.
                                                               // with a window (split reduce must respect the softmax mask) and hd=512.
-        std::env::set_var("INFR_PV_SPLITS", "4");
+        let _env = infr_core::test_env::EnvGuard::with([("INFR_PV_SPLITS", "4")]);
         run_attn_prefill_nonfa(70, 300, 4, 2, 128, 0, 0.0);
         run_attn_prefill_nonfa(128, 500, 2, 1, 128, 0, 0.0);
         run_attn_prefill_nonfa(128, 3000, 16, 8, 256, 200, 1.0); // SWA, long kv, split-K
         run_attn_prefill_nonfa(128, 3000, 16, 1, 512, 0, 1.0); // full hd=512, long kv, split-K
-        std::env::remove_var("INFR_PV_SPLITS");
+                                                               // `_env` restores INFR_PV_SPLITS (and releases the env lock) here.
     }
 
     fn run_attn_prefill_nonfa(
@@ -10164,22 +10164,21 @@ mod tests {
             run_attn_prefill_flash(q, kv, nh, nkv, hd);
         }
         // force the split-K flash path (partial+combine) and verify the merge is correct
-        std::env::set_var("INFR_FLASH_SPLITS", "4");
+        let mut env = infr_core::test_env::EnvGuard::with([("INFR_FLASH_SPLITS", "4")]);
         run_attn_prefill_flash(64, 2000, 16, 8, 128);
         run_attn_prefill_flash(128, 500, 2, 1, 128);
-        std::env::remove_var("INFR_FLASH_SPLITS");
+        env.unset("INFR_FLASH_SPLITS");
         // Force the bm=32 tile (otherwise only selected on sub-64 KB-shared devices like NVIDIA /
         // MoltenVK) so the small shaders get numeric-parity coverage on any GPU: the fused kernel
         // (hd=64), the warp split-K partial+combine (hd=128), and the non-warp partial
         // (INFR_NO_FLASH_WARP). Without this, a 64 KB device only ever exercises the bm=64 build.
-        std::env::set_var("INFR_FLASH_BM", "32");
+        env.set("INFR_FLASH_BM", "32");
         run_attn_prefill_flash(80, 300, 9, 3, 64); // fused attn_flash_bm32
         run_attn_prefill_flash(128, 200, 4, 2, 128); // warp partial+combine (bm32)
         run_attn_prefill_flash(448, 2000, 16, 8, 128); // warp, multi-block kv
-        std::env::set_var("INFR_NO_FLASH_WARP", "1");
+        env.set("INFR_NO_FLASH_WARP", "1");
         run_attn_prefill_flash(128, 500, 2, 1, 128); // non-warp attn_flash_partial_bm32
-        std::env::remove_var("INFR_NO_FLASH_WARP");
-        std::env::remove_var("INFR_FLASH_BM");
+                                                     // `env` restores INFR_FLASH_BM / INFR_NO_FLASH_WARP (and unlocks) on drop.
     }
 
     fn run_attn_prefill_flash(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
@@ -10319,8 +10318,14 @@ mod tests {
         // Pin Off onto the DIRECT attn_flash_partial (same kernel the staged builds fork from):
         // no register warp, forced split-K partial+combine (n_splits==1 else takes the fused
         // attn_flash). Staged/Dequant force the partial path themselves but read the same splits.
-        std::env::set_var("INFR_NO_FLASH_WARP", "1");
-        std::env::set_var("INFR_FLASH_SPLITS", "2");
+        // EnvGuard, not bare set_var: this test and `attn_flash_warp_dequant_parity` both drive
+        // INFR_FLASH_SPLITS, and when they overlapped one would clear the knob the other was
+        // still running under — both failed together and passed individually. The guard
+        // serializes them and restores the prior values on drop.
+        let _env = infr_core::test_env::EnvGuard::with([
+            ("INFR_NO_FLASH_WARP", "1"),
+            ("INFR_FLASH_SPLITS", "2"),
+        ]);
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -10465,8 +10470,7 @@ mod tests {
                 println!("flash dequant parity OK {dt:?} q={q_len} kv={kv_len} nh={nh} nkv={nkv}");
             }
         }
-        std::env::remove_var("INFR_NO_FLASH_WARP");
-        std::env::remove_var("INFR_FLASH_SPLITS");
+        // `_env` restores INFR_NO_FLASH_WARP / INFR_FLASH_SPLITS (and unlocks) here.
     }
 
     /// Lever 2 on the WARP kernel (kv-decode-perf-levers): the register-tiled `attn_flash_warp_deq_*`
@@ -10484,7 +10488,8 @@ mod tests {
         let be = VulkanBackend::new().unwrap();
         // Leave warp ON (no INFR_NO_FLASH_WARP). Force split-K so the warp partial+combine reduce is
         // covered in addition to the n_splits==1 warp path.
-        std::env::set_var("INFR_FLASH_SPLITS", "2");
+        // See `attn_flash_stage_dequant_parity`: guarded because the two share this knob.
+        let _env = infr_core::test_env::EnvGuard::with([("INFR_FLASH_SPLITS", "2")]);
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -10586,7 +10591,7 @@ mod tests {
                 );
             }
         }
-        std::env::remove_var("INFR_FLASH_SPLITS");
+        // `_env` restores INFR_FLASH_SPLITS (and unlocks) here.
     }
 
     /// Upload f16 K/V into a `KvCache` buffer (device-addressed → `device_addr()` is `Some`), so the
@@ -10720,8 +10725,11 @@ mod tests {
                 ),
             ];
             for (envs, label) in cases {
+                // One guard per case: it both serializes against the other flash tests that drive
+                // these knobs and restores whatever they were before this case.
+                let mut env = infr_core::test_env::EnvGuard::new();
                 for (k, v) in *envs {
-                    std::env::set_var(k, v);
+                    env.set(k, v);
                 }
                 let bound = run_flash_bytes(
                     &be,
@@ -10751,9 +10759,7 @@ mod tests {
                     FlashStage::Off,
                     addr,
                 );
-                for (k, _) in *envs {
-                    std::env::remove_var(k);
-                }
+                drop(env); // restore this case's knobs before scoring/printing
                 let bf: &[f32] = bytemuck::cast_slice(&bound);
                 assert!(
                     bf[..q_len * nh * hd]
@@ -10946,10 +10952,10 @@ mod tests {
         ] {
             run_attn_flash_reg(q, kv, nh, nkv, 128);
         }
-        std::env::set_var("INFR_FLASH_SPLITS", "4");
+        let _env = infr_core::test_env::EnvGuard::with([("INFR_FLASH_SPLITS", "4")]);
         run_attn_flash_reg(128, 2000, 16, 8, 128);
         run_attn_flash_reg(200, 600, 2, 1, 128);
-        std::env::remove_var("INFR_FLASH_SPLITS");
+        // `_env` restores INFR_FLASH_SPLITS (and unlocks) here.
     }
 
     fn run_attn_flash_reg(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {

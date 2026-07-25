@@ -9,6 +9,10 @@ use infr_vulkan::VulkanBackend;
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn q4k_gemm_variants_bench() {
+    // One EnvGuard for the whole bench: serializes against every other test in this binary
+    // that reads these knobs, and restores the caller's values on drop (see infr_core::test_env).
+    #[allow(unused_mut)]
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     let (m, k, n) = (512usize, 1024usize, 6144usize);
     let reps = 20usize;
@@ -53,7 +57,7 @@ fn q4k_gemm_variants_bench() {
             n,
         );
     });
-    std::env::set_var("INFR_NO_GEMM_WARP", "1");
+    env.set("INFR_NO_GEMM_WARP", "1");
     run("native64", &|rec| {
         rec.matmul_native(
             infr_core::DType::Q4K,
@@ -65,7 +69,7 @@ fn q4k_gemm_variants_bench() {
             n,
         );
     });
-    std::env::remove_var("INFR_NO_GEMM_WARP");
+    env.unset("INFR_NO_GEMM_WARP");
     run("warp", &|rec| {
         rec.matmul_native(
             infr_core::DType::Q4K,
@@ -143,6 +147,10 @@ fn qwen35_gemm_inventory_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn qwen3_gemm_inventory_bench() {
+    // One EnvGuard for the whole bench: serializes against every other test in this binary
+    // that reads these knobs, and restores the caller's values on drop (see infr_core::test_env).
+    #[allow(unused_mut)]
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     let m = 512usize;
     // (k, n, count/layer-set): q, k+v, o, gate+up (fused), down — 28 layers.
@@ -157,7 +165,7 @@ fn qwen3_gemm_inventory_bench() {
     let c = be.alloc(m * 6144 * 4, BufferUsage::Activations).unwrap();
     for variant in ["warp", "native64"] {
         if variant == "native64" {
-            std::env::set_var("INFR_NO_GEMM_WARP", "1");
+            env.set("INFR_NO_GEMM_WARP", "1");
         }
         let mut total = 0f64;
         for (k, n, cnt) in shapes {
@@ -197,7 +205,7 @@ fn qwen3_gemm_inventory_bench() {
             total += us * cnt as f64 / 1e3;
         }
         println!("[{variant:>8}] qwen3-0.6B m=512 GEMM total: {total:.1} ms\n");
-        std::env::remove_var("INFR_NO_GEMM_WARP");
+        env.unset("INFR_NO_GEMM_WARP");
     }
 }
 
@@ -271,6 +279,10 @@ fn qwen3_8b_gemm_shapes_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn wide_square_occupancy_sweep() {
+    // One EnvGuard for the whole bench: serializes against every other test in this binary
+    // that reads these knobs, and restores the caller's values on drop (see infr_core::test_env).
+    #[allow(unused_mut)]
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     let m = 512usize;
     let dt = infr_core::DType::Q4K;
@@ -303,7 +315,7 @@ fn wide_square_occupancy_sweep() {
         };
 
         // wide ag (old BN=256 tile, restored via INFR_GEMM_WIDE_TILE)
-        std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
+        env.set("INFR_GEMM_WIDE_TILE", "1");
         let us = time(&|rec| {
             rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
             rec.matmul_native_f16a(
@@ -317,7 +329,7 @@ fn wide_square_occupancy_sweep() {
                 n,
             );
         });
-        std::env::remove_var("INFR_GEMM_WIDE_TILE");
+        env.unset("INFR_GEMM_WIDE_TILE");
         println!(
             "[{label:>5}] [{k}x{n}] wide_ag      {us:7.1} us  {:5.1} TF",
             tf(us, k, n)
@@ -379,6 +391,10 @@ fn wide_square_occupancy_sweep() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn wide_n128_crossover_sweep() {
+    // One EnvGuard for the whole bench: serializes against every other test in this binary
+    // that reads these knobs, and restores the caller's values on drop (see infr_core::test_env).
+    #[allow(unused_mut)]
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     let dt = infr_core::DType::Q4K;
     // (m, k, n): only n%256==0 (wide-eligible). Covers qwen3-0.6b (k=1024, n up to 6144),
@@ -411,9 +427,9 @@ fn wide_n128_crossover_sweep() {
     for (m, k, n) in grid {
         let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         let tf = |us: f64| (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
-        let time = |wide: bool| -> f64 {
+        let mut time = |wide: bool| -> f64 {
             if wide {
-                std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
+                env.set("INFR_GEMM_WIDE_TILE", "1");
             }
             let f = |rec: &infr_vulkan::Recorder| {
                 rec.matmul_native_f16a(
@@ -436,7 +452,7 @@ fn wide_n128_crossover_sweep() {
                 f(&rec);
             }
             rec.finish().unwrap();
-            std::env::remove_var("INFR_GEMM_WIDE_TILE");
+            env.unset("INFR_GEMM_WIDE_TILE");
             t0.elapsed().as_micros() as f64 / reps as f64
         };
         // interleave wide/n128 twice, take the min of each (thermal-robust)
@@ -1290,6 +1306,10 @@ fn moe_expert_row_tile_bench_down() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn dense_small_m_row_tile_bench() {
+    // One EnvGuard for the whole bench: serializes against every other test in this binary
+    // that reads these knobs, and restores the caller's values on drop (see infr_core::test_env).
+    #[allow(unused_mut)]
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     let reps = 30usize;
     let ms: &[usize] = &[4, 6, 8, 12, 16, 20, 24, 32, 48, 64];
@@ -1326,9 +1346,9 @@ fn dense_small_m_row_tile_bench() {
         for &m in ms {
             for (tile_label, no_small_bm) in [("BM32", false), ("BM64", true)] {
                 if no_small_bm {
-                    std::env::set_var("INFR_NO_SMALL_BM", "1");
+                    env.set("INFR_NO_SMALL_BM", "1");
                 } else {
-                    std::env::remove_var("INFR_NO_SMALL_BM");
+                    env.unset("INFR_NO_SMALL_BM");
                 }
                 let rec = be_.recorder().unwrap();
                 rec.matmul_native_f16a(
@@ -1368,7 +1388,7 @@ fn dense_small_m_row_tile_bench() {
             }
         }
     }
-    std::env::remove_var("INFR_NO_SMALL_BM");
+    env.unset("INFR_NO_SMALL_BM");
 
     // sk_ag family (matmul_native_splitk, a_is_f16=true): narrow-N deep-k shapes — down/o/kv-proj.
     let sk_shapes: &[(&str, infr_core::DType, usize, usize)] = &[
@@ -1398,9 +1418,9 @@ fn dense_small_m_row_tile_bench() {
         for &m in ms {
             for (tile_label, no_small_bm) in [("BM32", false), ("BM64", true)] {
                 if no_small_bm {
-                    std::env::set_var("INFR_NO_SMALL_BM", "1");
+                    env.set("INFR_NO_SMALL_BM", "1");
                 } else {
-                    std::env::remove_var("INFR_NO_SMALL_BM");
+                    env.unset("INFR_NO_SMALL_BM");
                 }
                 let rec = be_.recorder().unwrap();
                 rec.matmul_native_splitk(
@@ -1446,7 +1466,7 @@ fn dense_small_m_row_tile_bench() {
             }
         }
     }
-    std::env::remove_var("INFR_NO_SMALL_BM");
+    env.unset("INFR_NO_SMALL_BM");
 }
 
 /// BM=16 vs BM=32 vs BM=64 dense A_GLOBAL warp-GEMM row tile at the SAME real qwen35-4B verify
@@ -1461,6 +1481,10 @@ fn dense_small_m_row_tile_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn bm16_crossover_bench() {
+    // One EnvGuard for the whole bench: serializes against every other test in this binary
+    // that reads these knobs, and restores the caller's values on drop (see infr_core::test_env).
+    #[allow(unused_mut)]
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     let reps = 30usize;
     let ms: &[usize] = &[4, 6, 8, 12, 16, 24, 32];
@@ -1504,14 +1528,14 @@ fn bm16_crossover_bench() {
                 ("BM64", true, false, 64.0),
             ] {
                 if no_small_bm {
-                    std::env::set_var("INFR_NO_SMALL_BM", "1");
+                    env.set("INFR_NO_SMALL_BM", "1");
                 } else {
-                    std::env::remove_var("INFR_NO_SMALL_BM");
+                    env.unset("INFR_NO_SMALL_BM");
                 }
                 if no_bm16 {
-                    std::env::set_var("INFR_NO_BM16", "1");
+                    env.set("INFR_NO_BM16", "1");
                 } else {
-                    std::env::remove_var("INFR_NO_BM16");
+                    env.unset("INFR_NO_BM16");
                 }
                 let rec = be_.recorder().unwrap();
                 rec.matmul_native_f16a(
@@ -1551,8 +1575,8 @@ fn bm16_crossover_bench() {
             }
         }
     }
-    std::env::remove_var("INFR_NO_SMALL_BM");
-    std::env::remove_var("INFR_NO_BM16");
+    env.unset("INFR_NO_SMALL_BM");
+    env.unset("INFR_NO_BM16");
 }
 
 // REAL production routing distributions captured via `INFR_MOE_COUNTS_DEBUG=1

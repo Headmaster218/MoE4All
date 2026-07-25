@@ -114,18 +114,25 @@ pub fn kv_bytes_per_elem(dt: DType) -> f64 {
 /// The boolean-flag grammar every overflow knob uses: set and neither empty nor `"0"` ⇒ on.
 /// Unset ⇒ off. (`INFR_KV_OVERFLOW`, `INFR_ROCM_WEIGHT_OVERFLOW`.)
 pub fn env_flag(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .is_some_and(|v| !v.is_empty() && v != "0")
+    flag_from(std::env::var(var).ok().as_deref())
+}
+
+/// [`env_flag`]'s grammar over an explicit value, so it is testable without touching the process
+/// environment (see `infr_core::test_env`): `Some(v)` with `v` neither empty nor `"0"` ⇒ on.
+pub fn flag_from(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// A MiB-valued `INFR_*` knob in bytes; `None` when unset or unparseable. (`0` parses to
 /// `Some(0)` — the diagnostic caps use it to mean "nothing resident", which is NOT the same as
 /// "no cap".)
 pub fn env_mib(var: &str) -> Option<u64> {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    mib_from(std::env::var(var).ok().as_deref())
+}
+
+/// [`env_mib`]'s grammar over an explicit value — MiB → bytes, `None` when absent or unparseable.
+pub fn mib_from(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
         .map(|mb| mb * 1024 * 1024)
 }
 
@@ -137,7 +144,13 @@ pub fn env_mib(var: &str) -> Option<u64> {
 /// Over-reserving costs residency; under-reserving OOMs mid-forward in an allocator that is
 /// infallible by contract, so the floor is deliberate.
 pub fn overflow_vram_reserve(total_vram: u64, env: &str) -> u64 {
-    if let Some(bytes) = env_mib(env) {
+    reserve_from(total_vram, std::env::var(env).ok().as_deref())
+}
+
+/// [`overflow_vram_reserve`] over an explicit override value — the whole policy, no environment
+/// (see `crate::test_env` for why the tests want it that way).
+pub fn reserve_from(total_vram: u64, raw: Option<&str>) -> u64 {
+    if let Some(bytes) = mib_from(raw) {
         return bytes;
     }
     (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
@@ -383,13 +396,11 @@ mod tests {
         }
     }
 
-    /// `empty`/`0`/unset = off; anything else = on. Own env names per case — infr-core's tests
-    /// share a process.
+    /// `empty`/`0`/unset = off; anything else = on — over explicit values via [`flag_from`], so
+    /// no test in this binary has to touch the process environment (see `crate::test_env`).
     #[test]
     fn env_flag_grammar() {
-        const V: &str = "INFR_BUDGET_TEST_FLAG";
-        std::env::remove_var(V);
-        assert!(!env_flag(V));
+        assert!(!flag_from(None));
         for (raw, want) in [
             ("", false),
             ("0", false),
@@ -398,18 +409,26 @@ mod tests {
             ("true", true),
             ("no", true),
         ] {
-            std::env::set_var(V, raw);
-            assert_eq!(env_flag(V), want, "{V}={raw:?}");
+            assert_eq!(flag_from(Some(raw)), want, "raw={raw:?}");
         }
-        std::env::remove_var(V);
     }
 
-    /// MiB → bytes, with `0` distinct from unset (it forces whole-host placement).
+    /// The part `flag_from` cannot cover: `env_flag` reads the variable it was handed. Guarded.
+    #[test]
+    fn env_flag_reads_its_variable() {
+        const V: &str = "INFR_BUDGET_TEST_FLAG";
+        let mut env = crate::test_env::EnvGuard::new();
+        env.unset(V);
+        assert!(!env_flag(V));
+        env.set(V, "1");
+        assert!(env_flag(V));
+    }
+
+    /// MiB → bytes, with `0` distinct from unset (it forces whole-host placement) — over explicit
+    /// values via [`mib_from`], no environment.
     #[test]
     fn env_mib_grammar() {
-        const V: &str = "INFR_BUDGET_TEST_MIB";
-        std::env::remove_var(V);
-        assert_eq!(env_mib(V), None);
+        assert_eq!(mib_from(None), None);
         for (raw, want) in [
             ("0", Some(0)),
             ("1", Some(1024 * 1024)),
@@ -419,32 +438,49 @@ mod tests {
             ("-1", None),
             ("1.5", None),
         ] {
-            std::env::set_var(V, raw);
-            assert_eq!(env_mib(V), want, "{V}={raw:?}");
+            assert_eq!(mib_from(Some(raw)), want, "raw={raw:?}");
         }
-        std::env::remove_var(V);
     }
 
-    /// 12% of total, floored at 2 GiB, env override in MiB — verbatim from ROCm's two inline
-    /// copies (`kv_overflow_vram_reserve` / `weight_overflow_vram_reserve`).
+    /// The part `mib_from` cannot cover: `env_mib` reads the variable it was handed. Guarded.
+    #[test]
+    fn env_mib_reads_its_variable() {
+        const V: &str = "INFR_BUDGET_TEST_MIB";
+        let mut env = crate::test_env::EnvGuard::new();
+        env.unset(V);
+        assert_eq!(env_mib(V), None);
+        env.set(V, "512");
+        assert_eq!(env_mib(V), Some(512 * 1024 * 1024));
+    }
+
+    /// 12% of total, floored at 2 GiB, override in MiB — verbatim from ROCm's two inline copies
+    /// (`kv_overflow_vram_reserve` / `weight_overflow_vram_reserve`), over [`reserve_from`] so the
+    /// case sweep needs no environment.
     #[test]
     fn overflow_vram_reserve_matches_the_inline_formula() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Below the crossover (2 GiB / 0.12 ≈ 16.67 GiB) the floor wins.
+        assert_eq!(reserve_from(8 * GIB, None), 2 * GIB);
+        assert_eq!(reserve_from(16 * GIB, None), 2 * GIB);
+        // Above it, 12% — computed as `total / 100 * 12`, the shipped (truncating) order.
+        assert_eq!(reserve_from(24 * GIB, None), 24 * GIB / 100 * 12);
+        assert_eq!(reserve_from(0, None), 2 * GIB);
+        // The override wins outright, including below the floor and at zero.
+        assert_eq!(reserve_from(24 * GIB, Some("128")), 128 * 1024 * 1024);
+        assert_eq!(reserve_from(24 * GIB, Some("0")), 0);
+        assert_eq!(reserve_from(24 * GIB, Some("abc")), 24 * GIB / 100 * 12);
+    }
+
+    /// And that the env-reading wrapper picks up its variable. Guarded.
+    #[test]
+    fn overflow_vram_reserve_reads_its_variable() {
         const V: &str = "INFR_BUDGET_TEST_RESERVE_MB";
         const GIB: u64 = 1024 * 1024 * 1024;
-        std::env::remove_var(V);
-        // Below the crossover (2 GiB / 0.12 ≈ 16.67 GiB) the floor wins.
-        assert_eq!(overflow_vram_reserve(8 * GIB, V), 2 * GIB);
-        assert_eq!(overflow_vram_reserve(16 * GIB, V), 2 * GIB);
-        // Above it, 12% — computed as `total / 100 * 12`, the shipped (truncating) order.
+        let mut env = crate::test_env::EnvGuard::new();
+        env.unset(V);
         assert_eq!(overflow_vram_reserve(24 * GIB, V), 24 * GIB / 100 * 12);
-        assert_eq!(overflow_vram_reserve(0, V), 2 * GIB);
-        // The override wins outright, including below the floor.
-        std::env::set_var(V, "128");
+        env.set(V, "128");
         assert_eq!(overflow_vram_reserve(24 * GIB, V), 128 * 1024 * 1024);
-        std::env::set_var(V, "0");
-        assert_eq!(overflow_vram_reserve(24 * GIB, V), 0);
-        std::env::remove_var(V);
-        assert_eq!(overflow_vram_reserve(24 * GIB, V), 24 * GIB / 100 * 12);
     }
 
     /// The cumulative cap admits up to and including the cap, and `Some(0)` admits nothing —

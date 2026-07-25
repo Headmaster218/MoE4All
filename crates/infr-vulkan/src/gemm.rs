@@ -2859,8 +2859,10 @@ dyn_spv!(attn_partial_dynac_nohd_spv, "attn_partial_dynac_nohd");
 /// `INFR_NO_ATTN_HD=1` — select the `-DNO_HD_SPEC` attn_partial variants (general loops only).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_hd_spec_disabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("INFR_NO_ATTN_HD").is_ok())
+    // Not memoized: a `OnceLock` here latches whatever the first attention record saw, so a test
+    // that toggles the knob afterwards silently measures nothing. The call sites are pipeline
+    // SELECTION (once per recorded attention op, not per dispatch), where a `getenv` is noise.
+    std::env::var("INFR_NO_ATTN_HD").is_ok()
 }
 // Coupled Q8_0 KV cache: scalar dequant-on-read attention (static + record-once) and the row
 // quantize-store kernels (f32 V + f16 K sources, each with a params/decode variant).

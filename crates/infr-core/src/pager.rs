@@ -271,10 +271,18 @@ impl Pager {
 /// than a fourth copy of the clamp. The staging ring ITSELF (the buffers, the fences, the half
 /// rotation) stays per-backend.
 pub fn ring_bytes_policy(pager_budget: u64) -> usize {
+    ring_bytes_from(
+        pager_budget,
+        std::env::var("INFR_PAGER_RING").ok().as_deref(),
+    )
+}
+
+/// [`ring_bytes_policy`] over an explicit `INFR_PAGER_RING` value — all of the policy, none of the
+/// process environment, so the tests need no env mutation (see `infr_core::test_env`).
+pub fn ring_bytes_from(pager_budget: u64, raw: Option<&str>) -> usize {
     const MIB: u64 = 1024 * 1024;
-    if let Some(b) = std::env::var("INFR_PAGER_RING")
-        .ok()
-        .and_then(|v| crate::parse_size(&v))
+    if let Some(b) = raw
+        .and_then(crate::parse_size)
         .map(|s| s.resolve(0) as usize)
         .filter(|&b| b > 0)
     {
@@ -290,26 +298,33 @@ mod tests {
     /// The ring clamp's boundaries, pinning the pre-hoist inline expression
     /// `(budget / 8).clamp(256 MiB, 2048 MiB)` — the seam subtracts this from the pager budget
     /// before splitting arena shares, so a moved edge silently re-sizes every MoE arena — plus the
-    /// `INFR_PAGER_RING` override. ONE test: unlike the tier knobs, this env var's name is fixed,
-    /// so two tests toggling it would race in the shared test process.
+    /// `INFR_PAGER_RING` override grammar. Driven through [`ring_bytes_from`], which takes the
+    /// override as a plain string: no process-environment mutation, so this cannot race another
+    /// test in the shared binary (see `crate::test_env`).
     #[test]
     fn ring_bytes_policy_clamp_boundaries_and_env_override() {
         const MIB: u64 = 1024 * 1024;
-        std::env::remove_var("INFR_PAGER_RING");
         // Below the floor's crossover (8 x 256 MiB = 2 GiB of budget) the floor wins — including
         // the `0` budget the pager passes when it has no budget figure at all.
-        assert_eq!(ring_bytes_policy(0), 256 * MIB as usize);
-        assert_eq!(ring_bytes_policy(2048 * MIB), 256 * MIB as usize);
+        assert_eq!(ring_bytes_from(0, None), 256 * MIB as usize);
+        assert_eq!(ring_bytes_from(2048 * MIB, None), 256 * MIB as usize);
         // Exactly at the crossover, and just past it, the eighth wins.
-        assert_eq!(ring_bytes_policy(2048 * MIB + 8), (256 * MIB + 1) as usize);
-        assert_eq!(ring_bytes_policy(8 * 1024 * MIB), (1024 * MIB) as usize);
-        // The 2 GiB ceiling (8 x 2 GiB = 16 GiB of budget) and beyond.
-        assert_eq!(ring_bytes_policy(16 * 1024 * MIB), (2048 * MIB) as usize);
-        assert_eq!(ring_bytes_policy(64 * 1024 * MIB), (2048 * MIB) as usize);
+        assert_eq!(
+            ring_bytes_from(2048 * MIB + 8, None),
+            (256 * MIB + 1) as usize
+        );
+        // At the ceiling's crossover (8 x 2 GiB) and beyond, the ceiling wins.
+        assert_eq!(
+            ring_bytes_from(16 * 1024 * MIB, None),
+            (2048 * MIB) as usize
+        );
+        assert_eq!(
+            ring_bytes_from(64 * 1024 * MIB, None),
+            (2048 * MIB) as usize
+        );
 
-        // `INFR_PAGER_RING` overrides the budget fraction outright, through the shared size
-        // grammar; an unparseable or zero value falls back to the policy (a 0-byte ring could
-        // never stage a slot).
+        // The override in the shared size grammar; anything unparseable or zero falls through to
+        // the policy (a `0` ring would mean "never stage a slot").
         for (raw, want) in [
             ("1g", Some(1024 * MIB as usize)),
             ("512m", Some(512 * MIB as usize)),
@@ -319,16 +334,25 @@ mod tests {
             ("banana", None),
             ("1GiB", None), // not the shared grammar's spelling — treated as unset
         ] {
-            std::env::set_var("INFR_PAGER_RING", raw);
-            let got = ring_bytes_policy(64 * 1024 * MIB);
+            let got = ring_bytes_from(64 * 1024 * MIB, Some(raw));
             match want {
-                Some(w) => assert_eq!(got, w, "INFR_PAGER_RING={raw:?}"),
+                Some(w) => assert_eq!(got, w, "raw={raw:?}"),
                 // Falls through to the policy, which caps at 2 GiB on this budget.
-                None => assert_eq!(got, (2048 * MIB) as usize, "INFR_PAGER_RING={raw:?}"),
+                None => assert_eq!(got, (2048 * MIB) as usize, "raw={raw:?}"),
             }
         }
-        std::env::remove_var("INFR_PAGER_RING");
+    }
+
+    /// The one thing `ring_bytes_from` cannot cover: `ring_bytes_policy` reads `INFR_PAGER_RING`.
+    /// Guarded, so it neither races nor leaks the knob.
+    #[test]
+    fn ring_bytes_policy_reads_infr_pager_ring() {
+        const MIB: u64 = 1024 * 1024;
+        let mut env = crate::test_env::EnvGuard::new();
+        env.unset("INFR_PAGER_RING");
         assert_eq!(ring_bytes_policy(64 * 1024 * MIB), (2048 * MIB) as usize);
+        env.set("INFR_PAGER_RING", "1g");
+        assert_eq!(ring_bytes_policy(64 * 1024 * MIB), 1024 * MIB as usize);
     }
 
     #[test]

@@ -17,6 +17,10 @@ fn blk_bytes(dt: DType) -> usize {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn decode_gemv_bw() {
+    // Every knob this bench flips goes through ONE guard: it serializes against any other test in
+    // the binary that reads these, and restores the caller's environment when the test ends (a
+    // bare `remove_var` sweep at the end would clobber a value the caller had set).
+    let mut env = infr_core::test_env::EnvGuard::new();
     let be = VulkanBackend::new().unwrap();
     // (label, in_f, out_f, dtype) — the Qwen3-8B decode GEMV shapes.
     let shapes = [
@@ -84,30 +88,30 @@ fn decode_gemv_bw() {
 
         // Mode selects tree(RM1) / RM=2/4 (bit-identical) / SG NR=2/4/8 (reassociated). Each mode
         // fully re-sets the env so precedence is explicit (SG > RM > tree in the recorder).
-        let cfg = |mode: &str| {
-            std::env::set_var("INFR_GEMV_RM_MAXOUT", "999999");
-            std::env::set_var("INFR_GEMV_SG_MINOUT", "0");
-            std::env::set_var("INFR_GEMV_SG_MAXOUT", "999999");
+        let cfg = |env: &mut infr_core::test_env::EnvGuard, mode: &str| {
+            env.set("INFR_GEMV_RM_MAXOUT", "999999");
+            env.set("INFR_GEMV_SG_MINOUT", "0");
+            env.set("INFR_GEMV_SG_MAXOUT", "999999");
             match mode {
                 "1" => {
-                    std::env::set_var("INFR_NO_GEMV_RM", "1");
-                    std::env::set_var("INFR_NO_GEMV_SG", "1");
+                    env.set("INFR_NO_GEMV_RM", "1");
+                    env.set("INFR_NO_GEMV_SG", "1");
                 }
                 "R2" | "R4" => {
-                    std::env::remove_var("INFR_NO_GEMV_RM");
-                    std::env::set_var("INFR_NO_GEMV_SG", "1");
-                    std::env::set_var("INFR_GEMV_RM", &mode[1..]);
+                    env.unset("INFR_NO_GEMV_RM");
+                    env.set("INFR_NO_GEMV_SG", "1");
+                    env.set("INFR_GEMV_RM", &mode[1..]);
                 }
                 _ => {
                     // SG NR = mode[1..]
-                    std::env::set_var("INFR_NO_GEMV_RM", "1");
-                    std::env::remove_var("INFR_NO_GEMV_SG");
-                    std::env::set_var("INFR_GEMV_SG_NR", &mode[1..]);
+                    env.set("INFR_NO_GEMV_RM", "1");
+                    env.unset("INFR_NO_GEMV_SG");
+                    env.set("INFR_GEMV_SG_NR", &mode[1..]);
                 }
-            }
+            };
         };
-        let run_once = |mode: &str| -> Vec<f32> {
-            cfg(mode);
+        let run_once = |env: &mut infr_core::test_env::EnvGuard, mode: &str| -> Vec<f32> {
+            cfg(env, mode);
             let rec = be.recorder().unwrap();
             rec.linear_native(
                 dt,
@@ -122,10 +126,10 @@ fn decode_gemv_bw() {
             rec.finish().unwrap();
             read(y.as_ref(), out_f)
         };
-        let base = run_once("1");
+        let base = run_once(&mut env, "1");
         // RM stays BIT-identical to the tree kernel.
         for m in ["R2", "R4"] {
-            let got = run_once(m);
+            let got = run_once(&mut env, m);
             let mism = base
                 .iter()
                 .zip(&got)
@@ -136,7 +140,7 @@ fn decode_gemv_bw() {
         // SG is reassociated (not bit-identical) — measure how close it stays to the tree ref.
         let mut sg_maxrel = 0f32;
         for m in ["S2", "S4", "S8"] {
-            let got = run_once(m);
+            let got = run_once(&mut env, m);
             let mut mr = 0f32;
             for (a, b) in base.iter().zip(&got) {
                 let d = (a - b).abs() / (a.abs().max(b.abs()) + 1e-6);
@@ -146,8 +150,8 @@ fn decode_gemv_bw() {
         }
 
         // Bandwidth A/B (cold, rotated).
-        let bench = |mode: &str| -> f64 {
-            cfg(mode);
+        let bench = |env: &mut infr_core::test_env::EnvGuard, mode: &str| -> f64 {
+            cfg(env, mode);
             let run = || {
                 let rec = be.recorder().unwrap();
                 for r in 0..reps {
@@ -175,7 +179,7 @@ fn decode_gemv_bw() {
         let mut best = [0f64; 6];
         for _ in 0..3 {
             for (i, m) in modes.iter().enumerate() {
-                best[i] = best[i].max(bench(m));
+                best[i] = best[i].max(bench(&mut env, m));
             }
         }
         let [g1, r2, r4, s2, s4, s8] = best;
@@ -188,15 +192,5 @@ fn decode_gemv_bw() {
             (sg_best / rm_best - 1.0) * 100.0,
         );
     }
-    for v in [
-        "INFR_NO_GEMV_RM",
-        "INFR_GEMV_RM",
-        "INFR_GEMV_RM_MAXOUT",
-        "INFR_NO_GEMV_SG",
-        "INFR_GEMV_SG_NR",
-        "INFR_GEMV_SG_MINOUT",
-        "INFR_GEMV_SG_MAXOUT",
-    ] {
-        std::env::remove_var(v);
-    }
+    // `env` (the guard) restores every knob it touched when it drops here.
 }

@@ -56,10 +56,18 @@ pub struct EnvRows {
 
 impl EnvRows {
     /// The effective value: the parsed override clamped into `[min, max]`, else `default`.
+    ///
+    /// One `std::env::var` and a call to [`resolve`](Self::resolve), which holds ALL of the policy
+    /// — so the tests exercise `resolve` on plain strings instead of mutating the process
+    /// environment (see `infr_core::test_env` for why that matters in a threaded test binary).
     pub fn get(&self) -> usize {
-        std::env::var(self.env)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        self.resolve(std::env::var(self.env).ok().as_deref())
+    }
+
+    /// [`get`](Self::get)'s policy over an explicit override string: parse, else `default`, then
+    /// clamp into `[min, max]`. `None` (or an unparseable value) ⇒ the clamped default.
+    pub fn resolve(&self, raw: Option<&str>) -> usize {
+        raw.and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(self.default)
             .clamp(self.min, self.max)
     }
@@ -232,26 +240,19 @@ mod tests {
     /// Vulkan `attn_combine.comp`'s `shared float wexp[1024]`.
     const VK_MAX_CHUNKS: usize = 1024;
 
+    /// The knob grammar, over explicit strings via [`EnvRows::resolve`] — NO process-environment
+    /// mutation, so this cannot race another test in the same binary (see `crate::test_env`).
+    /// `get()` is `resolve(std::env::var(..))` and carries no policy of its own.
     #[test]
     fn env_rows_defaults_parses_and_clamps() {
-        // A knob whose env is unset yields the default untouched.
-        let unset = EnvRows {
-            env: "INFR_TIER_TEST_UNSET_KNOB",
-            default: 8,
-            min: 0,
-            max: 64,
-        };
-        std::env::remove_var(unset.env);
-        assert_eq!(unset.get(), 8);
-
-        // Own env name per case: infr-core's tests share a process, and a knob name reused across
-        // tests would race.
         let knob = EnvRows {
             env: "INFR_TIER_TEST_ROWS",
             default: 8,
             min: 0,
             max: 64,
         };
+        // Unset (and every unparseable spelling) yields the default untouched.
+        assert_eq!(knob.resolve(None), 8);
         for (raw, want) in [
             ("0", 0), // no floor on this knob — 0 is a legal "never take the path"
             ("1", 1),
@@ -264,11 +265,8 @@ mod tests {
             ("-1", 8), // negative doesn't parse as usize → unset, NOT 0
             ("4.5", 8),
         ] {
-            std::env::set_var(knob.env, raw);
-            assert_eq!(knob.get(), want, "INFR_TIER_TEST_ROWS={raw:?}");
+            assert_eq!(knob.resolve(Some(raw)), want, "raw={raw:?}");
         }
-        std::env::remove_var(knob.env);
-        assert_eq!(knob.get(), 8);
 
         // A knob with a FLOOR instead of a ceiling (the canvas chunk divisor shape): 0 would be a
         // division by zero downstream, so it clamps up.
@@ -278,12 +276,26 @@ mod tests {
             min: 1,
             max: usize::MAX,
         };
-        std::env::set_var(floored.env, "0");
-        assert_eq!(floored.get(), 1);
-        std::env::set_var(floored.env, "7");
-        assert_eq!(floored.get(), 7);
-        std::env::remove_var(floored.env);
-        assert_eq!(floored.get(), 3);
+        assert_eq!(floored.resolve(Some("0")), 1);
+        assert_eq!(floored.resolve(Some("7")), 7);
+        assert_eq!(floored.resolve(None), 3);
+    }
+
+    /// The one thing `resolve` cannot cover: that `get()` reads the RIGHT variable. Guarded, so it
+    /// neither races nor leaks the knob into another test.
+    #[test]
+    fn env_rows_get_reads_its_own_variable() {
+        let knob = EnvRows {
+            env: "INFR_TIER_TEST_GET",
+            default: 8,
+            min: 0,
+            max: 64,
+        };
+        let mut env = crate::test_env::EnvGuard::new();
+        env.unset(knob.env);
+        assert_eq!(knob.get(), 8);
+        env.set(knob.env, "65");
+        assert_eq!(knob.get(), 64, "get() must read + clamp its own env var");
     }
 
     #[test]

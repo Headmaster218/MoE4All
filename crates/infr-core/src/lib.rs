@@ -17,6 +17,8 @@ pub mod pager;
 pub mod progress;
 pub mod shutdown;
 pub mod tensor;
+/// Test-support: race-free `INFR_*` env access (see the module docs).
+pub mod test_env;
 pub mod tier;
 
 pub use backend::{

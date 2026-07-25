@@ -5986,13 +5986,15 @@ mod tests {
             ..Default::default()
         };
         // (env value for INFR_MMV_MW, label) — None = unset (the shipping default).
+        // ONE guard for the whole sweep: it serializes this test against anything else in the
+        // binary that reads INFR_MMV_MW, and restores the caller's value when the test ends.
+        let mut guard = infr_core::test_env::EnvGuard::new();
         for env in [None, Some("1"), Some("0")] {
             for (caps, vendor) in [(&amd, "amd"), (&intel, "intel")] {
-                // Serialized by the env mutation; these are pure table lookups.
                 match env {
-                    Some(v) => std::env::set_var("INFR_MMV_MW", v),
-                    None => std::env::remove_var("INFR_MMV_MW"),
-                }
+                    Some(v) => guard.set("INFR_MMV_MW", v),
+                    None => guard.unset("INFR_MMV_MW"),
+                };
                 for dt in POLICY_DTYPES {
                     let decode_int8 = mmv_int8_decode_dtypes(caps).contains(&dt);
                     let verify_int8 = mrow_int8_dtype_ok(caps, dt, true);
@@ -6013,7 +6015,7 @@ mod tests {
                 }
             }
         }
-        std::env::remove_var("INFR_MMV_MW");
+        guard.unset("INFR_MMV_MW");
         // The shipping AMD default, spelled out so a policy edit has to face it: Q2_K int8 in BOTH
         // decode and verify (the measured +20% win), Q3_K f32-exact in both. Q3_K's DECODE stays
         // off despite the accuracy isolation (see `mrow_int8_prefill_dtypes`'s doc) finding the

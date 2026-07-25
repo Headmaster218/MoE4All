@@ -35,14 +35,21 @@ macro_rules! need_model {
     };
 }
 
-/// Serialize the model-gated generation tests. They mutate PROCESS-GLOBAL env that generation reads
-/// (`INFR_TEMP`, and `INFR_NO_THINK` — read at render time in infr-chat), and cargo
-/// runs tests in parallel; without this, one test's env leaks into another's generation (e.g.
-/// `INFR_NO_THINK=1` flipping a Qwen3 golden's thinking off → hash mismatch). Poison-tolerant so a
-/// failing test doesn't cascade-poison the rest.
-fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// Serialize the model-gated generation tests AND scope their env mutations.
+///
+/// They drive PROCESS-GLOBAL knobs that generation reads (`INFR_TEMP`, `INFR_NO_THINK` — the
+/// latter at render time in infr-chat), and cargo runs tests in parallel, so without this one
+/// test's env leaks into another's generation (`INFR_NO_THINK=1` flipping a Qwen3 golden's
+/// thinking off → hash mismatch). [`infr_core::test_env::EnvGuard`] is both halves of the fix: it
+/// holds a process-wide lock for its lifetime AND restores every key it touched on drop, so a
+/// knob can no longer outlive the test that set it (a bare `remove_var` at the end of a test
+/// cannot do that — it clobbers whatever the caller had). Poison-tolerant, so a failing test does
+/// not cascade-poison the rest.
+///
+/// Set knobs THROUGH the returned guard (`env.set("INFR_TEMP", "0")`), never with `set_var`, and
+/// take it exactly once per test — it is not re-entrant.
+fn test_serial_lock() -> infr_core::test_env::EnvGuard {
+    infr_core::test_env::EnvGuard::new()
 }
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
@@ -155,8 +162,13 @@ fn qwen2_05b() -> Option<PathBuf> {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen2() {
     let path = need_model!(qwen2_05b(), "Qwen2.5-0.5B-Instruct");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(
+        &mut _tlk,
+        &path,
+        "What is the capital of France? Answer briefly.",
+        16,
+    );
 }
 
 // Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
@@ -179,8 +191,8 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3_GOLDEN);
 }
@@ -204,8 +216,8 @@ fn is_degenerate(s: &str) -> bool {
 #[test]
 fn cpu_no_garbage_on_repeated_forward() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let p = repeat_prompt();
     let g1 = cpu_gen(&model, &p, 20);
@@ -232,13 +244,13 @@ fn cpu_no_garbage_on_repeated_forward() {
 #[test]
 fn cpu_kv_q8_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let prompt = repeat_prompt();
     // f16 baseline, then each K/V quant mix. Load once per env (the KV dtype is read at graph build).
     for (k, v) in [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")] {
-        std::env::set_var("INFR_KV_TYPE_K", k);
-        std::env::set_var("INFR_KV_TYPE_V", v);
+        _tlk.set("INFR_KV_TYPE_K", k);
+        _tlk.set("INFR_KV_TYPE_V", v);
         let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
@@ -247,8 +259,8 @@ fn cpu_kv_q8_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
-    std::env::remove_var("INFR_KV_TYPE_K");
-    std::env::remove_var("INFR_KV_TYPE_V");
+    _tlk.unset("INFR_KV_TYPE_K");
+    _tlk.unset("INFR_KV_TYPE_V");
 }
 
 /// TurboQuant KV cache (CPU reference): WHT-rotated 2/3/4-bit PolarQuant, 128-elem blocks. The
@@ -259,11 +271,11 @@ fn cpu_kv_q8_coherent() {
 #[test]
 fn cpu_kv_turbo_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_KV_TYPE_K", "f16");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_KV_TYPE_K", "f16");
     for v in ["turbo2", "turbo3", "turbo4"] {
-        std::env::set_var("INFR_KV_TYPE_V", v);
+        _tlk.set("INFR_KV_TYPE_V", v);
         let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, &repeat_prompt(), 24);
         assert!(
@@ -272,8 +284,8 @@ fn cpu_kv_turbo_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
-    std::env::remove_var("INFR_KV_TYPE_K");
-    std::env::remove_var("INFR_KV_TYPE_V");
+    _tlk.unset("INFR_KV_TYPE_K");
+    _tlk.unset("INFR_KV_TYPE_V");
 }
 
 /// Mainline llama.cpp KV cache types (CPU reference): f32/bf16 (dense) + the low-bit round quants
@@ -283,8 +295,8 @@ fn cpu_kv_turbo_coherent() {
 #[test]
 fn cpu_kv_mainline_quants_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let prompt = repeat_prompt();
     for (k, v) in [
         ("f32", "f32"),
@@ -295,8 +307,8 @@ fn cpu_kv_mainline_quants_coherent() {
         ("f16", "q5_1"),
         ("f16", "iq4_nl"),
     ] {
-        std::env::set_var("INFR_KV_TYPE_K", k);
-        std::env::set_var("INFR_KV_TYPE_V", v);
+        _tlk.set("INFR_KV_TYPE_K", k);
+        _tlk.set("INFR_KV_TYPE_V", v);
         let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
@@ -305,8 +317,8 @@ fn cpu_kv_mainline_quants_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
-    std::env::remove_var("INFR_KV_TYPE_K");
-    std::env::remove_var("INFR_KV_TYPE_V");
+    _tlk.unset("INFR_KV_TYPE_K");
+    _tlk.unset("INFR_KV_TYPE_V");
 }
 
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
@@ -356,8 +368,8 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_gpu_golden(
         |p, n| {
@@ -379,8 +391,13 @@ fn gpu_seam_golden_qwen3() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_iq4xs() {
     let path = need_model!(qwen3_quant("IQ4_XS"), "Qwen3-0.6B-IQ4_XS");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(
+        &mut _tlk,
+        &path,
+        "What is the capital of France? Answer briefly.",
+        16,
+    );
 }
 
 /// Q2_K (2-bit quants + 4-bit sub-block scale/min + super-block d/dmin) through the Vulkan seam vs
@@ -401,8 +418,13 @@ fn gpu_seam_matches_cpu_qwen3_iq4xs() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q2k() {
     let path = need_model!(qwen3_quant("Q2_K"), "Qwen3-0.6B-Q2_K");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(
+        &mut _tlk,
+        &path,
+        "What is the capital of France? Answer briefly.",
+        16,
+    );
 }
 
 /// int8 cooperative-matrix (WMMA) prefill GEMM measurement kernel (`INFR_I8_COOPMAT=1`, Q8_0 only —
@@ -417,10 +439,15 @@ fn gpu_seam_matches_cpu_qwen3_q2k() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_I8_COOPMAT", "1");
-    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
-    std::env::remove_var("INFR_I8_COOPMAT");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_I8_COOPMAT", "1");
+    seam_vulkan_matches_cpu(
+        &mut _tlk,
+        &path,
+        "What is the capital of France? Answer briefly.",
+        16,
+    );
+    _tlk.unset("INFR_I8_COOPMAT");
 }
 
 /// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
@@ -431,8 +458,8 @@ fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_flash_matches_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     // ~100+ tokens → pf_m ≥ 64 → flash prefill on the seam.
     let long = "Photosynthesis is the process by which green plants, algae, and some bacteria \
@@ -477,8 +504,13 @@ fn gpu_seam_flash_matches_cpu() {
 /// quant dtype — measured against the host decode: CPU 3.4e-3..4.7e-3 vs Vulkan ~1e-7 — which is
 /// invisible at Q4_K+ but flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg
 /// therefore failed the more accurate implementation; the reference mode is the honest oracle.
-fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
-    std::env::set_var("INFR_TEMP", "0");
+fn seam_vulkan_matches_cpu(
+    env: &mut infr_core::test_env::EnvGuard,
+    path: &std::path::Path,
+    prompt: &str,
+    n: usize,
+) {
+    env.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(path, None).expect("cpu load");
     let rendered = model.render_chat(prompt).expect("render chat");
     let mut cpu_txt = String::new();
@@ -503,8 +535,8 @@ fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_reuse_matches_fresh() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.vulkan_session(512).expect("session");
 
@@ -549,9 +581,9 @@ fn gpu_seam_kv_reuse_matches_fresh() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_q8_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_KV_Q8", "1");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_KV_Q8", "1");
     let head = |s: &str| s.chars().take(64).collect::<String>();
     // A prompt long enough (>64 tokens) to take the prefill path, then a deep-cache decode.
     let long =
@@ -578,13 +610,13 @@ fn gpu_seam_kv_q8_coherent() {
         "Q8 session Vulkan output degenerate: {:?}",
         head(&g_sess)
     );
-    std::env::remove_var("INFR_KV_Q8");
+    _tlk.unset("INFR_KV_Q8");
 
     // (c) DECOUPLED K/V: each mixed side (K=q8/V=f16 and K=f16/V=q8) must also stay coherent — the
     // per-side attn_partial_{k,v}q8 / attention_kv_{k,v}q8 variants read one Q8 side + one f16 side.
     for (k, v) in [("q8_0", "f16"), ("f16", "q8_0")] {
-        std::env::set_var("INFR_KV_TYPE_K", k);
-        std::env::set_var("INFR_KV_TYPE_V", v);
+        _tlk.set("INFR_KV_TYPE_K", k);
+        _tlk.set("INFR_KV_TYPE_V", v);
         let m = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = m.generate_dense_vulkan(&long, 20).expect("mixed gen");
         assert!(
@@ -593,8 +625,8 @@ fn gpu_seam_kv_q8_coherent() {
             head(&out)
         );
     }
-    std::env::remove_var("INFR_KV_TYPE_K");
-    std::env::remove_var("INFR_KV_TYPE_V");
+    _tlk.unset("INFR_KV_TYPE_K");
+    _tlk.unset("INFR_KV_TYPE_V");
 }
 
 /// Mainline low-bit KV quants on the Vulkan seam: q4_0/q4_1/q5_0/q5_1/iq4_nl run via a quantizing
@@ -605,8 +637,8 @@ fn gpu_seam_kv_q8_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_mainline_quants_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let head = |s: &str| s.chars().take(64).collect::<String>();
     // Long enough (>64 tokens) to take the flash prefill on the dequanted scratch, then deep decode.
     let long =
@@ -624,8 +656,8 @@ fn gpu_seam_kv_mainline_quants_coherent() {
         ("f16", "turbo3"),
         ("f16", "turbo4"),
     ] {
-        std::env::set_var("INFR_KV_TYPE_K", k);
-        std::env::set_var("INFR_KV_TYPE_V", v);
+        _tlk.set("INFR_KV_TYPE_K", k);
+        _tlk.set("INFR_KV_TYPE_V", v);
         let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = model.generate_dense_vulkan(&long, 24).expect("gpu kv gen");
         assert!(
@@ -634,8 +666,8 @@ fn gpu_seam_kv_mainline_quants_coherent() {
             head(&out)
         );
     }
-    std::env::remove_var("INFR_KV_TYPE_K");
-    std::env::remove_var("INFR_KV_TYPE_V");
+    _tlk.unset("INFR_KV_TYPE_K");
+    _tlk.unset("INFR_KV_TYPE_V");
 }
 
 /// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a
@@ -646,8 +678,8 @@ fn gpu_seam_kv_mainline_quants_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_multi_slot_prefix_sharing() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.vulkan_session(512).expect("session");
 
@@ -712,8 +744,8 @@ fn gpu_seam_multi_slot_prefix_sharing() {
 #[test]
 fn metal_spec_decode_matches_target_only_greedy() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let target = infr_llama::SeamModel::load(&path, None).expect("target load");
     let draft = infr_llama::SeamModel::load(&path, None).expect("draft load");
     let prompt = target
@@ -749,27 +781,27 @@ fn metal_spec_decode_matches_target_only_greedy() {
 #[test]
 fn metal_decode_chain_matches_per_token_greedy() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("model load");
     let prompt = model
         .render_chat("Explain why the sky is blue in two sentences.")
         .expect("render chat");
 
-    std::env::set_var("INFR_DECODE_CHAIN", "1");
+    _tlk.set("INFR_DECODE_CHAIN", "1");
     let mut per_token = String::new();
     model
         .generate_metal(&prompt, 32, None, |p| per_token.push_str(p))
         .expect("per-token greedy");
 
-    std::env::set_var("INFR_DECODE_CHAIN", "8");
+    _tlk.set("INFR_DECODE_CHAIN", "8");
     let mut chained = String::new();
     model
         .generate_metal(&prompt, 32, None, |p| chained.push_str(p))
         .expect("chained greedy");
 
-    std::env::remove_var("INFR_DECODE_CHAIN");
-    std::env::remove_var("INFR_TEMP");
+    _tlk.unset("INFR_DECODE_CHAIN");
+    _tlk.unset("INFR_TEMP");
     assert_eq!(chained, per_token, "chained Metal decode diverged");
 }
 
@@ -777,23 +809,23 @@ fn metal_decode_chain_matches_per_token_greedy() {
 #[test]
 fn metal_decode_chain_matches_per_token_sampling() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0.7");
-    std::env::set_var("INFR_TOP_K", "20");
-    std::env::set_var("INFR_TOP_P", "0.95");
-    std::env::set_var("INFR_SEED", "47");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0.7");
+    _tlk.set("INFR_TOP_K", "20");
+    _tlk.set("INFR_TOP_P", "0.95");
+    _tlk.set("INFR_SEED", "47");
     let model = infr_llama::SeamModel::load(&path, None).expect("model load");
     let prompt = model
         .render_chat("Explain why the sky is blue in two sentences.")
         .expect("render chat");
 
-    std::env::set_var("INFR_DECODE_CHAIN", "1");
+    _tlk.set("INFR_DECODE_CHAIN", "1");
     let mut per_token = String::new();
     model
         .generate_metal(&prompt, 32, None, |p| per_token.push_str(p))
         .expect("per-token sampling");
 
-    std::env::set_var("INFR_DECODE_CHAIN", "8");
+    _tlk.set("INFR_DECODE_CHAIN", "8");
     let mut chained = String::new();
     model
         .generate_metal(&prompt, 32, None, |p| chained.push_str(p))
@@ -806,7 +838,7 @@ fn metal_decode_chain_matches_per_token_sampling() {
         "INFR_TOP_P",
         "INFR_SEED",
     ] {
-        std::env::remove_var(var);
+        _tlk.unset(var);
     }
     assert_eq!(chained, per_token, "chained Metal sampling diverged");
 }
@@ -819,8 +851,8 @@ fn metal_decode_chain_matches_per_token_sampling() {
 #[test]
 fn metal_seam_multi_slot_prefix_sharing() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.metal_session(512).expect("session");
 
@@ -884,8 +916,13 @@ fn metal_seam_multi_slot_prefix_sharing() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(
+        &mut _tlk,
+        &path,
+        "What is the capital of France? Answer briefly.",
+        16,
+    );
 }
 
 /// gemma3 Q2_K — unsloth's Q2_K here is a MIXED quant whose ffn up/gate and attn_q are IQ4_NL
@@ -903,8 +940,8 @@ fn gpu_seam_matches_cpu_gemma3() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
     let path = need_model!(gemma3_1b_q2k(), "gemma-3-1b Q2_K");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let rendered = model
         .render_chat("Count from one to five, digits only.")
@@ -937,8 +974,8 @@ fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_llama() {
     let path = need_model!(llama32_1b(), "Llama-3.2-1B");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "Count from one to five, digits only.", 16);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&mut _tlk, &path, "Count from one to five, digits only.", 16);
 }
 
 /// Plain Llama RoPE must produce the same multi-token continuation through Metal's default decode
@@ -948,8 +985,8 @@ fn gpu_seam_matches_cpu_llama() {
 #[test]
 fn metal_llama_replay_matches_static() {
     let path = need_model!(llama32_1b(), "Llama-3.2-1B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("model load");
     let prompt = model
         .render_chat("Count from one to five, digits only.")
@@ -957,21 +994,21 @@ fn metal_llama_replay_matches_static() {
 
     let run_metal = |no_replay: bool| {
         if no_replay {
-            std::env::set_var("INFR_SEAM_NO_REPLAY", "1");
+            _tlk.set("INFR_SEAM_NO_REPLAY", "1");
         } else {
-            std::env::remove_var("INFR_SEAM_NO_REPLAY");
+            _tlk.unset("INFR_SEAM_NO_REPLAY");
         }
         let mut out = String::new();
         model
             .generate_metal(&prompt, 16, None, |p| out.push_str(p))
             .expect("metal generation");
-        std::env::remove_var("INFR_SEAM_NO_REPLAY");
+        _tlk.unset("INFR_SEAM_NO_REPLAY");
         out
     };
 
     let replay = run_metal(false);
     let statc = run_metal(true);
-    std::env::remove_var("INFR_TEMP");
+    _tlk.unset("INFR_TEMP");
     assert_eq!(
         replay, statc,
         "Metal replay diverged from static Llama decode"
@@ -986,8 +1023,8 @@ fn metal_llama_replay_matches_static() {
 fn metal_kv_scratch_paths_are_coherent() {
     const EXPECTED: u64 = 0xef91_912b_db14_c7fd;
     let path = need_model!(llama32_1b(), "Llama-3.2-1B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let prompt =
         "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
     for (k, v) in [
@@ -1000,8 +1037,8 @@ fn metal_kv_scratch_paths_are_coherent() {
         ("f16", "turbo3"),
         ("f16", "turbo4"),
     ] {
-        std::env::set_var("INFR_KV_TYPE_K", k);
-        std::env::set_var("INFR_KV_TYPE_V", v);
+        _tlk.set("INFR_KV_TYPE_K", k);
+        _tlk.set("INFR_KV_TYPE_V", v);
         let model = infr_llama::SeamModel::load(&path, None).expect("model load");
         let rendered = model.render_chat(&prompt).expect("render chat");
         let mut out = String::new();
@@ -1024,7 +1061,7 @@ fn metal_kv_scratch_paths_are_coherent() {
         );
     }
     for var in ["INFR_TEMP", "INFR_KV_TYPE_K", "INFR_KV_TYPE_V"] {
-        std::env::remove_var(var);
+        _tlk.unset(var);
     }
 }
 
@@ -1033,8 +1070,8 @@ fn metal_kv_scratch_paths_are_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4() {
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&mut _tlk, &path, "What is 2+2? Answer briefly.", 12);
 }
 
 /// gemma4 E2B (per-layer embeddings, KV/FFN sharing) through the Vulkan seam (per-token prefill —
@@ -1062,8 +1099,8 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&mut _tlk, &path, "What is 2+2? Answer briefly.", 12);
 }
 
 /// qwen3moe (routed-expert Op::MoeFfn) through the Vulkan seam, batched GPU-routed prefill. The
@@ -1075,8 +1112,8 @@ fn gpu_seam_matches_cpu_gemma4_e2b() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let rendered = model
         .render_chat("What is 2+2? Answer briefly.")
@@ -1115,8 +1152,8 @@ fn gpu_seam_bf16_matches_cpu() {
         eprintln!("skip: no BF16 model");
         return;
     }
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let prompt = model
         .render_chat("What is the capital of France? Answer in one word.")
@@ -1152,8 +1189,8 @@ const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
 
 #[test]
 fn cpu_golden_qwen3_quants() {
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let bless = std::env::var("INFR_BLESS").is_ok();
     let prompt = "The capital of France is";
     for (quant, n, want) in QWEN3_QUANT_GOLDEN {
@@ -1213,8 +1250,8 @@ const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA3_GOLDEN);
 }
@@ -1250,8 +1287,8 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN35_GOLDEN);
 }
@@ -1271,8 +1308,8 @@ fn cpu_golden_qwen35() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn unified_qwen35_gpu_seam_matches_cpu() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is bash? Answer briefly.", 24);
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&mut _tlk, &path, "What is bash? Answer briefly.", 24);
 }
 
 /// qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary — it can't rewind to an
@@ -1288,9 +1325,9 @@ fn unified_qwen35_gpu_seam_matches_cpu() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn unified_qwen35_session_no_rewind() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_IGNORE_EOS", "1"); // fixed-length turns, no early EOS stop
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_IGNORE_EOS", "1"); // fixed-length turns, no early EOS stop
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.vulkan_session(512).expect("session");
 
@@ -1342,7 +1379,7 @@ fn unified_qwen35_session_no_rewind() {
         "divergent turn didn't fully re-prefill (no-rewind rule violated): got {} vs fresh {}",
         s3.n_prompt, sf3.n_prompt
     );
-    std::env::remove_var("INFR_IGNORE_EOS");
+    _tlk.unset("INFR_IGNORE_EOS");
 }
 
 // ─── MTP (multi-token prediction) speculative decoding — Phase 1 (issue #33) ────────────────
@@ -1859,8 +1896,8 @@ fn mtp_head_trunk_acceptance_rate() {
 #[ignore = "MTP parked: int8 decode noise flips a close-margin greedy token (see mtp::mtp_enabled)"]
 fn mtp_spec_matches_target_only_greedy() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let prompt = model
         .render_chat("Tell me a short story about a brave knight.")
@@ -1902,8 +1939,8 @@ fn mtp_spec_matches_target_only_greedy() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_spec_acceptance_stats() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
@@ -1959,8 +1996,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 #[test]
 fn cpu_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
@@ -1989,9 +2026,9 @@ fn cpu_golden_qwen3moe() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_UBATCH", "1");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_UBATCH", "1");
     let n = 8usize;
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
@@ -2005,7 +2042,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
         .expect("cpu gen");
 
-    std::env::remove_var("INFR_CACHE");
+    _tlk.unset("INFR_CACHE");
     let mut resident_ids = Vec::new();
     model
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
@@ -2013,13 +2050,13 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 
     // 0.05 GB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
     // real eviction pressure across the model's 48 MoE layers.
-    std::env::set_var("INFR_CACHE", "50m");
-    std::env::set_var("INFR_PAGER_STATS", "1");
+    _tlk.set("INFR_CACHE", "50m");
+    _tlk.set("INFR_PAGER_STATS", "1");
     let mut paged_ids = Vec::new();
     let paged_result = model.generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id));
-    std::env::remove_var("INFR_CACHE");
-    std::env::remove_var("INFR_UBATCH");
-    std::env::remove_var("INFR_PAGER_STATS");
+    _tlk.unset("INFR_CACHE");
+    _tlk.unset("INFR_UBATCH");
+    _tlk.unset("INFR_PAGER_STATS");
     paged_result.expect("paged gpu gen");
 
     assert_eq!(
@@ -2046,8 +2083,8 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_and_cpu() {
     let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let n = 8usize;
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
@@ -2061,7 +2098,7 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
         .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
         .expect("cpu gen");
 
-    std::env::remove_var("INFR_CACHE");
+    _tlk.unset("INFR_CACHE");
     let mut resident_ids = Vec::new();
     model
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
@@ -2069,12 +2106,12 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
 
     // 0.2 GB is far below the model's ~1.4 GB of streamable projections — every pool runs at its
     // floor slot count, so (nearly) every layer re-uploads every pass: real eviction pressure.
-    std::env::set_var("INFR_CACHE", "200m");
-    std::env::set_var("INFR_PAGER_STATS", "1");
+    _tlk.set("INFR_CACHE", "200m");
+    _tlk.set("INFR_PAGER_STATS", "1");
     let mut streamed_ids = Vec::new();
     let streamed_result = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id));
-    std::env::remove_var("INFR_CACHE");
-    std::env::remove_var("INFR_PAGER_STATS");
+    _tlk.unset("INFR_CACHE");
+    _tlk.unset("INFR_PAGER_STATS");
     streamed_result.expect("streamed gpu gen");
 
     assert_eq!(
@@ -2103,8 +2140,8 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let n = 8usize;
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
@@ -2118,18 +2155,18 @@ fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
         .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
         .expect("cpu gen");
 
-    std::env::remove_var("INFR_CACHE");
+    _tlk.unset("INFR_CACHE");
     let mut resident_ids = Vec::new();
     model
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
         .expect("resident gpu gen");
 
-    std::env::set_var("INFR_CACHE", "8g");
-    std::env::set_var("INFR_PAGER_STATS", "1");
+    _tlk.set("INFR_CACHE", "8g");
+    _tlk.set("INFR_PAGER_STATS", "1");
     let mut streamed_ids = Vec::new();
     let streamed_result = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id));
-    std::env::remove_var("INFR_CACHE");
-    std::env::remove_var("INFR_PAGER_STATS");
+    _tlk.unset("INFR_CACHE");
+    _tlk.unset("INFR_PAGER_STATS");
     streamed_result.expect("streamed gpu gen");
 
     assert_eq!(
@@ -2155,8 +2192,8 @@ fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_prefill_matches_resident() {
     let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let n = 8usize;
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
@@ -2173,19 +2210,19 @@ fn gpu_seam_dense_stream_prefill_matches_resident() {
         prompt_ids.len()
     );
 
-    std::env::remove_var("INFR_CACHE");
+    _tlk.unset("INFR_CACHE");
     let mut resident_ids = Vec::new();
     model
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
         .expect("resident gpu gen");
 
     // Below the model's ~1.4 GB of streamable projections → real eviction every pass.
-    std::env::set_var("INFR_CACHE", "200m");
+    _tlk.set("INFR_CACHE", "200m");
     let mut streamed_a = Vec::new();
     let ra = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_a.push(id));
     let mut streamed_b = Vec::new();
     let rb = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_b.push(id));
-    std::env::remove_var("INFR_CACHE");
+    _tlk.unset("INFR_CACHE");
     ra.expect("streamed gpu gen (rep a)");
     rb.expect("streamed gpu gen (rep b)");
 
@@ -2203,8 +2240,8 @@ fn gpu_seam_dense_stream_prefill_matches_resident() {
 #[test]
 fn cpu_golden_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA4_E2B_GOLDEN);
 }
@@ -2236,7 +2273,7 @@ fn qwen35moe_35b_a3b() -> Option<PathBuf> {
 #[test]
 fn cpu_qwen35moe_prefill_finite() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let cfg = model.config();
     assert!(
@@ -2278,7 +2315,7 @@ fn cpu_qwen35moe_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen35moe() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let tokens = model
         .encode("What is the capital of France? Answer briefly.")
@@ -2317,7 +2354,7 @@ fn gpu_seam_matches_cpu_qwen35moe() {
 #[test]
 fn cpu_qwen35_dense_unaffected_by_moe_fields() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let cfg = model.config();
     assert!(cfg.qwen35);
@@ -2394,8 +2431,8 @@ fn cpu_llama4_config() {
 #[test]
 fn cpu_llama4_scout_greedy() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let prompt =
         std::env::var("INFR_L4_PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
@@ -2445,9 +2482,9 @@ fn cpu_llama4_scout_greedy() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_PAGER_STATS", "1");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_PAGER_STATS", "1");
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
     let mut ids = model.encode("The capital of France is").expect("encode");
     ids.insert(0, 200000); // Scout's BOS (<|begin_of_text|>), matching cpu_llama4_scout_greedy
@@ -2511,7 +2548,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 #[test]
 fn cpu_diffusion_gemma_prefill_finite() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     assert!(
         model.config().diffusion_gemma,
@@ -2549,7 +2586,7 @@ fn cpu_diffusion_gemma_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let tokens = model
         .encode("What is the capital of France? Answer briefly.")
@@ -2623,8 +2660,8 @@ fn gpu_seam_matches_cpu_diffusion_gemma() {
 #[test]
 fn cpu_diffusion_gemma_denoise_step() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let vocab = model.config().vocab;
     let canvas_len = model.config().canvas_length;
@@ -2733,8 +2770,8 @@ fn cpu_diffusion_gemma_denoise_step() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let vocab = model.config().vocab;
     let canvas_len = model.config().canvas_length;
@@ -2849,8 +2886,8 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let vocab = model.config().vocab;
     let canvas_len = model.config().canvas_length;
@@ -2860,11 +2897,11 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
         .expect("encode");
     let canvas: Vec<u32> = vec![mask_id; canvas_len];
 
-    let run = |no_replay: bool| -> Vec<f32> {
+    let mut run = |no_replay: bool| -> Vec<f32> {
         if no_replay {
-            std::env::set_var("INFR_SEAM_NO_REPLAY", "1");
+            _tlk.set("INFR_SEAM_NO_REPLAY", "1");
         } else {
-            std::env::remove_var("INFR_SEAM_NO_REPLAY");
+            _tlk.unset("INFR_SEAM_NO_REPLAY");
         }
         let mut sess = model
             .diffusion_gemma_vulkan_session(tokens.len() + canvas_len + 8)
@@ -2873,7 +2910,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
         let outcome = sess
             .denoise(&model, &canvas, None, 1.0, 1.0, None)
             .expect("vulkan denoise");
-        std::env::remove_var("INFR_SEAM_NO_REPLAY");
+        _tlk.unset("INFR_SEAM_NO_REPLAY");
         match outcome {
             infr_llama::seam::DenoiseOutcome::Logits(v) => v,
             infr_llama::seam::DenoiseOutcome::Reduced(_) => {
@@ -2932,7 +2969,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn diffusion_gemma_decode_matches_oracle() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     assert!(
         model.config().diffusion_gemma,
@@ -3028,10 +3065,10 @@ fn two_models_two_devices_concurrent() {
         );
         return;
     }
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     // Deterministic + no <think> span, so the answer settles on "Paris" within a few tokens.
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_NO_THINK", "1");
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_NO_THINK", "1");
 
     /// One session's outcome, carried back out of its thread.
     struct DevOut {
@@ -3160,9 +3197,9 @@ fn pipeline_matches_single_device() {
         );
         return;
     }
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_NO_THINK", "1");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_NO_THINK", "1");
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
     let prompt = model
@@ -3241,9 +3278,9 @@ fn tensor_parallel_matches_single_device() {
         );
         return;
     }
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_NO_THINK", "1");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_NO_THINK", "1");
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
     let prompt = model
@@ -3316,11 +3353,11 @@ fn expert_parallel_matches_single_device() {
         );
         return;
     }
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_NO_THINK", "1");
+    let mut _tlk = test_serial_lock();
+    _tlk.set("INFR_TEMP", "0");
+    _tlk.set("INFR_NO_THINK", "1");
     // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic).
-    std::env::set_var("INFR_MOE_SMALL_M", "64");
+    _tlk.set("INFR_MOE_SMALL_M", "64");
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");
     let prompt = model
@@ -3424,7 +3461,7 @@ fn cpu_bitnet_config() {
 #[test]
 fn cpu_bitnet_prefill_paris() {
     let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let cfg = model.config();
     assert!(cfg.sub_norm);
@@ -3457,7 +3494,7 @@ fn cpu_bitnet_prefill_paris() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_bitnet() {
     let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
-    let _tlk = test_serial_lock();
+    let mut _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut tokens = model.encode("The capital of France is").expect("encode");
     tokens.insert(0, 1); // BOS
@@ -3542,8 +3579,13 @@ mod rocm_seam_gate {
     /// (rendered through the model's chat template) must match token-for-token. The ROCm twin of
     /// [`seam_vulkan_matches_cpu`]. A fresh `rocm_session` per call = a full prefill each time (the
     /// CPU reference runs the IDENTICAL `Graph`); greedy is selected by `INFR_TEMP=0` + `req=None`.
-    fn seam_rocm_matches_cpu(path: &Path, prompt: &str, n: usize) {
-        std::env::set_var("INFR_TEMP", "0");
+    fn seam_rocm_matches_cpu(
+        env: &mut infr_core::test_env::EnvGuard,
+        path: &Path,
+        prompt: &str,
+        n: usize,
+    ) {
+        env.set("INFR_TEMP", "0");
         let model = infr_llama::SeamModel::load(path, None).expect("cpu load");
         let rendered = model.render_chat(prompt).expect("render chat");
 
@@ -3600,8 +3642,8 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_qwen3() {
         let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-        let _tlk = test_serial_lock();
-        std::env::set_var("INFR_TEMP", "0");
+        let mut _tlk = test_serial_lock();
+        _tlk.set("INFR_TEMP", "0");
         let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         check_gpu_golden(|p, n| rocm_gen(&model, p, n), QWEN3_ROCM_GOLDEN);
     }
@@ -3611,8 +3653,13 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_qwen3_q8_0() {
         let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(
+            &mut _tlk,
+            &path,
+            "What is the capital of France? Answer briefly.",
+            16,
+        );
     }
 
     /// Qwen3-0.6B at IQ4_XS (non-linear 4-bit codebook quant) through the ROCm seam — model-level
@@ -3621,8 +3668,13 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_qwen3_iq4xs() {
         let path = need_model!(qwen3_quant("IQ4_XS"), "Qwen3-0.6B-IQ4_XS");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(
+            &mut _tlk,
+            &path,
+            "What is the capital of France? Answer briefly.",
+            16,
+        );
     }
 
     /// gemma3-1b (SWA + dual-rope + GeGLU + sandwich norms, hd=256) Q4_K_M through the ROCm seam.
@@ -3630,8 +3682,13 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_gemma3() {
         let path = need_model!(gemma3_1b(), "gemma-3-1b");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(
+            &mut _tlk,
+            &path,
+            "What is the capital of France? Answer briefly.",
+            16,
+        );
     }
 
     /// qwen35 / Qwen3-Next 0.8B (gated DeltaNet recurrence + conv + gated full attention) Q4_K_M
@@ -3640,8 +3697,8 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_qwen35() {
         let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "What is bash? Answer briefly.", 24);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(&mut _tlk, &path, "What is bash? Answer briefly.", 24);
     }
 
     /// Llama-3.2-1B (plain interleaved RoPE, no qk-norm) Q4_K_M through the ROCm seam.
@@ -3649,8 +3706,8 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_llama() {
         let path = need_model!(llama32_1b_q4km(), "Llama-3.2-1B Q4_K_M");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "Count from one to five, digits only.", 16);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(&mut _tlk, &path, "Count from one to five, digits only.", 16);
     }
 
     /// Qwen2.5-0.5B-Instruct (biased q/k/v projections + tied lm-head) Q4_K_M through the ROCm seam.
@@ -3658,8 +3715,13 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_qwen2() {
         let path = need_model!(qwen25_05b_q4km(), "Qwen2.5-0.5B-Instruct");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(
+            &mut _tlk,
+            &path,
+            "What is the capital of France? Answer briefly.",
+            16,
+        );
     }
 
     /// gemma4 E2B (per-layer input embeddings + KV/FFN sharing, heterogeneous head dims) Q4_K_M
@@ -3668,8 +3730,8 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_gemma4_e2b() {
         let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
-        let _tlk = test_serial_lock();
-        seam_rocm_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
+        let mut _tlk = test_serial_lock();
+        seam_rocm_matches_cpu(&mut _tlk, &path, "What is 2+2? Answer briefly.", 12);
     }
 
     /// BitNet-b1.58-2B-4T (i2_s ternary, SubLN, NEOX rope) through the ROCm seam — LOGITS-PARITY
@@ -3681,7 +3743,7 @@ mod rocm_seam_gate {
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_bitnet() {
         let path = need_model!(bitnet_2b_i2s(), "bitnet-b1.58-2B-4T i2_s");
-        let _tlk = test_serial_lock();
+        let mut _tlk = test_serial_lock();
         let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let mut tokens = model.encode("The capital of France is").expect("encode");
         tokens.insert(0, 1); // BOS (the GGUF sets add_bos_token; the base model needs it)
