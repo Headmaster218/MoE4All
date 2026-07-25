@@ -295,6 +295,43 @@ fn moe_down_i8_kernel(dn: &str) -> &'static str {
     }
 }
 
+/// Device-routed (Slice 38) twin of `moe_expert_kernel` — the `moe_ffn_expert_routed_<gu>_<dn>`
+/// native-decode expert FFN that resolves the per-expert bank pointer + routing weight on-device.
+fn moe_expert_routed_kernel(gu: &str, dn: &str) -> &'static str {
+    match (gu, dn) {
+        ("q80", "q80") => "moe_ffn_expert_routed_q80_q80",
+        ("q80", "q4k") => "moe_ffn_expert_routed_q80_q4k",
+        ("q80", "q6k") => "moe_ffn_expert_routed_q80_q6k",
+        ("q4k", "q80") => "moe_ffn_expert_routed_q4k_q80",
+        ("q4k", "q4k") => "moe_ffn_expert_routed_q4k_q4k",
+        ("q4k", "q6k") => "moe_ffn_expert_routed_q4k_q6k",
+        ("q6k", "q80") => "moe_ffn_expert_routed_q6k_q80",
+        ("q6k", "q4k") => "moe_ffn_expert_routed_q6k_q4k",
+        ("q6k", "q6k") => "moe_ffn_expert_routed_q6k_q6k",
+        _ => unreachable!("moe_expert_routed_kernel: uncovered ({gu}, {dn})"),
+    }
+}
+
+/// Device-routed twin of `moe_gate_up_i8_kernel`.
+fn moe_gate_up_i8_routed_kernel(gu: &str) -> &'static str {
+    match gu {
+        "q80" => "moe_gate_up_act_i8_routed_q80",
+        "q4k" => "moe_gate_up_act_i8_routed_q4k",
+        "q6k" => "moe_gate_up_act_i8_routed_q6k",
+        _ => unreachable!("moe_gate_up_i8_routed_kernel: uncovered ({gu})"),
+    }
+}
+
+/// Device-routed twin of `moe_down_i8_kernel`.
+fn moe_down_i8_routed_kernel(dn: &str) -> &'static str {
+    match dn {
+        "q80" => "moe_down_i8_routed_q80",
+        "q4k" => "moe_down_i8_routed_q4k",
+        "q6k" => "moe_down_i8_routed_q6k",
+        _ => unreachable!("moe_down_i8_routed_kernel: uncovered ({dn})"),
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -423,6 +460,9 @@ fn arg_ptr(p: *mut c_void) -> Vec<u8> {
     (p as u64).to_le_bytes().to_vec()
 }
 fn arg_i32(v: i32) -> Vec<u8> {
+    v.to_le_bytes().to_vec()
+}
+fn arg_i64(v: i64) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 fn arg_f32(v: f32) -> Vec<u8> {
@@ -2287,14 +2327,6 @@ fn run_op(
                     arg_i32(n_expert as i32),
                 ],
             )?;
-            unsafe {
-                ffi::hipStreamSynchronize(ctx.stream);
-            }
-            let logits_all: Vec<f32> = {
-                let raw = read_bytes(&logits_dev, ctx.stream);
-                bytemuck::cast_slice::<u8, f32>(&raw).to_vec()
-            };
-
             let at: i32 = match act {
                 infr_core::graph::Activation::Silu => 0,
                 infr_core::graph::Activation::Gelu => 1,
@@ -2332,196 +2364,430 @@ fn run_op(
             };
 
             let dd = ctx.zero_dev(rows * neu);
-            for row in 0..rows {
-                let logits = &logits_all[row * nexp..row * nexp + nexp];
-                // Gating: softmax over experts (qwen3moe/…) or per-expert sigmoid (llama4).
-                let probs: Vec<f32> = match gating {
-                    infr_core::graph::MoeGating::Softmax => {
-                        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
-                        let sum: f32 = exps.iter().sum();
-                        exps.iter().map(|v| v / sum).collect()
-                    }
-                    infr_core::graph::MoeGating::Sigmoid => {
-                        logits.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect()
-                    }
+
+            // ── RESIDENT path (Slice 38): GPU-side top-k routing, no host readback. ──
+            // `moe_topk` reads the router logits (already on-device in `logits_dev`), computes the
+            // top-`n_used` experts + gate weights per row into device buffers, and the `*_routed_*`
+            // expert kernels resolve the per-expert bank pointer from `expert_id` in-kernel. The host
+            // loop below issues a FIXED `rows * n_used` grid of dispatches with NO knowledge of which
+            // experts were picked, so nothing is read back — removing the per-MoE-layer D2H stall.
+            if !is_paged {
+                let route_ids = ctx.pool_buf((rows * nu * 4).max(4), false);
+                let route_wts = ctx.pool_buf((rows * nu * 4).max(4), false);
+                let gating_flag: i32 = match gating {
+                    infr_core::graph::MoeGating::Softmax => 0,
+                    infr_core::graph::MoeGating::Sigmoid => 1,
                 };
-                let mut idx: Vec<usize> = (0..nexp).collect();
-                idx.sort_unstable_by(|&a, &b| {
-                    probs[b]
-                        .partial_cmp(&probs[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                idx.truncate(nu);
-                // `norm_w`: renormalize the selected weights to sum to 1 before scaling
-                // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
-                let wsum: f32 = if norm_w {
-                    idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20)
+                let normw_flag: i32 = if norm_w { 1 } else { 0 };
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "moe_topk",
+                    (rows as u32) * 128,
+                    128,
+                    args![
+                        arg_ptr(logits_dev.ptr),
+                        arg_ptr(route_ids.ptr),
+                        arg_ptr(route_wts.ptr),
+                        arg_i32(nexp as i32),
+                        arg_i32(nu as i32),
+                        arg_f32(scale),
+                        arg_i32(gating_flag),
+                        arg_i32(normw_flag),
+                    ],
+                )?;
+
+                // Per-expert down-projection scale on device (diffusion-gemma); null ⇒ all 1.0. The
+                // synchronous copy is tiny (n_expert floats) and only runs for models that carry a
+                // `down_scale` (the coherence-critical qwen3moe has none → null → no copy).
+                let dsc_dev = if down_scale.is_some() {
+                    let b = ctx.pool_buf((nexp * 4).max(4), false);
+                    unsafe {
+                        ffi::hipMemcpy(
+                            b.ptr,
+                            dsc_vals.as_ptr() as *const c_void,
+                            nexp * 4,
+                            HIP_MEMCPY_HOST_TO_DEVICE,
+                        );
+                    }
+                    Some(b)
                 } else {
-                    1.0
+                    None
                 };
-                let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
-                let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
-                // Int8 path: quantize this token's input row ONCE (reused across all experts).
-                if use_i8 {
-                    dispatch_1d(
-                        pipelines,
-                        ctx.stream,
-                        "quant_i8_32",
-                        (neu / 32) as u32,
-                        256,
-                        args![
-                            arg_ptr(x_row),
-                            arg_ptr(qx_x.as_ref().unwrap().ptr),
-                            arg_ptr(xs_x.as_ref().unwrap().ptr),
-                            arg_i32(1),
-                            arg_i32(ne as i32),
-                        ],
-                    )?;
-                }
-                for &ei in &idx {
-                    let w = probs[ei] / wsum * scale;
-                    // Per-expert pointers. Native path: byte offset = (element_offset / qpb) * bpb
-                    // into the RAW quant bank (every element offset is a multiple of the block size,
-                    // since the per-expert stride is a whole number of `ne`-wide rows and `ne` is a
-                    // multiple of the block elem count). Fallback path: element_offset * 2 into the
-                    // f16 cache. Gate/up share the `gu` format+geometry; down carries the `dn` one.
-                    let (gs, us, ds, kname) = if is_paged {
-                        // Page each routed expert into its VRAM slot; the slot holds exactly this
-                        // expert's raw quant bytes at offset 0, so there is no per-expert bank
-                        // offset — the slot base IS the expert pointer. A fused gate_up slot is
-                        // double-width: gate at 0, up at the within-slot half offset.
-                        let ((gu, gu_qpb, gu_bpb), (dn, _dqpb, _dbpb)) =
-                            native.expect("is_paged implies native");
-                        let mut mp = ctx.moe_pager.lock().unwrap();
-                        let p = mp.as_mut().unwrap();
-                        let gs = p.ensure_slot(crate::pager::Role::Gate, gate_buf_id, ei as u32)?;
-                        let us = if fused_gate_up {
-                            unsafe {
-                                (gs as *mut u8).add((nfu * neu / gu_qpb) * gu_bpb) as *mut c_void
-                            }
-                        } else {
-                            p.ensure_slot(crate::pager::Role::Up, up_buf_id, ei as u32)?
-                        };
-                        let ds = p.ensure_slot(crate::pager::Role::Down, down_buf_id, ei as u32)?;
-                        (gs, us, ds, moe_expert_kernel(gu, dn))
-                    } else if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
-                        let gs = unsafe {
-                            (gw_ptr as *mut u8).add((ei * ge_stride / gu_qpb) * gu_bpb)
-                                as *mut c_void
-                        };
-                        let us = if fused_gate_up {
-                            unsafe {
-                                (gw_ptr as *mut u8)
-                                    .add(((ei * ge_stride + nfu * neu) / gu_qpb) * gu_bpb)
-                                    as *mut c_void
-                            }
-                        } else {
-                            unsafe {
-                                (uw_ptr as *mut u8).add((ei * nfu * neu / gu_qpb) * gu_bpb)
-                                    as *mut c_void
-                            }
-                        };
-                        let ds = unsafe {
-                            (dw_ptr as *mut u8).add((ei * neu * nfu / dn_qpb) * dn_bpb)
-                                as *mut c_void
-                        };
-                        (gs, us, ds, moe_expert_kernel(gu, dn))
-                    } else {
-                        let gs =
-                            unsafe { (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void };
-                        let us = if fused_gate_up {
-                            unsafe {
-                                (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2)
-                                    as *mut c_void
-                            }
-                        } else {
-                            unsafe { (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void }
-                        };
-                        let ds =
-                            unsafe { (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void };
-                        (gs, us, ds, "moe_ffn_expert")
-                    };
-                    let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
-                    if let (true, Some(((gu, _, _), (dn, _, _)))) = (use_i8, native) {
-                        // int8 dp4a: gate+up+activation (→ h_buf), quant h, then down (accumulate).
-                        // The routing weight is folded into h via wg/wo (same split as the fused
-                        // f16 kernel: `weight_before` applies it to the gate/up inputs, else output).
-                        let wg = if weight_before { w } else { 1.0 };
-                        let wo = if weight_before { 1.0 } else { w };
-                        let h_ptr = h_buf.as_ref().unwrap().ptr;
-                        dispatch_grid(
-                            pipelines,
-                            ctx.stream,
-                            moe_gate_up_i8_kernel(gu),
-                            n_ff_exp,
-                            1,
-                            32,
-                            args![
-                                arg_ptr(qx_x.as_ref().unwrap().ptr),
-                                arg_ptr(xs_x.as_ref().unwrap().ptr),
-                                arg_ptr(gs),
-                                arg_ptr(us),
-                                arg_ptr(h_ptr),
-                                arg_i32(ne as i32),
-                                arg_i32(n_ff_exp as i32),
-                                arg_i32(at),
-                                arg_f32(wg),
-                                arg_f32(wo),
-                                arg_f32(dsc),
-                            ],
-                        )?;
+                let dsc_ptr = dsc_dev
+                    .as_ref()
+                    .map(|b| b.ptr)
+                    .unwrap_or(std::ptr::null_mut());
+                let fused_flag: i32 = if fused_gate_up { 1 } else { 0 };
+
+                for row in 0..rows {
+                    let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                    let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                    if use_i8 {
+                        // int8 activation quant of this token's input row (reused across all n_used).
                         dispatch_1d(
                             pipelines,
                             ctx.stream,
                             "quant_i8_32",
-                            (nfu / 32) as u32,
-                            256,
-                            args![
-                                arg_ptr(h_ptr),
-                                arg_ptr(hq.as_ref().unwrap().ptr),
-                                arg_ptr(hs.as_ref().unwrap().ptr),
-                                arg_i32(1),
-                                arg_i32(n_ff_exp as i32),
-                            ],
-                        )?;
-                        dispatch_grid(
-                            pipelines,
-                            ctx.stream,
-                            moe_down_i8_kernel(dn),
-                            ne,
-                            1,
-                            32,
-                            args![
-                                arg_ptr(hq.as_ref().unwrap().ptr),
-                                arg_ptr(hs.as_ref().unwrap().ptr),
-                                arg_ptr(ds),
-                                arg_ptr(dst_row),
-                                arg_i32(ne as i32),
-                                arg_i32(n_ff_exp as i32),
-                            ],
-                        )?;
-                    } else {
-                        dispatch_1d(
-                            pipelines,
-                            ctx.stream,
-                            kname,
-                            n_ff_exp,
+                            (neu / 32) as u32,
                             256,
                             args![
                                 arg_ptr(x_row),
-                                arg_ptr(gs),
-                                arg_ptr(us),
-                                arg_ptr(ds),
-                                arg_ptr(dst_row),
+                                arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                arg_ptr(xs_x.as_ref().unwrap().ptr),
+                                arg_i32(1),
                                 arg_i32(ne as i32),
-                                arg_i32(n_ff_exp as i32),
-                                arg_i32(at),
-                                arg_f32(w),
-                                arg_f32(dsc),
-                                arg_i32(wb_flag),
                             ],
                         )?;
+                    }
+                    for k in 0..nu {
+                        let slot = (row * nu + k) as i32;
+                        if let (true, Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb)))) =
+                            (use_i8, native)
+                        {
+                            let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
+                            let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                            let up_half_boff = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                            let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
+                            let h_ptr = h_buf.as_ref().unwrap().ptr;
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_gate_up_i8_routed_kernel(gu),
+                                n_ff_exp,
+                                1,
+                                32,
+                                args![
+                                    arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                    arg_ptr(xs_x.as_ref().unwrap().ptr),
+                                    arg_ptr(gw_ptr),
+                                    arg_ptr(uw_ptr),
+                                    arg_ptr(h_ptr),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_i32(wb_flag),
+                                    arg_ptr(dsc_ptr),
+                                    arg_ptr(route_ids.ptr),
+                                    arg_ptr(route_wts.ptr),
+                                    arg_i32(slot),
+                                    arg_i64(gate_bstride),
+                                    arg_i64(up_bstride),
+                                    arg_i32(fused_flag),
+                                    arg_i64(up_half_boff),
+                                ],
+                            )?;
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "quant_i8_32",
+                                (nfu / 32) as u32,
+                                256,
+                                args![
+                                    arg_ptr(h_ptr),
+                                    arg_ptr(hq.as_ref().unwrap().ptr),
+                                    arg_ptr(hs.as_ref().unwrap().ptr),
+                                    arg_i32(1),
+                                    arg_i32(n_ff_exp as i32),
+                                ],
+                            )?;
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_down_i8_routed_kernel(dn),
+                                ne,
+                                1,
+                                32,
+                                args![
+                                    arg_ptr(hq.as_ref().unwrap().ptr),
+                                    arg_ptr(hs.as_ref().unwrap().ptr),
+                                    arg_ptr(dw_ptr),
+                                    arg_ptr(dst_row),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_ptr(route_ids.ptr),
+                                    arg_i32(slot),
+                                    arg_i64(down_bstride),
+                                ],
+                            )?;
+                        } else if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
+                            let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
+                            let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                            let up_half_boff = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                            let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                moe_expert_routed_kernel(gu, dn),
+                                n_ff_exp,
+                                256,
+                                args![
+                                    arg_ptr(x_row),
+                                    arg_ptr(gw_ptr),
+                                    arg_ptr(uw_ptr),
+                                    arg_ptr(dw_ptr),
+                                    arg_ptr(dst_row),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_i32(wb_flag),
+                                    arg_ptr(dsc_ptr),
+                                    arg_ptr(route_ids.ptr),
+                                    arg_ptr(route_wts.ptr),
+                                    arg_i32(slot),
+                                    arg_i64(gate_bstride),
+                                    arg_i64(up_bstride),
+                                    arg_i64(down_bstride),
+                                    arg_i32(fused_flag),
+                                    arg_i64(up_half_boff),
+                                ],
+                            )?;
+                        } else {
+                            // f16 dequant-cache fallback: element strides into the __half banks.
+                            let gate_estride = ge_stride as i64;
+                            let up_estride = (nfu * neu) as i64;
+                            let down_estride = (neu * nfu) as i64;
+                            let up_half_eoff = (nfu * neu) as i64;
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "moe_ffn_expert_routed",
+                                n_ff_exp,
+                                256,
+                                args![
+                                    arg_ptr(x_row),
+                                    arg_ptr(gw_ptr),
+                                    arg_ptr(uw_ptr),
+                                    arg_ptr(dw_ptr),
+                                    arg_ptr(dst_row),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_i32(wb_flag),
+                                    arg_ptr(dsc_ptr),
+                                    arg_ptr(route_ids.ptr),
+                                    arg_ptr(route_wts.ptr),
+                                    arg_i32(slot),
+                                    arg_i64(gate_estride),
+                                    arg_i64(up_estride),
+                                    arg_i64(down_estride),
+                                    arg_i32(fused_flag),
+                                    arg_i64(up_half_eoff),
+                                ],
+                            )?;
+                        }
+                    }
+                }
+            }
+
+            // ── PAGED path: host-side routing (the pager must know WHICH experts to page in, so the
+            //    router logits are read back to the host). Unchanged from the pre-Slice-38 flow. ──
+            if is_paged {
+                unsafe {
+                    ffi::hipStreamSynchronize(ctx.stream);
+                }
+                let logits_all: Vec<f32> = {
+                    let raw = read_bytes(&logits_dev, ctx.stream);
+                    bytemuck::cast_slice::<u8, f32>(&raw).to_vec()
+                };
+                for row in 0..rows {
+                    let logits = &logits_all[row * nexp..row * nexp + nexp];
+                    // Gating: softmax over experts (qwen3moe/…) or per-expert sigmoid (llama4).
+                    let probs: Vec<f32> = match gating {
+                        infr_core::graph::MoeGating::Softmax => {
+                            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
+                            let sum: f32 = exps.iter().sum();
+                            exps.iter().map(|v| v / sum).collect()
+                        }
+                        infr_core::graph::MoeGating::Sigmoid => {
+                            logits.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect()
+                        }
+                    };
+                    let mut idx: Vec<usize> = (0..nexp).collect();
+                    idx.sort_unstable_by(|&a, &b| {
+                        probs[b]
+                            .partial_cmp(&probs[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    idx.truncate(nu);
+                    // `norm_w`: renormalize the selected weights to sum to 1 before scaling
+                    // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
+                    let wsum: f32 = if norm_w {
+                        idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20)
+                    } else {
+                        1.0
+                    };
+                    let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                    let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                    // Int8 path: quantize this token's input row ONCE (reused across all experts).
+                    if use_i8 {
+                        dispatch_1d(
+                            pipelines,
+                            ctx.stream,
+                            "quant_i8_32",
+                            (neu / 32) as u32,
+                            256,
+                            args![
+                                arg_ptr(x_row),
+                                arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                arg_ptr(xs_x.as_ref().unwrap().ptr),
+                                arg_i32(1),
+                                arg_i32(ne as i32),
+                            ],
+                        )?;
+                    }
+                    for &ei in &idx {
+                        let w = probs[ei] / wsum * scale;
+                        // Per-expert pointers. Native path: byte offset = (element_offset / qpb) * bpb
+                        // into the RAW quant bank (every element offset is a multiple of the block size,
+                        // since the per-expert stride is a whole number of `ne`-wide rows and `ne` is a
+                        // multiple of the block elem count). Fallback path: element_offset * 2 into the
+                        // f16 cache. Gate/up share the `gu` format+geometry; down carries the `dn` one.
+                        let (gs, us, ds, kname) = if is_paged {
+                            // Page each routed expert into its VRAM slot; the slot holds exactly this
+                            // expert's raw quant bytes at offset 0, so there is no per-expert bank
+                            // offset — the slot base IS the expert pointer. A fused gate_up slot is
+                            // double-width: gate at 0, up at the within-slot half offset.
+                            let ((gu, gu_qpb, gu_bpb), (dn, _dqpb, _dbpb)) =
+                                native.expect("is_paged implies native");
+                            let mut mp = ctx.moe_pager.lock().unwrap();
+                            let p = mp.as_mut().unwrap();
+                            let gs =
+                                p.ensure_slot(crate::pager::Role::Gate, gate_buf_id, ei as u32)?;
+                            let us = if fused_gate_up {
+                                unsafe {
+                                    (gs as *mut u8).add((nfu * neu / gu_qpb) * gu_bpb)
+                                        as *mut c_void
+                                }
+                            } else {
+                                p.ensure_slot(crate::pager::Role::Up, up_buf_id, ei as u32)?
+                            };
+                            let ds =
+                                p.ensure_slot(crate::pager::Role::Down, down_buf_id, ei as u32)?;
+                            (gs, us, ds, moe_expert_kernel(gu, dn))
+                        } else if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
+                            let gs = unsafe {
+                                (gw_ptr as *mut u8).add((ei * ge_stride / gu_qpb) * gu_bpb)
+                                    as *mut c_void
+                            };
+                            let us = if fused_gate_up {
+                                unsafe {
+                                    (gw_ptr as *mut u8)
+                                        .add(((ei * ge_stride + nfu * neu) / gu_qpb) * gu_bpb)
+                                        as *mut c_void
+                                }
+                            } else {
+                                unsafe {
+                                    (uw_ptr as *mut u8).add((ei * nfu * neu / gu_qpb) * gu_bpb)
+                                        as *mut c_void
+                                }
+                            };
+                            let ds = unsafe {
+                                (dw_ptr as *mut u8).add((ei * neu * nfu / dn_qpb) * dn_bpb)
+                                    as *mut c_void
+                            };
+                            (gs, us, ds, moe_expert_kernel(gu, dn))
+                        } else {
+                            let gs = unsafe {
+                                (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void
+                            };
+                            let us = if fused_gate_up {
+                                unsafe {
+                                    (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2)
+                                        as *mut c_void
+                                }
+                            } else {
+                                unsafe {
+                                    (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void
+                                }
+                            };
+                            let ds = unsafe {
+                                (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void
+                            };
+                            (gs, us, ds, "moe_ffn_expert")
+                        };
+                        let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
+                        if let (true, Some(((gu, _, _), (dn, _, _)))) = (use_i8, native) {
+                            // int8 dp4a: gate+up+activation (→ h_buf), quant h, then down (accumulate).
+                            // The routing weight is folded into h via wg/wo (same split as the fused
+                            // f16 kernel: `weight_before` applies it to the gate/up inputs, else output).
+                            let wg = if weight_before { w } else { 1.0 };
+                            let wo = if weight_before { 1.0 } else { w };
+                            let h_ptr = h_buf.as_ref().unwrap().ptr;
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_gate_up_i8_kernel(gu),
+                                n_ff_exp,
+                                1,
+                                32,
+                                args![
+                                    arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                    arg_ptr(xs_x.as_ref().unwrap().ptr),
+                                    arg_ptr(gs),
+                                    arg_ptr(us),
+                                    arg_ptr(h_ptr),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_f32(wg),
+                                    arg_f32(wo),
+                                    arg_f32(dsc),
+                                ],
+                            )?;
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "quant_i8_32",
+                                (nfu / 32) as u32,
+                                256,
+                                args![
+                                    arg_ptr(h_ptr),
+                                    arg_ptr(hq.as_ref().unwrap().ptr),
+                                    arg_ptr(hs.as_ref().unwrap().ptr),
+                                    arg_i32(1),
+                                    arg_i32(n_ff_exp as i32),
+                                ],
+                            )?;
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_down_i8_kernel(dn),
+                                ne,
+                                1,
+                                32,
+                                args![
+                                    arg_ptr(hq.as_ref().unwrap().ptr),
+                                    arg_ptr(hs.as_ref().unwrap().ptr),
+                                    arg_ptr(ds),
+                                    arg_ptr(dst_row),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                ],
+                            )?;
+                        } else {
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                kname,
+                                n_ff_exp,
+                                256,
+                                args![
+                                    arg_ptr(x_row),
+                                    arg_ptr(gs),
+                                    arg_ptr(us),
+                                    arg_ptr(ds),
+                                    arg_ptr(dst_row),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_f32(w),
+                                    arg_f32(dsc),
+                                    arg_i32(wb_flag),
+                                ],
+                            )?;
+                        }
                     }
                 }
             }

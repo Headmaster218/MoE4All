@@ -66,6 +66,7 @@ const HIP_PARTS: &[&str] = &[
     RMSNORM_QUANT_I8,
     MOE_FFN_INT8,
     WMMA_PREFILL,
+    MOE_ROUTING,
 ];
 
 // One BLOCK per row (grid.x = rows, blockDim.x = RMS_BLOCK). The sum-of-squares is a strided
@@ -2857,6 +2858,247 @@ GEN_WMMA_Q6K(wmma_i8_q6k_2x2, 2, 2)
 GEN_WMMA_Q50(wmma_i8_q50_1x1, 1, 1)
 GEN_WMMA_Q50(wmma_i8_q50_2x1, 2, 1)
 GEN_WMMA_Q50(wmma_i8_q50_2x2, 2, 2)
+"#;
+
+// ── GPU-side MoE top-k routing + device-driven expert dispatch (Slice 38) ────
+//
+// Moves the resident-MoE router off the host. The Phase-1..4 `MoeFfn` arm computed the router GEMV
+// on the GPU, then read the `[rows, n_expert]` logits BACK to the host (`hipStreamSynchronize` +
+// D2H), did top-k + gating in Rust, and host-dispatched the selected expert GEMVs — that per-layer
+// readback stalled the decode pipeline every MoE layer. `moe_topk` performs the identical top-k +
+// gating on the GPU into a `[rows, n_used]` (expert_id, gate_weight) device buffer, and the
+// `*_routed_*` expert kernels read (expert_id, gate) from that buffer to index the RESIDENT expert
+// bank + scale — a fixed host launch grid (`rows * n_used` slots) that needs no host knowledge of
+// WHICH experts were picked, so no readback. The paged path still reads back (the pager must know
+// which experts to page in), so this only fires for `!paged`.
+//
+// `moe_topk` is a faithful port of the Vulkan `moe_topk.comp`: one 128-lane block per token row,
+// each lane owning `ceil(n_expert/128)` experts (MAX_CHUNKS=8 ⇒ up to 1024 experts), top-k by raw
+// logit (both gating funcs are monotone in the logit → same selection), ties broken toward the
+// lower expert id, then weights by softmax(max-shifted)/sigmoid with optional renorm × scale. This
+// matches the host reference math (exec.rs) within f32 rounding.
+//
+// The `*_routed_*` kernels are twins of the host-routed expert kernels (`moe_ffn_expert`,
+// `moe_ffn_expert_<gu>_<dn>`, `moe_gate_up_act_i8_<gu>`, `moe_down_i8_<dn>`) with the per-expert bank
+// pointer computed IN-kernel from a bank base + a host-supplied per-expert byte/element stride and
+// the device-read `expert_id`, and the routing weight read from the device buffer. `deq_*` /
+// `i8acc_*` / `wave_sum32` / `idot4` are all defined in parts assembled before this one.
+const MOE_ROUTING: &str = r#"
+#define MOE_TOPK_MAX_CHUNKS 8
+extern "C" __global__ void moe_topk(
+    const float* __restrict__ logits,  /* [rows, n_expert] */
+    int* __restrict__ ids,             /* [rows, n_used] */
+    float* __restrict__ wts,           /* [rows, n_used] */
+    int n_expert, int n_used, float scale, int gating, int norm_w
+) {
+    __shared__ float sval[128];
+    __shared__ int sidx[128];
+    __shared__ float glmax;
+    int tok = blockIdx.x;
+    int t = threadIdx.x;
+    long lbase = (long)tok * n_expert;
+    long obase = (long)tok * n_used;
+    float llog[MOE_TOPK_MAX_CHUNKS];
+    bool taken[MOE_TOPK_MAX_CHUNKS];
+    for (int c = 0; c < MOE_TOPK_MAX_CHUNKS; c++) {
+        int e = t + c * 128;
+        llog[c] = (e < n_expert) ? logits[lbase + e] : -1e30f;
+        taken[c] = false;
+    }
+    for (int k = 0; k < n_used; k++) {
+        float bv = -1e30f; int be = 0x7fffffff;
+        for (int c = 0; c < MOE_TOPK_MAX_CHUNKS; c++) {
+            if (!taken[c] && llog[c] > bv) { bv = llog[c]; be = t + c * 128; }
+        }
+        sval[t] = bv; sidx[t] = be;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (t < s) {
+                bool better = sval[t + s] > sval[t]
+                    || (sval[t + s] == sval[t] && sidx[t + s] < sidx[t]);
+                if (better) { sval[t] = sval[t + s]; sidx[t] = sidx[t + s]; }
+            }
+            __syncthreads();
+        }
+        int winner = sidx[0];
+        if (t == 0) { ids[obase + k] = winner; if (k == 0) glmax = sval[0]; }
+        for (int c = 0; c < MOE_TOPK_MAX_CHUNKS; c++) {
+            if (t + c * 128 == winner) taken[c] = true;
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        float wsum = 0.0f;
+        for (int k = 0; k < n_used; k++) {
+            float lg = logits[lbase + ids[obase + k]];
+            wsum += (gating == 0) ? expf(lg - glmax) : (1.0f / (1.0f + expf(-lg)));
+        }
+        if (norm_w != 0) {
+            wsum = fmaxf(wsum, 1e-20f);
+            for (int k = 0; k < n_used; k++) {
+                float lg = logits[lbase + ids[obase + k]];
+                float sc = (gating == 0) ? expf(lg - glmax) : (1.0f / (1.0f + expf(-lg)));
+                wts[obase + k] = sc / wsum * scale;
+            }
+        } else if (gating == 0) {
+            float full = 0.0f;
+            for (int e = 0; e < n_expert; e++) full += expf(logits[lbase + e] - glmax);
+            full = fmaxf(full, 1e-20f);
+            for (int k = 0; k < n_used; k++) {
+                wts[obase + k] = expf(logits[lbase + ids[obase + k]] - glmax) / full * scale;
+            }
+        } else {
+            for (int k = 0; k < n_used; k++) {
+                float lg = logits[lbase + ids[obase + k]];
+                wts[obase + k] = (1.0f / (1.0f + expf(-lg))) * scale;
+            }
+        }
+    }
+}
+
+// f16 dequant-cache fallback, device-routed. Element strides into the __half banks.
+extern "C" __global__ void moe_ffn_expert_routed(
+    const float* __restrict__ x,             /* [ne] input row (host-advanced) */
+    const __half* __restrict__ gate_base,    /* [n_expert, n_ff_exp, ne] */
+    const __half* __restrict__ up_base,      /* [n_expert, n_ff_exp, ne] */
+    const __half* __restrict__ down_base,    /* [n_expert, ne, n_ff_exp] */
+    float* __restrict__ dst,                 /* [ne] out row (host-advanced) */
+    int ne, int n_ff_exp, int act_type, int weight_before,
+    const float* __restrict__ dsc_dev,       /* [n_expert] or null (⇒ 1.0) */
+    const int* __restrict__ route_ids, const float* __restrict__ route_wts, int slot,
+    long gate_estride, long up_estride, long down_estride,
+    int fused, long fused_up_half_eoff
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_ff_exp) return;
+    int e = route_ids[slot];
+    float weight = route_wts[slot];
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f;
+    const __half* gate_w = gate_base + (long)e * gate_estride;
+    const __half* up_w = fused ? gate_base + (long)e * gate_estride + fused_up_half_eoff
+                               : up_base + (long)e * up_estride;
+    const __half* down_w = down_base + (long)e * down_estride;
+    float wg = weight_before ? weight : 1.0f;
+    float wo = weight_before ? 1.0f : weight;
+    float g = 0.0f, u = 0.0f;
+    for (int j = 0; j < ne; j++) {
+        g += x[j] * __half2float(gate_w[(long)i * ne + j]);
+        u += x[j] * __half2float(up_w[(long)i * ne + j]);
+    }
+    g *= wg; u *= wg;
+    float a;
+    if (act_type == 0) { a = g / (1.0f + expf(-g)); }
+    else if (act_type == 1) { float x3 = g * g * g; a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); }
+    else { a = 1.0f / (1.0f + expf(-g)); }
+    float h = a * u * wo * dsc;
+    for (int d = 0; d < ne; d++) {
+        atomicAdd(&dst[d], h * __half2float(down_w[(long)d * n_ff_exp + i]));
+    }
+}
+
+// Native in-kernel decode, device-routed. Per-expert byte strides into the raw quant banks.
+#define GEN_MOE_FFN_ROUTED(GU, DN) \
+extern "C" __global__ void moe_ffn_expert_routed_##GU##_##DN( \
+    const float* __restrict__ x, \
+    const unsigned char* __restrict__ gate_base, \
+    const unsigned char* __restrict__ up_base, \
+    const unsigned char* __restrict__ down_base, \
+    float* __restrict__ dst, \
+    int ne, int n_ff_exp, int act_type, int weight_before, \
+    const float* __restrict__ dsc_dev, \
+    const int* __restrict__ route_ids, const float* __restrict__ route_wts, int slot, \
+    long gate_bstride, long up_bstride, long down_bstride, int fused, long fused_up_half_boff) { \
+    int i = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i >= n_ff_exp) return; \
+    int e = route_ids[slot]; \
+    float weight = route_wts[slot]; \
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    const unsigned char* gate_w = gate_base + (long)e * gate_bstride; \
+    const unsigned char* up_w = fused ? gate_base + (long)e * gate_bstride + fused_up_half_boff \
+                                      : up_base + (long)e * up_bstride; \
+    const unsigned char* down_w = down_base + (long)e * down_bstride; \
+    float wg = weight_before ? weight : 1.0f; \
+    float wo = weight_before ? 1.0f : weight; \
+    float g = 0.0f, u = 0.0f; \
+    for (int j = 0; j < ne; j++) { \
+        long idx = (long)i * ne + j; \
+        g += x[j] * deq_##GU(gate_w, idx); \
+        u += x[j] * deq_##GU(up_w, idx); \
+    } \
+    g *= wg; u *= wg; \
+    float a; \
+    if (act_type == 0) { a = g / (1.0f + expf(-g)); } \
+    else if (act_type == 1) { float x3 = g * g * g; a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); } \
+    else { a = 1.0f / (1.0f + expf(-g)); } \
+    float h = a * u * wo * dsc; \
+    for (int d = 0; d < ne; d++) { \
+        atomicAdd(&dst[d], h * deq_##DN(down_w, (long)d * n_ff_exp + i)); \
+    } \
+}
+GEN_MOE_FFN_ROUTED(q80, q80)
+GEN_MOE_FFN_ROUTED(q80, q4k)
+GEN_MOE_FFN_ROUTED(q80, q6k)
+GEN_MOE_FFN_ROUTED(q4k, q80)
+GEN_MOE_FFN_ROUTED(q4k, q4k)
+GEN_MOE_FFN_ROUTED(q4k, q6k)
+GEN_MOE_FFN_ROUTED(q6k, q80)
+GEN_MOE_FFN_ROUTED(q6k, q4k)
+GEN_MOE_FFN_ROUTED(q6k, q6k)
+
+// Int8-activation dp4a gate+up+activation, device-routed. One wave32 block per nff output row.
+#define GEN_MOE_GATE_UP_ROUTED(GU) \
+extern "C" __global__ void moe_gate_up_act_i8_routed_##GU( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ gate_base, const unsigned char* __restrict__ up_base, \
+    float* __restrict__ h_out, \
+    int ne, int nff, int act_type, int weight_before, const float* __restrict__ dsc_dev, \
+    const int* __restrict__ route_ids, const float* __restrict__ route_wts, int slot, \
+    long gate_bstride, long up_bstride, int fused, long fused_up_half_boff) { \
+    int o = blockIdx.x; int tid = threadIdx.x; \
+    if (o >= nff) return; \
+    int e = route_ids[slot]; \
+    float weight = route_wts[slot]; \
+    float wg = weight_before ? weight : 1.0f; \
+    float wo = weight_before ? 1.0f : weight; \
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    const unsigned char* gate_w = gate_base + (long)e * gate_bstride; \
+    const unsigned char* up_w = fused ? gate_base + (long)e * gate_bstride + fused_up_half_boff \
+                                      : up_base + (long)e * up_bstride; \
+    int nb = ne >> 5; \
+    float g = i8acc_##GU(qx, xs, gate_w, o, nb, tid); \
+    float u = i8acc_##GU(qx, xs, up_w, o, nb, tid); \
+    g = wave_sum32(g); u = wave_sum32(u); \
+    if (tid == 0) { \
+        g *= wg; u *= wg; \
+        float a; \
+        if (act_type == 0) { a = g / (1.0f + expf(-g)); } \
+        else if (act_type == 1) { float x3 = g * g * g; a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); } \
+        else { a = 1.0f / (1.0f + expf(-g)); } \
+        h_out[o] = a * u * wo * dsc; \
+    } \
+}
+GEN_MOE_GATE_UP_ROUTED(q80)
+GEN_MOE_GATE_UP_ROUTED(q4k)
+GEN_MOE_GATE_UP_ROUTED(q6k)
+
+// Int8-activation dp4a down projection, device-routed. One wave32 block per ne output row.
+#define GEN_MOE_DOWN_ROUTED(DN) \
+extern "C" __global__ void moe_down_i8_routed_##DN( \
+    const signed char* __restrict__ hq, const float* __restrict__ hs, \
+    const unsigned char* __restrict__ down_base, float* __restrict__ dst, \
+    int ne, int nff, const int* __restrict__ route_ids, int slot, long down_bstride) { \
+    int d = blockIdx.x; int tid = threadIdx.x; \
+    if (d >= ne) return; \
+    int e = route_ids[slot]; \
+    const unsigned char* down_w = down_base + (long)e * down_bstride; \
+    int nb = nff >> 5; \
+    float acc = i8acc_##DN(hq, hs, down_w, d, nb, tid); \
+    acc = wave_sum32(acc); \
+    if (tid == 0) atomicAdd(&dst[d], acc); \
+}
+GEN_MOE_DOWN_ROUTED(q80)
+GEN_MOE_DOWN_ROUTED(q4k)
+GEN_MOE_DOWN_ROUTED(q6k)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────
