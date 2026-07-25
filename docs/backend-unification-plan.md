@@ -336,7 +336,7 @@ that drift independently.
   intersects with its own kernel coverage — becomes candidate A's predicate
   parameter.
 
-### H. Decode spec + shared parity harness — HIGH (logic) / HARD (device) ✅ LANDED
+### H. Decode spec + shared parity harness — HIGH (logic) / HARD (device) ✅ LANDED (`f817c25`)
 
 **Done — both halves.**
 
