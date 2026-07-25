@@ -467,7 +467,7 @@ oracle informally.
   Closes the rocm/metal parity-test gap. Not a runtime dedup — a _spec + test_
   seam.
 
-### I. KV/paging budget math — MED / MIXED ✅ LANDED
+### I. KV/paging budget math — MED / MIXED ✅ LANDED (`d473517`)
 
 **Done — every device-independent piece; the placement DECISIONS stay per
 backend.** `infr-core/src/budget.rs` is the new home, plus one function moved
