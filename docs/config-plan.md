@@ -1,25 +1,28 @@
 # config-plan.md — replace the `INFR_*` env gates with a layered `Config`
 
-**Status: PLAN ONLY. No code has been written for this yet.** Every section
-below is prescriptive: follow it literally. Where a decision is still open it is
-marked **[DECIDE]** and must be answered by the repo owner before the slice that
-needs it starts.
+**Status: S0 (the scaffold) has LANDED; S1 onward are still plan.** Every
+section below is prescriptive: follow it literally. Where a decision is still
+open it is marked **[DECIDE]** and must be answered by the repo owner before the
+slice that needs it starts.
 
-**Facts in this document were verified against `6573fb3`.** Line numbers drift;
-every read site is quoted with enough source text to be re-found by string
-search. The knob inventory (§6) is NOT hand-maintained truth — §6.0 gives the
-commands that re-derive it, and S0 checks a generated manifest into the tree so
-the compiler, not this file, is the authority.
+**Facts in this document were verified against `6573fb3` and RE-VERIFIED against
+`2dd0c5a` while landing S0.** Line numbers drift; every read site is quoted with
+enough source text to be re-found by string search. The knob inventory (§6) is
+NOT hand-maintained truth — §6.0 gives the commands that re-derive it, and
+`crates/infr-core/src/config/manifest.rs` now holds the checked-in table so the
+compiler, not this file, is the authority.
 
 ## 1. The problem
 
-Runtime behaviour is currently steered by **179 distinct `INFR_*` keys** read
-across **206 literal `std::env::var` / `env::var_os` call sites** plus ~30 more
-reads that go through a helper taking the key name as a `&str` parameter (§6.0).
-They are spread over `infr-vulkan` (64 keys), `infr-llama` (38), `infr-metal`
-(20), `infr-cli` (13), `infr-rocm` (13), `infr-cpu` (6), `infr-core`,
-`infr-server`, `infr-chat`, `infr-gguf`, `infr-prof-rt`. The full inventory is
-§6.
+Runtime behaviour is currently steered by **177 distinct `INFR_*` keys** read
+across **205 literal `std::env::var` / `env::var_os` call sites** plus the 27
+keys that are read ONLY through a helper taking the key name as a `&str`
+parameter (§6.0). (An earlier revision said 179/206; re-derived at `2dd0c5a`,
+where `git log 6573fb3..HEAD -- crates/` is empty — the tree did not move, the
+counts were simply wrong.) They are spread over `infr-vulkan` (64 keys),
+`infr-llama` (38), `infr-metal` (20), `infr-cli` (13), `infr-rocm` (13),
+`infr-cpu` (6), `infr-core`, `infr-server`, `infr-chat`, `infr-gguf`,
+`infr-prof-rt`. The full inventory is §6.
 
 Concrete consequences, all observed in this repo:
 
@@ -348,17 +351,20 @@ the code.**
 ### 6.0 Re-derive this inventory before you trust it
 
 These tables are a starting point, not an oracle. Run this first; if the count
-differs from 179 the tree has moved and the tables below are stale:
+differs from 177 the tree has moved and the tables below are stale. The
+equivalent check now also runs as a `#[test]`
+(`config::tests::manifest_matches_the_tree`), which fails when a new `INFR_*`
+literal appears with no `manifest.rs` entry:
 
 ```bash
 # 1. every INFR_* literal in shipped code (this is the S0 manifest seed)
 grep -rhoE '"INFR_[A-Z_0-9]*"' crates/*/src crates/*/build.rs | tr -d '"' | sort -u \
   | grep -vE '_TEST_|^INFR_(TP|EP|CPU|METAL)$'
-# → 179 keys at 6573fb3
+# → 177 keys at 2dd0c5a = manifest::KEYS (174) + manifest::NOT_MIGRATED (3)
 
 # 2. the subset a naive grep finds (do NOT stop here — see §1.6)
 grep -rn 'env::var\(_os\)\?("INFR_' crates/*/src crates/*/build.rs
-# → 206 sites / 153 keys
+# → 205 sites / 153 keys (150 real + INFR_TEST_GGUF/INFR_TEST_MODEL/INFR_METAL)
 
 # 3. the ~30 reads a helper hides
 grep -rn 'env_flag(\|env_mib(\|overflow_vram_reserve(\|EnvRows {\|disable_env:\|parse_device_list(\|cap_from_env(\|GemvKnobs::resolve' crates/*/src
@@ -431,18 +437,18 @@ decide whether to publish the flag value — that whole block disappears in S1
 
 ### 6.3 `kv` — `KvCfg`
 
-| Env                           | Grammar                      | Config path                           | Default                            | Read sites                                                                          |
-| ----------------------------- | ---------------------------- | ------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------- |
-| `INFR_KV_TYPE_K`              | dtype name; ALSO presence    | `kv.type_k: Option<DType>`            | `None`                             | value: `llama/seam/runner.rs:451,476` (`parse_kv_fmt`); presence: `seam/mod.rs:725` |
-| `INFR_KV_TYPE_V`              | dtype name; ALSO presence    | `kv.type_v: Option<DType>`            | `None`                             | value: `llama/seam/runner.rs:451,477`; presence: `seam/mod.rs:726`                  |
-| `INFR_KV_Q8`                  | presence                     | `kv.force_q8: bool`                   | `false`                            | `seam/mod.rs:727`; `seam/model.rs:341`; `seam/runner.rs:464`                        |
-| `INFR_KV_SLOTS`               | usize, default 4             | `kv.slots: usize`                     | `4`                                | `llama/seam/model.rs:200`                                                           |
-| `INFR_NO_KV_RING`             | presence-inv                 | `kv.ring: bool`                       | `true`                             | `llama/seam/mod.rs:828`                                                             |
-| `INFR_KV_INLINE`              | presence                     | `kv.inline_decode: bool`              | `false`                            | `vulkan/adapter.rs:2746`                                                            |
-| `INFR_KV_COOPMAT_BDA`         | presence                     | `kv.coopmat_bda: bool`                | `false`                            | `vulkan/adapter.rs:2883`                                                            |
-| `INFR_KV_OVERFLOW`            | flag (`budget::flag_from`)   | `kv.overflow: bool`                   | `false`                            | `llama/seam/mod.rs:720`; `vulkan/lib.rs:587`; `rocm/backend.rs:44`                  |
-| `INFR_KV_OVERFLOW_VRAM_MB`    | MiB (`budget::mib_from`)     | `kv.overflow_vram_mb: Option<u64>`    | `None`                             | `vulkan/lib.rs:609`; `rocm/backend.rs:72`                                           |
-| `INFR_KV_OVERFLOW_RESERVE_MB` | MiB (`budget::reserve_from`) | `kv.overflow_reserve_mb: Option<u64>` | `None` ⇒ `max(12% of VRAM, 2 GiB)` | `rocm/backend.rs:37`                                                                |
+| Env                           | Grammar                      | Config path                           | Default                            | Read sites                                                                                                                              |
+| ----------------------------- | ---------------------------- | ------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `INFR_KV_TYPE_K`              | dtype name; ALSO presence    | `kv.type_k: Option<DType>`            | `None`                             | value: `llama/seam/runner.rs:451,476` (`parse_kv_fmt`) AND `seam/mod.rs:820` (`kv_ring_wanted`'s `fmt_ok`); presence: `seam/mod.rs:725` |
+| `INFR_KV_TYPE_V`              | dtype name; ALSO presence    | `kv.type_v: Option<DType>`            | `None`                             | value: `llama/seam/runner.rs:451,477` AND `seam/mod.rs:821`; presence: `seam/mod.rs:726`                                                |
+| `INFR_KV_Q8`                  | presence                     | `kv.force_q8: bool`                   | `false`                            | `seam/mod.rs:727`; `seam/model.rs:341`; `seam/runner.rs:464`                                                                            |
+| `INFR_KV_SLOTS`               | usize, default 4             | `kv.slots: usize`                     | `4`                                | `llama/seam/model.rs:200`                                                                                                               |
+| `INFR_NO_KV_RING`             | presence-inv                 | `kv.ring: bool`                       | `true`                             | `llama/seam/mod.rs:828`                                                                                                                 |
+| `INFR_KV_INLINE`              | presence                     | `kv.inline_decode: bool`              | `false`                            | `vulkan/adapter.rs:2746`                                                                                                                |
+| `INFR_KV_COOPMAT_BDA`         | presence                     | `kv.coopmat_bda: bool`                | `false`                            | `vulkan/adapter.rs:2883`                                                                                                                |
+| `INFR_KV_OVERFLOW`            | flag (`budget::flag_from`)   | `kv.overflow: bool`                   | `false`                            | `llama/seam/mod.rs:720`; `vulkan/lib.rs:587`; `rocm/backend.rs:44`                                                                      |
+| `INFR_KV_OVERFLOW_VRAM_MB`    | MiB (`budget::mib_from`)     | `kv.overflow_vram_mb: Option<u64>`    | `None`                             | `vulkan/lib.rs:609`; `rocm/backend.rs:72`                                                                                               |
+| `INFR_KV_OVERFLOW_RESERVE_MB` | MiB (`budget::reserve_from`) | `kv.overflow_reserve_mb: Option<u64>` | `None` ⇒ `max(12% of VRAM, 2 GiB)` | `rocm/backend.rs:37`                                                                                                                    |
 
 The K/V dtype parser already exists twice (`seam/runner.rs::parse_kv_fmt`,
 `budget::parse_kv_dtype`); the config layer uses
@@ -451,6 +457,13 @@ Note `parse_kv_fmt` is a **gated** parse: the requested dtype is silently
 downgraded to f16 unless the backend/alignment gates pass (`runner.rs:453-473`).
 That gating is policy and stays at the call site (R5); the config carries only
 the requested `DType`.
+
+**There is a THIRD read of `INFR_KV_TYPE_K` / `_V` that an earlier draft
+missed** — `kv_ring_wanted`'s `fmt_ok` closure (`seam/mod.rs:820-826`) reads the
+VALUE and requires it to parse to f16 or q8 for the SWA ring to stay eligible.
+It is covered by the [DECIDE-8] model without extra fields: unset ⇒ `!specified`
+⇒ eligible; a garbage name ⇒ `specified && type_k.is_none()` ⇒ NOT eligible,
+which is what `parse_kv_dtype(&v)` returning `None` does today.
 
 `flag_from` grammar (`budget.rs:122`): `Some(v)` with `v` neither `""` nor `"0"`
 ⇒ on. This is NOT the same as `is_ok()` — see §10.5.
@@ -661,7 +674,7 @@ and overflow half lives in §6.4; the kernel half is:
 | ------------------------ | --------------------------------- | ---------------------------------------- | ------- | ---------------------------------------- |
 | `INFR_ROCM_WMMA_TILE`    | exact `"1x1"`/`"2x1"`/`"2x2"`     | `kernels.rocm.wmma_tile: Option<String>` | `None`  | `rocm/exec.rs:133`                       |
 | `INFR_ROCM_NO_WMMA`      | presence                          | `kernels.rocm.no_wmma: bool`             | `false` | `rocm/exec.rs:182,1266`                  |
-| `INFR_ROCM_NO_I8`        | presence                          | `kernels.rocm.i8: bool` (inverted)       | `true`  | `rocm/exec.rs:104,183,293,1267`          |
+| `INFR_ROCM_NO_I8`        | **presence-inv**                  | `kernels.rocm.i8: bool`                  | `true`  | `rocm/exec.rs:104,183,293,1267`          |
 | `INFR_ROCM_NO_PIPE`      | presence-inv                      | `kernels.rocm.pipe: bool`                | `true`  | `rocm/exec.rs:193`                       |
 | `INFR_ROCM_COOP`         | presence (OPT-IN)                 | `kernels.rocm.coop: bool`                | `false` | `rocm/exec.rs:236`                       |
 | `INFR_ROCM_COOP_TILE`    | string, default `"128x64"`        | `kernels.rocm.coop_tile: Option<String>` | `None`  | `rocm/exec.rs:238`                       |
@@ -938,7 +951,14 @@ Note row 3: for an `is_err()` knob, `INFR_NO_GEMM_WARP=0` turns the feature
 keep it. Contrast the four `budget::env_flag` knobs (§6.12 last row) where `"0"`
 means off.
 
-### S0 — scaffold (no behaviour change, no migration)
+### S0 — scaffold (no behaviour change, no migration) — **LANDED**
+
+Landed as
+`crates/infr-core/src/config/{mod,partial,env,file,cli,manifest,tests}.rs`.
+`manifest::KEYS` holds 174 knobs (+3 in `NOT_MIGRATED`), all `migrated: false`;
+`Config`/`PartialConfig` and the dotted-path accessors are generated by ONE
+macro (`partial::cfg_struct!`) so the resolved struct, the partial, the TOML
+schema and `--set`'s path set cannot drift apart. No read site was touched.
 
 1. Create `crates/infr-core/src/config/` per §4 with: `Config` + all section
    structs, all fields, `impl Default` reproducing today's defaults,
@@ -1093,13 +1113,17 @@ In `config/tests.rs` (these are the acceptance criteria for S0):
    failure, per the decided **[DECIDE-5]**; the sibling case
    `unknown_set_path_is_an_error` covers `--set`. Original note: do not write
    this test until that decision is answered.
-6. `bad_value_is_an_error_not_a_silent_default` — `ctx = "banana"` fails to
-   load. **But only for the keys that error TODAY** (`INFR_SG`,
-   `INFR_SUBMIT_DISPATCHES`, the three `multi` device lists, and any `SizeSpec`
-   field). Every other key currently swallows a bad value via
-   `.and_then(parse).ok().unwrap_or(default)`, and R1 says keep it. The test
-   must be table-driven over both classes, with the class recorded in
-   `manifest.rs`.
+6. `bad_value_is_an_error_not_a_silent_default` — table-driven over both
+   classes, with the class recorded in `manifest.rs` (`KnobKey::bad_value`). The
+   two layers differ, and an earlier draft conflated them:
+   - **Environment layer.** Only the keys that error TODAY may error: `INFR_SG`,
+     `INFR_SUBMIT_DISPATCHES` and the three `multi` device lists. **`SizeSpec`
+     keys are NOT in that set** — `INFR_CTX=banana` is `.and_then(parse_size)` ⇒
+     `None` ⇒ the default, at every site (`cli/main.rs:3481`, `chat/mod.rs:164`,
+     `seam/mod.rs:907`, `pager.rs:276`), and R1 says keep it.
+   - **File layer.** `ctx = "banana"` DOES fail to load: a value of the wrong
+     type for a known key is a hard error there per the decided [DECIDE-5]. That
+     is the case this test's name comes from.
 7. `presence_inverted_knobs_have_the_right_polarity` — table-driven over every
    `presence-inv` entry in `manifest.rs`: env set to `""`, `"0"` and `"1"` ⇒
    field `false` in all three; env unset ⇒ field `true`. The `"0"` case is the

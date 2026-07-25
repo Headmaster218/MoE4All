@@ -6,6 +6,8 @@
 
 pub mod backend;
 pub mod budget;
+/// The layered `INFR_*` replacement: a typed, explicitly-passed [`config::Config`].
+pub mod config;
 pub mod decode_spec;
 pub mod error;
 pub mod exec;

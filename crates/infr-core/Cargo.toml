@@ -12,3 +12,4 @@ thiserror.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 indicatif.workspace = true
+toml.workspace = true

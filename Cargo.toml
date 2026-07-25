@@ -51,6 +51,10 @@ serde = { version = "1", features = ["derive"] }
 # transformers and llama.cpp-minja both keep the author's key order, so infr must too (BTreeMap
 # would alphabetize the JSON the model sees).
 serde_json = { version = "1", features = ["preserve_order"] }
+# The config-file layer (`infr_core::config::file`). Parsed as a `toml::Value` tree rather than a
+# serde-derived struct, because an unknown key must WARN and be skipped (docs/config-plan.md §11
+# [DECIDE-5]) and `deny_unknown_fields` can only fail.
+toml = "0.8"
 memmap2 = "0.9"
 rayon = "1"
 # SIGINT/SIGTERM via `sigaction` in the CLI (see `infr_core::shutdown`). Already in the lockfile
