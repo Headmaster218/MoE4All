@@ -82,32 +82,59 @@ fn open_backend(dev: Option<usize>) -> Result<infr_vulkan::VulkanBackend> {
     }
 }
 
-/// A persistent Vulkan seam session (see [`SeamModel::vulkan_session`]): owns the backend and the
-/// conversation [`SlotPool`].
-pub struct DenseVulkanSession {
-    vk: infr_vulkan::VulkanBackend,
-    pool: SlotPool,
-    max_ctx: usize,
-    /// This session's OWN placement pins (see [`crate::seam::PlacementPins`]): per-session so a
-    /// multi-model process never leaks one model's pinned chunk / auto-q8 decision into another.
-    /// Entered as the current [`crate::seam::PlacementScope`] around the default-ctx clamp (at
-    /// construction) and every generation.
-    pins: std::sync::Arc<crate::seam::PlacementPins>,
+/// A persistent seam session: the backend it owns, the conversation [`SlotPool`], and the context
+/// window its generations are sized to. ONE struct for every GPU backend — Vulkan, Metal and ROCm
+/// used to declare three byte-identical copies of this shape (candidate E of
+/// `docs/backend-unification-plan.md`) differing only in the backend field's type.
+///
+/// `B` is the backend (it is only ever passed to the seam as `&dyn Backend`, so no bound is needed
+/// here); `X` is per-backend extension state — `()` where a backend needs none (Metal, ROCm),
+/// Vulkan's per-session [placement pins](crate::seam::PlacementPins) otherwise. Each backend names
+/// its own concrete pairing through a type alias ([`DenseVulkanSession`], [`DenseMetalSession`],
+/// [`DenseRocmSession`]) so every call site is unchanged.
+pub struct DenseSession<B, X = ()> {
+    pub(crate) be: B,
+    pub(crate) pool: SlotPool,
+    pub(crate) max_ctx: usize,
+    /// Backend-specific extension state (see the struct doc); `()` for the backends with none.
+    pub(crate) ext: X,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-impl DenseVulkanSession {
+impl<B, X> DenseSession<B, X> {
     /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
-    /// warmup generation so the first real prompt starts from clean slots.
+    /// warmup generation so the first real prompt starts from clean slots. The ONE implementation
+    /// every backend's session shares (it is pure [`SlotPool`] policy — no device involvement).
     pub fn reset_cache(&mut self) {
         self.pool.reset_cache();
+    }
+}
+
+/// The Vulkan session's [`DenseSession::ext`] state: that session's OWN placement pins (see
+/// `crate::seam::PlacementPins`) — per-session so a multi-model process never leaks one model's
+/// pinned chunk / auto-q8 decision into another. Opaque: the pins stay crate-private, this wrapper
+/// only exists so the public [`DenseVulkanSession`] alias can name a public type.
+pub struct VulkanSessionPins(std::sync::Arc<crate::seam::PlacementPins>);
+
+/// A persistent Vulkan seam session (see [`SeamModel::vulkan_session`]): owns the backend and the
+/// conversation [`SlotPool`], plus this session's [`VulkanSessionPins`] — entered as the current
+/// `crate::seam::PlacementScope` around the default-ctx clamp (at construction) and every
+/// generation.
+pub type DenseVulkanSession = DenseSession<infr_vulkan::VulkanBackend, VulkanSessionPins>;
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl DenseVulkanSession {
+    /// This session's placement pins — the `ext` state the Vulkan pairing carries (see
+    /// [`VulkanSessionPins`]); entered as a placement scope around every generation.
+    pub(crate) fn pins(&self) -> &std::sync::Arc<crate::seam::PlacementPins> {
+        &self.ext.0
     }
 
     /// The name of the physical device this session's backend bound (e.g. the discrete GPU or the
     /// iGPU). Multi-device introspection: two sessions pinned to different indices report different
     /// names — the proof that a model-level device pool actually placed each session on its own GPU.
     pub fn device_name(&self) -> String {
-        self.vk.capabilities().name
+        self.be.capabilities().name
     }
 
     /// Live VRAM snapshot for THIS session's device (see [`infr_vulkan::VramInfo`]). Used to confirm
@@ -116,7 +143,7 @@ impl DenseVulkanSession {
     /// heaps are unified). The discrete/iGPU split is visible because each session owns its OWN
     /// backend/device, so the snapshot is per-device, never a global sum.
     pub fn vram(&self) -> infr_vulkan::VramInfo {
-        self.vk.vram()
+        self.be.vram()
     }
 }
 
@@ -269,21 +296,7 @@ impl SlotPool {
 /// covers the bound KV/IO buffer addresses) — one graph-walk token per switch, never a stale
 /// replay.
 #[cfg(target_os = "macos")]
-pub struct DenseMetalSession {
-    mtl: infr_metal::MetalBackend,
-    pool: SlotPool,
-    max_ctx: usize,
-}
-
-#[cfg(target_os = "macos")]
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-impl DenseMetalSession {
-    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
-    /// warmup generation so the first real prompt starts from clean slots.
-    pub fn reset_cache(&mut self) {
-        self.pool.reset_cache();
-    }
-}
+pub type DenseMetalSession = DenseSession<infr_metal::MetalBackend>;
 
 /// ROCm seam session — the AMD-GPU twin of [`DenseMetalSession`]: owns the
 /// backend and the conversation [`SlotPool`], so every later
@@ -291,26 +304,14 @@ impl DenseMetalSession {
 /// slot's previous turn, and concurrent conversations (serve) each keep their own KV slot off
 /// the one shared weight upload.
 #[cfg(all(target_os = "linux", feature = "rocm"))]
-pub struct DenseRocmSession {
-    pub(crate) rocm: infr_rocm::RocmBackend,
-    pub(crate) pool: SlotPool,
-    pub(crate) max_ctx: usize,
-}
+pub type DenseRocmSession = DenseSession<infr_rocm::RocmBackend>;
 
 /// ROCm seam session placeholder — an empty stub for when the `rocm` feature is not active.
-/// The CLI surfaces the feature gate via [`SeamModel::rocm_session`].
+/// The CLI surfaces the feature gate via [`SeamModel::rocm_session`]; nothing ever constructs
+/// one, so its `reset_cache` (the only method callers reach for) is a no-op.
 #[cfg(not(all(target_os = "linux", feature = "rocm")))]
 pub struct DenseRocmSession {
     _max_ctx: usize,
-}
-
-#[cfg(all(target_os = "linux", feature = "rocm"))]
-impl DenseRocmSession {
-    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
-    /// warmup generation so the first real prompt starts from clean slots.
-    pub fn reset_cache(&mut self) {
-        self.pool.reset_cache();
-    }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "rocm")))]
@@ -400,10 +401,10 @@ impl SeamModel {
     ) -> Result<DenseVulkanSession> {
         let vk = open_backend(dev)?;
         Ok(DenseVulkanSession {
-            vk,
+            be: vk,
             pool: SlotPool::new(),
             max_ctx,
-            pins: std::sync::Arc::new(crate::seam::PlacementPins::default()),
+            ext: VulkanSessionPins(std::sync::Arc::new(crate::seam::PlacementPins::default())),
         })
     }
 
@@ -430,10 +431,10 @@ impl SeamModel {
         let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
         drop(scope);
         Ok(DenseVulkanSession {
-            vk,
+            be: vk,
             pool: SlotPool::new(),
             max_ctx,
-            pins,
+            ext: VulkanSessionPins(pins),
         })
     }
 
@@ -463,10 +464,10 @@ impl SeamModel {
         drop(scope);
         let max_ctx = ((fit as f64 * frac) as usize).max(1024);
         Ok(DenseVulkanSession {
-            vk,
+            be: vk,
             pool: SlotPool::new(),
             max_ctx,
-            pins,
+            ext: VulkanSessionPins(pins),
         })
     }
 
@@ -660,7 +661,7 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session.pool.pick(&session.vk, &self.cfg, &prompt_tokens)?;
+        let slot = session.pool.pick(&session.be, &self.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
         // Cap the reply to the context that's actually left ("a turn also caps to remaining
         // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
@@ -671,9 +672,9 @@ impl SeamModel {
         let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS session's pins (warm calls must agree
         // with the buffers placement sized) — never a process-global cell shared across models.
-        let _scope = crate::seam::PlacementScope::enter(session.pins.clone());
+        let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
         let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
-            &session.vk,
+            &session.be,
             &self.gguf,
             &self.cfg,
             self.embd(),
@@ -1344,9 +1345,10 @@ impl SeamModel {
     pub fn metal_session(&self, max_ctx: usize) -> Result<DenseMetalSession> {
         let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DenseMetalSession {
-            mtl,
+            be: mtl,
             pool: SlotPool::new(),
             max_ctx,
+            ext: (),
         })
     }
 
@@ -1357,9 +1359,10 @@ impl SeamModel {
         let rocm =
             infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
         Ok(DenseRocmSession {
-            rocm,
+            be: rocm,
             pool: SlotPool::new(),
             max_ctx,
+            ext: (),
         })
     }
 
@@ -1403,11 +1406,9 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session
-            .pool
-            .pick(&session.rocm, &self.cfg, &prompt_tokens)?;
+        let slot = session.pool.pick(&session.be, &self.cfg, &prompt_tokens)?;
         let (_generated, stats) = crate::seam::generate_dense_rocm_session(
-            &session.rocm,
+            &session.be,
             &self.gguf,
             &self.cfg,
             self.embd(),
@@ -1461,9 +1462,9 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session.pool.pick(&session.mtl, &self.cfg, &prompt_tokens)?;
+        let slot = session.pool.pick(&session.be, &self.cfg, &prompt_tokens)?;
         let (_generated, stats) = crate::seam::generate_dense_metal_session(
-            &session.mtl,
+            &session.be,
             &self.gguf,
             &self.cfg,
             self.embd(),
@@ -1557,10 +1558,10 @@ impl SeamModel {
         // happens inside pick). A returning conversation suffix-prefills its own slots; a
         // different conversation forks/seeds instead of clobbering — multi-user spec serve
         // stops paying a full re-prefill of BOTH models on every conversation switch.
-        let t_slot = session.pool.pick(&session.mtl, &self.cfg, &committed)?;
+        let t_slot = session.pool.pick(&session.be, &self.cfg, &committed)?;
         let d_slot = draft_session
             .pool
-            .pick(&draft_session.mtl, &draft.cfg, &committed)?;
+            .pick(&draft_session.be, &draft.cfg, &committed)?;
 
         // Initial fill: the target's normal (chunked-prefill) path produces the first token —
         // verify forwards are only for the small k+1 suffixes.
@@ -1568,7 +1569,7 @@ impl SeamModel {
         let mut acc_buf: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let (first, _stats) = crate::seam::generate_dense_metal_session(
-            &session.mtl,
+            &session.be,
             &self.gguf,
             &self.cfg,
             self.embd(),
@@ -1622,7 +1623,7 @@ impl SeamModel {
             let budget = k_now.min(max_new - out.len());
             let td = std::time::Instant::now();
             let (cand, _) = crate::seam::generate_dense_metal_session(
-                &draft_session.mtl,
+                &draft_session.be,
                 &draft.gguf,
                 &draft.cfg,
                 draft.embd(),
@@ -1649,7 +1650,7 @@ impl SeamModel {
             let td = td.elapsed();
             let tv = std::time::Instant::now();
             let (logits, vstats) = crate::seam::verify_dense_metal2(
-                &session.mtl,
+                &session.be,
                 &self.gguf,
                 &self.cfg,
                 self.embd(),
@@ -1735,9 +1736,9 @@ impl SeamModel {
                 s.reset_tokens();
             }
         }
-        let _profile_guard = (!profile).then(|| session.mtl.suppress_profiling());
+        let _profile_guard = (!profile).then(|| session.be.suppress_profiling());
         let (_, stats) = crate::seam::generate_dense_metal_session(
-            &session.mtl,
+            &session.be,
             &self.gguf,
             &self.cfg,
             self.embd(),

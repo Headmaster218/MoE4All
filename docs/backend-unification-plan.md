@@ -98,7 +98,16 @@ interpreter"), cpu `lib.rs:465`, vulkan `lower_op` `adapter.rs:1067`. The
   Biggest structural prize but touches every hot loop — **stage after A/F**
   prove the shared-IR-pass pattern.
 
-### C. `be(msg) -> Error` helper — MED (trivial) / CLEAN
+### C. `be(msg) -> Error` helper — MED (trivial) / CLEAN ✅ LANDED
+
+**Done.** All 7 wrappers were verified byte-identical first (each already
+delegated to `Error::backend`; only Vulkan's carried an extra doc comment +
+`infr_prof::instrument`, and the shared constructor is itself instrumented, so
+nothing was lost). `infr-core/src/error.rs` gained the free-function form
+`infr_core::error::backend(msg)`; each of the 7 files now does
+`use infr_core::error::backend as be;` instead of declaring a wrapper. All ~271
+`be(...)` call sites and every error string are unchanged. Original audit below
+(historical).
 
 Identical error-wrapper duplicated in **7 files** (rocm ×5: `backend.rs:19`,
 `exec.rs:21`, `kernels.rs:18`, `pager.rs:66`, `weight_pager.rs:63`; metal
@@ -107,12 +116,49 @@ Identical error-wrapper duplicated in **7 files** (rocm ×5: `backend.rs:19`,
 - **Extract:** one `infr_core::error::backend(msg)` constructor. Trivial, do it
   first alongside A.
 
-### D. Chat `ChatModel` wrappers + `warmup`/`reset_kv` — MED / CLEAN
+### D. Chat `ChatModel` wrappers + `warmup`/`reset_kv` — MED / CLEAN ⚠️ PARTLY LANDED
 
-`chat/{vulkan,rocm,metal}.rs` are structurally identical:
-`{model, session: Option<…Session>, …}`, `new`, `ensure_session` (lazy open +
-`INFR_CTX` via `parse_size`), and a `ChatModel` impl whose `warmup` is
-copy-paste `self.generate("Hi", 2, …)?; session.reset_cache()` (vulkan
+**Done — the parts that really were mechanical.** Three shared pieces now live
+in `chat/mod.rs` and every backend chat calls them:
+
+- `ChatModel::warmup_session()` — a provided method holding the copy-pasted
+  warmup body (`generate("Hi", 2, …)?` then `reset_kv()`). Deliberately NOT the
+  `warmup` default (that stays a no-op so the stateless backends and the test
+  mocks are untouched); Vulkan/Metal/ROCm opt in. Vulkan still wraps its call in
+  `with_prof2_suppressed`, Metal still deliberately does not — the one real
+  difference between the three, kept.
+- `reset_session(&mut Option<DenseSession<B, X>>)` — the identical `reset_kv`
+  body, generic over candidate E's session pairing; 5 call sites (three
+  `reset_kv` impls plus `SpecMetalChat::warmup`'s two).
+- `env_ctx_spec()` / `env_ctx(n_ctx_train)` — the `INFR_CTX` parse. Metal's and
+  ROCm's `ensure_session` bodies were byte-identical; Vulkan takes the raw
+  `SizeSpec` (it routes `Bytes`/`Percent` to different VRAM-fit constructors).
+  `INFR_CTX` is now named in exactly one place.
+
+**NOT done — `SessionChat<S>` + a blanket `ChatModel` impl.** The three are only
+identical down to the struct header; past it they diverge for real reasons, and
+forcing a generic would have meant either behavior changes or a generic with one
+user. Concretely: Vulkan carries four extra fields (`mtp_head`, `mtp_checked`,
+`mtp_vk`, `dev`) and a `new_on` constructor; Vulkan and Metal `generate` branch
+into two DIFFERENT MTP drivers before touching the session, ROCm has none; ROCm
+implements no `generate_constrained`; the three `ensure_session` bodies call
+three differently-shaped session constructors (Vulkan's is a 3-way `SizeSpec`
+match into `vulkan_session_on`/`_frac_on`/`_default_on`). A blanket impl would
+have to push `generate` back into the trait parameter, at which point the
+"shared" shell is the two fields + `reset_kv` that the three helpers above
+already single-source. Re-scope this before re-attempting.
+
+Also NOT done: the `feature_stub!` macro. There are only two
+`cfg(not(feature = "rocm"))` placeholders (`RocmSeamChat` in `chat/rocm.rs`,
+`DenseRocmSession` in `seam/model.rs`), they have different shapes, and each
+stub method carries its own `unreachable!`/`bail!` text — a macro over two
+dissimilar single-use stubs would obfuscate ~15 lines, not dedup them.
+
+Original audit below (historical). `chat/{vulkan,rocm,metal}.rs` are
+structurally identical: `{model, session: Option<…Session>, …}`, `new`,
+`ensure_session` (lazy open + `INFR_CTX` via `parse_size`), and a `ChatModel`
+impl whose `warmup` is copy-paste
+`self.generate("Hi", 2, …)?; session.reset_cache()` (vulkan
 `chat/vulkan.rs:143`, rocm `chat/rocm.rs:62`, metal `chat/metal.rs:87`);
 `reset_kv` identical.
 
@@ -121,7 +167,18 @@ copy-paste `self.generate("Hi", 2, …)?; session.reset_cache()` (vulkan
   becomes one blanket impl. A `feature_stub!` macro removes rocm's doubled
   `cfg(not(feature="rocm"))` placeholder too.
 
-### E. `Dense{Vulkan,Metal,Rocm}Session` structs — MED / CLEAN
+### E. `Dense{Vulkan,Metal,Rocm}Session` structs — MED / CLEAN ✅ LANDED
+
+**Done.** One `DenseSession<B, X = ()> { be, pool, max_ctx, ext }` in
+`seam/model.rs` with the single shared `reset_cache` (pure `SlotPool` policy, no
+device involvement). `X` is per-backend extension state — `()` for Metal/ROCm,
+`VulkanSessionPins` (an opaque wrapper so the crate-private `PlacementPins`
+stays private) for Vulkan — i.e. backend-parameterized rather than flattened to
+a lowest common denominator. `DenseVulkanSession`/`DenseMetalSession`/
+`DenseRocmSession` remain as type aliases, so every public signature and call
+site is unchanged; Vulkan's `device_name`/`vram`/`pins()` live in an
+alias-specific `impl`. The non-`rocm` `DenseRocmSession` placeholder stays its
+own struct (nothing ever constructs it). Original audit below (historical).
 
 `seam/model.rs`: `DenseVulkanSession:87`, `DenseMetalSession:272`,
 `DenseRocmSession:294` are the same shape (`{backend, pool: SlotPool, max_ctx}`;
@@ -201,6 +258,9 @@ arithmetic (`ring_bytes_policy` `pager.rs:606`). Also: vulkan's
    collapse to one.
 2. **C** `be()` helper + **E** `DenseSession<B>` + **D** `SessionChat<S>` —
    cheap, mechanical; removes ~7+3+3 copies and rocm's feature-stub doubling.
+   **C and E landed; D landed only in part** — see its entry for what a
+   `SessionChat<S>` blanket impl would have had to break, and re-scope before
+   re-attempting.
 3. **F. tiering policy module** — moderate, high leverage; makes the existing
    cross-tier assertions structural.
 4. **B. GraphExecutor skeleton** — the biggest structural prize, but it touches

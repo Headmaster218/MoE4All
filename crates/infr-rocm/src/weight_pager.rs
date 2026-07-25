@@ -55,14 +55,13 @@
 
 use std::ffi::c_void;
 
-use infr_core::error::{Error, Result};
+use infr_core::error::Result;
 
 use crate::backend::RocmBuffer;
 use crate::ffi::{self, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+/// Terse local shorthand for the shared backend-error constructor.
+use infr_core::error::backend as be;
 
 /// Default per-bank size cap (MiB): banks larger than this are NOT staged (they fall back to the
 /// Slice-35 host-alias read) so one giant bank — the lm_head / token_embd, which is `vocab*hidden`

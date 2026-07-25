@@ -112,6 +112,21 @@ pub trait ChatModel {
         Ok(())
     }
 
+    /// The warmup body every session-backed backend (Vulkan/Metal/ROCm) copy-pasted: a two-token
+    /// throwaway generation to force the lazy session open + every pipeline compiled, then
+    /// [`reset_kv`](Self::reset_kv) so the warmup tokens are dropped and the first REAL prompt
+    /// prefills clean slots from row 0 instead of forking off a garbage prefix.
+    ///
+    /// Deliberately NOT the [`warmup`](Self::warmup) default — that stays a no-op so the stateless
+    /// backends and the test mocks are unaffected. A session-backed backend opts in with
+    /// `fn warmup(&mut self) -> Result<()> { self.warmup_session() }` (Vulkan wraps the call in
+    /// `with_prof2_suppressed`; Metal deliberately does not — see that helper's doc).
+    fn warmup_session(&mut self) -> Result<()> {
+        self.generate("Hi", 2, None, &mut |_| {})?;
+        self.reset_kv();
+        Ok(())
+    }
+
     /// Like [`generate`](Self::generate), with an llguidance grammar constraint applied to the
     /// decode (serve's FORCED tool_choice). Backends without constraint support return an error —
     /// the caller falls back to unconstrained generation.
@@ -127,6 +142,41 @@ pub trait ChatModel {
             "grammar-constrained generation is not supported by this backend"
         ))
     }
+}
+
+/// Drop a lazily-opened seam session's materialized tokens, if it has been opened yet — the body
+/// every session-backed [`ChatModel::reset_kv`] (and warmup discard) copy-pasted. Generic over the
+/// backend/extension pairing so ONE implementation serves Vulkan, Metal and ROCm; a chat whose
+/// session is still `None` has nothing to reset (its first `generate` opens a clean one).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn reset_session<B, X>(session: &mut Option<crate::seam::model::DenseSession<B, X>>) {
+    if let Some(s) = session {
+        s.reset_cache();
+    }
+}
+
+/// The user's `INFR_CTX` override in the shared size grammar (`8192`, `256k`, `50%`), unresolved.
+/// The ONE place the session-backed chats name that env var — Vulkan wants the raw
+/// [`infr_core::SizeSpec`] (it routes `Bytes`/`Percent` to different VRAM-fit constructors);
+/// Metal/ROCm resolve it through [`env_ctx`]. `None` = unset or unparseable.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn env_ctx_spec() -> Option<infr_core::SizeSpec> {
+    std::env::var("INFR_CTX")
+        .ok()
+        .and_then(|v| infr_core::parse_size(&v))
+}
+
+/// [`env_ctx_spec`] resolved to a token count: a percentage resolves against the model's TRAINED
+/// context, since these paths have no VRAM-fit calc to take a fraction of. `None` = no override —
+/// the caller supplies its own default. Shared by the Metal and ROCm chats, whose `ensure_session`
+/// bodies were byte-identical.
+///
+/// `allow(dead_code)`: both callers are cfg-gated (macOS / `--features rocm`), so a plain
+/// Linux+Vulkan build compiles this with no call site.
+#[allow(dead_code)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn env_ctx(n_ctx_train: usize) -> Option<usize> {
+    env_ctx_spec().map(|s| s.resolve(n_ctx_train as u64) as usize)
 }
 
 /// Store only the ANSWER, dropping the model's reasoning (Qwen3 excludes prior-turn thinking;

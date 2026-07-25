@@ -35,12 +35,10 @@ impl RocmSeamChat {
 
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
+            // INFR_CTX shared size grammar; % resolves against the trained context (shared with
+            // the Metal path — `chat::env_ctx`).
             let train = self.model.config().n_ctx_train;
-            let max_ctx = std::env::var("INFR_CTX")
-                .ok()
-                .and_then(|v| infr_core::parse_size(&v))
-                .map(|s| s.resolve(train as u64) as usize)
-                .unwrap_or(train);
+            let max_ctx = super::env_ctx(train).unwrap_or(train);
             self.session = Some(self.model.rocm_session(max_ctx, self.dev_idx)?);
         }
         Ok(())
@@ -54,17 +52,13 @@ impl ChatModel for RocmSeamChat {
     }
 
     fn reset_kv(&mut self) {
-        if let Some(s) = &mut self.session {
-            s.reset_cache();
-        }
+        super::reset_session(&mut self.session);
     }
 
     fn warmup(&mut self) -> Result<()> {
-        self.generate("Hi", 2, None, &mut |_| {})?;
-        if let Some(s) = &mut self.session {
-            s.reset_cache();
-        }
-        Ok(())
+        // The shared session warmup, unwrapped (the ROCm backend has no INFR_PROF2 recorder to
+        // suppress) — same body Metal uses.
+        self.warmup_session()
     }
 
     fn generate(

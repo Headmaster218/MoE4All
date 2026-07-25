@@ -10,7 +10,7 @@ use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP
 use crate::kernels::Pipelines;
 use half::f16;
 use infr_core::backend::{Bindings, GraphPlan, Plan};
-use infr_core::error::{Error, Result};
+use infr_core::error::Result;
 use infr_core::graph::{AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant;
@@ -18,9 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+/// Terse local shorthand for the shared backend-error constructor.
+use infr_core::error::backend as be;
 
 fn rocm_buf(b: &dyn infr_core::backend::Buffer) -> &crate::RocmBuffer {
     b.as_any()

@@ -27,7 +27,7 @@
 //! kernels (GEMV occupancy / fusion) are future work.
 
 use infr_core::backend::{Backend, Bindings, BufferUsage, Capabilities, GraphPlan, Plan};
-use infr_core::error::{Error, Result};
+use infr_core::error::Result;
 use infr_core::graph::Graph;
 use metal::{Buffer as MtlBuffer, CommandQueue, Device};
 
@@ -36,9 +36,8 @@ mod profile;
 mod shaders;
 pub use shaders::msl_source;
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+/// Terse local shorthand for the shared backend-error constructor.
+use infr_core::error::backend as be;
 
 /// A device buffer. On Apple Silicon `StorageModeShared` memory is CPU-visible, so `upload`/
 /// `download` are plain `memcpy`s against [`MtlBuffer::contents`].

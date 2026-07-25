@@ -56,18 +56,15 @@ use gpu_allocator::MemoryLocation;
 
 use infr_core::{
     backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
-    error::{Error, Result},
+    error::Result,
     graph::Graph,
     Backend,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Terse local shorthand for the shared [`Error::backend`] constructor.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-fn be(s: impl std::fmt::Display) -> Error {
-    Error::backend(s)
-}
+/// Terse local shorthand for the shared [`infr_core::error::backend`] constructor.
+use infr_core::error::backend as be;
 
 /// Resolve an `INFR_DEV` value to a Vulkan physical-device index (`None` = "use the discrete
 /// default"). `INFR_DEV` is the SINGLE device-selection env, sharing the CLI's `--dev` grammar, so

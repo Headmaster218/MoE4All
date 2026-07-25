@@ -33,4 +33,12 @@ impl Error {
     }
 }
 
+/// Free-function form of [`Error::backend`] — the terse `be(msg)` shorthand every backend crate
+/// used to re-declare locally (rocm ×5, metal, vulkan). Import it under the short name instead of
+/// defining a wrapper: `use infr_core::error::backend as be;`. Same error variant, same text.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub fn backend(msg: impl std::fmt::Display) -> Error {
+    Error::backend(msg)
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

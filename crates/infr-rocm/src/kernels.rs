@@ -10,14 +10,13 @@
 //! `HashMap`. The module is compiled once at backend init via `hiprtcCompileProgram`.
 
 use crate::ffi;
-use infr_core::error::{Error, Result};
+use infr_core::error::Result;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CString};
 use std::sync::Mutex;
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+/// Terse local shorthand for the shared backend-error constructor.
+use infr_core::error::backend as be;
 
 // ── Kernel source ────────────────────────────────────────────────────────────
 

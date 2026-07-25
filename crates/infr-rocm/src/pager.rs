@@ -57,15 +57,14 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use infr_core::error::{Error, Result};
+use infr_core::error::Result;
 use infr_core::pager::{Pager, PagerStats, Resolution};
 
 use crate::backend::RocmBuffer;
 use crate::ffi::{self, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+/// Terse local shorthand for the shared backend-error constructor.
+use infr_core::error::backend as be;
 
 /// One paged expert role. A FUSED gate_up bank registers under `Gate` (double-width slot); a
 /// fused model then has no `Up` sources. A role with mixed per-expert byte sizes across layers

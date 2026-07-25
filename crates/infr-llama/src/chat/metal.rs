@@ -60,11 +60,7 @@ impl MetalSeamChat {
             // INFR_CTX shared size grammar; % resolves against the trained context (this path
             // has no VRAM-fit calc — the Metal working-set guard is the backstop).
             let train = self.model.config().n_ctx_train;
-            let max_ctx = std::env::var("INFR_CTX")
-                .ok()
-                .and_then(|v| infr_core::parse_size(&v))
-                .map(|s| s.resolve(train as u64) as usize)
-                .unwrap_or(train);
+            let max_ctx = super::env_ctx(train).unwrap_or(train);
             self.session = Some(self.model.metal_session(max_ctx)?);
         }
         Ok(())
@@ -79,22 +75,15 @@ impl ChatModel for MetalSeamChat {
     }
 
     fn reset_kv(&mut self) {
-        if let Some(s) = &mut self.session {
-            s.reset_cache();
-        }
+        super::reset_session(&mut self.session);
     }
 
     fn warmup(&mut self) -> Result<()> {
-        // (No INFR_METAL_PROFILE suppression: the Metal backend reads it at CONSTRUCTION —
-        // which happens inside this first generate — so unsetting it here would disable
-        // profiling for the whole session, not just the warmup.)
-        self.generate("Hi", 2, None, &mut |_| {})?;
-        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0
-        // instead of forking off a garbage prefix.
-        if let Some(s) = &mut self.session {
-            s.reset_cache();
-        }
-        Ok(())
+        // The shared session warmup, UNWRAPPED (no INFR_METAL_PROFILE / INFR_PROF2 suppression:
+        // the Metal backend reads its profile env at CONSTRUCTION — which happens inside this
+        // first generate — so suppressing here would disable profiling for the whole session,
+        // not just the warmup).
+        self.warmup_session()
     }
 
     fn generate(
@@ -177,11 +166,7 @@ impl SpecMetalChat {
             // Default to 8k unless INFR_CTX says otherwise (shared size grammar; % of the
             // trained context, same note as ensure_session above).
             let train = self.target.config().n_ctx_train;
-            let max_ctx = std::env::var("INFR_CTX")
-                .ok()
-                .and_then(|v| infr_core::parse_size(&v))
-                .map(|s| s.resolve(train as u64) as usize)
-                .unwrap_or_else(|| train.min(8192));
+            let max_ctx = super::env_ctx(train).unwrap_or_else(|| train.min(8192));
             self.target_session = Some(self.target.metal_session(max_ctx)?);
             self.draft_session = Some(self.draft.metal_session(max_ctx)?);
         }
@@ -200,13 +185,11 @@ impl ChatModel for SpecMetalChat {
         // Compile BOTH models' pipelines now (a spec round drives target prefill, draft decode,
         // and the batched verify) so serve's first request doesn't pay two cold starts.
         self.generate("Hi", 2, None, &mut |_| {})?;
-        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0.
-        if let Some(s) = &mut self.target_session {
-            s.reset_cache();
-        }
-        if let Some(s) = &mut self.draft_session {
-            s.reset_cache();
-        }
+        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0. Both
+        // sessions, so this can't use the shared `warmup_session` (whose discard is `reset_kv`,
+        // which this backend deliberately leaves a no-op — see the trait's doc).
+        super::reset_session(&mut self.target_session);
+        super::reset_session(&mut self.draft_session);
         Ok(())
     }
 

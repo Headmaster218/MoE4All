@@ -10,15 +10,14 @@ use infr_core::backend::{
     Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, ProgressScope,
     COOPMAT_TILE_16,
 };
-use infr_core::error::{Error, Result};
+use infr_core::error::Result;
 use infr_core::graph::Graph;
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+/// Terse local shorthand for the shared backend-error constructor.
+use infr_core::error::backend as be;
 
 /// VRAM headroom (bytes) kept free when placing KV in VRAM under `INFR_KV_OVERFLOW`: the spill
 /// decision reserves this much so the per-forward activation scratch (the pooled GEMV/attention/FFN

@@ -96,9 +96,7 @@ impl DenseSeamChat {
     /// long-context model's default KV cache can't blow VRAM.
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
-            let user_ctx = std::env::var("INFR_CTX")
-                .ok()
-                .and_then(|v| infr_core::parse_size(&v));
+            let user_ctx = super::env_ctx_spec();
             self.session = Some(match user_ctx {
                 Some(infr_core::SizeSpec::Bytes(ctx)) => {
                     self.model.vulkan_session_on(self.dev, ctx as usize)?
@@ -135,19 +133,13 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn reset_kv(&mut self) {
-        if let Some(s) = &mut self.session {
-            s.reset_cache();
-        }
+        super::reset_session(&mut self.session);
     }
 
     fn warmup(&mut self) -> Result<()> {
-        crate::with_prof2_suppressed(|| self.generate("Hi", 2, None, &mut |_| {}))?;
-        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0
-        // instead of forking off a garbage prefix.
-        if let Some(s) = &mut self.session {
-            s.reset_cache();
-        }
-        Ok(())
+        // The shared session warmup (throwaway generate + reset so the first real prompt prefills
+        // clean slots from row 0), wrapped in the INFR_PROF2 suppression the Vulkan recorders need.
+        crate::with_prof2_suppressed(|| self.warmup_session())
     }
 
     fn generate(
