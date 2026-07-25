@@ -180,14 +180,30 @@ multi-GPU stack across `tp.rs`/`ep.rs`/`pipeline.rs`/`p2p.rs`/`tp_sem.rs`/
 
 ## 9. Perf endgame — ≥1.0× per model × quant
 
-Close the resident-perf gap to llama.cpp HIP (currently ~0.2–0.3×). The plateau
-analysis (Slices 25–28) identified the remaining prefill lever as a
-**cooperative-LDS, async-pipelined int8 mmq** (decode-once weight-tile reuse +
-double-buffered LDS to hide the decode→WMMA chain — the bit-faithful cooperative
-kernels landed opt-in as its foundation). Decode needs an **mmvq-style GEMV**
-tuning pass. Endgame: `infr compare --sweep` the full model×quant matrix vs
-`llama.cpp` HIP, biggest-gap-first, to ≥1.0×. This is the hardest,
-most-uncertain work — matching a mature backend's kernel engineering.
+**Measured baseline (RX 7900 XTX / gfx1100, Q4_K_M, r=3, resident; `infr` t/s ÷
+`llama.cpp` HIP t/s — `llama-bench -sm none -mg 0 -fa 1`).** This is the target
+to beat, captured after the current campaign:
+
+| model                   | pp512 (infr / llama = ratio) | tg128 (ratio)           |
+| ----------------------- | ---------------------------- | ----------------------- |
+| Qwen3-0.6B              | 3975 / 22822 = **0.17×**     | 72 / 383 = **0.19×**    |
+| gemma-3-1b              | 4755 / 18855 = **0.25×**     | 69 / 275 = **0.25×**    |
+| Qwen3.5-0.8B (DeltaNet) | 1198 / 17909 = **0.067×**    | 12.6 / 305 = **0.041×** |
+| Llama-3.2-1B            | 3674 / 17643 = **0.21×**     | 51 / 450 = **0.11×**    |
+| Qwen3-30B-A3B (MoE)     | 104 / 2878 = **0.036×**      | 33 / 141 = **0.23×**    |
+
+Started far worse: DeltaNet prefill was 0.0007× (1350× gap) and gemma-3 0.04×
+before the model-specific catastrophes were fixed; decode climbed ~60× over the
+naive baseline. The remaining broad gap is the GEMM/GEMV kernel engineering.
+
+Close it to llama.cpp HIP. The plateau analysis (Slices 25–28) identified the
+remaining prefill lever as a **cooperative-LDS, async-pipelined int8 mmq**
+(decode-once weight-tile reuse + double-buffered LDS to hide the decode→WMMA
+chain — the bit-faithful cooperative kernels landed opt-in as its foundation).
+Decode needs an **mmvq-style GEMV** tuning pass. Endgame: `infr compare --sweep`
+the full model×quant matrix vs `llama.cpp` HIP, biggest-gap-first, to ≥1.0×.
+This is the hardest, most-uncertain work — matching a mature backend's kernel
+engineering.
 
 ---
 
