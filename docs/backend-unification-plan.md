@@ -188,7 +188,7 @@ vulkan adds `pins`) with identical `reset_cache` delegating to the
 - **Extract:** `DenseSession<B: Backend> { be: B, pool: SlotPool, max_ctx }`;
   collapses three structs + three `reset_cache` into one. Pairs with D.
 
-### F. Capability-tiering / kernel-selection policy — MED / MED ⚠️ PARTLY LANDED
+### F. Capability-tiering / kernel-selection policy — MED / MED ⚠️ PARTLY LANDED (`6c5cbd2`)
 
 **Done — the arithmetic that really was shared.** `infr-core/src/tier.rs` now
 hosts the device-independent half of kernel selection; every measured number
