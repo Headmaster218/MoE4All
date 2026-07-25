@@ -2070,9 +2070,12 @@ fn run_op(
                     ));
                 }
                 // Open one touch batch per pool for this (layer) op, so every expert this op
-                // pages is eviction-protected from the op's own later touches.
+                // pages is eviction-protected from the op's own later touches, and reset the
+                // copy-stream overlap engine's per-op in-flight cursor (the router-logit readback
+                // `hipStreamSynchronize` below drains prior copies before any slot is reused).
                 let mut mp = ctx.moe_pager.lock().unwrap();
                 let p = mp.as_mut().unwrap();
+                p.begin_paged_op();
                 p.begin_batch(gate_buf_id)?;
                 if !fused_gate_up {
                     p.begin_batch(up_buf_id)?;

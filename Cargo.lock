@@ -1292,6 +1292,7 @@ dependencies = [
  "infr-core",
  "infr-cpu",
  "infr-gguf",
+ "rayon",
 ]
 
 [[package]]

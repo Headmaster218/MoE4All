@@ -73,6 +73,16 @@ extern "C" {
     pub fn hipStreamSynchronize(stream: hipStream_t) -> c_int;
     /// Destroy a stream.
     pub fn hipStreamDestroy(stream: hipStream_t) -> c_int;
+    /// Create an event with `flags` (see `HIP_EVENT_*`). The paged-MoE pager records one on its
+    /// copy stream after each async slot fill, then makes the compute stream wait on it so an
+    /// expert GEMV overlaps the NEXT expert's page-in copy.
+    pub fn hipEventCreateWithFlags(event: *mut hipEvent_t, flags: u32) -> c_int;
+    /// Record `event` in `stream` (captures the stream's progress at this point).
+    pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> c_int;
+    /// Make `stream` wait until `event` has been reached (cross-stream ordering, no host sync).
+    pub fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: u32) -> c_int;
+    /// Destroy an event.
+    pub fn hipEventDestroy(event: hipEvent_t) -> c_int;
     /// Load a code object (PTX-alike, from hiprtc or hipcc) into a module.
     pub fn hipModuleLoadData(module: *mut hipModule_t, image: *const c_void) -> c_int;
     /// Get a kernel function from a module by name.
@@ -196,6 +206,8 @@ pub const ROCBLAS_GEMM_ALGO_STANDARD: c_int = 0;
 
 /// An opaque HIP stream.
 pub type hipStream_t = *mut c_void;
+/// An opaque HIP event.
+pub type hipEvent_t = *mut c_void;
 /// An opaque HIP module (compiled code object).
 pub type hipModule_t = *mut c_void;
 /// An opaque HIP kernel function.
@@ -215,6 +227,11 @@ pub type hipMemcpyKind = c_int;
 pub const HIP_MEMCPY_HOST_TO_DEVICE: hipMemcpyKind = 1;
 pub const HIP_MEMCPY_DEVICE_TO_HOST: hipMemcpyKind = 2;
 pub const HIP_MEMCPY_DEVICE_TO_DEVICE: hipMemcpyKind = 3;
+
+// ── hipEvent flags ───────────────────────────────────────────────────────────
+
+/// Event flag: skip timing bookkeeping (cheaper record/wait) — the pager only needs ordering.
+pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 
 // ── hipHostMalloc flags ──────────────────────────────────────────────────────
 
