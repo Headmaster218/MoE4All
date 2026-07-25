@@ -98,7 +98,7 @@ interpreter"), cpu `lib.rs:465`, vulkan `lower_op` `adapter.rs:1067`. The
   Biggest structural prize but touches every hot loop — **stage after A/F**
   prove the shared-IR-pass pattern.
 
-### C. `be(msg) -> Error` helper — MED (trivial) / CLEAN ✅ LANDED
+### C. `be(msg) -> Error` helper — MED (trivial) / CLEAN ✅ LANDED (`87bca71`)
 
 **Done.** All 7 wrappers were verified byte-identical first (each already
 delegated to `Error::backend`; only Vulkan's carried an extra doc comment +
@@ -116,7 +116,7 @@ Identical error-wrapper duplicated in **7 files** (rocm ×5: `backend.rs:19`,
 - **Extract:** one `infr_core::error::backend(msg)` constructor. Trivial, do it
   first alongside A.
 
-### D. Chat `ChatModel` wrappers + `warmup`/`reset_kv` — MED / CLEAN ⚠️ PARTLY LANDED
+### D. Chat `ChatModel` wrappers + `warmup`/`reset_kv` — MED / CLEAN ⚠️ PARTLY LANDED (`87bca71`)
 
 **Done — the parts that really were mechanical.** Three shared pieces now live
 in `chat/mod.rs` and every backend chat calls them:
@@ -167,7 +167,7 @@ impl whose `warmup` is copy-paste
   becomes one blanket impl. A `feature_stub!` macro removes rocm's doubled
   `cfg(not(feature="rocm"))` placeholder too.
 
-### E. `Dense{Vulkan,Metal,Rocm}Session` structs — MED / CLEAN ✅ LANDED
+### E. `Dense{Vulkan,Metal,Rocm}Session` structs — MED / CLEAN ✅ LANDED (`87bca71`)
 
 **Done.** One `DenseSession<B, X = ()> { be, pool, max_ctx, ext }` in
 `seam/model.rs` with the single shared `reset_cache` (pure `SlotPool` policy, no
