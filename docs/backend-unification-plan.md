@@ -52,7 +52,17 @@ per-backend copy there.
 Ranked by value × cleanliness. Severity = how much drift-prone duplication;
 extraction = how clean the refactor is.
 
-### A. Peephole fusion → one shared Graph-rewrite pass — HIGH / CLEAN ⭐
+### A. Peephole fusion → one shared Graph-rewrite pass — HIGH / CLEAN ⭐ ✅ LANDED (`e6d9c25`)
+
+**Done (candidates A + G together).** Extracted to `infr-core/src/fusion.rs`:
+`plan_fusions(graph, &FusionCfg) -> FusionPlan`, the union of all three passes
+(`Linear→Add`, `RmsNorm→Linear`, `Rope/QkNormRope→WriteKv`), each gated by a
+backend-supplied `weight_ok: &dyn Fn(DType)->bool` predicate + a `disable_env`
+hatch. ROCm's live-range bound is applied to every backend. `DType::is_kquant`/
+`is_legacy_round`/`is_iquant` added (candidate G). All three backends rewired to
+consume the same `(fused, skip)`; net −170 lines; no golden moved (qwen3
+`0xfd63781ea3bfa785` unmoved, Vulkan gpu_seam unmoved, ROCm 30/30). Original
+audit notes below (historical).
 
 `linear_add_peephole` is re-implemented near-identically in **three** backends —
 vulkan `adapter.rs:827`, metal `exec.rs:719`, rocm `exec.rs:923` (folded into
