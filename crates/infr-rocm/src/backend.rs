@@ -244,6 +244,11 @@ pub struct RocmBackend {
     rocblas: ffi::rocblas_handle,
     /// Active weight-load progress bar.
     weight_pb: Arc<Mutex<Option<indicatif::ProgressBar>>>,
+    /// Paged MoE expert cache (Slice 33 — see `crate::pager`). `Some` only when the loaded model's
+    /// expert banks are paged (too big to keep resident, or forced via `INFR_ROCM_EXPERT_BUDGET`);
+    /// `None` (the common case) means every expert is resident, zero change. `Backend::moe_paged`
+    /// reads this.
+    pub(crate) moe_pager: Mutex<Option<crate::pager::RocmMoePager>>,
 }
 
 // The backend owns streams and device handles which are Send/Sync.
@@ -305,6 +310,7 @@ impl RocmBackend {
             pool: Mutex::new(BufferPool::new()),
             rocblas,
             weight_pb: Arc::new(Mutex::new(None)),
+            moe_pager: Mutex::new(None),
         })
     }
 
@@ -313,6 +319,50 @@ impl RocmBackend {
         let mut props: ffi::hipDeviceProp_t = unsafe { std::mem::zeroed() };
         unsafe { ffi::hipGetDeviceProperties(&mut props, self.device) };
         props
+    }
+
+    /// `(free, total)` device memory in bytes — the paged-MoE budget input and the peak-VRAM
+    /// report. Returns `(0, 0)` if the query fails (a caller treats free==0 as "unknown").
+    pub fn vram_info(&self) -> (usize, usize) {
+        let (mut free, mut total) = (0usize, 0usize);
+        let rc = unsafe { ffi::hipMemGetInfo(&mut free, &mut total) };
+        if rc != HIP_SUCCESS {
+            return (0, 0);
+        }
+        (free, total)
+    }
+
+    /// Install this model's paged-MoE session (see [`crate::pager::RocmMoePager`]), sized but with
+    /// no tensor registered yet. Called by the seam BEFORE the weight-load walk, so
+    /// `Backend::moe_paged` answers truthy and the first paged tensor's placeholder is registered
+    /// as it is bound. The arenas allocate here (one contiguous VRAM buffer per pool).
+    pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
+        let session = crate::pager::RocmMoePager::new(layout, self.stream)?;
+        *self.moe_pager.lock().unwrap() = Some(session);
+        Ok(())
+    }
+
+    /// Register one paged layer's role tensor with the session `init_moe_pager` installed. Panics
+    /// if no session is installed (a caller bug: `init_moe_pager` must run first).
+    pub fn register_paged_expert(
+        &self,
+        role: crate::pager::Role,
+        buf_id: usize,
+        source: crate::pager::ExpertSource,
+    ) -> Result<()> {
+        self.moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("register_paged_expert called before init_moe_pager")
+            .register(role, buf_id, source)
+    }
+
+    /// `INFR_PAGER_STATS=1` hit/miss/eviction dump for the paged session (no-op when unpaged).
+    pub fn print_moe_pager_stats(&self) {
+        if let Some(p) = self.moe_pager.lock().unwrap().as_ref() {
+            p.print_stats_if_enabled();
+        }
     }
 }
 
@@ -442,11 +492,19 @@ impl Backend for RocmBackend {
             &self.pipelines,
             &self.weight_cache,
             &self.pool,
+            &self.moe_pager,
             self.stream,
             self.rocblas,
             plan,
             bindings,
         )
+    }
+
+    /// A paged MoE model (Slice 33 — `crate::pager`) keeps its expert banks in host memory and
+    /// pages the routed experts into a VRAM slot arena. `true` only while such a session is
+    /// installed; `false` for every resident model (the common case, zero change).
+    fn moe_paged(&self) -> bool {
+        self.moe_pager.lock().unwrap().is_some()
     }
 
     fn sync(&self) -> Result<()> {

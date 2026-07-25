@@ -41,6 +41,18 @@ extern "C" {
         count: usize,
         stream: hipStream_t,
     ) -> c_int;
+    /// Copy `count` bytes between host and device (direction `kind`), asynchronously on `stream`.
+    /// The paged-MoE slot fill (`pager::RocmMoePager::ensure_slot`): stream-ordered so the copy
+    /// completes before the expert GEMV enqueued after it on the same stream reads the slot.
+    pub fn hipMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: hipMemcpyKind,
+        stream: hipStream_t,
+    ) -> c_int;
+    /// Free and total device memory in bytes (the paged-MoE budget + peak-VRAM report).
+    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     /// Create a non-blocking stream.
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> c_int;
     /// Block until all work on `stream` finishes.

@@ -437,6 +437,9 @@ struct ExecCtx<'a> {
     weight_cache: &'a Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
     /// Reusable device-scratch pool (persists across `execute` calls on the backend).
     pool: &'a Mutex<BufferPool>,
+    /// Paged MoE expert cache (Slice 33 — `crate::pager`), `None` for a resident model. The
+    /// `Op::MoeFfn` arm resolves per-expert slot pointers through it instead of the resident bank.
+    moe_pager: &'a Mutex<Option<crate::pager::RocmMoePager>>,
     /// Pool draws made this forward pass: `(ptr, bucket_bytes)`, returned to `pool` on `Drop`
     /// (both the success path and any early-error return) so nothing is `hipFree`'d per op.
     pooled: Vec<(*mut c_void, usize)>,
@@ -636,6 +639,7 @@ pub fn execute_graph(
     pipelines: &Pipelines,
     weight_cache: &Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
     pool: &Mutex<BufferPool>,
+    moe_pager: &Mutex<Option<crate::pager::RocmMoePager>>,
     stream: ffi::hipStream_t,
     rocblas: ffi::rocblas_handle,
     plan: &dyn Plan,
@@ -652,6 +656,7 @@ pub fn execute_graph(
         vals: (0..n).map(|_| None).collect(),
         weight_cache,
         pool,
+        moe_pager,
         pooled: Vec::new(),
         stream,
         rocblas,
@@ -2033,7 +2038,52 @@ fn run_op(
                 .zip(moe_native_fmt(down_dt))
                 .filter(|_| fused_gate_up || up_dt == gate_dt);
 
-            let (gw_ptr, uw_ptr, dw_ptr) = if native.is_some() {
+            // Paged MoE (Slice 33): when the bound `_exps` buffers are registered with the pager,
+            // the expert banks live in HOST memory and each routed expert is paged into a VRAM
+            // slot on demand (host routing already happens below). The bound buffer's device
+            // pointer is the pager identity. Paging is only installed for native-covered banks
+            // (the seam gates on it), so `is_paged` implies `native.is_some()`.
+            let gate_buf_id =
+                rocm_buf(bindings.get(gate_exps).expect("rocm: unbound gate_exps")).ptr as usize;
+            let up_buf_id = if fused_gate_up {
+                gate_buf_id
+            } else {
+                rocm_buf(bindings.get(up_exps).expect("rocm: unbound up_exps")).ptr as usize
+            };
+            let down_buf_id =
+                rocm_buf(bindings.get(down_exps).expect("rocm: unbound down_exps")).ptr as usize;
+            let is_paged = {
+                let mp = ctx.moe_pager.lock().unwrap();
+                mp.as_ref()
+                    .is_some_and(|p| p.is_paged(crate::pager::Role::Gate, gate_buf_id))
+            };
+            if is_paged {
+                if native.is_none() {
+                    return Err(be(
+                        "rocm moe pager: paged expert bank has a non-native quant format \
+                         (only Q8_0/Q4_K/Q6_K page — Q2_K/Q3_K await native MoE decode)",
+                    ));
+                }
+                // Open one touch batch per pool for this (layer) op, so every expert this op
+                // pages is eviction-protected from the op's own later touches.
+                let mut mp = ctx.moe_pager.lock().unwrap();
+                let p = mp.as_mut().unwrap();
+                p.begin_batch(gate_buf_id)?;
+                if !fused_gate_up {
+                    p.begin_batch(up_buf_id)?;
+                }
+                p.begin_batch(down_buf_id)?;
+            }
+
+            let (gw_ptr, uw_ptr, dw_ptr) = if is_paged {
+                // Bank pointers are unused on the paged path — per-expert slot pointers are
+                // resolved through the pager in the routing loop below.
+                (
+                    std::ptr::null_mut::<c_void>(),
+                    std::ptr::null_mut::<c_void>(),
+                    std::ptr::null_mut::<c_void>(),
+                )
+            } else if native.is_some() {
                 // Raw quant device pointers (the bound buffers) — no dequant, no f16 cache.
                 let gw = ctx.ensure_device(gate_exps, g, bindings)?;
                 let uw = if fused_gate_up {
@@ -2191,48 +2241,62 @@ fn run_op(
                     // since the per-expert stride is a whole number of `ne`-wide rows and `ne` is a
                     // multiple of the block elem count). Fallback path: element_offset * 2 into the
                     // f16 cache. Gate/up share the `gu` format+geometry; down carries the `dn` one.
-                    let (gs, us, ds, kname) =
-                        if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
-                            let gs = unsafe {
-                                (gw_ptr as *mut u8).add((ei * ge_stride / gu_qpb) * gu_bpb)
-                                    as *mut c_void
-                            };
-                            let us = if fused_gate_up {
-                                unsafe {
-                                    (gw_ptr as *mut u8)
-                                        .add(((ei * ge_stride + nfu * neu) / gu_qpb) * gu_bpb)
-                                        as *mut c_void
-                                }
-                            } else {
-                                unsafe {
-                                    (uw_ptr as *mut u8).add((ei * nfu * neu / gu_qpb) * gu_bpb)
-                                        as *mut c_void
-                                }
-                            };
-                            let ds = unsafe {
-                                (dw_ptr as *mut u8).add((ei * neu * nfu / dn_qpb) * dn_bpb)
-                                    as *mut c_void
-                            };
-                            (gs, us, ds, moe_expert_kernel(gu, dn))
+                    let (gs, us, ds, kname) = if is_paged {
+                        // Page each routed expert into its VRAM slot; the slot holds exactly this
+                        // expert's raw quant bytes at offset 0, so there is no per-expert bank
+                        // offset — the slot base IS the expert pointer. A fused gate_up slot is
+                        // double-width: gate at 0, up at the within-slot half offset.
+                        let ((gu, gu_qpb, gu_bpb), (dn, _dqpb, _dbpb)) =
+                            native.expect("is_paged implies native");
+                        let mut mp = ctx.moe_pager.lock().unwrap();
+                        let p = mp.as_mut().unwrap();
+                        let gs = p.ensure_slot(crate::pager::Role::Gate, gate_buf_id, ei as u32)?;
+                        let us = if fused_gate_up {
+                            unsafe {
+                                (gs as *mut u8).add((nfu * neu / gu_qpb) * gu_bpb) as *mut c_void
+                            }
                         } else {
-                            let gs = unsafe {
-                                (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void
-                            };
-                            let us = if fused_gate_up {
-                                unsafe {
-                                    (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2)
-                                        as *mut c_void
-                                }
-                            } else {
-                                unsafe {
-                                    (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void
-                                }
-                            };
-                            let ds = unsafe {
-                                (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void
-                            };
-                            (gs, us, ds, "moe_ffn_expert")
+                            p.ensure_slot(crate::pager::Role::Up, up_buf_id, ei as u32)?
                         };
+                        let ds = p.ensure_slot(crate::pager::Role::Down, down_buf_id, ei as u32)?;
+                        (gs, us, ds, moe_expert_kernel(gu, dn))
+                    } else if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
+                        let gs = unsafe {
+                            (gw_ptr as *mut u8).add((ei * ge_stride / gu_qpb) * gu_bpb)
+                                as *mut c_void
+                        };
+                        let us = if fused_gate_up {
+                            unsafe {
+                                (gw_ptr as *mut u8)
+                                    .add(((ei * ge_stride + nfu * neu) / gu_qpb) * gu_bpb)
+                                    as *mut c_void
+                            }
+                        } else {
+                            unsafe {
+                                (uw_ptr as *mut u8).add((ei * nfu * neu / gu_qpb) * gu_bpb)
+                                    as *mut c_void
+                            }
+                        };
+                        let ds = unsafe {
+                            (dw_ptr as *mut u8).add((ei * neu * nfu / dn_qpb) * dn_bpb)
+                                as *mut c_void
+                        };
+                        (gs, us, ds, moe_expert_kernel(gu, dn))
+                    } else {
+                        let gs =
+                            unsafe { (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void };
+                        let us = if fused_gate_up {
+                            unsafe {
+                                (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2)
+                                    as *mut c_void
+                            }
+                        } else {
+                            unsafe { (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void }
+                        };
+                        let ds =
+                            unsafe { (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void };
+                        (gs, us, ds, "moe_ffn_expert")
+                    };
                     let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
                     if let (true, Some(((gu, _, _), (dn, _, _)))) = (use_i8, native) {
                         // int8 dp4a: gate+up+activation (→ h_buf), quant h, then down (accumulate).

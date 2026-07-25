@@ -117,6 +117,229 @@ fn rocm_upload_bind(be: &infr_rocm::RocmBackend) -> Box<BindWeight<'_>> {
     })
 }
 
+/// Whether a MoE expert bank of `dt` can be PAGED on ROCm — the native `moe_ffn_expert_*` /
+/// int8 `moe_*_i8_*` kernels decode a slot in place only for these formats, so paging a bank of
+/// any other dtype (Scout's Q2_K/Q3_K) would need native MoE decode that does not exist yet
+/// (`docs/rocm-plan.md` P3). Kept in sync with `infr-rocm`'s `moe_native_fmt`.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+fn rocm_moe_pageable(dt: DType) -> bool {
+    matches!(dt, DType::Q8_0 | DType::Q4K | DType::Q6K)
+}
+
+/// The ROCm MoE-aware weight binder (Slice 33) — the ROCm twin of [`vulkan_moe_binder`], but
+/// simpler: the ROCm `Op::MoeFfn` executor routes on the HOST (reads the router logits back and
+/// picks the top-k in Rust), so the pager needs no device LUT / ring, just a host→VRAM slot
+/// cache (`infr_rocm::pager`). On the FIRST load it decides which expert layers to page, installs
+/// the pager session (so `Backend::moe_paged` is truthy before the walk), and returns a closure
+/// that binds a tiny placeholder + registers the host expert source for each paged `_exps` bank,
+/// uploading everything else resident.
+///
+/// Paging tiers (precedence):
+///   1. `INFR_ROCM_EXPERT_BUDGET=<size>` — force EVERY expert layer through the pager with that
+///      VRAM arena budget (the shared size grammar; a percentage resolves against free VRAM).
+///      Lets a caller force the paged path deterministically on a model that would fit resident.
+///   2. Auto (unset): resident (the fast path, zero change) when the banks fit VRAM; otherwise the
+///      pager with budget = free VRAM after dense weights + KV + a 2 GiB activation headroom.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+fn rocm_moe_binder<'a>(
+    rocm: &'a infr_rocm::RocmBackend,
+    g: &'a Gguf,
+    cfg: &'a Config,
+    first_load: bool,
+    want_ctx: usize,
+) -> AResult<Box<BindWeight<'a>>> {
+    use infr_rocm::pager::Role;
+    // Same `blk.{l}.…_exps…` layer parse + role map as the Vulkan binder.
+    let exps_layer = |name: &str| -> Option<usize> {
+        if !name.contains("_exps") {
+            return None;
+        }
+        name.strip_prefix("blk.")
+            .and_then(|r| r.split('.').next())
+            .and_then(|l| l.parse::<usize>().ok())
+    };
+    let moe_role_of = |name: &str| -> Option<Role> {
+        if name.ends_with("ffn_gate_exps.weight") || name.ends_with("ffn_gate_up_exps.weight") {
+            Some(Role::Gate)
+        } else if name.ends_with("ffn_up_exps.weight") {
+            Some(Role::Up)
+        } else if name.ends_with("ffn_down_exps.weight") {
+            Some(Role::Down)
+        } else {
+            None
+        }
+    };
+
+    let explicit = std::env::var("INFR_ROCM_EXPERT_BUDGET")
+        .ok()
+        .and_then(|v| infr_core::parse_size(&v));
+
+    let mut n_paged = 0usize;
+    let mut budget_bytes = 0u64;
+    if first_load && cfg.moe.is_some() {
+        let (free, _total) = rocm.vram_info();
+        let free = free as u64;
+        match explicit {
+            Some(spec) => {
+                n_paged = cfg.n_layer;
+                budget_bytes = spec.resolve(free);
+            }
+            None => {
+                let fp = crate::weights::weight_footprint(g);
+                let ring = kv_ring_wanted(cfg);
+                let kv_bytes = kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(), kv_auto_q8());
+                const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+                // free==0 means the VRAM query failed — don't guess; stay resident.
+                if free > 0 && free >= fp.dense + kv_bytes {
+                    let budget = free.saturating_sub(fp.dense + kv_bytes + ACT_HEADROOM);
+                    if budget < fp.expert {
+                        n_paged = cfg.n_layer;
+                        budget_bytes = budget;
+                    }
+                }
+            }
+        }
+    }
+
+    if first_load && n_paged > 0 {
+        let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
+        let n_expert = moe.n_expert.max(1);
+        // Enumerate every paged `_exps` bank's (role, per-expert bytes): one pool per distinct
+        // pair (a mixed-dtype role — Qwen3-30B down is Q4_K on 24 layers + Q6_K on 24 — splits
+        // into a pool per byte size). Reject non-pageable dtypes loudly (Scout's Q2_K/Q3_K).
+        let mut pool_blocks: Vec<(Role, usize, usize)> = Vec::new();
+        for t in g.tensors() {
+            if exps_layer(&t.name).is_none_or(|l| l >= n_paged) {
+                continue;
+            }
+            let Some(role) = moe_role_of(&t.name) else {
+                continue;
+            };
+            if !rocm_moe_pageable(t.dtype) {
+                return Err(anyhow!(
+                    "ROCm MoE paging: expert bank {} is {:?}, which has no native MoE decode \
+                     kernel yet — only Q8_0/Q4_K/Q6_K page (docs/rocm-plan.md P3)",
+                    t.name,
+                    t.dtype,
+                ));
+            }
+            let sb = (t.nbytes / n_expert).max(4);
+            match pool_blocks
+                .iter_mut()
+                .find(|(r, s, _)| *r == role && *s == sb)
+            {
+                Some((_, _, n)) => *n += n_expert,
+                None => pool_blocks.push((role, sb, n_expert)),
+            }
+        }
+        if pool_blocks.is_empty() {
+            n_paged = 0;
+        } else {
+            let n_blocks = n_paged * n_expert;
+            let total_bytes: u64 = pool_blocks
+                .iter()
+                .map(|&(_, sb, nb)| (sb * nb) as u64)
+                .sum::<u64>()
+                .max(1);
+            let pools: Vec<infr_rocm::pager::MoePoolSpec> = pool_blocks
+                .iter()
+                .map(|&(role, sb, nb)| {
+                    // Proportional-to-bank-bytes budget split (uniform routing → byte share is
+                    // access share); floored at `n_expert` so one batched-prefill op's full expert
+                    // set is always simultaneously resident (the `Pager` within-batch invariant),
+                    // capped at the pool's distinct-expert count.
+                    let share =
+                        (budget_bytes as u128 * (sb * nb) as u128 / total_bytes as u128) as u64;
+                    let floor = n_expert.min(nb).max(1);
+                    let n_slots = ((share / sb as u64) as usize).clamp(floor, nb);
+                    infr_rocm::pager::MoePoolSpec {
+                        role,
+                        slot_bytes: sb,
+                        n_slots,
+                    }
+                })
+                .collect();
+            let cached: usize = pools.iter().map(|p| p.n_slots).sum();
+            let arena_bytes: u64 = pools
+                .iter()
+                .map(|p| (p.slot_bytes * p.n_slots) as u64)
+                .sum();
+            let pool_desc: Vec<String> = pool_blocks
+                .iter()
+                .zip(&pools)
+                .map(|(&(role, sb, nb), p)| {
+                    format!("{role:?}[{:.1}MB] {}/{}", sb as f64 / 1e6, p.n_slots, nb)
+                })
+                .collect();
+            eprintln!(
+                "ROCm MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached \
+                 — {}; {:.2} GB arena; ctx={want_ctx})",
+                cfg.n_layer,
+                pool_desc.join(", "),
+                arena_bytes as f64 / 1e9,
+            );
+            rocm.init_moe_pager(infr_rocm::pager::MoePagerLayout { n_blocks, pools })
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+    }
+
+    let n_paged = n_paged; // freeze for the closure
+    Ok(Box::new(move |name, tb, dt, _n| {
+        use infr_rocm::pager::Role;
+        let role_of = |name: &str| -> Option<Role> {
+            if name.ends_with("ffn_gate_exps.weight") || name.ends_with("ffn_gate_up_exps.weight") {
+                Some(Role::Gate)
+            } else if name.ends_with("ffn_up_exps.weight") {
+                Some(Role::Up)
+            } else if name.ends_with("ffn_down_exps.weight") {
+                Some(Role::Down)
+            } else {
+                None
+            }
+        };
+        let layer_of = |name: &str| -> Option<usize> {
+            if !name.contains("_exps") {
+                return None;
+            }
+            name.strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|l| l.parse::<usize>().ok())
+        };
+        if let Some(l) = layer_of(name).filter(|&l| l < n_paged) {
+            if let (WBytes::Mmap(bytes), Some(role)) = (&tb, role_of(name)) {
+                let n_expert = cfg
+                    .moe
+                    .as_ref()
+                    .expect("a paged tensor implies an MoE config")
+                    .n_expert
+                    .max(1);
+                let stride_bytes = bytes.len() / n_expert;
+                // Tiny placeholder bound in place of the full bank; its device pointer is the
+                // pager identity the executor recovers at `MoeFfn` time.
+                let placeholder = rocm
+                    .alloc_uninit(4, BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                let buf_id = infr_rocm::pager::buffer_identity(placeholder.as_ref());
+                let source = infr_rocm::pager::ExpertSource {
+                    bytes: std::sync::Arc::new(bytes.clone())
+                        as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+                    stride_bytes,
+                    layer_base: (l * n_expert) as u32,
+                };
+                rocm.register_paged_expert(role, buf_id, source)
+                    .map_err(|e| anyhow!("{e}"))?;
+                return Ok((placeholder, dt));
+            }
+        }
+        // Ordinary resident weight — raw native-dtype upload (same as `rocm_upload_bind`).
+        let buf = rocm
+            .alloc(tb.len().max(1), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        rocm.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    }))
+}
+
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
 //
 // Builds the n=1 decode Graph and drives it through `CpuBackend`, one token at a time, for BOTH
@@ -2006,26 +2229,23 @@ pub(crate) fn generate_dense_rocm_session(
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
-    generate_dense_backend(
-        rocm,
-        &rocm_upload_bind(rocm),
-        g,
-        cfg,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        on_token,
-        state,
-        want_ctx,
-        constraint,
-        None,
-        None,
-        None,
-        None,
-        None,
-        req,
-    )
+    // Warm call (`state.is_some()`): weights are already resident/registered and the runner never
+    // re-binds, so skip building the MoE binder (which re-reads env + would re-install the pager).
+    let warm_binder: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+        Err(anyhow!("warm rocm session must not re-bind {name}"))
+    });
+    let bind = if state.is_some() {
+        warm_binder
+    } else {
+        rocm_moe_binder(rocm, g, cfg, true, want_ctx)?
+    };
+    let out = generate_dense_backend(
+        rocm, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
+        constraint, None, None, None, None, None, req,
+    )?;
+    // INFR_PAGER_STATS=1: per-pool hit/miss counters (no-op for a resident model).
+    rocm.print_moe_pager_stats();
+    Ok(out)
 }
 
 /// Speculative VERIFY on the Metal seam: one batched forward of `tokens`' un-cached suffix with
