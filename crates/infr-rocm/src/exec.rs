@@ -920,129 +920,35 @@ struct DecodeFusion {
     skip: HashSet<usize>,
 }
 
+/// Weight-dtype predicate for BOTH decode fusions: a covered int8-decode GEMV format
+/// (`native_i8_fmt`, i.e. Q8_0/Q4_K/Q6_K/Q5_0, or `None` under `INFR_ROCM_NO_I8`). The `rmsnorm→
+/// int8-decode-Linear` and `int8-decode-Linear→Add` folds share it.
+fn fuse_weight_ok(dt: DType) -> bool {
+    native_i8_fmt(dt).is_some()
+}
+static FUSE_WEIGHT_OK: fn(DType) -> bool = fuse_weight_ok;
+
 fn decode_fusion(g: &Graph) -> DecodeFusion {
-    let mut f = DecodeFusion::default();
-    let no_norm = std::env::var_os("INFR_ROCM_NO_FUSE_NORM").is_some();
-    let no_add = std::env::var_os("INFR_ROCM_NO_FUSE_ADD").is_some();
-
-    // Fusion 1: RmsNorm → int8 decode Linear(s).
-    if !no_norm {
-        for (i, op) in g.ops.iter().enumerate() {
-            let Op::RmsNorm {
-                x,
-                weight,
-                dst,
-                dim,
-                eps,
-                ..
-            } = *op
-            else {
-                continue;
-            };
-            if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
-                continue;
-            }
-            // The normalized-output tensor is a scratch handle RECYCLED across layers, so a
-            // whole-graph reader scan would wrongly match every layer's q/k/v against ONE norm.
-            // Only readers in THIS norm's live range — from here until the next op that rewrites
-            // `dst` — are its consumers. Each must be a fusable int8 decode GEMV whose `in_f`
-            // matches the norm `dim` (the fused reduction spans exactly the normalized row).
-            let mut consumers: Vec<usize> = Vec::new();
-            let mut ok = true;
-            for j in (i + 1)..g.ops.len() {
-                let (ins, outs) = g.ops[j].io();
-                if ins.contains(&dst) {
-                    match &g.ops[j] {
-                        Op::Linear {
-                            x: lx,
-                            weight: lw,
-                            m: 1,
-                            in_f,
-                            ..
-                        } if *lx == dst
-                            && *in_f == dim
-                            && native_i8_fmt(g.desc(*lw).dtype).is_some() =>
-                        {
-                            consumers.push(j);
-                        }
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if outs.contains(&dst) {
-                    break; // `dst` rewritten — live range ends (a fusable Linear never writes it).
-                }
-            }
-            if ok && !consumers.is_empty() {
-                f.skip.insert(i);
-                for j in consumers {
-                    f.norm.insert(j, (x, weight, eps));
-                }
-            }
-        }
+    // The two decode folds (`RmsNorm → int8 Linear` normalize-in-kernel, `int8 Linear → Add`
+    // residual epilogue) are the shared `plan_fusions` rmsnorm_linear + linear_add passes, gated to
+    // the int8-decode GEMV coverage. Escape hatches: `INFR_ROCM_NO_FUSE_NORM`/`INFR_ROCM_NO_FUSE_ADD`.
+    let cfg = infr_core::fusion::FusionCfg {
+        linear_add: Some(infr_core::fusion::LinearAddCfg {
+            weight_ok: &FUSE_WEIGHT_OK,
+            disable_env: Some("INFR_ROCM_NO_FUSE_ADD"),
+        }),
+        rmsnorm_linear: Some(infr_core::fusion::RmsNormLinearCfg {
+            weight_ok: &FUSE_WEIGHT_OK,
+            disable_env: Some("INFR_ROCM_NO_FUSE_NORM"),
+        }),
+        kv_write: false,
+    };
+    let plan = infr_core::fusion::plan_fusions(g, &cfg);
+    DecodeFusion {
+        norm: plan.rmsnorm_linear,
+        add: plan.linear_add,
+        skip: plan.skip,
     }
-
-    // Fusion 2: int8 decode Linear → Add(residual).
-    if !no_add {
-        for (i, op) in g.ops.iter().enumerate() {
-            let Op::Linear {
-                dst,
-                weight,
-                m: 1,
-                out_f,
-                ..
-            } = *op
-            else {
-                continue;
-            };
-            if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal)
-                || native_i8_fmt(g.desc(weight).dtype).is_none()
-            {
-                continue;
-            }
-            let Some(Op::Add {
-                a,
-                b,
-                dst: add_dst,
-                n,
-            }) = g.ops.get(i + 1)
-            else {
-                continue;
-            };
-            if *n != out_f {
-                continue;
-            }
-            let residual = if *b == dst && *a != dst {
-                *a
-            } else if *a == dst && *b != dst {
-                *b
-            } else {
-                continue;
-            };
-            // The Linear's dst must be consumed ONLY by this Add before it is next rewritten —
-            // eliding the standalone write is unsafe if anything else reads the un-added projection.
-            // (Bounded to the live range: the dst scratch may be recycled by a later layer.)
-            let mut only_add = true;
-            for j in (i + 2)..g.ops.len() {
-                let (ins, outs) = g.ops[j].io();
-                if ins.contains(&dst) {
-                    only_add = false;
-                    break;
-                }
-                if outs.contains(&dst) {
-                    break;
-                }
-            }
-            if !only_add {
-                continue;
-            }
-            f.add.insert(i, (residual, *add_dst));
-            f.skip.insert(i + 1);
-        }
-    }
-    f
 }
 
 // ── Per-op dispatch ──────────────────────────────────────────────────────────

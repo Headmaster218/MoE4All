@@ -710,58 +710,28 @@ struct Resident {
     dynpos: Option<u32>,
 }
 
-/// Fuse `Linear (m==1, Q4_K/Q6_K weight, Internal dst) → Add(residual)` into the fused-residual
-/// GEMV (`linear_q4k_add`/`linear_q6k_add`) — one dispatch + one dependency stage instead of two,
-/// and no round-trip of the sublayer output (the decode o_proj/down_proj shape; mirrors the
-/// Vulkan adapter's peephole). Only the IMMEDIATELY following Add fuses: the seam builder emits
-/// the pair adjacent for non-gemma models, and gemma's sandwich norm sits between and correctly
-/// blocks it.
-fn linear_add_peephole(
-    g: &infr_core::graph::Graph,
-) -> (
-    std::collections::HashMap<usize, (TensorId, TensorId)>,
-    std::collections::HashSet<usize>,
-) {
-    let mut fused = std::collections::HashMap::new();
-    let mut skip = std::collections::HashSet::new();
-    for (i, op) in g.ops.iter().enumerate() {
-        let Op::Linear {
-            dst, m: 1, weight, ..
-        } = op
-        else {
-            continue;
-        };
-        if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
-            continue;
-        }
-        if !matches!(
-            g.desc(*weight).dtype,
-            DType::Q4K
-                | DType::Q6K
-                | DType::Q8_0
-                | DType::Q5_0
-                | DType::Q4_0
-                | DType::Q5_1
-                | DType::Q4_1
-        ) {
-            continue;
-        }
-        if let Some(Op::Add {
-            a, b, dst: add_dst, ..
-        }) = g.ops.get(i + 1)
-        {
-            let residual = if a == dst {
-                *b
-            } else if b == dst {
-                *a
-            } else {
-                continue;
-            };
-            fused.insert(i, (residual, *add_dst));
-            skip.insert(i + 1);
-        }
+/// Weight-dtype predicate for the shared `Linear→Add` residual fusion (see
+/// [`infr_core::fusion::plan_fusions`]): this backend's fused-residual GEMV
+/// (`linear_q4k_add`/`linear_q6k_add`/…) coverage — the k-quants Q4_K/Q6_K plus the legacy-round
+/// formats (Q8_0/Q5_0/Q4_0/Q5_1/Q4_1).
+fn linear_add_weight_ok(dt: DType) -> bool {
+    dt.is_legacy_round() || matches!(dt, DType::Q4K | DType::Q6K)
+}
+static LINEAR_ADD_WEIGHT_OK: fn(DType) -> bool = linear_add_weight_ok;
+
+/// This backend's [`FusionCfg`](infr_core::fusion::FusionCfg): only the `Linear→Add` residual
+/// fusion (one dispatch + one dependency stage instead of two, no round-trip of the sublayer
+/// output — the decode o_proj/down_proj shape). `plan_fusions` returns the same `(fused, skip)`
+/// the former private `linear_add_peephole` did.
+fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
+    infr_core::fusion::FusionCfg {
+        linear_add: Some(infr_core::fusion::LinearAddCfg {
+            weight_ok: &LINEAR_ADD_WEIGHT_OK,
+            disable_env: None,
+        }),
+        rmsnorm_linear: None,
+        kv_write: false,
     }
-    (fused, skip)
 }
 
 /// One recorded dispatch: everything `encode_tg` needs to re-encode it verbatim. The buffer clones
@@ -1854,9 +1824,9 @@ impl MetalBackend {
             }
         }
         {
-            let (fused, skip) = linear_add_peephole(g);
-            r.fused = fused;
-            r.skip = skip;
+            let plan = infr_core::fusion::plan_fusions(g, &fusion_cfg());
+            r.fused = plan.linear_add;
+            r.skip = plan.skip;
         }
         if record {
             // Recording (`replay_shape` held): the tape must read/write the BOUND buffers, not

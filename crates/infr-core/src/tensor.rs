@@ -89,6 +89,41 @@ impl DType {
         )
     }
 
+    /// True for the GGUF "k-quant" family (`Q2_K`..`Q6_K`) — super-block quants with a per-block
+    /// scale/min hierarchy. A building block for the per-backend fusion/coverage predicates
+    /// (see [`crate::fusion`]) so those stop re-enumerating raw `DType::Q4K | …` lists.
+    pub fn is_kquant(self) -> bool {
+        matches!(
+            self,
+            DType::Q2K | DType::Q3K | DType::Q4K | DType::Q5K | DType::Q6K
+        )
+    }
+
+    /// True for the "legacy round" quants (`Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_0`) — the original
+    /// llama.cpp block formats (simple per-block `d`/`m` scale, no super-block hierarchy).
+    pub fn is_legacy_round(self) -> bool {
+        matches!(
+            self,
+            DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Q8_0
+        )
+    }
+
+    /// True for the codebook "i-quant" family (`IQ1`..`IQ4`) — grid/codebook lookups.
+    pub fn is_iquant(self) -> bool {
+        matches!(
+            self,
+            DType::Iq1S
+                | DType::Iq1M
+                | DType::Iq2Xxs
+                | DType::Iq2Xs
+                | DType::Iq2S
+                | DType::Iq3Xxs
+                | DType::Iq3S
+                | DType::Iq4Nl
+                | DType::Iq4Xs
+        )
+    }
+
     /// Bytes for `n` elements of a non-quant dtype. Returns `None` for quant types
     /// (those are sized by block, computed by the loader from the GGUF layout).
     pub fn dense_bytes(self, n: usize) -> Option<usize> {

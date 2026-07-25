@@ -11,7 +11,7 @@ use infr_core::error::{Error, Result};
 use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::recorder::RecordedCmd;
@@ -817,110 +817,26 @@ struct DynAttnCtx {
     pacc: Box<dyn Buffer>,
 }
 
-/// Fuse `Linear (m==1, native/f16 weight, Internal dst) → Add(residual)` into the fused-residual
-/// GEMV (`linear_add_native` / `linear_add`) — the bespoke decode path's `o_or_down` shape (one
-/// dispatch + barrier instead of two, and no round-trip of the sublayer output). Keyed by the
-/// Linear's op index → (residual, final dst); the absorbed Add lands in the skip set. Only the
-/// IMMEDIATELY following Add fuses (the seam builder emits the pair adjacent for non-gemma models;
-/// gemma's sandwich norm sits between and correctly blocks the fusion).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-fn linear_add_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, TensorId)>, HashSet<usize>) {
-    let mut fused: HashMap<usize, (TensorId, TensorId)> = HashMap::new();
-    let mut skip: HashSet<usize> = HashSet::new();
-    if std::env::var("INFR_NO_FUSE_ADD").is_ok() {
-        return (fused, skip);
-    }
-    for (i, op) in graph.ops.iter().enumerate() {
-        let Op::Linear {
-            dst,
-            m: 1,
-            weight,
-            out_f,
-            ..
-        } = op
-        else {
-            continue;
-        };
-        if !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal) {
-            continue;
-        }
-        let dt = graph.desc(*weight).dtype;
-        if !(native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)) {
-            continue;
-        }
-        if let Some(Op::Add {
-            a,
-            b,
-            dst: add_dst,
-            n,
-        }) = graph.ops.get(i + 1)
-        {
-            if *n != *out_f {
-                continue;
-            }
-            let residual = if b == dst && a != dst {
-                *a
-            } else if a == dst && b != dst {
-                *b
-            } else {
-                continue;
-            };
-            fused.insert(i, (residual, *add_dst));
-            skip.insert(i + 1);
-        }
-    }
-    (fused, skip)
+/// Weight-dtype predicate for the shared `Linear→Add` residual fusion (see
+/// [`infr_core::fusion::plan_fusions`]): the dense native-block formats plus f16 — exactly the
+/// fused-residual GEMV (`linear_add_native` / `linear_add`) coverage this adapter records.
+fn linear_add_weight_ok(dt: infr_core::DType) -> bool {
+    native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)
 }
+static LINEAR_ADD_WEIGHT_OK: fn(infr_core::DType) -> bool = linear_add_weight_ok;
 
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-fn kv_write_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, usize)>, HashSet<usize>) {
-    let mut fused: HashMap<usize, (TensorId, usize)> = HashMap::new();
-    let mut skip: HashSet<usize> = HashSet::new();
-    for (i, op) in graph.ops.iter().enumerate() {
-        // QkNormRope (qwen/gemma) or f16-out Rope (llama) — both write the f16 K row the peephole
-        // can redirect straight into the KV cache.
-        let kxx = match op {
-            Op::QkNormRope { dst, .. } | Op::Rope { dst, .. } => dst,
-            _ => continue,
-        };
-        // Only fuse an Internal (scratch) dst (we redirect the write into the KV cache). The
-        // output must be f16 (the shader casts f32→f16); WriteKv of an f16 src is a plain copy.
-        if !matches!(graph.tensors[kxx.0 as usize].kind, TensorKind::Internal) {
-            continue;
-        }
-        if !matches!(graph.desc(*kxx).dtype, infr_core::DType::F16) {
-            continue;
-        }
-        if let Some(Op::WriteKv {
-            src,
-            cache,
-            pos,
-            rows,
-            row_stride,
-        }) = graph.ops.get(i + 1)
-        {
-            // A Q8_0 cache needs a real quantizing WriteKv (store_q8), so DON'T fuse the f16 rope
-            // write into it — leave the standalone WriteKv to run.
-            if src == kxx && matches!(graph.desc(*cache).dtype, infr_core::DType::F16) {
-                // SWA ring cache (row capacity < full context): the write row is pos % cap_rows.
-                // The fused rope kernels write `rows` CONTIGUOUS rows from out_base, so a batched
-                // prefill write that would cross the ring's wrap boundary can't fuse — leave the
-                // standalone WriteKv, whose lowering splits the write at the wrap. Decode (rows
-                // == 1) always fuses; a full-context cache never wraps (pos < cap_rows).
-                let cap_rows = graph.desc(*cache).numel() / (*row_stride as usize).max(1);
-                let pos_r = if cap_rows > 0 {
-                    *pos as usize % cap_rows
-                } else {
-                    *pos as usize
-                };
-                if cap_rows == 0 || pos_r + *rows as usize <= cap_rows {
-                    fused.insert(i, (*cache, pos_r));
-                    skip.insert(i + 1);
-                }
-            }
-        }
+/// This adapter's [`FusionCfg`](infr_core::fusion::FusionCfg): the `Linear→Add` residual fusion
+/// (`INFR_NO_FUSE_ADD` hatch) and the `Rope/QkNormRope→WriteKv` KV-write fusion. `plan_fusions`
+/// returns the same `(fused, skip)` the two former private peepholes did.
+fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
+    infr_core::fusion::FusionCfg {
+        linear_add: Some(infr_core::fusion::LinearAddCfg {
+            weight_ok: &LINEAR_ADD_WEIGHT_OK,
+            disable_env: Some("INFR_NO_FUSE_ADD"),
+        }),
+        rmsnorm_linear: None,
+        kv_write: true,
     }
-    (fused, skip)
 }
 
 /// How pos-dependent ops (`QkNormRope`, `WriteKv`, `Attention`) are lowered:
@@ -4470,9 +4386,10 @@ fn record_decode_replay(
             _ => None,
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
-    let (fused_kv_write, mut skip_op) = kv_write_peephole(graph);
-    let (fused_add, skip_add) = linear_add_peephole(graph);
-    skip_op.extend(skip_add);
+    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg());
+    let fused_kv_write = plan.kv_write;
+    let fused_add = plan.linear_add;
+    let mut skip_op = plan.skip;
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -4663,8 +4580,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         }
     }
 
-    let (fused_kv_write, mut skip_op) = kv_write_peephole(graph);
-    let (mut fused_add, mut skip_add) = linear_add_peephole(graph);
+    let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg());
     // Dense layer streaming: the fused Linear+Add kernels bake a ZERO weight offset, so un-fuse
     // any pair whose Linear weight is a streamed block — the standalone Add op runs instead
     // (bit-identical math: the fused kernel only moves the same exact add in-kernel).
@@ -4672,7 +4588,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         let guard = be_.dense_pager().lock().unwrap();
         if let Some(sess) = guard.as_ref() {
             let mut unfuse: Vec<usize> = Vec::new();
-            for &idx in fused_add.keys() {
+            for &idx in plan.linear_add.keys() {
                 if let Op::Linear { weight, .. } = &graph.ops[idx] {
                     let w = resolve(&scratch, bindings, *weight)?;
                     if sess.is_streamed(crate::pager::buffer_identity(w)) {
@@ -4681,12 +4597,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 }
             }
             for idx in unfuse {
-                fused_add.remove(&idx);
-                skip_add.remove(&(idx + 1));
+                plan.linear_add.remove(&idx);
+                plan.skip.remove(&(idx + 1));
             }
         }
     }
-    skip_op.extend(skip_add);
+    let fused_kv_write = plan.kv_write;
+    let fused_add = plan.linear_add;
+    let skip_op = plan.skip;
 
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
     // recorder — hold them here so they drop only after `rec.finish()` submits.
