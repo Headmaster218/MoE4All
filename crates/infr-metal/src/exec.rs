@@ -347,6 +347,33 @@ mod tests {
         assert!(!prefer_iq4nl_rt("linear_q4_0", 2));
     }
 
+    /// The mrv m-ladder moved to the shared `infr_core::tier` policy (candidate F): the configured
+    /// band must reproduce the OLD inline `(2..=8).contains(&m) && out_f < 65536` decision exactly.
+    #[test]
+    fn mrv_band_matches_inline_formula() {
+        use infr_core::tier::{linear_tier, LinearTier};
+        let old = |m: usize, out_f: usize| (2..=8).contains(&m) && out_f < 65536;
+        for m in 0usize..=12 {
+            for &out_f in &[1usize, 1152, 6912, 9216, 65_535, 65_536, 248_320] {
+                let tier = linear_tier(m, out_f, &[MRV_BAND]);
+                assert_eq!(
+                    matches!(tier, LinearTier::MultiRow { .. }),
+                    old(m, out_f),
+                    "mrv band m={m} out_f={out_f}"
+                );
+                assert_eq!(m == 1, tier == LinearTier::Decode, "decode m={m}");
+            }
+        }
+        // INFR_METAL_LMHEAD_MRV lifts ONLY the lm_head ceiling — the m window is untouched.
+        let lifted = infr_core::tier::MultiRowBand {
+            out_f_max: usize::MAX,
+            ..MRV_BAND
+        };
+        assert!(lifted.contains(8, 248_320));
+        assert!(!lifted.contains(9, 248_320));
+        assert!(!lifted.contains(1, 6912));
+    }
+
     #[test]
     fn q5k_row_tile_policy_is_limited_to_four_rows() {
         for m in [1usize, 2, 3, 5] {
@@ -917,6 +944,22 @@ fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
         _ => return None,
     })
 }
+
+/// The multi-row GEMV (`*_mrv`) band of the dense `Linear` m-ladder — the SHAPE half of the
+/// decision, in the shared [`infr_core::tier`] policy. `m = 2..=8` (weight bytes hoisted to
+/// registers and reused across the rows: one DRAM stream per 8 tokens, where the cooperative tile
+/// is latency-bound on its serial k-loop) at any per-layer width, up to the lm_head ceiling: at
+/// `out_f >= 65536` mrv spawns `out_f/2 * m` simdgroups and loses to the cmm GEMM tile. `m == 1`
+/// keeps the exact-f32 GEMV (decode's precision contract). Which dtypes have an mrv kernel, and
+/// the `INFR_METAL_LMHEAD_MRV` hatch, stay at the `Op::Linear` arm — see the rationale written up
+/// there.
+const MRV_BAND: infr_core::tier::MultiRowBand = infr_core::tier::MultiRowBand {
+    min_m: 2,
+    max_m: 8,
+    narrow_max_m: 8,
+    wide_out_f_max: usize::MAX,
+    out_f_max: 65535,
+};
 
 fn prefer_rmsnorm_vec4(rows: usize, dim: usize) -> bool {
     rows <= 4 && dim >= 2048 && dim.is_multiple_of(4)
@@ -2600,14 +2643,22 @@ impl MetalBackend {
                     // Measured on qwen3.5-4B-MTP verify (m=7): routing the lm_head to cmm is +8% on
                     // the MTP cycle (1.30x -> 1.39x), token-identical to greedy. Gate at 65536 —
                     // comfortably above every per-layer out_f, below any real lm_head/vocab width.
-                    // INFR_METAL_LMHEAD_MRV forces the old mrv path (A/B + escape hatch).
-                    let mr_kern =
-                        if out_f >= 65536 && std::env::var("INFR_METAL_LMHEAD_MRV").is_err() {
-                            None
+                    // INFR_METAL_LMHEAD_MRV forces the old mrv path (A/B + escape hatch) by
+                    // lifting the band's `out_f` ceiling. The m window + that ceiling are the
+                    // shared `infr_core::tier` band ([`MRV_BAND`]); the per-dtype kernel choice
+                    // above stays Metal's own.
+                    let band = infr_core::tier::MultiRowBand {
+                        out_f_max: if std::env::var("INFR_METAL_LMHEAD_MRV").is_err() {
+                            MRV_BAND.out_f_max
                         } else {
-                            mr_kern
-                        };
-                    if let (true, Some(kn), 0) = ((2..=8).contains(&m), mr_kern, w_off) {
+                            usize::MAX
+                        },
+                        ..MRV_BAND
+                    };
+                    let mrv_tier = infr_core::tier::linear_tier(m, out_f, &[band]);
+                    if let (infr_core::tier::LinearTier::MultiRow { .. }, Some(kn), 0) =
+                        (mrv_tier, mr_kern, w_off)
+                    {
                         let pso = self.pipelines.get(kn)?;
                         let bd = self.dev_dst(r, dst, m * out_f);
                         let sgs = out_f.div_ceil(2) * m;

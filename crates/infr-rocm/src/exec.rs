@@ -154,6 +154,18 @@ fn wmma_tile(out_f: u32) -> (u32, u32) {
     }
 }
 
+/// Flash-decoding (split-KV) attention chunk policy for `attention_split_partial`: aim ~32
+/// chunks/head, each 64..512 keys. Same window as Vulkan's `attn_partial`, but CEIL-rounded — a
+/// real (small) divergence from Vulkan's floor, preserved here because neither has been shown
+/// better and changing it re-shapes every decode dispatch. See
+/// [`infr_core::tier::ChunkRounding`].
+const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
+    target_chunks: 32,
+    min_chunk: 64,
+    max_chunk: 512,
+    rounding: infr_core::tier::ChunkRounding::Up,
+};
+
 /// Matrix-core (WMMA) int8 prefill GEMM kernel (Phase 5, Slice-25 RM×CN-tiled) for a covered dtype.
 /// Routed only for `m > 1` (prefill); decode (`m == 1`) stays on the `linear_i8_*` GEMV, which WMMA
 /// can't help. Same int8 precision as `native_i8_fmt` (identical activation quant + weight codes),
@@ -1665,15 +1677,17 @@ fn run_op(
             // ONE wave per (row, head) that scans ALL kv serially — fine at low depth, but at long
             // context that one wave crawls while ~95 CUs idle. Split-KV partitions kv into `n_chunks`
             // contiguous chunks, launches one wave per (row, head, chunk) to compute per-chunk
-            // online-softmax partials, then a combine wave merges them. Adaptive chunking (mirrors the
-            // Vulkan attn_partial policy): aim ~32 chunks/head, each 64..512 keys. Only worth it when
-            // rows==1 AND the derived n_chunks>1 (short-context decode → n_chunks==1 → plain kernel,
-            // no scratch, no combine). Prefill (rows>1) already fills the grid with rows*n_head waves
-            // and stays on the plain kernel.
+            // online-softmax partials, then a combine wave merges them. Adaptive chunking via the
+            // shared `infr_core::tier` policy ([`ATTN_SPLIT`]): aim ~32 chunks/head, each 64..512
+            // keys. Only worth it when rows==1 AND the derived n_chunks>1 (short-context decode →
+            // n_chunks==1 → plain kernel, no scratch, no combine). Prefill (rows>1) already fills
+            // the grid with rows*n_head waves and stays on the plain kernel. No chunk-COUNT cap
+            // here: `attention_split_combine` walks n_chunks straight out of global memory (no
+            // fixed shared array), unlike Vulkan's attn_combine.
             let heads = rows as usize * n_head as usize;
             let kvl = kv_len as usize;
-            let chunk_size = kvl.div_ceil(32).clamp(64, 512);
-            let n_chunks = kvl.div_ceil(chunk_size).max(1);
+            let chunk_size = infr_core::tier::adaptive_chunk(kvl, &ATTN_SPLIT);
+            let n_chunks = infr_core::tier::n_chunks(kvl, chunk_size).max(1);
             if rows == 1 && n_chunks > 1 {
                 let hd = head_dim as usize;
                 let pm = ctx.pool_buf(heads * n_chunks * 4, false);

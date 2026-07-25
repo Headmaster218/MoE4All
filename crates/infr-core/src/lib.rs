@@ -14,6 +14,7 @@ pub mod pager;
 pub mod progress;
 pub mod shutdown;
 pub mod tensor;
+pub mod tier;
 
 pub use backend::{
     initial_submit_dispatch_cap, integrated_ubatch_rows, submit_cap_from_measurement, Backend,

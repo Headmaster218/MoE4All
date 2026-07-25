@@ -188,7 +188,59 @@ vulkan adds `pins`) with identical `reset_cache` delegating to the
 - **Extract:** `DenseSession<B: Backend> { be: B, pool: SlotPool, max_ctx }`;
   collapses three structs + three `reset_cache` into one. Pairs with D.
 
-### F. Capability-tiering / kernel-selection policy — MED / MED
+### F. Capability-tiering / kernel-selection policy — MED / MED ⚠️ PARTLY LANDED
+
+**Done — the arithmetic that really was shared.** `infr-core/src/tier.rs` now
+hosts the device-independent half of kernel selection; every measured number
+stays with its backend and is passed IN as config:
+
+- **`EnvRows { env, default, min, max }` + `get()`** — the `INFR_*` numeric
+  row/count knob (parse → default → clamp). Vulkan's `INFR_MOE_SMALL_M` (default
+  8, ceiling 64 — an unclamped override device-losts the GPU) and
+  `INFR_CANVAS_CHUNK_N` (default 3, floor 1) now declare a config instead of
+  re-spelling the parse chain.
+- **`linear_tier(m, out_f, &[MultiRowBand]) -> LinearTier`** — the dense
+  `Linear` m-ladder as an enum (`Decode` / `MultiRow { band }` / `Gemm`) the
+  backend maps to its own kernels. `MultiRowBand` carries `min_m`/`max_m`/
+  `narrow_max_m`/`wide_out_f_max`/`out_f_max`, which expresses all three shapes
+  exactly: Vulkan's `MROW_BANDS` (m=2..=8 with the `out_f<=8192` wide-n cutoff
+  above m=4, plus the m=9..=16 int8 band) and Metal's `MRV_BAND` (m=2..=8 up to
+  the `out_f<65536` lm_head ceiling, which `INFR_METAL_LMHEAD_MRV` lifts). The
+  capability half — kernel builds, dtype sets, `caps.i8_dot`, the env hatches —
+  deliberately stays at each `Op::Linear` arm.
+- **`adaptive_chunk` / `n_chunks` / `cap_chunk_count` / `baked_chunk`** — the
+  flash-decoding split-K attention chunk policy (`AttnSplitCfg`: ~32
+  chunks/head, 64..512 keys), shared by Vulkan's `attn_partial` and ROCm's
+  `attention_split_partial`, plus the chunk-COUNT cap Vulkan needs because
+  `attn_combine.comp` indexes `shared float wexp[1024]` (ROCm's combine reads
+  from global memory and takes no cap — that stayed a Vulkan-only parameter).
+  The ROCm copy's comment claimed it "mirrors the Vulkan policy"; it does not
+  quite — Vulkan floors `span/32`, ROCm ceils. That one-key divergence is real
+  and observable, so it is now explicit config (`ChunkRounding::{Down, Up}`)
+  with a test pinning it, not silently unified.
+
+Vulkan's cross-tier assertions are structural against the shared policy:
+`split_k_chunk_count_cap_*` now also assert `adaptive_chunk(span, &ATTN_SPLIT)`
+reproduces the old inline `(span/32).clamp(64,512)` for every span, and the new
+`mrow_bands_match_inline_formula` / `mrv_band_matches_inline_formula` (Metal)
+sweep the old inline row/width expressions verbatim. `infr-core` gained 7 unit
+tests over boundaries + env parsing. No golden moved; no tier decision changes
+for any `(m, out_f, span)`.
+
+**NOT done — the prefill GEMM's narrow-n split-K count.** Vulkan's
+`split_k_plan` and Metal's inline `ks_split` look like the same idea ("does the
+tile grid fill the device? if not, split k") but encode different device facts:
+different tile geometry (64×128 coopmat vs 32×64 threadgroup), different fill
+targets (256 vs 160 workgroups), a `next_power_of_two` vs a min-K-steps tail
+rule, and different applicability windows (`in_f>=1024` vs `m<16`). A shared
+form would need one config field per line of either formula — LCD flattening,
+not unification. Left per-backend; both keep their own test.
+
+Also NOT moved: ROCm's dense `Linear` ladder is a bare `m > 1` (prefill WMMA vs
+decode GEMV) with no multi-row band, so routing it through
+`linear_tier(m, out_f, &[])` would add a call and remove nothing.
+Per-dtype/per-vendor coverage sets (`mrow_int8_dtype_ok`, Metal's `prefer_*`)
+are candidate G's territory, not arithmetic. Original audit below (historical).
 
 The m-based tier thresholds are pure host arithmetic but live per-backend.
 Vulkan is richest: `moe_small_m_threshold` (`adapter.rs:160`,
@@ -262,7 +314,8 @@ arithmetic (`ring_bytes_policy` `pager.rs:606`). Also: vulkan's
    `SessionChat<S>` blanket impl would have had to break, and re-scope before
    re-attempting.
 3. **F. tiering policy module** — moderate, high leverage; makes the existing
-   cross-tier assertions structural.
+   cross-tier assertions structural. **Landed in part** — see its entry for the
+   prefill-GEMM split-K formulas that stayed per-backend and why.
 4. **B. GraphExecutor skeleton** — the biggest structural prize, but it touches
    every backend's hot loop; do it only after A/F prove the shared-IR-pass
    pattern and with the full per-backend test suites as the guardrail.

@@ -149,21 +149,23 @@ fn is_kv_inline_decode(dt: infr_core::DType) -> bool {
 /// path re-reads a shared expert's weight once per occurrence, so it degrades faster). `8` sits
 /// right at the edge of the small path's win region with headroom to spare.
 ///
-/// `INFR_MOE_SMALL_M` overrides the threshold for experimentation, clamped to `MOE_SMALL_M_MAX`:
+/// `INFR_MOE_SMALL_M` overrides the threshold for experimentation, clamped to the knob's `max`:
 /// the small path's GEMV dispatches one workgroup PER (row, slot, out-column) with no row-tile
 /// batching, so at the seam's normal prefill chunk size (`INFR_UBATCH`, 1024 rows by default) an
 /// UNCLAMPED override turns every prefill chunk into a multi-second single dispatch — this isn't
 /// just slow, it trips the amdgpu ring watchdog and device-losts the whole process (reproduced:
 /// `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s UBATCH doc for
 /// the same failure class with an unchunked prefill).
+const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
+    env: "INFR_MOE_SMALL_M",
+    default: 8,
+    min: 0,
+    max: 64,
+};
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn moe_small_m_threshold() -> usize {
-    const MOE_SMALL_M_MAX: usize = 64;
-    std::env::var("INFR_MOE_SMALL_M")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
-        .min(MOE_SMALL_M_MAX)
+    MOE_SMALL_M.get()
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -363,6 +365,38 @@ type ScratchPool = HashMap<(&'static str, usize), Box<dyn Buffer>>;
 /// the smallest clear payer), 4096x4096 o −5% kernel-only but a whole-model LOSS on
 /// dispatch-bound decodes (gemma3-1b −2.3%, qwen3moe −6% with no gate).
 const MMV_MIN_ELEMS: usize = 48 << 20;
+
+/// The multi-row GEMV (`mrow`) bands of the dense `Linear` m-ladder, in selection order. Only the
+/// SHAPE arithmetic lives in the shared [`infr_core::tier`] policy; the capability half (an mrow
+/// build for the dtype, `caps.i8_dot`, the int8 dtype sets, `INFR_NO_MROW`/`INFR_NO_MROW16`) stays
+/// at the `Op::Linear` arm, which is where the measured rationale for each number is written up.
+///
+/// - [`MROW_BAND`] (m = 2..=8): the small multi-row batch — spec-decode verify rows, a short
+///   chat-turn suffix prefill. m=5..8 gates on `out_f <= 8192` (past that the GEMM's tile grid
+///   fills the device and wins).
+/// - [`MROW16_BAND`] (m = 9..=16): the int8-only extension for an MTP verify batch carrying
+///   committed rows on top of the drafts. Same wide-n cutoff; NO dequant fallback, hence its
+///   extra up-front capability gate.
+const MROW_BANDS: [infr_core::tier::MultiRowBand; 2] = [
+    infr_core::tier::MultiRowBand {
+        min_m: 2,
+        max_m: 8,
+        narrow_max_m: 4,
+        wide_out_f_max: 8192,
+        out_f_max: usize::MAX,
+    },
+    infr_core::tier::MultiRowBand {
+        min_m: 9,
+        max_m: 16,
+        narrow_max_m: 0,
+        wide_out_f_max: 8192,
+        out_f_max: usize::MAX,
+    },
+];
+/// Index of the m = 2..=8 band in [`MROW_BANDS`].
+const MROW_BAND: usize = 0;
+/// Index of the m = 9..=16 int8 band in [`MROW_BANDS`].
+const MROW16_BAND: usize = 1;
 
 /// The m=1 DECODE int8 mmv is DEFAULT-OFF (opt in with `INFR_MMV_DECODE=1`). The word-parallel
 /// K-quant `dqblk` (whole-u32 decode, commit 51a35c8) sped up the SCALAR dequant GEMV enough that
@@ -849,13 +883,38 @@ enum RopeMode<'a> {
     Dynamic(&'a dyn Buffer),
 }
 
-/// Cap the static split-K attention chunk COUNT so `n_chunks = span.div_ceil(chunk) <= 1024` —
-/// `attn_combine.comp` indexes `shared float wexp[1024]` by chunk, so a larger count is an OOB
-/// shared-memory write. Raises the chunk floor to `span.div_ceil(1024)`; only bites when
+/// `attn_combine.comp` indexes `shared float wexp[ATTN_MAX_CHUNKS]` by chunk, so a split-K
+/// dispatch with a larger chunk COUNT is an OOB shared-memory write. This is the device fact the
+/// shared [`infr_core::tier::cap_chunk_count`] / [`infr_core::tier::baked_chunk`] policy is
+/// parameterized by.
+const ATTN_MAX_CHUNKS: usize = 1024;
+
+/// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
+/// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
+/// rounding is config and not a shared constant).
+const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
+    target_chunks: 32,
+    min_chunk: 64,
+    max_chunk: 512,
+    rounding: infr_core::tier::ChunkRounding::Down,
+};
+
+/// Canvas-mask (`AttnMask::Canvas`) chunk DIVISOR: the canvas span is cut into ~this many chunks
+/// rather than sized adaptively (the fixed `lo` override makes the span short and known). The
+/// floor of 1 keeps the `kv_len.div_ceil(n)` below from dividing by zero.
+const CANVAS_CHUNK_N: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
+    env: "INFR_CANVAS_CHUNK_N",
+    default: 3,
+    min: 1,
+    max: usize::MAX,
+};
+
+/// Cap the static split-K attention chunk COUNT so `n_chunks = span.div_ceil(chunk) <= 1024` (see
+/// [`ATTN_MAX_CHUNKS`]). Raises the chunk floor to `span.div_ceil(1024)`; only bites when
 /// `span > 512*1024` (≈524k keys, reachable under `INFR_KV_OVERFLOW` huge ctx). Below that it
 /// returns `chunk` unchanged, so the recorded dispatch is byte-identical for every realistic span.
 fn split_k_chunk_count_cap(span: usize, chunk: usize) -> usize {
-    chunk.max(span.div_ceil(1024))
+    infr_core::tier::cap_chunk_count(span, chunk, ATTN_MAX_CHUNKS)
 }
 
 /// Narrow-n deep-k split-K count for the coopmat-warp prefill GEMM (see the resident native-dense
@@ -1287,12 +1346,15 @@ fn lower_op(
             // m=11 sk_ag 148us vs mmvr m=7 67.5us; q6k 194us). Same out_f <= 8192 wide-n cutoff
             // as m=5..8 (the GEMM tiles win on gate_up-wide shapes), same formats as the m<=8
             // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
-            let mrow16 = (9..=16).contains(&m)
-                && out_f <= 8192
+            // The two bands' SHAPE arithmetic lives in `MROW_BANDS` (shared policy); the
+            // capability half — kernel builds, dtype sets, caps, env hatches — stays here.
+            let mrow_tier = infr_core::tier::linear_tier(m, out_f, &MROW_BANDS);
+            let in_band = |b: usize| mrow_tier == infr_core::tier::LinearTier::MultiRow { band: b };
+            let mrow16 = in_band(MROW16_BAND)
                 && mmv_gate
                 && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
                 && std::env::var("INFR_NO_MROW16").is_err();
-            if ((2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192) || mrow16)
+            if (in_band(MROW_BAND) || mrow16)
                 && in_f % 32 == 0
                 && crate::gemm::native_mrow_kernel_name(dt).is_some()
                 && std::env::var("INFR_NO_MROW").is_err()
@@ -2499,11 +2561,13 @@ fn lower_op(
                 // planar-Q8 scales-region base push constant): shadowing the latter with the
                 // former here is exactly the bug that garbled Q8 KV under record-once replay.
                 let cap_rows = graph.desc(*k_cache).numel() / (nkv * hd);
-                // Baked MIN chunk (64, rising only when the capacity would exceed the 1024-chunk
-                // scratch/combine cap); the kernel derives the effective adaptive chunk from the
-                // live kv_len each token, so one recorded plan serves every depth.
-                let chunk = cap_rows.div_ceil(1024).max(64);
-                let n_chunks = cap_rows.div_ceil(chunk);
+                // Baked MIN chunk (the policy's `min_chunk`, rising only when the capacity would
+                // exceed the ATTN_MAX_CHUNKS scratch/combine cap); the kernel derives the effective
+                // adaptive chunk from the live kv_len each token, so one recorded plan serves every
+                // depth.
+                let chunk =
+                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_SPLIT.min_chunk);
+                let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
@@ -2655,7 +2719,7 @@ fn lower_op(
                     0
                 };
                 let dec_span = kv_len - dec_swa_base;
-                let dec_chunk = (dec_span / 32).clamp(64, 512);
+                let dec_chunk = infr_core::tier::adaptive_chunk(dec_span, &ATTN_SPLIT);
                 // Only exclude a RING cache (SWA past its wrap) — its RROW-wrapped inline read is
                 // correct but out of the kv_addr_parity coverage, so keep the prepass there for now.
                 // (`cap_short` — the nonfa 256-row PREFILL tile-pad guard — is irrelevant to the
@@ -2955,11 +3019,7 @@ fn lower_op(
                 // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
                 let cap_short = kv_len.div_ceil(256) * 256 > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
-                    let n = std::env::var("INFR_CANVAS_CHUNK_N")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(3)
-                        .max(1);
+                    let n = CANVAS_CHUNK_N.get();
                     kv_len.div_ceil(n).min(kv_len - 1).max(1)
                 } else if batched_attn {
                     256
@@ -2971,7 +3031,7 @@ fn lower_op(
                     // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
                 } else {
-                    (span / 32).clamp(64, 512)
+                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT)
                 };
                 // Bound the chunk COUNT, not just its size: attn_combine.comp indexes its
                 // `shared float wexp[1024]` by chunk, so n_chunks (= span.div_ceil(chunk), computed
@@ -5657,8 +5717,10 @@ mod tests {
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
 
-    /// The OLD static split-K chunk formula (the else-branch decode/prefill policy, before the
-    /// count cap). Kept here as the byte-identity reference for `split_k_chunk_count_cap`.
+    /// The OLD static split-K chunk formula, spelled out inline (the else-branch decode/prefill
+    /// policy, before the count cap and before it moved to `infr_core::tier`). Kept as the
+    /// byte-identity reference for BOTH the shared `adaptive_chunk` policy and the count cap: a
+    /// re-tune of `ATTN_SPLIT` must face this literal.
     fn old_static_chunk(span: usize) -> usize {
         (span / 32).clamp(64, 512)
     }
@@ -5689,6 +5751,13 @@ mod tests {
         ]);
         for span in spans {
             let old = old_static_chunk(span);
+            // Structural: the shared policy configured with `ATTN_SPLIT` must reproduce the old
+            // inline formula exactly, at every span.
+            assert_eq!(
+                infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT),
+                old,
+                "ATTN_SPLIT drifted from the inline formula at span {span}"
+            );
             let capped = split_k_chunk_count_cap(span, old);
             assert_eq!(
                 old, capped,
@@ -5741,6 +5810,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The mrow m-ladder moved to the shared `infr_core::tier` policy (candidate F): the two
+    /// configured bands must reproduce the OLD inline row/width expressions exactly, for every
+    /// (m, out_f) either could see. A band edit that changes a routing decision fails here.
+    #[test]
+    fn mrow_bands_match_inline_formula() {
+        use infr_core::tier::{linear_tier, LinearTier};
+        // The pre-extraction expressions, verbatim.
+        let old_mrow = |m: usize, out_f: usize| {
+            (2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192)
+        };
+        let old_mrow16 = |m: usize, out_f: usize| (9..=16).contains(&m) && out_f <= 8192;
+        for m in 0usize..=24 {
+            for &out_f in &[
+                1usize, 64, 4096, 8191, 8192, 8193, 9216, 24576, 65536, 151_936,
+            ] {
+                let tier = linear_tier(m, out_f, &MROW_BANDS);
+                assert_eq!(
+                    tier == LinearTier::MultiRow { band: MROW_BAND },
+                    old_mrow(m, out_f),
+                    "mrow band m={m} out_f={out_f}"
+                );
+                assert_eq!(
+                    tier == LinearTier::MultiRow { band: MROW16_BAND },
+                    old_mrow16(m, out_f),
+                    "mrow16 band m={m} out_f={out_f}"
+                );
+                // m == 1 is the decode GEMV on every width — never a band.
+                assert_eq!(m == 1, tier == LinearTier::Decode, "decode m={m}");
+            }
+        }
+    }
+
+    /// The `INFR_*` tier knobs' shipping numbers, asserted on the config (not on `get()`, which
+    /// would read the developer's environment). A default/ceiling edit has to face this.
+    #[test]
+    fn tier_knob_defaults_and_clamps() {
+        // `INFR_MOE_SMALL_M`: measured crossover 8, hard ceiling 64 (past it a prefill chunk
+        // becomes one multi-second dispatch and trips the amdgpu watchdog).
+        assert_eq!(MOE_SMALL_M.env, "INFR_MOE_SMALL_M");
+        assert_eq!(MOE_SMALL_M.default, 8);
+        assert_eq!((MOE_SMALL_M.min, MOE_SMALL_M.max), (0, 64));
+        // `INFR_CANVAS_CHUNK_N`: a divisor, so it floors at 1 rather than capping.
+        assert_eq!(CANVAS_CHUNK_N.env, "INFR_CANVAS_CHUNK_N");
+        assert_eq!(CANVAS_CHUNK_N.default, 3);
+        assert_eq!(CANVAS_CHUNK_N.min, 1);
+        // The split-K policy the attention lowering is configured with.
+        assert_eq!(ATTN_SPLIT.target_chunks, 32);
+        assert_eq!((ATTN_SPLIT.min_chunk, ATTN_SPLIT.max_chunk), (64, 512));
+        assert_eq!(ATTN_SPLIT.rounding, infr_core::tier::ChunkRounding::Down);
+        assert_eq!(ATTN_MAX_CHUNKS, 1024); // attn_combine.comp's shared wexp[1024]
     }
 
     /// #3: a strided-gate `Silu` (`gate_stride != 0`) is shape-legal but `silu_mul` reads the gate
