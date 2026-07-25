@@ -8,9 +8,16 @@ agreement with the CPU reference — before a single perf lever is pulled, then
 climbs from naive kernels to a fast kernel for every supported model × quant
 combination.
 
-> Status: **PLAN ONLY — nothing built yet.** This doc is the roadmap and the
-> design record. Update the phase checkboxes and the commit refs as slices land,
-> the same way `docs/igpu.md` and `docs/cpu-perf.md` track their campaigns.
+> Status: **BUILT & LANDED (37+ slices on `main`).** Part A correctness is
+> complete for every arch that fits VRAM; the perf climb (Part B) is well under
+> way (native/int8 decode, WMMA prefill, split-KV attention, decode fusion) and
+> all three Vulkan-style memory-paging modes — **MoE experts, KV-cache overflow,
+> and dense-weight paging** — are implemented and prefetch-optimized. Current
+> resident perf is ~0.2–0.3× llama.cpp HIP on Q4_K_M (decode ~130 t/s, up ~60×
+> from the naive baseline); ≥1.0× vs llama.cpp remains open (deep mmq/mmvq
+> kernel work). Big-model capability: 30B MoE, 27 GiB KV contexts, and >VRAM
+> dense models all run via paging on a 24 GB card. This doc is the roadmap +
+> design record; phase checkboxes below are updated as slices land.
 
 ## Why a ROCm backend at all (infr already runs on AMD via Vulkan)
 
