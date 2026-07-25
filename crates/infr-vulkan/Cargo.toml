@@ -36,3 +36,6 @@ infr-gguf.workspace = true
 
 [dev-dependencies]
 memmap2.workspace = true
+# The shared backend decode-parity harness (`tests/shared_decode_parity.rs`, plus the converted
+# `*_matches_host` unit tests in `adapter.rs`).
+infr-testkit.workspace = true

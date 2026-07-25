@@ -253,83 +253,16 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
 
 /// Returns `(elements_per_block, bytes_per_block)` for the GGUF block layout.
 ///
-/// Sizes taken from llama.cpp `ggml/src/ggml.c` `type_traits[]` `.blck_size` / `.type_size`.
+/// Thin re-export of [`infr_core::decode_spec::block_layout`], the single source of truth for block
+/// geometry (sizes from llama.cpp `ggml/src/ggml.c` `type_traits[]` `.blck_size` / `.type_size`;
+/// each arm's defining formula is cross-checked there by `block_bytes_match_the_ggml_formulas`).
 /// GGUF dim order: `ne[0]` is the fastest-varying axis (innermost / columns).
 /// Public so placement code (dense layer streaming) can align streamed slot strides to whole
 /// quant blocks — a slot base that isn't a whole number of blocks breaks the kernels'
 /// element-offset weight addressing.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn block_layout(dtype: DType) -> (usize, usize) {
-    match dtype {
-        DType::F32 => (1, 4),
-        DType::F16 => (1, 2),
-        DType::Bf16 => (1, 2),
-        // Legacy round quants (QK4_0=32, QK5_0=32, QK5_1=32, QK8_0=32)
-        // block_q4_0: half d + uint8_t qs[16] = 18 bytes
-        DType::Q4_0 => (32, 18),
-        // block_q4_1: half d + half m + uint8_t qs[16] = 20 bytes
-        DType::Q4_1 => (32, 20),
-        // block_q5_0: half d + uint8_t qh[4] + uint8_t qs[16] = 22 bytes
-        DType::Q5_0 => (32, 22),
-        // block_q5_1: half d + half m + uint8_t qh[4] + uint8_t qs[16] = 24 bytes
-        DType::Q5_1 => (32, 24),
-        // block_q8_0: half d + int8_t qs[32] = 34 bytes
-        DType::Q8_0 => (32, 34),
-        // K-quants (QK_K=256)
-        // block_q2_K: 2*half + QK_K/16 + QK_K/4 = 4+16+64 = 84 bytes
-        DType::Q2K => (256, 84),
-        // block_q3_K: half + QK_K/4 + QK_K/8 + 12 = 2+64+32+12 = 110 bytes
-        DType::Q3K => (256, 110),
-        // block_q4_K: 2*half + 12 + QK_K/2 = 4+12+128 = 144 bytes
-        DType::Q4K => (256, 144),
-        // block_q5_K: 2*half + 12 + QK_K/8 + QK_K/2 = 4+12+32+128 = 176 bytes
-        DType::Q5K => (256, 176),
-        // block_q6_K: QK_K/2 + QK_K/4 + QK_K/16 + half = 128+64+16+2 = 210 bytes
-        DType::Q6K => (256, 210),
-        // I-quants (codebook, QK_K=256 unless noted)
-        // block_iq2_xxs: half + QK_K/8*sizeof(u16) = 2+64 = 66 bytes
-        DType::Iq2Xxs => (256, 66),
-        // block_iq2_xs: half + QK_K/8*sizeof(u16) + QK_K/32 = 2+64+8 = 74 bytes
-        DType::Iq2Xs => (256, 74),
-        // block_iq2_s: half + QK_K/4 + QK_K/16 = 2+64+16 = 82 bytes
-        DType::Iq2S => (256, 82),
-        // block_iq3_xxs: half + 3*(QK_K/8) = 2+96 = 98 bytes
-        DType::Iq3Xxs => (256, 98),
-        // block_iq3_s: half + 13*(QK_K/32) + QK_K/64 = 2+104+4 = 110 bytes
-        DType::Iq3S => (256, 110),
-        // block_iq1_s: half + QK_K/8 + QK_K/32*sizeof(u16) = 2+32+16 = 50 bytes
-        DType::Iq1S => (256, 50),
-        // block_iq1_m: QK_K/8 + QK_K/16 + QK_K/32 = 32+16+8 = 56 bytes (no half — scale in scales)
-        DType::Iq1M => (256, 56),
-        // block_iq4_nl: half + QK4_NL/2 = 2+16 = 18 bytes; QK4_NL=32
-        DType::Iq4Nl => (32, 18),
-        // block_iq4_xs: half + sizeof(u16) + QK_K/64 + QK_K/2 = 2+2+4+128 = 136 bytes
-        DType::Iq4Xs => (256, 136),
-        // Ternary quants (QK_K=256)
-        // block_tq1_0: half + QK_K/64 + (QK_K-4*QK_K/64)/5 = 2+4+48 = 54 bytes
-        DType::Tq1_0 => (256, 54),
-        // block_tq2_0: half + QK_K/4 = 2+64 = 66 bytes
-        DType::Tq2_0 => (256, 66),
-        // block_q2_0: half d + QK2_0/4 = 2+16 = 18 bytes; QK2_0=64 (Bonsai ternary, 2.25 bpw)
-        DType::Q2_0 => (64, 18),
-        // i2_s (BitNet ternary): 4 elements per byte (2 bits each). This block figure covers ONLY
-        // the packed codes — the format also carries a SINGLE per-tensor f32 scale after all codes,
-        // which the block model can't express; `tensor_nbytes` special-cases I2S to add those 4
-        // bytes so the mmap slice includes the scale (and `dequant_codebook` reads it from the tail).
-        DType::I2S => (4, 1),
-        // FP4 quants
-        // block_mxfp4: uint8 e + QK_MXFP4/2 = 1+16 = 17 bytes; QK_MXFP4=32
-        DType::Mxfp4 => (32, 17),
-        // block_nvfp4: uint8[QK_NVFP4/QK_NVFP4_SUB] + QK_NVFP4/2 = 4+32 = 36 bytes; QK_NVFP4=64
-        DType::Nvfp4 => (64, 36),
-        // TurboQuant KV-cache formats (never GGUF weights), 128-elem blocks: turbo2 = norm+qs[32] =
-        // 34 B, turbo3 = norm+qs[32]+signs[16] = 50 B, turbo4 = norm+qs[64] = 66 B.
-        DType::Turbo2 => (128, 34),
-        DType::Turbo3 => (128, 50),
-        DType::Turbo4 => (128, 66),
-        // I32 / U32 are not reachable via ggml_type_to_dtype; kept for exhaustiveness
-        DType::I32 | DType::U32 => (1, 4),
-    }
+    infr_core::decode_spec::block_layout(dtype)
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

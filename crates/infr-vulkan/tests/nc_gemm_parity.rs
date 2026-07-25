@@ -35,27 +35,10 @@ impl Rng {
 }
 
 /// (elements per block, bytes per block) for every mmq dtype under test.
+/// `(elements, bytes)` per block, from the shared decode spec (`infr_core::decode_spec` via
+/// `infr_gguf::block_layout`) — not a hand-kept local table.
 fn block_geom(dt: DType) -> (usize, usize) {
-    match dt {
-        DType::Q4_0 => (32, 18),
-        DType::Q4_1 => (32, 20),
-        DType::Q5_0 => (32, 22),
-        DType::Q5_1 => (32, 24),
-        DType::Q8_0 => (32, 34),
-        DType::Q2K => (256, 84),
-        DType::Q3K => (256, 110),
-        DType::Q4K => (256, 144),
-        DType::Q5K => (256, 176),
-        DType::Q6K => (256, 210),
-        DType::Iq4Nl => (32, 18),
-        DType::Iq4Xs => (256, 136),
-        DType::Iq2S => (256, 82),
-        DType::Iq3S => (256, 110),
-        DType::Mxfp4 => (32, 17),
-        DType::Nvfp4 => (64, 36),
-        DType::Q2_0 => (64, 18),
-        other => panic!("no geometry for {other:?}"),
-    }
+    infr_gguf::block_layout(dt)
 }
 
 /// Synthetic VALID bank: random payload bytes with the scale fields patched small (a valid

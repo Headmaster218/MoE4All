@@ -336,15 +336,130 @@ that drift independently.
   intersects with its own kernel coverage — becomes candidate A's predicate
   parameter.
 
-### H. Decode spec + shared parity harness — HIGH (logic) / HARD (device)
+### H. Decode spec + shared parity harness — HIGH (logic) / HARD (device) ✅ LANDED
 
-Block decode is re-implemented per shader language (GLSL/MSL/HIP) and **cannot**
-be one Rust fn. But two things can be shared: (1) a **decode spec/constants**
-module (block sizes, scale layout) that shaders are generated-from or
-checked-against (the IQ grids already are, via `iquant_grids`); (2) a **shared
-parity-test harness** built on the host `dequant_block` oracle that every
-backend runs. Today vulkan has ~75 `*_matches_host` tests; **rocm/metal have
-none under `src/`** — they lean on the oracle informally.
+**Done — both halves.**
+
+**(1) The spec.** `infr-core/src/decode_spec.rs` is now the single named
+description of every GGUF block format:
+`block_spec(dtype) -> BlockSpec { dtype, block_elems, block_bytes, scales: &[ScaleSlot], name }`
+plus `block_layout(dtype) -> (elems, bytes)` and the `WEIGHT_QUANTS` (24) /
+`KV_ONLY_QUANTS` rosters. A `ScaleSlot` is `{ offset, enc, role }` — where a
+block's scale field lives and how it is encoded (`F16`, MXFP4's `E8M0`, NVFP4's
+four `Ue4m3` sub-scales, IQ1_M's `Iq1mSplitF16` `d` spread across the top
+nibbles of its four scale words) — with `BlockSpec::write_scales` as the
+primitive that writes them. Deliberately NOT here: the decode arithmetic;
+`infr_gguf::dequant_block` stays the single host oracle and the kernels stay the
+device implementations. A fourth Rust decoder would be a liability, not a spec.
+
+Wired both ways, so a wrong entry fails a test rather than sitting unread:
+`infr_gguf::block_layout` is now a thin delegation; `dequant_factored`'s second
+10-entry `(qpb, bpb)` table is gone (it keeps only the "which formats are
+factorable" decision); ROCm's `native_decode_fmt` / `native_i8_fmt` /
+`moe_native_fmt` derive their block geometry from it instead of re-spelling
+`(256, 144)` (pinned against the pre-hoist literals by a new `exec.rs` unit
+test); and five Vulkan test-local `blk_bytes`/`block_geom`/`blk_shape` tables
+(`decode_gemv_bw`, `mmv_mw_parity`, `mmv_mrow_legacy_formats`, `nc_gemm_parity`,
+`mmv_row1_bit_identical` — 17 entries in the largest) collapse to one call.
+infr-core gains 6 unit tests, incl. `block_bytes_match_the_ggml_formulas`, which
+restates every `type_size` as its defining `QK_K` formula so a typo cannot pass.
+
+**(2) The harness — `infr-testkit`.** A new dev-only crate (in the workspace,
+`publish = false`, a `[dev-dependencies]` entry in cpu/rocm/metal/vulkan and
+nothing else). It offers `synth_weight(dtype, n_elem, seed)` — ONE spec-driven
+builder covering all 24 weight quants, replacing the per-suite
+`synth_q`/`synth_q4k`/`synth_mxfp4`/`synth_nvfp4`/`synth_iq1m`/`lcg_bytes`
+families that ROCm's and Metal's parity suites had independently reinvented —
+plus `dequant_oracle`, an f64-accumulated `ref_linear`, a generic
+`run_graph(&dyn Backend, &Graph, bound, out, n)`, and
+`check_linear`/`sweep_linear{,_on}` returning scored `CaseReport`s (rel/abs/
+`max|ref|`, with an all-zero oracle counted as VACUOUS, not passing).
+
+**Why a crate, not a `cfg(test)` module in infr-core:** the oracle IS
+`infr_gguf::dequant_block` and infr-gguf depends on infr-core, so an infr-core
+module reaching for it is a dependency cycle — cargo feature or not. A separate
+crate also keeps the harness out of every production dependency graph by
+construction, which a `feature = "test-harness"` cannot promise under workspace
+feature unification.
+
+**New tests (11), all from that one source:**
+
+- **cpu** — `infr-cpu/tests/decode_parity.rs`, 3 tests, NOT ignored (the
+  harness's GPU-less instantiation, so a GPU-less box actually exercises it).
+  All 24 weight quants at m=1 and m=2 plus F32/F16. Not a tautology: infr-cpu's
+  quant `Linear` runs its own `vec_dot_*` decoders, an INDEPENDENT
+  implementation from `dequant_block`. Measured worst case 7.6e-3 (Q2_K) against
+  a 2e-2 bound — the gap is the CPU path's int8 ACTIVATION quant, not decode.
+- **rocm** — `infr-rocm/tests/shared_decode_parity.rs`, 3 tests, `#[ignore]`d.
+  All 24 at **m=1** (the `linear_i8_*` dp4a GEMV) and **m=16** (the WMMA
+  matrix-core prefill GEMM) — two tiers the legacy
+  `all_quant_linear_matches_cpu` sweep (one shape, m=2) never reached — against
+  the HOST oracle rather than `CpuBackend`, which is itself lossy. **All 48
+  cases pass**, worst case 4.7e-3 (Q6_K m=1) vs the 2e-2 bound; the f32-exact
+  formats come in at ~3e-7.
+- **metal** — `infr-metal/tests/shared_decode_parity.rs`, 3 tests,
+  `#[ignore]`d + `#![cfg(target_os = "macos")]`. All 24 at m=1 and m=4 plus
+  F32/F16. Compiles clean for `x86_64-apple-darwin`; **not executed — no Mac in
+  this environment**, so its `2e-2` is the defensible ceiling, not a measured
+  number (see below).
+- **vulkan** — `infr-vulkan/tests/shared_decode_parity.rs`, 3 tests,
+  `#[ignore]`d. All 24 at m=1 and m=4, which pins
+  `linear::native_dense_dtypes`'s claimed roster (exactly `WEIGHT_QUANTS`)
+  against what actually runs. All 48 pass at ~1.6e-7 worst case.
+
+Plus **three existing Vulkan `*_matches_host` tests moved onto the harness** —
+`rmsnorm_graph_matches_host`, `linear_graph_matches_host`,
+`gated_act_silu_matches_host` in `adapter.rs` — same shapes, same references,
+same tolerances, ~20 lines of alloc/upload/bind/execute/download each replaced
+by `infr_testkit::run_graph`. Deliberately a demonstration, not a mass rewrite.
+
+**Corrected audit note:** the original entry's "rocm/metal have none under
+`src/`" was literally true and misleading. Both have large suites under `tests/`
+(rocm `parity.rs` ~97 KB / 30 tests incl. a 24-format sweep; metal `parity.rs`
+~140 KB with ~60 per-format quant-Linear tests). The real gap H closes is not
+"no coverage" — it is **three independent copies of the block layouts and synth
+builders**, and the m-tiers no single sweep reached.
+
+**NOT done, and why:**
+
+- **The Metal numbers are unmeasured.** Everything else was run on the RX 7900
+  XTX; Metal was only compile-checked. Its `2e-2` matches ROCm's joint bound by
+  argument (same two lossy stages), while `tests/parity.rs` already holds Metal
+  to `1e-3` on the shapes it picks — so the sweep is coverage-shaped, not the
+  tightest bound. **Re-measure on a Mac and tighten.**
+- **Metal's `m >= 16` half-fragment coop-GEMM tier is not swept.** That kernel
+  rounds BOTH weights and activations to f16 before the dot, so an f32 oracle is
+  the wrong comparand (`tests/parity.rs` handles it by mirroring the rounding
+  into its reference via `half_ops`). Teaching the harness a "device rounds to
+  f16 first" mode is follow-up.
+- **The other ~70 Vulkan `*_matches_host` tests stay put.** Several (the
+  `moe_ffn_*` family, the pager/mmq integration tests) build multi-op graphs and
+  read back several tensors, which needs a multi-output `run_graph` the harness
+  does not have; others (`mmv_mrow_symmetric_q2k_q3k`, `small_m_bench`) drive
+  the raw `Recorder`, below the `Backend` seam the harness takes, and are
+  testing kernel-vs-kernel agreement rather than decode-vs-oracle.
+- **`dequant_codebook`'s per-arm `let bpb = 18usize;` locals** (14 of them) were
+  left alone. Each sits inside its own decoder next to that format's field
+  offsets, and rewiring 14 arms is typo risk for no drift protection —
+  `oracle_agrees_with_the_spec_geometry_for_every_weight_quant` already fails if
+  any of them disagrees with the spec, which is the property that matters.
+- **No shader GENERATION from the spec.** The plan offered "generated-from or
+  checked-against"; this is checked-against. Emitting block strides into GLSL
+  the way `iquant_grids` emits codebooks is a bigger, separate change.
+
+Behavior: additive. No runtime path changed (the ROCm/gguf rewires are literal
+value hoists), no golden moved — cpu 23/23 incl. qwen3 `0xfd63781ea3bfa785`,
+gpu_seam 26/27 (`gpu_seam_matches_cpu_qwen3_q2k` fails identically on base —
+pre-existing), ROCm 30/30 legacy + 3 new, Vulkan full suite green.
+
+Original audit below (historical). Block decode is re-implemented per shader
+language (GLSL/MSL/HIP) and **cannot** be one Rust fn. But two things can be
+shared: (1) a **decode spec/constants** module (block sizes, scale layout) that
+shaders are generated-from or checked-against (the IQ grids already are, via
+`iquant_grids`); (2) a **shared parity-test harness** built on the host
+`dequant_block` oracle that every backend runs. Today vulkan has ~75
+`*_matches_host` tests; **rocm/metal have none under `src/`** — they lean on the
+oracle informally.
 
 - **Extract:** a `backend-parity` test harness (drive a one-op `Graph` on the
   backend, compare to `dequant_block` + a reference GEMV) parameterized by the
@@ -395,8 +510,10 @@ arithmetic (`ring_bytes_policy` `pager.rs:606`). Also: vulkan's
    container, the per-op bodies, Vulkan's recorder and cpu's inline walk stayed
    where they are.
 5. **H** shared decode-spec + parity harness and **I** KV/budget math —
-   spec/test and math hoists (not runtime dedup); H also closes the rocm/metal
-   parity-test gap.
+   spec/test and math hoists (not runtime dedup). **H landed** —
+   `infr_core::decode_spec` + the `infr-testkit` harness, with cpu/rocm/metal/
+   vulkan parity sweeps built from it; see its entry for the Metal numbers that
+   still need a Mac and the Vulkan tests that stayed put. **I** is open.
 
 ## Guardrails
 

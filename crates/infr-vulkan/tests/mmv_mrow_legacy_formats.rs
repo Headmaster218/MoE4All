@@ -25,17 +25,11 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
 
-/// Bytes per 32-element block (llama.cpp `block_q*` sizes).
+/// Bytes per 32-element block (llama.cpp `block_q*` sizes), from the shared decode spec
+/// (`infr_core::decode_spec` via `infr_gguf::block_layout`) — not a hand-kept local table. Each
+/// format's field layout is documented in the spec's `block_spec` arm.
 fn blk_bytes(dt: DType) -> usize {
-    match dt {
-        DType::Q8_0 => 34,  // [f16 d][i8 qs[32]]
-        DType::Q4_0 => 18,  // [f16 d][u8 qs[16]]
-        DType::Q5_0 => 22,  // [f16 d][u8 qh[4]][u8 qs[16]]
-        DType::Q4_1 => 20,  // [f16 d][f16 m][u8 qs[16]]
-        DType::Q5_1 => 24,  // [f16 d][f16 m][u8 qh[4]][u8 qs[16]]
-        DType::Iq4Nl => 18, // [f16 d][u8 qs[16]] — Q4_0 layout, codebook codes
-        _ => unreachable!(),
-    }
+    infr_gguf::block_layout(dt).1
 }
 
 /// The IQ4_NL non-linear codebook (llama.cpp `kvalues_iq4nl`), spelled out rather than decoded from

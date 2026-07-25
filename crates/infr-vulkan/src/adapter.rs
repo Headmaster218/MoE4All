@@ -6123,6 +6123,9 @@ mod tests {
     /// Prove the adapter machinery end-to-end (compile → bind → execute → download): a one-op
     /// `RmsNorm` graph run through the Vulkan seam must match a host reference. (Milestone #2: a
     /// small graph runs on Vulkan.)
+    ///
+    /// On the SHARED harness (`infr_testkit::run_graph`) — see the `linear_graph_matches_host`
+    /// doc for what the conversion buys and what is left to follow up.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn rmsnorm_graph_matches_host() {
@@ -6155,21 +6158,16 @@ mod tests {
             dim: dim as u32,
             eps,
         });
-        // device buffers + bind
-        let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        let wb = be_.alloc(dim * 4, BufferUsage::Weights).unwrap();
-        let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-        be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
-        let plan = be_.compile(&g).unwrap();
-        let mut bind = Bindings::new();
-        bind.bind(xi, xb.as_ref());
-        bind.bind(wi, wb.as_ref());
-        bind.bind(yi, yb.as_ref());
-        be_.execute(plan.as_ref(), &bind).unwrap();
-        let mut got = vec![0f32; rows * dim];
-        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
-            .unwrap();
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[
+                (xi, infr_testkit::f32_bytes(&x)),
+                (wi, infr_testkit::f32_bytes(&w)),
+            ],
+            yi,
+            rows * dim,
+        );
         for i in 0..rows * dim {
             assert!(
                 (got[i] - want[i]).abs() < 1e-3,
@@ -6251,6 +6249,17 @@ mod tests {
     }
 
     /// A one-op `Linear` graph (f16 weight, 1-row GEMV) through the seam must match a host matvec.
+    ///
+    /// **On the shared harness** (backend-unification candidate H): the graph build stays here —
+    /// it IS what the test is about — but the bind/alloc/upload/compile/execute/download ladder and
+    /// the host oracle now come from `infr-testkit`, which cpu/rocm/metal drive the same way. Same
+    /// shapes, same reference, same tolerance; ~20 lines of boilerplate gone.
+    ///
+    /// Follow-up: the other ~70 `*_matches_host` tests in this crate can move the same way, but
+    /// several (the `moe_ffn_*` family, the pager/mmq integration tests) build multi-op graphs with
+    /// several read-back tensors, which needs a multi-output `run_graph` the harness does not have
+    /// yet. Converted here + `rmsnorm_graph_matches_host` + `gated_act_silu_matches_host` to prove
+    /// the shape, deliberately NOT mass-rewritten.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn linear_graph_matches_host() {
@@ -6260,19 +6269,11 @@ mod tests {
         let (in_f, out_f) = (16usize, 4usize);
         let x: Vec<f32> = (0..in_f).map(|i| i as f32 * 0.1 - 0.8).collect();
         let w: Vec<f32> = (0..out_f * in_f).map(|i| (i as f32 * 0.03).sin()).collect();
-        let wf16: Vec<u8> = w
-            .iter()
-            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
-            .collect();
-        // host reference uses the same f16-rounded weight the GPU reads
-        let wq: Vec<f32> = wf16
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect();
-        let mut want = vec![0f32; out_f];
-        for (o, wo) in want.iter_mut().enumerate() {
-            *wo = (0..in_f).map(|i| x[i] * wq[o * in_f + i]).sum();
-        }
+        let wf16 = infr_testkit::f16_bytes(&w);
+        // Host reference uses the same f16-rounded weight the GPU reads — i.e. the shared decode
+        // oracle over the SAME bytes, then the shared reference GEMV.
+        let wq = infr_testkit::dequant_oracle(DType::F16, &wf16);
+        let want = infr_testkit::ref_linear(&x, &wq, 1, in_f, out_f);
         let mut g = Graph::new();
         let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
         let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F16));
@@ -6286,20 +6287,13 @@ mod tests {
             out_f: out_f as u32,
             w_off: 0,
         });
-        let xb = be_.alloc(in_f * 4, BufferUsage::Activations).unwrap();
-        let wb = be_.alloc(wf16.len(), BufferUsage::Weights).unwrap();
-        let yb = be_.alloc(out_f * 4, BufferUsage::Activations).unwrap();
-        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-        be_.upload(wb.as_ref(), &wf16).unwrap();
-        let plan = be_.compile(&g).unwrap();
-        let mut bind = Bindings::new();
-        bind.bind(xi, xb.as_ref());
-        bind.bind(wi, wb.as_ref());
-        bind.bind(yi, yb.as_ref());
-        be_.execute(plan.as_ref(), &bind).unwrap();
-        let mut got = vec![0f32; out_f];
-        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
-            .unwrap();
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[(xi, infr_testkit::f32_bytes(&x)), (wi, wf16)],
+            yi,
+            out_f,
+        );
         for o in 0..out_f {
             assert!(
                 (got[o] - want[o]).abs() < 1e-2,
@@ -6311,6 +6305,8 @@ mod tests {
     }
 
     /// A one-op `GatedAct` (SwiGLU: silu(gate)·up) graph through the seam must match a host loop.
+    ///
+    /// On the SHARED harness (`infr_testkit::run_graph`) — see `linear_graph_matches_host`.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_act_silu_matches_host() {
@@ -6338,21 +6334,16 @@ mod tests {
             up_stride: 0,
             gate_block_width: 0,
         });
-        let gb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
-        let ub = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
-        let yb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
-        be_.upload(gb.as_ref(), bytemuck::cast_slice(&gate))
-            .unwrap();
-        be_.upload(ub.as_ref(), bytemuck::cast_slice(&up)).unwrap();
-        let plan = be_.compile(&g).unwrap();
-        let mut bind = Bindings::new();
-        bind.bind(gi, gb.as_ref());
-        bind.bind(ui, ub.as_ref());
-        bind.bind(yi, yb.as_ref());
-        be_.execute(plan.as_ref(), &bind).unwrap();
-        let mut got = vec![0f32; nff];
-        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
-            .unwrap();
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[
+                (gi, infr_testkit::f32_bytes(&gate)),
+                (ui, infr_testkit::f32_bytes(&up)),
+            ],
+            yi,
+            nff,
+        );
         for i in 0..nff {
             assert!(
                 (got[i] - want[i]).abs() < 1e-3,

@@ -8,13 +8,10 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
 
+/// Bytes per block, from the shared decode spec (`infr_core::decode_spec` via
+/// `infr_gguf::block_layout`) — not a hand-kept local table.
 fn blk_bytes(dt: DType) -> usize {
-    match dt {
-        DType::Q4K => 144,
-        DType::Q6K => 210,
-        DType::Iq4Xs => 136,
-        _ => unreachable!(),
-    }
+    infr_gguf::block_layout(dt).1
 }
 
 #[test]

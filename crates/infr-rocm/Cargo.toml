@@ -18,6 +18,8 @@ rayon.workspace = true
 
 [dev-dependencies]
 infr-cpu.workspace = true
+# The shared backend decode-parity harness (`tests/shared_decode_parity.rs`).
+infr-testkit.workspace = true
 
 [[example]]
 name = "smoke_test"

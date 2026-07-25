@@ -1181,6 +1181,7 @@ dependencies = [
  "infr-gguf",
  "infr-prof",
  "infr-prof-rt",
+ "infr-testkit",
  "rayon",
 ]
 
@@ -1265,6 +1266,7 @@ dependencies = [
  "infr-core",
  "infr-cpu",
  "infr-gguf",
+ "infr-testkit",
  "metal",
  "objc",
 ]
@@ -1292,6 +1294,7 @@ dependencies = [
  "infr-core",
  "infr-cpu",
  "infr-gguf",
+ "infr-testkit",
  "rayon",
 ]
 
@@ -1314,6 +1317,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "infr-testkit"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "half",
+ "infr-core",
+ "infr-gguf",
+]
+
+[[package]]
 name = "infr-vulkan"
 version = "0.0.0"
 dependencies = [
@@ -1326,6 +1339,7 @@ dependencies = [
  "infr-gguf",
  "infr-prof",
  "infr-prof-rt",
+ "infr-testkit",
  "libc",
  "memmap2",
  "rayon",

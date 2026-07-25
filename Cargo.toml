@@ -15,6 +15,7 @@ members = [
     "crates/infr-cli",
     "crates/infr-prof",
     "crates/infr-prof-rt",
+    "crates/infr-testkit",
 ]
 
 [workspace.package]
@@ -37,6 +38,8 @@ infr-engine = { path = "crates/infr-engine" }
 infr-server = { path = "crates/infr-server" }
 infr-prof = { path = "crates/infr-prof" }
 infr-prof-rt = { path = "crates/infr-prof-rt" }
+# Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
+infr-testkit = { path = "crates/infr-testkit" }
 
 # shared third-party
 thiserror = "2"

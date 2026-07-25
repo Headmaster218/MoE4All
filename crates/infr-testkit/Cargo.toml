@@ -1,0 +1,22 @@
+[package]
+name = "infr-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Test-support only: every backend takes this as a `[dev-dependencies]` entry, so it is never in a
+# production dependency graph. Not published.
+publish = false
+
+[dependencies]
+# The agnostic seam the harness drives a backend through (`Backend`/`Graph`/`Op`) plus the shared
+# block-decode spec it synthesizes weights from.
+infr-core.workspace = true
+# The host decode ORACLE (`dequant_block`) every device decoder is compared against. This is why
+# the harness cannot live inside `infr-core`: infr-gguf DEPENDS on infr-core, so an infr-core
+# module that reached for `dequant_block` — even behind a cargo feature — would be a dependency
+# cycle. A separate dev-only crate also keeps the harness out of every release build by
+# construction, which a feature flag cannot promise under workspace feature unification.
+infr-gguf.workspace = true
+half.workspace = true
+bytemuck.workspace = true

@@ -14,3 +14,7 @@ bytemuck.workspace = true
 half.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# The shared backend decode-parity harness (`tests/decode_parity.rs`).
+infr-testkit.workspace = true

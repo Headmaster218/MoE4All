@@ -25,3 +25,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [dev-dependencies]
 infr-cpu.workspace = true
+# The shared backend decode-parity harness (`tests/shared_decode_parity.rs`).
+infr-testkit.workspace = true

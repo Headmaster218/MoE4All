@@ -116,19 +116,14 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Result<Factore
     use infr_core::DType::*;
     // Only affine quants have a factored form; a non-affine dtype (F16/Iq*/Tq*/fp4)
     // must error, never panic — callers can pass an untrusted-model dtype here.
-    let (qpb, bpb) = match dtype {
-        Q4_0 => (32, 18),
-        Q4_1 => (32, 20),
-        Q5_0 => (32, 22),
-        Q5_1 => (32, 24),
-        Q8_0 => (32, 34),
-        Q2K => (256, 84),
-        Q3K => (256, 110),
-        Q4K => (256, 144),
-        Q5K => (256, 176),
-        Q6K => (256, 210),
+    // Which formats have a factored form is the decision here; the block GEOMETRY comes from the
+    // shared decode spec (`infr_core::decode_spec::block_layout`) rather than a second hand-kept
+    // `(elems, bytes)` table that could drift from the loader's.
+    match dtype {
+        Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K => {}
         other => bail!("dequant_factored: unsupported (non-affine) dtype {other:?}"),
-    };
+    }
+    let (qpb, bpb) = infr_core::decode_spec::block_layout(dtype);
     let nblk = bytes.len() / bpb;
     let numel = nblk * qpb;
     let dblk = qpb; // every affine format's (d, dmin) covers exactly one quant block

@@ -81,13 +81,18 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<f32>> {
 /// `None` (uncovered formats keep the dequant→f16 fallback). The decode is bit-faithful to the
 /// old cache path (see `kernels.rs` NATIVE_DECODE), so goldens do not move.
 fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static str)> {
-    match dt {
-        DType::Q8_0 => Some((32, 34, "linear_q80", "embed_q80")),
-        DType::Q4K => Some((256, 144, "linear_q4k", "embed_q4k")),
-        DType::Q6K => Some((256, 210, "linear_q6k", "embed_q6k")),
-        DType::Q5_0 => Some((32, 22, "linear_q50", "embed_q50")),
-        _ => None,
-    }
+    // Kernel COVERAGE is the decision here; the block geometry is read from the shared decode spec
+    // (`infr_core::decode_spec`) instead of re-spelling `(256, 144)` — see also `native_i8_fmt`
+    // and `moe_native_fmt`, which read the same table.
+    let (lin, emb) = match dt {
+        DType::Q8_0 => ("linear_q80", "embed_q80"),
+        DType::Q4K => ("linear_q4k", "embed_q4k"),
+        DType::Q6K => ("linear_q6k", "embed_q6k"),
+        DType::Q5_0 => ("linear_q50", "embed_q50"),
+        _ => return None,
+    };
+    let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
+    Some((elems, bytes, lin, emb))
 }
 
 /// Int8-activation dp4a GEMV kernel (Phase 4) for a covered dtype: `(bytes_per_block, kernel)`.
@@ -99,13 +104,14 @@ fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
     if std::env::var_os("INFR_ROCM_NO_I8").is_some() {
         return None;
     }
-    match dt {
-        DType::Q8_0 => Some((34, "linear_i8_q80")),
-        DType::Q4K => Some((144, "linear_i8_q4k")),
-        DType::Q6K => Some((210, "linear_i8_q6k")),
-        DType::Q5_0 => Some((22, "linear_i8_q50")),
-        _ => None,
-    }
+    let kernel = match dt {
+        DType::Q8_0 => "linear_i8_q80",
+        DType::Q4K => "linear_i8_q4k",
+        DType::Q6K => "linear_i8_q6k",
+        DType::Q5_0 => "linear_i8_q50",
+        _ => return None,
+    };
+    Some((infr_core::decode_spec::block_layout(dt).1, kernel))
 }
 
 /// Dequant-to-f16 kernel name (`deqf16_*`, kernels.rs `DEQUANT_F16`) for a covered dtype — the
@@ -253,12 +259,14 @@ fn q4k_coop_kernel() -> Option<(&'static str, u32, u32, u32)> {
 /// `deq_*` decoder baked into the `moe_ffn_expert_<gu>_<dn>` kernel and the block geometry gives
 /// the per-expert byte offset. `None` for uncovered formats (they keep the dequant→f16 fallback).
 fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
-    match dt {
-        DType::Q8_0 => Some(("q80", 32, 34)),
-        DType::Q4K => Some(("q4k", 256, 144)),
-        DType::Q6K => Some(("q6k", 256, 210)),
-        _ => None,
-    }
+    let suffix = match dt {
+        DType::Q8_0 => "q80",
+        DType::Q4K => "q4k",
+        DType::Q6K => "q6k",
+        _ => return None,
+    };
+    let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
+    Some((suffix, elems, bytes))
 }
 
 /// Static kernel name for the `(gate/up format, down format)` combo — the 9 covered pairs over
@@ -2944,4 +2952,45 @@ fn run_op(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod decode_spec_tests {
+    use super::{moe_native_fmt, native_decode_fmt, native_i8_fmt};
+    use infr_core::DType;
+
+    /// The three kernel tables now derive their block geometry from
+    /// `infr_core::decode_spec::block_layout` instead of carrying inline `(256, 144)` literals.
+    /// Pin them against the numbers that were spelled out here before the rewire, so the hoist
+    /// stays behavior-preserving and a wrong spec entry cannot silently reshape a HIP dispatch
+    /// (the block stride is what the kernels' byte addressing is built on).
+    #[test]
+    fn native_tables_reproduce_the_inline_block_geometry() {
+        // (dtype, elems/block, bytes/block) — verbatim from the pre-hoist tables.
+        for (dt, elems, bytes) in [
+            (DType::Q8_0, 32usize, 34usize),
+            (DType::Q4K, 256, 144),
+            (DType::Q6K, 256, 210),
+            (DType::Q5_0, 32, 22),
+        ] {
+            let (e, b, _, _) = native_decode_fmt(dt).expect("covered by native decode");
+            assert_eq!((e, b), (elems, bytes), "{dt:?} native_decode_fmt geometry");
+            // `native_i8_fmt` self-disables under INFR_ROCM_NO_I8; only check it when enabled.
+            if let Some((b8, _)) = native_i8_fmt(dt) {
+                assert_eq!(b8, bytes, "{dt:?} native_i8_fmt bytes/block");
+            }
+        }
+        for (dt, elems, bytes) in [
+            (DType::Q8_0, 32usize, 34usize),
+            (DType::Q4K, 256, 144),
+            (DType::Q6K, 256, 210),
+        ] {
+            let (_, e, b) = moe_native_fmt(dt).expect("covered by MoE native decode");
+            assert_eq!((e, b), (elems, bytes), "{dt:?} moe_native_fmt geometry");
+        }
+        // Coverage is unchanged: nothing outside the four/three formats routes native.
+        assert!(native_decode_fmt(DType::Q5K).is_none());
+        assert!(native_i8_fmt(DType::Q5K).is_none());
+        assert!(moe_native_fmt(DType::Q5_0).is_none());
+    }
 }

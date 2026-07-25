@@ -37,22 +37,12 @@ use infr_core::DType;
 use infr_vulkan::VulkanBackend;
 
 /// (bytes per block, elements per block) — the k-quants are 256-element super-blocks, the legacy
-/// "_0"/"_1" family and IQ4_NL are flat 32-element blocks.
+/// "_0"/"_1" family and IQ4_NL are flat 32-element blocks. Read from the shared decode spec
+/// (`infr_core::decode_spec` via `infr_gguf::block_layout`, which reports `(elems, bytes)`) rather
+/// than a hand-kept local table.
 fn blk_shape(dt: DType) -> (usize, usize) {
-    match dt {
-        DType::Q4K => (144, 256),
-        DType::Q6K => (210, 256),
-        DType::Q2K => (84, 256),
-        DType::Q3K => (110, 256),
-        DType::Q5K => (176, 256),
-        DType::Q8_0 => (34, 32),
-        DType::Q4_0 => (18, 32),
-        DType::Q5_0 => (22, 32),
-        DType::Q4_1 => (20, 32),
-        DType::Q5_1 => (24, 32),
-        DType::Iq4Nl => (18, 32),
-        _ => unreachable!(),
-    }
+    let (elems, bytes) = infr_gguf::block_layout(dt);
+    (bytes, elems)
 }
 
 fn f16b(x: f32) -> [u8; 2] {
