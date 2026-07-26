@@ -141,8 +141,8 @@ impl ParallelSeam {
     }
 
     /// [`new`](Self::new) pinned to physical device `dev`: `Some(idx)` binds `VulkanN`
-    /// ([`infr_vulkan::VulkanBackend::new_on`], bypassing `INFR_DEV`/the discrete-default rule),
-    /// `None` is the default device (byte-identical to `new`). This is what lets `infr multi` host
+    /// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default
+    /// rule), `None` is the default device (byte-identical to `new`). This is what lets `infr multi` host
     /// several concurrent-slot engines side by side, each on its own GPU: the whole engine (weights,
     /// N KV slots, recorder) lives on the ONE backend this constructs, so nothing crosses devices.
     pub fn new_on(
@@ -152,10 +152,12 @@ impl ParallelSeam {
         want_ctx: Option<infr_core::SizeSpec>,
     ) -> Result<Self> {
         let n_slots = n_slots.max(1);
+        let ecfg = model.cfg().clone();
         let vk = match dev {
-            Some(idx) => infr_vulkan::VulkanBackend::new_on(idx)
+            Some(idx) => infr_vulkan::VulkanBackend::new_on_with(idx, ecfg)
                 .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
-            None => infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?,
+            None => infr_vulkan::VulkanBackend::new_with(ecfg)
+                .map_err(|e| anyhow!("vulkan init: {e}"))?,
         };
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is

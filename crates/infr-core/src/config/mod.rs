@@ -700,23 +700,24 @@ impl Config {
         Ok(cfg)
     }
 
-    /// **TRANSITIONAL (S2) — delete with its last caller (S4/S5/S6).**
+    /// **TRANSITIONAL (S2) — delete with its last caller (S6/S8).**
     ///
     /// The `Default` < environment fold, with no file and no CLI layer: the config a crate builds
     /// for ITSELF at its construction boundary while it waits to be HANDED an `Arc<Config>` by
-    /// `main()`. `VulkanBackend::new` and `RocmBackend::new` call it once each and store the
-    /// result, which is what lets `infr-core`'s own knobs (`tier::EnvRows`, the spill budgets, the
-    /// pager ring, the fusion hatches) take their value from a `&Config` before those crates'
-    /// slices land. Each such call site carries a comment naming the slice that removes it; when
-    /// the last one becomes `new_with(cfg)`, this function goes with it.
+    /// `main()`. `RocmBackend::new` (S6) and `SeamModel::load` (S8) are the two callers left; the
+    /// Vulkan one went away in S5a, when `VulkanBackend::new_with(cfg)` became the real
+    /// constructor. Each remaining call site carries a comment naming the slice that removes it.
     ///
     /// It is NOT `Config::load`: no file layer (these knobs were env-only before the migration, so
     /// reading a file here would ADD behaviour, and the diagnostics banner would print twice), and
-    /// deliberately infallible. The five keys that reject a bad value loudly (`INFR_SG`,
-    /// `INFR_SUBMIT_DISPATCHES`, the three device lists) are NOT migrated yet — they are still
-    /// read, and still rejected, at their own sites, so a layer error here must neither pre-empt
-    /// nor duplicate their error text (R1). A rejected layer therefore falls back to
-    /// `Config::default()`, whose values for this slice's knobs are the shipped ones.
+    /// deliberately INFALLIBLE, so a layer error can neither pre-empt nor duplicate the error text
+    /// an unmigrated read site still produces for itself (R1) — a rejected layer falls back to
+    /// `Config::default()`.
+    ///
+    /// That infallibility is exactly why `VulkanBackend::new` does NOT use this: after S5a all five
+    /// of the loud keys are `Config`-sourced, so swallowing the layer error there would silently
+    /// drop an `INFR_SG` / `INFR_SUBMIT_DISPATCHES` rejection a caller gets today. It builds the
+    /// same fold with `ConfigLayer::env()?` instead.
     pub fn load_from_env() -> Config {
         let layer = ConfigLayer::env().unwrap_or_default();
         Config::load_from_layers(&[layer])

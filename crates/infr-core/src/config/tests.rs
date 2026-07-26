@@ -850,9 +850,34 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_UBATCH_PARALLEL",
     ];
 
+    /// S5a — `infr-vulkan`'s CONSTRUCTION-time tier: everything `VulkanBackend::new_with` resolves
+    /// once, at device selection / capability probing / allocator setup. The six §5.2 capability
+    /// maskers fold into the PROBE (they are NOT `Capabilities` fields and nothing downstream
+    /// re-reads them), `device.subgroup_pref` + `device.submit_dispatches` are the last two of the
+    /// five loud keys, and `device.dev` reaches `pick_default_device` as a parameter.
+    ///
+    /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — the Vulkan pager reads it
+    /// from `Config` now, but `infr-rocm`'s pager still reads the environment until S6; and the
+    /// whole recorder/adapter/gemm hot-path tier, which is S5b.
+    const S5A: &[&str] = &[
+        "INFR_CM_8X8",
+        "INFR_DEBUG_COOPMAT",
+        "INFR_DEV",
+        "INFR_NO_COOPMAT",
+        "INFR_NO_F16",
+        "INFR_NO_I8DOT",
+        "INFR_NO_PIPELINE_CACHE",
+        "INFR_NO_PUSH_DESC",
+        "INFR_NO_VRAM_GUARD",
+        "INFR_POISON_UNINIT",
+        "INFR_SG",
+        "INFR_SUBMIT_DISPATCHES",
+        "INFR_VRAM_LOG",
+    ];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
-    let mut want: Vec<&str> = S2.iter().chain(S3).chain(S4).copied().collect();
+    let mut want: Vec<&str> = S2.iter().chain(S3).chain(S4).chain(S5A).copied().collect();
     want.sort_unstable();
     assert_eq!(
         got, want,

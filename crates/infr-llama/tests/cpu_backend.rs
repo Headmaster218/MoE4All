@@ -60,9 +60,9 @@ fn test_serial_lock() -> infr_core::test_env::EnvGuard {
 ///
 /// This is what replaced the `env.set("INFR_TEMP", "0")` / `env.set("INFR_KV_TYPE_K", …)` pattern
 /// throughout this file. `test_serial_lock` is still taken where a test drives a knob that has NOT
-/// migrated yet (`INFR_NO_THINK` in `infr-chat`, `INFR_MOE_SMALL_M`/`INFR_PAGER_STATS`/
-/// `INFR_SEAM_NO_REPLAY`'s Vulkan half, `INFR_I8_COOPMAT`) — and for the GPU tests, which must stay
-/// serialised against each other regardless.
+/// migrated yet (`INFR_NO_THINK` in `infr-chat`, `INFR_SEAM_NO_REPLAY`'s Vulkan half,
+/// `INFR_I8_COOPMAT` — all S5b/S7) — and for the GPU tests, which must stay serialised against each
+/// other regardless. `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it in S5a.
 fn model_cfg(
     path: &std::path::Path,
     f: impl FnOnce(&mut infr_llama::EngineConfig),
@@ -1963,7 +1963,6 @@ fn cpu_golden_qwen3moe() {
 fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_PAGER_STATS", "1"); // still an env read in infr-vulkan's pager (S5)
     let n = 8usize;
 
     // `device.ubatch = 1` pins every prefill chunk to rows=1 (see the doc above). `paging.cache`
@@ -1994,11 +1993,15 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     let paged = model_cfg(&path, |c| {
         pin_ubatch(c);
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(50 * 1024 * 1024));
+        // `paging.stats`: the pager's hit/miss/eviction report, on the PAGED model only. A value
+        // on this model's config since S5a (`VulkanBackend::new_with` hands it to the pager
+        // sessions), so it no longer has to be an env write the resident run above would also see.
+        c.paging.stats = true;
     });
     let mut paged_ids = Vec::new();
-    let paged_result = paged.generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id));
-    _tlk.unset("INFR_PAGER_STATS");
-    paged_result.expect("paged gpu gen");
+    paged
+        .generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id))
+        .expect("paged gpu gen");
 
     assert_eq!(
         paged_ids, resident_ids,
@@ -2025,7 +2028,6 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 fn gpu_seam_dense_stream_matches_resident_and_cpu() {
     let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
     let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_PAGER_STATS", "1"); // still an env read in infr-vulkan's pager (S5)
     let n = 8usize;
 
     let model = model_default(&path);
@@ -2048,11 +2050,12 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
     // floor slot count, so (nearly) every layer re-uploads every pass: real eviction pressure.
     let streamed = model_cfg(&path, |c| {
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+        c.paging.stats = true; // see `gpu_seam_paged_moe_matches_resident_and_cpu`
     });
     let mut streamed_ids = Vec::new();
-    let streamed_result = streamed.generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id));
-    _tlk.unset("INFR_PAGER_STATS");
-    streamed_result.expect("streamed gpu gen");
+    streamed
+        .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+        .expect("streamed gpu gen");
 
     assert_eq!(
         streamed_ids, resident_ids,
@@ -2081,7 +2084,6 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
 fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
     let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_PAGER_STATS", "1"); // still an env read in infr-vulkan's pager (S5)
     let n = 8usize;
 
     let model = model_default(&path);
@@ -2102,11 +2104,12 @@ fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
 
     let streamed = model_cfg(&path, |c| {
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(8 * 1024 * 1024 * 1024));
+        c.paging.stats = true; // see `gpu_seam_paged_moe_matches_resident_and_cpu`
     });
     let mut streamed_ids = Vec::new();
-    let streamed_result = streamed.generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id));
-    _tlk.unset("INFR_PAGER_STATS");
-    streamed_result.expect("streamed gpu gen");
+    streamed
+        .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+        .expect("streamed gpu gen");
 
     assert_eq!(
         streamed_ids, resident_ids,
@@ -2419,8 +2422,7 @@ fn cpu_llama4_scout_greedy() {
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
     let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_PAGER_STATS", "1");
-    let model = model_default(&path);
+    let model = model_cfg(&path, |c| c.paging.stats = true);
     let mut ids = model.encode("The capital of France is").expect("encode");
     ids.insert(0, 200000); // Scout's BOS (<|begin_of_text|>), matching cpu_llama4_scout_greedy
     let n = 24usize;
@@ -2993,7 +2995,9 @@ fn diffusion_gemma_decode_matches_oracle() {
 #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
 fn two_models_two_devices_concurrent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let devices = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    let devices =
+        infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
+            .expect("enumerate devices");
     if devices.len() < 2 {
         eprintln!(
             "skip: two_models_two_devices needs >=2 Vulkan devices (found {})",
@@ -3124,7 +3128,8 @@ fn two_models_two_devices_concurrent() {
 #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
 fn pipeline_matches_single_device() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
+        .expect("enumerate devices");
     if devs.len() < 2 {
         eprintln!(
             "skip: pipeline_matches_single_device needs >=2 Vulkan devices (found {})",
@@ -3204,7 +3209,8 @@ fn pipeline_matches_single_device() {
 #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
 fn tensor_parallel_matches_single_device() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
+        .expect("enumerate devices");
     if devs.len() < 2 {
         eprintln!(
             "skip: tensor_parallel_matches_single_device needs >=2 Vulkan devices (found {})",
@@ -3270,15 +3276,16 @@ fn tensor_parallel_matches_single_device() {
 // computes only its band, and all-reduces the partial MoE outputs per layer. Ideally token-identical;
 // the cross-rank sum reassociates the per-expert weighted accumulate vs a single-device accumulate, so
 // a mismatch (if any) must stay at reduction-order tolerance — asserted as token-identity, which
-// greedy decode holds in practice. `INFR_MOE_SMALL_M=64` forces the id-indexed small-m expert path for
-// both the short prefill and decode so the run is deterministic and light. Run:
+// greedy decode holds in practice. `kernels.vulkan.moe_small_m = 64` forces the id-indexed small-m
+// expert path for both the short prefill and decode so the run is deterministic and light. Run:
 //   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend \
 //     expert_parallel_matches_single_device -- --include-ignored --nocapture
 #[test]
 #[ignore = "requires TWO Vulkan GPUs + the Qwen3-30B-A3B MoE model: run with --include-ignored on a multi-GPU box"]
 fn expert_parallel_matches_single_device() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
+        .expect("enumerate devices");
     if devs.len() < 2 {
         eprintln!(
             "skip: expert_parallel_matches_single_device needs >=2 Vulkan devices (found {})",
@@ -3289,14 +3296,10 @@ fn expert_parallel_matches_single_device() {
     let mut _tlk = test_serial_lock();
     _tlk.set("INFR_NO_THINK", "1");
     // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic).
-    // `INFR_MOE_SMALL_M` migrated to `kernels.vulkan.moe_small_m` in S2, but this test cannot build
-    // the value into a `Config` yet: it drives `SeamModel`, which opens its own backends and does
-    // not take an `Arc<Config>` until S4/S5. The env still reaches the field through S2's
-    // transitional bridge (`VulkanBackend::new` → `Config::load_from_env`) because the guard is set
-    // BEFORE the model loads. Convert this (and drop the `set`) with S5. See R7.
-    _tlk.set("INFR_MOE_SMALL_M", "64");
-
-    let model = model_default(&path);
+    // A VALUE on this model's own `Config` since S5a: the EP backends are opened by `SeamModel`
+    // through `VulkanBackend::new_on_with`, so `kernels.vulkan.moe_small_m` reaches
+    // `tier::EnvRows::clamped` without an env write. S2's recorded R7 exception is CLOSED.
+    let model = model_cfg(&path, |c| c.kernels.vulkan.moe_small_m = 64);
     let prompt = model
         .render_chat("What is the capital of France? Reply with just the city name.")
         .expect("render");

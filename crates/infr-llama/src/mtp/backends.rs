@@ -108,7 +108,8 @@ pub fn generate_mtp_spec_vulkan_timed(
     max_new: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
-    let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let vk = infr_vulkan::VulkanBackend::new_with(model.cfg().clone())
+        .map_err(|e| anyhow!("vulkan init: {e}"))?;
     generate_mtp_spec_vulkan_timed_on(&vk, model, head, prompt, max_new, on_piece)
 }
 

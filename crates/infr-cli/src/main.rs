@@ -160,8 +160,9 @@ fn selected_backend(cfg: &Config) -> anyhow::Result<Backend> {
 }
 
 /// The `device.dev` spelling for a parsed [`Backend`] — the inverse of [`parse_dev_spec`], and the
-/// value `--dev` contributes to the CLI config layer (and that the S1 bridge re-publishes as
-/// `INFR_DEV`, since `infr-vulkan`'s device pick still reads the environment).
+/// value `--dev` contributes to the CLI config layer. Since S5a that layer is the ONLY route to
+/// `infr-vulkan`'s device pick: it takes `cfg.device.dev` off the `Arc<Config>` it is constructed
+/// with, so the S1 bridge no longer re-publishes `INFR_DEV`.
 fn dev_spec_of(backend: &Backend) -> String {
     match backend {
         Backend::Vulkan(Some(d)) | Backend::Rocm(Some(d)) => d.clone(),
@@ -647,7 +648,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
 fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
-        Cmd::Devices => cmd_devices(),
+        Cmd::Devices => cmd_devices(cfg),
         Cmd::Run { model, message, .. } => cmd_run(&model, message.as_deref(), cfg),
         Cmd::Serve {
             model,
@@ -767,19 +768,21 @@ fn publish_thread_count(cfg: &Config) {
 /// with `std::env::set_var` itself.
 ///
 /// **TRANSITIONAL — S1 ONLY. S8 deletes this function and its call site, and nothing else.** The
-/// CLI now resolves these ten knobs from the layered [`Config`], but their READERS are still deep
-/// in the crates this slice does not touch — `infr-vulkan`'s device pick (`INFR_DEV`),
-/// `infr-llama`'s seam and sampler (`INFR_CTX`, `INFR_UBATCH`, `INFR_TEMP`, `INFR_TOP_K`,
-/// `INFR_TOP_P`, `INFR_SEED`, `INFR_MAX_NEW`, `INFR_IGNORE_EOS`) and `infr-chat`'s template
-/// (`INFR_NO_THINK`) — so the value has to travel the old way until S4–S7 move those read sites
-/// onto `Arc<Config>`. Because of that, none of these keys is `migrated` in `config::manifest` yet.
+/// CLI now resolves these knobs from the layered [`Config`], but their READERS are still deep in
+/// the crates this slice does not touch — `infr-llama`'s seam and sampler (`INFR_CTX`,
+/// `INFR_UBATCH`, `INFR_TEMP`, `INFR_TOP_K`, `INFR_TOP_P`, `INFR_SEED`, `INFR_MAX_NEW`,
+/// `INFR_IGNORE_EOS`) and `infr-chat`'s template (`INFR_NO_THINK`) — so the value has to travel
+/// the old way until S7/S8 move those read sites onto `Arc<Config>`. Because of that, none of the
+/// keys still published here is `migrated` in `config::manifest` yet.
+///
+/// `INFR_DEV` came OFF this list in S5a: `VulkanBackend::new_with` takes `device.dev` from the
+/// config it is handed, so re-publishing it would have been a write nobody reads.
 ///
 /// Callers that depend on it: `cmd_bench` (its `sampling.ignore_eos` flag becomes
 /// `INFR_IGNORE_EOS=1`, which `dg_bench_run` and every decode loop read — this replaces the
 /// `set_var` that used to sit at the top of `cmd_bench`), `cmd_run` (`INFR_MAX_NEW`),
 /// `set_default_sampling_env` (whose `is_err` guard is what makes an unspecified sampler fall back
-/// to the model's recommendation), `run_chat`'s server-side `INFR_MAX_NEW` default, and every
-/// backend funnel through `INFR_DEV`.
+/// to the model's recommendation), and `run_chat`'s server-side `INFR_MAX_NEW` default.
 ///
 /// Only what a LAYER specified is published; a knob nobody mentioned leaves the environment alone,
 /// so a value the process inherited in a spelling the layer could not parse (`INFR_CTX=banana`)
@@ -805,7 +808,6 @@ fn publish_transitional_env(cfg: &Config, specified: &PartialConfig) {
         }
     };
 
-    opt("device.dev", "INFR_DEV", cfg.device.dev.clone());
     opt(
         "device.ctx",
         "INFR_CTX",
@@ -915,8 +917,8 @@ fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
 
 /// `infr devices` — enumerate the Vulkan physical devices (index/name/type/VRAM), mark the default
 /// pick, and report external-memory extensions so the multi-GPU campaign can see the P2P surface.
-fn cmd_devices() -> anyhow::Result<()> {
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices().map_err(|e| anyhow!("{e}"))?;
+fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
     if devs.is_empty() {
         println!("no Vulkan physical devices found");
         return Ok(());
@@ -1994,10 +1996,10 @@ fn cmd_bench(
     json: bool,
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
-    // `--dev`/`-u`/`-t` reached the engine before the model loads: `--dev` through this `cfg` (and,
-    // until S8, through the `INFR_DEV` the S1 bridge re-publishes for the deep Vulkan device pick),
-    // `-u` through INFR_UBATCH, `-t` through RAYON_NUM_THREADS. So `--dev metal`/`--dev cpu` route
-    // here exactly like a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
+    // `--dev`/`-u`/`-t` reached the engine before the model loads: `--dev` through this `cfg`
+    // (which `VulkanBackend::new_with` reads its device pick off since S5a), `-u` through
+    // INFR_UBATCH, `-t` through RAYON_NUM_THREADS. So `--dev metal`/`--dev cpu` route here exactly
+    // like a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
     // Bench also pins `sampling.ignore_eos` (see `cli_flag_layer`): benchmarks decode a FIXED token
     // count (llama-bench semantics) and never stop at EOS — a model that emits EOS instantly on the
     // dummy context would otherwise report fictional tok/s.
@@ -2087,9 +2089,9 @@ fn cmd_bench(
         print_bench_avg(&samples, &label, depth, "", reps, json);
         return Ok(());
     }
-    // `--dev VulkanN` was already published to the backend as INFR_DEV=VulkanN by `DeviceOpts::resolve`;
-    // `VulkanBackend::new()` reads it when picking the physical device, and the prefill chunk
-    // (`-u`/INFR_UBATCH) landed there too. Nothing to set here — straight to the Vulkan seam.
+    // `--dev VulkanN` is `device.dev` on this `cfg`, which the seam hands to
+    // `VulkanBackend::new_with` when it picks the physical device; the prefill chunk
+    // (`-u`/`device.ubatch`) rides the same config. Nothing to set here — straight to the seam.
     let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
     let samples = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
     let label = if let Some((p, g)) = pg {
@@ -3840,7 +3842,7 @@ fn cmd_multi(
 
     // Enumerate the device pool once: for validation, round-robin assignment of specs that omit a
     // device, and the routing table's device names.
-    let devices = infr_vulkan::VulkanBackend::enumerate_devices().map_err(|e| anyhow!("{e}"))?;
+    let devices = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
     if devices.is_empty() {
         anyhow::bail!("no Vulkan physical devices found (see `infr devices`)");
     }

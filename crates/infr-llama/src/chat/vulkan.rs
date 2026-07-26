@@ -115,10 +115,11 @@ impl DenseSeamChat {
     /// construct its own per-call backend.
     fn ensure_mtp_backend(&mut self) -> Result<()> {
         if self.mtp_vk.is_none() {
+            let cfg = self.model.cfg().clone();
             self.mtp_vk = Some(match self.dev {
-                Some(idx) => infr_vulkan::VulkanBackend::new_on(idx)
+                Some(idx) => infr_vulkan::VulkanBackend::new_on_with(idx, cfg)
                     .map_err(|e| anyhow::anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
-                None => infr_vulkan::VulkanBackend::new()
+                None => infr_vulkan::VulkanBackend::new_with(cfg)
                     .map_err(|e| anyhow::anyhow!("vulkan init: {e}"))?,
             });
         }

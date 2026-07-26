@@ -57,6 +57,7 @@ use gpu_allocator::MemoryLocation;
 use infr_core::{
     backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
     budget::{spill_report_line, SpillNouns, SpillTally},
+    config::Config,
     error::Result,
     graph::Graph,
     Backend,
@@ -888,14 +889,12 @@ pub struct VulkanBackend {
     /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
     /// R4/R6).
     ///
-    /// **TRANSITIONAL (S2), replaced by S5:** built here from the environment via
-    /// [`infr_core::config::Config::load_from_env`] instead of being HANDED in, because
-    /// `infr-vulkan` does not get its `Arc<Config>` from `main()` until its own slice. S5a adds
-    /// `VulkanBackend::new_with(cfg: Arc<Config>)` and `new()` becomes
-    /// `new_with(Arc::new(Config::default()))`; the `load_from_env()` call in `new_selected` is
-    /// what that slice deletes. Until then this is ONE env-sourced construction per backend in
-    /// place of the scattered per-read `std::env::var` calls it replaced.
-    cfg: Arc<infr_core::config::Config>,
+    /// Handed in by [`VulkanBackend::new_with`] (S5a); the S2 `Config::load_from_env()` bridge that
+    /// used to build it inside `new_selected` is GONE. `infr-cli` resolves the four layers once in
+    /// `main()` and the `Arc` reaches here through the seam, so nothing on the production path
+    /// crosses this boundary through the environment. The env-only [`VulkanBackend::new`] entry
+    /// point remains for this crate's own GPU tests and for external library callers.
+    cfg: Arc<Config>,
     shared: Arc<VulkanShared>,
 }
 
@@ -979,6 +978,10 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
 /// `BufferUsage::Weights` allocations advance the bar; on drop it finishes and clears it.
 pub struct WeightProgress {
     shared: Arc<VulkanShared>,
+    /// `prof.vram_log` (`INFR_VRAM_LOG`), copied off the backend's `Config` when the scope opens —
+    /// `Drop` holds only the shared state, so the flag rides along rather than being looked up
+    /// (S5a; R4 — no global, no second config).
+    vram_log: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -991,12 +994,12 @@ impl Drop for WeightProgress {
         if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
             pb.finish_and_clear();
         }
-        // Post-load memory-hygiene visibility (INFR_VRAM_LOG=1): the LIVE in-use figure right
+        // Post-load memory-hygiene visibility (`prof.vram_log`): the LIVE in-use figure right
         // after the LAST weight upload — the number the VRAM-audit residual math (in-use minus
         // weights+KV estimate) starts from. The upload staging that ran under this scope was
         // dedicated-allocated (see `Backend::upload`), so by this drop it has fully returned
         // its device memory; what remains is weights + already-allocated session buffers.
-        if std::env::var("INFR_VRAM_LOG").is_ok() {
+        if self.vram_log {
             let v = vram_info(&self.shared);
             eprintln!(
                 "post-load vram in use: {:.2} GiB of {:.2} GiB ({})",
@@ -1030,9 +1033,8 @@ impl VulkanBackend {
     /// (`docs/config-plan.md` R6).
     ///
     /// `pub` because `infr-llama`'s seam reads the paging/KV knobs off the backend it already
-    /// holds rather than growing a second env-sourced config of its own; S4/S5 replace both with
-    /// the `Arc<Config>` threaded from `main()`.
-    pub fn cfg(&self) -> &infr_core::config::Config {
+    /// holds rather than growing a second env-sourced config of its own.
+    pub fn cfg(&self) -> &Config {
         &self.cfg
     }
 
@@ -1064,11 +1066,16 @@ impl VulkanBackend {
     /// `metal`/`cpu` (or empty/unset) value falls back to the discrete default rather than erroring
     /// — since a process that reaches this Vulkan constructor built a Vulkan backend regardless.
     /// Split out of `new()` so `new_on` can bypass it, and so the behavior is a single named unit.
+    ///
+    /// `spec` is `device.dev` off the caller's [`Config`] (S5a) — the raw string, unparsed, exactly
+    /// as `INFR_DEV` delivered it before. §6.12/§10.8: the CLI's `parse_dev_spec` and this
+    /// crate's [`resolve_infr_dev_index`] are two DIFFERENT parsers of that one string and are
+    /// deliberately NOT unified.
     fn pick_default_device(
         instance: &ash::Instance,
         pdevices: &[vk::PhysicalDevice],
+        spec: Option<&str>,
     ) -> Result<vk::PhysicalDevice> {
-        let spec = std::env::var("INFR_DEV").ok();
         // A pinned Vulkan index needs the device names for the "no such device" message; build them
         // once (cold init path, a handful of devices).
         let names: Vec<String> = pdevices
@@ -1082,7 +1089,7 @@ impl VulkanBackend {
                 format!("Vulkan{i}={n}")
             })
             .collect();
-        match resolve_infr_dev_index(spec.as_deref(), &names)? {
+        match resolve_infr_dev_index(spec, &names)? {
             Some(idx) => Ok(pdevices[idx]), // range already checked by the resolver
             None => Ok(pdevices
                 .iter()
@@ -1100,7 +1107,10 @@ impl VulkanBackend {
     /// and the interconnect probe. Each entry's `index` is the `VulkanN` / `INFR_DEV` / `new_on`
     /// handle. Also reports the external-memory extensions each device exposes — the P2P /
     /// host-less-transfer feasibility signal the multi-GPU campaign needs.
-    pub fn enumerate_devices() -> Result<Vec<DeviceInfo>> {
+    ///
+    /// Takes the caller's [`Config`] because `is_default_pick` marks the device
+    /// [`new_with`](Self::new_with) WOULD bind, which `device.dev` (`INFR_DEV`) steers (S5a).
+    pub fn enumerate_devices(cfg: &Config) -> Result<Vec<DeviceInfo>> {
         Self::reject_on_apple()?;
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| be(format!("ash::Entry::load: {e}")))?;
@@ -1116,7 +1126,8 @@ impl VulkanBackend {
         let result = (|| -> Result<Vec<DeviceInfo>> {
             let pdevices = unsafe { instance.enumerate_physical_devices() }
                 .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
-            let default_pick = Self::pick_default_device(&instance, &pdevices).ok();
+            let default_pick =
+                Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref()).ok();
             let mut out = Vec::with_capacity(pdevices.len());
             for (index, &pd) in pdevices.iter().enumerate() {
                 let p = unsafe { instance.get_physical_device_properties(pd) };
@@ -1156,27 +1167,69 @@ impl VulkanBackend {
         result
     }
 
-    /// Default-device constructor: pick `INFR_DEV` if set, else the first discrete GPU (else device
-    /// 0). Byte-identical to the historical single-device path. See [`new_on`](Self::new_on) to pin a
-    /// SPECIFIC physical-device index (the multi-device entry point).
+    /// **The real constructor (S5a).** Build a backend on the default device, reading every
+    /// construction-time knob — device pick, capability masking, subgroup preference, the submit
+    /// splitter, the VRAM guard, the pipeline-cache and pager diagnostics — from `cfg` instead of
+    /// the process environment. The `Arc` is held for the backend's whole life and borrowed
+    /// (never cloned) at each read site (`docs/config-plan.md` R4/R6).
+    ///
+    /// Device pick: `cfg.device.dev` (`INFR_DEV`) if it names a `VulkanN`, else the first discrete
+    /// GPU, else device 0. See [`new_on_with`](Self::new_on_with) to pin a SPECIFIC index.
+    pub fn new_with(cfg: Arc<Config>) -> Result<Self> {
+        Self::new_selected(None, cfg)
+    }
+
+    /// [`new_with`](Self::new_with) pinned to physical-device `index`. See
+    /// [`new_on`](Self::new_on) for the index semantics.
+    pub fn new_on_with(index: usize, cfg: Arc<Config>) -> Result<Self> {
+        Self::new_selected(Some(index), cfg)
+    }
+
+    /// Default-device constructor for callers that have no [`Config`] to hand in — this crate's own
+    /// `#[cfg(test)]` GPU tests and external library users. Resolves `Default` < environment once
+    /// (the same fold [`Config::load_from_env`] performs, but FALLIBLE, so `INFR_SG` /
+    /// `INFR_SUBMIT_DISPATCHES` / the device lists still reject a bad value LOUDLY here exactly as
+    /// the pre-S5a read sites did) and forwards to [`new_with`](Self::new_with). Every caller
+    /// inside `infr-llama` and `infr-cli` passes its own `Arc<Config>` instead.
     pub fn new() -> Result<Self> {
-        Self::new_selected(None)
+        Self::new_with(Self::cfg_from_env()?)
     }
 
     /// Construct a backend pinned to physical-device `index` (enumeration order, matching
     /// [`enumerate_devices`](Self::enumerate_devices) and `INFR_DEV=VulkanN`), IGNORING the
-    /// `INFR_DEV` env and the discrete-default rule. This is the multi-device foundation: two
+    /// `device.dev` spec and the discrete-default rule. This is the multi-device foundation: two
     /// backends built with different indices can be held live simultaneously (each owns its own
     /// instance + logical device + allocator), enabling later tensor/expert-parallel slices. An
     /// out-of-range `index` is a hard error, never a silent fallback.
     ///
-    /// `new()` (the default path) is unchanged — a caller that does not opt into multi-device sees
-    /// exactly today's behavior.
+    /// The environment-sourced twin of [`new_on_with`](Self::new_on_with); see [`new`](Self::new).
     pub fn new_on(index: usize) -> Result<Self> {
-        Self::new_selected(Some(index))
+        Self::new_on_with(index, Self::cfg_from_env()?)
     }
 
-    fn new_selected(explicit_index: Option<usize>) -> Result<Self> {
+    /// `Default` < environment, for the [`new`](Self::new)/[`new_on`](Self::new_on)/
+    /// [`enumerate_devices_from_env`](Self::enumerate_devices_from_env) entry points that are handed
+    /// no `Config`.
+    ///
+    /// Deliberately NOT [`Config::load_from_env`]: that one is infallible (S2 needed it to be,
+    /// because the loud keys were still read — and still rejected — at their own sites). S5a moved
+    /// the last two of those five (`INFR_SG`, `INFR_SUBMIT_DISPATCHES`) onto `Config`, so swallowing
+    /// a layer error here would SILENTLY drop an error a `VulkanBackend::new()` caller gets today
+    /// (R1). No file layer either — these knobs were env-only, and a second diagnostics banner
+    /// would print.
+    fn cfg_from_env() -> Result<Arc<Config>> {
+        let layer = infr_core::config::ConfigLayer::env().map_err(|e| be(e.to_string()))?;
+        Ok(Arc::new(Config::load_from_layers(&[layer])))
+    }
+
+    /// [`enumerate_devices`](Self::enumerate_devices) for callers with no [`Config`] — see
+    /// [`new`](Self::new).
+    pub fn enumerate_devices_from_env() -> Result<Vec<DeviceInfo>> {
+        let cfg = Self::cfg_from_env()?;
+        Self::enumerate_devices(&cfg)
+    }
+
+    fn new_selected(explicit_index: Option<usize>, cfg: Arc<Config>) -> Result<Self> {
         // Apple: the Vulkan backend is DELIBERATELY unsupported (the only Vulkan on Apple is
         // MoltenVK, which lacks features this backend depends on — e.g. `bufferDeviceAddress` for
         // the paged MoE arena — and is slower than talking to Metal directly). infr ships a NATIVE
@@ -1184,6 +1237,11 @@ impl VulkanBackend {
         // `unreachable_code`, so the Vulkan body below still compiles clean on macOS (it is simply
         // never reached). See `reject_on_apple`.
         Self::reject_on_apple()?;
+
+        // Every knob below is resolved ONCE, here, from the caller's config — the construction-time
+        // tier (`docs/config-plan.md` §7 S5a). Borrowed, never cloned (R6); `cfg` itself moves onto
+        // the backend at the bottom of this function.
+        let vkcfg = &cfg.kernels.vulkan;
 
         // ── entry ──────────────────────────────────────────────────────────────
         let entry =
@@ -1293,7 +1351,7 @@ impl VulkanBackend {
                     pdevices.len()
                 ))
             })?,
-            None => Self::pick_default_device(&instance, &pdevices)?,
+            None => Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref())?,
         };
 
         // Selection log: which of the enumerated devices this backend actually bound.
@@ -1377,12 +1435,12 @@ impl VulkanBackend {
         // GPU busy time is small, so the fixed per-dispatch descriptor churn is a bigger fraction
         // of wall time). Near-universally supported (desktop RADV/NVIDIA/Intel); the pooled path
         // stays as a fallback for drivers that lack it (e.g. some portability/MoltenVK builds).
-        // INFR_NO_PUSH_DESC=1 forces the pooled-classic fallback even when the extension exists —
-        // lets a RADV dev box exercise the code path a driver WITHOUT push descriptors takes
-        // (field report: teardown validation findings on Intel Arc/ANV that RADV runs never
-        // reproduce because the classic pools are never created here). Test/diagnosis knob only.
-        let has_push_descriptor =
-            has_ext(c"VK_KHR_push_descriptor") && std::env::var("INFR_NO_PUSH_DESC").is_err();
+        // `kernels.vulkan.push_desc = false` (`INFR_NO_PUSH_DESC=1`) forces the pooled-classic
+        // fallback even when the extension exists — lets a RADV dev box exercise the code path a
+        // driver WITHOUT push descriptors takes (field report: teardown validation findings on
+        // Intel Arc/ANV that RADV runs never reproduce because the classic pools are never created
+        // here). Test/diagnosis knob only.
+        let has_push_descriptor = has_ext(c"VK_KHR_push_descriptor") && vkcfg.push_desc;
 
         // ── probe features (via VK 1.1 get_physical_device_features2) ─────────
         // Memory model and subgroup-size-control are probed rather than assumed: a portability
@@ -1518,8 +1576,8 @@ impl VulkanBackend {
         // Diagnostic: dump every enumerated (M,N,K,aType,bType,cType,resultType) — the definitive
         // list of what the matrix unit accepts, for bringing up new HW (RDNA4 fp8, bf16, Intel's
         // 8/8/16 tiles) and sanity-checking the per-type/per-dim detection below.
-        // `INFR_DEBUG_COOPMAT=1`.
-        if std::env::var("INFR_DEBUG_COOPMAT").is_ok() {
+        // `debug.coopmat` (`INFR_DEBUG_COOPMAT=1`).
+        if cfg.debug.coopmat {
             let raws: Vec<(u32, u32, u32, i32, i32, i32, i32)> = coopmat_configs
                 .iter()
                 .map(|&(m, n, k, a, b, c, r)| {
@@ -1545,7 +1603,7 @@ impl VulkanBackend {
         // enumeration, not assumed from the ext bit. `has_coop_matrix` (any usable f16 shape)
         // keeps its downstream role (ext-enable, feature chain).
         let f16c = vk::ComponentTypeKHR::FLOAT16;
-        let cm8_env = std::env::var("INFR_CM_8X8").is_ok();
+        let cm8_env = vkcfg.coopmat_8x8;
         let coopmat_f16 = select_coopmat_shape(
             coopmat_configs
                 .iter()
@@ -1603,14 +1661,17 @@ impl VulkanBackend {
         );
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
-        // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
+        // These knobs drop a DETECTED capability so the next kernel tier down is exercised on a
         // device that actually has the feature — otherwise the portability fallbacks are only
-        // reachable on hardware we may not own. Applied before the ext list / feature chain so a
-        // forced-off feature is genuinely NOT enabled on the device (a faithful simulation, not just
-        // a caps flag flip). f16 is a coopmat prerequisite, so INFR_NO_F16 ⇒ NO coopmat too.
-        let has_f16 = has_f16 && std::env::var("INFR_NO_F16").is_err();
+        // reachable on hardware we may not own. This is `docs/config-plan.md` §5.2: `Capabilities`
+        // stays a PROBE result (no config fields on it, nothing downstream re-reads a knob), and
+        // the config MASKS the probe right here, at construction. Applied before the ext list /
+        // feature chain so a forced-off feature is genuinely NOT enabled on the device (a faithful
+        // simulation, not just a caps flag flip). f16 is a coopmat prerequisite, so `!f16` ⇒ NO
+        // coopmat too — preserve that AND, it is not a bug.
+        let has_f16 = has_f16 && vkcfg.f16;
         let coopmat_f16 = coopmat_f16
-            .filter(|_| has_f16 && std::env::var("INFR_NO_COOPMAT").is_err())
+            .filter(|_| has_f16 && vkcfg.coopmat)
             .filter(|&s| {
                 // 8x8x16 additionally needs a pinnable subgroup size 16: the `_cm8` builds run
                 // 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native) and reuse the
@@ -1638,9 +1699,9 @@ impl VulkanBackend {
         // i8 coopmat rides the SAME device feature enable (coopmat_ci is only chained into
         // device_ci below when `has_coop_matrix`) — without it the extension isn't enabled on the
         // logical device even if int8 configs were enumerated, so this is a real dependency, not
-        // just symmetry with coopmat_f8 above. INFR_NO_COOPMAT/INFR_NO_F16 drop it too.
+        // just symmetry with coopmat_f8 above. `!coopmat`/`!f16` drop it too.
         let coopmat_i8 = coopmat_i8.filter(|_| has_coop_matrix);
-        let has_i8_dot = has_i8_dot && std::env::var("INFR_NO_I8DOT").is_err();
+        let has_i8_dot = has_i8_dot && vkcfg.i8_dot;
         // INFR_CM_8X8=1 outcome notice (once, at device init): the tester A/B knob must be loud
         // about whether it actually engaged — on RADV (16x16x16 enumerated) or any device without
         // an 8x8x16 f16 config it changes NOTHING, and the kernel set stays identical.
@@ -1661,9 +1722,9 @@ impl VulkanBackend {
                 ),
             }
         }
-        // Extend the INFR_DEBUG_COOPMAT dump with the CHOSEN shape per component type (the raw
+        // Extend the `debug.coopmat` dump with the CHOSEN shape per component type (the raw
         // enumeration is printed above, before selection).
-        if std::env::var("INFR_DEBUG_COOPMAT").is_ok() {
+        if cfg.debug.coopmat {
             eprintln!(
                 "[infr] coopmat chosen shapes (M,N,K): f16={coopmat_f16:?} bf16={coopmat_bf16:?} \
                  f8={coopmat_f8:?} i8={coopmat_i8:?}"
@@ -1876,14 +1937,18 @@ impl VulkanBackend {
         } else {
             32
         };
-        // INFR_SG=16|32: A/B override (Intel testers; inert on devices that can't pin the value).
-        let sg_pref = match std::env::var("INFR_SG").ok().as_deref() {
-            Some("16") => 16,
-            Some("32") => 32,
+        // `device.subgroup_pref` (`INFR_SG=16|32`): A/B override (Intel testers; inert on devices
+        // that can't pin the value). The env layer already rejects anything but "16"/"32" with the
+        // pre-S5a wording, but the field is now also reachable from the TOML file and `--set`, so
+        // the "only 16 and 32 have builds" POLICY stays here at the consumer (R5) and still refuses
+        // a value it has no kernels for.
+        let sg_pref = match cfg.device.subgroup_pref {
+            Some(16) => 16,
+            Some(32) => 32,
             Some(other) => {
                 return Err(be(format!(
-                    "INFR_SG must be 16 or 32 (got {other:?}) — the decode GEMV family only has \
-                     subgroup-16 and subgroup-32 builds"
+                    "device.subgroup_pref (INFR_SG) must be 16 or 32 (got {other}) — the decode \
+                     GEMV family only has subgroup-16 and subgroup-32 builds"
                 )))
             }
             None => sg_default,
@@ -2003,16 +2068,14 @@ impl VulkanBackend {
             caps.max_shared_memory_bytes / 1024,
         );
         // Submit splitter (see `VulkanShared::submit_dispatch_cap`): the initial, pre-measurement
-        // cap. `INFR_SUBMIT_DISPATCHES` overrides it (`0` = never split) — the kill switch if this
-        // ever misjudges a device.
-        let submit_dispatch_cap = match std::env::var("INFR_SUBMIT_DISPATCHES") {
-            Ok(v) => v.parse::<usize>().map_err(|e| {
-                be(format!(
-                    "INFR_SUBMIT_DISPATCHES: expected a dispatch count (0 = never split): {e}"
-                ))
-            })?,
-            Err(_) => infr_core::initial_submit_dispatch_cap(caps.integrated),
-        };
+        // cap. `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides it (`0` = never
+        // split) — the kill switch if this ever misjudges a device. A non-numeric value is still
+        // rejected loudly, now by the env layer, with the SAME text
+        // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
+        let submit_dispatch_cap = cfg
+            .device
+            .submit_dispatches
+            .unwrap_or_else(|| infr_core::initial_submit_dispatch_cap(caps.integrated));
         // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
         // pass split across several submits so no single command buffer can trip the GPU's hang
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
@@ -2071,7 +2134,7 @@ impl VulkanBackend {
         .map_err(|e| be(format!("gpu_allocator::Allocator::new: {e}")))?;
 
         // ── on-disk pipeline cache (see `pcache.rs`) ───────────────────────────
-        let pcache = crate::pcache::PcachePersist::new(&props);
+        let pcache = crate::pcache::PcachePersist::new(&props, vkcfg.pipeline_cache_disk);
         let initial = pcache.as_ref().and_then(|p| p.load()).unwrap_or_default();
         let mut pc_info = vk::PipelineCacheCreateInfo::default();
         if !initial.is_empty() {
@@ -2118,9 +2181,7 @@ impl VulkanBackend {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
-            // TRANSITIONAL (S2) — S5a replaces this with the `Arc<Config>` passed to
-            // `new_with`. See the `cfg` field's doc.
-            cfg: Arc::new(infr_core::config::Config::load_from_env()),
+            cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
                 instance,
@@ -2208,6 +2269,7 @@ impl VulkanBackend {
         *self.shared.weight_pb.lock().unwrap() = Some(pb);
         WeightProgress {
             shared: self.shared.clone(),
+            vram_log: self.cfg.prof.vram_log,
         }
     }
 
@@ -2325,7 +2387,7 @@ impl VulkanBackend {
     /// individually blow the budget and stay covered by the next large allocation's check).
     fn check_vram_budget(&self, want: u64) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
-        if want < CHECK_MIN || std::env::var("INFR_NO_VRAM_GUARD").is_ok() {
+        if want < CHECK_MIN || self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
         // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
@@ -3183,13 +3245,14 @@ impl Backend for VulkanBackend {
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
         // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
-        // INFR_POISON_UNINIT=1 forces the poison in release too — for hunting layout-sensitive
-        // read-before-write bugs whose output shifts with unrelated code changes.
+        // `debug.poison_uninit` (`INFR_POISON_UNINIT=1`) forces the poison in release too — for
+        // hunting layout-sensitive read-before-write bugs whose output shifts with unrelated code
+        // changes.
         let buf = self.make_alloc(bytes, usage)?;
         #[cfg(debug_assertions)]
         self.fill_buf(&buf, 0xFF)?;
         #[cfg(not(debug_assertions))]
-        if std::env::var("INFR_POISON_UNINIT").is_ok() {
+        if self.cfg.debug.poison_uninit {
             self.fill_buf(&buf, 0xFF)?;
         }
         Ok(Box::new(buf))
@@ -3530,6 +3593,213 @@ mod tests {
         assert!(resolve_infr_dev_index(Some("Vulkan99"), &names).is_err());
         // Unparseable Vulkan spec → HARD ERROR.
         assert!(resolve_infr_dev_index(Some("VulkanX"), &names).is_err());
+    }
+
+    /// A `Config` built as a VALUE reaches `pick_default_device` (S5a): `device.dev` is threaded in
+    /// as a parameter, so the two consumers of the one raw string (`infr-cli`'s `parse_dev_spec`
+    /// and this crate's index resolver, §10.8) each keep their own parse and neither reads the
+    /// environment. No GPU needed — this pins the plumbing, `dev_from_config_selects_the_device`
+    /// below pins the effect.
+    #[test]
+    fn config_device_dev_feeds_the_index_resolver() {
+        let names: Vec<String> = vec!["Vulkan0=A".into(), "Vulkan1=B".into()];
+        let spec = |v: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.device.dev = v.map(str::to_string);
+            resolve_infr_dev_index(cfg.device.dev.as_deref(), &names)
+        };
+        assert_eq!(spec(None).unwrap(), None, "unset ⇒ the discrete default");
+        assert_eq!(spec(Some("Vulkan1")).unwrap(), Some(1));
+        assert_eq!(
+            spec(Some("metal")).unwrap(),
+            None,
+            "tolerated, not an error"
+        );
+        assert!(spec(Some("Vulkan99")).is_err(), "typo protection preserved");
+    }
+
+    /// `kernels.vulkan.pipeline_cache_disk = false` (`INFR_NO_PIPELINE_CACHE`) must suppress DISK
+    /// persistence — the whole knob — while the default keeps it. Driven through the field, not the
+    /// environment (R7); no GPU needed since the constructor only reads properties + `$HOME`.
+    #[test]
+    fn pipeline_cache_disk_flag_gates_persistence() {
+        let props = vk::PhysicalDeviceProperties::default();
+        assert!(
+            crate::pcache::PcachePersist::new(&props, false).is_none(),
+            "cleared `pipeline_cache_disk` must disable on-disk persistence"
+        );
+        // The default is ON; it can still be `None` when there is no cache dir (no `HOME`/
+        // `XDG_CACHE_HOME`), which is not this knob's doing — assert only the knob's direction.
+        let has_cache_dir =
+            std::env::var_os("XDG_CACHE_HOME").is_some() || std::env::var_os("HOME").is_some();
+        assert_eq!(
+            crate::pcache::PcachePersist::new(&props, true).is_some(),
+            has_cache_dir,
+            "with the flag set, persistence is on iff a cache dir exists"
+        );
+    }
+
+    /// §5.2, on real hardware: the capability MASKERS are configuration, `Capabilities` stays a
+    /// probe result. Clearing `kernels.vulkan.f16` must drop `caps.f16` AND `caps.f16_coopmat()`
+    /// (f16 is a coopmat prerequisite — the AND `INFR_NO_F16` has always implied); clearing
+    /// `coopmat` alone must drop the coopmat tiers while LEAVING `caps.f16` up; clearing `i8_dot`
+    /// must drop `caps.i8_dot` alone. Each backend is built from a VALUE — no env, no `EnvGuard`,
+    /// no ordering hazard (R7).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_masks_the_capability_probe() {
+        let build = |f: &dyn Fn(&mut Config)| {
+            let mut cfg = Config::default();
+            f(&mut cfg);
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let base = build(&|_| {});
+        let (f16, cm, i8dot) = {
+            let c = base.caps();
+            (c.f16, c.f16_coopmat(), c.i8_dot)
+        };
+        drop(base);
+        println!("baseline caps: f16={f16} f16cm={cm} i8dot={i8dot}");
+
+        let no_f16 = build(&|c| c.kernels.vulkan.f16 = false);
+        assert!(!no_f16.caps().f16, "`f16 = false` must clear caps.f16");
+        assert!(
+            !no_f16.caps().f16_coopmat(),
+            "f16 is a coopmat prerequisite: clearing it must drop coopmat too"
+        );
+        drop(no_f16);
+
+        let no_cm = build(&|c| c.kernels.vulkan.coopmat = false);
+        assert!(
+            !no_cm.caps().f16_coopmat(),
+            "`coopmat = false` must drop the f16 coopmat tier"
+        );
+        assert_eq!(
+            no_cm.caps().f16,
+            f16,
+            "`coopmat = false` must NOT touch plain f16"
+        );
+        drop(no_cm);
+
+        let no_i8 = build(&|c| c.kernels.vulkan.i8_dot = false);
+        assert!(
+            !no_i8.caps().i8_dot,
+            "`i8_dot = false` must clear caps.i8_dot"
+        );
+        assert_eq!(no_i8.caps().f16, f16, "i8_dot must not perturb f16");
+    }
+
+    /// `device.subgroup_pref` (`INFR_SG`) reaches `caps.sg_pref`, and a value the kernel set has no
+    /// builds for is still refused LOUDLY — the policy moved to the consumer (R5) but did not
+    /// vanish. `16` is only pinnable where the device's subgroup range admits it; on RADV wave32
+    /// the documented fallback to 32 applies, so assert the reachable outcome rather than the
+    /// request.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_subgroup_pref_drives_sg_pref() {
+        let build = |sg: Option<u32>| {
+            let mut cfg = Config::default();
+            cfg.device.subgroup_pref = sg;
+            VulkanBackend::new_with(Arc::new(cfg))
+        };
+        let be32 = build(Some(32)).expect("sg_pref 32 is always pinnable");
+        assert_eq!(be32.caps().sg_pref, 32);
+        let (min, max) = (be32.caps().subgroup_min, be32.caps().subgroup_max);
+        drop(be32);
+
+        let be16 = build(Some(16)).expect("sg_pref 16 request");
+        let want16 = min <= 16 && 16 <= max;
+        assert_eq!(
+            be16.caps().sg_pref,
+            if want16 { 16 } else { 32 },
+            "a 16 request is honored iff the range [{min}, {max}] can pin it, else it falls back"
+        );
+        drop(be16);
+
+        let msg = match build(Some(17)) {
+            Ok(_) => panic!("subgroup_pref 17 must be refused: no subgroup-17 kernel builds exist"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("must be 16 or 32") && msg.contains("INFR_SG"),
+            "the loud rejection kept its wording: {msg}"
+        );
+    }
+
+    /// `kernels.vulkan.push_desc = false` (`INFR_NO_PUSH_DESC`) forces the pooled-classic
+    /// descriptor path even where `VK_KHR_push_descriptor` exists — the loader must be absent, so
+    /// the extension is genuinely not enabled on the logical device (a faithful simulation, not a
+    /// flag flip). Skips itself on a device that has no push descriptors to drop.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_push_desc_forces_the_pooled_fallback() {
+        let build = |on: bool| {
+            let mut cfg = Config::default();
+            cfg.kernels.vulkan.push_desc = on;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let dflt = build(true);
+        let available = dflt.shared.push_descriptor.is_some();
+        drop(dflt);
+        if !available {
+            eprintln!("skip: this device does not expose VK_KHR_push_descriptor");
+            return;
+        }
+        assert!(
+            build(false).shared.push_descriptor.is_none(),
+            "`push_desc = false` must drop the push-descriptor loader"
+        );
+    }
+
+    /// `kernels.vulkan.no_vram_guard` (`INFR_NO_VRAM_GUARD`) — a SANCTIONED negative field (§4).
+    /// Set, it turns the alloc-time budget check into a no-op; clear, an ask several times the
+    /// device's capacity is refused. Drives `check_vram_budget` directly, so it asserts the guard
+    /// itself and allocates nothing.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_no_vram_guard_disables_the_budget_check() {
+        let build = |off: bool| {
+            let mut cfg = Config::default();
+            cfg.kernels.vulkan.no_vram_guard = off;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let guarded = build(false);
+        let huge = guarded.vram().total.saturating_mul(4);
+        assert!(
+            guarded.check_vram_budget(huge).is_err(),
+            "the guard must refuse {huge} bytes on a device with {} total",
+            guarded.vram().total
+        );
+        // The sub-MiB skip is unconditional and unchanged.
+        assert!(guarded.check_vram_budget(1024).is_ok());
+        drop(guarded);
+
+        let unguarded = build(true);
+        assert!(
+            unguarded.check_vram_budget(huge).is_ok(),
+            "`no_vram_guard = true` must make the check a no-op"
+        );
+    }
+
+    /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
+    /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated)`.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_submit_dispatches_overrides_the_splitter_cap() {
+        let build = |n: Option<usize>| {
+            let mut cfg = Config::default();
+            cfg.device.submit_dispatches = n;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let dflt = build(None);
+        let integrated = dflt.caps().integrated;
+        assert_eq!(
+            dflt.submit_dispatch_cap(),
+            infr_core::initial_submit_dispatch_cap(integrated)
+        );
+        drop(dflt);
+        assert_eq!(build(Some(7)).submit_dispatch_cap(), 7);
+        assert_eq!(build(Some(0)).submit_dispatch_cap(), 0, "0 = no split");
     }
 
     /// Shape selection over synthetic property lists (no GPU needed) — the caps-table core of the

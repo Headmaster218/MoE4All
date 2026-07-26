@@ -1603,11 +1603,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
 
 /// Open one Vulkan backend per physical device index (the shared front of every multi-GPU
 /// `generate_*` wrapper). Errors name the failing `VulkanN`.
-fn open_vulkan_devices(devices: &[usize]) -> AResult<Vec<infr_vulkan::VulkanBackend>> {
+///
+/// Every backend gets the SAME `Arc<Config>` — `docs/config-plan.md` §5.1: per-device configs are
+/// explicitly out of scope for the config campaign, and today's multi-GPU paths all read one
+/// process environment, so one shared handle reproduces that exactly.
+fn open_vulkan_devices(
+    devices: &[usize],
+    ec: &EngineConfig,
+) -> AResult<Vec<infr_vulkan::VulkanBackend>> {
+    let cfg = std::sync::Arc::new(ec.clone());
     devices
         .iter()
         .map(|&idx| {
-            infr_vulkan::VulkanBackend::new_on(idx)
+            infr_vulkan::VulkanBackend::new_on_with(idx, cfg.clone())
                 .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))
         })
         .collect()
@@ -1737,7 +1745,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     dense_multi_gpu_guard(cfg, "INFR_PIPELINE")?;
-    let backends = open_vulkan_devices(devices)?;
+    let backends = open_vulkan_devices(devices, ec)?;
     let layer_map = infr_vulkan::PipelineBackend::balanced_layer_map(cfg.n_layer, backends.len());
     // Placement report: how many layers landed on each physical device.
     let names = backends
@@ -1952,7 +1960,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     dense_multi_gpu_guard(cfg, "INFR_TENSOR_PARALLEL")?;
-    let backends = open_vulkan_devices(devices)?;
+    let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
         .map(|b| {
@@ -2131,7 +2139,7 @@ pub(crate) fn generate_moe_vulkan_ep(
             "INFR_EXPERT_PARALLEL does not support diffusion-gemma"
         ));
     }
-    let backends = open_vulkan_devices(devices)?;
+    let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
         .map(|b| {

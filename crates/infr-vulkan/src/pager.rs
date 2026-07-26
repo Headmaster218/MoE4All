@@ -481,15 +481,7 @@ fn expert_bytes(arc: &Arc<dyn AsRef<[u8]> + Send + Sync>) -> &[u8] {
     inner.as_ref()
 }
 
-/// `INFR_PAGER_STATS` gate. Read on every `new` — NOT memoized: a process-wide `OnceLock` latches
-/// whatever the FIRST pager session saw, which makes a test that sets the knob later silently
-/// measure nothing (and un-settable once any earlier test has read it). The two call sites are
-/// pager-session construction, i.e. twice per model load, so a `getenv` there is free.
-fn pager_stats_enabled() -> bool {
-    std::env::var("INFR_PAGER_STATS").is_ok()
-}
-
-/// The shared `hits/misses/evictions/hit_rate` fragment of both sessions' `INFR_PAGER_STATS` lines
+/// The shared `hits/misses/evictions/hit_rate` fragment of both sessions' `paging.stats` lines
 /// (each session prepends its own label + slot size and appends its own slot-count suffix).
 fn stats_suffix(s: &PagerStats) -> String {
     format!(
@@ -642,7 +634,7 @@ impl MoePagerSession {
             ring_half_bytes,
             tape,
             tape_words,
-            print_stats: pager_stats_enabled(),
+            print_stats: vk.cfg().paging.stats,
             global_scratch: Vec::new(),
         })
     }
@@ -929,9 +921,9 @@ impl MoePagerSession {
         agg
     }
 
-    /// `INFR_PAGER_STATS=1`: print each pool's hit/miss/eviction counters. Called after
-    /// generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to always
-    /// compute, only printed when asked.
+    /// `paging.stats` (`INFR_PAGER_STATS=1`): print each pool's hit/miss/eviction counters. Called
+    /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
+    /// always compute, only printed when asked.
     pub fn print_stats_if_enabled(&self) {
         if !self.print_stats {
             return;
@@ -1070,7 +1062,7 @@ impl DensePagerSession {
             sources: HashMap::new(),
             ring,
             ring_half_bytes,
-            print_stats: pager_stats_enabled(),
+            print_stats: vk.cfg().paging.stats,
         })
     }
 
@@ -1159,9 +1151,9 @@ impl DensePagerSession {
         self.ring_half_bytes
     }
 
-    /// `INFR_PAGER_STATS=1`: per-pool hit/miss/eviction counters (cyclic-sweep hit rate =
-    /// `(n_slots-1) / n_blocks` per pass at steady state — the honest expectation to check
-    /// against).
+    /// `paging.stats` (`INFR_PAGER_STATS=1`): per-pool hit/miss/eviction counters (cyclic-sweep
+    /// hit rate = `(n_slots-1) / n_blocks` per pass at steady state — the honest expectation to
+    /// check against).
     pub fn print_stats_if_enabled(&self) {
         if !self.print_stats {
             return;

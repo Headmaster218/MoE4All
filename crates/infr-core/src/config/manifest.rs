@@ -123,12 +123,12 @@ macro_rules! knobs {
 
 knobs! {
     // ── device (§6.1) ────────────────────────────────────────────────────────
-    "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", pending;
+    "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", migrated;
     "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     pending;
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
-    "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      pending;
-    "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     pending;
+    "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
+    "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
 
     // ── sampling (§6.2) ──────────────────────────────────────────────────────
     "INFR_TEMP"                 => "sampling.temp",       Float,      Ignored, "0.6",  pending;
@@ -168,15 +168,15 @@ knobs! {
     "INFR_ROCM_PAGER_NOOVERLAP" => "paging.rocm_no_overlap",           Presence, Ignored, "1",   pending;
 
     // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
-    "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", pending;
-    "INFR_CM_8X8"       => "kernels.vulkan.coopmat_8x8",  Presence,    Ignored, "1", pending;
+    "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", migrated;
+    "INFR_CM_8X8"       => "kernels.vulkan.coopmat_8x8",  Presence,    Ignored, "1", migrated;
     "INFR_BF16_COOPMAT" => "kernels.vulkan.bf16_coopmat", Presence,    Ignored, "1", pending;
     "INFR_F8_COOPMAT"   => "kernels.vulkan.f8_coopmat",   Presence,    Ignored, "1", pending;
     "INFR_F8_PREPACK"   => "kernels.vulkan.f8_prepack",   Presence,    Ignored, "1", pending;
     "INFR_I8_COOPMAT"   => "kernels.vulkan.i8_coopmat",   Presence,    Ignored, "1", pending;
     "INFR_I8_ROW_SCALE" => "kernels.vulkan.i8_row_scale", Presence,    Ignored, "1", pending;
-    "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", pending;
-    "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", pending;
+    "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
 
     // ── kernels.vulkan — GEMM / GEMV tiers (§6.5) ────────────────────────────
     "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  pending;
@@ -218,9 +218,9 @@ knobs! {
     "INFR_NO_DN_CHUNK"        => "kernels.vulkan.dn_chunk",           PresenceInv, Ignored, "1", pending;
     "INFR_NO_DN_SPLIT"        => "kernels.vulkan.dn_split",           PresenceInv, Ignored, "1", pending;
     "INFR_DELTA_STRIDED"      => "kernels.vulkan.delta_strided",      Presence,    Ignored, "1", pending;
-    "INFR_NO_PUSH_DESC"       => "kernels.vulkan.push_desc",          PresenceInv, Ignored, "1", pending;
-    "INFR_NO_PIPELINE_CACHE"  => "kernels.vulkan.pipeline_cache_disk", PresenceInv, Ignored, "1", pending;
-    "INFR_NO_VRAM_GUARD"      => "kernels.vulkan.no_vram_guard",      Presence,    Ignored, "1", pending;
+    "INFR_NO_PUSH_DESC"       => "kernels.vulkan.push_desc",          PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_PIPELINE_CACHE"  => "kernels.vulkan.pipeline_cache_disk", PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_VRAM_GUARD"      => "kernels.vulkan.no_vram_guard",      Presence,    Ignored, "1", migrated;
     "INFR_NO_MOE_SM_POOL"     => "kernels.vulkan.no_moe_sm_pool",     Presence,    Ignored, "1", pending;
     "INFR_SEAM_NO_REPLAY"     => "kernels.vulkan.no_replay",          Presence,    Ignored, "1", pending;
     "INFR_NO_GPU_POS"         => "kernels.vulkan.gpu_pos",            PresenceInv, Ignored, "1", pending;
@@ -314,7 +314,7 @@ knobs! {
     "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            migrated;
     "INFR_PROFILE_OUT"      => "prof.profile_out",      Path,     Ignored, "/tmp/p.json",  pending;
-    "INFR_VRAM_LOG"         => "prof.vram_log",         Presence, Ignored, "1",            pending;
+    "INFR_VRAM_LOG"         => "prof.vram_log",         Presence, Ignored, "1",            migrated;
     "INFR_MTP_TIME"         => "prof.mtp_time",         Presence, Ignored, "1",            migrated;
     "INFR_DIFFUSION_TIME"   => "prof.diffusion_time",   Presence, Ignored, "1",            migrated;
     "INFR_EB_TRACE"         => "prof.eb_trace",         Presence, Ignored, "1",            migrated;
@@ -323,12 +323,12 @@ knobs! {
 
     // ── debug (§6.9) ─────────────────────────────────────────────────────────
     "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", pending;
-    "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", pending;
+    "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", migrated;
     "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", pending;
     "INFR_DEBUG_CHAT"          => "debug.chat",            Presence, Ignored, "1", pending;
     "INFR_MOE_COUNTS_DEBUG"    => "debug.moe_counts",      Presence, Ignored, "1", migrated;
     "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", migrated;
-    "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", pending;
+    "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;
     "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", pending;
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", pending;
 

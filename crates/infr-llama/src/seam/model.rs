@@ -84,15 +84,22 @@ fn pick_continuation(
 }
 
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
-/// ([`infr_vulkan::VulkanBackend::new_on`], bypassing `INFR_DEV`/the discrete-default rule for the
-/// multi-device path), `None` is the historical default ([`infr_vulkan::VulkanBackend::new`],
-/// byte-identical to before). The single funnel every seam-session constructor uses so the pinned
-/// and default paths stay in lockstep.
-fn open_backend(dev: Option<usize>) -> Result<infr_vulkan::VulkanBackend> {
+/// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default rule
+/// for the multi-device path), `None` is the historical default
+/// ([`infr_vulkan::VulkanBackend::new_with`]). The single funnel every seam-session constructor
+/// uses so the pinned and default paths stay in lockstep.
+///
+/// `cfg` is the MODEL's `Arc<Config>` (S4/S5a): the backend reads its construction-time knobs —
+/// device pick, capability masking, VRAM guard, pager diagnostics — off it instead of the
+/// environment.
+fn open_backend(
+    dev: Option<usize>,
+    cfg: std::sync::Arc<crate::EngineConfig>,
+) -> Result<infr_vulkan::VulkanBackend> {
     match dev {
-        Some(idx) => infr_vulkan::VulkanBackend::new_on(idx)
+        Some(idx) => infr_vulkan::VulkanBackend::new_on_with(idx, cfg)
             .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}")),
-        None => infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}")),
+        None => infr_vulkan::VulkanBackend::new_with(cfg).map_err(|e| anyhow!("vulkan init: {e}")),
     }
 }
 
@@ -366,6 +373,13 @@ fn kv_bytes_per_elem(side: Option<DType>, ec: &crate::EngineConfig, auto_q8: boo
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamModel {
+    /// The engine configuration this model was loaded with (see the `ecfg` field). Handed to every
+    /// backend this model — or a caller holding it (`ParallelSeam`, `DenseSeamChat`, the MTP entry
+    /// points) — opens, so nothing downstream has to re-read the environment (S4/S5a).
+    pub fn cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
+        &self.ecfg
+    }
+
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
     pub fn load(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
@@ -440,7 +454,7 @@ impl SeamModel {
         dev: Option<usize>,
         max_ctx: usize,
     ) -> Result<DenseVulkanSession> {
-        let vk = open_backend(dev)?;
+        let vk = open_backend(dev, self.ecfg.clone())?;
         Ok(DenseVulkanSession {
             be: vk,
             pool: SlotPool::new(),
@@ -465,7 +479,7 @@ impl SeamModel {
     /// VRAM budget clamps its own default context — a session on the weak iGPU gets a window sized
     /// to the iGPU's memory, independent of the discrete card's.
     pub fn vulkan_session_default_on(&self, dev: Option<usize>) -> Result<DenseVulkanSession> {
-        let vk = open_backend(dev)?;
+        let vk = open_backend(dev, self.ecfg.clone())?;
         // The clamp's auto-q8 rung may pin this session's KV format — do it under THIS session's
         // placement scope so the decision lands on its own pins, not a process-global cell.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
@@ -498,7 +512,7 @@ impl SeamModel {
         dev: Option<usize>,
         frac: f64,
     ) -> Result<DenseVulkanSession> {
-        let vk = open_backend(dev)?;
+        let vk = open_backend(dev, self.ecfg.clone())?;
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
@@ -914,7 +928,8 @@ impl SeamModel {
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan
     /// cross-backend parity check.
     pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
         crate::seam::verify_dense_vulkan(
             &vk,
             &self.gguf,
@@ -967,7 +982,8 @@ impl SeamModel {
         &self,
         max_ctx: usize,
     ) -> Result<DiffusionGemmaVulkanSession> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DiffusionGemmaVulkanSession {
             be: vk,
             state: None,
@@ -1020,7 +1036,8 @@ impl SeamModel {
     /// backends — this is the end-to-end dense CPU↔GPU parity path.
     pub fn generate_dense_vulkan(&self, prompt: &str, max_new: usize) -> Result<String> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
             &self.gguf,
@@ -1051,7 +1068,8 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
             &self.gguf,
@@ -1231,7 +1249,8 @@ impl SeamModel {
         pg: Option<(usize, usize)>,
         reps: usize,
     ) -> Result<Vec<f64>> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
         // +16: the untimed warmup runs an 8-prompt + 2-gen turn through the SAME session, so the
         // KV must fit it even when the measured shape is tiny (pp2 with +8 sized the cache to 10

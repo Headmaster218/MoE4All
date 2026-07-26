@@ -63,7 +63,8 @@
 //! for a crashed one — and one backend's clean drop only disarms ITS OWN marker, never a live
 //! sibling's.
 //!
-//! `INFR_NO_PIPELINE_CACHE=1` disables persistence (the in-process cache handle still works).
+//! `kernels.vulkan.pipeline_cache_disk = false` (`INFR_NO_PIPELINE_CACHE=1`) disables persistence
+//! (the in-process cache handle still works).
 
 use ash::vk;
 use std::io::Write;
@@ -149,8 +150,12 @@ fn pid_alive(pid: i32) -> bool {
 impl PcachePersist {
     /// `~/.cache/infr/vk-pipeline-cache-{vendor:08x}-{device:08x}.bin` (XDG-aware) — keyed per
     /// device so a multi-GPU box never clobbers one GPU's cache with another's.
-    pub(crate) fn new(props: &vk::PhysicalDeviceProperties) -> Option<Self> {
-        if std::env::var_os("INFR_NO_PIPELINE_CACHE").is_some() {
+    ///
+    /// `disk` is `kernels.vulkan.pipeline_cache_disk` off the backend's `Config`
+    /// (`INFR_NO_PIPELINE_CACHE` inverted, S5a): `false` ⇒ no persistence, which is `None` here.
+    /// The in-process cache handle is unaffected either way.
+    pub(crate) fn new(props: &vk::PhysicalDeviceProperties, disk: bool) -> Option<Self> {
+        if !disk {
             return None;
         }
         let base = std::env::var_os("XDG_CACHE_HOME")

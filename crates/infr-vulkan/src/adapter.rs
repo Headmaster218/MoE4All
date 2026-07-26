@@ -7434,7 +7434,7 @@ mod tests {
     #[test]
     #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
     fn ep_matches_single_device_synthetic() {
-        let Ok(devs) = VulkanBackend::enumerate_devices() else {
+        let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
             return; // no Vulkan — self-skip
         };
         if devs.len() < 2 {
