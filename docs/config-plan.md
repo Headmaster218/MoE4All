@@ -577,6 +577,27 @@ means off.
 re-publication block and `RAYON_NUM_THREADS`; `infr run` / `infr bench` /
 `infr serve` produce identical output to the parent commit on a fixed seed.
 
+### Carried into later slices from S1
+
+- **The transitional bridge lives in `crates/infr-cli/src/main.rs`**:
+  `publish_transitional_env(cfg, specified)` re-publishes ten knobs (`INFR_DEV`,
+  `INFR_CTX`, `INFR_UBATCH`, `INFR_TEMP`, `INFR_TOP_K`, `INFR_TOP_P`,
+  `INFR_SEED`, `INFR_MAX_NEW`, `INFR_NO_THINK`, `INFR_IGNORE_EOS`) from the
+  resolved config, and ONLY for paths a layer actually specified — that "only if
+  specified" rule is what keeps the model-default sampling fallback intact. **S8
+  deletes it**, once every deep reader takes its value from `Config`.
+  `publish_thread_count` (`RAYON_NUM_THREADS`) is permanent and stays.
+- **`set_default_sampling_env` (same file) still reads and writes env.**
+  Converting it needs the "specified" partial threaded into
+  `cmd_run`/`cmd_serve`/`cmd_multi`; it is part of the bridge and dies with it
+  in S8.
+- **`SeamModel::load` kept its signature** — S4 is where `infr-llama` grows its
+  `Arc<Config>`, and where the CLI's remaining seam-side plumbing lands.
+- **`Config::load` now runs for every subcommand**, so the five loud keys
+  (`INFR_SG`, `INFR_SUBMIT_DISPATCHES`, the three device lists) now fail at
+  startup rather than at backend construction — including on subcommands that
+  never build a backend (`infr pull`). Intended; note it if a user reports it.
+
 ### S2 — `infr-core`'s own knobs
 
 `tier::EnvRows` (2 knobs: `INFR_MOE_SMALL_M`, `INFR_CANVAS_CHUNK_N` — both
