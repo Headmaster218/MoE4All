@@ -60,9 +60,9 @@ fn test_serial_lock() -> infr_core::test_env::EnvGuard {
 ///
 /// This is what replaced the `env.set("INFR_TEMP", "0")` / `env.set("INFR_KV_TYPE_K", …)` pattern
 /// throughout this file. `test_serial_lock` is still taken where a test drives a knob that has NOT
-/// migrated yet (`INFR_NO_THINK` in `infr-chat`, `INFR_SEAM_NO_REPLAY`'s Vulkan half,
-/// `INFR_I8_COOPMAT` — all S5b/S7) — and for the GPU tests, which must stay serialised against each
-/// other regardless. `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it in S5a.
+/// migrated yet (`INFR_NO_THINK` in `infr-chat` — S7) — and for the GPU tests, which must stay
+/// serialised against each other regardless. `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it
+/// in S5a; `INFR_SEAM_NO_REPLAY`'s Vulkan half and `INFR_I8_COOPMAT` came off it in S5b.
 fn model_cfg(
     path: &std::path::Path,
     f: impl FnOnce(&mut infr_llama::EngineConfig),
@@ -441,10 +441,14 @@ fn gpu_seam_matches_cpu_qwen3_q2k() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
-    let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_I8_COOPMAT", "1");
-    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
-    _tlk.unset("INFR_I8_COOPMAT");
+    // The GPU tests stay serialized against each other; the KNOB is a config value since S5b.
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu_cfg(
+        &path,
+        "What is the capital of France? Answer briefly.",
+        16,
+        |c| c.kernels.vulkan.i8_coopmat = true,
+    );
 }
 
 /// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
@@ -501,7 +505,18 @@ fn gpu_seam_flash_matches_cpu() {
 /// invisible at Q4_K+ but flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg
 /// therefore failed the more accurate implementation; the reference mode is the honest oracle.
 fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
-    let model = model_default(path);
+    seam_vulkan_matches_cpu_cfg(path, prompt, n, |_| {});
+}
+
+/// [`seam_vulkan_matches_cpu`] on an explicit engine configuration — for the tier knobs whose
+/// numerics have to be scored against the CPU oracle (the `INFR_I8_COOPMAT` measurement kernel).
+fn seam_vulkan_matches_cpu_cfg(
+    path: &std::path::Path,
+    prompt: &str,
+    n: usize,
+    f: impl FnOnce(&mut infr_llama::EngineConfig),
+) {
+    let model = model_cfg(path, f);
     let rendered = model.render_chat(prompt).expect("render chat");
     let mut cpu_txt = String::new();
     model
@@ -2821,10 +2836,11 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    // The guard stays: `INFR_SEAM_NO_REPLAY`'s OTHER half is still an env read in the Vulkan
-    // adapter (§6.12 — S5 moves it), and this test needs BOTH halves flipped together. The seam's
-    // half is the per-model `kernels.vulkan.no_replay` below.
-    let mut _tlk = test_serial_lock();
+    // The guard now only serializes this GPU test against the others: BOTH halves of
+    // `INFR_SEAM_NO_REPLAY` (§6.12 — the seam's replay gate and the Vulkan adapter's
+    // `decode_eligible`) read the per-model `kernels.vulkan.no_replay` since S5b, so the mode is
+    // entirely a value on the config below.
+    let _tlk = test_serial_lock();
     let base = model_default(&path);
     let vocab = base.config().vocab;
     let canvas_len = base.config().canvas_length;
@@ -2834,12 +2850,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
         .expect("encode");
     let canvas: Vec<u32> = vec![mask_id; canvas_len];
 
-    let mut run = |no_replay: bool| -> Vec<f32> {
-        if no_replay {
-            _tlk.set("INFR_SEAM_NO_REPLAY", "1");
-        } else {
-            _tlk.unset("INFR_SEAM_NO_REPLAY");
-        }
+    let run = |no_replay: bool| -> Vec<f32> {
         let model = model_cfg(&path, |c| c.kernels.vulkan.no_replay = no_replay);
         let mut sess = model
             .diffusion_gemma_vulkan_session(tokens.len() + canvas_len + 8)
@@ -2848,7 +2859,6 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
         let outcome = sess
             .denoise(&model, &canvas, None, 1.0, 1.0, None)
             .expect("vulkan denoise");
-        _tlk.unset("INFR_SEAM_NO_REPLAY");
         match outcome {
             infr_llama::seam::DenoiseOutcome::Logits(v) => v,
             infr_llama::seam::DenoiseOutcome::Reduced(_) => {
@@ -2879,7 +2889,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
         }
     }
     println!(
-        "default vs INFR_SEAM_NO_REPLAY: {ndiff}/{} elements differ, maxabs={maxabs}, \
+        "default vs no_replay: {ndiff}/{} elements differ, maxabs={maxabs}, \
          argmax flips {argmax_flips}/{canvas_len}",
         replay.len()
     );

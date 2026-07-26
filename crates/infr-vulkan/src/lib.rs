@@ -3415,7 +3415,7 @@ impl Backend for VulkanBackend {
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
-        adapter::compile(graph)
+        adapter::compile(self, graph)
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {

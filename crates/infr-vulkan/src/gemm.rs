@@ -2856,13 +2856,16 @@ dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
 dyn_spv!(attn_partial_nohd_spv, "attn_partial_nohd");
 dyn_spv!(attn_partial_dyn_nohd_spv, "attn_partial_dyn_nohd");
 dyn_spv!(attn_partial_dynac_nohd_spv, "attn_partial_dynac_nohd");
-/// `INFR_NO_ATTN_HD=1` — select the `-DNO_HD_SPEC` attn_partial variants (general loops only).
+/// `INFR_NO_ATTN_HD=1` (`kernels.vulkan.no_attn_hd_spec`) — select the `-DNO_HD_SPEC` attn_partial
+/// variants (general loops only).
+///
+/// Takes the knob as a BORROWED config (S5b): it used to be a `std::env::var` here, deliberately
+/// un-memoized because a `OnceLock` latched whatever the first attention record saw and made the
+/// knob unsettable from a test (§10.6). Reading it off the recorder's backing `Config` removes both
+/// the memo question and the `getenv`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn attn_hd_spec_disabled() -> bool {
-    // Not memoized: a `OnceLock` here latches whatever the first attention record saw, so a test
-    // that toggles the knob afterwards silently measures nothing. The call sites are pipeline
-    // SELECTION (once per recorded attention op, not per dispatch), where a `getenv` is noise.
-    std::env::var("INFR_NO_ATTN_HD").is_ok()
+pub(crate) fn attn_hd_spec_disabled(vk: &infr_core::config::VulkanCfg) -> bool {
+    vk.no_attn_hd_spec
 }
 // Coupled Q8_0 KV cache: scalar dequant-on-read attention (static + record-once) and the row
 // quantize-store kernels (f32 V + f16 K sources, each with a params/decode variant).

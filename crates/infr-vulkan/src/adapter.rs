@@ -32,10 +32,10 @@ pub(crate) struct VkDecodePlan {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkDecodePlan {
-    fn boxed(graph: &Graph) -> Box<dyn Plan> {
+    fn boxed(be_: &VulkanBackend, graph: &Graph) -> Box<dyn Plan> {
         Box::new(VkDecodePlan {
             graph: graph.clone(),
-            eligible: decode_eligible(graph),
+            eligible: decode_eligible(be_, graph),
             replay: Mutex::new(None),
         })
     }
@@ -77,10 +77,11 @@ struct DecodeReplay {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn compile(graph: &Graph) -> Result<Box<dyn Plan>> {
+pub(crate) fn compile(be_: &VulkanBackend, graph: &Graph) -> Result<Box<dyn Plan>> {
     // Eligibility (record-once replay vs per-execute static recording) is a pure function of the
-    // graph shape, so decide it here, once. `execute` builds the replay lazily on first run.
-    Ok(VkDecodePlan::boxed(graph))
+    // graph shape and the backend's `kernels.vulkan.no_replay`, so decide it here, once. `execute`
+    // builds the replay lazily on first run.
+    Ok(VkDecodePlan::boxed(be_, graph))
 }
 
 /// Record-once replay applies to a single-token decode graph the `_dyn` kernels cover: every
@@ -169,10 +170,12 @@ fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn decode_eligible(graph: &Graph) -> bool {
-    // INFR_SEAM_NO_REPLAY forces the static per-execute path (INFR_PROF2 timestamps work there;
-    // the replay path can't report them).
-    if std::env::var("INFR_SEAM_NO_REPLAY").is_ok() {
+fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
+    // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`) forces the static per-execute path
+    // (INFR_PROF2 timestamps work there; the replay path can't report them). §6.12: ONE field read
+    // `is_ok()` here and `!no_replay` in the llama runner — both halves now come off the same
+    // `Config` (the runner's moved in S4, this one in S5b).
+    if be_.cfg().kernels.vulkan.no_replay {
         return false;
     }
     // Producer opt-out (see `Graph::no_decode_replay`): the replay tape's `_dyn` kernels are only
@@ -405,8 +408,12 @@ const MROW16_BAND: usize = 1;
 /// 0.6B 667 vs 662 (+0.8%), 8B tg64@d4096 113.7 vs 110.4 (+3.0%). So decode routes to the scalar
 /// GEMV; the mmv kernels stay reachable for A/B + future re-tuning. (The m≥3 mrow PREFILL mmv is
 /// UNAFFECTED — it still wins: E2B pp4@d4096 loses 5.3% under `INFR_NO_MMV`.)
-fn mmv_decode_enabled() -> bool {
-    std::env::var("INFR_MMV_DECODE").is_ok() && std::env::var("INFR_NO_MMV").is_err()
+///
+/// §10.2: the two knobs are DIFFERENT grammars and interact here — `INFR_MMV_DECODE` is `presence`
+/// (`mmv_decode`, default `false`), `INFR_NO_MMV` is `presence-inv` (`mmv`, default `true`), and the
+/// site is `mmv_decode && mmv`.
+fn mmv_decode_enabled(vk: &infr_core::config::VulkanCfg) -> bool {
+    vk.mmv_decode && vk.mmv
 }
 
 /// Multi-warp int8 dp4a decode GEMV route (`native_mmv_mw.comp`, llama's mul_mat_vec_q block:
@@ -504,14 +511,19 @@ fn mmv_decode_enabled() -> bool {
 /// MTP-verify/decode split (`Graph::mtp_verify`) is exactly the "clean way to bank it" this doc
 /// used to defer to, and it is now in place. MTP verify still runs Q5_K f32-exact (matching
 /// decode), so token-identity holds; only ordinary prefill takes the win.
-fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [infr_core::DType] {
+fn mmv_int8_decode_dtypes(
+    caps: &infr_core::backend::Capabilities,
+    vk: &infr_core::config::VulkanCfg,
+) -> &'static [infr_core::DType] {
     use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
-    match std::env::var("INFR_MMV_MW").ok().as_deref() {
-        Some("0") => &[], // force-off everywhere
+    // §10.3: `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
+    // string `"0"`, `Some(true)` any other value, and `None` (unset) the per-vendor default.
+    match vk.mmv_mw {
+        Some(false) => &[], // force-off everywhere
         // Explicit opt-in: every dtype with an int8 decode arm, any vendor (the A/B measurement
         // escape). The legacy 32-block set is included so its decode tier is measurable without a
         // rebuild — none of them are on any vendor's DEFAULT set (see the `None` arms).
-        Some(_) => &[Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl],
+        Some(true) => &[Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl],
         // Intel: the four measured-on-Intel wins. Q5_K is NOT included — its FMT_Q5K mmv_mw build
         // exists (Intel's decode kernel) but has never been measured on Intel hardware; adding it
         // here on the strength of an AMD number would be exactly the assume-don't-measure this
@@ -685,11 +697,12 @@ fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
 /// MTP verify lands on the f32-exact path (matching decode) while ordinary prefill keeps the win.
 fn mrow_int8_dtype_ok(
     caps: &infr_core::backend::Capabilities,
+    vk: &infr_core::config::VulkanCfg,
     dt: infr_core::DType,
     verify: bool,
 ) -> bool {
     if verify {
-        mmv_int8_decode_dtypes(caps).contains(&dt)
+        mmv_int8_decode_dtypes(caps, vk).contains(&dt)
     } else {
         mrow_int8_prefill_dtypes(dt)
     }
@@ -715,11 +728,12 @@ fn unified_mmv_row1(caps: &infr_core::backend::Capabilities) -> bool {
 
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
+    vk: &infr_core::config::VulkanCfg,
     dt: infr_core::DType,
     in_f: usize,
     out_f: usize,
 ) -> Option<u32> {
-    if !caps.i8_dot || !mmv_int8_decode_dtypes(caps).contains(&dt) {
+    if !caps.i8_dot || !mmv_int8_decode_dtypes(caps, vk).contains(&dt) {
         return None;
     }
     // Skip tiny GEMVs where per-dispatch overhead dominates (k/v projections); the projection band
@@ -737,9 +751,9 @@ fn mmv_mw_choice(
     } else {
         1u32
     };
-    let warps = std::env::var("INFR_MMV_MW_WARPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    let warps = vk
+        .mmv_mw_warps
+        .and_then(|w| u32::try_from(w).ok())
         .unwrap_or(default_warps);
     // SPIR-V existence gate — per ROUTE, not one-size-fits-all: AMD dispatches
     // `linear_mmv_mrow(rows=1)` (see [`unified_mmv_row1`]) and never touches `native_mmv_mw.comp`,
@@ -959,7 +973,7 @@ fn native_warp_gemm(
     let use_ag = out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
         && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
-        && std::env::var("INFR_NO_GEMM_WARP").is_err();
+        && be_.cfg().kernels.vulkan.gemm_warp;
     let a16 = if use_ag {
         let mpad = m.div_ceil(64) * 64;
         let key = pooled(pool, be_, "lin_a16", mpad * in_f * 2)?;
@@ -1190,7 +1204,12 @@ fn lower_op(
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
                     // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
                     // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
-                    if crate::recorder::bda_weight_breaches(dt, in_f, out_f) {
+                    if crate::recorder::bda_weight_breaches(
+                        dt,
+                        in_f,
+                        out_f,
+                        &be_.cfg().kernels.vulkan,
+                    ) {
                         return Err(be(format!(
                             "vulkan adapter: streamed output-projection GEMM (m={m}, in_f={in_f}, \
                              out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked \
@@ -1231,7 +1250,9 @@ fn lower_op(
                 if native_dense_supported(dt) {
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
-                    if let Some(warps) = mmv_mw_choice(be_.caps(), dt, in_f, out_f) {
+                    if let Some(warps) =
+                        mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
+                    {
                         let nblk = in_f / 32;
                         let qa = pooled(pool, be_, "mmv_qa", in_f)?;
                         let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
@@ -1277,7 +1298,7 @@ fn lower_op(
                                 out_f,
                             );
                         }
-                    } else if mmv_decode_enabled()
+                    } else if mmv_decode_enabled(&be_.cfg().kernels.vulkan)
                         && be_.caps().i8_dot
                         && in_f % 32 == 0
                         && in_f * out_f >= MMV_MIN_ELEMS
@@ -1339,8 +1360,8 @@ fn lower_op(
                 && in_f * out_f >= 8 << 20
                 && out_f < 65536
                 && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
-                && mrow_int8_dtype_ok(be_.caps(), dt, graph.mtp_verify)
-                && std::env::var("INFR_NO_MMV").is_err();
+                && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
+                && be_.cfg().kernels.vulkan.mmv;
             // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
             // once its rollback window carries a few committed rows on top of the n_max drafts.
             // These shapes previously fell through to the split-K coopmat tile, which streams the
@@ -1355,11 +1376,11 @@ fn lower_op(
             let mrow16 = in_band(MROW16_BAND)
                 && mmv_gate
                 && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
-                && std::env::var("INFR_NO_MROW16").is_err();
+                && be_.cfg().kernels.vulkan.mrow16;
             if (in_band(MROW_BAND) || mrow16)
                 && in_f % 32 == 0
                 && crate::gemm::native_mrow_kernel_name(dt).is_some()
-                && std::env::var("INFR_NO_MROW").is_err()
+                && be_.cfg().kernels.vulkan.mrow
             {
                 // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
                 // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
@@ -1468,9 +1489,8 @@ fn lower_op(
             // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
             // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
-            let nc_tier = gemm_ok
-                && !be_.caps().f16_coopmat()
-                && std::env::var("INFR_NO_MMQ_FALLBACK").is_err();
+            let nc_tier =
+                gemm_ok && !be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.mmq_fallback;
             let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
             let nc_fma =
                 nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
@@ -1480,7 +1500,7 @@ fn lower_op(
             // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
             // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
             if (is_gemm || nc_mmq || nc_fma)
-                && crate::recorder::bda_weight_breaches(dt, in_f, out_f)
+                && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
             {
                 return Err(be(format!(
                     "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, \
@@ -1502,7 +1522,7 @@ fn lower_op(
                     // INFR_NO_MMQ also skips mmq for A/B.
                     let warp_ok = out_f % 128 == 0
                         && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
-                        && std::env::var("INFR_NO_GEMM_WARP").is_err();
+                        && be_.cfg().kernels.vulkan.gemm_warp;
                     // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
                     // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
                     // hardware detection only (see its doc); this dispatch ALSO requires
@@ -1534,10 +1554,10 @@ fn lower_op(
                     let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                         && be_.caps().f8_coopmat()
                         && (f8_wide || f8_narrow)
-                        && std::env::var("INFR_F8_COOPMAT").is_ok();
+                        && be_.cfg().kernels.vulkan.f8_coopmat;
                     let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                         && be_.caps().i8_coopmat()
-                        && std::env::var("INFR_I8_COOPMAT").is_ok();
+                        && be_.cfg().kernels.vulkan.i8_coopmat;
                     // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
                     // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
                     // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
@@ -1557,7 +1577,7 @@ fn lower_op(
                     let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
                         && be_.caps().bf16_coopmat()
                         && (bf16cm_wide || bf16cm_narrow)
-                        && std::env::var("INFR_BF16_COOPMAT").is_ok();
+                        && be_.cfg().kernels.vulkan.bf16_coopmat;
                     if cm8_ok {
                         // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
                         // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
@@ -1586,7 +1606,7 @@ fn lower_op(
                         // redo it per Linear; this is a per-op profiling isolation path, not the
                         // proposed production shape. Unset (default): unchanged dqblk path below,
                         // byte-identical to before this branch existed.
-                        if std::env::var("INFR_F8_PREPACK").is_ok() {
+                        if be_.cfg().kernels.vulkan.f8_prepack {
                             let f8_w8 = pooled(pool, be_, "f8_w8", out_f * in_f)?;
                             rec.repack_q8_to_f8(w, w_off, pool[&f8_w8].as_ref(), out_f, in_f);
                             rec.matmul_f8cm_q8_0_prepacked(
@@ -1617,7 +1637,7 @@ fn lower_op(
                         // quant_q8_row.comp. Separate pool tag (different buffer size/layout) and a
                         // separate kernel pair, so this can be measured and reverted independently of
                         // the i8cm baseline path above.
-                        if std::env::var("INFR_I8_ROW_SCALE").is_ok() {
+                        if be_.cfg().kernels.vulkan.i8_row_scale {
                             let qa = pooled(pool, be_, "i8cm_qa_row", m * in_f)?;
                             let dact_row = pooled(pool, be_, "i8cm_dact_row", m * 2)?;
                             rec.quant_q8_row(
@@ -1666,7 +1686,7 @@ fn lower_op(
                     } else if matches!(dt, infr_core::DType::Q4K)
                         && !warp_ok
                         && be_.caps().i8_dot
-                        && std::env::var("INFR_NO_MMQ").is_err()
+                        && be_.cfg().kernels.vulkan.mmq
                     {
                         // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
                         // Scratch is pooled — every same-shape Linear in the graph reuses one set.
@@ -1724,7 +1744,7 @@ fn lower_op(
                         if matches!(dt, infr_core::DType::F16)
                             && splits > 1
                             && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
-                            && std::env::var("INFR_NO_GEMM_WARP").is_err()
+                            && be_.cfg().kernels.vulkan.gemm_warp
                         {
                             let mpad = m.div_ceil(64) * 64;
                             let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
@@ -1797,8 +1817,14 @@ fn lower_op(
                 // route — route a breaching weight to the chunked path rather than wrap its u32
                 // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
                 // only for a 256k-vocab model's single vocab GEMV.
-                let mw = if m == 1 && !crate::recorder::bda_weight_breaches(dt, in_f, out_f) {
-                    mmv_mw_choice(be_.caps(), dt, in_f, out_f)
+                let mw = if m == 1
+                    && !crate::recorder::bda_weight_breaches(
+                        dt,
+                        in_f,
+                        out_f,
+                        &be_.cfg().kernels.vulkan,
+                    ) {
+                    mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
                 } else {
                     None
                 };
@@ -1847,7 +1873,7 @@ fn lower_op(
                         );
                     }
                 } else if m == 1
-                    && mmv_decode_enabled()
+                    && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
                     && be_.caps().i8_dot
                     && in_f % 32 == 0
                     && in_f * out_f >= MMV_MIN_ELEMS
@@ -1857,7 +1883,7 @@ fn lower_op(
                     // breaching weight to the chunked path rather than wrap its u32 index (issue
                     // #77). Only lm_head/embed can breach, and the perf tier they skip here matters
                     // only for a 256k-vocab model's single vocab GEMV.
-                    && !crate::recorder::bda_weight_breaches(dt, in_f, out_f)
+                    && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
                 {
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmv_qa", in_f)?;
@@ -2745,7 +2771,7 @@ fn lower_op(
                     // coalesced vec4 decoder (scale-once, b128 nibble reads), not per-element dq().
                     // Kept behind INFR_KV_INLINE=1 for that follow-up + A/B; the shader arm, builds,
                     // recorder plumbing and bit-identity are all in place and gate-clean.
-                    && std::env::var("INFR_KV_INLINE").is_ok();
+                    && be_.cfg().kv.inline_decode;
                 // Lever 2 (INFR_FLASH_DEQUANT, kv-decode-perf-levers): dequant-in-flash. When the
                 // coopmat flash-prefill geometry holds AND the KV cache is a supported quant format
                 // (K==V ∈ {Q4_0,Q4_1,Q5_0,Q5_1,Q8_0}), SKIP the dequant_kv_f16 prepass and let
@@ -2755,10 +2781,7 @@ fn lower_op(
                 // below, flash_ok reduces to `flash_geom`, so the flash arm is guaranteed taken.
                 // Read ONCE and share: `flash_geom` (below) and `nc_fa_ok` (further down) both floor
                 // on this row count and MUST agree — two reads risked a divergence trap.
-                let flash_min_rows: usize = std::env::var("INFR_FLASH_MIN_ROWS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(24);
+                let flash_min_rows: usize = be_.cfg().kernels.vulkan.flash_min_rows;
                 let flash_geom = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
                     // The flash kernels read K/V in BN=64 column tiles, so the last tile over-reads up
@@ -2787,7 +2810,7 @@ fn lower_op(
                             | infr_core::DType::Q5_0
                             | infr_core::DType::Q5_1
                     )
-                    && std::env::var("INFR_FLASH_DEQUANT").is_ok()
+                    && be_.cfg().kernels.vulkan.flash_dequant
                 {
                     Some(kdt)
                 } else {
@@ -2871,7 +2894,7 @@ fn lower_op(
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
                 let flash_stage = if let Some(dt) = flash_deq_fmt {
                     crate::recorder::FlashStage::Dequant(dt)
-                } else if flash_geom && std::env::var("INFR_FLASH_STAGE").is_ok() {
+                } else if flash_geom && be_.cfg().kernels.vulkan.flash_stage {
                     crate::recorder::FlashStage::Stage
                 } else {
                     crate::recorder::FlashStage::Off
@@ -2882,7 +2905,7 @@ fn lower_op(
                 // gate it there. On RADV/RDNA3 this REGRESSES prefill (~0.8x, no saddr from a
                 // buffer_reference coopmat base), so it stays off by default; kept for other silicon.
                 let kv_coopmat_bda = matches!(flash_stage, crate::recorder::FlashStage::Off)
-                    && std::env::var("INFR_KV_COOPMAT_BDA").is_ok();
+                    && be_.cfg().kv.coopmat_bda;
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -2933,7 +2956,7 @@ fn lower_op(
                     && hd % 4 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
-                    && std::env::var("INFR_NO_NC_FA").is_err();
+                    && be_.cfg().kernels.vulkan.nc_fa;
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
                 // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
                 // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
@@ -2951,13 +2974,19 @@ fn lower_op(
                 // bandwidth saving pays. hd<=128 (one q vec4 per lane per row); q8 never reaches
                 // rows>1 (dequanted above). INFR_MROWS_ATTN=1 forces the batched tier on (tests /
                 // A/B), INFR_NO_MROWS_ATTN forces it off.
+                //
+                // The pair is ONE asymmetric tri-state field (`kernels.vulkan.mrows_attn`):
+                // `Some(false)` = the `NO_` key, which wins unconditionally; `Some(true)` = the
+                // opt-in, which bypasses the rows/kv_len heuristic; `None` = let the heuristic
+                // decide. Reproduces the old `is_err()`/`is_ok()` pair exactly.
+                let mrows_attn = be_.cfg().kernels.vulkan.mrows_attn;
                 let batched_attn = rows >= 2
                     && hd <= 128
                     && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
                     && canvas_lo.is_none()
                     && !(k_q8_eff || v_q8_eff)
-                    && std::env::var("INFR_NO_MROWS_ATTN").is_err()
-                    && ((rows >= 12 && kv_len >= 8192) || std::env::var("INFR_MROWS_ATTN").is_ok());
+                    && mrows_attn != Some(false)
+                    && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true));
                 // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
                 // grid keeps the adaptive ~32-chunks policy.
                 //
@@ -3425,7 +3454,7 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
-            let chunked = rows_ >= 2 && std::env::var("INFR_NO_DN_CHUNK").is_err();
+            let chunked = rows_ >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
             // DEFAULT prefill path: the token-serial scan with the state column register-resident
             // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
             // state sweeps instead of `rows`, but counted out it does NOT save arithmetic (~420M vs
@@ -3446,8 +3475,8 @@ fn lower_op(
             if chunked
                 && kd_ == 128
                 && vd_.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
-                && std::env::var("INFR_DN_CHUNK_SCAN").is_err()
-                && std::env::var("INFR_NO_DN_SPLIT").is_err()
+                && be_.cfg().kernels.vulkan.dn_chunk_scan
+                && be_.cfg().kernels.vulkan.dn_split
             {
                 // alloc_uninit: every slot the scan reads is written by norm/gates first.
                 let kn =
@@ -3486,7 +3515,7 @@ fn lower_op(
             // (still fast, just not split-prep) `deltanet_chunked` kernel below instead of the
             // sequential one — chunked math doesn't require coopmat, only this particular prep
             // kernel's implementation does.
-            if chunked && be_.caps().f16_coopmat() && std::env::var("INFR_NO_DN_SPLIT").is_err() {
+            if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
                 let kn =
@@ -3528,7 +3557,7 @@ fn lower_op(
             } else {
                 // Strided DeltaNet (env-gated): when q==k==v (all same source buffer), derive
                 // stride from dimensions: 2*nk*kd + nv*vd.
-                let strided = *q == *k && *k == *v && std::env::var("INFR_DELTA_STRIDED").is_ok();
+                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
                 if strided {
                     let stride = 2 * nk_ * kd_ + nv_ * vd_;
                     rec.deltanet_strided(
@@ -4114,7 +4143,7 @@ fn lower_op(
             // qwen3moe's 48 MoE layers that was ~340 fence-waited submits of pure host stall
             // (decode never sees this — record-once replay allocs the pool once).
             // `INFR_NO_MOE_SM_POOL=1` restores the per-layer zeroed allocs (A/B correctness oracle).
-            let no_pool = std::env::var_os("INFR_NO_MOE_SM_POOL").is_some();
+            let no_pool = be_.cfg().kernels.vulkan.no_moe_sm_pool;
             let n_slots = rows * n_used;
             let logits = sm_buf(pool, be_, no_pool, "moe_sm_logits", rows * n_expert)?;
             let ids = sm_buf(pool, be_, no_pool, "moe_sm_ids", n_slots)?;
@@ -4472,7 +4501,7 @@ fn record_decode_replay(
     // increment FIRST — every replay self-advances and the host never writes pos/params again
     // (no dyn kernel reads the `positions` buffer; they all read params). INFR_NO_GPU_POS=1
     // keeps the per-replay host read_pos0 + params upload instead (A/B).
-    let self_advancing = std::env::var("INFR_NO_GPU_POS").is_err();
+    let self_advancing = be_.cfg().kernels.vulkan.gpu_pos;
     if self_advancing {
         let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
         let mut pbytes = [0u8; 8];
@@ -4992,11 +5021,11 @@ fn streamed_gemm_applies(
         && in_f.is_multiple_of(32)
         && be_.caps().f16_coopmat()
         && native_dense_supported(dt)
-        && std::env::var("INFR_NO_GEMM_WARP").is_err()
+        && be_.cfg().kernels.vulkan.gemm_warp
         && !(matches!(dt, infr_core::DType::Q4K)
             && !out_f.is_multiple_of(128)
             && be_.caps().i8_dot
-            && std::env::var("INFR_NO_MMQ").is_err())
+            && be_.cfg().kernels.vulkan.mmq)
 }
 
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
@@ -5997,53 +6026,54 @@ mod tests {
             vendor_intel: true,
             ..Default::default()
         };
-        // (env value for INFR_MMV_MW, label) — None = unset (the shipping default).
-        // ONE guard for the whole sweep: it serializes this test against anything else in the
-        // binary that reads INFR_MMV_MW, and restores the caller's value when the test ends.
-        let mut guard = infr_core::test_env::EnvGuard::new();
-        for env in [None, Some("1"), Some("0")] {
+        // `kernels.vulkan.mmv_mw`, the tri-state (§10.3): `None` = unset (the shipping default),
+        // `Some(true)` = `INFR_MMV_MW=1` (any non-"0" value), `Some(false)` = `INFR_MMV_MW=0`.
+        // A VALUE per sweep step since S5b — no process env, no guard, no serialization needed.
+        let vkcfg = |mmv_mw: Option<bool>| infr_core::config::VulkanCfg {
+            mmv_mw,
+            ..Default::default()
+        };
+        for mmv_mw in [None, Some(true), Some(false)] {
+            let vk = vkcfg(mmv_mw);
             for (caps, vendor) in [(&amd, "amd"), (&intel, "intel")] {
-                match env {
-                    Some(v) => guard.set("INFR_MMV_MW", v),
-                    None => guard.unset("INFR_MMV_MW"),
-                };
                 for dt in POLICY_DTYPES {
-                    let decode_int8 = mmv_int8_decode_dtypes(caps).contains(&dt);
-                    let verify_int8 = mrow_int8_dtype_ok(caps, dt, true);
+                    let decode_int8 = mmv_int8_decode_dtypes(caps, &vk).contains(&dt);
+                    let verify_int8 = mrow_int8_dtype_ok(caps, &vk, dt, true);
                     assert_eq!(
                         decode_int8, verify_int8,
-                        "{vendor} INFR_MMV_MW={env:?} {dt:?}: decode int8={decode_int8} but \
+                        "{vendor} mmv_mw={mmv_mw:?} {dt:?}: decode int8={decode_int8} but \
                          MTP-verify int8={verify_int8} — ASYMMETRIC (the Q5_K bug class)"
                     );
                     // Ordinary prefill is NEVER more conservative than MTP-verify (the decode set
                     // is always a subset of the prefill set) — prefill has no partner to protect,
                     // so it can only be equal or more permissive.
-                    let prefill_int8 = mrow_int8_dtype_ok(caps, dt, false);
+                    let prefill_int8 = mrow_int8_dtype_ok(caps, &vk, dt, false);
                     assert!(
                         prefill_int8 || !verify_int8,
-                        "{vendor} INFR_MMV_MW={env:?} {dt:?}: verify int8={verify_int8} but \
+                        "{vendor} mmv_mw={mmv_mw:?} {dt:?}: verify int8={verify_int8} but \
                          prefill int8={prefill_int8} — prefill is stricter than verify, backwards"
                     );
                 }
             }
         }
-        guard.unset("INFR_MMV_MW");
+        // The rest of the assertions are on the SHIPPING default (`mmv_mw: None`).
+        let vk = vkcfg(None);
         // The shipping AMD default, spelled out so a policy edit has to face it: Q2_K int8 in BOTH
         // decode and verify (the measured +20% win), Q3_K f32-exact in both. Q3_K's DECODE stays
         // off despite the accuracy isolation (see `mrow_int8_prefill_dtypes`'s doc) finding the
         // cliff was decode-side, not prefill-side — decode was never proven safe, just not (yet)
         // re-attempted, so it stays conservatively off pending its own measurement.
-        assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q2K));
-        assert!(mrow_int8_dtype_ok(&amd, DType::Q2K, true));
-        assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q3K));
-        assert!(!mrow_int8_dtype_ok(&amd, DType::Q3K, true));
+        assert!(mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q2K));
+        assert!(mrow_int8_dtype_ok(&amd, &vk, DType::Q2K, true));
+        assert!(!mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q3K));
+        assert!(!mrow_int8_dtype_ok(&amd, &vk, DType::Q3K, true));
         // Q4_K is ON the AMD decode default: the throughput win (README footnote 3) is real AND,
         // since decode dispatches the unified `linear_mmv_mrow(rows=1)` kernel (see
         // `unified_mmv_row1`) instead of the legacy `native_mmv_mw.comp`, it is bit-identical to
         // the m>=3 mrow verify tier at the same position — `mtp_spec_matches_target_only_greedy`
         // holds. `mmv_row1_bit_identical` (tests/mmv_row1_bit_identical.rs) is the numeric guard.
-        assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q4K));
-        assert!(mrow_int8_dtype_ok(&amd, DType::Q4K, true));
+        assert!(mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q4K));
+        assert!(mrow_int8_dtype_ok(&amd, &vk, DType::Q4K, true));
         assert!(
             unified_mmv_row1(&amd),
             "AMD must take the unified rows=1 path for Q4_K safety"
@@ -6051,26 +6081,29 @@ mod tests {
         // Q5_K: decode measured a small LOSS on AMD (66.8 int8 vs 67.8 f32, -1.4%; see
         // mmv_int8_decode_dtypes's doc) and is unmeasured on Intel — OFF the decode/verify default
         // on every vendor. Its ordinary-prefill win (+45%) IS banked below regardless.
-        assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q5K));
-        assert!(!mrow_int8_dtype_ok(&amd, DType::Q5K, true));
-        assert!(!mmv_int8_decode_dtypes(&intel).contains(&DType::Q5K));
-        assert!(!mrow_int8_dtype_ok(&intel, DType::Q5K, true));
+        assert!(!mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q5K));
+        assert!(!mrow_int8_dtype_ok(&amd, &vk, DType::Q5K, true));
+        assert!(!mmv_int8_decode_dtypes(&intel, &vk).contains(&DType::Q5K));
+        assert!(!mrow_int8_dtype_ok(&intel, &vk, DType::Q5K, true));
         // Q6_K: decode-ON on the AMD default since the word-parallel `wdec` rewrite (see
         // `mmv_int8_decode_dtypes`). IQ4_XS still has no int8 decode arm on ANY vendor, so its
         // MTP-verify batch correctly lands on the f32-exact path (matching its decode) — the
         // pre-split wart (README's former "Known wart") stays closed.
-        assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q6K));
-        assert!(!mrow_int8_dtype_ok(&amd, DType::Iq4Xs, true));
+        assert!(mmv_int8_decode_dtypes(&amd, &vk).contains(&DType::Q6K));
+        assert!(!mrow_int8_dtype_ok(&amd, &vk, DType::Iq4Xs, true));
         // The legacy 32-block set's decode default is a MEASURED split (see
         // `mmv_int8_decode_dtypes`): Q4_0/Q5_0/Q5_1/IQ4_NL win at m=1 and are ON; Q8_0 LOSES
         // (−4.2%) and Q4_1 washes, so both are decode-OFF and prefill-ONLY. Spelled out so a
         // "finish the set" edit has to face the numbers.
         for dt in [DType::Q4_0, DType::Q5_0, DType::Q5_1, DType::Iq4Nl] {
-            assert!(mmv_int8_decode_dtypes(&amd).contains(&dt), "{dt:?} decode");
+            assert!(
+                mmv_int8_decode_dtypes(&amd, &vk).contains(&dt),
+                "{dt:?} decode"
+            );
         }
         for dt in [DType::Q8_0, DType::Q4_1] {
             assert!(
-                !mmv_int8_decode_dtypes(&amd).contains(&dt),
+                !mmv_int8_decode_dtypes(&amd, &vk).contains(&dt),
                 "{dt:?}: decode measured a loss/wash — prefill-only, do not flip without a number"
             );
             assert!(mrow_int8_prefill_dtypes(dt), "{dt:?} prefill win must stay");
@@ -6079,7 +6112,7 @@ mod tests {
         // policy above — this is the actual point of the split: prefill has no partner to protect.
         for dt in POLICY_DTYPES {
             assert!(
-                mrow_int8_dtype_ok(&amd, dt, false),
+                mrow_int8_dtype_ok(&amd, &vk, dt, false),
                 "{dt:?} ordinary-prefill mrow must stay on"
             );
         }

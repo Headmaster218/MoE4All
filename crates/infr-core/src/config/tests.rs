@@ -875,9 +875,96 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_VRAM_LOG",
     ];
 
+    /// S5b — `infr-vulkan`'s PER-OP / PER-DISPATCH tier: everything `recorder.rs`, `adapter.rs` and
+    /// `gemm.rs` used to re-read inside a lowering or dispatch path. `Recorder` borrows
+    /// `&VulkanCfg` off the backend that created it (R6), and the two MEMOIZED families are hoisted
+    /// rather than de-memoized into per-call `getenv`s (§10.6): the eleven `kernels.vulkan.gemv.*`
+    /// keys (was `OnceLock<GemvKnobs>`) come off the borrowed config, and
+    /// `kernels.vulkan.bda_chunk_{elems,bytes}` (was two `AtomicU64` cells) become two `Recorder`
+    /// fields resolved at construction.
+    ///
+    /// This also closes the three §6.12 two-crate knobs (`delta_strided`, `no_replay`, `gpu_pos` —
+    /// the `infr-llama` halves moved in S4) and `prof.prof`, which S4 had to leave behind.
+    ///
+    /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — `infr-rocm`'s pager still
+    /// reads the environment until S6; `prof.profile_out` (`infr-prof-rt`) and `debug.chat`
+    /// (`infr-chat`) are S7.
+    const S5B: &[&str] = &[
+        "INFR_BDA_CHUNK_BYTES",
+        "INFR_BDA_CHUNK_ELEMS",
+        "INFR_BF16_COOPMAT",
+        "INFR_DEBUG_BDA_CHUNK",
+        "INFR_DEBUG_WIDE_DISPATCH",
+        "INFR_DELTA_STRIDED",
+        "INFR_DN_CHUNK_SCAN",
+        "INFR_F8_COOPMAT",
+        "INFR_F8_PREPACK",
+        "INFR_FLASH_BM",
+        "INFR_FLASH_DEQUANT",
+        "INFR_FLASH_MIN_ROWS",
+        "INFR_FLASH_SPLITS",
+        "INFR_FLASH_STAGE",
+        "INFR_FULLBARRIER",
+        "INFR_GEMM_WIDE_TILE",
+        "INFR_GEMV_RM",
+        "INFR_GEMV_RM_MAXOUT",
+        "INFR_GEMV_RM_MINOUT",
+        "INFR_GEMV_SG_MAXOUT",
+        "INFR_GEMV_SG_MINOUT",
+        "INFR_GEMV_SG_NR",
+        "INFR_GEMV_VARIANT",
+        "INFR_I8_COOPMAT",
+        "INFR_I8_ROW_SCALE",
+        "INFR_KV_COOPMAT_BDA",
+        "INFR_KV_INLINE",
+        "INFR_MMV_DECODE",
+        "INFR_MMV_MW",
+        "INFR_MMV_MW_WARPS",
+        "INFR_MROWS_ATTN",
+        "INFR_NOBARRIER",
+        "INFR_NO_ATTN_HD",
+        "INFR_NO_BM16",
+        "INFR_NO_DN_CHUNK",
+        "INFR_NO_DN_SPLIT",
+        "INFR_NO_F32_MROW",
+        "INFR_NO_F32_V4",
+        "INFR_NO_FLASH_WARP",
+        "INFR_NO_GEMM_WARP",
+        "INFR_NO_GEMV_ID_SG",
+        "INFR_NO_GEMV_REG",
+        "INFR_NO_GEMV_RM",
+        "INFR_NO_GEMV_SG",
+        "INFR_NO_GPU_POS",
+        "INFR_NO_MMQ",
+        "INFR_NO_MMQ_FALLBACK",
+        "INFR_NO_MMV",
+        "INFR_NO_MMV_M4",
+        "INFR_NO_MMV_O4",
+        "INFR_NO_MOE_SM_POOL",
+        "INFR_NO_MROW",
+        "INFR_NO_MROW16",
+        "INFR_NO_MROWS_ATTN",
+        "INFR_NO_NC_FA",
+        "INFR_NO_PV_WARP",
+        "INFR_NO_QK_WARP",
+        "INFR_NO_SMALL_BM",
+        "INFR_PROF",
+        "INFR_PROF2",
+        "INFR_PROF2_SHAPES",
+        "INFR_PV_SPLITS",
+        "INFR_SEAM_NO_REPLAY",
+    ];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
-    let mut want: Vec<&str> = S2.iter().chain(S3).chain(S4).chain(S5A).copied().collect();
+    let mut want: Vec<&str> = S2
+        .iter()
+        .chain(S3)
+        .chain(S4)
+        .chain(S5A)
+        .chain(S5B)
+        .copied()
+        .collect();
     want.sort_unstable();
     assert_eq!(
         got, want,

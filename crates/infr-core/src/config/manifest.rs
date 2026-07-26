@@ -145,8 +145,8 @@ knobs! {
     "INFR_KV_Q8"                => "kv.force_q8",            Presence,    Ignored, "1",    migrated;
     "INFR_KV_SLOTS"             => "kv.slots",               Int,         Ignored, "8",    migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
-    "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    pending;
-    "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    pending;
+    "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
+    "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
@@ -170,78 +170,78 @@ knobs! {
     // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
     "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", migrated;
     "INFR_CM_8X8"       => "kernels.vulkan.coopmat_8x8",  Presence,    Ignored, "1", migrated;
-    "INFR_BF16_COOPMAT" => "kernels.vulkan.bf16_coopmat", Presence,    Ignored, "1", pending;
-    "INFR_F8_COOPMAT"   => "kernels.vulkan.f8_coopmat",   Presence,    Ignored, "1", pending;
-    "INFR_F8_PREPACK"   => "kernels.vulkan.f8_prepack",   Presence,    Ignored, "1", pending;
-    "INFR_I8_COOPMAT"   => "kernels.vulkan.i8_coopmat",   Presence,    Ignored, "1", pending;
-    "INFR_I8_ROW_SCALE" => "kernels.vulkan.i8_row_scale", Presence,    Ignored, "1", pending;
+    "INFR_BF16_COOPMAT" => "kernels.vulkan.bf16_coopmat", Presence,    Ignored, "1", migrated;
+    "INFR_F8_COOPMAT"   => "kernels.vulkan.f8_coopmat",   Presence,    Ignored, "1", migrated;
+    "INFR_F8_PREPACK"   => "kernels.vulkan.f8_prepack",   Presence,    Ignored, "1", migrated;
+    "INFR_I8_COOPMAT"   => "kernels.vulkan.i8_coopmat",   Presence,    Ignored, "1", migrated;
+    "INFR_I8_ROW_SCALE" => "kernels.vulkan.i8_row_scale", Presence,    Ignored, "1", migrated;
     "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
 
     // ── kernels.vulkan — GEMM / GEMV tiers (§6.5) ────────────────────────────
-    "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  pending;
-    "INFR_GEMM_WIDE_TILE"   => "kernels.vulkan.gemm_wide_tile", Presence,    Ignored, "1",  pending;
-    "INFR_NO_SMALL_BM"      => "kernels.vulkan.small_bm",       PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_BM16"          => "kernels.vulkan.bm16",           PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  pending;
-    "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  pending;
-    "INFR_NO_MMV_M4"        => "kernels.vulkan.mmv_m4",         PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_MMV_O4"        => "kernels.vulkan.mmv_o4",         PresenceInv, Ignored, "1",  pending;
-    "INFR_MMV_MW"           => "kernels.vulkan.mmv_mw",         TriState,    Ignored, "0",  pending;
-    "INFR_MMV_MW_WARPS"     => "kernels.vulkan.mmv_mw_warps",   Int,         Ignored, "4",  pending;
-    "INFR_NO_MROW"          => "kernels.vulkan.mrow",           PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_MROW16"        => "kernels.vulkan.mrow16",         PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_F32_MROW"      => "kernels.vulkan.f32_mrow",       PresenceInv, Ignored, "1",  pending;
-    "INFR_NO_F32_V4"        => "kernels.vulkan.f32_v4",         PresenceInv, Ignored, "1",  pending;
+    "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  migrated;
+    "INFR_GEMM_WIDE_TILE"   => "kernels.vulkan.gemm_wide_tile", Presence,    Ignored, "1",  migrated;
+    "INFR_NO_SMALL_BM"      => "kernels.vulkan.small_bm",       PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_BM16"          => "kernels.vulkan.bm16",           PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
+    "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
+    "INFR_NO_MMV_M4"        => "kernels.vulkan.mmv_m4",         PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_MMV_O4"        => "kernels.vulkan.mmv_o4",         PresenceInv, Ignored, "1",  migrated;
+    "INFR_MMV_MW"           => "kernels.vulkan.mmv_mw",         TriState,    Ignored, "0",  migrated;
+    "INFR_MMV_MW_WARPS"     => "kernels.vulkan.mmv_mw_warps",   Int,         Ignored, "4",  migrated;
+    "INFR_NO_MROW"          => "kernels.vulkan.mrow",           PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_MROW16"        => "kernels.vulkan.mrow16",         PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_F32_MROW"      => "kernels.vulkan.f32_mrow",       PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_F32_V4"        => "kernels.vulkan.f32_v4",         PresenceInv, Ignored, "1",  migrated;
     "INFR_MOE_SMALL_M"      => "kernels.vulkan.moe_small_m",    Int,         Ignored, "16", migrated;
     "INFR_CANVAS_CHUNK_N"   => "kernels.vulkan.canvas_chunk_n", Int,         Ignored, "5",  migrated;
 
     // ── kernels.vulkan — attention (§6.5) ────────────────────────────────────
-    "INFR_FLASH_SPLITS"   => "kernels.vulkan.flash_splits",     Int,              Ignored, "2",  pending;
-    "INFR_FLASH_BM"       => "kernels.vulkan.flash_bm32",       Literal,          Ignored, "32", pending;
-    "INFR_FLASH_MIN_ROWS" => "kernels.vulkan.flash_min_rows",   Int,              Ignored, "8",  pending;
-    "INFR_FLASH_STAGE"    => "kernels.vulkan.flash_stage",      Presence,         Ignored, "1",  pending;
-    "INFR_FLASH_DEQUANT"  => "kernels.vulkan.flash_dequant",    Presence,         Ignored, "1",  pending;
-    "INFR_NO_FLASH_WARP"  => "kernels.vulkan.flash_warp",       PresenceInv,      Ignored, "1",  pending;
-    "INFR_NO_NC_FA"       => "kernels.vulkan.nc_fa",            PresenceInv,      Ignored, "1",  pending;
-    "INFR_NO_QK_WARP"     => "kernels.vulkan.qk_warp",          PresenceInv,      Ignored, "1",  pending;
-    "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  pending;
-    "INFR_PV_SPLITS"      => "kernels.vulkan.pv_splits",        Int,              Ignored, "2",  pending;
-    "INFR_NO_ATTN_HD"     => "kernels.vulkan.no_attn_hd_spec",  Presence,         Ignored, "1",  pending;
-    "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  pending;
-    "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  pending;
+    "INFR_FLASH_SPLITS"   => "kernels.vulkan.flash_splits",     Int,              Ignored, "2",  migrated;
+    "INFR_FLASH_BM"       => "kernels.vulkan.flash_bm32",       Literal,          Ignored, "32", migrated;
+    "INFR_FLASH_MIN_ROWS" => "kernels.vulkan.flash_min_rows",   Int,              Ignored, "8",  migrated;
+    "INFR_FLASH_STAGE"    => "kernels.vulkan.flash_stage",      Presence,         Ignored, "1",  migrated;
+    "INFR_FLASH_DEQUANT"  => "kernels.vulkan.flash_dequant",    Presence,         Ignored, "1",  migrated;
+    "INFR_NO_FLASH_WARP"  => "kernels.vulkan.flash_warp",       PresenceInv,      Ignored, "1",  migrated;
+    "INFR_NO_NC_FA"       => "kernels.vulkan.nc_fa",            PresenceInv,      Ignored, "1",  migrated;
+    "INFR_NO_QK_WARP"     => "kernels.vulkan.qk_warp",          PresenceInv,      Ignored, "1",  migrated;
+    "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  migrated;
+    "INFR_PV_SPLITS"      => "kernels.vulkan.pv_splits",        Int,              Ignored, "2",  migrated;
+    "INFR_NO_ATTN_HD"     => "kernels.vulkan.no_attn_hd_spec",  Presence,         Ignored, "1",  migrated;
+    "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  migrated;
+    "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;
 
     // ── kernels.vulkan — DeltaNet + misc (§6.5) ──────────────────────────────
-    "INFR_DN_CHUNK_SCAN"      => "kernels.vulkan.dn_chunk_scan",      PresenceInv, Ignored, "1", pending;
-    "INFR_NO_DN_CHUNK"        => "kernels.vulkan.dn_chunk",           PresenceInv, Ignored, "1", pending;
-    "INFR_NO_DN_SPLIT"        => "kernels.vulkan.dn_split",           PresenceInv, Ignored, "1", pending;
-    "INFR_DELTA_STRIDED"      => "kernels.vulkan.delta_strided",      Presence,    Ignored, "1", pending;
+    "INFR_DN_CHUNK_SCAN"      => "kernels.vulkan.dn_chunk_scan",      PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_DN_CHUNK"        => "kernels.vulkan.dn_chunk",           PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_DN_SPLIT"        => "kernels.vulkan.dn_split",           PresenceInv, Ignored, "1", migrated;
+    "INFR_DELTA_STRIDED"      => "kernels.vulkan.delta_strided",      Presence,    Ignored, "1", migrated;
     "INFR_NO_PUSH_DESC"       => "kernels.vulkan.push_desc",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_PIPELINE_CACHE"  => "kernels.vulkan.pipeline_cache_disk", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_VRAM_GUARD"      => "kernels.vulkan.no_vram_guard",      Presence,    Ignored, "1", migrated;
-    "INFR_NO_MOE_SM_POOL"     => "kernels.vulkan.no_moe_sm_pool",     Presence,    Ignored, "1", pending;
-    "INFR_SEAM_NO_REPLAY"     => "kernels.vulkan.no_replay",          Presence,    Ignored, "1", pending;
-    "INFR_NO_GPU_POS"         => "kernels.vulkan.gpu_pos",            PresenceInv, Ignored, "1", pending;
+    "INFR_NO_MOE_SM_POOL"     => "kernels.vulkan.no_moe_sm_pool",     Presence,    Ignored, "1", migrated;
+    "INFR_SEAM_NO_REPLAY"     => "kernels.vulkan.no_replay",          Presence,    Ignored, "1", migrated;
+    "INFR_NO_GPU_POS"         => "kernels.vulkan.gpu_pos",            PresenceInv, Ignored, "1", migrated;
     "INFR_NO_FUSE_ADD"        => "kernels.vulkan.fuse_add",           PresenceInv, Ignored, "1", migrated;
 
     // ── kernels.vulkan — BDA chunk caps (§6.5c) ──────────────────────────────
-    "INFR_BDA_CHUNK_ELEMS" => "kernels.vulkan.bda_chunk_elems", Int, Ignored, "1024", pending;
-    "INFR_BDA_CHUNK_BYTES" => "kernels.vulkan.bda_chunk_bytes", Int, Ignored, "4096", pending;
+    "INFR_BDA_CHUNK_ELEMS" => "kernels.vulkan.bda_chunk_elems", Int, Ignored, "1024", migrated;
+    "INFR_BDA_CHUNK_BYTES" => "kernels.vulkan.bda_chunk_bytes", Int, Ignored, "4096", migrated;
 
     // ── kernels.vulkan.gemv (§6.5b) ──────────────────────────────────────────
-    "INFR_NO_GEMV_RM"     => "kernels.vulkan.gemv.no_rm",     Presence,       Ignored, "1",     pending;
-    "INFR_GEMV_RM"        => "kernels.vulkan.gemv.rm",        Int,            Ignored, "4",     pending;
-    "INFR_GEMV_RM_MAXOUT" => "kernels.vulkan.gemv.rm_maxout", Int,            Ignored, "16384", pending;
-    "INFR_GEMV_RM_MINOUT" => "kernels.vulkan.gemv.rm_minout", Int,            Ignored, "1024",  pending;
-    "INFR_NO_GEMV_SG"     => "kernels.vulkan.gemv.no_sg",     Presence,       Ignored, "1",     pending;
-    "INFR_NO_GEMV_ID_SG"  => "kernels.vulkan.gemv.no_id_sg",  Presence,       Ignored, "1",     pending;
-    "INFR_GEMV_SG_MINOUT" => "kernels.vulkan.gemv.sg_minout", Int,            Ignored, "1024",  pending;
-    "INFR_GEMV_SG_MAXOUT" => "kernels.vulkan.gemv.sg_maxout", Int,            Ignored, "4096",  pending;
-    "INFR_GEMV_SG_NR"     => "kernels.vulkan.gemv.sg_nr",     Int,            Ignored, "4",     pending;
-    "INFR_NO_GEMV_REG"    => "kernels.vulkan.gemv.variant",   PresenceClears, Ignored, "1",     pending;
-    "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    pending;
+    "INFR_NO_GEMV_RM"     => "kernels.vulkan.gemv.no_rm",     Presence,       Ignored, "1",     migrated;
+    "INFR_GEMV_RM"        => "kernels.vulkan.gemv.rm",        Int,            Ignored, "4",     migrated;
+    "INFR_GEMV_RM_MAXOUT" => "kernels.vulkan.gemv.rm_maxout", Int,            Ignored, "16384", migrated;
+    "INFR_GEMV_RM_MINOUT" => "kernels.vulkan.gemv.rm_minout", Int,            Ignored, "1024",  migrated;
+    "INFR_NO_GEMV_SG"     => "kernels.vulkan.gemv.no_sg",     Presence,       Ignored, "1",     migrated;
+    "INFR_NO_GEMV_ID_SG"  => "kernels.vulkan.gemv.no_id_sg",  Presence,       Ignored, "1",     migrated;
+    "INFR_GEMV_SG_MINOUT" => "kernels.vulkan.gemv.sg_minout", Int,            Ignored, "1024",  migrated;
+    "INFR_GEMV_SG_MAXOUT" => "kernels.vulkan.gemv.sg_maxout", Int,            Ignored, "4096",  migrated;
+    "INFR_GEMV_SG_NR"     => "kernels.vulkan.gemv.sg_nr",     Int,            Ignored, "4",     migrated;
+    "INFR_NO_GEMV_REG"    => "kernels.vulkan.gemv.variant",   PresenceClears, Ignored, "1",     migrated;
+    "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    migrated;
 
     // ── kernels.metal (§6.6) ─────────────────────────────────────────────────
     "INFR_METAL_NO_F16_NATIVE"    => "kernels.metal.f16_native",    PresenceInv, Ignored, "1", pending;
@@ -307,9 +307,9 @@ knobs! {
     "INFR_EP_HOST"         => "multi.ep_p2p",          PresenceInv, Ignored, "1",   migrated;
 
     // ── prof (§6.9) ──────────────────────────────────────────────────────────
-    "INFR_PROF"             => "prof.prof",             Presence, Ignored, "1",            pending;
-    "INFR_PROF2"            => "prof.prof2",            Presence, Ignored, "1",            pending;
-    "INFR_PROF2_SHAPES"     => "prof.prof2_shapes",     Presence, Ignored, "1",            pending;
+    "INFR_PROF"             => "prof.prof",             Presence, Ignored, "1",            migrated;
+    "INFR_PROF2"            => "prof.prof2",            Presence, Ignored, "1",            migrated;
+    "INFR_PROF2_SHAPES"     => "prof.prof2_shapes",     Presence, Ignored, "1",            migrated;
     "INFR_PROF_DEC"         => "prof.prof_dec",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            migrated;
@@ -322,15 +322,15 @@ knobs! {
     "INFR_METAL_PROF_DEBUG" => "prof.metal_prof_debug", Presence, Ignored, "1",            pending;
 
     // ── debug (§6.9) ─────────────────────────────────────────────────────────
-    "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", pending;
+    "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", migrated;
     "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", migrated;
-    "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", pending;
+    "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", migrated;
     "INFR_DEBUG_CHAT"          => "debug.chat",            Presence, Ignored, "1", pending;
     "INFR_MOE_COUNTS_DEBUG"    => "debug.moe_counts",      Presence, Ignored, "1", migrated;
     "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", migrated;
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;
-    "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", pending;
-    "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", pending;
+    "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", migrated;
+    "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", migrated;
 
     // ── serve (§6.9) ─────────────────────────────────────────────────────────
     "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", pending;

@@ -114,71 +114,6 @@ const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 /// so those hot recording paths never touch the heap; a `debug_assert` guards the bound.
 const MAX_DISPATCH_BINDINGS: usize = 16;
 
-/// The `INFR_GEMV_*` / `INFR_NO_GEMV_*` routing knobs, resolved ONCE from the environment (env is
-/// process-constant) into a single struct behind [`gemv_knobs`]'s `OnceLock`. The native GEMV
-/// dispatchers (`linear_native`, `linear_add_native_at`, `native_rm_choice`, `native_sg_choice`,
-/// `native_id_sg_choice`) previously re-read ~10 of these via `std::env::var` on EVERY recorded
-/// GEMV — each a process-mutex-guarded lookup — contradicting `Recorder`'s own "debug knobs, read
-/// once" note. Prefill records thousands of GEMVs/forward, so that was thousands×10 needless host
-/// lookups in exactly the many-op regime the recorder is built to keep cheap. The routing
-/// decisions are unchanged: every field mirrors the exact default and parse the old inline reads
-/// used, so kernel selection stays byte-identical.
-struct GemvKnobs {
-    // `native_rm_choice`
-    no_gemv_rm: bool,
-    gemv_rm_maxout: usize,
-    gemv_rm_minout: usize,
-    gemv_rm: u32,
-    // `native_sg_choice` / `native_id_sg_choice` (shared band knobs)
-    no_gemv_sg: bool,
-    no_gemv_id_sg: bool,
-    gemv_sg_minout: usize,
-    gemv_sg_maxout: usize,
-    gemv_sg_nr: u32,
-    // `linear_native` / `linear_add_native_at` RM-v2 variant selection
-    // (`INFR_NO_GEMV_REG` / `INFR_GEMV_VARIANT`).
-    gemv_variant: Option<String>,
-}
-
-impl GemvKnobs {
-    /// Pure resolver: given an env reader (`name -> value`), produce the cached knobs. Split out so
-    /// a unit test can drive it against synthetic env states and confirm each field equals what the
-    /// old per-call `std::env::var` reads would have returned. `get(name).is_some()` mirrors
-    /// `std::env::var(name).is_ok()` (variable present, even if empty); the `parse().ok()` +
-    /// `unwrap_or(default)` chains mirror the originals exactly.
-    fn resolve(get: impl Fn(&str) -> Option<String>) -> Self {
-        let parse = |name: &str, default: usize| -> usize {
-            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-        };
-        let parse_u32 = |name: &str, default: u32| -> u32 {
-            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-        };
-        let gemv_variant = if get("INFR_NO_GEMV_REG").is_some() {
-            None
-        } else {
-            get("INFR_GEMV_VARIANT").or_else(|| Some("reg".to_string()))
-        };
-        Self {
-            no_gemv_rm: get("INFR_NO_GEMV_RM").is_some(),
-            gemv_rm_maxout: parse("INFR_GEMV_RM_MAXOUT", usize::MAX),
-            gemv_rm_minout: parse("INFR_GEMV_RM_MINOUT", 2048),
-            gemv_rm: parse_u32("INFR_GEMV_RM", 2),
-            no_gemv_sg: get("INFR_NO_GEMV_SG").is_some(),
-            no_gemv_id_sg: get("INFR_NO_GEMV_ID_SG").is_some(),
-            gemv_sg_minout: parse("INFR_GEMV_SG_MINOUT", 2048),
-            gemv_sg_maxout: parse("INFR_GEMV_SG_MAXOUT", 8192),
-            gemv_sg_nr: parse_u32("INFR_GEMV_SG_NR", 2),
-            gemv_variant,
-        }
-    }
-}
-
-/// Process-once cached [`GemvKnobs`] — the native GEMV dispatchers read these instead of the env.
-fn gemv_knobs() -> &'static GemvKnobs {
-    static KNOBS: std::sync::OnceLock<GemvKnobs> = std::sync::OnceLock::new();
-    KNOBS.get_or_init(|| GemvKnobs::resolve(|name| std::env::var(name).ok()))
-}
-
 /// Rows-per-workgroup for the multi-output-row decode GEMV, or `None` to keep the RM=1 path.
 /// The RM variant packs RM output rows into one workgroup (RM× the in-flight weight streams per
 /// wave) to feed enough MLP at low `out_f`, where the RM=1 grid (out_f workgroups) is too shallow
@@ -186,20 +121,28 @@ fn gemv_knobs() -> &'static GemvKnobs {
 /// so they stay there. Only Q4_K/Q6_K have RM builds ([`crate::gemm::native_rm_streamed_build_spv`]).
 /// Tunable for A/B: `INFR_NO_GEMV_RM` forces the RM=1 path; `INFR_GEMV_RM`=2|4 forces the factor;
 /// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
-fn native_rm_choice(dtype: infr_core::DType, out_f: usize) -> Option<u32> {
+///
+/// `k` is [`GemvCfg`](infr_core::config::GemvCfg) off the backend's `Config` — borrowed from the
+/// recorder, never re-resolved (`docs/config-plan.md` R6). It replaced a `OnceLock<GemvKnobs>` that
+/// re-read ~10 env vars process-once (§10.6): the memo is gone AND the value is now settable per
+/// backend, at the same per-GEMV cost (a field read off a reference).
+fn native_rm_choice(
+    dtype: infr_core::DType,
+    out_f: usize,
+    k: &infr_core::config::GemvCfg,
+) -> Option<u32> {
     use infr_core::DType::*;
-    let k = gemv_knobs();
-    if !matches!(dtype, Q4K | Q6K) || k.no_gemv_rm {
+    if !matches!(dtype, Q4K | Q6K) || k.no_rm {
         return None;
     }
-    let max_out = k.gemv_rm_maxout;
+    let max_out = k.rm_maxout;
     // Below ~2k outputs the RM=1 grid is already shallow; halving it starves the machine (k/v,
     // out_f=1024, regressed in the cold A/B), so those stay on RM=1.
-    let min_out = k.gemv_rm_minout;
+    let min_out = k.rm_minout;
     if out_f > max_out || out_f < min_out {
         return None;
     }
-    let rm = k.gemv_rm;
+    let rm = k.rm;
     (rm == 2 || rm == 4).then_some(rm)
 }
 
@@ -212,7 +155,12 @@ fn native_rm_choice(dtype: infr_core::DType, out_f: usize) -> Option<u32> {
 /// occupancy regression there. Q6_K ONLY (see below) — no Q4_K SG build exists.
 /// Env: `INFR_NO_GEMV_SG` forces the tree/RM path; `INFR_GEMV_SG_NR`=2|4|8 overrides NR;
 /// `INFR_GEMV_SG_MINOUT`/`INFR_GEMV_SG_MAXOUT` override the band.
-fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Option<u32> {
+fn native_sg_choice(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    k: &infr_core::config::GemvCfg,
+) -> Option<u32> {
     use infr_core::DType::*;
     // Q6_K ONLY: the heavier Q6_K decode (210-byte super-blocks, more unpack ALU) is where wave32 +
     // subgroupAdd's lower register/barrier overhead nets out. On Q4_K the tree/RM kernel already
@@ -220,20 +168,19 @@ fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Optio
     // out_f≈2048 (attn_v, out_f=1024: grid too shallow) and above the band (lm_head, out_f=151936:
     // already peak on the tree kernel + subgroupAdd occupancy regression) — so the band is the
     // out_f≈4096 Q6_K projections (ffn_down / o). Default NR=2 (best at every winning shape).
-    let k = gemv_knobs();
-    if !matches!(dtype, Q6K) || k.no_gemv_sg {
+    if !matches!(dtype, Q6K) || k.no_sg {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = k.gemv_sg_minout;
-    let max_out = k.gemv_sg_maxout;
+    let min_out = k.sg_minout;
+    let max_out = k.sg_maxout;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.gemv_sg_nr;
+    let nr = k.sg_nr;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -245,10 +192,14 @@ fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Optio
 /// the tree). Kept independent of `native_sg_choice` so the byte-identical dense SG path is untouched.
 /// Env: `INFR_NO_GEMV_ID_SG` forces the tree id path (id-only escape); `INFR_NO_GEMV_SG` disables BOTH
 /// the dense and id SG routes; `INFR_GEMV_SG_MINOUT`/`MAXOUT`/`INFR_GEMV_SG_NR` are the shared knobs.
-fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Option<u32> {
+fn native_id_sg_choice(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    k: &infr_core::config::GemvCfg,
+) -> Option<u32> {
     use infr_core::DType::*;
-    let k = gemv_knobs();
-    if k.no_gemv_id_sg || k.no_gemv_sg {
+    if k.no_id_sg || k.no_sg {
         return None;
     }
     // Heavy K-quant decodes only (Q6_K/Q5_K): the extra unpack ALU is where wave32 + subgroupAdd's
@@ -276,12 +227,12 @@ fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Op
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = k.gemv_sg_minout;
-    let max_out = k.gemv_sg_maxout;
+    let min_out = k.sg_minout;
+    let max_out = k.sg_maxout;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.gemv_sg_nr;
+    let nr = k.sg_nr;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -669,50 +620,32 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
 /// (lm_head / embed) into output-row ranges each strictly under BOTH — the DISPATCH-level answer to
 /// a `>= 2^32`-element tensor that does NOT widen any in-kernel index (widening per-element indices
 /// to u64 was measured at a 2.4x RDNA3 regression — see the resident-BDA campaign). Both default to
-/// `2^32`; `INFR_BDA_CHUNK_ELEMS` / `INFR_BDA_CHUNK_BYTES` lower them to FORCE a normal model's
-/// lm_head/embed to split so the always-1-chunk path can be proven bitwise-identical to the split
-/// one on real hardware. `0` = uninitialised; a first read seeds it from the env (idempotent).
+/// `2^32`; `INFR_BDA_CHUNK_ELEMS` / `INFR_BDA_CHUNK_BYTES` (`kernels.vulkan.bda_chunk_{elems,bytes}`)
+/// lower them to FORCE a normal model's lm_head/embed to split so the always-1-chunk path can be
+/// proven bitwise-identical to the split one on real hardware.
+///
+/// **S5b:** this pair used to be two `AtomicU64` cells seeded from the environment on first read
+/// (`cap_from_env`) — a memo, and therefore unsettable from a test (§10.6). The caps are now
+/// resolved ONCE per `Recorder` at construction (`Recorder::bda_chunk_elem_cap` /
+/// `bda_chunk_byte_cap` fields, hoisted from the backend's `Config`) and passed down, so nothing
+/// reads the environment and nothing latches process-wide.
 const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
-static BDA_CHUNK_ELEM_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static BDA_CHUNK_BYTE_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn cap_from_env(cell: &std::sync::atomic::AtomicU64, var: &str) -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    let v = cell.load(Relaxed);
-    if v != 0 {
-        return v;
-    }
-    // Uninitialised: seed once from the env (default = the real u32 cap). Concurrent first-readers
-    // parse the same value and store it, so the race is benign.
-    let seeded = std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n >= 2) // a cap < 2 can never fit even one row → treat as unset
-        .unwrap_or(BDA_CHUNK_UNIT_MAX);
-    cell.store(seeded, Relaxed);
-    seeded
-}
-
-fn bda_chunk_elem_cap() -> u64 {
-    #[cfg(test)]
-    if let Some((e, _)) = test_chunk_cap_override() {
-        return e;
-    }
-    cap_from_env(&BDA_CHUNK_ELEM_CAP, "INFR_BDA_CHUNK_ELEMS")
-}
-
-fn bda_chunk_byte_cap() -> u64 {
-    #[cfg(test)]
-    if let Some((_, b)) = test_chunk_cap_override() {
-        return b;
-    }
-    cap_from_env(&BDA_CHUNK_BYTE_CAP, "INFR_BDA_CHUNK_BYTES")
+/// `(elem_cap, byte_cap)` from a backend's Vulkan config. `None` (unset, or a value below 2, which
+/// can never fit even one row) = the real u32 cap — exactly what `cap_from_env`'s
+/// `.filter(|&n| n >= 2).unwrap_or(BDA_CHUNK_UNIT_MAX)` did.
+pub(crate) fn bda_chunk_caps(vk: &infr_core::config::VulkanCfg) -> (u64, u64) {
+    (
+        vk.bda_chunk_elems.unwrap_or(BDA_CHUNK_UNIT_MAX),
+        vk.bda_chunk_bytes.unwrap_or(BDA_CHUNK_UNIT_MAX),
+    )
 }
 
 // In-process cap override for the chunked-vs-unchunked GPU parity test (recorder `mod tests`).
 // Scoped to the calling thread (recording is synchronous on the test thread), so it is race-free
-// under parallel test execution and cannot be seen by any other test. Compiled only under
-// `cfg(test)` — production reads the env/atomic caps and pays nothing.
+// under parallel test execution and cannot be seen by any other test. NOT the environment and NOT
+// a config layer: the test drives ONE backend and has to flip the caps between two recordings on
+// it, which a per-backend `Config` cannot express. Compiled only under `cfg(test)`.
 #[cfg(test)]
 thread_local! {
     static TEST_CHUNK_CAP: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
@@ -730,11 +663,17 @@ fn with_bda_chunk_caps<R>(elem_cap: u64, byte_cap: u64, f: impl FnOnce() -> R) -
 }
 
 /// Whether a `[out_f, in_f]` dense weight read at within-tensor element offset `w_base` breaches
-/// either u32 addressing cap and therefore needs chunked dispatch. Cheap (two multiplies + two
-/// relaxed atomic loads, no allocation, no env syscall after the first call) so it sits on the
-/// decode hot path in front of the LITERAL original single dispatch — the always-on chunk loop runs
-/// exactly one iteration (this returns `false`) for every current model.
-fn bda_gemv_needs_chunk(dtype: infr_core::DType, in_f: usize, out_f: usize, w_base: usize) -> bool {
+/// either u32 addressing cap and therefore needs chunked dispatch. Cheap (two multiplies and two
+/// comparisons against already-resolved caps, no allocation, no env lookup) so it sits on the decode
+/// hot path in front of the LITERAL original single dispatch — the always-on chunk loop runs exactly
+/// one iteration (this returns `false`) for every current model.
+fn bda_gemv_needs_chunk(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    w_base: usize,
+    caps: (u64, u64),
+) -> bool {
     let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
     let whole_elems = w_base as u64 + (out_f as u64) * (in_f as u64);
     // Row bytes are exact only when a row is a whole number of blocks (always true for a real weight
@@ -744,7 +683,7 @@ fn bda_gemv_needs_chunk(dtype: infr_core::DType, in_f: usize, out_f: usize, w_ba
     } else {
         0
     };
-    whole_elems >= bda_chunk_elem_cap() || whole_bytes >= bda_chunk_byte_cap()
+    whole_elems >= caps.0 || whole_bytes >= caps.1
 }
 
 /// Whether a `[out_f, in_f]` dense weight breaches a u32 addressing cap (at slice offset 0). The
@@ -754,8 +693,17 @@ fn bda_gemv_needs_chunk(dtype: infr_core::DType, in_f: usize, out_f: usize, w_ba
 /// verify or an all-position-logits request on a big-vocab model — must fail LOUDLY rather than
 /// wrap. The adapter guards the GEMM dispatch with this. (Decode m=1 and the per-row GEMV ARE
 /// chunk-covered — see [`Recorder::dispatch_gemv_chunked`].)
-pub(crate) fn bda_weight_breaches(dtype: infr_core::DType, in_f: usize, out_f: usize) -> bool {
-    bda_gemv_needs_chunk(dtype, in_f, out_f, 0)
+pub(crate) fn bda_weight_breaches(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    vk: &infr_core::config::VulkanCfg,
+) -> bool {
+    #[cfg(test)]
+    if let Some(caps) = test_chunk_cap_override() {
+        return bda_gemv_needs_chunk(dtype, in_f, out_f, 0, caps);
+    }
+    bda_gemv_needs_chunk(dtype, in_f, out_f, 0, bda_chunk_caps(vk))
 }
 
 /// The maximum output-row count of a `[out_f, in_f]` weight per addressing unit. See [`OutRowChunk`].
@@ -861,7 +809,9 @@ pub struct Recorder<'a> {
     /// Set while recording an indirect dispatch so `sync` widens the barrier to cover the
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
-    /// Debug knobs, read once (avoid env lookups in the per-dispatch hot path).
+    /// Debug knobs, resolved ONCE at construction from the backend's `Config` — `debug.no_barrier`,
+    /// `debug.full_barrier`, `prof.prof` (S5b). Per-dispatch paths read these fields, never a config
+    /// tree walk and never the environment.
     no_barrier: bool,
     full_barrier: bool,
     prof: bool,
@@ -894,6 +844,11 @@ pub struct Recorder<'a> {
     /// The submit splitter reads it to decide when the segment has grown to the device's cap —
     /// see `VulkanShared::submit_dispatch_cap` and `adapter::execute_static`.
     dispatches: std::cell::Cell<usize>,
+    /// `kernels.vulkan.bda_chunk_elems` / `_bytes`, HOISTED here at construction (§10.6 — they used
+    /// to be two env-seeded `AtomicU64` memos). Read on the decode GEMV path via
+    /// [`Self::chunk_caps`].
+    bda_chunk_elem_cap: u64,
+    bda_chunk_byte_cap: u64,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -948,9 +903,12 @@ impl<'a> Recorder<'a> {
         // recording, so it can't report timestamps for replays.
         // `prof2_suppressed` is the non-env suppression path (see `infr_prof_rt`): benches /
         // warmups toggle it around untimed work instead of mutating the `INFR_PROF2` env var.
-        let prof2 =
-            std::env::var("INFR_PROF2").is_ok() && !persistent && !infr_prof_rt::prof2_suppressed();
-        let prof2_shapes = prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok();
+        let profcfg = &backend.cfg().prof;
+        let dbgcfg = &backend.cfg().debug;
+        let (bda_chunk_elem_cap, bda_chunk_byte_cap) =
+            bda_chunk_caps(&backend.cfg().kernels.vulkan);
+        let prof2 = profcfg.prof2 && !persistent && !infr_prof_rt::prof2_suppressed();
+        let prof2_shapes = prof2 && profcfg.prof2_shapes;
         let query_pool = if prof2 {
             let qp = unsafe {
                 device.create_query_pool(
@@ -976,9 +934,9 @@ impl<'a> Recorder<'a> {
             dirty_transfer: std::cell::Cell::new(false),
             barriers: RefCell::new(0),
             indirect_pending: std::cell::Cell::new(false),
-            no_barrier: std::env::var("INFR_NOBARRIER").is_ok(),
-            full_barrier: std::env::var("INFR_FULLBARRIER").is_ok(),
-            prof: std::env::var("INFR_PROF").is_ok(),
+            no_barrier: dbgcfg.no_barrier,
+            full_barrier: dbgcfg.full_barrier,
+            prof: profcfg.prof,
             prof2,
             prof2_shapes,
             query_pool,
@@ -989,7 +947,35 @@ impl<'a> Recorder<'a> {
             t0: std::time::Instant::now(),
             suppress: std::cell::Cell::new(false),
             dispatches: std::cell::Cell::new(0),
+            bda_chunk_elem_cap,
+            bda_chunk_byte_cap,
         })
+    }
+
+    /// The Vulkan kernel-tier config this recorder steers on — BORROWED off the backend that
+    /// created it, never cloned and never re-resolved (`docs/config-plan.md` R6). Every per-op /
+    /// per-dispatch knob below reads through here instead of `std::env::var` (S5b).
+    #[inline]
+    pub(crate) fn vk(&self) -> &infr_core::config::VulkanCfg {
+        &self.be.cfg().kernels.vulkan
+    }
+
+    /// The native-GEMV routing sub-config (`INFR_GEMV_*` / `INFR_NO_GEMV_*`), borrowed.
+    #[inline]
+    fn gemv(&self) -> &infr_core::config::GemvCfg {
+        &self.vk().gemv
+    }
+
+    /// The `(elem, byte)` u32 addressing caps for chunked dense GEMV dispatch — the two values
+    /// hoisted at construction. The `cfg(test)` arm is the chunk-parity test's thread-local
+    /// override (see [`with_bda_chunk_caps`]); production compiles to two field reads.
+    #[inline]
+    fn chunk_caps(&self) -> (u64, u64) {
+        #[cfg(test)]
+        if let Some(caps) = test_chunk_cap_override() {
+            return caps;
+        }
+        (self.bda_chunk_elem_cap, self.bda_chunk_byte_cap)
     }
 
     /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
@@ -1241,7 +1227,7 @@ impl<'a> Recorder<'a> {
             self.dispatch3(k, buffers, n_out, push, n, 1, 1);
         } else {
             let gy = n.div_ceil(Self::MAX_GROUP_COUNT_X);
-            if std::env::var("INFR_DEBUG_WIDE_DISPATCH").is_ok() {
+            if self.be.cfg().debug.wide_dispatch {
                 eprintln!(
                     "[infr] dispatch_wide SPLIT kernel={:?} n={n} -> gx={} gy={gy}",
                     k.name,
@@ -1498,15 +1484,8 @@ impl<'a> Recorder<'a> {
         mut push: [u8; 24],
         grid: impl Fn(u32) -> u32,
     ) {
-        let chunks = bda_out_f_chunks(
-            dtype,
-            in_f,
-            out_f,
-            w_base,
-            bda_chunk_elem_cap(),
-            bda_chunk_byte_cap(),
-        )
-        .expect(
+        let (elem_cap, byte_cap) = self.chunk_caps();
+        let chunks = bda_out_f_chunks(dtype, in_f, out_f, w_base, elem_cap, byte_cap).expect(
             "chunked dense GEMV reached an un-chunkable weight — the load-time addressing guard \
              (check_bda_element_cap / bda_weight_alloc) should have rejected it",
         );
@@ -1520,13 +1499,11 @@ impl<'a> Recorder<'a> {
                  keep every per-row binding offset device-aligned (in_f={in_f}, out_f={out_f})"
             );
         }
-        if std::env::var("INFR_DEBUG_BDA_CHUNK").is_ok() {
+        if self.be.cfg().debug.bda_chunk {
             eprintln!(
                 "[infr] dispatch_gemv_chunked {dtype:?} rows={rows} in_f={in_f} out_f={out_f} \
-                 -> {} chunks (caps: elems {}, bytes {})",
+                 -> {} chunks (caps: elems {elem_cap}, bytes {byte_cap})",
                 chunks.len(),
-                bda_chunk_elem_cap(),
-                bda_chunk_byte_cap()
             );
         }
         push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // each sub-dispatch is a single input row
@@ -1766,8 +1743,8 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
-        let use_mrow = rows > 1 && std::env::var("INFR_NO_F32_MROW").is_err();
-        let use_v4 = use_mrow && in_f.is_multiple_of(4) && std::env::var("INFR_NO_F32_V4").is_err();
+        let use_mrow = rows > 1 && self.vk().f32_mrow;
+        let use_v4 = use_mrow && in_f.is_multiple_of(4) && self.vk().f32_v4;
         let (name, spv, groups) = if use_v4 && rows <= 4 {
             (
                 "linear_f32r_mrow4_v4",
@@ -2015,7 +1992,7 @@ impl<'a> Recorder<'a> {
         // `Some(bn)` selects a warptile (BN=256 wide or BN=128 narrow) for `dtype`; `None` falls
         // back to the 64×64 kernel. The getters report tile availability only — weights are read by
         // 64-bit address via the `_streamed` twin below, so no resident SPV is loaded here.
-        let warp = if k.is_multiple_of(32) && std::env::var("INFR_NO_GEMM_WARP").is_err() {
+        let warp = if k.is_multiple_of(32) && self.vk().gemm_warp {
             if use_wide {
                 crate::gemm::native_gemm_warp_kernel_name(dtype).map(|_| 256usize)
             } else if n.is_multiple_of(128) {
@@ -2160,24 +2137,20 @@ impl<'a> Recorder<'a> {
         // split-K). Bit-identical to the wide tile (both BK=64, same k-accumulation order).
         // INFR_GEMM_WIDE_TILE restores the old BN=256 tile for A/B.
         let wide_grid = m.div_ceil(64) * (n / 256).max(1);
-        let use_wide = n.is_multiple_of(256)
-            && wide_grid >= 128
-            && std::env::var("INFR_GEMM_WIDE_TILE").is_ok();
+        let use_wide = n.is_multiple_of(256) && wide_grid >= 128 && self.vk().gemm_wide_tile;
         // Small-m batched prefill (MTP verify's draft window, m≈6-24): the default BM=64 row tile
         // is mostly masked waste (see DENSE_SMALL_TILE_MAX_M's doc) — switch to the BM=32 `_bm32`
         // n128_ag variant when it exists for `dtype` (only the K-quant formats verify actually
         // hits: Q4_K/Q5_K/Q6_K/Q8_0) and the wide tile wasn't explicitly requested (wide_grid>=128
         // never fires at these m anyway, short of the vocab-head GEMM under INFR_GEMM_WIDE_TILE).
-        let small_bm =
-            !use_wide && m <= DENSE_SMALL_TILE_MAX_M && std::env::var("INFR_NO_SMALL_BM").is_err();
+        let small_bm = !use_wide && m <= DENSE_SMALL_TILE_MAX_M && self.vk().small_bm;
         // Sub-band of small_bm: at the very smallest m, the BM=32 tile itself is still ~half
         // masked — BM=16 (one coopmat M-frag, the tiling floor) halves that again. It also HALVES
         // WN (doubling WARPS_N), a thinner-frag shape, so both model sizes were measured interleaved
         // rather than trusting one run: MTP +3.5% on qwen35-4B (k=2560) AND +2.8% on qwen35-9B
         // (k=4096), consistent across passes — a real win on both. `INFR_NO_BM16` is a standalone A/B
         // escape (falls back to BM=32, not BM=64).
-        let bm16 =
-            small_bm && m <= DENSE_SMALL_TILE_MAX_M16 && std::env::var("INFR_NO_BM16").is_err();
+        let bm16 = small_bm && m <= DENSE_SMALL_TILE_MAX_M16 && self.vk().bm16;
         let bm16 = bm16
             .then(|| crate::gemm::native_gemm_warp_n128_ag_bm16_kernel_name(dtype))
             .flatten();
@@ -2979,7 +2952,7 @@ impl<'a> Recorder<'a> {
         // `_streamed` twin (the build tables are 1:1 mirrored — see this fn's doc). Every branch
         // reachable here has a streamed kernel to route to.
         if rows == 1 {
-            if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
                     .is_some()
                 {
@@ -2987,13 +2960,13 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            if let Some(v) = &gemv_knobs().gemv_variant {
+            if let Some(v) = &self.gemv().variant {
                 if crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, false).is_some() {
                     self.linear_native_rm_v2_at(v, dtype, arena_addr, w_base, x, y, in_f, out_f);
                     return;
                 }
             }
-            if let Some(rm) = native_rm_choice(dtype, out_f) {
+            if let Some(rm) = native_rm_choice(dtype, out_f, self.gemv()) {
                 if crate::gemm::native_rm_streamed_build_spv(dtype, false, rm).is_some() {
                     self.linear_native_rm_at(dtype, arena_addr, w_base, x, y, in_f, out_f, rm);
                     return;
@@ -3052,7 +3025,7 @@ impl<'a> Recorder<'a> {
         // Chunked dispatch when the weight breaches a u32 addressing cap (a `>= 2^32`-element
         // lm_head/embed); the always-on check is `false` for every current model, taking the
         // literal single dispatch below unchanged.
-        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base, self.chunk_caps()) {
             self.dispatch_gemv_chunked(
                 k,
                 dtype,
@@ -3170,7 +3143,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base, self.chunk_caps()) {
             self.dispatch_gemv_chunked(
                 k,
                 dtype,
@@ -3223,7 +3196,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base, self.chunk_caps()) {
             self.dispatch_gemv_chunked(
                 k,
                 dtype,
@@ -3276,7 +3249,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base, self.chunk_caps()) {
             self.dispatch_gemv_chunked(
                 k,
                 dtype,
@@ -3382,8 +3355,8 @@ impl<'a> Recorder<'a> {
             "no fused-residual mrow build for {dtype:?} — dtype is decode-eligible but res-illegal"
         );
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
-        let o4 = in_f < 2048 && std::env::var("INFR_NO_MMV_O4").is_err();
-        let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
+        let o4 = in_f < 2048 && self.vk().mmv_o4;
+        let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
         let (name, spv) = if rows > 8 {
             crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 streamed spv")
@@ -3560,7 +3533,7 @@ impl<'a> Recorder<'a> {
         ];
         // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
         if rows == 1 {
-            if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_sg_streamed_build_spv(dtype, true, nr, self.sg16())
                 {
@@ -3572,7 +3545,7 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route — mirrors linear_add_native's variant-then-RM fallback.
         if rows == 1 {
-            if let Some(v) = &gemv_knobs().gemv_variant {
+            if let Some(v) = &self.gemv().variant {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, true)
                 {
@@ -3582,7 +3555,7 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            if let Some(rm) = native_rm_choice(dtype, out_f) {
+            if let Some(rm) = native_rm_choice(dtype, out_f, self.gemv()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_streamed_build_spv(dtype, true, rm)
                 {
@@ -3632,7 +3605,7 @@ impl<'a> Recorder<'a> {
         // would wrap). Driving this off `bda_chunk_elem_cap` — not a hardcoded 2^32 — lets
         // `INFR_BDA_CHUNK_ELEMS` force the fold path on a normal model, so the forced-chunking proof
         // exercises BOTH the lm_head GEMV split and this embed fold in one run.
-        let row_bytes = if (vocab as u64) * (ne as u64) >= bda_chunk_elem_cap() {
+        let row_bytes = if (vocab as u64) * (ne as u64) >= self.chunk_caps().0 {
             assert!(
                 row_stride.is_multiple_of(4),
                 "embed_gather: a >= 2^32-element {dtype:?} table (vocab={vocab}, ne={ne}) has a \
@@ -3643,7 +3616,7 @@ impl<'a> Recorder<'a> {
         } else {
             0 // fits u32: keep the original element-offset gather path
         };
-        if row_bytes != 0 && std::env::var("INFR_DEBUG_BDA_CHUNK").is_ok() {
+        if row_bytes != 0 && self.be.cfg().debug.bda_chunk {
             eprintln!(
                 "[infr] embed_gather {dtype:?} vocab={vocab} ne={ne} -> 64-bit row-base fold \
                  (row_bytes={row_bytes})"
@@ -4280,7 +4253,7 @@ impl<'a> Recorder<'a> {
 
         // stage 1: S = scale·Q·Kᵀ. 8-warp/256-thread warptile (BN=256, matches ollama's mul_mm)
         // unless INFR_NO_QK_WARP forces the 4-warp/2×2 attn_qk.
-        let qk_warp = std::env::var("INFR_NO_QK_WARP").is_err();
+        let qk_warp = self.vk().qk_warp;
         let (qk_name, qk_spv, qk_bn) = if qk_warp {
             ("attn_qk_warp", crate::gemm::attn_qk_warp_spv(), 256u32)
         } else {
@@ -4322,10 +4295,10 @@ impl<'a> Recorder<'a> {
         // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
         // into partials, then sum them.
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
-        let n_splits = match std::env::var("INFR_PV_SPLITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        // `pv_splits` is `Option<usize>` in the config; the dispatch count is a u32, so an
+        // out-of-range override falls back to the adaptive policy exactly as `.parse::<u32>().ok()`
+        // did at the old env read.
+        let n_splits = match self.vk().pv_splits.and_then(|v| u32::try_from(v).ok()) {
             Some(v) => v,
             None => {
                 if pv_base_wg >= 1024 || kv_pad < 4096 {
@@ -4341,7 +4314,7 @@ impl<'a> Recorder<'a> {
         let ksplit = kv_pad.div_ceil(n_splits).div_ceil(32) * 32;
         // 8-warp/256-thread PV warptile (BN=128=hd, matches ollama's mul_mm) when hd%128; else the
         // 4-warp/2×2 attn_pv (also handles hd<128, e.g. hd=64). INFR_NO_PV_WARP forces the 4-warp.
-        let pv_warp = hdu.is_multiple_of(128) && std::env::var("INFR_NO_PV_WARP").is_err();
+        let pv_warp = hdu.is_multiple_of(128) && self.vk().pv_warp;
         let (pv_name, pv_spv, pv_bn) = if pv_warp {
             ("attn_pv_warp", crate::gemm::attn_pv_warp_spv(), 128u32)
         } else {
@@ -4434,10 +4407,7 @@ impl<'a> Recorder<'a> {
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / 64) * nh as u32;
-        let n_splits = match std::env::var("INFR_FLASH_SPLITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
             Some(v) => v,
             None => {
                 if base_wg >= 1024 || kv_len < 4096 {
@@ -4458,9 +4428,10 @@ impl<'a> Recorder<'a> {
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
         let shared_limit = self.be.max_shared_memory_bytes();
         let bm64_shared = 64 * crate::FLASH_SHARED_PER_ROW; // 58112 B
-                                                            // INFR_FLASH_BM=32 forces the small (29056 B) tile even on a 64 KB device, so the bm=32
-                                                            // shaders get numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
-        let force_bm32 = std::env::var("INFR_FLASH_BM").ok().as_deref() == Some("32");
+                                                            // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32", §10.4)
+                                                            // forces the small (29056 B) tile even on a 64 KB device, so the bm=32 shaders get
+                                                            // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
+        let force_bm32 = self.vk().flash_bm32;
         // Partial tiles (rows < 64, the small-m deep-kv tier) take BM=32: half the padded-row
         // waste and half the shared scratch (2x resident workgroups). Measured @d16384 on a
         // 7900 XTX: pp24 1122 -> 1312 t/s, pp32 1510 -> 1734 (llama.cpp: 1313/1933). Full
@@ -4481,7 +4452,7 @@ impl<'a> Recorder<'a> {
         // for the split-K `attn_flash_partial`, so it alone forces that path (no fused `attn_flash`).
         let warp = matches!(stage, FlashStage::Off | FlashStage::Dequant(_))
             && hd == 128
-            && std::env::var("INFR_NO_FLASH_WARP").is_err();
+            && self.vk().flash_warp;
         if n_splits == 1 && !warp && matches!(stage, FlashStage::Off) {
             let (fname, fspv): (&'static str, &[u32]) = if bm == 32 {
                 ("attn_flash_bm32", crate::gemm::attn_flash_bm32_spv())
@@ -4686,10 +4657,7 @@ impl<'a> Recorder<'a> {
             64
         };
         let base_wg = (mpad / br) * nh as u32;
-        let n_splits = match std::env::var("INFR_FLASH_SPLITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
             Some(v) => v,
             None => {
                 if base_wg >= 1024 || kv_len < 4096 {
@@ -5742,10 +5710,10 @@ impl<'a> Recorder<'a> {
         let (p1name, p1spv) = if let Some(dt) = kv_ml {
             // Lever 1: mainline low-bit KV decode reads the cache INLINE (per-format FMT build).
             debug_assert!(bda && !k_q8 && !v_q8 && !batched);
-            crate::gemm::attn_partial_ml_kernel(dt, crate::gemm::attn_hd_spec_disabled())
+            crate::gemm::attn_partial_ml_kernel(dt, crate::gemm::attn_hd_spec_disabled(self.vk()))
         } else {
             match (k_q8, v_q8) {
-                (false, false) if crate::gemm::attn_hd_spec_disabled() => {
+                (false, false) if crate::gemm::attn_hd_spec_disabled(self.vk()) => {
                     if bda {
                         (
                             "attn_partial_nohd_bda",
@@ -6317,7 +6285,7 @@ impl<'a> Recorder<'a> {
         // `attn_live_prologue` per (nh, chunk, window) key — kv_len is identical for every layer
         // of a token, so the args buffer is shared across same-key attention ops instead of
         // re-derived per layer). Each f16 variant has a `_bda` device-address twin.
-        let (p1name, p1spv) = match (q8, crate::gemm::attn_hd_spec_disabled(), bda) {
+        let (p1name, p1spv) = match (q8, crate::gemm::attn_hd_spec_disabled(self.vk()), bda) {
             (true, _, false) => (
                 "attn_partial_dynac_q8",
                 crate::gemm::attn_partial_dynac_q8_spv(),
@@ -6441,7 +6409,7 @@ impl<'a> Recorder<'a> {
         kv_addr: Option<(u64, u64)>,
     ) {
         let bda = kv_addr.is_some();
-        let (p1name, p1spv) = match (crate::gemm::attn_hd_spec_disabled(), bda) {
+        let (p1name, p1spv) = match (crate::gemm::attn_hd_spec_disabled(self.vk()), bda) {
             (true, false) => (
                 "attn_partial_dyn_nohd",
                 crate::gemm::attn_partial_dyn_nohd_spv(),
@@ -8264,7 +8232,7 @@ impl<'a> Recorder<'a> {
         push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let bufs = [Self::vkb(x), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
         if rows == 1 {
-            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f) {
+            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
                 {
@@ -9416,9 +9384,26 @@ mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
 
-    /// #1 drift guard: the once-cached `GemvKnobs` must resolve, for any env state, EXACTLY what
-    /// the old per-call `std::env::var` reads in the GEMV dispatchers would have returned — so
-    /// caching the routing knobs can't change any kernel-selection decision.
+    /// A backend built on an EXPLICIT Vulkan kernel-tier configuration (`docs/config-plan.md` S5b).
+    ///
+    /// This is what replaced `EnvGuard::with([("INFR_FLASH_SPLITS", "4"), …])` in every test below:
+    /// the tier knobs are a VALUE handed to `VulkanBackend::new_with`, so nothing is process-global,
+    /// nothing has to be restored, and two backends with different tiers can be live at once (R7).
+    /// The cost is one device per configuration — these tests already built one per case.
+    fn be_with(f: impl FnOnce(&mut infr_core::config::VulkanCfg)) -> VulkanBackend {
+        let mut cfg = infr_core::config::Config::default();
+        f(&mut cfg.kernels.vulkan);
+        VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
+    }
+
+    /// #1 drift guard: `kernels.vulkan.gemv` must resolve, for any env state, EXACTLY what the
+    /// pre-config per-call `std::env::var` reads in the GEMV dispatchers would have returned — so
+    /// neither the (deleted) `OnceLock<GemvKnobs>` memo nor its replacement can change a
+    /// kernel-selection decision.
+    ///
+    /// S5b: the struct under test is now `infr_core::config::GemvCfg`, resolved through the config
+    /// ENV LAYER with an injected reader — the same `HashMap` states as before, and still zero
+    /// contact with the process environment (R7).
     #[test]
     fn gemv_knobs_resolve_matches_env_reads() {
         use std::collections::HashMap;
@@ -9447,53 +9432,57 @@ mod tests {
         ];
         for st in states {
             let get = |name: &str| st.get(name).map(|s| s.to_string());
-            let k = GemvKnobs::resolve(get);
+            let layer = infr_core::config::env::parse(&get).expect("gemv keys never error");
+            let k = &infr_core::config::Config::load_from_layers(&[layer])
+                .kernels
+                .vulkan
+                .gemv;
             // The OLD inline reads, replicated verbatim against the same env map:
             let old_variant = if get("INFR_NO_GEMV_REG").is_some() {
                 None
             } else {
                 get("INFR_GEMV_VARIANT").or_else(|| Some("reg".to_string()))
             };
-            assert_eq!(k.no_gemv_rm, get("INFR_NO_GEMV_RM").is_some());
+            assert_eq!(k.no_rm, get("INFR_NO_GEMV_RM").is_some());
             assert_eq!(
-                k.gemv_rm_maxout,
+                k.rm_maxout,
                 get("INFR_GEMV_RM_MAXOUT")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(usize::MAX)
             );
             assert_eq!(
-                k.gemv_rm_minout,
+                k.rm_minout,
                 get("INFR_GEMV_RM_MINOUT")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2048usize)
             );
             assert_eq!(
-                k.gemv_rm,
+                k.rm,
                 get("INFR_GEMV_RM")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2u32)
             );
-            assert_eq!(k.no_gemv_sg, get("INFR_NO_GEMV_SG").is_some());
-            assert_eq!(k.no_gemv_id_sg, get("INFR_NO_GEMV_ID_SG").is_some());
+            assert_eq!(k.no_sg, get("INFR_NO_GEMV_SG").is_some());
+            assert_eq!(k.no_id_sg, get("INFR_NO_GEMV_ID_SG").is_some());
             assert_eq!(
-                k.gemv_sg_minout,
+                k.sg_minout,
                 get("INFR_GEMV_SG_MINOUT")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2048usize)
             );
             assert_eq!(
-                k.gemv_sg_maxout,
+                k.sg_maxout,
                 get("INFR_GEMV_SG_MAXOUT")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(8192usize)
             );
             assert_eq!(
-                k.gemv_sg_nr,
+                k.sg_nr,
                 get("INFR_GEMV_SG_NR")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2u32)
             );
-            assert_eq!(k.gemv_variant, old_variant);
+            assert_eq!(k.variant, old_variant);
         }
     }
 
@@ -10059,29 +10048,31 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_nonfa_matches_cpu() {
+        let be = be_with(|_| {});
         // hd=128 (qwen3), full causal, default scale — the pre-existing regression cases.
-        run_attn_prefill_nonfa(64, 64, 2, 1, 128, 0, 0.0);
-        run_attn_prefill_nonfa(128, 200, 4, 2, 128, 0, 0.0);
-        run_attn_prefill_nonfa(70, 70, 2, 2, 128, 0, 0.0);
-        run_attn_prefill_nonfa(192, 500, 2, 1, 128, 0, 0.0);
-        run_attn_prefill_nonfa(80, 300, 9, 3, 64, 0, 0.0);
+        run_attn_prefill_nonfa(&be, 64, 64, 2, 1, 128, 0, 0.0);
+        run_attn_prefill_nonfa(&be, 128, 200, 4, 2, 128, 0, 0.0);
+        run_attn_prefill_nonfa(&be, 70, 70, 2, 2, 128, 0, 0.0);
+        run_attn_prefill_nonfa(&be, 192, 500, 2, 1, 128, 0, 0.0);
+        run_attn_prefill_nonfa(&be, 80, 300, 9, 3, 64, 0, 0.0);
         // gemma: hd=256 (SWA, GQA 16:8) and hd=512 (full, GQA 16:1), with the sliding-window mask
         // and the scale override (gemma4 = 1.0). These are the paths the new routing exercises.
-        run_attn_prefill_nonfa(128, 300, 16, 8, 256, 100, 1.0); // gemma4 SWA (window)
-        run_attn_prefill_nonfa(128, 300, 16, 1, 512, 0, 1.0); // gemma4 full (scale=1)
-        run_attn_prefill_nonfa(128, 300, 16, 8, 256, 100, 0.0); // gemma3 SWA (window, 1/√hd)
-        run_attn_prefill_nonfa(70, 400, 16, 8, 256, 64, 1.0); // SWA, non-64-aligned q
-                                                              // force the split-K PV path (n_splits>1) and verify the partial-sum reduce is correct, incl.
-                                                              // with a window (split reduce must respect the softmax mask) and hd=512.
-        let _env = infr_core::test_env::EnvGuard::with([("INFR_PV_SPLITS", "4")]);
-        run_attn_prefill_nonfa(70, 300, 4, 2, 128, 0, 0.0);
-        run_attn_prefill_nonfa(128, 500, 2, 1, 128, 0, 0.0);
-        run_attn_prefill_nonfa(128, 3000, 16, 8, 256, 200, 1.0); // SWA, long kv, split-K
-        run_attn_prefill_nonfa(128, 3000, 16, 1, 512, 0, 1.0); // full hd=512, long kv, split-K
-                                                               // `_env` restores INFR_PV_SPLITS (and releases the env lock) here.
+        run_attn_prefill_nonfa(&be, 128, 300, 16, 8, 256, 100, 1.0); // gemma4 SWA (window)
+        run_attn_prefill_nonfa(&be, 128, 300, 16, 1, 512, 0, 1.0); // gemma4 full (scale=1)
+        run_attn_prefill_nonfa(&be, 128, 300, 16, 8, 256, 100, 0.0); // gemma3 SWA (window, 1/√hd)
+        run_attn_prefill_nonfa(&be, 70, 400, 16, 8, 256, 64, 1.0); // SWA, non-64-aligned q
+                                                                   // Force the split-K PV path (n_splits>1) and verify the partial-sum reduce is correct,
+                                                                   // incl. with a window (split reduce must respect the softmax mask) and hd=512.
+        let split = be_with(|v| v.pv_splits = Some(4));
+        run_attn_prefill_nonfa(&split, 70, 300, 4, 2, 128, 0, 0.0);
+        run_attn_prefill_nonfa(&split, 128, 500, 2, 1, 128, 0, 0.0);
+        run_attn_prefill_nonfa(&split, 128, 3000, 16, 8, 256, 200, 1.0); // SWA, long kv, split-K
+        run_attn_prefill_nonfa(&split, 128, 3000, 16, 1, 512, 0, 1.0); // hd=512, long kv, split-K
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_attn_prefill_nonfa(
+        be: &VulkanBackend,
         q_len: usize,
         kv_len: usize,
         nh: usize,
@@ -10090,7 +10081,6 @@ mod tests {
         window: usize,
         scale: f32,
     ) {
-        let be = VulkanBackend::new().unwrap();
         let pos_offset = kv_len - q_len;
         let mpad = q_len.div_ceil(64) * 64;
         let kv_pad = kv_len.div_ceil(256) * 256; // recorder pads kv to 256 (8-warp attn_qk BN)
@@ -10109,9 +10099,9 @@ mod tests {
         kp.resize((kv_pad + 64) * nkv * hd, 0.0);
         let mut vp = v.clone();
         vp.resize((kv_pad + 64) * nkv * hd, 0.0);
-        let bq = upf16(&be, &qp);
-        let bk = upf16(&be, &kp);
-        let bv = upf16(&be, &vp);
+        let bq = upf16(be, &qp);
+        let bk = upf16(be, &kp);
+        let bv = upf16(be, &vp);
         let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
         let bs = be
             .alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)
@@ -10153,6 +10143,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_matches_cpu() {
+        let be = be_with(|_| {});
         for &(q, kv, nh, nkv, hd) in &[
             (64usize, 64usize, 2usize, 1usize, 128usize),
             (128, 200, 4, 2, 128),
@@ -10161,28 +10152,35 @@ mod tests {
             (80, 300, 9, 3, 64),
             (448, 2000, 16, 8, 128), // qwen3-shaped, multi-block kv
         ] {
-            run_attn_prefill_flash(q, kv, nh, nkv, hd);
+            run_attn_prefill_flash(&be, q, kv, nh, nkv, hd);
         }
         // force the split-K flash path (partial+combine) and verify the merge is correct
-        let mut env = infr_core::test_env::EnvGuard::with([("INFR_FLASH_SPLITS", "4")]);
-        run_attn_prefill_flash(64, 2000, 16, 8, 128);
-        run_attn_prefill_flash(128, 500, 2, 1, 128);
-        env.unset("INFR_FLASH_SPLITS");
+        let split = be_with(|v| v.flash_splits = Some(4));
+        run_attn_prefill_flash(&split, 64, 2000, 16, 8, 128);
+        run_attn_prefill_flash(&split, 128, 500, 2, 1, 128);
         // Force the bm=32 tile (otherwise only selected on sub-64 KB-shared devices like NVIDIA /
         // MoltenVK) so the small shaders get numeric-parity coverage on any GPU: the fused kernel
         // (hd=64), the warp split-K partial+combine (hd=128), and the non-warp partial
-        // (INFR_NO_FLASH_WARP). Without this, a 64 KB device only ever exercises the bm=64 build.
-        env.set("INFR_FLASH_BM", "32");
-        run_attn_prefill_flash(80, 300, 9, 3, 64); // fused attn_flash_bm32
-        run_attn_prefill_flash(128, 200, 4, 2, 128); // warp partial+combine (bm32)
-        run_attn_prefill_flash(448, 2000, 16, 8, 128); // warp, multi-block kv
-        env.set("INFR_NO_FLASH_WARP", "1");
-        run_attn_prefill_flash(128, 500, 2, 1, 128); // non-warp attn_flash_partial_bm32
-                                                     // `env` restores INFR_FLASH_BM / INFR_NO_FLASH_WARP (and unlocks) on drop.
+        // (`flash_warp = false`). Without this, a 64 KB device only ever exercises the bm=64 build.
+        let bm32 = be_with(|v| v.flash_bm32 = true);
+        run_attn_prefill_flash(&bm32, 80, 300, 9, 3, 64); // fused attn_flash_bm32
+        run_attn_prefill_flash(&bm32, 128, 200, 4, 2, 128); // warp partial+combine (bm32)
+        run_attn_prefill_flash(&bm32, 448, 2000, 16, 8, 128); // warp, multi-block kv
+        let bm32_nowarp = be_with(|v| {
+            v.flash_bm32 = true;
+            v.flash_warp = false;
+        });
+        run_attn_prefill_flash(&bm32_nowarp, 128, 500, 2, 1, 128); // non-warp attn_flash_partial_bm32
     }
 
-    fn run_attn_prefill_flash(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
-        let be = VulkanBackend::new().unwrap();
+    fn run_attn_prefill_flash(
+        be: &VulkanBackend,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
         let pos_offset = kv_len - q_len;
         let mpad = q_len.div_ceil(64) * 64;
         let gen = |n: usize, salt: usize| -> Vec<f32> {
@@ -10199,9 +10197,9 @@ mod tests {
         kp.resize((kv_len + 64) * nkv * hd, 0.0);
         let mut vp = v.clone();
         vp.resize((kv_len + 64) * nkv * hd, 0.0);
-        let bq = upf16(&be, &qp);
-        let bk = upf16(&be, &kp);
-        let bv = upf16(&be, &vp);
+        let bq = upf16(be, &qp);
+        let bk = upf16(be, &kp);
+        let bv = upf16(be, &vp);
         let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
         let po = be
             .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
@@ -10314,18 +10312,17 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attn_flash_stage_dequant_parity() {
         use infr_core::DType;
-        let be = VulkanBackend::new().unwrap();
         // Pin Off onto the DIRECT attn_flash_partial (same kernel the staged builds fork from):
         // no register warp, forced split-K partial+combine (n_splits==1 else takes the fused
         // attn_flash). Staged/Dequant force the partial path themselves but read the same splits.
-        // EnvGuard, not bare set_var: this test and `attn_flash_warp_dequant_parity` both drive
-        // INFR_FLASH_SPLITS, and when they overlapped one would clear the knob the other was
-        // still running under — both failed together and passed individually. The guard
-        // serializes them and restores the prior values on drop.
-        let _env = infr_core::test_env::EnvGuard::with([
-            ("INFR_NO_FLASH_WARP", "1"),
-            ("INFR_FLASH_SPLITS", "2"),
-        ]);
+        // A per-backend `Config` value, not an `EnvGuard`: this test and
+        // `attn_flash_warp_dequant_parity` both drive `flash_splits`, and while they were env-global
+        // one would clear the knob the other was still running under (both failed together, both
+        // passed individually). Two backends, two values, no lock, no restore (S5b / R7).
+        let be = be_with(|v| {
+            v.flash_warp = false;
+            v.flash_splits = Some(2);
+        });
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -10470,7 +10467,6 @@ mod tests {
                 println!("flash dequant parity OK {dt:?} q={q_len} kv={kv_len} nh={nh} nkv={nkv}");
             }
         }
-        // `_env` restores INFR_NO_FLASH_WARP / INFR_FLASH_SPLITS (and unlocks) here.
     }
 
     /// Lever 2 on the WARP kernel (kv-decode-perf-levers): the register-tiled `attn_flash_warp_deq_*`
@@ -10485,11 +10481,10 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attn_flash_warp_dequant_parity() {
         use infr_core::DType;
-        let be = VulkanBackend::new().unwrap();
-        // Leave warp ON (no INFR_NO_FLASH_WARP). Force split-K so the warp partial+combine reduce is
-        // covered in addition to the n_splits==1 warp path.
-        // See `attn_flash_stage_dequant_parity`: guarded because the two share this knob.
-        let _env = infr_core::test_env::EnvGuard::with([("INFR_FLASH_SPLITS", "2")]);
+        // Leave warp ON (`flash_warp` default `true`). Force split-K so the warp partial+combine
+        // reduce is covered in addition to the n_splits==1 warp path. Its own backend, so the knob
+        // cannot collide with `attn_flash_stage_dequant_parity` running in parallel.
+        let be = be_with(|v| v.flash_splits = Some(2));
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -10591,7 +10586,6 @@ mod tests {
                 );
             }
         }
-        // `_env` restores INFR_FLASH_SPLITS (and unlocks) here.
     }
 
     /// Upload f16 K/V into a `KvCache` buffer (device-addressed → `device_addr()` is `Some`), so the
@@ -10668,12 +10662,36 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attn_flash_coopmat_bda_parity() {
-        let be = VulkanBackend::new().unwrap();
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
                 .collect()
         };
+        // The four `attention_prefill_flash` build selections, each as its own backend + tier
+        // config. Pre-S5b these were four `EnvGuard` cases over ONE backend; the tiers are now
+        // resolved at construction, so a case IS a backend (R7 — no env, no serialization).
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(VulkanBackend, &str)> = vec![
+            (be_with(|_| {}), "warp (n_splits default)"),
+            (
+                be_with(|v| v.flash_splits = Some(2)),
+                "warp split-K partial+combine",
+            ),
+            (
+                be_with(|v| {
+                    v.flash_warp = false;
+                    v.flash_splits = Some(2);
+                }),
+                "non-warp attn_flash_partial",
+            ),
+            (
+                be_with(|v| {
+                    v.flash_bm32 = true;
+                    v.flash_splits = Some(2);
+                }),
+                "bm=32 tile",
+            ),
+        ];
         for &(q_len, kv_len, nh, nkv) in &[
             (128usize, 512usize, 8usize, 2usize),
             (64, 256, 4, 4),
@@ -10682,57 +10700,46 @@ mod tests {
         ] {
             let hd = 128usize;
             let pos_offset = kv_len - q_len;
-            let padrows = kv_len + 128; // pad rows read past kv_len (masked; must be finite/zero)
-            let bq = {
-                let mut v = r16(&gen(q_len * nh * hd, 1));
-                v.resize(q_len.div_ceil(128) * 128 * nh * hd, 0.0);
-                upf16(&be, &v)
+            // `padrows`: pad rows read past kv_len (masked; must be finite/zero).
+            let padrows = kv_len + 128;
+            // Buffers belong to the backend that allocated them, so each case makes its own set
+            // from the SAME synthetic bytes.
+            #[allow(clippy::type_complexity)]
+            let mk = |be: &VulkanBackend| -> (
+                Box<dyn Buffer>,
+                Box<dyn Buffer>,
+                Box<dyn Buffer>,
+                Option<(u64, u64)>,
+            ) {
+                let bq = {
+                    let mut v = r16(&gen(q_len * nh * hd, 1));
+                    v.resize(q_len.div_ceil(128) * 128 * nh * hd, 0.0);
+                    upf16(be, &v)
+                };
+                // K/V in KvCache buffers so both bound and BDA reads hit the same bytes.
+                let bk = {
+                    let mut v = r16(&gen(kv_len * nkv * hd, 2));
+                    v.resize(padrows * nkv * hd, 0.0);
+                    upf16_kv(be, &v)
+                };
+                let bv = {
+                    let mut v = r16(&gen(kv_len * nkv * hd, 3));
+                    v.resize(padrows * nkv * hd, 0.0);
+                    upf16_kv(be, &v)
+                };
+                let ka = bk
+                    .device_addr()
+                    .expect("KvCache K must have a device address");
+                let va = bv
+                    .device_addr()
+                    .expect("KvCache V must have a device address");
+                (bq, bk, bv, Some((ka, va)))
             };
-            // K/V in KvCache buffers so both bound and BDA reads hit the same bytes.
-            let bk = {
-                let mut v = r16(&gen(kv_len * nkv * hd, 2));
-                v.resize(padrows * nkv * hd, 0.0);
-                upf16_kv(&be, &v)
-            };
-            let bv = {
-                let mut v = r16(&gen(kv_len * nkv * hd, 3));
-                v.resize(padrows * nkv * hd, 0.0);
-                upf16_kv(&be, &v)
-            };
-            let ka = bk
-                .device_addr()
-                .expect("KvCache K must have a device address");
-            let va = bv
-                .device_addr()
-                .expect("KvCache V must have a device address");
-            let addr = Some((ka, va));
 
-            // Exercise the four `attention_prefill_flash` build selections against their bound twin.
-            // (env, label)
-            let cases: &[(&[(&str, &str)], &str)] = &[
-                (&[], "warp (n_splits default)"),
-                (
-                    &[("INFR_FLASH_SPLITS", "2")],
-                    "warp split-K partial+combine",
-                ),
-                (
-                    &[("INFR_NO_FLASH_WARP", "1"), ("INFR_FLASH_SPLITS", "2")],
-                    "non-warp attn_flash_partial",
-                ),
-                (
-                    &[("INFR_FLASH_BM", "32"), ("INFR_FLASH_SPLITS", "2")],
-                    "bm=32 tile",
-                ),
-            ];
-            for (envs, label) in cases {
-                // One guard per case: it both serializes against the other flash tests that drive
-                // these knobs and restores whatever they were before this case.
-                let mut env = infr_core::test_env::EnvGuard::new();
-                for (k, v) in *envs {
-                    env.set(k, v);
-                }
+            for (be, label) in &cases {
+                let (bq, bk, bv, addr) = mk(be);
                 let bound = run_flash_bytes(
-                    &be,
+                    be,
                     bq.as_ref(),
                     bk.as_ref(),
                     bv.as_ref(),
@@ -10746,7 +10753,7 @@ mod tests {
                     None,
                 );
                 let bda = run_flash_bytes(
-                    &be,
+                    be,
                     bq.as_ref(),
                     bk.as_ref(),
                     bv.as_ref(),
@@ -10759,7 +10766,6 @@ mod tests {
                     FlashStage::Off,
                     addr,
                 );
-                drop(env); // restore this case's knobs before scoring/printing
                 let bf: &[f32] = bytemuck::cast_slice(&bound);
                 assert!(
                     bf[..q_len * nh * hd]
@@ -10777,9 +10783,11 @@ mod tests {
                 );
             }
 
-            // The (test-only) register-O `attn_flash_reg` kernel, bound vs BDA.
+            // The (test-only) register-O `attn_flash_reg` kernel, bound vs BDA, on the DEFAULT tier.
+            let be = &cases[0].0;
+            let (bq, bk, bv, addr) = mk(be);
             let reg_bound = run_flash_reg_bytes(
-                &be,
+                be,
                 bq.as_ref(),
                 bk.as_ref(),
                 bv.as_ref(),
@@ -10792,7 +10800,7 @@ mod tests {
                 None,
             );
             let reg_bda = run_flash_reg_bytes(
-                &be,
+                be,
                 bq.as_ref(),
                 bk.as_ref(),
                 bv.as_ref(),
@@ -10943,6 +10951,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_reg_matches_cpu() {
+        let be = be_with(|_| {});
         for &(q, kv, nh, nkv) in &[
             (128usize, 128usize, 4usize, 2usize),
             (128, 300, 2, 1),
@@ -10950,16 +10959,21 @@ mod tests {
             (448, 2000, 16, 8), // qwen3-shaped
             (100, 100, 2, 2),   // q<128 → padded tile
         ] {
-            run_attn_flash_reg(q, kv, nh, nkv, 128);
+            run_attn_flash_reg(&be, q, kv, nh, nkv, 128);
         }
-        let _env = infr_core::test_env::EnvGuard::with([("INFR_FLASH_SPLITS", "4")]);
-        run_attn_flash_reg(128, 2000, 16, 8, 128);
-        run_attn_flash_reg(200, 600, 2, 1, 128);
-        // `_env` restores INFR_FLASH_SPLITS (and unlocks) here.
+        let split = be_with(|v| v.flash_splits = Some(4));
+        run_attn_flash_reg(&split, 128, 2000, 16, 8, 128);
+        run_attn_flash_reg(&split, 200, 600, 2, 1, 128);
     }
 
-    fn run_attn_flash_reg(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
-        let be = VulkanBackend::new().unwrap();
+    fn run_attn_flash_reg(
+        be: &VulkanBackend,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
         let pos_offset = kv_len - q_len;
         let mpad = q_len.div_ceil(128) * 128;
         let gen = |n: usize, salt: usize| -> Vec<f32> {
@@ -10976,9 +10990,9 @@ mod tests {
         kp.resize((kv_len + 128) * nkv * hd, 0.0);
         let mut vp = v.clone();
         vp.resize((kv_len + 128) * nkv * hd, 0.0);
-        let bq = upf16(&be, &qp);
-        let bk = upf16(&be, &kp);
-        let bv = upf16(&be, &vp);
+        let bq = upf16(be, &qp);
+        let bk = upf16(be, &kp);
+        let bv = upf16(be, &vp);
         let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
         let po = be
             .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)

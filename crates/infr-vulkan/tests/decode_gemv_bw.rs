@@ -17,11 +17,46 @@ fn blk_bytes(dt: DType) -> usize {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn decode_gemv_bw() {
-    // Every knob this bench flips goes through ONE guard: it serializes against any other test in
-    // the binary that reads these, and restores the caller's environment when the test ends (a
-    // bare `remove_var` sweep at the end would clobber a value the caller had set).
-    let mut env = infr_core::test_env::EnvGuard::new();
-    let be = VulkanBackend::new().unwrap();
+    // `kernels.vulkan.gemv.*` (`INFR_GEMV_*` / `INFR_NO_GEMV_*`) is resolved at backend
+    // construction since S5b — the routing knobs are a VALUE, not process env — so each mode is its
+    // own backend and the six stay live together (the interleaved best-of-3 below needs that).
+    // Each mode fully specifies the group so precedence is explicit (SG > RM > tree in the
+    // recorder), exactly as the old `cfg()` env re-set did.
+    //
+    // The six devices are built INSIDE the shape loop and dropped with it. Six live backends each
+    // holding a shape's ~200 MiB cache-busting weight set is 6x the pre-S5b footprint, and holding
+    // that across all 18 shapes trips the VRAM guard on a 24 GiB part; per-shape devices bound the
+    // peak to one shape (worst case: lm_head, 6 x 3 x 511 MB).
+    let mode_cfg = |mode: &str| -> infr_core::config::GemvCfg {
+        let mut g = infr_core::config::GemvCfg {
+            rm_maxout: 999_999,
+            sg_minout: 0,
+            sg_maxout: 999_999,
+            ..Default::default()
+        };
+        match mode {
+            "1" => {
+                g.no_rm = true;
+                g.no_sg = true;
+            }
+            "R2" | "R4" => {
+                g.no_sg = true;
+                g.rm = mode[1..].parse().unwrap();
+            }
+            _ => {
+                // SG NR = mode[1..]
+                g.no_rm = true;
+                g.sg_nr = mode[1..].parse().unwrap();
+            }
+        }
+        g
+    };
+    let be_for = |mode: &str| -> VulkanBackend {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.gemv = mode_cfg(mode);
+        VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
+    };
+    let modes = ["1", "R2", "R4", "S2", "S4", "S8"];
     // (label, in_f, out_f, dtype) — the Qwen3-8B decode GEMV shapes.
     let shapes = [
         ("q      ", 4096usize, 4096usize, DType::Q4K),
@@ -48,19 +83,23 @@ fn decode_gemv_bw() {
     ];
     let xmax = 12288;
     let xs: Vec<f32> = (0..xmax).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
-    let x = be.alloc(xmax * 4, BufferUsage::Activations).unwrap();
-    be.upload(x.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
-
-    let read = |b: &dyn infr_core::backend::Buffer, n: usize| -> Vec<f32> {
-        let mut out = vec![0u8; n * 4];
-        be.download(b, &mut out).unwrap();
-        bytemuck::cast_slice::<u8, f32>(&out).to_vec()
-    };
 
     for (label, in_f, out_f, dt) in shapes {
+        let bes: Vec<VulkanBackend> = modes.iter().map(|m| be_for(m)).collect();
+        let x: Vec<_> = bes
+            .iter()
+            .map(|be| {
+                let b = be.alloc(xmax * 4, BufferUsage::Activations).unwrap();
+                be.upload(b.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+                b
+            })
+            .collect();
         let wbytes = in_f * out_f / 256 * blk_bytes(dt);
         let n_w = (200usize << 20).div_ceil(wbytes).clamp(3, 24);
-        let ws: Vec<_> = (0..n_w)
+        // The same synthetic weight bytes, uploaded once per mode-backend (a buffer belongs to the
+        // device that allocated it) — so the reported bit-parity compare is still against the SAME
+        // weights, and the working set per mode is unchanged from the pre-S5b single-backend run.
+        let src: Vec<Vec<u8>> = (0..n_w)
             .map(|s| {
                 let mut src: Vec<u8> = (0..wbytes)
                     .map(|i| {
@@ -78,69 +117,64 @@ fn decode_gemv_bw() {
                         _ => unreachable!(),
                     }
                 }
-                let w = be.alloc(wbytes, BufferUsage::Weights).unwrap();
-                be.upload(w.as_ref(), &src).unwrap();
-                w
+                src
             })
             .collect();
-        let y = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+        let per_mode: Vec<(Vec<_>, _)> = bes
+            .iter()
+            .map(|be| {
+                let ws: Vec<_> = src
+                    .iter()
+                    .map(|s| {
+                        let w = be.alloc(wbytes, BufferUsage::Weights).unwrap();
+                        be.upload(w.as_ref(), s).unwrap();
+                        w
+                    })
+                    .collect();
+                let y = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+                (ws, y)
+            })
+            .collect();
         let reps = (n_w * 4).max(40);
 
-        // Mode selects tree(RM1) / RM=2/4 (bit-identical) / SG NR=2/4/8 (reassociated). Each mode
-        // fully re-sets the env so precedence is explicit (SG > RM > tree in the recorder).
-        let cfg = |env: &mut infr_core::test_env::EnvGuard, mode: &str| {
-            env.set("INFR_GEMV_RM_MAXOUT", "999999");
-            env.set("INFR_GEMV_SG_MINOUT", "0");
-            env.set("INFR_GEMV_SG_MAXOUT", "999999");
-            match mode {
-                "1" => {
-                    env.set("INFR_NO_GEMV_RM", "1");
-                    env.set("INFR_NO_GEMV_SG", "1");
-                }
-                "R2" | "R4" => {
-                    env.unset("INFR_NO_GEMV_RM");
-                    env.set("INFR_NO_GEMV_SG", "1");
-                    env.set("INFR_GEMV_RM", &mode[1..]);
-                }
-                _ => {
-                    // SG NR = mode[1..]
-                    env.set("INFR_NO_GEMV_RM", "1");
-                    env.unset("INFR_NO_GEMV_SG");
-                    env.set("INFR_GEMV_SG_NR", &mode[1..]);
-                }
-            };
-        };
-        let run_once = |env: &mut infr_core::test_env::EnvGuard, mode: &str| -> Vec<f32> {
-            cfg(env, mode);
+        // Mode selects tree(RM1) / RM=2/4 (bit-identical) / SG NR=2/4/8 (reassociated).
+        let run_once = |i: usize| -> Vec<f32> {
+            let (be, (ws, y)) = (&bes[i], &per_mode[i]);
             let rec = be.recorder().unwrap();
             rec.linear_native(
                 dt,
                 ws[0].as_ref(),
                 0,
-                x.as_ref(),
+                x[i].as_ref(),
                 y.as_ref(),
                 1,
                 in_f,
                 out_f,
             );
             rec.finish().unwrap();
-            read(y.as_ref(), out_f)
+            let mut out = vec![0u8; out_f * 4];
+            be.download(y.as_ref(), &mut out).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&out).to_vec()
         };
-        let base = run_once(&mut env, "1");
+        let base = run_once(0);
         // RM stays BIT-identical to the tree kernel.
-        for m in ["R2", "R4"] {
-            let got = run_once(&mut env, m);
+        for i in [1usize, 2] {
+            let got = run_once(i);
             let mism = base
                 .iter()
                 .zip(&got)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            assert_eq!(mism, 0, "{label} {m}: {mism} bits differ from tree");
+            assert_eq!(
+                mism, 0,
+                "{label} {}: {mism} bits differ from tree",
+                modes[i]
+            );
         }
         // SG is reassociated (not bit-identical) — measure how close it stays to the tree ref.
         let mut sg_maxrel = 0f32;
-        for m in ["S2", "S4", "S8"] {
-            let got = run_once(&mut env, m);
+        for i in [3usize, 4, 5] {
+            let got = run_once(i);
             let mut mr = 0f32;
             for (a, b) in base.iter().zip(&got) {
                 let d = (a - b).abs() / (a.abs().max(b.abs()) + 1e-6);
@@ -150,8 +184,8 @@ fn decode_gemv_bw() {
         }
 
         // Bandwidth A/B (cold, rotated).
-        let bench = |env: &mut infr_core::test_env::EnvGuard, mode: &str| -> f64 {
-            cfg(env, mode);
+        let bench = |i: usize| -> f64 {
+            let (be, (ws, y)) = (&bes[i], &per_mode[i]);
             let run = || {
                 let rec = be.recorder().unwrap();
                 for r in 0..reps {
@@ -159,7 +193,7 @@ fn decode_gemv_bw() {
                         dt,
                         ws[r % n_w].as_ref(),
                         0,
-                        x.as_ref(),
+                        x[i].as_ref(),
                         y.as_ref(),
                         1,
                         in_f,
@@ -175,11 +209,10 @@ fn decode_gemv_bw() {
             wbytes as f64 / (us * 1e-6) / 1e9
         };
         // Best-of-3, interleaved, to fight the ~25% thermal swing.
-        let modes = ["1", "R2", "R4", "S2", "S4", "S8"];
         let mut best = [0f64; 6];
         for _ in 0..3 {
-            for (i, m) in modes.iter().enumerate() {
-                best[i] = best[i].max(bench(&mut env, m));
+            for (i, b) in best.iter_mut().enumerate() {
+                *b = b.max(bench(i));
             }
         }
         let [g1, r2, r4, s2, s4, s8] = best;
@@ -192,5 +225,4 @@ fn decode_gemv_bw() {
             (sg_best / rm_best - 1.0) * 100.0,
         );
     }
-    // `env` (the guard) restores every knob it touched when it drops here.
 }
