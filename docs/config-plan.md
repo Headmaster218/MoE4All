@@ -7,10 +7,11 @@ them.
 
 ## Ledger
 
-| Slice | What                                                                                                                                                                                                             | Commit    |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests                                                                     | `a0bff9c` |
-| S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock | `addc1ac` |
+| Slice | What                                                                                                                                                                                                                                                                    | Commit    |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests                                                                                                                            | `a0bff9c` |
+| S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock                                                        | `addc1ac` |
+| S2    | `infr-core`'s own knobs (12) read from `Config`: `EnvRows::clamped`, `budget` flag/mib/reserve, `pager::ring_bytes`, `FusionCfg.enabled`. Temporary `Config::load_from_env()` bridge in `VulkanBackend::new_selected` (dies in S5a) and `RocmBackend::new` (dies in S6) | `6a8c2cb` |
 
 **Authority:** `crates/infr-core/src/config/manifest.rs` is the knob inventory —
 177 keys, their config paths, grammars, and a `migrated` flag — and the tests
@@ -571,19 +572,21 @@ means off.
   startup rather than at backend construction — including on subcommands that
   never build a backend (`infr pull`). Intended; note it if a user reports it.
 
-### S2 — `infr-core`'s own knobs
+### Carried into later slices from S2
 
-`tier::EnvRows` (2 knobs: `INFR_MOE_SMALL_M`, `INFR_CANVAS_CHUNK_N` — both
-DECLARED in `infr-vulkan/src/adapter.rs` but RESOLVED by `infr-core`),
-`budget::{env_flag, env_mib, overflow_vram_reserve}` (6 keys, §6.3/§6.4),
-`pager::ring_bytes_policy` (1 key). These already have pure `*_from`/`resolve`
-halves (landed `b9069a3`), so the slice is: delete the env-reading wrapper, take
-the value from `&Config` at the call site. Smallest possible first migration —
-use it to establish the pattern the other slices copy.
-
-**Exit:** `budget.rs`, `tier.rs` and `pager.rs` contain zero `std::env::var`;
-their `INFR_*_TEST_*` fixtures and the guarded "reads its variable" tests are
-deleted with the wrappers.
+- **`Config::load_from_env()` bridges**: `VulkanBackend::new_selected`
+  (`crates/infr-vulkan/src/lib.rs`) and `RocmBackend::new`
+  (`crates/infr-rocm/src/backend.rs`) each construct a config from the
+  environment ONCE and store it as `cfg: Arc<Config>`. **S5a** and **S6**
+  replace those with `new_with(cfg)` taking the caller's config and delete the
+  `load_from_env()` call. `infr-llama` needs no bridge — it reads `vk.cfg()` off
+  the backend it already holds, which S4/S5 swap for the threaded `Arc<Config>`.
+- **One R7 exception outstanding**: `crates/infr-llama/tests/cpu_backend.rs`
+  still drives `INFR_MOE_SMALL_M` through `EnvGuard` (annotated in place),
+  because `SeamModel` opens its own backends and takes no config until S4/S5.
+  Convert it there.
+- `budget.rs`'s `SpillNouns.env` and the `KV_SPILL`/`WEIGHT_SPILL` consts keep
+  the `INFR_*` spellings as user-visible BANNER TEXT, not reads. Leave them.
 
 ### S3 — `infr-cpu`
 
