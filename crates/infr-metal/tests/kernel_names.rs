@@ -133,7 +133,10 @@ fn q4k_q5k_use_wide_headers_only_for_cooperative_prefill() {
 #[test]
 fn q5k_four_row_can_prefer_the_existing_row_tile() {
     let exec = include_str!("../src/exec.rs");
-    asserts_token_seq(exec, "std::env::var(\"INFR_METAL_NO_Q5K_RT\").is_err()");
+    // The knob moved off the environment in the config campaign (S6): `INFR_METAL_NO_Q5K_RT` is
+    // now `kernels.metal.q5k_rt`, read once off the backend's config. The tripwire follows the
+    // value, not the spelling.
+    asserts_token_seq(exec, "let q5k_rt = self.metal().q5k_rt;");
     asserts_token_seq(exec, "prefer_q5k_rt(qw.kern, m, q5k_rt)");
 }
 
@@ -189,9 +192,11 @@ fn f16_small_multirow_linear_uses_the_exact_row_tile() {
 #[test]
 fn f32_linear_reads_the_bound_weight_directly() {
     let exec = include_str!("../src/exec.rs");
+    // `INFR_METAL_NO_F32_NATIVE` became `kernels.metal.f32_native` in the config campaign (S6);
+    // the optimization is unchanged, only where the gate's value comes from.
     asserts_token_seq(
         exec,
-        "let f32_native = wdt == DType::F32 && std::env::var(\"INFR_METAL_NO_F32_NATIVE\").is_err()",
+        "let f32_native = wdt == DType::F32 && mcfg.f32_native;",
     );
     asserts_token_seq(exec, "DType::F32 if f32_native => (\"linear_f32\", 4u64)");
 }
