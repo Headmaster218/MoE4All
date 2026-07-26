@@ -386,6 +386,47 @@ fn q51_blocks(blocks: usize) -> Vec<u8> {
     w
 }
 
+/// Build `blocks` valid IQ4_NL blocks (18 B = [f16 d][u8 qs[16]] — Q4_0's block shape) with a
+/// finite small scale and patterned 4-bit CODEBOOK INDICES (low nibbles are elements 0..15, high
+/// nibbles 16..31). Because 11 is coprime with 16, the pattern walks every table entry, so a kernel
+/// that indexed the codebook the wrong way (or read it byte-swapped) cannot pass by luck.
+fn iq4nl_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 18];
+    for blk in 0..blocks {
+        let base = blk * 18;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes());
+        for j in 0..16 {
+            w[base + 2 + j] = ((blk * 7 + j * 11) & 0xFF) as u8;
+        }
+    }
+    w
+}
+
+/// Build `blocks` valid IQ4_XS blocks (136 B = [f16 d][u16 scales_h][u8 scales_l[4]][u8 qs[128]]).
+/// The eight 6-bit sub-block scales are built EXPLICITLY (low 4 bits into `scales_l`, high 2 into
+/// `scales_h`) and walk 0..63, so `ls − 32` takes BOTH signs across the sub-blocks — a kernel that
+/// dropped the `−32` bias, or read `hi` from the wrong 2-bit field, lands at O(1) relative. The
+/// codebook indices use the same coprime pattern as `iq4nl_blocks`.
+fn iq4xs_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 136];
+    for blk in 0..blocks {
+        let base = blk * 136;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        let (mut scales_h, mut scales_l) = (0u16, [0u8; 4]);
+        for ib in 0..8usize {
+            let ls = ((blk * 5 + ib * 9) % 64) as u32;
+            scales_l[ib / 2] |= ((ls & 0xF) as u8) << (4 * (ib % 2));
+            scales_h |= (((ls >> 4) & 3) as u16) << (2 * ib);
+        }
+        w[base + 2..base + 4].copy_from_slice(&scales_h.to_le_bytes());
+        w[base + 4..base + 8].copy_from_slice(&scales_l);
+        for j in 0..128 {
+            w[base + 8 + j] = ((blk * 7 + j * 11) & 0xFF) as u8;
+        }
+    }
+    w
+}
+
 /// Build `blocks` valid Q6_K blocks (210 B = [ql 128][qh 64][int8 scales 16][f16 d]) with a finite
 /// small `d`, a benign in-range int8 sub-block scale, and patterned ql/qh.
 fn q6k_blocks(blocks: usize) -> Vec<u8> {
@@ -578,6 +619,41 @@ fn linear_i8_q51_matches_cpu() {
     );
 }
 
+/// IQ4_NL int8 GEMV (R4): the first CODEBOOK format on this tier — the 4-bit field indexes the
+/// signed 16-entry `kvalues_iq4nl` table, so the table value itself is the dp4a operand and there is
+/// NO ones-dot/min term. A kernel that kept an affine `code − 8` (or fed the raw index to dp4a)
+/// lands at O(1) relative here.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq4nl_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &iq4nl_blocks(blocks),
+        DType::Iq4Nl,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ4_NL",
+    );
+}
+
+/// IQ4_XS int8 GEMV (R4): the same codebook, but scaled by a 6-bit per-32-element sub-block `ls`
+/// biased by −32 on top of the super-block `d`. One 32-elem activation block is exactly one
+/// sub-block, so this keeps Q4_K's one-scale-per-block loop shape (not Q6_K's two-halves one).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq4xs_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &iq4xs_blocks(blocks),
+        DType::Iq4Xs,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ4_XS",
+    );
+}
+
 /// Q2_K int8 GEMV (R2): 2-bit weight, 4-bit sub-block scale + 4-bit min per 16 elements (so a
 /// 32-elem activation block spans TWO scale sub-blocks) + int8 activation.
 #[test]
@@ -741,6 +817,22 @@ fn wmma_q41_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn wmma_q51_matches_cpu() {
     check_wmma_linear(q51_blocks, DType::Q5_1, 32, 1.5e-2, "Q5_1");
+}
+
+/// IQ4_NL WMMA prefill GEMM (R4): the codebook body `GEN_WMMA_IQ4` at `XS=0` — Q8_0's shape (no
+/// ones-dot at all) with a nibble→`kv_iq4nl` gather in front of the B fragment.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq4nl_matches_cpu() {
+    check_wmma_linear(iq4nl_blocks, DType::Iq4Nl, 32, 1.5e-2, "IQ4_NL");
+}
+
+/// IQ4_XS WMMA prefill GEMM (R4): `GEN_WMMA_IQ4` at `XS=1` — the same body with the super-block
+/// address and the 6-bit `ls − 32` sub-block scale.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq4xs_matches_cpu() {
+    check_wmma_linear(iq4xs_blocks, DType::Iq4Xs, 256, 1.5e-2, "IQ4_XS");
 }
 
 /// Q2_K WMMA prefill GEMM (R2): 2-bit weight, per-16 sub-block 4-bit scale + 4-bit min (1 K-tile
@@ -1365,6 +1457,59 @@ fn moe_ffn_q51_gate_q80_down_experts_matches_cpu() {
         DType::Q5_1,
         DType::Q8_0,
         "Q5_1/Q5_1/Q8_0",
+    );
+}
+
+/// IQ4_XS gate/up + IQ4_NL down MoE experts (R4): `moe_gate_up_act_i8_iq4xs` + `moe_down_i8_iq4nl`
+/// and the `("iq4xs", "iq4nl")` cell — llama.cpp's IQ4 mixes pair an IQ4_XS gate/up with an IQ4_NL
+/// `ffn_down` whenever the down row is not 256-divisible, so this is a shape a real GGUF has.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq4xs_gate_iq4nl_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 256;
+    check_moe_experts(
+        &iq4xs_blocks(gu_blocks),
+        &iq4xs_blocks(gu_blocks),
+        &iq4nl_blocks(n_expert * ne * n_ff_exp / 32),
+        DType::Iq4Xs,
+        DType::Iq4Nl,
+        "IQ4_XS/IQ4_XS/IQ4_NL",
+    );
+}
+
+/// IQ4_NL gate/up + IQ4_XS down MoE experts (R4): the mirrored `("iq4nl", "iq4xs")` cell, so both
+/// new formats are exercised in BOTH the gate/up and the down role across the two cases.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq4nl_gate_iq4xs_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    check_moe_experts(
+        &iq4nl_blocks(gu_blocks),
+        &iq4nl_blocks(gu_blocks),
+        &iq4xs_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Iq4Nl,
+        DType::Iq4Xs,
+        "IQ4_NL/IQ4_NL/IQ4_XS",
+    );
+}
+
+/// IQ4_XS gate/up + Q6_K down MoE experts (R4): the mixed codebook×K-quant cell `("iq4xs", "q6k")`
+/// — an IQ4_XS ftype bumps `ffn_down` to Q6_K under `use_more_bits`, which is the most common real
+/// IQ4 MoE shape, and it pairs a no-min gate/up decode with a down decode that HAS a min term.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq4xs_gate_q6k_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 256;
+    check_moe_experts(
+        &iq4xs_blocks(gu_blocks),
+        &iq4xs_blocks(gu_blocks),
+        &q6k_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Iq4Xs,
+        DType::Q6K,
+        "IQ4_XS/IQ4_XS/Q6_K",
     );
 }
 
@@ -2847,6 +2992,24 @@ fn embed_gather_q41_native_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn embed_gather_q51_native_matches_cpu() {
     check_embed_native(q51_blocks, DType::Q5_1, 32, "Q5_1");
+}
+
+/// IQ4_NL embedding table through `embed_iq4nl` (R4). For a CODEBOOK format this element-wise path
+/// is doubly load-bearing: a wrong table index still produces a plausible-magnitude weight (the
+/// table spans −127..113), so it can hide inside a dot's error averaging — but not here, where every
+/// element is compared on its own.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq4nl_native_matches_cpu() {
+    check_embed_native(iq4nl_blocks, DType::Iq4Nl, 32, "IQ4_NL");
+}
+
+/// IQ4_XS embedding table through `embed_iq4xs` (R4): the same codebook plus the 6-bit `ls − 32`
+/// sub-block scale split across `scales_h`/`scales_l`, pinned element by element.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq4xs_native_matches_cpu() {
+    check_embed_native(iq4xs_blocks, DType::Iq4Xs, 256, "IQ4_XS");
 }
 
 /// Q2_K embedding table through the native `embed_q2k` in-kernel decode gather (×scale) vs CPU.

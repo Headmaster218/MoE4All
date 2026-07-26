@@ -1,9 +1,8 @@
 //! Graph execution: walk ops → resolve bound buffers → dispatch HIP kernels.
 //!
-//! Covered quant formats (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1, see
-//! `native_decode_fmt`) are
-//! decoded in-kernel from their RAW bytes on the `Linear`/`EmbedGather` paths — no f16 cache,
-//! VRAM ≈ quant_size.
+//! Covered quant formats (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS, see
+//! `native_decode_fmt`) are decoded in-kernel from their RAW bytes on the `Linear`/`EmbedGather`
+//! paths — no f16 cache, VRAM ≈ quant_size.
 //! Uncovered quantized weight tensors are dequantized to f16 on the host on first touch and
 //! cached by the raw device-pointer address of their bound buffer.
 
@@ -97,6 +96,8 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
         DType::Q4_0 => ("linear_q40", "embed_q40"),
         DType::Q4_1 => ("linear_q41", "embed_q41"),
         DType::Q5_1 => ("linear_q51", "embed_q51"),
+        DType::Iq4Nl => ("linear_iq4nl", "embed_iq4nl"),
+        DType::Iq4Xs => ("linear_iq4xs", "embed_iq4xs"),
         _ => return None,
     };
     let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
@@ -124,6 +125,8 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
         DType::Q4_0 => "linear_i8_q40",
         DType::Q4_1 => "linear_i8_q41",
         DType::Q5_1 => "linear_i8_q51",
+        DType::Iq4Nl => "linear_i8_iq4nl",
+        DType::Iq4Xs => "linear_i8_iq4xs",
         _ => return None,
     };
     Some((infr_core::decode_spec::block_layout(dt).1, kernel))
@@ -131,8 +134,8 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
 
 /// Dequant-to-f16 kernel name (`deqf16_*`, kernels.rs `DEQUANT_F16`) for a covered dtype — the
 /// weight decoder feeding the Slice-26 rocBLAS f16 prefill GEMM. Same covered set as
-/// [`native_decode_fmt`] (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1); `None` keeps a
-/// format off it.
+/// [`native_decode_fmt`] (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS);
+/// `None` keeps a format off it.
 fn deqf16_fmt(dt: DType) -> Option<&'static str> {
     match dt {
         DType::Q8_0 => Some("deqf16_q80"),
@@ -145,6 +148,8 @@ fn deqf16_fmt(dt: DType) -> Option<&'static str> {
         DType::Q4_0 => Some("deqf16_q40"),
         DType::Q4_1 => Some("deqf16_q41"),
         DType::Q5_1 => Some("deqf16_q51"),
+        DType::Iq4Nl => Some("deqf16_iq4nl"),
+        DType::Iq4Xs => Some("deqf16_iq4xs"),
         _ => None,
     }
 }
@@ -247,6 +252,12 @@ fn native_wmma_fmt(
         (DType::Q5_1, 1, 1) => "wmma_i8_q51_1x1",
         (DType::Q5_1, 2, 2) => "wmma_i8_q51_2x2",
         (DType::Q5_1, _, _) => "wmma_i8_q51_2x1",
+        (DType::Iq4Nl, 1, 1) => "wmma_i8_iq4nl_1x1",
+        (DType::Iq4Nl, 2, 2) => "wmma_i8_iq4nl_2x2",
+        (DType::Iq4Nl, _, _) => "wmma_i8_iq4nl_2x1",
+        (DType::Iq4Xs, 1, 1) => "wmma_i8_iq4xs_1x1",
+        (DType::Iq4Xs, 2, 2) => "wmma_i8_iq4xs_2x2",
+        (DType::Iq4Xs, _, _) => "wmma_i8_iq4xs_2x1",
         _ => return None,
     };
     Some((name, rm, cn))
@@ -309,6 +320,8 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
         DType::Q4_0 => "q40",
         DType::Q4_1 => "q41",
         DType::Q5_1 => "q51",
+        DType::Iq4Nl => "iq4nl",
+        DType::Iq4Xs => "iq4xs",
         _ => return None,
     };
     let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
@@ -317,23 +330,38 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
 
 /// Static kernel name for the `(gate/up format, down format)` combo of the Phase-3 f16-decode expert
 /// FFN, or `None` when that pair is NOT instantiated in `kernels.rs` — the caller then keeps the
-/// dequant→f16 `moe_ffn_expert` fallback. Instantiated set: the full `{q80, q2k, q3k, q4k, q5k,
-/// q6k}²` (36 — e.g. Q4_K_M is `("q4k", "q6k")`, Q3_K_M is `("q3k", "q5k")`) plus
-/// `{q40, q41, q51} × {q40, q41, q51, q80}` (12), i.e. 48 of the 81 `moe_native_fmt` pairs.
+/// dequant→f16 `moe_ffn_expert` fallback. Instantiated set (62 of the 121 `moe_native_fmt` pairs):
 ///
-/// **Why not the full cross product** (R2 documented this escape hatch for exactly this moment, and
-/// R3 measured it and took it): going 6×6 → 9×9 costs **+1.1 s of COLD hiprtc** — backend init plus a
-/// 1-token bench with `~/.cache/comgr` cleared goes 4.31 s → 6.27 s, against 5.44 s for the 48-pair
-/// set. (Warm-cache startup is ~0.48 s in every variant; the code-object cache absorbs it after the
-/// first run.) The 33 cells cut are the ones nothing can reach:
+/// * the full `{q80, q2k, q3k, q4k, q5k, q6k}²` (36 — e.g. Q4_K_M is `("q4k", "q6k")`, Q3_K_M is
+///   `("q3k", "q5k")`),
+/// * `{q40, q41, q51} × {q40, q41, q51, q80}` (12, R3),
+/// * `{iq4nl, iq4xs} × {iq4nl, iq4xs, q4k, q5k, q6k, q80}` (12, R4),
+/// * `{q2k, q3k} × {iq4nl}` (2, R4).
+///
+/// **Why not the full cross product** (R2 documented this escape hatch, R3 measured it and took it):
+/// going 6×6 → 9×9 cost **+1.1 s of COLD hiprtc** — backend init plus a 1-token bench with
+/// `~/.cache/comgr` cleared went 4.31 s → 6.27 s, against 5.44 s for the 48-pair set. R4 re-measured
+/// the same way at the 11-format mark (3 reps each): **5.50-5.55 s** at R3's 48 pairs → **6.39-6.60
+/// s** once R4's 24 DENSE kernels are added at the same 48 pairs → **6.72-6.75 s** at the shipped
+/// 62. So the 14 pairs added above cost only ~0.25 s (~18 ms each) — the dense kernels, i.e. the
+/// actual feature, are ~0.9 s of the delta — while the full 11×11 would have piled on ~59 more
+/// cells. Warm-cache startup is unchanged at ~0.48 s in every variant. The cells cut are the ones
+/// nothing can reach:
 ///
 /// * These kernels are NOT the shipping MoE path. The default int8 dp4a expert path dispatches the
 ///   per-FORMAT `moe_gate_up_act_i8_<gu>` + `moe_down_i8_<dn>` kernels, which ARE total over
-///   `moe_native_fmt` (9 each). `moe_ffn_expert_<gu>_<dn>` runs only under `INFR_ROCM_NO_I8` — an A/B
-///   benchmarking switch whose comparand is precisely the dequant→f16 path an absent pair falls to.
+///   `moe_native_fmt` (11 each). `moe_ffn_expert_<gu>_<dn>` runs only under `INFR_ROCM_NO_I8` — an
+///   A/B benchmarking switch whose comparand is precisely the dequant→f16 path an absent pair
+///   falls to.
 /// * Legacy round quants never mix with K-quants across gate/up vs down. llama.cpp's
 ///   `llama_tensor_get_type` bumps a Q4_0/Q4_1/Q5_1 model's `ffn_down` to another legacy round quant
 ///   or to Q8_0, never to a K-quant, and the K-quant ftypes never step down to a legacy type.
+/// * An IQ4 expert bank means an IQ-family ftype, whose `ffn_down` bump lands on another IQ4, on
+///   Q4_K/Q5_K/Q6_K (`use_more_bits`), or on Q8_0 — never on Q2_K/Q3_K, and never on a legacy round
+///   quant. The one direction that DOES reach a K-quant gate/up with an IQ4 down is
+///   `convert_incompatible_tensor`, which rewrites a Q2_K/Q3_K tensor whose row is not 256-divisible
+///   to **IQ4_NL** (Q4_K/Q5_K/Q6_K go to Q5_0/Q5_1/Q8_0 there instead, which is why only q2k/q3k
+///   appear in that third group).
 ///
 /// An absent pair is not a bug and never panics: `None` here makes the `MoeFfn` arm drop `native`
 /// (see the filter there), so the whole expert takes the correct, slower f16 path. Both this table
@@ -389,6 +417,20 @@ fn moe_expert_kernel(gu: &str, dn: &str) -> Option<&'static str> {
         ("q51", "q41") => Some("moe_ffn_expert_q51_q41"),
         ("q51", "q51") => Some("moe_ffn_expert_q51_q51"),
         ("q51", "q80") => Some("moe_ffn_expert_q51_q80"),
+        ("iq4nl", "iq4nl") => Some("moe_ffn_expert_iq4nl_iq4nl"),
+        ("iq4nl", "iq4xs") => Some("moe_ffn_expert_iq4nl_iq4xs"),
+        ("iq4nl", "q4k") => Some("moe_ffn_expert_iq4nl_q4k"),
+        ("iq4nl", "q5k") => Some("moe_ffn_expert_iq4nl_q5k"),
+        ("iq4nl", "q6k") => Some("moe_ffn_expert_iq4nl_q6k"),
+        ("iq4nl", "q80") => Some("moe_ffn_expert_iq4nl_q80"),
+        ("iq4xs", "iq4nl") => Some("moe_ffn_expert_iq4xs_iq4nl"),
+        ("iq4xs", "iq4xs") => Some("moe_ffn_expert_iq4xs_iq4xs"),
+        ("iq4xs", "q4k") => Some("moe_ffn_expert_iq4xs_q4k"),
+        ("iq4xs", "q5k") => Some("moe_ffn_expert_iq4xs_q5k"),
+        ("iq4xs", "q6k") => Some("moe_ffn_expert_iq4xs_q6k"),
+        ("iq4xs", "q80") => Some("moe_ffn_expert_iq4xs_q80"),
+        ("q2k", "iq4nl") => Some("moe_ffn_expert_q2k_iq4nl"),
+        ("q3k", "iq4nl") => Some("moe_ffn_expert_q3k_iq4nl"),
         _ => None,
     }
 }
@@ -412,6 +454,8 @@ fn moe_gate_up_i8_kernel(gu: &str) -> &'static str {
         "q40" => "moe_gate_up_act_i8_q40",
         "q41" => "moe_gate_up_act_i8_q41",
         "q51" => "moe_gate_up_act_i8_q51",
+        "iq4nl" => "moe_gate_up_act_i8_iq4nl",
+        "iq4xs" => "moe_gate_up_act_i8_iq4xs",
         _ => unreachable!("moe_gate_up_i8_kernel: uncovered ({gu})"),
     }
 }
@@ -428,6 +472,8 @@ fn moe_down_i8_kernel(dn: &str) -> &'static str {
         "q40" => "moe_down_i8_q40",
         "q41" => "moe_down_i8_q41",
         "q51" => "moe_down_i8_q51",
+        "iq4nl" => "moe_down_i8_iq4nl",
+        "iq4xs" => "moe_down_i8_iq4xs",
         _ => unreachable!("moe_down_i8_kernel: uncovered ({dn})"),
     }
 }
@@ -485,6 +531,20 @@ fn moe_expert_routed_kernel(gu: &str, dn: &str) -> Option<&'static str> {
         ("q51", "q41") => Some("moe_ffn_expert_routed_q51_q41"),
         ("q51", "q51") => Some("moe_ffn_expert_routed_q51_q51"),
         ("q51", "q80") => Some("moe_ffn_expert_routed_q51_q80"),
+        ("iq4nl", "iq4nl") => Some("moe_ffn_expert_routed_iq4nl_iq4nl"),
+        ("iq4nl", "iq4xs") => Some("moe_ffn_expert_routed_iq4nl_iq4xs"),
+        ("iq4nl", "q4k") => Some("moe_ffn_expert_routed_iq4nl_q4k"),
+        ("iq4nl", "q5k") => Some("moe_ffn_expert_routed_iq4nl_q5k"),
+        ("iq4nl", "q6k") => Some("moe_ffn_expert_routed_iq4nl_q6k"),
+        ("iq4nl", "q80") => Some("moe_ffn_expert_routed_iq4nl_q80"),
+        ("iq4xs", "iq4nl") => Some("moe_ffn_expert_routed_iq4xs_iq4nl"),
+        ("iq4xs", "iq4xs") => Some("moe_ffn_expert_routed_iq4xs_iq4xs"),
+        ("iq4xs", "q4k") => Some("moe_ffn_expert_routed_iq4xs_q4k"),
+        ("iq4xs", "q5k") => Some("moe_ffn_expert_routed_iq4xs_q5k"),
+        ("iq4xs", "q6k") => Some("moe_ffn_expert_routed_iq4xs_q6k"),
+        ("iq4xs", "q80") => Some("moe_ffn_expert_routed_iq4xs_q80"),
+        ("q2k", "iq4nl") => Some("moe_ffn_expert_routed_q2k_iq4nl"),
+        ("q3k", "iq4nl") => Some("moe_ffn_expert_routed_q3k_iq4nl"),
         _ => None,
     }
 }
@@ -501,6 +561,8 @@ fn moe_gate_up_i8_routed_kernel(gu: &str) -> &'static str {
         "q40" => "moe_gate_up_act_i8_routed_q40",
         "q41" => "moe_gate_up_act_i8_routed_q41",
         "q51" => "moe_gate_up_act_i8_routed_q51",
+        "iq4nl" => "moe_gate_up_act_i8_routed_iq4nl",
+        "iq4xs" => "moe_gate_up_act_i8_routed_iq4xs",
         _ => unreachable!("moe_gate_up_i8_routed_kernel: uncovered ({gu})"),
     }
 }
@@ -517,6 +579,8 @@ fn moe_down_i8_routed_kernel(dn: &str) -> &'static str {
         "q40" => "moe_down_i8_routed_q40",
         "q41" => "moe_down_i8_routed_q41",
         "q51" => "moe_down_i8_routed_q51",
+        "iq4nl" => "moe_down_i8_routed_iq4nl",
+        "iq4xs" => "moe_down_i8_routed_iq4xs",
         _ => unreachable!("moe_down_i8_routed_kernel: uncovered ({dn})"),
     }
 }
@@ -2381,8 +2445,8 @@ fn run_op(
                 if native.is_none() {
                     return Err(be(
                         "rocm moe pager: paged expert bank has a non-native quant format \
-                         (only Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_1 page — the IQ \
-                          formats await native MoE decode)",
+                         (only Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_1/IQ4_NL/IQ4_XS page \
+                          — the remaining IQ/fp4/ternary formats await native MoE decode)",
                     ));
                 }
                 // Open one touch batch per pool for this (layer) op, so every expert this op
@@ -3188,6 +3252,11 @@ mod decode_spec_tests {
             (DType::Q4_0, 32, 18),
             (DType::Q4_1, 32, 20),
             (DType::Q5_1, 32, 24),
+            // R4's codebook quants: IQ4_NL is Q4_0's block shape (18 B = f16 + 16 packed nibbles)
+            // and IQ4_XS is a 256-element super-block (136 B = f16 + u16 scales_h + 4 scales_l +
+            // 128 qs) whose 8 sub-blocks of 32 each carry their own 6-bit scale.
+            (DType::Iq4Nl, 32, 18),
+            (DType::Iq4Xs, 256, 136),
         ] {
             let (e, b, _, _) = native_decode_fmt(dt).expect("covered by native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} native_decode_fmt geometry");
@@ -3204,13 +3273,15 @@ mod decode_spec_tests {
             (DType::Q4_0, 32, 18),
             (DType::Q4_1, 32, 20),
             (DType::Q5_1, 32, 24),
+            (DType::Iq4Nl, 32, 18),
+            (DType::Iq4Xs, 256, 136),
         ] {
             let (_, e, b) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} moe_native_fmt geometry");
         }
         // Coverage boundary: the formats still awaiting a native kernel stay off the fast path.
-        assert!(native_decode_fmt(DType::Iq4Nl).is_none());
-        assert!(native_i8_fmt(DType::Iq4Nl, &rocm).is_none());
+        assert!(native_decode_fmt(DType::Iq2Xxs).is_none());
+        assert!(native_i8_fmt(DType::Iq2Xxs, &rocm).is_none());
         // Q5_0 is native on the DENSE paths but has no MoE expert kernel — no shipped GGUF packs
         // expert banks as Q5_0, so it stays off the (gate/up × down) cross product.
         assert!(moe_native_fmt(DType::Q5_0).is_none());
@@ -3219,10 +3290,16 @@ mod decode_spec_tests {
     /// The `(gate/up, down)` pairs `kernels.rs` instantiates the cross-product expert kernels for —
     /// the expected set both mappers are pinned against. Rationale lives on `moe_expert_kernel`.
     const MOE_EXPERT_PAIRS: &[(&str, &str)] = &{
+        // The K-quant square, then three rectangles: the R3 legacy round quants, the R4 codebook
+        // quants, and the `convert_incompatible_tensor` K-quant→IQ4_NL down bump.
         const K: [&str; 6] = ["q80", "q2k", "q3k", "q4k", "q5k", "q6k"];
         const L: [&str; 3] = ["q40", "q41", "q51"];
         const LD: [&str; 4] = ["q40", "q41", "q51", "q80"];
-        let mut out = [("", ""); K.len() * K.len() + L.len() * LD.len()];
+        const I: [&str; 2] = ["iq4nl", "iq4xs"];
+        const ID: [&str; 6] = ["iq4nl", "iq4xs", "q4k", "q5k", "q6k", "q80"];
+        const XK: [&str; 2] = ["q2k", "q3k"];
+        let mut out =
+            [("", ""); K.len() * K.len() + L.len() * LD.len() + I.len() * ID.len() + XK.len()];
         let (mut n, mut i) = (0, 0);
         while i < K.len() {
             let mut j = 0;
@@ -3243,10 +3320,26 @@ mod decode_spec_tests {
             }
             i += 1;
         }
+        let mut i = 0;
+        while i < I.len() {
+            let mut j = 0;
+            while j < ID.len() {
+                out[n] = (I[i], ID[j]);
+                n += 1;
+                j += 1;
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        while i < XK.len() {
+            out[n] = (XK[i], "iq4nl");
+            n += 1;
+            i += 1;
+        }
         out
     };
 
-    /// R3 escape hatch: the Phase-3 cross-product expert kernels are instantiated for
+    /// R3 escape hatch (extended by R4): the Phase-3 cross-product expert kernels are instantiated for
     /// [`MOE_EXPERT_PAIRS`] only, and BOTH mappers must cover exactly that set — the `MoeFfn` arm
     /// checks availability once (via `moe_expert_kernel`) and then dispatches EITHER the host-routed
     /// or the device-routed kernel, so a table that drifted would `expect`-panic at run time on a
@@ -3254,10 +3347,14 @@ mod decode_spec_tests {
     #[test]
     fn moe_expert_pair_tables_agree() {
         use super::{moe_expert_kernel, moe_expert_routed_kernel};
-        const ALL: [&str; 10] = [
-            "q80", "q2k", "q3k", "q4k", "q5k", "q6k", "q40", "q41", "q51", "q50",
+        const ALL: [&str; 12] = [
+            "q80", "q2k", "q3k", "q4k", "q5k", "q6k", "q40", "q41", "q51", "iq4nl", "iq4xs", "q50",
         ];
-        assert_eq!(MOE_EXPERT_PAIRS.len(), 48, "6×6 + 3×4 instantiated pairs");
+        assert_eq!(
+            MOE_EXPERT_PAIRS.len(),
+            62,
+            "6×6 + 3×4 + 2×6 + 2 instantiated pairs"
+        );
         for gu in ALL {
             for dn in ALL {
                 let want = MOE_EXPERT_PAIRS.contains(&(gu, dn));
@@ -3287,6 +3384,8 @@ mod decode_spec_tests {
             DType::Q4_0,
             DType::Q4_1,
             DType::Q5_1,
+            DType::Iq4Nl,
+            DType::Iq4Xs,
         ] {
             let (s, _, _) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!(

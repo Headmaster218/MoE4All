@@ -3608,8 +3608,11 @@ mod rocm_seam_gate {
         seam_rocm_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
     }
 
-    /// Qwen3-0.6B at IQ4_XS (non-linear 4-bit codebook quant) through the ROCm seam — model-level
-    /// quant path (the arch's projections are small, so this exercises the host block-dequant).
+    /// Qwen3-0.6B at IQ4_XS (non-linear 4-bit codebook quant) through the ROCm seam. Since R4 this
+    /// is the NATIVE path end to end: `linear_i8_iq4xs` at decode, `wmma_i8_iq4xs_*` at prefill,
+    /// `embed_iq4xs` on the embedding gather — all reading the raw quant bytes with the codebook
+    /// baked into the module from `KVALUES_IQ4NL`. Before R4 the same assertion covered the host
+    /// dequant→f16 fallback, and the golden did not move when the kernels replaced it.
     #[test]
     #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
     fn seam_rocm_matches_cpu_qwen3_iq4xs() {

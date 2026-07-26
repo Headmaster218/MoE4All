@@ -3,9 +3,9 @@
 //! Each kernel is a `__global__` function taking device pointers. Most operate on f16 or f32
 //! buffers — uncovered quantized weights are dequantized to f16 on the host BEFORE they reach a
 //! kernel (see `exec.rs`'s dequant cache), so those kernels stay format-agnostic and simple. The
-//! `NATIVE_DECODE` kernels (Phase 3, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q5_0) are the exception: they
-//! read the RAW quant bytes and decode each block in-kernel, so no f16 cache is materialized
-//! (VRAM ≈ quant_size).
+//! `NATIVE_DECODE` kernels (Phase 3, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/
+//! IQ4_XS) are the exception: they read the RAW quant bytes and decode each block in-kernel, so no
+//! f16 cache is materialized (VRAM ≈ quant_size).
 //!
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
 //! `HashMap`. The module is compiled once at backend init via `hiprtcCompileProgram`.
@@ -23,11 +23,53 @@ use infr_core::error::backend as be;
 
 /// Assemble the complete HIP source string from its parts.
 pub fn hip_source() -> String {
-    let mut s = String::with_capacity(128 * 1024);
+    let mut s = String::with_capacity(160 * 1024);
+    // The one GENERATED part (everything else is a literal in `HIP_PARTS`): the IQ4 codebook is
+    // emitted from the host const so the device table cannot drift from the decode oracle. It is
+    // self-contained (`kv_iq4nl` depends on nothing), so it can lead the source; NATIVE_DECODE and
+    // every later part that decodes IQ4_NL/IQ4_XS is assembled after it.
+    s.push_str(&iq4nl_codebook_src());
     for part in HIP_PARTS {
         s.push_str(part);
     }
     s
+}
+
+/// Emit the IQ4_NL / IQ4_XS 16-entry signed codebook (llama.cpp `kvalues_iq4nl`) as HIP source,
+/// GENERATED from [`infr_gguf::dequant::KVALUES_IQ4NL`] — the single host-side table the GGUF decode
+/// oracle (`dequant_codebook`) and the CPU kernels read. Emitting rather than re-typing it is what
+/// makes a drift between the device decode and its oracle impossible.
+///
+/// **Why baked into the source rather than uploaded as a constant buffer.** The module is a string
+/// this backend already assembles at run time and hands to hiprtc, so materializing 16 bytes of it
+/// costs nothing and is visible to the optimizer as a compile-time constant. A device buffer would
+/// instead need its own allocation plus an extra pointer parameter on EVERY IQ4 kernel — including
+/// the WMMA and MoE kernels, whose signatures come from macros shared with the affine formats, so
+/// the parameter would have to be threaded through those too — and it would put a memory load in
+/// the innermost decode loop, where this is pure ALU.
+///
+/// The 16 values are packed 4 signed bytes per `u32` and read back with a 4-way word select + a
+/// shift and `signed char` cast (the same shape `native_decode.glsl` uses, for the same reason): a
+/// dynamically indexed 16-element array lowers to a long select cascade or a scratch spill, while
+/// the 4-way select is a couple of `v_cndmask` and the intra-word extract is a single byte extract.
+fn iq4nl_codebook_src() -> String {
+    let kv = infr_gguf::dequant::KVALUES_IQ4NL;
+    // Little-endian byte order within the word: index `i` lives in byte `i & 3` of word `i >> 2`.
+    let w = |n: usize| -> u32 {
+        (0..4).fold(0u32, |acc, b| {
+            acc | ((kv[n * 4 + b] as u8 as u32) << (8 * b))
+        })
+    };
+    let (w0, w1, w2, w3) = (w(0), w(1), w(2), w(3));
+    format!(
+        "\n// ── IQ4_NL / IQ4_XS codebook — GENERATED from infr_gguf::dequant::KVALUES_IQ4NL ──\n\
+         // {kv:?}\n\
+         __device__ __forceinline__ int kv_iq4nl(int idx) {{\n\
+         \x20   unsigned int w = (idx < 8) ? ((idx < 4) ? {w0:#010x}u : {w1:#010x}u)\n\
+         \x20                             : ((idx < 12) ? {w2:#010x}u : {w3:#010x}u);\n\
+         \x20   return (int)(signed char)((w >> ((idx & 3) * 8)) & 0xFFu);\n\
+         }}\n"
+    )
 }
 
 /// The individual kernel source parts (one per kernel, so the hot-patching assembly is greppable).
@@ -1418,10 +1460,11 @@ extern "C" __global__ void moe_shared_expert_add(
 // These kernels read the RAW quantized weight bytes and decode each block ON THE FLY,
 // so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
-// lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and the legacy
-// 32-element round quants Q4_0, Q4_1, Q5_0, Q5_1 (the sets a Q2_K / Q3_K_M / Q4_K_M / Q5_K_M /
-// Q4_0 / Q4_1 GGUF uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is
-// already native via `linear_f16`).
+// lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, the legacy
+// 32-element round quants Q4_0, Q4_1, Q5_0, Q5_1, and the codebook 4-bit quants IQ4_NL, IQ4_XS
+// (the sets a Q2_K / Q3_K_M / Q4_K_M / Q5_K_M / Q4_0 / Q4_1 / IQ4_XS / IQ4_NL GGUF uses —
+// unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already native via
+// `linear_f16`).
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -1447,6 +1490,18 @@ __device__ __forceinline__ float rf16b(const unsigned char* p) {
 __device__ __forceinline__ float fin(float sc, int code, float mn) {
 #pragma clang fp contract(off)
     float val = sc * (float)code + mn;
+    return __half2float(__float2half(val));
+}
+
+// `fin` for a CODEBOOK quant (IQ4_NL / IQ4_XS): the decoded value is `sc * KV[code]` with NO offset
+// term at all — the 4-bit field is an INDEX into a fixed signed table, not a linear quant level, so
+// there is nothing to centre. The host oracle (`dequant_codebook`) spells it as exactly one f32
+// multiply, so this must NOT go through `fin(sc, kv, 0.0f)`: adding a literal zero is a no-op for
+// every finite product but flips `-0.0` to `+0.0`, and the point of this helper is to reproduce the
+// oracle's bits, not merely its value. Same f16 round-trip as `fin` (the dequant→f16 cache path).
+__device__ __forceinline__ float finc(float sc, int kv) {
+#pragma clang fp contract(off)
+    float val = sc * (float)kv;
     return __half2float(__float2half(val));
 }
 
@@ -1538,6 +1593,49 @@ __device__ __forceinline__ float deq_q51(const unsigned char* w, long i) {
         code = (qs[j] >> 4) | xh;
     }
     return fin(d, code, mn);                 // sc = d, mn = m
+}
+
+// ── Codebook 4-bit quants (IQ4_NL / IQ4_XS) ──────────────────────────────────
+// R4's new thing: the 4-bit field is an INDEX into the fixed 16-entry signed table `kv_iq4nl`
+// (GENERATED from the host `KVALUES_IQ4NL`, assembled at the head of this module), not a linear
+// quant level. So there is no `code − offset` and no min term anywhere in this family — the decoded
+// value is one multiply, `scale · KV[idx]` (hence `finc`, not `fin`).
+// Both share Q4_0's nibble packing: the LOW nibbles of a 16-byte `qs` group are elements 0..15 and
+// the HIGH nibbles are elements 16..31. They differ only in where the scale comes from:
+//   IQ4_NL  (18 B / 32 elems)   one f16 `d` per 32 elements                    → scale = d
+//   IQ4_XS  (136 B / 256 elems) f16 `d` × a 6-bit per-sub-block `ls`, biased   → scale = d·(ls−32)
+
+// ── IQ4_NL: 32 elems / 18 bytes = [half d][u8 qs[16]]; y = d * KV[q4]. ──
+__device__ __forceinline__ float deq_iq4nl(const unsigned char* w, long i) {
+    long blk = i >> 5;             // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 18;
+    float d = rf16b(b);
+    const unsigned char* qs = b + 2;
+    int idx = (within < 16) ? (qs[within] & 0x0F) : (qs[within - 16] >> 4);
+    return finc(d, kv_iq4nl(idx));
+}
+
+// ── IQ4_XS: 256 elems / 136 bytes = [half d][u16 scales_h][u8 scales_l[4]][u8 qs[128]]. ──
+// y = d·(ls − 32) * KV[q4], where `ls` is the 6-bit scale of the element's 32-element sub-block
+// `ib = within/32`: low 4 bits from nibble `ib&1` of `scales_l[ib/2]`, high 2 bits from bits
+// `2·ib` of `scales_h`. The oracle computes `dl = d * (ls − 32)` as its own f32 multiply and then
+// `dl * KV[idx]`, so the two multiplies stay separate here (two multiplies cannot contract, so no
+// `fp contract` pragma is needed on `dl` itself).
+__device__ __forceinline__ float deq_iq4xs(const unsigned char* w, long i) {
+    long blk = i >> 8;             // / 256
+    int p = (int)(i & 255);
+    const unsigned char* b = w + blk * 136;
+    float d = rf16b(b);
+    unsigned int scales_h = (unsigned int)b[2] | ((unsigned int)b[3] << 8);
+    int ib = p >> 5;               // 32-elem sub-block 0..7
+    int within = p & 31;
+    int lo = (b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F;
+    int hi = (int)((scales_h >> (2 * ib)) & 3u);
+    float dl = d * (float)((lo | (hi << 4)) - 32);
+    const unsigned char* qs = b + 8 + 16 * ib;
+    int idx = (within < 16) ? (qs[within] & 0x0F) : (qs[within - 16] >> 4);
+    return finc(dl, kv_iq4nl(idx));
 }
 
 // ── K-quant 16-elem sub-block traversal (Q2_K / Q3_K) ────────────────────────
@@ -1734,6 +1832,8 @@ GEN_LINEAR(q50)
 GEN_LINEAR(q40)
 GEN_LINEAR(q41)
 GEN_LINEAR(q51)
+GEN_LINEAR(iq4nl)
+GEN_LINEAR(iq4xs)
 GEN_EMBED(q80)
 GEN_EMBED(q2k)
 GEN_EMBED(q3k)
@@ -1744,6 +1844,8 @@ GEN_EMBED(q50)
 GEN_EMBED(q40)
 GEN_EMBED(q41)
 GEN_EMBED(q51)
+GEN_EMBED(iq4nl)
+GEN_EMBED(iq4xs)
 "#;
 
 // ── Dequant-to-f16 + activation cast (Slice 26, rocBLAS f16 prefill GEMM) ─────
@@ -1772,6 +1874,8 @@ GEN_DEQF16(q50)
 GEN_DEQF16(q40)
 GEN_DEQF16(q41)
 GEN_DEQF16(q51)
+GEN_DEQF16(iq4nl)
+GEN_DEQF16(iq4xs)
 
 extern "C" __global__ void cast_f32_f16(
     const float* __restrict__ x, __half* __restrict__ out, int n) {
@@ -1791,12 +1895,14 @@ extern "C" __global__ void cast_f32_f16(
 // Gate & up share ONE format (`GU`) — they are the same tensor when fused, and every GGUF stores
 // ffn_gate_exps / ffn_up_exps at the same quant type. The down bank has its OWN format (`DN`):
 // Q4_K_M packs gate/up as Q4_K but ffn_down_exps as Q6_K, so the two suffixes must be independent.
-// The 81 (GU × DN) combos over {q80, q2k, q3k, q4k, q5k, q6k, q40, q41, q51} cover every
-// mixed-precision MoE the covered formats produce; uncovered formats keep the dequant→f16
-// `moe_ffn_expert` fallback in exec.rs.
-// The full cross product is instantiated deliberately: `moe_native_fmt` resolves GU and DN from two
-// INDEPENDENT tensor dtypes (`ffn_gate_exps` vs `ffn_down_exps`), so no pair can be statically
-// excluded without making `moe_expert_kernel`'s `unreachable!` reachable on some real GGUF.
+// This cross product is NOT complete over `moe_native_fmt` (11 formats would be 121 pairs per
+// macro): R3 measured the full expansion at +1.1 s of COLD hiprtc and took R2's escape hatch, so
+// only the pairs a real GGUF can actually produce are instantiated — see `moe_expert_kernel` in
+// exec.rs for the reachability argument, and `MOE_EXPERT_PAIRS` (exec.rs test module) for the exact
+// set, which `moe_expert_pair_tables_agree` pins against both mappers. An absent pair is not a bug:
+// the `MoeFfn` arm drops `native` and the expert takes the dequant→f16 `moe_ffn_expert` fallback,
+// which is exactly the comparand of the `INFR_ROCM_NO_I8` switch these kernels serve. Uncovered
+// FORMATS take that same fallback.
 //
 // Pointers are pre-advanced HOST-SIDE to this expert's block-aligned byte offset (see the MoeFfn
 // arm), so the in-kernel element index is relative to the expert's own bank — identical geometry
@@ -1892,6 +1998,20 @@ GEN_MOE_FFN(q51, q40)
 GEN_MOE_FFN(q51, q41)
 GEN_MOE_FFN(q51, q51)
 GEN_MOE_FFN(q51, q80)
+GEN_MOE_FFN(iq4nl, iq4nl)
+GEN_MOE_FFN(iq4nl, iq4xs)
+GEN_MOE_FFN(iq4nl, q4k)
+GEN_MOE_FFN(iq4nl, q5k)
+GEN_MOE_FFN(iq4nl, q6k)
+GEN_MOE_FFN(iq4nl, q80)
+GEN_MOE_FFN(iq4xs, iq4nl)
+GEN_MOE_FFN(iq4xs, iq4xs)
+GEN_MOE_FFN(iq4xs, q4k)
+GEN_MOE_FFN(iq4xs, q5k)
+GEN_MOE_FFN(iq4xs, q6k)
+GEN_MOE_FFN(iq4xs, q80)
+GEN_MOE_FFN(q2k, iq4nl)
+GEN_MOE_FFN(q3k, iq4nl)
 "#;
 
 // ── Int8-activation dp4a decode GEMV (Phase 4) ───────────────────────────────
@@ -1915,9 +2035,13 @@ GEN_MOE_FFN(q51, q80)
 // REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
 // covers every row, so the activation quant cost amortizes over the whole GEMV.
 //
-// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1. `rf16b`/`k4`/
-// `q3k_sc6` live in NATIVE_DECODE (assembled before this part). Uncovered formats keep the
-// dequant→f16 fallback.
+// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ4_XS.
+// `rf16b`/`k4`/`q3k_sc6` live in NATIVE_DECODE and `kv_iq4nl` in the generated codebook part (both
+// assembled before this one). Uncovered formats keep the dequant→f16 fallback.
+//
+// The affine formats fold their offset into a SECOND integer dot against an all-ones B operand
+// (`isum`), weighted by the block's min. The R4 codebook formats (IQ4_NL/IQ4_XS) have no offset at
+// all — `kv_iq4nl(idx)` is already the signed weight — so they carry no `isum` term.
 const INT8_DECODE: &str = r#"
 // Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
 // scale = amax/127 (llama.cpp/GPU convention: `roundf`, half-away-from-zero). One thread / 32-block.
@@ -2480,6 +2604,104 @@ extern "C" __global__ void linear_i8_q51(
         dst[oi] = resid ? (acc + resid[oi]) : acc;
     }
 }
+
+// ── IQ4_NL (R4): 32 elems / 18 bytes; CODEBOOK — value = d · KV[idx], idx ∈ 0..15. ──
+// The one structural difference from every affine format in this tier: `kv_iq4nl(idx)` is ALREADY a
+// signed value (−127..113), so it IS the dp4a operand — there is nothing to centre and therefore NO
+// `isum` ones-dot / min-correction term at all. Per block: acc += d·xs·idot. (This is exactly what
+// the CPU reference `vec_dot_iq4nl_32_batch_scalar` does: one i32 `iprod`, one f32 multiply.)
+// The table values fit int8, so the 32-element dot cannot overflow i32 (|Σ| ≤ 32·127·127).
+extern "C" __global__ void linear_i8_iq4nl(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 18;
+        float d = rf16b(b);
+        const unsigned char* qs = b + 2;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)kv_iq4nl(qs[p] & 0x0F);
+            code[p + 16] = (signed char)kv_iq4nl(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+        }
+        acc += d * xsr[blk] * (float)idot;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+
+// ── IQ4_XS (R4): 256 elems / 136 bytes; codebook + a 6-bit per-sub-block scale. ──
+// value = d·(ls − 32) · KV[idx]. One 32-elem activation block is EXACTLY one of the 8 sub-blocks
+// (unlike Q2_K/Q3_K/Q6_K, whose 16-element sub-blocks make a 32-block span two), so this keeps
+// Q4_K's one-scale-per-32-block shape: `super = o·spr + blk/8`, sub-block `ib = blk & 7`. Same
+// codebook rule as IQ4_NL — signed table value straight into dp4a, no ones-dot.
+extern "C" __global__ void linear_i8_iq4xs(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    int spr = nb >> 3;             // IQ4_XS super-blocks (256 elems) per output row
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int ib = blk & 7;          // 32-elem sub-block 0..7 (== this 32-block)
+        const unsigned char* b = w + (long)super * 136;
+        float d = rf16b(b);
+        unsigned int scales_h = (unsigned int)b[2] | ((unsigned int)b[3] << 8);
+        int lo = (b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F;
+        int hi = (int)((scales_h >> (2 * ib)) & 3u);
+        float dl = d * (float)((lo | (hi << 4)) - 32);
+        const unsigned char* qs = b + 8 + 16 * ib;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)kv_iq4nl(qs[p] & 0x0F);
+            code[p + 16] = (signed char)kv_iq4nl(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+        }
+        acc += dl * xsr[blk] * (float)idot;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
 "#;
 
 // ── Fused RMSNorm → int8 activation quant (Slice 32) ──────────────────────────
@@ -2577,9 +2799,11 @@ extern "C" __global__ void rmsnorm_quant_i8_32(
 // SANCTIONED PRECISION FLIP: int8 activation quant is lossy in BOTH stages (x and h), so the output
 // differs (within tolerance) from the bit-faithful f16 expert path — parity is checked vs the CPU
 // reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q2_K, Q3_K,
-// Q4_K, Q5_K, Q6_K (every K-quant expert bank a real GGUF ships, incl. llama4-Scout's Q2_K/Q3_K)
-// plus the R3 legacy round quants Q4_0, Q4_1, Q5_1; uncovered keep the Phase-3
-// `moe_ffn_expert_*` fallback.
+// Q4_K, Q5_K, Q6_K (every K-quant expert bank a real GGUF ships, incl. llama4-Scout's Q2_K/Q3_K),
+// the R3 legacy round quants Q4_0, Q4_1, Q5_1, and the R4 codebook quants IQ4_NL, IQ4_XS;
+// uncovered keep the Phase-3 `moe_ffn_expert_*` fallback. Unlike the `moe_ffn_expert_<gu>_<dn>`
+// cross product, this per-FORMAT pair of kernels IS total over `moe_native_fmt` — which is what
+// keeps the SHIPPING (int8) expert path complete even though the cross product is not.
 //
 // `rf16b`/`k4` (NATIVE_DECODE) and `idot4`/`wave_sum32` (INT8_DECODE) are defined in the parts
 // assembled before this one.
@@ -2890,6 +3114,64 @@ __device__ __forceinline__ float i8acc_q51(
     return acc;
 }
 
+// IQ4_NL per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_iq4nl`. Codebook:
+// the table value IS the signed dp4a operand, so there is no ones-dot / min term.
+__device__ __forceinline__ float i8acc_iq4nl(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 18;
+        float d = rf16b(b);
+        const unsigned char* qs = b + 2;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)kv_iq4nl(qs[p] & 0x0F);
+            code[p + 16] = (signed char)kv_iq4nl(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+        }
+        acc += d * xsr[blk] * (float)idot;
+    }
+    return acc;
+}
+
+// IQ4_XS per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_iq4xs`.
+__device__ __forceinline__ float i8acc_iq4xs(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    int spr = nb >> 3;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int ib = blk & 7;
+        const unsigned char* b = w + (long)super * 136;
+        float d = rf16b(b);
+        unsigned int scales_h = (unsigned int)b[2] | ((unsigned int)b[3] << 8);
+        int lo = (b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F;
+        int hi = (int)((scales_h >> (2 * ib)) & 3u);
+        float dl = d * (float)((lo | (hi << 4)) - 32);
+        const unsigned char* qs = b + 8 + 16 * ib;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)kv_iq4nl(qs[p] & 0x0F);
+            code[p + 16] = (signed char)kv_iq4nl(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+        }
+        acc += dl * xsr[blk] * (float)idot;
+    }
+    return acc;
+}
+
 // Gate+up+activation for one expert: block `o` (0..nff) computes h_out[o] = act(g·wg)·(u·wg)·wo·dsc.
 // `qx`/`xs` are the int8 quantization of the token's input row x[ne] (produced ONCE per token, reused
 // across experts + both gate & up). gate_w/up_w are pre-advanced to this expert's banks (fused gate/up
@@ -2955,6 +3237,8 @@ GEN_MOE_GATE_UP(q6k)
 GEN_MOE_GATE_UP(q40)
 GEN_MOE_GATE_UP(q41)
 GEN_MOE_GATE_UP(q51)
+GEN_MOE_GATE_UP(iq4nl)
+GEN_MOE_GATE_UP(iq4xs)
 GEN_MOE_DOWN(q80)
 GEN_MOE_DOWN(q2k)
 GEN_MOE_DOWN(q3k)
@@ -2964,6 +3248,8 @@ GEN_MOE_DOWN(q6k)
 GEN_MOE_DOWN(q40)
 GEN_MOE_DOWN(q41)
 GEN_MOE_DOWN(q51)
+GEN_MOE_DOWN(iq4nl)
+GEN_MOE_DOWN(iq4xs)
 "#;
 
 // ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5, RM×CN register-tiled — Slice 25) ──
@@ -3530,6 +3816,81 @@ extern "C" __global__ void NAME( \
 #define GEN_WMMA_Q41(NAME, RM, CN) GEN_WMMA_R32(NAME, RM, CN, 20, 1, 0)
 #define GEN_WMMA_Q51(NAME, RM, CN) GEN_WMMA_R32(NAME, RM, CN, 24, 1, 1)
 
+// ── IQ4_NL / IQ4_XS (R4): codebook 4-bit, 32 elems per scale = 2 K-tiles, NO min term. ──
+// ONE macro for both, as `GEN_WMMA_R32` is one for the three legacy round quants: they share the
+// whole loop (identical nibble→`kv_iq4nl` decode, identical 2×wmma_dot, identical epilogue) and
+// differ ONLY in where the per-32-element scale comes from, which `XS` (a literal, so the branch
+// folds at compile time) selects:
+//   XS=0  IQ4_NL, 18 B per 32 elements     → scale = `d`,           qs at +2
+//   XS=1  IQ4_XS, 136 B per 256 elements   → scale = `d·(ls − 32)`, qs at +8 + 16·ib
+// Structurally this is `GEN_WMMA_Q80`'s shape, NOT `GEN_WMMA_R32`'s: like Q8_0 the weight operand is
+// already signed (the codebook value), so there is no ones-dot `sumacc` / `wmn` at all — which is
+// also why the R32 body could not simply be reused with another flag. The decode is byte-identical
+// to `linear_i8_iq4nl`/`linear_i8_iq4xs` and to `deq_iq4nl`/`deq_iq4xs`.
+#define GEN_WMMA_IQ4(NAME, RM, CN, XS) \
+extern "C" __global__ void NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int lane = threadIdx.x; \
+    int half = lane >> 4; \
+    int col_base = blockIdx.x * (16 * (CN)); \
+    int row_base = blockIdx.y * (16 * (RM)); \
+    int nblk = in_f >> 5; \
+    int spr = nblk >> 3; \
+    float acc[RM][CN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    signed char wc[CN][32]; \
+    float wsc[CN]; \
+    for (int blk = 0; blk < nblk; blk++) { \
+        for (int c = 0; c < (CN); c++) { \
+            int col = col_base + c * 16 + (lane & 15); \
+            if (col < out_f) { \
+                const unsigned char* qs; \
+                if (XS) { \
+                    const unsigned char* b = w + ((long)col * spr + (blk >> 3)) * 136; \
+                    int ib = blk & 7; \
+                    unsigned int sh = (unsigned int)b[2] | ((unsigned int)b[3] << 8); \
+                    int lo = (b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F; \
+                    int hi = (int)((sh >> (2 * ib)) & 3u); \
+                    wsc[c] = rf16b(b) * (float)((lo | (hi << 4)) - 32); \
+                    qs = b + 8 + 16 * ib; \
+                } else { \
+                    const unsigned char* b = w + ((long)col * nblk + blk) * 18; \
+                    wsc[c] = rf16b(b); \
+                    qs = b + 2; \
+                } \
+                for (int p = 0; p < 16; p++) { \
+                    wc[c][p]      = (signed char)kv_iq4nl(qs[p] & 0x0F); \
+                    wc[c][p + 16] = (signed char)kv_iq4nl(qs[p] >> 4); \
+                } \
+            } else { wsc[c] = 0.0f; for (int p = 0; p < 32; p++) wc[c][p] = 0; } \
+        } \
+        for (int r = 0; r < (RM); r++) { \
+            int row_in = row_base + r * 16 + (lane & 15); \
+            long arow = (long)row_in * in_f + (long)blk * 32; \
+            i4v a0 = load_a(qx, row_in, m, arow), a1 = load_a(qx, row_in, m, arow + 16); \
+            for (int c = 0; c < (CN); c++) { \
+                i8v dotacc = {0,0,0,0,0,0,0,0}; \
+                dotacc = wmma_dot(a0, pack16(wc[c]),      dotacc); \
+                dotacc = wmma_dot(a1, pack16(wc[c] + 16), dotacc); \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f; \
+                    acc[r][c][e] += axs * wsc[c] * (float)dotacc[e]; \
+                } \
+            } \
+        } \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + r * 16 + 2 * e + half; \
+        int col = col_base + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+#define GEN_WMMA_IQ4NL(NAME, RM, CN) GEN_WMMA_IQ4(NAME, RM, CN, 0)
+#define GEN_WMMA_IQ4XS(NAME, RM, CN) GEN_WMMA_IQ4(NAME, RM, CN, 1)
+
 // ── Q4_K PIPELINED (Slice 27): software-prefetched double-buffered weight nibbles. ──
 // Same math / accumulation order as GEN_WMMA_Q4K (bit-faithful, goldens unmoved) — the ONLY change is
 // scheduling: the 32 packed nibble bytes for weight-block blk+1 are issued as global `buffer_load`s
@@ -3854,6 +4215,19 @@ GEN_WMMA_Q41(wmma_i8_q41_2x2, 2, 2)
 GEN_WMMA_Q51(wmma_i8_q51_1x1, 1, 1)
 GEN_WMMA_Q51(wmma_i8_q51_2x1, 2, 1)
 GEN_WMMA_Q51(wmma_i8_q51_2x2, 2, 2)
+// R4 codebook quants. Plain tier only, for the same reason every format after Q4_K is: the Slice-27
+// `_pipe` prefetch and the Slice-28 `_coop` family are Q4_K-only. The pipe buffer prefetches exactly
+// Q4_K's 32 packed nibble bytes and re-reads the header inline; for IQ4 the nibbles are not the
+// latency being hidden — the codebook gather is ALU (the same finding Vulkan's bytes-vs-speed sweep
+// reached: IQ4_XS is 4.25 bpw, SMALLER than Q4_K's 4.5, yet 1.55-2.1x slower per dispatch at matched
+// shapes, i.e. gather-ALU bound, not DRAM bound), so prefetching them buys nothing. The coop family
+// is a measured gfx1100 regression regardless.
+GEN_WMMA_IQ4NL(wmma_i8_iq4nl_1x1, 1, 1)
+GEN_WMMA_IQ4NL(wmma_i8_iq4nl_2x1, 2, 1)
+GEN_WMMA_IQ4NL(wmma_i8_iq4nl_2x2, 2, 2)
+GEN_WMMA_IQ4XS(wmma_i8_iq4xs_1x1, 1, 1)
+GEN_WMMA_IQ4XS(wmma_i8_iq4xs_2x1, 2, 1)
+GEN_WMMA_IQ4XS(wmma_i8_iq4xs_2x2, 2, 2)
 "#;
 
 // ── GPU-side MoE top-k routing + device-driven expert dispatch (Slice 38) ────
@@ -4079,6 +4453,20 @@ GEN_MOE_FFN_ROUTED(q51, q40)
 GEN_MOE_FFN_ROUTED(q51, q41)
 GEN_MOE_FFN_ROUTED(q51, q51)
 GEN_MOE_FFN_ROUTED(q51, q80)
+GEN_MOE_FFN_ROUTED(iq4nl, iq4nl)
+GEN_MOE_FFN_ROUTED(iq4nl, iq4xs)
+GEN_MOE_FFN_ROUTED(iq4nl, q4k)
+GEN_MOE_FFN_ROUTED(iq4nl, q5k)
+GEN_MOE_FFN_ROUTED(iq4nl, q6k)
+GEN_MOE_FFN_ROUTED(iq4nl, q80)
+GEN_MOE_FFN_ROUTED(iq4xs, iq4nl)
+GEN_MOE_FFN_ROUTED(iq4xs, iq4xs)
+GEN_MOE_FFN_ROUTED(iq4xs, q4k)
+GEN_MOE_FFN_ROUTED(iq4xs, q5k)
+GEN_MOE_FFN_ROUTED(iq4xs, q6k)
+GEN_MOE_FFN_ROUTED(iq4xs, q80)
+GEN_MOE_FFN_ROUTED(q2k, iq4nl)
+GEN_MOE_FFN_ROUTED(q3k, iq4nl)
 
 // Int8-activation dp4a gate+up+activation, device-routed. One wave32 block per nff output row.
 #define GEN_MOE_GATE_UP_ROUTED(GU) \
@@ -4121,6 +4509,8 @@ GEN_MOE_GATE_UP_ROUTED(q6k)
 GEN_MOE_GATE_UP_ROUTED(q40)
 GEN_MOE_GATE_UP_ROUTED(q41)
 GEN_MOE_GATE_UP_ROUTED(q51)
+GEN_MOE_GATE_UP_ROUTED(iq4nl)
+GEN_MOE_GATE_UP_ROUTED(iq4xs)
 
 // Int8-activation dp4a down projection, device-routed. One wave32 block per ne output row.
 #define GEN_MOE_DOWN_ROUTED(DN) \
@@ -4146,6 +4536,8 @@ GEN_MOE_DOWN_ROUTED(q6k)
 GEN_MOE_DOWN_ROUTED(q40)
 GEN_MOE_DOWN_ROUTED(q41)
 GEN_MOE_DOWN_ROUTED(q51)
+GEN_MOE_DOWN_ROUTED(iq4nl)
+GEN_MOE_DOWN_ROUTED(iq4xs)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────
@@ -4252,5 +4644,44 @@ impl Drop for Pipelines {
     fn drop(&mut self) {
         // hipModuleDestroy doesn't exist in public API; the module leaks on drop.
         // This is fine for a single-backend-instance lifetime.
+    }
+}
+
+#[cfg(test)]
+mod codebook_tests {
+    /// The IQ4 codebook is packed into four `u32`s before it is emitted, and NOTHING on a CPU-only
+    /// box would catch a byte-order slip in that packing — the GPU parity tests need the device.
+    /// So unpack the emitted words the way `kv_iq4nl` does (word `i>>2`, byte `i&3`, sign-extended)
+    /// and require the result to BE `KVALUES_IQ4NL`, and require the emitted text to name the const
+    /// it came from. A hardcoded second copy of the table would fail the first check the moment the
+    /// host const changed; a wrong shift would fail it immediately.
+    #[test]
+    fn the_emitted_codebook_unpacks_back_to_the_host_const() {
+        let src = super::iq4nl_codebook_src();
+        assert!(
+            src.contains("GENERATED from infr_gguf::dequant::KVALUES_IQ4NL"),
+            "the emitted table must name its source of truth:\n{src}"
+        );
+        // The words are emitted as `{:#010x}u` — "0x", exactly 8 hex digits, then the `u` suffix.
+        // (Matching that shape skips the `0xFFu` byte mask in the same line.)
+        let words: Vec<u32> = src
+            .split("0x")
+            .skip(1)
+            .filter(|t| {
+                t.len() > 8
+                    && t.as_bytes()[8] == b'u'
+                    && t[..8].bytes().all(|c| c.is_ascii_hexdigit())
+            })
+            .map(|t| u32::from_str_radix(&t[..8], 16).expect("8 hex digits per emitted word"))
+            .collect();
+        assert_eq!(words.len(), 4, "four packed codebook words:\n{src}");
+        let unpacked: Vec<i8> = (0..16)
+            .map(|i: usize| (words[i >> 2] >> ((i & 3) * 8)) as u8 as i8)
+            .collect();
+        assert_eq!(
+            unpacked,
+            infr_gguf::dequant::KVALUES_IQ4NL.to_vec(),
+            "emitted codebook must unpack to the host KVALUES_IQ4NL"
+        );
     }
 }
