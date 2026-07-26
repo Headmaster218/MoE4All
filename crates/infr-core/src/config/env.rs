@@ -4,7 +4,8 @@
 //! [`parse`] takes an INJECTED reader (`Fn(&str) -> Option<String>`) rather than calling
 //! `std::env::var` itself. That is the whole point: a test drives it with a `HashMap`, never
 //! mutates the process environment, and therefore never races another test in the same binary
-//! (which is the bug `infr_core::test_env::EnvGuard` exists to work around). `ConfigLayer::env()`
+//! (which is the bug the deleted `infr_core::test_env::EnvGuard` existed to work around).
+//! `ConfigLayer::env()`
 //! is the thin impure wrapper that passes `|k| std::env::var(k).ok()`.
 //!
 //! **R5 — no behaviour here.** This module turns strings into `Option<T>` and nothing else. No

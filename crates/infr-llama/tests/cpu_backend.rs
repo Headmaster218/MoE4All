@@ -37,17 +37,19 @@ macro_rules! need_model {
 
 /// Serialize the model-gated GPU tests against each other.
 ///
-/// As of S7 NO test in this file drives a knob through the environment — the last one,
-/// `INFR_NO_THINK`, is a `sampling.no_think` VALUE on the model's own config (see [`model_cfg`]).
-/// What is left is the GPU: these tests upload whole models and open device sessions, and cargo
-/// runs a binary's tests in parallel, so several of them racing for the same device is a VRAM
-/// problem, not a configuration one. [`infr_core::test_env::EnvGuard`] is still what provides the
-/// process-wide lock here; S9 replaces it with a plain local mutex and deletes the module.
+/// No test in this file drives a knob through the environment any more — the last one,
+/// `INFR_NO_THINK`, became a `sampling.no_think` VALUE on the model's own config in S7 (see
+/// [`model_cfg`]). What is left is the GPU: these tests upload whole models and open device
+/// sessions, and cargo runs a binary's tests in parallel, so several of them racing for the same
+/// device is a VRAM problem, not a configuration one.
 ///
-/// Poison-tolerant, so a failing test does not cascade-poison the rest. Take it exactly once per
-/// test — it is not re-entrant.
-fn test_serial_lock() -> infr_core::test_env::EnvGuard {
-    infr_core::test_env::EnvGuard::new()
+/// So this is a plain, LOCAL mutex (S9), not `infr_core::test_env::EnvGuard` — that module existed
+/// to serialize *and restore* environment mutations, and with nothing left to restore anywhere in
+/// the tree it was deleted. Poison-tolerant, so a failing test does not cascade-poison the rest;
+/// not re-entrant, so take it exactly once per test.
+fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Load a model on an EXPLICIT engine configuration (`docs/config-plan.md` S4): `kv.*`, `spec.*`,

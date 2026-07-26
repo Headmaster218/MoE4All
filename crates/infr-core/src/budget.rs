@@ -396,7 +396,7 @@ mod tests {
     }
 
     /// `empty`/`0`/unset = off; anything else = on — over explicit values via [`flag_from`], so
-    /// no test in this binary has to touch the process environment (see `crate::test_env`).
+    /// no test in this binary has to touch the process environment.
     #[test]
     fn flag_grammar() {
         assert!(!flag_from(None));

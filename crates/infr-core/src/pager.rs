@@ -296,7 +296,7 @@ mod tests {
     /// before splitting arena shares, so a moved edge silently re-sizes every MoE arena — plus the
     /// `INFR_PAGER_RING` override grammar. Driven through [`ring_bytes_from`], which takes the
     /// override as a plain string: no process-environment mutation, so this cannot race another
-    /// test in the shared binary (see `crate::test_env`).
+    /// test in the shared binary.
     #[test]
     fn ring_bytes_clamp_boundaries_and_override_grammar() {
         const MIB: u64 = 1024 * 1024;

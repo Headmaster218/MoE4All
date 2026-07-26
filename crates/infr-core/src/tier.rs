@@ -251,7 +251,7 @@ mod tests {
     const VK_MAX_CHUNKS: usize = 1024;
 
     /// The knob grammar, over explicit strings via [`EnvRows::resolve`] — NO process-environment
-    /// mutation, so this cannot race another test in the same binary (see `crate::test_env`).
+    /// mutation, so this cannot race another test in the same binary.
     /// The knob's value now arrives from a `Config` (the env layer parses, `Config::default()`
     /// holds the default) and only [`EnvRows::clamped`] runs at the read site; `resolve` is the
     /// composition of the three and stays the one place the whole grammar is pinned.
