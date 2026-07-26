@@ -3,8 +3,9 @@
 //! Each kernel is a `__global__` function taking device pointers. Most operate on f16 or f32
 //! buffers — uncovered quantized weights are dequantized to f16 on the host BEFORE they reach a
 //! kernel (see `exec.rs`'s dequant cache), so those kernels stay format-agnostic and simple. The
-//! `NATIVE_DECODE` kernels (Phase 3, Q4_K/Q6_K/Q8_0) are the exception: they read the RAW quant
-//! bytes and decode each block in-kernel, so no f16 cache is materialized (VRAM ≈ quant_size).
+//! `NATIVE_DECODE` kernels (Phase 3, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q5_0) are the exception: they
+//! read the RAW quant bytes and decode each block in-kernel, so no f16 cache is materialized
+//! (VRAM ≈ quant_size).
 //!
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
 //! `HashMap`. The module is compiled once at backend init via `hiprtcCompileProgram`.
@@ -1417,9 +1418,9 @@ extern "C" __global__ void moe_shared_expert_add(
 // These kernels read the RAW quantized weight bytes and decode each block ON THE FLY,
 // so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
-// lever, docs/cpu-perf.md). Covered formats: Q4_K, Q5_K, Q6_K, Q8_0, Q5_0 (the sets a Q4_K_M /
-// Q5_K_M GGUF uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already
-// native via `linear_f16`).
+// lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q5_0 (the sets a
+// Q2_K / Q3_K_M / Q4_K_M / Q5_K_M GGUF uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as
+// Q5_0; F16 is already native via `linear_f16`).
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -1479,6 +1480,69 @@ __device__ __forceinline__ float deq_q50(const unsigned char* w, long i) {
         code = (qs[j] >> 4) | xh;
     }
     return fin(d, code, d * (float)(-16));   // sc = d, mn = d·(−16)
+}
+
+// ── K-quant 16-elem sub-block traversal (Q2_K / Q3_K) ────────────────────────
+// Both formats walk their 256 elements as n(2) × j(4) × half(2) × l(16), emitting 16 consecutive
+// output elements per (n, j, half) group. So sub-block `g = within/16` (0..15) decomposes as
+//   n = g>>3, j = (g>>1)&3, half = g&1,
+// its 16 codes live in the CONTIGUOUS bytes `qs[n*32 + half*16 .. +16]` as the 2-bit field at shift
+// `2j`, and the host oracle's per-group scale index `is` advances in lockstep with `out/16`, i.e.
+// `is == g`. Q3_K's rolling high-mask bit `m` (1<<0 .. 1<<7 across the whole traversal) is
+// `1 << (n*4 + j)` — and `n*4 + j == g>>1`, since `half` is exactly the bit `g` drops.
+
+// ── Q2_K: 256 elems / 84 bytes = [u8 scales[16]][u8 qs[64]][half d][half dmin]. ──
+// scale = d·(scales[g] & 0xF), min = dmin·(−(scales[g] >> 4)), code = 2 bits (0..3).
+__device__ __forceinline__ float deq_q2k(const unsigned char* w, long i) {
+    long blk = i >> 8;             // / 256
+    int within = (int)(i & 255);
+    const unsigned char* b = w + blk * 84;
+    const unsigned char* scales = b;
+    const unsigned char* qs = b + 16;
+    float d = rf16b(b + 80);
+    float dmin = rf16b(b + 82);
+    int g = within >> 4;           // 16-elem sub-block 0..15
+    int l = within & 15;
+    int sc = scales[g] & 0x0F;
+    int mm = scales[g] >> 4;
+    int code = (qs[(g >> 3) * 32 + (g & 1) * 16 + l] >> (2 * ((g >> 1) & 3))) & 3;
+    return fin(d * (float)sc, code, dmin * (float)(-mm));
+}
+
+// Decode the 6-bit sub-block scale `g` (0..15) of a Q3_K block from its packed 12 `scales` bytes,
+// already biased by −32. Closed form of llama.cpp's kmask1/kmask2 aux shuffle (the host oracle's
+// `dequant_factored` Q3K arm): with `wd = g/4`, `k = g%4`, aux word `wd` byte `k` is
+//   wd=0: (raw[k]   & 0x0F) | ((raw[8+k]      & 3) << 4)
+//   wd=1: (raw[4+k] & 0x0F) | (((raw[8+k]>>2) & 3) << 4)
+//   wd=2: (raw[k]   >>   4) | (((raw[8+k]>>4) & 3) << 4)
+//   wd=3: (raw[4+k] >>   4) | (((raw[8+k]>>6) & 3) << 4)
+// i.e. low byte source `raw[(wd&1)*4 + k]`, nibble half `wd>=2`, 2 top bits at shift `2*wd`.
+__device__ __forceinline__ int q3k_sc6(const unsigned char* sr, int g) {
+    int wd = g >> 2, k = g & 3;
+    int lo = sr[(wd & 1) * 4 + k];
+    int nib = (wd >= 2) ? (lo >> 4) : (lo & 0x0F);
+    int top = (sr[8 + k] >> (2 * wd)) & 3;
+    return (nib | (top << 4)) - 32;   // 6-bit value 0..63 → signed scale −32..31
+}
+
+// ── Q3_K: 256 elems / 110 bytes = [u8 hmask[32]][u8 qs[64]][u8 scales[12]][half d]. ──
+// scale = d·sc6, min = d·(−4·sc6), code = low 2 bits | (high-mask bit << 2), 0..7. NOTE the high
+// bit's polarity: the host oracle stores `hmask` SET as code +4 and folds the constant −4 into the
+// min, which is llama.cpp's `q3 − (hm ? 0 : 4)` — a flipped bit moves the value by 4·d·sc6.
+__device__ __forceinline__ float deq_q3k(const unsigned char* w, long i) {
+    long blk = i >> 8;             // / 256
+    int within = (int)(i & 255);
+    const unsigned char* b = w + blk * 110;
+    const unsigned char* hmask = b;
+    const unsigned char* qs = b + 32;
+    float d = rf16b(b + 108);
+    int g = within >> 4;           // 16-elem sub-block 0..15
+    int l = within & 15;
+    int sc = q3k_sc6(b + 96, g);
+    int p = (g & 1) * 16 + l;      // byte within the 32-byte half-plane (shared by qs and hmask)
+    int code = ((qs[(g >> 3) * 32 + p] >> (2 * ((g >> 1) & 3))) & 3)
+             | (((hmask[p] >> (g >> 1)) & 1) << 2);
+    return fin(d * (float)sc, code, d * (float)(-4 * sc));
 }
 
 // get_scale_min_k4: 6-bit scale `sc` + min `mm` for sub-block s (0..8) of a Q4_K block.
@@ -1603,11 +1667,15 @@ extern "C" __global__ void embed_##SUFFIX( \
 }
 
 GEN_LINEAR(q80)
+GEN_LINEAR(q2k)
+GEN_LINEAR(q3k)
 GEN_LINEAR(q4k)
 GEN_LINEAR(q5k)
 GEN_LINEAR(q6k)
 GEN_LINEAR(q50)
 GEN_EMBED(q80)
+GEN_EMBED(q2k)
+GEN_EMBED(q3k)
 GEN_EMBED(q4k)
 GEN_EMBED(q5k)
 GEN_EMBED(q6k)
@@ -1631,6 +1699,8 @@ extern "C" __global__ void deqf16_##SUFFIX( \
     if (i < (long)n) out[i] = __float2half(deq_##SUFFIX(w, i)); \
 }
 GEN_DEQF16(q80)
+GEN_DEQF16(q2k)
+GEN_DEQF16(q3k)
 GEN_DEQF16(q4k)
 GEN_DEQF16(q5k)
 GEN_DEQF16(q6k)
@@ -1654,8 +1724,9 @@ extern "C" __global__ void cast_f32_f16(
 // Gate & up share ONE format (`GU`) — they are the same tensor when fused, and every GGUF stores
 // ffn_gate_exps / ffn_up_exps at the same quant type. The down bank has its OWN format (`DN`):
 // Q4_K_M packs gate/up as Q4_K but ffn_down_exps as Q6_K, so the two suffixes must be independent.
-// The 16 (GU × DN) combos over {q80, q4k, q5k, q6k} cover every mixed-precision MoE the covered
-// formats produce; uncovered formats keep the dequant→f16 `moe_ffn_expert` fallback in exec.rs.
+// The 36 (GU × DN) combos over {q80, q2k, q3k, q4k, q5k, q6k} cover every mixed-precision MoE the
+// covered formats produce; uncovered formats keep the dequant→f16 `moe_ffn_expert` fallback in
+// exec.rs.
 // The full cross product is instantiated deliberately: `moe_native_fmt` resolves GU and DN from two
 // INDEPENDENT tensor dtypes (`ffn_gate_exps` vs `ffn_down_exps`), so no pair can be statically
 // excluded without making `moe_expert_kernel`'s `unreachable!` reachable on some real GGUF.
@@ -1707,18 +1778,38 @@ extern "C" __global__ void moe_ffn_expert_##GU##_##DN( \
 }
 
 GEN_MOE_FFN(q80, q80)
+GEN_MOE_FFN(q80, q2k)
+GEN_MOE_FFN(q80, q3k)
 GEN_MOE_FFN(q80, q4k)
 GEN_MOE_FFN(q80, q5k)
 GEN_MOE_FFN(q80, q6k)
+GEN_MOE_FFN(q2k, q80)
+GEN_MOE_FFN(q2k, q2k)
+GEN_MOE_FFN(q2k, q3k)
+GEN_MOE_FFN(q2k, q4k)
+GEN_MOE_FFN(q2k, q5k)
+GEN_MOE_FFN(q2k, q6k)
+GEN_MOE_FFN(q3k, q80)
+GEN_MOE_FFN(q3k, q2k)
+GEN_MOE_FFN(q3k, q3k)
+GEN_MOE_FFN(q3k, q4k)
+GEN_MOE_FFN(q3k, q5k)
+GEN_MOE_FFN(q3k, q6k)
 GEN_MOE_FFN(q4k, q80)
+GEN_MOE_FFN(q4k, q2k)
+GEN_MOE_FFN(q4k, q3k)
 GEN_MOE_FFN(q4k, q4k)
 GEN_MOE_FFN(q4k, q5k)
 GEN_MOE_FFN(q4k, q6k)
 GEN_MOE_FFN(q5k, q80)
+GEN_MOE_FFN(q5k, q2k)
+GEN_MOE_FFN(q5k, q3k)
 GEN_MOE_FFN(q5k, q4k)
 GEN_MOE_FFN(q5k, q5k)
 GEN_MOE_FFN(q5k, q6k)
 GEN_MOE_FFN(q6k, q80)
+GEN_MOE_FFN(q6k, q2k)
+GEN_MOE_FFN(q6k, q3k)
 GEN_MOE_FFN(q6k, q4k)
 GEN_MOE_FFN(q6k, q5k)
 GEN_MOE_FFN(q6k, q6k)
@@ -1745,8 +1836,8 @@ GEN_MOE_FFN(q6k, q6k)
 // REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
 // covers every row, so the activation quant cost amortizes over the whole GEMV.
 //
-// Covered formats: Q8_0, Q4_K, Q5_K, Q6_K, Q5_0. `rf16b`/`k4` are defined in NATIVE_DECODE
-// (this part is assembled after it). Uncovered formats keep the Phase-3 / dequant→f16 fallback.
+// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0. `rf16b`/`k4`/`q3k_sc6` live in
+// NATIVE_DECODE (assembled before this part). Uncovered formats keep the dequant→f16 fallback.
 const INT8_DECODE: &str = r#"
 // Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
 // scale = amax/127 (llama.cpp/GPU convention: `roundf`, half-away-from-zero). One thread / 32-block.
@@ -1832,6 +1923,115 @@ extern "C" __global__ void linear_i8_q80(
             idot = idot4(xp[k], wpack, idot);
         }
         acc += d * xsr[blk] * (float)idot;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+
+// ── Q2_K: 256 elems / 84 bytes; sub-block 16; code 0..3; value = d·sc·code + dmin·(−mm). ──
+// A 32-elem activation block spans TWO 16-elem scale sub-blocks (same shape as Q6_K), so the inner
+// loop runs the dp4a over 4 int-packed groups per half. Sub-block indexing per `deq_q2k`.
+extern "C" __global__ void linear_i8_q2k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    int spr = nb >> 3;             // Q2_K super-blocks (256 elems) per output row
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int w32 = blk & 7;
+        const unsigned char* b = w + (long)super * 84;
+        const unsigned char* scales = b;
+        const unsigned char* qs = b + 16;
+        float d = rf16b(b + 80);
+        float dmin = rf16b(b + 82);
+        float sx = xsr[blk];
+        for (int hh = 0; hh < 2; hh++) {
+            int g = w32 * 2 + hh;          // 16-elem sub-block 0..15
+            int sc = scales[g] & 0x0F;
+            int mm = scales[g] >> 4;
+            const unsigned char* qb = qs + (g >> 3) * 32 + (g & 1) * 16;
+            int sh = 2 * ((g >> 1) & 3);
+            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int idot = 0, isum = 0;
+            for (int k = 0; k < 4; k++) {  // 4 groups of 4 = 16
+                int wpack = 0;
+                for (int r = 0; r < 4; r++) wpack |= (int)((qb[k * 4 + r] >> sh) & 3) << (r * 8);
+                idot = idot4(xp[k], wpack, idot);
+                isum = idot4(xp[k], 0x01010101, isum);
+            }
+            acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+        }
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+
+// ── Q3_K: 256 elems / 110 bytes; sub-block 16 (6-bit packed scale); code 0..7; ──
+// value = d·sc6·code + d·(−4·sc6). Same two-halves-per-32-block shape as Q2_K/Q6_K.
+extern "C" __global__ void linear_i8_q3k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    int spr = nb >> 3;             // Q3_K super-blocks (256 elems) per output row
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int w32 = blk & 7;
+        const unsigned char* b = w + (long)super * 110;
+        const unsigned char* hmask = b;
+        const unsigned char* qs = b + 32;
+        float d = rf16b(b + 108);
+        float sx = xsr[blk];
+        for (int hh = 0; hh < 2; hh++) {
+            int g = w32 * 2 + hh;
+            int sc = q3k_sc6(b + 96, g);
+            const unsigned char* qb = qs + (g >> 3) * 32 + (g & 1) * 16;
+            const unsigned char* hb = hmask + (g & 1) * 16;
+            int sh = 2 * ((g >> 1) & 3);
+            int hsh = g >> 1;
+            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int idot = 0, isum = 0;
+            for (int k = 0; k < 4; k++) {
+                int wpack = 0;
+                for (int r = 0; r < 4; r++) {
+                    int p = k * 4 + r;
+                    int c = ((qb[p] >> sh) & 3) | (((hb[p] >> hsh) & 1) << 2);
+                    wpack |= c << (r * 8);
+                }
+                idot = idot4(xp[k], wpack, idot);
+                isum = idot4(xp[k], 0x01010101, isum);
+            }
+            acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-4 * sc)) * sx * (float)isum;
+        }
     }
     acc = wave_sum32(acc);
     // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
@@ -2158,8 +2358,9 @@ extern "C" __global__ void rmsnorm_quant_i8_32(
 //
 // SANCTIONED PRECISION FLIP: int8 activation quant is lossy in BOTH stages (x and h), so the output
 // differs (within tolerance) from the bit-faithful f16 expert path — parity is checked vs the CPU
-// reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q4_K, Q5_K,
-// Q6_K (the Q4_K_M/Q5_K_M expert-bank sets); uncovered keep the Phase-3 `moe_ffn_expert_*` fallback.
+// reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q2_K, Q3_K,
+// Q4_K, Q5_K, Q6_K (every K-quant expert bank a real GGUF ships, incl. llama4-Scout's Q2_K/Q3_K);
+// uncovered keep the Phase-3 `moe_ffn_expert_*` fallback.
 //
 // `rf16b`/`k4` (NATIVE_DECODE) and `idot4`/`wave_sum32` (INT8_DECODE) are defined in the parts
 // assembled before this one.
@@ -2183,6 +2384,80 @@ __device__ __forceinline__ float i8acc_q80(
             idot = idot4(xp[k], wpack, idot);
         }
         acc += d * xsr[blk] * (float)idot;
+    }
+    return acc;
+}
+
+// Q2_K per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q2k`.
+__device__ __forceinline__ float i8acc_q2k(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    int spr = nb >> 3;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int w32 = blk & 7;
+        const unsigned char* b = w + (long)super * 84;
+        const unsigned char* scales = b;
+        const unsigned char* qs = b + 16;
+        float d = rf16b(b + 80);
+        float dmin = rf16b(b + 82);
+        float sx = xsr[blk];
+        for (int hh = 0; hh < 2; hh++) {
+            int g = w32 * 2 + hh;
+            int sc = scales[g] & 0x0F;
+            int mm = scales[g] >> 4;
+            const unsigned char* qb = qs + (g >> 3) * 32 + (g & 1) * 16;
+            int sh = 2 * ((g >> 1) & 3);
+            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int idot = 0, isum = 0;
+            for (int k = 0; k < 4; k++) {
+                int wpack = 0;
+                for (int r = 0; r < 4; r++) wpack |= (int)((qb[k * 4 + r] >> sh) & 3) << (r * 8);
+                idot = idot4(xp[k], wpack, idot);
+                isum = idot4(xp[k], 0x01010101, isum);
+            }
+            acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+        }
+    }
+    return acc;
+}
+
+// Q3_K per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q3k`.
+__device__ __forceinline__ float i8acc_q3k(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    int spr = nb >> 3;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int w32 = blk & 7;
+        const unsigned char* b = w + (long)super * 110;
+        const unsigned char* hmask = b;
+        const unsigned char* qs = b + 32;
+        float d = rf16b(b + 108);
+        float sx = xsr[blk];
+        for (int hh = 0; hh < 2; hh++) {
+            int g = w32 * 2 + hh;
+            int sc = q3k_sc6(b + 96, g);
+            const unsigned char* qb = qs + (g >> 3) * 32 + (g & 1) * 16;
+            const unsigned char* hb = hmask + (g & 1) * 16;
+            int sh = 2 * ((g >> 1) & 3);
+            int hsh = g >> 1;
+            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int idot = 0, isum = 0;
+            for (int k = 0; k < 4; k++) {
+                int wpack = 0;
+                for (int r = 0; r < 4; r++) {
+                    int p = k * 4 + r;
+                    int c = ((qb[p] >> sh) & 3) | (((hb[p] >> hsh) & 1) << 2);
+                    wpack |= c << (r * 8);
+                }
+                idot = idot4(xp[k], wpack, idot);
+                isum = idot4(xp[k], 0x01010101, isum);
+            }
+            acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-4 * sc)) * sx * (float)isum;
+        }
     }
     return acc;
 }
@@ -2366,10 +2641,14 @@ extern "C" __global__ void moe_down_i8_##DN( \
 }
 
 GEN_MOE_GATE_UP(q80)
+GEN_MOE_GATE_UP(q2k)
+GEN_MOE_GATE_UP(q3k)
 GEN_MOE_GATE_UP(q4k)
 GEN_MOE_GATE_UP(q5k)
 GEN_MOE_GATE_UP(q6k)
 GEN_MOE_DOWN(q80)
+GEN_MOE_DOWN(q2k)
+GEN_MOE_DOWN(q3k)
 GEN_MOE_DOWN(q4k)
 GEN_MOE_DOWN(q5k)
 GEN_MOE_DOWN(q6k)
@@ -2412,8 +2691,9 @@ GEN_MOE_DOWN(q6k)
 // `INFR_ROCM_WMMA_TILE=RxC` (1x1/2x1/2x2) overrides the auto tier for A/B benchmarking.
 //
 // Bit-faithfulness (goldens MUST NOT move): the per-format code/scale/min extraction is byte-identical
-// to Slice-15 and the parity-tested `linear_i8_*` GEMV (same `k4`/`rf16b`, same nibble/region math).
-// The Q4_K/Q6_K/Q5_0 min term (`dmin·(−mm)·Σqx` / `d·(−32s)·Σqx` / `d·(−16)·Σqx`) is a second WMMA
+// to Slice-15 and the parity-tested `linear_i8_*` GEMV (same `k4`/`q3k_sc6`/`rf16b`, same nibble/
+// region math). The affine min term (Q4_K/Q5_K `dmin·(−mm)·Σqx`, Q6_K `d·(−32s)·Σqx`, Q5_0
+// `d·(−16)·Σqx`, Q2_K `dmin·(−mm)·Σqx`, Q3_K `d·(−4·sc6)·Σqx`) is a second WMMA
 // against an all-ones B fragment. Every output element `dst[re,col]` is still the SAME
 // `Σ_blk axs·(wsc·dot + wmn·sum)` summed in the SAME block order — RM/CN only re-group which (row,col)
 // tiles one wave owns, they never reorder an element's f32 accumulation. Pure scheduling change: no
@@ -2662,6 +2942,123 @@ extern "C" __global__ void NAME( \
                     else                  cc = (ql[qlo + 32 + l] >> 4)   | (((qh[qho + l] >> 6) & 3) << 4); \
                     wc[c][rr] = (signed char)cc; \
                 } \
+            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int rr = 0; rr < 16; rr++) wc[c][rr] = 0; } \
+        } \
+        for (int r = 0; r < (RM); r++) { \
+            int row_in = row_base + r * 16 + (lane & 15); \
+            long koff = (long)row_in * in_f + (long)sb * 16; \
+            i4v a = load_a(qx, row_in, m, koff); \
+            i8v sumacc = wmma_dot(a, ones, (i8v){0,0,0,0,0,0,0,0}); \
+            for (int c = 0; c < (CN); c++) { \
+                i8v dotacc = wmma_dot(a, pack16(wc[c]), (i8v){0,0,0,0,0,0,0,0}); \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk32] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc[c] * (float)dotacc[e] + wmn[c] * (float)sumacc[e]); \
+                } \
+            } \
+        } \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + r * 16 + 2 * e + half; \
+        int col = col_base + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+
+// ── Q2_K: 256/super-block, 16 sub-blocks of 16 (= 1 K-tile each), 4-bit scale + 4-bit min. ──
+// Same per-16 K-tile walk as GEN_WMMA_Q6K; the decode is byte-identical to `linear_i8_q2k`/`deq_q2k`.
+#define GEN_WMMA_Q2K(NAME, RM, CN) \
+extern "C" __global__ void NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int lane = threadIdx.x; \
+    int half = lane >> 4; \
+    int col_base = blockIdx.x * (16 * (CN)); \
+    int row_base = blockIdx.y * (16 * (RM)); \
+    int nblk = in_f >> 5; \
+    int spr = nblk >> 3; \
+    int n16 = in_f >> 4; \
+    float acc[RM][CN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    signed char wc[CN][16]; \
+    float wsc[CN], wmn[CN]; \
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
+    for (int sb = 0; sb < n16; sb++) { \
+        int blk32 = sb >> 1; \
+        for (int c = 0; c < (CN); c++) { \
+            int col = col_base + c * 16 + (lane & 15); \
+            if (col < out_f) { \
+                long super = (long)col * spr + (blk32 >> 3); \
+                int g = (blk32 & 7) * 2 + (sb & 1); \
+                const unsigned char* b = w + super * 84; \
+                float d = rf16b(b + 80), dmin = rf16b(b + 82); \
+                int sc = b[g] & 0x0F, mm = b[g] >> 4; \
+                wsc[c] = d * (float)sc; \
+                wmn[c] = dmin * (float)(-mm); \
+                const unsigned char* qb = (b + 16) + (g >> 3) * 32 + (g & 1) * 16; \
+                int sh = 2 * ((g >> 1) & 3); \
+                for (int rr = 0; rr < 16; rr++) wc[c][rr] = (signed char)((qb[rr] >> sh) & 3); \
+            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int rr = 0; rr < 16; rr++) wc[c][rr] = 0; } \
+        } \
+        for (int r = 0; r < (RM); r++) { \
+            int row_in = row_base + r * 16 + (lane & 15); \
+            long koff = (long)row_in * in_f + (long)sb * 16; \
+            i4v a = load_a(qx, row_in, m, koff); \
+            i8v sumacc = wmma_dot(a, ones, (i8v){0,0,0,0,0,0,0,0}); \
+            for (int c = 0; c < (CN); c++) { \
+                i8v dotacc = wmma_dot(a, pack16(wc[c]), (i8v){0,0,0,0,0,0,0,0}); \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk32] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc[c] * (float)dotacc[e] + wmn[c] * (float)sumacc[e]); \
+                } \
+            } \
+        } \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + r * 16 + 2 * e + half; \
+        int col = col_base + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+
+// ── Q3_K: 256/super-block, 16 sub-blocks of 16 (= 1 K-tile each), packed 6-bit scale, code 0..7. ──
+#define GEN_WMMA_Q3K(NAME, RM, CN) \
+extern "C" __global__ void NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int lane = threadIdx.x; \
+    int half = lane >> 4; \
+    int col_base = blockIdx.x * (16 * (CN)); \
+    int row_base = blockIdx.y * (16 * (RM)); \
+    int nblk = in_f >> 5; \
+    int spr = nblk >> 3; \
+    int n16 = in_f >> 4; \
+    float acc[RM][CN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    signed char wc[CN][16]; \
+    float wsc[CN], wmn[CN]; \
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
+    for (int sb = 0; sb < n16; sb++) { \
+        int blk32 = sb >> 1; \
+        for (int c = 0; c < (CN); c++) { \
+            int col = col_base + c * 16 + (lane & 15); \
+            if (col < out_f) { \
+                long super = (long)col * spr + (blk32 >> 3); \
+                int g = (blk32 & 7) * 2 + (sb & 1); \
+                const unsigned char* b = w + super * 110; \
+                float d = rf16b(b + 108); \
+                int sc = q3k_sc6(b + 96, g); \
+                wsc[c] = d * (float)sc; \
+                wmn[c] = d * (float)(-4 * sc); \
+                const unsigned char* qb = (b + 32) + (g >> 3) * 32 + (g & 1) * 16; \
+                const unsigned char* hb = b + (g & 1) * 16; \
+                int sh = 2 * ((g >> 1) & 3), hsh = g >> 1; \
+                for (int rr = 0; rr < 16; rr++) \
+                    wc[c][rr] = (signed char)(((qb[rr] >> sh) & 3) | (((hb[rr] >> hsh) & 1) << 2)); \
             } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int rr = 0; rr < 16; rr++) wc[c][rr] = 0; } \
         } \
         for (int r = 0; r < (RM); r++) { \
@@ -3037,6 +3434,12 @@ GEN_WMMA_Q4K_PIPE(wmma_i8_q4k_pipe_2x1, 2, 1)
 GEN_WMMA_Q80(wmma_i8_q80_1x1, 1, 1)
 GEN_WMMA_Q80(wmma_i8_q80_2x1, 2, 1)
 GEN_WMMA_Q80(wmma_i8_q80_2x2, 2, 2)
+GEN_WMMA_Q2K(wmma_i8_q2k_1x1, 1, 1)
+GEN_WMMA_Q2K(wmma_i8_q2k_2x1, 2, 1)
+GEN_WMMA_Q2K(wmma_i8_q2k_2x2, 2, 2)
+GEN_WMMA_Q3K(wmma_i8_q3k_1x1, 1, 1)
+GEN_WMMA_Q3K(wmma_i8_q3k_2x1, 2, 1)
+GEN_WMMA_Q3K(wmma_i8_q3k_2x2, 2, 2)
 GEN_WMMA_Q4K(wmma_i8_q4k_1x1, 1, 1)
 GEN_WMMA_Q4K(wmma_i8_q4k_2x1, 2, 1)
 GEN_WMMA_Q4K(wmma_i8_q4k_2x2, 2, 2)
@@ -3227,18 +3630,38 @@ extern "C" __global__ void moe_ffn_expert_routed_##GU##_##DN( \
     } \
 }
 GEN_MOE_FFN_ROUTED(q80, q80)
+GEN_MOE_FFN_ROUTED(q80, q2k)
+GEN_MOE_FFN_ROUTED(q80, q3k)
 GEN_MOE_FFN_ROUTED(q80, q4k)
 GEN_MOE_FFN_ROUTED(q80, q5k)
 GEN_MOE_FFN_ROUTED(q80, q6k)
+GEN_MOE_FFN_ROUTED(q2k, q80)
+GEN_MOE_FFN_ROUTED(q2k, q2k)
+GEN_MOE_FFN_ROUTED(q2k, q3k)
+GEN_MOE_FFN_ROUTED(q2k, q4k)
+GEN_MOE_FFN_ROUTED(q2k, q5k)
+GEN_MOE_FFN_ROUTED(q2k, q6k)
+GEN_MOE_FFN_ROUTED(q3k, q80)
+GEN_MOE_FFN_ROUTED(q3k, q2k)
+GEN_MOE_FFN_ROUTED(q3k, q3k)
+GEN_MOE_FFN_ROUTED(q3k, q4k)
+GEN_MOE_FFN_ROUTED(q3k, q5k)
+GEN_MOE_FFN_ROUTED(q3k, q6k)
 GEN_MOE_FFN_ROUTED(q4k, q80)
+GEN_MOE_FFN_ROUTED(q4k, q2k)
+GEN_MOE_FFN_ROUTED(q4k, q3k)
 GEN_MOE_FFN_ROUTED(q4k, q4k)
 GEN_MOE_FFN_ROUTED(q4k, q5k)
 GEN_MOE_FFN_ROUTED(q4k, q6k)
 GEN_MOE_FFN_ROUTED(q5k, q80)
+GEN_MOE_FFN_ROUTED(q5k, q2k)
+GEN_MOE_FFN_ROUTED(q5k, q3k)
 GEN_MOE_FFN_ROUTED(q5k, q4k)
 GEN_MOE_FFN_ROUTED(q5k, q5k)
 GEN_MOE_FFN_ROUTED(q5k, q6k)
 GEN_MOE_FFN_ROUTED(q6k, q80)
+GEN_MOE_FFN_ROUTED(q6k, q2k)
+GEN_MOE_FFN_ROUTED(q6k, q3k)
 GEN_MOE_FFN_ROUTED(q6k, q4k)
 GEN_MOE_FFN_ROUTED(q6k, q5k)
 GEN_MOE_FFN_ROUTED(q6k, q6k)
@@ -3276,6 +3699,8 @@ extern "C" __global__ void moe_gate_up_act_i8_routed_##GU( \
     } \
 }
 GEN_MOE_GATE_UP_ROUTED(q80)
+GEN_MOE_GATE_UP_ROUTED(q2k)
+GEN_MOE_GATE_UP_ROUTED(q3k)
 GEN_MOE_GATE_UP_ROUTED(q4k)
 GEN_MOE_GATE_UP_ROUTED(q5k)
 GEN_MOE_GATE_UP_ROUTED(q6k)
@@ -3296,6 +3721,8 @@ extern "C" __global__ void moe_down_i8_routed_##DN( \
     if (tid == 0) atomicAdd(&dst[d], acc); \
 }
 GEN_MOE_DOWN_ROUTED(q80)
+GEN_MOE_DOWN_ROUTED(q2k)
+GEN_MOE_DOWN_ROUTED(q3k)
 GEN_MOE_DOWN_ROUTED(q4k)
 GEN_MOE_DOWN_ROUTED(q5k)
 GEN_MOE_DOWN_ROUTED(q6k)

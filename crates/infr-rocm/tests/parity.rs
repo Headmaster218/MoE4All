@@ -355,6 +355,38 @@ fn q6k_blocks(blocks: usize) -> Vec<u8> {
     w
 }
 
+/// Build `blocks` valid Q2_K blocks (84 B = [u8 scales[16]][u8 qs[64]][f16 d][f16 dmin]). Every
+/// `scales` byte is legal (4-bit scale | 4-bit min), so the patterned fill sweeps sc/min across the
+/// 16 sub-blocks AND — because 37 is odd — every 2-bit code position through all four values.
+fn q2k_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 84];
+    for (i, byte) in w.iter_mut().enumerate() {
+        *byte = ((i * 37 + 11) & 0xFF) as u8;
+    }
+    for blk in 0..blocks {
+        let base = blk * 84;
+        w[base + 80..base + 82].copy_from_slice(&half::f16::from_f32(0.375).to_le_bytes());
+        w[base + 82..base + 84].copy_from_slice(&half::f16::from_f32(-0.125).to_le_bytes());
+    }
+    w
+}
+
+/// Build `blocks` valid Q3_K blocks (110 B = [u8 hmask[32]][u8 qs[64]][u8 scales[12]][f16 d]). All
+/// 12 scale bytes are legal (they pack 16 × 6-bit values through the kmask1/kmask2 shuffle), and the
+/// patterned `hmask` puts both states of every high bit in play — the bit whose polarity a wrong
+/// port flips.
+fn q3k_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 110];
+    for (i, byte) in w.iter_mut().enumerate() {
+        *byte = ((i * 37 + 11) & 0xFF) as u8;
+    }
+    for blk in 0..blocks {
+        let base = blk * 110;
+        w[base + 108..base + 110].copy_from_slice(&half::f16::from_f32(0.03).to_le_bytes());
+    }
+    w
+}
+
 /// Build `blocks` valid Q4_K blocks (144 B) — same construction as `linear_q4k_matches_cpu`.
 fn q4k_blocks(blocks: usize) -> Vec<u8> {
     let mut w = vec![0u8; blocks * 144];
@@ -445,6 +477,38 @@ fn linear_i8_q50_matches_cpu() {
         I8_OUT_F,
         1.5e-2,
         "Q5_0",
+    );
+}
+
+/// Q2_K int8 GEMV (R2): 2-bit weight, 4-bit sub-block scale + 4-bit min per 16 elements (so a
+/// 32-elem activation block spans TWO scale sub-blocks) + int8 activation.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q2k_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &q2k_blocks(blocks),
+        DType::Q2K,
+        I8_IN_F,
+        I8_OUT_F,
+        3e-2,
+        "Q2_K",
+    );
+}
+
+/// Q3_K int8 GEMV (R2): 3-bit weight (2 low bits + the `hmask` high bit), packed 6-bit sub-block
+/// scale per 16 elements + int8 activation.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q3k_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &q3k_blocks(blocks),
+        DType::Q3K,
+        I8_IN_F,
+        I8_OUT_F,
+        3e-2,
+        "Q3_K",
     );
 }
 
@@ -555,6 +619,22 @@ fn wmma_q80_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn wmma_q50_matches_cpu() {
     check_wmma_linear(q50_blocks, DType::Q5_0, 32, 1.5e-2, "Q5_0");
+}
+
+/// Q2_K WMMA prefill GEMM (R2): 2-bit weight, per-16 sub-block 4-bit scale + 4-bit min (1 K-tile
+/// per scale-block, the Q6_K walk).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q2k_matches_cpu() {
+    check_wmma_linear(q2k_blocks, DType::Q2K, 256, 3e-2, "Q2_K");
+}
+
+/// Q3_K WMMA prefill GEMM (R2): 3-bit weight (2 low bits + `hmask`), per-16 sub-block packed 6-bit
+/// scale with the folded −4 code offset in the min term.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q3k_matches_cpu() {
+    check_wmma_linear(q3k_blocks, DType::Q3K, 256, 3e-2, "Q3_K");
 }
 
 /// Q4_K WMMA prefill GEMM (4-bit weight + int8 activation, per-32 sub-block scale + min).
@@ -1037,6 +1117,96 @@ fn moe_ffn_q5k_experts_matches_cpu() {
         e / ref_mag < 6e-2,
         "MoeFfn [Q5_K experts] diverges from CPU reference: abs={e:e} rel={:e}",
         e / ref_mag
+    );
+}
+
+/// Shared MoE-expert parity check: `run_moe` on ROCm vs the CPU f32 reference for one (gate/up,
+/// down) format pair, at the widened two-lossy-int8-stage tolerance the Q4_K_M/Q5_K_M cases use.
+fn check_moe_experts(
+    gate_bytes: &[u8],
+    up_bytes: &[u8],
+    down_bytes: &[u8],
+    gu: DType,
+    dn: DType,
+    label: &str,
+) {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (2usize, 256usize, 4usize, 2usize, 256usize);
+    let x = gen(rows * ne, 3);
+    let router = gen(n_expert * ne, 9);
+    let run = |b: &dyn Backend| {
+        run_moe(
+            b,
+            &x,
+            &router,
+            gate_bytes,
+            up_bytes,
+            down_bytes,
+            gu,
+            gu,
+            dn,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            MoeGating::Softmax,
+            true,
+        )
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-6);
+    println!(
+        "MoeFfn [{label} experts] max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "MoeFfn [{label} experts] reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 6e-2,
+        "MoeFfn [{label} experts] diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q2_K gate/up + Q3_K down MoE experts (R2): the `("q2k", "q3k")` cell of the now-6×6
+/// `moe_expert_kernel` table, plus `moe_gate_up_act_i8_q2k` and `moe_down_i8_q3k`.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_q2k_gate_q3k_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 256;
+    check_moe_experts(
+        &q2k_blocks(gu_blocks),
+        &q2k_blocks(gu_blocks),
+        &q3k_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Q2K,
+        DType::Q3K,
+        "Q2_K/Q2_K/Q3_K",
+    );
+}
+
+/// Q3_K gate/up + Q2_K down MoE experts (R2): the mirrored `("q3k", "q2k")` cell, so both new
+/// formats are exercised in BOTH the gate/up and the down role across the two cases.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_q3k_gate_q2k_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 256;
+    check_moe_experts(
+        &q3k_blocks(gu_blocks),
+        &q3k_blocks(gu_blocks),
+        &q2k_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Q3K,
+        DType::Q2K,
+        "Q3_K/Q3_K/Q2_K",
     );
 }
 
@@ -2458,6 +2628,79 @@ fn linear_q80_native_matches_cpu() {
     assert!(
         e / ref_mag < 1e-2,
         "Linear Q8_0 native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q2_K embedding table through the native `embed_q2k` in-kernel decode gather (×scale) vs CPU.
+/// `embed_*` is the ONE path that reaches `deq_q2k` element-by-element (the GEMV tiers go through
+/// the int8 codes), so this pins EVERY bit of the layout — the n×shift×half sub-block traversal that
+/// makes the scale index `is` advance per 16-elem group, and the 4-bit scale / 4-bit min split — at
+/// the f16-rounding tolerance rather than a dot product's error-averaging one.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q2k_native_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+    let be = rocm().unwrap();
+    let (vocab, ne) = (6usize, 256usize); // ne = one whole Q2_K super-block; vocab > max(ids)
+    let scale = (ne as f32).sqrt(); // non-1.0 (Gemma-style) — must be applied on-device
+    let t_bytes = q2k_blocks(vocab * ne / 256);
+    let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::Q2K, vocab, ne, scale);
+    let r = run_embed_gather(&be, &ids, &t_bytes, DType::Q2K, vocab, ne, scale);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "EmbedGather Q2_K (native) scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "EmbedGather Q2_K reference is all-zero — test is vacuous"
+    );
+    // Bit-faithful decode: the only loss is the f16 round of `sc*code + mn`. A mis-ordered `is`
+    // (linear instead of n×shift×half) or a swapped scale/min nibble lands at O(1) relative.
+    assert!(
+        e / ref_mag < 2e-3,
+        "EmbedGather Q2_K native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q3_K embedding table through the native `embed_q3k` in-kernel decode gather (×scale) vs CPU.
+/// Same load-bearing role as the Q2_K case: the only element-wise path, so it pins the two places a
+/// Q3_K port goes wrong — the kmask1/kmask2 6-bit scale shuffle and the polarity of the `hmask` high
+/// bit (a flipped bit shifts the value by 4·d·sc6, i.e. O(1) relative).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q3k_native_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+    let be = rocm().unwrap();
+    let (vocab, ne) = (6usize, 256usize); // ne = one whole Q3_K super-block; vocab > max(ids)
+    let scale = (ne as f32).sqrt(); // non-1.0 (Gemma-style) — must be applied on-device
+    let t_bytes = q3k_blocks(vocab * ne / 256);
+    let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::Q3K, vocab, ne, scale);
+    let r = run_embed_gather(&be, &ids, &t_bytes, DType::Q3K, vocab, ne, scale);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "EmbedGather Q3_K (native) scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "EmbedGather Q3_K reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 2e-3,
+        "EmbedGather Q3_K native decode diverges from CPU reference: abs={e:e} rel={:e}",
         e / ref_mag
     );
 }

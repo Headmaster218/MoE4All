@@ -44,15 +44,16 @@ fn have_rocm() -> bool {
 /// Two lossy stages sit between them, and neither is a decode error:
 ///   * the **weight** round-trip — the uncovered formats are host-dequantized to **f16** before
 ///     the GEMV, so each weight carries up to one f16 ULP (~5e-4 relative);
-///   * the **activation** round-trip — the covered formats (Q8_0/Q4_K/Q6_K/Q5_0) take the int8
-///     dp4a path, quantizing `x` to 32-element int8 blocks (~`amax/254` per element).
+///   * the **activation** round-trip — the covered formats (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q5_0)
+///     take the int8 dp4a path, quantizing `x` to 32-element int8 blocks (~`amax/254` per element).
 ///
 /// Both accumulate over a 256-deep dot with partial cancellation, so `2e-2` relative to
 /// `max|oracle|` is the honest joint bound — the same figure `tests/parity.rs` settled on against
 /// the (also-lossy) CPU comparand.
 ///
-/// **Measured on an RX 7900 XTX (gfx1100), all 24 formats at both m-tiers: worst case `4.7e-3`**
-/// (Q6_K at m=1, the int8 dp4a GEMV), so this carries ~4x headroom. The formats that stay on the
+/// **Measured on an RX 7900 XTX (gfx1100), all 24 formats at both m-tiers: worst case `7.6e-3`**
+/// (Q2_K at m=1, the int8 dp4a GEMV — the 2-bit code has the least headroom against the int8
+/// activation quant of any covered format), so this carries ~2.6x headroom. Formats that stay on the
 /// f32-exact path (TQ1_0/TQ2_0/Q2_0/MXFP4/NVFP4) come in at ~3e-7. A genuinely mis-decoded format
 /// lands at O(1) relative, orders of magnitude above the bound — it is not hiding anything.
 const ROCM_TOL: f32 = 2e-2;
