@@ -2863,6 +2863,10 @@ fn parse_rocm_device(spec: &str) -> u32 {
     let lower = spec.to_ascii_lowercase();
     lower
         .strip_prefix("rocm")
+        // `rocm1` and `rocm:1` both mean device 1 — the separator spelling was documented for
+        // years and silently parsed as device 0 (the `.parse()` failed and fell through to the
+        // `unwrap_or`), so accept it rather than keep pointing users at a lie.
+        .map(|s| s.strip_prefix(':').unwrap_or(s))
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0)
 }
