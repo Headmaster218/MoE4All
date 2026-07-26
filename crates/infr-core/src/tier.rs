@@ -13,9 +13,9 @@
 //!
 //! What is here:
 //!
-//! - [`EnvRows`] — the `INFR_*` numeric row/count knob: parse, fall back to the measured default,
-//!   clamp into the safe range. (An UNCLAMPED override is not a slow run but a dead GPU — see
-//!   Vulkan's `INFR_MOE_SMALL_M` doc.)
+//! - [`EnvRows`] — the numeric row/count knob (`INFR_MOE_SMALL_M`, `INFR_CANVAS_CHUNK_N`): the
+//!   measured default plus the safe clamp range the configured value is bounded into. (An
+//!   UNCLAMPED override is not a slow run but a dead GPU — see Vulkan's `INFR_MOE_SMALL_M` doc.)
 //! - [`linear_tier`] / [`MultiRowBand`] — the dense `Linear` m-ladder: single-row decode GEMV,
 //!   the small-m multi-row GEMV band(s), the tiled prefill GEMM.
 //! - [`adaptive_chunk`] / [`cap_chunk_count`] / [`baked_chunk`] / [`n_chunks`] — the flash-decoding
@@ -33,9 +33,13 @@
 //!   `mrow_int8_dtype_ok`, Metal's `prefer_*`): capability, not arithmetic — candidate G's
 //!   territory, and already predicate-shaped.
 
-/// A numeric `INFR_*` row/count knob: the measured default, the safe clamp range, and the env var
-/// that overrides it. `usize`-valued (rows, chunk counts) — byte-valued knobs use
-/// [`crate::parse_size`] instead.
+/// A numeric row/count knob: the measured default, the safe clamp range, and the `INFR_*` name it
+/// answers to. `usize`-valued (rows, chunk counts) — byte-valued knobs use [`crate::parse_size`]
+/// instead.
+///
+/// The VALUE comes from the [`Config`](crate::config::Config) the backend was built with; this
+/// table is the accessor's policy half ([`clamped`](Self::clamped)) plus the shipped default,
+/// which must equal the corresponding `Config::default()` field (the backends pin that).
 ///
 /// The clamp is not cosmetic. A tier threshold pushed far past its measured range does not just
 /// mis-schedule: an unclamped `INFR_MOE_SMALL_M` turns a 1024-row prefill chunk into one
@@ -43,10 +47,13 @@
 /// loss. Every knob therefore names its own ceiling.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvRows {
-    /// Env var consulted for an override. Unparseable values are treated as unset.
+    /// The `INFR_*` name this knob is spelled with — its identity in `config::manifest`, and the
+    /// name a doc/error message quotes. Nothing here READS it (R3: the environment is read once,
+    /// in `config::env`).
     pub env: &'static str,
-    /// Value used when `env` is unset/unparseable. NOT clamped separately — a default outside
-    /// `[min, max]` is a config bug, and `get` would silently clamp it.
+    /// The shipped value, used when no layer specified the knob. Must match the knob's
+    /// `Config::default()` field. NOT clamped separately — a default outside `[min, max]` is a
+    /// config bug, and [`resolve`](Self::resolve) would silently clamp it.
     pub default: usize,
     /// Inclusive lower clamp for an override (`0` when the knob has no floor).
     pub min: usize,
@@ -55,21 +62,24 @@ pub struct EnvRows {
 }
 
 impl EnvRows {
-    /// The effective value: the parsed override clamped into `[min, max]`, else `default`.
-    ///
-    /// One `std::env::var` and a call to [`resolve`](Self::resolve), which holds ALL of the policy
-    /// — so the tests exercise `resolve` on plain strings instead of mutating the process
-    /// environment (see `infr_core::test_env` for why that matters in a threaded test binary).
-    pub fn get(&self) -> usize {
-        self.resolve(std::env::var(self.env).ok().as_deref())
+    /// The knob's value as CONFIGURED, clamped into `[min, max]` — the accessor half of the
+    /// migrated knob (`docs/config-plan.md` R5: the config layer only parses, the clamp is policy
+    /// and lives here). The caller passes `cfg.kernels.vulkan.moe_small_m` (etc.), whose
+    /// `Config::default()` is this table's [`default`](Self::default) — pinned by the backend's
+    /// own knob-table test, since the two spellings must not drift.
+    pub fn clamped(&self, value: usize) -> usize {
+        value.clamp(self.min, self.max)
     }
 
-    /// [`get`](Self::get)'s policy over an explicit override string: parse, else `default`, then
-    /// clamp into `[min, max]`. `None` (or an unparseable value) ⇒ the clamped default.
+    /// The WHOLE knob grammar over an explicit override string: parse, else `default`, then
+    /// [`clamped`](Self::clamped). This is what the env layer + `Config::default()` + `clamped`
+    /// reproduce between them, and the test that pins the grammar drives it — over plain strings,
+    /// so it never touches the process environment.
     pub fn resolve(&self, raw: Option<&str>) -> usize {
-        raw.and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(self.default)
-            .clamp(self.min, self.max)
+        self.clamped(
+            raw.and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(self.default),
+        )
     }
 }
 
@@ -242,7 +252,9 @@ mod tests {
 
     /// The knob grammar, over explicit strings via [`EnvRows::resolve`] — NO process-environment
     /// mutation, so this cannot race another test in the same binary (see `crate::test_env`).
-    /// `get()` is `resolve(std::env::var(..))` and carries no policy of its own.
+    /// The knob's value now arrives from a `Config` (the env layer parses, `Config::default()`
+    /// holds the default) and only [`EnvRows::clamped`] runs at the read site; `resolve` is the
+    /// composition of the three and stays the one place the whole grammar is pinned.
     #[test]
     fn env_rows_defaults_parses_and_clamps() {
         let knob = EnvRows {
@@ -281,21 +293,30 @@ mod tests {
         assert_eq!(floored.resolve(None), 3);
     }
 
-    /// The one thing `resolve` cannot cover: that `get()` reads the RIGHT variable. Guarded, so it
-    /// neither races nor leaks the knob into another test.
+    /// The read-site half on its own: whatever the config resolved to is clamped into the knob's
+    /// safe range, so a config file / `--set` / env override past the ceiling is as harmless as
+    /// the env override always was (the unclamped `INFR_MOE_SMALL_M=100000` device-loss).
     #[test]
-    fn env_rows_get_reads_its_own_variable() {
+    fn env_rows_clamped_bounds_a_configured_value() {
         let knob = EnvRows {
-            env: "INFR_TIER_TEST_GET",
+            env: "INFR_TIER_TEST_ROWS",
             default: 8,
             min: 0,
             max: 64,
         };
-        let mut env = crate::test_env::EnvGuard::new();
-        env.unset(knob.env);
-        assert_eq!(knob.get(), 8);
-        env.set(knob.env, "65");
-        assert_eq!(knob.get(), 64, "get() must read + clamp its own env var");
+        assert_eq!(knob.clamped(8), 8);
+        assert_eq!(knob.clamped(64), 64);
+        assert_eq!(knob.clamped(65), 64);
+        assert_eq!(knob.clamped(100_000), 64);
+        // A floored knob (the canvas chunk DIVISOR) clamps up instead — 0 would divide by zero.
+        let floored = EnvRows {
+            env: "INFR_TIER_TEST_FLOOR",
+            default: 3,
+            min: 1,
+            max: usize::MAX,
+        };
+        assert_eq!(floored.clamped(0), 1);
+        assert_eq!(floored.clamped(7), 7);
     }
 
     #[test]

@@ -711,15 +711,6 @@ pub(crate) fn pin_kv_auto_q8() {
     });
 }
 
-/// Opt-in KV overflow to system RAM (`INFR_KV_OVERFLOW=1`): the Vulkan backend places the KV
-/// cache in host RAM (read by attention over PCIe by device address) instead of device-local
-/// VRAM. Read here so the default-ctx clamp ladder's LAST rung can keep the requested big context
-/// (KV in host) rather than clamping/erroring when it doesn't fit VRAM. Must match the backend's
-/// own `kv_overflow_enabled` (empty or `0` = off). Off by default.
-pub(crate) fn kv_overflow_enabled() -> bool {
-    infr_core::budget::env_flag("INFR_KV_OVERFLOW")
-}
-
 /// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
 pub(crate) fn kv_env_unset() -> bool {
     std::env::var("INFR_KV_TYPE_K").is_err()
@@ -1062,7 +1053,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // `MoePagerSession`'s `ring` doc) lives in the same VRAM the arenas do: subtract it
             // from the budget BEFORE splitting arena shares so the paged footprint stays within
             // what the caller granted (INFR_CACHE) / what the auto tier measured as free.
-            let ring_bytes = infr_core::pager::ring_bytes_policy(pager_budget_bytes);
+            let ring_bytes = infr_core::pager::ring_bytes(pager_budget_bytes, vk.cfg().paging.ring);
             pager_budget_bytes = pager_budget_bytes.saturating_sub(ring_bytes as u64);
             let total_bytes: u64 = pool_blocks
                 .iter()
@@ -1358,7 +1349,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         .sum();
                     // "Covers": the budget minus its own upload-ring share holds every block.
                     let covers = |b: u64| {
-                        b.saturating_sub(infr_core::pager::ring_bytes_policy(b) as u64) >= need
+                        b.saturating_sub(
+                            infr_core::pager::ring_bytes(b, vk.cfg().paging.ring) as u64
+                        ) >= need
                     };
                     let ub_now = ubatch_rows();
                     let mut cands = vec![ub_now];
@@ -1393,7 +1386,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 planned.push((comps.clone(), pool, block_id));
             }
             // The pinned upload ring lives in the same VRAM the arenas do — subtract it first.
-            let ring_bytes = infr_core::pager::ring_bytes_policy(budget);
+            let ring_bytes = infr_core::pager::ring_bytes(budget, vk.cfg().paging.ring);
             budget = budget.saturating_sub(ring_bytes as u64);
             let total_bytes: u64 = pools
                 .iter()

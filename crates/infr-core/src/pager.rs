@@ -258,8 +258,9 @@ impl Pager {
     }
 }
 
-/// Upload-ring sizing policy: `INFR_PAGER_RING` (the shared size grammar, [`crate::parse_size`])
-/// wins; otherwise an eighth of the pager budget, clamped to [256 MiB, 2 GiB].
+/// Upload-ring sizing policy: the configured ring size (`paging.ring`, from `INFR_PAGER_RING` or a
+/// config file, in the shared size grammar) wins; otherwise an eighth of the pager budget, clamped
+/// to [256 MiB, 2 GiB].
 ///
 /// Bigger halves = fewer pipeline rotations, and each rotation stalls the CPU on the other half's
 /// fence — measured on Scout pp512 (miss-heavy steady state, ~22 GB staged/rep): 256 MiB →
@@ -270,25 +271,20 @@ impl Pager {
 /// without reaching into a backend crate, and a second paging backend gets the same policy rather
 /// than a fourth copy of the clamp. The staging ring ITSELF (the buffers, the fences, the half
 /// rotation) stays per-backend.
-pub fn ring_bytes_policy(pager_budget: u64) -> usize {
-    ring_bytes_from(
-        pager_budget,
-        std::env::var("INFR_PAGER_RING").ok().as_deref(),
-    )
-}
-
-/// [`ring_bytes_policy`] over an explicit `INFR_PAGER_RING` value — all of the policy, none of the
-/// process environment, so the tests need no env mutation (see `infr_core::test_env`).
-pub fn ring_bytes_from(pager_budget: u64, raw: Option<&str>) -> usize {
+pub fn ring_bytes(pager_budget: u64, ring: Option<crate::SizeSpec>) -> usize {
     const MIB: u64 = 1024 * 1024;
-    if let Some(b) = raw
-        .and_then(crate::parse_size)
-        .map(|s| s.resolve(0) as usize)
-        .filter(|&b| b > 0)
-    {
+    // A zero (or absent) override can never be honoured — a 0-byte ring means "never stage a
+    // slot" — so it falls through to the budget fraction, exactly as an unparseable value does.
+    if let Some(b) = ring.map(|s| s.resolve(0) as usize).filter(|&b| b > 0) {
         return b;
     }
     (pager_budget / 8).clamp(256 * MIB, 2048 * MIB) as usize
+}
+
+/// [`ring_bytes`] over the raw `INFR_PAGER_RING` STRING — the env spelling of the same policy
+/// (`crate::parse_size`, then the clamp), pinned here so the grammar has one home.
+pub fn ring_bytes_from(pager_budget: u64, raw: Option<&str>) -> usize {
+    ring_bytes(pager_budget, raw.and_then(crate::parse_size))
 }
 
 #[cfg(test)]
@@ -302,7 +298,7 @@ mod tests {
     /// override as a plain string: no process-environment mutation, so this cannot race another
     /// test in the shared binary (see `crate::test_env`).
     #[test]
-    fn ring_bytes_policy_clamp_boundaries_and_env_override() {
+    fn ring_bytes_clamp_boundaries_and_override_grammar() {
         const MIB: u64 = 1024 * 1024;
         // Below the floor's crossover (8 x 256 MiB = 2 GiB of budget) the floor wins — including
         // the `0` budget the pager passes when it has no budget figure at all.
@@ -343,16 +339,34 @@ mod tests {
         }
     }
 
-    /// The one thing `ring_bytes_from` cannot cover: `ring_bytes_policy` reads `INFR_PAGER_RING`.
-    /// Guarded, so it neither races nor leaks the knob.
+    /// The override as the read sites now take it: a `paging.ring` field off the backend's
+    /// `Config`, already through the shared size grammar. `None` (unset, or a value the grammar
+    /// rejects) falls through to the budget fraction.
     #[test]
-    fn ring_bytes_policy_reads_infr_pager_ring() {
+    fn ring_bytes_takes_the_override_from_the_config() {
+        use crate::config::Config;
         const MIB: u64 = 1024 * 1024;
-        let mut env = crate::test_env::EnvGuard::new();
-        env.unset("INFR_PAGER_RING");
-        assert_eq!(ring_bytes_policy(64 * 1024 * MIB), (2048 * MIB) as usize);
-        env.set("INFR_PAGER_RING", "1g");
-        assert_eq!(ring_bytes_policy(64 * 1024 * MIB), 1024 * MIB as usize);
+        assert_eq!(Config::default().paging.ring, None);
+        assert_eq!(
+            ring_bytes(64 * 1024 * MIB, Config::default().paging.ring),
+            (2048 * MIB) as usize
+        );
+        for (raw, want) in [
+            ("1g", 1024 * MIB as usize),
+            ("512m", 512 * MIB as usize),
+            ("banana", (2048 * MIB) as usize), // rejected by the grammar ⇒ field stays None
+            ("0", (2048 * MIB) as usize),      // a 0-byte ring is not a ring
+        ] {
+            let layer =
+                crate::config::env::parse(&|k| (k == "INFR_PAGER_RING").then(|| raw.to_string()))
+                    .expect("env layer");
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(
+                ring_bytes(64 * 1024 * MIB, cfg.paging.ring),
+                want,
+                "INFR_PAGER_RING={raw:?}"
+            );
+        }
     }
 
     #[test]

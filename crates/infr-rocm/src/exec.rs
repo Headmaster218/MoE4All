@@ -795,6 +795,7 @@ pub fn execute_graph(
     rocblas: ffi::rocblas_handle,
     plan: &dyn Plan,
     bindings: &Bindings,
+    cfg: &infr_core::config::Config,
 ) -> Result<()> {
     let g = &plan
         .as_any()
@@ -807,7 +808,7 @@ pub fn execute_graph(
     // set so it walks the exact ops the executor dispatches). Lazily build / resize the ring, then
     // prime it. Any failure leaves the ring `None` ⇒ the Linear arm falls back to the Slice-35
     // host-alias read (correct, un-overlapped).
-    let fusion = decode_fusion(g);
+    let fusion = decode_fusion(g, cfg);
     let prefetch_cap = crate::weight_pager::max_bank_bytes();
     let schedule = build_spilled_schedule(g, bindings, &fusion.skip, prefetch_cap);
     let weight_ring_active = if schedule.is_empty() {
@@ -937,18 +938,21 @@ fn fuse_weight_ok(dt: DType) -> bool {
 }
 static FUSE_WEIGHT_OK: fn(DType) -> bool = fuse_weight_ok;
 
-fn decode_fusion(g: &Graph) -> DecodeFusion {
+fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion {
     // The two decode folds (`RmsNorm → int8 Linear` normalize-in-kernel, `int8 Linear → Add`
     // residual epilogue) are the shared `plan_fusions` rmsnorm_linear + linear_add passes, gated to
     // the int8-decode GEMV coverage. Escape hatches: `INFR_ROCM_NO_FUSE_NORM`/`INFR_ROCM_NO_FUSE_ADD`.
     let cfg = infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
             weight_ok: &FUSE_WEIGHT_OK,
-            disable_env: Some("INFR_ROCM_NO_FUSE_ADD"),
+            // `INFR_ROCM_NO_FUSE_ADD` (config `kernels.rocm.fuse_add`, positive polarity):
+            // PRESENCE of the env key — including `=0` — turns the fold off.
+            enabled: engine.kernels.rocm.fuse_add,
         }),
         rmsnorm_linear: Some(infr_core::fusion::RmsNormLinearCfg {
             weight_ok: &FUSE_WEIGHT_OK,
-            disable_env: Some("INFR_ROCM_NO_FUSE_NORM"),
+            // `INFR_ROCM_NO_FUSE_NORM` (config `kernels.rocm.fuse_norm`), same polarity.
+            enabled: engine.kernels.rocm.fuse_norm,
         }),
         kv_write: false,
     };

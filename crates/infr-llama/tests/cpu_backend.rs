@@ -3357,6 +3357,11 @@ fn expert_parallel_matches_single_device() {
     _tlk.set("INFR_TEMP", "0");
     _tlk.set("INFR_NO_THINK", "1");
     // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic).
+    // `INFR_MOE_SMALL_M` migrated to `kernels.vulkan.moe_small_m` in S2, but this test cannot build
+    // the value into a `Config` yet: it drives `SeamModel`, which opens its own backends and does
+    // not take an `Arc<Config>` until S4/S5. The env still reaches the field through S2's
+    // transitional bridge (`VulkanBackend::new` → `Config::load_from_env`) because the guard is set
+    // BEFORE the model loads. Convert this (and drop the `set`) with S5. See R7.
     _tlk.set("INFR_MOE_SMALL_M", "64");
 
     let model = infr_llama::SeamModel::load(&path, None).expect("load");

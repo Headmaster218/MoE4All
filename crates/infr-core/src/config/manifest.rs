@@ -9,11 +9,12 @@
 //! ```
 //!
 //! which yields **177** keys at `2dd0c5a`: [`KEYS`]'s 174 plus [`NOT_MIGRATED`]'s 3. (A naive
-//! `grep 'env::var("INFR_'` finds only 153 of them — 205 literal call sites — because ~27 reads go
-//! through a helper that takes the key name as a `&str`: `budget::env_flag`/`env_mib`/
-//! `overflow_vram_reserve`, `pager::ring_bytes_policy`, `tier::EnvRows`, `fusion`'s
+//! `grep 'env::var("INFR_'` found only 153 of them — 205 literal call sites — because ~27 reads
+//! went through a helper that took the key name as a `&str`: `budget::env_flag`/`env_mib`/
+//! `overflow_vram_reserve`, `pager::ring_bytes_policy`, `tier::EnvRows::get`, `fusion`'s
 //! `disable_env`, `seam::parse_device_list`, `recorder::GemvKnobs::resolve` and
-//! `recorder::cap_from_env`. Any inventory built from that one grep is wrong by ~15%.)
+//! `recorder::cap_from_env`. Any inventory built from that one grep is wrong by ~15%. The first
+//! four of those wrappers are gone as of S2; the rest go with their own slices.)
 //!
 //! Three things read this table:
 //! - `config::tests::env_layer_reads_every_key` (§8.8) — set each key through the injected reader
@@ -146,13 +147,13 @@ knobs! {
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    pending;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    pending;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    pending;
-    "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    pending;
-    "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  pending;
-    "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  pending;
+    "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
+    "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
+    "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
 
     // ── paging (§6.4) ────────────────────────────────────────────────────────
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  pending;
-    "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  pending;
+    "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   pending;
     "INFR_ROCM_EXPERT_BUDGET"   => "paging.rocm_expert_budget",        Size,     Ignored, "4g",  pending;
     "INFR_ROCM_WEIGHT_PREFETCH_SLOTS" => "paging.rocm_prefetch_slots", Int,      Ignored, "6",   pending;
@@ -160,10 +161,10 @@ knobs! {
         => "paging.rocm_prefetch_max_bank_mb", Int, Ignored, "512", pending;
     "INFR_ROCM_WEIGHT_PREFETCH_OFF"   => "paging.rocm_prefetch_off",   Presence, Ignored, "1",   pending;
     "INFR_ROCM_WEIGHT_PREFETCH_STATS" => "paging.rocm_prefetch_stats", Presence, Ignored, "1",   pending;
-    "INFR_ROCM_WEIGHT_OVERFLOW" => "paging.rocm_weight_overflow",      Flag,     Ignored, "1",   pending;
-    "INFR_ROCM_WEIGHT_VRAM_MB"  => "paging.rocm_weight_vram_mb",       Mib,      Ignored, "512", pending;
+    "INFR_ROCM_WEIGHT_OVERFLOW" => "paging.rocm_weight_overflow",      Flag,     Ignored, "1",   migrated;
+    "INFR_ROCM_WEIGHT_VRAM_MB"  => "paging.rocm_weight_vram_mb",       Mib,      Ignored, "512", migrated;
     "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB"
-        => "paging.rocm_weight_reserve_mb", Mib, Ignored, "128", pending;
+        => "paging.rocm_weight_reserve_mb", Mib, Ignored, "128", migrated;
     "INFR_ROCM_PAGER_NOOVERLAP" => "paging.rocm_no_overlap",           Presence, Ignored, "1",   pending;
 
     // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
@@ -194,8 +195,8 @@ knobs! {
     "INFR_NO_MROW16"        => "kernels.vulkan.mrow16",         PresenceInv, Ignored, "1",  pending;
     "INFR_NO_F32_MROW"      => "kernels.vulkan.f32_mrow",       PresenceInv, Ignored, "1",  pending;
     "INFR_NO_F32_V4"        => "kernels.vulkan.f32_v4",         PresenceInv, Ignored, "1",  pending;
-    "INFR_MOE_SMALL_M"      => "kernels.vulkan.moe_small_m",    Int,         Ignored, "16", pending;
-    "INFR_CANVAS_CHUNK_N"   => "kernels.vulkan.canvas_chunk_n", Int,         Ignored, "5",  pending;
+    "INFR_MOE_SMALL_M"      => "kernels.vulkan.moe_small_m",    Int,         Ignored, "16", migrated;
+    "INFR_CANVAS_CHUNK_N"   => "kernels.vulkan.canvas_chunk_n", Int,         Ignored, "5",  migrated;
 
     // ── kernels.vulkan — attention (§6.5) ────────────────────────────────────
     "INFR_FLASH_SPLITS"   => "kernels.vulkan.flash_splits",     Int,              Ignored, "2",  pending;
@@ -223,7 +224,7 @@ knobs! {
     "INFR_NO_MOE_SM_POOL"     => "kernels.vulkan.no_moe_sm_pool",     Presence,    Ignored, "1", pending;
     "INFR_SEAM_NO_REPLAY"     => "kernels.vulkan.no_replay",          Presence,    Ignored, "1", pending;
     "INFR_NO_GPU_POS"         => "kernels.vulkan.gpu_pos",            PresenceInv, Ignored, "1", pending;
-    "INFR_NO_FUSE_ADD"        => "kernels.vulkan.fuse_add",           PresenceInv, Ignored, "1", pending;
+    "INFR_NO_FUSE_ADD"        => "kernels.vulkan.fuse_add",           PresenceInv, Ignored, "1", migrated;
 
     // ── kernels.vulkan — BDA chunk caps (§6.5c) ──────────────────────────────
     "INFR_BDA_CHUNK_ELEMS" => "kernels.vulkan.bda_chunk_elems", Int, Ignored, "1024", pending;
@@ -270,8 +271,8 @@ knobs! {
     "INFR_ROCM_COOP"         => "kernels.rocm.coop",      Presence,    Ignored, "1",     pending;
     "INFR_ROCM_COOP_TILE"    => "kernels.rocm.coop_tile", Text,        Ignored, "64x64", pending;
     "INFR_ROCM_BLAS"         => "kernels.rocm.blas",      Presence,    Ignored, "1",     pending;
-    "INFR_ROCM_NO_FUSE_ADD"  => "kernels.rocm.fuse_add",  PresenceInv, Ignored, "1",     pending;
-    "INFR_ROCM_NO_FUSE_NORM" => "kernels.rocm.fuse_norm", PresenceInv, Ignored, "1",     pending;
+    "INFR_ROCM_NO_FUSE_ADD"  => "kernels.rocm.fuse_add",  PresenceInv, Ignored, "1",     migrated;
+    "INFR_ROCM_NO_FUSE_NORM" => "kernels.rocm.fuse_norm", PresenceInv, Ignored, "1",     migrated;
 
     // ── kernels.cpu (§6.7) ───────────────────────────────────────────────────
     "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", pending;

@@ -507,7 +507,10 @@ impl SeamModel {
             // the KV cache live in system RAM (`INFR_KV_OVERFLOW`, honored by the Vulkan backend's
             // `BufferUsage::KvCache` alloc). Read over PCIe by attention — slower, but the big
             // context actually runs instead of clamping. Flag off ⇒ today's clamp/error unchanged.
-            if crate::seam::kv_overflow_enabled() {
+            // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the
+            // `Config` the backend was built with) — one value, so the clamp ladder and the
+            // allocator cannot disagree about whether the spill is armed.
+            if vk.cfg().kv.overflow {
                 eprintln!(
                     "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
                      INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"

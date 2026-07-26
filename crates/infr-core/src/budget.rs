@@ -14,8 +14,10 @@
 //! - [`kv_fmt_bytes`] — the EXACT allocation size of a KV buffer of `elems` elements, and
 //!   [`kv_bytes_per_elem`] — the same thing as a fractional per-element rate, which is what the
 //!   context-fit ESTIMATES divide by. The two must agree; a test pins them against each other.
-//! - [`env_flag`] / [`env_mib`] / [`overflow_vram_reserve`] — the `INFR_*` grammars the spill
-//!   knobs share (`empty`/`0` = off; a MiB count; the 12%-of-VRAM-floored-at-2-GiB reserve).
+//! - [`flag_from`] / [`mib_bytes`] / [`reserve_bytes`] — the grammars and accessors the spill
+//!   knobs share (`empty`/`0` = off; a MiB count → bytes; the 12%-of-VRAM-floored-at-2-GiB
+//!   reserve). The VALUES come from the backend's [`Config`](crate::config::Config); nothing here
+//!   reads the environment (R3).
 //! - [`SpillTally`] / [`SpillCounts`] / [`spill_report_line`] — the VRAM-first placement
 //!   bookkeeping and its banner. The counters and the message SKELETON are shared; every noun and
 //!   every device-specific clause is passed in ([`SpillNouns`]), and so is the byte formatter,
@@ -109,51 +111,48 @@ pub fn kv_bytes_per_elem(dt: DType) -> f64 {
     bytes as f64 / elems as f64
 }
 
-// ── `INFR_*` grammars shared by the spill knobs ──────────────────────────────
+// ── grammars + accessors shared by the spill knobs ───────────────────────────
 
-/// The boolean-flag grammar every overflow knob uses: set and neither empty nor `"0"` ⇒ on.
-/// Unset ⇒ off. (`INFR_KV_OVERFLOW`, `INFR_ROCM_WEIGHT_OVERFLOW`.)
-pub fn env_flag(var: &str) -> bool {
-    flag_from(std::env::var(var).ok().as_deref())
-}
-
-/// [`env_flag`]'s grammar over an explicit value, so it is testable without touching the process
-/// environment (see `infr_core::test_env`): `Some(v)` with `v` neither empty nor `"0"` ⇒ on.
+/// The boolean-flag grammar every overflow knob uses, over an explicit value: `Some(v)` with `v`
+/// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_OVERFLOW`,
+/// `INFR_ROCM_WEIGHT_OVERFLOW`.) NOT the same as the `is_ok()` presence grammar, where an empty
+/// value is ON — `config::env`'s `flag` reader calls this so the difference survives the
+/// migration; the read sites take the resolved `bool` off their backend's `Config`.
 pub fn flag_from(raw: Option<&str>) -> bool {
     raw.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// A MiB-valued `INFR_*` knob in bytes; `None` when unset or unparseable. (`0` parses to
-/// `Some(0)` — the diagnostic caps use it to mean "nothing resident", which is NOT the same as
-/// "no cap".)
-pub fn env_mib(var: &str) -> Option<u64> {
-    mib_from(std::env::var(var).ok().as_deref())
+/// A MiB-valued knob's CONFIG field in bytes. (`Some(0)` stays `Some(0)` — the diagnostic caps use
+/// it to mean "nothing resident", which is NOT the same as "no cap".)
+pub fn mib_bytes(mib: Option<u64>) -> Option<u64> {
+    mib.map(|mb| mb * 1024 * 1024)
 }
 
-/// [`env_mib`]'s grammar over an explicit value — MiB → bytes, `None` when absent or unparseable.
+/// The MiB grammar over an explicit string — the env spelling of [`mib_bytes`], `None` when absent
+/// or unparseable.
 pub fn mib_from(raw: Option<&str>) -> Option<u64> {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
+    mib_bytes(raw.and_then(|v| v.trim().parse::<u64>().ok()))
 }
 
 /// VRAM headroom a VRAM-first spill keeps free below the live free-byte figure, so the consumers
 /// that allocate AFTER the spilled class (per-forward activation scratch, dequant caches, BLAS
 /// workspace, a paged-MoE arena) still have room. Default 12% of total VRAM floored at 2 GiB —
-/// enough for a several-hundred-row prefill on a large-vocab model — overridden by `env` (MiB).
+/// enough for a several-hundred-row prefill on a large-vocab model — overridden by the knob's
+/// config field (`kv.overflow_reserve_mb` / `paging.rocm_weight_reserve_mb`, in MiB).
 ///
 /// Over-reserving costs residency; under-reserving OOMs mid-forward in an allocator that is
 /// infallible by contract, so the floor is deliberate.
-pub fn overflow_vram_reserve(total_vram: u64, env: &str) -> u64 {
-    reserve_from(total_vram, std::env::var(env).ok().as_deref())
-}
-
-/// [`overflow_vram_reserve`] over an explicit override value — the whole policy, no environment
-/// (see `crate::test_env` for why the tests want it that way).
-pub fn reserve_from(total_vram: u64, raw: Option<&str>) -> u64 {
-    if let Some(bytes) = mib_from(raw) {
+pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
+    if let Some(bytes) = mib_bytes(override_mib) {
         return bytes;
     }
     (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+}
+
+/// [`reserve_bytes`] over an explicit override STRING — the env spelling of the same policy, kept
+/// so the grammar (MiB, trimmed, unparseable ⇒ the default formula) is pinned in one place.
+pub fn reserve_from(total_vram: u64, raw: Option<&str>) -> u64 {
+    reserve_bytes(total_vram, raw.and_then(|v| v.trim().parse::<u64>().ok()))
 }
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
@@ -399,7 +398,7 @@ mod tests {
     /// `empty`/`0`/unset = off; anything else = on — over explicit values via [`flag_from`], so
     /// no test in this binary has to touch the process environment (see `crate::test_env`).
     #[test]
-    fn env_flag_grammar() {
+    fn flag_grammar() {
         assert!(!flag_from(None));
         for (raw, want) in [
             ("", false),
@@ -413,21 +412,33 @@ mod tests {
         }
     }
 
-    /// The part `flag_from` cannot cover: `env_flag` reads the variable it was handed. Guarded.
+    /// The same grammar as the CONFIG layer resolves it: `config::env`'s `flag` reader is
+    /// `flag_from`, so a `Config` built from these spellings carries exactly the booleans above —
+    /// which is what the spill sites now read.
     #[test]
-    fn env_flag_reads_its_variable() {
-        const V: &str = "INFR_BUDGET_TEST_FLAG";
-        let mut env = crate::test_env::EnvGuard::new();
-        env.unset(V);
-        assert!(!env_flag(V));
-        env.set(V, "1");
-        assert!(env_flag(V));
+    fn kv_overflow_config_field_follows_the_flag_grammar() {
+        use crate::config::Config;
+        for (raw, want) in [("", false), ("0", false), ("1", true), ("true", true)] {
+            for key in ["INFR_KV_OVERFLOW", "INFR_ROCM_WEIGHT_OVERFLOW"] {
+                let layer =
+                    crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
+                let cfg = Config::load_from_layers(&[layer]);
+                let got = match key {
+                    "INFR_KV_OVERFLOW" => cfg.kv.overflow,
+                    _ => cfg.paging.rocm_weight_overflow,
+                };
+                assert_eq!(got, want, "{key}={raw:?}");
+            }
+        }
+        // Unset ⇒ the shipped default, off — both spill classes.
+        assert!(!Config::default().kv.overflow);
+        assert!(!Config::default().paging.rocm_weight_overflow);
     }
 
     /// MiB → bytes, with `0` distinct from unset (it forces whole-host placement) — over explicit
     /// values via [`mib_from`], no environment.
     #[test]
-    fn env_mib_grammar() {
+    fn mib_grammar() {
         assert_eq!(mib_from(None), None);
         for (raw, want) in [
             ("0", Some(0)),
@@ -442,22 +453,33 @@ mod tests {
         }
     }
 
-    /// The part `mib_from` cannot cover: `env_mib` reads the variable it was handed. Guarded.
+    /// The MiB CAPS as the read sites now take them: a `Config` field in MiB, [`mib_bytes`] to
+    /// bytes. `Some(0)` (whole-host placement) must survive as `Some(0)`, not collapse to "no cap".
     #[test]
-    fn env_mib_reads_its_variable() {
-        const V: &str = "INFR_BUDGET_TEST_MIB";
-        let mut env = crate::test_env::EnvGuard::new();
-        env.unset(V);
-        assert_eq!(env_mib(V), None);
-        env.set(V, "512");
-        assert_eq!(env_mib(V), Some(512 * 1024 * 1024));
+    fn mib_caps_come_off_the_config_in_mib() {
+        use crate::config::Config;
+        assert_eq!(mib_bytes(None), None);
+        assert_eq!(mib_bytes(Some(0)), Some(0));
+        assert_eq!(mib_bytes(Some(512)), Some(512 * 1024 * 1024));
+        // Unset ⇒ no cap on either class; set ⇒ the MiB count, byte-converted at the site.
+        assert_eq!(Config::default().kv.overflow_vram_mb, None);
+        assert_eq!(Config::default().paging.rocm_weight_vram_mb, None);
+        let layer = crate::config::env::parse(&|k| match k {
+            "INFR_KV_OVERFLOW_VRAM_MB" => Some("  512  ".to_string()),
+            "INFR_ROCM_WEIGHT_VRAM_MB" => Some("0".to_string()),
+            _ => None,
+        })
+        .expect("env layer");
+        let cfg = Config::load_from_layers(&[layer]);
+        assert_eq!(mib_bytes(cfg.kv.overflow_vram_mb), Some(512 * 1024 * 1024));
+        assert_eq!(mib_bytes(cfg.paging.rocm_weight_vram_mb), Some(0));
     }
 
     /// 12% of total, floored at 2 GiB, override in MiB — verbatim from ROCm's two inline copies
     /// (`kv_overflow_vram_reserve` / `weight_overflow_vram_reserve`), over [`reserve_from`] so the
     /// case sweep needs no environment.
     #[test]
-    fn overflow_vram_reserve_matches_the_inline_formula() {
+    fn reserve_from_matches_the_inline_formula() {
         const GIB: u64 = 1024 * 1024 * 1024;
         // Below the crossover (2 GiB / 0.12 ≈ 16.67 GiB) the floor wins.
         assert_eq!(reserve_from(8 * GIB, None), 2 * GIB);
@@ -471,16 +493,29 @@ mod tests {
         assert_eq!(reserve_from(24 * GIB, Some("abc")), 24 * GIB / 100 * 12);
     }
 
-    /// And that the env-reading wrapper picks up its variable. Guarded.
+    /// The same policy driven off the CONFIG field (MiB) instead of a string — what the two ROCm
+    /// reserve sites now call. `reserve_from` is the string spelling of exactly this.
     #[test]
-    fn overflow_vram_reserve_reads_its_variable() {
-        const V: &str = "INFR_BUDGET_TEST_RESERVE_MB";
+    fn reserve_bytes_takes_the_override_from_the_config() {
+        use crate::config::Config;
         const GIB: u64 = 1024 * 1024 * 1024;
-        let mut env = crate::test_env::EnvGuard::new();
-        env.unset(V);
-        assert_eq!(overflow_vram_reserve(24 * GIB, V), 24 * GIB / 100 * 12);
-        env.set(V, "128");
-        assert_eq!(overflow_vram_reserve(24 * GIB, V), 128 * 1024 * 1024);
+        assert_eq!(reserve_bytes(24 * GIB, None), 24 * GIB / 100 * 12);
+        assert_eq!(reserve_bytes(8 * GIB, None), 2 * GIB);
+        assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
+        assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
+        // Unset in the shipped config ⇒ the formula, for both spill classes.
+        let d = Config::default();
+        assert_eq!(d.kv.overflow_reserve_mb, None);
+        assert_eq!(d.paging.rocm_weight_reserve_mb, None);
+        let layer = crate::config::env::parse(&|k| {
+            (k == "INFR_KV_OVERFLOW_RESERVE_MB").then(|| "128".to_string())
+        })
+        .expect("env layer");
+        let cfg = Config::load_from_layers(&[layer]);
+        assert_eq!(
+            reserve_bytes(24 * GIB, cfg.kv.overflow_reserve_mb),
+            128 * 1024 * 1024
+        );
     }
 
     /// The cumulative cap admits up to and including the cap, and `Some(0)` admits nothing —

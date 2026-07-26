@@ -718,13 +718,36 @@ fn toml_sections_mirror_the_struct_paths() {
     assert_eq!(cfg.multi.pipeline.as_deref(), Some(&[0usize, 1][..]));
 }
 
-/// Nothing is migrated yet: S0 is scaffold, every read site is still where it was, and the tree
-/// behaves exactly as before. A slice flips its own entries.
+/// The migrated set, pinned key by key. A slice flips its own entries AND updates this list, so
+/// "which knobs have actually moved" is one diff away and a stray flip cannot ride along
+/// unnoticed. Every key below must come back clean from the three R3 greps
+/// (`docs/config-plan.md` §3) — its read site takes the value from a `Config`.
 #[test]
-fn s0_ships_with_nothing_migrated() {
-    let migrated: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
-    assert!(
-        migrated.is_empty(),
-        "these knobs claim to be migrated — the R3 greps must come back clean for them: {migrated:?}"
+fn migrated_keys_are_exactly_the_landed_slices() {
+    /// S2 — `infr-core`'s own knobs: the two `tier::EnvRows` tables, the six `budget` spill knobs,
+    /// the pager ring, and the three `fusion` escape hatches.
+    const S2: &[&str] = &[
+        "INFR_CANVAS_CHUNK_N",
+        "INFR_KV_OVERFLOW",
+        "INFR_KV_OVERFLOW_RESERVE_MB",
+        "INFR_KV_OVERFLOW_VRAM_MB",
+        "INFR_MOE_SMALL_M",
+        "INFR_NO_FUSE_ADD",
+        "INFR_PAGER_RING",
+        "INFR_ROCM_NO_FUSE_ADD",
+        "INFR_ROCM_NO_FUSE_NORM",
+        "INFR_ROCM_WEIGHT_OVERFLOW",
+        "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB",
+        "INFR_ROCM_WEIGHT_VRAM_MB",
+    ];
+
+    let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
+    got.sort_unstable();
+    let mut want: Vec<&str> = S2.to_vec();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "the manifest's `migrated` set drifted from the slices that landed — flip an entry and \
+         list it here in the SAME commit"
     );
 }

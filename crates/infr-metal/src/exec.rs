@@ -755,7 +755,8 @@ fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
     infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
             weight_ok: &LINEAR_ADD_WEIGHT_OK,
-            disable_env: None,
+            // No escape hatch on this backend (Vulkan/ROCm each have one); always planned.
+            enabled: true,
         }),
         rmsnorm_linear: None,
         kv_write: false,

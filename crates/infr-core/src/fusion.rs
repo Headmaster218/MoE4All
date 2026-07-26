@@ -39,17 +39,19 @@ pub struct LinearAddCfg<'a> {
     /// fused-residual-GEMV kernel coverage (e.g. Vulkan `native_dense_supported || F16`, Metal's
     /// legacy+Q4K/Q6K list, ROCm's int8-decode set).
     pub weight_ok: &'a dyn Fn(DType) -> bool,
-    /// If set and the named env var is present, this pass is disabled entirely (the escape hatch
-    /// each backend already exposed — Vulkan `INFR_NO_FUSE_ADD`, ROCm `INFR_ROCM_NO_FUSE_ADD`).
-    pub disable_env: Option<&'static str>,
+    /// `false` disables this pass entirely — the backend's escape hatch, taken off ITS config
+    /// (Vulkan `kernels.vulkan.fuse_add` / `INFR_NO_FUSE_ADD`, ROCm `kernels.rocm.fuse_add` /
+    /// `INFR_ROCM_NO_FUSE_ADD`). A backend with no hatch passes `true`.
+    pub enabled: bool,
 }
 
 /// Per-pattern config for [`FusionCfg::rmsnorm_linear`].
 pub struct RmsNormLinearCfg<'a> {
     /// Fuse only when each consuming `Linear`'s weight dtype passes this predicate.
     pub weight_ok: &'a dyn Fn(DType) -> bool,
-    /// Env escape hatch (ROCm `INFR_ROCM_NO_FUSE_NORM`).
-    pub disable_env: Option<&'static str>,
+    /// `false` disables this pass entirely (ROCm `kernels.rocm.fuse_norm` /
+    /// `INFR_ROCM_NO_FUSE_NORM`).
+    pub enabled: bool,
 }
 
 /// Which peephole rewrites a backend wants planned, and the per-pattern predicates/hatches.
@@ -79,27 +81,20 @@ pub struct FusionPlan {
     pub skip: HashSet<usize>,
 }
 
-fn env_disabled(disable_env: Option<&'static str>) -> bool {
-    disable_env.is_some_and(|name| std::env::var_os(name).is_some())
-}
-
 /// Plan the peephole fusions `cfg` enables over `graph`. Pure host logic over the IR — no device
-/// types. The returned [`FusionPlan`] is what the backend feeds its executor.
+/// types, and (since the config campaign's S2) no environment: each pattern's escape hatch arrives
+/// as the `enabled` flag its backend read off its own `Config`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn plan_fusions(graph: &Graph, cfg: &FusionCfg) -> FusionPlan {
     let mut plan = FusionPlan::default();
     if cfg.kv_write {
         plan_kv_write(graph, &mut plan);
     }
-    if let Some(c) = &cfg.rmsnorm_linear {
-        if !env_disabled(c.disable_env) {
-            plan_rmsnorm_linear(graph, c, &mut plan);
-        }
+    if let Some(c) = cfg.rmsnorm_linear.as_ref().filter(|c| c.enabled) {
+        plan_rmsnorm_linear(graph, c, &mut plan);
     }
-    if let Some(c) = &cfg.linear_add {
-        if !env_disabled(c.disable_env) {
-            plan_linear_add(graph, c, &mut plan);
-        }
+    if let Some(c) = cfg.linear_add.as_ref().filter(|c| c.enabled) {
+        plan_linear_add(graph, c, &mut plan);
     }
     plan
 }
@@ -274,4 +269,95 @@ fn dst_only_read_by_next(graph: &Graph, start: usize, dst: TensorId) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::graph::Op;
+    use crate::tensor::TensorDesc;
+
+    /// A minimal decode `Linear(m==1) -> Add(residual)` pair, the shape both `linear_add` backends
+    /// fuse.
+    fn linear_add_graph() -> Graph {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![4, 4], DType::F16));
+        let dst = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let res = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let out = g.output(TensorDesc::new(vec![1, 4], DType::F32));
+        g.push(Op::Linear {
+            x,
+            weight: w,
+            dst,
+            m: 1,
+            in_f: 4,
+            out_f: 4,
+            w_off: 0,
+        });
+        g.push(Op::Add {
+            a: dst,
+            b: res,
+            dst: out,
+            n: 4,
+        });
+        g
+    }
+
+    /// The escape hatch, driven through a `Config` rather than the process environment: the
+    /// backend hands `plan_fusions` the POSITIVE `fuse_add` field, and a cleared field leaves the
+    /// pair split (both ops dispatched) exactly as `INFR_NO_FUSE_ADD` used to.
+    #[test]
+    fn linear_add_hatch_comes_from_the_config() {
+        let g = linear_add_graph();
+        let all: &dyn Fn(DType) -> bool = &|_| true;
+        let plan_with = |enabled: bool| {
+            plan_fusions(
+                &g,
+                &FusionCfg {
+                    linear_add: Some(LinearAddCfg {
+                        weight_ok: all,
+                        enabled,
+                    }),
+                    rmsnorm_linear: None,
+                    kv_write: false,
+                },
+            )
+        };
+
+        // Shipped default: the fold is planned and the standalone `Add` is elided.
+        let d = Config::default();
+        assert!(d.kernels.vulkan.fuse_add);
+        assert!(d.kernels.rocm.fuse_add);
+        assert!(d.kernels.rocm.fuse_norm);
+        let on = plan_with(d.kernels.vulkan.fuse_add);
+        assert_eq!(on.linear_add.len(), 1);
+        assert!(on.skip.contains(&1));
+
+        // The three `NO_FUSE` keys clear their POSITIVE field on PRESENCE — value irrelevant,
+        // including `=0` (the presence-inv truth table).
+        for raw in ["", "0", "1"] {
+            for (key, which) in [
+                ("INFR_NO_FUSE_ADD", 0usize),
+                ("INFR_ROCM_NO_FUSE_ADD", 1),
+                ("INFR_ROCM_NO_FUSE_NORM", 2),
+            ] {
+                let layer =
+                    crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
+                let cfg = Config::load_from_layers(&[layer]);
+                let field = match which {
+                    0 => cfg.kernels.vulkan.fuse_add,
+                    1 => cfg.kernels.rocm.fuse_add,
+                    _ => cfg.kernels.rocm.fuse_norm,
+                };
+                assert!(!field, "{key}={raw:?} must clear its fusion field");
+            }
+        }
+
+        // Cleared field => nothing planned, nothing skipped: both ops dispatch.
+        let off = plan_with(false);
+        assert!(off.linear_add.is_empty());
+        assert!(off.skip.is_empty());
+    }
 }

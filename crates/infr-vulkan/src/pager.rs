@@ -592,16 +592,17 @@ pub struct MoePagerLayout {
     pub pools: Vec<MoePoolSpec>,
     /// Total bytes for the pinned upload ring (two fence-rotated halves — see
     /// [`MoePagerSession`]'s `ring` field). `0` picks the default
-    /// ([`default_ring_bytes`]); either way each half is floored at the largest pool slot so one
+    /// ([`ring_bytes`]); either way each half is floored at the largest pool slot so one
     /// miss always fits. The seam's budget math subtracts this before splitting arena shares.
     pub ring_bytes: usize,
 }
 
 /// Upload-ring sizing policy — pure budget arithmetic, so it lives in the shared seam
-/// ([`infr_core::pager::ring_bytes_policy`], which owns the doc and the boundary tests). Re-exported
+/// ([`infr_core::pager::ring_bytes`], which owns the doc and the boundary tests). Re-exported
 /// under this crate's old path because the ring it sizes is a Vulkan buffer pair and every call
-/// site here reads better next to them.
-pub use infr_core::pager::ring_bytes_policy;
+/// site here reads better next to them. The `paging.ring` override comes off the backend's
+/// `Config` (`INFR_PAGER_RING`), so the caller passes it in.
+pub use infr_core::pager::ring_bytes;
 
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
@@ -623,7 +624,8 @@ impl MoePagerSession {
         let ring_total = if layout.ring_bytes > 0 {
             layout.ring_bytes
         } else {
-            ring_bytes_policy(0) // 0 budget → the clamp floor (env override still wins)
+            // 0 budget → the clamp floor; the configured `paging.ring` override still wins.
+            ring_bytes(0, vk.cfg().paging.ring)
         };
         let ring_half_bytes = (ring_total / 2).max(staging_bytes);
         let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
@@ -1012,7 +1014,7 @@ struct DensePool {
 /// the first placeholder.
 pub struct DensePagerLayout {
     pub pools: Vec<DensePoolSpec>,
-    /// Pinned upload ring total bytes (two fence-rotated halves); `0` = [`ring_bytes_policy`]'s
+    /// Pinned upload ring total bytes (two fence-rotated halves); `0` = [`ring_bytes`]'s
     /// floor. Each half is floored at the largest pool slot so one miss always fits.
     pub ring_bytes: usize,
 }
@@ -1058,7 +1060,7 @@ impl DensePagerSession {
         let ring_total = if layout.ring_bytes > 0 {
             layout.ring_bytes
         } else {
-            ring_bytes_policy(0)
+            ring_bytes(0, vk.cfg().paging.ring)
         };
         // Each half must hold the largest slot or `stage` could never make progress on that pool.
         let ring_half_bytes = (ring_total / 2).max(max_slot);

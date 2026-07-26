@@ -580,11 +580,14 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
 /// (the KV read seam is 100% `bufferDeviceAddress`, so off-device bytes need no shader change). So a
 /// context whose KV overflows VRAM by a modest amount keeps most layers resident and pays PCIe only
 /// on the spilled tail; a context that overflows entirely spills entirely (slice-1 whole-host as the
-/// limiting case). `INFR_KV_OVERFLOW=1`. Default OFF (empty or `0` = off) = today's VRAM-only
-/// behavior, unchanged. See [`VulkanBackend::alloc_kv_host`], [`VulkanBackend::vram_budget_fits`],
-/// and the ctx-clamp ladder's last rung.
-fn kv_overflow_enabled() -> bool {
-    infr_core::budget::env_flag("INFR_KV_OVERFLOW")
+/// limiting case). `INFR_KV_OVERFLOW=1` (config `kv.overflow`). Default OFF (empty or `0` = off) =
+/// today's VRAM-only behavior, unchanged. See [`VulkanBackend::alloc_kv_host`],
+/// [`VulkanBackend::vram_budget_fits`], and the ctx-clamp ladder's last rung.
+///
+/// Read off the backend's `Config`, not the process environment; `budget::flag_from`'s grammar
+/// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer.
+fn kv_overflow_enabled(cfg: &infr_core::config::Config) -> bool {
+    cfg.kv.overflow
 }
 
 /// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
@@ -605,8 +608,10 @@ const KV_SPILL: SpillNouns<'static> = SpillNouns {
 /// purpose is to make the partial-spill mix and the whole-host case reproducible on models that
 /// would otherwise fit entirely — for tests and apples-to-apples benchmarking. Gates KV placement
 /// alone, never the real VRAM guard. Ignored when `INFR_KV_OVERFLOW` is off.
-fn kv_overflow_vram_cap() -> Option<u64> {
-    infr_core::budget::env_mib("INFR_KV_OVERFLOW_VRAM_MB")
+///
+/// Carried on the `Config` in MiB (`kv.overflow_vram_mb`); the byte conversion is this accessor's.
+fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
+    infr_core::budget::mib_bytes(cfg.kv.overflow_vram_mb)
 }
 
 /// Headroom the VRAM budget reserves below the true heap size, shared by the hard guard
@@ -879,6 +884,18 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    /// The engine configuration this backend reads its knobs from — one value, held for the
+    /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
+    /// R4/R6).
+    ///
+    /// **TRANSITIONAL (S2), replaced by S5:** built here from the environment via
+    /// [`infr_core::config::Config::load_from_env`] instead of being HANDED in, because
+    /// `infr-vulkan` does not get its `Arc<Config>` from `main()` until its own slice. S5a adds
+    /// `VulkanBackend::new_with(cfg: Arc<Config>)` and `new()` becomes
+    /// `new_with(Arc::new(Config::default()))`; the `load_from_env()` call in `new_selected` is
+    /// what that slice deletes. Until then this is ONE env-sourced construction per backend in
+    /// place of the scattered per-read `std::env::var` calls it replaced.
+    cfg: Arc<infr_core::config::Config>,
     shared: Arc<VulkanShared>,
 }
 
@@ -1006,6 +1023,17 @@ impl VulkanBackend {
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
         &self.shared.caps
+    }
+
+    /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
+    /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering
+    /// (`docs/config-plan.md` R6).
+    ///
+    /// `pub` because `infr-llama`'s seam reads the paging/KV knobs off the backend it already
+    /// holds rather than growing a second env-sourced config of its own; S4/S5 replace both with
+    /// the `Arc<Config>` threaded from `main()`.
+    pub fn cfg(&self) -> &infr_core::config::Config {
+        &self.cfg
     }
 
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
@@ -2090,6 +2118,9 @@ impl VulkanBackend {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
+            // TRANSITIONAL (S2) — S5a replaces this with the `Arc<Config>` passed to
+            // `new_with`. See the `cfg` field's doc.
+            cfg: Arc::new(infr_core::config::Config::load_from_env()),
             shared: Arc::new(VulkanShared {
                 _entry: entry,
                 instance,
@@ -2907,7 +2938,7 @@ impl VulkanBackend {
             // `alloc_kv_host`). This bounds PCIe cost to the overflow tail instead of paying it on the
             // whole cache; whole-host (slice-1 behavior) is now just the case where nothing fits.
             // Off by default ⇒ unchanged device-local VRAM KV.
-            if kv_overflow_enabled() {
+            if kv_overflow_enabled(&self.cfg) {
                 // Probe agrees with the guard to the byte (both key off `vram_budget_fits`), so a
                 // `true` here means the VRAM alloc's own guard will pass. Guard against the rounding
                 // slop between the requested `bytes` and the allocation's aligned size at the exact
@@ -2923,7 +2954,7 @@ impl VulkanBackend {
                 let cap_ok = self
                     .shared
                     .kv_spill
-                    .admits(kv_overflow_vram_cap(), bytes as u64);
+                    .admits(kv_overflow_vram_cap(&self.cfg), bytes as u64);
                 if cap_ok && self.vram_budget_fits(bytes as u64) {
                     if let Ok(buf) =
                         self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true)
@@ -3312,7 +3343,7 @@ impl Backend for VulkanBackend {
     /// partial split is visible. All-resident (nothing spilled) and all-spilled (slice-1 whole-host)
     /// are both reported. Nothing printed with the flag off or when no KV was allocated.
     fn kv_overflow_report(&self) {
-        if !kv_overflow_enabled() {
+        if !kv_overflow_enabled(&self.cfg) {
             return;
         }
         if let Some(line) = spill_report_line(self.shared.kv_spill.counts(), &KV_SPILL, fmt_bytes) {

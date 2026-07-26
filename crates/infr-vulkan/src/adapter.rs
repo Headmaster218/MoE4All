@@ -164,8 +164,8 @@ const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
 };
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn moe_small_m_threshold() -> usize {
-    MOE_SMALL_M.get()
+fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
+    MOE_SMALL_M.clamped(be_.cfg().kernels.vulkan.moe_small_m)
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -862,11 +862,13 @@ static LINEAR_ADD_WEIGHT_OK: fn(infr_core::DType) -> bool = linear_add_weight_ok
 /// This adapter's [`FusionCfg`](infr_core::fusion::FusionCfg): the `Linear→Add` residual fusion
 /// (`INFR_NO_FUSE_ADD` hatch) and the `Rope/QkNormRope→WriteKv` KV-write fusion. `plan_fusions`
 /// returns the same `(fused, skip)` the two former private peepholes did.
-fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
+fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
     infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
             weight_ok: &LINEAR_ADD_WEIGHT_OK,
-            disable_env: Some("INFR_NO_FUSE_ADD"),
+            // `INFR_NO_FUSE_ADD` (config `kernels.vulkan.fuse_add`, positive polarity): PRESENCE
+            // of the env key — including `INFR_NO_FUSE_ADD=0` — turns the fold off.
+            enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
         rmsnorm_linear: None,
         kv_write: true,
@@ -3019,7 +3021,7 @@ fn lower_op(
                 // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
                 let cap_short = kv_len.div_ceil(256) * 256 > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
-                    let n = CANVAS_CHUNK_N.get();
+                    let n = CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n);
                     kv_len.div_ceil(n).min(kv_len - 1).max(1)
                 } else if batched_attn {
                     256
@@ -3774,7 +3776,7 @@ fn lower_op(
             // `linear_native_id_multi` id-indexed GEMVs are plain dequant-in-shader, no dp4a) —
             // correct for any `rows`, just without the batched path's cross-token weight-bank
             // reuse (a real perf cost for large-batch MoE prefill on such hardware).
-            if rows > moe_small_m_threshold() && be_.caps().i8_dot {
+            if rows > moe_small_m_threshold(be_) && be_.caps().i8_dot {
                 // `matmul_mmq_experts` is dtype-generic (dp4a mmq kernels exist for every dtype in
                 // `infr_core::tensor::MOE_MMQ_DTYPES` — that's why `down_ok` already covered the
                 // wider set) and role-agnostic (gate/up/down all call the SAME function, just with
@@ -4446,7 +4448,7 @@ fn record_decode_replay(
             _ => None,
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
-    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg());
+    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
@@ -4640,7 +4642,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         }
     }
 
-    let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg());
+    let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     // Dense layer streaming: the fused Linear+Add kernels bake a ZERO weight offset, so un-fuse
     // any pair whose Linear weight is a streamed block — the standalone Add op runs instead
     // (bit-identical math: the fused kernel only moves the same exact add in-kernel).
@@ -5360,7 +5362,7 @@ fn execute_paged_moe<'a>(
         } else {
             matches!(act, Activation::Silu)
         };
-        if rows > moe_small_m_threshold()
+        if rows > moe_small_m_threshold(be_)
             && be_.caps().i8_dot
             && act_ok
             && paged_mmq_ok(gdt)
@@ -5847,19 +5849,29 @@ mod tests {
         }
     }
 
-    /// The `INFR_*` tier knobs' shipping numbers, asserted on the config (not on `get()`, which
-    /// would read the developer's environment). A default/ceiling edit has to face this.
+    /// The tier knobs' shipping numbers, asserted on the tables and on `Config::default()` — the
+    /// two spellings of the same default, which MUST agree (the value now arrives from the config,
+    /// the clamp range from the table). A default/ceiling edit has to face this.
     #[test]
     fn tier_knob_defaults_and_clamps() {
+        let d = infr_core::config::Config::default();
         // `INFR_MOE_SMALL_M`: measured crossover 8, hard ceiling 64 (past it a prefill chunk
         // becomes one multi-second dispatch and trips the amdgpu watchdog).
         assert_eq!(MOE_SMALL_M.env, "INFR_MOE_SMALL_M");
         assert_eq!(MOE_SMALL_M.default, 8);
+        assert_eq!(d.kernels.vulkan.moe_small_m, MOE_SMALL_M.default);
         assert_eq!((MOE_SMALL_M.min, MOE_SMALL_M.max), (0, 64));
+        // A config value past the ceiling is clamped at the read site, exactly as the env override
+        // always was — `INFR_MOE_SMALL_M=100000` must not reach a dispatch.
+        assert_eq!(MOE_SMALL_M.clamped(100_000), 64);
         // `INFR_CANVAS_CHUNK_N`: a divisor, so it floors at 1 rather than capping.
         assert_eq!(CANVAS_CHUNK_N.env, "INFR_CANVAS_CHUNK_N");
         assert_eq!(CANVAS_CHUNK_N.default, 3);
+        assert_eq!(d.kernels.vulkan.canvas_chunk_n, CANVAS_CHUNK_N.default);
         assert_eq!(CANVAS_CHUNK_N.min, 1);
+        assert_eq!(CANVAS_CHUNK_N.clamped(0), 1);
+        // The fusion hatch is a POSITIVE field: fused by default, `INFR_NO_FUSE_ADD` clears it.
+        assert!(d.kernels.vulkan.fuse_add);
         // The split-K policy the attention lowering is configured with.
         assert_eq!(ATTN_SPLIT.target_chunks, 32);
         assert_eq!((ATTN_SPLIT.min_chunk, ATTN_SPLIT.max_chunk), (64, 512));

@@ -312,8 +312,8 @@ cfg_struct! {
         no_replay: bool = false,
         /// `INFR_NO_GPU_POS` (inverted). Also read in `infr-llama`'s runner.
         gpu_pos: bool = true,
-        /// `INFR_NO_FUSE_ADD` (inverted) — reaches the pass through `FusionCfg.disable_env`, not
-        /// a direct read.
+        /// `INFR_NO_FUSE_ADD` (inverted) — reaches the shared fusion pass as
+        /// `FusionCfg.linear_add.enabled`, not as a direct read.
         fuse_add: bool = true,
 
         /// `INFR_BDA_CHUNK_ELEMS`: element cap per BDA addressing unit. `None` =
@@ -391,9 +391,9 @@ cfg_struct! {
         coop_tile: Option<String> = None,
         /// `INFR_ROCM_BLAS`: OPT-IN rocBLAS prefill.
         blas: bool = false,
-        /// `INFR_ROCM_NO_FUSE_ADD` (inverted) — via `FusionCfg.disable_env`.
+        /// `INFR_ROCM_NO_FUSE_ADD` (inverted) — via `FusionCfg.linear_add.enabled`.
         fuse_add: bool = true,
-        /// `INFR_ROCM_NO_FUSE_NORM` (inverted) — via `FusionCfg.disable_env`.
+        /// `INFR_ROCM_NO_FUSE_NORM` (inverted) — via `FusionCfg.rmsnorm_linear.enabled`.
         fuse_norm: bool = true,
     }
 }
@@ -688,6 +688,28 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    /// **TRANSITIONAL (S2) — delete with its last caller (S4/S5/S6).**
+    ///
+    /// The `Default` < environment fold, with no file and no CLI layer: the config a crate builds
+    /// for ITSELF at its construction boundary while it waits to be HANDED an `Arc<Config>` by
+    /// `main()`. `VulkanBackend::new` and `RocmBackend::new` call it once each and store the
+    /// result, which is what lets `infr-core`'s own knobs (`tier::EnvRows`, the spill budgets, the
+    /// pager ring, the fusion hatches) take their value from a `&Config` before those crates'
+    /// slices land. Each such call site carries a comment naming the slice that removes it; when
+    /// the last one becomes `new_with(cfg)`, this function goes with it.
+    ///
+    /// It is NOT `Config::load`: no file layer (these knobs were env-only before the migration, so
+    /// reading a file here would ADD behaviour, and the diagnostics banner would print twice), and
+    /// deliberately infallible. The five keys that reject a bad value loudly (`INFR_SG`,
+    /// `INFR_SUBMIT_DISPATCHES`, the three device lists) are NOT migrated yet — they are still
+    /// read, and still rejected, at their own sites, so a layer error here must neither pre-empt
+    /// nor duplicate their error text (R1). A rejected layer therefore falls back to
+    /// `Config::default()`, whose values for this slice's knobs are the shipped ones.
+    pub fn load_from_env() -> Config {
+        let layer = ConfigLayer::env().unwrap_or_default();
+        Config::load_from_layers(&[layer])
     }
 
     /// Every dotted config path, in declaration order. The TOML schema, `--set`'s path set and
