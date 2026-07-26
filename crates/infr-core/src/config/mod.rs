@@ -724,15 +724,14 @@ impl Config {
         Ok(cfg)
     }
 
-    /// **TRANSITIONAL (S2) — delete with its last caller (S8).**
+    /// The `Default` < environment fold, with no file and no CLI layer.
     ///
-    /// The `Default` < environment fold, with no file and no CLI layer: the config a crate builds
-    /// for ITSELF at its construction boundary while it waits to be HANDED an `Arc<Config>` by
-    /// `main()`. `SeamModel::load` (S8) is the last TRANSITIONAL caller; `CpuBackend::new` /
-    /// `CpuBackend::reference` keep it as their env-sourced twin (infallible is right there — CPU
-    /// owns none of the loud keys). The Vulkan bridge went away in S5a and the ROCm one in S6, when
-    /// `VulkanBackend::new_with(cfg)` / `RocmBackend::new_with(device_id, cfg)` became the real
-    /// constructors.
+    /// No longer transitional: `SeamModel::load` — the last bridge caller — was deleted in S8, and
+    /// what remains is `CpuBackend::new` / `CpuBackend::reference`, the env-sourced TWINS of
+    /// `new_with`/`reference_with` that a library caller may legitimately want (infallible is
+    /// right there — CPU owns none of the loud keys). The Vulkan bridge went away in S5a and the
+    /// ROCm one in S6, when `VulkanBackend::new_with(cfg)` / `RocmBackend::new_with(device_id,
+    /// cfg)` became the real constructors.
     ///
     /// It is NOT `Config::load`: no file layer (these knobs were env-only before the migration, so
     /// reading a file here would ADD behaviour, and the diagnostics banner would print twice), and

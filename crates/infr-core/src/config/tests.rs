@@ -637,6 +637,99 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// **The R3 exit criterion, as a test so it cannot rot** (`docs/config-plan.md` §7 S8).
+///
+/// After S8 the process environment is read for an `INFR_*` knob in exactly ONE place — the config
+/// crate's env layer, through the injected reader `Config::load` passes it. Anything else is a
+/// regression: a knob that has crept back onto ambient state, invisible to the config file, to
+/// `--set`, and to any test that wants to drive it as a value.
+///
+/// This is the shell grep `env::var(_os)?("INFR_` over `crates/*/src` + `crates/*/build.rs`, in
+/// Rust, minus comments. The allowed hits are exactly §6.10's permanent exclusions:
+///
+/// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
+///   when it is read (§5.3).
+/// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
+///   point at files on disk, deliberately left on the environment.
+///
+/// `RAYON_NUM_THREADS` is not an `INFR_*` knob and is not in scope: `infr-cli` still PUBLISHES it,
+/// because rayon's global pool has no other input.
+#[test]
+fn no_infr_env_reads_outside_the_config_layer() {
+    /// Keys any file may still read directly (§6.10).
+    const FIXTURE_KEYS: &[&str] = &[
+        "INFR_TEST_GGUF",
+        "INFR_TEST_MODEL",
+        "INFR_LLAMA_DIFFUSION_CLI",
+    ];
+
+    let Some(crates) = repo_crates_dir() else {
+        return; // packaged/vendored build — no `crates/` to scan
+    };
+    let mut offenders: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("read crates/") {
+        let dir = entry.expect("crates/ entry").path();
+        scan_for_env_reads(&dir.join("src"), &mut offenders);
+        scan_file_for_env_reads(&dir.join("build.rs"), &mut offenders);
+    }
+    offenders.retain(|hit| {
+        let (path, key) = hit.rsplit_once(' ').expect("hit is `path KEY`");
+        if FIXTURE_KEYS.contains(&key) {
+            return false;
+        }
+        // `INFR_PROFILE` is the build scripts' alone.
+        !(key == "INFR_PROFILE" && path.ends_with("build.rs"))
+    });
+    assert!(
+        offenders.is_empty(),
+        "these sites read an INFR_* knob straight from the process environment — route it through \
+         `config/env.rs` and take the value off the `Config` the caller already owns (R3): \
+         {offenders:#?}"
+    );
+}
+
+fn scan_for_env_reads(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_for_env_reads(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            scan_file_for_env_reads(&path, out);
+        }
+    }
+}
+
+/// Every `std::env` var/var_os read of an `INFR_*` literal in `path` that is not inside a
+/// comment, reported as `"<path> <KEY>"`. Comment lines are skipped so the campaign's own prose
+/// (which names the reads it replaced) does not fail the check — a real read is never
+/// comment-only.
+fn scan_file_for_env_reads(path: &Path, out: &mut Vec<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        for needle in ["env::var(\"INFR_", "env::var_os(\"INFR_"] {
+            let mut from = 0;
+            while let Some(rel) = code[from..].find(needle) {
+                let start = from + rel + needle.len() - "INFR_".len();
+                let end = code[start..]
+                    .find('"')
+                    .map(|n| start + n)
+                    .unwrap_or(code.len());
+                out.push(format!("{} {}", path.display(), &code[start..end]));
+                from = end.max(from + 1);
+            }
+        }
+    }
+}
+
 // ── §8.10 — `--set` path validation ──────────────────────────────────────────
 
 /// `--set` with a typo'd path is a HARD error with a did-you-mean, never a silent no-op: it was
@@ -1054,6 +1147,24 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PROFILE_OUT",
     ];
 
+    /// S8 — the CLI's own transitional bridge, and with it the LAST unmigrated knob. The six
+    /// `sampling.*` keys had migrated READ sites since S4; what kept them `pending` was
+    /// `infr-cli`, which re-published the resolved values into the process environment
+    /// (`publish_transitional_env`) so that `apply_model_sampling_defaults` could probe
+    /// `std::env::var(..).is_ok()` to decide whether a layer had specified them. S8 threads the
+    /// `specified` `PartialConfig` down from `main()` instead, and deletes the publication.
+    ///
+    /// With this list, EVERY key in `KEYS` is migrated — which is what
+    /// `no_infr_env_reads_outside_the_config_layer` enforces against the tree.
+    const S8: &[&str] = &[
+        "INFR_IGNORE_EOS",
+        "INFR_MAX_NEW",
+        "INFR_SEED",
+        "INFR_TEMP",
+        "INFR_TOP_K",
+        "INFR_TOP_P",
+    ];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
     let mut want: Vec<&str> = S2
@@ -1064,6 +1175,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         .chain(S5B)
         .chain(S6)
         .chain(S7)
+        .chain(S8)
         .copied()
         .collect();
     want.sort_unstable();

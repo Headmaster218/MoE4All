@@ -2,7 +2,7 @@
 //! See docs/plan.md "Product surface".
 
 use clap::{Parser, Subcommand};
-use infr_core::config::{Config, ConfigOverrides, ConfigValue, PartialConfig};
+use infr_core::config::{Config, ConfigOverrides, PartialConfig};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -264,7 +264,7 @@ impl DeviceOpts {
 /// would be misleading. On `serve` these are the SERVER DEFAULTS — a per-request OpenAI field
 /// (`temperature`/`top_p`/…) still overrides them via `GenParams::from_request`.
 ///
-/// The layer is resolved BEFORE `set_default_sampling_env` (which only fills a knob no layer
+/// The layer is resolved BEFORE `apply_model_sampling_defaults` (which only fills a knob no layer
 /// specified), so a flag the user passed wins and the rest fall back to the chat defaults.
 #[derive(clap::Args)]
 struct SamplingOpts {
@@ -301,8 +301,8 @@ struct SamplingOpts {
 
 impl SamplingOpts {
     /// Fold the passed flags into the CLI config layer. Only a flag the user actually set specifies
-    /// anything, so an unset knob is left for the file/env layers, `set_default_sampling_env`, or
-    /// the reader default — in that order.
+    /// anything, so an unset knob is left for the file/env layers, `apply_model_sampling_defaults`,
+    /// or the reader default — in that order.
     fn overrides(&self, layer: &mut PartialConfig) {
         if let Some(t) = self.temp {
             layer.sampling.temp = Some(t);
@@ -618,14 +618,18 @@ fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::load(&overrides)?);
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
-    publish_transitional_env(&cfg, &specified_by_the_layers(&overrides)?);
+    // WHICH paths a layer actually specified — the one thing a resolved `Config` cannot answer,
+    // and the input the model-recommended sampling defaults need (they may only fill a knob nobody
+    // named). S1 answered it by re-publishing the values into the environment and probing it back;
+    // S8 hands the partial down instead. Nothing writes `INFR_*` any more.
+    let specified = specified_by_the_layers(&overrides)?;
 
     // The subcommand runs to completion (or to its abort) and EVERYTHING it owns — model, backend,
     // Vulkan device — is dropped as it returns. Only then does `exit_if_signalled` turn a latched
     // SIGINT/SIGTERM into 130/143, and it does so in preference to the abort error the unwinding
     // produced (an aborted forward reports `aborted: shutdown requested`, which is noise once we
     // are already saying "interrupted" with the right status).
-    let res = dispatch(cmd, &cfg);
+    let res = dispatch(cmd, &cfg, &specified);
     exit_if_signalled();
     res
 }
@@ -660,7 +664,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
     Ok(layer)
 }
 
-fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
+fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Devices => cmd_devices(cfg),
@@ -669,19 +673,25 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
             message,
             diffusion_visual,
             ..
-        } => cmd_run(&model, message.as_deref(), &diffusion_visual, cfg),
+        } => cmd_run(
+            &model,
+            message.as_deref(),
+            &diffusion_visual,
+            cfg,
+            specified,
+        ),
         Cmd::Serve {
             model,
             addr,
             parallel,
             ..
-        } => cmd_serve(&model, &addr, parallel, cfg),
+        } => cmd_serve(&model, &addr, parallel, cfg, specified),
         Cmd::Multi {
             models,
             addr,
             parallel,
             ctx,
-        } => cmd_multi(&models, &addr, parallel, ctx.as_deref(), cfg),
+        } => cmd_multi(&models, &addr, parallel, ctx.as_deref(), cfg, specified),
         Cmd::Bench {
             model,
             n_prompt,
@@ -717,6 +727,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
                     reps,
                     ubatch,
                     &llama_bench,
+                    cfg,
                 )
             } else {
                 if models.len() > 1 {
@@ -736,6 +747,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
                     gen,
                     &turns,
                     &llama_bench,
+                    cfg,
                 )
             }
         }
@@ -755,8 +767,11 @@ use std::path::{Path, PathBuf};
 /// file's unknown-key warnings, the diagnostics announcement and any `--set`-shadowed-by-a-flag
 /// warning.
 ///
-/// **Transitional — S1 only.** Its one caller, [`publish_transitional_env`], goes away once the deep
-/// readers take their values from `Arc<Config>` (S4–S7), and S8 deletes this with it.
+/// PERMANENT since S8. It used to feed the transitional env bridge; now it is threaded straight
+/// into the commands that need provenance — [`apply_model_sampling_defaults`] (the model's
+/// recommended sampler may only fill a knob NO layer named) and `cmd_run`'s `max_new` default
+/// (diffusion-gemma wants a different fallback from the autoregressive one). Nothing publishes
+/// `INFR_*` any more.
 fn specified_by_the_layers(overrides: &ConfigOverrides) -> anyhow::Result<PartialConfig> {
     use infr_core::config::{cli as cfg_cli, file as cfg_file, ConfigLayer};
     let mut layers = PartialConfig::default();
@@ -792,112 +807,6 @@ fn publish_thread_count(cfg: &Config) {
 /// `INFR_PROFILE_OUT` did.
 fn publish_profile_out(cfg: &Config) {
     infr_prof_rt::set_profile_out(cfg.prof.profile_out.as_deref().and_then(|p| p.to_str()));
-}
-
-// ── the S1 transitional env bridge (docs/config-plan.md §7 S1.3) ────────────────────────────────
-
-/// Hand the resolved values back to the process environment, for the knobs the CLI used to publish
-/// with `std::env::set_var` itself.
-///
-/// **TRANSITIONAL — S1 ONLY. S8 deletes this function and its call site, and nothing else.** The
-/// CLI now resolves these knobs from the layered [`Config`], but their READERS are still deep in
-/// the crates this slice does not touch — `infr-llama`'s seam and sampler (`INFR_CTX`,
-/// `INFR_UBATCH`, `INFR_TEMP`, `INFR_TOP_K`, `INFR_TOP_P`, `INFR_SEED`, `INFR_MAX_NEW`,
-/// `INFR_IGNORE_EOS`) and `infr-chat`'s template (`INFR_NO_THINK`) — so the value has to travel
-/// the old way until S7/S8 move those read sites onto `Arc<Config>`. Because of that, none of the
-/// keys still published here is `migrated` in `config::manifest` yet.
-///
-/// `INFR_DEV` came OFF this list in S5a: `VulkanBackend::new_with` takes `device.dev` from the
-/// config it is handed, so re-publishing it would have been a write nobody reads.
-///
-/// Callers that depend on it: `cmd_bench` (its `sampling.ignore_eos` flag becomes
-/// `INFR_IGNORE_EOS=1`, which `dg_bench_run` and every decode loop read — this replaces the
-/// `set_var` that used to sit at the top of `cmd_bench`), `cmd_run` (`INFR_MAX_NEW`),
-/// `set_default_sampling_env` (whose `is_err` guard is what makes an unspecified sampler fall back
-/// to the model's recommendation), and `run_chat`'s server-side `INFR_MAX_NEW` default.
-///
-/// Only what a LAYER specified is published; a knob nobody mentioned leaves the environment alone,
-/// so a value the process inherited in a spelling the layer could not parse (`INFR_CTX=banana`)
-/// still reaches its reader untouched and is still ignored there, exactly as today.
-fn publish_transitional_env(cfg: &Config, specified: &PartialConfig) {
-    // `Option` knobs: `Some` publishes, an explicit `none` UNSETS (the config said so).
-    let opt = |path: &str, key: &str, value: Option<String>| {
-        if specified.is_path_set(path) {
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-    };
-    // Presence knobs: `false` must UNSET, never publish "0" — `is_ok()` would read that as ON.
-    let presence = |path: &str, key: &str, on: bool| {
-        if specified.is_path_set(path) {
-            if on {
-                std::env::set_var(key, "1");
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    };
-
-    opt(
-        "device.ctx",
-        "INFR_CTX",
-        cfg.device.ctx.map(|c| c.to_display()),
-    );
-    opt(
-        "device.ubatch",
-        "INFR_UBATCH",
-        cfg.device.ubatch.map(|u| u.to_string()),
-    );
-
-    opt(
-        "sampling.temp",
-        "INFR_TEMP",
-        Some(cfg.sampling.temp.to_string()),
-    );
-    opt(
-        "sampling.top_k",
-        "INFR_TOP_K",
-        Some(cfg.sampling.top_k.to_string()),
-    );
-    opt(
-        "sampling.top_p",
-        "INFR_TOP_P",
-        Some(cfg.sampling.top_p.to_string()),
-    );
-    opt(
-        "sampling.seed",
-        "INFR_SEED",
-        cfg.sampling.seed.map(|s| s.to_string()),
-    );
-    opt(
-        "sampling.max_new",
-        "INFR_MAX_NEW",
-        Some(cfg.sampling.max_new.to_string()),
-    );
-    presence(
-        "sampling.ignore_eos",
-        "INFR_IGNORE_EOS",
-        cfg.sampling.ignore_eos,
-    );
-    // NOT a presence knob: `INFR_NO_THINK=0` is the "force thinking ON" spelling (`--think`), so
-    // both polarities are published verbatim.
-    opt(
-        "sampling.no_think",
-        "INFR_NO_THINK",
-        Some(if cfg.sampling.no_think { "1" } else { "0" }.to_string()),
-    );
-}
-
-/// Force greedy for Metal speculative decode.
-///
-/// **TRANSITIONAL — S1 ONLY, deleted with [`publish_transitional_env`] in S8.** Spec decode is
-/// greedy-only (the draft/verify equality check assumes argmax), and the sampler that has to hear
-/// about it still reads `INFR_TEMP` from the environment.
-#[cfg(target_os = "macos")]
-fn publish_transitional_greedy() {
-    std::env::set_var("INFR_TEMP", "0");
 }
 
 /// Is `path` a usable LOCAL model: an existing regular FILE whose extension is `.gguf`
@@ -1170,16 +1079,9 @@ fn cmd_run(
     message: Option<&str>,
     diffusion_visual: &str,
     cfg: &Arc<Config>,
+    specified: &PartialConfig,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    // Context window: the model's trained context by default; INFR_CTX overrides (shared size
-    // grammar — tokens, `256k`, or `%` of the free-VRAM KV capacity), read by the chat sessions.
-    let envu = |k: &str, d: usize| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
     let (gguf, tok) = resolve(model)?;
     // diffusion-gemma (block text-diffusion, Phase 3 — docs/diffusion-gemma.md): a cheap arch peek
     // (no full SeamModel load) so the default token budget below and the ChatModel selection further
@@ -1189,8 +1091,19 @@ fn cmd_run(
     // chat reply and still overridable via INFR_MAX_NEW.
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     // Generation ceiling per reply (a turn also caps to remaining context). High enough for long
-    // answers (lists/stories); override with INFR_MAX_NEW.
-    let max_new = envu("INFR_MAX_NEW", if is_dg { 1024 } else { 2048 });
+    // answers (lists/stories); override with `--max-new` / `sampling.max_new` / INFR_MAX_NEW.
+    //
+    // The knob has TWO defaults on this path — 2048 autoregressive, 1024 for diffusion-gemma — and
+    // `SamplingCfg::default()` can only carry one, so the fallback stays HERE (R5) and `specified`
+    // decides which side to take. That is exactly what the S1 bridge encoded by publishing
+    // `INFR_MAX_NEW` only when a layer had named it.
+    let max_new = if specified.is_path_set("sampling.max_new") {
+        cfg.sampling.max_new
+    } else if is_dg {
+        1024
+    } else {
+        2048
+    };
 
     // Multi-GPU PIPELINE (layer-split): `INFR_PIPELINE=Vulkan0,Vulkan1` splits ONE model's layers
     // across the listed devices (weights + KV per-layer resident on their device, the residual
@@ -1207,7 +1120,7 @@ fn cmd_run(
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
-        let cfg = apply_model_sampling_defaults(cfg, &gguf);
+        let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_dense_vulkan_pipeline(&devices, &rendered, max_new)?;
@@ -1230,7 +1143,7 @@ fn cmd_run(
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
-        let cfg = apply_model_sampling_defaults(cfg, &gguf);
+        let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_dense_vulkan_tp(&devices, &rendered, max_new)?;
@@ -1254,7 +1167,7 @@ fn cmd_run(
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
-        let cfg = apply_model_sampling_defaults(cfg, &gguf);
+        let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_moe_vulkan_ep(&devices, &rendered, max_new)?;
@@ -1268,7 +1181,7 @@ fn cmd_run(
     // the single REPL below. Every backend does history-based multi-turn; qwen35 (Qwen3.5) rides
     // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
     // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
-    let cfg = apply_model_sampling_defaults(cfg, &gguf);
+    let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
     let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, &cfg)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
@@ -1667,6 +1580,16 @@ fn metal_chat_model(
     cfg: &Arc<Config>,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     if let Some(draft_path) = cfg.spec.draft.clone() {
+        // Spec decode is GREEDY-ONLY: the draft/verify equality check assumes argmax, so a
+        // non-zero temperature would reject every correctly-drafted token. S1 forced that by
+        // writing `INFR_TEMP=0` into the process (`publish_transitional_greedy`); S8 pins it on
+        // the VALUE the two models are loaded with, which is where the sampler has read it since
+        // S4 — the env write had already stopped being observed by anything.
+        let cfg = &{
+            let mut greedy = (**cfg).clone();
+            greedy.sampling.temp = 0.0;
+            Arc::new(greedy)
+        };
         // Target and draft get the SAME config — a process loading both hands them one value
         // (`docs/config-plan.md` §5.1), which is exactly what the shared environment did.
         let target = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
@@ -1685,8 +1608,7 @@ fn metal_chat_model(
                  speculation only pays when the target is much larger (see #16)"
             );
         }
-        publish_transitional_greedy();
-        eprintln!("[metal spec — target + {k}-token draft verify, greedy (INFR_TEMP=0)]");
+        eprintln!("[metal spec — target + {k}-token draft verify, greedy (sampling.temp=0)]");
         Ok(Box::new(infr_llama::chat::SpecMetalChat::new(
             target, draft, k,
         )))
@@ -1752,6 +1674,15 @@ impl ParallelGenerator {
 /// duplicated per backend.
 trait GenBackend: Send + Sync {
     fn renderer(&self) -> &infr_llama::chat::OaiRenderer;
+
+    /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`,
+    /// default 2048) off the config this backend's renderer was opened with. A trait method
+    /// rather than a free function because the config is per-backend state — and the default
+    /// body serves both generators, since both hold the same renderer (S8; `run_chat` used to
+    /// read the `INFR_MAX_NEW` variable from the process environment here).
+    fn max_new_default(&self) -> usize {
+        self.renderer().engine_cfg().sampling.max_new
+    }
 
     /// This sequence's own state: sampling config, abort latch, and (when the engine is
     /// multi-slot) its turn on the GPU baton.
@@ -1903,14 +1834,12 @@ fn run_chat(
     {
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
         let prompt = be.renderer().render(messages, tools)?;
-        // The request's `max_tokens`/`max_completion_tokens` wins; INFR_MAX_NEW (default 2048) is
-        // the server-side default for requests that don't set one.
-        let max_new = params.max_tokens.map(|v| v as usize).unwrap_or_else(|| {
-            std::env::var("INFR_MAX_NEW")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048usize)
-        });
+        // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
+        // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
+        let max_new = params
+            .max_tokens
+            .map(|v| v as usize)
+            .unwrap_or_else(|| be.max_new_default());
         // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
         // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
         // or leak into, any other in-flight request.
@@ -2083,6 +2012,7 @@ fn cmd_bench(
             cpu,
             metal,
             json,
+            cfg,
         );
     }
     // qwen35 (Qwen3.5) benches through the STANDARD arms below (`cmd_bench_cpu` / the seam's
@@ -2102,6 +2032,7 @@ fn cmd_bench(
             pg,
             reps,
             json,
+            cfg,
         );
     }
     // Metal (set by `--dev metal` or `INFR_DEV=metal`): bench the dense forward on the Metal backend
@@ -2117,6 +2048,7 @@ fn cmd_bench(
             pg,
             reps,
             json,
+            cfg,
         );
     }
     // ROCm (set by `--dev rocm[:N]` / `INFR_DEV=rocm`): bench the dense/MoE forward on the AMD
@@ -2360,15 +2292,16 @@ fn cmd_bench_metal(
     pg: Option<(usize, usize)>,
     reps: usize,
     json: bool,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (gguf, tok, n_prompt, n_gen, depth, pg, reps, json);
+        let _ = (gguf, tok, n_prompt, n_gen, depth, pg, reps, json, cfg);
         anyhow::bail!("metal bench requires macOS");
     }
     #[cfg(target_os = "macos")]
     {
-        let model = infr_llama::SeamModel::load(gguf, tok)?;
+        let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
         let shape = metal_bench_shape(n_prompt, n_gen, depth, pg);
         // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
         // the dequant/repack weight caches persist (each rep still measures a full prefill —
@@ -2445,8 +2378,9 @@ fn cmd_bench_cpu(
     pg: Option<(usize, usize)>,
     reps: usize,
     json: bool,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
-    let model = infr_llama::SeamModel::load(gguf, tok)?;
+    let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
     // One untimed warmup (page-cache the mmap'd weights) before the timed reps.
     let _ = model.bench(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
@@ -2543,24 +2477,25 @@ fn dg_bench_run(
     // Phase D: the Metal DG session (macOS only — see the `one_rep!` dispatch below). `cpu` wins
     // if both are set (matches `cmd_run`/`cmd_serve`'s precedence).
     metal: bool,
+    ecfg: &Arc<Config>,
 ) -> anyhow::Result<DgBenchResult> {
     use infr_llama::diffusion::{diffusion_generate, EbConfig};
-    let model = infr_llama::SeamModel::load(gguf, tok)?;
+    let model = infr_llama::SeamModel::load_with(gguf, tok, ecfg.clone())?;
     let cfg = model.config();
     let canvas_len = cfg.canvas_length.max(1);
     let vocab = cfg.vocab;
     let eb = EbConfig::from_config(cfg);
-    // INFR_IGNORE_EOS (cmd_bench always sets it): a fixed generation budget should never
-    // early-stop on an EOS id, matching every AR bench arm's semantics for the same env.
-    let eos_ids: Vec<u32> = if std::env::var("INFR_IGNORE_EOS").is_ok() {
+    // `sampling.ignore_eos` (INFR_IGNORE_EOS — `cmd_bench` always pins it through the CLI flag
+    // layer, see `cli_flag_layer`): a fixed generation budget should never early-stop on an EOS
+    // id, matching every AR bench arm's semantics for the same knob.
+    let eos_ids: Vec<u32> = if ecfg.sampling.ignore_eos {
         Vec::new()
     } else {
         cfg.eos_ids.clone()
     };
-    let seed: u64 = std::env::var("INFR_SEED")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(42);
+    // `sampling.seed`; `42` is THIS path's fallback (the knob has two defaults in the tree and
+    // both stay at their sites — §6.12).
+    let seed: u64 = ecfg.sampling.seed.unwrap_or(42);
 
     if prompt_text.is_some() && depth > 0 {
         anyhow::bail!("dg_bench_run: prompt_text override is depth-0 only (compare's DG arm)");
@@ -2719,6 +2654,7 @@ fn cmd_bench_diffusion_gemma(
     cpu: bool,
     metal: bool,
     json: bool,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     if pg.is_some() {
         anyhow::bail!(
@@ -2726,7 +2662,9 @@ fn cmd_bench_diffusion_gemma(
              AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
         );
     }
-    let r = dg_bench_run(gguf, tok, n_prompt, n_gen, depth, reps, None, cpu, metal)?;
+    let r = dg_bench_run(
+        gguf, tok, n_prompt, n_gen, depth, reps, None, cpu, metal, cfg,
+    )?;
     let tag = if cpu {
         " [cpu]"
     } else if metal {
@@ -2762,6 +2700,7 @@ fn cmd_compare_sweep(
     reps: usize,
     ubatch: usize,
     llama_bench: &str,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     const METRICS: [&str; 4] = ["pp512", "tg128", "tg64@d", "pp4@d"];
     println!(
@@ -2775,7 +2714,16 @@ fn cmd_compare_sweep(
         let short = model.rsplit('/').next().unwrap_or(model);
         // Cooldown between models to reduce thermal skew across the sweep.
         std::thread::sleep(std::time::Duration::from_secs(10));
-        let mb = match ModelBench::new(model, dev, ngl, threads, reps, ubatch, llama_bench) {
+        let mb = match ModelBench::new(
+            model,
+            dev,
+            ngl,
+            threads,
+            reps,
+            ubatch,
+            llama_bench,
+            cfg.clone(),
+        ) {
             Ok(mb) => mb,
             Err(e) => {
                 println!("{short:<22} {:<10} | resolve failed: {e}", "-");
@@ -2942,9 +2890,15 @@ struct ModelBench {
     threads: usize,
     reps: usize,
     ubatch: usize,
+    /// The resolved process configuration. Only the DG arm needs it — [`dg_infr`](Self::dg_infr)
+    /// runs `dg_bench_run` IN-PROCESS (every other arm shells out to `infr bench`, which resolves
+    /// its own), and since S8 that function takes `sampling.ignore_eos` / `sampling.seed` from a
+    /// `Config` rather than from the environment.
+    cfg: Arc<Config>,
 }
 
 impl ModelBench {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         model: &str,
         dev: &str,
@@ -2953,6 +2907,7 @@ impl ModelBench {
         reps: usize,
         ubatch: usize,
         llama_bench: &str,
+        cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         let exe = std::env::current_exe().context("locating the infr binary")?;
         // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so
@@ -2995,6 +2950,7 @@ impl ModelBench {
             threads,
             reps,
             ubatch,
+            cfg,
         })
     }
 
@@ -3173,6 +3129,7 @@ impl ModelBench {
             Some(Self::DG_PROMPT),
             self.ngl == 0,
             false,
+            &self.cfg,
         )
     }
 
@@ -3451,8 +3408,18 @@ fn cmd_compare(
     gen: usize,
     turns: &[String],
     llama_bench: &str,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
-    let mb = ModelBench::new(model, dev, ngl, threads, reps, ubatch, llama_bench)?;
+    let mb = ModelBench::new(
+        model,
+        dev,
+        ngl,
+        threads,
+        reps,
+        ubatch,
+        llama_bench,
+        cfg.clone(),
+    )?;
     let infr_b = |args: &[&str]| mb.infr(args);
     let llama_b = |np: usize, ng: usize, args: &[&str]| mb.llama(np, ng, args);
 
@@ -3605,29 +3572,6 @@ fn cmd_compare(
     Ok(())
 }
 
-/// Seam paths read sampling from INFR_TEMP / INFR_TOP_K / INFR_TOP_P (library default = greedy so
-/// tests stay deterministic). For chat UX, run/serve set the qwen3-recommended defaults when the
-/// user hasn't — pure greedy makes thinking models degenerate. Mirrors the bespoke
-/// `Llama::set_sampling(0.6, 20, 0.95)` defaults.
-///
-/// **Part of the S1 transitional bridge** (see [`publish_transitional_env`]): the model-recommended
-/// value is the LOWEST-precedence source, below the config file, so it may only fill a knob no
-/// layer specified — which is what the `is_err` guard means now that
-/// [`publish_transitional_env`] has already published everything the layers DID specify. It stays
-/// on the environment because the sampler that consumes it still reads the environment; S7 makes
-/// this a proper layer under `Config` and S8 removes the writes.
-fn set_default_sampling_env(temp: f32, top_k: usize, top_p: f32) {
-    if std::env::var("INFR_TEMP").is_err() {
-        std::env::set_var("INFR_TEMP", temp.to_string());
-    }
-    if std::env::var("INFR_TOP_K").is_err() {
-        std::env::set_var("INFR_TOP_K", top_k.to_string());
-    }
-    if std::env::var("INFR_TOP_P").is_err() {
-        std::env::set_var("INFR_TOP_P", top_p.to_string());
-    }
-}
-
 /// Architecture-family recommended sampling `(temp, top_k, top_p)` — the published per-family
 /// defaults (`top_k = 0` = keep-all, i.e. top_k disabled). infr enables `<think>` by default, so
 /// the Qwen3.x row uses its THINKING recommendation. An unknown arch falls back to the neutral
@@ -3702,34 +3646,35 @@ fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) 
 /// the resolved `cfg` (via `SamplingOpts::overrides`), so it wins and shows through here. Shared
 /// by `run`, `serve` and `multi`.
 ///
-/// **Precedence, unchanged:** the model recommendation is the LOWEST source, below the config file
-/// and below the environment — so it may only fill a knob NO layer specified. "Specified" is read
-/// off the environment, which is sound because [`publish_transitional_env`] has already run in
-/// `main()` and published exactly the paths a layer set (and an `INFR_TEMP` the process inherited
-/// was of course already there). That probe, [`set_default_sampling_env`]'s writes and this
-/// function's env reads are all the S1 bridge; S8 deletes them together, replacing the probe with
-/// the `specified` [`PartialConfig`] threaded down from `main()`.
+/// The seam reads `sampling.*` off this returned `Config` (S4), so what this function returns IS
+/// what `infr run` samples with — the library default is greedy, which is right for goldens and
+/// wrong for a chat REPL (pure argmax makes a thinking model degenerate).
 ///
-/// Since S4 the SEAM reads `sampling.*` from the returned `Config`, not from the environment — so
-/// returning it (rather than only publishing) is what keeps `infr run` on the model's recommended
-/// temperature instead of silently falling back to the library's greedy default.
-fn apply_model_sampling_defaults(cfg: &Arc<Config>, gguf: &std::path::Path) -> Arc<Config> {
+/// **Precedence, unchanged:** the model recommendation is the LOWEST source, below the config file
+/// and below the environment — so it may only fill a knob NO layer specified. S1 answered "did a
+/// layer specify it?" by re-publishing the resolved values into the process environment and then
+/// probing `std::env::var(..).is_ok()`; S8 asks the `specified` [`PartialConfig`] threaded down
+/// from `main()` directly, and nothing writes `INFR_*` any more.
+///
+/// One edge behaves better than it did: a value no layer could PARSE (`INFR_TEMP=banana`) used to
+/// answer "specified" to the env probe — the variable was present — and so suppressed the model
+/// recommendation, leaving the sampler on the library's greedy default. It is not in `specified`
+/// (the env layer emits `None` for an unparseable `Float`, §7.0 step 3), so the recommendation now
+/// applies, which is what an ignored bad value is supposed to mean.
+fn apply_model_sampling_defaults(
+    cfg: &Arc<Config>,
+    specified: &PartialConfig,
+    gguf: &std::path::Path,
+) -> Arc<Config> {
     let (t, k, p, src) = model_sampling_defaults(gguf);
-    // Probe BEFORE `set_default_sampling_env` writes its own fallbacks.
-    let (has_t, has_k, has_p) = (
-        std::env::var("INFR_TEMP").is_ok(),
-        std::env::var("INFR_TOP_K").is_ok(),
-        std::env::var("INFR_TOP_P").is_ok(),
-    );
-    set_default_sampling_env(t, k, p);
     let mut out = (**cfg).clone();
-    if !has_t {
+    if !specified.is_path_set("sampling.temp") {
         out.sampling.temp = t;
     }
-    if !has_k {
+    if !specified.is_path_set("sampling.top_k") {
         out.sampling.top_k = k;
     }
-    if !has_p {
+    if !specified.is_path_set("sampling.top_p") {
         out.sampling.top_p = p;
     }
     eprintln!(
@@ -3744,6 +3689,7 @@ fn cmd_serve(
     addr: &str,
     parallel: Option<usize>,
     cfg: &Arc<Config>,
+    specified: &PartialConfig,
 ) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let model_id = gguf
@@ -3763,7 +3709,7 @@ fn cmd_serve(
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
-    let cfg = &apply_model_sampling_defaults(cfg, &gguf);
+    let cfg = &apply_model_sampling_defaults(cfg, specified, &gguf);
 
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
@@ -3869,12 +3815,14 @@ fn parse_model_spec(spec: &str) -> anyhow::Result<(&str, Option<usize>)> {
 /// (`new_on`), so nothing crosses devices; the server dispatches a request to the generator for the
 /// model it names. Graceful shutdown drains EVERY device (the server aborts all in-flight requests,
 /// then each generator — and its backend — drops as `serve_multi` returns).
+#[allow(clippy::too_many_arguments)]
 fn cmd_multi(
     specs: &[String],
     addr: &str,
     parallel: usize,
     ctx: Option<&str>,
     cfg: &Arc<Config>,
+    specified: &PartialConfig,
 ) -> anyhow::Result<()> {
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let parallel = parallel.max(1);
@@ -3941,7 +3889,7 @@ fn cmd_multi(
         // Sampling defaults are process-global; apply the FIRST model's so the banner is honest, and
         // note that all hosted models share them (a per-model override would need per-request fields).
         if i == 0 {
-            hosted_cfg = apply_model_sampling_defaults(cfg, &gguf);
+            hosted_cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         }
 
         // A stable, unique wire id: the file stem, disambiguated by device when two specs collide

@@ -320,6 +320,12 @@ impl OaiRenderer {
         })
     }
 
+    /// The engine configuration this renderer holds (see the `ecfg` field) — the serve adapter
+    /// reads `sampling.max_new` off it for a request that names no budget.
+    pub fn engine_cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
+        &self.ecfg
+    }
+
     pub fn render(
         &self,
         messages: &[infr_chat::ChatMessage],

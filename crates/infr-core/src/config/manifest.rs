@@ -131,12 +131,12 @@ knobs! {
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
 
     // ── sampling (§6.2) ──────────────────────────────────────────────────────
-    "INFR_TEMP"                 => "sampling.temp",       Float,      Ignored, "0.6",  pending;
-    "INFR_TOP_K"                => "sampling.top_k",      Int,        Ignored, "40",   pending;
-    "INFR_TOP_P"                => "sampling.top_p",      Float,      Ignored, "0.9",  pending;
-    "INFR_SEED"                 => "sampling.seed",       Int,        Ignored, "42",   pending;
-    "INFR_MAX_NEW"              => "sampling.max_new",    Int,        Ignored, "256",  pending;
-    "INFR_IGNORE_EOS"           => "sampling.ignore_eos", Presence,   Ignored, "1",    pending;
+    "INFR_TEMP"                 => "sampling.temp",       Float,      Ignored, "0.6",  migrated;
+    "INFR_TOP_K"                => "sampling.top_k",      Int,        Ignored, "40",   migrated;
+    "INFR_TOP_P"                => "sampling.top_p",      Float,      Ignored, "0.9",  migrated;
+    "INFR_SEED"                 => "sampling.seed",       Int,        Ignored, "42",   migrated;
+    "INFR_MAX_NEW"              => "sampling.max_new",    Int,        Ignored, "256",  migrated;
+    "INFR_IGNORE_EOS"           => "sampling.ignore_eos", Presence,   Ignored, "1",    migrated;
     "INFR_NO_THINK"             => "sampling.no_think",   SetNotZero, Ignored, "1",    migrated;
 
     // ── kv (§6.3) ────────────────────────────────────────────────────────────

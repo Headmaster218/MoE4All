@@ -201,13 +201,12 @@ pub struct CpuBackend {
     /// R4/R6). The knobs it reads are `kernels.cpu.{spin,spinpool,repack_mb,reference}`,
     /// `prof.prof_ops` and `debug.moe_counts{,_dump}`.
     ///
-    /// **TRANSITIONAL (S3), replaced by S4:** [`CpuBackend::new`] builds this from the environment
-    /// via [`infr_core::config::Config::load_from_env`] instead of being HANDED one, because the
-    /// seam (`infr-llama`) constructs CPU backends and does not itself get an `Arc<Config>` until
-    /// its own slice. S4 threads the caller's config into those construction sites — they become
-    /// [`CpuBackend::new_with`] and the `load_from_env()` call in `new` is what that slice deletes.
-    /// Until then this is ONE env-sourced construction per backend in place of the scattered
-    /// per-read `std::env::var` calls it replaced.
+    /// Every construction site inside this repo goes through [`CpuBackend::new_with`] (S4 threaded
+    /// the seam's `Arc<Config>` into them). [`CpuBackend::new`] survives as the ENV-SOURCED twin
+    /// for a library caller that has no config of its own: ONE
+    /// [`infr_core::config::Config::load_from_env`] per backend, in place of the scattered
+    /// per-read `std::env::var` calls it replaced. It is not a bridge to be deleted — it is the
+    /// documented no-argument constructor.
     cfg: Arc<Config>,
 }
 
@@ -223,7 +222,7 @@ impl Default for CpuBackend {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBackend {
     /// A backend on the shipped configuration, with the environment folded in (see the `cfg`
-    /// field's TRANSITIONAL note — S4 replaces the callers of this with [`Self::new_with`]).
+    /// field). Prefer [`Self::new_with`] when you have a `Config`; nothing in this repo calls this.
     pub fn new() -> Self {
         Self::new_with(Arc::new(Config::load_from_env()))
     }

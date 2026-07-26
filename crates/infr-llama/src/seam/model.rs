@@ -25,12 +25,11 @@ pub struct SeamModel {
     /// (`docs/config-plan.md` R4/R6). Shared by `Arc` into every backend and session this model
     /// opens, which is exactly the per-process scope §5.1 prescribes.
     ///
-    /// **TRANSITIONAL (S4), deleted by S8:** [`SeamModel::load`] builds this from the environment
-    /// with [`infr_core::config::Config::load_from_env`] instead of being HANDED one, for the
-    /// library callers and tests that have no `Config` to give. Every CLI path already calls
-    /// [`SeamModel::load_with`] with the `Arc<Config>` `main()` resolved, so the PRODUCTION path
-    /// no longer goes through the environment here. S8 removes the CLI's env re-publication and
-    /// with it the last reason for this fallback.
+    /// Always HANDED in: [`SeamModel::load_with`] is the only constructor. S4's transitional
+    /// `load()` — which built one from the environment for callers that had none — is gone as of
+    /// S8; every caller in the tree (CLI commands, benches, tests) has a `Config` to give, and a
+    /// library caller that wants today's defaults writes `Arc::new(EngineConfig::default())`
+    /// rather than silently inheriting the developer's shell.
     ecfg: std::sync::Arc<crate::EngineConfig>,
     /// Host f32 token-embedding table — materialized LAZILY (see [`SeamModel::token_embd`]).
     /// Dequantizing it eagerly at load cost ~4s and ~3.1 GiB of RSS on Qwen3-14B (a 151936×5120
@@ -380,20 +379,14 @@ impl SeamModel {
         &self.ecfg
     }
 
-    /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
+    /// Load a model on a caller-supplied engine configuration. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
-    pub fn load(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
-        Self::load_with(
-            gguf_path,
-            tokenizer_path,
-            std::sync::Arc::new(crate::EngineConfig::load_from_env()),
-        )
-    }
-
-    /// [`load`](Self::load) on a caller-supplied engine configuration — the constructor the
-    /// campaign is heading for: no environment, no globals, no process-wide ordering hazard, and
-    /// two models with different configurations can coexist in one process. `infr-cli` resolves
-    /// ONE `Arc<Config>` in `main()` and hands the same handle to every model it loads (§5.1).
+    ///
+    /// THE constructor: no environment, no globals, no process-wide ordering hazard, and two
+    /// models with different configurations can coexist in one process. `infr-cli` resolves ONE
+    /// `Arc<Config>` in `main()` and hands the same handle to every model it loads (§5.1). S4's
+    /// `load(gguf, tok)` — which built a config from the environment for callers that had none —
+    /// was deleted in S8 once every caller had one to give.
     pub fn load_with(
         gguf_path: &Path,
         tokenizer_path: Option<&Path>,
