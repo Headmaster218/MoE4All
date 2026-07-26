@@ -69,6 +69,13 @@ fn opt_num<T: std::str::FromStr>(get: Get, key: &str) -> Option<Option<T>> {
     num::<T>(get, key).map(Some)
 }
 
+/// [`opt_num`] for the read sites that TRIM before parsing (`infr-rocm`'s two weight-prefetch
+/// sizing knobs did `v.trim().parse()`), so `" 6 "` keeps meaning `6` rather than falling back to
+/// the default. Same trim [`opt_mib`] applies.
+fn opt_num_trimmed<T: std::str::FromStr>(get: Get, key: &str) -> Option<Option<T>> {
+    get(key).and_then(|v| v.trim().parse().ok()).map(Some)
+}
+
 /// A MiB-valued knob (`budget::mib_from`'s trim-and-parse). Stored in MiB; the byte conversion
 /// belongs to the accessor (R5).
 fn opt_mib(get: Get, key: &str) -> Option<Option<u64>> {
@@ -198,8 +205,11 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
     p.paging.rocm_expert_budget = opt_size(get, "INFR_ROCM_EXPERT_BUDGET");
-    p.paging.rocm_prefetch_slots = opt_num(get, "INFR_ROCM_WEIGHT_PREFETCH_SLOTS");
-    p.paging.rocm_prefetch_max_bank_mb = opt_num(get, "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB");
+    // Both read sites trimmed before parsing; keep that (R1). The `max(2)` slot floor is POLICY and
+    // stays at `weight_pager`'s accessor (R5).
+    p.paging.rocm_prefetch_slots = opt_num_trimmed(get, "INFR_ROCM_WEIGHT_PREFETCH_SLOTS");
+    p.paging.rocm_prefetch_max_bank_mb =
+        opt_num_trimmed(get, "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB");
     p.paging.rocm_prefetch_off = presence(get, "INFR_ROCM_WEIGHT_PREFETCH_OFF");
     p.paging.rocm_prefetch_stats = presence(get, "INFR_ROCM_WEIGHT_PREFETCH_STATS");
     p.paging.rocm_weight_overflow = flag(get, "INFR_ROCM_WEIGHT_OVERFLOW");

@@ -134,10 +134,13 @@ fn moe_layer_wall() {
     }
     be.sync().unwrap();
     let per = t0.elapsed().as_secs_f64() / (reps * nlayers) as f64;
-    let path = if std::env::var("INFR_METAL_NOMOE").is_ok() {
-        "host"
-    } else {
+    // S6: the escape hatch is `kernels.metal.moe` now — read the label off the backend's OWN
+    // config so it can never disagree with the arm that actually ran. `MetalBackend::new()` still
+    // folds the environment, so `INFR_METAL_NOMOE=1 cargo test …` drives this exactly as before.
+    let path = if be.cfg().kernels.metal.moe {
         "device"
+    } else {
+        "host"
     };
     // Dense-equivalent bytes: grouped GEMM reuses each expert's weights across routed rows.
     let mb = (3 * n_used * nff * ne) as f64 * 0.5625 / 1e6;

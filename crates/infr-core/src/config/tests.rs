@@ -766,6 +766,37 @@ fn toml_sections_mirror_the_struct_paths() {
     assert_eq!(cfg.multi.pipeline.as_deref(), Some(&[0usize, 1][..]));
 }
 
+/// `INFR_METAL_PROFILE` is NOT an integer level (§6.12, §10.4): presence turns the profiler on,
+/// and the derived `prof_ops` / counter-set modes compare against the EXACT strings `"2"` and
+/// `"3"`. `=20` is therefore "on, level unrecognized" — not "≥ 2". S6 moved the read onto
+/// `ProfCfg`'s three accessors; this pins the grammar they must reproduce.
+#[test]
+fn metal_profile_is_three_exact_literals_not_a_level() {
+    let d = Config::default();
+    assert!(!d.prof.metal_profiling());
+    assert!(!d.prof.metal_prof_ops());
+    assert!(!d.prof.metal_prof_counters());
+
+    for (value, profiling, ops, counters) in [
+        ("", true, false, false),
+        ("0", true, false, false),
+        ("1", true, false, false),
+        ("2", true, true, false),
+        ("3", true, false, true),
+        ("20", true, false, false),
+        ("banana", true, false, false),
+    ] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_METAL_PROFILE", value)])]);
+        assert_eq!(cfg.prof.metal_profiling(), profiling, "{value:?} profiling");
+        assert_eq!(cfg.prof.metal_prof_ops(), ops, "{value:?} prof_ops");
+        assert_eq!(
+            cfg.prof.metal_prof_counters(),
+            counters,
+            "{value:?} counters"
+        );
+    }
+}
+
 /// The migrated set, pinned key by key. A slice flips its own entries AND updates this list, so
 /// "which knobs have actually moved" is one diff away and a stray flip cannot ride along
 /// unnoticed. Every key below must come back clean from the three R3 greps
@@ -955,6 +986,57 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SEAM_NO_REPLAY",
     ];
 
+    /// S6 — `infr-metal` (20) + `infr-rocm` (13). Both backends are now `INFR_*`-free.
+    ///
+    /// Metal: `MetalBackend::new_with(cfg)`, and `exec.rs` reads `self.metal()` (a borrow of the
+    /// backend's `Config`) at each selector. Fifteen of the twenty are `INFR_METAL_NO_*`
+    /// `presence-inv` kill-switches; `INFR_METAL_NODELTA`/`INFR_METAL_NOMOE` are §6.12's
+    /// read-both-ways pair collapsed onto ONE positive field each; `INFR_METAL_PROFILE` is the
+    /// three-derived-boolean literal grammar (`is_ok()` / `== "2"` / `== "3"`), NOT an int level.
+    ///
+    /// ROCm: `RocmBackend::new_with(device_id, cfg)` — which DELETES S2's `Config::load_from_env()`
+    /// bridge — plus `ExecCtx` borrowing `&RocmCfg` for the whole forward (R6). The int8-coverage
+    /// predicate the two decode fusions share became a closure over that borrow instead of a
+    /// `static fn(DType) -> bool`, because `INFR_ROCM_NO_I8` now reaches it as a value.
+    ///
+    /// `INFR_PAGER_STATS` is here at last: S5a moved the Vulkan pager and S5b left the key
+    /// unflipped because `infr-rocm`'s `pager.rs` still read the environment. It does not now.
+    const S6: &[&str] = &[
+        "INFR_METAL_LMHEAD_MRV",
+        "INFR_METAL_NODELTA",
+        "INFR_METAL_NOMOE",
+        "INFR_METAL_NO_BF16_CMM",
+        "INFR_METAL_NO_BF16_NATIVE",
+        "INFR_METAL_NO_BF16_RT",
+        "INFR_METAL_NO_CONV1D_PAR",
+        "INFR_METAL_NO_DN_GATE_PREP",
+        "INFR_METAL_NO_DN_NORM_PREP",
+        "INFR_METAL_NO_F16_CMM",
+        "INFR_METAL_NO_F16_NATIVE",
+        "INFR_METAL_NO_F16_RT",
+        "INFR_METAL_NO_F32_CMM",
+        "INFR_METAL_NO_F32_NATIVE",
+        "INFR_METAL_NO_F32_RT",
+        "INFR_METAL_NO_KQUANT_NATIVE",
+        "INFR_METAL_NO_Q5K_RT",
+        "INFR_METAL_NO_RMSNORM_VEC4",
+        "INFR_METAL_PROFILE",
+        "INFR_METAL_PROF_DEBUG",
+        "INFR_PAGER_STATS",
+        "INFR_ROCM_BLAS",
+        "INFR_ROCM_COOP",
+        "INFR_ROCM_COOP_TILE",
+        "INFR_ROCM_NO_I8",
+        "INFR_ROCM_NO_PIPE",
+        "INFR_ROCM_NO_WMMA",
+        "INFR_ROCM_PAGER_NOOVERLAP",
+        "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB",
+        "INFR_ROCM_WEIGHT_PREFETCH_OFF",
+        "INFR_ROCM_WEIGHT_PREFETCH_SLOTS",
+        "INFR_ROCM_WEIGHT_PREFETCH_STATS",
+        "INFR_ROCM_WMMA_TILE",
+    ];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
     let mut want: Vec<&str> = S2
@@ -963,6 +1045,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         .chain(S4)
         .chain(S5A)
         .chain(S5B)
+        .chain(S6)
         .copied()
         .collect();
     want.sort_unstable();

@@ -94,10 +94,13 @@ fn deltanet_layer_wall() {
         }
         be.sync().unwrap();
         let per = t0.elapsed().as_secs_f64() / reps as f64;
-        let path = if std::env::var("INFR_METAL_NODELTA").is_ok() {
-            "host"
-        } else {
+        // S6: read the label off the backend's OWN config (`kernels.metal.deltanet`) so it cannot
+        // disagree with the arm that ran. `MetalBackend::new()` still folds the environment, so
+        // `INFR_METAL_NODELTA=1 cargo test …` drives this exactly as before.
+        let path = if be.cfg().kernels.metal.deltanet {
             "device"
+        } else {
+            "host"
         };
         println!("deltanet rows={rows} ({path}): {:.3} ms/op", per * 1e3);
     }

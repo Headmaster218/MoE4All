@@ -26,7 +26,10 @@
 //! integer dots — so this backend is actually the slightly more accurate of the two. Faster matvec
 //! kernels (GEMV occupancy / fusion) are future work.
 
+use std::sync::Arc;
+
 use infr_core::backend::{Backend, Bindings, BufferUsage, Capabilities, GraphPlan, Plan};
+use infr_core::config::{Config, MetalCfg};
 use infr_core::error::Result;
 use infr_core::graph::Graph;
 use metal::{Buffer as MtlBuffer, CommandQueue, Device};
@@ -110,8 +113,10 @@ pub struct MetalBackend {
     /// `BufferUsage::Weights`/`HostWeights` allocation advances it (the funnel lives in `alloc`,
     /// so no loader can forget a tensor).
     weight_pb: std::sync::Arc<std::sync::Mutex<Option<indicatif::ProgressBar>>>,
-    /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set. `profiling` is
-    /// cached so the hot path avoids an env lookup and skips the `Instant` calls when off.
+    /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set (config
+    /// `prof.metal_profile`, resolved through [`ProfCfg::metal_profiling`](
+    /// infr_core::config::ProfCfg::metal_profiling)). `profiling` stays a resolved-once field so
+    /// the hot path skips the `Instant` calls when off.
     /// `prof_ops` (`INFR_METAL_PROFILE=2`) additionally flushes after each op to attribute GPU wall
     /// per op — costs the batching, so it's an analysis mode, not the fast path.
     pub(crate) profiling: bool,
@@ -136,6 +141,12 @@ pub struct MetalBackend {
     /// tracking orders each layer's writes after the previous layer's reads.
     pub(crate) scratch:
         std::sync::Mutex<std::collections::HashMap<(usize, u8), std::sync::Arc<metal::Buffer>>>,
+    /// The engine configuration this backend reads its knobs from — HANDED IN by the caller
+    /// ([`MetalBackend::new_with`], S6), held for the backend's whole life, and borrowed (never
+    /// cloned) at every read site, including the per-forward exec walk (`docs/config-plan.md`
+    /// R4/R6). The 15 `INFR_METAL_NO_*` kill-switches, `INFR_METAL_LMHEAD_MRV`,
+    /// `INFR_METAL_NODELTA`, `INFR_METAL_NOMOE` and the two profiler keys all come off it.
+    cfg: Arc<Config>,
 }
 
 // MTLDevice / MTLCommandQueue are documented thread-safe; the pipeline states are immutable after
@@ -144,9 +155,36 @@ unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
 
 impl MetalBackend {
+    /// Borrowed engine configuration — a REFERENCE, never a clone (`docs/config-plan.md` R6).
+    ///
+    /// `pub` so `infr-llama`'s seam and this crate's own probes read the knobs off the backend they
+    /// already hold instead of growing a second env-sourced config.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// The Metal kernel-tier slice of [`cfg`](Self::cfg) — what `exec.rs` reads per op.
+    pub(crate) fn metal(&self) -> &MetalCfg {
+        &self.cfg.kernels.metal
+    }
+
+    /// Default constructor for callers with no [`Config`] to hand in — this crate's own GPU
+    /// tests/probes and external library users. Resolves `Default` < environment once and forwards
+    /// to [`new_with`](Self::new_with). Fallible for the same reason `VulkanBackend::new` is (S5a):
+    /// the five LOUD keys are `Config`-sourced, so a layer error must not be swallowed.
     pub fn new() -> Result<Self> {
+        let layer = infr_core::config::ConfigLayer::env().map_err(|e| be(e.to_string()))?;
+        Self::new_with(Arc::new(Config::load_from_layers(&[layer])))
+    }
+
+    /// **The real constructor (S6).** Build a backend reading every knob — the profiler level, the
+    /// 15 kernel kill-switches, the DeltaNet/MoE escape hatches, the lm_head mrv ceiling — from the
+    /// `cfg` the caller hands in rather than the process environment.
+    pub fn new_with(cfg: Arc<Config>) -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| be("no Metal device found"))?;
-        let counter_set = (std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("3"))
+        let counter_set = cfg
+            .prof
+            .metal_prof_counters()
             .then(|| {
                 if !device
                     .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
@@ -181,14 +219,15 @@ impl MetalBackend {
             weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             qui_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             weight_pb: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
-            prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
+            profiling: cfg.prof.metal_profiling(),
+            prof_ops: cfg.prof.metal_prof_ops(),
             counter_set,
             profile_gate: ProfileGate::default(),
             ts_base,
             prof: std::sync::Mutex::new(profile::Profile::default()),
             replay: std::sync::Mutex::new(None),
             scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cfg,
         })
     }
 

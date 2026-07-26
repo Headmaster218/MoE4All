@@ -99,9 +99,10 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
 /// The activation row is quantized to int8 once (`quant_i8_32`) and integer-dotted against the
 /// decoded weight codes (scale-after) — dropping the Phase-3 per-element f16 round-trip. Returns
 /// `None` for uncovered formats (they keep the Phase-3 native decode / dequant→f16 fallback), or
-/// when `INFR_ROCM_NO_I8` selects the Phase-3 path for A/B benchmarking.
-fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
-    if std::env::var_os("INFR_ROCM_NO_I8").is_some() {
+/// when `INFR_ROCM_NO_I8` (config `kernels.rocm.i8`, POSITIVE polarity — presence of the env key,
+/// including `=0`, clears it) selects the Phase-3 path for A/B benchmarking.
+fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize, &'static str)> {
+    if !rocm.i8 {
         return None;
     }
     let kernel = match dt {
@@ -129,12 +130,10 @@ fn deqf16_fmt(dt: DType) -> Option<&'static str> {
 
 /// Explicit tile override for A/B benchmarking (`INFR_ROCM_WMMA_TILE=RxC`, one of 1x1/2x1/2x2).
 /// `None` when unset → the shape-driven auto tier in [`wmma_tile`] is used.
-fn wmma_tile_forced() -> Option<(u32, u32)> {
-    match std::env::var("INFR_ROCM_WMMA_TILE")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
+fn wmma_tile_forced(rocm: &infr_core::config::RocmCfg) -> Option<(u32, u32)> {
+    // The env layer already trimmed the value (`opt_text_trimmed`); an unrecognized spelling is
+    // treated as unset here, exactly as the `_ => None` arm always did.
+    match rocm.wmma_tile.as_deref() {
         Some("1x1") => Some((1, 1)),
         Some("2x1") => Some((2, 1)),
         Some("2x2") => Some((2, 2)),
@@ -149,8 +148,8 @@ fn wmma_tile_forced() -> Option<(u32, u32)> {
 /// every shape (+2..16%); the wider `2x2` additionally wins the wide-N shapes (out_f ≥ 2048: up/gate,
 /// wide projections) but loses ~11-14% on the square/narrow ones (qkv, down). So the auto tier is
 /// `2x2` for wide-N GEMMs and `2x1` otherwise. `INFR_ROCM_WMMA_TILE` overrides for benchmarking.
-fn wmma_tile(out_f: u32) -> (u32, u32) {
-    if let Some(t) = wmma_tile_forced() {
+fn wmma_tile(out_f: u32, rocm: &infr_core::config::RocmCfg) -> (u32, u32) {
+    if let Some(t) = wmma_tile_forced(rocm) {
         return t;
     }
     if out_f >= 2048 {
@@ -178,10 +177,12 @@ const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg 
 /// and bit-identical f32 accumulation order to the Slice-15 kernel, so it holds the blessed goldens.
 /// `INFR_ROCM_NO_WMMA` forces the GEMV path for A/B benchmarking. Returns `(kernel_name, RM, CN)`, or
 /// `None` when the int8 path itself is disabled (`INFR_ROCM_NO_I8`).
-fn native_wmma_fmt(dt: DType, out_f: u32) -> Option<(&'static str, u32, u32)> {
-    if std::env::var_os("INFR_ROCM_NO_WMMA").is_some()
-        || std::env::var_os("INFR_ROCM_NO_I8").is_some()
-    {
+fn native_wmma_fmt(
+    dt: DType,
+    out_f: u32,
+    rocm: &infr_core::config::RocmCfg,
+) -> Option<(&'static str, u32, u32)> {
+    if rocm.no_wmma || !rocm.i8 {
         return None;
     }
     // Slice-27: Q4_K prefill defaults to the software-pipelined (prefetched double-buffered nibble)
@@ -190,10 +191,10 @@ fn native_wmma_fmt(dt: DType, out_f: u32) -> Option<(&'static str, u32, u32)> {
     // wide-N GEMMs where the un-pipelined 2x2 previously won, so it supersedes the 2x1/2x2 split for
     // Q4_K. Bit-identical math to `wmma_i8_q4k_2x1` (goldens unmoved). `INFR_ROCM_NO_PIPE=1` falls
     // back to the Slice-25 auto-tier for A/B benchmarking.
-    if dt == DType::Q4K && std::env::var_os("INFR_ROCM_NO_PIPE").is_none() {
+    if dt == DType::Q4K && rocm.pipe {
         return Some(("wmma_i8_q4k_pipe_2x1", 2, 1));
     }
-    let (rm, cn) = wmma_tile(out_f);
+    let (rm, cn) = wmma_tile(out_f, rocm);
     let name = match (dt, rm, cn) {
         (DType::Q8_0, 1, 1) => "wmma_i8_q80_1x1",
         (DType::Q8_0, 2, 2) => "wmma_i8_q80_2x2",
@@ -231,15 +232,15 @@ fn native_wmma_fmt(dt: DType, out_f: u32) -> Option<(&'static str, u32, u32)> {
 /// kernels are kept (bit-faithful, parity-green) as that pipeline's foundation. `INFR_ROCM_COOP_TILE`
 /// selects the tile for A/B benchmarking (`examples/wmma_bench`). Bit-identical math to
 /// `wmma_i8_q4k_2x1` (same int8 codes + per-block scale-after order), so the blessed goldens hold.
-fn q4k_coop_kernel() -> Option<(&'static str, u32, u32, u32)> {
-    // Opt-in gate: absent env → `None` (fall through to the default pipe path).
-    std::env::var_os("INFR_ROCM_COOP")?;
+fn q4k_coop_kernel(rocm: &infr_core::config::RocmCfg) -> Option<(&'static str, u32, u32, u32)> {
+    // Opt-in gate: `kernels.rocm.coop` false (the default, i.e. `INFR_ROCM_COOP` absent) → `None`
+    // (fall through to the default pipe path).
+    if !rocm.coop {
+        return None;
+    }
     Some(
-        match std::env::var("INFR_ROCM_COOP_TILE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
+        // Trimmed by the env layer; an unrecognized tile falls to the `_` default, as before.
+        match rocm.coop_tile.as_deref() {
             Some("128x32") => ("wmma_i8_q4k_coop_128x32_w8", 128, 32, 256),
             Some("64x64") => ("wmma_i8_q4k_coop_64x64_w4", 64, 64, 128),
             Some("64x32") => ("wmma_i8_q4k_coop_64x32_w8", 64, 32, 256),
@@ -289,8 +290,8 @@ fn moe_expert_kernel(gu: &str, dn: &str) -> &'static str {
 
 /// Whether the int8-activation dp4a MoE expert path (Slice 20) is enabled. Reuses the dense
 /// `INFR_ROCM_NO_I8` A/B switch: when set, MoE falls back to the Phase-3 f16-decode expert kernel.
-fn moe_i8_enabled() -> bool {
-    std::env::var_os("INFR_ROCM_NO_I8").is_none()
+fn moe_i8_enabled(rocm: &infr_core::config::RocmCfg) -> bool {
+    rocm.i8
 }
 
 /// Static gate/up int8 kernel name for the gate/up format suffix (`moe_gate_up_act_i8_<gu>`). The
@@ -518,6 +519,9 @@ struct ExecCtx<'a> {
     /// rocBLAS handle bound to `stream` for the OPT-IN Slice-26 f16 prefill GEMM (`INFR_ROCM_BLAS=1`),
     /// or `null` (the default) — in which case the prefill path uses the int8 WMMA kernel.
     rocblas: ffi::rocblas_handle,
+    /// The backend's ROCm kernel-tier config, BORROWED for the whole forward (S6, R6): the int8 /
+    /// WMMA / pipe / cooperative selectors read it per op instead of calling `getenv`.
+    rocm: &'a infr_core::config::RocmCfg,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -809,7 +813,7 @@ pub fn execute_graph(
     // prime it. Any failure leaves the ring `None` ⇒ the Linear arm falls back to the Slice-35
     // host-alias read (correct, un-overlapped).
     let fusion = decode_fusion(g, cfg);
-    let prefetch_cap = crate::weight_pager::max_bank_bytes();
+    let prefetch_cap = crate::weight_pager::max_bank_bytes(&cfg.paging);
     let schedule = build_spilled_schedule(g, bindings, &fusion.skip, prefetch_cap);
     let weight_ring_active = if schedule.is_empty() {
         false
@@ -819,7 +823,7 @@ pub fn execute_graph(
         // (Re)build the ring if absent or if a bank now exceeds its slot (a fixed weight set never
         // grows, but the guard keeps the slot arithmetic sound if it ever did).
         if guard.as_ref().is_none_or(|r| r.slot_bytes() < max_bank) {
-            *guard = crate::weight_pager::RocmWeightRing::try_new(max_bank, stream);
+            *guard = crate::weight_pager::RocmWeightRing::try_new(max_bank, stream, &cfg.paging);
         }
         match guard.as_mut() {
             Some(ring) => {
@@ -842,6 +846,7 @@ pub fn execute_graph(
         pooled: Vec::new(),
         stream,
         rocblas,
+        rocm: &cfg.kernels.rocm,
     };
 
     // No per-op sync: the whole op list queues on ONE stream, which serializes device work, so
@@ -933,24 +938,28 @@ struct DecodeFusion {
 /// Weight-dtype predicate for BOTH decode fusions: a covered int8-decode GEMV format
 /// (`native_i8_fmt`, i.e. Q8_0/Q4_K/Q6_K/Q5_0, or `None` under `INFR_ROCM_NO_I8`). The `rmsnorm→
 /// int8-decode-Linear` and `int8-decode-Linear→Add` folds share it.
-fn fuse_weight_ok(dt: DType) -> bool {
-    native_i8_fmt(dt).is_some()
+fn fuse_weight_ok(dt: DType, rocm: &infr_core::config::RocmCfg) -> bool {
+    native_i8_fmt(dt, rocm).is_some()
 }
-static FUSE_WEIGHT_OK: fn(DType) -> bool = fuse_weight_ok;
 
 fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion {
     // The two decode folds (`RmsNorm → int8 Linear` normalize-in-kernel, `int8 Linear → Add`
     // residual epilogue) are the shared `plan_fusions` rmsnorm_linear + linear_add passes, gated to
     // the int8-decode GEMV coverage. Escape hatches: `INFR_ROCM_NO_FUSE_NORM`/`INFR_ROCM_NO_FUSE_ADD`.
+    // The int8-coverage predicate now needs the ROCm tier config (`INFR_ROCM_NO_I8` disables the
+    // int8 GEMV, and with it BOTH folds), so it is a closure borrowing `engine` rather than the
+    // former `static fn(DType) -> bool`. `FusionCfg::weight_ok` is a `&dyn Fn`, so one binding
+    // serves both passes; it is built ONCE per forward, not per op.
+    let weight_ok = |dt: DType| fuse_weight_ok(dt, &engine.kernels.rocm);
     let cfg = infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
-            weight_ok: &FUSE_WEIGHT_OK,
+            weight_ok: &weight_ok,
             // `INFR_ROCM_NO_FUSE_ADD` (config `kernels.rocm.fuse_add`, positive polarity):
             // PRESENCE of the env key — including `=0` — turns the fold off.
             enabled: engine.kernels.rocm.fuse_add,
         }),
         rmsnorm_linear: Some(infr_core::fusion::RmsNormLinearCfg {
-            weight_ok: &FUSE_WEIGHT_OK,
+            weight_ok: &weight_ok,
             // `INFR_ROCM_NO_FUSE_NORM` (config `kernels.rocm.fuse_norm`), same polarity.
             enabled: engine.kernels.rocm.fuse_norm,
         }),
@@ -1079,7 +1088,7 @@ fn run_op(
         } => {
             let wdt = g.desc(weight).dtype;
             if let (Some((qpb, bpb, _, _)), Some((bpb_i8, i8_kernel))) =
-                (native_decode_fmt(wdt), native_i8_fmt(wdt))
+                (native_decode_fmt(wdt), native_i8_fmt(wdt, ctx.rocm))
             {
                 // Int8-activation dp4a decode (Phase 4): quantize the `m×in_f` activation to int8
                 // ONCE (`quant_i8_32`, per-32-block scale), then integer-dot against the decoded
@@ -1265,12 +1274,9 @@ fn run_op(
                         // tile). It is bit-faithful to `wmma_i8_q4k_2x1` (goldens hold) but measured
                         // a regression on gfx1100 (see `q4k_coop_kernel`), so the DEFAULT stays the
                         // Slice-27 pipe. When not opted in, this falls through to the pipe / GEMV.
-                        let coop = (m > 1
-                            && wdt == DType::Q4K
-                            && std::env::var_os("INFR_ROCM_NO_WMMA").is_none()
-                            && std::env::var_os("INFR_ROCM_NO_I8").is_none())
-                        .then(q4k_coop_kernel)
-                        .flatten();
+                        let coop = (m > 1 && wdt == DType::Q4K && !ctx.rocm.no_wmma && ctx.rocm.i8)
+                            .then(|| q4k_coop_kernel(ctx.rocm))
+                            .flatten();
                         match coop {
                             Some((coop_kernel, bm, bn, threads)) => {
                                 // Grid = (ceil(out_f/BN), ceil(m/BM)); one multi-warp threadblock per
@@ -1294,7 +1300,10 @@ fn run_op(
                                     ],
                                 )?;
                             }
-                            None => match (m > 1).then(|| native_wmma_fmt(wdt, out_f)).flatten() {
+                            None => match (m > 1)
+                                .then(|| native_wmma_fmt(wdt, out_f, ctx.rocm))
+                                .flatten()
+                            {
                                 Some((wmma_kernel, rm, cn)) => {
                                     // Prefill (m>1), BLAS disabled: matrix-core int8 GEMM. Grid =
                                     // (ceil(out_f/(16*CN)), ceil(m/(16*RM))), one wave32 block per
@@ -2298,7 +2307,7 @@ fn run_op(
             // activation `h_buf` → `hq`/`hs` (overwritten each expert; the stream serializes the
             // gate_up → quant_h → down chain so the reuse never races). All fully written before read,
             // so `zero = false`.
-            let use_i8 = native.is_some() && moe_i8_enabled();
+            let use_i8 = native.is_some() && moe_i8_enabled(ctx.rocm);
             let (qx_x, xs_x, h_buf, hq, hs) = if use_i8 {
                 (
                     Some(ctx.pool_buf(neu.max(1), false)),
@@ -2961,6 +2970,7 @@ fn run_op(
 #[cfg(test)]
 mod decode_spec_tests {
     use super::{moe_native_fmt, native_decode_fmt, native_i8_fmt};
+    use infr_core::config::RocmCfg;
     use infr_core::DType;
 
     /// The three kernel tables now derive their block geometry from
@@ -2970,6 +2980,9 @@ mod decode_spec_tests {
     /// (the block stride is what the kernels' byte addressing is built on).
     #[test]
     fn native_tables_reproduce_the_inline_block_geometry() {
+        // S6: the int8 table is selected off a `RocmCfg` VALUE, not the environment — `default()`
+        // is `INFR_ROCM_NO_I8` unset (`i8: true`), so the int8 arm below is always exercised now.
+        let rocm = RocmCfg::default();
         // (dtype, elems/block, bytes/block) — verbatim from the pre-hoist tables.
         for (dt, elems, bytes) in [
             (DType::Q8_0, 32usize, 34usize),
@@ -2979,10 +2992,8 @@ mod decode_spec_tests {
         ] {
             let (e, b, _, _) = native_decode_fmt(dt).expect("covered by native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} native_decode_fmt geometry");
-            // `native_i8_fmt` self-disables under INFR_ROCM_NO_I8; only check it when enabled.
-            if let Some((b8, _)) = native_i8_fmt(dt) {
-                assert_eq!(b8, bytes, "{dt:?} native_i8_fmt bytes/block");
-            }
+            let (b8, _) = native_i8_fmt(dt, &rocm).expect("covered by the int8 decode");
+            assert_eq!(b8, bytes, "{dt:?} native_i8_fmt bytes/block");
         }
         for (dt, elems, bytes) in [
             (DType::Q8_0, 32usize, 34usize),
@@ -2994,7 +3005,117 @@ mod decode_spec_tests {
         }
         // Coverage is unchanged: nothing outside the four/three formats routes native.
         assert!(native_decode_fmt(DType::Q5K).is_none());
-        assert!(native_i8_fmt(DType::Q5K).is_none());
+        assert!(native_i8_fmt(DType::Q5K, &rocm).is_none());
         assert!(moe_native_fmt(DType::Q5_0).is_none());
+    }
+}
+
+/// S6 (`docs/config-plan.md` §8): every ROCm kernel-tier knob drives its selector from a
+/// `RocmCfg` VALUE. No environment, no `EnvGuard`, no GPU — these are pure kernel-name pickers.
+#[cfg(test)]
+mod config_tier_tests {
+    use super::{
+        fuse_weight_ok, moe_i8_enabled, native_i8_fmt, native_wmma_fmt, q4k_coop_kernel, wmma_tile,
+    };
+    use infr_core::config::RocmCfg;
+    use infr_core::DType;
+
+    fn cfg(f: impl FnOnce(&mut RocmCfg)) -> RocmCfg {
+        let mut c = RocmCfg::default();
+        f(&mut c);
+        c
+    }
+
+    /// `INFR_ROCM_NO_I8` (`kernels.rocm.i8`, POSITIVE, default `true`): clearing it drops the int8
+    /// GEMV, the WMMA prefill GEMM, the int8 MoE expert path AND both decode fusions (whose
+    /// coverage predicate is the int8 table). Setting the env to `0` clears it too — presence is
+    /// all that matters — which the env-layer polarity test in `infr-core` pins.
+    #[test]
+    fn i8_flag_gates_the_whole_int8_family() {
+        let on = RocmCfg::default();
+        assert!(on.i8);
+        assert!(native_i8_fmt(DType::Q4K, &on).is_some());
+        assert!(native_wmma_fmt(DType::Q4K, 4096, &on).is_some());
+        assert!(moe_i8_enabled(&on));
+        assert!(fuse_weight_ok(DType::Q4K, &on));
+
+        let off = cfg(|c| c.i8 = false);
+        assert!(native_i8_fmt(DType::Q4K, &off).is_none());
+        assert!(native_wmma_fmt(DType::Q4K, 4096, &off).is_none());
+        assert!(!moe_i8_enabled(&off));
+        assert!(!fuse_weight_ok(DType::Q4K, &off));
+    }
+
+    /// `INFR_ROCM_NO_WMMA` (`kernels.rocm.no_wmma`, a `presence` knob on a NEGATIVE field) forces
+    /// the dp4a GEMV without touching the int8 family.
+    #[test]
+    fn no_wmma_forces_the_gemv_but_keeps_int8() {
+        let off = cfg(|c| c.no_wmma = true);
+        assert!(native_wmma_fmt(DType::Q4K, 4096, &off).is_none());
+        assert!(native_i8_fmt(DType::Q4K, &off).is_some());
+    }
+
+    /// `INFR_ROCM_NO_PIPE` (`kernels.rocm.pipe`, POSITIVE, default `true`): with it the Q4_K
+    /// prefill is the Slice-27 software-pipelined kernel; without it, the Slice-25 auto tier
+    /// (`2x2` for wide-N, `2x1` otherwise).
+    #[test]
+    fn pipe_flag_selects_the_q4k_prefill_kernel() {
+        let on = RocmCfg::default();
+        assert_eq!(
+            native_wmma_fmt(DType::Q4K, 4096, &on),
+            Some(("wmma_i8_q4k_pipe_2x1", 2, 1))
+        );
+        let off = cfg(|c| c.pipe = false);
+        assert_eq!(
+            native_wmma_fmt(DType::Q4K, 4096, &off),
+            Some(("wmma_i8_q4k_2x2", 2, 2))
+        );
+        assert_eq!(
+            native_wmma_fmt(DType::Q4K, 1024, &off),
+            Some(("wmma_i8_q4k_2x1", 2, 1))
+        );
+    }
+
+    /// `INFR_ROCM_WMMA_TILE` is matched against the EXACT strings `1x1`/`2x1`/`2x2` (§10.4);
+    /// anything else — including a typo — is treated as unset and the shape-driven auto tier wins.
+    #[test]
+    fn wmma_tile_override_takes_only_the_three_literals() {
+        assert_eq!(wmma_tile(4096, &RocmCfg::default()), (2, 2));
+        assert_eq!(wmma_tile(1024, &RocmCfg::default()), (2, 1));
+        for (spec, want) in [("1x1", (1, 1)), ("2x1", (2, 1)), ("2x2", (2, 2))] {
+            let c = cfg(|c| c.wmma_tile = Some(spec.to_string()));
+            assert_eq!(wmma_tile(4096, &c), want, "{spec}");
+            assert_eq!(wmma_tile(1024, &c), want, "{spec}");
+        }
+        let bogus = cfg(|c| c.wmma_tile = Some("4x4".to_string()));
+        assert_eq!(wmma_tile(4096, &bogus), (2, 2), "unrecognized ⇒ auto tier");
+    }
+
+    /// `INFR_ROCM_COOP` is the opt-in gate (default OFF); `INFR_ROCM_COOP_TILE` picks the tile and
+    /// an unrecognized/absent name falls to the `128x64` default.
+    #[test]
+    fn coop_is_opt_in_and_its_tile_defaults() {
+        assert!(q4k_coop_kernel(&RocmCfg::default()).is_none());
+        let on = cfg(|c| c.coop = true);
+        assert_eq!(
+            q4k_coop_kernel(&on),
+            Some(("wmma_i8_q4k_coop_128x64_w8", 128, 64, 256))
+        );
+        let tiled = cfg(|c| {
+            c.coop = true;
+            c.coop_tile = Some("64x64".to_string());
+        });
+        assert_eq!(
+            q4k_coop_kernel(&tiled),
+            Some(("wmma_i8_q4k_coop_64x64_w4", 64, 64, 128))
+        );
+        let bogus = cfg(|c| {
+            c.coop = true;
+            c.coop_tile = Some("nope".to_string());
+        });
+        assert_eq!(
+            q4k_coop_kernel(&bogus),
+            Some(("wmma_i8_q4k_coop_128x64_w8", 128, 64, 256))
+        );
     }
 }

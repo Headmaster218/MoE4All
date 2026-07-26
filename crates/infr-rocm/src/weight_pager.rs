@@ -77,23 +77,19 @@ const DEFAULT_N_SLOTS: usize = 4;
 /// A spilled native Linear bank is staged only when its byte length is `<= cap`; larger banks fall
 /// back to the Slice-35 direct read. This is the SINGLE predicate the schedule build and the
 /// executor's per-op staged/fallback decision must agree on (keeping the ring cursor in lockstep).
-pub fn max_bank_bytes() -> usize {
-    std::env::var("INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+pub fn max_bank_bytes(paging: &infr_core::config::PagingCfg) -> usize {
+    paging
+        .rocm_prefetch_max_bank_mb
         .unwrap_or(DEFAULT_MAX_BANK_MB)
         * 1024
         * 1024
 }
 
 /// Ring depth (`INFR_ROCM_WEIGHT_PREFETCH_SLOTS`, default [`DEFAULT_N_SLOTS`]), floored at 2 so the
-/// ring can always double-buffer (one slot filling while another computes).
-fn n_slots() -> usize {
-    std::env::var("INFR_ROCM_WEIGHT_PREFETCH_SLOTS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_N_SLOTS)
-        .max(2)
+/// ring can always double-buffer (one slot filling while another computes). The floor is POLICY and
+/// stays here, at the accessor, not in the env layer (`docs/config-plan.md` R5).
+fn n_slots(paging: &infr_core::config::PagingCfg) -> usize {
+    paging.rocm_prefetch_slots.unwrap_or(DEFAULT_N_SLOTS).max(2)
 }
 
 /// One spilled dense weight bank scheduled for prefetch: its pinned host source (the Slice-35
@@ -152,14 +148,18 @@ impl RocmWeightRing {
     /// fallback) if any HIP call fails — prefetch must never hard-error just because VRAM for the
     /// ring or a second stream can't be had. `INFR_ROCM_WEIGHT_PREFETCH_OFF` also forces `None`
     /// (A/B lever: measure the Slice-35 synchronous-PCIe baseline).
-    pub fn try_new(slot_bytes: usize, compute_stream: ffi::hipStream_t) -> Option<Self> {
-        if std::env::var_os("INFR_ROCM_WEIGHT_PREFETCH_OFF").is_some() {
+    pub fn try_new(
+        slot_bytes: usize,
+        compute_stream: ffi::hipStream_t,
+        paging: &infr_core::config::PagingCfg,
+    ) -> Option<Self> {
+        if paging.rocm_prefetch_off {
             return None;
         }
         if slot_bytes == 0 {
             return None;
         }
-        let n = n_slots();
+        let n = n_slots(paging);
         let mut copy_stream: ffi::hipStream_t = std::ptr::null_mut();
         if unsafe { ffi::hipStreamCreate(&mut copy_stream) } != HIP_SUCCESS {
             return None;
@@ -207,7 +207,7 @@ impl RocmWeightRing {
             free,
             schedule: Vec::new(),
             cursor: 0,
-            print_stats: std::env::var_os("INFR_ROCM_WEIGHT_PREFETCH_STATS").is_some(),
+            print_stats: paging.rocm_prefetch_stats,
             stats_printed: false,
             staged_banks: 0,
             staged_bytes: 0,
@@ -355,5 +355,37 @@ impl Drop for RocmWeightRing {
         }
         unsafe { ffi::hipStreamDestroy(self.copy_stream) };
         // `self.slots` (RocmBuffer) frees its VRAM arena in its own Drop.
+    }
+}
+
+/// S6 (`docs/config-plan.md` §8): the prefetch sizing knobs come off `PagingCfg`, and the `max(2)`
+/// slot floor stays HERE — policy in the accessor, not in the env layer (R5).
+#[cfg(test)]
+mod config_tests {
+    use super::{max_bank_bytes, n_slots, DEFAULT_MAX_BANK_MB, DEFAULT_N_SLOTS};
+    use infr_core::config::PagingCfg;
+
+    fn paging(f: impl FnOnce(&mut PagingCfg)) -> PagingCfg {
+        let mut p = PagingCfg::default();
+        f(&mut p);
+        p
+    }
+
+    #[test]
+    fn prefetch_bank_cap_defaults_and_overrides() {
+        let d = PagingCfg::default();
+        assert_eq!(max_bank_bytes(&d), DEFAULT_MAX_BANK_MB * 1024 * 1024);
+        let p = paging(|p| p.rocm_prefetch_max_bank_mb = Some(512));
+        assert_eq!(max_bank_bytes(&p), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn prefetch_slots_default_and_floor_at_two() {
+        let d = PagingCfg::default();
+        assert_eq!(n_slots(&d), DEFAULT_N_SLOTS);
+        assert_eq!(n_slots(&paging(|p| p.rocm_prefetch_slots = Some(6))), 6);
+        // The double-buffer floor is the accessor's policy, so 0 and 1 both clamp up to 2.
+        assert_eq!(n_slots(&paging(|p| p.rocm_prefetch_slots = Some(0))), 2);
+        assert_eq!(n_slots(&paging(|p| p.rocm_prefetch_slots = Some(1))), 2);
     }
 }

@@ -154,18 +154,18 @@ knobs! {
     // ── paging (§6.4) ────────────────────────────────────────────────────────
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
-    "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   pending;
+    "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
     "INFR_ROCM_EXPERT_BUDGET"   => "paging.rocm_expert_budget",        Size,     Ignored, "4g",  migrated;
-    "INFR_ROCM_WEIGHT_PREFETCH_SLOTS" => "paging.rocm_prefetch_slots", Int,      Ignored, "6",   pending;
+    "INFR_ROCM_WEIGHT_PREFETCH_SLOTS" => "paging.rocm_prefetch_slots", Int,      Ignored, "6",   migrated;
     "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB"
-        => "paging.rocm_prefetch_max_bank_mb", Int, Ignored, "512", pending;
-    "INFR_ROCM_WEIGHT_PREFETCH_OFF"   => "paging.rocm_prefetch_off",   Presence, Ignored, "1",   pending;
-    "INFR_ROCM_WEIGHT_PREFETCH_STATS" => "paging.rocm_prefetch_stats", Presence, Ignored, "1",   pending;
+        => "paging.rocm_prefetch_max_bank_mb", Int, Ignored, "512", migrated;
+    "INFR_ROCM_WEIGHT_PREFETCH_OFF"   => "paging.rocm_prefetch_off",   Presence, Ignored, "1",   migrated;
+    "INFR_ROCM_WEIGHT_PREFETCH_STATS" => "paging.rocm_prefetch_stats", Presence, Ignored, "1",   migrated;
     "INFR_ROCM_WEIGHT_OVERFLOW" => "paging.rocm_weight_overflow",      Flag,     Ignored, "1",   migrated;
     "INFR_ROCM_WEIGHT_VRAM_MB"  => "paging.rocm_weight_vram_mb",       Mib,      Ignored, "512", migrated;
     "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB"
         => "paging.rocm_weight_reserve_mb", Mib, Ignored, "128", migrated;
-    "INFR_ROCM_PAGER_NOOVERLAP" => "paging.rocm_no_overlap",           Presence, Ignored, "1",   pending;
+    "INFR_ROCM_PAGER_NOOVERLAP" => "paging.rocm_no_overlap",           Presence, Ignored, "1",   migrated;
 
     // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
     "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", migrated;
@@ -244,33 +244,33 @@ knobs! {
     "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    migrated;
 
     // ── kernels.metal (§6.6) ─────────────────────────────────────────────────
-    "INFR_METAL_NO_F16_NATIVE"    => "kernels.metal.f16_native",    PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_F32_NATIVE"    => "kernels.metal.f32_native",    PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_BF16_NATIVE"   => "kernels.metal.bf16_native",   PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_F16_CMM"       => "kernels.metal.f16_cmm",       PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_BF16_CMM"      => "kernels.metal.bf16_cmm",      PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_F32_CMM"       => "kernels.metal.f32_cmm",       PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_F16_RT"        => "kernels.metal.f16_rt",        PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_BF16_RT"       => "kernels.metal.bf16_rt",       PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_F32_RT"        => "kernels.metal.f32_rt",        PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_KQUANT_NATIVE" => "kernels.metal.kquant_native", PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_Q5K_RT"        => "kernels.metal.q5k_rt",        PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_RMSNORM_VEC4"  => "kernels.metal.rmsnorm_vec4",  PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_CONV1D_PAR"    => "kernels.metal.conv1d_par",    PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_DN_GATE_PREP"  => "kernels.metal.dn_gate_prep",  PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NO_DN_NORM_PREP"  => "kernels.metal.dn_norm_prep",  PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_LMHEAD_MRV"       => "kernels.metal.lmhead_mrv_uncapped", Presence, Ignored, "1", pending;
-    "INFR_METAL_NODELTA"          => "kernels.metal.deltanet",      PresenceInv, Ignored, "1", pending;
-    "INFR_METAL_NOMOE"            => "kernels.metal.moe",           PresenceInv, Ignored, "1", pending;
+    "INFR_METAL_NO_F16_NATIVE"    => "kernels.metal.f16_native",    PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_F32_NATIVE"    => "kernels.metal.f32_native",    PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_BF16_NATIVE"   => "kernels.metal.bf16_native",   PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_F16_CMM"       => "kernels.metal.f16_cmm",       PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_BF16_CMM"      => "kernels.metal.bf16_cmm",      PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_F32_CMM"       => "kernels.metal.f32_cmm",       PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_F16_RT"        => "kernels.metal.f16_rt",        PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_BF16_RT"       => "kernels.metal.bf16_rt",       PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_F32_RT"        => "kernels.metal.f32_rt",        PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_KQUANT_NATIVE" => "kernels.metal.kquant_native", PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_Q5K_RT"        => "kernels.metal.q5k_rt",        PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_RMSNORM_VEC4"  => "kernels.metal.rmsnorm_vec4",  PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_CONV1D_PAR"    => "kernels.metal.conv1d_par",    PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_DN_GATE_PREP"  => "kernels.metal.dn_gate_prep",  PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NO_DN_NORM_PREP"  => "kernels.metal.dn_norm_prep",  PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_LMHEAD_MRV"       => "kernels.metal.lmhead_mrv_uncapped", Presence, Ignored, "1", migrated;
+    "INFR_METAL_NODELTA"          => "kernels.metal.deltanet",      PresenceInv, Ignored, "1", migrated;
+    "INFR_METAL_NOMOE"            => "kernels.metal.moe",           PresenceInv, Ignored, "1", migrated;
 
     // ── kernels.rocm (§6.7) ──────────────────────────────────────────────────
-    "INFR_ROCM_WMMA_TILE"    => "kernels.rocm.wmma_tile", Text,        Ignored, "2x2",   pending;
-    "INFR_ROCM_NO_WMMA"      => "kernels.rocm.no_wmma",   Presence,    Ignored, "1",     pending;
-    "INFR_ROCM_NO_I8"        => "kernels.rocm.i8",        PresenceInv, Ignored, "1",     pending;
-    "INFR_ROCM_NO_PIPE"      => "kernels.rocm.pipe",      PresenceInv, Ignored, "1",     pending;
-    "INFR_ROCM_COOP"         => "kernels.rocm.coop",      Presence,    Ignored, "1",     pending;
-    "INFR_ROCM_COOP_TILE"    => "kernels.rocm.coop_tile", Text,        Ignored, "64x64", pending;
-    "INFR_ROCM_BLAS"         => "kernels.rocm.blas",      Presence,    Ignored, "1",     pending;
+    "INFR_ROCM_WMMA_TILE"    => "kernels.rocm.wmma_tile", Text,        Ignored, "2x2",   migrated;
+    "INFR_ROCM_NO_WMMA"      => "kernels.rocm.no_wmma",   Presence,    Ignored, "1",     migrated;
+    "INFR_ROCM_NO_I8"        => "kernels.rocm.i8",        PresenceInv, Ignored, "1",     migrated;
+    "INFR_ROCM_NO_PIPE"      => "kernels.rocm.pipe",      PresenceInv, Ignored, "1",     migrated;
+    "INFR_ROCM_COOP"         => "kernels.rocm.coop",      Presence,    Ignored, "1",     migrated;
+    "INFR_ROCM_COOP_TILE"    => "kernels.rocm.coop_tile", Text,        Ignored, "64x64", migrated;
+    "INFR_ROCM_BLAS"         => "kernels.rocm.blas",      Presence,    Ignored, "1",     migrated;
     "INFR_ROCM_NO_FUSE_ADD"  => "kernels.rocm.fuse_add",  PresenceInv, Ignored, "1",     migrated;
     "INFR_ROCM_NO_FUSE_NORM" => "kernels.rocm.fuse_norm", PresenceInv, Ignored, "1",     migrated;
 
@@ -318,8 +318,8 @@ knobs! {
     "INFR_MTP_TIME"         => "prof.mtp_time",         Presence, Ignored, "1",            migrated;
     "INFR_DIFFUSION_TIME"   => "prof.diffusion_time",   Presence, Ignored, "1",            migrated;
     "INFR_EB_TRACE"         => "prof.eb_trace",         Presence, Ignored, "1",            migrated;
-    "INFR_METAL_PROFILE"    => "prof.metal_profile",    Text,     Ignored, "2",            pending;
-    "INFR_METAL_PROF_DEBUG" => "prof.metal_prof_debug", Presence, Ignored, "1",            pending;
+    "INFR_METAL_PROFILE"    => "prof.metal_profile",    Text,     Ignored, "2",            migrated;
+    "INFR_METAL_PROF_DEBUG" => "prof.metal_prof_debug", Presence, Ignored, "1",            migrated;
 
     // ── debug (§6.9) ─────────────────────────────────────────────────────────
     "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", migrated;

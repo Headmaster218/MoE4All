@@ -535,6 +535,30 @@ cfg_struct! {
     }
 }
 
+impl ProfCfg {
+    /// `INFR_METAL_PROFILE` is set to ANYTHING (including the empty string) ⇒ the Metal execution
+    /// profiler runs. Exactly `std::env::var("INFR_METAL_PROFILE").is_ok()`, which is what
+    /// `MetalBackend::new` read (S6).
+    pub fn metal_profiling(&self) -> bool {
+        self.metal_profile.is_some()
+    }
+
+    /// `INFR_METAL_PROFILE` is the EXACT string `"2"` ⇒ flush after each op so its GPU wall is
+    /// isolable. NOT an integer level: `=20` is not `>= 2`, it is simply "profiling on, level
+    /// unrecognized" (§6.12, §10.4). R1-frozen.
+    pub fn metal_prof_ops(&self) -> bool {
+        self.metal_profile.as_deref() == Some("2")
+    }
+
+    /// `INFR_METAL_PROFILE` is the EXACT string `"3"` ⇒ ask the device for the timestamp counter
+    /// set (stage-boundary GPU sampling). Same exact-literal grammar as
+    /// [`metal_prof_ops`](Self::metal_prof_ops); the two are mutually exclusive by construction and
+    /// BOTH additionally imply [`metal_profiling`](Self::metal_profiling).
+    pub fn metal_prof_counters(&self) -> bool {
+        self.metal_profile.as_deref() == Some("3")
+    }
+}
+
 cfg_struct! {
     /// Debug/poison/barrier switches. Setting any of these from the config FILE is announced at
     /// startup (§11 [DECIDE-7]).
@@ -700,13 +724,15 @@ impl Config {
         Ok(cfg)
     }
 
-    /// **TRANSITIONAL (S2) — delete with its last caller (S6/S8).**
+    /// **TRANSITIONAL (S2) — delete with its last caller (S8).**
     ///
     /// The `Default` < environment fold, with no file and no CLI layer: the config a crate builds
     /// for ITSELF at its construction boundary while it waits to be HANDED an `Arc<Config>` by
-    /// `main()`. `RocmBackend::new` (S6) and `SeamModel::load` (S8) are the two callers left; the
-    /// Vulkan one went away in S5a, when `VulkanBackend::new_with(cfg)` became the real
-    /// constructor. Each remaining call site carries a comment naming the slice that removes it.
+    /// `main()`. `SeamModel::load` (S8) is the last TRANSITIONAL caller; `CpuBackend::new` /
+    /// `CpuBackend::reference` keep it as their env-sourced twin (infallible is right there — CPU
+    /// owns none of the loud keys). The Vulkan bridge went away in S5a and the ROCm one in S6, when
+    /// `VulkanBackend::new_with(cfg)` / `RocmBackend::new_with(device_id, cfg)` became the real
+    /// constructors.
     ///
     /// It is NOT `Config::load`: no file layer (these knobs were env-only before the migration, so
     /// reading a file here would ADD behaviour, and the diagnostics banner would print twice), and
@@ -714,10 +740,11 @@ impl Config {
     /// an unmigrated read site still produces for itself (R1) — a rejected layer falls back to
     /// `Config::default()`.
     ///
-    /// That infallibility is exactly why `VulkanBackend::new` does NOT use this: after S5a all five
-    /// of the loud keys are `Config`-sourced, so swallowing the layer error there would silently
-    /// drop an `INFR_SG` / `INFR_SUBMIT_DISPATCHES` rejection a caller gets today. It builds the
-    /// same fold with `ConfigLayer::env()?` instead.
+    /// That infallibility is exactly why `VulkanBackend::new`, `RocmBackend::new` and
+    /// `MetalBackend::new` do NOT use this: all five loud keys are `Config`-sourced now, so
+    /// swallowing the layer error there would silently drop an `INFR_SG` /
+    /// `INFR_SUBMIT_DISPATCHES` / device-list rejection a caller gets today. They build the same
+    /// fold with `ConfigLayer::env()?` instead.
     pub fn load_from_env() -> Config {
         let layer = ConfigLayer::env().unwrap_or_default();
         Config::load_from_layers(&[layer])

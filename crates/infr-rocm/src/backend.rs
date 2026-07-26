@@ -432,15 +432,10 @@ pub struct RocmBackend {
     /// One-shot latch so the weight-overflow banner prints exactly once, on the first `execute`
     /// (after the whole weight-load walk has run). `false` until printed.
     wt_reported: std::sync::atomic::AtomicBool,
-    /// The engine configuration this backend reads its knobs from — one value, held for the
-    /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
-    /// R4/R6).
-    ///
-    /// **TRANSITIONAL (S2), replaced by S6:** built here from the environment via
-    /// [`Config::load_from_env`] instead of being HANDED in, because `infr-rocm` does not get its
-    /// `Arc<Config>` from `main()` until its own slice. S6 adds `RocmBackend::new_with(device_id,
-    /// cfg)` and deletes the `load_from_env()` call in [`RocmBackend::new`]. Until then it is ONE
-    /// env-sourced construction per backend in place of the eight scattered reads it replaced.
+    /// The engine configuration this backend reads its knobs from — one value, HANDED IN by the
+    /// caller ([`RocmBackend::new_with`]), held for the backend's whole life, and borrowed (never
+    /// cloned) at every read site including the per-forward `execute_graph` walk
+    /// (`docs/config-plan.md` R4/R6). S6 replaced S2's `Config::load_from_env()` bridge with it.
     cfg: Arc<Config>,
 }
 
@@ -449,8 +444,37 @@ unsafe impl Send for RocmBackend {}
 unsafe impl Sync for RocmBackend {}
 
 impl RocmBackend {
-    /// Create a new ROCm backend on the given device index.
+    /// Borrowed engine configuration — every knob this backend steers on. A REFERENCE, never a
+    /// clone: `execute_graph` reads it per forward and the kernel-tier helpers read it per op
+    /// (`docs/config-plan.md` R6).
+    ///
+    /// `pub` so `infr-llama`'s seam and this crate's own probes can read the knobs off the backend
+    /// they already hold instead of growing a second env-sourced config.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// `Default` < environment, for the [`new`](Self::new) entry point that is handed no
+    /// [`Config`] — this crate's own tests/examples and external library callers. Fallible for the
+    /// same reason `VulkanBackend::cfg_from_env` is (S5a): the five LOUD keys (`INFR_SG`,
+    /// `INFR_SUBMIT_DISPATCHES`, the three device lists) are `Config`-sourced now, so swallowing a
+    /// layer error would silently drop a rejection.
+    fn cfg_from_env() -> Result<Arc<Config>> {
+        let layer = infr_core::config::ConfigLayer::env().map_err(|e| be(e.to_string()))?;
+        Ok(Arc::new(Config::load_from_layers(&[layer])))
+    }
+
+    /// Create a ROCm backend on `device_id`, resolving `Default` < environment for itself. Every
+    /// caller inside `infr-llama` passes its own `Arc<Config>` to
+    /// [`new_with`](Self::new_with) instead.
     pub fn new(device_id: c_int) -> Result<Self> {
+        Self::new_with(device_id, Self::cfg_from_env()?)
+    }
+
+    /// **The real constructor (S6).** Build a backend on `device_id`, reading every knob — the
+    /// rocBLAS opt-in, the kernel tiers, the pager/prefetch diagnostics, the KV/weight overflow
+    /// budgets — from the `cfg` the caller hands in rather than the process environment.
+    pub fn new_with(device_id: c_int, cfg: Arc<Config>) -> Result<Self> {
         let mut count: c_int = 0;
         let rc = unsafe { ffi::hipGetDeviceCount(&mut count) };
         if rc != HIP_SUCCESS {
@@ -486,7 +510,7 @@ impl RocmBackend {
         // path stays on the hand int8 WMMA kernel; `INFR_ROCM_BLAS=1` opts into the library GEMM for
         // experimentation. A create failure is non-fatal — the handle stays null and WMMA is used.
         let mut rocblas: ffi::rocblas_handle = std::ptr::null_mut();
-        if std::env::var_os("INFR_ROCM_BLAS").is_some() {
+        if cfg.kernels.rocm.blas {
             let rc = unsafe { ffi::rocblas_create_handle(&mut rocblas) };
             if rc == ffi::ROCBLAS_STATUS_SUCCESS {
                 unsafe { ffi::rocblas_set_stream(rocblas, stream) };
@@ -508,9 +532,7 @@ impl RocmBackend {
             kv_spill: SpillTally::default(),
             wt_spill: SpillTally::default(),
             wt_reported: std::sync::atomic::AtomicBool::new(false),
-            // TRANSITIONAL (S2) — S6 replaces this with the `Arc<Config>` passed to `new_with`.
-            // See the `cfg` field's doc.
-            cfg: Arc::new(Config::load_from_env()),
+            cfg,
         })
     }
 
@@ -606,7 +628,7 @@ impl RocmBackend {
     /// `Backend::moe_paged` answers truthy and the first paged tensor's placeholder is registered
     /// as it is bound. The arenas allocate here (one contiguous VRAM buffer per pool).
     pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
-        let session = crate::pager::RocmMoePager::new(layout, self.stream)?;
+        let session = crate::pager::RocmMoePager::new(layout, self.stream, &self.cfg.paging)?;
         *self.moe_pager.lock().unwrap() = Some(session);
         Ok(())
     }

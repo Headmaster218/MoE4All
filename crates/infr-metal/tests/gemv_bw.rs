@@ -3,10 +3,29 @@
 //! `cargo test -p infr-metal --release --test gemv_bw -- --ignored --nocapture`.
 #![cfg(target_os = "macos")]
 
+use std::sync::Arc;
+
 use infr_core::backend::{Backend, Bindings, BufferUsage};
+use infr_core::config::{Config, MetalCfg};
 use infr_core::graph::{Graph, Op};
 use infr_core::tensor::{DType, TensorDesc};
 use infr_metal::MetalBackend;
+
+/// A backend on an EXPLICIT `MetalCfg` (S6). Every kill-switch these probes A/B is a config field
+/// now, so each arm builds its own backend from a VALUE — no `EnvGuard`, no process-wide lock, no
+/// restore, and no ordering hazard against the other tests in this binary.
+fn be_with(metal: &MetalCfg) -> MetalBackend {
+    let mut cfg = Config::default();
+    cfg.kernels.metal = metal.clone();
+    MetalBackend::new_with(Arc::new(cfg)).expect("metal backend")
+}
+
+/// `MetalCfg::default()` with one kill-switch cleared — the `INFR_METAL_NO_*=1` arm of a probe.
+fn metal_off(f: impl FnOnce(&mut MetalCfg)) -> MetalCfg {
+    let mut m = MetalCfg::default();
+    f(&mut m);
+    m
+}
 
 fn lcg_bytes(mut seed: u32, n: usize) -> Vec<u8> {
     (0..n)
@@ -53,8 +72,16 @@ fn synth_q5k(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
-fn bench(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: usize, bpw: f64, label: &str) {
-    let be = MetalBackend::new().unwrap();
+fn bench(
+    metal: &MetalCfg,
+    dtype: DType,
+    wbytes: Vec<u8>,
+    in_f: usize,
+    out_f: usize,
+    bpw: f64,
+    label: &str,
+) {
+    let be = be_with(metal);
     let m = 1usize;
     let xs: Vec<f32> = (0..in_f).map(|i| (i % 7) as f32 * 0.01).collect();
 
@@ -105,7 +132,9 @@ fn bench(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: usize, bpw: f64, lab
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn gemv_bandwidth() {
     // lm_head shape (Qwen3-0.6B): 151936x1024 Q6K -> quik6, 8.125 bpw
+    let m = MetalCfg::default();
     bench(
+        &m,
         DType::Q6K,
         synth_q6k(151936 * 1024, 1),
         1024,
@@ -115,6 +144,7 @@ fn gemv_bandwidth() {
     );
     // Same shape as Q4K -> quik4, 6.125 bpw
     bench(
+        &m,
         DType::Q4K,
         synth_q4k(151936 * 1024, 2),
         1024,
@@ -124,6 +154,7 @@ fn gemv_bandwidth() {
     );
     // FFN shape: 3072x1024 Q4K (small stream: launch overhead visible)
     bench(
+        &m,
         DType::Q4K,
         synth_q4k(3072 * 1024, 3),
         1024,
@@ -137,17 +168,20 @@ fn gemv_bandwidth() {
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn q5k_swar_probe() {
     let wq5k = synth_q5k(65536 * 1152, 4);
-    bench_chained(DType::Q5K, &wq5k, 1152, 65536, 5.5, "q5k head");
+    bench_chained(
+        &MetalCfg::default(),
+        DType::Q5K,
+        &wq5k,
+        1152,
+        65536,
+        5.5,
+        "q5k head",
+    );
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f16_native_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 65536usize);
     let wf: Vec<f32> = (0..out_f * in_f).map(|i| (i % 13) as f32 * 0.01).collect();
     let w16: Vec<u8> = wf
@@ -155,20 +189,15 @@ fn f16_native_probe() {
         .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
         .collect();
 
-    env.set("INFR_METAL_NO_F16_NATIVE", "1");
-    bench_chained(DType::F16, &w16, in_f, out_f, 32.0, "f16 cached-f32");
-    env.unset("INFR_METAL_NO_F16_NATIVE");
-    bench_chained(DType::F16, &w16, in_f, out_f, 16.0, "f16 native");
+    let off = metal_off(|m| m.f16_native = false);
+    bench_chained(&off, DType::F16, &w16, in_f, out_f, 32.0, "f16 cached-f32");
+    let on = MetalCfg::default();
+    bench_chained(&on, DType::F16, &w16, in_f, out_f, 16.0, "f16 native");
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn bf16_native_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 65536usize);
     let w16: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| {
@@ -177,20 +206,23 @@ fn bf16_native_probe() {
         })
         .collect();
 
-    env.set("INFR_METAL_NO_BF16_NATIVE", "1");
-    bench_chained(DType::Bf16, &w16, in_f, out_f, 32.0, "bf16 cached-f32");
-    env.unset("INFR_METAL_NO_BF16_NATIVE");
-    bench_chained(DType::Bf16, &w16, in_f, out_f, 16.0, "bf16 native");
+    let off = metal_off(|m| m.bf16_native = false);
+    bench_chained(
+        &off,
+        DType::Bf16,
+        &w16,
+        in_f,
+        out_f,
+        32.0,
+        "bf16 cached-f32",
+    );
+    let on = MetalCfg::default();
+    bench_chained(&on, DType::Bf16, &w16, in_f, out_f, 16.0, "bf16 native");
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn bf16_rt_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 8192usize);
     let w16: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| {
@@ -199,10 +231,15 @@ fn bf16_rt_probe() {
         })
         .collect();
 
-    env.set("INFR_METAL_NO_BF16_CMM", "1");
+    // CMM off across the whole probe (both arms); the RT switch is the A/B.
+    let no_rt = metal_off(|m| {
+        m.bf16_cmm = false;
+        m.bf16_rt = false;
+    });
+    let rt = metal_off(|m| m.bf16_cmm = false);
     for m in [2usize, 4, 8, 16, 32] {
-        env.set("INFR_METAL_NO_BF16_RT", "1");
         bench_chained_m(
+            &no_rt,
             DType::Bf16,
             &w16,
             m,
@@ -211,8 +248,8 @@ fn bf16_rt_probe() {
             16.0 * m as f64,
             "bf16 native-gemv",
         );
-        env.unset("INFR_METAL_NO_BF16_RT");
         bench_chained_m(
+            &rt,
             DType::Bf16,
             &w16,
             m,
@@ -222,17 +259,11 @@ fn bf16_rt_probe() {
             "bf16 rt",
         );
     }
-    env.unset("INFR_METAL_NO_BF16_CMM");
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn bf16_cmm_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 8192usize);
     let w16: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| {
@@ -241,9 +272,11 @@ fn bf16_cmm_probe() {
         })
         .collect();
 
+    let no_cmm = metal_off(|m| m.bf16_cmm = false);
+    let cmm = MetalCfg::default();
     for m in [6usize, 8, 12, 16, 32] {
-        env.set("INFR_METAL_NO_BF16_CMM", "1");
         bench_chained_m(
+            &no_cmm,
             DType::Bf16,
             &w16,
             m,
@@ -252,23 +285,14 @@ fn bf16_cmm_probe() {
             16.0 * m.div_ceil(8) as f64,
             "bf16 rt",
         );
-        env.unset("INFR_METAL_NO_BF16_CMM");
-        bench_chained_m(DType::Bf16, &w16, m, in_f, out_f, 16.0, "bf16 cmm");
+        bench_chained_m(&cmm, DType::Bf16, &w16, m, in_f, out_f, 16.0, "bf16 cmm");
     }
 }
 
+/// `force_cache` selects the dequant-to-f32 CACHE path (`kernels.metal.f32_native = false`, i.e.
+/// `INFR_METAL_NO_F32_NATIVE` set) instead of reading the bound f32 weight directly.
 fn bench_f32_cold(wbytes: &[u8], in_f: usize, out_f: usize, force_cache: bool, label: &str) {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
-    if force_cache {
-        env.set("INFR_METAL_NO_F32_NATIVE", "1");
-    } else {
-        env.unset("INFR_METAL_NO_F32_NATIVE");
-    }
-    let be = MetalBackend::new().unwrap();
+    let be = be_with(&metal_off(|m| m.f32_native = !force_cache));
     let xs = vec![0.01f32; in_f];
     let mut g = Graph::new();
     let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
@@ -305,35 +329,26 @@ fn bench_f32_cold(wbytes: &[u8], in_f: usize, out_f: usize, force_cache: bool, l
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f32_native_cold_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1024usize, 16384usize);
     let wf: Vec<f32> = (0..out_f * in_f).map(|i| (i % 13) as f32 * 0.01).collect();
     let wbytes = bytemuck::cast_slice(&wf);
     bench_f32_cold(wbytes, in_f, out_f, true, "f32 cached copy");
     bench_f32_cold(wbytes, in_f, out_f, false, "f32 direct");
-    env.unset("INFR_METAL_NO_F32_NATIVE");
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f32_rt_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 8192usize);
     let w32: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| ((i % 13) as f32 * 0.01).to_le_bytes())
         .collect();
 
+    let no_rt = metal_off(|m| m.f32_rt = false);
+    let rt = MetalCfg::default();
     for m in [2usize, 4, 8] {
-        env.set("INFR_METAL_NO_F32_RT", "1");
         bench_chained_m(
+            &no_rt,
             DType::F32,
             &w32,
             m,
@@ -342,32 +357,28 @@ fn f32_rt_probe() {
             32.0 * m as f64,
             "f32 native-gemv",
         );
-        env.unset("INFR_METAL_NO_F32_RT");
-        bench_chained_m(DType::F32, &w32, m, in_f, out_f, 32.0, "f32 rt");
+        bench_chained_m(&rt, DType::F32, &w32, m, in_f, out_f, 32.0, "f32 rt");
     }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f32_cmm_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 8192usize);
     let w32: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| ((i % 13) as f32 * 0.01).to_le_bytes())
         .collect();
 
+    let no_cmm = metal_off(|m| m.f32_cmm = false);
+    let cmm = MetalCfg::default();
     for m in [8usize, 12, 16, 32] {
-        env.set("INFR_METAL_NO_F32_CMM", "1");
         let (fallback_bpw, fallback_label) = if m < 16 {
             (32.0, "f32 rt")
         } else {
             (32.0 * m as f64, "f32 native-gemv")
         };
         bench_chained_m(
+            &no_cmm,
             DType::F32,
             &w32,
             m,
@@ -376,32 +387,28 @@ fn f32_cmm_probe() {
             fallback_bpw,
             fallback_label,
         );
-        env.unset("INFR_METAL_NO_F32_CMM");
-        bench_chained_m(DType::F32, &w32, m, in_f, out_f, 32.0, "f32 cmm");
+        bench_chained_m(&cmm, DType::F32, &w32, m, in_f, out_f, 32.0, "f32 cmm");
     }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f16_cmm_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 8192usize);
     let w16: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| half::f16::from_f32((i % 13) as f32 * 0.01).to_le_bytes())
         .collect();
 
+    let no_cmm = metal_off(|m| m.f16_cmm = false);
+    let cmm = MetalCfg::default();
     for m in [8usize, 12, 16, 32] {
-        env.set("INFR_METAL_NO_F16_CMM", "1");
         let (fallback_bpw, fallback_label) = if m < 16 {
             (16.0 * m.div_ceil(8) as f64, "f16 rt")
         } else {
             (16.0 * m as f64, "f16 native-gemv")
         };
         bench_chained_m(
+            &no_cmm,
             DType::F16,
             &w16,
             m,
@@ -410,27 +417,23 @@ fn f16_cmm_probe() {
             fallback_bpw,
             fallback_label,
         );
-        env.unset("INFR_METAL_NO_F16_CMM");
-        bench_chained_m(DType::F16, &w16, m, in_f, out_f, 16.0, "f16 cmm");
+        bench_chained_m(&cmm, DType::F16, &w16, m, in_f, out_f, 16.0, "f16 cmm");
     }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f16_rt_probe() {
-    // One EnvGuard for the whole probe: serializes against every other test in this binary
-    // that reads these knobs, and restores the caller's values on drop (see
-    // infr_core::test_env — a bare set_var/remove_var pair races and leaks).
-    #[allow(unused_mut)]
-    let mut env = infr_core::test_env::EnvGuard::new();
     let (in_f, out_f) = (1152usize, 8192usize);
     let w16: Vec<u8> = (0..out_f * in_f)
         .flat_map(|i| half::f16::from_f32((i % 13) as f32 * 0.01).to_le_bytes())
         .collect();
 
+    let no_rt = metal_off(|m| m.f16_rt = false);
+    let rt = MetalCfg::default();
     for m in [2usize, 4, 8] {
-        env.set("INFR_METAL_NO_F16_RT", "1");
         bench_chained_m(
+            &no_rt,
             DType::F16,
             &w16,
             m,
@@ -439,8 +442,7 @@ fn f16_rt_probe() {
             16.0 * m as f64,
             "f16 native-gemv",
         );
-        env.unset("INFR_METAL_NO_F16_RT");
-        bench_chained_m(DType::F16, &w16, m, in_f, out_f, 16.0, "f16 rt");
+        bench_chained_m(&rt, DType::F16, &w16, m, in_f, out_f, 16.0, "f16 rt");
     }
 }
 
@@ -487,7 +489,9 @@ fn synth_iq4nl(n_elem: usize, seed: u32) -> Vec<u8> {
 // Chained bench: K identical GEMVs over K DISTINCT weight copies in ONE graph (one command
 // buffer) — the per-cb commit+wait overhead amortizes away and the number reflects the
 // in-decode-chain cost. Distinct weights so the stream is not cache-resident.
+#[allow(clippy::too_many_arguments)]
 fn bench_chained_m(
+    metal: &MetalCfg,
     dtype: DType,
     wbytes: &[u8],
     m: usize,
@@ -496,7 +500,7 @@ fn bench_chained_m(
     bpw: f64,
     label: &str,
 ) {
-    let be = MetalBackend::new().unwrap();
+    let be = be_with(metal);
     let k = 8usize;
     let xs: Vec<f32> = (0..m * in_f).map(|i| (i % 7) as f32 * 0.01).collect();
 
@@ -551,31 +555,42 @@ fn bench_chained_m(
     );
 }
 
-fn bench_chained(dtype: DType, wbytes: &[u8], in_f: usize, out_f: usize, bpw: f64, label: &str) {
-    bench_chained_m(dtype, wbytes, 1, in_f, out_f, bpw, label);
+fn bench_chained(
+    metal: &MetalCfg,
+    dtype: DType,
+    wbytes: &[u8],
+    in_f: usize,
+    out_f: usize,
+    bpw: f64,
+    label: &str,
+) {
+    bench_chained_m(metal, dtype, wbytes, 1, in_f, out_f, bpw, label);
 }
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn gemv_bandwidth_gemma_shapes() {
-    // gemma3-1b decode shapes, chained (in-decode-chain cost, cb overhead amortized)
+    // gemma3-1b decode shapes, chained (in-decode-chain cost, cb overhead amortized). Shipping
+    // defaults throughout — this probe measures the DEFAULT tier, it does not A/B a kill-switch.
+    let d = MetalCfg::default();
     let wq5 = synth_q5_0(6912 * 1152, 11);
-    bench_chained(DType::Q5_0, &wq5, 1152, 6912, 5.5, "q5_0 gate/up");
+    bench_chained(&d, DType::Q5_0, &wq5, 1152, 6912, 5.5, "q5_0 gate/up");
     let wq6 = synth_q6k(6912 * 1152, 12);
-    bench_chained(DType::Q6K, &wq6, 1152, 6912, 6.5625, "q6k down");
+    bench_chained(&d, DType::Q6K, &wq6, 1152, 6912, 6.5625, "q6k down");
     let wq4 = synth_q4k(1024 * 1152, 13);
-    bench_chained(DType::Q4K, &wq4, 1024, 1152, 4.5, "q4k o");
+    bench_chained(&d, DType::Q4K, &wq4, 1024, 1152, 4.5, "q4k o");
     let wq5q = synth_q5_0(1152 * 1024, 14);
-    bench_chained(DType::Q5_0, &wq5q, 1152, 1024, 5.5, "q5_0 q");
+    bench_chained(&d, DType::Q5_0, &wq5q, 1152, 1024, 5.5, "q5_0 q");
     let wf: Vec<f32> = (0..(65536usize * 1152))
         .map(|i| (i % 13) as f32 * 0.01)
         .collect();
     let w8 = quantize_q8_0(&wf);
-    bench_chained(DType::Q8_0, &w8, 1152, 65536, 8.5, "q8_0 head/4");
+    bench_chained(&d, DType::Q8_0, &w8, 1152, 65536, 8.5, "q8_0 head/4");
     let wiq4 = synth_iq4nl(6912 * 1152, 15);
-    bench_chained(DType::Iq4Nl, &wiq4, 1152, 6912, 4.5, "iq4_nl gate/up");
+    bench_chained(&d, DType::Iq4Nl, &wiq4, 1152, 6912, 4.5, "iq4_nl gate/up");
     for m in 2..=8 {
         bench_chained_m(
+            &d,
             DType::Iq4Nl,
             &wiq4,
             m,
@@ -588,6 +603,7 @@ fn gemv_bandwidth_gemma_shapes() {
     let wiq4rt = synth_iq4nl(6911 * 1152, 18);
     for m in 2..=8 {
         bench_chained_m(
+            &d,
             DType::Iq4Nl,
             &wiq4rt,
             m,
@@ -598,7 +614,7 @@ fn gemv_bandwidth_gemma_shapes() {
         );
     }
     let wiq4d = synth_iq4nl(1152 * 6912, 17);
-    bench_chained(DType::Iq4Nl, &wiq4d, 6912, 1152, 4.5, "iq4_nl down");
+    bench_chained(&d, DType::Iq4Nl, &wiq4d, 6912, 1152, 4.5, "iq4_nl down");
     let wiq4h = synth_iq4nl(65536 * 1152, 16);
-    bench_chained(DType::Iq4Nl, &wiq4h, 1152, 65536, 4.5, "iq4_nl head");
+    bench_chained(&d, DType::Iq4Nl, &wiq4h, 1152, 65536, 4.5, "iq4_nl head");
 }

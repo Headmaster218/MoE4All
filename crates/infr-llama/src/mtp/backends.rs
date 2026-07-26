@@ -173,7 +173,8 @@ pub fn generate_mtp_spec_metal_timed(
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
-    let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+    let mtl = infr_metal::MetalBackend::new_with(model.cfg().clone())
+        .map_err(|e| anyhow!("metal init: {e}"))?;
     let bind: &BindWeightFn = &|_name, tb, dt, _n| {
         let buf = mtl
             .alloc(tb.len().max(1), BufferUsage::Weights)

@@ -3,6 +3,7 @@
 
 use crate::{metal_buf, MetalBackend};
 use infr_core::backend::{Bindings, Plan};
+use infr_core::config::MetalCfg;
 use infr_core::error::Error;
 use infr_core::exec::Provision;
 use infr_core::graph::{Op, TensorKind};
@@ -1074,7 +1075,11 @@ fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Optio
 /// Is this graph the decode shape the replay tape supports? Every op must be one the recorder
 /// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
 /// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
-fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
+///
+/// `m` is the backend's [`MetalCfg`] (S6): the Conv1dSilu/DeltaNet gates mirror their arms'
+/// `cfg.deltanet` (`INFR_METAL_NODELTA`) and the MoeFfn gate mirrors `cfg.moe`
+/// (`INFR_METAL_NOMOE`) — see §6.12, where each key is read BOTH ways with one meaning.
+fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) -> bool {
     use infr_core::graph::TensorKind;
     let mut has_rope = false;
     let mut has_attn = false;
@@ -1114,7 +1119,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::CopyStrided { .. } => {}
             Op::Conv1dSilu { state, kernel, .. } => {
                 if *kernel > 8
-                    || std::env::var("INFR_METAL_NODELTA").is_ok()
+                    || !m.deltanet
                     || bindings.get(*state).is_none()
                 {
                     return false;
@@ -1129,7 +1134,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                 if *head_k > 256
                     || !head_k.is_multiple_of(32)
                     || !(head_v.is_multiple_of(4) && *head_v <= 1024)
-                    || std::env::var("INFR_METAL_NODELTA").is_ok()
+                    || !m.deltanet
                     || bindings.get(*state).is_none()
                 {
                     return false;
@@ -1153,7 +1158,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                     || *n_used > 16
                     || *ne % 256 != 0
                     || *n_ff_exp % 256 != 0
-                    || std::env::var("INFR_METAL_NOMOE").is_ok()
+                    || !m.moe
                 {
                     return false;
                 }
@@ -1637,7 +1642,7 @@ impl MetalBackend {
                         }
                     };
                     let ts = Self::resolve_counters(csb, r.csb_idx);
-                    if std::env::var("INFR_METAL_PROF_DEBUG").is_ok() {
+                    if self.cfg.prof.metal_prof_debug {
                         eprintln!(
                             "ns_per_tick={ns_per_tick:.4} first samples: {:?}",
                             &ts[..8.min(ts.len())]
@@ -1695,7 +1700,7 @@ impl MetalBackend {
     }
 
     fn replay_capable(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
-        if self.active_counter_set().is_some() || !replay_shape(g, bindings) {
+        if self.active_counter_set().is_some() || !replay_shape(g, bindings, self.metal()) {
             return false;
         }
         let Some((kern, need)) = g.ops.iter().find_map(|op| match op {
@@ -2125,7 +2130,7 @@ impl MetalBackend {
         // extraction; Q2_K is affine (per-16 4-bit scale+min) and Q3_K is signed (per-16 6-bit
         // aux-shuffled scale + hmask high bit) — all decode the raw GGUF block so the narrower
         // stream (2.5 / 3.44 bpw) is what the decode GEMV is bound on, no host repack.
-        let kq_native = std::env::var("INFR_METAL_NO_KQUANT_NATIVE").is_err();
+        let kq_native = self.metal().kquant_native;
         let native_kern = match g.desc(id).dtype {
             DType::Q4K => Some("linear_q4k"),
             DType::Q5K if kq_native => Some("linear_q5k"),
@@ -2308,11 +2313,10 @@ impl MetalBackend {
                 // and the launch shared two lookups before). `.ok().filter(cap)` reproduces the
                 // old `get(..).map(cap>=256).unwrap_or(false)` — a get error or a sub-cap pipeline
                 // both degrade to the next tier, never propagate.
-                let vec4_pso = (std::env::var("INFR_METAL_NO_RMSNORM_VEC4").is_err()
-                    && prefer_rmsnorm_vec4(rows, dim))
-                .then(|| self.pipelines.get("rmsnorm_vec4_f32").ok())
-                .flatten()
-                .filter(|pl| pl.max_total_threads_per_threadgroup() >= 256);
+                let vec4_pso = (self.metal().rmsnorm_vec4 && prefer_rmsnorm_vec4(rows, dim))
+                    .then(|| self.pipelines.get("rmsnorm_vec4_f32").ok())
+                    .flatten()
+                    .filter(|pl| pl.max_total_threads_per_threadgroup() >= 256);
                 let wide_pso = (rows <= 4)
                     .then(|| self.pipelines.get("rmsnorm_wide_f32").ok())
                     .flatten()
@@ -2632,7 +2636,7 @@ impl MetalBackend {
                     // Fetch each candidate PSO ONCE (the cap read and the later dispatch share it),
                     // preserving the original `?` propagation: `get` only runs — and can only
                     // error — when the shape pre-conditions hold, exactly as before.
-                    let q5k_rt = std::env::var("INFR_METAL_NO_Q5K_RT").is_err();
+                    let q5k_rt = self.metal().q5k_rt;
                     let cmm_pso = if m >= 2
                         && !prefer_iq4nl_rt(qw.kern, m)
                         && !prefer_q5k_rt(qw.kern, m, q5k_rt)
@@ -2676,10 +2680,10 @@ impl MetalBackend {
                     // shared `infr_core::tier` band ([`MRV_BAND`]); the per-dtype kernel choice
                     // above stays Metal's own.
                     let band = infr_core::tier::MultiRowBand {
-                        out_f_max: if std::env::var("INFR_METAL_LMHEAD_MRV").is_err() {
-                            MRV_BAND.out_f_max
-                        } else {
+                        out_f_max: if self.metal().lmhead_mrv_uncapped {
                             usize::MAX
+                        } else {
+                            MRV_BAND.out_f_max
                         },
                         ..MRV_BAND
                     };
@@ -2964,38 +2968,25 @@ impl MetalBackend {
                     // dev_dst deferred here (see the quant branch): every native-float sub-path
                     // below writes it, none returns before it.
                     let bd = self.dev_dst(r, dst, m * out_f);
-                    let f16_native =
-                        wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
-                    let f32_native =
-                        wdt == DType::F32 && std::env::var("INFR_METAL_NO_F32_NATIVE").is_err();
-                    let bf16_native =
-                        wdt == DType::Bf16 && std::env::var("INFR_METAL_NO_BF16_NATIVE").is_err();
+                    let mcfg = self.metal();
+                    let f16_native = wdt == DType::F16 && mcfg.f16_native;
+                    let f32_native = wdt == DType::F32 && mcfg.f32_native;
+                    let bf16_native = wdt == DType::Bf16 && mcfg.bf16_native;
                     // Fetch each candidate cmm PSO ONCE; the cap read and the dispatch share it
                     // (the three are mutually exclusive by `wdt`). `?` still only fires when the
                     // shape pre-conditions hold, exactly as the old `&& get(..)?` chain did.
-                    let f16_cmm_pso = if f16_native
-                        && m >= 8
-                        && out_f % 64 == 0
-                        && std::env::var("INFR_METAL_NO_F16_CMM").is_err()
-                    {
+                    let f16_cmm_pso = if f16_native && m >= 8 && out_f % 64 == 0 && mcfg.f16_cmm {
                         Some(self.pipelines.get("linear_f16_cmm")?)
                     } else {
                         None
                     };
-                    let bf16_cmm_pso = if bf16_native
-                        && m >= 6
-                        && out_f % 64 == 0
-                        && std::env::var("INFR_METAL_NO_BF16_CMM").is_err()
+                    let bf16_cmm_pso = if bf16_native && m >= 6 && out_f % 64 == 0 && mcfg.bf16_cmm
                     {
                         Some(self.pipelines.get("linear_bf16_cmm")?)
                     } else {
                         None
                     };
-                    let f32_cmm_pso = if f32_native
-                        && m >= 8
-                        && out_f % 64 == 0
-                        && std::env::var("INFR_METAL_NO_F32_CMM").is_err()
-                    {
+                    let f32_cmm_pso = if f32_native && m >= 8 && out_f % 64 == 0 && mcfg.f32_cmm {
                         Some(self.pipelines.get("linear_f32_cmm")?)
                     } else {
                         None
@@ -3015,14 +3006,9 @@ impl MetalBackend {
                         } else {
                             None
                         };
-                    let f16_rt = f16_native
-                        && (2..16).contains(&m)
-                        && std::env::var("INFR_METAL_NO_F16_RT").is_err();
-                    let bf16_rt =
-                        bf16_native && m >= 2 && std::env::var("INFR_METAL_NO_BF16_RT").is_err();
-                    let f32_rt = f32_native
-                        && (2..16).contains(&m)
-                        && std::env::var("INFR_METAL_NO_F32_RT").is_err();
+                    let f16_rt = f16_native && (2..16).contains(&m) && mcfg.f16_rt;
+                    let bf16_rt = bf16_native && m >= 2 && mcfg.bf16_rt;
+                    let f32_rt = f32_native && (2..16).contains(&m) && mcfg.f32_rt;
                     let native_rt = if f16_rt {
                         Some("linear_f16_rt")
                     } else if bf16_rt {
@@ -4312,7 +4298,7 @@ impl MetalBackend {
                     && nffx % 256 == 0
                     && !fused_gate_up
                     && down_scale.is_none()
-                    && std::env::var("INFR_METAL_NOMOE").is_err()
+                    && self.metal().moe
                     && moe_kern(gdt2).is_some()
                     && moe_kern(udt2).is_some()
                     && moe_kern(ddt2).is_some();
@@ -4696,7 +4682,7 @@ impl MetalBackend {
                 // thread deps, rows loop in-kernel, state updated in the BOUND buffer (the
                 // write-back self-copy guard keeps it authoritative). kk > 8 exceeds the
                 // kernel's register window; no real conv ships that (qwen3-next uses 4).
-                if kk <= 8 && std::env::var("INFR_METAL_NODELTA").is_err() {
+                if kk <= 8 && self.metal().deltanet {
                     if let Some(sb) = bindings.get(state) {
                         let bx = self.ensure_device(r, x);
                         let bw = self.weight_buf(weight, g, bindings)?;
@@ -4708,8 +4694,7 @@ impl MetalBackend {
                         let mut p = (rr as u32).to_ne_bytes().to_vec();
                         p.extend_from_slice(&(cc as u32).to_ne_bytes());
                         p.extend_from_slice(&(kk as u32).to_ne_bytes());
-                        let parallel = prefer_conv1d_parallel(rr, kk)
-                            && std::env::var("INFR_METAL_NO_CONV1D_PAR").is_err();
+                        let parallel = prefer_conv1d_parallel(rr, kk) && self.metal().conv1d_par;
                         if parallel {
                             let pso = self.pipelines.get("conv1d_silu_par_f32")?;
                             self.encode_w(
@@ -4817,16 +4802,14 @@ impl MetalBackend {
                     && kd.is_multiple_of(32)
                     && vd.is_multiple_of(4)
                     && vd <= 1024
-                    && std::env::var("INFR_METAL_NODELTA").is_err()
+                    && self.metal().deltanet
                 {
                     if let Some(sb) = bindings.get(state) {
                         // KPL = kd/32 is a compile-time template parameter (register
                         // promotion needs the fixed bound) — pick the instantiation.
-                        let gate_prep = prefer_deltanet_gate_prep(rr)
-                            && std::env::var("INFR_METAL_NO_DN_GATE_PREP").is_err();
-                        let norm_prep = gate_prep
-                            && prefer_deltanet_norm_prep(rr)
-                            && std::env::var("INFR_METAL_NO_DN_NORM_PREP").is_err();
+                        let gate_prep = prefer_deltanet_gate_prep(rr) && self.metal().dn_gate_prep;
+                        let norm_prep =
+                            gate_prep && prefer_deltanet_norm_prep(rr) && self.metal().dn_norm_prep;
                         let dn_kern: &'static str = match (gate_prep, norm_prep, kd / 32) {
                             (false, _, 1) => "deltanet_f32_k1",
                             (false, _, 2) => "deltanet_f32_k2",

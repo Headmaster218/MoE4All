@@ -194,7 +194,14 @@ unsafe impl Send for RocmMoePager {}
 unsafe impl Sync for RocmMoePager {}
 
 impl RocmMoePager {
-    pub fn new(layout: MoePagerLayout, stream: ffi::hipStream_t) -> Result<Self> {
+    /// `paging` is the backend's [`PagingCfg`](infr_core::config::PagingCfg) (S6): `paging.stats`
+    /// (`INFR_PAGER_STATS`) arms the hit/miss dump, `paging.rocm_no_overlap`
+    /// (`INFR_ROCM_PAGER_NOOVERLAP`) forces the in-line copy path.
+    pub fn new(
+        layout: MoePagerLayout,
+        stream: ffi::hipStream_t,
+        paging: &infr_core::config::PagingCfg,
+    ) -> Result<Self> {
         let mut pools = Vec::with_capacity(layout.pools.len());
         let mut max_slot = 0usize;
         for spec in &layout.pools {
@@ -216,13 +223,13 @@ impl RocmMoePager {
         }
         // Best-effort overlap engine; a failure to pin host memory or make a copy stream degrades
         // to the in-line copy path, never an error (paging still works, just serial).
-        let copy = CopyEngine::try_new(max_slot);
+        let copy = CopyEngine::try_new(max_slot, paging.rocm_no_overlap);
         Ok(Self {
             pools,
             sources: HashMap::new(),
             stream,
             copy,
-            print_stats: std::env::var_os("INFR_PAGER_STATS").is_some(),
+            print_stats: paging.stats,
         })
     }
 
@@ -371,9 +378,11 @@ impl CopyEngine {
     /// `region_bytes` (>= the largest slot), and one event per region. Returns `None` (in-line
     /// fallback) if any HIP call fails — paging must not hard-error just because host memory can't
     /// be pinned.
-    fn try_new(max_slot_bytes: usize) -> Option<Self> {
+    ///
+    /// `no_overlap` is `paging.rocm_no_overlap` (`INFR_ROCM_PAGER_NOOVERLAP`, S6).
+    fn try_new(max_slot_bytes: usize, no_overlap: bool) -> Option<Self> {
         // A/B lever: force the Slice-33 in-line compute-stream copy (no overlap) for measurement.
-        if std::env::var_os("INFR_ROCM_PAGER_NOOVERLAP").is_some() {
+        if no_overlap {
             return None;
         }
         let region_bytes = max_slot_bytes.max(4);

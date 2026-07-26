@@ -947,8 +947,8 @@ impl SeamModel {
     /// (top token + whole-vocab cosine) exactly like the Vulkan BitNet gate.
     #[cfg(all(target_os = "linux", feature = "rocm"))]
     pub fn prefill_logits_rocm(&self, tokens: &[u32], dev_idx: u32) -> Result<Vec<f32>> {
-        let rocm =
-            infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
+        let rocm = infr_rocm::RocmBackend::new_with(dev_idx as i32, self.ecfg.clone())
+            .map_err(|e| anyhow!("rocm init: {e}"))?;
         crate::seam::verify_dense_rocm(
             &rocm,
             &self.gguf,
@@ -1001,7 +1001,8 @@ impl SeamModel {
         &self,
         max_ctx: usize,
     ) -> Result<DiffusionGemmaMetalSession> {
-        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DiffusionGemmaMetalSession {
             be: mtl,
             state: None,
@@ -1342,8 +1343,8 @@ impl SeamModel {
         reps: usize,
         dev_idx: u32,
     ) -> Result<Vec<f64>> {
-        let rocm =
-            infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
+        let rocm = infr_rocm::RocmBackend::new_with(dev_idx as i32, self.ecfg.clone())
+            .map_err(|e| anyhow!("rocm init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
         // +16: identical rationale to `bench_vulkan` — the untimed 8+2 warmup turn shares the
         // session, so size the KV for it even when the measured shape is tiny.
@@ -1430,7 +1431,8 @@ impl SeamModel {
     /// later calls prefill only the un-cached suffix.
     #[cfg(target_os = "macos")]
     pub fn metal_session(&self, max_ctx: usize) -> Result<DenseMetalSession> {
-        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DenseMetalSession {
             be: mtl,
             pool: SlotPool::new(),
@@ -1444,8 +1446,8 @@ impl SeamModel {
     /// later calls prefill only the un-cached suffix.
     #[cfg(all(target_os = "linux", feature = "rocm"))]
     pub fn rocm_session(&self, max_ctx: usize, dev_idx: u32) -> Result<DenseRocmSession> {
-        let rocm =
-            infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
+        let rocm = infr_rocm::RocmBackend::new_with(dev_idx as i32, self.ecfg.clone())
+            .map_err(|e| anyhow!("rocm init: {e}"))?;
         Ok(DenseRocmSession {
             be: rocm,
             pool: SlotPool::new(),
@@ -1588,7 +1590,8 @@ impl SeamModel {
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
-        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("metal init: {e}"))?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let (_generated, stats) = crate::seam::generate_dense_metal(
