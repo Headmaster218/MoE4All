@@ -4778,7 +4778,7 @@ pub(crate) fn vec_dot_q3k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
 /// Dispatches to the best SIMD path available at runtime (avx512bw → avx2 → scalar) — this is
 /// DiffusionGemma's `down` projection kernel (`n_ff_exp=704` isn't a multiple of 256, so it can't use
 /// the K-quant/Q8_0-256 batch path above), previously the single largest scalar hot loop in the MoE
-/// arm (measured via `INFR_PROF_OPS=1`'s per-stage MoeFfn breakdown).
+/// arm (measured via `prof.prof_ops`'s per-stage MoeFfn breakdown).
 /// AVX512-VNNI variant of [`vec_dot_q8_0_32_batch_avx512bw`]: dpbusd fuses the maddubs+madd pair
 /// (sign trick unchanged: `dpbusd(|qw|, sign(q8,qw))`; |qw| ≤128 × |q8| ≤127 never saturated the
 /// i16 chain either, so this is bit-identical — same per-4-byte i32 group sums, same hadd and the

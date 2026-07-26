@@ -275,9 +275,9 @@ knobs! {
     "INFR_ROCM_NO_FUSE_NORM" => "kernels.rocm.fuse_norm", PresenceInv, Ignored, "1",     migrated;
 
     // ── kernels.cpu (§6.7) ───────────────────────────────────────────────────
-    "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", pending;
-    "INFR_CPU_NO_SPINPOOL" => "kernels.cpu.spinpool",  SetNotZeroInv, Ignored, "1",    pending;
-    "INFR_CPU_REPACK_MB"   => "kernels.cpu.repack_mb", Int,           Ignored, "1024", pending;
+    "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", migrated;
+    "INFR_CPU_NO_SPINPOOL" => "kernels.cpu.spinpool",  SetNotZeroInv, Ignored, "1",    migrated;
+    "INFR_CPU_REPACK_MB"   => "kernels.cpu.repack_mb", Int,           Ignored, "1024", migrated;
 
     // ── kernels — graph shape, `infr-llama` (§6.9) ───────────────────────────
     "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", pending;
@@ -311,7 +311,7 @@ knobs! {
     "INFR_PROF2"            => "prof.prof2",            Presence, Ignored, "1",            pending;
     "INFR_PROF2_SHAPES"     => "prof.prof2_shapes",     Presence, Ignored, "1",            pending;
     "INFR_PROF_DEC"         => "prof.prof_dec",         Presence, Ignored, "1",            pending;
-    "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            pending;
+    "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            pending;
     "INFR_PROFILE_OUT"      => "prof.profile_out",      Path,     Ignored, "/tmp/p.json",  pending;
     "INFR_VRAM_LOG"         => "prof.vram_log",         Presence, Ignored, "1",            pending;
@@ -326,8 +326,8 @@ knobs! {
     "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", pending;
     "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", pending;
     "INFR_DEBUG_CHAT"          => "debug.chat",            Presence, Ignored, "1", pending;
-    "INFR_MOE_COUNTS_DEBUG"    => "debug.moe_counts",      Presence, Ignored, "1", pending;
-    "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", pending;
+    "INFR_MOE_COUNTS_DEBUG"    => "debug.moe_counts",      Presence, Ignored, "1", migrated;
+    "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", migrated;
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", pending;
     "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", pending;
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", pending;

@@ -19,6 +19,7 @@ mod quant;
 mod repack;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
+use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
 use infr_core::graph::{AttnMask, Graph, MoeGating, Op};
@@ -170,7 +171,6 @@ impl Buffer for CpuBuffer {
     }
 }
 
-#[derive(Default)]
 pub struct CpuBackend {
     /// Dequantized-weight cache keyed by the bound buffer's `(address, byte-len, dtype)` (weights
     /// are bound the same every step, so dequant once and reuse). Only the small norm weights
@@ -184,11 +184,11 @@ pub struct CpuBackend {
     /// keyed by the expert weight slice's (address, length) — stable for the mmap'd/upload-once
     /// weight buffers this backend binds (same lifetime argument as `weight_cache`). ggml pays
     /// its `block_q4_Kx8` repack once at LOAD; this pays it once per (expert, session) instead
-    /// of once per CALL. Byte-budgeted (`INFR_CPU_REPACK_MB`, default 4096): over budget, packs
-    /// are built transient and not inserted. The `usize` is the current cached-bytes total.
+    /// of once per CALL. Byte-budgeted (`kernels.cpu.repack_mb`, default 4096 MiB): over budget,
+    /// packs are built transient and not inserted. The `usize` is the current cached-bytes total.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
-    /// Q6_K sibling of `repack_cache` (same keying and budget env; separate accounting) — holds
+    /// Q6_K sibling of `repack_cache` (same keying and budget knob; separate accounting) — holds
     /// e.g. the tied Q6_K lm_head's ~740 MB pack, built once per session.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack6_cache: Mutex<Repack6CacheState>,
@@ -196,16 +196,49 @@ pub struct CpuBackend {
     /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
     /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
     pool: std::sync::OnceLock<pool::SpinPool>,
-    /// REFERENCE mode (see [`CpuBackend::reference`]): decode every quantized weight to f32 and
-    /// take an f32 dot, instead of the production int8-quantized-activation kernels. Off by
-    /// default — production CPU inference keeps the fast (and llama.cpp-equivalent) int8 path.
-    reference: bool,
+    /// The engine configuration this backend reads its knobs from — one value, held for the
+    /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
+    /// R4/R6). The knobs it reads are `kernels.cpu.{spin,spinpool,repack_mb,reference}`,
+    /// `prof.prof_ops` and `debug.moe_counts{,_dump}`.
+    ///
+    /// **TRANSITIONAL (S3), replaced by S4:** [`CpuBackend::new`] builds this from the environment
+    /// via [`infr_core::config::Config::load_from_env`] instead of being HANDED one, because the
+    /// seam (`infr-llama`) constructs CPU backends and does not itself get an `Arc<Config>` until
+    /// its own slice. S4 threads the caller's config into those construction sites — they become
+    /// [`CpuBackend::new_with`] and the `load_from_env()` call in `new` is what that slice deletes.
+    /// Until then this is ONE env-sourced construction per backend in place of the scattered
+    /// per-read `std::env::var` calls it replaced.
+    cfg: Arc<Config>,
+}
+
+/// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
+/// value is what makes this slice behaviour-preserving: before S3 `CpuBackend` derived `Default`
+/// and `new()` was `default()`, and every knob was read from the environment further down.
+impl Default for CpuBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBackend {
+    /// A backend on the shipped configuration, with the environment folded in (see the `cfg`
+    /// field's TRANSITIONAL note — S4 replaces the callers of this with [`Self::new_with`]).
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with(Arc::new(Config::load_from_env()))
+    }
+
+    /// A backend that reads its knobs from `cfg`. This is the constructor the campaign is heading
+    /// for: no environment, no globals, no process-wide ordering hazard — two backends with
+    /// different configurations can coexist in one test.
+    pub fn new_with(cfg: Arc<Config>) -> Self {
+        Self {
+            weight_cache: Mutex::default(),
+            repack_cache: Mutex::default(),
+            repack6_cache: Mutex::default(),
+            pool: std::sync::OnceLock::new(),
+            cfg,
+        }
     }
 
     /// A backend in REFERENCE mode: every quantized `Op::Linear` (dense and MoE-expert) decodes
@@ -220,15 +253,28 @@ impl CpuBackend {
     ///
     /// Reference mode is for oracles and triage only — it is far slower and it is NOT what the
     /// CPU goldens pin (`cpu_golden_qwen3` = the production int8 path).
+    ///
+    /// Since S3 the mode is the `kernels.cpu.reference` config field and this is the shorthand for
+    /// setting it — `new()`'s configuration with that one field flipped, so an oracle run still
+    /// honours the same `kernels.cpu.*` knobs the production backend does. It has no env key and
+    /// never had one: the caller chooses the mode, which is the shape the rest of the campaign
+    /// converges on.
     pub fn reference() -> Self {
-        Self {
-            reference: true,
-            ..Self::default()
-        }
+        let mut cfg = Config::load_from_env();
+        cfg.kernels.cpu.reference = true;
+        Self::new_with(Arc::new(cfg))
     }
 
     fn pool(&self) -> &pool::SpinPool {
-        self.pool.get_or_init(pool::SpinPool::new)
+        self.pool
+            .get_or_init(|| pool::SpinPool::new(&self.cfg.kernels.cpu))
+    }
+
+    /// The repack caches' byte budget (`kernels.cpu.repack_mb`, MiB → bytes). One spelling for both
+    /// [`Self::q4k_pack_for`] and [`Self::q6k_pack_for`], which had the same parse twice.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn repack_budget_bytes(&self) -> usize {
+        self.cfg.kernels.cpu.repack_mb * 1024 * 1024
     }
 
     /// Fetch-or-build the [`Q4kPack`] for one weight bank slice (see `repack_cache`'s doc).
@@ -241,14 +287,10 @@ impl CpuBackend {
             return p.clone();
         }
         let pack = Arc::new(unsafe { q4k_pack(w, in_f, out_f) });
-        let budget_mb: usize = std::env::var("INFR_CPU_REPACK_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
         let bytes = pack.bytes();
         // Re-check under the lock: another thread may have inserted `key` between our miss and here.
         let mut guard = self.repack_cache.lock().unwrap();
-        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, budget_mb * 1024 * 1024)
+        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, self.repack_budget_bytes())
     }
 
     /// Fetch-or-build the [`Q6kPack`] for one weight bank slice — `q4k_pack_for`'s Q6_K sibling.
@@ -259,14 +301,10 @@ impl CpuBackend {
             return p.clone();
         }
         let pack = Arc::new(q6k_pack(w, in_f, out_f));
-        let budget_mb: usize = std::env::var("INFR_CPU_REPACK_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
         let bytes = pack.bytes();
         // Re-check under the lock: another thread may have inserted `key` between our miss and here.
         let mut guard = self.repack6_cache.lock().unwrap();
-        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, budget_mb * 1024 * 1024)
+        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, self.repack_budget_bytes())
     }
 
     /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
@@ -530,7 +568,13 @@ impl Backend for CpuBackend {
             self.cached_weight(key, &bytes)
         };
 
-        let prof_ops = std::env::var("INFR_PROF_OPS").is_ok();
+        // The knobs this interpreter loop consults, read ONCE off the backend's config: the loop
+        // below runs them per op (`reference`) or per MoeFfn op (`moe_counts`), so a resolve per
+        // iteration would be a cost the env reads never had either (`docs/config-plan.md` R6).
+        let prof_ops = self.cfg.prof.prof_ops;
+        let reference = self.cfg.kernels.cpu.reference;
+        let moe_counts = self.cfg.debug.moe_counts;
+        let moe_counts_dump = self.cfg.debug.moe_counts_dump;
         let mut op_times: HashMap<&'static str, f64> = HashMap::new();
         for op in &g.ops {
             let __t0 = if prof_ops {
@@ -713,7 +757,7 @@ impl Backend for CpuBackend {
                     // the int8-activation kernels below carry ~4e-3 relative error, which flips
                     // greedy tokens at Q2_K. The float dtypes already take an exact dot, so they
                     // stay on their (identical, faster) production arms.
-                    if self.reference && !matches!(dt, DType::F32 | DType::F16 | DType::Bf16) {
+                    if reference && !matches!(dt, DType::F32 | DType::F16 | DType::Bf16) {
                         let mut out_t = vec![0f32; out_f * m];
                         self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
@@ -1945,7 +1989,7 @@ impl Backend for CpuBackend {
                     // (`CpuBackend::reference`) forces every bank onto `ActsKind::Raw`, i.e. the
                     // f32-activation path decode (rows == 1) already takes, so an oracle run has
                     // no int8-activation error anywhere.
-                    let int8_ok = rows >= 2 && !self.reference;
+                    let int8_ok = rows >= 2 && !reference;
                     let pool = self.pool();
                     // Router GEMM on the pool: serial it was 12-20ms/layer at 512 rows (134M MAC)
                     // — long enough that spinning pool workers SMT-throttled it, which is where
@@ -2068,17 +2112,17 @@ impl Backend for CpuBackend {
                         }
                     }
                     let n_pairs = pair_row.len();
-                    // `INFR_MOE_COUNTS_DEBUG=1`: print the REAL per-expert row-count distribution
+                    // `debug.moe_counts`: print the REAL per-expert row-count distribution
                     // for this chunk/layer (this CPU interpreter's top-k routing is bit-identical
                     // to the GPU's, so this is a host-side stand-in for reading the GPU's own
                     // counts/offsets buffers without a mid-graph readback). Used to check whether
                     // `matmul_mmq_experts`' BM=32/64 row-tile heuristic (recorder.rs,
                     // MOE_EXPERT_SMALL_TILE_AVG_ROWS) — picked against a MEAN-BALANCED synthetic
                     // distribution — still holds up against real (possibly skewed) routing.
-                    // `INFR_MOE_COUNTS_DUMP=1` additionally dumps the raw per-expert counts array
-                    // (for feeding into an isolated GPU tile-choice bench, e.g.
-                    // `moe_expert_row_tile_bench_real_skew` in infr-vulkan's gemm_bench.rs).
-                    if std::env::var("INFR_MOE_COUNTS_DEBUG").is_ok() {
+                    // `debug.moe_counts_dump` additionally dumps the raw
+                    // per-expert counts array (for feeding into an isolated GPU tile-choice bench,
+                    // e.g. `moe_expert_row_tile_bench_real_skew` in infr-vulkan's gemm_bench.rs).
+                    if moe_counts {
                         let mut counts = vec![0usize; n_expert];
                         for &(e, _, c) in buckets.iter() {
                             counts[e] = c;
@@ -2136,7 +2180,7 @@ impl Backend for CpuBackend {
                             real_tiles(32),
                             real_tiles(64),
                         );
-                        if std::env::var("INFR_MOE_COUNTS_DUMP").is_ok() {
+                        if moe_counts_dump {
                             eprintln!("MOE_COUNTS_RAW {counts:?}");
                         }
                     }
@@ -3105,5 +3149,41 @@ mod tests {
             &[7.0, 8.0, 9.0],
             "different len must miss and dequant fresh"
         );
+    }
+
+    /// `kernels.cpu.repack_mb` is the Q4_K/Q6_K repack caches' byte budget, in MiB, and BOTH
+    /// caches take it off the same field of the backend's own `Config` — no environment, so two
+    /// backends in one process can carry different budgets. The shipped default is still 4096 MiB;
+    /// what the number then DOES (insert vs. build-transient) is `repack::cache_insert_if_absent`'s
+    /// own test.
+    #[test]
+    fn repack_budget_comes_off_the_config() {
+        assert_eq!(Config::default().kernels.cpu.repack_mb, 4096);
+        let dflt = CpuBackend::new_with(Arc::new(Config::default()));
+        assert_eq!(dflt.repack_budget_bytes(), 4096 * 1024 * 1024);
+
+        let mut cfg = Config::default();
+        cfg.kernels.cpu.repack_mb = 3;
+        let small = CpuBackend::new_with(Arc::new(cfg));
+        assert_eq!(small.repack_budget_bytes(), 3 * 1024 * 1024);
+        // Independent values, live at the same time — the thing a process-wide env read could not do.
+        assert_eq!(dflt.repack_budget_bytes(), 4096 * 1024 * 1024);
+    }
+
+    /// `kernels.cpu.reference` is a plain field on the config the backend was handed, and
+    /// [`CpuBackend::reference`] is the shorthand that sets it. (The numeric consequence — an f32
+    /// decode dot instead of the int8-activation kernels — is
+    /// `decode_parity::cpu_reference_mode_is_exact_for_every_weight_quant`.)
+    #[test]
+    fn reference_mode_is_a_config_field() {
+        assert!(!Config::default().kernels.cpu.reference);
+        assert!(
+            !CpuBackend::new_with(Arc::new(Config::default()))
+                .cfg
+                .kernels
+                .cpu
+                .reference
+        );
+        assert!(CpuBackend::reference().cfg.kernels.cpu.reference);
     }
 }

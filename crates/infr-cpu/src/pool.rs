@@ -11,8 +11,10 @@
 //! Scheduling only — every converted call site runs the exact same per-row math in the same
 //! order as its rayon predecessor, so outputs are bit-identical.
 //!
-//! `INFR_CPU_NO_SPINPOOL=1` routes `run` through rayon instead (A/B + escape hatch).
+//! Clearing `kernels.cpu.spinpool` routes `run` through rayon instead
+//! (A/B + escape hatch).
 
+use infr_core::config::CpuCfg;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,8 +38,8 @@ struct Shared {
     /// A task panicked (caught per-task so `done` still advances; `run` re-panics).
     panicked: AtomicBool,
     shutdown: AtomicBool,
-    /// Ceiling for the adaptive spin budget (constant `spin_limit()` since phase 3 removed the
-    /// last rayon section from the interpreter; kept a field for future per-graph tuning).
+    /// Ceiling for the adaptive spin budget (constant `SpinPool::spin_limit` since phase 3 removed
+    /// the last rayon section from the interpreter; kept a field for future per-graph tuning).
     budget_cap: AtomicU32,
     /// Per-worker "I am parked" flags — see the park handshake in `worker_loop`.
     sleeping: Vec<AtomicBool>,
@@ -53,32 +55,26 @@ pub(crate) struct SpinPool {
     handles: Vec<std::thread::JoinHandle<()>>,
     /// Worker thread count (callers participate too, so parallelism = workers + 1).
     workers: usize,
-    /// `INFR_CPU_NO_SPINPOOL=1`: run jobs through rayon instead.
+    /// `!kernels.cpu.spinpool`: run jobs through rayon instead.
     rayon_fallback: bool,
+    /// CEILING for the adaptive per-worker spin budget, and the caller-side wait loop's
+    /// yield threshold — `kernels.cpu.spin`, read ONCE at construction.
+    ///
+    /// Two measured failure modes bound the budget: too LONG and the spinning workers' SMT
+    /// siblings throttle the op loop's SERIAL bookkeeping between pool ops (per-op profile:
+    /// RmsNorm/Add more than DOUBLED; DG exec 2.87 → 3.18s at a fixed 32k) — rayon's MoeFfn itself
+    /// was unharmed once a pause mechanism parked waiters for it (both since removed with the rayon
+    /// sections themselves — phase 3 staged MoeFfn onto this pool). Too SHORT and dense prefill pays
+    /// a worker wake per op (qwen3 pp512 404 → 356 t/s at a fixed 1k). The adaptive budget collapses
+    /// after a park and regrows on jobs arriving mid-spin, so the ceiling can be generous.
+    ///
+    /// A FIELD, not a `OnceLock` memo (`docs/config-plan.md` §10.6): the value comes off the
+    /// backend's `Config`, so a per-call read would be a `getenv`-shaped cost on the wait loop and
+    /// a memo would pin the first pool's value process-wide.
+    spin_limit: u32,
     /// Serializes `run` — the pool holds ONE job; concurrent dispatch is a caller bug
     /// (converted call sites are all reached from the single-threaded `execute` op loop).
     in_run: AtomicBool,
-}
-
-/// CEILING for the adaptive per-worker spin budget (see `worker_loop`'s adaptive-budget doc).
-/// Two measured failure modes bound the budget: too LONG and the spinning workers' SMT siblings
-/// throttle the op loop's SERIAL bookkeeping between pool ops (per-op profile: RmsNorm/Add more
-/// than DOUBLED; DG exec 2.87 → 3.18s at a fixed 32k) — rayon's MoeFfn itself was unharmed once
-/// a pause mechanism parked waiters for it (both since removed with the rayon sections
-/// themselves — phase 3 staged MoeFfn onto this pool). Too SHORT and dense prefill pays a worker wake per
-/// op (qwen3 pp512 404 → 356 t/s at a fixed 1k). The adaptive budget collapses after a park and
-/// regrows on jobs arriving mid-spin, so the ceiling can be generous. `INFR_CPU_SPIN` overrides.
-static SPIN_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-
-// per-call leaf, too small to probe (see docs/perf.md)
-#[cfg_attr(infr_profile, infr_prof::skip)]
-fn spin_limit() -> u32 {
-    *SPIN_LIMIT.get_or_init(|| {
-        std::env::var("INFR_CPU_SPIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1 << 15)
-    })
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -91,7 +87,7 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
     // ADAPTIVE spin budget, per worker: spinning is only worth its SMT-sibling tax (it throttles
     // the op loop's serial sections running on the paired hyperthread) when the next job arrives
     // before the budget runs out. Jobs arriving mid-spin → inter-op gaps are short (dense
-    // prefill) → grow toward `spin_limit()`. Having to park → gaps are long (decode's serial
+    // prefill) → grow toward `SpinPool::spin_limit`. Having to park → gaps are long (decode's serial
     // stretches, MoE's rayon section) → collapse to a near-immediate park. Measured: fixed
     // budgets force a 3-way tradeoff (qwen3 pp 416 vs tg 44 vs DG 2.87s — each best at a
     // DIFFERENT value); the gap history picks the right regime per phase automatically.
@@ -160,11 +156,13 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SpinPool {
     /// Thread count follows rayon's (`RAYON_NUM_THREADS` / available parallelism) so `-t` pins
-    /// both pools identically.
-    pub(crate) fn new() -> Self {
+    /// both pools identically. Both knobs (`spin`, `spinpool`) are read out of `cfg` HERE and
+    /// never again — see [`SpinPool::spin_limit`].
+    pub(crate) fn new(cfg: &CpuCfg) -> Self {
         let n_threads = rayon::current_num_threads().max(1);
         let workers = n_threads - 1;
-        let rayon_fallback = std::env::var("INFR_CPU_NO_SPINPOOL").is_ok_and(|v| v != "0");
+        let rayon_fallback = !cfg.spinpool;
+        let spin_limit = cfg.spin;
         let shared = Arc::new(Shared {
             job: UnsafeCell::new(None),
             seq: AtomicUsize::new(0),
@@ -173,7 +171,7 @@ impl SpinPool {
             done: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
-            budget_cap: AtomicU32::new(spin_limit()),
+            budget_cap: AtomicU32::new(spin_limit),
             sleeping: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         });
         let handles = (0..workers)
@@ -190,6 +188,7 @@ impl SpinPool {
             handles,
             workers,
             rayon_fallback,
+            spin_limit,
             in_run: AtomicBool::new(false),
         }
     }
@@ -252,7 +251,7 @@ impl SpinPool {
         let mut spins = 0u32;
         while sh.done.load(Ordering::Acquire) < self.workers {
             spins += 1;
-            if spins < spin_limit() {
+            if spins < self.spin_limit {
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();
@@ -360,7 +359,7 @@ mod tests {
 
     #[test]
     fn spin_pool_runs_every_task_once() {
-        let pool = SpinPool::new();
+        let pool = SpinPool::new(&CpuCfg::default());
         for &n in &[1usize, 2, 7, 64, 1000, 10007] {
             let hits: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
             pool.run(n, &|t| {
@@ -375,7 +374,7 @@ mod tests {
 
     #[test]
     fn spin_pool_chunks_and_collect() {
-        let pool = SpinPool::new();
+        let pool = SpinPool::new(&CpuCfg::default());
         let mut v = vec![0u32; 1000];
         pool.for_chunks_mut(&mut v, 16, 3, &|c, piece| {
             for (i, x) in piece.iter_mut().enumerate() {
@@ -389,7 +388,7 @@ mod tests {
 
     #[test]
     fn spin_pool_reusable_across_many_jobs() {
-        let pool = SpinPool::new();
+        let pool = SpinPool::new(&CpuCfg::default());
         let acc = AtomicU64::new(0);
         for _ in 0..200 {
             pool.run(32, &|_| {
@@ -397,5 +396,51 @@ mod tests {
             });
         }
         assert_eq!(acc.load(Ordering::Relaxed), 200 * 32);
+    }
+
+    /// `kernels.cpu.spin` reaches the two places it is used — the workers' adaptive-budget ceiling
+    /// and the caller-side wait loop's yield threshold — from the `CpuCfg` the pool was built with,
+    /// and the SHIPPED default is still `1 << 15`. Before S3 this was a process-wide `OnceLock`
+    /// memo of the knob's env spelling, so a second pool could not see a different value at all
+    /// (§10.6); two pools with different budgets in one test is what could not be written before.
+    #[test]
+    fn spin_budget_comes_off_the_config_per_pool() {
+        assert_eq!(CpuCfg::default().spin, 1 << 15);
+        let dflt = SpinPool::new(&CpuCfg::default());
+        assert_eq!(dflt.spin_limit, 1 << 15);
+        assert_eq!(dflt.shared.budget_cap.load(Ordering::Relaxed), 1 << 15);
+
+        let tight = SpinPool::new(&CpuCfg {
+            spin: 4,
+            ..CpuCfg::default()
+        });
+        assert_eq!(tight.spin_limit, 4);
+        assert_eq!(tight.shared.budget_cap.load(Ordering::Relaxed), 4);
+        // Scheduling-only knob: a near-zero budget parks workers immediately but must still run
+        // every task exactly once.
+        let hits: Vec<AtomicU64> = (0..777).map(|_| AtomicU64::new(0)).collect();
+        tight.run(777, &|t| {
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    /// `kernels.cpu.spinpool` cleared routes `run` through rayon —
+    /// scheduling only, so the observable contract is unchanged: every task still runs once.
+    #[test]
+    fn cleared_spinpool_falls_back_to_rayon() {
+        assert!(CpuCfg::default().spinpool);
+        assert!(!SpinPool::new(&CpuCfg::default()).rayon_fallback);
+
+        let pool = SpinPool::new(&CpuCfg {
+            spinpool: false,
+            ..CpuCfg::default()
+        });
+        assert!(pool.rayon_fallback);
+        let hits: Vec<AtomicU64> = (0..1000).map(|_| AtomicU64::new(0)).collect();
+        pool.run(1000, &|t| {
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
     }
 }

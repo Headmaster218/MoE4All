@@ -401,8 +401,9 @@ cfg_struct! {
 cfg_struct! {
     /// CPU backend knobs.
     CpuCfg / PartialCpuCfg {
-        /// `INFR_CPU_SPIN`: spin-pool idle ceiling. Memoized in a `OnceLock` today; migrating it
-        /// removes the memo, so the value must be hoisted to a field (§10.6).
+        /// `INFR_CPU_SPIN`: spin-pool idle ceiling. Was a `OnceLock` memo before S3 (§10.6); it is
+        /// now hoisted to a `SpinPool` field at construction, so it costs nothing per call AND a
+        /// second pool can hold a different value.
         spin: u32 = 32768,
         /// `INFR_CPU_NO_SPINPOOL` (inverted): set AND `!= "0"` routes jobs through rayon.
         spinpool: bool = true,

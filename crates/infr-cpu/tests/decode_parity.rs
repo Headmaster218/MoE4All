@@ -12,8 +12,32 @@
 //!
 //! Run: `cargo test -p infr-cpu --test decode_parity -- --nocapture`
 
+use infr_core::config::{Config, CpuCfg, KernelCfg};
 use infr_core::DType;
 use infr_testkit::{sweep_linear_on, weight_quant_cases, LinearCase};
+use std::sync::Arc;
+
+/// A reference-mode backend built the way the config campaign says a mode is chosen: a typed field
+/// on a `Config` the caller owns (`kernels.cpu.reference`), handed to
+/// [`infr_cpu::CpuBackend::new_with`]. No environment, no global, no ordering hazard — these tests
+/// run in parallel with the production sweeps in the same binary and cannot disturb them.
+///
+/// [`infr_cpu::CpuBackend::reference()`] is this same config, spelled shorter, and
+/// `cpu_production_matches_the_reference_backend` below keeps using it so the shorthand stays
+/// pinned to the field.
+fn reference_backend() -> infr_cpu::CpuBackend {
+    let cfg = Config {
+        kernels: KernelCfg {
+            cpu: CpuCfg {
+                reference: true,
+                ..CpuCfg::default()
+            },
+            ..KernelCfg::default()
+        },
+        ..Config::default()
+    };
+    infr_cpu::CpuBackend::new_with(Arc::new(cfg))
+}
 
 /// Relative tolerance for the CPU quant `Linear` path against the f32 oracle.
 ///
@@ -53,23 +77,45 @@ fn cpu_linear_all_weight_quants_match_the_host_oracle_at_m1() {
     sweep_linear_on("cpu Linear m=1", &be, &cases, |_| CPU_INT8_ACT_TOL).assert_ok();
 }
 
-/// The REFERENCE backend ([`infr_cpu::CpuBackend::reference`]) on the SAME sweep: it decodes the
-/// weight to f32 and takes an f32 dot, so the int8-activation term above is gone entirely and only
-/// summation order is left. That is what makes it usable as the oracle a GPU-vs-CPU token
-/// comparison is scored against (`gpu_seam_matches_cpu_qwen3_q2k` failed for exactly this reason:
-/// the production CPU leg's ~4e-3 moved a greedy token at Q2_K while the GPU sat at ~1e-7).
+/// A backend with `kernels.cpu.reference` SET, on the SAME sweep: it decodes the weight to f32 and
+/// takes an f32 dot, so the int8-activation term above is gone entirely and only summation order is
+/// left. That is what makes it usable as the oracle a GPU-vs-CPU token comparison is scored against
+/// (`gpu_seam_matches_cpu_qwen3_q2k` failed for exactly this reason: the production CPU leg's ~4e-3
+/// moved a greedy token at Q2_K while the GPU sat at ~1e-7).
+///
+/// This is also the `kernels.cpu.reference` knob's behaviour test (`docs/config-plan.md` §8): the
+/// mode is selected purely by the `Config` handed to the backend, and the assertion is the numeric
+/// consequence of picking it.
 ///
 /// The `1e-5` bound is ~3 orders tighter than [`CPU_INT8_ACT_TOL`] — if reference mode ever silently
 /// falls back to an int8 kernel, this test fails while the production sweeps stay green.
 #[test]
 fn cpu_reference_mode_is_exact_for_every_weight_quant() {
-    let be = infr_cpu::CpuBackend::reference();
+    let be = reference_backend();
     for m in [1usize, 2] {
         let cases = weight_quant_cases(m, 256, 8);
         sweep_linear_on(&format!("cpu REFERENCE Linear m={m}"), &be, &cases, |_| {
             1e-5
         })
         .assert_ok();
+    }
+}
+
+/// The shorthand constructor and the config field are the SAME backend: `CpuBackend::reference()`
+/// is `new_with(cfg)` with `kernels.cpu.reference` set, so the two must agree bit-for-bit (not
+/// within a tolerance). This is what lets the GPU-vs-CPU seam oracle keep calling the short
+/// spelling while the mode itself lives in the `Config`.
+#[test]
+fn reference_shorthand_is_the_config_field() {
+    let shorthand = infr_cpu::CpuBackend::reference();
+    let from_cfg = reference_backend();
+    for case in weight_quant_cases(1, 256, 8) {
+        assert_eq!(
+            infr_testkit::run_linear(&shorthand, case),
+            infr_testkit::run_linear(&from_cfg, case),
+            "{:?}: CpuBackend::reference() diverged from kernels.cpu.reference",
+            case.dtype
+        );
     }
 }
 
