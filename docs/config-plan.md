@@ -7,9 +7,10 @@ them.
 
 ## Ledger
 
-| Slice | What                                                                                                                                         | Commit    |
-| ----- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests | `a0bff9c` |
+| Slice | What                                                                                                                                                                                                             | Commit    |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests                                                                     | `a0bff9c` |
+| S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock | `addc1ac` |
 
 **Authority:** `crates/infr-core/src/config/manifest.rs` is the knob inventory —
 177 keys, their config paths, grammars, and a `migrated` flag — and the tests
@@ -548,34 +549,6 @@ Note row 3: for an `is_err()` knob, `INFR_NO_GEMM_WARP=0` turns the feature
 **off**, because only presence matters. That is today's behaviour and R1 says
 keep it. Contrast the four `budget::env_flag` knobs (§6.12 last row) where `"0"`
 means off.
-
-### S1 — CLI produces a `Config`
-
-1. `infr-cli/src/main.rs`: add `--config <PATH>`; build `Config` in `main()`
-   from file+env+flags; stop `set_var`-ing in `DeviceOpts::resolve` /
-   `SamplingOpts::resolve` (the block at `main.rs:197-291`, plus the standalone
-   writes at `:1441` (`INFR_TEMP=0`), `:1799` (`INFR_IGNORE_EOS=1`) and
-   `:3360-3366`) — fill `ConfigOverrides` instead. Keep publishing
-   `RAYON_NUM_THREADS` (§6.1).
-2. Thread `Arc<Config>` into the commands (`run`/`serve`/`bench`/`chat`) and
-   into `SeamModel::load`.
-3. **Until later slices land, the deep readers still read env** — so in S1 ONLY,
-   after building the config, the CLI re-publishes the knobs it used to publish
-   (`INFR_DEV`, `INFR_CTX`, `INFR_UBATCH`, `INFR_TEMP`, `INFR_TOP_K`,
-   `INFR_TOP_P`, `INFR_SEED`, `INFR_MAX_NEW`, `INFR_NO_THINK`,
-   `INFR_IGNORE_EOS`) so behaviour is unchanged. Delete that re-publication in
-   S8. Note this re-publication is what `cmd_bench` relies on at `main.rs:1799`.
-4. Convert `cli/main.rs`'s `mod tests` off its hand-rolled `ENV_LOCK` (R7).
-5. Add `--set <config.path>=<value>` — DECIDED, ship it (§11 [DECIDE-3]).
-   ADDITIVE to the existing flags: every current flag keeps its name and
-   semantics, `--set` only reaches the knobs that have no dedicated flag. A
-   bespoke flag and a `--set` targeting the SAME field ⇒ the bespoke flag wins
-   and a warning names the field; two `--set`s for the same path ⇒ error. Path
-   grammar is still **[DECIDE-6]** (config path vs env name).
-
-**Exit:** `grep -n 'set_var' crates/infr-cli/src/main.rs` shows only the S1
-re-publication block and `RAYON_NUM_THREADS`; `infr run` / `infr bench` /
-`infr serve` produce identical output to the parent commit on a fixed seed.
 
 ### Carried into later slices from S1
 
