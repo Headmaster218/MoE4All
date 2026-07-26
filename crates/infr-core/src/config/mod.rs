@@ -404,6 +404,17 @@ cfg_struct! {
         fuse_add: bool = true,
         /// `INFR_ROCM_NO_FUSE_NORM` (inverted) — via `FusionCfg.rmsnorm_linear.enabled`.
         fuse_norm: bool = true,
+        /// Persist the hiprtc-compiled HIP module to disk
+        /// (`infr_core::kernel_cache`, `~/.cache/infr/rocm-module-<arch>.bin`) and reload it at
+        /// backend init instead of recompiling. Measured: ~9.2 s cold / ~0.25 s warm of
+        /// `hiprtcCompileProgram` on EVERY launch without it.
+        ///
+        /// Has NO env key and never had one — the config campaign removed them; this follows
+        /// `CpuCfg::reference`'s model (a typed field the caller chooses), settable with
+        /// `--set kernels.rocm.module_cache=false` or the TOML file. Clear it to force a compile
+        /// (bisecting a suspected cache bug); the cache is otherwise self-invalidating on any
+        /// source/arch/runtime change.
+        module_cache: bool = true,
     }
 }
 

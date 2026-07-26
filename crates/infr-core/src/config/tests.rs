@@ -101,6 +101,10 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kernels.cpu.spinpool);
     assert_eq!(d.kernels.cpu.repack_mb, 4096);
     assert!(!d.kernels.cpu.reference);
+    // §6.7: the ROCm hiprtc module cache is ON by default — the whole point is that a launch does
+    // not pay `hiprtcCompileProgram` (~9.2 s cold / ~0.25 s warm). Like `kernels.cpu.reference` it
+    // has NO env key; it is settable only from the file or `--set`.
+    assert!(d.kernels.rocm.module_cache);
     assert_eq!(d.serve.max_tokens_cap, 131_072);
     assert_eq!(d.serve.api_key, None);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.

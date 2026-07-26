@@ -21,6 +21,41 @@ use std::sync::{Arc, Mutex};
 /// Terse local shorthand for the shared backend-error constructor.
 use infr_core::error::backend as be;
 
+/// Query one device's properties. A FREE fn, not just [`RocmBackend::prop`]'s body, because
+/// `Pipelines::build` needs the gfx arch to key its on-disk module cache BEFORE a `RocmBackend`
+/// exists to ask. A failed query leaves the zeroed struct (an empty `gcn_arch_name`), which the
+/// cache treats as "unknown arch ⇒ do not cache" rather than guessing.
+pub(crate) fn device_prop(device: c_int) -> ffi::hipDeviceProp_t {
+    let mut props: ffi::hipDeviceProp_t = unsafe { std::mem::zeroed() };
+    unsafe { ffi::hipGetDeviceProperties(&mut props as *mut _ as *mut c_void, device) };
+    props
+}
+
+/// This device's `gcnArchName` (`gfx1100`, `gfx90a:sramecc+:xnack-`, …) — the arch the module
+/// cache keys and names its blob by. Read through [`ffi::hipDeviceProp_tR0000`], the layout the
+/// linked symbol actually fills (see the note beside that struct).
+///
+/// Empty when the value does not look like an arch at all, which is how a layout that moved under
+/// us degrades: the caller then declines to cache rather than risk one file for two archs.
+pub(crate) fn device_arch_name(device: c_int) -> String {
+    let mut props: ffi::hipDeviceProp_tR0000 = unsafe { std::mem::zeroed() };
+    let rc = unsafe { ffi::hipGetDeviceProperties(&mut props as *mut _ as *mut c_void, device) };
+    if rc != HIP_SUCCESS {
+        return String::new();
+    }
+    let name: String = props
+        .gcn_arch_name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8 as char)
+        .collect();
+    if name.starts_with("gfx") {
+        name
+    } else {
+        String::new()
+    }
+}
+
 /// VRAM headroom (bytes) kept free when placing KV in VRAM under `INFR_KV_OVERFLOW`: the spill
 /// decision reserves this much so the per-forward activation scratch (the pooled GEMV/attention/FFN
 /// buffers, whose peak scales with the prefill ubatch), the weight-dequant cache, and the rocBLAS
@@ -535,7 +570,7 @@ impl RocmBackend {
             return Err(be(format!("hipStreamCreate: rc={rc}")));
         }
 
-        let pipelines = Pipelines::build(device)?;
+        let pipelines = Pipelines::build(device, &cfg)?;
 
         // rocBLAS handle for the OPT-IN f16 prefill GEMM (Slice 26), bound once to our work stream.
         // OFF by default: the isolated GEMM wins 3.6-5.9× (examples/blas_probe), but the per-forward
@@ -641,9 +676,7 @@ impl RocmBackend {
 
     /// Read a device property field.
     fn prop(&self) -> ffi::hipDeviceProp_t {
-        let mut props: ffi::hipDeviceProp_t = unsafe { std::mem::zeroed() };
-        unsafe { ffi::hipGetDeviceProperties(&mut props, self.device) };
-        props
+        device_prop(self.device)
     }
 
     /// `(free, total)` device memory in bytes — the paged-MoE budget input and the peak-VRAM

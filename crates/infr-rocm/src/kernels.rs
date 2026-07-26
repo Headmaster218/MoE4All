@@ -8,10 +8,15 @@
 //! decode each block in-kernel, so no f16 cache is materialized (VRAM ≈ quant_size).
 //!
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
-//! `HashMap`. The module is compiled once at backend init via `hiprtcCompileProgram`.
+//! `HashMap`. The module is compiled at most ONCE per (source, arch, HIP stack): `Pipelines::build`
+//! first tries the persisted code object (`infr_core::kernel_cache`,
+//! `~/.cache/infr/rocm-module-<arch>.bin`) and only falls back to `hiprtcCompileProgram` — ~9.2 s
+//! on a cold comgr cache, ~0.25 s even when comgr is hot — on a miss.
 
 use crate::ffi;
+use infr_core::config::Config;
 use infr_core::error::Result;
+use infr_core::kernel_cache::KernelCache;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CString};
 use std::sync::Mutex;
@@ -5163,22 +5168,151 @@ GEN_MOE_DOWN_ROUTED(iq3s)
 
 // ── Module cache ─────────────────────────────────────────────────────────────
 
+/// hiprtc options, ONE list feeding both the compile call and the disk cache's key — a flag that
+/// changed the generated code but not the key would let a stale code object be reloaded.
+const COMPILE_OPTS: [&str; 1] = ["-std=c++17"];
+
+/// Producer magic + on-disk layout version for the persisted HIP code object. Bump on any change
+/// to what the payload MEANS; the envelope then rejects every old file instead of misreading it.
+const MODULE_CACHE_MAGIC: [u8; 8] = *b"INFRRMC1";
+
+/// The gfx arch this device reports (`gfx1100`, `gfx90a:sramecc+:xnack-`, …) as a filename-safe
+/// token. Empty when the arch is unknown — the caller then refuses to cache rather than guessing,
+/// since two different archs must never share a blob.
+fn gfx_arch(device: c_int) -> String {
+    sanitize_arch(&crate::backend::device_arch_name(device))
+}
+
+/// `gcnArchName` → a filename-safe token. Split out from [`gfx_arch`] so it is testable without a
+/// device.
+///
+/// The escape is INJECTIVE, not merely "safe": a real arch carries feature flags
+/// (`gfx90a:sramecc+:xnack-`) that CHANGE the generated code, so `xnack+` and `xnack-` must not
+/// land on one file name — folding both to `_` did exactly that. Alphanumerics pass through
+/// lowercased; everything else (including `_` itself, so the escape cannot be forged) becomes
+/// `_<hex>`.
+fn sanitize_arch(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b.to_ascii_lowercase() as char);
+        } else {
+            out.push_str(&format!("_{b:02x}"));
+        }
+    }
+    out
+}
+
+/// The on-disk cache for this device's compiled HIP module (see [`infr_core::kernel_cache`] for the
+/// envelope/durability/tripwire contract this rides on).
+///
+/// The KEY is what makes reloading safe, and it is composed so that NOTHING that changes the
+/// generated code can leave it unmoved:
+///
+/// * `FNV-1a(hip_source())` **and the source length** — `hip_source()` is assembled at RUN time
+///   (it embeds the IQ4 codebook and the IQ2/IQ3 grids emitted from the host tables), so hashing
+///   the actual string covers every kernel edit by construction; no build.rs fingerprint is needed
+///   and none can drift from it. The length is one extra cheap field against an FNV collision.
+/// * the **gfx arch** — also in the FILE NAME, so two GPUs of different archs in one box never
+///   share a blob; in the key too because the name is a convention and the key is a check.
+/// * the **HIP runtime, HIP driver and hiprtc versions** — a code object is only loadable by the
+///   stack that produced it, and any of the three can move independently on an upgrade.
+/// * the **compile options** ([`COMPILE_OPTS`]).
+///
+/// Disabled (`kernels.rocm.module_cache = false`, or an unknown arch) ⇒ a total no-op.
+fn module_cache(device: c_int, src: &str, cfg: &Config) -> KernelCache {
+    let arch = gfx_arch(device);
+    let enabled = cfg.kernels.rocm.module_cache && !arch.is_empty();
+    let mut key = Vec::with_capacity(64 + arch.len());
+    key.extend_from_slice(&infr_core::kernel_cache::fnv1a(src.as_bytes()).to_le_bytes());
+    key.extend_from_slice(&(src.len() as u64).to_le_bytes());
+    key.extend_from_slice(arch.as_bytes());
+    key.push(0);
+    for o in COMPILE_OPTS {
+        key.extend_from_slice(o.as_bytes());
+        key.push(0);
+    }
+    let (mut rt, mut drv, mut rtc_major, mut rtc_minor) = (0, 0, 0, 0);
+    unsafe {
+        ffi::hipRuntimeGetVersion(&mut rt);
+        ffi::hipDriverGetVersion(&mut drv);
+        ffi::hiprtcVersion(&mut rtc_major, &mut rtc_minor);
+    }
+    for v in [rt, drv, rtc_major, rtc_minor] {
+        key.extend_from_slice(&v.to_le_bytes());
+    }
+    KernelCache::open(
+        &format!("rocm-module-{arch}.bin"),
+        MODULE_CACHE_MAGIC,
+        key,
+        enabled,
+    )
+}
+
 /// Compiled HIP module + kernel-function cache.
 pub struct Pipelines {
     module: ffi::hipModule_t,
     /// Kernel name → function handle (lazily fetched).
     cache: Mutex<HashMap<&'static str, ffi::hipFunction_t>>,
+    /// The on-disk code-object cache this module came from (or a disabled no-op). Held for its
+    /// tripwire: a clean drop disarms the marker that `load` armed.
+    disk: KernelCache,
 }
 
 unsafe impl Send for Pipelines {}
 unsafe impl Sync for Pipelines {}
 
 impl Pipelines {
-    /// Compile the assembled HIP source via hiprtc and load the resulting module.
-    // `_device` is accepted for call-site symmetry with the other backends; the active device is
-    // already selected via `hipSetDevice` before `build`, and hiprtc targets the arch via options.
-    pub fn build(_device: c_int) -> Result<Self> {
+    /// Load this device's HIP module: from the on-disk code-object cache when it is valid,
+    /// otherwise by compiling `hip_source()` with hiprtc and storing the result.
+    ///
+    /// `hiprtcCompileProgram` is ~9.2 s on a cold comgr cache and still ~0.25 s of a 0.48 s launch
+    /// when comgr's own lower-level cache is hot — one-time work that re-ran on EVERY process
+    /// launch before this. The cache is self-invalidating on any source / arch / runtime change
+    /// (see [`module_cache`]).
+    ///
+    /// A cached blob that `hipModuleLoadData` REJECTS is not an error: the file is invalidated and
+    /// this falls through to a normal compile.
+    // The active device is already selected via `hipSetDevice` before `build`, and hiprtc targets
+    // that arch via the auto-detect below; `device` is used to KEY the cache.
+    pub fn build(device: c_int, cfg: &Config) -> Result<Self> {
         let src = hip_source();
+        let disk = module_cache(device, &src, cfg);
+
+        if let Some(code) = disk.load() {
+            match Self::load_module(&code) {
+                Ok(module) => return Ok(Self::with_module(module, disk)),
+                Err(e) => {
+                    // The stack moved under a key that did not see it (or the file is subtly
+                    // wrong). Recompiling is the correct answer, not a failure — but say so, since
+                    // a cache that silently misses every launch is a perf bug nobody would notice.
+                    eprintln!(
+                        "[infr] the cached ROCm module was rejected by the HIP runtime ({e}) — \
+                         discarding it and recompiling."
+                    );
+                    disk.invalidate();
+                }
+            }
+        }
+
+        let code = Self::compile(&src)?;
+        // Best-effort: a full disk or a read-only cache dir must not fail a backend that has a
+        // perfectly good freshly-compiled module in hand.
+        let _ = disk.store(&code);
+        let module = Self::load_module(&code)?;
+        Ok(Self::with_module(module, disk))
+    }
+
+    fn with_module(module: ffi::hipModule_t, disk: KernelCache) -> Self {
+        Self {
+            module,
+            cache: Mutex::new(HashMap::new()),
+            disk,
+        }
+    }
+
+    /// hiprtc: assembled HIP source → a device code object.
+    fn compile(src: &str) -> Result<Vec<u8>> {
         let csrc = CString::new(src).map_err(|e| be(format!("kernel source NUL-byte: {e}")))?;
         let mut prog: ffi::hiprtcProgram = std::ptr::null_mut();
         let name_cstr = CString::new("infr_kernels").unwrap();
@@ -5199,10 +5333,14 @@ impl Pipelines {
         // Compile without --gpu-architecture: hiprtc auto-detects the device from the active
         // hipSetDevice context. The int8 dp4a dot is written as a portable scalar idiom (not the
         // `sdot4` builtin), so no optional target feature (`dot1-insts`) needs to be pinned — the
-        // plain auto-detect target compiles it in every launch context. `_device` is accepted for
-        // call-site symmetry; the active device is already selected before `build`.
-        let std_flag = CString::new("-std=c++17").unwrap();
-        let opts: [*const c_char; 1] = [std_flag.as_ptr()];
+        // plain auto-detect target compiles it in every launch context. (The auto-detected arch is
+        // therefore NOT visible in the options, which is why the module cache keys the arch
+        // explicitly — see [`module_cache`].)
+        let opt_cstrs: Vec<CString> = COMPILE_OPTS
+            .iter()
+            .map(|o| CString::new(*o).unwrap())
+            .collect();
+        let opts: Vec<*const c_char> = opt_cstrs.iter().map(|o| o.as_ptr()).collect();
         let rc = unsafe { ffi::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_ptr()) };
         if rc != ffi::HIPRTC_SUCCESS {
             // Fetch the compile log for diagnostics
@@ -5229,8 +5367,15 @@ impl Pipelines {
             return Err(be(format!("hiprtcGetCode: rc={rc}")));
         }
         unsafe { ffi::hiprtcDestroyProgram(&mut prog) };
+        Ok(code)
+    }
 
-        // Load the code object into a module
+    /// Load a code object (freshly compiled or off disk) into a HIP module. An `Err` from a CACHED
+    /// blob is recoverable — see [`build`](Self::build).
+    fn load_module(code: &[u8]) -> Result<ffi::hipModule_t> {
+        if code.is_empty() {
+            return Err(be("hipModuleLoadData: empty code object"));
+        }
         let mut module: ffi::hipModule_t = std::ptr::null_mut();
         let rc = unsafe {
             ffi::hipModuleLoadData(&mut module, code.as_ptr() as *const std::ffi::c_void)
@@ -5238,11 +5383,7 @@ impl Pipelines {
         if rc != ffi::HIP_SUCCESS {
             return Err(be(format!("hipModuleLoadData: rc={rc}")));
         }
-
-        Ok(Self {
-            module,
-            cache: Mutex::new(HashMap::new()),
-        })
+        Ok(module)
     }
 
     /// Get (creating + caching on first use) the kernel function for a given name.
@@ -5265,6 +5406,59 @@ impl Drop for Pipelines {
     fn drop(&mut self) {
         // hipModuleDestroy doesn't exist in public API; the module leaks on drop.
         // This is fine for a single-backend-instance lifetime.
+        //
+        // TRIPWIRE step 2 (see `infr_core::kernel_cache`): we got here, so this run did NOT hang
+        // the GPU on whatever it seeded from disk. Clear THIS instance's marker; a sibling
+        // backend's stays armed. A run that dies without reaching here leaves its marker behind,
+        // and the next launch discards the blob it accuses.
+        self.disk.disarm();
+    }
+}
+
+#[cfg(test)]
+mod module_cache_tests {
+    use super::*;
+
+    /// The blob file name is what keeps two archs in one box off each other's code objects, so the
+    /// arch token must be INJECTIVE — including over the feature suffixes (`:sramecc+:xnack-`),
+    /// which change the generated code. Folding every non-alphanumeric to `_` failed exactly that:
+    /// `xnack+` and `xnack-` became one name.
+    #[test]
+    fn the_arch_token_is_filename_safe_and_injective() {
+        assert_eq!(sanitize_arch("gfx1100"), "gfx1100");
+        assert_eq!(sanitize_arch("GFX1100"), "gfx1100", "case-folded");
+        assert_eq!(
+            sanitize_arch("gfx90a:sramecc+:xnack-"),
+            "gfx90a_3asramecc_2b_3axnack_2d"
+        );
+        // Distinct arch strings ⇒ distinct file names. `_` is itself escaped, so no input can
+        // forge another input's escape.
+        let names: Vec<String> = [
+            "gfx90a",
+            "gfx90a:xnack-",
+            "gfx90a:xnack+",
+            "gfx90a:sramecc-:xnack+",
+            "gfx90a:sramecc+:xnack-",
+            "gfx90a_3axnack_2d",
+            "gfx1100",
+            "gfx1101",
+        ]
+        .iter()
+        .map(|a| sanitize_arch(a))
+        .collect();
+        let mut uniq = names.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len(), "arch tokens collided: {names:?}");
+        for n in &names {
+            assert!(
+                n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "the token names a file: {n}"
+            );
+        }
+        // An unknown arch (`device_arch_name` rejected what it read) is an EMPTY token, which
+        // `module_cache` reads as "do not cache" rather than sharing a `rocm-module-.bin`.
+        assert_eq!(sanitize_arch(""), "");
     }
 }
 

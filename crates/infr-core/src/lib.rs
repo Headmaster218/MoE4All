@@ -14,6 +14,9 @@ pub mod exec;
 pub mod fusion;
 pub mod graph;
 pub mod iquant_grids;
+/// The shared on-disk cache for compiled kernel artifacts (Vulkan pipeline blobs, ROCm code
+/// objects) — envelope, durability, and the poisoned-blob tripwire, once.
+pub mod kernel_cache;
 pub mod loader;
 pub mod pager;
 pub mod progress;

@@ -13,3 +13,6 @@ half.workspace = true
 bytemuck.workspace = true
 indicatif.workspace = true
 toml.workspace = true
+# `kernel_cache`'s tripwire needs ONE syscall: `kill(pid, 0)` to ask whether the process that
+# seeded a cached kernel binary is still alive (see `kernel_cache.rs`).
+libc.workspace = true

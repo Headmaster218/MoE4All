@@ -1168,6 +1168,7 @@ dependencies = [
  "indicatif",
  "infr-prof",
  "infr-prof-rt",
+ "libc",
  "thiserror 2.0.18",
  "toml",
 ]

@@ -3526,3 +3526,111 @@ fn embed_gather_q80_native_matches_cpu() {
         e / ref_mag
     );
 }
+
+// ── the on-disk HIP module cache (slice RC) ──────────────────────────────────
+
+/// The persisted code object for THIS box's arch, or `None` if no backend has written one yet.
+/// (Globbed rather than recomputed: the arch token is `kernels.rs`-private, and a test that
+/// duplicated the naming rule would pass while the real one drifted.)
+fn module_cache_blob() -> Option<std::path::PathBuf> {
+    let dir = infr_core::kernel_cache::cache_dir()?;
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rocm-module-") && n.ends_with(".bin"))
+        })
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+/// **A cache must never be able to produce a wrong result silently.** Two ways a persisted code
+/// object can be wrong, and the recovery each takes:
+///
+/// 1. **Bit-rot in the payload** — caught by OUR envelope checksum, so the bytes never reach
+///    `hipModuleLoadData` (where invalid cache data is undefined behavior, i.e. a hung ring).
+/// 2. **A payload that is internally consistent but not a code object this runtime accepts** — a
+///    checksum cannot see that, so `hipModuleLoadData` is the last check: its rejection must be a
+///    RECOVERY (invalidate → compile → store), not a backend-init failure.
+///
+/// After each, a real `Op::Linear` must still match the CPU reference, and the file must be a
+/// working blob again for the NEXT launch.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn a_corrupt_module_cache_blob_recovers_cleanly() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    // One backend has built, so the blob is on disk (written by this run or a previous one).
+    drop(be);
+    let Some(path) = module_cache_blob() else {
+        panic!("no rocm-module-*.bin after a backend build — the module cache never stored");
+    };
+    let good = std::fs::read(&path).expect("read the cached code object");
+    assert!(good.len() > 28, "an envelope plus a payload");
+
+    // The reference answer, and a closure that rebuilds a backend and re-runs it.
+    let cpu = infr_cpu::CpuBackend::new();
+    let (m, in_f, out_f) = (3usize, 256usize, 8usize);
+    let x = gen(m * in_f, 4);
+    let w_bytes: Vec<u8> = gen(out_f * in_f, 7)
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let want = run_linear(&cpu, &x, &w_bytes, DType::F16, m, in_f, out_f);
+    let rebuild_and_check = |case: &str| {
+        let be = rocm().expect("a corrupt cache must never fail backend init");
+        let got = run_linear(&be, &x, &w_bytes, DType::F16, m, in_f, out_f);
+        let e = maxerr(&want, &got);
+        assert!(
+            e < 1e-3,
+            "{case}: recovered module diverges from CPU: {e:e}"
+        );
+    };
+
+    // Envelope offsets (`infr_core::kernel_cache`): magic(8) ++ version(2) ++ key_len(2) ++
+    // payload_len(8) ++ payload_hash(8), then the key, then the payload.
+    let key_len = u16::from_le_bytes(good[10..12].try_into().unwrap()) as usize;
+    let start = 28 + key_len;
+    assert!(good.len() > start, "the payload is non-empty");
+
+    // ── 1. bit-rot: the checksum must catch it, and the file is discarded ──
+    let mut rot = good.clone();
+    rot[start + 64] ^= 0x01;
+    std::fs::write(&path, &rot).unwrap();
+    rebuild_and_check("bit-rotted payload");
+    assert_eq!(
+        std::fs::read(&path).unwrap()[..start],
+        good[..start],
+        "after a checksum miss the blob must be re-stored, not left damaged"
+    );
+
+    // ── 2. a well-enveloped payload the runtime cannot load ──
+    // Scramble the payload AND fix up the checksum, so every check we own passes and only
+    // `hipModuleLoadData` can say no.
+    let mut poison = good.clone();
+    for b in poison[start..].iter_mut() {
+        *b ^= 0xA5;
+    }
+    let sum = infr_core::kernel_cache::fnv1a(&poison[start..]);
+    poison[20..28].copy_from_slice(&sum.to_le_bytes());
+    std::fs::write(&path, &poison).unwrap();
+    rebuild_and_check("runtime-rejected code object");
+    let after = std::fs::read(&path).unwrap();
+    assert_ne!(
+        after, poison,
+        "a rejected blob must be replaced by a freshly compiled one, not kept"
+    );
+    assert_eq!(
+        after.len(),
+        good.len(),
+        "and it is a real code object again"
+    );
+
+    // The recovered file must itself load cleanly — otherwise every later launch pays a compile.
+    rebuild_and_check("re-stored blob");
+}

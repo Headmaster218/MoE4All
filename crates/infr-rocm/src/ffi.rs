@@ -18,8 +18,11 @@ extern "C" {
     pub fn hipGetDeviceCount(count: *mut c_int) -> c_int;
     /// Select the active device.
     pub fn hipSetDevice(device: c_int) -> c_int;
-    /// Query device properties into `props` (allocated by caller).
-    pub fn hipGetDeviceProperties(props: *mut hipDeviceProp_t, device: c_int) -> c_int;
+    /// Query device properties into `props` (allocated by caller). Typed `*mut c_void` because
+    /// this crate reads it through TWO layouts — [`hipDeviceProp_t`] and the legacy
+    /// [`hipDeviceProp_tR0000`] the symbol actually fills (see the note beside that struct) — and
+    /// a second `extern` declaration of one symbol with two signatures is a lint error.
+    pub fn hipGetDeviceProperties(props: *mut c_void, device: c_int) -> c_int;
     /// Allocate `size` bytes of device memory.
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     /// Free device memory.
@@ -110,6 +113,13 @@ extern "C" {
     pub fn hipDeviceSynchronize() -> c_int;
     /// Copy from one device buffer to another.
     pub fn hipMemcpyDtoD(dst: *mut c_void, src: *const c_void, count: usize) -> c_int;
+    /// HIP runtime version (`major*10000000 + minor*100000 + patch`). Folded into the module
+    /// cache's key: a runtime upgrade re-generates code objects, and an old one must not be
+    /// re-loaded (see `kernels.rs`).
+    pub fn hipRuntimeGetVersion(version: *mut c_int) -> c_int;
+    /// HIP driver version — same role in the key. The runtime and the driver ship separately, and
+    /// either moving is enough to invalidate a cached code object.
+    pub fn hipDriverGetVersion(version: *mut c_int) -> c_int;
 }
 
 // ── libhiprtc ────────────────────────────────────────────────────────────────
@@ -141,6 +151,9 @@ extern "C" {
     pub fn hiprtcGetProgramLogSize(prog: hiprtcProgram, log_size: *mut usize) -> c_int;
     /// Destroy a program, freeing its resources.
     pub fn hiprtcDestroyProgram(prog: *mut hiprtcProgram) -> c_int;
+    /// hiprtc's own version — the COMPILER that produced a cached code object, which can move
+    /// independently of the HIP runtime. Third version in the module cache's key.
+    pub fn hiprtcVersion(major: *mut c_int, minor: *mut c_int) -> c_int;
 }
 
 // ── librocblas ───────────────────────────────────────────────────────────────
@@ -277,3 +290,61 @@ pub struct hipDeviceArch_t {
     pub has_watchdog: c_int,
     pub cooperative_launch: c_int,
 }
+
+// ── hipDeviceProp_tR0000 — the LEGACY layout, for `gcnArchName` only ──────────
+//
+// The struct above does NOT match what the linked `hipGetDeviceProperties` symbol
+// (`hip_4.2`) actually writes: measured on ROCm 7 / RX 7900 XTX, `gcnArchName` lands at byte
+// 396 (not the 1160 that struct assumes) — i.e. the symbol fills the LEGACY
+// `hipDeviceProp_tR0000`, which ROCm 6+ froze for ABI compatibility when it renamed the current
+// struct to `hipDeviceProp_tR0600`. (`multi_processor_count` above reads 1024 on a 96-CU card
+// for the same reason; that predates this slice and is left alone here — see the RC report.)
+//
+// The module cache needs exactly ONE field and must not guess, so this declares the legacy
+// layout it is actually handed. Reading `gcnArchName` through the WRONG layout is not merely
+// useless: a stable-but-wrong token could name one cache file for two different archs. The
+// caller therefore also demands the value start with `gfx` and disables caching otherwise.
+
+/// The legacy (`R0000`) device-properties layout, named down to `gcnArchName` and padded past it.
+/// Offsets are asserted below, so a field slipping out of order is a COMPILE error, not a subtly
+/// wrong cache key.
+#[repr(C)]
+pub struct hipDeviceProp_tR0000 {
+    pub name: [c_char; 256],
+    pub total_global_mem: usize,
+    pub shared_mem_per_block: usize,
+    pub regs_per_block: c_int,
+    pub warp_size: c_int,
+    pub max_threads_per_block: c_int,
+    pub max_threads_dim: [c_int; 3],
+    pub max_grid_size: [c_int; 3],
+    pub clock_rate: c_int,
+    pub memory_clock_rate: c_int,
+    pub memory_bus_width: c_int,
+    pub total_const_mem: usize,
+    pub major: c_int,
+    pub minor: c_int,
+    pub multi_processor_count: c_int,
+    pub l2_cache_size: c_int,
+    pub max_threads_per_multi_processor: c_int,
+    pub compute_mode: c_int,
+    pub clock_instruction_rate: c_int,
+    /// 17 single-bit fields in ONE 32-bit storage unit — 4 bytes, not 8.
+    pub arch: u32,
+    pub concurrent_kernels: c_int,
+    pub pci_domain_id: c_int,
+    pub pci_bus_id: c_int,
+    pub pci_device_id: c_int,
+    pub max_shared_memory_per_multi_processor: usize,
+    pub is_multi_gpu_board: c_int,
+    pub can_map_host_memory: c_int,
+    pub gcn_arch: c_int,
+    pub gcn_arch_name: [c_char; 256],
+    /// Everything after the arch name, padded to the 1472 bytes the caller's buffer already
+    /// reserves — the runtime writes its own `sizeof`, which is no larger.
+    _tail: [u8; 820],
+}
+
+// The one offset the module cache depends on, checked at COMPILE time against the layout above.
+const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, gcn_arch_name) == 396);
+const _: () = assert!(std::mem::size_of::<hipDeviceProp_tR0000>() == 1472);

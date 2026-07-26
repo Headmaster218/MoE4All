@@ -219,7 +219,9 @@ and these exist to force one off when bisecting a correctness or perf problem.
   dtype, plus `deltanet` and `moe`.
 - **`[kernels.rocm]`** — `wmma_tile` (`1x1`/`2x1`/`2x2`), `no_wmma`, the int8
   (`i8`) and software-pipelined (`pipe`) kernels, opt-in `coop` and `blas`
-  prefill, and the two fusion gates.
+  prefill, the two fusion gates, and `module_cache` (persist the hiprtc-compiled
+  HIP module to `~/.cache/infr`; no `INFR_*` twin, like
+  `kernels.cpu.reference`).
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
   `repack_mb`, and `reference` (the bit-reference kernel path, which has no
   `INFR_*` twin and never had one).
