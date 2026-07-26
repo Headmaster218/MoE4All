@@ -90,9 +90,11 @@ and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
   `stream_options.include_usage` parsing) and the e2e disconnect→slot-release
   path (integration-only; the latch logic is unit-tested).
 - **`infr-cli` (all 6 findings)** — TDD, +7 tests; dead-code `#![allow]`
-  removed. `--dev` now `remove_var`s the sibling backend envs (an inherited
-  `INFR_CPU` can't shadow it) via a pure `resolve_backend` + one unified
-  `selected_backend()` reader (consistent METAL>CPU>Vulkan precedence); model
+  removed. `--dev` beats an inherited device setting via a pure
+  `resolve_backend` + one unified `selected_backend()` reader. (As landed this
+  `remove_var`d the sibling `INFR_METAL`/`INFR_CPU` envs; both keys were since
+  removed outright, and the config campaign replaced the env writes with the CLI
+  layer of the resolved `Config`, which already beats the env layer.) Model
   `resolve` only treats an existing `.gguf` FILE as local (mistyped paths give a
   clear error, not a network pull); the sweep sort is NaN-safe (`total_cmp`);
   the spurious "`--parallel` ignored" note fires only when explicitly set
@@ -168,15 +170,16 @@ and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
   byte-identity verified on the RX 7900 XTX** (MoE-mmq resident+paged, GEMV
   row1/mrow/mw/id, and weight-addr goldens all match host). Per-dispatch
   `INFR_GEMV_*` env reads are resolved once into a `GemvKnobs` `OnceLock` (same
-  routing); `dispatch3`/`bind_descriptors` use stack arrays (no per-dispatch
-  heap `Vec`); `finish`/`finish_nowait` free the cmd buffer + pools on their
-  error paths (was a leak); the two ~180-line `matmul_mmq_experts`/`_paged`
-  tables collapse to one `moe_mmq_desc` table (a drift test asserts the same
-  `(kernel,nbind)` for every `MOE_MMQ_DTYPES`); the descriptor pool is
-  proportioned so sets+descriptors exhaust together. #5: the 2 genuinely
-  parity-only `_at` fns are gated behind a new `parity` feature — the other 9
-  carried a **stale** "not wired" doc but are in fact production-wired
-  (correctly left `pub`).
+  routing — the `OnceLock` was later deleted by the config campaign, which
+  hoists the same values off the backend's `Config` instead);
+  `dispatch3`/`bind_descriptors` use stack arrays (no per-dispatch heap `Vec`);
+  `finish`/`finish_nowait` free the cmd buffer + pools on their error paths (was
+  a leak); the two ~180-line `matmul_mmq_experts`/`_paged` tables collapse to
+  one `moe_mmq_desc` table (a drift test asserts the same `(kernel,nbind)` for
+  every `MOE_MMQ_DTYPES`); the descriptor pool is proportioned so
+  sets+descriptors exhaust together. #5: the 2 genuinely parity-only `_at` fns
+  are gated behind a new `parity` feature — the other 9 carried a **stale** "not
+  wired" doc but are in fact production-wired (correctly left `pub`).
 - **`infr-vulkan` adapter (all 6 findings)** — TDD, +3 pure tests, **gpu_seam
   byte-identity verified** (GEMM prefill `nc_gemm`/`warp_gemm`, attention/KV
   `kv_addr` 15, MoE-mmq all match host). Batched-MoE `counts` drops the
@@ -238,14 +241,21 @@ and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
   drops the fused `fill[]=0` (zeroed by a separate overlapping dispatch — MoE
   goldens byte-identical).
 - **`infr-vulkan` attention/flash shaders (7 of 8; #7 deferred)** — **gpu_seam
-  verified** (flash stage/warp/coopmat/matches-cpu + kv*addr + kv_q8 goldens
+  verified** (flash stage/warp/coopmat/matches-cpu + `kv_addr` + `kv_q8` goldens
   pass, run serially). The direct `coopMatLoad` K/V over-read past `kv_len` is
-  made SAFE by tightening the host `flash_geom` gate to `kv_len.div_ceil(64)*64
-  <=
-  att*cap_rows`(a non-ring KV cache allocates non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read columns contribute nothing;`attn_flash.comp`documents the mpad precondition (keeps writing all BM rows to stay bit-identical with the staged/split-K paths — a store guard there was reverted after it broke the STAGE==direct golden); host debug-asserts guard`attn_pv` `tilesN`, `attn_combine` `ntile`, and `attn_partial_mrows` `chunk`; `quant_kv`Q5_1 gets the`clamp(0,31)`(never triggers); dead`MAXS`removed.
-  \_Pre-existing note:* the flash parity LIB tests race on
-  process-global`INFR_FLASH*\*`env under parallel cargo threads — pass
-  with`--test-threads=1`.
+  made SAFE by tightening the host `flash_geom` gate to
+  `kv_len.div_ceil(64)*64 <= att_cap_rows` (a non-ring KV cache allocates
+  non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read
+  columns contribute nothing; `attn_flash.comp` documents the mpad precondition
+  (keeps writing all BM rows to stay bit-identical with the staged/split-K paths
+  — a store guard there was reverted after it broke the STAGE==direct golden);
+  host debug-asserts guard `attn_pv` `tilesN`, `attn_combine` `ntile`, and
+  `attn_partial_mrows` `chunk`; `quant_kv` `Q5_1` gets the `clamp(0,31)` (never
+  triggers); dead `MAXS` removed. **Pre-existing note, since RESOLVED:** the
+  flash parity LIB tests used to race on the process-global `INFR_FLASH_*`
+  variables under parallel cargo threads and needed `--test-threads=1`. The
+  config campaign moved them onto an explicit `Config`; `infr-vulkan`'s suite
+  runs in parallel again.
 - **`infr-vulkan` GEMM/GEMV shaders (7 of 8; #6 dp4a DRY deferred)** —
   **gpu_seam byte-identity verified** (`weight_addr`/`gemm_proj` 28,
   `sample_topk`, MoE-mmq, `nc_gemm` all match host). `gemm_proj.comp` now stages

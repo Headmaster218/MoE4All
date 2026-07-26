@@ -265,18 +265,20 @@ the "no source markers at all" niche. (A proc-macro attribute on non-inline
 `mod foo;` is also unstable, which is why annotation is per-item, not per-file.)
 
 **Deprecation rule:** do not add new one-off `Instant::now()` accumulators or
-env-gated eprintln timers (`INFR_PROF_DEC`-style) — build with `INFR_PROFILE=1`
-instead. The existing `INFR_PROF*` env gates stay until this system has proven
-itself in a few campaigns, then get removed. GPU-side timing is the same idea at
-the dispatch chokepoint: `INFR_PROF2` device timestamps are auto-labeled with
-the kernel name (no manual stamp calls — see the Profiling section above), but
-stay **runtime**-gated, not build-gated: timestamp queries cost nothing when
-off, and toggling GPU profiling without a rebuild is worth keeping. The two
-compose: run an `INFR_PROFILE=1` build with `INFR_PROF2=1` and the exit report
-prints the host function table AND the GPU op aggregate in one output
-(`INFR_PROFILE_OUT` JSON carries both as `"sites"` + `"gpu"`) — the host section
-tells you _that_ the GPU path waits in `replay_n`; the GPU section tells you
-which ops the GPU spent it on.
+config-gated eprintln timers (`prof.prof_dec` / `INFR_PROF_DEC`-style) — build
+with `INFR_PROFILE=1` instead. The existing `prof.*` knobs stay until this
+system has proven itself in a few campaigns, then get removed. (`INFR_PROFILE`
+itself is a BUILD-time input read by `build.rs`, which is why it is one of the
+few `INFR_*` keys that is deliberately not a `Config` field.) GPU-side timing is
+the same idea at the dispatch chokepoint: `INFR_PROF2` device timestamps are
+auto-labeled with the kernel name (no manual stamp calls — see the Profiling
+section above), but stay **runtime**-gated, not build-gated: timestamp queries
+cost nothing when off, and toggling GPU profiling without a rebuild is worth
+keeping. The two compose: run an `INFR_PROFILE=1` build with `INFR_PROF2=1` and
+the exit report prints the host function table AND the GPU op aggregate in one
+output (`INFR_PROFILE_OUT` JSON carries both as `"sites"` + `"gpu"`) — the host
+section tells you _that_ the GPU path waits in `replay_n`; the GPU section tells
+you which ops the GPU spent it on.
 
 ### CPU profiling (samply)
 
@@ -404,9 +406,12 @@ Perf work is only real if the output is unchanged.
   only when every element is provably written before read. Padding rows that
   hold garbage are fine only when the garbage provably never feeds a real output
   (GEMM rows are independent; document the argument in a comment).
-- Watch for **env leaks in tests** (parallel in-process tests + env-driven
-  backend switches) — a "flaky golden" has turned out to be another test's
-  leftover env var. Use serial locks and `remove_var`.
+- **Tests configure behaviour with a `Config`, never with the environment.**
+  Build the `Config` you want and pass it (`VulkanBackend::new_with(cfg)`,
+  `CpuBackend::new_with(cfg)`, …). Setting an `INFR_*` variable from a test is a
+  process-wide write that races every other test in the binary — that was the
+  original "flaky golden" — and there is no longer an `EnvGuard` to work around
+  it. See [`config.md`](config.md).
 
 ## Codebase habits
 

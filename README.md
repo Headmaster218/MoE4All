@@ -101,10 +101,54 @@ infr run unsloth/Qwen3-0.6B-GGUF:IQ4_XS   "Write a haiku about Rust."
 # path (their `nextn` tensors are simply unused) and are otherwise fully supported.
 infr run unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_XL "Explain how a hash map works."
 
-# Sampling: greedy by default (INFR_TEMP=0). Temperature / top-k / top-p:
-INFR_TEMP=0.7 INFR_TOP_K=40 INFR_TOP_P=0.95 \
-  infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "Tell me a story."
+# Sampling defaults to the model's own recommended values; override per run:
+infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "Tell me a story." \
+  --temp 0.7 --top-k 40 --top-p 0.95
 ```
+
+## Configuration
+
+Everything the engine can be told — device, context, sampling, KV format, paging
+budgets, every kernel-tier switch — is one typed value resolved once at startup
+from **four layers, later wins**:
+
+```
+defaults  <  config file (TOML)  <  INFR_* environment  <  CLI flags / --set
+```
+
+The config file is the **first existing** of `--config <PATH>` (an error if that
+path does not exist), `./infr.toml`, then `$XDG_CONFIG_HOME/infr/config.toml`
+(else `~/.config/infr/config.toml`). First match wins — there is no merging
+across files, and finding no file is a no-op.
+
+```toml
+# ./infr.toml — see infr.example.toml for a commented starting point
+[device]
+ctx = "32k"
+
+[kv]
+type_k = "q8_0"
+
+[kernels.vulkan]
+flash_splits = 2
+gemm_warp = false     # the file speaks the POSITIVE field names
+```
+
+**Every documented `INFR_*` variable still works** — nothing was renamed; the
+variables now feed the same resolved value the file and the flags do. Knobs
+without a dedicated flag are reachable with `--set <config.path>=<value>`, which
+takes the same paths as the file:
+
+```bash
+infr bench "$M" -p 512 -n 0 --set kernels.vulkan.flash_splits=2
+```
+
+Where a bespoke flag and a `--set` name the same field, the flag wins and says
+so (`--ctx 4096 --set device.ctx=8192` runs at 4096 and prints a warning).
+
+Full reference — the per-section walkthrough, `--set` semantics, the unknown-key
+behaviour, and the handful of `INFR_*` keys that are deliberately not
+configuration — is in [`docs/config.md`](docs/config.md).
 
 ### Serving
 
@@ -124,9 +168,9 @@ Works as a drop-in backend for OpenAI-API clients (opencode, the Claude Code
 CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 (Qwen, Llama-3.x, Gemma tool dialects supported).
 
-Sampling is greedy at `INFR_TEMP=0`; otherwise `INFR_TEMP` / `INFR_TOP_K` /
-`INFR_TOP_P` control it (see
-[Benchmarking & profiling](#benchmarking--profiling) for the full env list).
+`--temp` / `--top-k` / `--top-p` set the SERVER defaults (`--temp 0` = greedy);
+a per-request OpenAI `temperature`/`top_p` still overrides them. See
+[Configuration](#configuration).
 
 ## Benchmarking & profiling
 
@@ -195,8 +239,9 @@ steps) and `dg-e2e` (informational end-to-end tok/s, each side's own step count
 folded into the row so the mismatch is visible). Details in
 [`docs/diffusion-gemma.md`](docs/diffusion-gemma.md).
 
-Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
-greedy), `INFR_MAX_NEW`, `INFR_CTX`, `INFR_NO_FLASH`.
+Useful knobs: `--temp` / `--top-k` / `--top-p` (sampling; `--temp 0` → greedy),
+`--max-new`, `--ctx` — or the `sampling.*` / `device.*` config paths, or their
+`INFR_*` twins. See [Configuration](#configuration).
 
 **MoE expert placement**: resident when the expert banks fit VRAM (zero config,
 zero change); otherwise every layer pages through a VRAM-resident LRU expert
@@ -234,7 +279,8 @@ CPU when the overflow is smaller — measured crossover on this box is around a
 quarter of the model overflowing). An MoE model whose DENSE part also doesn't
 fit is out of scope and errors clearly.
 
-**Size grammar** — `INFR_CACHE` and `INFR_CTX` share one value grammar
+**Size grammar** — `paging.cache` / `INFR_CACHE` and `device.ctx` / `INFR_CTX` /
+`--ctx` share one value grammar
 (`infr_core::parse_size`): a plain number is the base unit (bytes for
 `INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t` suffixes scale by 1024
 (`INFR_CACHE=19g`, `INFR_CTX=256k`), and `%` resolves against the
@@ -691,7 +737,7 @@ hybrid: 6.55 — decode stays upload-bound: a 24 GB budget can't hold the ~37 GB
 decode working set, so ~350 MB/token still pages in). `INFR_CACHE` sizes the
 pager's budget (see the MoE placement paragraph above); `INFR_PAGER_RING`
 overrides the staging-ring size (default: budget/8 clamped to [256 MiB, 2 GiB]);
-pure CPU stays available under `INFR_CPU=1` / `-ngl 0`. Remaining follow-up:
+pure CPU stays available under `--dev cpu` / `-ngl 0`. Remaining follow-up:
 splitting a role across several arena buffers to lift the 4 GiB per-role cache
 cap.
 
@@ -715,9 +761,9 @@ dequant).
   E2B + 26B-A4B MoE), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU
   reference; DiffusionGemma (block text-diffusion, CPU + GPU); Llama 4 (Scout —
   GPU by default via the paged expert cache, 37 GB Q2_K on a 24 GB card; pure
-  CPU under `INFR_CPU=1`)
+  CPU under `--dev cpu`)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
-  via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
+  via a native **Metal backend** (`--dev metal`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
   optimized (simdgroup-matrix GEMM + flash attention, raw-block quant decode;
   within ~1.3-1.5× of llama.cpp Metal on M3 Pro — architecture and numbers in

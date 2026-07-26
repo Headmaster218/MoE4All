@@ -201,10 +201,12 @@ in `chat/mod.rs` and every backend chat calls them:
 - `reset_session(&mut Option<DenseSession<B, X>>)` — the identical `reset_kv`
   body, generic over candidate E's session pairing; 5 call sites (three
   `reset_kv` impls plus `SpecMetalChat::warmup`'s two).
-- `env_ctx_spec()` / `env_ctx(n_ctx_train)` — the `INFR_CTX` parse. Metal's and
-  ROCm's `ensure_session` bodies were byte-identical; Vulkan takes the raw
-  `SizeSpec` (it routes `Bytes`/`Percent` to different VRAM-fit constructors).
-  `INFR_CTX` is now named in exactly one place.
+- `cfg_ctx_spec(cfg)` / `cfg_ctx(cfg, n_ctx_train)` — the context-override read.
+  Metal's and ROCm's `ensure_session` bodies were byte-identical; Vulkan takes
+  the raw `SizeSpec` (it routes `Bytes`/`Percent` to different VRAM-fit
+  constructors). Landed as `env_ctx_spec()`/`env_ctx()` parsing `INFR_CTX`
+  directly; the config campaign (S7) turned them into `device.ctx` reads off the
+  borrowed `Config`, so the environment is no longer touched here at all.
 
 **NOT done — `SessionChat<S>` + a blanket `ChatModel` impl.** The three are only
 identical down to the struct header; past it they diverge for real reasons, and
@@ -227,8 +229,8 @@ dissimilar single-use stubs would obfuscate ~15 lines, not dedup them.
 
 Original audit below (historical). `chat/{vulkan,rocm,metal}.rs` are
 structurally identical: `{model, session: Option<…Session>, …}`, `new`,
-`ensure_session` (lazy open + `INFR_CTX` via `parse_size`), and a `ChatModel`
-impl whose `warmup` is copy-paste
+`ensure_session` (lazy open + the `INFR_CTX` size spec, now `device.ctx` off the
+resolved `Config`), and a `ChatModel` impl whose `warmup` is copy-paste
 `self.generate("Hi", 2, …)?; session.reset_cache()` (vulkan
 `chat/vulkan.rs:143`, rocm `chat/rocm.rs:62`, metal `chat/metal.rs:87`);
 `reset_kv` identical.
@@ -265,11 +267,13 @@ vulkan adds `pins`) with identical `reset_cache` delegating to the
 hosts the device-independent half of kernel selection; every measured number
 stays with its backend and is passed IN as config:
 
-- **`EnvRows { env, default, min, max }` + `get()`** — the `INFR_*` numeric
-  row/count knob (parse → default → clamp). Vulkan's `INFR_MOE_SMALL_M` (default
-  8, ceiling 64 — an unclamped override device-losts the GPU) and
-  `INFR_CANVAS_CHUNK_N` (default 3, floor 1) now declare a config instead of
-  re-spelling the parse chain.
+- **`EnvRows { env, default, min, max }`** — the numeric row/count knob (default
+  → clamp). Vulkan's `INFR_MOE_SMALL_M` (default 8, ceiling 64 — an unclamped
+  override device-losts the GPU) and `INFR_CANVAS_CHUNK_N` (default 3, floor 1)
+  declare a config instead of re-spelling the parse chain. Its `get()` read is
+  gone: the config campaign moved the parse into the config layer, so the struct
+  now names its `INFR_*` key for identity only and the read site calls
+  `clamped(cfg_value)`.
 - **`linear_tier(m, out_f, &[MultiRowBand]) -> LinearTier`** — the dense
   `Linear` m-ladder as an enum (`Decode` / `MultiRow { band }` / `Gemm`) the
   backend maps to its own kernels. `MultiRowBand` carries `min_m`/`max_m`/
@@ -506,7 +510,10 @@ into `infr-core/src/pager.rs`:
 - **`env_flag` / `env_mib` / `overflow_vram_reserve`** — the `INFR_*` grammars
   the spill knobs share: the `empty`/`0` = off flag (4 copies: Vulkan, ROCm ×2,
   the seam's `kv_overflow_enabled`), the MiB→bytes cap parse (3 copies), and the
-  12%-of-VRAM-floored-at-2-GiB reserve (2 copies).
+  12%-of-VRAM-floored-at-2-GiB reserve (2 copies). (The config campaign has
+  since split each into a pure grammar the config layer uses and an accessor the
+  read site uses — `flag_from` / `mib_from` / `mib_bytes` / `reserve_bytes`;
+  none of them touch the environment any more.)
 - **`infr_core::pager::ring_bytes_policy`** — moved out of `infr-vulkan` (which
   re-exports it under the old path). Pure budget arithmetic with an
   `INFR_PAGER_RING` override, and the seam's placement math was already reaching

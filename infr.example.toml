@@ -1,0 +1,260 @@
+# infr configuration — example file.
+#
+# Copy to `./infr.toml` (project-local) or `~/.config/infr/config.toml` (global)
+# and edit. Full reference: docs/config.md. The complete key list is
+# `infr_core::config::Config::all_paths()`; the env-name mapping is
+# `crates/infr-core/src/config/manifest.rs`.
+#
+# Precedence, later wins:  defaults < this file < INFR_* env < CLI flags/--set.
+# Lookup, FIRST existing file wins (no merging):
+#   1. --config <PATH>          (an error if it does not exist)
+#   2. ./infr.toml
+#   3. $XDG_CONFIG_HOME/infr/config.toml, else ~/.config/infr/config.toml
+#
+# The file speaks the POSITIVE field names: `gemm_warp = false`, never
+# `no_gemm_warp`. The `INFR_NO_*` spellings exist only in the environment.
+#
+# Every ACTIVE line below is set to its shipped DEFAULT, so this file as-is
+# changes nothing. Commented lines show the grammar for knobs whose default is
+# "unset"; their default is stated in the comment.
+
+# ── device ───────────────────────────────────────────────────────────────────
+
+[device]
+# Device for the forward: "Vulkan0"/"Vulkan1"/…, "metal", "cpu", "rocm[N]".
+# Same grammar as `--dev` / INFR_DEV. Default: unset = first discrete Vulkan GPU.
+# dev = "Vulkan0"
+
+# Context window. Shared size grammar: 8192 / 256k / 50% (of the free-VRAM KV
+# capacity). Default: unset = the model's trained context, clamped to VRAM.
+# ctx = "32k"
+
+# Prefill micro-batch rows (llama-bench's -ub). Default: unset = the engine's
+# adaptive chunk policy.
+# ubatch = 512
+
+# Worker threads; published as RAYON_NUM_THREADS. Not an INFR_* knob.
+# Default: unset = all cores.
+# threads = 16
+
+# Prefill chunk for a sequence sharing the GPU (`serve --parallel N`).
+ubatch_parallel = 256
+
+# Submit-splitter cap; 0 = never split. Raise only to chase an iGPU watchdog
+# reset. Default: unset = the measured per-device cap. A bad value is a HARD
+# error, not a fallback.
+# submit_dispatches = 64
+
+# Subgroup-size preference — exactly 16 or 32; anything else is a HARD error.
+# Default: unset = vendor-derived.
+# subgroup_pref = 32
+
+# ── sampling ─────────────────────────────────────────────────────────────────
+#
+# CAUTION: temp / top_k / top_p / max_new are PROVENANCE-sensitive. `infr run`
+# and `infr serve` fill whatever NO layer specified from the model's own
+# recommended sampling (the arch-family table plus any generation_config.json
+# beside the model). Naming one here PINS it and suppresses that fallback —
+# which is the point of setting it, but it is not the same as leaving it out.
+# The `Config` defaults, used by library callers, are temp 0.0 (greedy),
+# top_k 20, top_p 0.95, max_new 2048.
+
+[sampling]
+# temp = 0.6      # 0 = greedy/argmax
+# top_k = 40      # 0 = keep all
+# top_p = 0.95
+# max_new = 2048
+
+# RNG seed. Default: unset = seeded from the clock (the CLI/diffusion paths use
+# 42 as their own fallback).
+# seed = 42
+
+# Never stop at EOS. Bench pins this on for its own runs.
+ignore_eos = false
+
+# Suppress the model's `<think>` block where the template supports one.
+no_think = false
+
+# ── kv cache ─────────────────────────────────────────────────────────────────
+
+[kv]
+# K/V cache element format. Names: f16 f32 bf16 q8_0 q4_0 q4_1 q5_0 q5_1
+# iq4_nl turbo2 turbo3 turbo4. Default: unset = f16 (with the engine's auto-q8
+# policy, which naming EITHER of these suppresses).
+# type_k = "q8_0"
+# type_v = "q8_0"
+
+# Legacy both-sides-q8 alias for the pair above.
+force_q8 = false
+
+# Prefix-cache slots (`infr serve` reuses a matching prefix across requests).
+slots = 4
+
+# The sliding-window ring cache (INFR_NO_KV_RING inverted).
+ring = true
+
+# Decode-time inline KV write, and the coopmat/BDA KV path.
+inline_decode = false
+coopmat_bda = false
+
+# Spill the KV cache to host RAM when VRAM runs out (VRAM-first). Note the
+# grammar of the env twin: INFR_KV_OVERFLOW="" and ="0" are OFF.
+overflow = false
+# VRAM ceiling for the KV cache, in MiB. Default: unset = the fit calculation.
+# overflow_vram_mb = 512
+# Headroom left for everything else, in MiB. Default: max(12% of VRAM, 2 GiB).
+# overflow_reserve_mb = 2048
+
+# ── paging (MoE expert cache + dense layer streaming) ────────────────────────
+
+[paging]
+# Force every layer through the paged VRAM cache with this budget, regardless of
+# whether the weights would have fit. Size grammar (19g / 80%).
+# Default: unset = resident when it fits, paged with the remaining VRAM if not.
+# cache = "8g"
+
+# Upload staging ring. Default: unset = budget/8, clamped to [256 MiB, 2 GiB].
+# ring = "1g"
+
+# Print per-pool hit/miss/eviction counts at exit.
+stats = false
+
+# ROCm weight paging (feature `rocm` only).
+rocm_prefetch_off = false
+rocm_prefetch_stats = false
+rocm_no_overlap = false
+# rocm_expert_budget = "4g"          # default: unset
+# rocm_prefetch_slots = 4            # default: unset = 4, floored at 2
+# rocm_prefetch_max_bank_mb = 256    # default: unset = 256
+
+# ── kernels ──────────────────────────────────────────────────────────────────
+#
+# Backend-independent graph-shape gates. Everything under [kernels.*] is a
+# kernel-TIER override: the engine picks the best tier its device supports, and
+# these exist to force a tier off when bisecting a correctness or perf problem.
+
+[kernels]
+qkv_fuse = true
+gated_rmsnorm = true
+
+[kernels.vulkan]
+# Capability masking — these AND with what the device actually reports.
+# `f16 = false` also turns coopmat off, regardless of `coopmat`.
+coopmat = true
+f16 = true
+i8_dot = true
+coopmat_8x8 = false # Intel Arc XMX 8x8x16 opt-in
+i8_coopmat = false
+bf16_coopmat = false
+
+# GEMM / GEMV tiers.
+gemm_warp = true
+mmq = true
+mmv = true
+mrow = true
+moe_small_m = 8 # clamped to 0..=64 by the accessor
+
+# Attention.
+flash_warp = true
+flash_min_rows = 24
+# flash_splits = 2   # default: unset = the engine's split heuristic
+# pv_splits = 2      # default: unset
+
+# Misc.
+push_desc = true
+pipeline_cache_disk = true
+gpu_pos = true
+fuse_add = true
+no_replay = false # sanctioned negative: true DISABLES the decode replay tape
+
+[kernels.cpu]
+spin = 32768 # spin-pool idle ceiling
+spinpool = true
+repack_mb = 4096 # repack-cache budget, MiB
+reference = false # bit-reference kernels (no env twin)
+
+[kernels.rocm]
+i8 = true
+pipe = true
+coop = false
+blas = false
+no_wmma = false
+fuse_add = true
+fuse_norm = true
+# wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
+# coop_tile = "64x64" # default: unset = the 128x64 tile
+
+[kernels.metal]
+f16_cmm = true
+bf16_cmm = true
+f32_cmm = true
+kquant_native = true
+deltanet = true
+moe = true
+
+# ── speculative decode / MTP ─────────────────────────────────────────────────
+
+[spec]
+# MTP self-speculative decode is currently PARKED — see README "MTP is parked".
+mtp = false
+k = 6 # draft-length upper bound
+decode_chain = 8 # decode iterations per submission
+debug = false
+gpu_argmax = true
+gpu_sample = true
+gpu_embed = true
+# draft = "/path/to/draft.gguf"   # default: unset
+
+# ── multi-GPU ────────────────────────────────────────────────────────────────
+
+[multi]
+# Device lists: [0, 1] or ["Vulkan0", "Vulkan1"]. pipeline and tensor_parallel
+# need >= 2 devices, expert_parallel >= 1; too few is a HARD error.
+# Default for all three: unset = single device.
+# pipeline = [0, 1]
+# tensor_parallel = [0, 1]
+# expert_parallel = [0]
+
+# Transport. true = GPU-to-GPU P2P, false = stage through host RAM (the
+# INFR_*_HOST env keys, inverted).
+pipeline_p2p = true
+tp_p2p = true
+ep_p2p = true
+
+# ── profiling ────────────────────────────────────────────────────────────────
+#
+# Turning any prof.* / debug.* knob on FROM THIS FILE prints one line at startup
+# naming the file and the fields, so "why is my server printing timings" stays
+# answerable from the command line.
+
+[prof]
+prof = false
+prof2 = false # per-dispatch GPU timestamps
+prof2_shapes = false # shape-itemized GEMV/GEMM buckets (needs prof2)
+prof_dec = false
+prof_pf = false
+vram_log = false
+mtp_time = false
+# profile_out = "/tmp/infr-profile.json"   # default: unset
+# metal_profile = "2"   # presence = on, "2" = per-op, "3" = counter set
+
+# ── serve ────────────────────────────────────────────────────────────────────
+
+[serve]
+# Bearer token for the HTTP API. An EMPTY value means NO auth.
+# Default: unset = no auth.
+# api_key = "hunter2"
+
+max_tokens_cap = 131072
+
+# ── debug ────────────────────────────────────────────────────────────────────
+
+[debug]
+coopmat = false # print the enumerated/chosen coopmat shapes
+bda_chunk = false
+wide_dispatch = false
+chat = false
+moe_counts = false
+poison_uninit = false # fill fresh buffers with a poison pattern
+no_barrier = false
+full_barrier = false

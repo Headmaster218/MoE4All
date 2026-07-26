@@ -71,20 +71,24 @@ impl CompletionShell {
 }
 
 /// The backend selected for a forward. Produced by the ONE decision function [`resolve_backend`]
-/// (from `--dev` + the inherited env) and by the ONE reader [`selected_backend`] (from the env
-/// alone) — so `--dev`, [`DeviceOpts::resolve`]'s env publishing, and every command's backend
-/// funnel (`run`/`serve`/`bench`) can never disagree on the pick.
+/// (from `--dev` + whatever `device.dev` the other layers carry) and by the ONE reader
+/// [`selected_backend`] (from the resolved [`Config`] alone) — so `--dev`,
+/// [`DeviceOpts::overrides`] and every command's backend funnel (`run`/`serve`/`bench`) can never
+/// disagree on the pick. Since S8 nothing publishes `INFR_DEV` back into the environment; the CLI
+/// layer of the `Config` is the whole delivery mechanism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
-    /// A Vulkan GPU. `Some("Vulkan1")` pins a device (published as `INFR_DEV=VulkanN`); `None` =
+    /// A Vulkan GPU. `Some("Vulkan1")` pins a device (carried as `device.dev`); `None` =
     /// the default "first discrete GPU, else device 0".
     Vulkan(Option<String>),
-    /// The Apple GPU (`INFR_DEV=metal`).
+    /// The Apple GPU (`device.dev = "metal"` / `INFR_DEV=metal`).
     Metal,
-    /// The CPU reference backend (`INFR_DEV=cpu`).
+    /// The CPU reference backend (`device.dev = "cpu"` / `INFR_DEV=cpu`).
     Cpu,
-    /// AMD GPU through the ROCm/HIP stack (`INFR_DEV=rocm` or `INFR_DEV=rocm:N`).
-    /// `Some("rocm1")` pins a device index; `None` = device 0.
+    /// AMD GPU through the ROCm/HIP stack (`INFR_DEV=rocm` or `INFR_DEV=rocmN`).
+    /// `Some("rocm1")` pins a device index; `None` = device 0. Note the index is glued to the
+    /// name — [`parse_rocm_device`] strips the `rocm` prefix and parses the rest, so a separator
+    /// (`rocm:1`) parses as device 0.
     Rocm(Option<String>),
 }
 

@@ -18,14 +18,15 @@
   bidirectional `[lo, kv_len)`-for-every-row reach `AttnMask::Canvas` needs (see
   "Metal implementation notes" below); `DiffusionGemmaMetalSession`
   (`crates/infr-llama/src/seam_model.rs`) is the Vulkan session's twin;
-  `infr run`/`serve`/`bench` now route `INFR_METAL` there instead of falling
-  back to CPU. In-graph self-conditioning (`gpu_sc`, Phase B) widened to cover
-  Metal too — its `Op::Softmax`/`Op::Linear` already handled the shape/dtype.
-  Metal hardware validation is deferred to the M3 collaborator (see the
-  checklist at the end of this section); CPU and Vulkan remain the validated
-  backends until then. **Not done in Phase D**: a Metal batched-MoE pipeline —
-  DG's fused MoE shape still runs Metal's per-token host-loop fallback (too
-  large to build blind; same gap as Vulkan, see "Known gaps" below).
+  `infr run`/`serve`/`bench` now route `--dev metal` (`INFR_DEV=metal`) there
+  instead of falling back to CPU. In-graph self-conditioning (`gpu_sc`, Phase B)
+  widened to cover Metal too — its `Op::Softmax`/`Op::Linear` already handled
+  the shape/dtype. Metal hardware validation is deferred to the M3 collaborator
+  (see the checklist at the end of this section); CPU and Vulkan remain the
+  validated backends until then. **Not done in Phase D**: a Metal batched-MoE
+  pipeline — DG's fused MoE shape still runs Metal's per-token host-loop
+  fallback (too large to build blind; same gap as Vulkan, see "Known gaps"
+  below).
 - **What works**: `infr run` (CPU + Vulkan, entropy-bound block-diffusion
   decode, multi-turn REPL — see the oracle-equivalent captured runs below);
   `infr serve` (OpenAI `/v1/chat/completions`, streaming + non-streaming,
@@ -226,23 +227,28 @@ Resolved from the oracle source (`diffusion-cli.cpp` run_turn, ~line 413+):
 
 ## Live denoise view (`infr run`)
 
-`INFR_DIFFUSION_VISUAL=1` turns on a live canvas view while `infr run` denoises
-a block — a small opt-in port of the oracle's `--diffusion-visual` UX (see
+`infr run --diffusion-visual` turns on a live canvas view while it denoises a
+block — a small opt-in port of the oracle's `--diffusion-visual` UX (see
 `~/Projects/mxaddict/llama.cpp-dg/examples/diffusion/diffusion-cli.cpp`), not a
-dependency on it. Only active on a TTY stdout (piped/redirected output is left
-alone); `INFR_DIFFUSION_VISUAL=force` bypasses the TTY check for scripted
+dependency on it. It is CLI presentation only, so it is a plain clap flag rather
+than a `Config` field; the `INFR_DIFFUSION_VISUAL` spelling still works as the
+flag's env fallback. Only active on a TTY stdout (piped/redirected output is
+left alone); `--diffusion-visual=force` bypasses the TTY check for scripted
 verification. Per step it decodes the block's current canvas fresh (a throwaway
 tokenizer, ≤ `canvas_length` tokens, no GPU work), prints already-accepted runs
 as normal text and still-renoising positions (this sampler has no literal mask
 token — see `crate::diffusion`'s module doc) as a dim `·` placeholder, and
 redraws a fixed-size scratch region in place (cursor-up + erase) so the terminal
 never scrolls mid-block. The region is erased right before the finished reply
-prints, so the ordinary transcript stays clean; the hook is a no-op with the env
-unset (byte-identical decode loop, zero GPU cost).
+prints, so the ordinary transcript stays clean; the hook is a no-op with the
+flag unset (byte-identical decode loop, zero GPU cost).
 
 ```bash
-INFR_DIFFUSION_VISUAL=1 infr run <dg-gguf>
+infr run <dg-gguf> --diffusion-visual
 ```
+
+(The flag takes an optional value, so it must follow the model argument — put it
+first and clap consumes the model as its value.)
 
 ## Validation ladder
 
@@ -363,10 +369,10 @@ unverified):
 - [ ] `cargo test -p infr-metal --test kernel_names -- --include-ignored` —
       confirms `attention_canvas*` resolve in the compiled MSL library (the
       tripwire test).
-- [ ] A real DG denoise run (`INFR_METAL=1 infr run <dg-gguf>`) produces
+- [ ] A real DG denoise run (`infr run --dev metal <dg-gguf>`) produces
       coherent, non-garbage text — the end-to-end smoke test no unit test can
       substitute for.
-- [ ] `INFR_METAL=1 infr bench <dg-gguf> -p 128 -n 256` reports a sane
+- [ ] `infr bench --dev metal <dg-gguf> -p 128 -n 256` reports a sane
       (non-crashing, non-degenerate) pp/decode rate, ideally compared against
       the Vulkan number on the same machine if available.
 - [ ] With self-conditioning on (the default after a step 0), confirm output
