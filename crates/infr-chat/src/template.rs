@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use infr_core::config::Config;
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource; // brings `Gguf::metadata()` into scope
 use infr_gguf::Gguf;
@@ -114,12 +115,20 @@ impl std::error::Error for TemplateError {}
 /// `tokenizer.chat_template`. Template handling (pycompat, `enable_thinking`, bos/eos, tools) lives
 /// here so every caller (single-turn, multi-turn, CPU + GPU backends) shares it. Returns `None` if
 /// there's no template or it fails to render (caller falls back to [`chatml`]).
+///
+/// `cfg` supplies the two knobs this renderer reads — `sampling.no_think` (`INFR_NO_THINK`) and
+/// `debug.chat` (`INFR_DEBUG_CHAT`). It is a BORROWED parameter rather than a field on a renderer
+/// struct because `infr-chat` deliberately owns no state at all (no model, no backend, no cache
+/// beyond the compiled-template memo): every entry point here is a pure function of its inputs, and
+/// the config is one of those inputs. Callers that DO own a renderer — `SeamModel`,
+/// `infr_llama::chat::OaiRenderer` — hold the `Arc<Config>` and hand out a borrow (§5, R6).
 pub fn render_chat_jinja(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
     eos: u32,
     messages: &[(&str, &str)],
     add_generation_prompt: bool,
+    cfg: &Config,
 ) -> Option<String> {
     let msgs: Vec<Value> = messages
         .iter()
@@ -132,6 +141,7 @@ pub fn render_chat_jinja(
         msgs,
         Value::Null,
         add_generation_prompt,
+        cfg,
     )
     .ok()
 }
@@ -147,6 +157,7 @@ pub fn render_chat_jinja(
 ///
 /// Errors carry the real cause ([`TemplateError`]) so serve can return the render error message
 /// instead of a bare 500.
+#[allow(clippy::too_many_arguments)]
 pub fn render_chat_oai(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
@@ -154,10 +165,19 @@ pub fn render_chat_oai(
     messages: &[ChatMessage],
     tools: Option<&Value>,
     add_generation_prompt: bool,
+    cfg: &Config,
 ) -> Result<String, TemplateError> {
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
     let tools = tools.cloned().unwrap_or(Value::Null);
-    render_core(gguf, tokenizer, eos, msgs, tools, add_generation_prompt)
+    render_core(
+        gguf,
+        tokenizer,
+        eos,
+        msgs,
+        tools,
+        add_generation_prompt,
+        cfg,
+    )
 }
 
 /// Build the template's per-message dict, preserving the tool round-trip fields the HF chat templates
@@ -189,6 +209,7 @@ fn message_to_json(m: &ChatMessage) -> Value {
 
 /// Core renderer over a GGUF: pull the template + bos/eos out of the metadata, then delegate to
 /// [`render_template`]. Shared by every entry point so template handling lives in ONE place.
+#[allow(clippy::too_many_arguments)]
 fn render_core(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
@@ -196,6 +217,7 @@ fn render_core(
     msgs: Vec<Value>,
     tools: Value,
     add_generation_prompt: bool,
+    cfg: &Config,
 ) -> Result<String, TemplateError> {
     let template = gguf
         .metadata()
@@ -215,9 +237,7 @@ fn render_core(
     // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
     // then behave the same under `infr run`/`serve` regardless of what their template's own
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
-    // INFR_NO_THINK=1 turns thinking off (INFR_NO_THINK=0 is a no-op, matching the other INFR_NO_*
-    // toggles).
-    let think = !std::env::var("INFR_NO_THINK").is_ok_and(|v| v != "0");
+    let think = thinking_enabled(cfg);
     match render_template(
         template,
         msgs,
@@ -228,18 +248,28 @@ fn render_core(
         think,
     ) {
         Ok(s) => {
-            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+            if cfg.debug.chat {
                 eprintln!("[chat-template] rendered:\n{s}\n[/chat-template]");
             }
             Ok(s)
         }
         Err(e) => {
-            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+            if cfg.debug.chat {
                 eprintln!("[chat-template] render error: {e:#}");
             }
             Err(TemplateError::Render(e))
         }
     }
+}
+
+/// The `enable_thinking` a render gets, from `sampling.no_think` (S7 — [`render_core`] used to
+/// read the `INFR_NO_THINK` variable from the process environment right here).
+///
+/// `INFR_NO_THINK=1` turns thinking OFF and `INFR_NO_THINK=0` is a NO-OP, matching the other
+/// `INFR_NO_*` toggles — that is the `SetNotZero` env grammar the config layer parses, so the
+/// polarity lives in exactly one place and this is a plain negation.
+fn thinking_enabled(cfg: &Config) -> bool {
+    !cfg.sampling.no_think
 }
 
 /// Render a raw chat-template STRING with the full infr jinja environment (pycompat,
@@ -277,8 +307,9 @@ pub fn render_chat_user(
     tokenizer: &Tokenizer,
     eos: u32,
     user: &str,
+    cfg: &Config,
 ) -> Option<String> {
-    render_chat_jinja(gguf, tokenizer, eos, &[("user", user)], true)
+    render_chat_jinja(gguf, tokenizer, eos, &[("user", user)], true, cfg)
 }
 
 #[cfg(test)]
@@ -312,5 +343,49 @@ mod template_tests {
         let b = render_template(other, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
         assert_ne!(a, b);
         assert_eq!(b, "ONLY:hi");
+    }
+
+    /// `sampling.no_think` drives the template's `enable_thinking`, read off a `Config` VALUE —
+    /// never the environment (S7, R7). The truth table the env layer feeds this with:
+    ///
+    /// | `INFR_NO_THINK` | env layer emits | `sampling.no_think` | `enable_thinking` |
+    /// | --------------- | --------------- | ------------------- | ----------------- |
+    /// | unset           | `None`          | `false`             | `true`  (thinking) |
+    /// | `"0"`           | `None`          | `false`             | `true`  (NO-OP)    |
+    /// | `""`            | `Some(true)`    | `true`              | `false` (off)      |
+    /// | `"1"`           | `Some(true)`    | `true`              | `false` (off)      |
+    #[test]
+    fn no_think_config_drives_enable_thinking() {
+        let mut cfg = Config::default();
+        assert!(thinking_enabled(&cfg), "default = thinking ON");
+        cfg.sampling.no_think = true;
+        assert!(!thinking_enabled(&cfg), "sampling.no_think = thinking OFF");
+
+        // …and the flag really reaches the template context.
+        const PROBE: &str = "think={{ enable_thinking }}";
+        let mut cfg = Config::default();
+        let on = render_template(
+            PROBE,
+            msgs(),
+            Value::Null,
+            "",
+            "",
+            true,
+            thinking_enabled(&cfg),
+        )
+        .unwrap();
+        cfg.sampling.no_think = true;
+        let off = render_template(
+            PROBE,
+            msgs(),
+            Value::Null,
+            "",
+            "",
+            true,
+            thinking_enabled(&cfg),
+        )
+        .unwrap();
+        assert_eq!(on, "think=true");
+        assert_eq!(off, "think=false");
     }
 }

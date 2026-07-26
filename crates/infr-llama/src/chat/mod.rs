@@ -155,28 +155,27 @@ pub(crate) fn reset_session<B, X>(session: &mut Option<crate::seam::model::Dense
     }
 }
 
-/// The user's `INFR_CTX` override in the shared size grammar (`8192`, `256k`, `50%`), unresolved.
-/// The ONE place the session-backed chats name that env var — Vulkan wants the raw
-/// [`infr_core::SizeSpec`] (it routes `Bytes`/`Percent` to different VRAM-fit constructors);
-/// Metal/ROCm resolve it through [`env_ctx`]. `None` = unset or unparseable.
+/// The user's `device.ctx` (`INFR_CTX`) override in the shared size grammar (`8192`, `256k`,
+/// `50%`), unresolved. Vulkan wants the raw [`infr_core::SizeSpec`] (it routes `Bytes`/`Percent`
+/// to different VRAM-fit constructors); Metal/ROCm resolve it through [`cfg_ctx`]. `None` = no
+/// override.
+///
+/// Takes the borrowed engine config each chat already owns through its [`crate::SeamModel`] (S7) —
+/// this used to read the `INFR_CTX` variable from the process environment, where an unparseable
+/// value fell through to `None`; the env LAYER now drops it just the same (R5).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn env_ctx_spec() -> Option<infr_core::SizeSpec> {
-    std::env::var("INFR_CTX")
-        .ok()
-        .and_then(|v| infr_core::parse_size(&v))
+pub(crate) fn cfg_ctx_spec(cfg: &crate::EngineConfig) -> Option<infr_core::SizeSpec> {
+    cfg.device.ctx
 }
 
-/// [`env_ctx_spec`] resolved to a token count: a percentage resolves against the model's TRAINED
+/// [`cfg_ctx_spec`] resolved to a token count: a percentage resolves against the model's TRAINED
 /// context, since these paths have no VRAM-fit calc to take a fraction of. `None` = no override —
 /// the caller supplies its own default. Shared by the Metal and ROCm chats, whose `ensure_session`
-/// bodies were byte-identical.
-///
-/// `allow(dead_code)`: both callers are cfg-gated (macOS / `--features rocm`), so a plain
-/// Linux+Vulkan build compiles this with no call site.
-#[allow(dead_code)]
+/// bodies were byte-identical — plus the diffusion-gemma chat, whose own copy of the resolve this
+/// replaced.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn env_ctx(n_ctx_train: usize) -> Option<usize> {
-    env_ctx_spec().map(|s| s.resolve(n_ctx_train as u64) as usize)
+pub(crate) fn cfg_ctx(cfg: &crate::EngineConfig, n_ctx_train: usize) -> Option<usize> {
+    cfg_ctx_spec(cfg).map(|s| s.resolve(n_ctx_train as u64) as usize)
 }
 
 /// Store only the ANSWER, dropping the model's reasoning (Qwen3 excludes prior-turn thinking;
@@ -296,11 +295,15 @@ pub struct OaiRenderer {
     gguf: infr_gguf::Gguf,
     tokenizer: tokenizers::Tokenizer,
     eos: u32,
+    /// The engine configuration this renderer was opened with — `infr-chat`'s renderer reads
+    /// `sampling.no_think` / `debug.chat` off it (S7). Held as the `Arc` the caller resolved in
+    /// `main()`, borrowed at the render site (R6).
+    ecfg: std::sync::Arc<crate::EngineConfig>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl OaiRenderer {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
+    pub fn open(path: &std::path::Path, ecfg: std::sync::Arc<crate::EngineConfig>) -> Result<Self> {
         let gguf = infr_gguf::Gguf::open(path).map_err(|e| anyhow::anyhow!("open gguf: {e}"))?;
         let tokenizer = crate::build_tokenizer(&gguf)?;
         // Raw metadata (NOT Config::from_gguf — that parser is dense-only and rejects qwen35).
@@ -313,6 +316,7 @@ impl OaiRenderer {
             gguf,
             tokenizer,
             eos,
+            ecfg,
         })
     }
 
@@ -321,14 +325,22 @@ impl OaiRenderer {
         messages: &[infr_chat::ChatMessage],
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
-        infr_chat::render_chat_oai(&self.gguf, &self.tokenizer, self.eos, messages, tools, true)
-            .map_err(|e| match e {
-                // No embedded template at all → the standard "infr requires an instruct model" error.
-                infr_chat::TemplateError::NoTemplate => no_template_err(),
-                // The template EXISTS but failed to render → surface the actual jinja error so
-                // serve's 500 body says what broke (not a generic "no usable template").
-                e @ infr_chat::TemplateError::Render(_) => anyhow::anyhow!("{e}"),
-            })
+        infr_chat::render_chat_oai(
+            &self.gguf,
+            &self.tokenizer,
+            self.eos,
+            messages,
+            tools,
+            true,
+            &self.ecfg,
+        )
+        .map_err(|e| match e {
+            // No embedded template at all → the standard "infr requires an instruct model" error.
+            infr_chat::TemplateError::NoTemplate => no_template_err(),
+            // The template EXISTS but failed to render → surface the actual jinja error so
+            // serve's 500 body says what broke (not a generic "no usable template").
+            e @ infr_chat::TemplateError::Render(_) => anyhow::anyhow!("{e}"),
+        })
     }
 
     /// Build the FORCED tool-call grammar constraint for this model's tokenizer (see
@@ -489,6 +501,25 @@ mod tests {
             1,
             "render must not contain two consecutive user turns: {last}"
         );
+    }
+
+    /// `device.ctx` (`INFR_CTX`) reaches the session-backed chats off the `Config` their
+    /// `SeamModel` carries — never `std::env::var` (S7, R7). Both halves of the knob: the raw
+    /// `SizeSpec` the Vulkan chat routes on, and the token count Metal/ROCm/diffusion resolve.
+    #[test]
+    fn ctx_override_comes_from_the_config() {
+        let mut cfg = crate::EngineConfig::default();
+        assert_eq!(cfg_ctx_spec(&cfg), None, "unset = no override");
+        assert_eq!(cfg_ctx(&cfg, 40_960), None);
+
+        // An explicit token count is used verbatim.
+        cfg.device.ctx = Some(infr_core::SizeSpec::Bytes(8192));
+        assert_eq!(cfg_ctx_spec(&cfg), Some(infr_core::SizeSpec::Bytes(8192)));
+        assert_eq!(cfg_ctx(&cfg, 40_960), Some(8192));
+
+        // A percentage resolves against the model's TRAINED context on these paths (no VRAM fit).
+        cfg.device.ctx = Some(infr_core::SizeSpec::Percent(0.5));
+        assert_eq!(cfg_ctx(&cfg, 40_960), Some(20_480));
     }
 
     #[test]

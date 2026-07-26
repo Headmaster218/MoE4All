@@ -123,8 +123,12 @@ impl Cfg {
 /// Render a plain user message through the qwen35 GGUF's own jinja chat template (falls back to
 /// ChatML — qwen35's native format — if there's no template). So `infr run` / tests pass plain text.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
-    render_chat_messages(path, &[("user", user)])
+pub fn render_chat(
+    path: &std::path::Path,
+    user: &str,
+    ecfg: &crate::EngineConfig,
+) -> Result<String> {
+    render_chat_messages(path, &[("user", user)], ecfg)
 }
 
 /// Render a multi-turn conversation `(role, content)` through the qwen35 GGUF's own jinja chat
@@ -132,11 +136,15 @@ pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
 /// the shared [`crate::chat::Chat`] can drive a history-based REPL. Errors if the GGUF has no usable
 /// `tokenizer.chat_template`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -> Result<String> {
+pub fn render_chat_messages(
+    path: &std::path::Path,
+    messages: &[(&str, &str)],
+    ecfg: &crate::EngineConfig,
+) -> Result<String> {
     let g = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let tok = crate::build_tokenizer(&g)?;
     let eos = g.metadata().u64("tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
-    infr_chat::render_chat_jinja(&g, &tok, eos, messages, true).ok_or_else(|| {
+    infr_chat::render_chat_jinja(&g, &tok, eos, messages, true, ecfg).ok_or_else(|| {
         anyhow!(
             "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
              render — set INFR_DEBUG_CHAT=1 for details)."

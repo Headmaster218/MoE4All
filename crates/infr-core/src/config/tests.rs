@@ -1037,6 +1037,23 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_ROCM_WMMA_TILE",
     ];
 
+    /// S7 — the last four crates. `device.ctx` moved to the session-backed chats (`chat/mod.rs`'s
+    /// `cfg_ctx`/`cfg_ctx_spec` + the diffusion chat's own copy); `sampling.no_think` and
+    /// `debug.chat` to `infr-chat`'s renderer, which now takes the `&Config` its callers own;
+    /// `prof.profile_out` is PUSHED into `infr-prof-rt` at startup (its report runs from a C
+    /// `atexit` hook with nothing to borrow); `serve.*` moved onto `AppState`.
+    ///
+    /// NOT here: `INFR_DIFFUSION_VISUAL`, which §6.10 sends to a plain clap flag rather than to
+    /// `Config` — it stays in `manifest::NOT_MIGRATED`.
+    const S7: &[&str] = &[
+        "INFR_API_KEY",
+        "INFR_CTX",
+        "INFR_DEBUG_CHAT",
+        "INFR_MAX_TOKENS_CAP",
+        "INFR_NO_THINK",
+        "INFR_PROFILE_OUT",
+    ];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
     let mut want: Vec<&str> = S2
@@ -1046,6 +1063,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         .chain(S5A)
         .chain(S5B)
         .chain(S6)
+        .chain(S7)
         .copied()
         .collect();
     want.sort_unstable();

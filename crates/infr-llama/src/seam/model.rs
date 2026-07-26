@@ -1866,7 +1866,7 @@ impl SeamModel {
     /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).
     pub fn render_chat(&self, user: &str) -> Result<String> {
-        render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user)
+        render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user, &self.ecfg)
             .ok_or_else(no_template_err)
     }
 
@@ -1875,8 +1875,15 @@ impl SeamModel {
     /// shared [`crate::chat::Chat`] can drive a history-based REPL. Same template + error contract as
     /// [`render_chat`](Self::render_chat), generalized past a single user turn.
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
-        render_chat_jinja(&self.gguf, &self.tokenizer, self.cfg.eos, messages, true)
-            .ok_or_else(no_template_err)
+        render_chat_jinja(
+            &self.gguf,
+            &self.tokenizer,
+            self.cfg.eos,
+            messages,
+            true,
+            &self.ecfg,
+        )
+        .ok_or_else(no_template_err)
     }
 
     /// Greedy generation on the CPU reference backend (no GPU). Returns the decoded text plus

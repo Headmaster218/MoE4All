@@ -343,6 +343,20 @@ enum Cmd {
         model: String,
         /// Optional one-shot message (otherwise drop into a REPL).
         message: Option<String>,
+        /// Live per-denoise-step canvas view (diffusion-gemma models only). Bare `--diffusion-visual`
+        /// (or `=1`) draws it when stdout is a tty; `=force` draws it anyway, for scripted
+        /// verification against piped stdout. CLI presentation only — NOT a `Config` field
+        /// (docs/config-plan.md §6.10), so it never reaches the forward.
+        #[arg(
+            long = "diffusion-visual",
+            value_name = "MODE",
+            num_args = 0..=1,
+            default_missing_value = "1",
+            default_value = "",
+            env = "INFR_DIFFUSION_VISUAL",
+            hide_env = true
+        )]
+        diffusion_visual: String,
         #[command(flatten)]
         device: DeviceOpts,
         #[command(flatten)]
@@ -603,6 +617,7 @@ fn main() -> anyhow::Result<()> {
     };
     let cfg = Arc::new(Config::load(&overrides)?);
     publish_thread_count(&cfg);
+    publish_profile_out(&cfg);
     publish_transitional_env(&cfg, &specified_by_the_layers(&overrides)?);
 
     // The subcommand runs to completion (or to its abort) and EVERYTHING it owns — model, backend,
@@ -649,7 +664,12 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Devices => cmd_devices(cfg),
-        Cmd::Run { model, message, .. } => cmd_run(&model, message.as_deref(), cfg),
+        Cmd::Run {
+            model,
+            message,
+            diffusion_visual,
+            ..
+        } => cmd_run(&model, message.as_deref(), &diffusion_visual, cfg),
         Cmd::Serve {
             model,
             addr,
@@ -760,6 +780,18 @@ fn publish_thread_count(cfg: &Config) {
     if let Some(t) = cfg.device.threads {
         std::env::set_var("RAYON_NUM_THREADS", t.to_string());
     }
+}
+
+/// `prof.profile_out` → the profiler runtime's report destination (S7).
+///
+/// PERMANENT, like [`publish_thread_count`] and unlike the S1 bridge: `infr-prof-rt` writes its
+/// JSON from a C `atexit` hook that has no receiver and no config to borrow, and it cannot depend
+/// on `infr-core` to fetch one (the dependency runs the other way). So the resolved value is PUSHED
+/// into the reporter here, once, in `main` — a value handed across an API boundary, not laundered
+/// through the environment. `None` leaves the reporter on stderr only, exactly as an unset
+/// `INFR_PROFILE_OUT` did.
+fn publish_profile_out(cfg: &Config) {
+    infr_prof_rt::set_profile_out(cfg.prof.profile_out.as_deref().and_then(|p| p.to_str()));
 }
 
 // ── the S1 transitional env bridge (docs/config-plan.md §7 S1.3) ────────────────────────────────
@@ -1133,7 +1165,12 @@ fn build_chat_model(
     }
 }
 
-fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Result<()> {
+fn cmd_run(
+    model: &str,
+    message: Option<&str>,
+    diffusion_visual: &str,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
     use std::io::Write;
     // Context window: the model's trained context by default; INFR_CTX overrides (shared size
     // grammar — tokens, `256k`, or `%` of the free-VRAM KV capacity), read by the chat sessions.
@@ -1241,7 +1278,7 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
     // Live denoise canvas view (diffusion-gemma only — see `DiffusionVisual`'s doc); `None` when
     // unset/not-DG/not-a-tty leaves `run_chat_turn` on the exact pre-existing `chat.turn` path.
     let mut visual = if is_dg {
-        DiffusionVisual::new(&gguf)?
+        DiffusionVisual::new(&gguf, diffusion_visual, &cfg)?
     } else {
         None
     };
@@ -1444,10 +1481,15 @@ struct DiffusionVisual {
 }
 
 impl DiffusionVisual {
-    /// `None` unless `INFR_DIFFUSION_VISUAL=1` (stdout must be a tty) or `=force` (bypasses the
-    /// tty check — for scripted verification against piped stdout, e.g. `... | tail -20`).
-    fn new(gguf: &Path) -> anyhow::Result<Option<Self>> {
-        let mode = std::env::var("INFR_DIFFUSION_VISUAL").unwrap_or_default();
+    /// `None` unless `mode` is `"1"` (stdout must be a tty) or `"force"` (bypasses the tty check —
+    /// for scripted verification against piped stdout, e.g. `... | tail -20`).
+    ///
+    /// `mode` is `infr run --diffusion-visual`'s value. This is a CLI PRESENTATION knob, not a
+    /// `Config` field (§6.10): nothing below `main` can observe it, and it steers a terminal
+    /// drawing routine rather than the forward. The `INFR_DIFFUSION_VISUAL` spelling survives as
+    /// clap's `env` fallback for the flag, so scripts that set it keep working (R2) and the value
+    /// still enters through the flag layer, not a `std::env::var` in the middle of `cmd_run`.
+    fn new(gguf: &Path, mode: &str, cfg: &Arc<Config>) -> anyhow::Result<Option<Self>> {
         let force = mode == "force";
         if !force && mode != "1" {
             return Ok(None);
@@ -1463,7 +1505,7 @@ impl DiffusionVisual {
             .map(|c| DG_VISUAL_COLS.min(c))
             .unwrap_or(DG_VISUAL_COLS);
         Ok(Some(Self {
-            oai: infr_llama::chat::OaiRenderer::open(gguf)?,
+            oai: infr_llama::chat::OaiRenderer::open(gguf, cfg.clone())?,
             prev_rows: 0,
             active: false,
             cols,
@@ -1676,10 +1718,11 @@ impl SeamGenerator {
     fn new(
         gguf_path: &Path,
         model: Box<dyn infr_llama::chat::ChatModel + Send>,
+        cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             model: std::sync::Mutex::new(model),
-            renderer: infr_llama::chat::OaiRenderer::open(gguf_path)?,
+            renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
         })
     }
 }
@@ -1692,10 +1735,14 @@ struct ParallelGenerator {
 }
 
 impl ParallelGenerator {
-    fn new(gguf_path: &Path, engine: infr_llama::parallel::ParallelSeam) -> anyhow::Result<Self> {
+    fn new(
+        gguf_path: &Path,
+        engine: infr_llama::parallel::ParallelSeam,
+        cfg: Arc<Config>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             engine,
-            renderer: infr_llama::chat::OaiRenderer::open(gguf_path)?,
+            renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
         })
     }
 }
@@ -3736,13 +3783,19 @@ fn cmd_serve(
         let n_slots = engine.n_slots();
         let max_ctx = engine.max_ctx();
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine)?);
+            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
         println!(
             "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx)",
             if n_slots == 1 { "" } else { "s" },
         );
-        return rt.block_on(infr_server::serve(generator, model_id, sockaddr, n_slots));
+        return rt.block_on(infr_server::serve(
+            generator,
+            model_id,
+            sockaddr,
+            n_slots,
+            cfg.clone(),
+        ));
     }
 
     // ── the SERIALISED path: CPU / Metal / ROCm / diffusion-gemma ────────────────────────────
@@ -3775,10 +3828,16 @@ fn cmd_serve(
             t0.elapsed().as_secs_f32()
         );
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(SeamGenerator::new(&gguf, m)?);
+            std::sync::Arc::new(SeamGenerator::new(&gguf, m, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
-        rt.block_on(infr_server::serve(generator, model_id, sockaddr, 1))
+        rt.block_on(infr_server::serve(
+            generator,
+            model_id,
+            sockaddr,
+            1,
+            cfg.clone(),
+        ))
     }
 }
 
@@ -3913,7 +3972,7 @@ fn cmd_multi(
         let n_slots = engine.n_slots();
         let dev_name = engine.device_name();
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine)?);
+            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, hosted_cfg.clone())?);
         routing.push((model_id.clone(), dev, dev_name));
         entries.push((model_id, generator, n_slots));
     }
@@ -3930,7 +3989,7 @@ fn cmd_multi(
     println!();
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(infr_server::serve_multi(entries, sockaddr))
+    rt.block_on(infr_server::serve_multi(entries, sockaddr, hosted_cfg))
 }
 
 #[cfg(test)]
@@ -4258,6 +4317,7 @@ mod tests {
         let layer = cli_flag_layer(&Cmd::Run {
             model: "m".to_string(),
             message: None,
+            diffusion_visual: String::new(),
             device: device_opts(None),
             sampling: no_sampling_opts(),
         })

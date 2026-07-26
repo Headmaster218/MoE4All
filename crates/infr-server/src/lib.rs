@@ -33,6 +33,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use infr_core::config::Config;
 use infr_engine::{ChatMessage, Delta, ToolCall};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -557,6 +558,11 @@ struct ModelEntry {
 pub struct AppState {
     /// Invariant: non-empty. `models[0]` is the default route.
     models: Arc<Vec<ModelEntry>>,
+    /// The resolved process configuration (S7). The handler reads `serve.api_key` and
+    /// `serve.max_tokens_cap` off it instead of the environment; it is an EXPLICIT constructor
+    /// parameter on every entry point that can host a real model, so an embedder cannot silently
+    /// end up with auth disabled by forgetting to pass one.
+    cfg: Arc<Config>,
 }
 
 impl AppState {
@@ -567,6 +573,7 @@ impl AppState {
         generator: Arc<dyn ChatGenerator>,
         model_id: impl Into<String>,
         n_parallel: usize,
+        cfg: Arc<Config>,
     ) -> Self {
         Self {
             models: Arc::new(vec![ModelEntry {
@@ -574,6 +581,7 @@ impl AppState {
                 engine: Some(generator),
                 slots: Arc::new(Semaphore::new(n_parallel.max(1))),
             }]),
+            cfg,
         }
     }
 
@@ -584,7 +592,7 @@ impl AppState {
     ///
     /// Panics if `entries` is empty (the state invariant is a non-empty model set); the CLI never
     /// calls it with none.
-    pub fn multi(entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>) -> Self {
+    pub fn multi(entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>, cfg: Arc<Config>) -> Self {
         assert!(
             !entries.is_empty(),
             "AppState::multi needs at least one model"
@@ -599,17 +607,21 @@ impl AppState {
             .collect();
         Self {
             models: Arc::new(models),
+            cfg,
         }
     }
 
-    /// No-engine state — for /health, /v1/models, and serialisation tests.
-    pub fn headless(model_id: impl Into<String>) -> Self {
+    /// No-engine state — for /health, /v1/models, and serialisation tests. Takes the config too,
+    /// so an auth/cap test drives `serve.*` through a `Config` value rather than the environment
+    /// (R7).
+    pub fn headless(model_id: impl Into<String>, cfg: Arc<Config>) -> Self {
         Self {
             models: Arc::new(vec![ModelEntry {
                 id: Arc::from(model_id.into().as_str()),
                 engine: None,
                 slots: Arc::new(Semaphore::new(1)),
             }]),
+            cfg,
         }
     }
 
@@ -649,8 +661,9 @@ pub async fn serve(
     model_id: String,
     addr: SocketAddr,
     n_parallel: usize,
+    cfg: Arc<Config>,
 ) -> anyhow::Result<()> {
-    serve_state(AppState::new(generator, model_id, n_parallel), addr).await
+    serve_state(AppState::new(generator, model_id, n_parallel, cfg), addr).await
 }
 
 /// Start the server hosting SEVERAL models at once, each routed by its `model_id` and admitted with
@@ -663,8 +676,9 @@ pub async fn serve(
 pub async fn serve_multi(
     entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>,
     addr: SocketAddr,
+    cfg: Arc<Config>,
 ) -> anyhow::Result<()> {
-    serve_state(AppState::multi(entries), addr).await
+    serve_state(AppState::multi(entries, cfg), addr).await
 }
 
 /// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
@@ -727,12 +741,12 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    // Optional bearer auth: enforced ONLY when INFR_API_KEY is configured. Default = open (existing
-    // localhost usage is unaffected). Checked before any work, so an unauthenticated request cannot
-    // even reach model routing / slot admission.
-    if let Some(key) = configured_api_key() {
+    // Optional bearer auth: enforced ONLY when `serve.api_key` (INFR_API_KEY) is configured.
+    // Default = open (existing localhost usage is unaffected). Checked before any work, so an
+    // unauthenticated request cannot even reach model routing / slot admission.
+    if let Some(key) = configured_api_key(&state.cfg) {
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-        if !authorize(Some(&key), auth) {
+        if !authorize(Some(key), auth) {
             return json_error(
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid Authorization bearer token".into(),
@@ -749,7 +763,7 @@ async fn chat_completions_handler(
         Err(e) => return param_error(Some(e.param), e.message),
     };
     // Cap an absurd explicit budget so one request can't pin a slot forever. Unset stays unset.
-    params.max_tokens = clamp_max_tokens(params.max_tokens, max_tokens_cap());
+    params.max_tokens = clamp_max_tokens(params.max_tokens, max_tokens_cap(&state.cfg));
     let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
     // Pass the request's `tools` array THROUGH as a Value (moved into the blocking task) — no
     // Value→string→Value round-trip (audit finding 6).
@@ -1153,14 +1167,20 @@ fn make_id() -> String {
 /// generous (128k) but finite, so one request cannot pin a slot for an absurd budget.
 const DEFAULT_MAX_TOKENS_CAP: u32 = 131_072;
 
-/// The configured `max_tokens` ceiling: `INFR_MAX_TOKENS_CAP` if a valid positive integer, else
-/// [`DEFAULT_MAX_TOKENS_CAP`]. Read per-request (cheap) so it needs no plumbing through `AppState`.
-fn max_tokens_cap() -> u32 {
-    std::env::var("INFR_MAX_TOKENS_CAP")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_MAX_TOKENS_CAP)
+/// The configured `max_tokens` ceiling: `serve.max_tokens_cap` (`INFR_MAX_TOKENS_CAP`) if a
+/// positive integer, else [`DEFAULT_MAX_TOKENS_CAP`]. Read per-request off the borrowed `Config`
+/// the [`AppState`] owns (S7 — this used to be a per-request `std::env::var`).
+///
+/// The `> 0` guard stays HERE, at the accessor (R5): the env layer already drops a non-positive
+/// `INFR_MAX_TOKENS_CAP`, but a config FILE can name the same field, and "must be a positive
+/// integer, else the default" is this knob's grammar whatever layer supplied it.
+fn max_tokens_cap(cfg: &Config) -> u32 {
+    let cap = cfg.serve.max_tokens_cap;
+    if cap > 0 {
+        cap
+    } else {
+        DEFAULT_MAX_TOKENS_CAP
+    }
 }
 
 /// Clamp an explicit `max_tokens` to `cap`. `None` (unset) passes through untouched — the generator
@@ -1187,9 +1207,19 @@ fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
     }
 }
 
-/// The configured API key, or `None` when `INFR_API_KEY` is unset/empty (auth disabled).
-fn configured_api_key() -> Option<String> {
-    std::env::var("INFR_API_KEY").ok().filter(|k| !k.is_empty())
+/// The configured API key, or `None` when `serve.api_key` (`INFR_API_KEY`) is unset OR EMPTY —
+/// auth disabled.
+///
+/// The empty-string filter is load-bearing and is NOT the `is_ok()` presence grammar every other
+/// knob uses (§10.5): `INFR_API_KEY=` means "no auth", not "auth with the empty key". The env
+/// layer already maps an empty value to `Some(None)`; the filter is kept here as well so a config
+/// FILE saying `api_key = ""` means the same thing (S7 — this used to read the `INFR_API_KEY`
+/// variable from the process environment and apply the same filter).
+fn configured_api_key(cfg: &Config) -> Option<&str> {
+    cfg.serve
+        .api_key
+        .as_deref()
+        .filter(|k: &&str| !k.is_empty())
 }
 
 fn unix_ts() -> i64 {
@@ -1268,7 +1298,10 @@ mod tests {
     /// Router backed by a headless state — no Engine, so /health and /v1/models work
     /// but /v1/chat/completions would return 500.  That's fine: we never call it here.
     fn test_router() -> Router {
-        build_router(AppState::headless("test-model"))
+        build_router(AppState::headless(
+            "test-model",
+            Arc::new(Config::default()),
+        ))
     }
 
     // --- HTTP endpoint tests (no Engine required) ---------------------------
@@ -1335,10 +1368,10 @@ mod tests {
     fn multi_router() -> Router {
         let a: Arc<dyn ChatGenerator> = Arc::new(EchoGen("alpha"));
         let b: Arc<dyn ChatGenerator> = Arc::new(EchoGen("beta"));
-        build_router(AppState::multi(vec![
-            ("alpha".into(), a, 2),
-            ("beta".into(), b, 2),
-        ]))
+        build_router(AppState::multi(
+            vec![("alpha".into(), a, 2), ("beta".into(), b, 2)],
+            Arc::new(Config::default()),
+        ))
     }
 
     #[tokio::test]
@@ -2117,6 +2150,77 @@ mod tests {
         assert!(!authorize(key, Some("Basic s3cret")));
     }
 
+    // --- the `serve.*` knobs, driven through a `Config` (S7, R7: never the environment) ------
+
+    /// `serve.api_key` decides whether auth is on, and the EMPTY string still means OFF — the
+    /// grammar `INFR_API_KEY=` has always had (§10.5). Getting this backwards would turn an empty
+    /// key into a credential every request has to guess, so it is asserted explicitly.
+    #[test]
+    fn configured_api_key_reads_the_config_and_empty_still_means_no_auth() {
+        let mut cfg = Config::default();
+        assert_eq!(configured_api_key(&cfg), None, "unset => auth disabled");
+
+        cfg.serve.api_key = Some(String::new());
+        assert_eq!(configured_api_key(&cfg), None, "empty => auth DISABLED");
+
+        cfg.serve.api_key = Some("hunter2".into());
+        assert_eq!(configured_api_key(&cfg), Some("hunter2"));
+        // …and a configured key really does gate the request.
+        assert!(authorize(configured_api_key(&cfg), Some("Bearer hunter2")));
+        assert!(!authorize(configured_api_key(&cfg), None));
+    }
+
+    /// `serve.max_tokens_cap` feeds the clamp, and a non-positive value falls back to the shipped
+    /// default rather than clamping every request to zero.
+    #[test]
+    fn max_tokens_cap_reads_the_config_and_rejects_non_positive() {
+        let mut cfg = Config::default();
+        assert_eq!(max_tokens_cap(&cfg), DEFAULT_MAX_TOKENS_CAP);
+
+        cfg.serve.max_tokens_cap = 4096;
+        assert_eq!(max_tokens_cap(&cfg), 4096);
+        assert_eq!(
+            clamp_max_tokens(Some(10_000), max_tokens_cap(&cfg)),
+            Some(4096)
+        );
+
+        cfg.serve.max_tokens_cap = 0;
+        assert_eq!(max_tokens_cap(&cfg), DEFAULT_MAX_TOKENS_CAP);
+    }
+
+    /// End to end through the router: a state built with `serve.api_key` set answers 401 without a
+    /// bearer token and gets past auth with one. Proves the handler reads the state's config, not
+    /// the process environment.
+    #[tokio::test]
+    async fn configured_api_key_gates_the_chat_endpoint() {
+        let mut cfg = Config::default();
+        cfg.serve.api_key = Some("s3cret".into());
+        let state = AppState::headless("test-model", Arc::new(cfg));
+        let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = |auth: Option<&str>| {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(Body::from(body)).unwrap()
+        };
+        let resp = build_router(state.clone())
+            .oneshot(req(None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // With the right token the request gets PAST auth (headless => 500 from the missing
+        // engine, which is exactly "not 401").
+        let resp = build_router(state)
+            .oneshot(req(Some("Bearer s3cret")))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     // --- finish-reason mapping: Err is an error frame, never `stop` (finding 1) ---
 
     /// A generator whose `chat` fails mid-stream. The streaming path must NOT relabel this as a
@@ -2140,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_error_emits_error_frame_not_stop() {
         let g: Arc<dyn ChatGenerator> = Arc::new(FailGen);
-        let router = build_router(AppState::new(g, "m", 1));
+        let router = build_router(AppState::new(g, "m", 1, Arc::new(Config::default())));
         let resp = router
             .oneshot(
                 Request::builder()

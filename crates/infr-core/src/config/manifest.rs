@@ -124,7 +124,7 @@ macro_rules! knobs {
 knobs! {
     // ── device (§6.1) ────────────────────────────────────────────────────────
     "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", migrated;
-    "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     pending;
+    "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     migrated;
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
@@ -137,7 +137,7 @@ knobs! {
     "INFR_SEED"                 => "sampling.seed",       Int,        Ignored, "42",   pending;
     "INFR_MAX_NEW"              => "sampling.max_new",    Int,        Ignored, "256",  pending;
     "INFR_IGNORE_EOS"           => "sampling.ignore_eos", Presence,   Ignored, "1",    pending;
-    "INFR_NO_THINK"             => "sampling.no_think",   SetNotZero, Ignored, "1",    pending;
+    "INFR_NO_THINK"             => "sampling.no_think",   SetNotZero, Ignored, "1",    migrated;
 
     // ── kv (§6.3) ────────────────────────────────────────────────────────────
     "INFR_KV_TYPE_K"            => "kv.type_k",              Dtype,       Ignored, "q8_0", migrated;
@@ -313,7 +313,7 @@ knobs! {
     "INFR_PROF_DEC"         => "prof.prof_dec",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            migrated;
-    "INFR_PROFILE_OUT"      => "prof.profile_out",      Path,     Ignored, "/tmp/p.json",  pending;
+    "INFR_PROFILE_OUT"      => "prof.profile_out",      Path,     Ignored, "/tmp/p.json",  migrated;
     "INFR_VRAM_LOG"         => "prof.vram_log",         Presence, Ignored, "1",            migrated;
     "INFR_MTP_TIME"         => "prof.mtp_time",         Presence, Ignored, "1",            migrated;
     "INFR_DIFFUSION_TIME"   => "prof.diffusion_time",   Presence, Ignored, "1",            migrated;
@@ -325,7 +325,7 @@ knobs! {
     "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", migrated;
     "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", migrated;
     "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", migrated;
-    "INFR_DEBUG_CHAT"          => "debug.chat",            Presence, Ignored, "1", pending;
+    "INFR_DEBUG_CHAT"          => "debug.chat",            Presence, Ignored, "1", migrated;
     "INFR_MOE_COUNTS_DEBUG"    => "debug.moe_counts",      Presence, Ignored, "1", migrated;
     "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", migrated;
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;
@@ -333,8 +333,8 @@ knobs! {
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", migrated;
 
     // ── serve (§6.9) ─────────────────────────────────────────────────────────
-    "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", pending;
-    "INFR_MAX_TOKENS_CAP" => "serve.max_tokens_cap", Int,  Ignored, "4096",    pending;
+    "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", migrated;
+    "INFR_MAX_TOKENS_CAP" => "serve.max_tokens_cap", Int,  Ignored, "4096",    migrated;
 }
 
 /// `INFR_*` keys that exist in `crates/*/src` (or a `build.rs`) and deliberately do NOT become
@@ -352,7 +352,9 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
     ),
     (
         "INFR_DIFFUSION_VISUAL",
-        "CLI presentation only — becomes a plain clap flag in S7, not a Config field.",
+        "CLI presentation only, NOT a Config field: since S7 it is `infr run --diffusion-visual`, \
+         a plain clap flag whose `env =` fallback keeps the old spelling working. The literal that \
+         remains in `cli/main.rs` is that clap attribute, not a `std::env::var` read.",
     ),
 ];
 

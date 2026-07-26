@@ -96,7 +96,7 @@ impl DenseSeamChat {
     /// long-context model's default KV cache can't blow VRAM.
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
-            let user_ctx = super::env_ctx_spec();
+            let user_ctx = super::cfg_ctx_spec(self.model.engine_cfg());
             self.session = Some(match user_ctx {
                 Some(infr_core::SizeSpec::Bytes(ctx)) => {
                     self.model.vulkan_session_on(self.dev, ctx as usize)?

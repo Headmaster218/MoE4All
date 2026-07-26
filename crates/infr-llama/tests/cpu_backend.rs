@@ -35,19 +35,17 @@ macro_rules! need_model {
     };
 }
 
-/// Serialize the model-gated generation tests AND scope their env mutations.
+/// Serialize the model-gated GPU tests against each other.
 ///
-/// They drive PROCESS-GLOBAL knobs that generation reads (`INFR_TEMP`, `INFR_NO_THINK` — the
-/// latter at render time in infr-chat), and cargo runs tests in parallel, so without this one
-/// test's env leaks into another's generation (`INFR_NO_THINK=1` flipping a Qwen3 golden's
-/// thinking off → hash mismatch). [`infr_core::test_env::EnvGuard`] is both halves of the fix: it
-/// holds a process-wide lock for its lifetime AND restores every key it touched on drop, so a
-/// knob can no longer outlive the test that set it (a bare `remove_var` at the end of a test
-/// cannot do that — it clobbers whatever the caller had). Poison-tolerant, so a failing test does
-/// not cascade-poison the rest.
+/// As of S7 NO test in this file drives a knob through the environment — the last one,
+/// `INFR_NO_THINK`, is a `sampling.no_think` VALUE on the model's own config (see [`model_cfg`]).
+/// What is left is the GPU: these tests upload whole models and open device sessions, and cargo
+/// runs a binary's tests in parallel, so several of them racing for the same device is a VRAM
+/// problem, not a configuration one. [`infr_core::test_env::EnvGuard`] is still what provides the
+/// process-wide lock here; S9 replaces it with a plain local mutex and deletes the module.
 ///
-/// Set knobs THROUGH the returned guard (`env.set("INFR_TEMP", "0")`), never with `set_var`, and
-/// take it exactly once per test — it is not re-entrant.
+/// Poison-tolerant, so a failing test does not cascade-poison the rest. Take it exactly once per
+/// test — it is not re-entrant.
 fn test_serial_lock() -> infr_core::test_env::EnvGuard {
     infr_core::test_env::EnvGuard::new()
 }
@@ -59,10 +57,10 @@ fn test_serial_lock() -> infr_core::test_env::EnvGuard {
 /// used to change a golden's output; starting from `EngineConfig::default()` makes that impossible).
 ///
 /// This is what replaced the `env.set("INFR_TEMP", "0")` / `env.set("INFR_KV_TYPE_K", …)` pattern
-/// throughout this file. `test_serial_lock` is still taken where a test drives a knob that has NOT
-/// migrated yet (`INFR_NO_THINK` in `infr-chat` — S7) — and for the GPU tests, which must stay
-/// serialised against each other regardless. `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it
-/// in S5a; `INFR_SEAM_NO_REPLAY`'s Vulkan half and `INFR_I8_COOPMAT` came off it in S5b.
+/// throughout this file. `test_serial_lock` is now taken ONLY to serialise the GPU tests against
+/// each other; no test in this file sets a knob through the environment any more.
+/// `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it in S5a; `INFR_SEAM_NO_REPLAY`'s Vulkan
+/// half and `INFR_I8_COOPMAT` in S5b; `INFR_NO_THINK` — the last one — in S7.
 fn model_cfg(
     path: &std::path::Path,
     f: impl FnOnce(&mut infr_llama::EngineConfig),
@@ -3015,9 +3013,7 @@ fn two_models_two_devices_concurrent() {
         );
         return;
     }
-    let mut _tlk = test_serial_lock();
-    // Deterministic + no <think> span, so the answer settles on "Paris" within a few tokens.
-    _tlk.set("INFR_NO_THINK", "1");
+    let _tlk = test_serial_lock();
 
     /// One session's outcome, carried back out of its thread.
     struct DevOut {
@@ -3035,7 +3031,11 @@ fn two_models_two_devices_concurrent() {
     let run_on = |dev: usize| {
         let path = path.clone();
         std::thread::spawn(move || -> DevOut {
-            let model = model_default(&path);
+            // Deterministic + no <think> span, so the answer settles on "Paris" within a few
+            // tokens. `sampling.no_think` is a VALUE on this model's own config since S7 — the
+            // renderer takes it from the `Config` its `SeamModel` carries, so this no longer
+            // writes `INFR_NO_THINK` into the process the sibling thread is also rendering in.
+            let model = model_cfg(&path, |c| c.sampling.no_think = true);
             let mut sess = model
                 .vulkan_session_default_on(Some(dev))
                 .expect("open pinned session");
@@ -3147,10 +3147,11 @@ fn pipeline_matches_single_device() {
         );
         return;
     }
-    let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_NO_THINK", "1");
+    let _tlk = test_serial_lock();
 
-    let model = model_default(&path);
+    // No <think> span, so the answer settles within `n` tokens. A VALUE on this model's own
+    // config since S7 (`sampling.no_think`), not a process-global `INFR_NO_THINK` write.
+    let model = model_cfg(&path, |c| c.sampling.no_think = true);
     let prompt = model
         .render_chat("What is the capital of France? Reply with just the city name.")
         .expect("render");
@@ -3228,10 +3229,11 @@ fn tensor_parallel_matches_single_device() {
         );
         return;
     }
-    let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_NO_THINK", "1");
+    let _tlk = test_serial_lock();
 
-    let model = model_default(&path);
+    // No <think> span, so the answer settles within `n` tokens. A VALUE on this model's own
+    // config since S7 (`sampling.no_think`), not a process-global `INFR_NO_THINK` write.
+    let model = model_cfg(&path, |c| c.sampling.no_think = true);
     let prompt = model
         .render_chat("What is the capital of France? Reply with just the city name.")
         .expect("render");
@@ -3303,13 +3305,17 @@ fn expert_parallel_matches_single_device() {
         );
         return;
     }
-    let mut _tlk = test_serial_lock();
-    _tlk.set("INFR_NO_THINK", "1");
-    // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic).
-    // A VALUE on this model's own `Config` since S5a: the EP backends are opened by `SeamModel`
-    // through `VulkanBackend::new_on_with`, so `kernels.vulkan.moe_small_m` reaches
-    // `tier::EnvRows::clamped` without an env write. S2's recorded R7 exception is CLOSED.
-    let model = model_cfg(&path, |c| c.kernels.vulkan.moe_small_m = 64);
+    let _tlk = test_serial_lock();
+    // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic),
+    // and drop the <think> span so the answer settles within `n` tokens.
+    // A VALUE on this model's own `Config`: the EP backends are opened by `SeamModel` through
+    // `VulkanBackend::new_on_with`, so `kernels.vulkan.moe_small_m` reaches `tier::EnvRows::clamped`
+    // without an env write (S5a, closing S2's recorded R7 exception); `sampling.no_think` joined it
+    // in S7, when `infr-chat`'s renderer stopped reading `INFR_NO_THINK` from the environment.
+    let model = model_cfg(&path, |c| {
+        c.kernels.vulkan.moe_small_m = 64;
+        c.sampling.no_think = true;
+    });
     let prompt = model
         .render_chat("What is the capital of France? Reply with just the city name.")
         .expect("render");

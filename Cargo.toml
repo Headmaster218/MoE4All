@@ -63,7 +63,10 @@ libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["trace"] }
-clap = { version = "4", features = ["derive"] }
+# `env`: the CLI-presentation knob `INFR_DIFFUSION_VISUAL` is a plain clap flag
+# (docs/config-plan.md §6.10) whose env spelling stays supported — as clap's own fallback for the
+# flag, so it enters through the FLAG layer instead of a `std::env::var` deep in `cmd_run` (R3).
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 clap_complete_nushell = "4"
 clap_mangen = "0.3"

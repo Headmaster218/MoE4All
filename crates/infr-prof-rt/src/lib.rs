@@ -233,6 +233,30 @@ pub fn prof2_suppressed() -> bool {
     PROF2_SUPPRESSED.load(Relaxed)
 }
 
+/// Where [`report`] writes its JSON report — the resolved `prof.profile_out` (`INFR_PROFILE_OUT`),
+/// PUSHED here at startup by whoever owns the `Config` (S7; `infr-cli`'s `main`, beside
+/// `publish_thread_count`). `None`/empty = no JSON, stderr report only.
+///
+/// It is report state on this crate's existing process-global reporter, not a `Config` bridge
+/// (R4): the report runs from a C `atexit` hook — `extern "C" fn report_at_exit()` — which has no
+/// receiver, no arguments and no config to borrow, and `infr-prof-rt` cannot depend on `infr-core`
+/// to fetch one (the dependency runs the other way). It sits next to [`PROF2_SUPPRESSED`], which
+/// exists for the same reason.
+static PROFILE_OUT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Install the resolved `prof.profile_out`. Call once at startup, before the process can exit.
+/// An empty path is stored as-is and treated as "no JSON" by [`report`], matching the old
+/// `INFR_PROFILE_OUT=` grammar exactly.
+pub fn set_profile_out(path: Option<&str>) {
+    *PROFILE_OUT.lock().unwrap() = path.map(str::to_owned);
+}
+
+/// The installed [`PROFILE_OUT`], cloned out from under the lock (the reporter must not hold it
+/// while it writes a file).
+fn profile_out() -> Option<String> {
+    PROFILE_OUT.lock().unwrap().clone()
+}
+
 /// Open a span for `site` on the current thread. Returns an RAII guard; span closes when the
 /// guard drops (any exit path). Must be strictly LIFO per thread — guaranteed because the guard
 /// is a local of the instrumented fn.
@@ -438,7 +462,7 @@ pub fn report() {
             );
         }
     }
-    if let Ok(path) = std::env::var("INFR_PROFILE_OUT") {
+    if let Some(path) = profile_out() {
         if !path.is_empty() {
             match write_json(&path, &rows, &gpu, n_threads, wall_ns) {
                 Ok(()) => eprintln!("profile JSON written to {path}"),
@@ -581,5 +605,20 @@ mod tests {
         assert!(d.count >= 1 && d.total_ns == 0 && d.self_ns == 0);
         // Restore the registry (drops the padding and OVER's over-cap registration).
         global().names.lock().unwrap().truncate(saved_len);
+    }
+
+    /// `prof.profile_out` reaches the reporter by being PUSHED at startup (S7) — the report itself
+    /// never touches the environment. Round-trips the installed value, including the "unset =
+    /// stderr only" state; a non-empty value is what makes [`report`] write its JSON.
+    #[test]
+    fn profile_out_is_pushed_not_read_from_the_environment() {
+        assert_eq!(profile_out(), None, "nothing installed by default");
+        set_profile_out(Some("/tmp/infr-profile.json"));
+        assert_eq!(profile_out().as_deref(), Some("/tmp/infr-profile.json"));
+        // The `INFR_PROFILE_OUT=` grammar: an empty path is stored, and `report` treats it as off.
+        set_profile_out(Some(""));
+        assert_eq!(profile_out().as_deref(), Some(""));
+        set_profile_out(None);
+        assert_eq!(profile_out(), None);
     }
 }

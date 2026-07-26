@@ -135,12 +135,9 @@ impl DiffusionGemmaChat {
             return Ok(());
         }
         let cfg = self.model.config();
-        // INFR_CTX shared size grammar; % resolves against the trained context (DG sessions
-        // size against the canvas/prompt shape, not a VRAM-fit calc).
-        let max_ctx = std::env::var("INFR_CTX")
-            .ok()
-            .and_then(|v| infr_core::parse_size(&v))
-            .map(|s| s.resolve(cfg.n_ctx_train as u64) as usize)
+        // `device.ctx` (INFR_CTX) shared size grammar; % resolves against the trained context (DG
+        // sessions size against the canvas/prompt shape, not a VRAM-fit calc).
+        let max_ctx = super::cfg_ctx(self.model.engine_cfg(), cfg.n_ctx_train)
             .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
             .max(needed);
         self.max_ctx = max_ctx;

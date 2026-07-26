@@ -35,10 +35,10 @@ impl RocmSeamChat {
 
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
-            // INFR_CTX shared size grammar; % resolves against the trained context (shared with
-            // the Metal path — `chat::env_ctx`).
+            // `device.ctx` (INFR_CTX) shared size grammar; % resolves against the trained context
+            // (shared with the Metal path — `chat::cfg_ctx`).
             let train = self.model.config().n_ctx_train;
-            let max_ctx = super::env_ctx(train).unwrap_or(train);
+            let max_ctx = super::cfg_ctx(self.model.engine_cfg(), train).unwrap_or(train);
             self.session = Some(self.model.rocm_session(max_ctx, self.dev_idx)?);
         }
         Ok(())
