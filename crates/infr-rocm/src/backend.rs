@@ -75,8 +75,8 @@ fn kv_overflow_vram_cap(cfg: &Config) -> Option<u64> {
 /// device-mapped HOST RAM (read by the native Linear/EmbedGather GEMV over PCIe) when they would not
 /// fit VRAM. Empty / `0` = off (unchanged VRAM-only weights). The ROCm twin of the Vulkan
 /// `dense_paged` capability, but via the same zero-copy host-visible trick as the KV path — no
-/// prefetch ring, no per-slot weight offsets, no kernel changes: a covered-format (Q4_K/Q6_K/Q8_0/
-/// Q5_0) weight in host RAM is decoded in place exactly like a resident one. The uncovered formats
+/// prefetch ring, no per-slot weight offsets, no kernel changes: a covered-format (Q4_K/Q5_K/Q6_K/
+/// Q8_0/Q5_0) weight in host RAM is decoded in place exactly like a resident one. The uncovered formats
 /// that dequant→f16 into a VRAM cache do NOT benefit (the f16 copy re-lands in VRAM), so spilling
 /// them saves nothing — this path is meaningful for the native-decode formats.
 fn weight_overflow_enabled(cfg: &Config) -> bool {

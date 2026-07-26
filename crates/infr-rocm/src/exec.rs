@@ -1,6 +1,6 @@
 //! Graph execution: walk ops → resolve bound buffers → dispatch HIP kernels.
 //!
-//! Covered quant formats (Q4_K/Q6_K/Q8_0, see `native_decode_fmt`) are decoded in-kernel
+//! Covered quant formats (Q4_K/Q5_K/Q6_K/Q8_0/Q5_0, see `native_decode_fmt`) are decoded in-kernel
 //! from their RAW bytes on the `Linear`/`EmbedGather` paths — no f16 cache, VRAM ≈ quant_size.
 //! Uncovered quantized weight tensors are dequantized to f16 on the host on first touch and
 //! cached by the raw device-pointer address of their bound buffer.
@@ -87,6 +87,7 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
     let (lin, emb) = match dt {
         DType::Q8_0 => ("linear_q80", "embed_q80"),
         DType::Q4K => ("linear_q4k", "embed_q4k"),
+        DType::Q5K => ("linear_q5k", "embed_q5k"),
         DType::Q6K => ("linear_q6k", "embed_q6k"),
         DType::Q5_0 => ("linear_q50", "embed_q50"),
         _ => return None,
@@ -108,6 +109,7 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
     let kernel = match dt {
         DType::Q8_0 => "linear_i8_q80",
         DType::Q4K => "linear_i8_q4k",
+        DType::Q5K => "linear_i8_q5k",
         DType::Q6K => "linear_i8_q6k",
         DType::Q5_0 => "linear_i8_q50",
         _ => return None,
@@ -117,11 +119,12 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
 
 /// Dequant-to-f16 kernel name (`deqf16_*`, kernels.rs `DEQUANT_F16`) for a covered dtype — the
 /// weight decoder feeding the Slice-26 rocBLAS f16 prefill GEMM. Same covered set as
-/// [`native_decode_fmt`] (Q8_0/Q4_K/Q6_K/Q5_0); `None` keeps a format on the WMMA/GEMV path.
+/// [`native_decode_fmt`] (Q8_0/Q4_K/Q5_K/Q6_K/Q5_0); `None` keeps a format on the WMMA/GEMV path.
 fn deqf16_fmt(dt: DType) -> Option<&'static str> {
     match dt {
         DType::Q8_0 => Some("deqf16_q80"),
         DType::Q4K => Some("deqf16_q4k"),
+        DType::Q5K => Some("deqf16_q5k"),
         DType::Q6K => Some("deqf16_q6k"),
         DType::Q5_0 => Some("deqf16_q50"),
         _ => None,
@@ -202,6 +205,9 @@ fn native_wmma_fmt(
         (DType::Q4K, 1, 1) => "wmma_i8_q4k_1x1",
         (DType::Q4K, 2, 2) => "wmma_i8_q4k_2x2",
         (DType::Q4K, _, _) => "wmma_i8_q4k_2x1",
+        (DType::Q5K, 1, 1) => "wmma_i8_q5k_1x1",
+        (DType::Q5K, 2, 2) => "wmma_i8_q5k_2x2",
+        (DType::Q5K, _, _) => "wmma_i8_q5k_2x1",
         (DType::Q6K, 1, 1) => "wmma_i8_q6k_1x1",
         (DType::Q6K, 2, 2) => "wmma_i8_q6k_2x2",
         (DType::Q6K, _, _) => "wmma_i8_q6k_2x1",
@@ -263,6 +269,7 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
     let suffix = match dt {
         DType::Q8_0 => "q80",
         DType::Q4K => "q4k",
+        DType::Q5K => "q5k",
         DType::Q6K => "q6k",
         _ => return None,
     };
@@ -270,19 +277,27 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
     Some((suffix, elems, bytes))
 }
 
-/// Static kernel name for the `(gate/up format, down format)` combo — the 9 covered pairs over
-/// {q80, q4k, q6k} (e.g. Q4_K_M is `("q4k", "q6k")`). Both suffixes come from `moe_native_fmt`, so
-/// the `_` arm is unreachable.
+/// Static kernel name for the `(gate/up format, down format)` combo — the 16 covered pairs over
+/// {q80, q4k, q5k, q6k} (e.g. Q4_K_M is `("q4k", "q6k")`, Q5_K_M is `("q5k", "q6k")`). Both
+/// suffixes come from `moe_native_fmt` and are resolved from two INDEPENDENT tensor dtypes, so the
+/// full cross product is instantiated in `kernels.rs` and the `_` arm is unreachable.
 fn moe_expert_kernel(gu: &str, dn: &str) -> &'static str {
     match (gu, dn) {
         ("q80", "q80") => "moe_ffn_expert_q80_q80",
         ("q80", "q4k") => "moe_ffn_expert_q80_q4k",
+        ("q80", "q5k") => "moe_ffn_expert_q80_q5k",
         ("q80", "q6k") => "moe_ffn_expert_q80_q6k",
         ("q4k", "q80") => "moe_ffn_expert_q4k_q80",
         ("q4k", "q4k") => "moe_ffn_expert_q4k_q4k",
+        ("q4k", "q5k") => "moe_ffn_expert_q4k_q5k",
         ("q4k", "q6k") => "moe_ffn_expert_q4k_q6k",
+        ("q5k", "q80") => "moe_ffn_expert_q5k_q80",
+        ("q5k", "q4k") => "moe_ffn_expert_q5k_q4k",
+        ("q5k", "q5k") => "moe_ffn_expert_q5k_q5k",
+        ("q5k", "q6k") => "moe_ffn_expert_q5k_q6k",
         ("q6k", "q80") => "moe_ffn_expert_q6k_q80",
         ("q6k", "q4k") => "moe_ffn_expert_q6k_q4k",
+        ("q6k", "q5k") => "moe_ffn_expert_q6k_q5k",
         ("q6k", "q6k") => "moe_ffn_expert_q6k_q6k",
         _ => unreachable!("moe_expert_kernel: uncovered ({gu}, {dn})"),
     }
@@ -300,6 +315,7 @@ fn moe_gate_up_i8_kernel(gu: &str) -> &'static str {
     match gu {
         "q80" => "moe_gate_up_act_i8_q80",
         "q4k" => "moe_gate_up_act_i8_q4k",
+        "q5k" => "moe_gate_up_act_i8_q5k",
         "q6k" => "moe_gate_up_act_i8_q6k",
         _ => unreachable!("moe_gate_up_i8_kernel: uncovered ({gu})"),
     }
@@ -310,6 +326,7 @@ fn moe_down_i8_kernel(dn: &str) -> &'static str {
     match dn {
         "q80" => "moe_down_i8_q80",
         "q4k" => "moe_down_i8_q4k",
+        "q5k" => "moe_down_i8_q5k",
         "q6k" => "moe_down_i8_q6k",
         _ => unreachable!("moe_down_i8_kernel: uncovered ({dn})"),
     }
@@ -321,12 +338,19 @@ fn moe_expert_routed_kernel(gu: &str, dn: &str) -> &'static str {
     match (gu, dn) {
         ("q80", "q80") => "moe_ffn_expert_routed_q80_q80",
         ("q80", "q4k") => "moe_ffn_expert_routed_q80_q4k",
+        ("q80", "q5k") => "moe_ffn_expert_routed_q80_q5k",
         ("q80", "q6k") => "moe_ffn_expert_routed_q80_q6k",
         ("q4k", "q80") => "moe_ffn_expert_routed_q4k_q80",
         ("q4k", "q4k") => "moe_ffn_expert_routed_q4k_q4k",
+        ("q4k", "q5k") => "moe_ffn_expert_routed_q4k_q5k",
         ("q4k", "q6k") => "moe_ffn_expert_routed_q4k_q6k",
+        ("q5k", "q80") => "moe_ffn_expert_routed_q5k_q80",
+        ("q5k", "q4k") => "moe_ffn_expert_routed_q5k_q4k",
+        ("q5k", "q5k") => "moe_ffn_expert_routed_q5k_q5k",
+        ("q5k", "q6k") => "moe_ffn_expert_routed_q5k_q6k",
         ("q6k", "q80") => "moe_ffn_expert_routed_q6k_q80",
         ("q6k", "q4k") => "moe_ffn_expert_routed_q6k_q4k",
+        ("q6k", "q5k") => "moe_ffn_expert_routed_q6k_q5k",
         ("q6k", "q6k") => "moe_ffn_expert_routed_q6k_q6k",
         _ => unreachable!("moe_expert_routed_kernel: uncovered ({gu}, {dn})"),
     }
@@ -337,6 +361,7 @@ fn moe_gate_up_i8_routed_kernel(gu: &str) -> &'static str {
     match gu {
         "q80" => "moe_gate_up_act_i8_routed_q80",
         "q4k" => "moe_gate_up_act_i8_routed_q4k",
+        "q5k" => "moe_gate_up_act_i8_routed_q5k",
         "q6k" => "moe_gate_up_act_i8_routed_q6k",
         _ => unreachable!("moe_gate_up_i8_routed_kernel: uncovered ({gu})"),
     }
@@ -347,6 +372,7 @@ fn moe_down_i8_routed_kernel(dn: &str) -> &'static str {
     match dn {
         "q80" => "moe_down_i8_routed_q80",
         "q4k" => "moe_down_i8_routed_q4k",
+        "q5k" => "moe_down_i8_routed_q5k",
         "q6k" => "moe_down_i8_routed_q6k",
         _ => unreachable!("moe_down_i8_routed_kernel: uncovered ({dn})"),
     }
@@ -2200,7 +2226,7 @@ fn run_op(
                 if native.is_none() {
                     return Err(be(
                         "rocm moe pager: paged expert bank has a non-native quant format \
-                         (only Q8_0/Q4_K/Q6_K page — Q2_K/Q3_K await native MoE decode)",
+                         (only Q8_0/Q4_K/Q5_K/Q6_K page — Q2_K/Q3_K await native MoE decode)",
                     ));
                 }
                 // Open one touch batch per pool for this (layer) op, so every expert this op
@@ -2987,6 +3013,9 @@ mod decode_spec_tests {
         for (dt, elems, bytes) in [
             (DType::Q8_0, 32usize, 34usize),
             (DType::Q4K, 256, 144),
+            // R1: Q5_K joined the natively-decoded set (256 elems / 176 bytes = 2×f16 + 12 scale
+            // bytes + 32 qh + 128 qs); the kernels' byte addressing is built on this stride.
+            (DType::Q5K, 256, 176),
             (DType::Q6K, 256, 210),
             (DType::Q5_0, 32, 22),
         ] {
@@ -2998,14 +3027,15 @@ mod decode_spec_tests {
         for (dt, elems, bytes) in [
             (DType::Q8_0, 32usize, 34usize),
             (DType::Q4K, 256, 144),
+            (DType::Q5K, 256, 176),
             (DType::Q6K, 256, 210),
         ] {
             let (_, e, b) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} moe_native_fmt geometry");
         }
-        // Coverage is unchanged: nothing outside the four/three formats routes native.
-        assert!(native_decode_fmt(DType::Q5K).is_none());
-        assert!(native_i8_fmt(DType::Q5K, &rocm).is_none());
+        // Coverage boundary: the formats still awaiting a native kernel stay off the fast path.
+        assert!(native_decode_fmt(DType::Q3K).is_none());
+        assert!(native_i8_fmt(DType::Q3K, &rocm).is_none());
         assert!(moe_native_fmt(DType::Q5_0).is_none());
     }
 }

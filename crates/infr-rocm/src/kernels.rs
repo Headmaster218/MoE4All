@@ -1417,9 +1417,9 @@ extern "C" __global__ void moe_shared_expert_add(
 // These kernels read the RAW quantized weight bytes and decode each block ON THE FLY,
 // so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
-// lever, docs/cpu-perf.md). Covered formats: Q4_K, Q6_K, Q8_0, Q5_0 (the set a Q4_K_M GGUF
-// uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already native
-// via `linear_f16`).
+// lever, docs/cpu-perf.md). Covered formats: Q4_K, Q5_K, Q6_K, Q8_0, Q5_0 (the sets a Q4_K_M /
+// Q5_K_M GGUF uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already
+// native via `linear_f16`).
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -1512,6 +1512,30 @@ __device__ __forceinline__ float deq_q4k(const unsigned char* w, long i) {
     return fin(d * (float)sc, code, dmin * (float)(-mm));
 }
 
+// ── Q5_K: 256 elems / 176 bytes = [half d][half dmin][u8 scales[12]][u8 qh[32]][u8 qs[128]]. ──
+// Identical structure to Q4_K (same 6-bit `k4` scale/min per 32-elem sub-block, same nibble layout)
+// plus a 5th code bit: element `within` takes bit `s = within/32` of `qh[within%32]` — the host
+// oracle's `u1 = 1<<2j` / `u2 = 2<<2j` for sub-block pair `j`, which is exactly `1 << s` because the
+// low-nibble half is s = 2j and the high-nibble half is s = 2j+1.
+__device__ __forceinline__ float deq_q5k(const unsigned char* w, long i) {
+    long blk = i >> 8;             // / 256
+    int within = (int)(i & 255);
+    const unsigned char* b = w + blk * 176;
+    float d = rf16b(b);
+    float dmin = rf16b(b + 2);
+    const unsigned char* scales = b + 4;
+    const unsigned char* qh = b + 16;
+    const unsigned char* qs = b + 48;
+    int s = within >> 5;           // sub-block 0..7
+    int sc, mm;
+    k4(scales, s, &sc, &mm);
+    int p = within & 31;
+    int nib_base = (s >> 1) * 32 + p;
+    int code = (s & 1) ? (qs[nib_base] >> 4) : (qs[nib_base] & 0x0F);
+    code |= ((qh[p] >> s) & 1) << 4;
+    return fin(d * (float)sc, code, dmin * (float)(-mm));
+}
+
 // ── Q6_K: 256 elems / 210 bytes = [u8 ql[128]][u8 qh[64]][int8 scales[16]][half d]. ──
 // Scale index is `within/16` (0..15); the 6-bit code = 4 low bits (ql) + 2 high bits (qh),
 // with the ql/qh byte + shift chosen by the region `(within%128)/32`.
@@ -1580,10 +1604,12 @@ extern "C" __global__ void embed_##SUFFIX( \
 
 GEN_LINEAR(q80)
 GEN_LINEAR(q4k)
+GEN_LINEAR(q5k)
 GEN_LINEAR(q6k)
 GEN_LINEAR(q50)
 GEN_EMBED(q80)
 GEN_EMBED(q4k)
+GEN_EMBED(q5k)
 GEN_EMBED(q6k)
 GEN_EMBED(q50)
 "#;
@@ -1606,6 +1632,7 @@ extern "C" __global__ void deqf16_##SUFFIX( \
 }
 GEN_DEQF16(q80)
 GEN_DEQF16(q4k)
+GEN_DEQF16(q5k)
 GEN_DEQF16(q6k)
 GEN_DEQF16(q50)
 
@@ -1627,8 +1654,11 @@ extern "C" __global__ void cast_f32_f16(
 // Gate & up share ONE format (`GU`) — they are the same tensor when fused, and every GGUF stores
 // ffn_gate_exps / ffn_up_exps at the same quant type. The down bank has its OWN format (`DN`):
 // Q4_K_M packs gate/up as Q4_K but ffn_down_exps as Q6_K, so the two suffixes must be independent.
-// The 9 (GU × DN) combos over {q80, q4k, q6k} cover every mixed-precision MoE the covered formats
-// produce; uncovered formats keep the dequant→f16 `moe_ffn_expert` fallback in exec.rs.
+// The 16 (GU × DN) combos over {q80, q4k, q5k, q6k} cover every mixed-precision MoE the covered
+// formats produce; uncovered formats keep the dequant→f16 `moe_ffn_expert` fallback in exec.rs.
+// The full cross product is instantiated deliberately: `moe_native_fmt` resolves GU and DN from two
+// INDEPENDENT tensor dtypes (`ffn_gate_exps` vs `ffn_down_exps`), so no pair can be statically
+// excluded without making `moe_expert_kernel`'s `unreachable!` reachable on some real GGUF.
 //
 // Pointers are pre-advanced HOST-SIDE to this expert's block-aligned byte offset (see the MoeFfn
 // arm), so the in-kernel element index is relative to the expert's own bank — identical geometry
@@ -1678,12 +1708,19 @@ extern "C" __global__ void moe_ffn_expert_##GU##_##DN( \
 
 GEN_MOE_FFN(q80, q80)
 GEN_MOE_FFN(q80, q4k)
+GEN_MOE_FFN(q80, q5k)
 GEN_MOE_FFN(q80, q6k)
 GEN_MOE_FFN(q4k, q80)
 GEN_MOE_FFN(q4k, q4k)
+GEN_MOE_FFN(q4k, q5k)
 GEN_MOE_FFN(q4k, q6k)
+GEN_MOE_FFN(q5k, q80)
+GEN_MOE_FFN(q5k, q4k)
+GEN_MOE_FFN(q5k, q5k)
+GEN_MOE_FFN(q5k, q6k)
 GEN_MOE_FFN(q6k, q80)
 GEN_MOE_FFN(q6k, q4k)
+GEN_MOE_FFN(q6k, q5k)
 GEN_MOE_FFN(q6k, q6k)
 "#;
 
@@ -1708,7 +1745,7 @@ GEN_MOE_FFN(q6k, q6k)
 // REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
 // covers every row, so the activation quant cost amortizes over the whole GEMV.
 //
-// Covered formats: Q8_0, Q4_K, Q6_K, Q5_0 (the Q4_K_M set). `rf16b`/`k4` are defined in NATIVE_DECODE
+// Covered formats: Q8_0, Q4_K, Q5_K, Q6_K, Q5_0. `rf16b`/`k4` are defined in NATIVE_DECODE
 // (this part is assembled after it). Uncovered formats keep the Phase-3 / dequant→f16 fallback.
 const INT8_DECODE: &str = r#"
 // Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
@@ -1843,6 +1880,58 @@ extern "C" __global__ void linear_i8_q4k(
             } else {
                 wpack = (int)(q[0] & 0xF) | ((int)(q[1] & 0xF) << 8)
                       | ((int)(q[2] & 0xF) << 16) | ((int)(q[3] & 0xF) << 24);
+            }
+            idot = idot4(xp[k], wpack, idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+
+// ── Q5_K: 256 elems / 176 bytes; sub-block 32; code 0..31 (nibble + qh bit `s`); Q4_K scale/min. ──
+extern "C" __global__ void linear_i8_q5k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    int spr = nb >> 3;             // Q5_K super-blocks (256 elems) per output row
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);   // global super-block for (output row o, this 32-block)
+        int s = blk & 7;           // sub-block 0..7 (== the 32-block) == the qh bit index
+        const unsigned char* b = w + (long)super * 176;
+        float d = rf16b(b);
+        float dmin = rf16b(b + 2);
+        const unsigned char* scales = b + 4;
+        const unsigned char* qh = b + 16;
+        const unsigned char* qs = b + 48;
+        int sc, mm; k4(scales, s, &sc, &mm);
+        const unsigned char* qbase = qs + (s >> 1) * 32;   // nibble byte base
+        int hi = s & 1;                                    // high nibble for odd sub-blocks
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            int wpack = 0;
+            for (int r = 0; r < 4; r++) {
+                int p = k * 4 + r;
+                int c = (hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)) | (((qh[p] >> s) & 1) << 4);
+                wpack |= c << (r * 8);
             }
             idot = idot4(xp[k], wpack, idot);
             isum = idot4(xp[k], 0x01010101, isum);
@@ -2069,8 +2158,8 @@ extern "C" __global__ void rmsnorm_quant_i8_32(
 //
 // SANCTIONED PRECISION FLIP: int8 activation quant is lossy in BOTH stages (x and h), so the output
 // differs (within tolerance) from the bit-faithful f16 expert path — parity is checked vs the CPU
-// reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q4_K, Q6_K
-// (the Q4_K_M expert-bank set); uncovered formats keep the Phase-3 `moe_ffn_expert_*` fallback.
+// reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q4_K, Q5_K,
+// Q6_K (the Q4_K_M/Q5_K_M expert-bank sets); uncovered keep the Phase-3 `moe_ffn_expert_*` fallback.
 //
 // `rf16b`/`k4` (NATIVE_DECODE) and `idot4`/`wave_sum32` (INT8_DECODE) are defined in the parts
 // assembled before this one.
@@ -2126,6 +2215,42 @@ __device__ __forceinline__ float i8acc_q4k(
             } else {
                 wpack = (int)(q[0] & 0xF) | ((int)(q[1] & 0xF) << 8)
                       | ((int)(q[2] & 0xF) << 16) | ((int)(q[3] & 0xF) << 24);
+            }
+            idot = idot4(xp[k], wpack, idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+    }
+    return acc;
+}
+
+// Q5_K per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q5k`.
+__device__ __forceinline__ float i8acc_q5k(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    int spr = nb >> 3;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);
+        int s = blk & 7;
+        const unsigned char* b = w + (long)super * 176;
+        float d = rf16b(b);
+        float dmin = rf16b(b + 2);
+        const unsigned char* scales = b + 4;
+        const unsigned char* qh = b + 16;
+        const unsigned char* qs = b + 48;
+        int sc, mm; k4(scales, s, &sc, &mm);
+        const unsigned char* qbase = qs + (s >> 1) * 32;
+        int hi = s & 1;
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            int wpack = 0;
+            for (int r = 0; r < 4; r++) {
+                int p = k * 4 + r;
+                int c = (hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)) | (((qh[p] >> s) & 1) << 4);
+                wpack |= c << (r * 8);
             }
             idot = idot4(xp[k], wpack, idot);
             isum = idot4(xp[k], 0x01010101, isum);
@@ -2242,9 +2367,11 @@ extern "C" __global__ void moe_down_i8_##DN( \
 
 GEN_MOE_GATE_UP(q80)
 GEN_MOE_GATE_UP(q4k)
+GEN_MOE_GATE_UP(q5k)
 GEN_MOE_GATE_UP(q6k)
 GEN_MOE_DOWN(q80)
 GEN_MOE_DOWN(q4k)
+GEN_MOE_DOWN(q5k)
 GEN_MOE_DOWN(q6k)
 "#;
 
@@ -2396,6 +2523,68 @@ extern "C" __global__ void NAME( \
                 const unsigned char* qbase = (b + 16) + (s >> 1) * 32; \
                 int hi = s & 1; \
                 for (int p = 0; p < 32; p++) wc[c][p] = (signed char)(hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)); \
+            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int p = 0; p < 32; p++) wc[c][p] = 0; } \
+        } \
+        for (int r = 0; r < (RM); r++) { \
+            int row_in = row_base + r * 16 + (lane & 15); \
+            long arow = (long)row_in * in_f + (long)blk * 32; \
+            i4v a0 = load_a(qx, row_in, m, arow), a1 = load_a(qx, row_in, m, arow + 16); \
+            i8v sumacc = {0,0,0,0,0,0,0,0}; \
+            sumacc = wmma_dot(a0, ones, sumacc); sumacc = wmma_dot(a1, ones, sumacc); \
+            for (int c = 0; c < (CN); c++) { \
+                i8v dotacc = {0,0,0,0,0,0,0,0}; \
+                dotacc = wmma_dot(a0, pack16(wc[c]),      dotacc); \
+                dotacc = wmma_dot(a1, pack16(wc[c] + 16), dotacc); \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc[c] * (float)dotacc[e] + wmn[c] * (float)sumacc[e]); \
+                } \
+            } \
+        } \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + r * 16 + 2 * e + half; \
+        int col = col_base + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+
+// ── Q5_K: 256/super-block, 8 sub-blocks of 32 (= 2 K-tiles each), Q4_K scale/min + a 5th code bit. ──
+// Byte-identical decode to `linear_i8_q5k` / `deq_q5k`; only the register tiling differs, so the
+// per-output f32 accumulation order matches the GEMV tier exactly (same Σ_blk axs·(wsc·dot + wmn·sum)).
+#define GEN_WMMA_Q5K(NAME, RM, CN) \
+extern "C" __global__ void NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int lane = threadIdx.x; \
+    int half = lane >> 4; \
+    int col_base = blockIdx.x * (16 * (CN)); \
+    int row_base = blockIdx.y * (16 * (RM)); \
+    int nblk = in_f >> 5; \
+    int spr = nblk >> 3; \
+    float acc[RM][CN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    signed char wc[CN][32]; \
+    float wsc[CN], wmn[CN]; \
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
+    for (int blk = 0; blk < nblk; blk++) { \
+        for (int c = 0; c < (CN); c++) { \
+            int col = col_base + c * 16 + (lane & 15); \
+            if (col < out_f) { \
+                long super = (long)col * spr + (blk >> 3); \
+                int s = blk & 7; \
+                const unsigned char* b = w + super * 176; \
+                float d = rf16b(b), dmin = rf16b(b + 2); \
+                int sc, mm; k4(b + 4, s, &sc, &mm); \
+                wsc[c] = d * (float)sc; \
+                wmn[c] = dmin * (float)(-mm); \
+                const unsigned char* qh = b + 16; \
+                const unsigned char* qbase = (b + 48) + (s >> 1) * 32; \
+                int hi = s & 1; \
+                for (int p = 0; p < 32; p++) \
+                    wc[c][p] = (signed char)((hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)) | (((qh[p] >> s) & 1) << 4)); \
             } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int p = 0; p < 32; p++) wc[c][p] = 0; } \
         } \
         for (int r = 0; r < (RM); r++) { \
@@ -2851,6 +3040,9 @@ GEN_WMMA_Q80(wmma_i8_q80_2x2, 2, 2)
 GEN_WMMA_Q4K(wmma_i8_q4k_1x1, 1, 1)
 GEN_WMMA_Q4K(wmma_i8_q4k_2x1, 2, 1)
 GEN_WMMA_Q4K(wmma_i8_q4k_2x2, 2, 2)
+GEN_WMMA_Q5K(wmma_i8_q5k_1x1, 1, 1)
+GEN_WMMA_Q5K(wmma_i8_q5k_2x1, 2, 1)
+GEN_WMMA_Q5K(wmma_i8_q5k_2x2, 2, 2)
 GEN_WMMA_Q6K(wmma_i8_q6k_1x1, 1, 1)
 GEN_WMMA_Q6K(wmma_i8_q6k_2x1, 2, 1)
 GEN_WMMA_Q6K(wmma_i8_q6k_2x2, 2, 2)
@@ -3036,12 +3228,19 @@ extern "C" __global__ void moe_ffn_expert_routed_##GU##_##DN( \
 }
 GEN_MOE_FFN_ROUTED(q80, q80)
 GEN_MOE_FFN_ROUTED(q80, q4k)
+GEN_MOE_FFN_ROUTED(q80, q5k)
 GEN_MOE_FFN_ROUTED(q80, q6k)
 GEN_MOE_FFN_ROUTED(q4k, q80)
 GEN_MOE_FFN_ROUTED(q4k, q4k)
+GEN_MOE_FFN_ROUTED(q4k, q5k)
 GEN_MOE_FFN_ROUTED(q4k, q6k)
+GEN_MOE_FFN_ROUTED(q5k, q80)
+GEN_MOE_FFN_ROUTED(q5k, q4k)
+GEN_MOE_FFN_ROUTED(q5k, q5k)
+GEN_MOE_FFN_ROUTED(q5k, q6k)
 GEN_MOE_FFN_ROUTED(q6k, q80)
 GEN_MOE_FFN_ROUTED(q6k, q4k)
+GEN_MOE_FFN_ROUTED(q6k, q5k)
 GEN_MOE_FFN_ROUTED(q6k, q6k)
 
 // Int8-activation dp4a gate+up+activation, device-routed. One wave32 block per nff output row.
@@ -3078,6 +3277,7 @@ extern "C" __global__ void moe_gate_up_act_i8_routed_##GU( \
 }
 GEN_MOE_GATE_UP_ROUTED(q80)
 GEN_MOE_GATE_UP_ROUTED(q4k)
+GEN_MOE_GATE_UP_ROUTED(q5k)
 GEN_MOE_GATE_UP_ROUTED(q6k)
 
 // Int8-activation dp4a down projection, device-routed. One wave32 block per ne output row.
@@ -3097,6 +3297,7 @@ extern "C" __global__ void moe_down_i8_routed_##DN( \
 }
 GEN_MOE_DOWN_ROUTED(q80)
 GEN_MOE_DOWN_ROUTED(q4k)
+GEN_MOE_DOWN_ROUTED(q5k)
 GEN_MOE_DOWN_ROUTED(q6k)
 "#;
 

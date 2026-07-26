@@ -36,14 +36,14 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
   parity-validated; a `rocm_seam` gpu_seam gate (9 models, token-for-token/hash
   vs CPU). Goldens locked.
 - **Decode** — native in-kernel block decode + int8-activation dp4a GEMV for
-  **Q8_0/Q4_K/Q6_K/Q5_0**; grid-underfill fixed across attention/WriteKv/
+  **Q8_0/Q4_K/Q5_K/Q6_K/Q5_0**; grid-underfill fixed across attention/WriteKv/
   GatedAct/RmsNorm/Argmax/QkNormRope; RmsNorm→Linear + Linear→Add fusion. ~1.9 →
   ~130 t/s (Qwen3-0.6B Q4_K_M, ~60× over naive, ~0.3× llama.cpp).
 - **Prefill** — int8 **WMMA** matrix-core GEMM (RM×CN register tiling +
   software-pipelined Q4_K); ~4500 t/s (~0.2× llama.cpp).
 - **Attention** — split-KV / flash-decoding (10.6× at depth), Causal/SWA/Canvas.
 - **DeltaNet** — chunked/parallel prefill (88×) + column-parallel decode.
-- **MoE** — int8 dp4a experts ({q80,q4k,q6k}²) + **GPU-side top-k routing**
+- **MoE** — int8 dp4a experts ({q80,q4k,q5k,q6k}²) + **GPU-side top-k routing**
   (device-routed, no host readback).
 - **Memory paging** — all three Vulkan modes: MoE expert LRU cache (host→VRAM,
   copy-stream overlap), KV-cache overflow to host (`INFR_KV_OVERFLOW`),
@@ -62,22 +62,31 @@ kernels correct).
 ## 1. Quant coverage — fast kernels for ALL 24 formats × all paths
 
 **The biggest correctness-of-perf gap.** ROCm has native/int8 fast kernels for
-only **4** formats (Q8_0/Q4_K/Q6_K/Q5_0); every other quant falls back to the
-slow `dequant→f16` GEMV (256 threads — the pathology that made gemma-3's Q5_0
-0.04× before it was covered). Vulkan is native on **all 24** + floats, with a
-full `native_id`/`native_idm` MoE-GEMV family
+only **5** formats (Q8_0/Q4_K/**Q5_K**/Q6_K/Q5_0); every other quant falls back
+to the slow `dequant→f16` GEMV (256 threads — the pathology that made gemma-3's
+Q5_0 0.04× before it was covered). Vulkan is native on **all 24** + floats, with
+a full `native_id`/`native_idm` MoE-GEMV family
 (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
 
-- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining ~20:
-  `Q4_0, Q4_1, Q5_1, Q2_K, Q3_K, Q5_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, TQ1_0, TQ2_0, Q2_0, MXFP4, NVFP4`
-  (+ `Bf16` weights). Priority by real usage: **Q5_K** (Q5_K_M builds),
-  **Q2_K/Q3_K** (small quants + llama4-Scout's experts), **Q4_0/IQ4_XS/IQ4_NL**
-  (common), then the exotic IQ/fp4/ternary. Reuse
-  `infr_gguf::dequant`/`iquant_grids` for bit-faithful decode; mirror the
-  DEC-per-block pattern in `kernels.rs`.
-- **MoE experts beyond {q80,q4k,q6k}²** — extend `moe_ffn_expert*`/`moe_*_i8*`
-  to every format, so **llama4-Scout (Q2_K/Q3_K experts, 37 GB)** finally runs
-  through the (already-fast) expert pager, and Q5_K MoE builds work.
+- ✅ **R1 — Q5_K LANDED.** `deq_q5k` native decode (+ `linear_q5k`/`embed_q5k`/
+  `deqf16_q5k`), `linear_i8_q5k`/`i8acc_q5k` int8 dp4a GEMV, the
+  `wmma_i8_q5k_{1x1,2x1,2x2}` WMMA prefill tier, and Q5_K MoE experts (the
+  `{q80,q4k,q5k,q6k}²` cross product, host-routed + device-routed). Measured on
+  the RX 7900 XTX with Qwen3-0.6B Q5_K_M: decode **14.6 → 125.2 t/s** (8.6×),
+  prefill **1363 → 4133 t/s** (3.0×); Q4_K_M unmoved (126.6 → 127.1 tg, 4403 →
+  4420 pp). Q5_K stays on the plain WMMA tier — the Slice-27 software-pipelined
+  and Slice-28 cooperative kernels remain Q4_K-only (the pipe prefetch buffer
+  would have to carry `qh` as well as the nibbles, and the coop family is a
+  measured regression on gfx1100 anyway).
+- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining ~19:
+  `Q4_0, Q4_1, Q5_1, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, TQ1_0, TQ2_0, Q2_0, MXFP4, NVFP4`
+  (+ `Bf16` weights). Priority by real usage: **Q2_K/Q3_K** (small quants +
+  llama4-Scout's experts), **Q4_0/IQ4_XS/IQ4_NL** (common), then the exotic
+  IQ/fp4/ternary. Reuse `infr_gguf::dequant`/`iquant_grids` for bit-faithful
+  decode; mirror the DEC-per-block pattern in `kernels.rs`.
+- **MoE experts beyond {q80,q4k,q5k,q6k}²** — extend `moe_ffn_expert*`/
+  `moe_*_i8*` to every format, so **llama4-Scout (Q2_K/Q3_K experts, 37 GB)**
+  finally runs through the (already-fast) expert pager.
 - **The `native_id`/`native_idm`/paged-id MoE GEMV family** — Vulkan's
   id-indexed decode GEMVs for resident + paged small-m MoE. ROCm's expert path
   is the batched/routed kernels; add the id-GEMV tier for the low-m regime.

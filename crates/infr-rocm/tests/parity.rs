@@ -369,6 +369,22 @@ fn q4k_blocks(blocks: usize) -> Vec<u8> {
     w
 }
 
+/// Build `blocks` valid Q5_K blocks (176 B = [f16 d][f16 dmin][u8 scales[12]][u8 qh[32]][u8
+/// qs[128]]) — the Q4_K construction plus the 32-byte `qh` plane that carries each code's 5th bit,
+/// so the patterned fill exercises both nibble halves AND both states of every high bit.
+fn q5k_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 176];
+    for (i, byte) in w.iter_mut().enumerate() {
+        *byte = ((i * 37 + 11) & 0xFF) as u8;
+    }
+    for blk in 0..blocks {
+        let base = blk * 176;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.375).to_le_bytes());
+        w[base + 2..base + 4].copy_from_slice(&half::f16::from_f32(-0.125).to_le_bytes());
+    }
+    w
+}
+
 /// Shared int8-GEMV parity check: ROCm int8 `Linear` vs the CPU f32 reference, m=2, within `tol`.
 fn check_i8_linear(w_bytes: &[u8], dt: DType, in_f: usize, out_f: usize, tol: f32, label: &str) {
     let Some(be) = rocm() else {
@@ -444,6 +460,22 @@ fn linear_i8_q4k_matches_cpu() {
         I8_OUT_F,
         3e-2,
         "Q4_K",
+    );
+}
+
+/// Q5_K int8 GEMV (R1): 5-bit weight (Q4_K's 6-bit sub-block scale/min + a `qh`-plane 5th bit)
+/// + int8 activation; same tolerance as the other k-quants.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q5k_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &q5k_blocks(blocks),
+        DType::Q5K,
+        I8_IN_F,
+        I8_OUT_F,
+        3e-2,
+        "Q5_K",
     );
 }
 
@@ -530,6 +562,13 @@ fn wmma_q50_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn wmma_q4k_matches_cpu() {
     check_wmma_linear(q4k_blocks, DType::Q4K, 256, 3e-2, "Q4_K");
+}
+
+/// Q5_K WMMA prefill GEMM (R1): Q4_K's per-32 sub-block scale + min, plus the `qh` 5th code bit.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q5k_matches_cpu() {
+    check_wmma_linear(q5k_blocks, DType::Q5K, 256, 3e-2, "Q5_K");
 }
 
 /// Q6_K WMMA prefill GEMM (6-bit weight, per-16 sub-block int8 scale — 1 K-tile per scale-block).
@@ -925,6 +964,78 @@ fn moe_ffn_quant_experts_matches_cpu() {
     assert!(
         e / ref_mag < 6e-2,
         "MoeFfn [quant experts] diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q5_K MoE experts (R1): gate/up as Q5_K + down as Q6_K — the Q5_K_M expert-bank layout, and the
+/// `("q5k", "q6k")` cell of the now-4×4 `moe_expert_kernel` / `moe_gate_up_i8_kernel` tables. Same
+/// two-lossy-int8-stage path (and therefore the same widened tolerance) as the Q4_K_M case above.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_q5k_experts_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (2usize, 256usize, 4usize, 2usize, 256usize);
+
+    let x = gen(rows * ne, 3);
+    let router = gen(n_expert * ne, 9);
+    // gate/up: Q5_K [n_expert, n_ff_exp, ne]; down: Q6_K [n_expert, ne, n_ff_exp].
+    let gate = q5k_blocks(n_expert * n_ff_exp * ne / 256);
+    let up = q5k_blocks(n_expert * n_ff_exp * ne / 256);
+    let down = q6k_blocks(n_expert * ne * n_ff_exp / 256);
+
+    let c = run_moe(
+        &cpu,
+        &x,
+        &router,
+        &gate,
+        &up,
+        &down,
+        DType::Q5K,
+        DType::Q5K,
+        DType::Q6K,
+        rows,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        MoeGating::Softmax,
+        true,
+    );
+    let r = run_moe(
+        &be,
+        &x,
+        &router,
+        &gate,
+        &up,
+        &down,
+        DType::Q5K,
+        DType::Q5K,
+        DType::Q6K,
+        rows,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        MoeGating::Softmax,
+        true,
+    );
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-6);
+    println!(
+        "MoeFfn [Q5_K/Q5_K/Q6_K experts] max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "MoeFfn [Q5_K experts] reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 6e-2,
+        "MoeFfn [Q5_K experts] diverges from CPU reference: abs={e:e} rel={:e}",
         e / ref_mag
     );
 }
@@ -2347,6 +2458,44 @@ fn linear_q80_native_matches_cpu() {
     assert!(
         e / ref_mag < 1e-2,
         "Linear Q8_0 native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q5_K embedding table through the native `embed_q5k` in-kernel decode gather (×scale) vs CPU.
+/// `embed_*` is the ONE path that reaches `deq_q5k` element-by-element (the GEMV tiers go through
+/// the int8 codes), so this pins the bit-faithful `sc*code + mn` decode — including the `qh` 5th
+/// bit — against `dequant_block` for every element of a row, not just a dot product of them.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q5k_native_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+    let be = rocm().unwrap();
+    let (vocab, ne) = (6usize, 256usize); // ne = one whole Q5_K super-block; vocab > max(ids)
+    let scale = (ne as f32).sqrt(); // non-1.0 (Gemma-style) — must be applied on-device
+    let t_bytes = q5k_blocks(vocab * ne / 256);
+    let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::Q5K, vocab, ne, scale);
+    let r = run_embed_gather(&be, &ids, &t_bytes, DType::Q5K, vocab, ne, scale);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "EmbedGather Q5_K (native) scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "EmbedGather Q5_K reference is all-zero — test is vacuous"
+    );
+    // Bit-faithful decode: the only loss is the f16 round of `sc*code + mn`, so the bound is the
+    // f16-rounding one, an order tighter than the int8-GEMV tolerances above. A wrong `qh` bit
+    // moves a code by 16/31 of its range and lands at O(1) relative — far outside this.
+    assert!(
+        e / ref_mag < 2e-3,
+        "EmbedGather Q5_K native decode diverges from CPU reference: abs={e:e} rel={:e}",
         e / ref_mag
     );
 }
