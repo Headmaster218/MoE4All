@@ -7,13 +7,14 @@ them.
 
 ## Ledger
 
-| Slice | What                                                                                                                                                                                                                                                                    | Commit    |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests                                                                                                                            | `a0bff9c` |
-| S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock                                                        | `addc1ac` |
-| S2    | `infr-core`'s own knobs (12) read from `Config`: `EnvRows::clamped`, `budget` flag/mib/reserve, `pager::ring_bytes`, `FusionCfg.enabled`. Temporary `Config::load_from_env()` bridge in `VulkanBackend::new_selected` (dies in S5a) and `RocmBackend::new` (dies in S6) | `6a8c2cb` |
-| S3    | `infr-cpu` (6 knobs) on `Config`: `CpuBackend::new_with(cfg)`, `reference()` → `kernels.cpu.reference`, `spin_limit()`'s `OnceLock` deleted (per-pool field). Crate is `INFR_*`-free. Bridge `Config::load_from_env()` in `CpuBackend::new` dies in **S4**              | `b2d6f04` |
-| S4    | `infr-llama` seam (35 keys): `SeamModel`/`DenseSession` carry `Arc<Config>`, `Sampler::from_cfg`, `device.ubatch_specified` added, device-list grammar moved into `infr-core`, CPU bridge deleted, 44 test loads + 32 `INFR_TEMP` writes converted                      | `c29d816` |
+| Slice | What                                                                                                                                                                                                                                                                                         | Commit    |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests                                                                                                                                                 | `a0bff9c` |
+| S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock                                                                             | `addc1ac` |
+| S2    | `infr-core`'s own knobs (12) read from `Config`: `EnvRows::clamped`, `budget` flag/mib/reserve, `pager::ring_bytes`, `FusionCfg.enabled`. Temporary `Config::load_from_env()` bridge in `VulkanBackend::new_selected` (dies in S5a) and `RocmBackend::new` (dies in S6)                      | `6a8c2cb` |
+| S3    | `infr-cpu` (6 knobs) on `Config`: `CpuBackend::new_with(cfg)`, `reference()` → `kernels.cpu.reference`, `spin_limit()`'s `OnceLock` deleted (per-pool field). Crate is `INFR_*`-free. Bridge `Config::load_from_env()` in `CpuBackend::new` dies in **S4**                                   | `b2d6f04` |
+| S4    | `infr-llama` seam (35 keys): `SeamModel`/`DenseSession` carry `Arc<Config>`, `Sampler::from_cfg`, `device.ubatch_specified` added, device-list grammar moved into `infr-core`, CPU bridge deleted, 44 test loads + 32 `INFR_TEMP` writes converted                                           | `c29d816` |
+| S5a   | `infr-vulkan` construction knobs (13): `VulkanBackend::new_with(cfg)` reached from every seam/CLI caller, capability masks folded into the probe (§5.2), S2's Vulkan `load_from_env()` bridge deleted, `INFR_DEV` dropped from the CLI bridge, S2's `INFR_MOE_SMALL_M` test exception closed | `a481747` |
 
 **Authority:** `crates/infr-core/src/config/manifest.rs` is the knob inventory —
 177 keys, their config paths, grammars, and a `migrated` flag — and the tests
@@ -615,23 +616,22 @@ means off.
   env var after the model loaded, which the config makes a no-op). macOS CI is
   the gate; read those closely.
 
-### S5 — `infr-vulkan` (74 sites / 64 keys, split into S5a/S5b)
+### S5b — `infr-vulkan` hot-path tier knobs (the rest of S5)
 
-S5a: `VulkanBackend::new_with` + the construction-time knobs — the six
-`Capabilities` maskers (§5.2), `INFR_VRAM_LOG`, `INFR_NO_VRAM_GUARD`,
-`INFR_SUBMIT_DISPATCHES`, `INFR_POISON_UNINIT`, `INFR_NO_PIPELINE_CACHE`,
-`INFR_DEBUG_COOPMAT`.
+S5a landed the construction half. S5b is everything read per-op or per-dispatch:
+the `INFR_FLASH_*` family, `INFR_NO_GEMM_WARP`, the mmv/mrow tiers, the
+`OnceLock`-memoized GEMV group (`GemvKnobs::resolve`), the atomic-memoized BDA
+chunk caps (`cap_from_env`), `prof.prof`, and the Vulkan halves of the two-crate
+knobs `delta_strided` / `no_replay` / `gpu_pos` whose `infr-llama` halves moved
+in S4.
 
-S5b: `Recorder`/`adapter.rs`/`gemm.rs` kernel-tier knobs — the hot paths. Do the
-GEMV family first (§6.5b — it is already a pure resolver, so it is the cheapest
-and sets the pattern), then the BDA chunk caps (§6.5c, delete the `cfg(test)`
-override), then the tier tables. Borrow `&VulkanCfg` from the backend; R6
-applies (no clones per dispatch).
-
-**Exit for S5b specifically:** an interleaved decode+prefill bench (§9) versus
-the parent commit shows no regression outside noise. This is the ONLY slice
-where a wrong polarity is invisible to the tests (§10.1), so the bench is not
-optional.
+- `Recorder` borrows `&VulkanCfg` from the backend that created it (R6: no
+  clone, no re-resolve per dispatch). The two memoized families must be HOISTED
+  into the owning struct, not turned into per-call `getenv`s (§10.6).
+- `INFR_PAGER_STATS` stays unflipped until **S6** (ROCm's pager still reads it).
+- Closes the `EnvGuard` uses for `INFR_SEAM_NO_REPLAY` and `INFR_I8_COOPMAT`.
+- Perf is the gate here, not just the goldens: interleaved decode AND prefill
+  pairs vs the parent commit, warmed up (§9's thermal trap).
 
 ### S6 — `infr-metal` (26 sites / 20 keys) and `infr-rocm` (17 sites / 13 keys)
 
