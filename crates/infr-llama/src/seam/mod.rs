@@ -119,11 +119,36 @@ fn rocm_upload_bind(be: &infr_rocm::RocmBackend) -> Box<BindWeight<'_>> {
 
 /// Whether a MoE expert bank of `dt` can be PAGED on ROCm — the native `moe_ffn_expert_*` /
 /// int8 `moe_*_i8_*` kernels decode a slot in place only for these formats, so paging a bank of
-/// any other dtype (Scout's Q2_K/Q3_K) would need native MoE decode that does not exist yet
-/// (`docs/rocm-plan.md` P3). Kept in sync with `infr-rocm`'s `moe_native_fmt`.
+/// any other dtype would need native MoE decode that does not exist yet (`docs/rocm-plan.md` §1).
+/// Kept in sync with `infr-rocm`'s `moe_native_fmt`, which is the authority; `exec.rs`'s own
+/// `MoeFfn` guard is the backstop if the two ever drift.
+///
+/// This list had gone STALE at R0's `{Q8_0, Q4_K, Q6_K}` while R1-R5 added thirteen more to
+/// `moe_native_fmt`, so a paged bank in any of them was rejected at load time even though its
+/// kernels existed — that is what R5 hit on `Qwen3.6-35B-A3B-UD-IQ3_S` (IQ2_S gate/up, IQ3_S +
+/// IQ4_XS down), and it is why R2's Q2_K/Q3_K work never actually reached llama4-Scout's paged
+/// expert banks.
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 fn rocm_moe_pageable(dt: DType) -> bool {
-    matches!(dt, DType::Q8_0 | DType::Q4K | DType::Q6K)
+    matches!(
+        dt,
+        DType::Q8_0
+            | DType::Q2K
+            | DType::Q3K
+            | DType::Q4K
+            | DType::Q5K
+            | DType::Q6K
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q5_1
+            | DType::Iq4Nl
+            | DType::Iq4Xs
+            | DType::Iq2Xxs
+            | DType::Iq2Xs
+            | DType::Iq2S
+            | DType::Iq3Xxs
+            | DType::Iq3S
+    )
 }
 
 /// The ROCm MoE-aware weight binder (Slice 33) — the ROCm twin of [`vulkan_moe_binder`], but
@@ -219,7 +244,8 @@ fn rocm_moe_binder<'a>(
             if !rocm_moe_pageable(t.dtype) {
                 return Err(anyhow!(
                     "ROCm MoE paging: expert bank {} is {:?}, which has no native MoE decode \
-                     kernel yet — only Q8_0/Q4_K/Q6_K page (docs/rocm-plan.md P3)",
+                     kernel yet — see `rocm_moe_pageable` for the set that pages \
+                     (docs/rocm-plan.md §1)",
                     t.name,
                     t.dtype,
                 ));

@@ -427,6 +427,38 @@ fn iq4xs_blocks(blocks: usize) -> Vec<u8> {
     w
 }
 
+// ── R5 grid quants: IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S ───────────────
+//
+// These five take their blocks from the SHARED spec-driven builder
+// (`infr_testkit::synth_weight`, which reads `infr_core::decode_spec`) rather than a bespoke
+// per-format writer like the ones above, for two reasons specific to a grid quant:
+//
+//   * There is no "invalid" payload to avoid. Every field except `d` is either a grid index (the
+//     kernels mask it to the table's exact size — 8/9/10 bits over a 256/512/1024-entry grid), a
+//     sign pattern, or a 4-bit scale magnitude, so pseudo-random bytes are already a legal block
+//     AND they walk the whole codebook — which is exactly the property the bespoke builders above
+//     had to construct by hand with coprime strides.
+//   * The `d` magnitudes are the ones the shared harness converged on per format
+//     (`infr_testkit::synth_scales`), so these cases and the `shared_decode_parity.rs` sweep are
+//     measuring the same weights rather than two independently tuned sets.
+//
+// One super-block is 256 elements for all five, so `blocks` here means super-blocks.
+fn iq2xxs_blocks(blocks: usize) -> Vec<u8> {
+    infr_testkit::synth_weight(DType::Iq2Xxs, blocks * 256, 0x5101)
+}
+fn iq2xs_blocks(blocks: usize) -> Vec<u8> {
+    infr_testkit::synth_weight(DType::Iq2Xs, blocks * 256, 0x5102)
+}
+fn iq2s_blocks(blocks: usize) -> Vec<u8> {
+    infr_testkit::synth_weight(DType::Iq2S, blocks * 256, 0x5103)
+}
+fn iq3xxs_blocks(blocks: usize) -> Vec<u8> {
+    infr_testkit::synth_weight(DType::Iq3Xxs, blocks * 256, 0x5104)
+}
+fn iq3s_blocks(blocks: usize) -> Vec<u8> {
+    infr_testkit::synth_weight(DType::Iq3S, blocks * 256, 0x5105)
+}
+
 /// Build `blocks` valid Q6_K blocks (210 B = [ql 128][qh 64][int8 scales 16][f16 d]) with a finite
 /// small `d`, a benign in-range int8 sub-block scale, and patterned ql/qh.
 fn q6k_blocks(blocks: usize) -> Vec<u8> {
@@ -654,6 +686,99 @@ fn linear_i8_iq4xs_matches_cpu() {
     );
 }
 
+// ── R5 grid-quant int8 GEMV ──────────────────────────────────────────────────
+// All five go through ONE shared per-32-block decoder (`wdec_*`) and ONE macro body, so what these
+// five cases separate is precisely the five decoders: a swapped grid table, a sign field read from
+// the wrong place, or a scale taken per-32 where it is per-16 shows up in exactly one of them.
+// Like R4's codebook formats there is NO ones-dot term — the grid byte is already signed — so a
+// kernel that grew one (by copying an affine format's body) lands at O(1) relative.
+
+/// IQ2_XXS int8 GEMV (R5): the first GRID format — an 8-bit index into a 256-entry table of packed
+/// 8-byte signed vectors, a 7-bit `ksigns` index per group of 8, and ONE scale per 32-element
+/// block taken from the top nibble of the group's `aux1` word.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq2xxs_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &iq2xxs_blocks(blocks),
+        DType::Iq2Xxs,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ2_XXS",
+    );
+}
+
+/// IQ2_XS int8 GEMV (R5): a 9-bit grid index packed with its 7-bit sign index in one u16, and TWO
+/// scales per 32-element block (the two nibbles of `scales[ib32]`, one per 16 elements) — the case
+/// that pins the split accumulation. A kernel that applied one scale to all 32 lands at O(1).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq2xs_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &iq2xs_blocks(blocks),
+        DType::Iq2Xs,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ2_XS",
+    );
+}
+
+/// IQ2_S int8 GEMV (R5): a 10-bit grid index (8 bits from `qs`, 2 more from `qh` at shift `8−2l`)
+/// and RAW sign bytes — no `ksigns` indirection at all, unlike IQ2_XXS/IQ2_XS. Same two-scale
+/// split as IQ2_XS.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq2s_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &iq2s_blocks(blocks),
+        DType::Iq2S,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ2_S",
+    );
+}
+
+/// IQ3_XXS int8 GEMV (R5): the IQ3 grids hold FOUR bytes per entry, so a group of 8 elements needs
+/// TWO grid entries sharing one 8-bit sign pattern (elements 4..7 take sign bits 4..7). One scale
+/// per 32, from `aux32`'s top nibble, with the `·0.5` IQ3 factor rather than IQ2's `·0.25`.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq3xxs_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &iq3xxs_blocks(blocks),
+        DType::Iq3Xxs,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ3_XXS",
+    );
+}
+
+/// IQ3_S int8 GEMV (R5): two 9-bit grid indices per group (the 9th bit from `qh` at shift `8−2l`
+/// for the first entry and `7−2l` for the second — an off-by-one there is invisible to a coarse
+/// tolerance but not to `embed_gather`), raw sign bytes, and the `d·(1+2·ls)` scale form that no
+/// other format in this family uses.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_iq3s_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &iq3s_blocks(blocks),
+        DType::Iq3S,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "IQ3_S",
+    );
+}
+
 /// Q2_K int8 GEMV (R2): 2-bit weight, 4-bit sub-block scale + 4-bit min per 16 elements (so a
 /// 32-elem activation block spans TWO scale sub-blocks) + int8 activation.
 #[test]
@@ -833,6 +958,47 @@ fn wmma_iq4nl_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn wmma_iq4xs_matches_cpu() {
     check_wmma_linear(iq4xs_blocks, DType::Iq4Xs, 256, 1.5e-2, "IQ4_XS");
+}
+
+// R5 grid quants on the WMMA prefill tier. All five share ONE `GEN_WMMA_IQG` body over the same
+// `wdec_*` decoders the int8 GEMV uses, so what these add over the GEMV cases is the TILING: the
+// per-16 K-tile split (each half of a 32-block scaled independently, which is why the body carries
+// `ws0`/`ws1` instead of Q8_0's single `wsc`) and the m/out_f edge masking.
+
+/// IQ2_XXS WMMA prefill GEMM (R5).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq2xxs_matches_cpu() {
+    check_wmma_linear(iq2xxs_blocks, DType::Iq2Xxs, 256, 1.5e-2, "IQ2_XXS");
+}
+
+/// IQ2_XS WMMA prefill GEMM (R5) — the two-scales-per-32-block case, so this is the one that pins
+/// `ws0`/`ws1` reaching the right K-tile.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq2xs_matches_cpu() {
+    check_wmma_linear(iq2xs_blocks, DType::Iq2Xs, 256, 1.5e-2, "IQ2_XS");
+}
+
+/// IQ2_S WMMA prefill GEMM (R5) — 10-bit grid index + raw sign bytes, two scales per block.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq2s_matches_cpu() {
+    check_wmma_linear(iq2s_blocks, DType::Iq2S, 256, 1.5e-2, "IQ2_S");
+}
+
+/// IQ3_XXS WMMA prefill GEMM (R5) — two 4-byte grid entries per group of 8.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq3xxs_matches_cpu() {
+    check_wmma_linear(iq3xxs_blocks, DType::Iq3Xxs, 256, 1.5e-2, "IQ3_XXS");
+}
+
+/// IQ3_S WMMA prefill GEMM (R5) — the `qh` 9th index bit and the `d·(1+2·ls)` scale form.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_iq3s_matches_cpu() {
+    check_wmma_linear(iq3s_blocks, DType::Iq3S, 256, 1.5e-2, "IQ3_S");
 }
 
 /// Q2_K WMMA prefill GEMM (R2): 2-bit weight, per-16 sub-block 4-bit scale + 4-bit min (1 K-tile
@@ -1492,6 +1658,76 @@ fn moe_ffn_iq4nl_gate_iq4xs_down_experts_matches_cpu() {
         DType::Iq4Nl,
         DType::Iq4Xs,
         "IQ4_NL/IQ4_NL/IQ4_XS",
+    );
+}
+
+/// IQ2_S gate/up + IQ3_S down MoE experts (R5): the cell a real GGUF on this box actually needs —
+/// `Qwen3.6-35B-A3B-UD-IQ3_S` packs `ffn_gate_exps`/`ffn_up_exps` as IQ2_S with `ffn_down_exps` as
+/// IQ3_S. Exercises `moe_gate_up_act_i8_iq2s` + `moe_down_i8_iq2s`'s partner `moe_down_i8_iq3s`,
+/// and the `("iq2s","iq3s")` cross-product cell, with a two-scales-per-block gate/up decode against
+/// a one-scale-per-block down decode.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq2s_gate_iq3s_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    check_moe_experts(
+        &iq2s_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq2s_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq3s_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Iq2S,
+        DType::Iq3S,
+        "IQ2_S/IQ2_S/IQ3_S",
+    );
+}
+
+/// IQ2_XXS gate/up + IQ4_XS down MoE experts (R5): the other real IQ shape — the same 35B GGUF
+/// bumps 3 of its `ffn_down_exps` to IQ4_XS — and it pairs an R5 grid gate/up with an R4 CODEBOOK
+/// down, i.e. two different table mechanisms in one expert.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq2xxs_gate_iq4xs_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    check_moe_experts(
+        &iq2xxs_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq2xxs_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq4xs_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Iq2Xxs,
+        DType::Iq4Xs,
+        "IQ2_XXS/IQ2_XXS/IQ4_XS",
+    );
+}
+
+/// IQ3_XXS gate/up + Q6_K down MoE experts (R5): the `use_more_bits` K-quant down bump, pairing a
+/// no-min grid gate/up decode with a down decode that HAS a min term — the mixed-mechanism cell
+/// that a shared-scale or shared-ones-dot slip between the two families would break.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq3xxs_gate_q6k_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    check_moe_experts(
+        &iq3xxs_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq3xxs_blocks(n_expert * n_ff_exp * ne / 256),
+        &q6k_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Iq3Xxs,
+        DType::Q6K,
+        "IQ3_XXS/IQ3_XXS/Q6_K",
+    );
+}
+
+/// IQ2_XS gate/up + IQ3_XXS down MoE experts (R5): the two formats the first three cases leave
+/// only in a gate/up or only in a down role, so across the four every R5 format is exercised in
+/// BOTH roles at least once.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_iq2xs_gate_iq3xxs_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    check_moe_experts(
+        &iq2xs_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq2xs_blocks(n_expert * n_ff_exp * ne / 256),
+        &iq3xxs_blocks(n_expert * ne * n_ff_exp / 256),
+        DType::Iq2Xs,
+        DType::Iq3Xxs,
+        "IQ2_XS/IQ2_XS/IQ3_XXS",
     );
 }
 
@@ -3010,6 +3246,64 @@ fn embed_gather_iq4nl_native_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn embed_gather_iq4xs_native_matches_cpu() {
     check_embed_native(iq4xs_blocks, DType::Iq4Xs, 256, "IQ4_XS");
+}
+
+// ── R5 grid quants through the element-wise `embed_*` decode gather ──────────
+//
+// This is THE load-bearing case for a grid format, more so than for any format before it, and the
+// only one in the suite that compares decoded elements individually rather than through a dot.
+// Two whole classes of bug are invisible to the GEMV/WMMA tolerances and caught only here:
+//
+//   * a wrong GRID INDEX — every entry of an IQ2/IQ3 grid is a plausible-magnitude weight vector,
+//     so reading entry 137 instead of 138 produces a perfectly reasonable-looking dot, and a
+//     256-term sum with cancellation buries the difference well inside 1.5e-2;
+//   * a flipped or misaligned SIGN BIT — the sign field is packed separately from the index (in
+//     `ksigns` for IQ2_XXS/IQ2_XS/IQ3_XXS, in raw bytes for IQ2_S/IQ3_S), and one wrong bit in
+//     eight changes a dot by ~2/8 of one term's magnitude, again inside the bound.
+//
+// Element by element, both land at O(1) relative. `check_embed_native` also runs the decode
+// through `deq_*` rather than `wdec_*`, so these are the cases that pin the two decoders (the
+// per-element one and the per-32-block one) against each other and against the host oracle.
+
+/// IQ2_XXS embedding table through `embed_iq2xxs` (R5).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq2xxs_native_matches_cpu() {
+    check_embed_native(iq2xxs_blocks, DType::Iq2Xxs, 256, "IQ2_XXS");
+}
+
+/// IQ2_XS embedding table through `embed_iq2xs` (R5) — 9-bit index + 7-bit sign index in one u16,
+/// and the per-16 scale nibble split, all pinned per element.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq2xs_native_matches_cpu() {
+    check_embed_native(iq2xs_blocks, DType::Iq2Xs, 256, "IQ2_XS");
+}
+
+/// IQ2_S embedding table through `embed_iq2s` (R5) — the 2 high index bits from `qh` at shift
+/// `8−2l` and the raw sign byte at `qs[32 + …]`, the two fields most easily read from the wrong
+/// offset.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq2s_native_matches_cpu() {
+    check_embed_native(iq2s_blocks, DType::Iq2S, 256, "IQ2_S");
+}
+
+/// IQ3_XXS embedding table through `embed_iq3xxs` (R5) — the two-grid-entries-per-group split, in
+/// which elements 4..7 take grid entry 2 but sign bits 4..7 (not 0..3).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq3xxs_native_matches_cpu() {
+    check_embed_native(iq3xxs_blocks, DType::Iq3Xxs, 256, "IQ3_XXS");
+}
+
+/// IQ3_S embedding table through `embed_iq3s` (R5) — the asymmetric `qh` shifts (`8−2l` for the
+/// first grid entry of a group, `7−2l` for the second). Swapping them moves at most one bit of one
+/// index per group, which only an element-wise comparison sees.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_iq3s_native_matches_cpu() {
+    check_embed_native(iq3s_blocks, DType::Iq3S, 256, "IQ3_S");
 }
 
 /// Q2_K embedding table through the native `embed_q2k` in-kernel decode gather (×scale) vs CPU.

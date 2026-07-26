@@ -36,7 +36,7 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
   parity-validated; a `rocm_seam` gpu_seam gate (9 models, token-for-token/hash
   vs CPU). Goldens locked.
 - **Decode** — native in-kernel block decode + int8-activation dp4a GEMV for
-  **Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS**;
+  **Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S**;
   grid-underfill fixed across
   attention/WriteKv/GatedAct/RmsNorm/Argmax/QkNormRope; RmsNorm→Linear +
   Linear→Add fusion. ~1.9 → ~130 t/s (Qwen3-0.6B Q4_K_M, ~60× over naive, ~0.3×
@@ -46,8 +46,9 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
 - **Attention** — split-KV / flash-decoding (10.6× at depth), Causal/SWA/Canvas.
 - **DeltaNet** — chunked/parallel prefill (88×) + column-parallel decode.
 - **MoE** — int8 dp4a experts
-  ({q80,q2k,q3k,q4k,q5k,q6k,q40,q41,q51,iq4nl,iq4xs}, gate/up × down) +
-  **GPU-side top-k routing** (device-routed, no host readback).
+  ({q80,q2k,q3k,q4k,q5k,q6k,q40,q41,q51,iq4nl,iq4xs,iq2xxs,iq2xs,iq2s,iq3xxs,iq3s},
+  gate/up × down) + **GPU-side top-k routing** (device-routed, no host
+  readback).
 - **Memory paging** — all three Vulkan modes: MoE expert LRU cache (host→VRAM,
   copy-stream overlap), KV-cache overflow to host (`INFR_KV_OVERFLOW`),
   dense-weight prefetch ring. 30B MoE, 27 GiB KV contexts, and >VRAM dense
@@ -65,11 +66,12 @@ kernels correct).
 ## 1. Quant coverage — fast kernels for ALL 24 formats × all paths
 
 **The biggest correctness-of-perf gap.** ROCm has native/int8 fast kernels for
-**12** formats (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/**IQ4_NL**/
-**IQ4_XS**); every other quant falls back to the slow `dequant→f16` GEMV (256
-threads — the pathology that made gemma-3's Q5_0 0.04× before it was covered).
-Vulkan is native on **all 24** + floats, with a full `native_id`/`native_idm`
-MoE-GEMV family (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
+**17** formats (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/
+**IQ2_XXS**/**IQ2_XS**/**IQ2_S**/**IQ3_XXS**/**IQ3_S**); every other quant falls
+back to the slow `dequant→f16` GEMV (256 threads — the pathology that made
+gemma-3's Q5_0 0.04× before it was covered). Vulkan is native on **all 24** +
+floats, with a full `native_id`/`native_idm` MoE-GEMV family
+(`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
 
 - ✅ **R1 — Q5_K LANDED.** `deq_q5k` native decode (+ `linear_q5k`/`embed_q5k`/
   `deqf16_q5k`), `linear_i8_q5k`/`i8acc_q5k` int8 dp4a GEMV, the
@@ -135,30 +137,91 @@ MoE-GEMV family (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
   prefetching the wrong thing anyway: the codebook gather is ALU-bound, not
   DRAM-bound (Vulkan's bytes-vs-speed sweep measured IQ4_XS at 4.25 bpw running
   1.55-2.1× SLOWER per dispatch than Q4_K's 4.5 bpw at matched shapes).
-- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining 12:
-  `IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, TQ1_0, TQ2_0, Q2_0, MXFP4, NVFP4`
-  (+ `Bf16` weights). The remaining IQ formats add a second new axis on top of
-  R4's codebook lookup: a packed GRID (`iquant_grids`) plus sign bits, so
-  `IQ3_XXS`/`IQ3_S` are the natural next step. Reuse
-  `infr_gguf::dequant`/`iquant_grids` for bit-faithful decode (R4's
-  generate-into-the-module trick extends to the grids); mirror the DEC-per-block
-  pattern in `kernels.rs`.
+- ✅ **R5 — IQ2_XXS + IQ2_XS + IQ2_S + IQ3_XXS + IQ3_S LANDED.** The GRID
+  (codebook-of-vectors) family — the last structurally-new decode shape. One
+  axis past R4's codebook: the stored code indexes a table of packed signed-byte
+  VECTORS (8 bytes per entry for the IQ2 grids, 4 for the IQ3 ones) and a
+  separately packed sign bit negates each element, so a decoded value is
+  `db · gv · sign` — still with NO offset, so the int8 tier feeds the (already
+  signed) grid byte straight into dp4a with no ones-dot term, exactly as R4's
+  codebook formats do. All five are 256-element super-blocks walked as 8
+  sub-blocks × 4 groups × 8 elements; they differ only in the grid index width
+  (8/9/10 bits), the sign source (`ksigns[7b]` for IQ2_XXS/IQ2_XS/IQ3_XXS, raw
+  sign BYTES for IQ2_S/IQ3_S) and whether the 32-element block carries one scale
+  or two (IQ2_XS/IQ2_S put a 4-bit magnitude on each half). **The grids are
+  generated into the HIP module from `infr_core::iquant_grids`**
+  (`iquant_grid_src`) — 17.1 KiB across six tables, parsed back by a unit test
+  and required to BE the host statics. A device buffer was re-weighed at this
+  size and rejected: it would need an extra pointer parameter on every IQ2/IQ3
+  kernel, including the ones whose signatures come from macros shared with the
+  affine formats, and it buys nothing at run time because on AMDGCN a
+  module-scope `__device__ const` array already IS device global memory. (This
+  is where HIP differs from Vulkan, which must mirror the same tables into LDS
+  by hand — glslang/ACO materialize a dynamically-indexed `const` array into
+  per-invocation scratch. There is no such lowering here, so no LDS mirror and
+  no `grid_init()` barrier.) Landed per format: `deq_*` native decode with its
+  `infr_rocm::kernels::linear_iq3xxs`, `infr_rocm::kernels::embed_iq3xxs` and
+  `infr_rocm::kernels::deqf16_iq3xxs` instantiations; the
+  `infr_rocm::kernels::linear_i8_iq3xxs` / `i8acc_iq3xxs` int8 dp4a GEMV; the
+  `wmma_i8_iq2xxs_*` … `wmma_i8_iq3s_*` WMMA prefill tier in all three tiles;
+  and grid MoE experts. All five tiers share ONE per-32-block decoder per format
+  (`wdec_*`), which is what lets ONE `GEN_LINEAR_I8_IQG` and ONE `GEN_WMMA_IQG`
+  body serve the whole family and makes the tiers unable to drift. The grid
+  entry and sign pattern are fetched once per GROUP OF 8 and peeled in registers
+  — the hoisting Vulkan's grid GEMVs also needed; a per-element gather re-reads
+  the same entry 8 times. Measured on the RX 7900 XTX with Qwen3-0.6B: IQ2_XXS
+  decode **13.0 → 147.5 t/s** (11.3×), prefill **1245 → 4612 t/s** (3.7×);
+  IQ3_XXS decode **13.5 → 148.1 t/s** (11.0×), prefill **1248 → 4587 t/s**
+  (3.7×); Q4_K_M control unmoved (126.7 → 127.3 tg, 4445 → 4464 pp). Both beat
+  the Q4_K_M control at decode, which is the expected shape — at 2.1/3.1 bpw
+  they stream less than half the weight bytes. No IQ2_XS/IQ2_S GGUF exists
+  standalone, but the two cached Qwen3-0.6B UD mixes contain all five formats
+  between them (UD-IQ3_XXS is IQ3_XXS + IQ3_S + IQ2_S + IQ2_XS + IQ4_XS), so
+  every kernel runs in a real coherent generation. All five stay on the plain
+  WMMA tier for the same reason every format after Q4_K does — and R4's extra
+  argument against the `_pipe` applies with MORE force here: a fixed-shape
+  prefetch cannot reach the GRID reads, whose addresses are not known until the
+  block's own indices have been fetched and unpacked. The decode is not purely
+  DRAM-bound either — at 2.06 bpw IQ2_XXS streams under half Q4_K's 4.5 bpw of
+  weight bytes yet runs only 1.16× its decode rate. R5 also fixed a STALE gate
+  outside the backend: `rocm_moe_pageable` (`infr-llama/src/seam/mod.rs`) still
+  listed R0's `{Q8_0, Q4_K, Q6_K}` while `moe_native_fmt` had grown to 16
+  formats, so a paged expert bank in any of the other 13 was rejected at LOAD
+  time even though its kernels existed — which is why R2's Q2_K/Q3_K work never
+  actually reached llama4-Scout's paged banks. With it synced,
+  `Qwen3.6-35B-A3B-UD-IQ3_S` (IQ2_S gate/up, IQ3_S + IQ4_XS down) runs
+  coherently on the 24 GB card through the expert pager at 6.6 t/s — it
+  previously refused to load at all.
+- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining 7:
+  `IQ1_S, IQ1_M, TQ1_0, TQ2_0, Q2_0, MXFP4, NVFP4` (+ `Bf16` weights). IQ1_S /
+  IQ1_M are the last of the grid family and reuse R5's machinery almost
+  wholesale (`IQ1S_GRID` is already emitted-ready; IQ1_S adds a per-group
+  `delta` ADDEND to the grid value, which is the one thing no format in R1-R5
+  has, and IQ1_M splits `d` across four scale words). TQ1_0/TQ2_0/Q2_0/MXFP4/
+  NVFP4 are not codebooks at all and currently land at ~3e-7 on the f32-exact
+  host path, so they are a perf item, not a correctness one. Reuse
+  `infr_gguf::dequant`/`iquant_grids` for bit-faithful decode; mirror the
+  per-block `wdec_*` + `GEN_*_IQG` pattern in `kernels.rs`.
 - **MoE experts beyond the current set** — extend `moe_ffn_expert*`/`moe_*_i8*`
   to the remaining formats. The **escape hatch is taken** (R3 measured it, R4
   re-measured it): the Phase-3 `moe_ffn_expert_<gu>_<dn>` cross product is not
   complete over `moe_native_fmt`. Going 6×6 → 9×9 (81 pairs/macro) cost **+1.1 s
   of COLD hiprtc**, so `moe_expert_kernel` and its routed twin return `Option`
-  and only the **reachable** pairs are instantiated — now **62**:
+  and only the **reachable** pairs are instantiated — now **97**:
   `{q80,q2k,q3k,q4k,q5k,q6k}²` (36), `{q40,q41,q51} × {q40,q41,q51,q80}` (12),
-  `{iq4nl,iq4xs} × {iq4nl,iq4xs,q4k,q5k,q6k,q80}` (12) and `{q2k,q3k} × {iq4nl}`
-  (2, llama.cpp's `convert_incompatible_tensor` rewrite). R4's cold-hiprtc
+  `{iq4nl,iq4xs} × {iq4nl,iq4xs,q4k,q5k,q6k,q80}` (12), `{q2k,q3k} × {iq4nl}`
+  (2, llama.cpp's `convert_incompatible_tensor` rewrite) and
+  `{iq2xxs,iq2xs,iq2s,iq3xxs,iq3s} × {iq2s,iq3xxs,iq3s,iq4nl,iq4xs,q4k,q6k}`
+  (35, R5 — grid quants are gate/up banks only, since an IQ ftype always bumps
+  `ffn_down` to something wider; the cached `Qwen3.6-35B-A3B-UD-IQ3_S` is
+  exactly `("iq2s","iq3s")` + `("iq2s","iq4xs")`). R5's cold-hiprtc
   re-measurement (backend init + a 1-token bench, `~/.cache/comgr` cleared, 3
-  reps each): **5.50-5.55 s** at R3's 48 pairs → **6.39-6.60 s** once R4's 24
-  DENSE kernels are added at the same 48 pairs → **6.72-6.75 s** at the
-  shipped 62. So the 14 new pairs cost only ~0.25 s (~18 ms each) and the dense
-  kernels — the actual feature — are ~0.9 s of it; the full 11×11 would have
-  added ~59 more cells (~1.1 s) for nothing. **Warm-cache startup is unchanged
-  at ~0.48 s.** Absent pairs fall back to the dequant→f16 `moe_ffn_expert` path,
+  reps each): **6.81-6.93 s** at R4's 62 pairs → **8.28-9.02 s** once R5's 55
+  DENSE kernels are added at the same 62 pairs → **9.14-9.30 s** at the
+  shipped 97. So the 35 new pairs cost ~0.5 s (~14 ms each) and the dense
+  kernels — the actual feature — are ~1.6 s of it; the full 16×16 would have
+  added 159 more cells (~2.2 s) for nothing. **Warm-cache startup is unchanged
+  at ~0.51 s.** Absent pairs fall back to the dequant→f16 `moe_ffn_expert` path,
   which costs nothing real: those kernels only run under `INFR_ROCM_NO_I8` (the
   default int8 expert path uses the per-FORMAT
   `moe_gate_up_act_i8_<gu>`/`moe_down_i8_<dn>` kernels, still total over
