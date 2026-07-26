@@ -13,6 +13,7 @@ them.
 | S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock                                                        | `addc1ac` |
 | S2    | `infr-core`'s own knobs (12) read from `Config`: `EnvRows::clamped`, `budget` flag/mib/reserve, `pager::ring_bytes`, `FusionCfg.enabled`. Temporary `Config::load_from_env()` bridge in `VulkanBackend::new_selected` (dies in S5a) and `RocmBackend::new` (dies in S6) | `6a8c2cb` |
 | S3    | `infr-cpu` (6 knobs) on `Config`: `CpuBackend::new_with(cfg)`, `reference()` → `kernels.cpu.reference`, `spin_limit()`'s `OnceLock` deleted (per-pool field). Crate is `INFR_*`-free. Bridge `Config::load_from_env()` in `CpuBackend::new` dies in **S4**              | `b2d6f04` |
+| S4    | `infr-llama` seam (35 keys): `SeamModel`/`DenseSession` carry `Arc<Config>`, `Sampler::from_cfg`, `device.ubatch_specified` added, device-list grammar moved into `infr-core`, CPU bridge deleted, 44 test loads + 32 `INFR_TEMP` writes converted                      | `c29d816` |
 
 **Authority:** `crates/infr-core/src/config/manifest.rs` is the knob inventory —
 177 keys, their config paths, grammars, and a `migrated` flag — and the tests
@@ -589,20 +590,30 @@ means off.
 - `budget.rs`'s `SpillNouns.env` and the `KV_SPILL`/`WEIGHT_SPILL` consts keep
   the `INFR_*` spellings as user-visible BANNER TEXT, not reads. Leave them.
 
-### S4 — `infr-llama` seam (51 sites / 38 keys)
+### Carried into later slices from S4
 
-`kv`, `spec`, `multi` (§6.11), `device.ubatch`, `paging.cache`, `sampling`, and
-the two graph-shape knobs from §6.9 (`INFR_NO_QKV_FUSE`,
-`INFR_NO_GATED_RMSNORM`). `SeamModel` and `DenseSession<B, X>` gain
-`Arc<Config>`. `Sampler::from_env` → `Sampler::from_cfg`; `Sampler::resolve`'s
-signature and precedence are UNCHANGED (§5.1). This is the slice that unblocks
-deleting most `EnvGuard` uses in `crates/infr-llama/tests/cpu_backend.rs`.
-
-Split into S4a (`seam/mod.rs` — placement, kv gates, multi-GPU) and S4b
-(`seam/runner.rs` + `mtp/` — the decode loop) if the diff exceeds ~800 lines.
-
-**Exit:** `crates/infr-llama/tests/cpu_backend.rs` has no `EnvGuard` use for any
-`kv.*`/`spec.*`/`device.ubatch` knob; `cpu_golden` hashes unmoved.
+- **`sampling.*` is NOT migrated yet** (6 keys). The seam reads them from
+  `Config`, but the CLI's model-recommendation bridge
+  (`apply_model_sampling_defaults` + `set_default_sampling_env`) and the DG
+  bench arm still read `INFR_TEMP`/`TOP_K`/`TOP_P`/`SEED`/`IGNORE_EOS`/
+  `MAX_NEW`. **S8** replaces the "was it specified?" env probe with the
+  `specified` `PartialConfig` threaded from `main()`, then flips these keys.
+  `INFR_NO_THINK` belongs to `infr-chat` (**S7**).
+- **`prof.prof`** stays unmigrated until `infr-vulkan`'s recorder moves
+  (**S5**).
+- **`kernels.vulkan.{delta_strided,no_replay,gpu_pos}`** are two-crate knobs;
+  the `infr-llama` half moved, **S5** takes the adapter half.
+- **`SeamModel::load`'s own `load_from_env()`** remains (documented on the
+  field) — **S8** deletes it once the CLI hands its config in everywhere.
+- **`INFR_MOE_SMALL_M` in `cpu_backend.rs` still uses `EnvGuard`**: the seam
+  opens Vulkan backends via `VulkanBackend::new()`, which builds its own config
+  until **S5a**. Close it there.
+- **Metal paths edited but not compile-verified**
+  (`cargo check -p infr-llama --target x86_64-apple-darwin` fails on a native
+  C++ dep here): the two `metal_decode_chain_*` tests and
+  `metal_llama_replay_matches_static` were RESTRUCTURED (they used to flip an
+  env var after the model loaded, which the config makes a no-op). macOS CI is
+  the gate; read those closely.
 
 ### S5 — `infr-vulkan` (74 sites / 64 keys, split into S5a/S5b)
 
