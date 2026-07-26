@@ -85,8 +85,9 @@ pub fn parse_reporting(
             }
         }
         if overrides.flags.is_path_set(path) {
+            // Name the value the user typed — `--set x=` with an empty tail reads like a bug.
             warnings.push(format!(
-                "[infr] config: `--set {path}=` is overridden by the dedicated flag for `{path}`"
+                "[infr] config: `--set {path}={raw}` ignored — the dedicated flag for `{path}` wins"
             ));
         }
         seen.push(path.to_string());

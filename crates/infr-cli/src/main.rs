@@ -2,6 +2,8 @@
 //! See docs/plan.md "Product surface".
 
 use clap::{Parser, Subcommand};
+use infr_core::config::{Config, ConfigOverrides, ConfigValue, PartialConfig};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -13,6 +15,20 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+
+    /// Config file (TOML) — skips the default lookup, and is an ERROR if the path does not exist.
+    /// Unset: the first existing of `./infr.toml`, `$XDG_CONFIG_HOME/infr/config.toml`,
+    /// `~/.config/infr/config.toml` (an absent file is a no-op). Precedence, later wins:
+    /// defaults < file < `INFR_*` env < flags.
+    #[arg(long, value_name = "PATH", global = true)]
+    config: Option<PathBuf>,
+
+    /// Set one config field: `--set kernels.vulkan.flash_splits=2`. Repeatable. The path is the
+    /// CONFIG path (the same one the TOML file uses), never the `INFR_*` name — they are not 1:1.
+    /// ADDITIVE to the dedicated flags: where both name the same field the dedicated flag wins and
+    /// says so; the same path twice, or an unknown path, is an error.
+    #[arg(long = "set", value_name = "PATH=VALUE", global = true)]
+    set: Vec<String>,
 
     /// Print shell completions to stdout and exit (packaging helper).
     #[arg(long, value_enum, value_name = "SHELL", hide = true)]
@@ -72,25 +88,27 @@ enum Backend {
     Rocm(Option<String>),
 }
 
-/// A snapshot of the process-global env vars that select a backend, so the backend DECISION
+/// The INHERITED half of the device decision, so the backend DECISION
 /// ([`resolve_backend`]/[`selected_backend`]) is a pure, unit-testable function of its inputs rather
 /// than a scatter of ad-hoc `std::env::var` reads with drifting precedence.
 ///
-/// `INFR_DEV` is the SINGLE device-selection env (same grammar as `--dev`). The old
-/// `INFR_METAL=1`/`INFR_CPU=1` flags were removed cleanly (no aliases) — use `INFR_DEV=metal`/`cpu`.
+/// `device.dev` is the SINGLE device-selection knob (`INFR_DEV`, or `[device] dev` in the config
+/// file, same grammar as `--dev`); since S1 it reaches this struct through the resolved [`Config`]
+/// rather than through a direct `std::env::var`. The old `INFR_METAL=1`/`INFR_CPU=1` flags were
+/// removed cleanly (no aliases) — use `INFR_DEV=metal`/`cpu`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BackendEnv {
-    /// `INFR_DEV` (the device spec — `VulkanN`/`metal`/`cpu`), if non-empty.
+    /// The device spec (`VulkanN`/`metal`/`cpu`/`rocm[N]`), if non-empty.
     dev: Option<String>,
 }
 
 impl BackendEnv {
-    /// Read the live process env (`INFR_DEV`).
-    fn current() -> Self {
+    /// The device spec the resolved config carries. The empty-string filter is this consumer's
+    /// policy and stays here (the config layer keeps the raw spec, because `infr-vulkan`'s
+    /// `resolve_infr_dev_index` tolerates an empty value and this parser does not).
+    fn from_cfg(cfg: &Config) -> Self {
         Self {
-            dev: std::env::var("INFR_DEV")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            dev: cfg.device.dev.clone().filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -133,11 +151,27 @@ fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend
     Ok(Backend::Vulkan(None))
 }
 
-/// The backend the current process env selects — the ONE reader precedence for `run`/`serve`/
-/// `bench`'s backend funnels. Equivalent to `resolve_backend(None, BackendEnv::current())`; the
-/// `None` arg never errors on a well-formed env, but a garbage `INFR_DEV` DOES surface here.
-fn selected_backend() -> anyhow::Result<Backend> {
-    resolve_backend(None, BackendEnv::current())
+/// The backend the resolved [`Config`] selects — the ONE reader precedence for `run`/`serve`/
+/// `bench`'s backend funnels. Equivalent to `resolve_backend(None, BackendEnv::from_cfg(cfg))`: an
+/// explicit `--dev` already won inside the config fold (the CLI layer beats the env layer), so the
+/// `None` arg is right, but a garbage `INFR_DEV`/`[device] dev` DOES surface here.
+fn selected_backend(cfg: &Config) -> anyhow::Result<Backend> {
+    resolve_backend(None, BackendEnv::from_cfg(cfg))
+}
+
+/// The `device.dev` spelling for a parsed [`Backend`] — the inverse of [`parse_dev_spec`], and the
+/// value `--dev` contributes to the CLI config layer (and that the S1 bridge re-publishes as
+/// `INFR_DEV`, since `infr-vulkan`'s device pick still reads the environment).
+fn dev_spec_of(backend: &Backend) -> String {
+    match backend {
+        Backend::Vulkan(Some(d)) | Backend::Rocm(Some(d)) => d.clone(),
+        // Unreachable from `parse_dev_spec` (it always carries the spec) — spelled out so a future
+        // parser change cannot silently publish the wrong device.
+        Backend::Vulkan(None) => "vulkan".to_string(),
+        Backend::Rocm(None) => "rocm".to_string(),
+        Backend::Metal => "metal".to_string(),
+        Backend::Cpu => "cpu".to_string(),
+    }
 }
 
 /// Total-order comparison of two f64 ratios for the sweep's worst-first ranking. `total_cmp` never
@@ -147,10 +181,10 @@ fn nan_safe_ratio_cmp(a: f64, b: f64) -> std::cmp::Ordering {
     a.total_cmp(&b)
 }
 
-/// The shared device/config flags for `run`/`serve`/`bench`. Every field funnels through a
-/// process-global env var that the backends read deep inside the session seam (far from argv), so
-/// this struct is a FRONT-END: [`resolve`](DeviceOpts::resolve) publishes the envs, replacing the
-/// per-command setters that used to do it piecemeal.
+/// The shared device/config flags for `run`/`serve`/`bench`. Every field is a knob the engine
+/// resolves from the layered [`Config`], so this struct is a FRONT-END:
+/// [`overrides`](DeviceOpts::overrides) turns the flags into the CLI config layer (they used to be
+/// laundered through the process environment with `std::env::set_var`).
 ///
 /// The unified `--dev` matches llama.cpp: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal`, or `cpu`,
 /// case-insensitive. This is the fix for `--dev metal`/`--dev cpu` being silent no-ops on
@@ -162,133 +196,128 @@ struct DeviceOpts {
     /// Vulkan GPU, else device 0.
     #[arg(long)]
     dev: Option<String>,
-    /// Context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV capacity). Sets
-    /// INFR_CTX. Default: the model's trained context, clamped to VRAM.
+    /// Context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV capacity). Config
+    /// `device.ctx` / INFR_CTX. Default: the model's trained context, clamped to VRAM.
     #[arg(long, value_name = "TOKENS")]
     ctx: Option<String>,
-    /// Physical batch = tokens per forward = the prefill chunk (matches llama-bench -ub). Sets
-    /// INFR_UBATCH. Unset = the engine's adaptive chunk policy.
+    /// Physical batch = tokens per forward = the prefill chunk (matches llama-bench -ub). Config
+    /// `device.ubatch` / INFR_UBATCH. Unset = the engine's adaptive chunk policy.
     #[arg(long, visible_alias = "ub", short = 'u', value_name = "N")]
     ubatch: Option<usize>,
-    /// CPU threads (matches llama-bench -t). Sets RAYON_NUM_THREADS. Unset = all cores.
+    /// CPU threads (matches llama-bench -t). Config `device.threads`; published as
+    /// RAYON_NUM_THREADS (rayon has no other input). Unset = all cores.
     #[arg(long, short = 't', value_name = "N")]
     threads: Option<usize>,
 }
 
 impl DeviceOpts {
-    /// Publish the flags to the process-global env vars the backends read. Called once, up front,
-    /// before the model loads (so `RAYON_NUM_THREADS` lands before any parallel work spins the
-    /// rayon pool up, and `INFR_DEV` before the session seam constructs a backend).
+    /// Fold the flags into the CLI config layer. Called once, up front, before the model loads (so
+    /// the resolved `Config` — and the `RAYON_NUM_THREADS` publication that rides on it — lands
+    /// before any parallel work spins the rayon pool up or the session seam builds a backend).
     ///
-    /// `INFR_DEV` is the SINGLE device-selection env. An explicit `--dev` OVERRIDES an inherited
-    /// `INFR_DEV` (`set_var` overwrites, so the flag naturally wins) and publishes the chosen spec
-    /// so both the CLI reader ([`selected_backend`]) and the deep Vulkan reader agree: a specific
-    /// Vulkan device is published as `INFR_DEV=VulkanN`, `metal`/`cpu` leave `INFR_DEV` holding that
-    /// spec (the deep Vulkan reader tolerates it), and the Vulkan-default clears `INFR_DEV`. It no
-    /// longer writes the deprecated `INFR_METAL`/`INFR_CPU` (which now lose to `INFR_DEV` anyway).
-    /// `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`], `vulkan*`/`metal`/`cpu`,
-    /// case-insensitive). Unset `--dev` leaves the inherited env untouched — the default "first
-    /// discrete GPU, else device 0".
-    fn resolve(&self) -> anyhow::Result<()> {
-        let backend = resolve_backend(self.dev.as_deref(), BackendEnv::current())?;
-        // Only an EXPLICIT --dev mutates the backend env; unset preserves whatever was inherited.
-        if self.dev.is_some() {
-            match &backend {
-                Backend::Vulkan(Some(d)) => std::env::set_var("INFR_DEV", d),
-                Backend::Vulkan(None) => std::env::remove_var("INFR_DEV"),
-                Backend::Metal => std::env::set_var("INFR_DEV", "metal"),
-                Backend::Cpu => std::env::set_var("INFR_DEV", "cpu"),
-                Backend::Rocm(Some(d)) => std::env::set_var("INFR_DEV", d),
-                Backend::Rocm(None) => std::env::set_var("INFR_DEV", "rocm"),
-            }
+    /// PRECEDENCE, unchanged: an explicit `--dev` OVERRIDES an inherited `INFR_DEV` because the CLI
+    /// layer beats the env layer in the fold; an UNSET `--dev` specifies nothing, so the inherited
+    /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "first discrete GPU,
+    /// else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
+    /// `vulkan*`/`metal`/`cpu`/`rocm*`, case-insensitive) and a garbage `--dev` still fails fast
+    /// here, before anything is loaded. The deprecated `INFR_METAL`/`INFR_CPU` are still not
+    /// written and still not read.
+    fn overrides(&self, layer: &mut PartialConfig) -> anyhow::Result<()> {
+        if let Some(d) = self.dev.as_deref() {
+            let backend = parse_dev_spec(d).with_context(|| format!("invalid --dev `{d}`"))?;
+            layer.device.dev = Some(Some(dev_spec_of(&backend)));
         }
-        // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX, which it sets; a
-        // typo fails fast here (the check `cmd_serve` used to own).
+        // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX; a typo fails fast
+        // here (the check `cmd_serve` used to own).
         if let Some(c) = &self.ctx {
-            if infr_core::parse_size(c).is_none() {
-                anyhow::bail!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)");
-            }
-            std::env::set_var("INFR_CTX", c);
+            let spec = infr_core::parse_size(c)
+                .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))?;
+            layer.device.ctx = Some(Some(spec));
         }
-        // INFR_UBATCH=0 is read as "adaptive" (`ubatch_rows` filters `v > 0`), matching the old
-        // `-u 0` default; likewise RAYON_NUM_THREADS=0 falls back to all cores in rayon.
+        // `-u 0` stays "adaptive": the value is carried verbatim and the seam's `ubatch_rows`
+        // filters `v > 0`, exactly as it did when this was published as INFR_UBATCH=0. Likewise
+        // RAYON_NUM_THREADS=0 falls back to all cores in rayon.
         if let Some(u) = self.ubatch {
-            std::env::set_var("INFR_UBATCH", u.to_string());
+            layer.device.ubatch = Some(Some(u));
         }
         if let Some(t) = self.threads {
-            std::env::set_var("RAYON_NUM_THREADS", t.to_string());
+            layer.device.threads = Some(Some(t));
         }
         Ok(())
     }
 }
 
 /// The shared SAMPLING flags for `run`/`serve` — the sibling of [`DeviceOpts`]. Same front-end
-/// pattern: every field funnels through a process-global env var (`INFR_TEMP`/`INFR_TOP_K`/
-/// `INFR_TOP_P`/`INFR_SEED`/`INFR_MAX_NEW`/`INFR_NO_THINK`) that the decode loop reads, so
-/// [`resolve`](SamplingOpts::resolve) publishes the envs and the piecemeal setters go away.
+/// pattern: every field is a `sampling.*` config knob (`INFR_TEMP`/`INFR_TOP_K`/`INFR_TOP_P`/
+/// `INFR_SEED`/`INFR_MAX_NEW`/`INFR_NO_THINK`) that the decode loop resolves, so
+/// [`overrides`](SamplingOpts::overrides) fills the CLI config layer instead of writing the envs.
 ///
-/// NOT on `bench`: bench pins greedy (`INFR_TEMP=0`) so its numbers are deterministic, so exposing
-/// sampling there would be misleading. On `serve` these are the SERVER DEFAULTS — a per-request
-/// OpenAI field (`temperature`/`top_p`/…) still overrides them via `GenParams::from_request`.
+/// NOT on `bench`: bench pins greedy so its numbers are deterministic, so exposing sampling there
+/// would be misleading. On `serve` these are the SERVER DEFAULTS — a per-request OpenAI field
+/// (`temperature`/`top_p`/…) still overrides them via `GenParams::from_request`.
 ///
-/// `resolve` is called BEFORE `set_default_sampling_env` (which only fills a knob left unset, via
-/// its `is_err` guard), so a flag the user passed wins and the rest fall back to the chat defaults.
+/// The layer is resolved BEFORE `set_default_sampling_env` (which only fills a knob no layer
+/// specified), so a flag the user passed wins and the rest fall back to the chat defaults.
 #[derive(clap::Args)]
 struct SamplingOpts {
-    /// Sampling temperature (0 = greedy/argmax). Sets INFR_TEMP. Default: the model's recommended
-    /// value (arch-family table + any generation_config.json beside the model) — e.g. 0.6 for
-    /// Qwen3, 1.0 for Gemma; 0.6 fallback. The startup banner prints the effective value.
+    /// Sampling temperature (0 = greedy/argmax). Config `sampling.temp` / INFR_TEMP. Default: the
+    /// model's recommended value (arch-family table + any generation_config.json beside the model)
+    /// — e.g. 0.6 for Qwen3, 1.0 for Gemma; 0.6 fallback. The startup banner prints the effective
+    /// value.
     #[arg(long, value_name = "T")]
     temp: Option<f32>,
-    /// Top-k: keep only the k most-likely tokens (0 = keep all). Sets INFR_TOP_K. Default:
-    /// model-recommended (e.g. 20 for Qwen3, 64 for Gemma, off for Llama).
+    /// Top-k: keep only the k most-likely tokens (0 = keep all). Config `sampling.top_k` /
+    /// INFR_TOP_K. Default: model-recommended (e.g. 20 for Qwen3, 64 for Gemma, off for Llama).
     #[arg(long = "top-k", value_name = "K")]
     top_k: Option<usize>,
-    /// Top-p (nucleus): keep the smallest set whose probability mass ≥ p. Sets INFR_TOP_P.
-    /// Default: model-recommended (e.g. 0.95 for Qwen3/Gemma, 0.9 for Llama).
+    /// Top-p (nucleus): keep the smallest set whose probability mass ≥ p. Config `sampling.top_p` /
+    /// INFR_TOP_P. Default: model-recommended (e.g. 0.95 for Qwen3/Gemma, 0.9 for Llama).
     #[arg(long = "top-p", value_name = "P")]
     top_p: Option<f32>,
-    /// RNG seed for reproducible sampling. Sets INFR_SEED. Unset = seeded from the clock.
+    /// RNG seed for reproducible sampling. Config `sampling.seed` / INFR_SEED. Unset = seeded from
+    /// the clock.
     #[arg(long, value_name = "N")]
     seed: Option<u64>,
-    /// Max tokens to generate per reply. Sets INFR_MAX_NEW. (No short flag: `-n` is taken by
-    /// bench's `--n-gen` and serve's `--parallel`.)
+    /// Max tokens to generate per reply. Config `sampling.max_new` / INFR_MAX_NEW. (No short flag:
+    /// `-n` is taken by bench's `--n-gen` and serve's `--parallel`.)
     #[arg(long = "max-new", value_name = "N")]
     max_new: Option<usize>,
-    /// Force reasoning OFF for models that emit `<think>` (sets INFR_NO_THINK=1). Thinking is on by
-    /// default where the template supports it.
+    /// Force reasoning OFF for models that emit `<think>` (config `sampling.no_think` /
+    /// INFR_NO_THINK=1). Thinking is on by default where the template supports it.
     #[arg(long = "no-think", conflicts_with = "think")]
     no_think: bool,
-    /// Force reasoning ON, overriding an inherited INFR_NO_THINK (sets INFR_NO_THINK=0).
+    /// Force reasoning ON, overriding an inherited INFR_NO_THINK (`sampling.no_think = false`).
     #[arg(long)]
     think: bool,
 }
 
 impl SamplingOpts {
-    /// Publish the passed flags to the sampling env vars. Only a flag the user actually set touches
-    /// the environment, so an unset knob is left for `set_default_sampling_env`/the reader default.
-    fn resolve(&self) {
+    /// Fold the passed flags into the CLI config layer. Only a flag the user actually set specifies
+    /// anything, so an unset knob is left for the file/env layers, `set_default_sampling_env`, or
+    /// the reader default — in that order.
+    fn overrides(&self, layer: &mut PartialConfig) {
         if let Some(t) = self.temp {
-            std::env::set_var("INFR_TEMP", t.to_string());
+            layer.sampling.temp = Some(t);
         }
         if let Some(k) = self.top_k {
-            std::env::set_var("INFR_TOP_K", k.to_string());
+            layer.sampling.top_k = Some(k);
         }
         if let Some(p) = self.top_p {
-            std::env::set_var("INFR_TOP_P", p.to_string());
+            layer.sampling.top_p = Some(p);
         }
         if let Some(s) = self.seed {
-            std::env::set_var("INFR_SEED", s.to_string());
+            layer.sampling.seed = Some(Some(s));
         }
         if let Some(m) = self.max_new {
-            std::env::set_var("INFR_MAX_NEW", m.to_string());
+            layer.sampling.max_new = Some(m);
         }
         // `--no-think`/`--think` are mutually exclusive (clap `conflicts_with`); each maps to the
-        // existing INFR_NO_THINK grammar (`=1` off, `=0`/unset on — see infr-chat template.rs).
+        // existing INFR_NO_THINK grammar (`=1` off, `=0`/unset on — see infr-chat template.rs),
+        // which the bridge re-publishes verbatim.
         if self.no_think {
-            std::env::set_var("INFR_NO_THINK", "1");
+            layer.sampling.no_think = Some(true);
         } else if self.think {
-            std::env::set_var("INFR_NO_THINK", "0");
+            layer.sampling.no_think = Some(false);
         }
     }
 }
@@ -555,49 +584,76 @@ fn main() -> anyhow::Result<()> {
         Cli::command().print_help()?;
         return Ok(());
     };
+
+    // THE configuration, resolved exactly once: defaults < config file < `INFR_*` < flags/`--set`
+    // (docs/config-plan.md §2). It is a VALUE, threaded into the commands as an `Arc` — there is
+    // deliberately no global (R4).
+    let overrides = ConfigOverrides {
+        config_path: cli.config.clone(),
+        sets: cli.set.clone(),
+        flags: cli_flag_layer(&cmd)?,
+    };
+    let cfg = Arc::new(Config::load(&overrides)?);
+    publish_thread_count(&cfg);
+    publish_transitional_env(&cfg, &specified_by_the_layers(&overrides)?);
+
     // The subcommand runs to completion (or to its abort) and EVERYTHING it owns — model, backend,
     // Vulkan device — is dropped as it returns. Only then does `exit_if_signalled` turn a latched
     // SIGINT/SIGTERM into 130/143, and it does so in preference to the abort error the unwinding
     // produced (an aborted forward reports `aborted: shutdown requested`, which is noise once we
     // are already saying "interrupted" with the right status).
-    let res = dispatch(cmd);
+    let res = dispatch(cmd, &cfg);
     exit_if_signalled();
     res
 }
 
-fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
+/// The CLI layer's BESPOKE half: what this invocation's dedicated flags specify (`--set` is folded
+/// in by `infr-core`, and loses to these — §11 [DECIDE-3]).
+///
+/// Built before dispatch so a bad `--dev`/`--ctx` fails fast, before anything is downloaded or
+/// loaded, exactly as `DeviceOpts::resolve` did.
+fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
+    let mut layer = PartialConfig::default();
+    match cmd {
+        Cmd::Run {
+            device, sampling, ..
+        }
+        | Cmd::Serve {
+            device, sampling, ..
+        } => {
+            device.overrides(&mut layer)?;
+            sampling.overrides(&mut layer);
+        }
+        Cmd::Bench { device, .. } => {
+            device.overrides(&mut layer)?;
+            // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a
+            // model that emits EOS instantly on the dummy context would otherwise report fictional
+            // tok/s. `cmd_bench` used to `set_var("INFR_IGNORE_EOS", "1")` itself; as a flag-level
+            // override it wins over the file and the environment just as that overwrite did.
+            layer.sampling.ignore_eos = Some(true);
+        }
+        Cmd::Pull { .. } | Cmd::Devices | Cmd::Multi { .. } | Cmd::Compare { .. } => {}
+    }
+    Ok(layer)
+}
+
+fn dispatch(cmd: Cmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Devices => cmd_devices(),
-        Cmd::Run {
-            model,
-            message,
-            device,
-            sampling,
-        } => {
-            device.resolve()?;
-            // Before cmd_run's set_default_sampling_env: a flag the user passed is now already in
-            // the env, so the default-filler's `is_err` guard leaves it alone.
-            sampling.resolve();
-            cmd_run(&model, message.as_deref())
-        }
+        Cmd::Run { model, message, .. } => cmd_run(&model, message.as_deref(), cfg),
         Cmd::Serve {
             model,
             addr,
             parallel,
-            device,
-            sampling,
-        } => {
-            device.resolve()?;
-            sampling.resolve();
-            cmd_serve(&model, &addr, parallel)
-        }
+            ..
+        } => cmd_serve(&model, &addr, parallel, cfg),
         Cmd::Multi {
             models,
             addr,
             parallel,
             ctx,
-        } => cmd_multi(&models, &addr, parallel, ctx.as_deref()),
+        } => cmd_multi(&models, &addr, parallel, ctx.as_deref(), cfg),
         Cmd::Bench {
             model,
             n_prompt,
@@ -607,11 +663,8 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             reps,
             ngl,
             json,
-            device,
-        } => {
-            device.resolve()?;
-            cmd_bench(&model, n_prompt, n_gen, depth, pg, reps, ngl, json)
-        }
+            ..
+        } => cmd_bench(&model, n_prompt, n_gen, depth, pg, reps, ngl, json, cfg),
         Cmd::Compare {
             models,
             sweep,
@@ -663,6 +716,148 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
 
 use anyhow::{anyhow, Context};
 use std::path::{Path, PathBuf};
+
+/// Which paths some LAYER actually specified — the question a resolved [`Config`] cannot answer,
+/// because it is all values and no provenance (`sampling.temp == 0.0` cannot tell `--temp 0` from
+/// "nobody said anything", and the difference decides whether the model's recommended sampling
+/// applies).
+///
+/// Re-derives the three layers through their PURE halves (re-reading the config file, which is why
+/// this is not on any hot path), so nothing is printed twice: `Config::load` already emitted the
+/// file's unknown-key warnings, the diagnostics announcement and any `--set`-shadowed-by-a-flag
+/// warning.
+///
+/// **Transitional — S1 only.** Its one caller, [`publish_transitional_env`], goes away once the deep
+/// readers take their values from `Arc<Config>` (S4–S7), and S8 deletes this with it.
+fn specified_by_the_layers(overrides: &ConfigOverrides) -> anyhow::Result<PartialConfig> {
+    use infr_core::config::{cli as cfg_cli, file as cfg_file, ConfigLayer};
+    let mut layers = PartialConfig::default();
+    if let Some(path) = cfg_file::discover(overrides.config_path.as_deref())? {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("config file {}", path.display()))?;
+        layers.merge(cfg_file::parse_str(&text, &path)?.0);
+    }
+    layers.merge(ConfigLayer::env()?);
+    layers.merge(cfg_cli::parse_reporting(overrides)?.0);
+    Ok(layers)
+}
+
+/// `-t`/`--threads` → `RAYON_NUM_THREADS`.
+///
+/// PERMANENT, unlike the bridge below (docs/config-plan.md §6.1): rayon's global pool has no input
+/// other than the process environment, and `device.threads` is not an `INFR_*` knob — it only ever
+/// comes from the flag or the config file, so publishing it is the whole delivery mechanism, not a
+/// stand-in for one. Must run before any parallel work spins the pool up, hence: in `main`.
+fn publish_thread_count(cfg: &Config) {
+    if let Some(t) = cfg.device.threads {
+        std::env::set_var("RAYON_NUM_THREADS", t.to_string());
+    }
+}
+
+// ── the S1 transitional env bridge (docs/config-plan.md §7 S1.3) ────────────────────────────────
+
+/// Hand the resolved values back to the process environment, for the knobs the CLI used to publish
+/// with `std::env::set_var` itself.
+///
+/// **TRANSITIONAL — S1 ONLY. S8 deletes this function and its call site, and nothing else.** The
+/// CLI now resolves these ten knobs from the layered [`Config`], but their READERS are still deep
+/// in the crates this slice does not touch — `infr-vulkan`'s device pick (`INFR_DEV`),
+/// `infr-llama`'s seam and sampler (`INFR_CTX`, `INFR_UBATCH`, `INFR_TEMP`, `INFR_TOP_K`,
+/// `INFR_TOP_P`, `INFR_SEED`, `INFR_MAX_NEW`, `INFR_IGNORE_EOS`) and `infr-chat`'s template
+/// (`INFR_NO_THINK`) — so the value has to travel the old way until S4–S7 move those read sites
+/// onto `Arc<Config>`. Because of that, none of these keys is `migrated` in `config::manifest` yet.
+///
+/// Callers that depend on it: `cmd_bench` (its `sampling.ignore_eos` flag becomes
+/// `INFR_IGNORE_EOS=1`, which `dg_bench_run` and every decode loop read — this replaces the
+/// `set_var` that used to sit at the top of `cmd_bench`), `cmd_run` (`INFR_MAX_NEW`),
+/// `set_default_sampling_env` (whose `is_err` guard is what makes an unspecified sampler fall back
+/// to the model's recommendation), `run_chat`'s server-side `INFR_MAX_NEW` default, and every
+/// backend funnel through `INFR_DEV`.
+///
+/// Only what a LAYER specified is published; a knob nobody mentioned leaves the environment alone,
+/// so a value the process inherited in a spelling the layer could not parse (`INFR_CTX=banana`)
+/// still reaches its reader untouched and is still ignored there, exactly as today.
+fn publish_transitional_env(cfg: &Config, specified: &PartialConfig) {
+    // `Option` knobs: `Some` publishes, an explicit `none` UNSETS (the config said so).
+    let opt = |path: &str, key: &str, value: Option<String>| {
+        if specified.is_path_set(path) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    };
+    // Presence knobs: `false` must UNSET, never publish "0" — `is_ok()` would read that as ON.
+    let presence = |path: &str, key: &str, on: bool| {
+        if specified.is_path_set(path) {
+            if on {
+                std::env::set_var(key, "1");
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    };
+
+    opt("device.dev", "INFR_DEV", cfg.device.dev.clone());
+    opt(
+        "device.ctx",
+        "INFR_CTX",
+        cfg.device.ctx.map(|c| c.to_display()),
+    );
+    opt(
+        "device.ubatch",
+        "INFR_UBATCH",
+        cfg.device.ubatch.map(|u| u.to_string()),
+    );
+
+    opt(
+        "sampling.temp",
+        "INFR_TEMP",
+        Some(cfg.sampling.temp.to_string()),
+    );
+    opt(
+        "sampling.top_k",
+        "INFR_TOP_K",
+        Some(cfg.sampling.top_k.to_string()),
+    );
+    opt(
+        "sampling.top_p",
+        "INFR_TOP_P",
+        Some(cfg.sampling.top_p.to_string()),
+    );
+    opt(
+        "sampling.seed",
+        "INFR_SEED",
+        cfg.sampling.seed.map(|s| s.to_string()),
+    );
+    opt(
+        "sampling.max_new",
+        "INFR_MAX_NEW",
+        Some(cfg.sampling.max_new.to_string()),
+    );
+    presence(
+        "sampling.ignore_eos",
+        "INFR_IGNORE_EOS",
+        cfg.sampling.ignore_eos,
+    );
+    // NOT a presence knob: `INFR_NO_THINK=0` is the "force thinking ON" spelling (`--think`), so
+    // both polarities are published verbatim.
+    opt(
+        "sampling.no_think",
+        "INFR_NO_THINK",
+        Some(if cfg.sampling.no_think { "1" } else { "0" }.to_string()),
+    );
+}
+
+/// Force greedy for Metal speculative decode.
+///
+/// **TRANSITIONAL — S1 ONLY, deleted with [`publish_transitional_env`] in S8.** Spec decode is
+/// greedy-only (the draft/verify equality check assumes argmax), and the sampler that has to hear
+/// about it still reads `INFR_TEMP` from the environment.
+#[cfg(target_os = "macos")]
+fn publish_transitional_greedy() {
+    std::env::set_var("INFR_TEMP", "0");
+}
 
 /// Is `path` a usable LOCAL model: an existing regular FILE whose extension is `.gguf`
 /// (case-insensitive)? A directory, a wrong-extension file, or a missing path is NOT local — the
@@ -841,7 +1036,7 @@ impl ThinkRender {
 }
 
 /// Build the per-backend generation primitive (`ChatModel`) for run AND serve, from the backend the
-/// process env selects ([`selected_backend`]) and the cheap diffusion-gemma arch peek the caller
+/// resolved config selects ([`selected_backend`]) and the cheap diffusion-gemma arch peek the caller
 /// already did. ONE funnel so `cmd_run` and `cmd_serve` can never disagree on how a backend is
 /// constructed (the DG→Metal→CPU→Vulkan selection used to be copy-pasted in both). The backend
 /// banner goes to stderr on both surfaces.
@@ -849,8 +1044,9 @@ fn build_chat_model(
     gguf: &Path,
     tok: Option<&Path>,
     is_dg: bool,
+    cfg: &Config,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
-    let backend = selected_backend()?;
+    let backend = selected_backend(cfg)?;
     if is_dg {
         // diffusion-gemma (Phase 3/D, docs/diffusion-gemma.md): the entropy-bound block-diffusion
         // loop over a persistent session — Vulkan by default, CPU under INFR_DEV=cpu, Metal under
@@ -928,7 +1124,7 @@ fn build_chat_model(
     }
 }
 
-fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
+fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Result<()> {
     use std::io::Write;
     // Context window: the model's trained context by default; INFR_CTX overrides (shared size
     // grammar — tokens, `256k`, or `%` of the free-VRAM KV capacity), read by the chat sessions.
@@ -962,7 +1158,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                  INFR_PIPELINE=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
             );
         };
-        if is_dg || !matches!(selected_backend()?, Backend::Vulkan(_)) {
+        if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
         apply_model_sampling_defaults(&gguf);
@@ -985,7 +1181,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                  INFR_TENSOR_PARALLEL=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
             );
         };
-        if is_dg || !matches!(selected_backend()?, Backend::Vulkan(_)) {
+        if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
         apply_model_sampling_defaults(&gguf);
@@ -1009,7 +1205,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                  INFR_EXPERT_PARALLEL=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
             );
         };
-        if is_dg || !matches!(selected_backend()?, Backend::Vulkan(_)) {
+        if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
         apply_model_sampling_defaults(&gguf);
@@ -1027,7 +1223,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
     // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
     apply_model_sampling_defaults(&gguf);
-    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg)?;
+    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, cfg)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
@@ -1438,7 +1634,7 @@ fn metal_chat_model(
                  speculation only pays when the target is much larger (see #16)"
             );
         }
-        std::env::set_var("INFR_TEMP", "0");
+        publish_transitional_greedy();
         eprintln!("[metal spec — target + {k}-token draft verify, greedy (INFR_TEMP=0)]");
         Ok(Box::new(infr_llama::chat::SpecMetalChat::new(
             target, draft, k,
@@ -1789,14 +1985,15 @@ fn cmd_bench(
     reps: usize,
     ngl: usize,
     json: bool,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
-    // `--dev`/`-u`/`-t` were already published to the process-global envs (INFR_DEV, INFR_UBATCH,
-    // RAYON_NUM_THREADS) by `DeviceOpts::resolve` in `dispatch`, before the model loads — the
-    // backend picks and thread pool read them there. So `--dev metal`/`--dev cpu` now route here
-    // through INFR_DEV, same as a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
-    // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a model
-    // that emits EOS instantly on the dummy context would otherwise report fictional tok/s.
-    std::env::set_var("INFR_IGNORE_EOS", "1");
+    // `--dev`/`-u`/`-t` reached the engine before the model loads: `--dev` through this `cfg` (and,
+    // until S8, through the `INFR_DEV` the S1 bridge re-publishes for the deep Vulkan device pick),
+    // `-u` through INFR_UBATCH, `-t` through RAYON_NUM_THREADS. So `--dev metal`/`--dev cpu` route
+    // here exactly like a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
+    // Bench also pins `sampling.ignore_eos` (see `cli_flag_layer`): benchmarks decode a FIXED token
+    // count (llama-bench semantics) and never stop at EOS — a model that emits EOS instantly on the
+    // dummy context would otherwise report fictional tok/s.
     // -pg "P,G": a coding-agent turn (ingest P then generate G); throughput = (P+G)/time.
     let pg = pg
         .map(|s| -> anyhow::Result<(usize, usize)> {
@@ -1811,7 +2008,7 @@ fn cmd_bench(
     let backend = if ngl == 0 {
         Backend::Cpu
     } else {
-        selected_backend()?
+        selected_backend(cfg)?
     };
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
@@ -1907,7 +2104,7 @@ fn cmd_bench(
         && n_gen > 0
         && model.config().n_layer_nextn > 0
     {
-        Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps)?)
+        Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps, cfg)?)
     } else {
         None
     };
@@ -1945,6 +2142,7 @@ fn bench_mtp_tg(
     depth: usize,
     n_gen: usize,
     reps: usize,
+    cfg: &Config,
 ) -> anyhow::Result<MtpBenchStats> {
     let head = infr_llama::mtp::load_mtp_head(model.gguf(), model.config())?;
     let want = (n_prompt + depth).max(1);
@@ -1955,7 +2153,7 @@ fn bench_mtp_tg(
     // routes the MTP driver onto the Apple-GPU trunk+head (issue #39 — measuring Metal's accept rate
     // needs the Metal timed path, not Vulkan's), everything else stays on Vulkan. Timed fns share a
     // signature.
-    let use_metal = matches!(selected_backend()?, Backend::Metal);
+    let use_metal = matches!(selected_backend(cfg)?, Backend::Metal);
     for _ in 0..reps.max(1) {
         let (stats, t) = if use_metal {
             #[cfg(target_os = "macos")]
@@ -2162,7 +2360,7 @@ fn cmd_bench_metal(
             && n_gen > 0
             && model.config().n_layer_nextn > 0
         {
-            Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps)?)
+            Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps, cfg)?)
         } else {
             None
         };
@@ -3355,6 +3553,13 @@ fn cmd_compare(
 /// tests stay deterministic). For chat UX, run/serve set the qwen3-recommended defaults when the
 /// user hasn't — pure greedy makes thinking models degenerate. Mirrors the bespoke
 /// `Llama::set_sampling(0.6, 20, 0.95)` defaults.
+///
+/// **Part of the S1 transitional bridge** (see [`publish_transitional_env`]): the model-recommended
+/// value is the LOWEST-precedence source, below the config file, so it may only fill a knob no
+/// layer specified — which is what the `is_err` guard means now that
+/// [`publish_transitional_env`] has already published everything the layers DID specify. It stays
+/// on the environment because the sampler that consumes it still reads the environment; S7 makes
+/// this a proper layer under `Config` and S8 removes the writes.
 fn set_default_sampling_env(temp: f32, top_k: usize, top_p: f32) {
     if std::env::var("INFR_TEMP").is_err() {
         std::env::set_var("INFR_TEMP", temp.to_string());
@@ -3450,7 +3655,12 @@ fn apply_model_sampling_defaults(gguf: &std::path::Path) {
     );
 }
 
-fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result<()> {
+fn cmd_serve(
+    model: &str,
+    addr: &str,
+    parallel: Option<usize>,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let model_id = gguf
         .file_stem()
@@ -3462,11 +3672,12 @@ fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result
     let parallel_explicit = parallel;
     let parallel = parallel.unwrap_or(4).max(1);
 
-    // `--ctx` is the PER-SLOT context. `DeviceOpts::resolve` already validated it and published it
-    // as INFR_CTX (shared size grammar `8192`/`256k`/`50%`); the ParallelSeam below reads INFR_CTX
-    // and divides it across the slots. One grammar, one meaning (`infr_core::parse_size`).
+    // `--ctx` is the PER-SLOT context. `DeviceOpts::overrides` already validated it into
+    // `device.ctx` (shared size grammar `8192`/`256k`/`50%`); the ParallelSeam below takes it from
+    // the resolved config and divides it across the slots. One grammar, one meaning
+    // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
-    let is_vulkan = !is_dg && matches!(selected_backend()?, Backend::Vulkan(_));
+    let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
     apply_model_sampling_defaults(&gguf);
 
@@ -3478,10 +3689,7 @@ fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
         // a `%` is a fraction of the whole device's KV capacity split across the slots, and unset
         // derives it from the VRAM fit divided by N. See `SeamModel::vulkan_slot_ctx`.
-        let want_ctx = std::env::var("INFR_CTX")
-            .ok()
-            .as_deref()
-            .and_then(infr_core::parse_size);
+        let want_ctx = cfg.device.ctx;
         let t0 = std::time::Instant::now();
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
         eprintln!(
@@ -3519,7 +3727,7 @@ fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result
     // the reference backends; Vulkan is the default. qwen35 shares the SAME funnel as every other arch
     // (issue #30). Metal also honours INFR_SPEC_DRAFT (draft-verify speculative decode) via
     // `metal_chat_model` inside the funnel.
-    let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg)?;
+    let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg, cfg)?;
     {
         // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
         // request doesn't pay seconds of pipeline builds on top of its own prefill.
@@ -3570,6 +3778,7 @@ fn cmd_multi(
     addr: &str,
     parallel: usize,
     ctx: Option<&str>,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let parallel = parallel.max(1);
@@ -3577,7 +3786,7 @@ fn cmd_multi(
     // `infr multi` is the VULKAN concurrent engine only — the reference backends have no multi-slot
     // engine and no device pool to spread across. Refuse the reference-backend envs up front rather
     // than silently ignoring them.
-    if !matches!(selected_backend()?, Backend::Vulkan(_)) {
+    if !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
         anyhow::bail!(
             "`infr multi` hosts models on the Vulkan device pool; drop INFR_DEV=cpu/INFR_DEV=metal \
              (the CPU/Metal reference backends have no multi-slot engine)"
@@ -3687,6 +3896,42 @@ fn cmd_multi(
 mod tests {
     use super::*;
     use infr_llama::arch::*;
+
+    /// A synthetic `INFR_*` environment, driven through the config env layer's INJECTED reader.
+    ///
+    /// This is what replaced the module's old `static ENV_LOCK: Mutex<()>` (docs/config-plan.md R7):
+    /// the tests that used to mutate the real process environment — and therefore had to serialise
+    /// against each other and restore afterwards — now build a `Config` from a `HashMap` and assert
+    /// on the resolved value. Nothing here touches the process environment, so it all runs in
+    /// parallel with everything else in the binary.
+    fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        infr_core::config::env::parse(&|k| map.get(k).cloned())
+            .expect("the env layer rejected a synthetic environment")
+    }
+
+    /// The layers a real invocation folds, minus the config file: `Default` < env < flags/`--set`.
+    fn resolve_cfg(env: &[(&str, &str)], flags: PartialConfig, sets: &[&str]) -> Config {
+        let cli = infr_core::config::ConfigLayer::cli(&ConfigOverrides {
+            sets: sets.iter().map(|s| (*s).to_string()).collect(),
+            flags,
+            ..Default::default()
+        })
+        .expect("the cli layer rejected a valid override");
+        Config::load_from_layers(&[env_layer(env), cli])
+    }
+
+    fn device_opts(dev: Option<&str>) -> DeviceOpts {
+        DeviceOpts {
+            dev: dev.map(str::to_string),
+            ctx: None,
+            ubatch: None,
+            threads: None,
+        }
+    }
 
     #[test]
     fn metal_prefill_bench_materializes_depth_and_times_exact_rows() {
@@ -3814,54 +4059,231 @@ mod tests {
     #[test]
     fn legacy_metal_cpu_flags_are_no_longer_read() {
         // The old INFR_METAL=1 / INFR_CPU=1 flags were removed cleanly — with no INFR_DEV set they
-        // do NOT select a backend; the resolver falls through to the Vulkan default.
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("INFR_DEV");
-        std::env::set_var("INFR_CPU", "1");
-        std::env::set_var("INFR_METAL", "1");
-        assert_eq!(selected_backend().unwrap(), Backend::Vulkan(None));
-        std::env::remove_var("INFR_CPU");
-        std::env::remove_var("INFR_METAL");
+        // do NOT select a backend (they are not even config knobs: `manifest::NOT_KNOBS`), so the
+        // resolver falls through to the Vulkan default.
+        let cfg = resolve_cfg(
+            &[("INFR_CPU", "1"), ("INFR_METAL", "1")],
+            PartialConfig::default(),
+            &[],
+        );
+        assert_eq!(cfg.device.dev, None);
+        assert_eq!(selected_backend(&cfg).unwrap(), Backend::Vulkan(None));
     }
 
-    // Serialise the few tests that must touch the real process env (env is process-global).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn dev_flag_lands_on_the_config_and_beats_an_inherited_infr_dev() {
+        // Inherit INFR_DEV=cpu AND a stale INFR_CPU (a dead env), then pass `--dev vulkan0`: the
+        // CLI layer beats the env layer in the fold, so `device.dev` is the flag's spec and the
+        // reader agrees. That spec is what the deep Vulkan device pick has to see.
+        let mut flags = PartialConfig::default();
+        device_opts(Some("vulkan0")).overrides(&mut flags).unwrap();
+        let cfg = resolve_cfg(&[("INFR_DEV", "cpu"), ("INFR_CPU", "1")], flags, &[]);
+        assert_eq!(cfg.device.dev.as_deref(), Some("vulkan0"));
+        assert_eq!(
+            selected_backend(&cfg).unwrap(),
+            Backend::Vulkan(Some("vulkan0".to_string()))
+        );
+
+        // `--dev metal` resolves to the `metal` spec (never to the removed INFR_METAL flag).
+        let mut flags = PartialConfig::default();
+        device_opts(Some("metal")).overrides(&mut flags).unwrap();
+        let cfg = resolve_cfg(&[("INFR_DEV", "Vulkan1")], flags, &[]);
+        assert_eq!(cfg.device.dev.as_deref(), Some("metal"));
+        assert_eq!(selected_backend(&cfg).unwrap(), Backend::Metal);
+    }
 
     #[test]
-    fn device_resolve_publishes_infr_dev_and_wins_over_stale_alias() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // Inherit a stale INFR_CPU (now a dead env), then pass `--dev vulkan0`: resolve publishes
-        // INFR_DEV=vulkan0 and the reader picks Vulkan (the stale INFR_CPU is not read at all).
-        std::env::set_var("INFR_CPU", "1");
-        std::env::remove_var("INFR_METAL");
-        std::env::remove_var("INFR_DEV");
-        let opts = DeviceOpts {
-            dev: Some("vulkan0".to_string()),
-            ctx: None,
-            ubatch: None,
-            threads: None,
-        };
-        opts.resolve().unwrap();
-        assert_eq!(std::env::var("INFR_DEV").ok().as_deref(), Some("vulkan0"));
+    fn unset_dev_flag_preserves_the_inherited_infr_dev() {
+        // The other half of the precedence `DeviceOpts` has always documented: an UNSET `--dev`
+        // specifies nothing, so whatever the environment (or the config file) said survives.
+        let mut flags = PartialConfig::default();
+        device_opts(None).overrides(&mut flags).unwrap();
+        assert!(!flags.is_path_set("device.dev"));
+        let cfg = resolve_cfg(&[("INFR_DEV", "Vulkan1")], flags, &[]);
+        assert_eq!(cfg.device.dev.as_deref(), Some("Vulkan1"));
         assert_eq!(
-            selected_backend().unwrap(),
-            Backend::Vulkan(Some("vulkan0".to_string()))
-        ); // reader agrees: not CPU
+            selected_backend(&cfg).unwrap(),
+            Backend::Vulkan(Some("Vulkan1".to_string()))
+        );
+        // …and with neither, the default pick.
+        let cfg = resolve_cfg(&[], PartialConfig::default(), &[]);
+        assert_eq!(selected_backend(&cfg).unwrap(), Backend::Vulkan(None));
+    }
 
-        // `--dev metal` publishes INFR_DEV=metal (no INFR_METAL write), still winning the reader.
+    #[test]
+    fn device_flags_land_on_the_config_layer() {
         let opts = DeviceOpts {
-            dev: Some("metal".to_string()),
+            dev: None,
+            ctx: Some("32k".to_string()),
+            ubatch: Some(512),
+            threads: Some(6),
+        };
+        let mut flags = PartialConfig::default();
+        opts.overrides(&mut flags).unwrap();
+        let cfg = resolve_cfg(&[], flags, &[]);
+        assert_eq!(cfg.device.ctx, Some(infr_core::SizeSpec::Bytes(32 * 1024)));
+        assert_eq!(cfg.device.ubatch, Some(512));
+        assert_eq!(cfg.device.threads, Some(6));
+
+        // `-u 0` keeps its "adaptive" meaning: carried verbatim, filtered by the seam (`v > 0`).
+        let mut flags = PartialConfig::default();
+        DeviceOpts {
+            dev: None,
             ctx: None,
+            ubatch: Some(0),
+            threads: None,
+        }
+        .overrides(&mut flags)
+        .unwrap();
+        assert_eq!(resolve_cfg(&[], flags, &[]).device.ubatch, Some(0));
+
+        // A garbage `--ctx` still fails fast, with the same message.
+        let e = DeviceOpts {
+            dev: None,
+            ctx: Some("banana".to_string()),
             ubatch: None,
             threads: None,
-        };
-        opts.resolve().unwrap();
-        assert_eq!(std::env::var("INFR_DEV").ok().as_deref(), Some("metal"));
-        assert!(std::env::var_os("INFR_METAL").is_none()); // no longer written
-        assert_eq!(selected_backend().unwrap(), Backend::Metal);
+        }
+        .overrides(&mut PartialConfig::default())
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("invalid --ctx"), "{e:#}");
+    }
 
-        std::env::remove_var("INFR_DEV");
-        std::env::remove_var("INFR_CPU");
+    #[test]
+    fn sampling_flags_land_on_the_config_layer_and_beat_the_env() {
+        let opts = SamplingOpts {
+            temp: Some(0.0),
+            top_k: Some(40),
+            top_p: Some(0.8),
+            seed: Some(7),
+            max_new: Some(64),
+            no_think: false,
+            think: false,
+        };
+        let mut flags = PartialConfig::default();
+        opts.overrides(&mut flags);
+        // An explicit `--temp 0` is NOT the same as an unspecified temp, even though 0.0 is also
+        // the default: the layer records that it was ASKED for, which is what stops the
+        // model-recommended default from filling it in.
+        assert!(flags.is_path_set("sampling.temp"));
+        let cfg = resolve_cfg(&[("INFR_TEMP", "0.6"), ("INFR_TOP_K", "20")], flags, &[]);
+        assert_eq!(cfg.sampling.temp, 0.0);
+        assert_eq!(cfg.sampling.top_k, 40);
+        assert!((cfg.sampling.top_p - 0.8).abs() < 1e-6);
+        assert_eq!(cfg.sampling.seed, Some(7));
+        assert_eq!(cfg.sampling.max_new, 64);
+
+        // `--no-think` / `--think` are the two INFR_NO_THINK polarities.
+        let mut flags = PartialConfig::default();
+        SamplingOpts {
+            no_think: true,
+            ..no_sampling_opts()
+        }
+        .overrides(&mut flags);
+        assert!(resolve_cfg(&[], flags, &[]).sampling.no_think);
+        let mut flags = PartialConfig::default();
+        SamplingOpts {
+            think: true,
+            ..no_sampling_opts()
+        }
+        .overrides(&mut flags);
+        assert!(
+            !resolve_cfg(&[("INFR_NO_THINK", "1")], flags, &[])
+                .sampling
+                .no_think
+        );
+    }
+
+    #[test]
+    fn bench_pins_ignore_eos_through_the_cli_layer() {
+        // What `cmd_bench`'s `set_var("INFR_IGNORE_EOS", "1")` used to do: a flag-level override,
+        // so it wins over the environment exactly as that overwrite did.
+        let layer = cli_flag_layer(&bench_cmd()).unwrap();
+        assert!(layer.is_path_set("sampling.ignore_eos"));
+        assert!(resolve_cfg(&[], layer, &[]).sampling.ignore_eos);
+        // …and `run` does NOT pin it.
+        let layer = cli_flag_layer(&Cmd::Run {
+            model: "m".to_string(),
+            message: None,
+            device: device_opts(None),
+            sampling: no_sampling_opts(),
+        })
+        .unwrap();
+        assert!(!layer.is_path_set("sampling.ignore_eos"));
+    }
+
+    #[test]
+    fn set_reaches_a_knob_with_no_flag_and_loses_to_the_flag_that_has_one() {
+        // `--set` is the escape hatch for the knobs with no dedicated flag…
+        let cfg = resolve_cfg(
+            &[],
+            PartialConfig::default(),
+            &["kernels.vulkan.flash_splits=2"],
+        );
+        assert_eq!(cfg.kernels.vulkan.flash_splits, Some(2));
+        // …it beats the environment…
+        let cfg = resolve_cfg(
+            &[("INFR_TEMP", "0.6")],
+            PartialConfig::default(),
+            &["sampling.temp=0.2"],
+        );
+        assert!((cfg.sampling.temp - 0.2).abs() < 1e-6);
+        // …and it LOSES to the dedicated flag for the same field (§11 [DECIDE-3]).
+        let mut flags = PartialConfig::default();
+        SamplingOpts {
+            temp: Some(0.9),
+            ..no_sampling_opts()
+        }
+        .overrides(&mut flags);
+        let cfg = resolve_cfg(&[], flags, &["sampling.temp=0.2"]);
+        assert!((cfg.sampling.temp - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unknown_set_path_is_a_hard_error_with_a_suggestion() {
+        let err = infr_core::config::ConfigLayer::cli(&ConfigOverrides {
+            sets: vec!["nonsense.path=1".to_string()],
+            ..Default::default()
+        })
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown config path"), "{msg}");
+        assert!(msg.contains("nonsense.path"), "{msg}");
+
+        // A near miss suggests the real path.
+        let err = infr_core::config::ConfigLayer::cli(&ConfigOverrides {
+            sets: vec!["kv.slot=2".to_string()],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(format!("{err}").contains("kv.slots"), "{err}");
+    }
+
+    /// A `bench` invocation with everything at its clap default — the shape `cli_flag_layer` sees.
+    fn bench_cmd() -> Cmd {
+        Cmd::Bench {
+            model: "m".to_string(),
+            n_prompt: 512,
+            n_gen: 0,
+            depth: 0,
+            pg: None,
+            reps: 3,
+            ngl: 999,
+            json: false,
+            device: device_opts(None),
+        }
+    }
+
+    fn no_sampling_opts() -> SamplingOpts {
+        SamplingOpts {
+            temp: None,
+            top_k: None,
+            top_p: None,
+            seed: None,
+            max_new: None,
+            no_think: false,
+            think: false,
+        }
     }
 
     // ── finding 3: local `.gguf` FILE vs HF ref classifier ──────────────────────────────────────
