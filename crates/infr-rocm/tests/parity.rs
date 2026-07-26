@@ -336,6 +336,56 @@ fn q50_blocks(blocks: usize) -> Vec<u8> {
     w
 }
 
+/// Build `blocks` valid Q4_0 blocks (18 B = [f16 d][u8 qs[16]]) with a finite small scale and
+/// patterned 4-bit codes (low nibbles are elements 0..15, high nibbles 16..31).
+fn q40_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 18];
+    for blk in 0..blocks {
+        let base = blk * 18;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes());
+        for j in 0..16 {
+            w[base + 2 + j] = ((blk * 7 + j * 11) & 0xFF) as u8;
+        }
+    }
+    w
+}
+
+/// Build `blocks` valid Q4_1 blocks (20 B = [f16 d][f16 m][u8 qs[16]]). The AFFINE minimum `m`
+/// ALTERNATES sign block-to-block: a constant `m` would still pass a kernel that read `m` from the
+/// wrong block, and a zero `m` would pass one that dropped the min term entirely.
+fn q41_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 20];
+    for blk in 0..blocks {
+        let base = blk * 20;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes());
+        let m = if blk % 2 == 0 { -0.11 } else { 0.07 };
+        w[base + 2..base + 4].copy_from_slice(&half::f16::from_f32(m).to_le_bytes());
+        for j in 0..16 {
+            w[base + 4 + j] = ((blk * 7 + j * 11) & 0xFF) as u8;
+        }
+    }
+    w
+}
+
+/// Build `blocks` valid Q5_1 blocks (24 B = [f16 d][f16 m][u8 qh[4]][u8 qs[16]]) — `q41_blocks`'
+/// alternating affine minimum plus `q50_blocks`' patterned `qh` bitfield carrying each code's 5th
+/// bit, so both nibble halves AND both states of every high bit are exercised.
+fn q51_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 24];
+    for blk in 0..blocks {
+        let base = blk * 24;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes());
+        let m = if blk % 2 == 0 { -0.11 } else { 0.07 };
+        w[base + 2..base + 4].copy_from_slice(&half::f16::from_f32(m).to_le_bytes());
+        let qh = (blk as u32).wrapping_mul(2654435761);
+        w[base + 4..base + 8].copy_from_slice(&qh.to_le_bytes());
+        for j in 0..16 {
+            w[base + 8 + j] = ((blk * 7 + j * 11) & 0xFF) as u8;
+        }
+    }
+    w
+}
+
 /// Build `blocks` valid Q6_K blocks (210 B = [ql 128][qh 64][int8 scales 16][f16 d]) with a finite
 /// small `d`, a benign in-range int8 sub-block scale, and patterned ql/qh.
 fn q6k_blocks(blocks: usize) -> Vec<u8> {
@@ -480,6 +530,54 @@ fn linear_i8_q50_matches_cpu() {
     );
 }
 
+/// Q4_0 int8 GEMV (R3): 4-bit weight, single per-32-block scale + the constant `−8` offset via the
+/// ones-dot + int8 activation.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q40_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &q40_blocks(blocks),
+        DType::Q4_0,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "Q4_0",
+    );
+}
+
+/// Q4_1 int8 GEMV (R3): 4-bit weight with an AFFINE per-block minimum — the ones-dot is weighted by
+/// each block's own `m` instead of a constant multiple of `d`, which is the one structural way this
+/// tier differs from Q4_0/Q5_0.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q41_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &q41_blocks(blocks),
+        DType::Q4_1,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "Q4_1",
+    );
+}
+
+/// Q5_1 int8 GEMV (R3): Q4_1's affine `(d, m)` header plus Q5_0's `qh` 5th code bit.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q51_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &q51_blocks(blocks),
+        DType::Q5_1,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "Q5_1",
+    );
+}
+
 /// Q2_K int8 GEMV (R2): 2-bit weight, 4-bit sub-block scale + 4-bit min per 16 elements (so a
 /// 32-elem activation block spans TWO scale sub-blocks) + int8 activation.
 #[test]
@@ -619,6 +717,30 @@ fn wmma_q80_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn wmma_q50_matches_cpu() {
     check_wmma_linear(q50_blocks, DType::Q5_0, 32, 1.5e-2, "Q5_0");
+}
+
+/// Q4_0 WMMA prefill GEMM (R3): 4-bit weight, single per-32-block scale + the `−8` offset via the
+/// ones-dot (the `GEN_WMMA_R32` shared body at `HASMIN=0, FIVEBIT=0`).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q40_matches_cpu() {
+    check_wmma_linear(q40_blocks, DType::Q4_0, 32, 1.5e-2, "Q4_0");
+}
+
+/// Q4_1 WMMA prefill GEMM (R3): the affine variant — `HASMIN=1`, so the ones-dot carries the
+/// block's own `m` (a kernel that reused Q4_0's `d·(−8)` lands at O(1) relative here).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q41_matches_cpu() {
+    check_wmma_linear(q41_blocks, DType::Q4_1, 32, 1.5e-2, "Q4_1");
+}
+
+/// Q5_1 WMMA prefill GEMM (R3): affine min + the `qh` 5th code bit (`HASMIN=1, FIVEBIT=1`), which
+/// also shifts `qs` to +8 — a stale +4 offset would read the `qh` word as codes.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q51_matches_cpu() {
+    check_wmma_linear(q51_blocks, DType::Q5_1, 32, 1.5e-2, "Q5_1");
 }
 
 /// Q2_K WMMA prefill GEMM (R2): 2-bit weight, per-16 sub-block 4-bit scale + 4-bit min (1 K-tile
@@ -1207,6 +1329,42 @@ fn moe_ffn_q3k_gate_q2k_down_experts_matches_cpu() {
         DType::Q3K,
         DType::Q2K,
         "Q3_K/Q3_K/Q2_K",
+    );
+}
+
+/// Q4_0 gate/up + Q4_1 down MoE experts (R3): `moe_gate_up_act_i8_q40` + `moe_down_i8_q41`, and the
+/// `("q40", "q41")` cell of the `moe_expert_kernel` table (llama.cpp bumps a Q4_0 model's `ffn_down`
+/// to Q4_1, so this is the shape a real legacy-quant MoE actually has).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_q40_gate_q41_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    check_moe_experts(
+        &q40_blocks(gu_blocks),
+        &q40_blocks(gu_blocks),
+        &q41_blocks(n_expert * ne * n_ff_exp / 32),
+        DType::Q4_0,
+        DType::Q4_1,
+        "Q4_0/Q4_0/Q4_1",
+    );
+}
+
+/// Q5_1 gate/up + Q8_0 down MoE experts (R3): the mirrored role for the affine 5-bit format, plus
+/// the `("q51", "q80")` cell — legacy ftypes bump `ffn_down` to Q8_0, the other reachable legacy
+/// pairing, and Q8_0 down is the one that carries no min term at all.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_q51_gate_q80_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    check_moe_experts(
+        &q51_blocks(gu_blocks),
+        &q51_blocks(gu_blocks),
+        &q80_blocks(n_expert * ne * n_ff_exp / 32),
+        DType::Q5_1,
+        DType::Q8_0,
+        "Q5_1/Q5_1/Q8_0",
     );
 }
 
@@ -2630,6 +2788,65 @@ fn linear_q80_native_matches_cpu() {
         "Linear Q8_0 native decode diverges from CPU reference: abs={e:e} rel={:e}",
         e / ref_mag
     );
+}
+
+/// Shared native-EmbedGather parity check (R3): `embed_*` is the ONE path that reaches `deq_*`
+/// ELEMENT BY ELEMENT — every GEMV tier goes through int8 codes, where a dot product averages a
+/// decode slip away. So this is where a format's layout is pinned bit for bit, at the f16-rounding
+/// tolerance (`sc*code + mn` rounded once) rather than a dot's error-averaging one.
+fn check_embed_native(w_bytes_for: impl Fn(usize) -> Vec<u8>, dt: DType, qpb: usize, label: &str) {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+    let (vocab, ne) = (6usize, 256usize); // ne a multiple of every block size; vocab > max(ids)
+    let scale = (ne as f32).sqrt(); // non-1.0 (Gemma-style) — must be applied on-device
+    let t_bytes = w_bytes_for(vocab * ne / qpb);
+    let c = run_embed_gather(&cpu, &ids, &t_bytes, dt, vocab, ne, scale);
+    let r = run_embed_gather(&be, &ids, &t_bytes, dt, vocab, ne, scale);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "EmbedGather {label} (native) scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "EmbedGather {label} reference is all-zero — test is vacuous"
+    );
+    // Bit-faithful decode: the only loss is the f16 round. A swapped nibble half, a min read from
+    // the wrong offset, or a dropped `qh` bit lands at O(1) relative — far outside this.
+    assert!(
+        e / ref_mag < 2e-3,
+        "EmbedGather {label} native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q4_0 embedding table through the native `embed_q40` decode gather (R3): pins the nibble split
+/// (low nibbles are elements 0..15, high nibbles 16..31) and the constant `d·(−8)` min.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q40_native_matches_cpu() {
+    check_embed_native(q40_blocks, DType::Q4_0, 32, "Q4_0");
+}
+
+/// Q4_1 embedding table through `embed_q41` (R3): the AFFINE min — the oracle's `dd = (d, m)` with
+/// multipliers `(1, 1)`, so the decoded value is `d·code + m`. The alternating-sign `m` in
+/// `q41_blocks` means a min read from the neighbouring block also lands at O(1) relative.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q41_native_matches_cpu() {
+    check_embed_native(q41_blocks, DType::Q4_1, 32, "Q4_1");
+}
+
+/// Q5_1 embedding table through `embed_q51` (R3): affine min + the `qh` 5th bit at header offset 4
+/// (so `qs` starts at 8) — the two places a Q5_0-derived port goes wrong.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q51_native_matches_cpu() {
+    check_embed_native(q51_blocks, DType::Q5_1, 32, "Q5_1");
 }
 
 /// Q2_K embedding table through the native `embed_q2k` in-kernel decode gather (×scale) vs CPU.

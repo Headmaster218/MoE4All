@@ -36,16 +36,16 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
   parity-validated; a `rocm_seam` gpu_seam gate (9 models, token-for-token/hash
   vs CPU). Goldens locked.
 - **Decode** — native in-kernel block decode + int8-activation dp4a GEMV for
-  **Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q5_0**; grid-underfill fixed across
-  attention/WriteKv/GatedAct/RmsNorm/Argmax/QkNormRope; RmsNorm→Linear +
+  **Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1**; grid-underfill fixed
+  across attention/WriteKv/GatedAct/RmsNorm/Argmax/QkNormRope; RmsNorm→Linear +
   Linear→Add fusion. ~1.9 → ~130 t/s (Qwen3-0.6B Q4_K_M, ~60× over naive, ~0.3×
   llama.cpp).
 - **Prefill** — int8 **WMMA** matrix-core GEMM (RM×CN register tiling +
   software-pipelined Q4_K); ~4500 t/s (~0.2× llama.cpp).
 - **Attention** — split-KV / flash-decoding (10.6× at depth), Causal/SWA/Canvas.
 - **DeltaNet** — chunked/parallel prefill (88×) + column-parallel decode.
-- **MoE** — int8 dp4a experts ({q80,q2k,q3k,q4k,q5k,q6k}²) + **GPU-side top-k
-  routing** (device-routed, no host readback).
+- **MoE** — int8 dp4a experts ({q80,q2k,q3k,q4k,q5k,q6k,q40,q41,q51}, gate/up ×
+  down) + **GPU-side top-k routing** (device-routed, no host readback).
 - **Memory paging** — all three Vulkan modes: MoE expert LRU cache (host→VRAM,
   copy-stream overlap), KV-cache overflow to host (`INFR_KV_OVERFLOW`),
   dense-weight prefetch ring. 30B MoE, 27 GiB KV contexts, and >VRAM dense
@@ -63,11 +63,11 @@ kernels correct).
 ## 1. Quant coverage — fast kernels for ALL 24 formats × all paths
 
 **The biggest correctness-of-perf gap.** ROCm has native/int8 fast kernels for
-only **7** formats (Q8_0/**Q2_K**/**Q3_K**/Q4_K/Q5_K/Q6_K/Q5_0); every other
-quant falls back to the slow `dequant→f16` GEMV (256 threads — the pathology
-that made gemma-3's Q5_0 0.04× before it was covered). Vulkan is native on **all
-24** + floats, with a full `native_id`/`native_idm` MoE-GEMV family
-(`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
+**10** formats (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/**Q4_0**/**Q4_1**/Q5_0/**Q5_1**);
+every other quant falls back to the slow `dequant→f16` GEMV (256 threads — the
+pathology that made gemma-3's Q5_0 0.04× before it was covered). Vulkan is
+native on **all 24** + floats, with a full `native_id`/`native_idm` MoE-GEMV
+family (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
 
 - ✅ **R1 — Q5_K LANDED.** `deq_q5k` native decode (+ `linear_q5k`/`embed_q5k`/
   `deqf16_q5k`), `linear_i8_q5k`/`i8acc_q5k` int8 dp4a GEMV, the
@@ -91,18 +91,43 @@ that made gemma-3's Q5_0 0.04× before it was covered). Vulkan is native on **al
   plain WMMA tier for the same reason Q5_K does (the Slice-27 pipe and Slice-28
   coop kernels are Q4_K-only). The 6×6 MoE cross product costs no measurable
   hiprtc time (backend init + a 1-token bench is unchanged at ~0.46 s wall).
-- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining ~17:
-  `Q4_0, Q4_1, Q5_1, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, TQ1_0, TQ2_0, Q2_0, MXFP4, NVFP4`
-  (+ `Bf16` weights). Priority by real usage: **Q4_0/IQ4_XS/IQ4_NL** (common),
-  then the exotic IQ/fp4/ternary. Reuse `infr_gguf::dequant`/`iquant_grids` for
+- ✅ **R3 — Q4_0 + Q4_1 + Q5_1 LANDED.** The legacy 32-element round quants join
+  Q5_0 on every fast path: `deq_q40`/`deq_q41`/`deq_q51` native decode (each
+  with its `linear_q40`, `embed_q40` and `deqf16_q40` instantiations), the
+  `linear_i8_q40` / `i8acc_q40` int8 dp4a GEMV, the `wmma_i8_q40_2x1` WMMA
+  prefill tier in all three tiles, and Q4_0/Q4_1/Q5_1 MoE experts. One shared
+  `GEN_WMMA_R32` body covers all three WMMA formats — they differ only in `BPB`,
+  `HASMIN` and `FIVEBIT`. Q4_1 and Q5_1 are the first AFFINE 32-block formats:
+  the offset is a per-block f16 min `m` rather than a constant multiple of `d`,
+  so the int8 ones-dot is weighted by each block's own `m`. Measured on the RX
+  7900 XTX with Qwen3-0.6B: Q4_0 decode **12.8 → 138.9 t/s** (10.9×), prefill
+  **1235 → 4885 t/s** (4.0×); Q4_1 decode **12.8 → 138.8 t/s** (10.8×), prefill
+  **1226 → 4889 t/s** (4.0×); Q4_K_M control unmoved (125.7 → 126.9 tg, 4431 →
+  4441 pp). No Q5_1 GGUF is cached on the box, so Q5_1 rests on the parity tests
+  (shared decode sweep at both m-tiers, int8 GEMV, WMMA, EmbedGather, MoE
+  expert). All three stay on the plain WMMA tier for the same reason
+  Q5_K/Q2_K/Q3_K do (the Slice-27 pipe and Slice-28 coop kernels are Q4_K-only).
+- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining ~14:
+  `IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, TQ1_0, TQ2_0, Q2_0, MXFP4, NVFP4`
+  (+ `Bf16` weights). Priority by real usage: **IQ4_XS/IQ4_NL** (common), then
+  the exotic IQ/fp4/ternary. Reuse `infr_gguf::dequant`/`iquant_grids` for
   bit-faithful decode; mirror the DEC-per-block pattern in `kernels.rs`.
-- **MoE experts beyond {q80,q2k,q3k,q4k,q5k,q6k}²** — extend `moe_ffn_expert*`/
-  `moe_*_i8*` to the remaining formats. NOTE the cross product is now 36 kernels
-  per macro (gate/up and down resolve from two INDEPENDENT tensor dtypes, so no
-  pair is statically excludable); a 7th format makes it 49. Before adding one,
-  measure hiprtc compile time — if it starts to bite, the cut is to make
-  `moe_expert_kernel` return `Option` and fall back to the dequant→f16
-  `moe_ffn_expert` path for the rare combos instead of instantiating them.
+- **MoE experts beyond the current set** — extend `moe_ffn_expert*`/`moe_*_i8*`
+  to the remaining formats. The **escape hatch is now taken** (R3 measured it):
+  the Phase-3 `moe_ffn_expert_<gu>_<dn>` cross product is no longer complete
+  over `moe_native_fmt`. Going 6×6 → 9×9 (81 pairs/macro) cost **+1.1 s of COLD
+  hiprtc** (4.31 → 6.27 s for backend init + a 1-token bench with
+  `~/.cache/comgr` cleared; warm startup is ~0.48 s in every variant), so
+  `moe_expert_kernel` and its routed twin now return `Option` and only the **48
+  reachable** pairs are instantiated — `{q80,q2k,q3k,q4k,q5k,q6k}²` plus
+  `{q40,q41,q51} × {q40,q41,q51,q80}` (5.44 s cold). Absent pairs fall back to
+  the dequant→f16 `moe_ffn_expert` path, which costs nothing real: those kernels
+  only run under `INFR_ROCM_NO_I8` (the default int8 expert path uses the
+  per-FORMAT `moe_gate_up_act_i8_<gu>`/`moe_down_i8_<dn>` kernels, still total
+  over `moe_native_fmt`), and that switch's comparand IS the f16 path. When
+  adding a format, extend `MOE_EXPERT_PAIRS` (exec.rs test module) with only the
+  pairs a real GGUF can produce; `moe_expert_pair_tables_agree` pins both
+  mappers to it.
 - **The `native_id`/`native_idm`/paged-id MoE GEMV family** — Vulkan's
   id-indexed decode GEMVs for resident + paged small-m MoE. ROCm's expert path
   is the batched/routed kernels; add the id-GEMV tier for the low-m regime.

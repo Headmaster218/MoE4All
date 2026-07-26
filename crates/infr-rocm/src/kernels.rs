@@ -1418,9 +1418,10 @@ extern "C" __global__ void moe_shared_expert_add(
 // These kernels read the RAW quantized weight bytes and decode each block ON THE FLY,
 // so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
-// lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q5_0 (the sets a
-// Q2_K / Q3_K_M / Q4_K_M / Q5_K_M GGUF uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as
-// Q5_0; F16 is already native via `linear_f16`).
+// lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and the legacy
+// 32-element round quants Q4_0, Q4_1, Q5_0, Q5_1 (the sets a Q2_K / Q3_K_M / Q4_K_M / Q5_K_M /
+// Q4_0 / Q4_1 GGUF uses — unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is
+// already native via `linear_f16`).
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -1480,6 +1481,63 @@ __device__ __forceinline__ float deq_q50(const unsigned char* w, long i) {
         code = (qs[j] >> 4) | xh;
     }
     return fin(d, code, d * (float)(-16));   // sc = d, mn = d·(−16)
+}
+
+// ── Legacy 32-block round quants (Q4_0 / Q4_1 / Q5_1) ────────────────────────
+// All three share Q5_0's block shape: ONE f16 super-scale per 32 elements, nibble codes packed so the
+// LOW nibbles of `qs[0..16]` are elements 0..15 and the HIGH nibbles are elements 16..31. They differ
+// only in the min term and whether a 5th code bit exists:
+//   Q4_0  sc = d, mn = d·(−8)   code 0..15   (symmetric, like Q5_0's d·(−16))
+//   Q4_1  sc = d, mn = m        code 0..15   (AFFINE: a per-block f16 minimum, not a constant)
+//   Q5_1  sc = d, mn = m        code 0..31   (affine + Q5_0's `qh` 5th bit)
+// The oracle (`dequant_factored`) spells the affine pair as `dd = (d, m)` with multipliers
+// `(sc, mn) = (1, 1)`, so the expanded value is `(d·1)·code + (m·1)` — i.e. exactly `fin(d, code, m)`.
+
+// ── Q4_0: 32 elems / 18 bytes = [half d][u8 qs[16]]; y = d*(q4 − 8), q4 ∈ 0..15. ──
+__device__ __forceinline__ float deq_q40(const unsigned char* w, long i) {
+    long blk = i >> 5;             // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 18;
+    float d = rf16b(b);
+    const unsigned char* qs = b + 2;
+    int code = (within < 16) ? (qs[within] & 0x0F) : (qs[within - 16] >> 4);
+    return fin(d, code, d * (float)(-8));    // sc = d, mn = d·(−8)
+}
+
+// ── Q4_1: 32 elems / 20 bytes = [half d][half m][u8 qs[16]]; y = d*q4 + m. ──
+__device__ __forceinline__ float deq_q41(const unsigned char* w, long i) {
+    long blk = i >> 5;             // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 20;
+    float d = rf16b(b);
+    float mn = rf16b(b + 2);
+    const unsigned char* qs = b + 4;
+    int code = (within < 16) ? (qs[within] & 0x0F) : (qs[within - 16] >> 4);
+    return fin(d, code, mn);                 // sc = d, mn = m (per-block, NOT a constant offset)
+}
+
+// ── Q5_1: 32 elems / 24 bytes = [half d][half m][u8 qh[4]][u8 qs[16]]; y = d*q5 + m. ──
+// The 5th bit of element `within` comes from bit `within` of the 32-bit `qh`, exactly as in Q5_0 —
+// only the header is 2 bytes longer, so `qh` sits at +4 and `qs` at +8.
+__device__ __forceinline__ float deq_q51(const unsigned char* w, long i) {
+    long blk = i >> 5;             // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 24;
+    float d = rf16b(b);
+    float mn = rf16b(b + 2);
+    unsigned int qh = (unsigned int)b[4] | ((unsigned int)b[5] << 8)
+                    | ((unsigned int)b[6] << 16) | ((unsigned int)b[7] << 24);
+    const unsigned char* qs = b + 8;
+    int code;
+    if (within < 16) {
+        int xh = (int)(((qh >> within) << 4) & 0x10);
+        code = (qs[within] & 0x0F) | xh;
+    } else {
+        int j = within - 16;
+        int xh = (int)((qh >> (j + 12)) & 0x10);
+        code = (qs[j] >> 4) | xh;
+    }
+    return fin(d, code, mn);                 // sc = d, mn = m
 }
 
 // ── K-quant 16-elem sub-block traversal (Q2_K / Q3_K) ────────────────────────
@@ -1673,6 +1731,9 @@ GEN_LINEAR(q4k)
 GEN_LINEAR(q5k)
 GEN_LINEAR(q6k)
 GEN_LINEAR(q50)
+GEN_LINEAR(q40)
+GEN_LINEAR(q41)
+GEN_LINEAR(q51)
 GEN_EMBED(q80)
 GEN_EMBED(q2k)
 GEN_EMBED(q3k)
@@ -1680,6 +1741,9 @@ GEN_EMBED(q4k)
 GEN_EMBED(q5k)
 GEN_EMBED(q6k)
 GEN_EMBED(q50)
+GEN_EMBED(q40)
+GEN_EMBED(q41)
+GEN_EMBED(q51)
 "#;
 
 // ── Dequant-to-f16 + activation cast (Slice 26, rocBLAS f16 prefill GEMM) ─────
@@ -1705,6 +1769,9 @@ GEN_DEQF16(q4k)
 GEN_DEQF16(q5k)
 GEN_DEQF16(q6k)
 GEN_DEQF16(q50)
+GEN_DEQF16(q40)
+GEN_DEQF16(q41)
+GEN_DEQF16(q51)
 
 extern "C" __global__ void cast_f32_f16(
     const float* __restrict__ x, __half* __restrict__ out, int n) {
@@ -1724,9 +1791,9 @@ extern "C" __global__ void cast_f32_f16(
 // Gate & up share ONE format (`GU`) — they are the same tensor when fused, and every GGUF stores
 // ffn_gate_exps / ffn_up_exps at the same quant type. The down bank has its OWN format (`DN`):
 // Q4_K_M packs gate/up as Q4_K but ffn_down_exps as Q6_K, so the two suffixes must be independent.
-// The 36 (GU × DN) combos over {q80, q2k, q3k, q4k, q5k, q6k} cover every mixed-precision MoE the
-// covered formats produce; uncovered formats keep the dequant→f16 `moe_ffn_expert` fallback in
-// exec.rs.
+// The 81 (GU × DN) combos over {q80, q2k, q3k, q4k, q5k, q6k, q40, q41, q51} cover every
+// mixed-precision MoE the covered formats produce; uncovered formats keep the dequant→f16
+// `moe_ffn_expert` fallback in exec.rs.
 // The full cross product is instantiated deliberately: `moe_native_fmt` resolves GU and DN from two
 // INDEPENDENT tensor dtypes (`ffn_gate_exps` vs `ffn_down_exps`), so no pair can be statically
 // excluded without making `moe_expert_kernel`'s `unreachable!` reachable on some real GGUF.
@@ -1813,6 +1880,18 @@ GEN_MOE_FFN(q6k, q3k)
 GEN_MOE_FFN(q6k, q4k)
 GEN_MOE_FFN(q6k, q5k)
 GEN_MOE_FFN(q6k, q6k)
+GEN_MOE_FFN(q40, q40)
+GEN_MOE_FFN(q40, q41)
+GEN_MOE_FFN(q40, q51)
+GEN_MOE_FFN(q40, q80)
+GEN_MOE_FFN(q41, q40)
+GEN_MOE_FFN(q41, q41)
+GEN_MOE_FFN(q41, q51)
+GEN_MOE_FFN(q41, q80)
+GEN_MOE_FFN(q51, q40)
+GEN_MOE_FFN(q51, q41)
+GEN_MOE_FFN(q51, q51)
+GEN_MOE_FFN(q51, q80)
 "#;
 
 // ── Int8-activation dp4a decode GEMV (Phase 4) ───────────────────────────────
@@ -1836,8 +1915,9 @@ GEN_MOE_FFN(q6k, q6k)
 // REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
 // covers every row, so the activation quant cost amortizes over the whole GEMV.
 //
-// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0. `rf16b`/`k4`/`q3k_sc6` live in
-// NATIVE_DECODE (assembled before this part). Uncovered formats keep the dequant→f16 fallback.
+// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1. `rf16b`/`k4`/
+// `q3k_sc6` live in NATIVE_DECODE (assembled before this part). Uncovered formats keep the
+// dequant→f16 fallback.
 const INT8_DECODE: &str = r#"
 // Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
 // scale = amax/127 (llama.cpp/GPU convention: `roundf`, half-away-from-zero). One thread / 32-block.
@@ -2262,6 +2342,144 @@ extern "C" __global__ void linear_i8_q50(
         dst[oi] = resid ? (acc + resid[oi]) : acc;
     }
 }
+
+// ── Q4_0: 32 elems / 18 bytes; single scale d, offset −8; code 0..15. value = d·(code − 8). ──
+// Q5_0's inner loop without the `qh` 5th bit: acc += d·xs·(idot − 8·isum).
+extern "C" __global__ void linear_i8_q40(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 18;
+        float d = rf16b(b);
+        const unsigned char* qs = b + 2;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)(qs[p] & 0x0F);
+            code[p + 16] = (signed char)(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + (d * (float)(-8)) * sx * (float)isum;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+
+// ── Q4_1: 32 elems / 20 bytes; AFFINE — scale d, per-block min m; code 0..15. value = d·code + m. ──
+// The min term is `m·Σx` (not a constant multiple of `d`), so the `isum` ones-dot is weighted by the
+// block's OWN `m` — the only structural difference from Q4_0/Q5_0 in this tier.
+extern "C" __global__ void linear_i8_q41(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 20;
+        float d = rf16b(b);
+        float mn = rf16b(b + 2);
+        const unsigned char* qs = b + 4;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)(qs[p] & 0x0F);
+            code[p + 16] = (signed char)(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + mn * sx * (float)isum;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
+
+// ── Q5_1: 32 elems / 24 bytes; affine (d, m) + Q5_0's `qh` 5th bit; code 0..31. value = d·code + m. ──
+extern "C" __global__ void linear_i8_q51(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 24;
+        float d = rf16b(b);
+        float mn = rf16b(b + 2);
+        unsigned int qh = (unsigned int)b[4] | ((unsigned int)b[5] << 8)
+                        | ((unsigned int)b[6] << 16) | ((unsigned int)b[7] << 24);
+        const unsigned char* qs = b + 8;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            int xh0 = (int)(((qh >> p) << 4) & 0x10);
+            int xh1 = (int)((qh >> (p + 12)) & 0x10);
+            code[p]      = (signed char)((qs[p] & 0x0F) | xh0);
+            code[p + 16] = (signed char)((qs[p] >> 4) | xh1);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + mn * sx * (float)isum;
+    }
+    acc = wave_sum32(acc);
+    // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
+    // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
+    // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
+    if (tid == 0) {
+        long oi = (long)row * out_f + o;
+        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    }
+}
 "#;
 
 // ── Fused RMSNorm → int8 activation quant (Slice 32) ──────────────────────────
@@ -2359,8 +2577,9 @@ extern "C" __global__ void rmsnorm_quant_i8_32(
 // SANCTIONED PRECISION FLIP: int8 activation quant is lossy in BOTH stages (x and h), so the output
 // differs (within tolerance) from the bit-faithful f16 expert path — parity is checked vs the CPU
 // reference with a widened int8 tolerance (docs/perf.md). Covered GU/DN formats: Q8_0, Q2_K, Q3_K,
-// Q4_K, Q5_K, Q6_K (every K-quant expert bank a real GGUF ships, incl. llama4-Scout's Q2_K/Q3_K);
-// uncovered keep the Phase-3 `moe_ffn_expert_*` fallback.
+// Q4_K, Q5_K, Q6_K (every K-quant expert bank a real GGUF ships, incl. llama4-Scout's Q2_K/Q3_K)
+// plus the R3 legacy round quants Q4_0, Q4_1, Q5_1; uncovered keep the Phase-3
+// `moe_ffn_expert_*` fallback.
 //
 // `rf16b`/`k4` (NATIVE_DECODE) and `idot4`/`wave_sum32` (INT8_DECODE) are defined in the parts
 // assembled before this one.
@@ -2584,6 +2803,93 @@ __device__ __forceinline__ float i8acc_q6k(
     return acc;
 }
 
+// Q4_0 per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q40`.
+__device__ __forceinline__ float i8acc_q40(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 18;
+        float d = rf16b(b);
+        const unsigned char* qs = b + 2;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)(qs[p] & 0x0F);
+            code[p + 16] = (signed char)(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + (d * (float)(-8)) * sx * (float)isum;
+    }
+    return acc;
+}
+
+// Q4_1 per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q41`.
+__device__ __forceinline__ float i8acc_q41(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 20;
+        float d = rf16b(b);
+        float mn = rf16b(b + 2);
+        const unsigned char* qs = b + 4;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            code[p]      = (signed char)(qs[p] & 0x0F);
+            code[p + 16] = (signed char)(qs[p] >> 4);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + mn * sx * (float)isum;
+    }
+    return acc;
+}
+
+// Q5_1 per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q51`.
+__device__ __forceinline__ float i8acc_q51(
+    const signed char* __restrict__ qxr, const float* __restrict__ xsr,
+    const unsigned char* __restrict__ w, int o, int nb, int tid) {
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 24;
+        float d = rf16b(b);
+        float mn = rf16b(b + 2);
+        unsigned int qh = (unsigned int)b[4] | ((unsigned int)b[5] << 8)
+                        | ((unsigned int)b[6] << 16) | ((unsigned int)b[7] << 24);
+        const unsigned char* qs = b + 8;
+        signed char code[32];
+        for (int p = 0; p < 16; p++) {
+            int xh0 = (int)(((qh >> p) << 4) & 0x10);
+            int xh1 = (int)((qh >> (p + 12)) & 0x10);
+            code[p]      = (signed char)((qs[p] & 0x0F) | xh0);
+            code[p + 16] = (signed char)((qs[p] >> 4) | xh1);
+        }
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const int* cp = (const int*)(code + k * 4);
+            idot = idot4(xp[k], cp[0], idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += d * sx * (float)idot + mn * sx * (float)isum;
+    }
+    return acc;
+}
+
 // Gate+up+activation for one expert: block `o` (0..nff) computes h_out[o] = act(g·wg)·(u·wg)·wo·dsc.
 // `qx`/`xs` are the int8 quantization of the token's input row x[ne] (produced ONCE per token, reused
 // across experts + both gate & up). gate_w/up_w are pre-advanced to this expert's banks (fused gate/up
@@ -2646,12 +2952,18 @@ GEN_MOE_GATE_UP(q3k)
 GEN_MOE_GATE_UP(q4k)
 GEN_MOE_GATE_UP(q5k)
 GEN_MOE_GATE_UP(q6k)
+GEN_MOE_GATE_UP(q40)
+GEN_MOE_GATE_UP(q41)
+GEN_MOE_GATE_UP(q51)
 GEN_MOE_DOWN(q80)
 GEN_MOE_DOWN(q2k)
 GEN_MOE_DOWN(q3k)
 GEN_MOE_DOWN(q4k)
 GEN_MOE_DOWN(q5k)
 GEN_MOE_DOWN(q6k)
+GEN_MOE_DOWN(q40)
+GEN_MOE_DOWN(q41)
+GEN_MOE_DOWN(q51)
 "#;
 
 // ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5, RM×CN register-tiled — Slice 25) ──
@@ -3143,6 +3455,81 @@ extern "C" __global__ void NAME( \
     } \
 }
 
+// ── Q4_0 / Q4_1 / Q5_1: 32 elems/block = 2 K-tiles, one f16 scale per block (the Q5_0 shape). ──
+// ONE macro for all three — they share Q5_0's geometry and differ only in three compile-time
+// constants, so triplicating the 45-line body would only invite the three copies to drift:
+//   `BPB`    bytes/block (18 / 20 / 24),
+//   `HASMIN` 1 ⇒ the header is [d][m] and the ones-dot is weighted by that per-block `m`;
+//            0 ⇒ the header is [d] alone and the weight is the constant `d·(−8)` (Q4_0),
+//   `FIVEBIT` 1 ⇒ a 4-byte `qh` bitfield follows the header and supplies each code's 5th bit (Q5_1).
+// `qs` therefore starts at `2 + 2·HASMIN + 4·FIVEBIT`. The decode is byte-identical to the matching
+// `linear_i8_*` / `deq_*` (same nibble halves, same `qh` bit), so the per-output f32 accumulation
+// order matches the GEMV tier exactly.
+#define GEN_WMMA_R32(NAME, RM, CN, BPB, HASMIN, FIVEBIT) \
+extern "C" __global__ void NAME( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ w, float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int lane = threadIdx.x; \
+    int half = lane >> 4; \
+    int col_base = blockIdx.x * (16 * (CN)); \
+    int row_base = blockIdx.y * (16 * (RM)); \
+    int nblk = in_f >> 5; \
+    float acc[RM][CN][8]; \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
+    signed char wc[CN][32]; \
+    float wsc[CN], wmn[CN]; \
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
+    for (int blk = 0; blk < nblk; blk++) { \
+        for (int c = 0; c < (CN); c++) { \
+            int col = col_base + c * 16 + (lane & 15); \
+            if (col < out_f) { \
+                const unsigned char* b = w + ((long)col * nblk + blk) * (BPB); \
+                float d = rf16b(b); \
+                wsc[c] = d; \
+                wmn[c] = (HASMIN) ? rf16b(b + 2) : d * (float)(-8); \
+                const unsigned char* qhp = b + 2 + 2 * (HASMIN); \
+                unsigned int qh = (FIVEBIT) \
+                    ? ((unsigned int)qhp[0] | ((unsigned int)qhp[1] << 8) \
+                       | ((unsigned int)qhp[2] << 16) | ((unsigned int)qhp[3] << 24)) \
+                    : 0u; \
+                const unsigned char* qs = qhp + 4 * (FIVEBIT); \
+                for (int p = 0; p < 16; p++) { \
+                    int xh0 = (FIVEBIT) ? (int)(((qh >> p) << 4) & 0x10) : 0; \
+                    int xh1 = (FIVEBIT) ? (int)((qh >> (p + 12)) & 0x10) : 0; \
+                    wc[c][p]      = (signed char)((qs[p] & 0x0F) | xh0); \
+                    wc[c][p + 16] = (signed char)((qs[p] >> 4) | xh1); \
+                } \
+            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int p = 0; p < 32; p++) wc[c][p] = 0; } \
+        } \
+        for (int r = 0; r < (RM); r++) { \
+            int row_in = row_base + r * 16 + (lane & 15); \
+            long arow = (long)row_in * in_f + (long)blk * 32; \
+            i4v a0 = load_a(qx, row_in, m, arow), a1 = load_a(qx, row_in, m, arow + 16); \
+            i8v sumacc = {0,0,0,0,0,0,0,0}; \
+            sumacc = wmma_dot(a0, ones, sumacc); sumacc = wmma_dot(a1, ones, sumacc); \
+            for (int c = 0; c < (CN); c++) { \
+                i8v dotacc = {0,0,0,0,0,0,0,0}; \
+                dotacc = wmma_dot(a0, pack16(wc[c]),      dotacc); \
+                dotacc = wmma_dot(a1, pack16(wc[c] + 16), dotacc); \
+                for (int e = 0; e < 8; e++) { \
+                    int re = row_base + r * 16 + 2 * e + half; \
+                    float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f; \
+                    acc[r][c][e] += axs * (wsc[c] * (float)dotacc[e] + wmn[c] * (float)sumacc[e]); \
+                } \
+            } \
+        } \
+    } \
+    for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) { \
+        int re = row_base + r * 16 + 2 * e + half; \
+        int col = col_base + c * 16 + (lane & 15); \
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[r][c][e]; \
+    } \
+}
+#define GEN_WMMA_Q40(NAME, RM, CN) GEN_WMMA_R32(NAME, RM, CN, 18, 0, 0)
+#define GEN_WMMA_Q41(NAME, RM, CN) GEN_WMMA_R32(NAME, RM, CN, 20, 1, 0)
+#define GEN_WMMA_Q51(NAME, RM, CN) GEN_WMMA_R32(NAME, RM, CN, 24, 1, 1)
+
 // ── Q4_K PIPELINED (Slice 27): software-prefetched double-buffered weight nibbles. ──
 // Same math / accumulation order as GEN_WMMA_Q4K (bit-faithful, goldens unmoved) — the ONLY change is
 // scheduling: the 32 packed nibble bytes for weight-block blk+1 are issued as global `buffer_load`s
@@ -3452,6 +3839,21 @@ GEN_WMMA_Q6K(wmma_i8_q6k_2x2, 2, 2)
 GEN_WMMA_Q50(wmma_i8_q50_1x1, 1, 1)
 GEN_WMMA_Q50(wmma_i8_q50_2x1, 2, 1)
 GEN_WMMA_Q50(wmma_i8_q50_2x2, 2, 2)
+// R3 legacy 32-block round quants. Plain tier only, for the same reason Q5_K/Q2_K/Q3_K are: the
+// Slice-27 `_pipe` prefetch and the Slice-28 `_coop` family are Q4_K-only. The pipe buffer prefetches
+// exactly the 32 packed NIBBLE bytes of a Q4_K sub-block and re-reads the header inline — Q4_1/Q5_1
+// would have to carry a second f16 (and Q5_1 its `qh` word) through the ping-pong buffers, and these
+// formats' headers are per-32-block (not amortized over 8 sub-blocks/super like Q4_K's), so the
+// prefetch has far less to hide; the coop family is a measured gfx1100 regression regardless.
+GEN_WMMA_Q40(wmma_i8_q40_1x1, 1, 1)
+GEN_WMMA_Q40(wmma_i8_q40_2x1, 2, 1)
+GEN_WMMA_Q40(wmma_i8_q40_2x2, 2, 2)
+GEN_WMMA_Q41(wmma_i8_q41_1x1, 1, 1)
+GEN_WMMA_Q41(wmma_i8_q41_2x1, 2, 1)
+GEN_WMMA_Q41(wmma_i8_q41_2x2, 2, 2)
+GEN_WMMA_Q51(wmma_i8_q51_1x1, 1, 1)
+GEN_WMMA_Q51(wmma_i8_q51_2x1, 2, 1)
+GEN_WMMA_Q51(wmma_i8_q51_2x2, 2, 2)
 "#;
 
 // ── GPU-side MoE top-k routing + device-driven expert dispatch (Slice 38) ────
@@ -3665,6 +4067,18 @@ GEN_MOE_FFN_ROUTED(q6k, q3k)
 GEN_MOE_FFN_ROUTED(q6k, q4k)
 GEN_MOE_FFN_ROUTED(q6k, q5k)
 GEN_MOE_FFN_ROUTED(q6k, q6k)
+GEN_MOE_FFN_ROUTED(q40, q40)
+GEN_MOE_FFN_ROUTED(q40, q41)
+GEN_MOE_FFN_ROUTED(q40, q51)
+GEN_MOE_FFN_ROUTED(q40, q80)
+GEN_MOE_FFN_ROUTED(q41, q40)
+GEN_MOE_FFN_ROUTED(q41, q41)
+GEN_MOE_FFN_ROUTED(q41, q51)
+GEN_MOE_FFN_ROUTED(q41, q80)
+GEN_MOE_FFN_ROUTED(q51, q40)
+GEN_MOE_FFN_ROUTED(q51, q41)
+GEN_MOE_FFN_ROUTED(q51, q51)
+GEN_MOE_FFN_ROUTED(q51, q80)
 
 // Int8-activation dp4a gate+up+activation, device-routed. One wave32 block per nff output row.
 #define GEN_MOE_GATE_UP_ROUTED(GU) \
@@ -3704,6 +4118,9 @@ GEN_MOE_GATE_UP_ROUTED(q3k)
 GEN_MOE_GATE_UP_ROUTED(q4k)
 GEN_MOE_GATE_UP_ROUTED(q5k)
 GEN_MOE_GATE_UP_ROUTED(q6k)
+GEN_MOE_GATE_UP_ROUTED(q40)
+GEN_MOE_GATE_UP_ROUTED(q41)
+GEN_MOE_GATE_UP_ROUTED(q51)
 
 // Int8-activation dp4a down projection, device-routed. One wave32 block per ne output row.
 #define GEN_MOE_DOWN_ROUTED(DN) \
@@ -3726,6 +4143,9 @@ GEN_MOE_DOWN_ROUTED(q3k)
 GEN_MOE_DOWN_ROUTED(q4k)
 GEN_MOE_DOWN_ROUTED(q5k)
 GEN_MOE_DOWN_ROUTED(q6k)
+GEN_MOE_DOWN_ROUTED(q40)
+GEN_MOE_DOWN_ROUTED(q41)
+GEN_MOE_DOWN_ROUTED(q51)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────
