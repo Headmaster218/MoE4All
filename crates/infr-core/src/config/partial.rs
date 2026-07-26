@@ -115,20 +115,12 @@ impl ConfigValue for DType {
 }
 
 impl ConfigValue for Vec<usize> {
-    /// The multi-GPU device-list grammar (`Vulkan0,Vulkan1,…`; a bare index is also accepted).
-    /// The per-knob minimum device count is NOT checked here — that is policy and belongs to the
-    /// consumer (R5); the env layer applies it because it must reproduce today's loud error.
+    /// The multi-GPU device-list grammar — [`super::parse_device_spec`], the ONE copy (S4 folded
+    /// `infr-llama`'s duplicate into it). The per-knob minimum device count is NOT checked here
+    /// (`min: 0`): that is policy and belongs to the consumer (R5); the env layer applies it
+    /// because it must reproduce today's loud error.
     fn parse_set(raw: &str) -> Result<Self, String> {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|part| {
-                part.strip_prefix("Vulkan")
-                    .unwrap_or(part)
-                    .parse::<usize>()
-                    .map_err(|_| format!("'{part}' is not VulkanN or a device index"))
-            })
-            .collect()
+        super::parse_device_spec(raw, 0)
     }
     fn to_display(&self) -> String {
         self.iter()

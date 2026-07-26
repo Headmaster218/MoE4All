@@ -23,36 +23,28 @@ impl Default for Sampler {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Sampler {
-    /// Sampler from the INFR_TEMP / INFR_TOP_K / INFR_TOP_P env knobs — the seam paths' sampling
-    /// config (the bespoke path plumbs the same values through `Llama::set_sampling`). Defaults to
-    /// GREEDY when the vars are unset, so library callers and the golden/parity tests stay
-    /// deterministic; the CLI sets chat-appropriate defaults for run/serve.
-    pub fn from_env() -> Self {
-        let f = |k: &str, d: f32| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        let u = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
+    /// The process-default sampler, read from the resolved [`SamplingCfg`] — the seam paths'
+    /// sampling config (the bespoke path plumbs the same values through `Llama::set_sampling`).
+    ///
+    /// Was `Sampler::from_env()` until S4 (`docs/config-plan.md` §5.1). Its doc CONTRACT is
+    /// unchanged and is what `SamplingCfg::default()` now carries: nothing set ⇒ `temp: 0.0` ⇒
+    /// GREEDY, so library callers and the golden/parity tests stay deterministic; the CLI sets
+    /// chat-appropriate defaults for run/serve through the config's CLI layer instead of the
+    /// environment. `top_k: 20` / `top_p: 0.95` are inert under greedy and unchanged.
+    pub fn from_cfg(cfg: &infr_core::config::SamplingCfg) -> Self {
         Self {
-            temp: f("INFR_TEMP", 0.0),
-            top_k: u("INFR_TOP_K", 20),
-            top_p: f("INFR_TOP_P", 0.95),
+            temp: cfg.temp,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
         }
     }
 
     /// The sampler the decode loop actually runs: ONE sequence's EXPLICIT overrides (its
-    /// [`RequestCtx`], carried by the scheduler's slot) layered over [`from_env`](Self::from_env).
-    /// `req: None` (`infr run`, `bench`, every test) IS `from_env()` — byte-for-byte the old
-    /// behavior.
-    pub fn resolve(req: Option<&RequestCtx>) -> Self {
-        let mut s = Self::from_env();
+    /// [`RequestCtx`], carried by the scheduler's slot) layered over [`from_cfg`](Self::from_cfg).
+    /// `req: None` (`infr run`, `bench`, every test) IS `from_cfg(cfg)` — the precedence
+    /// (`RequestCtx` > `Config`) is byte-for-byte what it was over `from_env()` (§5.1).
+    pub fn resolve(req: Option<&RequestCtx>, cfg: &infr_core::config::SamplingCfg) -> Self {
+        let mut s = Self::from_cfg(cfg);
         if let Some(r) = req.map(RequestCtx::sampling) {
             if let Some(t) = r.temp {
                 s.temp = t;
@@ -289,17 +281,17 @@ impl Drop for GatePass<'_> {
     }
 }
 
-/// The RNG seed for this generation: the sequence's explicit `seed` wins, else `INFR_SEED`, else
-/// wall clock (see [`seed_rng`]). Per-SEQUENCE, so `seed: 42` reproduces byte-identically no matter
-/// how many other requests are in flight.
-pub(crate) fn resolve_seed(req: Option<&RequestCtx>) -> u64 {
+/// The RNG seed for this generation: the sequence's explicit `seed` wins, else `sampling.seed`
+/// (`INFR_SEED`), else wall clock (see [`seed_rng`]). Per-SEQUENCE, so `seed: 42` reproduces
+/// byte-identically no matter how many other requests are in flight.
+pub(crate) fn resolve_seed(req: Option<&RequestCtx>, cfg: &infr_core::config::SamplingCfg) -> u64 {
     match req.and_then(|r| r.sampling.seed) {
         // xorshift64 state must be nonzero, but `s | 1` collapses adjacent seeds (`2k` and `2k+1`
         // map to the SAME odd state → "different seed, same result"). Only the degenerate `0` needs
         // remapping; every other seed passes through untouched so distinct seeds stay distinct.
         Some(0) => 0x9E37_79B9_7F4A_7C15,
         Some(s) => s,
-        None => seed_rng(),
+        None => seed_rng(cfg),
     }
 }
 
@@ -375,21 +367,20 @@ impl Penalties {
     }
 }
 
-/// RNG seed for a generation's sampling draws (unused under greedy). `INFR_SEED` pins it for
-/// distribution-identity testing (chained vs per-token temp sampling must draw the same stream
-/// given the same seed); unset falls back to a wall-clock seed.
+/// RNG seed for a generation's sampling draws (unused under greedy). `sampling.seed`
+/// (`INFR_SEED`) pins it for distribution-identity testing (chained vs per-token temp sampling must
+/// draw the same stream given the same seed); unset falls back to a wall-clock seed.
+///
+/// `sampling.seed` is deliberately an `Option`: the knob has TWO defaults in the tree (this
+/// wall-clock one, and `42` in the CLI/diffusion paths) and BOTH stay at their own site (§6.12).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn seed_rng() -> u64 {
-    std::env::var("INFR_SEED")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
-        })
-        | 1
+pub(crate) fn seed_rng(cfg: &infr_core::config::SamplingCfg) -> u64 {
+    cfg.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15)
+    }) | 1
 }
 
 /// Advance the xorshift64 state and return a uniform draw in [0, 1) — the factored-out RNG step
@@ -603,6 +594,45 @@ mod tests {
         }
     }
 
+    /// The PROCESS-default sampling config these tests layer their per-request overrides over —
+    /// the shipped defaults, built as a value. Since S4 this is what `Sampler::resolve` /
+    /// `resolve_seed` take instead of reading the environment, so these tests no longer depend on
+    /// (or perturb) `INFR_TEMP`/`INFR_SEED` at all and run in parallel with everything else.
+    fn scfg() -> infr_core::config::SamplingCfg {
+        infr_core::config::SamplingCfg::default()
+    }
+
+    /// `Sampler::from_cfg`'s doc contract, pinned as a value: nothing set ⇒ GREEDY. This is what
+    /// keeps the goldens and every library caller deterministic (§10.7); it used to be spelled
+    /// "`INFR_TEMP` unset".
+    #[test]
+    fn default_sampling_cfg_is_greedy() {
+        let s = Sampler::from_cfg(&scfg());
+        assert_eq!(s.temp, 0.0, "unset ⇒ greedy");
+        assert_eq!(s.top_k, 20);
+        assert_eq!(s.top_p, 0.95);
+        // And with no per-request overrides `resolve` IS `from_cfg`.
+        let r = Sampler::resolve(None, &scfg());
+        assert_eq!((r.temp, r.top_k, r.top_p), (s.temp, s.top_k, s.top_p));
+    }
+
+    /// `sampling.seed` reaches the RNG, and an unset seed still yields a usable (nonzero, odd)
+    /// xorshift state from the wall clock.
+    #[test]
+    fn seed_comes_off_the_config() {
+        let pinned = infr_core::config::SamplingCfg {
+            seed: Some(47),
+            ..Default::default()
+        };
+        assert_eq!(seed_rng(&pinned), 47);
+        assert_eq!(resolve_seed(None, &pinned), 47);
+        // A per-request seed still WINS over the process config (§5.1's unchanged precedence).
+        let ctx = RequestCtx::new(cfg(1.0, 7));
+        assert_eq!(resolve_seed(Some(&ctx), &pinned), 7);
+        // Unset: nonzero (xorshift's forbidden state) and odd.
+        assert!(seed_rng(&scfg()) % 2 == 1);
+    }
+
     /// **The regression test for the thread-local.**
     ///
     /// `RequestSampling` used to live in a `thread_local!` installed by an RAII `RequestScope`. That
@@ -621,13 +651,21 @@ mod tests {
 
         for _ in 0..8 {
             // A step of sequence A, then a step of sequence B, then A again — one thread, both live.
-            assert_eq!(Sampler::resolve(Some(&a)).temp, 0.0, "A must keep temp 0");
-            assert_eq!(Sampler::resolve(Some(&b)).temp, 1.5, "B must keep temp 1.5");
+            assert_eq!(
+                Sampler::resolve(Some(&a), &scfg()).temp,
+                0.0,
+                "A must keep temp 0"
+            );
+            assert_eq!(
+                Sampler::resolve(Some(&b), &scfg()).temp,
+                1.5,
+                "B must keep temp 1.5"
+            );
         }
         // Finding 4: seeds now pass through untouched (only the degenerate 0 is remapped), so a
         // request's seed is no longer collapsed onto an adjacent one.
-        assert_eq!(resolve_seed(Some(&a)), 42);
-        assert_eq!(resolve_seed(Some(&b)), 7);
+        assert_eq!(resolve_seed(Some(&a), &scfg()), 42);
+        assert_eq!(resolve_seed(Some(&b), &scfg()), 7);
 
         // The abort latch (stop sequences) is per-sequence too: A hitting its stop string must not
         // halt B.
@@ -652,7 +690,7 @@ mod tests {
 
         // Sequence A, alone.
         let a = RequestCtx::new(cfg(1.0, 42));
-        let mut rng_a = resolve_seed(Some(&a));
+        let mut rng_a = resolve_seed(Some(&a), &scfg());
         let alone: Vec<u32> = (0..16)
             .map(|_| sample_logits(&logits, s, &mut rng_a))
             .collect();
@@ -661,8 +699,8 @@ mod tests {
         // one of A's draws (the interleaved-scheduler shape).
         let a2 = RequestCtx::new(cfg(1.0, 42));
         let b = RequestCtx::new(cfg(1.5, 7));
-        let mut rng_a2 = resolve_seed(Some(&a2));
-        let mut rng_b = resolve_seed(Some(&b));
+        let mut rng_a2 = resolve_seed(Some(&a2), &scfg());
+        let mut rng_b = resolve_seed(Some(&b), &scfg());
         let interleaved: Vec<u32> = (0..16)
             .map(|_| {
                 let t = sample_logits(&logits, s, &mut rng_a2);
@@ -733,7 +771,7 @@ mod tests {
                 seed: Some(seed),
                 ..Default::default()
             });
-            let mut rng = resolve_seed(Some(&ctx));
+            let mut rng = resolve_seed(Some(&ctx), &scfg());
             (0..16)
                 .map(|_| sample_logits(&logits, s, &mut rng))
                 .collect()
@@ -757,7 +795,7 @@ mod tests {
             seed: Some(seed),
             ..Default::default()
         });
-        resolve_seed(Some(&ctx))
+        resolve_seed(Some(&ctx), &scfg())
     }
 
     /// **Finding 5 (characterization) — the `top_k==0` heap/partial-select refactor must return the

@@ -260,7 +260,15 @@ impl CpuBackend {
     /// never had one: the caller chooses the mode, which is the shape the rest of the campaign
     /// converges on.
     pub fn reference() -> Self {
-        let mut cfg = Config::load_from_env();
+        Self::reference_with(Arc::new(Config::load_from_env()))
+    }
+
+    /// [`Self::reference`] on a CALLER-supplied configuration — the same `kernels.cpu.reference`
+    /// flip, applied to the config the caller already holds instead of one built from the
+    /// environment. S4's seam uses this (it owns an `Arc<Config>` and must not re-read the
+    /// environment); `reference()` stays as the shorthand for callers that have none.
+    pub fn reference_with(cfg: Arc<Config>) -> Self {
+        let mut cfg = (*cfg).clone();
         cfg.kernels.cpu.reference = true;
         Self::new_with(Arc::new(cfg))
     }

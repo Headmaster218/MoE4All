@@ -10,7 +10,7 @@ use super::weights::{
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
-use crate::{Config, GenStats, PerLayerEmbd};
+use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{Activation, AttnMask, Graph, Op};
@@ -43,11 +43,16 @@ pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool 
 /// `Op::Linear.w_off`). Needs every layer to own all three projections in ONE native-supported
 /// dtype, uniform dims, and a backend that opted into combined weights — mixed-precision GGUFs
 /// (llama.cpp's Q4_K_M bumps attn_v to Q6_K on alternating layers) fail the uniform-dtype gate
-/// and keep the split form. `INFR_NO_QKV_FUSE` forces the split form for A/B. Shared with the
-/// seam's dense-streaming plan — see [`fuse_gu_decision`].
-pub(crate) fn fuse_qkv_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool {
+/// and keep the split form. `kernels.qkv_fuse` (`INFR_NO_QKV_FUSE`, inverted) forces the split form
+/// for A/B. Shared with the seam's dense-streaming plan — see [`fuse_gu_decision`].
+pub(crate) fn fuse_qkv_decision(
+    combined_gu: bool,
+    g: &Gguf,
+    c: &Config,
+    ec: &EngineConfig,
+) -> bool {
     combined_gu
-        && std::env::var("INFR_NO_QKV_FUSE").is_err()
+        && ec.kernels.qkv_fuse
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
                 let name = format!("blk.{l}.{s}");
@@ -132,7 +137,12 @@ fn bind_layer_io<'a>(
 /// Compute the [`SessionStable`] derivations — the per-layer tensor scans + real `load_tensor_dequant`s
 /// that are pure in `(backend caps, gguf, config, env)`. Run ONCE at cold session init (the result
 /// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
-fn session_stable(be: &dyn Backend, g: &Gguf, c: &Config) -> AResult<SessionStable> {
+fn session_stable(
+    be: &dyn Backend,
+    g: &Gguf,
+    c: &Config,
+    ec: &EngineConfig,
+) -> AResult<SessionStable> {
     // Capabilities are a per-backend invariant; query ONCE (each call clones an owned struct with a
     // heap `String name`) and read fields off the cached copy — this function otherwise queried the
     // backend 8× per build.
@@ -214,7 +224,7 @@ fn session_stable(be: &dyn Backend, g: &Gguf, c: &Config) -> AResult<SessionStab
     // GGUFs (e.g. Qwen3-8B Q4_K_M: v = 18×Q4K + 18×Q6K) fail the uniform-dtype gate and keep the
     // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
     // form is bit-identical — same dots, same fixed-order sums).
-    let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c);
+    let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
     // Batched-prefill eligibility for MoE: every layer's expert banks must have a dp4a-mmq kernel
     // (`MOE_MMQ_DTYPES`) — see the decode_start call site's comment for the full rationale.
     let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
@@ -297,6 +307,11 @@ pub(crate) fn generate_dense_backend(
     bind_weight: &BindWeight,
     g: &Gguf,
     cfg: &Config,
+    // The ENGINE configuration this whole forward reads its knobs from — `kv.*`, `spec.*`,
+    // `sampling.*`, `device.ubatch*`, `kernels.{qkv_fuse,gated_rmsnorm}` and the `prof.*`
+    // diagnostics. BORROWED for the call (R6): every value it feeds is hoisted into a local
+    // ABOVE the decode loop, so a token costs no field walk and certainly no clone.
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -372,7 +387,7 @@ pub(crate) fn generate_dense_backend(
     // `rope_freqs`/`fuse_gu`/`fuse_qkv`/`moe_batched_ok` all live here — see `SessionStable`.
     let stable: std::sync::Arc<SessionStable> = match state.as_ref() {
         Some(kv) => std::sync::Arc::clone(&kv.stable),
-        None => std::sync::Arc::new(session_stable(be, g, c)?),
+        None => std::sync::Arc::new(session_stable(be, g, c, ec)?),
     };
     // Local views into the session-stable derivations (the code below reads these under their
     // original names; `rope_freqs` is read directly as `stable.rope_freqs` at its two sites).
@@ -387,8 +402,9 @@ pub(crate) fn generate_dense_backend(
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
     // backends that track hazards (Vulkan). `Op::GatedRmsNorm` collapses the pair into one
     // dispatch with bit-identical math (same reduction, elementwise gate multiply added on
-    // store). INFR_NO_GATED_RMSNORM forces the split form for A/B (default unset = fuse).
-    let fuse_gated_rmsnorm = caps.gated_rmsnorm && std::env::var("INFR_NO_GATED_RMSNORM").is_err();
+    // store). `kernels.gated_rmsnorm` (`INFR_NO_GATED_RMSNORM`, inverted) forces the split form
+    // for A/B (default = fuse).
+    let fuse_gated_rmsnorm = caps.gated_rmsnorm && ec.kernels.gated_rmsnorm;
 
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
@@ -403,7 +419,7 @@ pub(crate) fn generate_dense_backend(
             .iter()
             .find(|t| t.name == "token_embd.weight")
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
-        && std::env::var("INFR_NO_GPU_EMBED").is_err();
+        && ec.spec.gpu_embed;
     // gemma4-E2B: gather the per-layer TOKEN embedding rows on-device too (the same
     // Op::EmbedGather, table = per_layer_token_embd, scale = sqrt(npl)) — the last host-side
     // per-token gather. Costs the quantized table's on-disk size in VRAM (uploaded once);
@@ -447,9 +463,11 @@ pub(crate) fn generate_dense_backend(
     // the runner's, since they turn on this backend and this model's layout. A request that fails
     // its gate — or a name nothing recognizes — falls through to the default ladder exactly as
     // the old inline match did.
-    let parse_kv_fmt = |var: &str| -> DType {
-        let side = std::env::var(var).ok();
-        let want = side.as_deref().and_then(infr_core::budget::parse_kv_dtype);
+    // `want` is the config's already-parsed dtype (`budget::parse_kv_dtype`, applied once in the
+    // env/file/CLI layer). A name nothing recognizes yields `None` here AND leaves `*_specified`
+    // true, which is exactly today's split (§11 decision 8): it falls through to the ladder below
+    // while still having suppressed auto-q8 up in the placement.
+    let parse_kv_fmt = |want: Option<DType>| -> DType {
         match want {
             Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
             Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
@@ -460,8 +478,8 @@ pub(crate) fn generate_dense_backend(
             }
             Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
             Some(DType::F16) => DType::F16,
-            // unset/unknown/gated-out → legacy INFR_KV_Q8 alias (both sides q8) or f16.
-            _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,
+            // unset/unknown/gated-out → legacy `kv.force_q8` alias (both sides q8) or f16.
+            _ if ec.kv.force_q8 && kv_align_ok && kv_q8_backend => DType::Q8_0,
             // Placement-pinned auto-q8 (see `crate::seam::PlacementPins`): the Vulkan placement
             // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin
             // is a Vulkan placement decision and must not leak into a CPU/Metal session (e.g.
@@ -473,8 +491,8 @@ pub(crate) fn generate_dense_backend(
             _ => DType::F16,
         }
     };
-    let mut k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");
-    let mut v_fmt = parse_kv_fmt("INFR_KV_TYPE_V");
+    let mut k_fmt = parse_kv_fmt(ec.kv.type_k);
+    let mut v_fmt = parse_kv_fmt(ec.kv.type_v);
     // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
     // mixed request with q8/f32 on one side would misread the other — clamp those to coupled f16.
     // The prepass formats (block quants / bf16 / turbo) expand each side to its own f16 scratch, so
@@ -496,7 +514,7 @@ pub(crate) fn generate_dense_backend(
     // flag; the env set is stable for the process, so warm sessions always recompute the same
     // value their buffers were sized with.
     let kv_ring = caps.kv_swa_ring
-        && crate::seam::kv_ring_wanted(c)
+        && crate::seam::kv_ring_wanted(c, ec)
         && matches!(k_fmt, DType::F16 | DType::Q8_0)
         && matches!(v_fmt, DType::F16 | DType::Q8_0);
 
@@ -885,7 +903,7 @@ pub(crate) fn generate_dense_backend(
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
             // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows
             // the window mask already excludes — `crate::seam::kv_rows` has the argument).
-            let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring);
+            let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
             kbufs.push(
                 be.alloc(kv_fmt_bytes(k_fmt, rows_l * kvrow_l), BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -1072,7 +1090,7 @@ pub(crate) fn generate_dense_backend(
     let start = if kv_ring && start > 0 && start < cached.len() {
         let safe = (0..c.n_layer)
             .filter(|&l| c.is_swa_layer(l))
-            .map(|l| crate::seam::kv_rows(c, l, max_ctx, true))
+            .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
             .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
             .all(|rows_l| {
                 let live_from = cached.len().saturating_sub(rows_l);
@@ -1123,8 +1141,8 @@ pub(crate) fn generate_dense_backend(
     // Sampling: greedy unless INFR_TEMP is set (the CLI sets chat defaults for run/serve; the
     // golden/parity tests pin INFR_TEMP=0 or leave it unset). Defined BEFORE `build` — the
     // GPU-sampling ops bake the sampler config into the graph.
-    let sampler = crate::sampling::Sampler::resolve(req);
-    let mut rng = crate::sampling::resolve_seed(req);
+    let sampler = crate::sampling::Sampler::resolve(req, &ec.sampling);
+    let mut rng = crate::sampling::resolve_seed(req, &ec.sampling);
     // Repetition penalties (`infr serve`'s presence/frequency/repeat request fields). `None` for
     // every non-serve caller AND for any request that leaves them at their neutral defaults — see
     // `Penalties::resolve`. When active they must MUTATE the logits row, so they force the host
@@ -1138,7 +1156,7 @@ pub(crate) fn generate_dense_backend(
     let gpu_argmax = (sampler.temp <= 0.0 || sampler.top_k == 1)
         && constraint.is_none()
         && !penalize
-        && std::env::var("INFR_NO_GPU_ARGMAX").is_err();
+        && ec.spec.gpu_argmax;
     // GPU-resident stochastic sampling (`Op::Sample`): temperature + top-k + top-p ON the device,
     // inverse-CDF'd with a host-drawn uniform uploaded as 4 bytes/token — the host consumes the
     // SAME xorshift stream as the host sampler (`next_uniform`), so the two paths are
@@ -1150,7 +1168,7 @@ pub(crate) fn generate_dense_backend(
         && constraint.is_none()
         && !penalize
         && caps.gpu_sample
-        && std::env::var("INFR_NO_GPU_SAMPLE").is_err();
+        && ec.spec.gpu_sample;
 
     let build = |batch: usize,
                  start_pos: usize,
@@ -1250,7 +1268,7 @@ pub(crate) fn generate_dense_backend(
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
             // Declared rows MUST equal the allocation above: every backend derives the ring's
             // row capacity from this declared element count (row = pos % (numel / row_width)).
-            let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring);
+            let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
             k_cache.push(g.input(kd(rows_l * kvrow_l)));
             v_cache.push(g.input(vd(rows_l * kvrow_l)));
         }
@@ -1908,7 +1926,7 @@ pub(crate) fn generate_dense_backend(
                 // Strided DeltaNet: when INFR_DELTA_STRIDED=1 and batch==1 (decode only —
                 // the chunked prefill path doesn't support stride), q/k/v read from conv_out,
                 // skipping 3 CopyStrided dispatches per layer.
-                let delta_strided = batch == 1 && std::env::var("INFR_DELTA_STRIDED").is_ok();
+                let delta_strided = batch == 1 && ec.kernels.vulkan.delta_strided;
                 if !delta_strided {
                     g.push(Op::CopyStrided {
                         src: dn_convout,
@@ -3016,7 +3034,7 @@ pub(crate) fn generate_dense_backend(
         // Phase A found `sc` was ~85% of every step (the host SC matvec); Phase B moved that
         // in-graph on Vulkan, so `sc` now reports only the (cheap) host prep — embed gather, and
         // the temp_inv premultiply on the gpu_sc path — while `exec` absorbs the SC math itself.
-        let time_diffusion = std::env::var("INFR_DIFFUSION_TIME").is_ok();
+        let time_diffusion = ec.prof.diffusion_time;
         let canvas = req.canvas_tokens;
         // Canvas ids index the embedding table (`tok * n_embd`) below — range-check once so an
         // out-of-vocab id is a clean error, not an OOB slice panic.
@@ -3474,7 +3492,7 @@ pub(crate) fn generate_dense_backend(
         // history behind it, i.e. the qwen35 no-rewind fallback fired) vs the cheap incremental
         // suffix-only path. This is the number the MTP perf pass profiles before touching any
         // code — see mtp.rs's `generate_mtp_spec_vulkan_timed` doc on the no-rewind cost.
-        let time_verify = std::env::var("INFR_MTP_TIME").is_ok();
+        let time_verify = ec.prof.mtp_time;
         let full_reprefill = start == 0 && m > 1;
         // GPU-resident verify accept (issue #31, task #31): per-row Op::Argmax appended to the
         // batched forward — m u32 ids read back instead of the m×vocab f32 logits. Host-logits
@@ -3484,8 +3502,8 @@ pub(crate) fn generate_dense_backend(
         let gpu_verify_ids = verify_ids.is_some()
             && constraint.is_none()
             && caps.argmax_rows
-            && std::env::var("INFR_NO_GPU_ARGMAX").is_err()
-            && std::env::var("INFR_NO_GPU_MTP_ACCEPT").is_err();
+            && ec.spec.gpu_argmax
+            && ec.spec.gpu_mtp_accept;
         let t_vbuild0 = std::time::Instant::now();
         let (vg, vh) = build(
             m,
@@ -3634,12 +3652,15 @@ pub(crate) fn generate_dense_backend(
     let mut cur = prompt.to_vec();
     let mut logits = vec![0f32; c.vocab];
     // INFR_PROF=1: report prompt-ingest + decode tok/s to stderr (CPU perf iteration).
-    let prof = std::env::var("INFR_PROF").is_ok();
+    let prof = ec.prof.prof;
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
-    // INFR_PROF_DEC: split decode per-token wall time into host setup (build graph + compile + bind)
-    // vs execute (record + submit + GPU + wait) to guide the record-once-replay decision.
+    // `prof.prof_dec` (INFR_PROF_DEC): split decode per-token wall time into host setup (build
+    // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
+    // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
+    // EVERY decode step (R6/§10.9).
+    let prof_dec = ec.prof.prof_dec;
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;
 
@@ -3699,9 +3720,9 @@ pub(crate) fn generate_dense_backend(
         // batch: same starvation bound, no batching win. A sole request (`req` None, or `-np 1`)
         // keeps the full 1024-row chunk — prefill throughput is UNCHANGED there.
         let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
-            crate::seam::ubatch_rows().min(crate::seam::ubatch_rows_parallel())
+            crate::seam::ubatch_rows(ec).min(crate::seam::ubatch_rows_parallel(ec))
         } else {
-            crate::seam::ubatch_rows()
+            crate::seam::ubatch_rows(ec)
         };
         let pf_end = prompt.len() - 1;
         let mut cstart = start;
@@ -3816,7 +3837,7 @@ pub(crate) fn generate_dense_backend(
             // INFR_PROF_PF: split the per-chunk prefill wall time into host graph build, plan
             // compile, and execute (record + submit + GPU) — where a small-batch chunk's fixed
             // cost lives decides whether to attack recording or kernels.
-            if std::env::var("INFR_PROF_PF").is_ok() {
+            if ec.prof.prof_pf {
                 eprintln!(
                     "[pf prof] m={pf_m} build={:.1}ms compile={:.1}ms execute={:.1}ms",
                     t_build.as_secs_f64() * 1e3,
@@ -3862,7 +3883,7 @@ pub(crate) fn generate_dense_backend(
     let dyn_replay = caps.decode_replay
         && !be.moe_paged()
         && !be.dense_paged()
-        && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
+        && !ec.kernels.vulkan.no_replay
         // DiffusionGemma graphs opt out of the replay tape entirely (`Graph::no_decode_replay`,
         // set in `build` above — the adapter's `decode_eligible` rejects them, this mirror just
         // skips building the then-unused replay plan). Keeps this gate a strict subset of the
@@ -3935,16 +3956,13 @@ pub(crate) fn generate_dense_backend(
     // INFR_IGNORE_EOS=1 (benchmarks): decode the full requested count — a model that emits EOS
     // instantly on a dummy context (gemma at depth) otherwise "finishes" 64 tokens in one step
     // and the reported tok/s is fiction. llama-bench ignores EOS the same way.
-    let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
+    let ignore_eos = ec.sampling.ignore_eos;
     // Chained decode (Vulkan): run N decode iterations in ONE submission — the sampled id feeds
     // the next iteration's embed gather on-device (shared `id_out` slot), params self-advance,
     // and the N ids come back from the replay's id ring in one readback. Falls back to the
     // per-token path whenever any step needs host work (grammar, logits_out, temp sampling's
     // per-step uniform) or the backend declines. INFR_DECODE_CHAIN sets N (default 8, 0/1 off).
-    let chain_n: usize = std::env::var("INFR_DECODE_CHAIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
+    let chain_n: usize = ec.spec.decode_chain;
     // gemma4-E2B can't chain: its per-layer token-embedding rows (`ipl_buf`) are host-gathered
     // per FED token — chained iterations 2..n would read the first token's stale rows. Lifting
     // this needs the per-layer table resident + gathered on-device (task #28 follow-up).
@@ -3958,7 +3976,7 @@ pub(crate) fn generate_dense_backend(
         && ro.is_some()
         && chain_n >= 2
         && ipl_buf.is_none()
-        && std::env::var("INFR_NO_GPU_POS").is_err();
+        && ec.kernels.vulkan.gpu_pos;
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
     // Highest absolute position whose KV row was actually WRITTEN by a kept token this call — the
@@ -4203,7 +4221,7 @@ pub(crate) fn generate_dense_backend(
         // excluded from `last_written` — the fix for the `max_new==0` frontier and the
         // constrained-break unfed-forced-token cache-corruption cases.
         last_written = Some(pos);
-        if std::env::var("INFR_PROF_DEC").is_ok() && pos + 1 >= prompt.len() {
+        if prof_dec && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;
         }
@@ -4326,7 +4344,7 @@ pub(crate) fn generate_dense_backend(
             ts(decode_t, decode_n),
         );
     }
-    if std::env::var("INFR_PROF_DEC").is_ok() && decode_n > 0 {
+    if prof_dec && decode_n > 0 {
         eprintln!(
             "[dec prof] {} decode tok | setup(build+compile+bind) {:.3}ms/tok | exec(record+submit+gpu) {:.3}ms/tok",
             decode_n,

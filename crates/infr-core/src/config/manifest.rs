@@ -125,8 +125,8 @@ knobs! {
     // ── device (§6.1) ────────────────────────────────────────────────────────
     "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", pending;
     "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     pending;
-    "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     pending;
-    "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     pending;
+    "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
+    "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      pending;
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     pending;
 
@@ -140,11 +140,11 @@ knobs! {
     "INFR_NO_THINK"             => "sampling.no_think",   SetNotZero, Ignored, "1",    pending;
 
     // ── kv (§6.3) ────────────────────────────────────────────────────────────
-    "INFR_KV_TYPE_K"            => "kv.type_k",              Dtype,       Ignored, "q8_0", pending;
-    "INFR_KV_TYPE_V"            => "kv.type_v",              Dtype,       Ignored, "q8_0", pending;
-    "INFR_KV_Q8"                => "kv.force_q8",            Presence,    Ignored, "1",    pending;
-    "INFR_KV_SLOTS"             => "kv.slots",               Int,         Ignored, "8",    pending;
-    "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    pending;
+    "INFR_KV_TYPE_K"            => "kv.type_k",              Dtype,       Ignored, "q8_0", migrated;
+    "INFR_KV_TYPE_V"            => "kv.type_v",              Dtype,       Ignored, "q8_0", migrated;
+    "INFR_KV_Q8"                => "kv.force_q8",            Presence,    Ignored, "1",    migrated;
+    "INFR_KV_SLOTS"             => "kv.slots",               Int,         Ignored, "8",    migrated;
+    "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    pending;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    pending;
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
@@ -152,10 +152,10 @@ knobs! {
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
 
     // ── paging (§6.4) ────────────────────────────────────────────────────────
-    "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  pending;
+    "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   pending;
-    "INFR_ROCM_EXPERT_BUDGET"   => "paging.rocm_expert_budget",        Size,     Ignored, "4g",  pending;
+    "INFR_ROCM_EXPERT_BUDGET"   => "paging.rocm_expert_budget",        Size,     Ignored, "4g",  migrated;
     "INFR_ROCM_WEIGHT_PREFETCH_SLOTS" => "paging.rocm_prefetch_slots", Int,      Ignored, "6",   pending;
     "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB"
         => "paging.rocm_prefetch_max_bank_mb", Int, Ignored, "512", pending;
@@ -280,44 +280,44 @@ knobs! {
     "INFR_CPU_REPACK_MB"   => "kernels.cpu.repack_mb", Int,           Ignored, "1024", migrated;
 
     // ── kernels — graph shape, `infr-llama` (§6.9) ───────────────────────────
-    "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", pending;
-    "INFR_NO_GATED_RMSNORM" => "kernels.gated_rmsnorm", PresenceInv, Ignored, "1", pending;
+    "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_GATED_RMSNORM" => "kernels.gated_rmsnorm", PresenceInv, Ignored, "1", migrated;
 
     // ── spec (§6.8) ──────────────────────────────────────────────────────────
-    "INFR_MTP"                => "spec.mtp",             Literal,     Ignored, "1",         pending;
-    "INFR_NO_MTP_CKPT"        => "spec.mtp_ckpt",        PresenceInv, Ignored, "1",         pending;
-    "INFR_NO_MTP_REPRIME"     => "spec.mtp_reprime",     PresenceInv, Ignored, "1",         pending;
-    "INFR_NO_MTP_DRAFT_CHAIN" => "spec.mtp_draft_chain", PresenceInv, Ignored, "1",         pending;
-    "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", pending;
-    "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         pending;
-    "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         pending;
-    "INFR_DECODE_CHAIN"       => "spec.decode_chain",    Int,         Ignored, "4",         pending;
-    "INFR_NO_GPU_DRAFT_PROB"  => "spec.gpu_draft_prob",  PresenceInv, Ignored, "1",         pending;
-    "INFR_NO_GPU_MTP_ACCEPT"  => "spec.gpu_mtp_accept",  PresenceInv, Ignored, "1",         pending;
-    "INFR_NO_GPU_ARGMAX"      => "spec.gpu_argmax",      PresenceInv, Ignored, "1",         pending;
-    "INFR_NO_GPU_SAMPLE"      => "spec.gpu_sample",      PresenceInv, Ignored, "1",         pending;
-    "INFR_NO_GPU_EMBED"       => "spec.gpu_embed",       PresenceInv, Ignored, "1",         pending;
+    "INFR_MTP"                => "spec.mtp",             Literal,     Ignored, "1",         migrated;
+    "INFR_NO_MTP_CKPT"        => "spec.mtp_ckpt",        PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_MTP_REPRIME"     => "spec.mtp_reprime",     PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_MTP_DRAFT_CHAIN" => "spec.mtp_draft_chain", PresenceInv, Ignored, "1",         migrated;
+    "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", migrated;
+    "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         migrated;
+    "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         migrated;
+    "INFR_DECODE_CHAIN"       => "spec.decode_chain",    Int,         Ignored, "4",         migrated;
+    "INFR_NO_GPU_DRAFT_PROB"  => "spec.gpu_draft_prob",  PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_GPU_MTP_ACCEPT"  => "spec.gpu_mtp_accept",  PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_GPU_ARGMAX"      => "spec.gpu_argmax",      PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_GPU_SAMPLE"      => "spec.gpu_sample",      PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_GPU_EMBED"       => "spec.gpu_embed",       PresenceInv, Ignored, "1",         migrated;
 
     // ── multi (§6.11) ────────────────────────────────────────────────────────
-    "INFR_PIPELINE"        => "multi.pipeline",        DeviceList,  Error,   "0,1", pending;
-    "INFR_TENSOR_PARALLEL" => "multi.tensor_parallel", DeviceList,  Error,   "0,1", pending;
-    "INFR_EXPERT_PARALLEL" => "multi.expert_parallel", DeviceList,  Error,   "0",   pending;
-    "INFR_PIPELINE_HOST"   => "multi.pipeline_p2p",    PresenceInv, Ignored, "1",   pending;
-    "INFR_TP_HOST"         => "multi.tp_p2p",          PresenceInv, Ignored, "1",   pending;
-    "INFR_EP_HOST"         => "multi.ep_p2p",          PresenceInv, Ignored, "1",   pending;
+    "INFR_PIPELINE"        => "multi.pipeline",        DeviceList,  Error,   "0,1", migrated;
+    "INFR_TENSOR_PARALLEL" => "multi.tensor_parallel", DeviceList,  Error,   "0,1", migrated;
+    "INFR_EXPERT_PARALLEL" => "multi.expert_parallel", DeviceList,  Error,   "0",   migrated;
+    "INFR_PIPELINE_HOST"   => "multi.pipeline_p2p",    PresenceInv, Ignored, "1",   migrated;
+    "INFR_TP_HOST"         => "multi.tp_p2p",          PresenceInv, Ignored, "1",   migrated;
+    "INFR_EP_HOST"         => "multi.ep_p2p",          PresenceInv, Ignored, "1",   migrated;
 
     // ── prof (§6.9) ──────────────────────────────────────────────────────────
     "INFR_PROF"             => "prof.prof",             Presence, Ignored, "1",            pending;
     "INFR_PROF2"            => "prof.prof2",            Presence, Ignored, "1",            pending;
     "INFR_PROF2_SHAPES"     => "prof.prof2_shapes",     Presence, Ignored, "1",            pending;
-    "INFR_PROF_DEC"         => "prof.prof_dec",         Presence, Ignored, "1",            pending;
+    "INFR_PROF_DEC"         => "prof.prof_dec",         Presence, Ignored, "1",            migrated;
     "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            migrated;
-    "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            pending;
+    "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            migrated;
     "INFR_PROFILE_OUT"      => "prof.profile_out",      Path,     Ignored, "/tmp/p.json",  pending;
     "INFR_VRAM_LOG"         => "prof.vram_log",         Presence, Ignored, "1",            pending;
-    "INFR_MTP_TIME"         => "prof.mtp_time",         Presence, Ignored, "1",            pending;
-    "INFR_DIFFUSION_TIME"   => "prof.diffusion_time",   Presence, Ignored, "1",            pending;
-    "INFR_EB_TRACE"         => "prof.eb_trace",         Presence, Ignored, "1",            pending;
+    "INFR_MTP_TIME"         => "prof.mtp_time",         Presence, Ignored, "1",            migrated;
+    "INFR_DIFFUSION_TIME"   => "prof.diffusion_time",   Presence, Ignored, "1",            migrated;
+    "INFR_EB_TRACE"         => "prof.eb_trace",         Presence, Ignored, "1",            migrated;
     "INFR_METAL_PROFILE"    => "prof.metal_profile",    Text,     Ignored, "2",            pending;
     "INFR_METAL_PROF_DEBUG" => "prof.metal_prof_debug", Presence, Ignored, "1",            pending;
 

@@ -105,7 +105,10 @@ fn opt_kv_dtype(get: Get, key: &str) -> Option<Option<DType>> {
 
 /// A multi-GPU device list. This is one of the five knobs that ERROR on a bad value today, so the
 /// error propagates out of the layer instead of falling back (§6.1, §6.11). The per-knob minimum
-/// device counts differ (2 / 2 / 1) and are preserved by the caller.
+/// device counts differ (2 / 2 / 1) and are passed straight through to the shared parser.
+///
+/// The grammar itself is [`super::parse_device_spec`] — the ONE copy since S4, shared with the
+/// `--set`/TOML value grammar and with what used to be `infr_llama::seam::parse_device_spec`.
 fn device_list(
     get: Get,
     key: &'static str,
@@ -114,17 +117,8 @@ fn device_list(
     let Some(spec) = get(key) else {
         return Ok(None);
     };
-    let devs = <Vec<usize> as super::ConfigValue>::parse_set(&spec)
+    let devs = super::parse_device_spec(&spec, min)
         .map_err(|message| ConfigError::Env { key, message })?;
-    if devs.len() < min {
-        return Err(ConfigError::Env {
-            key,
-            message: format!(
-                "needs >={min} device(s) for a real split (got '{spec}'); unset it to run \
-                 single-device"
-            ),
-        });
-    }
     Ok(Some(Some(devs)))
 }
 
@@ -143,7 +137,10 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // policy and stays at its site, and `resolve_infr_dev_index` tolerates an empty value.
     p.device.dev = opt_text(get, "INFR_DEV");
     p.device.ctx = opt_size(get, "INFR_CTX");
+    // §6.12: the VALUE (`>0`, else fall through) and the PRESENCE (the placement sweeps' "the user
+    // pinned a height") are recorded separately — `INFR_UBATCH=0`/`=abc` is specified-but-unusable.
     p.device.ubatch = num_pos(get, "INFR_UBATCH").map(Some);
+    p.device.ubatch_specified = presence(get, "INFR_UBATCH");
     p.device.ubatch_parallel = num_pos(get, "INFR_UBATCH_PARALLEL");
     // Rejects a bad value LOUDLY today (`VulkanBackend::new` returns an error) — keep erroring.
     if let Some(v) = get("INFR_SUBMIT_DISPATCHES") {

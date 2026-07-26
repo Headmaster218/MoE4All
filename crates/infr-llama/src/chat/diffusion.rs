@@ -263,12 +263,10 @@ impl DiffusionGemmaChat {
         let eos_ids = cfg.eos_ids.clone();
         let eb = crate::diffusion::EbConfig::from_config(cfg);
         // Seed determinism (see `crate::diffusion::diffusion_generate`'s doc): the reference
-        // reseeds its RNG from a fixed value every block, so a fixed INFR_SEED (default 42,
-        // matching the oracle's `-s 42`) makes every turn reproducible.
-        let seed: u64 = std::env::var("INFR_SEED")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(42);
+        // reseeds its RNG from a fixed value every block, so a fixed `sampling.seed` (INFR_SEED;
+        // default 42 HERE — §6.12's two-defaults knob, both kept at their own site — matching the
+        // oracle's `-s 42`) makes every turn reproducible.
+        let seed: u64 = self.model.engine_cfg().sampling.seed.unwrap_or(42);
 
         // Size the session to THIS turn's [prompt | every block's canvas] plus REPL headroom —
         // NOT n_ctx_train: DG's per-token KV is heavy (hd 256/512 across 30 layers ≈ 225 KB/tok)

@@ -196,6 +196,7 @@ impl ParallelSeam {
                 &self.vk,
                 self.model.gguf(),
                 self.model.config(),
+                self.model.engine_cfg(),
                 self.model.embd(),
                 self.model.per_layer_embd(),
                 &[1u32],
@@ -216,14 +217,16 @@ impl ParallelSeam {
         for i in 1..n_slots {
             // A fork shares the `Arc<SeamWeights>` — it costs only its own KV + IO buffers. If VRAM
             // refuses, say so HERE, at boot, with the two knobs that fix it. Never mid-request.
-            let kv = slot0.fork(&self.vk, self.model.config()).map_err(|e| {
-                anyhow!(
-                    "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
+            let kv = slot0
+                .fork(&self.vk, self.model.config(), self.model.engine_cfg())
+                .map_err(|e| {
+                    anyhow!(
+                        "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
                      lower --parallel, or lower --ctx (each slot owns a full context of KV cache)",
-                    i + 1,
-                    self.max_ctx,
-                )
-            })?;
+                        i + 1,
+                        self.max_ctx,
+                    )
+                })?;
             slots.push(Slot {
                 kv: Some(kv),
                 busy: false,
@@ -290,6 +293,7 @@ impl ParallelSeam {
         /// Seeding shorter prefixes than this isn't worth the copy submit.
         const MIN_SEED: usize = 16;
         let cfg: &Config = self.model.config();
+        let ec = self.model.engine_cfg();
         let mut p = self.pool.lock().expect("pool poisoned");
         loop {
             let free: Vec<usize> = (0..p.slots.len()).filter(|&i| !p.slots[i].busy).collect();
@@ -349,7 +353,7 @@ impl ParallelSeam {
                         let r = {
                             let _gp = req.gate_pass();
                             match dst.as_mut() {
-                                Some(dst) => dst.seed_from(&self.vk, cfg, &src, best_s),
+                                Some(dst) => dst.seed_from(&self.vk, cfg, ec, &src, best_s),
                                 None => Ok(()),
                             }
                         };
@@ -413,6 +417,7 @@ impl ParallelSeam {
             &self.vk,
             self.model.gguf(),
             self.model.config(),
+            self.model.engine_cfg(),
             self.model.embd(),
             self.model.per_layer_embd(),
             &prompt_tokens,

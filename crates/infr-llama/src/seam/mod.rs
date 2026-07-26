@@ -9,7 +9,7 @@
 //! family, and the small shared helpers every submodule reaches into.
 #![allow(clippy::too_many_arguments)]
 
-use crate::{dequant_block, Config, GenStats, PerLayerEmbd};
+use crate::{dequant_block, Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::tensor::DType;
@@ -135,9 +135,10 @@ fn rocm_moe_pageable(dt: DType) -> bool {
 /// uploading everything else resident.
 ///
 /// Paging tiers (precedence):
-///   1. `INFR_ROCM_EXPERT_BUDGET=<size>` — force EVERY expert layer through the pager with that
-///      VRAM arena budget (the shared size grammar; a percentage resolves against free VRAM).
-///      Lets a caller force the paged path deterministically on a model that would fit resident.
+///   1. `paging.rocm_expert_budget` (`INFR_ROCM_EXPERT_BUDGET=<size>`) — force EVERY expert layer
+///      through the pager with that VRAM arena budget (the shared size grammar; a percentage
+///      resolves against free VRAM). Lets a caller force the paged path deterministically on a
+///      model that would fit resident.
 ///   2. Auto (unset): resident (the fast path, zero change) when the banks fit VRAM; otherwise the
 ///      pager with budget = free VRAM after dense weights + KV + a 2 GiB activation headroom.
 #[cfg(all(target_os = "linux", feature = "rocm"))]
@@ -145,6 +146,7 @@ fn rocm_moe_binder<'a>(
     rocm: &'a infr_rocm::RocmBackend,
     g: &'a Gguf,
     cfg: &'a Config,
+    ec: &EngineConfig,
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<Box<BindWeight<'a>>> {
@@ -170,9 +172,7 @@ fn rocm_moe_binder<'a>(
         }
     };
 
-    let explicit = std::env::var("INFR_ROCM_EXPERT_BUDGET")
-        .ok()
-        .and_then(|v| infr_core::parse_size(&v));
+    let explicit = ec.paging.rocm_expert_budget;
 
     let mut n_paged = 0usize;
     let mut budget_bytes = 0u64;
@@ -186,8 +186,9 @@ fn rocm_moe_binder<'a>(
             }
             None => {
                 let fp = crate::weights::weight_footprint(g);
-                let ring = kv_ring_wanted(cfg);
-                let kv_bytes = kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(), kv_auto_q8());
+                let ring = kv_ring_wanted(cfg, ec);
+                let kv_bytes =
+                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), kv_auto_q8());
                 const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
                 // free==0 means the VRAM query failed — don't guess; stay resident.
                 if free > 0 && free >= fp.dense + kv_bytes {
@@ -355,6 +356,7 @@ fn rocm_moe_binder<'a>(
 pub(crate) fn generate_dense_cpu(
     g: &Gguf,
     cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -362,10 +364,13 @@ pub(crate) fn generate_dense_cpu(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    // S4 deletes S3's bridge: the CPU backend takes the config the SEAM was handed instead of
+    // building one from the environment inside `CpuBackend::new`.
     generate_dense_cpu_mode(
-        CpuBackend::new(),
+        CpuBackend::new_with(ec.clone()),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         prompt,
@@ -386,6 +391,7 @@ pub(crate) fn generate_dense_cpu_mode(
     cpu_be: CpuBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -401,6 +407,7 @@ pub(crate) fn generate_dense_cpu_mode(
         &bind,
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         prompt,
@@ -429,6 +436,7 @@ pub(crate) fn generate_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -439,6 +447,7 @@ pub(crate) fn generate_dense_vulkan(
         vk,
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         prompt,
@@ -447,7 +456,7 @@ pub(crate) fn generate_dense_vulkan(
         &mut None,
         prompt.len() + max_new + 1,
         None, // constraint
-        None, // req: the one-shot runner is a sole sequence — env sampling, no gate
+        None, // req: the one-shot runner is a sole sequence — config sampling, no gate
     )
 }
 
@@ -460,6 +469,7 @@ pub(crate) fn generate_dense_vulkan_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -476,18 +486,19 @@ pub(crate) fn generate_dense_vulkan_session(
     //
     // A WARM call (`state.is_some()`) has every weight already resident, and the runner never calls
     // `bind_weight` again (see the `state.is_none()` init block in `generate_dense_backend`), so
-    // building the full `vulkan_moe_binder` — which re-reads INFR_CACHE/env and allocs a Box — is
-    // pure per-turn waste. Skip it: a no-op binder that errors loudly if the invariant ever breaks.
+    // building the full `vulkan_moe_binder` — which re-resolves the placement tiers and allocs a
+    // Box — is pure per-turn waste. Skip it: a no-op binder that errors loudly if the invariant
+    // ever breaks.
     let warm_binder: Box<BindWeight<'_>> =
         Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
     let bind = if state.is_some() {
         warm_binder
     } else {
         let _gp = req.and_then(|r| r.gate_pass());
-        vulkan_moe_binder(vk, g, cfg, true, want_ctx)?
+        vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx)?
     };
     let out = generate_dense_backend(
-        vk, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
+        vk, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
         constraint, None, None, None, None, None, req,
     )?;
     // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
@@ -535,8 +546,8 @@ pub(crate) fn generate_dense_vulkan_session(
 /// under-reserving makes the alloc-time VRAM guard error a live request mid-prefill (exactly
 /// what the old formula did on this 31B at pp2048 — the second chunk's 512 MiB `nonfa_pv`
 /// tripped the guard mid-run), over-reserving only streams/clamps a borderline model.
-pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize) -> u64 {
-    dense_act_reserve_at(cfg, want_ctx, ubatch_rows())
+pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize, ec: &EngineConfig) -> u64 {
+    dense_act_reserve_at(cfg, want_ctx, ubatch_rows(ec))
 }
 
 /// [`dense_act_reserve`] at an EXPLICIT chunk height (the try-resident sweep).
@@ -569,18 +580,33 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     FIXED + rows * per_row * 5 / 4
 }
 
-/// Batched-prefill micro-batch: rows per prefill chunk (INFR_UBATCH, default 1024 — but see
-/// [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the prefill loop,
-/// the activation reserve, and the SWA ring sizing below all derive from this, because the ring's
-/// correctness bound is "window + one whole prefill chunk".
-pub(crate) fn ubatch_rows() -> usize {
-    std::env::var("INFR_UBATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or_else(|| {
-            with_placement_pins(|p| p.ubatch.get().copied()).unwrap_or_else(default_ubatch_rows)
-        })
+/// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
+/// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
+/// prefill loop, the activation reserve, and the SWA ring sizing below all derive from this,
+/// because the ring's correctness bound is "window + one whole prefill chunk".
+///
+/// **`ubatch_specified` IS needed** (the S0 report's open question; §10's `INFR_UBATCH=abc` note).
+/// `INFR_UBATCH` is a §6.12 two-consumer knob — the VALUE here, and the PRESENCE the placement
+/// sweeps read ([`user_pinned_ubatch`]) — and the two DISAGREE about an unusable value, exactly as
+/// the KV dtypes do (§11 decision 8). The old value site was
+/// `.parse().ok().filter(|&v| v > 0).unwrap_or_else(pin/default)` and the old presence site was a
+/// bare `is_err()` on the raw variable, so `INFR_UBATCH=0` (and `=abc`) yielded NO height
+/// while still disabling the sweep. That is not a corner case: `infr … -u 0` is the DOCUMENTED
+/// "stay adaptive" spelling and the CLI publishes it verbatim. Collapsing both readers onto
+/// `device.ubatch.is_some()` would silently re-enable the residency sweep for it, so `DeviceCfg`
+/// carries the presence flag separately and every input — valid value, `0`, garbage, unset — keeps
+/// today's behaviour bit-for-bit (R1).
+pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
+    ec.device.ubatch.filter(|&v| v > 0).unwrap_or_else(|| {
+        with_placement_pins(|p| p.ubatch.get().copied()).unwrap_or_else(default_ubatch_rows)
+    })
+}
+
+/// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` (§6.12) — the dense
+/// placement sweeps skip themselves when it is true, because the user's height is authoritative.
+/// True even for a value this reader cannot use (`0`, garbage): see [`ubatch_rows`].
+pub(crate) fn user_pinned_ubatch(ec: &EngineConfig) -> bool {
+    ec.device.ubatch_specified
 }
 
 /// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
@@ -609,12 +635,8 @@ fn default_ubatch_rows() -> usize {
 /// `bench`, the goldens, and a `-np 1` server all keep the full [`ubatch_rows`] chunk, so prefill
 /// throughput there is UNCHANGED. INFR_UBATCH_PARALLEL overrides; it only ever SHRINKS the chunk
 /// (the runner takes the `min` with [`ubatch_rows`]).
-pub(crate) fn ubatch_rows_parallel() -> usize {
-    std::env::var("INFR_UBATCH_PARALLEL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(256)
+pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
+    ec.device.ubatch_parallel
 }
 
 /// The two placement decisions the VRAM ladder pins for a session and then keeps STABLE for its
@@ -712,10 +734,13 @@ pub(crate) fn pin_kv_auto_q8() {
 }
 
 /// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
-pub(crate) fn kv_env_unset() -> bool {
-    std::env::var("INFR_KV_TYPE_K").is_err()
-        && std::env::var("INFR_KV_TYPE_V").is_err()
-        && std::env::var("INFR_KV_Q8").is_err()
+///
+/// §11 decision 8: the `*_specified` flags, NOT `type_k.is_some()`. An unrecognized format name
+/// (`INFR_KV_TYPE_K=nonsense`) parses to no dtype, so the runner falls through to f16 — but it was
+/// still SUPPLIED, and today's `is_err()` reads it as "the user chose", suppressing auto-q8. Both
+/// halves of that asymmetry are preserved.
+pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
+    !ec.kv.type_k_specified && !ec.kv.type_v_specified && !ec.kv.force_q8
 }
 
 /// Layout gate for a Q8_0 KV cache — every layer's KV row must be whole 32-elem blocks (the
@@ -752,8 +777,14 @@ pub(crate) fn kv_rows_at(
 /// of `window + ubatch` rows never recycles a row the sliding-window mask hasn't ALREADY excluded
 /// (that mask discards everything older than `pos - window`); attention output is therefore
 /// identical to the full-context cache. Global (non-SWA) layers keep full `want_ctx` rows.
-pub(crate) fn kv_rows(cfg: &Config, l: usize, want_ctx: usize, ring: bool) -> usize {
-    kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows())
+pub(crate) fn kv_rows(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    ring: bool,
+    ec: &EngineConfig,
+) -> usize {
+    kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows(ec))
 }
 
 /// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
@@ -802,23 +833,21 @@ fn kv_pair_bytes(elems: u64, q8: bool) -> u64 {
 ///   - non-f16/q8 KV formats (the low-bit block quants / bf16 / f32 / turbo read the cache
 ///     through a dequant-the-prefix prepass sized in positions, and their static-only writes
 ///     never learned the ring split — they keep full-context caches, documented scope gate);
-///   - INFR_NO_KV_RING=1 (A/B and escape hatch).
-pub(crate) fn kv_ring_wanted(cfg: &Config) -> bool {
-    // Unset = the f16 default = ring-capable; otherwise the requested format must PARSE to f16 or
-    // q8 (a name the runner would not recognize either is not ring-capable). Spellings come from
-    // the one shared table, so adding an alias cannot make this gate and the runner disagree.
-    let fmt_ok = |var: &str| match std::env::var(var).ok() {
-        None => true,
-        Some(v) => matches!(
-            infr_core::budget::parse_kv_dtype(&v),
-            Some(DType::F16 | DType::Q8_0)
-        ),
+///   - `kv.ring = false` (`INFR_NO_KV_RING=1`, A/B and escape hatch).
+pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
+    // Not-supplied = the f16 default = ring-capable; otherwise the requested format must PARSE to
+    // f16 or q8 (a name the runner would not recognize either is not ring-capable — the
+    // `specified && dtype.is_none()` case, §11 decision 8). The dtype comes from the ONE shared
+    // spelling table (`budget::parse_kv_dtype`, now applied in the config's env layer), so adding
+    // an alias cannot make this gate and the runner disagree.
+    let fmt_ok = |specified: bool, dt: Option<DType>| {
+        !specified || matches!(dt, Some(DType::F16 | DType::Q8_0))
     };
     cfg.swa_window > 0
         && !cfg.diffusion_gemma
-        && std::env::var("INFR_NO_KV_RING").is_err()
-        && fmt_ok("INFR_KV_TYPE_K")
-        && fmt_ok("INFR_KV_TYPE_V")
+        && ec.kv.ring
+        && fmt_ok(ec.kv.type_k_specified, ec.kv.type_k)
+        && fmt_ok(ec.kv.type_v_specified, ec.kv.type_v)
 }
 
 /// One resident-BDA / streamed-arena addressing unit's ELEMENT-count cap (the invariant's element
@@ -874,6 +903,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     vk: &'a infr_vulkan::VulkanBackend,
     g: &'a Gguf,
     cfg: &'a Config,
+    ec: &EngineConfig,
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<Box<BindWeight<'a>>> {
@@ -895,9 +925,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // with a double-width slot, and MIXED-dtype roles (unsloth-dynamic quants bumping a subset
     // of layers' banks to a wider format) split into per-(role, slot_bytes) arena pools — see
     // `infr_vulkan::pager`'s MoE-session doc.
-    let cache_override = std::env::var("INFR_CACHE")
-        .ok()
-        .and_then(|v| infr_core::parse_size(&v));
+    let cache_override = ec.paging.cache;
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut pager_budget_bytes = 0u64;
@@ -931,12 +959,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let vram = vk.vram();
                 // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
-                let ring = kv_ring_wanted(cfg);
+                let ring = kv_ring_wanted(cfg, ec);
                 // Route through the shared q8-aware helper (the dense placement path already does),
                 // so a pinned auto-q8 KV cache is priced at ~half the bytes instead of the old
                 // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
                 let kv_bytes: u64 =
-                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(), kv_auto_q8());
+                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), kv_auto_q8());
                 // 2 GiB: covers activation scratch (pooled, but per-tag sizes scale with n_embd/
                 // n_ff and this budget calc's `fp`/`kv_bytes` are estimates, not the exact bytes
                 // `alloc`/gpu-allocator's 256 MiB block granularity ends up committing) plus the
@@ -1144,7 +1172,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         std::collections::HashMap::new();
     if first_load && cfg.moe.is_none() {
         let fuse_gu = runner::fuse_gu_decision(vk.capabilities().combined_gu, g, cfg);
-        let fuse_qkv = runner::fuse_qkv_decision(vk.capabilities().combined_gu, g, cfg);
+        let fuse_qkv = runner::fuse_qkv_decision(vk.capabilities().combined_gu, g, cfg, ec);
         // Candidate groups in LAYER ORDER — the cyclic-sweep schedule key. Key = names[0] (what
         // `bind_weight` receives for the group).
         let mut groups: Vec<Vec<String>> = Vec::new();
@@ -1207,7 +1235,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`) — this is what
         // lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its KV small enough to
         // take the try-resident tier at real contexts instead of streaming. +64 rows/layer slop.
-        let ring = kv_ring_wanted(cfg);
+        let ring = kv_ring_wanted(cfg, ec);
         // KV bytes at an EXPLICIT chunk height and side format — the ONE pricing helper every
         // decision below shares (try-resident, the chunk sweeps, the auto-q8 rung, the streaming
         // budget), so they all price exactly the allocation the runner will make. `q8` prices
@@ -1241,18 +1269,18 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // explicit INFR_UBATCH disables the sweep (the user's height is authoritative). Runs
         // BEFORE the auto-q8 rung below: a shorter prefill chunk costs only some prefill
         // throughput, while q8 KV costs ~10-16% GQA decode — prefer the cheaper concession.
-        let mut resident = fits(ubatch_rows(), kv_auto_q8());
-        if !resident && std::env::var("INFR_UBATCH").is_err() && cache_override.is_none() {
+        let mut resident = fits(ubatch_rows(ec), kv_auto_q8());
+        if !resident && !user_pinned_ubatch(ec) && cache_override.is_none() {
             for cand in [512usize, 256, 128] {
                 if fits(cand, kv_auto_q8()) {
                     pin_ubatch(cand);
                     // Re-read through the pin (a racing earlier set wins — use whatever stuck).
-                    if fits(ubatch_rows(), kv_auto_q8()) {
+                    if fits(ubatch_rows(ec), kv_auto_q8()) {
                         eprintln!(
                             "dense placement: resident with a {}-row prefill chunk (the default \
                              1024-row chunk's activation reserve wouldn't fit); set INFR_UBATCH \
                              to override",
-                            ubatch_rows().min(want_ctx),
+                            ubatch_rows(ec).min(want_ctx),
                         );
                         resident = true;
                     }
@@ -1275,22 +1303,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if !resident
             && cache_override.is_none()
             && !kv_auto_q8()
-            && kv_env_unset()
+            && kv_unset(ec)
             && kv_q8_layout_ok(cfg)
         {
-            let ub_now = ubatch_rows();
+            let ub_now = ubatch_rows(ec);
             let mut cands = vec![ub_now];
-            if std::env::var("INFR_UBATCH").is_err() {
+            if !user_pinned_ubatch(ec) {
                 cands.extend([512usize, 256, 128].into_iter().filter(|&c| c < ub_now));
             }
             for cand in cands {
                 if fits(cand, true) {
                     pin_kv_auto_q8();
-                    if cand != ubatch_rows() {
+                    if cand != ubatch_rows(ec) {
                         pin_ubatch(cand);
                     }
                     // Re-read through the pins (racing earlier sets win — use whatever stuck).
-                    if kv_auto_q8() && fits(ubatch_rows(), true) {
+                    if kv_auto_q8() && fits(ubatch_rows(ec), true) {
                         eprintln!(
                             "kv auto-quant: q8_0 (f16 KV wouldn't fit resident at ctx={want_ctx}; \
                              INFR_KV_TYPE_K/V=f16 to force f16)"
@@ -1342,7 +1370,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         base + kv_total_at(ub, q8) + dense_act_reserve_at(cfg, want_ctx, ub),
                     )
                 };
-                if std::env::var("INFR_UBATCH").is_err() && !eligible.is_empty() {
+                if !user_pinned_ubatch(ec) && !eligible.is_empty() {
                     let need: u64 = eligible
                         .iter()
                         .map(|(_, dt, raw, _)| stride_of(*dt, *raw) as u64)
@@ -1353,7 +1381,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             infr_core::pager::ring_bytes(b, vk.cfg().paging.ring) as u64
                         ) >= need
                     };
-                    let ub_now = ubatch_rows();
+                    let ub_now = ubatch_rows(ec);
                     let mut cands = vec![ub_now];
                     cands.extend([512usize, 256, 128].into_iter().filter(|&c| c < ub_now));
                     let pick = cands
@@ -1365,7 +1393,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         pin_ubatch(pick);
                     }
                 }
-                Some(budget_at(ubatch_rows()))
+                Some(budget_at(ubatch_rows(ec)))
             }
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
@@ -1440,7 +1468,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 alloc as f64 / 1e9,
                 ring_bytes as f64 / 1e9,
                 (budget + ring_bytes as u64) as f64 / 1e9,
-                ubatch_rows().min(want_ctx),
+                ubatch_rows(ec).min(want_ctx),
             );
             vk.init_dense_pager(infr_vulkan::pager::DensePagerLayout {
                 pools: specs,
@@ -1620,6 +1648,7 @@ fn run_dense_oneshot(
     bind: &BindWeight<'_>,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -1631,6 +1660,7 @@ fn run_dense_oneshot(
         bind,
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         prompt,
@@ -1648,45 +1678,14 @@ fn run_dense_oneshot(
     )
 }
 
-/// Parse a multi-GPU device spec (`Vulkan0,Vulkan1,…` — a bare index `N` is also accepted) into
-/// physical device indices, requiring at least `min`. `label` is the env-var name used in error
-/// messages. The PURE core of the `parse_*_devices` env readers (unit-tested directly).
-fn parse_device_spec(spec: &str, min: usize, label: &str) -> AResult<Vec<usize>> {
-    let mut devs = Vec::new();
-    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let idx = part
-            .strip_prefix("Vulkan")
-            .unwrap_or(part)
-            .parse::<usize>()
-            .map_err(|_| anyhow!("{label}: '{part}' is not VulkanN or a device index"))?;
-        devs.push(idx);
-    }
-    if devs.len() < min {
-        return Err(anyhow!(
-            "{label} needs >={min} device(s) for a real split (got '{spec}'); \
-             unset it to run single-device"
-        ));
-    }
-    Ok(devs)
-}
-
-/// Read env var `label`, parsing its device list via [`parse_device_spec`] (requiring `min`), or
-/// `None` when the var is unset. The shared body of the three `parse_*_devices` entry points.
-fn parse_device_list(label: &str, min: usize) -> AResult<Option<Vec<usize>>> {
-    let Some(spec) = std::env::var_os(label) else {
-        return Ok(None);
-    };
-    Ok(Some(parse_device_spec(
-        &spec.to_string_lossy(),
-        min,
-        label,
-    )?))
-}
-
-/// Parse the `INFR_PIPELINE` device list (`Vulkan0,Vulkan1,…`) into physical device indices, or
-/// `None` when the flag is unset. Needs >=2 devices for a layer split; garbage errors loudly.
-pub fn parse_pipeline_devices() -> AResult<Option<Vec<usize>>> {
-    parse_device_list("INFR_PIPELINE", 2)
+/// The `multi.pipeline` device list (`INFR_PIPELINE=Vulkan0,Vulkan1,…`), or `None` for
+/// single-device. Needs >=2 devices for a layer split; garbage or too-few errors LOUDLY — but now
+/// at `Config::load`, not here (see `docs/config-plan.md`'s S1 note), since the grammar and the
+/// minimum both moved into `infr_core::config::parse_device_spec`. The `parse_device_spec` /
+/// `parse_device_list` pair this crate used to own is DELETED — it was a second copy of that
+/// grammar (§6.11).
+pub fn pipeline_devices(ec: &EngineConfig) -> Option<&[usize]> {
+    ec.multi.pipeline.as_deref()
 }
 
 /// A device-aware [`BindWeight`] for the multi-GPU pipeline: each weight is placed on the device
@@ -1730,6 +1729,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     devices: &[usize],
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -1747,7 +1747,8 @@ pub(crate) fn generate_dense_vulkan_pipeline(
             b.capabilities().name
         })
         .collect::<Vec<_>>();
-    let use_p2p = std::env::var_os("INFR_PIPELINE_HOST").is_none();
+    // `multi.pipeline_p2p` (`INFR_PIPELINE_HOST` inverted): its ABSENCE selects P2P.
+    let use_p2p = ec.multi.pipeline_p2p;
     let pb = infr_vulkan::PipelineBackend::new(backends, layer_map.clone(), use_p2p)
         .map_err(|e| anyhow!("{e}"))?;
     eprintln!(
@@ -1774,7 +1775,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     }
     let bind = pipeline_binder(&pb);
     run_dense_oneshot(
-        &pb, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token,
+        &pb, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -1782,10 +1783,10 @@ pub(crate) fn generate_dense_vulkan_pipeline(
 // Tensor parallelism (dense) — Megatron-style intra-op weight sharding. See `infr_vulkan::tp`.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Parse the `INFR_TENSOR_PARALLEL` device list (`Vulkan0,Vulkan1,…`) into physical device indices,
-/// or `None` when unset. Sibling of [`parse_pipeline_devices`]; needs >=2 devices for a real split.
-pub fn parse_tensor_parallel_devices() -> AResult<Option<Vec<usize>>> {
-    parse_device_list("INFR_TENSOR_PARALLEL", 2)
+/// The `multi.tensor_parallel` device list (`INFR_TENSOR_PARALLEL=Vulkan0,Vulkan1,…`), or `None`
+/// when unset. Sibling of [`pipeline_devices`]; needs >=2 devices for a real split.
+pub fn tensor_parallel_devices(ec: &EngineConfig) -> Option<&[usize]> {
+    ec.multi.tensor_parallel.as_deref()
 }
 
 /// The tensor-parallel device role of a weight (by GGUF tensor name), plus its INNER dim `in_f` (for
@@ -1943,6 +1944,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     devices: &[usize],
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -1958,7 +1960,8 @@ pub(crate) fn generate_dense_vulkan_tp(
             b.capabilities().name
         })
         .collect::<Vec<_>>();
-    let use_p2p = std::env::var_os("INFR_TP_HOST").is_none();
+    // `multi.tp_p2p` (`INFR_TP_HOST` inverted): its ABSENCE selects P2P.
+    let use_p2p = ec.multi.tp_p2p;
     let tp =
         infr_vulkan::TensorParallelBackend::new(backends, cfg.n_head, cfg.n_kv, cfg.n_ff, use_p2p)
             .map_err(|e| anyhow!("{e}"))?;
@@ -1983,7 +1986,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     }
     let bind = tensor_parallel_binder(&tp, cfg);
     run_dense_oneshot(
-        &tp, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token,
+        &tp, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -1991,11 +1994,12 @@ pub(crate) fn generate_dense_vulkan_tp(
 // Expert parallelism (MoE) — shard the experts across devices. See `infr_vulkan::ep`.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Parse the `INFR_EXPERT_PARALLEL` device list (`Vulkan0,Vulkan1,…`) into physical device indices,
-/// or `None` when unset. Sibling of [`parse_tensor_parallel_devices`]; needs >=2 devices for a real
-/// expert split (a single device is the identity, used only as the correctness reference).
-pub fn parse_expert_parallel_devices() -> AResult<Option<Vec<usize>>> {
-    parse_device_list("INFR_EXPERT_PARALLEL", 1)
+/// The `multi.expert_parallel` device list (`INFR_EXPERT_PARALLEL=Vulkan0,Vulkan1,…`), or `None`
+/// when unset. Sibling of [`tensor_parallel_devices`], but its minimum is **1**, not 2 (a single
+/// device is the identity, used only as the correctness reference) — the three minimums differ and
+/// are preserved by the env layer (§6.11).
+pub fn expert_parallel_devices(ec: &EngineConfig) -> Option<&[usize]> {
+    ec.multi.expert_parallel.as_deref()
 }
 
 /// Whether `name` is a stacked expert-bank weight (`ffn_{gate,up,down}_exps` or fused
@@ -2091,6 +2095,7 @@ pub(crate) fn generate_moe_vulkan_ep(
     devices: &[usize],
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -2134,7 +2139,8 @@ pub(crate) fn generate_moe_vulkan_ep(
             b.capabilities().name
         })
         .collect::<Vec<_>>();
-    let use_p2p = std::env::var_os("INFR_EP_HOST").is_none();
+    // `multi.ep_p2p` (`INFR_EP_HOST` inverted): its ABSENCE selects P2P.
+    let use_p2p = ec.multi.ep_p2p;
     let ep = infr_vulkan::ExpertParallelBackend::new(backends, moe.n_expert, use_p2p)
         .map_err(|e| anyhow!("{e}"))?;
     let nl = ep.experts_per_device();
@@ -2155,7 +2161,7 @@ pub(crate) fn generate_moe_vulkan_ep(
     }
     let bind = expert_parallel_binder(&ep, cfg);
     run_dense_oneshot(
-        &ep, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token,
+        &ep, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -2169,6 +2175,7 @@ pub(crate) fn generate_dense_metal(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -2180,6 +2187,7 @@ pub(crate) fn generate_dense_metal(
         mtl,
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         prompt,
@@ -2202,6 +2210,7 @@ pub(crate) fn generate_dense_metal_session(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -2217,6 +2226,7 @@ pub(crate) fn generate_dense_metal_session(
         &metal_upload_bind(mtl),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         prompt,
@@ -2243,6 +2253,7 @@ pub(crate) fn generate_dense_rocm_session(
     rocm: &infr_rocm::RocmBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -2261,10 +2272,10 @@ pub(crate) fn generate_dense_rocm_session(
     let bind = if state.is_some() {
         warm_binder
     } else {
-        rocm_moe_binder(rocm, g, cfg, true, want_ctx)?
+        rocm_moe_binder(rocm, g, cfg, ec, true, want_ctx)?
     };
     let out = generate_dense_backend(
-        rocm, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
+        rocm, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
         constraint, None, None, None, None, None, req,
     )?;
     // INFR_PAGER_STATS=1: per-pool hit/miss counters (no-op for a resident model).
@@ -2284,6 +2295,7 @@ pub(crate) fn verify_dense_metal2(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
@@ -2296,6 +2308,7 @@ pub(crate) fn verify_dense_metal2(
         &metal_upload_bind(mtl),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         tokens,
@@ -2322,11 +2335,12 @@ pub(crate) fn verify_dense_metal2(
 pub(crate) fn verify_dense_cpu(
     g: &Gguf,
     cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
-    let cpu_be = CpuBackend::new();
+    let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut state = None;
     generate_dense_backend(
@@ -2334,6 +2348,7 @@ pub(crate) fn verify_dense_cpu(
         &cpu_upload_bind(&cpu_be),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         tokens,
@@ -2360,11 +2375,12 @@ pub(crate) fn verify_dense_cpu(
 pub(crate) fn verify_dense_cpu_with_h(
     g: &Gguf,
     cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
-    let cpu_be = CpuBackend::new();
+    let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut h = Vec::new();
     let mut state = None;
@@ -2373,6 +2389,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         &cpu_upload_bind(&cpu_be),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         tokens,
@@ -2401,11 +2418,12 @@ pub(crate) fn verify_dense_cpu_with_h(
 pub(crate) fn verify_rows_cpu_with_h(
     g: &Gguf,
     cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
-    let cpu_be = CpuBackend::new();
+    let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut h = Vec::new();
     let mut state = None;
@@ -2414,6 +2432,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         &cpu_upload_bind(&cpu_be),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         tokens,
@@ -2439,6 +2458,7 @@ pub(crate) fn verify_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
@@ -2458,6 +2478,7 @@ pub(crate) fn verify_dense_vulkan(
         },
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         tokens,
@@ -2485,6 +2506,7 @@ pub(crate) fn verify_dense_rocm(
     rocm: &infr_rocm::RocmBackend,
     g: &Gguf,
     cfg: &Config,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
@@ -2496,6 +2518,7 @@ pub(crate) fn verify_dense_rocm(
         &rocm_upload_bind(rocm),
         g,
         cfg,
+        ec,
         token_embd,
         ple,
         tokens,
@@ -2716,30 +2739,92 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
-    use super::{kv_pair_bytes, parse_device_spec, PlacementPins, PlacementScope};
+    use super::{kv_pair_bytes, EngineConfig, PlacementPins, PlacementScope};
 
+    // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
+    // (S4 deleted this crate's duplicate of that grammar — §6.11).
+
+    /// `device.ubatch` is TWO readers, and an unusable value must split them (§6.12, and the
+    /// `ubatch_specified` decision recorded on [`super::ubatch_rows`]): `-u 0` / a typo yields no
+    /// chunk height yet still counts as "the user pinned one", which is what disables the dense
+    /// placement sweeps. Collapsing them onto `Option::is_some` would silently re-enable the sweep.
     #[test]
-    fn parse_device_spec_accepts_vulkan_and_bare_indices() {
+    fn ubatch_value_and_presence_are_separate_readers() {
+        // Own scope: the fallback pins are process-global, and this test asserts the UNPINNED
+        // default. (That this is even possible per-scope is the point of `PlacementPins`.)
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let unset = EngineConfig::default();
+        assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
-            parse_device_spec("Vulkan0,Vulkan1", 2, "INFR_TP").unwrap(),
-            vec![0, 1]
+            super::ubatch_rows(&unset),
+            1024,
+            "no pin, no iGPU: the 1024 default"
         );
-        // Bare indices and whitespace/empty segments are tolerated.
+
+        let pinned = EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(512),
+                ubatch_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(super::user_pinned_ubatch(&pinned));
+        assert_eq!(super::ubatch_rows(&pinned), 512);
+
+        // `-u 0` / `INFR_UBATCH=abc`: specified, but no usable height.
+        let adaptive = EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(0),
+                ubatch_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            super::user_pinned_ubatch(&adaptive),
+            "an unusable value is still a pin — the sweep must stay off"
+        );
         assert_eq!(
-            parse_device_spec(" 0 , 1 ,2, ", 1, "INFR_TP").unwrap(),
-            vec![0, 1, 2]
+            super::ubatch_rows(&adaptive),
+            1024,
+            "…and the height falls back"
         );
     }
 
+    /// The `*_specified` rule (§11 decision 8): an UNRECOGNIZED KV format name still suppresses
+    /// auto-q8 (it was supplied) while yielding no dtype, and it is not ring-capable either.
     #[test]
-    fn parse_device_spec_rejects_garbage_and_too_few() {
-        // Non-numeric / non-VulkanN part.
-        assert!(parse_device_spec("Vulkan0,foo", 2, "INFR_TP").is_err());
-        // Fewer than `min` devices.
-        assert!(parse_device_spec("Vulkan0", 2, "INFR_TP").is_err());
-        assert!(parse_device_spec("", 1, "INFR_EP").is_err());
-        // Exactly `min` passes.
-        assert!(parse_device_spec("Vulkan3", 1, "INFR_EP").is_ok());
+    fn kv_specified_beats_a_parsed_dtype() {
+        let unset = EngineConfig::default();
+        assert!(
+            super::kv_unset(&unset),
+            "nothing supplied ⇒ auto-q8 may fill"
+        );
+
+        // `INFR_KV_TYPE_K=nonsense`: specified, no dtype.
+        let nonsense = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: None,
+                type_k_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            !super::kv_unset(&nonsense),
+            "an unparseable name still counts as an explicit choice"
+        );
+
+        // The legacy both-sides alias counts too.
+        let q8 = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                force_q8: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!super::kv_unset(&q8));
     }
 
     #[test]

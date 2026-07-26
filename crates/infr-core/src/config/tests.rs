@@ -60,7 +60,7 @@ fn default_config_matches_documented_defaults() {
     );
 
     let d = Config::default();
-    // §10.7: `Sampler::from_env`'s doc contract — unset ⇒ greedy, so goldens stay deterministic.
+    // §10.7: `Sampler::from_cfg`'s doc contract — unset ⇒ greedy, so goldens stay deterministic.
     assert_eq!(d.sampling.temp, 0.0);
     assert_eq!(d.sampling.top_k, 20);
     assert_eq!(d.sampling.top_p, 0.95);
@@ -282,6 +282,54 @@ fn bad_value_is_an_error_not_a_silent_default() {
         ConfigError::Value { path, .. } => assert_eq!(path, "device.ctx"),
         other => panic!("expected a value error, got {other:?}"),
     }
+}
+
+/// The device-list grammar, inherited from `infr_llama::seam::parse_device_spec` when S4 deleted
+/// that duplicate — these are its `seam_helper_tests` cases, moved to the surviving copy.
+#[test]
+fn device_spec_accepts_vulkan_and_bare_indices() {
+    assert_eq!(
+        super::parse_device_spec("Vulkan0,Vulkan1", 2).unwrap(),
+        vec![0, 1]
+    );
+    // Bare indices and whitespace/empty segments are tolerated.
+    assert_eq!(
+        super::parse_device_spec(" 0 , 1 ,2, ", 1).unwrap(),
+        vec![0, 1, 2]
+    );
+    // `min: 0` (the `--set`/TOML path) accepts an empty list — the count bound is the consumer's.
+    assert_eq!(
+        super::parse_device_spec("", 0).unwrap(),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn device_spec_rejects_garbage_and_too_few() {
+    // Non-numeric / non-VulkanN part.
+    assert!(super::parse_device_spec("Vulkan0,foo", 2).is_err());
+    // Fewer than `min` devices.
+    assert!(super::parse_device_spec("Vulkan0", 2).is_err());
+    assert!(super::parse_device_spec("", 1).is_err());
+    // Exactly `min` passes.
+    assert!(super::parse_device_spec("Vulkan3", 1).is_ok());
+}
+
+/// The three device lists land on their fields, with the minimums the manifest records.
+#[test]
+fn device_lists_reach_their_fields() {
+    let cfg = Config::load_from_layers(&[env_layer(&[
+        ("INFR_PIPELINE", "Vulkan0,Vulkan1"),
+        ("INFR_TENSOR_PARALLEL", "0,1"),
+        ("INFR_EXPERT_PARALLEL", "2"),
+    ])]);
+    assert_eq!(cfg.multi.pipeline.as_deref(), Some(&[0usize, 1][..]));
+    assert_eq!(cfg.multi.tensor_parallel.as_deref(), Some(&[0usize, 1][..]));
+    assert_eq!(cfg.multi.expert_parallel.as_deref(), Some(&[2usize][..]));
+    // Absent ⇒ single-device, exactly what the deleted `parse_device_list` returned as `None`.
+    let none = Config::default();
+    assert_eq!(none.multi.pipeline, None);
+    assert!(none.multi.pipeline_p2p && none.multi.tp_p2p && none.multi.ep_p2p);
 }
 
 // ── §8.7 — polarity ──────────────────────────────────────────────────────────
@@ -753,9 +801,58 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PROF_OPS",
     ];
 
+    /// S4 — `infr-llama`'s seam: the whole `kv`, `spec` and `multi` sections, `device.ubatch*`,
+    /// `paging.cache` + `paging.rocm_expert_budget` (both read ONLY in the seam's placement
+    /// binders), the two graph-shape gates, and the seam's own `prof.*` diagnostics.
+    ///
+    /// NOT here, deliberately: `sampling.*` — the SEAM reads it from `Config` now
+    /// (`Sampler::from_cfg`), but `infr-cli`'s model-recommendation bridge
+    /// (`set_default_sampling_env` + the DG bench arm) still reads `INFR_TEMP`/`INFR_TOP_K`/
+    /// `INFR_TOP_P`/`INFR_SEED`/`INFR_IGNORE_EOS`/`INFR_MAX_NEW` from the environment until S8
+    /// deletes it, and `INFR_NO_THINK` is `infr-chat`'s until S7. Likewise `prof.prof`
+    /// (`infr-vulkan`'s recorder still reads it) and `kernels.vulkan.{delta_strided, no_replay,
+    /// gpu_pos}` (§6.12's two-crate knobs — the llama half moved, S5 takes the Vulkan half).
+    const S4: &[&str] = &[
+        "INFR_CACHE",
+        "INFR_DECODE_CHAIN",
+        "INFR_DIFFUSION_TIME",
+        "INFR_EB_TRACE",
+        "INFR_EP_HOST",
+        "INFR_EXPERT_PARALLEL",
+        "INFR_KV_Q8",
+        "INFR_KV_SLOTS",
+        "INFR_KV_TYPE_K",
+        "INFR_KV_TYPE_V",
+        "INFR_MTP",
+        "INFR_MTP_TIME",
+        "INFR_NO_GATED_RMSNORM",
+        "INFR_NO_GPU_ARGMAX",
+        "INFR_NO_GPU_DRAFT_PROB",
+        "INFR_NO_GPU_EMBED",
+        "INFR_NO_GPU_MTP_ACCEPT",
+        "INFR_NO_GPU_SAMPLE",
+        "INFR_NO_KV_RING",
+        "INFR_NO_MTP_CKPT",
+        "INFR_NO_MTP_DRAFT_CHAIN",
+        "INFR_NO_MTP_REPRIME",
+        "INFR_NO_QKV_FUSE",
+        "INFR_PIPELINE",
+        "INFR_PIPELINE_HOST",
+        "INFR_PROF_DEC",
+        "INFR_PROF_PF",
+        "INFR_ROCM_EXPERT_BUDGET",
+        "INFR_SPEC_DEBUG",
+        "INFR_SPEC_DRAFT",
+        "INFR_SPEC_K",
+        "INFR_TENSOR_PARALLEL",
+        "INFR_TP_HOST",
+        "INFR_UBATCH",
+        "INFR_UBATCH_PARALLEL",
+    ];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
-    let mut want: Vec<&str> = S2.iter().chain(S3).copied().collect();
+    let mut want: Vec<&str> = S2.iter().chain(S3).chain(S4).copied().collect();
     want.sort_unstable();
     assert_eq!(
         got, want,

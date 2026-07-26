@@ -19,6 +19,19 @@ use tokenizers::Tokenizer;
 pub struct SeamModel {
     gguf: Gguf,
     cfg: Config,
+    /// The ENGINE configuration every seam path this model drives reads its knobs from —
+    /// `kv.*`, `spec.*`, `sampling.*`, `multi.*`, `device.ubatch*`, `paging.cache`, the seam's
+    /// `prof.*` diagnostics — held for the model's whole life and BORROWED at each read site
+    /// (`docs/config-plan.md` R4/R6). Shared by `Arc` into every backend and session this model
+    /// opens, which is exactly the per-process scope §5.1 prescribes.
+    ///
+    /// **TRANSITIONAL (S4), deleted by S8:** [`SeamModel::load`] builds this from the environment
+    /// with [`infr_core::config::Config::load_from_env`] instead of being HANDED one, for the
+    /// library callers and tests that have no `Config` to give. Every CLI path already calls
+    /// [`SeamModel::load_with`] with the `Arc<Config>` `main()` resolved, so the PRODUCTION path
+    /// no longer goes through the environment here. S8 removes the CLI's env re-publication and
+    /// with it the last reason for this fallback.
+    ecfg: std::sync::Arc<crate::EngineConfig>,
     /// Host f32 token-embedding table — materialized LAZILY (see [`SeamModel::token_embd`]).
     /// Dequantizing it eagerly at load cost ~4s and ~3.1 GiB of RSS on Qwen3-14B (a 151936×5120
     /// Q4_K table blown up to f32) for every load, while the GPU/Metal dense path never reads it:
@@ -97,6 +110,11 @@ pub struct DenseSession<B, X = ()> {
     pub(crate) be: B,
     pub(crate) pool: SlotPool,
     pub(crate) max_ctx: usize,
+    /// The ENGINE configuration this session was OPENED with — cloned from the [`SeamModel`] that
+    /// opened it, so every later call on the session (which must agree with the buffers placement
+    /// sized) reads exactly the values the placement decided on. Read as [`Self::cfg`]; never
+    /// cloned per token (R6).
+    pub(crate) cfg: std::sync::Arc<crate::EngineConfig>,
     /// Backend-specific extension state (see the struct doc); `()` for the backends with none.
     pub(crate) ext: X,
 }
@@ -108,6 +126,12 @@ impl<B, X> DenseSession<B, X> {
     /// every backend's session shares (it is pure [`SlotPool`] policy — no device involvement).
     pub fn reset_cache(&mut self) {
         self.pool.reset_cache();
+    }
+
+    /// The engine configuration this session runs on (see the `cfg` field) — what the seam runner
+    /// and every session-driven path read their knobs from instead of the process environment.
+    pub fn cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
+        &self.cfg
     }
 }
 
@@ -193,15 +217,12 @@ impl SlotPool {
         &mut self,
         be: &dyn infr_core::backend::Backend,
         cfg: &crate::Config,
+        ec: &crate::EngineConfig,
         prompt: &[u32],
     ) -> Result<usize> {
         // Seeding shorter prefixes than this isn't worth the copy submit.
         const MIN_SEED: usize = 16;
-        let max_slots: usize = std::env::var("INFR_KV_SLOTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(4);
+        let max_slots: usize = ec.kv.slots;
         self.tick += 1;
         if self.slots.is_empty() {
             self.slots.push(None);
@@ -250,7 +271,7 @@ impl SlotPool {
                 .flatten()
                 .next()
                 .expect("pick_slot: no initialized slot to fork from");
-            match src.fork(be, cfg) {
+            match src.fork(be, cfg, ec) {
                 Ok(fresh) => {
                     self.slots.push(Some(fresh));
                     self.last_used.push(self.tick);
@@ -279,7 +300,7 @@ impl SlotPool {
             if best_s > score(&self.slots[target]) {
                 let src = self.slots[best_i].take().expect("scored slot is Some");
                 if let Some(dst) = self.slots[target].as_mut() {
-                    dst.seed_from(be, cfg, &src, best_s)?;
+                    dst.seed_from(be, cfg, ec, &src, best_s)?;
                 }
                 self.slots[best_i] = Some(src);
             }
@@ -321,26 +342,24 @@ impl DenseRocmSession {
     pub fn reset_cache(&mut self) {}
 }
 
-/// Estimated KV-cache bytes per element for one side (K or V), from the same env override the
-/// runner honors (`INFR_KV_TYPE_K/V`, legacy `INFR_KV_Q8`). ESTIMATE ONLY — the runner
-/// additionally gates each format on backend/alignment and falls back to f16, so a gated-out
-/// low-bit request can under-estimate here; the alloc-time VRAM budget guard backstops that.
+/// Estimated KV-cache bytes per element for one side (K or V), from the same config the runner
+/// honors (`kv.type_k`/`kv.type_v`, legacy `kv.force_q8`). ESTIMATE ONLY — the runner additionally
+/// gates each format on backend/alignment and falls back to f16, so a gated-out low-bit request
+/// can under-estimate here; the alloc-time VRAM budget guard backstops that.
 /// Unknown/unset → `auto_q8` picks between f16 (2 bytes, the GPU default) and Q8_0 — pass the
 /// current [`crate::seam::kv_auto_q8`] pin (or `true` to PRICE a candidate auto-q8 placement
 /// before pinning it, as `clamp_default_ctx` does).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn kv_bytes_per_elem(var: &str, auto_q8: bool) -> f64 {
+fn kv_bytes_per_elem(side: Option<DType>, ec: &crate::EngineConfig, auto_q8: bool) -> f64 {
     // Format spellings and their per-element rates both come from the shared seam — the same
     // table the runner turns into an actual allocation — so this estimate can no longer price a
     // format the runner would allocate differently. Only the DEFAULT ladder (the legacy
-    // `INFR_KV_Q8` alias, then the placement-pinned auto-q8, then f16) is local; it is env policy,
-    // not format arithmetic.
-    let side = std::env::var(var).ok();
-    match side.as_deref().and_then(infr_core::budget::parse_kv_dtype) {
+    // `kv.force_q8` alias, then the placement-pinned auto-q8, then f16) is local; it is policy,
+    // not format arithmetic. An unrecognized format name reaches here as `None` (§11 decision 8) —
+    // priced as the ladder's fallback, exactly as the runner will allocate it.
+    match side {
         Some(dt) => infr_core::budget::kv_bytes_per_elem(dt),
-        None if std::env::var("INFR_KV_Q8").is_ok() || auto_q8 => {
-            infr_core::budget::kv_bytes_per_elem(DType::Q8_0)
-        }
+        None if ec.kv.force_q8 || auto_q8 => infr_core::budget::kv_bytes_per_elem(DType::Q8_0),
         None => infr_core::budget::kv_bytes_per_elem(DType::F16),
     }
 }
@@ -350,6 +369,22 @@ impl SeamModel {
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
     pub fn load(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
+        Self::load_with(
+            gguf_path,
+            tokenizer_path,
+            std::sync::Arc::new(crate::EngineConfig::load_from_env()),
+        )
+    }
+
+    /// [`load`](Self::load) on a caller-supplied engine configuration — the constructor the
+    /// campaign is heading for: no environment, no globals, no process-wide ordering hazard, and
+    /// two models with different configurations can coexist in one process. `infr-cli` resolves
+    /// ONE `Arc<Config>` in `main()` and hands the same handle to every model it loads (§5.1).
+    pub fn load_with(
+        gguf_path: &Path,
+        tokenizer_path: Option<&Path>,
+        ecfg: std::sync::Arc<crate::EngineConfig>,
+    ) -> Result<Self> {
         let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
         let mut cfg = Config::from_gguf(&g)?;
         let tokenizer = match tokenizer_path {
@@ -364,11 +399,19 @@ impl SeamModel {
         Ok(Self {
             gguf: g,
             cfg,
+            ecfg,
             token_embd: std::sync::OnceLock::new(),
             per_layer_embd,
             tokenizer,
             footprint: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The ENGINE configuration this model was loaded with (see the `ecfg` field). Every seam path
+    /// below borrows it; the sessions this model opens clone the `Arc` so a warm call always reads
+    /// the same values its buffers were placed with.
+    pub fn engine_cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
+        &self.ecfg
     }
 
     /// The model's resident weight footprint, computed once and memoized (see the `footprint`
@@ -402,6 +445,7 @@ impl SeamModel {
             be: vk,
             pool: SlotPool::new(),
             max_ctx,
+            cfg: self.ecfg.clone(),
             ext: VulkanSessionPins(std::sync::Arc::new(crate::seam::PlacementPins::default())),
         })
     }
@@ -432,6 +476,7 @@ impl SeamModel {
             be: vk,
             pool: SlotPool::new(),
             max_ctx,
+            cfg: self.ecfg.clone(),
             ext: VulkanSessionPins(pins),
         })
     }
@@ -465,6 +510,7 @@ impl SeamModel {
             be: vk,
             pool: SlotPool::new(),
             max_ctx,
+            cfg: self.ecfg.clone(),
             ext: VulkanSessionPins(pins),
         })
     }
@@ -491,7 +537,7 @@ impl SeamModel {
             // (MoE placement budgets pager arenas separately from this fit math).
             if self.cfg.moe.is_none()
                 && !crate::seam::kv_auto_q8()
-                && crate::seam::kv_env_unset()
+                && crate::seam::kv_unset(&self.ecfg)
                 && crate::seam::kv_q8_layout_ok(&self.cfg)
                 && self.kv_fit_ctx_fmt(vk, true).is_some_and(|f| f >= want)
             {
@@ -579,14 +625,15 @@ impl SeamModel {
             act_headroom = act_headroom.max(crate::seam::dense_act_reserve(
                 &self.cfg,
                 self.cfg.n_ctx_train,
+                &self.ecfg,
             ));
         }
         // Bytes per token across all layers, K side + V side (bytes-per-element from the same
         // env the runner honors; formats it would gate back to f16 are an estimate only — the
         // alloc guard catches a resulting overflow).
         let (kb, vb) = (
-            kv_bytes_per_elem("INFR_KV_TYPE_K", auto_q8),
-            kv_bytes_per_elem("INFR_KV_TYPE_V", auto_q8),
+            kv_bytes_per_elem(self.ecfg.kv.type_k, &self.ecfg, auto_q8),
+            kv_bytes_per_elem(self.ecfg.kv.type_v, &self.ecfg, auto_q8),
         );
         let kv_per_tok: u64 = (0..self.cfg.n_layer)
             .map(|l| {
@@ -610,8 +657,9 @@ impl SeamModel {
         // (free - swa_fixed) / full_per_tok — a mostly-SWA model's default ctx clamp relaxes
         // enormously. The linear fit stays authoritative while it lands BELOW ring_rows (no
         // layer would actually ring there).
-        if crate::seam::kv_ring_wanted(&self.cfg) && fit_linear >= 1024 {
-            let ring_rows = (self.cfg.swa_window + crate::seam::ubatch_rows()).next_multiple_of(64);
+        if crate::seam::kv_ring_wanted(&self.cfg, &self.ecfg) && fit_linear >= 1024 {
+            let ring_rows =
+                (self.cfg.swa_window + crate::seam::ubatch_rows(&self.ecfg)).next_multiple_of(64);
             if fit_linear >= ring_rows {
                 let (mut full_per_tok, mut swa_fixed) = (0f64, 0f64);
                 for l in 0..self.cfg.n_layer {
@@ -662,7 +710,9 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session.pool.pick(&session.be, &self.cfg, &prompt_tokens)?;
+        let slot = session
+            .pool
+            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
         // Cap the reply to the context that's actually left ("a turn also caps to remaining
         // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
@@ -678,6 +728,7 @@ impl SeamModel {
             &session.be,
             &self.gguf,
             &self.cfg,
+            &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -822,6 +873,7 @@ impl SeamModel {
         crate::seam::verify_dense_cpu(
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
@@ -836,6 +888,7 @@ impl SeamModel {
         crate::seam::verify_dense_cpu_with_h(
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
@@ -851,6 +904,7 @@ impl SeamModel {
         crate::seam::verify_rows_cpu_with_h(
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
@@ -865,6 +919,7 @@ impl SeamModel {
             &vk,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
@@ -883,6 +938,7 @@ impl SeamModel {
             &rocm,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
@@ -899,7 +955,7 @@ impl SeamModel {
     /// cache (must fit the whole prompt + canvas_length + any headroom for later blocks).
     pub fn diffusion_gemma_cpu_session(&self, max_ctx: usize) -> DiffusionGemmaCpuSession {
         DiffusionGemmaCpuSession {
-            be: CpuBackend::new(),
+            be: CpuBackend::new_with(self.ecfg.clone()),
             state: None,
             max_ctx,
         }
@@ -946,6 +1002,7 @@ impl SeamModel {
         let (_, stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt,
@@ -968,6 +1025,7 @@ impl SeamModel {
             &vk,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -998,6 +1056,7 @@ impl SeamModel {
             &vk,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
@@ -1022,6 +1081,7 @@ impl SeamModel {
             devices,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1046,6 +1106,7 @@ impl SeamModel {
             devices,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
@@ -1071,6 +1132,7 @@ impl SeamModel {
             devices,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1095,6 +1157,7 @@ impl SeamModel {
             devices,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
@@ -1120,6 +1183,7 @@ impl SeamModel {
             devices,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1144,6 +1208,7 @@ impl SeamModel {
             devices,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
@@ -1182,6 +1247,7 @@ impl SeamModel {
                 &vk,
                 &self.gguf,
                 &self.cfg,
+                &self.ecfg,
                 self.embd(),
                 self.per_layer_embd.as_ref(),
                 &dummy(prompt_len),
@@ -1273,6 +1339,7 @@ impl SeamModel {
                 &rocm,
                 &self.gguf,
                 &self.cfg,
+                &self.ecfg,
                 self.embd(),
                 self.per_layer_embd.as_ref(),
                 &dummy(prompt_len),
@@ -1349,6 +1416,7 @@ impl SeamModel {
             be: mtl,
             pool: SlotPool::new(),
             max_ctx,
+            cfg: self.ecfg.clone(),
             ext: (),
         })
     }
@@ -1363,6 +1431,7 @@ impl SeamModel {
             be: rocm,
             pool: SlotPool::new(),
             max_ctx,
+            cfg: self.ecfg.clone(),
             ext: (),
         })
     }
@@ -1407,11 +1476,14 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session.pool.pick(&session.be, &self.cfg, &prompt_tokens)?;
+        let slot = session
+            .pool
+            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
         let (_generated, stats) = crate::seam::generate_dense_rocm_session(
             &session.be,
             &self.gguf,
             &self.cfg,
+            &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1463,11 +1535,14 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session.pool.pick(&session.be, &self.cfg, &prompt_tokens)?;
+        let slot = session
+            .pool
+            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
         let (_generated, stats) = crate::seam::generate_dense_metal_session(
             &session.be,
             &self.gguf,
             &self.cfg,
+            &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1501,6 +1576,7 @@ impl SeamModel {
             &mtl,
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1533,7 +1609,7 @@ impl SeamModel {
         k: usize,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        let sampler = crate::sampling::Sampler::from_env();
+        let sampler = crate::sampling::Sampler::from_cfg(&self.ecfg.sampling);
         if sampler.temp > 0.0 {
             return Err(anyhow!(
                 "speculative decoding is greedy-only — set INFR_TEMP=0"
@@ -1559,10 +1635,15 @@ impl SeamModel {
         // happens inside pick). A returning conversation suffix-prefills its own slots; a
         // different conversation forks/seeds instead of clobbering — multi-user spec serve
         // stops paying a full re-prefill of BOTH models on every conversation switch.
-        let t_slot = session.pool.pick(&session.be, &self.cfg, &committed)?;
-        let d_slot = draft_session
+        let t_slot = session
             .pool
-            .pick(&draft_session.be, &draft.cfg, &committed)?;
+            .pick(&session.be, &self.cfg, &session.cfg, &committed)?;
+        let d_slot = draft_session.pool.pick(
+            &draft_session.be,
+            &draft.cfg,
+            &draft_session.cfg,
+            &committed,
+        )?;
 
         // Initial fill: the target's normal (chunked-prefill) path produces the first token —
         // verify forwards are only for the small k+1 suffixes.
@@ -1573,6 +1654,7 @@ impl SeamModel {
             &session.be,
             &self.gguf,
             &self.cfg,
+            &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &committed,
@@ -1593,7 +1675,7 @@ impl SeamModel {
         // every verify round.
         let mut feed: Vec<u32> = Vec::new();
         let mut feed_committed_len = 0usize;
-        let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
+        let ignore_eos = self.ecfg.sampling.ignore_eos;
         let t1 = std::time::Instant::now();
         // Adaptive draft length: k tracks recent acceptance (EMA) — code-shaped output
         // accepts ~3/round and deserves the full k; high-entropy text accepts ~1-2 and a
@@ -1627,6 +1709,7 @@ impl SeamModel {
                 &draft_session.be,
                 &draft.gguf,
                 &draft.cfg,
+                &draft_session.cfg,
                 draft.embd(),
                 draft.per_layer_embd.as_ref(),
                 &committed,
@@ -1654,13 +1737,14 @@ impl SeamModel {
                 &session.be,
                 &self.gguf,
                 &self.cfg,
+                &session.cfg,
                 self.embd(),
                 self.per_layer_embd.as_ref(),
                 &feed,
                 &mut session.pool.slots[t_slot],
                 session.max_ctx,
             )?;
-            if std::env::var("INFR_SPEC_DEBUG").is_ok() {
+            if self.ecfg.spec.debug {
                 eprintln!(
                     "[spec] draft {:.1}ms verify {:.1}ms (exec {:.1}ms) cand={}",
                     td.as_secs_f64() * 1e3,
@@ -1742,6 +1826,7 @@ impl SeamModel {
             &session.be,
             &self.gguf,
             &self.cfg,
+            &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt,
@@ -1790,6 +1875,7 @@ impl SeamModel {
         let (_generated, stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1817,9 +1903,10 @@ impl SeamModel {
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
-            infr_cpu::CpuBackend::reference(),
+            infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
@@ -1843,6 +1930,7 @@ impl SeamModel {
         let (generated, _stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
+            &self.ecfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
@@ -1898,6 +1986,7 @@ impl DiffusionGemmaCpuSession {
             &*bind,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             model.embd(),
             model.per_layer_embd.as_ref(),
             tokens,
@@ -1938,6 +2027,7 @@ impl DiffusionGemmaCpuSession {
             &*bind,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             model.embd(),
             model.per_layer_embd.as_ref(),
             &[], // denoise never touches the prompt/generation token stream — see `DenoiseReq`
@@ -1978,6 +2068,7 @@ impl DiffusionGemmaVulkanSession {
             &self.be,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             self.state.is_none(),
             self.max_ctx,
         )?;
@@ -1986,6 +2077,7 @@ impl DiffusionGemmaVulkanSession {
             &*bind,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             model.embd(),
             model.per_layer_embd.as_ref(),
             tokens,
@@ -2036,6 +2128,7 @@ impl DiffusionGemmaVulkanSession {
             &self.be,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             self.state.is_none(),
             self.max_ctx,
         )?;
@@ -2044,6 +2137,7 @@ impl DiffusionGemmaVulkanSession {
             &*bind,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             model.embd(),
             model.per_layer_embd.as_ref(),
             &[],
@@ -2092,6 +2186,7 @@ impl DiffusionGemmaMetalSession {
             &*bind,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             model.embd(),
             model.per_layer_embd.as_ref(),
             tokens,
@@ -2126,6 +2221,7 @@ impl DiffusionGemmaMetalSession {
             &*bind,
             &model.gguf,
             &model.cfg,
+            &model.ecfg,
             model.embd(),
             model.per_layer_embd.as_ref(),
             &[],

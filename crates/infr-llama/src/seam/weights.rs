@@ -358,7 +358,12 @@ impl SeamKv {
         Ok(())
     }
 
-    pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
+    pub(crate) fn fork(
+        &self,
+        be: &dyn Backend,
+        cfg: &Config,
+        ec: &crate::EngineConfig,
+    ) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
@@ -382,7 +387,7 @@ impl SeamKv {
             let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
             // Same per-layer geometry as the original allocation: SWA layers ring at
             // window+ubatch rows when this session was ring-sized (see `crate::seam::kv_rows`).
-            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring);
+            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
             kbufs.push(
                 be.alloc(
                     kv_fmt_bytes(self.k_fmt, rows_l * kvrow_l),
@@ -457,6 +462,7 @@ impl SeamKv {
         &mut self,
         be: &dyn Backend,
         cfg: &Config,
+        ec: &crate::EngineConfig,
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
@@ -477,7 +483,7 @@ impl SeamKv {
         if self.kv_ring {
             let wrapped = (0..cfg.n_layer)
                 .filter(|&l| cfg.is_swa_layer(l))
-                .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true))
+                .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true, ec))
                 .any(|rows_l| src.cached.len() > rows_l);
             if wrapped {
                 return Ok(());

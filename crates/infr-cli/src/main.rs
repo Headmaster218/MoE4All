@@ -237,8 +237,15 @@ impl DeviceOpts {
         // `-u 0` stays "adaptive": the value is carried verbatim and the seam's `ubatch_rows`
         // filters `v > 0`, exactly as it did when this was published as INFR_UBATCH=0. Likewise
         // RAYON_NUM_THREADS=0 falls back to all cores in rayon.
+        //
+        // `ubatch_specified` is the OTHER half of the knob (§6.12, and `seam::ubatch_rows`'s doc):
+        // passing `-u` at all pins the chunk height, which is what disables the dense placement
+        // sweeps — including for `-u 0`, where the value itself is unusable. That used to be
+        // carried by the mere PRESENCE of the published `INFR_UBATCH`; the flag layer has to say
+        // so explicitly now.
         if let Some(u) = self.ubatch {
             layer.device.ubatch = Some(Some(u));
+            layer.device.ubatch_specified = Some(true);
         }
         if let Some(t) = self.threads {
             layer.device.threads = Some(Some(t));
@@ -1044,7 +1051,7 @@ fn build_chat_model(
     gguf: &Path,
     tok: Option<&Path>,
     is_dg: bool,
-    cfg: &Config,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     let backend = selected_backend(cfg)?;
     if is_dg {
@@ -1061,7 +1068,7 @@ fn build_chat_model(
                 Backend::Vulkan(_) => "vulkan seam",
             }
         );
-        let loaded = infr_llama::SeamModel::load(gguf, tok)?;
+        let loaded = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
         return Ok(match backend {
             Backend::Cpu => Box::new(infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)),
             Backend::Metal => Box::new(infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)),
@@ -1082,7 +1089,7 @@ fn build_chat_model(
                 "[rocm backend — dense/MoE forward on AMD GPU via ROCm/HIP, persistent KV session]"
             );
             Ok(Box::new(infr_llama::chat::RocmSeamChat::new(
-                infr_llama::SeamModel::load(gguf, tok)?,
+                infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
                 dev_idx,
             )?))
         }
@@ -1092,12 +1099,12 @@ fn build_chat_model(
             );
             #[cfg(target_os = "macos")]
             {
-                metal_chat_model(gguf, tok)
+                metal_chat_model(gguf, tok, cfg)
             }
             #[cfg(not(target_os = "macos"))]
             {
                 Ok(Box::new(infr_llama::chat::CpuDenseChat::new_metal(
-                    infr_llama::SeamModel::load(gguf, tok)?,
+                    infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
                 )))
             }
         }
@@ -1106,7 +1113,7 @@ fn build_chat_model(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
             Ok(Box::new(infr_llama::chat::CpuDenseChat::new(
-                infr_llama::SeamModel::load(gguf, tok)?,
+                infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
             )))
         }
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
@@ -1118,7 +1125,7 @@ fn build_chat_model(
                 "[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]"
             );
             Ok(Box::new(infr_llama::chat::DenseSeamChat::new(
-                infr_llama::SeamModel::load(gguf, tok)?,
+                infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
             )))
         }
     }
@@ -1151,7 +1158,7 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
     // handed across the boundary). One-shot (a single message), dense models only — a capacity
     // path (run a model too big for one device), byte-identical to single-device. Unset ⇒ the
     // normal persistent-session chat below (byte-for-byte unchanged).
-    if let Some(devices) = infr_llama::seam::parse_pipeline_devices()? {
+    if let Some(devices) = infr_llama::seam::pipeline_devices(cfg).map(<[usize]>::to_vec) {
         let Some(msg) = message else {
             anyhow::bail!(
                 "INFR_PIPELINE runs one-shot: pass a message, e.g. \
@@ -1161,8 +1168,8 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
-        apply_model_sampling_defaults(&gguf);
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let cfg = apply_model_sampling_defaults(cfg, &gguf);
+        let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_dense_vulkan_pipeline(&devices, &rendered, max_new)?;
         println!("{out}");
@@ -1174,7 +1181,7 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
     // P2P all-reduce per attention + per FFN — the single-stream decode speedup (splits the weight
     // GEMV). One-shot, dense models only; output equals single-device to reduction-order tolerance.
     // Unset ⇒ the normal persistent-session chat below (byte-for-byte unchanged).
-    if let Some(devices) = infr_llama::seam::parse_tensor_parallel_devices()? {
+    if let Some(devices) = infr_llama::seam::tensor_parallel_devices(cfg).map(<[usize]>::to_vec) {
         let Some(msg) = message else {
             anyhow::bail!(
                 "INFR_TENSOR_PARALLEL runs one-shot: pass a message, e.g. \
@@ -1184,8 +1191,8 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
-        apply_model_sampling_defaults(&gguf);
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let cfg = apply_model_sampling_defaults(cfg, &gguf);
+        let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_dense_vulkan_tp(&devices, &rendered, max_new)?;
         println!("{out}");
@@ -1198,7 +1205,7 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
     // all-reduce per MoE layer combines the partial expert outputs — a capacity split + parallel
     // expert compute. One-shot, MoE models only; output equals single-device to reduction-order
     // tolerance. Unset ⇒ the normal persistent-session chat below (byte-for-byte unchanged).
-    if let Some(devices) = infr_llama::seam::parse_expert_parallel_devices()? {
+    if let Some(devices) = infr_llama::seam::expert_parallel_devices(cfg).map(<[usize]>::to_vec) {
         let Some(msg) = message else {
             anyhow::bail!(
                 "INFR_EXPERT_PARALLEL runs one-shot: pass a message, e.g. \
@@ -1208,8 +1215,8 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
             anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
         }
-        apply_model_sampling_defaults(&gguf);
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let cfg = apply_model_sampling_defaults(cfg, &gguf);
+        let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_moe_vulkan_ep(&devices, &rendered, max_new)?;
         println!("{out}");
@@ -1222,8 +1229,8 @@ fn cmd_run(model: &str, message: Option<&str>, cfg: &Arc<Config>) -> anyhow::Res
     // the single REPL below. Every backend does history-based multi-turn; qwen35 (Qwen3.5) rides
     // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
     // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
-    apply_model_sampling_defaults(&gguf);
-    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, cfg)?;
+    let cfg = apply_model_sampling_defaults(cfg, &gguf);
+    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, &cfg)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
@@ -1613,17 +1620,17 @@ fn render_dim_line(items: &[(char, bool)]) -> String {
 fn metal_chat_model(
     gguf: &Path,
     tok: Option<&Path>,
+    cfg: &Arc<Config>,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
-    if let Ok(draft_path) = std::env::var("INFR_SPEC_DRAFT") {
-        let target = infr_llama::SeamModel::load(gguf, tok)?;
-        let draft = infr_llama::SeamModel::load(std::path::Path::new(&draft_path), None)?;
+    if let Some(draft_path) = cfg.spec.draft.clone() {
+        // Target and draft get the SAME config — a process loading both hands them one value
+        // (`docs/config-plan.md` §5.1), which is exactly what the shared environment did.
+        let target = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
+        let draft = infr_llama::SeamModel::load_with(&draft_path, None, cfg.clone())?;
         // Upper bound on the draft length; the driver adapts the actual k per round to recent
         // acceptance (verify cost scales with rows on this hardware, so over-drafting
         // low-acceptance text costs real time).
-        let k = std::env::var("INFR_SPEC_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6);
+        let k = cfg.spec.k;
         let (tb, db) = (
             std::fs::metadata(gguf).map(|m| m.len()).unwrap_or(0),
             std::fs::metadata(&draft_path).map(|m| m.len()).unwrap_or(0),
@@ -1641,7 +1648,7 @@ fn metal_chat_model(
         )))
     } else {
         Ok(Box::new(infr_llama::chat::MetalSeamChat::new(
-            infr_llama::SeamModel::load(gguf, tok)?,
+            infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
         )))
     }
 }
@@ -2068,7 +2075,7 @@ fn cmd_bench(
     // directly comparable to `llama-bench` on a HIP build. Device index parsed from the spec.
     if let Backend::Rocm(rocm_spec) = &backend {
         let dev_idx = rocm_spec.as_deref().map(parse_rocm_device).unwrap_or(0);
-        let model = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         let samples = model.bench_rocm(n_prompt, n_gen, depth, pg, reps, dev_idx)?;
         let label = if let Some((p, g)) = pg {
             format!("pg{p}+{g}")
@@ -2083,7 +2090,7 @@ fn cmd_bench(
     // `--dev VulkanN` was already published to the backend as INFR_DEV=VulkanN by `DeviceOpts::resolve`;
     // `VulkanBackend::new()` reads it when picking the physical device, and the prefill chunk
     // (`-u`/INFR_UBATCH) landed there too. Nothing to set here — straight to the Vulkan seam.
-    let model = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+    let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
     let samples = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
@@ -3640,19 +3647,47 @@ fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) 
     (t, k, p, src)
 }
 
-/// Fill unset `INFR_TEMP`/`INFR_TOP_K`/`INFR_TOP_P` with the model's recommended sampling (see
-/// [`model_sampling_defaults`]) and print a one-line banner of the EFFECTIVE sampler — a `--temp`/
-/// `--top-k`/`--top-p` the user passed is already in the env (via `SamplingOpts::resolve`), so it
-/// wins and shows through here. Shared by `run` and `serve`.
-fn apply_model_sampling_defaults(gguf: &std::path::Path) {
+/// Fold the model's recommended sampling (see [`model_sampling_defaults`]) into the config the
+/// models this command loads are handed, for the knobs no layer specified, and print a one-line
+/// banner of the EFFECTIVE sampler. A `--temp`/`--top-k`/`--top-p` the user passed is already in
+/// the resolved `cfg` (via `SamplingOpts::overrides`), so it wins and shows through here. Shared
+/// by `run`, `serve` and `multi`.
+///
+/// **Precedence, unchanged:** the model recommendation is the LOWEST source, below the config file
+/// and below the environment — so it may only fill a knob NO layer specified. "Specified" is read
+/// off the environment, which is sound because [`publish_transitional_env`] has already run in
+/// `main()` and published exactly the paths a layer set (and an `INFR_TEMP` the process inherited
+/// was of course already there). That probe, [`set_default_sampling_env`]'s writes and this
+/// function's env reads are all the S1 bridge; S8 deletes them together, replacing the probe with
+/// the `specified` [`PartialConfig`] threaded down from `main()`.
+///
+/// Since S4 the SEAM reads `sampling.*` from the returned `Config`, not from the environment — so
+/// returning it (rather than only publishing) is what keeps `infr run` on the model's recommended
+/// temperature instead of silently falling back to the library's greedy default.
+fn apply_model_sampling_defaults(cfg: &Arc<Config>, gguf: &std::path::Path) -> Arc<Config> {
     let (t, k, p, src) = model_sampling_defaults(gguf);
+    // Probe BEFORE `set_default_sampling_env` writes its own fallbacks.
+    let (has_t, has_k, has_p) = (
+        std::env::var("INFR_TEMP").is_ok(),
+        std::env::var("INFR_TOP_K").is_ok(),
+        std::env::var("INFR_TOP_P").is_ok(),
+    );
     set_default_sampling_env(t, k, p);
+    let mut out = (**cfg).clone();
+    if !has_t {
+        out.sampling.temp = t;
+    }
+    if !has_k {
+        out.sampling.top_k = k;
+    }
+    if !has_p {
+        out.sampling.top_p = p;
+    }
     eprintln!(
         "[sampling: temp={} top_k={} top_p={} ({src}); --temp/--top-k/--top-p to override]",
-        std::env::var("INFR_TEMP").unwrap_or_default(),
-        std::env::var("INFR_TOP_K").unwrap_or_default(),
-        std::env::var("INFR_TOP_P").unwrap_or_default(),
+        out.sampling.temp, out.sampling.top_k, out.sampling.top_p,
     );
+    Arc::new(out)
 }
 
 fn cmd_serve(
@@ -3679,13 +3714,13 @@ fn cmd_serve(
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
-    apply_model_sampling_defaults(&gguf);
+    let cfg = &apply_model_sampling_defaults(cfg, &gguf);
 
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
     // default `infr serve` engine.
     if is_vulkan {
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
         // a `%` is a fraction of the whole device's KV capacity split across the slots, and unset
         // derives it from the VRAM fit divided by N. See `SeamModel::vulkan_slot_ctx`.
@@ -3820,6 +3855,10 @@ fn cmd_multi(
     )> = Vec::with_capacity(specs.len());
     let mut routing: Vec<(String, usize, String)> = Vec::with_capacity(specs.len());
     let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The config EVERY hosted model is loaded with. Sampling defaults are process-wide here (see
+    // the `i == 0` note below), so the first model's recommendation is folded in once and the same
+    // value is handed to all of them — exactly what the shared environment used to do.
+    let mut hosted_cfg = cfg.clone();
 
     for (i, spec) in specs.iter().enumerate() {
         let (model_ref, dev_opt) = parse_model_spec(spec)?;
@@ -3841,7 +3880,7 @@ fn cmd_multi(
         // Sampling defaults are process-global; apply the FIRST model's so the banner is honest, and
         // note that all hosted models share them (a per-model override would need per-request fields).
         if i == 0 {
-            apply_model_sampling_defaults(&gguf);
+            hosted_cfg = apply_model_sampling_defaults(cfg, &gguf);
         }
 
         // A stable, unique wire id: the file stem, disambiguated by device when two specs collide
@@ -3866,7 +3905,7 @@ fn cmd_multi(
             "[multi] loading {model_id} on Vulkan{dev} ({})",
             devices[dev].name
         );
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), hosted_cfg.clone())?;
         let engine =
             infr_llama::parallel::ParallelSeam::new_on(Some(dev), loaded, parallel, want_ctx)?;
         let n_slots = engine.n_slots();
@@ -4123,9 +4162,11 @@ mod tests {
         let cfg = resolve_cfg(&[], flags, &[]);
         assert_eq!(cfg.device.ctx, Some(infr_core::SizeSpec::Bytes(32 * 1024)));
         assert_eq!(cfg.device.ubatch, Some(512));
+        assert!(cfg.device.ubatch_specified, "-u pins the chunk height");
         assert_eq!(cfg.device.threads, Some(6));
 
-        // `-u 0` keeps its "adaptive" meaning: carried verbatim, filtered by the seam (`v > 0`).
+        // `-u 0` keeps its "adaptive" meaning: carried verbatim, filtered by the seam (`v > 0`) —
+        // but it is still SPECIFIED, which is what keeps the dense placement sweeps off (§6.12).
         let mut flags = PartialConfig::default();
         DeviceOpts {
             dev: None,
@@ -4135,7 +4176,17 @@ mod tests {
         }
         .overrides(&mut flags)
         .unwrap();
-        assert_eq!(resolve_cfg(&[], flags, &[]).device.ubatch, Some(0));
+        let zero = resolve_cfg(&[], flags, &[]);
+        assert_eq!(zero.device.ubatch, Some(0));
+        assert!(
+            zero.device.ubatch_specified,
+            "`-u 0` must still count as a pin — the value is unusable, the intent is not"
+        );
+
+        // …and NO `-u` at all specifies neither half.
+        let none = resolve_cfg(&[], PartialConfig::default(), &[]);
+        assert_eq!(none.device.ubatch, None);
+        assert!(!none.device.ubatch_specified);
 
         // A garbage `--ctx` still fails fast, with the same message.
         let e = DeviceOpts {

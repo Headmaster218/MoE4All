@@ -57,10 +57,19 @@ cfg_struct! {
         dev: Option<String> = None,
         /// `INFR_CTX`: context length (the shared size grammar).
         ctx: Option<SizeSpec> = None,
-        /// `INFR_UBATCH`: prefill micro-batch rows. `None` = the user did not pin one, which is
-        /// also the PRESENCE signal the placement sweep reads; the 1024 / iGPU-adaptive fallback
-        /// chain stays at its call site (R5).
+        /// `INFR_UBATCH`: prefill micro-batch rows. `None` = no usable value; the 1024 /
+        /// iGPU-adaptive fallback chain stays at its call site (R5).
         ubatch: Option<usize> = None,
+        /// Was `INFR_UBATCH` / `--ubatch` supplied AT ALL, usable or not? The PRESENCE half of
+        /// §6.12's two-consumer knob, and — like [`KvCfg::type_k_specified`] — a SEPARATE flag
+        /// rather than `ubatch.is_some()`, because the two consumers disagree about an unusable
+        /// value: `INFR_UBATCH=0` and `INFR_UBATCH=abc` yield NO chunk height (the value site is
+        /// `.parse().ok().filter(|&v| v > 0)`) yet still count as "the user pinned a height", which
+        /// is what the seam's dense placement sweeps read to skip themselves (`is_err()` at
+        /// `seam/mod.rs`'s three sweep gates). Collapsing the two onto one `Option` would silently
+        /// re-enable the sweep for `-u 0`, a shipped CLI spelling (R1). S0 left this open; S4
+        /// resolved it here.
+        ubatch_specified: bool = false,
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
         ubatch_parallel: usize = 256,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
@@ -76,7 +85,7 @@ cfg_struct! {
 
 cfg_struct! {
     /// Process-default sampling. A server request's `RequestCtx` still layers OVER this, exactly
-    /// as it layers over `Sampler::from_env()` today (§5.1) — that precedence is unchanged.
+    /// as it layered over `Sampler::from_env()` before S4 (§5.1) — that precedence is unchanged.
     SamplingCfg / PartialSamplingCfg {
         /// `INFR_TEMP`. `0.0` = greedy: the doc contract that keeps library callers and the
         /// goldens deterministic.
@@ -771,6 +780,43 @@ impl ConfigLayer {
     pub fn cli(overrides: &ConfigOverrides) -> Result<PartialConfig, ConfigError> {
         cli::parse(overrides)
     }
+}
+
+/// Parse a multi-GPU device spec (`Vulkan0,Vulkan1,…`; a bare index `N` is also accepted) into
+/// physical device indices, requiring at least `min` of them.
+///
+/// **The ONE copy of this grammar.** It existed twice until S4 — here (behind
+/// `ConfigValue for Vec<usize>`) and as `infr_llama::seam::parse_device_spec` — which is precisely
+/// the drift class this campaign removes. The seam's copy, and the `parse_device_list` `var_os`
+/// wrapper around it, are deleted; the env layer (§6.11), the TOML file and `--set` all come here.
+///
+/// `min` is the per-knob minimum device count — `INFR_PIPELINE`/`INFR_TENSOR_PARALLEL` need 2,
+/// `INFR_EXPERT_PARALLEL` needs 1, and those three minimums are NOT the same (R1). `0` skips the
+/// check entirely, which is what the `--set`/TOML value grammar wants: a count bound is policy and
+/// belongs to the consumer (R5), while the env layer applies it because it must reproduce today's
+/// loud error.
+///
+/// Empty and whitespace-only segments are skipped (`" 0 , 1 ,2, "` is three devices), matching the
+/// pre-config seam parser byte for byte. The error text names no key: the caller prefixes it with
+/// the `INFR_*` variable or the dotted path the spec came from.
+pub fn parse_device_spec(spec: &str, min: usize) -> Result<Vec<usize>, String> {
+    let devs: Vec<usize> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|part| {
+            part.strip_prefix("Vulkan")
+                .unwrap_or(part)
+                .parse::<usize>()
+                .map_err(|_| format!("'{part}' is not VulkanN or a device index"))
+        })
+        .collect::<Result<_, _>>()?;
+    if devs.len() < min {
+        return Err(format!(
+            "needs >={min} device(s) for a real split (got '{spec}'); unset it to run single-device"
+        ));
+    }
+    Ok(devs)
 }
 
 /// The closest known config path to `typo`, for a did-you-mean suggestion. `None` when nothing is

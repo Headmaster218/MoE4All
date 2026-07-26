@@ -78,7 +78,7 @@ impl DenseSeamChat {
         self.mtp_checked = true;
         // Shared gate (`crate::mtp::should_use_mtp`) so Vulkan and Metal can't drift: `INFR_MTP=1`,
         // MTP not parked, and a head-bearing GGUF. It emits the "parked" warning itself.
-        if !crate::mtp::should_use_mtp(self.model.config()) {
+        if !crate::mtp::should_use_mtp(self.model.config(), self.model.engine_cfg()) {
             return Ok(false);
         }
         self.mtp_head = Some(crate::mtp::load_mtp_head(

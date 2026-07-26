@@ -45,7 +45,7 @@ impl MetalSeamChat {
         // Shared gate (`crate::mtp::should_use_mtp`) — the Metal twin of Vulkan's `wants_mtp`, one
         // decision so the two can't drift (Metal previously ignored the parked path SILENTLY while
         // Vulkan warned; the shared gate warns for both).
-        if !crate::mtp::should_use_mtp(self.model.config()) {
+        if !crate::mtp::should_use_mtp(self.model.config(), self.model.engine_cfg()) {
             return Ok(false);
         }
         self.mtp_head = Some(crate::mtp::load_mtp_head(

@@ -102,8 +102,10 @@ pub fn mtp_enabled() -> bool {
 /// runs — its `nextn` tensors are simply unused). Extracted because the Vulkan and Metal gates had
 /// drifted: one warned on the parked path, the other silently ignored the env var.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn should_use_mtp(cfg: &crate::Config) -> bool {
-    if std::env::var("INFR_MTP").ok().as_deref() != Some("1") {
+pub fn should_use_mtp(cfg: &crate::Config, ec: &crate::EngineConfig) -> bool {
+    // `spec.mtp` is the EXACT string "1" (§10.4) — `INFR_MTP=true` did nothing before and still
+    // does nothing; the env layer owns that comparison now.
+    if !ec.spec.mtp {
         return false;
     }
     if !mtp_enabled() {
@@ -1339,6 +1341,10 @@ fn build_mtp_draft_chain_graph(
 pub struct MtpHeadSession<'a> {
     be: &'a dyn Backend,
     cfg: crate::Config,
+    /// The engine configuration the head reads its own knobs from — today just
+    /// `spec.gpu_draft_prob` ([`gpu_draft_prob_enabled`](Self::gpu_draft_prob_enabled)). Borrowed
+    /// from the driver, which borrows it from the `SeamModel` (R4/R6).
+    ec: &'a crate::EngineConfig,
     /// The table `forward` gathers embedding rows from (host-side, like every other embed-gather
     /// call site on this seam) — the main model's `token_embd`, or [`resolve_own_embed_table`]'s
     /// result when the GGUF ships its own `nextn.embed_tokens`.
@@ -1372,6 +1378,7 @@ impl<'a> MtpHeadSession<'a> {
         cpu_be: &'a infr_cpu::CpuBackend,
         g: &Gguf,
         cfg: &crate::Config,
+        ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
         embed_table: &'a [f32],
         max_ctx: usize,
@@ -1392,6 +1399,7 @@ impl<'a> MtpHeadSession<'a> {
             },
             g,
             cfg,
+            ec,
             head,
             embed_table,
             max_ctx,
@@ -1404,6 +1412,7 @@ impl<'a> MtpHeadSession<'a> {
         vk: &'a infr_vulkan::VulkanBackend,
         g: &Gguf,
         cfg: &crate::Config,
+        ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
         embed_table: &'a [f32],
         max_ctx: usize,
@@ -1421,6 +1430,7 @@ impl<'a> MtpHeadSession<'a> {
             },
             g,
             cfg,
+            ec,
             head,
             embed_table,
             max_ctx,
@@ -1434,6 +1444,7 @@ impl<'a> MtpHeadSession<'a> {
         mtl: &'a infr_metal::MetalBackend,
         g: &Gguf,
         cfg: &crate::Config,
+        ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
         embed_table: &'a [f32],
         max_ctx: usize,
@@ -1449,17 +1460,20 @@ impl<'a> MtpHeadSession<'a> {
             },
             g,
             cfg,
+            ec,
             head,
             embed_table,
             max_ctx,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         be: &'a dyn Backend,
         bind_weight: &BindWeightFn,
         g: &Gguf,
         cfg: &crate::Config,
+        ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
         embed_table: &'a [f32],
         max_ctx: usize,
@@ -1476,6 +1490,7 @@ impl<'a> MtpHeadSession<'a> {
         Ok(Self {
             be,
             cfg: cfg.clone(),
+            ec,
             embed_table,
             wbufs,
             wspecs,
@@ -1743,10 +1758,11 @@ impl<'a> MtpHeadSession<'a> {
     }
 
     /// Whether [`forward_draft`](Self::forward_draft) should build the fused `Op::ArgmaxProb`
-    /// graph: the backend must advertise the capability, and the `INFR_NO_GPU_DRAFT_PROB` A/B
-    /// escape (byte-identity verification against the host `top1_softmax` path) must be unset.
+    /// graph: the backend must advertise the capability, and the `spec.gpu_draft_prob` A/B escape
+    /// (`INFR_NO_GPU_DRAFT_PROB`, inverted — byte-identity verification against the host
+    /// `top1_softmax` path) must be on.
     fn gpu_draft_prob_enabled(&self) -> bool {
-        self.be.capabilities().argmax_prob && std::env::var("INFR_NO_GPU_DRAFT_PROB").is_err()
+        self.be.capabilities().argmax_prob && self.ec.spec.gpu_draft_prob
     }
 
     /// Whether [`draft_chain`](Self::draft_chain) can run: the head's embedding table uploaded as
@@ -2055,6 +2071,7 @@ fn run_verify(
     bind: &BindWeightFn,
     g: &Gguf,
     cfg: &crate::Config,
+    ec: &crate::EngineConfig,
     token_embd: crate::seam::TokenEmbd<'_>,
     tokens: &[u32],
     state: &mut Option<crate::seam::SeamKv>,
@@ -2068,6 +2085,7 @@ fn run_verify(
         bind,
         g,
         cfg,
+        ec,
         token_embd,
         None,
         tokens,
@@ -2116,6 +2134,7 @@ fn run_verify_full(
     bind: &BindWeightFn,
     g: &Gguf,
     cfg: &crate::Config,
+    ec: &crate::EngineConfig,
     token_embd: crate::seam::TokenEmbd<'_>,
     tokens: &[u32],
     state: &mut Option<crate::seam::SeamKv>,
@@ -2128,6 +2147,7 @@ fn run_verify_full(
         bind,
         g,
         cfg,
+        ec,
         token_embd,
         None,
         tokens,
@@ -2173,6 +2193,7 @@ fn run_prime_last(
     bind: &BindWeightFn,
     g: &Gguf,
     cfg: &crate::Config,
+    ec: &crate::EngineConfig,
     token_embd: crate::seam::TokenEmbd<'_>,
     tokens: &[u32],
     state: &mut Option<crate::seam::SeamKv>,
@@ -2186,6 +2207,7 @@ fn run_prime_last(
         bind,
         g,
         cfg,
+        ec,
         token_embd,
         None,
         tokens,
@@ -2321,7 +2343,7 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// caller-built [`MtpHeadSession`] (bound to the same `be`). Everything between — draft, accept,
 /// catch-up, streaming — is backend-agnostic.
 ///
-/// Sampling: reads `Sampler::from_env()` (`INFR_TEMP`/`INFR_TOP_K`/`INFR_TOP_P`) exactly like the
+/// Sampling: reads `Sampler::from_cfg(&ec.sampling)` (`sampling.temp`/`top_k`/`top_p`) like the
 /// non-MTP seam decode loop. `temp <= 0` takes the ORIGINAL greedy fast path — `draft` +
 /// `crate::seam::model::spec_accept` against the trunk's GPU-resident argmax, bit-identical to
 /// before this doc comment was added (pinned by `mtp_spec_matches_target_only_greedy`). `temp > 0`
@@ -2347,9 +2369,10 @@ fn generate_mtp_spec_core(
     mut on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
+    let ec = model.engine_cfg();
     let ne = cfg.n_embd;
     let n_max = DEFAULT_N_MAX;
-    let time_mtp = std::env::var("INFR_MTP_TIME").is_ok();
+    let time_mtp = ec.prof.mtp_time;
     // qwen35 DeltaNet spec-decode rollback (default ON; A/B escape via INFR_NO_MTP_CKPT): snapshot
     // the trunk's DeltaNet recurrent state at each clean committed boundary so a partial-accept
     // cycle rolls back to it and re-prefills only the short accepted suffix, instead of qwen35's
@@ -2358,7 +2381,7 @@ fn generate_mtp_spec_core(
     // in `generate_dense_backend`'s `start` computation). Token-identical either way (a pure decode
     // speedup): restoring an exact state snapshot + re-prefilling the same committed tokens yields
     // the same recurrence as prefilling them from zero.
-    let mtp_ckpt = std::env::var("INFR_NO_MTP_CKPT").is_err();
+    let mtp_ckpt = ec.spec.mtp_ckpt;
     // Bounded rollback window (INFR_NO_MTP_REPRIME=1 A/B escape): the snapshot above only advances
     // on FULL-accept cycles, so at low accept rates (alpha≈0.5 on repetitive/dummy prompts —
     // full-accept probability ≈ alpha^n_max ≈ 2%) the boundary stalls and each cycle's verify
@@ -2375,14 +2398,14 @@ fn generate_mtp_spec_core(
     // partial cycle vs +22% on the 9B whose window actually blew out. Repriming only when
     // window + n_max + 1 > MTP_REPRIME_MAX_M keeps typical cycles single-stream and caps the
     // verify at the BM16 tile's m<=16 gate (`DENSE_SMALL_TILE_MAX_M16`).
-    let mtp_reprime = mtp_ckpt && std::env::var("INFR_NO_MTP_REPRIME").is_err();
+    let mtp_reprime = mtp_ckpt && ec.spec.mtp_reprime;
     const MTP_REPRIME_MAX_M: usize = 16;
-    let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
+    let ignore_eos = ec.sampling.ignore_eos;
     let hit_eos = |t: u32| !ignore_eos && (cfg.eos_ids.contains(&t) || t == cfg.eos);
     // Sampling config (see this fn's doc): temp<=0 keeps the original bit-identical greedy path;
     // temp>0 (the CLI's chat default, INFR_TEMP=0.6) takes the stochastic accept rule.
-    let sampler = crate::sampling::Sampler::from_env();
-    let mut rng = crate::sampling::seed_rng();
+    let sampler = crate::sampling::Sampler::from_cfg(&ec.sampling);
+    let mut rng = crate::sampling::seed_rng(&ec.sampling);
     let stochastic = sampler.temp > 0.0;
 
     let prompt_tokens = model.encode(prompt)?;
@@ -2402,6 +2425,7 @@ fn generate_mtp_spec_core(
             bind,
             model.gguf(),
             cfg,
+            ec,
             model.embd(),
             &prompt_tokens,
             &mut trunk_state,
@@ -2414,6 +2438,7 @@ fn generate_mtp_spec_core(
             bind,
             model.gguf(),
             cfg,
+            ec,
             model.embd(),
             &prompt_tokens,
             &mut trunk_state,
@@ -2504,7 +2529,7 @@ fn generate_mtp_spec_core(
             let cand = drafted.iter().map(|(id, _)| *id).collect();
             let q_dists = drafted.into_iter().map(|(_, q)| q).collect();
             (cand, q_dists)
-        } else if head_sess.can_draft_chain() && std::env::var("INFR_NO_MTP_DRAFT_CHAIN").is_err() {
+        } else if head_sess.can_draft_chain() && ec.spec.mtp_draft_chain {
             // Fused single-submission chain (issue #33 follow-up — see `draft_chain`'s doc for the
             // correctness argument): replaces `n_max_round` sequential submit→wait→readback
             // round-trips with ONE compile+execute+download. `INFR_NO_MTP_DRAFT_CHAIN=1` A/B
@@ -2535,6 +2560,7 @@ fn generate_mtp_spec_core(
                 bind,
                 model.gguf(),
                 cfg,
+                ec,
                 model.embd(),
                 &feed,
                 &mut trunk_state,
@@ -2547,6 +2573,7 @@ fn generate_mtp_spec_core(
                 bind,
                 model.gguf(),
                 cfg,
+                ec,
                 model.embd(),
                 &feed,
                 &mut trunk_state,
@@ -2731,6 +2758,7 @@ fn generate_mtp_spec_core(
                 bind,
                 model.gguf(),
                 cfg,
+                ec,
                 model.embd(),
                 &committed,
                 &mut trunk_state,
