@@ -861,7 +861,7 @@ fn arg_f32(v: f32) -> Vec<u8> {
 struct ExecCtx<'a> {
     dev: Vec<Option<crate::RocmBuffer>>,
     vals: Vec<Option<Vec<f32>>>,
-    weight_cache: &'a Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
+    weight_cache: &'a crate::backend::WeightCache,
     /// Reusable device-scratch pool (persists across `execute` calls on the backend).
     pool: &'a Mutex<BufferPool>,
     /// Paged MoE expert cache (Slice 33 — `crate::pager`), `None` for a resident model. The
@@ -921,6 +921,9 @@ impl<'a> ExecCtx<'a> {
             len,
             owned: false,
             host_ptr: std::ptr::null_mut(),
+            // A fresh draw is a NEW logical buffer even though the pool recycled the bytes behind
+            // it — stamp it accordingly so nothing can memoize across two unrelated draws.
+            uid: crate::backend::next_buffer_uid(),
         }
     }
 
@@ -973,12 +976,14 @@ impl<'a> ExecCtx<'a> {
             TensorKind::Input | TensorKind::Weight => {
                 let b = rocm_buf(bindings.get(id).expect("rocm: unbound Input/Weight"));
                 let p = b.ptr;
-                // Track in dev so subsequent accesses find it.
+                // Track in dev so subsequent accesses find it. A view of the bound allocation, so
+                // it carries that allocation's identity.
                 self.dev[i] = Some(crate::RocmBuffer {
                     ptr: p,
                     len: b.len,
                     owned: false,
                     host_ptr: std::ptr::null_mut(),
+                    uid: b.uid,
                 });
                 p
             }
@@ -1023,13 +1028,17 @@ impl<'a> ExecCtx<'a> {
     ) -> Result<*mut c_void> {
         let i = id.0 as usize;
         let b = rocm_buf(bindings.get(id).expect("rocm: unbound Weight"));
-        // Key on (address, byte length): a recycled device address that now backs a differently-
-        // sized weight must MISS (its stale dequant has the wrong length), forcing a re-dequant.
+        // (address, byte length) is only the SLOT — HIP recycles a freed address for the next
+        // same-sized allocation, so it is not an identity. The bound buffer's `uid` is; a hit is
+        // served only when it matches, otherwise the address was recycled for different weights and
+        // the stale dequant must not be handed out (see `RocmBackend::weight_cache`).
         let key = (b.ptr as usize, b.len);
         {
             let cache = self.weight_cache.lock().unwrap();
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached.ptr);
+            if let Some((uid, cached)) = cache.get(&key) {
+                if *uid == b.uid {
+                    return Ok(cached.ptr);
+                }
             }
         }
         let dt = g.desc(id).dtype;
@@ -1039,17 +1048,24 @@ impl<'a> ExecCtx<'a> {
         let dq = self.f16_dev(&f16_bytes);
         let ptr = dq.ptr;
         let len = dq.len;
+        let dq_uid = dq.uid;
         {
             let mut cache = self.weight_cache.lock().unwrap();
-            // Cache owns the device memory (owned: true)
+            // Cache owns the device memory (owned: true), stamped with the identity of the WEIGHT
+            // buffer it was dequantized from. Inserting on an already-occupied key is the
+            // recycled-address case: the replaced entry drops here, freeing the stale dequant.
             cache.insert(
                 key,
-                crate::RocmBuffer {
-                    ptr: dq.ptr,
-                    len: dq.len,
-                    owned: true,
-                    host_ptr: std::ptr::null_mut(),
-                },
+                (
+                    b.uid,
+                    crate::RocmBuffer {
+                        ptr: dq.ptr,
+                        len: dq.len,
+                        owned: true,
+                        host_ptr: std::ptr::null_mut(),
+                        uid: dq_uid,
+                    },
+                ),
             );
         }
         // Store a non-owned reference in dev so ctx.drop doesn't free it.
@@ -1060,6 +1076,7 @@ impl<'a> ExecCtx<'a> {
             len,
             owned: false,
             host_ptr: std::ptr::null_mut(),
+            uid: dq_uid,
         });
         Ok(ptr)
     }
@@ -1158,7 +1175,7 @@ fn build_spilled_schedule(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_graph(
     pipelines: &Pipelines,
-    weight_cache: &Mutex<HashMap<(usize, usize), crate::RocmBuffer>>,
+    weight_cache: &crate::backend::WeightCache,
     pool: &Mutex<BufferPool>,
     moe_pager: &Mutex<Option<crate::pager::RocmMoePager>>,
     weight_ring: &Mutex<Option<crate::weight_pager::RocmWeightRing>>,
@@ -1633,6 +1650,7 @@ fn run_op(
                                     len: b.len,
                                     owned: false,
                                     host_ptr: std::ptr::null_mut(),
+                                    uid: b.uid,
                                 }
                             }
                             None => ctx.zero_dev(mu * ou),

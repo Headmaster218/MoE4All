@@ -126,6 +126,21 @@ fn fmt_bytes(n: u64) -> String {
 
 // ── RocmBuffer ───────────────────────────────────────────────────────────────
 
+/// Monotonic source of [`RocmBuffer::uid`]. Process-wide (not per-backend) so a uid is unique
+/// across every backend alive in the process — two models, `infr serve`, the multi-GPU paths.
+/// `u64` and never reused: at one allocation per nanosecond it wraps in ~584 years.
+static NEXT_BUFFER_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Stamp the next allocation identity. See [`RocmBuffer::uid`].
+pub(crate) fn next_buffer_uid() -> u64 {
+    NEXT_BUFFER_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The dequant→f16 weight cache: (bound-buffer device address, byte length) → (that buffer's
+/// [`uid`](RocmBuffer::uid), the dequantized f16 device buffer). See
+/// [`RocmBackend::weight_cache`] for why the uid is carried alongside the address key.
+pub(crate) type WeightCache = Mutex<std::collections::HashMap<(usize, usize), (u64, RocmBuffer)>>;
+
 /// A device buffer. Normally `hipMalloc`'d VRAM; for the `INFR_KV_OVERFLOW` spill path it is a
 /// `hipHostMalloc`'d, page-locked, device-mapped HOST allocation (`host_ptr` set), whose device
 /// alias (`ptr`, from `hipHostGetDevicePointer`) the KV kernels bind and read/write over PCIe.
@@ -142,6 +157,14 @@ pub struct RocmBuffer {
     /// dense weight bank under `INFR_ROCM_WEIGHT_OVERFLOW`): the HOST pointer, freed with
     /// `hipHostFree` in `drop` (which takes the host pointer, not the device alias in `ptr`).
     pub(crate) host_ptr: *mut c_void,
+    /// **Allocation identity.** A process-unique serial stamped on every real allocation and NEVER
+    /// reused. A device ADDRESS is not an identity: `hipFree` returns the block to HIP's allocator
+    /// and the very next same-sized `hipMalloc` hands the same address back for entirely different
+    /// contents. Anything that memoizes per-buffer derived state (the dequant→f16
+    /// [`weight_cache`](RocmBackend::weight_cache)) must therefore compare uids, not pointers.
+    /// A non-owning VIEW inherits the uid of the allocation it aliases; a fresh pool draw gets a
+    /// fresh uid (it is a new logical buffer even when the bytes behind it are recycled).
+    pub(crate) uid: u64,
 }
 
 // Raw device pointers are Send/Sync (they identify a VRAM region, not a CPU address).
@@ -173,6 +196,7 @@ impl RocmBuffer {
             len: bytes,
             owned: true,
             host_ptr: std::ptr::null_mut(),
+            uid: next_buffer_uid(),
         })
     }
 
@@ -192,6 +216,7 @@ impl RocmBuffer {
             len: bytes,
             owned: true,
             host_ptr: std::ptr::null_mut(),
+            uid: next_buffer_uid(),
         })
     }
 
@@ -235,6 +260,7 @@ impl RocmBuffer {
             len: bytes,
             owned: true,
             host_ptr,
+            uid: next_buffer_uid(),
         })
     }
 
@@ -395,12 +421,19 @@ pub struct RocmBackend {
     stream: ffi::hipStream_t,
     /// Compiled kernel module + function cache.
     pipelines: Pipelines,
-    /// Dequantized-weight cache: (bound-buffer device address, byte length) → f16 device buffer.
-    /// Single-generation lifetime (one backend per generation); keys are stable. The byte length
-    /// is part of the key so a freed weight buffer whose device address is later RECYCLED for a
-    /// DIFFERENTLY-SIZED weight cannot collide (address alone aliases the stale dequant — the
-    /// classic "wrong scalar for a later head" corruption when two DeltaNet shapes share a backend).
-    pub(crate) weight_cache: Mutex<std::collections::HashMap<(usize, usize), RocmBuffer>>,
+    /// Dequantized-weight cache: (bound-buffer device address, byte length) → (the bound buffer's
+    /// [`uid`](RocmBuffer::uid), f16 device buffer).
+    ///
+    /// The address is only the *slot*; the uid is the *identity*. `hipFree` returns a block to HIP's
+    /// allocator and the next same-sized `hipMalloc` hands the same address straight back, so
+    /// (address, length) alone collides whenever a weight buffer is freed and a DIFFERENT weight of
+    /// the SAME size takes its place — which is the common case, not an exotic one (an expert bank's
+    /// gate/up/down are byte-identical in size, as are the per-layer banks of any uniform model).
+    /// The old (address, length) key served the stale dequant on that collision: silently wrong
+    /// weights, no error, output wrong by ~200%. So a hit is served only when the stored uid matches
+    /// the bound buffer's; a uid mismatch means the address was recycled and the entry is REPLACED
+    /// (which frees the stale dequant, keeping the map bounded by live weight buffers).
+    pub(crate) weight_cache: WeightCache,
     /// Reusable op-scratch pool (see [`BufferPool`]). Persists across `execute` calls so the
     /// decode replay loop draws from the free-list instead of `hipMalloc`/`hipFree` per op.
     pub(crate) pool: Mutex<BufferPool>,

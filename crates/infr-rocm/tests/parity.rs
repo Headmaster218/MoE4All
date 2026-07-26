@@ -1349,6 +1349,82 @@ fn moe_ffn_matches_cpu() {
     }
 }
 
+/// Regression (R6): the dequant→f16 weight cache must key on the bound buffer's IDENTITY, not on
+/// its device ADDRESS. HIP hands a just-freed address straight back to the next same-sized
+/// `hipMalloc`, so a second graph run on the same backend sees the first run's addresses again —
+/// and before the fix it was served the FIRST run's dequantized weights for a bank whose bytes had
+/// changed, i.e. silently wrong weights with no error anywhere.
+///
+/// The MoE case makes it deterministic: `gate`/`up`/`down` are all the SAME byte length here
+/// (`n_expert*n_ff_exp*ne` f16 either way), so the three banks are exactly the recycling pool for
+/// each other. Run once with `(a, b, c)`, then again with the contents ROTATED to `(c, a, b)` — the
+/// same three addresses now back different bytes — and require the second run to still match the
+/// CPU reference. Pre-fix this fails by ~200% (the same signature as the intermittent
+/// `moe_ffn_matches_cpu` flake, which hit the identical collision whenever concurrent test threads
+/// perturbed the allocator's free-list order between its two gating arms).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn weight_dequant_cache_survives_recycled_device_addresses() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (2usize, 128usize, 4usize, 2usize, 64usize);
+
+    let x = gen(rows * ne, 3);
+    let router = gen(n_expert * ne, 9);
+    // Three same-sized expert banks with WELL-SEPARATED contents, so serving one bank's dequant
+    // for another cannot pass by luck.
+    let a = f16_bytes(&gen(n_expert * n_ff_exp * ne, 11));
+    let b = f16_bytes(&gen(n_expert * n_ff_exp * ne, 17));
+    let c = f16_bytes(&gen(n_expert * ne * n_ff_exp, 23));
+    assert_eq!(a.len(), b.len(), "banks must be the same size to collide");
+    assert_eq!(a.len(), c.len(), "banks must be the same size to collide");
+
+    let go = |backend: &dyn Backend, g: &[u8], u: &[u8], d: &[u8]| {
+        run_moe(
+            backend,
+            &x,
+            &router,
+            g,
+            u,
+            d,
+            DType::F16,
+            DType::F16,
+            DType::F16,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            MoeGating::Softmax,
+            true,
+        )
+    };
+
+    // Pass 1 populates the cache; its buffers are freed on return.
+    let _ = go(&be, &a, &b, &c);
+    // Pass 2 reuses those addresses for ROTATED contents.
+    let want = go(&cpu, &c, &a, &b);
+    let got = go(&be, &c, &a, &b);
+
+    let e = maxerr(&want, &got);
+    let ref_mag = maxabs(&want).max(1e-6);
+    println!(
+        "MoeFfn [recycled addresses] max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "MoeFfn [recycled addresses] reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 2e-2,
+        "stale dequant served for a recycled device address: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
 /// Quantized MoE experts (Slice 18 / Slice 20): gate/up as Q4_K + down as Q6_K — the Q4_K_M
 /// expert-bank layout. By default this now exercises the Slice-20 int8-activation dp4a expert path
 /// (`moe_gate_up_act_i8_q4k` + `moe_down_i8_q6k`): the token input is int8-quantized once, the
