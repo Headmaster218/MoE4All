@@ -12,6 +12,7 @@ them.
 | S0    | Config scaffold in `infr-core`: `Config` + sections, partial/merge fold, env(injected reader)/file(TOML)/cli layers, `manifest.rs`, 23 tests                                                                                                                            | `a0bff9c` |
 | S1    | CLI builds the `Config`: `--config`, `--set`, `DeviceOpts`/`SamplingOpts` fill a `ConfigOverrides` instead of `set_var`, `Arc<Config>` threaded into every command, CLI `mod tests` off its hand-rolled env lock                                                        | `addc1ac` |
 | S2    | `infr-core`'s own knobs (12) read from `Config`: `EnvRows::clamped`, `budget` flag/mib/reserve, `pager::ring_bytes`, `FusionCfg.enabled`. Temporary `Config::load_from_env()` bridge in `VulkanBackend::new_selected` (dies in S5a) and `RocmBackend::new` (dies in S6) | `6a8c2cb` |
+| S3    | `infr-cpu` (6 knobs) on `Config`: `CpuBackend::new_with(cfg)`, `reference()` → `kernels.cpu.reference`, `spin_limit()`'s `OnceLock` deleted (per-pool field). Crate is `INFR_*`-free. Bridge `Config::load_from_env()` in `CpuBackend::new` dies in **S4**              | `b2d6f04` |
 
 **Authority:** `crates/infr-core/src/config/manifest.rs` is the knob inventory —
 177 keys, their config paths, grammars, and a `migrated` flag — and the tests
@@ -587,16 +588,6 @@ means off.
   Convert it there.
 - `budget.rs`'s `SpillNouns.env` and the `KV_SPILL`/`WEIGHT_SPILL` consts keep
   the `INFR_*` spellings as user-visible BANNER TEXT, not reads. Leave them.
-
-### S3 — `infr-cpu`
-
-7 read sites / 6 keys (§6.7 + `INFR_PROF_OPS`, `INFR_MOE_COUNTS_DEBUG`,
-`INFR_MOE_COUNTS_DUMP`). `CpuBackend::new_with(cfg)`; fold `reference: bool`
-into `kernels.cpu`; delete the `SPIN_LIMIT` `OnceLock`. Rewrite
-`crates/infr-cpu/tests/decode_parity.rs` to build a `Config` instead of calling
-`CpuBackend::reference()`.
-
-**Exit:** `grep -rn 'INFR_' crates/infr-cpu/src` returns nothing.
 
 ### S4 — `infr-llama` seam (51 sites / 38 keys)
 
