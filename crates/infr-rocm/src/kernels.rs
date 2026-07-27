@@ -4,8 +4,9 @@
 //! buffers — uncovered quantized weights are dequantized to f16 on the host BEFORE they reach a
 //! kernel (see `exec.rs`'s dequant cache), so those kernels stay format-agnostic and simple. The
 //! `NATIVE_DECODE` kernels (Phase 3, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/
-//! IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S) are the exception: they read the RAW quant bytes and
-//! decode each block in-kernel, so no f16 cache is materialized (VRAM ≈ quant_size).
+//! IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0) are the exception: they
+//! read the RAW quant bytes and decode each block in-kernel, so no f16 cache is materialized
+//! (VRAM ≈ quant_size).
 //!
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
 //! `HashMap`. The module is compiled at most ONCE per (source, arch, HIP stack): `Pipelines::build`
@@ -78,18 +79,19 @@ fn iq4nl_codebook_src() -> String {
     )
 }
 
-/// Emit the IQ2 / IQ3 **grids** and the shared `ksigns` sign-pattern table as HIP source,
-/// GENERATED from [`infr_core::iquant_grids`] — the single host-side source of truth that
+/// Emit the IQ1 / IQ2 / IQ3 **grids**, the shared `ksigns` sign-pattern table and the IQ1 `delta`
+/// constant as HIP source, GENERATED from [`infr_core::iquant_grids`] and
+/// [`infr_gguf::dequant::IQ1S_DELTA`] — the single host-side sources of truth that
 /// `infr_gguf::dequant::dequant_codebook` (the decode oracle), the CPU kernels and Vulkan's
 /// `native_grids.glsl` all read. As with R4's codebook, emitting rather than re-typing is what
 /// makes a drift between the device decode and its oracle impossible; a unit test parses the
 /// emitted text back and requires it to BE the host statics.
 ///
 /// **Why baked into the module source rather than uploaded as a device buffer.** These are much
-/// bigger than R4's 16-byte codebook — 17.1 KiB across six tables — so the trade was re-measured
-/// rather than inherited:
+/// bigger than R4's 16-byte codebook — 33.1 KiB across seven tables, of which R6's 2048-entry
+/// `g_iq1s` is 16 KiB on its own — so the trade was re-measured rather than inherited:
 ///
-/// * A device buffer would need an extra pointer parameter on EVERY IQ2/IQ3 kernel. Those
+/// * A device buffer would need an extra pointer parameter on EVERY IQ1/IQ2/IQ3 kernel. Those
 ///   signatures come from macros SHARED with the affine formats (`GEN_LINEAR`, `GEN_EMBED`,
 ///   `GEN_DEQF16`, `GEN_MOE_FFN`, `GEN_MOE_GATE_UP`, `GEN_MOE_DOWN` and their routed twins), and
 ///   `exec.rs` binds those kernels' arguments positionally from ONE per-op arm each, so the
@@ -105,17 +107,18 @@ fn iq4nl_codebook_src() -> String {
 /// * The measured cost is hiprtc parse time on a COLD comgr cache only, and it is small next to
 ///   the kernels themselves (see the R5 numbers on `moe_expert_kernel`).
 ///
-/// The IQ2 grids are `unsigned long long` (8 packed signed bytes per entry) and the IQ3 grids
+/// The IQ1/IQ2 grids are `unsigned long long` (8 packed signed bytes per entry) and the IQ3 grids
 /// `unsigned int` (4), matching the host types exactly so the index arithmetic is the oracle's.
 fn iquant_grid_src() -> String {
     use infr_core::iquant_grids as g;
-    let mut s = String::with_capacity(80 * 1024);
+    let mut s = String::with_capacity(160 * 1024);
     s.push_str(
-        "\n// ── IQ2/IQ3 grids — GENERATED from infr_core::iquant_grids ──────────────────────\n\
+        "\n// ── IQ1/IQ2/IQ3 grids — GENERATED from infr_core::iquant_grids ──────────────────\n\
          // The stored code is an INDEX into a table of packed signed-byte vectors (8 bytes per\n\
-         // entry for IQ2, 4 for IQ3); a separate sign bit per element negates it. `ksigns_iq2xs`\n\
-         // expands a 7-bit sign-pattern index into the 8 sign bits (IQ2_S / IQ3_S carry raw sign\n\
-         // BYTES instead and do not use it).\n",
+         // entry for IQ1/IQ2, 4 for IQ3); a separate sign bit per element negates it (IQ2/IQ3) or\n\
+         // a separate ±`IQ1S_DELTA` addend shifts it (IQ1). `ksigns_iq2xs` expands a 7-bit\n\
+         // sign-pattern index into the 8 sign bits (IQ2_S / IQ3_S carry raw sign BYTES instead and\n\
+         // do not use it; the IQ1 formats have no sign field at all).\n",
     );
     // One emitter for all six tables: `per_line` keeps the generated text greppable, and the
     // fixed-width hex makes the round-trip parse in `codebook_tests` unambiguous.
@@ -145,6 +148,11 @@ fn iquant_grid_src() -> String {
         ("g_iq2xxs", &g::IQ2XXS_GRID[..]),
         ("g_iq2xs", &g::IQ2XS_GRID[..]),
         ("g_iq2s", &g::IQ2S_GRID[..]),
+        // R6: IQ1_S and IQ1_M SHARE this one — 2048 entries, an 11-bit index (the widest in the
+        // family), and every packed byte is −1/0/+1, which is what lets the int8 tier fold the
+        // fractional delta into the code (`8·gv ± 1`). Same `unsigned long long` type as the IQ2
+        // grids, so `gsb8` reads it unchanged.
+        ("g_iq1s", &g::IQ1S_GRID[..]),
     ] {
         table(
             "unsigned long long",
@@ -164,6 +172,14 @@ fn iquant_grid_src() -> String {
             8,
         );
     }
+    // R6: the IQ1 ADDEND, emitted from the host constant for the same reason the tables are — a
+    // re-typed 0.125f would be a second source of truth for the one number that distinguishes this
+    // family from R5's. `{:e}` keeps it a valid C float literal for any value the host might hold.
+    s.push_str(&format!(
+        "// IQ1_S / IQ1_M grid addend — GENERATED from infr_gguf::dequant::IQ1S_DELTA\n\
+         #define IQ1S_DELTA {:e}f\n",
+        infr_gguf::dequant::IQ1S_DELTA
+    ));
     s
 }
 
@@ -1556,10 +1572,12 @@ extern "C" __global__ void moe_shared_expert_add(
 // so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
 // lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, the legacy
-// 32-element round quants Q4_0, Q4_1, Q5_0, Q5_1, and the codebook 4-bit quants IQ4_NL, IQ4_XS
-// (the sets a Q2_K / Q3_K_M / Q4_K_M / Q5_K_M / Q4_0 / Q4_1 / IQ4_XS / IQ4_NL GGUF uses —
-// unsloth's gemma-3 Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already native via
-// `linear_f16`).
+// 32-element round quants Q4_0, Q4_1, Q5_0, Q5_1, the codebook 4-bit quants IQ4_NL, IQ4_XS, the
+// grid quants IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, the IQ1 quants IQ1_S, IQ1_M, and the ternary
+// quants TQ1_0, TQ2_0, Q2_0 — 22 of the 24 weight formats (the sets a Q2_K / Q3_K_M / Q4_K_M /
+// Q5_K_M / Q4_0 / Q4_1 / IQ4_XS / IQ4_NL / UD-IQ*_* / TQ*_0 / Q2_0 GGUF uses — unsloth's gemma-3
+// Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already native via `linear_f16`). Only MXFP4 and
+// NVFP4 remain on the dequant→f16 fallback.
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -1883,22 +1901,178 @@ __device__ __forceinline__ float deq_iq3s(const unsigned char* w, long i) {
     return fing(db, gsb4(g_iq3s[gidx], j & 3), (int)((sg >> j) & 1u));
 }
 
-// ── Per-32-block int8 decode for the grid quants ─────────────────────────────
+// ── IQ1 quants (IQ1_S / IQ1_M) — R5's grid shape plus a fractional ADDEND ────
+// R6's genuinely new decode shape. Like R5 the stored code indexes a table of packed signed-byte
+// vectors (here `g_iq1s`, 2048 entries / an 11-bit index — shared by BOTH formats), but there is no
+// sign field: instead the decoded element is
+//     y = dl · (gv + delta),   delta = ±IQ1S_DELTA (±0.125)
+// i.e. a per-group ADDEND applied INSIDE the code's own scale. Nothing in R1..R5 has that shape —
+// it is not the affine `d·code + m` either, whose `m` sits OUTSIDE the code's scale, which is why
+// this needs its own `fina` helper rather than `fin` or `fing`.
+//
+// Both walk 256 elements as 8 sub-blocks of 32, each 4 groups of 8 (ib = p>>5, l = (p>>3)&3,
+// j = p&7 — R5's traversal exactly). They differ in where the scale, the 3 high index bits and the
+// delta sign come from:
+//                grid index          delta sign        scale per group
+//   IQ1_S  50 B  qs[4ib+l] | qh<<8   qh bit 15         ONE per 32: d·(2·((qh>>12)&7)+1)
+//   IQ1_M  56 B  qs[4ib+l] | qh<<8|4 qh byte 0x08/0x80 TWO per 32: dl1 (l<2) / dl2 (l≥2)
+// IQ1_M has no standalone `d` field at all — its f16 bits are the TOP NIBBLES of the four u16
+// scale words, whose low 12 bits carry the four 3-bit `dl` sub-scales (`iq1m_d` reassembles it;
+// `infr_core::decode_spec::ScaleEnc::Iq1mSplitF16` is the host description of the same layout).
+
+// The `2·ls + 1` sub-scale form both IQ1 formats use, contraction pinned off for the same reason
+// `fin` pins it: the host reference does not fuse and an FMA could move the f16 round.
+__device__ __forceinline__ float iq1_dl(float d, int ls) {
+#pragma clang fp contract(off)
+    return d * (2.0f * (float)ls + 1.0f);
+}
+
+// IQ1_M's `d`: no standalone f16 field — nibble `i` of the f16 lives in bits 12..16 of the little-
+// endian u16 scale word `i` (block bytes 48..56). Reassemble the bits and read them as a __half,
+// exactly as the host oracle does with `half::f16::from_bits`.
+__device__ __forceinline__ float iq1m_d(const unsigned char* b) {
+    unsigned int s0 = (unsigned int)b[48] | ((unsigned int)b[49] << 8);
+    unsigned int s1 = (unsigned int)b[50] | ((unsigned int)b[51] << 8);
+    unsigned int s2 = (unsigned int)b[52] | ((unsigned int)b[53] << 8);
+    unsigned int s3 = (unsigned int)b[54] | ((unsigned int)b[55] << 8);
+    union { unsigned short u; __half h; } cvt;
+    cvt.u = (unsigned short)((s0 >> 12) | ((s1 >> 8) & 0x00f0u)
+                           | ((s2 >> 4) & 0x0f00u) | (s3 & 0xf000u));
+    return __half2float(cvt.h);
+}
+
+// `fin` for an IQ1 quant. The host spells the element as `dl * (gv + delta)` — ONE add inside ONE
+// multiply — so reproduce THAT, not `fin(dl, gv, dl*delta)` (algebraically equal, two roundings
+// instead of one) and not `finc`. Same f16 round-trip as every other native decode.
+__device__ __forceinline__ float fina(float dl, int gv, float delta) {
+#pragma clang fp contract(off)
+    float val = dl * ((float)gv + delta);
+    return __half2float(__float2half(val));
+}
+
+// ── IQ1_S: 256 elems / 50 bytes = [half d][u8 qs[32]][u16 qh[8]]. ──
+// Sub-block `ib` owns one `qh` u16: bits 0..11 are the four groups' 3 high index bits (group `l` at
+// shift `3l`), bits 12..14 the sub-scale, bit 15 the delta sign.
+__device__ __forceinline__ float deq_iq1s(const unsigned char* w, long i) {
+    long blk = i >> 8;                 // / 256
+    int p = (int)(i & 255);
+    const unsigned char* b = w + blk * 50;
+    int ib = p >> 5, l = (p >> 3) & 3, j = p & 7;
+    const unsigned char* qhp = b + 34 + 2 * ib;
+    unsigned int qh = (unsigned int)qhp[0] | ((unsigned int)qhp[1] << 8);
+    float dl = iq1_dl(rf16b(b), (int)((qh >> 12) & 7u));
+    float delta = (qh & 0x8000u) ? -IQ1S_DELTA : IQ1S_DELTA;
+    unsigned int gidx = (unsigned int)b[2 + ib * 4 + l] | (((qh >> (3 * l)) & 7u) << 8);
+    return fina(dl, gsb8(g_iq1s[gidx], j), delta);
+}
+
+// ── IQ1_M: 256 elems / 56 bytes = [u8 qs[32]][u8 qh[16]][u8 scales[8]]. ──
+// Two `qh` BYTES per sub-block: byte `ib*2` serves groups l=0,1 and byte `ib*2+1` groups l=2,3.
+// Within a byte the even group takes its 3 high index bits at shift 8 and its delta from bit 0x08,
+// the odd group at shift 4 and from bit 0x80. The sub-scale is the 3-bit field at `6·(ib&1)` (+3
+// for l≥2) of scale word `ib>>1`.
+__device__ __forceinline__ float deq_iq1m(const unsigned char* w, long i) {
+    long blk = i >> 8;                 // / 256
+    int p = (int)(i & 255);
+    const unsigned char* b = w + blk * 56;
+    int ib = p >> 5, l = (p >> 3) & 3, j = p & 7;
+    const unsigned char* sp = b + 48 + 2 * (ib >> 1);
+    unsigned int scw = (unsigned int)sp[0] | ((unsigned int)sp[1] << 8);
+    float dl = iq1_dl(iq1m_d(b), (int)((scw >> (6 * (ib & 1) + ((l < 2) ? 0 : 3))) & 7u));
+    unsigned int qhb = b[32 + ib * 2 + (l >> 1)];
+    unsigned int gidx = (unsigned int)b[ib * 4 + l] | ((qhb << ((l & 1) ? 4 : 8)) & 0x700u);
+    float delta = (qhb & ((l & 1) ? 0x80u : 0x08u)) ? -IQ1S_DELTA : IQ1S_DELTA;
+    return fina(dl, gsb8(g_iq1s[gidx], j), delta);
+}
+
+// ── TERNARY quants (TQ1_0 / TQ2_0 / Q2_0) ────────────────────────────────────
+// The other half of R6, and the SIMPLEST family in the set: no grid, no codebook, no sign field, no
+// sub-block scales — ONE f16 `d` per block and a small unsigned code that dequants to
+// `y = (code − 1) · d` with the level set {−1, 0, +1} (TQ1_0) or {−1, 0, +1, +2} (TQ2_0 / Q2_0,
+// whose top code is unused in practice). The `−1` is a CONSTANT offset, so unlike the affine quants
+// it is folded straight into the signed weight code and the int8 tier carries no ones-dot either.
+// Since the value is one f32 multiply with no addend, the oracle's expression is `finc`'s.
+// They differ only in the packing:
+//   TQ1_0  54 B / 256   FIVE base-3 digits per byte, `digit = ((u8)(byte·3ⁿ) · 3) >> 8`
+//   TQ2_0  66 B / 256   4 elements per byte at 2 bits, two 32-byte chunks × 4 shifts × 32
+//   Q2_0   18 B /  64   4 elements per byte at 2 bits, SEQUENTIAL (infr's own 64-element format)
+
+// 3ⁿ for n ∈ 0..4 as a select cascade, NOT a local array: a dynamically indexed local `const int[5]`
+// lowers to per-invocation scratch on AMDGCN, and this is on the innermost decode path.
+__device__ __forceinline__ unsigned int tq1_pow3(int n) {
+    return (n < 2) ? ((n < 1) ? 1u : 3u) : ((n < 3) ? 9u : ((n < 4) ? 27u : 81u));
+}
+
+// Signed ternary code (`digit − 1` ∈ {−1,0,+1}) for element `p` of the TQ1_0 super-block at `b`.
+// The dequant emits its 256 elements in THREE segments, and this is that walk inverted:
+//   p <  160   qs[0..32]  × 5 digit passes   byte = qs[p&31],        n = p>>5
+//   p <  240   qs[32..48] × 5 digit passes   byte = qs[32+((p−160)&15)], n = (p−160)>>4
+//   else       qh[0..4]   × 4 digit passes   byte = qh[(p−240)&3],   n = (p−240)>>2
+// The byte×3ⁿ product WRAPS at 8 bits (the host does a `u8::wrapping_mul`), which is what makes the
+// base-3 digit extraction work — masking to 0xFF here is that wrap, not a defensive clamp.
+__device__ __forceinline__ int tq10_code(const unsigned char* b, int p) {
+    int n, by;
+    if (p < 160)      { n = p >> 5;              by = b[p & 31]; }
+    else if (p < 240) { int q = p - 160; n = q >> 4; by = b[32 + (q & 15)]; }
+    else              { int q = p - 240; n = q >> 2; by = b[48 + (q & 3)]; }
+    unsigned int v = ((unsigned int)by * tq1_pow3(n)) & 0xFFu;
+    return (int)((v * 3u) >> 8) - 1;
+}
+
+// ── TQ1_0: 256 elems / 54 bytes = [u8 qs[48]][u8 qh[4]][half d]. ──
+__device__ __forceinline__ float deq_tq10(const unsigned char* w, long i) {
+    const unsigned char* b = w + (i >> 8) * 54;
+    return finc(rf16b(b + 52), tq10_code(b, (int)(i & 255)));
+}
+
+// ── TQ2_0: 256 elems / 66 bytes = [u8 qs[64]][half d]. ──
+// Element `p` = chunk `p>>7` (which 32-byte half of `qs`), shift `2·((p>>5)&3)`, byte `p&31`.
+__device__ __forceinline__ float deq_tq20(const unsigned char* w, long i) {
+    int p = (int)(i & 255);
+    const unsigned char* b = w + (i >> 8) * 66;
+    int code = (int)((b[(p >> 7) * 32 + (p & 31)] >> (2 * ((p >> 5) & 3))) & 3u) - 1;
+    return finc(rf16b(b + 64), code);
+}
+
+// ── Q2_0: 64 elems / 18 bytes = [half d][u8 qs[16]]. ──
+// infr's OWN ternary format (the only 64-element block in the natively decoded set): element `j`
+// is simply the 2-bit field at shift `2·(j&3)` of byte `j>>2` — no chunking, no digit packing.
+__device__ __forceinline__ float deq_q20(const unsigned char* w, long i) {
+    int p = (int)(i & 63);
+    const unsigned char* b = w + (i >> 6) * 18;   // 64 elements per block
+    int code = (int)((b[2 + (p >> 2)] >> (2 * (p & 3))) & 3u) - 1;
+    return finc(rf16b(b), code);
+}
+
+// ── Per-32-block int8 decode: the `wdec_*` family ────────────────────────────
 // The SHARED body of the dp4a GEMV (`linear_i8_*` / `i8acc_*`) and the WMMA prefill tier: decode
 // 32-block `blk` of output row `col` into 32 SIGNED codes plus the two f32 scales its 16-element
 // halves carry (`*s0` for elements 0..15, `*s1` for 16..31 — equal for the formats whose scale is
 // per-32). Having one decoder per format instead of one per format×tier is what keeps the three
-// tiers provably in agreement, and it is what lets ONE `GEN_WMMA_IQG` body serve all five.
+// tiers provably in agreement, and it is what lets ONE `GEN_WMMA_WDEC` body serve all of them.
 //
-// The grid byte is ALREADY signed and the sign bit merely negates it, so `code` IS the dp4a
-// operand: like R4's codebook formats — and unlike every affine one — there is no offset and
-// therefore no ones-dot / min-correction term anywhere in this family. |code| ≤ 62 (IQ3_XXS's
-// widest grid byte), so a 32-wide dot against int8 activations stays far inside i32.
+// EVERY format on this seam has a SIGNED code and therefore NO ones-dot / min-correction term
+// anywhere — that is the property that admits the shared body, and it is why the affine formats
+// (which need an `isum` against an all-ones B operand) keep their own hand-written kernels:
+//   * R5's grid quants — the grid byte is already signed, the sign bit merely negates it.
+//     |code| ≤ 62 (IQ3_XXS's widest grid byte).
+//   * R6's IQ1 quants — the element is `dl·(gv + delta)` with `gv ∈ {−1,0,+1}` and
+//     `delta = ±0.125`, so ×8 makes it EXACTLY integer: `code = 8·gv ± 1 ∈ {−9,−7,−1,+1,+7,+9}`
+//     with the scale `dl·0.125`. Both halves of that identity are exact in binary (0.125 is a power
+//     of two; `dl` is never near subnormal), so this is a re-association of the oracle, not an
+//     approximation — and it dissolves the addend into the code instead of paying a per-group
+//     ones-dot, which IQ1_M would need PER GROUP OF 8 (its delta sign varies per 8) rather than
+//     per 32. |code| ≤ 9.
+//   * R6's ternary quants — the constant `−1` offset is folded into the stored code directly,
+//     giving `code ∈ {−1,0,+1}` (TQ1_0) or `{−1,0,+1,+2}` (TQ2_0/Q2_0). |code| ≤ 2.
+// The widest of those is 62, so a 32-wide dot against int8 activations stays far inside i32, and
+// every code fits the int8 WMMA operand.
 //
-// The grid entry and the sign pattern are fetched ONCE PER GROUP OF 8 and the 8 elements peeled off
-// them in registers. That hoisting is the whole performance story for these formats: a per-element
-// gather re-reads the same table entry 8 times and leaves an already ALU-heavy decode gather-bound
-// (the finding Vulkan's grid GEMVs reached independently).
+// For the grid formats the grid entry and the sign pattern are fetched ONCE PER GROUP OF 8 and the
+// 8 elements peeled off them in registers. That hoisting is the whole performance story for those:
+// a per-element gather re-reads the same table entry 8 times and leaves an already ALU-heavy decode
+// gather-bound (the finding Vulkan's grid GEMVs reached independently). The ternary formats have no
+// table at all, so their bodies are a flat 32-element unpack.
 __device__ __forceinline__ void wdec_iq2xxs(
     const unsigned char* __restrict__ w, long col, int nblk, int blk,
     signed char* code, float* s0, float* s1) {
@@ -1996,6 +2170,89 @@ __device__ __forceinline__ void wdec_iq3s(
             int gv = gsb4((j < 4) ? g1 : g2, j & 3);
             code[l * 8 + j] = (signed char)(((sg >> j) & 1u) ? -gv : gv);
         }
+    }
+}
+
+// R6 IQ1: the ×8 fold described above turns `dl·(gv + delta)` into `(dl·0.125)·(8·gv ± 1)`, so the
+// delta never reaches the f32 epilogue and the family needs no ones-dot. IQ1_S's scale and delta
+// sign are per-32 (`*s0 == *s1`); IQ1_M's scale is per-16 and its delta sign per-8, which is why
+// the sign is recomputed inside the group loop there and hoisted out of it here.
+__device__ __forceinline__ void wdec_iq1s(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * (nblk >> 3) + (blk >> 3)) * 50;
+    int ib = blk & 7;
+    const unsigned char* qhp = b + 34 + 2 * ib;
+    unsigned int qh = (unsigned int)qhp[0] | ((unsigned int)qhp[1] << 8);
+    float ds = iq1_dl(rf16b(b), (int)((qh >> 12) & 7u)) * IQ1S_DELTA;
+    *s0 = ds; *s1 = ds;
+    int sgn = (qh & 0x8000u) ? -1 : 1;
+    const unsigned char* qs = b + 2 + ib * 4;
+    for (int l = 0; l < 4; l++) {
+        unsigned long long g = g_iq1s[(unsigned int)qs[l] | (((qh >> (3 * l)) & 7u) << 8)];
+        for (int j = 0; j < 8; j++) code[l * 8 + j] = (signed char)(8 * gsb8(g, j) + sgn);
+    }
+}
+
+__device__ __forceinline__ void wdec_iq1m(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * (nblk >> 3) + (blk >> 3)) * 56;
+    int ib = blk & 7;
+    float d = iq1m_d(b);
+    const unsigned char* sp = b + 48 + 2 * (ib >> 1);
+    unsigned int scw = (unsigned int)sp[0] | ((unsigned int)sp[1] << 8);
+    int sh = 6 * (ib & 1);
+    *s0 = iq1_dl(d, (int)((scw >> sh) & 7u)) * IQ1S_DELTA;
+    *s1 = iq1_dl(d, (int)((scw >> (sh + 3)) & 7u)) * IQ1S_DELTA;
+    const unsigned char* qs = b + ib * 4;
+    const unsigned char* qh = b + 32 + ib * 2;
+    for (int l = 0; l < 4; l++) {
+        unsigned int qhb = qh[l >> 1];
+        unsigned long long g = g_iq1s[(unsigned int)qs[l] | ((qhb << ((l & 1) ? 4 : 8)) & 0x700u)];
+        int sgn = (qhb & ((l & 1) ? 0x80u : 0x08u)) ? -1 : 1;
+        for (int j = 0; j < 8; j++) code[l * 8 + j] = (signed char)(8 * gsb8(g, j) + sgn);
+    }
+}
+
+// R6 ternary: ONE `d` per block for all three, so `*s0 == *s1` always and the whole decode is the
+// element unpack with the `−1` folded in.
+__device__ __forceinline__ void wdec_tq10(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * (nblk >> 3) + (blk >> 3)) * 54;
+    float d = rf16b(b + 52);
+    *s0 = d; *s1 = d;
+    int base = (blk & 7) * 32;
+    for (int p = 0; p < 32; p++) code[p] = (signed char)tq10_code(b, base + p);
+}
+
+__device__ __forceinline__ void wdec_tq20(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * (nblk >> 3) + (blk >> 3)) * 66;
+    float d = rf16b(b + 64);
+    *s0 = d; *s1 = d;
+    // A 32-element block is exactly one (chunk, shift) pair, so the 32 codes are 32 CONSECUTIVE
+    // bytes read at one shift — the tidiest inner loop of any covered format.
+    int w32 = blk & 7;
+    const unsigned char* qs = b + (w32 >> 2) * 32;
+    int sh = 2 * (w32 & 3);
+    for (int p = 0; p < 32; p++) code[p] = (signed char)((int)((qs[p] >> sh) & 3u) - 1);
+}
+
+// Q2_0 is the ONE covered format whose block is not 32 or 256 elements: 64, i.e. TWO activation
+// 32-blocks per header. So the block index is `blk>>1` (not `blk>>3`) and the half selects which
+// 8 of the 16 `qs` bytes this 32-block owns.
+__device__ __forceinline__ void wdec_q20(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * (nblk >> 1) + (blk >> 1)) * 18;
+    float d = rf16b(b);
+    *s0 = d; *s1 = d;
+    const unsigned char* qs = b + 2 + (blk & 1) * 8;
+    for (int p = 0; p < 32; p++) {
+        code[p] = (signed char)((int)((qs[p >> 2] >> (2 * (p & 3))) & 3u) - 1);
     }
 }
 
@@ -2200,6 +2457,11 @@ GEN_LINEAR(iq2xs)
 GEN_LINEAR(iq2s)
 GEN_LINEAR(iq3xxs)
 GEN_LINEAR(iq3s)
+GEN_LINEAR(iq1s)
+GEN_LINEAR(iq1m)
+GEN_LINEAR(tq10)
+GEN_LINEAR(tq20)
+GEN_LINEAR(q20)
 GEN_EMBED(q80)
 GEN_EMBED(q2k)
 GEN_EMBED(q3k)
@@ -2217,6 +2479,11 @@ GEN_EMBED(iq2xs)
 GEN_EMBED(iq2s)
 GEN_EMBED(iq3xxs)
 GEN_EMBED(iq3s)
+GEN_EMBED(iq1s)
+GEN_EMBED(iq1m)
+GEN_EMBED(tq10)
+GEN_EMBED(tq20)
+GEN_EMBED(q20)
 "#;
 
 // ── Dequant-to-f16 + activation cast (Slice 26, rocBLAS f16 prefill GEMM) ─────
@@ -2252,6 +2519,11 @@ GEN_DEQF16(iq2xs)
 GEN_DEQF16(iq2s)
 GEN_DEQF16(iq3xxs)
 GEN_DEQF16(iq3s)
+GEN_DEQF16(iq1s)
+GEN_DEQF16(iq1m)
+GEN_DEQF16(tq10)
+GEN_DEQF16(tq20)
+GEN_DEQF16(q20)
 
 extern "C" __global__ void cast_f32_f16(
     const float* __restrict__ x, __half* __restrict__ out, int n) {
@@ -2423,6 +2695,25 @@ GEN_MOE_FFN(iq3s, iq4nl)
 GEN_MOE_FFN(iq3s, iq4xs)
 GEN_MOE_FFN(iq3s, q4k)
 GEN_MOE_FFN(iq3s, q6k)
+GEN_MOE_FFN(iq1s, iq1s)
+GEN_MOE_FFN(iq1s, iq1m)
+GEN_MOE_FFN(iq1s, iq2xxs)
+GEN_MOE_FFN(iq1s, iq2s)
+GEN_MOE_FFN(iq1s, iq3s)
+GEN_MOE_FFN(iq1s, iq4xs)
+GEN_MOE_FFN(iq1s, q4k)
+GEN_MOE_FFN(iq1s, q6k)
+GEN_MOE_FFN(iq1m, iq1s)
+GEN_MOE_FFN(iq1m, iq1m)
+GEN_MOE_FFN(iq1m, iq2xxs)
+GEN_MOE_FFN(iq1m, iq2s)
+GEN_MOE_FFN(iq1m, iq3s)
+GEN_MOE_FFN(iq1m, iq4xs)
+GEN_MOE_FFN(iq1m, q4k)
+GEN_MOE_FFN(iq1m, q6k)
+GEN_MOE_FFN(tq10, tq10)
+GEN_MOE_FFN(tq20, tq20)
+GEN_MOE_FFN(q20, q20)
 "#;
 
 // ── Int8-activation dp4a decode GEMV (Phase 4) ───────────────────────────────
@@ -2446,15 +2737,17 @@ GEN_MOE_FFN(iq3s, q6k)
 // REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
 // covers every row, so the activation quant cost amortizes over the whole GEMV.
 //
-// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ4_XS and
-// the R5 grid quants IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S. `rf16b`/`k4`/`q3k_sc6`/`wdec_*` live in
-// NATIVE_DECODE, `kv_iq4nl` and the grids in the generated parts (all assembled before this one).
-// Uncovered formats keep the dequant→f16 fallback.
+// Covered formats: Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ4_XS, the
+// R5 grid quants IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, and the R6 IQ1 quants IQ1_S, IQ1_M plus
+// ternary quants TQ1_0, TQ2_0, Q2_0. `rf16b`/`k4`/`q3k_sc6`/`wdec_*` live in NATIVE_DECODE,
+// `kv_iq4nl` and the grids in the generated parts (all assembled before this one). Uncovered
+// formats (MXFP4, NVFP4) keep the dequant→f16 fallback.
 //
 // The affine formats fold their offset into a SECOND integer dot against an all-ones B operand
-// (`isum`), weighted by the block's min. The R4 codebook formats (IQ4_NL/IQ4_XS) and the R5 grid
-// formats have no offset at all — the table value is already the signed weight — so they carry no
-// `isum` term.
+// (`isum`), weighted by the block's min. Everything on the `wdec_*` seam — the R4 codebook formats
+// (IQ4_NL/IQ4_XS), the R5 grid formats, and R6's IQ1/ternary formats — carries NO `isum` term: the
+// decoded code is already the signed weight (see the `wdec_*` header for the per-family reason,
+// including IQ1's ×8 delta fold and ternary's folded `−1`).
 const INT8_DECODE: &str = r#"
 // Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
 // scale = amax/127 (llama.cpp/GPU convention: `roundf`, half-away-from-zero). One thread / 32-block.
@@ -3116,17 +3409,18 @@ extern "C" __global__ void linear_i8_iq4xs(
     }
 }
 
-// ── GRID quants (R5): IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S. ──
-// ONE macro for all five, because `wdec_##FMT` (NATIVE_DECODE) already absorbed every difference
+// ── The `wdec_*` seam: R5's grid quants + R6's IQ1 and ternary quants. ──
+// ONE macro for all ten, because `wdec_##FMT` (NATIVE_DECODE) already absorbed every difference
 // between them: it hands back 32 signed codes and the two scales the block's 16-element halves
-// carry. Like R4's codebook formats the grid byte IS the dp4a operand, so there is no ones-dot.
+// carry. Every format on this seam has an already-signed code (see the `wdec_*` header for why —
+// the grid byte, IQ1's ×8 delta fold, ternary's folded `−1`), so there is no ones-dot.
 //
-// Why TWO 16-wide dots rather than Q8_0's single 32-wide one: IQ2_XS and IQ2_S put a separate
-// 4-bit scale magnitude on each half of a 32-element block (`scales[ib32]`'s two nibbles), so the
-// halves cannot share an int accumulator. The three formats whose scale IS per-32 pass the same
-// value twice — one extra f32 multiply per block, which keeps a single body for the family instead
-// of splitting it two ways over a difference that costs nothing in a decode-bound kernel.
-#define GEN_LINEAR_I8_IQG(FMT) \
+// Why TWO 16-wide dots rather than Q8_0's single 32-wide one: IQ2_XS, IQ2_S and IQ1_M put a
+// separate scale on each half of a 32-element block, so the halves cannot share an int accumulator.
+// The formats whose scale IS per-32 pass the same value twice — one extra f32 multiply per block,
+// which keeps a single body for the family instead of splitting it two ways over a difference that
+// costs nothing in a decode-bound kernel.
+#define GEN_LINEAR_I8_WDEC(FMT) \
 extern "C" __global__ void linear_i8_##FMT( \
     const signed char* __restrict__ qx, \
     const float* __restrict__ xs, \
@@ -3161,11 +3455,16 @@ extern "C" __global__ void linear_i8_##FMT( \
         dst[oi] = resid ? (acc + resid[oi]) : acc; \
     } \
 }
-GEN_LINEAR_I8_IQG(iq2xxs)
-GEN_LINEAR_I8_IQG(iq2xs)
-GEN_LINEAR_I8_IQG(iq2s)
-GEN_LINEAR_I8_IQG(iq3xxs)
-GEN_LINEAR_I8_IQG(iq3s)
+GEN_LINEAR_I8_WDEC(iq2xxs)
+GEN_LINEAR_I8_WDEC(iq2xs)
+GEN_LINEAR_I8_WDEC(iq2s)
+GEN_LINEAR_I8_WDEC(iq3xxs)
+GEN_LINEAR_I8_WDEC(iq3s)
+GEN_LINEAR_I8_WDEC(iq1s)
+GEN_LINEAR_I8_WDEC(iq1m)
+GEN_LINEAR_I8_WDEC(tq10)
+GEN_LINEAR_I8_WDEC(tq20)
+GEN_LINEAR_I8_WDEC(q20)
 "#;
 
 // ── Fused RMSNorm → int8 activation quant (Slice 32) ──────────────────────────
@@ -3636,10 +3935,11 @@ __device__ __forceinline__ float i8acc_iq4xs(
     return acc;
 }
 
-// Per-lane int8 dp4a accumulation for the R5 GRID quants — the `linear_i8_##FMT` inner loop
-// verbatim, over the same shared `wdec_##FMT` decoder, so the MoE expert path and the dense GEMV
-// cannot diverge. Same two-16-wide-dots shape and the same no-ones-dot rule as there.
-#define GEN_I8ACC_IQG(FMT) \
+// Per-lane int8 dp4a accumulation for every format on the `wdec_*` seam (R5's grid quants, R6's
+// IQ1 and ternary quants) — the `linear_i8_##FMT` inner loop verbatim, over the same shared
+// `wdec_##FMT` decoder, so the MoE expert path and the dense GEMV cannot diverge. Same
+// two-16-wide-dots shape and the same no-ones-dot rule as there.
+#define GEN_I8ACC_WDEC(FMT) \
 __device__ __forceinline__ float i8acc_##FMT( \
     const signed char* __restrict__ qxr, const float* __restrict__ xsr, \
     const unsigned char* __restrict__ w, int o, int nb, int tid) { \
@@ -3659,11 +3959,16 @@ __device__ __forceinline__ float i8acc_##FMT( \
     } \
     return acc; \
 }
-GEN_I8ACC_IQG(iq2xxs)
-GEN_I8ACC_IQG(iq2xs)
-GEN_I8ACC_IQG(iq2s)
-GEN_I8ACC_IQG(iq3xxs)
-GEN_I8ACC_IQG(iq3s)
+GEN_I8ACC_WDEC(iq2xxs)
+GEN_I8ACC_WDEC(iq2xs)
+GEN_I8ACC_WDEC(iq2s)
+GEN_I8ACC_WDEC(iq3xxs)
+GEN_I8ACC_WDEC(iq3s)
+GEN_I8ACC_WDEC(iq1s)
+GEN_I8ACC_WDEC(iq1m)
+GEN_I8ACC_WDEC(tq10)
+GEN_I8ACC_WDEC(tq20)
+GEN_I8ACC_WDEC(q20)
 
 // Gate+up+activation for one expert: block `o` (0..nff) computes h_out[o] = act(g·wg)·(u·wg)·wo·dsc.
 // `qx`/`xs` are the int8 quantization of the token's input row x[ne] (produced ONCE per token, reused
@@ -3737,6 +4042,11 @@ GEN_MOE_GATE_UP(iq2xs)
 GEN_MOE_GATE_UP(iq2s)
 GEN_MOE_GATE_UP(iq3xxs)
 GEN_MOE_GATE_UP(iq3s)
+GEN_MOE_GATE_UP(iq1s)
+GEN_MOE_GATE_UP(iq1m)
+GEN_MOE_GATE_UP(tq10)
+GEN_MOE_GATE_UP(tq20)
+GEN_MOE_GATE_UP(q20)
 GEN_MOE_DOWN(q80)
 GEN_MOE_DOWN(q2k)
 GEN_MOE_DOWN(q3k)
@@ -3753,6 +4063,11 @@ GEN_MOE_DOWN(iq2xs)
 GEN_MOE_DOWN(iq2s)
 GEN_MOE_DOWN(iq3xxs)
 GEN_MOE_DOWN(iq3s)
+GEN_MOE_DOWN(iq1s)
+GEN_MOE_DOWN(iq1m)
+GEN_MOE_DOWN(tq10)
+GEN_MOE_DOWN(tq20)
+GEN_MOE_DOWN(q20)
 "#;
 
 // ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5, RM×CN register-tiled — Slice 25) ──
@@ -4394,18 +4709,19 @@ extern "C" __global__ void NAME( \
 #define GEN_WMMA_IQ4NL(NAME, RM, CN) GEN_WMMA_IQ4(NAME, RM, CN, 0)
 #define GEN_WMMA_IQ4XS(NAME, RM, CN) GEN_WMMA_IQ4(NAME, RM, CN, 1)
 
-// ── GRID quants (R5): IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S — ONE body for all five. ──
-// The five differ only inside `wdec_##FMT` (NATIVE_DECODE), which hands back this 32-block's 32
-// signed codes and the two scales its 16-element halves carry — so unlike `GEN_WMMA_IQ4`'s `XS`
-// flag, there is no per-format branch left in the body at all, and the same decoder serves the
-// `linear_i8_*` GEMV tier (they cannot drift).
+// ── The `wdec_*` seam — ONE body for all ten formats on it. ──
+// R5's grid quants (IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S) and R6's IQ1 (IQ1_S/IQ1_M) and ternary
+// (TQ1_0/TQ2_0/Q2_0) quants differ only inside `wdec_##FMT` (NATIVE_DECODE), which hands back this
+// 32-block's 32 signed codes and the two scales its 16-element halves carry — so unlike
+// `GEN_WMMA_IQ4`'s `XS` flag, there is no per-format branch left in the body at all, and the same
+// decoder serves the `linear_i8_*` GEMV tier (they cannot drift).
 //
-// Structurally Q8_0's shape, not `GEN_WMMA_R32`'s: the grid byte is already signed, so there is no
-// ones-dot `sumacc`/`wmn` anywhere. The ONE difference from `GEN_WMMA_Q80` is that the two K-tiles
-// of a 32-block are scaled INDEPENDENTLY (`ws0`/`ws1`) instead of sharing one `wsc` — IQ2_XS and
-// IQ2_S put a separate 4-bit scale magnitude on each half. The three per-32-scale formats pass the
-// same value twice, which costs one extra f32 multiply per (block, column) and keeps one body.
-#define GEN_WMMA_IQG(NAME, RM, CN, FMT) \
+// Structurally Q8_0's shape, not `GEN_WMMA_R32`'s: every code on this seam is already signed, so
+// there is no ones-dot `sumacc`/`wmn` anywhere. The ONE difference from `GEN_WMMA_Q80` is that the
+// two K-tiles of a 32-block are scaled INDEPENDENTLY (`ws0`/`ws1`) instead of sharing one `wsc` —
+// IQ2_XS, IQ2_S and IQ1_M put a separate scale on each half. The per-32-scale formats pass the same
+// value twice, which costs one extra f32 multiply per (block, column) and keeps one body.
+#define GEN_WMMA_WDEC(NAME, RM, CN, FMT) \
 extern "C" __global__ void NAME( \
     const signed char* __restrict__ qx, const float* __restrict__ xs, \
     const unsigned char* __restrict__ w, float* __restrict__ dst, \
@@ -4794,21 +5110,46 @@ GEN_WMMA_IQ4XS(wmma_i8_iq4xs_2x2, 2, 2)
 // cannot reach them at all. The measured end-to-end decode agrees that these are not purely
 // DRAM-bound: at 2.06 bpw IQ2_XXS streams under HALF Q4_K's 4.5 bpw of weight bytes yet runs only
 // 1.16x its decode rate (147.5 vs 127.3 t/s on Qwen3-0.6B), so the gather/ALU is a real share.
-GEN_WMMA_IQG(wmma_i8_iq2xxs_1x1, 1, 1, iq2xxs)
-GEN_WMMA_IQG(wmma_i8_iq2xxs_2x1, 2, 1, iq2xxs)
-GEN_WMMA_IQG(wmma_i8_iq2xxs_2x2, 2, 2, iq2xxs)
-GEN_WMMA_IQG(wmma_i8_iq2xs_1x1, 1, 1, iq2xs)
-GEN_WMMA_IQG(wmma_i8_iq2xs_2x1, 2, 1, iq2xs)
-GEN_WMMA_IQG(wmma_i8_iq2xs_2x2, 2, 2, iq2xs)
-GEN_WMMA_IQG(wmma_i8_iq2s_1x1, 1, 1, iq2s)
-GEN_WMMA_IQG(wmma_i8_iq2s_2x1, 2, 1, iq2s)
-GEN_WMMA_IQG(wmma_i8_iq2s_2x2, 2, 2, iq2s)
-GEN_WMMA_IQG(wmma_i8_iq3xxs_1x1, 1, 1, iq3xxs)
-GEN_WMMA_IQG(wmma_i8_iq3xxs_2x1, 2, 1, iq3xxs)
-GEN_WMMA_IQG(wmma_i8_iq3xxs_2x2, 2, 2, iq3xxs)
-GEN_WMMA_IQG(wmma_i8_iq3s_1x1, 1, 1, iq3s)
-GEN_WMMA_IQG(wmma_i8_iq3s_2x1, 2, 1, iq3s)
-GEN_WMMA_IQG(wmma_i8_iq3s_2x2, 2, 2, iq3s)
+GEN_WMMA_WDEC(wmma_i8_iq2xxs_1x1, 1, 1, iq2xxs)
+GEN_WMMA_WDEC(wmma_i8_iq2xxs_2x1, 2, 1, iq2xxs)
+GEN_WMMA_WDEC(wmma_i8_iq2xxs_2x2, 2, 2, iq2xxs)
+GEN_WMMA_WDEC(wmma_i8_iq2xs_1x1, 1, 1, iq2xs)
+GEN_WMMA_WDEC(wmma_i8_iq2xs_2x1, 2, 1, iq2xs)
+GEN_WMMA_WDEC(wmma_i8_iq2xs_2x2, 2, 2, iq2xs)
+GEN_WMMA_WDEC(wmma_i8_iq2s_1x1, 1, 1, iq2s)
+GEN_WMMA_WDEC(wmma_i8_iq2s_2x1, 2, 1, iq2s)
+GEN_WMMA_WDEC(wmma_i8_iq2s_2x2, 2, 2, iq2s)
+GEN_WMMA_WDEC(wmma_i8_iq3xxs_1x1, 1, 1, iq3xxs)
+GEN_WMMA_WDEC(wmma_i8_iq3xxs_2x1, 2, 1, iq3xxs)
+GEN_WMMA_WDEC(wmma_i8_iq3xxs_2x2, 2, 2, iq3xxs)
+GEN_WMMA_WDEC(wmma_i8_iq3s_1x1, 1, 1, iq3s)
+GEN_WMMA_WDEC(wmma_i8_iq3s_2x1, 2, 1, iq3s)
+GEN_WMMA_WDEC(wmma_i8_iq3s_2x2, 2, 2, iq3s)
+// R6 IQ1 + ternary quants. Plain tier only, same reason as every format after Q4_K: the Slice-27
+// `_pipe` prefetch and the Slice-28 `_coop` family are Q4_K-only, and coop is a measured gfx1100
+// regression regardless. R5's extra argument against the pipe holds UNCHANGED for IQ1_S/IQ1_M —
+// their critical-path reads are `g_iq1s` gathers whose addresses are not known until the block's
+// own `qs`/`qh` have been fetched and unpacked, so a fixed-shape prefetch cannot reach them at all.
+// For the ternary formats the argument is the opposite one and lands in the same place: there is no
+// table and the whole "weight tile" is 32 (TQ2_0/Q2_0) or ≤48 (TQ1_0) bytes per 32 elements read at
+// a statically known offset, so a prefetch has essentially nothing left to hide — TQ1_0 at 1.69 bpw
+// and Q2_0 at 2.25 bpw are the lightest weight streams in the covered set, and what remains on the
+// critical path is the base-3 digit ALU (TQ1_0) or a plain shift-and-mask (TQ2_0/Q2_0).
+GEN_WMMA_WDEC(wmma_i8_iq1s_1x1, 1, 1, iq1s)
+GEN_WMMA_WDEC(wmma_i8_iq1s_2x1, 2, 1, iq1s)
+GEN_WMMA_WDEC(wmma_i8_iq1s_2x2, 2, 2, iq1s)
+GEN_WMMA_WDEC(wmma_i8_iq1m_1x1, 1, 1, iq1m)
+GEN_WMMA_WDEC(wmma_i8_iq1m_2x1, 2, 1, iq1m)
+GEN_WMMA_WDEC(wmma_i8_iq1m_2x2, 2, 2, iq1m)
+GEN_WMMA_WDEC(wmma_i8_tq10_1x1, 1, 1, tq10)
+GEN_WMMA_WDEC(wmma_i8_tq10_2x1, 2, 1, tq10)
+GEN_WMMA_WDEC(wmma_i8_tq10_2x2, 2, 2, tq10)
+GEN_WMMA_WDEC(wmma_i8_tq20_1x1, 1, 1, tq20)
+GEN_WMMA_WDEC(wmma_i8_tq20_2x1, 2, 1, tq20)
+GEN_WMMA_WDEC(wmma_i8_tq20_2x2, 2, 2, tq20)
+GEN_WMMA_WDEC(wmma_i8_q20_1x1, 1, 1, q20)
+GEN_WMMA_WDEC(wmma_i8_q20_2x1, 2, 1, q20)
+GEN_WMMA_WDEC(wmma_i8_q20_2x2, 2, 2, q20)
 "#;
 
 // ── GPU-side MoE top-k routing + device-driven expert dispatch (Slice 38) ────
@@ -5083,6 +5424,25 @@ GEN_MOE_FFN_ROUTED(iq3s, iq4nl)
 GEN_MOE_FFN_ROUTED(iq3s, iq4xs)
 GEN_MOE_FFN_ROUTED(iq3s, q4k)
 GEN_MOE_FFN_ROUTED(iq3s, q6k)
+GEN_MOE_FFN_ROUTED(iq1s, iq1s)
+GEN_MOE_FFN_ROUTED(iq1s, iq1m)
+GEN_MOE_FFN_ROUTED(iq1s, iq2xxs)
+GEN_MOE_FFN_ROUTED(iq1s, iq2s)
+GEN_MOE_FFN_ROUTED(iq1s, iq3s)
+GEN_MOE_FFN_ROUTED(iq1s, iq4xs)
+GEN_MOE_FFN_ROUTED(iq1s, q4k)
+GEN_MOE_FFN_ROUTED(iq1s, q6k)
+GEN_MOE_FFN_ROUTED(iq1m, iq1s)
+GEN_MOE_FFN_ROUTED(iq1m, iq1m)
+GEN_MOE_FFN_ROUTED(iq1m, iq2xxs)
+GEN_MOE_FFN_ROUTED(iq1m, iq2s)
+GEN_MOE_FFN_ROUTED(iq1m, iq3s)
+GEN_MOE_FFN_ROUTED(iq1m, iq4xs)
+GEN_MOE_FFN_ROUTED(iq1m, q4k)
+GEN_MOE_FFN_ROUTED(iq1m, q6k)
+GEN_MOE_FFN_ROUTED(tq10, tq10)
+GEN_MOE_FFN_ROUTED(tq20, tq20)
+GEN_MOE_FFN_ROUTED(q20, q20)
 
 // Int8-activation dp4a gate+up+activation, device-routed. One wave32 block per nff output row.
 #define GEN_MOE_GATE_UP_ROUTED(GU) \
@@ -5132,6 +5492,11 @@ GEN_MOE_GATE_UP_ROUTED(iq2xs)
 GEN_MOE_GATE_UP_ROUTED(iq2s)
 GEN_MOE_GATE_UP_ROUTED(iq3xxs)
 GEN_MOE_GATE_UP_ROUTED(iq3s)
+GEN_MOE_GATE_UP_ROUTED(iq1s)
+GEN_MOE_GATE_UP_ROUTED(iq1m)
+GEN_MOE_GATE_UP_ROUTED(tq10)
+GEN_MOE_GATE_UP_ROUTED(tq20)
+GEN_MOE_GATE_UP_ROUTED(q20)
 
 // Int8-activation dp4a down projection, device-routed. One wave32 block per ne output row.
 #define GEN_MOE_DOWN_ROUTED(DN) \
@@ -5164,6 +5529,11 @@ GEN_MOE_DOWN_ROUTED(iq2xs)
 GEN_MOE_DOWN_ROUTED(iq2s)
 GEN_MOE_DOWN_ROUTED(iq3xxs)
 GEN_MOE_DOWN_ROUTED(iq3s)
+GEN_MOE_DOWN_ROUTED(iq1s)
+GEN_MOE_DOWN_ROUTED(iq1m)
+GEN_MOE_DOWN_ROUTED(tq10)
+GEN_MOE_DOWN_ROUTED(tq20)
+GEN_MOE_DOWN_ROUTED(q20)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────
@@ -5500,12 +5870,13 @@ mod codebook_tests {
         );
     }
 
-    /// The R5 grids are ~17 KiB of generated table text, and a slip in the emitter — a wrong
-    /// element count in the declared bound, a truncated table, `{:#x}` losing a leading zero — is
-    /// exactly the kind of thing no CPU-only check would otherwise see and that the GPU parity
-    /// tests would only report as "IQ2_S is wrong somewhere". So parse the emitted declarations
-    /// back out (name, declared length, and every literal) and require each to BE the host static
-    /// from `infr_core::iquant_grids`, element for element.
+    /// The grids are ~33 KiB of generated table text, and a slip in the emitter — a wrong element
+    /// count in the declared bound, a truncated table, `{:#x}` losing a leading zero — is exactly
+    /// the kind of thing no CPU-only check would otherwise see and that the GPU parity tests would
+    /// only report as "IQ2_S is wrong somewhere". So parse the emitted declarations back out (name,
+    /// declared length, and every literal) and require each to BE the host static from
+    /// `infr_core::iquant_grids`, element for element. R6 adds the 2048-entry `g_iq1s` (half the
+    /// emitted bytes on its own) and the `IQ1S_DELTA` addend.
     #[test]
     fn the_emitted_grids_parse_back_to_the_host_statics() {
         use infr_core::iquant_grids as g;
@@ -5548,6 +5919,7 @@ mod codebook_tests {
             ("g_iq2xxs", &g::IQ2XXS_GRID[..]),
             ("g_iq2xs", &g::IQ2XS_GRID[..]),
             ("g_iq2s", &g::IQ2S_GRID[..]),
+            ("g_iq1s", &g::IQ1S_GRID[..]),
         ] {
             check(name, grid.iter().map(|&v| v as u128).collect());
         }
@@ -5561,22 +5933,40 @@ mod codebook_tests {
             src.contains("GENERATED from infr_core::iquant_grids"),
             "the emitted tables must name their source of truth"
         );
+        // R6: the IQ1 addend rides along with the grids and is the one number that separates this
+        // family from R5's, so pin that the emitted literal parses back to the host constant.
+        let lit = src
+            .split("#define IQ1S_DELTA ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .expect("emitted IQ1S_DELTA define");
+        assert_eq!(
+            lit.trim_end_matches('f')
+                .parse::<f32>()
+                .expect("f32 literal"),
+            infr_gguf::dequant::IQ1S_DELTA,
+            "emitted IQ1S_DELTA must BE the host constant"
+        );
     }
 
-    /// Every kernel the R5 routing tables can name must actually exist in the assembled module.
+    /// Every kernel the R5/R6 routing tables can name must actually exist in the assembled module.
     /// `exec.rs` looks kernels up by STRING at dispatch time (`hipModuleGetFunction`), so a
     /// format registered in `native_i8_fmt`/`native_wmma_fmt`/the MoE mappers but never
     /// instantiated in the source here fails only on the box, on the one model that uses it.
     #[test]
-    fn the_r5_grid_kernels_are_all_instantiated() {
+    fn the_r5_and_r6_wdec_kernels_are_all_instantiated() {
         let src = super::hip_source();
-        for f in ["iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s"] {
+        for f in [
+            // R5 grid quants.
+            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", // R6 IQ1 + ternary quants.
+            "iq1s", "iq1m", "tq10", "tq20", "q20",
+        ] {
             for k in [
                 format!("GEN_LINEAR({f})"),
                 format!("GEN_EMBED({f})"),
                 format!("GEN_DEQF16({f})"),
-                format!("GEN_LINEAR_I8_IQG({f})"),
-                format!("GEN_I8ACC_IQG({f})"),
+                format!("GEN_LINEAR_I8_WDEC({f})"),
+                format!("GEN_I8ACC_WDEC({f})"),
                 format!("GEN_MOE_GATE_UP({f})"),
                 format!("GEN_MOE_DOWN({f})"),
                 format!("GEN_MOE_GATE_UP_ROUTED({f})"),

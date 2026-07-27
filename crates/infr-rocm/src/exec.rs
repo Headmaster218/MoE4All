@@ -1,9 +1,10 @@
 //! Graph execution: walk ops → resolve bound buffers → dispatch HIP kernels.
 //!
 //! Covered quant formats (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/
-//! IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S, see `native_decode_fmt`) are decoded in-kernel from their RAW bytes
-//! on the `Linear`/`EmbedGather` paths — no f16 cache, VRAM ≈ quant_size.
-//! Uncovered quantized weight tensors are dequantized to f16 on the host on first touch and
+//! IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0 — 22 of the 24 weight quants, see
+//! `native_decode_fmt`) are decoded in-kernel from their RAW bytes on the `Linear`/`EmbedGather`
+//! paths — no f16 cache, VRAM ≈ quant_size.
+//! The two uncovered formats (MXFP4, NVFP4) are dequantized to f16 on the host on first touch and
 //! cached by the raw device-pointer address of their bound buffer.
 
 use crate::backend::{bucket_bytes, BufferPool};
@@ -103,6 +104,11 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
         DType::Iq2S => ("linear_iq2s", "embed_iq2s"),
         DType::Iq3Xxs => ("linear_iq3xxs", "embed_iq3xxs"),
         DType::Iq3S => ("linear_iq3s", "embed_iq3s"),
+        DType::Iq1S => ("linear_iq1s", "embed_iq1s"),
+        DType::Iq1M => ("linear_iq1m", "embed_iq1m"),
+        DType::Tq1_0 => ("linear_tq10", "embed_tq10"),
+        DType::Tq2_0 => ("linear_tq20", "embed_tq20"),
+        DType::Q2_0 => ("linear_q20", "embed_q20"),
         _ => return None,
     };
     let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
@@ -137,6 +143,11 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
         DType::Iq2S => "linear_i8_iq2s",
         DType::Iq3Xxs => "linear_i8_iq3xxs",
         DType::Iq3S => "linear_i8_iq3s",
+        DType::Iq1S => "linear_i8_iq1s",
+        DType::Iq1M => "linear_i8_iq1m",
+        DType::Tq1_0 => "linear_i8_tq10",
+        DType::Tq2_0 => "linear_i8_tq20",
+        DType::Q2_0 => "linear_i8_q20",
         _ => return None,
     };
     Some((infr_core::decode_spec::block_layout(dt).1, kernel))
@@ -165,6 +176,11 @@ fn deqf16_fmt(dt: DType) -> Option<&'static str> {
         DType::Iq2S => Some("deqf16_iq2s"),
         DType::Iq3Xxs => Some("deqf16_iq3xxs"),
         DType::Iq3S => Some("deqf16_iq3s"),
+        DType::Iq1S => Some("deqf16_iq1s"),
+        DType::Iq1M => Some("deqf16_iq1m"),
+        DType::Tq1_0 => Some("deqf16_tq10"),
+        DType::Tq2_0 => Some("deqf16_tq20"),
+        DType::Q2_0 => Some("deqf16_q20"),
         _ => None,
     }
 }
@@ -288,6 +304,21 @@ fn native_wmma_fmt(
         (DType::Iq3S, 1, 1) => "wmma_i8_iq3s_1x1",
         (DType::Iq3S, 2, 2) => "wmma_i8_iq3s_2x2",
         (DType::Iq3S, _, _) => "wmma_i8_iq3s_2x1",
+        (DType::Iq1S, 1, 1) => "wmma_i8_iq1s_1x1",
+        (DType::Iq1S, 2, 2) => "wmma_i8_iq1s_2x2",
+        (DType::Iq1S, _, _) => "wmma_i8_iq1s_2x1",
+        (DType::Iq1M, 1, 1) => "wmma_i8_iq1m_1x1",
+        (DType::Iq1M, 2, 2) => "wmma_i8_iq1m_2x2",
+        (DType::Iq1M, _, _) => "wmma_i8_iq1m_2x1",
+        (DType::Tq1_0, 1, 1) => "wmma_i8_tq10_1x1",
+        (DType::Tq1_0, 2, 2) => "wmma_i8_tq10_2x2",
+        (DType::Tq1_0, _, _) => "wmma_i8_tq10_2x1",
+        (DType::Tq2_0, 1, 1) => "wmma_i8_tq20_1x1",
+        (DType::Tq2_0, 2, 2) => "wmma_i8_tq20_2x2",
+        (DType::Tq2_0, _, _) => "wmma_i8_tq20_2x1",
+        (DType::Q2_0, 1, 1) => "wmma_i8_q20_1x1",
+        (DType::Q2_0, 2, 2) => "wmma_i8_q20_2x2",
+        (DType::Q2_0, _, _) => "wmma_i8_q20_2x1",
         _ => return None,
     };
     Some((name, rm, cn))
@@ -357,6 +388,11 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
         DType::Iq2S => "iq2s",
         DType::Iq3Xxs => "iq3xxs",
         DType::Iq3S => "iq3s",
+        DType::Iq1S => "iq1s",
+        DType::Iq1M => "iq1m",
+        DType::Tq1_0 => "tq10",
+        DType::Tq2_0 => "tq20",
+        DType::Q2_0 => "q20",
         _ => return None,
     };
     let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
@@ -365,14 +401,16 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
 
 /// Static kernel name for the `(gate/up format, down format)` combo of the Phase-3 f16-decode expert
 /// FFN, or `None` when that pair is NOT instantiated in `kernels.rs` — the caller then keeps the
-/// dequant→f16 `moe_ffn_expert` fallback. Instantiated set (97 of the 256 `moe_native_fmt` pairs):
+/// dequant→f16 `moe_ffn_expert` fallback. Instantiated set (116 of the 441 `moe_native_fmt` pairs):
 ///
 /// * the full `{q80, q2k, q3k, q4k, q5k, q6k}²` (36 — e.g. Q4_K_M is `("q4k", "q6k")`, Q3_K_M is
 ///   `("q3k", "q5k")`),
 /// * `{q40, q41, q51} × {q40, q41, q51, q80}` (12, R3),
 /// * `{iq4nl, iq4xs} × {iq4nl, iq4xs, q4k, q5k, q6k, q80}` (12, R4),
 /// * `{q2k, q3k} × {iq4nl}` (2, R4),
-/// * `{iq2xxs, iq2xs, iq2s, iq3xxs, iq3s} × {iq2s, iq3xxs, iq3s, iq4nl, iq4xs, q4k, q6k}` (35, R5).
+/// * `{iq2xxs, iq2xs, iq2s, iq3xxs, iq3s} × {iq2s, iq3xxs, iq3s, iq4nl, iq4xs, q4k, q6k}` (35, R5),
+/// * `{iq1s, iq1m} × {iq1s, iq1m, iq2xxs, iq2s, iq3s, iq4xs, q4k, q6k}` (16, R6),
+/// * the three ternary SELF pairs `{(tq10,tq10), (tq20,tq20), (q20,q20)}` (3, R6).
 ///
 /// **Why not the full cross product** (R2 documented this escape hatch, R3 measured it and took it):
 /// going 6×6 → 9×9 cost **+1.1 s of COLD hiprtc** — backend init plus a 1-token bench with
@@ -386,7 +424,7 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
 ///
 /// * These kernels are NOT the shipping MoE path. The default int8 dp4a expert path dispatches the
 ///   per-FORMAT `moe_gate_up_act_i8_<gu>` + `moe_down_i8_<dn>` kernels, which ARE total over
-///   `moe_native_fmt` (16 each). `moe_ffn_expert_<gu>_<dn>` runs only under `INFR_ROCM_NO_I8` — an
+///   `moe_native_fmt` (21 each). `moe_ffn_expert_<gu>_<dn>` runs only under `INFR_ROCM_NO_I8` — an
 ///   A/B benchmarking switch whose comparand is precisely the dequant→f16 path an absent pair
 ///   falls to.
 /// * Legacy round quants never mix with K-quants across gate/up vs down. llama.cpp's
@@ -406,6 +444,23 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
 ///   dev box) packs `ffn_gate_exps`/`ffn_up_exps` as **IQ2_S** with `ffn_down_exps` split **IQ3_S**
 ///   (37 tensors) / **IQ4_XS** (3), i.e. it needs exactly `("iq2s","iq3s")` and `("iq2s","iq4xs")`.
 ///   Nothing gives a grid quant as a `dn` under a K-quant or legacy `gu`, so those 55 cells are cut.
+/// * The R6 IQ1 quants are gate/up banks too, but UNLIKE the grid quants they are also a legal `dn`
+///   — an IQ1 ftype leaves most `ffn_down` tensors at the SAME type and only boosts a minority. The
+///   `dn` set is read off the two cached UD-IQ1 GGUFs rather than guessed: `Qwen3-0.6B-UD-IQ1_S`
+///   packs `ffn_gate`/`ffn_up` as **IQ1_S** with `ffn_down` split **IQ1_S** (18 layers) / **IQ2_S**
+///   (5) / **IQ3_S** (5), and `Qwen3-0.6B-UD-IQ1_M` packs gate/up as **IQ1_M** (18) / IQ1_S (5) /
+///   IQ2_XXS (5) with `ffn_down` split **IQ1_M** (18) / **IQ2_S** (5) / **IQ3_S** (5). (Those are
+///   dense FFN tensors — the box has no IQ1 MoE cached — but `llama_tensor_get_type` applies the
+///   same `ffn_down` rule to `ffn_down_exps`, and the IQ2_XXS/IQ2_S/IQ3_S `gu` cells that mix in
+///   are already covered by R5's rectangle.) The 8 `dn` entries are that observed set (`iq1s`,
+///   `iq1m`, `iq2s`, `iq3s`) plus the wider bumps a big-MoE IQ1 mix reaches — `iq2xxs` (the shape
+///   `DeepSeek-R1-UD-IQ1_S` ships), `iq4xs`, and the two `use_more_bits` targets `q4k`/`q6k`.
+///   Never a legacy round quant, never Q2_K/Q3_K/Q5_K, never a ternary type.
+/// * The R6 ternary quants pair only with THEMSELVES. TQ1_0/TQ2_0/Q2_0 are not ftype mixes at all —
+///   they are whole-model conversion targets for a natively ternary checkpoint (BitNet / TriLM /
+///   Bonsai), so every FFN tensor in such a model carries the one type and there is no `ffn_down`
+///   bump to model. Nothing mixes a ternary bank with any other family in either direction, so the
+///   three self pairs are the complete reachable set for them.
 ///
 /// An absent pair is not a bug and never panics: `None` here makes the `MoeFfn` arm drop `native`
 /// (see the filter there), so the whole expert takes the correct, slower f16 path. Both this table
@@ -510,6 +565,25 @@ fn moe_expert_kernel(gu: &str, dn: &str) -> Option<&'static str> {
         ("iq3s", "iq4xs") => Some("moe_ffn_expert_iq3s_iq4xs"),
         ("iq3s", "q4k") => Some("moe_ffn_expert_iq3s_q4k"),
         ("iq3s", "q6k") => Some("moe_ffn_expert_iq3s_q6k"),
+        ("iq1s", "iq1s") => Some("moe_ffn_expert_iq1s_iq1s"),
+        ("iq1s", "iq1m") => Some("moe_ffn_expert_iq1s_iq1m"),
+        ("iq1s", "iq2xxs") => Some("moe_ffn_expert_iq1s_iq2xxs"),
+        ("iq1s", "iq2s") => Some("moe_ffn_expert_iq1s_iq2s"),
+        ("iq1s", "iq3s") => Some("moe_ffn_expert_iq1s_iq3s"),
+        ("iq1s", "iq4xs") => Some("moe_ffn_expert_iq1s_iq4xs"),
+        ("iq1s", "q4k") => Some("moe_ffn_expert_iq1s_q4k"),
+        ("iq1s", "q6k") => Some("moe_ffn_expert_iq1s_q6k"),
+        ("iq1m", "iq1s") => Some("moe_ffn_expert_iq1m_iq1s"),
+        ("iq1m", "iq1m") => Some("moe_ffn_expert_iq1m_iq1m"),
+        ("iq1m", "iq2xxs") => Some("moe_ffn_expert_iq1m_iq2xxs"),
+        ("iq1m", "iq2s") => Some("moe_ffn_expert_iq1m_iq2s"),
+        ("iq1m", "iq3s") => Some("moe_ffn_expert_iq1m_iq3s"),
+        ("iq1m", "iq4xs") => Some("moe_ffn_expert_iq1m_iq4xs"),
+        ("iq1m", "q4k") => Some("moe_ffn_expert_iq1m_q4k"),
+        ("iq1m", "q6k") => Some("moe_ffn_expert_iq1m_q6k"),
+        ("tq10", "tq10") => Some("moe_ffn_expert_tq10_tq10"),
+        ("tq20", "tq20") => Some("moe_ffn_expert_tq20_tq20"),
+        ("q20", "q20") => Some("moe_ffn_expert_q20_q20"),
         _ => None,
     }
 }
@@ -540,6 +614,11 @@ fn moe_gate_up_i8_kernel(gu: &str) -> &'static str {
         "iq2s" => "moe_gate_up_act_i8_iq2s",
         "iq3xxs" => "moe_gate_up_act_i8_iq3xxs",
         "iq3s" => "moe_gate_up_act_i8_iq3s",
+        "iq1s" => "moe_gate_up_act_i8_iq1s",
+        "iq1m" => "moe_gate_up_act_i8_iq1m",
+        "tq10" => "moe_gate_up_act_i8_tq10",
+        "tq20" => "moe_gate_up_act_i8_tq20",
+        "q20" => "moe_gate_up_act_i8_q20",
         _ => unreachable!("moe_gate_up_i8_kernel: uncovered ({gu})"),
     }
 }
@@ -563,6 +642,11 @@ fn moe_down_i8_kernel(dn: &str) -> &'static str {
         "iq2s" => "moe_down_i8_iq2s",
         "iq3xxs" => "moe_down_i8_iq3xxs",
         "iq3s" => "moe_down_i8_iq3s",
+        "iq1s" => "moe_down_i8_iq1s",
+        "iq1m" => "moe_down_i8_iq1m",
+        "tq10" => "moe_down_i8_tq10",
+        "tq20" => "moe_down_i8_tq20",
+        "q20" => "moe_down_i8_q20",
         _ => unreachable!("moe_down_i8_kernel: uncovered ({dn})"),
     }
 }
@@ -669,6 +753,25 @@ fn moe_expert_routed_kernel(gu: &str, dn: &str) -> Option<&'static str> {
         ("iq3s", "iq4xs") => Some("moe_ffn_expert_routed_iq3s_iq4xs"),
         ("iq3s", "q4k") => Some("moe_ffn_expert_routed_iq3s_q4k"),
         ("iq3s", "q6k") => Some("moe_ffn_expert_routed_iq3s_q6k"),
+        ("iq1s", "iq1s") => Some("moe_ffn_expert_routed_iq1s_iq1s"),
+        ("iq1s", "iq1m") => Some("moe_ffn_expert_routed_iq1s_iq1m"),
+        ("iq1s", "iq2xxs") => Some("moe_ffn_expert_routed_iq1s_iq2xxs"),
+        ("iq1s", "iq2s") => Some("moe_ffn_expert_routed_iq1s_iq2s"),
+        ("iq1s", "iq3s") => Some("moe_ffn_expert_routed_iq1s_iq3s"),
+        ("iq1s", "iq4xs") => Some("moe_ffn_expert_routed_iq1s_iq4xs"),
+        ("iq1s", "q4k") => Some("moe_ffn_expert_routed_iq1s_q4k"),
+        ("iq1s", "q6k") => Some("moe_ffn_expert_routed_iq1s_q6k"),
+        ("iq1m", "iq1s") => Some("moe_ffn_expert_routed_iq1m_iq1s"),
+        ("iq1m", "iq1m") => Some("moe_ffn_expert_routed_iq1m_iq1m"),
+        ("iq1m", "iq2xxs") => Some("moe_ffn_expert_routed_iq1m_iq2xxs"),
+        ("iq1m", "iq2s") => Some("moe_ffn_expert_routed_iq1m_iq2s"),
+        ("iq1m", "iq3s") => Some("moe_ffn_expert_routed_iq1m_iq3s"),
+        ("iq1m", "iq4xs") => Some("moe_ffn_expert_routed_iq1m_iq4xs"),
+        ("iq1m", "q4k") => Some("moe_ffn_expert_routed_iq1m_q4k"),
+        ("iq1m", "q6k") => Some("moe_ffn_expert_routed_iq1m_q6k"),
+        ("tq10", "tq10") => Some("moe_ffn_expert_routed_tq10_tq10"),
+        ("tq20", "tq20") => Some("moe_ffn_expert_routed_tq20_tq20"),
+        ("q20", "q20") => Some("moe_ffn_expert_routed_q20_q20"),
         _ => None,
     }
 }
@@ -692,6 +795,11 @@ fn moe_gate_up_i8_routed_kernel(gu: &str) -> &'static str {
         "iq2s" => "moe_gate_up_act_i8_routed_iq2s",
         "iq3xxs" => "moe_gate_up_act_i8_routed_iq3xxs",
         "iq3s" => "moe_gate_up_act_i8_routed_iq3s",
+        "iq1s" => "moe_gate_up_act_i8_routed_iq1s",
+        "iq1m" => "moe_gate_up_act_i8_routed_iq1m",
+        "tq10" => "moe_gate_up_act_i8_routed_tq10",
+        "tq20" => "moe_gate_up_act_i8_routed_tq20",
+        "q20" => "moe_gate_up_act_i8_routed_q20",
         _ => unreachable!("moe_gate_up_i8_routed_kernel: uncovered ({gu})"),
     }
 }
@@ -715,6 +823,11 @@ fn moe_down_i8_routed_kernel(dn: &str) -> &'static str {
         "iq2s" => "moe_down_i8_routed_iq2s",
         "iq3xxs" => "moe_down_i8_routed_iq3xxs",
         "iq3s" => "moe_down_i8_routed_iq3s",
+        "iq1s" => "moe_down_i8_routed_iq1s",
+        "iq1m" => "moe_down_i8_routed_iq1m",
+        "tq10" => "moe_down_i8_routed_tq10",
+        "tq20" => "moe_down_i8_routed_tq20",
+        "q20" => "moe_down_i8_routed_q20",
         _ => unreachable!("moe_down_i8_routed_kernel: uncovered ({dn})"),
     }
 }
@@ -2598,8 +2711,8 @@ fn run_op(
                     return Err(be(
                         "rocm moe pager: paged expert bank has a non-native quant format \
                          (only Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_1/IQ4_NL/IQ4_XS/ \
-                          IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S page — the IQ1/fp4/ternary formats \
-                          await native MoE decode)",
+                          IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0 page \
+                          — the fp4 formats await native MoE decode)",
                     ));
                 }
                 // Open one touch batch per pool for this (layer) op, so every expert this op
@@ -3417,6 +3530,19 @@ mod decode_spec_tests {
             (DType::Iq2S, 256, 82),
             (DType::Iq3Xxs, 256, 98),
             (DType::Iq3S, 256, 110),
+            // R6's IQ1 quants — 256-element super-blocks sharing the 2048-entry IQ1 grid. IQ1_S
+            // (50 B = f16 + 32 qs + 8×u16 qh) carries a standalone `d`; IQ1_M (56 B = 32 qs + 16 qh
+            // + 4×u16 scales) has NONE — its `d` is split across the scale words' top nibbles.
+            (DType::Iq1S, 256, 50),
+            (DType::Iq1M, 256, 56),
+            // R6's ternary quants. TQ1_0 (54 B = 48 qs + 4 qh + f16) packs 5 base-3 digits per
+            // byte; TQ2_0 (66 B = 64 qs + f16) packs 4 elements per byte at 2 bits. Q2_0 is infr's
+            // OWN format and the only 64-ELEMENT block in the covered set (18 B = f16 + 16 qs), so
+            // one activation 32-block is HALF a Q2_0 block — the geometry every byte offset in
+            // `wdec_q20` is built on.
+            (DType::Tq1_0, 256, 54),
+            (DType::Tq2_0, 256, 66),
+            (DType::Q2_0, 64, 18),
         ] {
             let (e, b, _, _) = native_decode_fmt(dt).expect("covered by native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} native_decode_fmt geometry");
@@ -3440,13 +3566,22 @@ mod decode_spec_tests {
             (DType::Iq2S, 256, 82),
             (DType::Iq3Xxs, 256, 98),
             (DType::Iq3S, 256, 110),
+            (DType::Iq1S, 256, 50),
+            (DType::Iq1M, 256, 56),
+            (DType::Tq1_0, 256, 54),
+            (DType::Tq2_0, 256, 66),
+            (DType::Q2_0, 64, 18),
         ] {
             let (_, e, b) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} moe_native_fmt geometry");
         }
         // Coverage boundary: the formats still awaiting a native kernel stay off the fast path.
-        assert!(native_decode_fmt(DType::Iq1S).is_none());
-        assert!(native_i8_fmt(DType::Iq1S, &rocm).is_none());
+        // After R6 that is only the two FP4 microscaling formats (MXFP4 / NVFP4) — every other
+        // weight quant in `decode_spec::WEIGHT_QUANTS` decodes in-kernel.
+        assert!(native_decode_fmt(DType::Mxfp4).is_none());
+        assert!(native_i8_fmt(DType::Mxfp4, &rocm).is_none());
+        assert!(native_decode_fmt(DType::Nvfp4).is_none());
+        assert!(native_i8_fmt(DType::Nvfp4, &rocm).is_none());
         // Q5_0 is native on the DENSE paths but has no MoE expert kernel — no shipped GGUF packs
         // expert banks as Q5_0, so it stays off the (gate/up × down) cross product.
         assert!(moe_native_fmt(DType::Q5_0).is_none());
@@ -3455,9 +3590,10 @@ mod decode_spec_tests {
     /// The `(gate/up, down)` pairs `kernels.rs` instantiates the cross-product expert kernels for —
     /// the expected set both mappers are pinned against. Rationale lives on `moe_expert_kernel`.
     const MOE_EXPERT_PAIRS: &[(&str, &str)] = &{
-        // The K-quant square, then four rectangles: the R3 legacy round quants, the R4 codebook
-        // quants, the `convert_incompatible_tensor` K-quant→IQ4_NL down bump, and the R5 grid
-        // quants (gate/up only — see `moe_expert_kernel` for why nothing yields a grid `dn`).
+        // The K-quant square, then five rectangles and a diagonal: the R3 legacy round quants, the
+        // R4 codebook quants, the `convert_incompatible_tensor` K-quant→IQ4_NL down bump, the R5
+        // grid quants (gate/up only — see `moe_expert_kernel` for why nothing yields a grid `dn`),
+        // the R6 IQ1 quants (which ARE also a legal `dn`), and the R6 ternary SELF pairs.
         const K: [&str; 6] = ["q80", "q2k", "q3k", "q4k", "q5k", "q6k"];
         const L: [&str; 3] = ["q40", "q41", "q51"];
         const LD: [&str; 4] = ["q40", "q41", "q51", "q80"];
@@ -3466,12 +3602,19 @@ mod decode_spec_tests {
         const XK: [&str; 2] = ["q2k", "q3k"];
         const G: [&str; 5] = ["iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s"];
         const GD: [&str; 7] = ["iq2s", "iq3xxs", "iq3s", "iq4nl", "iq4xs", "q4k", "q6k"];
+        const O: [&str; 2] = ["iq1s", "iq1m"];
+        const OD: [&str; 8] = [
+            "iq1s", "iq1m", "iq2xxs", "iq2s", "iq3s", "iq4xs", "q4k", "q6k",
+        ];
+        const T: [&str; 3] = ["tq10", "tq20", "q20"];
         let mut out = [("", "");
             K.len() * K.len()
                 + L.len() * LD.len()
                 + I.len() * ID.len()
                 + XK.len()
-                + G.len() * GD.len()];
+                + G.len() * GD.len()
+                + O.len() * OD.len()
+                + T.len()];
         let (mut n, mut i) = (0, 0);
         while i < K.len() {
             let mut j = 0;
@@ -3518,6 +3661,22 @@ mod decode_spec_tests {
             }
             i += 1;
         }
+        let mut i = 0;
+        while i < O.len() {
+            let mut j = 0;
+            while j < OD.len() {
+                out[n] = (O[i], OD[j]);
+                n += 1;
+                j += 1;
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        while i < T.len() {
+            out[n] = (T[i], T[i]);
+            n += 1;
+            i += 1;
+        }
         out
     };
 
@@ -3529,14 +3688,15 @@ mod decode_spec_tests {
     #[test]
     fn moe_expert_pair_tables_agree() {
         use super::{moe_expert_kernel, moe_expert_routed_kernel};
-        const ALL: [&str; 17] = [
+        const ALL: [&str; 22] = [
             "q80", "q2k", "q3k", "q4k", "q5k", "q6k", "q40", "q41", "q51", "iq4nl", "iq4xs",
-            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "q50",
+            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq1s", "iq1m", "tq10", "tq20", "q20",
+            "q50",
         ];
         assert_eq!(
             MOE_EXPERT_PAIRS.len(),
-            97,
-            "6×6 + 3×4 + 2×6 + 2 + 5×7 instantiated pairs"
+            116,
+            "6×6 + 3×4 + 2×6 + 2 + 5×7 + 2×8 + 3 instantiated pairs"
         );
         for gu in ALL {
             for dn in ALL {
@@ -3574,6 +3734,11 @@ mod decode_spec_tests {
             DType::Iq2S,
             DType::Iq3Xxs,
             DType::Iq3S,
+            DType::Iq1S,
+            DType::Iq1M,
+            DType::Tq1_0,
+            DType::Tq2_0,
+            DType::Q2_0,
         ] {
             let (s, _, _) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!(

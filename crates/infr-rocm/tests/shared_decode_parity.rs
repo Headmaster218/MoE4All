@@ -44,9 +44,9 @@ fn have_rocm() -> bool {
 /// Two lossy stages sit between them, and neither is a decode error:
 ///   * the **weight** round-trip — the uncovered formats are host-dequantized to **f16** before
 ///     the GEMV, so each weight carries up to one f16 ULP (~5e-4 relative);
-///   * the **activation** round-trip — the covered formats (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K and the
-///     legacy round quants Q4_0/Q4_1/Q5_0/Q5_1) take the int8 dp4a path, quantizing `x` to
-///     32-element int8 blocks (~`amax/254` per element).
+///   * the **activation** round-trip — the covered formats (after R6, all 22 weight quants except
+///     MXFP4/NVFP4) take the int8 dp4a path, quantizing `x` to 32-element int8 blocks
+///     (~`amax/254` per element).
 ///
 /// Both accumulate over a 256-deep dot with partial cancellation, so `2e-2` relative to
 /// `max|oracle|` is the honest joint bound — the same figure `tests/parity.rs` settled on against
@@ -56,13 +56,16 @@ fn have_rocm() -> bool {
 /// (Q2_K at m=1, the int8 dp4a GEMV — the 2-bit code has the least headroom against the int8
 /// activation quant of any covered format), so this carries ~2.6x headroom. R3 moved Q4_0/Q4_1/Q5_1
 /// off the dequant→f16 path (~5e-4, weight-ULP only) onto that same int8 tier, where they land at
-/// 3.0-4.2e-3 — well inside the bound, and Q2_K stays the binding case. Formats that stay on the
-/// f32-exact path (TQ1_0/TQ2_0/Q2_0/MXFP4/NVFP4) come in at ~3e-7. A genuinely mis-decoded format
-/// lands at O(1) relative, orders of magnitude above the bound — it is not hiding anything.
+/// 3.0-4.2e-3 — well inside the bound, and Q2_K stays the binding case. R6 did the same for the
+/// last five (IQ1_S 5.3e-3 / 3.7e-3, IQ1_M 3.8e-3 / 4.4e-3, TQ1_0 4.4e-3 / 4.0e-3, TQ2_0 3.7e-3 /
+/// 3.9e-3, Q2_0 2.7e-3 / 3.5e-3 at m=1 / m=16); the ternary three had been ~3e-7 on the f32-exact
+/// dequant path, and landing in the int8 band is itself the evidence the new kernels are the ones
+/// running. Only MXFP4/NVFP4 now stay f32-exact (~3e-7). A genuinely mis-decoded format lands at
+/// O(1) relative, orders of magnitude above the bound — it is not hiding anything.
 const ROCM_TOL: f32 = 2e-2;
 
-/// All 24 weight quants at **m=1** — the decode GEMV tier (`linear_i8_*` for the four natively
-/// covered formats, dequant→f16 GEMV for the rest). Not covered by the legacy `m=2` sweep.
+/// All 24 weight quants at **m=1** — the decode GEMV tier (`linear_i8_*` for the 22 natively
+/// covered formats, dequant→f16 GEMV for MXFP4/NVFP4). Not covered by the legacy `m=2` sweep.
 #[test]
 #[ignore = "requires a ROCm GPU"]
 fn rocm_linear_all_weight_quants_m1_match_the_host_oracle() {

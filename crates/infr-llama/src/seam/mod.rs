@@ -127,7 +127,8 @@ fn rocm_upload_bind(be: &infr_rocm::RocmBackend) -> Box<BindWeight<'_>> {
 /// `moe_native_fmt`, so a paged bank in any of them was rejected at load time even though its
 /// kernels existed — that is what R5 hit on `Qwen3.6-35B-A3B-UD-IQ3_S` (IQ2_S gate/up, IQ3_S +
 /// IQ4_XS down), and it is why R2's Q2_K/Q3_K work never actually reached llama4-Scout's paged
-/// expert banks.
+/// expert banks. R6 adds IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0 in step with the same slice's
+/// `moe_native_fmt` growth, so the two stay level.
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 fn rocm_moe_pageable(dt: DType) -> bool {
     matches!(
@@ -148,6 +149,11 @@ fn rocm_moe_pageable(dt: DType) -> bool {
             | DType::Iq2S
             | DType::Iq3Xxs
             | DType::Iq3S
+            | DType::Iq1S
+            | DType::Iq1M
+            | DType::Tq1_0
+            | DType::Tq2_0
+            | DType::Q2_0
     )
 }
 
