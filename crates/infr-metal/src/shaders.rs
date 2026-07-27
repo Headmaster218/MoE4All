@@ -16,7 +16,7 @@ use crate::pcache::ArchiveCache;
 use infr_core::config::Config;
 use infr_core::error::Result;
 use metal::{ComputePipelineState, Device, Library};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -58,6 +58,15 @@ pub struct PipelineCacheStats {
     /// Was the archive seeded from a blob at init? `false` on a cold machine, after any
     /// key-invalidating change, and whenever the cache is off.
     pub seeded: bool,
+    /// Every kernel whose pipeline was CREATED this run (i.e. first use — `get`'s in-process hit
+    /// does not appear), mapped to whether the persisted archive served it. `hits`/`misses` are
+    /// this map's two value counts.
+    ///
+    /// The names, not just the totals, because "warm hits == cold misses" would still hold if the
+    /// manifest round-tripped the WRONG set — a drifted key, a truncated name list, a kernel added
+    /// under a different name. `tests/pcache.rs` compares the two runs' key sets, which is the
+    /// assertion that fails when the manifest stops describing the archive.
+    pub served: BTreeMap<&'static str, bool>,
 }
 
 unsafe impl Send for Pipelines {}
@@ -213,6 +222,7 @@ impl Pipelines {
             } else {
                 s.misses += 1;
             }
+            s.served.insert(name, hit);
         }
         self.cache.lock().unwrap().insert(name, pso.clone());
         Ok(pso)

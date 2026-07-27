@@ -356,7 +356,14 @@ is never used; a miss must recompile, not error.
 `--set kernels.metal.pipeline_cache=false` turns it off.
 
 `INFR_PROF` prints the breakdown: library-compile ms, PSO count and ms, archive
-hits vs misses, blob size.
+hits vs misses, blob size. `MetalBackend::pipeline_cache_stats()` returns the
+same numbers plus the per-kernel `served` map (name → came from the archive).
+Since nobody on this project has a Metal device, the macOS CI job runs
+`cargo test -p infr-metal -- --include-ignored --nocapture` so
+`tests/pcache.rs`'s cold-vs-warm table — front end vs back end, side by side —
+lands in the log permanently. If the (uncacheable) front end dominates a warm
+start, the table says so outright: the next lever is a build-time `.metallib`,
+not this cache.
 
 ## Profiling
 
@@ -386,13 +393,21 @@ literal in exec.rs must resolve in the compiled library (the cap-check fallback
 otherwise turns a vanished kernel into silent perf loss — it happened once, 3×
 decode loss with zero errors). `tests/dispatch_overhead.rs`, `tests/gemv_bw.rs`
 — evidence probes (ignored), kept so the floors above stay reproducible.
-`tests/pcache.rs` — the pipeline cache end to end (cold → save → reload →
-pipelines from the archive, identical results), plus the damaged-blob,
-rejected-archive, stale-key and cache-off degradation paths. It holds exactly
-ONE test because it repoints `XDG_CACHE_HOME`; a second test in that binary
-would race it. The device-free halves are unit tests: `src/pcache_blob.rs`
-(payload framing, key composition, device token — runnable off a Mac with
-`rustc --test`) and `src/pcache.rs` (save debounce, temp-path shapes).
+`tests/pcache.rs` — the pipeline cache end to end, and a gate on it actually
+being USED, not merely reloadable: cold is `hits == 0`/`misses > 0` + a
+non-empty blob, warm is `misses == 0` (every pipeline out of the archive) over
+the SAME set of kernel names, and an archive-backed pipeline's output must be
+bitwise identical (`f32::to_bits`) to one compiled fresh with the cache off —
+the poisoned-blob class no checksum can see. Without those, a cache that
+silently missed every launch would still pass. Plus the damaged-blob,
+rejected-archive, stale-key and cache-off degradation paths. Timings are
+printed, not gated, except one catastrophic-shape bound (warm PSO wall ≤ 4×
+cold, floor 25 ms) — a gate that fails on runner noise gets ignored, and the
+structural assertions would go with it. It holds exactly ONE test because it
+repoints `XDG_CACHE_HOME`; a second test in that binary would race it. The
+device-free halves are unit tests: `src/pcache_blob.rs` (payload framing, key
+composition, device token — runnable off a Mac with `rustc --test`) and
+`src/pcache.rs` (save debounce, temp-path shapes).
 
 ## Negative results (measured — don't re-try without new evidence)
 

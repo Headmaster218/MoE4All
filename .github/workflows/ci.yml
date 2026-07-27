@@ -170,6 +170,11 @@ jobs:
   # Apple-Silicon runner — which has a real Metal device — and runs the
   # infr-metal parity suite. Those tests are `#[ignore]`d like the Vulkan GPU
   # tests, so they need an explicit `--include-ignored`.
+  #
+  # `--nocapture` is load-bearing, not debug noise: `tests/pcache.rs` prints the
+  # cold-vs-warm pipeline-cache breakdown (MSL front end, which is NOT cached,
+  # versus PSO creation, which is), and this log is the ONLY place that
+  # measurement exists — no one on this project has a Metal device.
   test-macos:
     name: cargo test (macOS / Metal)
     runs-on: macos-15
@@ -184,4 +189,4 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
-      - run: cargo test -p infr-metal --locked -- --include-ignored
+      - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
