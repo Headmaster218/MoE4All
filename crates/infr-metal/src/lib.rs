@@ -35,8 +35,11 @@ use infr_core::graph::Graph;
 use metal::{Buffer as MtlBuffer, CommandQueue, Device};
 
 mod exec;
+mod idcache;
 mod profile;
 mod shaders;
+
+use idcache::{BufId, IdCache};
 pub use shaders::msl_source;
 
 /// Terse local shorthand for the shared backend-error constructor.
@@ -47,6 +50,26 @@ use infr_core::error::backend as be;
 pub struct MetalBuffer {
     raw: MtlBuffer,
     len: usize,
+    /// **Allocation identity.** A process-unique serial stamped on every allocation and NEVER
+    /// reused. `raw.contents()` is an ADDRESS, not an identity: releasing an `MTLBuffer` returns
+    /// its pages to Metal's allocator and a later `newBuffer` hands the same pointer back for
+    /// entirely different contents. Anything that memoizes state derived from a buffer's *bytes*
+    /// (the [`weight_cache`](MetalBackend::weight_cache) /
+    /// [`qui_cache`](MetalBackend::qui_cache)) must therefore compare uids, not pointers — see
+    /// [`idcache`].
+    uid: u64,
+}
+
+impl MetalBuffer {
+    /// How this buffer identifies itself to the derived-state caches: recycled slot + unrecycled
+    /// identity. See [`idcache::BufId`].
+    fn id(&self) -> BufId {
+        BufId {
+            addr: self.raw.contents() as usize,
+            len: self.len,
+            uid: self.uid,
+        }
+    }
 }
 
 // MTLBuffer is documented thread-safe for the create/read/write use here; the raw pointer in the
@@ -96,19 +119,20 @@ pub struct MetalBackend {
     device: Device,
     queue: CommandQueue,
     pipelines: shaders::Pipelines,
-    /// Dequantized-weight cache: bound-buffer address → device f32 buffer. Weights are bound the
+    /// Dequantized-weight cache: bound weight buffer → device f32 buffer. Weights are bound the
     /// same every step, so a quantized weight is dequantized once and reused.
     ///
-    /// Keyed by address only, and never invalidated — safe because this has a *single-generation
-    /// lifetime*: each `generate_*` builds a fresh `MetalBackend`, so the cache lives for exactly one
-    /// generation and distinct weights have distinct addresses. Reusing an instance across models
-    /// (with buffer free/realloc) could return a stale f32 for a recycled address; don't.
-    weight_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<MtlBuffer>>>,
-    /// Native-quant weight cache (same single-generation lifetime as `weight_cache`): a quantized
-    /// weight kept in its compact factored form — bit-packed 4/6/8-bit codes + i16 (sc, m) per 16
-    /// elems + f16 (d, dmin) per quant block — that the `linear_quik*` kernels decode inline.
-    /// ~6-8 bpw vs f32's 32, and reconstructs the exact same value.
-    qui_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<exec::QuiWeight>>>,
+    /// Keyed on the buffer's IDENTITY, not its address (see [`idcache`]): this used to be a
+    /// `HashMap<contents() as usize, _>`, and a released `MTLBuffer`'s `contents()` pointer comes
+    /// straight back out of Metal's allocator for the next allocation — so any backend that saw a
+    /// weight buffer freed and a DIFFERENT weight land on its address was served the first
+    /// weight's dequant. Silently wrong weights, no error anywhere.
+    weight_cache: std::sync::Mutex<IdCache<std::sync::Arc<MtlBuffer>>>,
+    /// Native-quant weight cache (same keying and lifetime as `weight_cache`): a quantized weight
+    /// kept in its compact factored form — bit-packed 4/6/8-bit codes + i16 (sc, m) per 16 elems +
+    /// f16 (d, dmin) per quant block — that the `linear_quik*` kernels decode inline. ~6-8 bpw vs
+    /// f32's 32, and reconstructs the exact same value.
+    qui_cache: std::sync::Mutex<IdCache<std::sync::Arc<exec::QuiWeight>>>,
     /// Active weight-load progress bar (see [`Backend::weight_progress`]): every
     /// `BufferUsage::Weights`/`HostWeights` allocation advances it (the funnel lives in `alloc`,
     /// so no loader can forget a tensor).
@@ -216,8 +240,8 @@ impl MetalBackend {
             device,
             queue,
             pipelines,
-            weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            qui_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            weight_cache: std::sync::Mutex::new(IdCache::default()),
+            qui_cache: std::sync::Mutex::new(IdCache::default()),
             weight_pb: std::sync::Arc::new(std::sync::Mutex::new(None)),
             profiling: cfg.prof.metal_profiling(),
             prof_ops: cfg.prof.metal_prof_ops(),
@@ -366,7 +390,11 @@ impl Backend for MetalBackend {
                 pb.inc(bytes as u64);
             }
         }
-        Ok(Box::new(MetalBuffer { raw, len }))
+        Ok(Box::new(MetalBuffer {
+            raw,
+            len,
+            uid: idcache::next_buffer_uid(),
+        }))
     }
 
     fn alloc_uninit(
@@ -384,7 +412,11 @@ impl Backend for MetalBackend {
         unsafe {
             std::ptr::write_bytes(raw.contents() as *mut u8, 0xFFu8, len)
         };
-        Ok(Box::new(MetalBuffer { raw, len }))
+        Ok(Box::new(MetalBuffer {
+            raw,
+            len,
+            uid: idcache::next_buffer_uid(),
+        }))
     }
 
     fn upload(&self, dst: &dyn infr_core::backend::Buffer, src: &[u8]) -> Result<()> {

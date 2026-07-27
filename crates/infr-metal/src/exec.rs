@@ -2063,13 +2063,17 @@ impl MetalBackend {
         bindings: &Bindings,
     ) -> Result<Arc<MtlBuffer>> {
         let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
-        // Key on the UNDERLYING MTLBuffer (unified-memory contents pointer), not the wrapper
-        // address: the runner rebuilds its bindings map per prefill graph, so wrapper addresses
-        // change every forward and a wrapper-keyed cache re-repacks each one — hundreds of ms
-        // per forward on a factored-format checkpoint. The MTLBuffer lives as long as the
-        // uploaded weight, so its contents pointer is stable and unique.
-        let key = buf.raw.contents() as usize;
-        if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
+        // Key on the UNDERLYING MTLBuffer, not the wrapper: the runner rebuilds its bindings map
+        // per prefill graph, so wrapper addresses change every forward and a wrapper-keyed cache
+        // re-repacks each one — hundreds of ms per forward on a factored-format checkpoint. The
+        // MTLBuffer lives as long as the uploaded weight, so it is stable across forwards.
+        //
+        // But its `contents()` POINTER is only the slot, never the identity — Metal re-hands a
+        // released buffer's address to the next allocation, and this cache does not retain the
+        // weight it dequantized from, so nothing keeps that address occupied. `buf.id()` carries
+        // the allocation's uid alongside, and a hit is served only when it matches; see `idcache`.
+        let key = buf.id();
+        if let Some(w) = self.weight_cache.lock().unwrap().get(key) {
             return Ok(w.clone());
         }
         let dt = g.desc(id).dtype;
@@ -2120,9 +2124,13 @@ impl MetalBackend {
         bindings: &Bindings,
     ) -> Arc<QuiWeight> {
         let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
-        // Stable underlying-buffer key — see `weight_buf` for why the wrapper address is not.
-        let key = buf.raw.contents() as usize;
-        if let Some(w) = self.qui_cache.lock().unwrap().get(&key) {
+        // Identity of the underlying buffer — see `weight_buf` for why neither the wrapper address
+        // nor the MTLBuffer's `contents()` pointer will do. (The native-kernel arm below happens to
+        // retain the weight's MTLBuffer in `QuiWeight::codes`, which pins its address for as long
+        // as the entry lives; the factored `linear_quik*` arm copies the bytes out and retains
+        // nothing, so that arm has the same exposure as `weight_buf`.)
+        let key = buf.id();
+        if let Some(w) = self.qui_cache.lock().unwrap().get(key) {
             return w.clone();
         }
         // INFR_METAL_NO_KQUANT_NATIVE routes the non-Q4_K/Q6_K K-quants (Q5_K/Q2_K/Q3_K) back
