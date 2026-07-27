@@ -316,6 +316,48 @@ recycling. Slot switches are replay-safe by construction — the tape fingerprin
 covers the bound KV/IO buffer addresses, so a switch re-records (one graph-walk
 token) instead of replaying into a stale slot's buffers.
 
+## Shader compilation and the on-disk pipeline cache
+
+Getting from MSL to something the GPU runs is two compilers, and only one of
+them is cacheable:
+
+- **front end**, MSL → AIR: `newLibraryWithSource:` over the ~340 KB
+  `msl_source()` assembles (9 `.metal` files plus the IQ2/IQ3 grids emitted from
+  `infr_core::iquant_grids`). Runs on **every launch** and there is no way
+  around it at runtime — `MTLLibrary` cannot serialize the AIR back out, and the
+  only supported way to persist a `.metallib` is `xcrun metal` ahead of time,
+  which would make Xcode CLT a runtime dependency. If this turns out to dominate
+  startup, the fix is a build-time `.metallib` in the release artifact.
+- **back end**, AIR → GPU ISA: one run per `MTLComputePipelineState`, created
+  lazily by `Pipelines::get` on a kernel's first use. **This is cached**
+  (`src/pcache.rs`): an `MTLBinaryArchive` is seeded at backend init from
+  `~/.cache/infr/metal-pipelines-<device>.bin`, passed as
+  `MTLComputePipelineDescriptor.binaryArchives` at every creation, extended as
+  new kernels appear, and re-serialized (debounced, and on drop).
+
+The archive grows lazily during a run, so the lifecycle is Vulkan's
+(`infr-vulkan/src/pcache.rs`), not ROCm's whole-artifact-at-init one; the bytes
+go through the shared `infr_core::kernel_cache` seam, which owns the envelope,
+the payload checksum, the atomic+durable write and the poisoned-blob tripwire.
+The payload additionally carries a manifest of the function names inside the
+archive — without it every launch would re-`add` (and so re-compile) every
+kernel, and the cache would cost exactly what it saves.
+
+The key is
+`FNV(msl_source()) ++ source length ++ device name ++ MTLDevice.architecture.name ++ NSProcessInfo.operatingSystemVersionString ++ fast-math`,
+so a kernel edit, a GPU swap or an OS bump discards the blob wholesale.
+`registryID` is deliberately NOT in it (not stable across boots — it would
+invalidate every reboot).
+
+Every failure degrades: no binary-archive support, a rejected archive, a failed
+serialize, a bad blob — all fall back to plain
+`newComputePipelineStateWithFunction:` at cold speed. `FailOnBinaryArchiveMiss`
+is never used; a miss must recompile, not error.
+`--set kernels.metal.pipeline_cache=false` turns it off.
+
+`INFR_PROF` prints the breakdown: library-compile ms, PSO count and ms, archive
+hits vs misses, blob size.
+
 ## Profiling
 
 `INFR_METAL_PROFILE=1`: per-op CPU-encode + GPU commit+wait wall, printed on
@@ -344,6 +386,13 @@ literal in exec.rs must resolve in the compiled library (the cap-check fallback
 otherwise turns a vanished kernel into silent perf loss — it happened once, 3×
 decode loss with zero errors). `tests/dispatch_overhead.rs`, `tests/gemv_bw.rs`
 — evidence probes (ignored), kept so the floors above stay reproducible.
+`tests/pcache.rs` — the pipeline cache end to end (cold → save → reload →
+pipelines from the archive, identical results), plus the damaged-blob,
+rejected-archive, stale-key and cache-off degradation paths. It holds exactly
+ONE test because it repoints `XDG_CACHE_HOME`; a second test in that binary
+would race it. The device-free halves are unit tests: `src/pcache_blob.rs`
+(payload framing, key composition, device token — runnable off a Mac with
+`rustc --test`) and `src/pcache.rs` (save debounce, temp-path shapes).
 
 ## Negative results (measured — don't re-try without new evidence)
 

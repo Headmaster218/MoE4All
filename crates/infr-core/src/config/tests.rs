@@ -108,6 +108,9 @@ fn default_config_matches_documented_defaults() {
     // R8: the id-indexed MoE GEMV tier's row-batch bound. Also env-key-less; `infr-rocm` pins this
     // default against its own `MOE_ID_ROWS` knob table.
     assert_eq!(d.kernels.rocm.moe_id_rows, 128);
+    // RM: the Metal `MTLBinaryArchive` pipeline cache is ON by default, for the same reason — a
+    // launch should not re-run the driver's AIR → ISA back end for every kernel. Env-key-less too.
+    assert!(d.kernels.metal.pipeline_cache);
     assert_eq!(d.serve.max_tokens_cap, 131_072);
     assert_eq!(d.serve.api_key, None);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.

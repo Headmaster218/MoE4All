@@ -216,7 +216,11 @@ and these exist to force one off when bisecting a correctness or perf problem.
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
   today.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
-  dtype, plus `deltanet` and `moe`.
+  dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
+  `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so
+  a launch does not re-run the driver's AIR → GPU-ISA back end for every kernel;
+  the MSL → AIR front end is not cacheable and still runs every launch). Like
+  `kernels.rocm.module_cache` it has no `INFR_*` twin.
 - **`[kernels.rocm]`** — `wmma_tile` (`1x1`/`2x1`/`2x2`), `no_wmma`, the int8
   (`i8`) and software-pipelined (`pipe`) kernels, opt-in `coop` and `blas`
   prefill, the two fusion gates, `module_cache` (persist the hiprtc-compiled HIP

@@ -379,6 +379,20 @@ cfg_struct! {
         deltanet: bool = true,
         /// `INFR_METAL_NOMOE`: as [`MetalCfg::deltanet`].
         moe: bool = true,
+        /// Persist the compiled `MTLComputePipelineState`s to disk as an `MTLBinaryArchive`
+        /// (`infr_core::kernel_cache`, `~/.cache/infr/metal-pipelines-<device>.bin`) and seed
+        /// pipeline creation from it on later launches instead of re-running the driver's
+        /// AIR → GPU-ISA back end for every kernel, every launch.
+        ///
+        /// This caches the BACK end only: `MTLLibrary` exposes no way to serialize the AIR it
+        /// compiled from MSL, so the ~340 KB front-end compile in `Pipelines::build` still runs
+        /// every launch (see `infr-metal/src/pcache.rs`).
+        ///
+        /// Has NO env key, like [`RocmCfg::module_cache`] and [`CpuCfg::reference`] — settable
+        /// with `--set kernels.metal.pipeline_cache=false` or the TOML file. Clear it to force
+        /// cold pipeline creation (bisecting a suspected cache bug); the cache is otherwise
+        /// self-invalidating on any source / device / OS / compile-option change.
+        pipeline_cache: bool = true,
     }
 }
 

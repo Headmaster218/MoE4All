@@ -36,11 +36,13 @@ use metal::{Buffer as MtlBuffer, CommandQueue, Device};
 
 mod exec;
 mod idcache;
+mod pcache;
+mod pcache_blob;
 mod profile;
 mod shaders;
 
 use idcache::{BufId, IdCache};
-pub use shaders::msl_source;
+pub use shaders::{msl_source, PipelineCacheStats};
 
 /// Terse local shorthand for the shared backend-error constructor.
 use infr_core::error::backend as be;
@@ -192,6 +194,16 @@ impl MetalBackend {
         &self.cfg.kernels.metal
     }
 
+    /// What the persisted pipeline cache did this run: MSL-compile time, pipeline-creation time,
+    /// archive hits vs misses, and where the blob lives. See [`PipelineCacheStats`].
+    ///
+    /// `pub` because it is the only way to MEASURE this backend's startup cost from a Mac — the
+    /// dev box has no Metal device, so `tests/pcache.rs` and anyone benchmarking a launch read the
+    /// numbers here rather than off a log line.
+    pub fn pipeline_cache_stats(&self) -> PipelineCacheStats {
+        self.pipelines.cache_stats()
+    }
+
     /// Default constructor for callers with no [`Config`] to hand in — this crate's own GPU
     /// tests/probes and external library users. Resolves `Default` < environment once and forwards
     /// to [`new_with`](Self::new_with). Fallible for the same reason `VulkanBackend::new` is (S5a):
@@ -235,7 +247,7 @@ impl MetalBackend {
             (c, g)
         };
         let queue = device.new_command_queue();
-        let pipelines = shaders::Pipelines::build(&device)?;
+        let pipelines = shaders::Pipelines::build(&device, &cfg)?;
         Ok(Self {
             device,
             queue,
