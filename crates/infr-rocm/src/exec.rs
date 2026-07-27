@@ -1103,6 +1103,49 @@ fn arg_f32(v: f32) -> Vec<u8> {
 
 // ── ExecCtx ──────────────────────────────────────────────────────────────────
 
+/// Decode activation-quantization memo (F1b).
+///
+/// The int8 GEMV path quantizes its activation row before every projection. On every arch the seam
+/// emits, SIBLING projections read the SAME row: `q`/`k`/`v` all consume one input norm, `gate`/`up`
+/// (when not concatenated) one post-attention norm, and a fused-QKV upload issues several `w_off`
+/// slices of one weight. Each of those re-ran `rmsnorm_quant_i8_32` / `quant_i8_32` over identical
+/// input and wrote identical bytes to a fresh scratch pair — pure redundancy, and it also forced a
+/// WAR hazard between the siblings (each quant rewrote the buffer the previous GEMV was reading).
+///
+/// So remember the pass: the NEXT op, if it is a decode GEMV over the same source row with the same
+/// norm, binds the same `(qx, xs)` instead of recomputing them. Byte-identical by construction — the
+/// GEMV reads the exact bytes the elided pass would have written — so it needs no capability, no
+/// tolerance and no golden movement.
+///
+/// The memo is `take()`n at the top of every [`run_op`] and restored ONLY by the int8 branch, so any
+/// other op in between (which may rewrite the row) invalidates it by construction; the branch
+/// additionally refuses to publish a memo whose source row is what this very GEMV just wrote (the
+/// fused-residual epilogue writes into the residual stream, which is also some norms' input).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct QuantKey {
+    /// Source activation row: the raw pre-norm row when the RmsNorm→Linear fold is active, else the
+    /// already-normalized `x`. Held as BOTH the graph tensor and the device pointer the quant
+    /// kernel actually read — a hit needs both, so neither a rebound tensor nor a recycled handle
+    /// can match a stale memo.
+    src: (TensorId, *mut c_void),
+    /// Norm weight, or `None` for the plain (`quant_i8_32`) pass. Two Linears over the same raw row
+    /// but under DIFFERENT norm weights are different activations.
+    norm: Option<(TensorId, *mut c_void)>,
+    /// `eps` by bit pattern — the key is an exact match, never a float compare.
+    eps_bits: u32,
+    m: u32,
+    in_f: u32,
+}
+
+#[derive(Clone, Copy)]
+struct QuantMemo {
+    key: QuantKey,
+    /// The int8 codes + per-32-block scales that pass wrote. Pool draws live until end-of-forward
+    /// (`ExecCtx::pooled`), so these stay valid for every op that can still read the memo.
+    qx: *mut c_void,
+    xs: *mut c_void,
+}
+
 struct ExecCtx<'a> {
     dev: Vec<Option<crate::RocmBuffer>>,
     vals: Vec<Option<Vec<f32>>>,
@@ -1134,6 +1177,9 @@ struct ExecCtx<'a> {
     /// The backend's ROCm kernel-tier config, BORROWED for the whole forward (S6, R6): the int8 /
     /// WMMA / pipe / cooperative selectors read it per op instead of calling `getenv`.
     rocm: &'a infr_core::config::RocmCfg,
+    /// F1b sibling-GEMV activation-quant memo — see [`QuantMemo`]. `None` at the start of every
+    /// forward and after any op that is not a memo-publishing int8 GEMV.
+    qmemo: Option<QuantMemo>,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -1476,6 +1522,7 @@ pub fn execute_graph(
         stream,
         rocblas,
         rocm: &cfg.kernels.rocm,
+        qmemo: None,
     };
 
     // No per-op sync: the whole op list queues on ONE stream, which serializes device work, so
@@ -1644,6 +1691,11 @@ fn run_op(
     norm_fuse: Option<(TensorId, TensorId, f32)>,
     add_fuse: Option<(TensorId, TensorId)>,
 ) -> Result<()> {
+    // F1b: the sibling-GEMV quant memo is valid only for the op IMMEDIATELY after the pass that
+    // published it. Clearing it here and republishing it from the int8 GEMV branch alone means any
+    // op that could have rewritten the activation row invalidates the memo without having to know
+    // about it. (Same discipline as Vulkan's `mmv_memo`.)
+    let qmemo_prev = ctx.qmemo.take();
     match *op {
         Op::RmsNorm {
             x,
@@ -1836,48 +1888,75 @@ fn run_op(
                         // un-cleared) and stay live until end-of-forward, so the async GEMM/GEMV that
                         // reads them never races a pool reuse.
                         let nb = inu / 32; // in_f is 32-aligned for every covered format
-                        let qx = ctx.pool_buf((mu * inu).max(1), false);
-                        let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
-                        if let Some((x_raw, norm_w, eps)) = norm_fuse {
-                            // Slice-32 RmsNorm→Linear: one block per row reduces the sum-of-squares
-                            // over the RAW row, then int8-quantizes the normalized row in registers
-                            // (bit-identical to `rmsnorm` then `quant_i8_32`), killing the `rmsnorm`
-                            // launch + the normalized-activation DRAM round-trip.
-                            let wnptr = ctx.dequant_weight_or_cache(norm_w, g, bindings)?;
-                            let xrp = ctx.ensure_device(x_raw, g, bindings)?;
-                            dispatch_grid(
-                                pipelines,
-                                ctx.stream,
-                                "rmsnorm_quant_i8_32",
-                                m,
-                                1,
-                                256,
-                                args![
-                                    arg_ptr(xrp),
-                                    arg_ptr(wnptr),
-                                    arg_ptr(qx.ptr),
-                                    arg_ptr(xs.ptr),
-                                    arg_i32(m as i32),
-                                    arg_i32(in_f as i32),
-                                    arg_f32(eps),
-                                ],
-                            )?;
-                        } else {
-                            dispatch_1d(
-                                pipelines,
-                                ctx.stream,
-                                "quant_i8_32",
-                                (mu * nb) as u32,
-                                256,
-                                args![
-                                    arg_ptr(bx_ptr),
-                                    arg_ptr(qx.ptr),
-                                    arg_ptr(xs.ptr),
-                                    arg_i32(m as i32),
-                                    arg_i32(in_f as i32),
-                                ],
-                            )?;
-                        }
+
+                        // F1b: resolve the exact (row, norm) this projection would quantize BEFORE
+                        // drawing scratch, so a sibling GEMV over the same pair can bind the memo
+                        // instead of re-running a pass that writes provably the same bytes.
+                        let (q_src, q_norm, q_eps) = match norm_fuse {
+                            Some((x_raw, norm_w, eps)) => {
+                                let wnptr = ctx.dequant_weight_or_cache(norm_w, g, bindings)?;
+                                let xrp = ctx.ensure_device(x_raw, g, bindings)?;
+                                ((x_raw, xrp), Some((norm_w, wnptr)), eps)
+                            }
+                            None => ((x, bx_ptr), None, 0.0),
+                        };
+                        let qkey = QuantKey {
+                            src: q_src,
+                            norm: q_norm,
+                            eps_bits: q_eps.to_bits(),
+                            m,
+                            in_f,
+                        };
+                        let hit = qmemo_prev.filter(|p| p.key == qkey);
+                        let (qx_ptr, xs_ptr) = match hit {
+                            // Sibling projection off the same activation row: the previous GEMV's
+                            // codes/scales ARE this one's, bit for bit. Skip the pass.
+                            Some(p) => (p.qx, p.xs),
+                            None => {
+                                let qx = ctx.pool_buf((mu * inu).max(1), false);
+                                let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
+                                if norm_fuse.is_some() {
+                                    // Slice-32 RmsNorm→Linear: one block per row reduces the
+                                    // sum-of-squares over the RAW row, then int8-quantizes the
+                                    // normalized row in registers (bit-identical to `rmsnorm` then
+                                    // `quant_i8_32`), killing the `rmsnorm` launch + the
+                                    // normalized-activation DRAM round-trip.
+                                    dispatch_grid(
+                                        pipelines,
+                                        ctx.stream,
+                                        "rmsnorm_quant_i8_32",
+                                        m,
+                                        1,
+                                        256,
+                                        args![
+                                            arg_ptr(q_src.1),
+                                            arg_ptr(q_norm.unwrap().1),
+                                            arg_ptr(qx.ptr),
+                                            arg_ptr(xs.ptr),
+                                            arg_i32(m as i32),
+                                            arg_i32(in_f as i32),
+                                            arg_f32(q_eps),
+                                        ],
+                                    )?;
+                                } else {
+                                    dispatch_1d(
+                                        pipelines,
+                                        ctx.stream,
+                                        "quant_i8_32",
+                                        (mu * nb) as u32,
+                                        256,
+                                        args![
+                                            arg_ptr(q_src.1),
+                                            arg_ptr(qx.ptr),
+                                            arg_ptr(xs.ptr),
+                                            arg_i32(m as i32),
+                                            arg_i32(in_f as i32),
+                                        ],
+                                    )?;
+                                }
+                                (qx.ptr, xs.ptr)
+                            }
+                        };
                         // Slice-32 Linear→Add: when the following residual Add is fused in, the GEMV
                         // writes (and adds) straight into the residual stream's live buffer — no
                         // fresh zeroed dst, no standalone `add`. `resid_ptr` is null otherwise, so
@@ -1921,8 +2000,8 @@ fn run_op(
                                     m.div_ceil(bm),
                                     threads,
                                     args![
-                                        arg_ptr(qx.ptr),
-                                        arg_ptr(xs.ptr),
+                                        arg_ptr(qx_ptr),
+                                        arg_ptr(xs_ptr),
                                         arg_ptr(wptr_off),
                                         arg_ptr(dd.ptr),
                                         arg_i32(m as i32),
@@ -1949,8 +2028,8 @@ fn run_op(
                                         m.div_ceil(16 * rm),
                                         32,
                                         args![
-                                            arg_ptr(qx.ptr),
-                                            arg_ptr(xs.ptr),
+                                            arg_ptr(qx_ptr),
+                                            arg_ptr(xs_ptr),
                                             arg_ptr(wptr_off),
                                             arg_ptr(dd.ptr),
                                             arg_i32(m as i32),
@@ -1972,8 +2051,8 @@ fn run_op(
                                         m,
                                         32,
                                         args![
-                                            arg_ptr(qx.ptr),
-                                            arg_ptr(xs.ptr),
+                                            arg_ptr(qx_ptr),
+                                            arg_ptr(xs_ptr),
                                             arg_ptr(wptr_off),
                                             arg_ptr(dd.ptr),
                                             arg_ptr(resid_ptr),
@@ -1985,11 +2064,23 @@ fn run_op(
                                 }
                             },
                         }
+                        let dd_ptr = dd.ptr;
                         // When the residual Add is fused, `dd` aliases the residual stream buffer
                         // (already mapped in `ctx.dev` via `ensure_device(add_dst)`) and the result
                         // is written in place — nothing to remap. Otherwise publish the fresh dst.
                         if add_fuse.is_none() {
                             ctx.dev[dst.0 as usize] = Some(dd);
+                        }
+                        // F1b: publish the memo for the next op — UNLESS this GEMV just wrote the
+                        // very row it quantized (the fused-residual epilogue writes into the
+                        // residual stream, which is also the input norm's `x`). In that case the
+                        // codes no longer describe the row and the memo must not survive.
+                        if dd_ptr != q_src.1 {
+                            ctx.qmemo = Some(QuantMemo {
+                                key: qkey,
+                                qx: qx_ptr,
+                                xs: xs_ptr,
+                            });
                         }
                     }
                 }

@@ -483,26 +483,9 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72 `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's
-  cold-hiprtc re-measurement (backend init + a 1-token
-  bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps
-  each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE
-  kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs →
-  **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost
-  ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s
-  of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7
-  re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00
-  s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2
-  new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor
-  — essentially all of the delta is the dense kernels. **Warm-cache startup is
-  unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the
-  dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only
-  run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the
-  per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total
-  over`moe_native_fmt`), and that switch's comparand IS the f16 path. When
-  adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the
-  pairs a real GGUF can produce;`moe_expert_pair_tables_agree` pins both mappers
-  to it.
+  72
+  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
+  pins both mappers to it.
 - ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
   (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
   over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
@@ -630,31 +613,120 @@ Vulkan has the full set (`crates/infr-vulkan/src/recorder.rs:4251-6559`).
 
 ## 3. Fusion breadth
 
-ROCm has RmsNorm→Linear + Linear→Add peepholes (Slice 32) plus, since **F1**,
-the capability-gated fusions its executor already implemented but the "start
-with NOTHING fused" bring-up dial in `backend.rs`'s `capabilities()` had never
-let the seam emit. Each was proved against the CPU reference first
+ROCm has RmsNorm→Linear + Linear→Add peepholes (Slice 32), the **F1b**
+sibling-GEMV activation-quant memo (below), plus, since **F1**, the
+capability-gated fusions its executor already implemented but the "start with
+NOTHING fused" bring-up dial in `backend.rs`'s `capabilities()` had never let
+the seam emit. Each was proved against the CPU reference first
 (`crates/infr-rocm/tests/parity.rs`, the "F1 fusion gate" section) and then
 measured on a 7900 XTX:
 
-| capability      | state | evidence                                                                                                                                                                                                                                                                                               |
-| --------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `combined_gu`   | ON    | one `[2*nff, ne]` FFN GEMV + `GatedActFused`. Qwen3-0.6B Q4_K_M tg128 126.3 → **137.3 t/s (+8.7%)**, pp512 +0.7%. Golden unmoved.                                                                                                                                                                      |
-| `gated_rmsnorm` | ON    | fused per-head RMSNorm×SiLU-gate, **bit-identical** to the `QkNorm`→`GatedAct` pair (max_err 0.0). Qwen3.5-0.8B pp512 +1.3%, tg a wash.                                                                                                                                                                |
-| `argmax_rows`   | ON    | multi-row `Op::Argmax` is id-for-id with the CPU at a 151936 vocab, ties included. No perf change today — it gates only the MTP verify accept, and no ROCm `MtpHeadSession` exists yet.                                                                                                                |
-| `embed_gather`  | OFF   | works, but the native `embed_*` decode f16-rounds each element (`fin`) where the host embed path is exact f32 — ~2.5e-4 relative on the **Q6_K** `token_embd` a Q4_K_M GGUF ships, which moves the qwen3 golden. Also −1.2% tg. Needs an exact-f32 `deq_*` sibling before it is even worth re-pricing. |
+| capability      | state | evidence                                                                                                                                                                                                                                                                                                |
+| --------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `combined_gu`   | ON    | one `[2*nff, ne]` FFN GEMV + `GatedActFused`. Qwen3-0.6B Q4_K_M tg128 126.3 → **137.3 t/s (+8.7%)**, pp512 +0.7%. Golden unmoved.                                                                                                                                                                       |
+| `gated_rmsnorm` | ON    | fused per-head RMSNorm×SiLU-gate, **bit-identical** to the `QkNorm`→`GatedAct` pair (max_err 0.0). Qwen3.5-0.8B pp512 +1.3%, tg a wash.                                                                                                                                                                 |
+| `argmax_rows`   | ON    | multi-row `Op::Argmax` is id-for-id with the CPU at a 151936 vocab, ties included. No perf change today — it gates only the MTP verify accept, and no ROCm `MtpHeadSession` exists yet.                                                                                                                 |
+| `embed_gather`  | OFF   | works, but the native `embed_*` decode f16-rounds each element (`fin`) where the host embed path is exact f32 — ~2.5e-4 relative on the **Q6_K** `token_embd` a Q4*K_M GGUF ships, which moves the qwen3 golden. Also −1.2% tg. Needs an exact-f32 `deq*\*` sibling before it is even worth re-pricing. |
 
 Kernel launches per decode token, before → after: Qwen3-0.6B **563 → 507**,
 Qwen3.5-0.8B **561 → 495**, Qwen3-30B-A3B **1059 → 1059** (a pure-MoE arch has
 no dense `ffn_gate`/`ffn_up` to concatenate — see §9's MoE items for its share).
 
-Still absent versus Vulkan (`adapter.rs`):
+### F1b — the sibling-GEMV activation-quant memo
 
-- **Fused per-head QkNormRope + KV-cache write** (`kv_write_peephole`,
-  `adapter.rs:876`).
-- **`Op::RmsNormAdd`** fused norm+residual as a runner-emitted op
-  (`adapter.rs:1134`) — the largest remaining dense-decode launch item now that
-  the FFN pair is fused: two dispatches per layer per token.
+**`Op::RmsNormAdd` was a false lead and is CLOSED.** F1 named it the largest
+remaining dense-decode item; a per-kernel launch histogram says otherwise. The
+Slice-32 peepholes already leave the dense qwen3 decode with **zero** standalone
+`rmsnorm` and **zero** standalone `add` dispatches — the norm is folded into
+each consuming GEMV's quant and the residual into the GEMV epilogue — so there
+is no adjacent norm+residual pair left to fuse. The op itself is implemented
+(`exec.rs`, `rmsnorm_add`) and already emitted wherever the seam emits it
+(gemma4-E2B's per-layer projection tail, `seam/runner.rs`); nothing was gated
+off. The "56 per token" was real, but it belonged to the item below.
+
+The actual largest item was **`rmsnorm_quant_i8_32` at 113 of 507** — 4 per
+layer where the arch has 2 norms. `q`/`k`/`v` are three separate GEMVs off ONE
+input norm, and each re-ran the whole normalize+int8-quantize pass over the
+identical row into its own scratch. So the executor now runs the pass ONCE and
+rebinds the same `(codes, scales)` for the siblings (`QuantMemo` in `exec.rs`:
+keyed on the source row's `TensorId` **and** device pointer, the norm weight,
+`eps`, `m` and `in_f`; taken at the top of every `run_op` and republished only
+by the int8 GEMV branch, so any op that could rewrite the row invalidates it by
+construction, and never republished by a GEMV whose fused-residual epilogue
+wrote the very row it quantized). Vulkan has had the same thing since its
+`mmv_memo`.
+
+It is **bit-identical**, not merely close: the GEMV binds the exact bytes the
+elided pass would have written. `quant_memo_sibling_linears_are_bit_identical`
+asserts `==` (not a tolerance) between three sibling projections issued in one
+graph and the same three issued one graph at a time, for Q4_K / Q4_0 / Q8_0;
+`quant_memo_is_dropped_when_the_gemv_rewrites_its_own_source` pins the
+invalidation guard (removing it makes that case ~100 % wrong, not subtly wrong).
+All nine `rocm_seam` goldens hold with qwen3 at `0xfd63781ea3bfa785`, and temp-0
+output is token-identical before/after on a dense, an MoE and a DeltaNet model.
+
+Kernel launches per decode token, F1 → F1b:
+
+| model                       | total          | `rmsnorm_quant_i8_32` |
+| --------------------------- | -------------- | --------------------- |
+| Qwen3-0.6B Q4_K_M (dense)   | 507 → **451**  | 113 → 57              |
+| Qwen3.5-0.8B Q4_K_M (Delta) | 495 → **447**  | 115 → 67              |
+| Qwen3-30B-A3B Q4_K_M (MoE)  | 1059 → **963** | 145 → 49              |
+
+Measured interleaved against an F1 binary, warmed, first burst discarded (the
+box drifts over a long session — the pairs matter, the absolutes do not):
+
+- Qwen3-0.6B `tg128`: 11/11 pairs positive. Final binary 121.2/121.0/120.3 →
+  **125.3/124.9/125.3 (+3.6 %)**; the earlier stable batch 119.0/119.9/119.6/
+  119.7 → 124.1/123.6/123.4/122.0 (+3.2 %); a first, drifting batch 116.3 →
+  123.0.
+- Qwen3-30B-A3B `tg64`: base 42.1/42.5/42.6 → **44.1/44.1/44.1 (+3.8 %)**.
+- `pp512` a wash everywhere (dense 4458.8 → 4469.7; MoE 252.9 → 252.6) — prefill
+  is weight-bandwidth-bound, and the pass it elides is per-row.
+- Qwen3.5-0.8B `tg128`: **a wash.** A first session read −1.7 % across 6
+  forward-and-reversed pairs; a longer 3-way interleave (F1 / F1b / an F1b built
+  to keep the pool-draw sequence identical) put all three inside 18.0-18.4, i.e.
+  inside this model's ±2 % run-to-run band. Its decode is ~55 ms/token dominated
+  by `deltanet_decode`, so 48 fewer small launches is not resolvable there.
+
+### Next on this axis
+
+Dense decode is now 451/token: `linear_i8_q4k` 140 (5 real GEMVs/layer),
+`rmsnorm_quant_i8_32` 57, `qk_norm_rope` 56, `quant_i8_32` 56, `write_kv` 56,
+`linear_i8_q6k` 29, `attention` 28, `gated_act` 28, `argmax` 1.
+
+- **`write_kv` (56, of which 28 are fusable)** — the largest remaining _fusable_
+  item, and the `kv_write_peephole` §3 already names (`adapter.rs:876`). The
+  shared pass plans it already (`infr_core::fusion::plan_kv_write`); ROCm's
+  `decode_fusion` passes `kv_write: false`. The blocker is the kernel, not the
+  plan: the peephole's contract is an **f16** K row written straight into an f16
+  cache, and ROCm's `qk_norm_rope` writes a fresh **f32** packed buffer
+  (`zero_dev`). Needs an f16-out variant taking the cache pointer + ring row. V
+  has no rope to absorb its write, so the ceiling is 28.
+- **`quant_i8_32` (56) + `gated_act` (28) + `attention` (28)** — the remaining
+  quant passes are _not_ sibling-redundant (o_proj's row comes from `attention`,
+  down_proj's from `gated_act`); killing them means an int8-emitting epilogue on
+  the producing kernel, i.e. new kernels rather than a peephole.
+
+### MoE, examined but NOT landed (for the next slice)
+
+Qwen3-30B-A3B is 963/token after F1b, and **96 of those are a standalone
+`rmsnorm` ×48 and `add` ×48** that the dense path does not pay:
+
+- **`rmsnorm` ×48** — the post-attention norm feeds the **F16** router `Linear`
+  _and_ `Op::MoeFfn`. `plan_rmsnorm_linear` requires every consumer in the
+  norm's live range to be a fusable int8 decode `Linear`; the `MoeFfn` consumer
+  disqualifies the fold outright, and the router's F16 weight would fail
+  `native_i8_fmt` regardless.
+- **`add` ×48** — the MoE residual is `MoeFfn → Add`, so `plan_linear_add`
+  (which matches `Linear → Add`) never sees it. Folding the residual into the
+  `moe_accum_idm` epilogue is the exact analogue of the Linear→Add fold and is
+  the cleanest 48 launches on the board.
+
+Both want an `infr_core::fusion` extension, which is shared with Vulkan and
+Metal — out of scope for a ROCm-only slice, and not worth half-landing. The MoE
+`quant_i8_32` ×144 (3/layer: o_proj input, expert gate/up input, expert down
+input) is genuinely three different rows and has nothing for the memo to reuse.
 
 ## 4. Device-side sampling
 

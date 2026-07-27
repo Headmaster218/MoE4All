@@ -5040,3 +5040,248 @@ fn argmax_multirow_matches_cpu() {
         );
     }
 }
+
+// ── F1b: the sibling-GEMV activation-quant memo ────────────────────────────────────────────────
+//    Consecutive decode `Linear`s that read the SAME activation row (q/k/v off one input norm, the
+//    `w_off` slices of a fused-QKV bank, gate+up off one post-attention norm) used to re-run the
+//    int8 quantization pass per projection. The executor now runs it ONCE and rebinds the same
+//    codes/scales for the siblings. The claim is not "close enough" but BIT-IDENTICAL — the GEMV
+//    reads the exact bytes the elided pass would have written — so these tests assert `==`, not a
+//    tolerance, against the same projections issued in a shape where no memo can form.
+
+/// Run `n_proj` decode `Linear`s off ONE `RmsNorm`, either as a single graph (siblings adjacent →
+/// the memo fires for projections 2..n) or as one graph per projection (nothing to memoize).
+/// Returns the concatenated outputs.
+#[allow(clippy::too_many_arguments)]
+fn run_sibling_projections(
+    be: &dyn Backend,
+    x: &[f32],
+    norm_w: &[f32],
+    w: &[Vec<u8>],
+    dt: DType,
+    in_f: usize,
+    out_f: usize,
+    together: bool,
+) -> Vec<f32> {
+    let groups: Vec<std::ops::Range<usize>> = if together {
+        // ONE graph holding every projection — siblings adjacent, so the memo fires.
+        std::iter::once(0..w.len()).collect()
+    } else {
+        // One graph per projection — nothing for the memo to reuse.
+        (0..w.len()).map(|i| i..i + 1).collect()
+    };
+    let mut out = Vec::new();
+    for grp in groups {
+        let mut g = Graph::new();
+        let xid = g.input(f32d(in_f));
+        let nwid = g.weight(TensorDesc::new(vec![in_f], DType::F32));
+        let normed = g.internal(f32d(in_f));
+        g.push(Op::RmsNorm {
+            x: xid,
+            weight: nwid,
+            dst: normed,
+            rows: 1,
+            dim: in_f as u32,
+            eps: 1e-6,
+        });
+        let ids: Vec<_> = grp
+            .map(|i| {
+                let wid = g.weight(TensorDesc::new(vec![out_f * in_f], dt));
+                let dst = g.output(f32d(out_f));
+                g.push(Op::Linear {
+                    x: normed,
+                    weight: wid,
+                    dst,
+                    m: 1,
+                    in_f: in_f as u32,
+                    out_f: out_f as u32,
+                    w_off: 0,
+                });
+                (i, wid, dst)
+            })
+            .collect();
+        let plan = be.compile(&g).expect("compile");
+        let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+        be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+        let nwb = be
+            .alloc(norm_w.len() * 4, BufferUsage::Weights)
+            .expect("nw");
+        be.upload(nwb.as_ref(), bytemuck::cast_slice(norm_w))
+            .unwrap();
+        let mut bd = Bindings::new();
+        bd.bind(xid, xb.as_ref());
+        bd.bind(nwid, nwb.as_ref());
+        let wbs: Vec<_> = ids
+            .iter()
+            .map(|(i, wid, _)| {
+                let wb = be.alloc(w[*i].len(), BufferUsage::Weights).expect("w");
+                be.upload(wb.as_ref(), &w[*i]).unwrap();
+                (*wid, wb)
+            })
+            .collect();
+        for (wid, wb) in &wbs {
+            bd.bind(*wid, wb.as_ref());
+        }
+        let obs: Vec<_> = ids
+            .iter()
+            .map(|(_, _, dst)| {
+                let ob = be.alloc(out_f * 4, BufferUsage::Readback).expect("out");
+                (*dst, ob)
+            })
+            .collect();
+        for (dst, ob) in &obs {
+            bd.bind(*dst, ob.as_ref());
+        }
+        be.execute(plan.as_ref(), &bd).expect("execute");
+        for (_, ob) in &obs {
+            let mut o = vec![0f32; out_f];
+            be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                .unwrap();
+            out.extend_from_slice(&o);
+        }
+    }
+    out
+}
+
+/// The memo must change NOTHING it computes. Three decode projections off one `RmsNorm` (the
+/// q/k/v shape, where only the first re-quantizes) are compared BIT-FOR-BIT against the same three
+/// projections issued one graph at a time, where no sibling exists to memoize — and, at a
+/// tolerance, against the CPU reference. Run for a k-quant, a legacy round quant and Q8_0 so the
+/// rebound `(codes, scales)` pair is proved against more than one shape of int8 GEMV.
+///
+/// The weights must DIFFER per projection: identical banks would make a mis-bound memo (or a
+/// mis-bound weight) invisible.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn quant_memo_sibling_linears_are_bit_identical() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (in_f, out_f) = (256usize, 24usize);
+    let x = gen(in_f, 31);
+    let norm_w = gen(in_f, 37);
+    for dt in [DType::Q4K, DType::Q4_0, DType::Q8_0] {
+        let w: Vec<Vec<u8>> = (0..3)
+            .map(|i| infr_testkit::synth_weight(dt, out_f * in_f, 0xB100 + i as u32))
+            .collect();
+        // Fresh backend per case — `dequant_weight_or_cache` keys on the device pointer, and a
+        // recycled address across cases would serve a stale norm weight (see `linear_w_off`).
+        let Some(be) = rocm() else {
+            return;
+        };
+        let split = run_sibling_projections(&be, &x, &norm_w, &w, dt, in_f, out_f, false);
+        let Some(be) = rocm() else {
+            return;
+        };
+        let memoed = run_sibling_projections(&be, &x, &norm_w, &w, dt, in_f, out_f, true);
+        assert_eq!(
+            split, memoed,
+            "{dt:?}: the memoized sibling GEMVs are NOT bit-identical to the same projections \
+             quantized individually — the rebound codes/scales do not describe the same row"
+        );
+        // Sanity: the three projections must actually differ, else bit-identity is vacuous.
+        assert_ne!(
+            &memoed[..out_f],
+            &memoed[out_f..2 * out_f],
+            "{dt:?}: sibling projections produced identical output — test is vacuous"
+        );
+        let c = run_sibling_projections(&cpu, &x, &norm_w, &w, dt, in_f, out_f, true);
+        let e = maxerr(&c, &memoed);
+        let mag = maxabs(&c).max(1e-3);
+        println!(
+            "quant-memo {dt:?} vs CPU max_err={e:e} max|ref|={mag:e} rel={:e}",
+            e / mag
+        );
+        assert!(mag > 1e-3, "{dt:?}: reference all-zero — vacuous");
+        assert!(
+            e / mag < 2e-2,
+            "{dt:?}: memoized siblings diverge from the CPU reference: abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
+/// The memo's invalidation guard. A decode `Linear` whose residual `Add` is fused writes into the
+/// residual stream — which, on a real graph, is also the next norm's input row. If such a GEMV
+/// published its activation memo, a following projection off that same row would dot a
+/// quantization of the row's PREVIOUS contents: a silent, plausible-looking wrong answer.
+///
+/// So: `Linear(x) → Add(into x)`, then a second `Linear(x)`. The second must see the UPDATED row.
+/// Checked against the CPU reference, which has neither memo nor fusion.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn quant_memo_is_dropped_when_the_gemv_rewrites_its_own_source() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let n = 256usize; // square projections so the fused Add can land back on `x`
+    let x0 = gen(n, 41);
+    let w1 = infr_testkit::synth_weight(DType::Q4K, n * n, 0xB201);
+    let w2 = infr_testkit::synth_weight(DType::Q4K, n * n, 0xB202);
+    let run = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let xid = g.input(f32d(n));
+        let w1id = g.weight(TensorDesc::new(vec![n * n], DType::Q4K));
+        let w2id = g.weight(TensorDesc::new(vec![n * n], DType::Q4K));
+        let t = g.internal(f32d(n));
+        let dst = g.output(f32d(n));
+        g.push(Op::Linear {
+            x: xid,
+            weight: w1id,
+            dst: t,
+            m: 1,
+            in_f: n as u32,
+            out_f: n as u32,
+            w_off: 0,
+        });
+        // Residual add straight back onto the row the GEMV read (`plan_linear_add` folds this into
+        // the GEMV epilogue on ROCm, so the GEMV's own write target IS its quant source).
+        g.push(Op::Add {
+            a: t,
+            b: xid,
+            dst: xid,
+            n: n as u32,
+        });
+        g.push(Op::Linear {
+            x: xid,
+            weight: w2id,
+            dst,
+            m: 1,
+            in_f: n as u32,
+            out_f: n as u32,
+            w_off: 0,
+        });
+        let plan = b.compile(&g).expect("compile");
+        let xb = b.alloc(n * 4, BufferUsage::Activations).expect("x");
+        b.upload(xb.as_ref(), bytemuck::cast_slice(&x0)).unwrap();
+        let w1b = b.alloc(w1.len(), BufferUsage::Weights).expect("w1");
+        b.upload(w1b.as_ref(), &w1).unwrap();
+        let w2b = b.alloc(w2.len(), BufferUsage::Weights).expect("w2");
+        b.upload(w2b.as_ref(), &w2).unwrap();
+        let ob = b.alloc(n * 4, BufferUsage::Readback).expect("out");
+        let mut bd = Bindings::new();
+        bd.bind(xid, xb.as_ref());
+        bd.bind(w1id, w1b.as_ref());
+        bd.bind(w2id, w2b.as_ref());
+        bd.bind(dst, ob.as_ref());
+        b.execute(plan.as_ref(), &bd).expect("execute");
+        let mut o = vec![0f32; n];
+        b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+    let Some(be) = rocm() else {
+        return;
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    let e = maxerr(&c, &r);
+    let mag = maxabs(&c).max(1e-3);
+    println!(
+        "quant-memo invalidation max_err={e:e} max|ref|={mag:e} rel={:e}",
+        e / mag
+    );
+    assert!(mag > 1e-3, "reference all-zero — vacuous");
+    assert!(
+        e / mag < 2e-2,
+        "the second projection did not see the updated residual row — a stale activation memo \
+         survived the GEMV that rewrote its source: abs={e:e} rel={:e}",
+        e / mag
+    );
+}
