@@ -483,9 +483,26 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72
-  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
-  pins both mappers to it.
+  72 `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's
+  cold-hiprtc re-measurement (backend init + a 1-token
+  bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps
+  each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE
+  kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs →
+  **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost
+  ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s
+  of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7
+  re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00
+  s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2
+  new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor
+  — essentially all of the delta is the dense kernels. **Warm-cache startup is
+  unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the
+  dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only
+  run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the
+  per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total
+  over`moe_native_fmt`), and that switch's comparand IS the f16 path. When
+  adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the
+  pairs a real GGUF can produce;`moe_expert_pair_tables_agree` pins both mappers
+  to it.
 - ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
   (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
   over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
@@ -613,25 +630,47 @@ Vulkan has the full set (`crates/infr-vulkan/src/recorder.rs:4251-6559`).
 
 ## 3. Fusion breadth
 
-ROCm has RmsNorm→Linear + Linear→Add peepholes (Slice 32); Vulkan has more
-(`adapter.rs`):
+ROCm has RmsNorm→Linear + Linear→Add peepholes (Slice 32) plus, since **F1**,
+the capability-gated fusions its executor already implemented but the "start
+with NOTHING fused" bring-up dial in `backend.rs`'s `capabilities()` had never
+let the seam emit. Each was proved against the CPU reference first
+(`crates/infr-rocm/tests/parity.rs`, the "F1 fusion gate" section) and then
+measured on a 7900 XTX:
 
-- **`GatedActFused`** — SiLU/GeGLU gate×up in one kernel (Vulkan
-  `adapter.rs:2115`; ROCm has a fused gate-up in MoE but not the general
-  `combined_gu` capability for dense FFN).
+| capability      | state | evidence                                                                                                                                                                                                                                                                                               |
+| --------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `combined_gu`   | ON    | one `[2*nff, ne]` FFN GEMV + `GatedActFused`. Qwen3-0.6B Q4_K_M tg128 126.3 → **137.3 t/s (+8.7%)**, pp512 +0.7%. Golden unmoved.                                                                                                                                                                      |
+| `gated_rmsnorm` | ON    | fused per-head RMSNorm×SiLU-gate, **bit-identical** to the `QkNorm`→`GatedAct` pair (max_err 0.0). Qwen3.5-0.8B pp512 +1.3%, tg a wash.                                                                                                                                                                |
+| `argmax_rows`   | ON    | multi-row `Op::Argmax` is id-for-id with the CPU at a 151936 vocab, ties included. No perf change today — it gates only the MTP verify accept, and no ROCm `MtpHeadSession` exists yet.                                                                                                                |
+| `embed_gather`  | OFF   | works, but the native `embed_*` decode f16-rounds each element (`fin`) where the host embed path is exact f32 — ~2.5e-4 relative on the **Q6_K** `token_embd` a Q4_K_M GGUF ships, which moves the qwen3 golden. Also −1.2% tg. Needs an exact-f32 `deq_*` sibling before it is even worth re-pricing. |
+
+Kernel launches per decode token, before → after: Qwen3-0.6B **563 → 507**,
+Qwen3.5-0.8B **561 → 495**, Qwen3-30B-A3B **1059 → 1059** (a pure-MoE arch has
+no dense `ffn_gate`/`ffn_up` to concatenate — see §9's MoE items for its share).
+
+Still absent versus Vulkan (`adapter.rs`):
+
 - **Fused per-head QkNormRope + KV-cache write** (`kv_write_peephole`,
   `adapter.rs:876`).
 - **`Op::RmsNormAdd`** fused norm+residual as a runner-emitted op
-  (`adapter.rs:1134`).
+  (`adapter.rs:1134`) — the largest remaining dense-decode launch item now that
+  the FFN pair is fused: two dispatches per layer per token.
 
 ## 4. Device-side sampling
 
-ROCm reads logits back to the host and samples in Rust. Vulkan samples on-GPU
-(`recorder.rs:7401-7693`): `argmax`, `argmax_prob`, two-stage `sample_topk` (+
+ROCm samples greedily in-graph already (`Op::Argmax`, rows 1 and — since F1 —
+rows > 1); what is missing is the stochastic and diffusion half. Vulkan
+(`recorder.rs:7401-7693`) also has `argmax_prob`, two-stage `sample_topk` (+
 chained `_dyn`), and `dg_eb_sample` (diffusion entropy-bound, logits stay in
-VRAM). Port these + flip the `gpu_sample`/`argmax_rows`/`argmax_prob`/
-`eb_sample_reduce` caps — this also unblocks MTP speculative decode and the
-DiffusionGemma in-graph sampler on ROCm.
+VRAM). Port these + flip the `gpu_sample`/`argmax_prob`/`eb_sample_reduce` caps
+— this also unblocks MTP speculative decode and the DiffusionGemma in-graph
+sampler on ROCm.
+
+Do NOT expect throughput from the readback itself: F1 measured a temp-0.6 decode
+(which downloads the whole `[vocab]` logits row every token — 608 KB for Qwen3)
+against a greedy one that reads back 4 bytes, and the two are indistinguishable
+(137.0 vs 136.6 t/s). At ~25 GB/s over PCIe that transfer is ~24 µs against a
+7.3 ms token. The win here is capability, not bandwidth.
 
 ## 5. Decode-replay tape (record-once decode) — evaluate first
 

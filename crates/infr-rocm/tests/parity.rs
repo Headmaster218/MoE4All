@@ -4440,6 +4440,43 @@ fn embed_gather_q3k_native_matches_cpu() {
     );
 }
 
+/// Q6_K embedding table through the native `embed_q6k` in-kernel decode gather (×scale) vs CPU.
+/// THE table format that matters in practice: llama.cpp's Q4_K_M recipe stores `token_embd.weight`
+/// as Q6_K (Qwen3-0.6B-Q4_K_M does), so this is the decode the `embed_gather` capability actually
+/// runs on the golden model — and it was the one k-quant `embed_*` case with no coverage.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q6k_native_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+    let be = rocm().unwrap();
+    let (vocab, ne) = (6usize, 256usize); // ne = one whole Q6_K super-block; vocab > max(ids)
+    let scale = (ne as f32).sqrt(); // non-1.0 (Gemma-style) — must be applied on-device
+    let t_bytes = q6k_blocks(vocab * ne / 256);
+    let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::Q6K, vocab, ne, scale);
+    let r = run_embed_gather(&be, &ids, &t_bytes, DType::Q6K, vocab, ne, scale);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "EmbedGather Q6_K (native) scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "EmbedGather Q6_K reference is all-zero — test is vacuous"
+    );
+    // Bit-faithful decode: the only loss is the f16 round of `d * sc * code`, so the same
+    // f16-rounding bound the Q5_K case uses.
+    assert!(
+        e / ref_mag < 2e-3,
+        "EmbedGather Q6_K native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
 /// Q5_K embedding table through the native `embed_q5k` in-kernel decode gather (×scale) vs CPU.
 /// `embed_*` is the ONE path that reaches `deq_q5k` element-by-element (the GEMV tiers go through
 /// the int8 codes), so this pins the bit-faithful `sc*code + mn` decode — including the `qh` 5th
@@ -4618,4 +4655,388 @@ fn a_corrupt_module_cache_blob_recovers_cleanly() {
 
     // The recovered file must itself load cleanly — otherwise every later launch pays a compile.
     rebuild_and_check("re-stored blob");
+}
+
+// ── F1 fusion gate: the ops the `combined_gu` / `gated_rmsnorm` / `argmax_rows` capabilities ────
+//    make the seam emit. Each was implemented during ROCm bring-up but never proved against the
+//    CPU reference, because the "start with NOTHING fused" capability dial kept the seam from ever
+//    emitting it. These are the proofs that had to exist before the flags could be flipped.
+
+/// Declare a plain f32 `[n]` graph Input (the shape every activation in these fusion cases uses).
+fn f32_in(g: &mut Graph, n: usize) -> infr_core::tensor::TensorId {
+    g.input(f32d(n))
+}
+
+/// `Op::GatedActFused` over the COMBINED `gu` buffer `[rows, 2*nff]` (gate half first, up half
+/// second per row): `dst[r,i] = act(gu[r,i]) * gu[r, nff+i]`. This is what a `combined_gu` backend
+/// emits after the one wide `[2*nff, ne]` FFN projection, replacing `Linear`+`Linear`+`GatedAct`.
+/// The ROCm handler drives the SAME `gated_act` kernel as the split form, with `up_off = nff` and
+/// `up_stride = gate_stride = 2*nff`, so the half-selection arithmetic is the thing under test: an
+/// off-by-`nff` reads the up half as the gate and silently produces plausible-but-wrong
+/// activations. Decode (rows=1) and prefill (rows=4) shapes, SiLU and GeLU.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn gated_act_fused_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let nff = 128usize;
+    for (rows, act, label) in [
+        (1usize, Activation::Silu, "silu rows=1"),
+        (4usize, Activation::Silu, "silu rows=4"),
+        (1usize, Activation::Gelu, "gelu rows=1"),
+        (4usize, Activation::Gelu, "gelu rows=4"),
+    ] {
+        let gu = gen(rows * 2 * nff, 17);
+        let run = |b: &dyn Backend| -> Vec<f32> {
+            let mut g = Graph::new();
+            let gid = f32_in(&mut g, rows * 2 * nff);
+            let dst = g.output(f32d(rows * nff));
+            g.push(Op::GatedActFused {
+                gu: gid,
+                dst,
+                rows: rows as u32,
+                nff: nff as u32,
+                act,
+            });
+            let plan = b.compile(&g).expect("compile");
+            let gb = b.alloc(gu.len() * 4, BufferUsage::Activations).expect("gu");
+            b.upload(gb.as_ref(), bytemuck::cast_slice(&gu)).unwrap();
+            let ob = b.alloc(rows * nff * 4, BufferUsage::Readback).expect("out");
+            let mut bd = Bindings::new();
+            bd.bind(gid, gb.as_ref());
+            bd.bind(dst, ob.as_ref());
+            b.execute(plan.as_ref(), &bd).expect("execute");
+            let mut o = vec![0f32; rows * nff];
+            b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                .unwrap();
+            o
+        };
+        let c = run(&cpu);
+        let r = run(&be);
+        let e = maxerr(&c, &r);
+        let mag = maxabs(&c).max(1e-6);
+        println!("GatedActFused {label} max_err={e:e} max|ref|={mag:e}");
+        assert!(
+            mag > 1e-3,
+            "GatedActFused {label} reference all-zero — vacuous"
+        );
+        assert!(
+            e / mag < 1e-3,
+            "GatedActFused {label} diverges from CPU reference (wrong gate/up half?): abs={e:e}"
+        );
+    }
+}
+
+/// `Op::Linear` with a non-zero `w_off` — the OFFSET decode GEMV into a combined weight bank. A
+/// `combined_gu` backend also opts the seam into the fused QKV upload (`fuse_qkv_decision` reads
+/// the same capability), whose decode path issues three GEMVs at `w_off = 0 / qrow*ne /
+/// (qrow+kvrow)*ne` into ONE `[qrow+2*kvrow, ne]` buffer. Nothing on ROCm exercised `w_off` before
+/// this: the block-offset arithmetic (`(w_off/qpb)*bpb`) is quant-layout-specific, and getting it
+/// wrong reads a shifted weight bank — coherent-looking garbage. Q4_K weight, decode (m=1) and
+/// prefill (m=4), every slice of a 3-way split checked against the CPU reference.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_w_off_matches_cpu() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let in_f = 256usize; // one Q4_K super-block per weight row
+    let slice_rows = 32usize; // rows per projection slice
+    let out_f_total = 3 * slice_rows;
+    // Per-BLOCK distinct payload (`lcg_bytes(seed ^ block)`), NOT the local `q4k_blocks` byte ramp:
+    // that ramp has a 256-byte period and a slice is 32×144 = 4608 bytes ≡ 0 (mod 256), so all
+    // three slices would carry byte-identical weights and a wrong `w_off` could not be observed.
+    let w_bytes = infr_testkit::synth_weight(DType::Q4K, out_f_total * in_f, 0x5F01);
+    for m in [1usize, 4] {
+        let x = gen(m * in_f, 23);
+        // Every slice must produce a DIFFERENT reference output, else a wrong offset is invisible.
+        let mut refs: Vec<Vec<f32>> = Vec::new();
+        for slice in 0..3 {
+            // Fresh backend per case — `dequant_weight_or_cache` keys on the device pointer
+            // (see `embed_gather_matches_cpu`'s note on recycled addresses).
+            let Some(be) = rocm() else {
+                return;
+            };
+            let w_off = slice * slice_rows * in_f;
+            let run = |b: &dyn Backend| -> Vec<f32> {
+                let mut g = Graph::new();
+                let xid = f32_in(&mut g, m * in_f);
+                let wid = g.weight(TensorDesc::new(vec![out_f_total * in_f], DType::Q4K));
+                let dst = g.output(f32d(m * slice_rows));
+                g.push(Op::Linear {
+                    x: xid,
+                    weight: wid,
+                    dst,
+                    m: m as u32,
+                    in_f: in_f as u32,
+                    out_f: slice_rows as u32,
+                    w_off: w_off as u32,
+                });
+                let plan = b.compile(&g).expect("compile");
+                let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+                b.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+                let wb = b.alloc(w_bytes.len(), BufferUsage::Weights).expect("w");
+                b.upload(wb.as_ref(), &w_bytes).unwrap();
+                let ob = b
+                    .alloc(m * slice_rows * 4, BufferUsage::Readback)
+                    .expect("out");
+                let mut bd = Bindings::new();
+                bd.bind(xid, xb.as_ref());
+                bd.bind(wid, wb.as_ref());
+                bd.bind(dst, ob.as_ref());
+                b.execute(plan.as_ref(), &bd).expect("execute");
+                let mut o = vec![0f32; m * slice_rows];
+                b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                    .unwrap();
+                o
+            };
+            let c = run(&cpu);
+            let r = run(&be);
+            let e = maxerr(&c, &r);
+            let mag = maxabs(&c).max(1e-6);
+            println!(
+                "Linear w_off m={m} slice={slice} max_err={e:e} max|ref|={mag:e} rel={:e}",
+                e / mag
+            );
+            assert!(
+                mag > 1e-3,
+                "Linear w_off m={m} slice={slice} reference all-zero — vacuous"
+            );
+            // int8-activation dp4a decode / WMMA prefill vs the f32 CPU dot: the same tolerance
+            // the other native-quant GEMV cases here use.
+            assert!(
+                e / mag < 3e-2,
+                "Linear w_off m={m} slice={slice} diverges from CPU (wrong block offset?): rel={:e}",
+                e / mag
+            );
+            refs.push(c);
+        }
+        for i in 0..refs.len() {
+            for j in i + 1..refs.len() {
+                assert!(
+                    maxerr(&refs[i], &refs[j]) > 1e-3,
+                    "m={m}: slices {i} and {j} produce the SAME reference output — the weight \
+                     payload does not vary per slice, so this case could not catch a wrong w_off"
+                );
+            }
+        }
+    }
+}
+
+/// Compile + run a 2-input (`x`, `gate`) + 1-weight graph on `b` and download `dst` as `out_len`
+/// f32s. Shared by the fused and split arms of [`gated_rmsnorm_matches_cpu`] so the two differ
+/// only in the ops pushed.
+#[allow(clippy::too_many_arguments)]
+fn run_xzw(
+    b: &dyn Backend,
+    g: Graph,
+    xid: infr_core::tensor::TensorId,
+    zid: infr_core::tensor::TensorId,
+    wid: infr_core::tensor::TensorId,
+    dst: infr_core::tensor::TensorId,
+    x: &[f32],
+    z: &[f32],
+    w_bytes: &[u8],
+    out_len: usize,
+) -> Vec<f32> {
+    let plan = b.compile(&g).expect("compile");
+    let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    b.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+    let zb = b.alloc(z.len() * 4, BufferUsage::Activations).expect("z");
+    b.upload(zb.as_ref(), bytemuck::cast_slice(z)).unwrap();
+    let wb = b.alloc(w_bytes.len(), BufferUsage::Weights).expect("w");
+    b.upload(wb.as_ref(), w_bytes).unwrap();
+    let ob = b.alloc(out_len * 4, BufferUsage::Readback).expect("out");
+    let mut bd = Bindings::new();
+    bd.bind(xid, xb.as_ref());
+    bd.bind(zid, zb.as_ref());
+    bd.bind(wid, wb.as_ref());
+    bd.bind(dst, ob.as_ref());
+    b.execute(plan.as_ref(), &bd).expect("execute");
+    let mut o = vec![0f32; out_len];
+    b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// `Op::GatedRmsNorm` (qwen35 DeltaNet z-gate): per-head RMSNorm × learned weight × `silu(gate)`
+/// in ONE dispatch, replacing the `QkNorm`→`GatedAct` pair the runner emits when the capability is
+/// off. Checked against the CPU interpreter's own `GatedRmsNorm` (which it implements precisely so
+/// this parity can exist) AND against the split pair on BOTH backends — so the fusion is proved to
+/// be the same math as what it replaces, not merely self-consistent.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn gated_rmsnorm_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (3usize, 4usize, 64usize);
+    let eps = 1e-6f32;
+    let x = gen(rows * nh * hd, 5);
+    let gate = gen(rows * nh * hd, 29);
+    let wf32 = gen(hd, 7);
+    let w_bytes = f16_bytes(&wf32);
+    let fused = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let xid = f32_in(&mut g, rows * nh * hd);
+        let zid = f32_in(&mut g, rows * nh * hd);
+        let wid = g.weight(TensorDesc::new(vec![hd], DType::F16));
+        let dst = g.output(f32d(rows * nh * hd));
+        g.push(Op::GatedRmsNorm {
+            x: xid,
+            weight: wid,
+            gate: zid,
+            dst,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            eps,
+        });
+        run_xzw(
+            b,
+            g,
+            xid,
+            zid,
+            wid,
+            dst,
+            &x,
+            &gate,
+            &w_bytes,
+            rows * nh * hd,
+        )
+    };
+    // The SPLIT pair the runner emits without the capability: QkNorm (per-head rmsnorm × weight)
+    // then GatedAct (SiLU gate × the normed value, packed strides).
+    let split = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let xid = f32_in(&mut g, rows * nh * hd);
+        let zid = f32_in(&mut g, rows * nh * hd);
+        let wid = g.weight(TensorDesc::new(vec![hd], DType::F16));
+        let normed = g.internal(f32d(rows * nh * hd));
+        let dst = g.output(f32d(rows * nh * hd));
+        g.push(Op::QkNorm {
+            x: xid,
+            weight: wid,
+            dst: normed,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            eps,
+            x_stride: 0,
+        });
+        g.push(Op::GatedAct {
+            gate: zid,
+            up: normed,
+            dst,
+            rows: rows as u32,
+            nff: (nh * hd) as u32,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+        });
+        run_xzw(
+            b,
+            g,
+            xid,
+            zid,
+            wid,
+            dst,
+            &x,
+            &gate,
+            &w_bytes,
+            rows * nh * hd,
+        )
+    };
+    let c_fused = fused(&cpu);
+    let c_split = split(&cpu);
+    let mag = maxabs(&c_fused).max(1e-6);
+    assert!(mag > 1e-3, "GatedRmsNorm reference all-zero — vacuous");
+    let e_ref = maxerr(&c_fused, &c_split);
+    println!("GatedRmsNorm cpu fused-vs-split max_err={e_ref:e} max|ref|={mag:e}");
+    assert!(
+        e_ref / mag < 1e-6,
+        "the fused op is not the same math as the QkNorm→GatedAct pair it replaces: rel={:e}",
+        e_ref / mag
+    );
+    let r_fused = fused(&be);
+    let e = maxerr(&c_fused, &r_fused);
+    println!("GatedRmsNorm rocm-vs-cpu max_err={e:e} rel={:e}", e / mag);
+    assert!(
+        e / mag < 1e-3,
+        "GatedRmsNorm diverges from the CPU reference: abs={e:e} rel={:e}",
+        e / mag
+    );
+    // And ROCm's fused op must agree with the split pair ROCm itself runs today — the exact swap
+    // flipping the capability performs.
+    let r_split = split(&be);
+    let e2 = maxerr(&r_split, &r_fused);
+    println!(
+        "GatedRmsNorm rocm fused-vs-split max_err={e2:e} rel={:e}",
+        e2 / mag
+    );
+    assert!(
+        e2 / mag < 1e-3,
+        "ROCm's fused op disagrees with its own split pair: abs={e2:e}"
+    );
+}
+
+/// `Op::Argmax` with `rows > 1` — the `argmax_rows` capability (MTP speculative-verify accept: m
+/// u32 ids read back instead of the m×vocab logits). Bit-EXACT: the id is a u32 bit-pattern, so
+/// any difference is a wrong token, not a rounding error. The tie case is the point — the
+/// reference rule is first-max (strict `>`, lowest index wins), and the HIP kernel reaches it
+/// through a shared-memory tree reduce that has to break ties the same way. Includes a real
+/// vocab-sized row (151936) and a deliberate duplicate maximum inside row 0.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn argmax_multirow_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    for (rows, n) in [(1usize, 151936usize), (4, 151936), (6, 1024), (3, 257)] {
+        let mut x = gen(rows * n, 11);
+        // A unique maximum per row at a scattered index …
+        for r in 0..rows {
+            x[r * n + (r * 7919 + 13) % n] = 9.0 + r as f32;
+        }
+        // … plus, in row 0, the SAME value planted a second time so the first-max tie rule is
+        // exercised (the LOWER index must win, on both backends).
+        if rows > 1 {
+            x[(n / 3).min(n - 1)] = 9.0;
+        }
+        let run = |b: &dyn Backend| -> Vec<u32> {
+            let mut g = Graph::new();
+            let xid = f32_in(&mut g, rows * n);
+            let dst = g.output(f32d(rows));
+            g.push(Op::Argmax {
+                x: xid,
+                dst,
+                n: n as u32,
+                rows: rows as u32,
+            });
+            let plan = b.compile(&g).expect("compile");
+            let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+            b.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let ob = b.alloc(rows * 4, BufferUsage::Readback).expect("out");
+            let mut bd = Bindings::new();
+            bd.bind(xid, xb.as_ref());
+            bd.bind(dst, ob.as_ref());
+            b.execute(plan.as_ref(), &bd).expect("execute");
+            let mut o = vec![0u32; rows];
+            b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                .unwrap();
+            o
+        };
+        let c = run(&cpu);
+        let r = run(&be);
+        println!("Argmax rows={rows} n={n} cpu={c:?} rocm={r:?}");
+        assert_eq!(
+            c, r,
+            "Argmax rows={rows} n={n} picked a different token than the CPU reference \
+             (tie rule or cross-thread reduce?)"
+        );
+    }
 }

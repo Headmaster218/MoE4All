@@ -784,14 +784,59 @@ impl Backend for RocmBackend {
             buffer_device_address: false,
             max_shared_memory_bytes: props.shared_mem_per_block as u32,
             unified_memory: false,
-            // ── correctness-dial: start with NOTHING fused ──
+            // ── fusion dial (F1) ──
+            // The bring-up dial started at "NOTHING fused" and was never revisited; F1 proved each
+            // handler against the CPU reference (`tests/parity.rs`, the "F1 fusion gate" section)
+            // and measured it on a 7900 XTX before setting it. Every value below is a measurement,
+            // not a default.
+            //
+            // Kernel launches per decode token, the campaign's north star, before → after:
+            //   Qwen3-0.6B Q4_K_M (dense, 28L)   563 → 507   (-9.9%)
+            //   Qwen3.5-0.8B Q4_K_M (DeltaNet)   561 → 495   (-11.8%)
+            //   Qwen3-30B-A3B Q4_K_M (MoE, 48L) 1059 → 1059  (no dense gate/up to fuse)
+            //
+            // A HIP-graph probe (Slice 31, `examples/graph_probe.rs`) measured replay at only
+            // 12-18% off a ~3 µs/op launch path — ~2.5-3% of a token. Negative; stays off.
             decode_replay: false,
-            combined_gu: false,
+            // One `[2*nff, ne]` FFN projection + `Op::GatedActFused` instead of two Linears +
+            // `GatedAct`. Qwen3-0.6B Q4_K_M tg128 126.3 → 137.3 t/s (+8.7%), pp512 +0.7%; the
+            // qwen3 seam golden 0xfd63781ea3bfa785 is unmoved (the concat reorders no arithmetic —
+            // each half is the same dot it always was, just issued in one dispatch). MoE-only archs
+            // have no dense `ffn_gate.weight` and are unaffected (Qwen3-30B-A3B: flat, as expected).
+            // NOTE this also opts the seam into the fused QKV upload (`fuse_qkv_decision` reads the
+            // SAME capability), whose decode path GEMVs at a non-zero `w_off` — covered by
+            // `linear_w_off_matches_cpu`. Mixed-precision Q4_K_M GGUFs (attn_v bumped to Q6_K) fail
+            // that decision's uniform-dtype gate and keep the split form regardless.
+            combined_gu: true,
+            // OFF, and not for want of a kernel: `Op::EmbedGather` works (bit-exact for Q4_K), but
+            // the native `embed_*` decode goes through `fin`, which deliberately ROUNDS EACH
+            // ELEMENT TO f16 to reproduce the dequant→f16 cache the GEMV tiers are blessed against.
+            // The host embed path it would replace dequantizes in exact f32, so the two disagree by
+            // ~2.5e-4 relative on the Q6_K `token_embd` that llama.cpp's Q4_K_M recipe ships
+            // (`embed_gather_q6k_native_matches_cpu` pins the gap) — enough to fork a greedy run:
+            // the qwen3 seam golden moves to 0xe91c03c96815974c. And it does not pay for itself
+            // even ignoring that: tg128 137.1 → 135.4 t/s (-1.2%, the one-thread-per-row gather is
+            // slower than the 4 KB/token upload it saves) with pp512 +0.2% and the MoE flat. Turning
+            // it on needs an exact-f32 sibling of the `deq_*` family first, and then a reason to.
             embed_gather: false,
+            // Phase 2 (`Op::Sample`/`Op::ArgmaxProb` return "Phase 2" from the executor).
             gpu_sample: false,
-            argmax_rows: false,
+            // The `argmax` kernel is one block per row (`grid.x = rows`) and breaks ties by lowest
+            // index through its shared-memory reduce, so it reproduces the reference first-max rule
+            // exactly — `argmax_multirow_matches_cpu` checks id-for-id against the CPU at a real
+            // 151936-wide vocab, including a planted duplicate maximum. No measurable perf change
+            // today: this capability gates ONLY the MTP speculative-verify accept (`rows > 1`), and
+            // the rows==1 decode argmax every backend owns is already emitted here. It is set
+            // because it is TRUE — the m×vocab verify readback is a bug waiting for the first ROCm
+            // `MtpHeadSession`, not something to rediscover then.
+            argmax_rows: true,
             argmax_prob: false,
-            gated_rmsnorm: false,
+            // Fused per-head RMSNorm + SiLU z-gate (qwen35 DeltaNet): one dispatch instead of
+            // `QkNorm`→`GatedAct`. BIT-IDENTICAL, not merely close — `gated_rmsnorm_matches_cpu`
+            // measures max_err 0.0 between the fused op and the split pair on ROCm AND on the CPU.
+            // Qwen3.5-0.8B Q4_K_M pp512 1216.8 → 1232.2 t/s (+1.3%), tg128 a wash (18.33 → 18.38);
+            // all nine seam goldens unmoved. Kept for being free and strictly fewer launches.
+            gated_rmsnorm: true,
             kv_swa_ring: false,
         }
     }
