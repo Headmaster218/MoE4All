@@ -869,6 +869,101 @@ fn moe_down_i8_routed_kernel(dn: &str) -> &'static str {
     }
 }
 
+/// Token rows per id-indexed MoE expert-GEMV dispatch (R8) — the `moe_*_idm_*` tier's batch bound.
+///
+/// **This is not Vulkan's `MOE_SMALL_M` with a different number, and it is deliberately not a
+/// crossover.** Vulkan's threshold picks between its id-GEMV tier and a bucket-sorted batched
+/// expert GEMM, and 8 is where the batched path's cross-token weight reuse starts to pay for its
+/// quant/count/scan/scatter prologue. ROCm HAS NO BATCHED EXPERT PATH: above the threshold it
+/// would fall back to the same per-`(row, slot)` host loop the id tier replaces, over the *same*
+/// per-slot weight traffic — so the id tier is a strict improvement at every `m` here and the
+/// only thing left to bound is the per-slot scratch (`[rows·n_used, n_ff_exp]` activations plus
+/// `[rows·n_used, ne]` partial outputs), which grows linearly in `rows`.
+///
+/// So `rows` is CHUNKED at this value rather than the tier being abandoned past it. Measured on
+/// the RX 7900 XTX with Qwen3-30B-A3B Q4_K_M `pp512`, 3 reps (see `docs/rocm-plan.md` R8):
+/// 8 → 237.1, 32 → 249.0, 128 → 253.3, unchunked → 261.2 t/s. Throughput rises with the chunk and
+/// flattens; 128 is NOT the top of that curve, and the last ~3% is deliberately left on the table,
+/// because it is not free: at `-p 1024` an unchunked (or 512-row) chunk asks ~50-100 MiB of pool
+/// on top of a 17 GiB weight set plus its KV and `BufferPool`'s `hipMalloc` FAILS — reproduced on
+/// this box, and today that aborts the process rather than degrading. `MOE_ID_SCRATCH_CAP` (at the
+/// use site) is the backstop that makes the ceiling a byte count as well as a row count.
+///
+/// The clamp is [`infr_core::tier::EnvRows`]' — the SHARED policy half, so this knob cannot grow
+/// its own bounds grammar. `0` keeps the meaning it has on Vulkan's crossover knob, "never take
+/// the id tier": it drops the resident MoE path back to the pre-R8 per-`(row, slot)` loop, which
+/// is the A/B comparand `moe_ffn_id_tier_matches_the_serial_tier_bitwise` runs against. The
+/// ceiling matches `INFR_UBATCH`'s default prefill chunk — a larger value cannot widen a dispatch
+/// beyond what the seam hands the op, it can only inflate the scratch.
+const MOE_ID_ROWS: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
+    // No env key — a typed config field (`kernels.rocm.moe_id_rows`), like `module_cache`. The
+    // manifest has nothing to map, so this names the config path it answers to instead.
+    env: "kernels.rocm.moe_id_rows",
+    default: 128,
+    min: 0,
+    max: 1024,
+};
+
+/// Multi-slot id-indexed twin of [`moe_gate_up_i8_routed_kernel`] (R8).
+fn moe_gate_up_i8_idm_kernel(gu: &str) -> &'static str {
+    match gu {
+        "q80" => "moe_gate_up_act_i8_idm_q80",
+        "q2k" => "moe_gate_up_act_i8_idm_q2k",
+        "q3k" => "moe_gate_up_act_i8_idm_q3k",
+        "q4k" => "moe_gate_up_act_i8_idm_q4k",
+        "q5k" => "moe_gate_up_act_i8_idm_q5k",
+        "q6k" => "moe_gate_up_act_i8_idm_q6k",
+        "q40" => "moe_gate_up_act_i8_idm_q40",
+        "q41" => "moe_gate_up_act_i8_idm_q41",
+        "q51" => "moe_gate_up_act_i8_idm_q51",
+        "iq4nl" => "moe_gate_up_act_i8_idm_iq4nl",
+        "iq4xs" => "moe_gate_up_act_i8_idm_iq4xs",
+        "iq2xxs" => "moe_gate_up_act_i8_idm_iq2xxs",
+        "iq2xs" => "moe_gate_up_act_i8_idm_iq2xs",
+        "iq2s" => "moe_gate_up_act_i8_idm_iq2s",
+        "iq3xxs" => "moe_gate_up_act_i8_idm_iq3xxs",
+        "iq3s" => "moe_gate_up_act_i8_idm_iq3s",
+        "iq1s" => "moe_gate_up_act_i8_idm_iq1s",
+        "iq1m" => "moe_gate_up_act_i8_idm_iq1m",
+        "tq10" => "moe_gate_up_act_i8_idm_tq10",
+        "tq20" => "moe_gate_up_act_i8_idm_tq20",
+        "q20" => "moe_gate_up_act_i8_idm_q20",
+        "mxfp4" => "moe_gate_up_act_i8_idm_mxfp4",
+        "nvfp4" => "moe_gate_up_act_i8_idm_nvfp4",
+        _ => unreachable!("moe_gate_up_i8_idm_kernel: uncovered ({gu})"),
+    }
+}
+
+/// Multi-slot id-indexed twin of [`moe_down_i8_routed_kernel`] (R8).
+fn moe_down_i8_idm_kernel(dn: &str) -> &'static str {
+    match dn {
+        "q80" => "moe_down_i8_idm_q80",
+        "q2k" => "moe_down_i8_idm_q2k",
+        "q3k" => "moe_down_i8_idm_q3k",
+        "q4k" => "moe_down_i8_idm_q4k",
+        "q5k" => "moe_down_i8_idm_q5k",
+        "q6k" => "moe_down_i8_idm_q6k",
+        "q40" => "moe_down_i8_idm_q40",
+        "q41" => "moe_down_i8_idm_q41",
+        "q51" => "moe_down_i8_idm_q51",
+        "iq4nl" => "moe_down_i8_idm_iq4nl",
+        "iq4xs" => "moe_down_i8_idm_iq4xs",
+        "iq2xxs" => "moe_down_i8_idm_iq2xxs",
+        "iq2xs" => "moe_down_i8_idm_iq2xs",
+        "iq2s" => "moe_down_i8_idm_iq2s",
+        "iq3xxs" => "moe_down_i8_idm_iq3xxs",
+        "iq3s" => "moe_down_i8_idm_iq3s",
+        "iq1s" => "moe_down_i8_idm_iq1s",
+        "iq1m" => "moe_down_i8_idm_iq1m",
+        "tq10" => "moe_down_i8_idm_tq10",
+        "tq20" => "moe_down_i8_idm_tq20",
+        "q20" => "moe_down_i8_idm_q20",
+        "mxfp4" => "moe_down_i8_idm_mxfp4",
+        "nvfp4" => "moe_down_i8_idm_nvfp4",
+        _ => unreachable!("moe_down_i8_idm_kernel: uncovered ({dn})"),
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -2857,7 +2952,27 @@ fn run_op(
             // gate_up → quant_h → down chain so the reuse never races). All fully written before read,
             // so `zero = false`.
             let use_i8 = native.is_some() && moe_i8_enabled(ctx.rocm);
-            let (qx_x, xs_x, h_buf, hq, hs) = if use_i8 {
+            // ── R8: the id-indexed multi-slot expert GEMV tier (`moe_*_idm_*`). ──
+            // Takes over the RESIDENT int8 expert path entirely — every (row, slot) pair in one
+            // dispatch per stage instead of the `3 * rows * n_used` serialized launches below.
+            // Scoped to `use_i8 && !is_paged`, and the exclusions are not arbitrary:
+            //
+            //  * PAGED stays on the per-expert loop. The pager routes on the HOST (it must know
+            //    which experts to page in before it can page them), and Slice 36 deliberately
+            //    INTERLEAVES each expert's H2D fill with the previous expert's GEMV on a separate
+            //    copy stream — collapsing the loop into one dispatch would serialize every fill
+            //    ahead of all compute and throw that overlap away for the sake of ~20 launches.
+            //    A paged bank's slot index is also not its expert id, so an id-GEMV would need
+            //    Vulkan's device LUT (`native_gemv_id*.comp`'s `-DPAGED` build, a per-layer window
+            //    into a slot-index tape) which the host-routing design has no need of. See the R8
+            //    entry in `docs/rocm-plan.md` for the measurement.
+            //  * `INFR_ROCM_NO_I8` / the dequant→f16 fallback stay on the loop: both are A/B
+            //    comparands whose whole job is to be the OTHER path, and neither ships.
+            //  * `kernels.rocm.moe_id_rows = 0` turns the tier off outright — the third A/B
+            //    comparand, and the one that isolates R8 itself (see [`MOE_ID_ROWS`]).
+            let id_rows = MOE_ID_ROWS.clamped(ctx.rocm.moe_id_rows);
+            let use_idm = use_i8 && !is_paged && id_rows > 0;
+            let (qx_x, xs_x, h_buf, hq, hs) = if use_i8 && !use_idm {
                 (
                     Some(ctx.pool_buf(neu.max(1), false)),
                     Some(ctx.pool_buf((neu / 32 * 4).max(1), false)),
@@ -2926,162 +3041,321 @@ fn run_op(
                     .unwrap_or(std::ptr::null_mut());
                 let fused_flag: i32 = if fused_gate_up { 1 } else { 0 };
 
-                for row in 0..rows {
-                    let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
-                    let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
-                    if use_i8 {
-                        // int8 activation quant of this token's input row (reused across all n_used).
+                if use_idm {
+                    // ── R8 id-indexed MULTI-SLOT tier: 5 dispatches per row-chunk, whatever
+                    // `n_used` is, and all `rows * n_used` experts run CONCURRENTLY. ──
+                    let ((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb)) =
+                        native.expect("use_idm implies native");
+                    // Per-expert BYTE strides — computed on the host in `usize` and passed as
+                    // `i64`, so the in-kernel `base + (long)expert_id * stride` is a 64-bit
+                    // multiply on a 64-bit pointer. Element-count strides scaled inside the kernel
+                    // are what overflowed 32 bits on Vulkan; see MOE_ID_MULTI's header.
+                    let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
+                    let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                    let up_half_boff = up_bstride;
+                    let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
+                    // Rows are CHUNKED (see `MOE_ID_ROWS`) — the scratch below is sized for ONE
+                    // chunk and reused across them, so a 1024-row prefill ubatch costs the same
+                    // VRAM as a 128-row one. `rows == 1` (decode) is a single chunk of 1.
+                    //
+                    // The chunk is bounded by BYTES as well as by rows, because a row count is not
+                    // a fixed footprint:
+                    // `ne` and `n_ff_exp` vary ~4× across MoE architectures and `n_used` 1..8, so
+                    // the same 128 rows is 13 MiB on qwen3moe and could be several times that
+                    // elsewhere. MEASURED, not hypothetical: at `-p 1024` on Qwen3-30B-A3B an
+                    // unchunked (or 512-row) chunk asks for ~50-100 MiB of pool on top of a 17 GiB
+                    // weight set plus its KV, and `BufferPool`'s `hipMalloc` fails — which today
+                    // aborts the process rather than degrading. The cap makes the knob a ceiling
+                    // on rows AND on bytes, so no shape can walk into that through the default.
+                    const MOE_ID_SCRATCH_CAP: usize = 16 << 20;
+                    let per_row =
+                        nu * (nfu * 4 + neu * 4 + nfu + (nfu / 32) * 4) + neu * 4 + (neu / 32) * 4;
+                    let chunk = id_rows
+                        .min(rows.max(1))
+                        .min((MOE_ID_SCRATCH_CAP / per_row.max(1)).max(1))
+                        .max(1);
+                    let max_slots = chunk * nu;
+                    // Every byte of each is written before it is read within the chunk (the quant
+                    // passes fill `qx`/`xs` and `hq`/`hs` completely, the two GEMVs fill `h`/`y`
+                    // completely), so `zero = false` — same argument the per-row scratch makes.
+                    let qxb = ctx.pool_buf((chunk * neu).max(1), false);
+                    let xsb = ctx.pool_buf((chunk * (neu / 32) * 4).max(1), false);
+                    let hb = ctx.pool_buf((max_slots * nfu * 4).max(1), false);
+                    let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
+                    let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
+                    let yb = ctx.pool_buf((max_slots * neu * 4).max(1), false);
+                    let mut r0 = 0usize;
+                    while r0 < rows {
+                        let nr = chunk.min(rows - r0);
+                        let n_slots = nr * nu;
+                        // `route_ids`/`route_wts` are `[rows, n_used]` flat, so a row chunk is a
+                        // contiguous window of slots — the kernels' `slot` is chunk-local and
+                        // `row = slot / n_used` recovers the chunk-local token row.
+                        let x_c = unsafe { (x_ptr as *mut u8).add(r0 * neu * 4) as *mut c_void };
+                        let dst_c = unsafe { (dd.ptr as *mut u8).add(r0 * neu * 4) as *mut c_void };
+                        let ids_c =
+                            unsafe { (route_ids.ptr as *mut u8).add(r0 * nu * 4) as *mut c_void };
+                        let wts_c =
+                            unsafe { (route_wts.ptr as *mut u8).add(r0 * nu * 4) as *mut c_void };
+                        // int8 quant of the chunk's WHOLE activation block in one dispatch — the
+                        // per-row loop's `quant_i8_32` with its own `m` finally carrying more
+                        // than 1.
                         dispatch_1d(
                             pipelines,
                             ctx.stream,
                             "quant_i8_32",
-                            (neu / 32) as u32,
+                            (nr * (neu / 32)) as u32,
                             256,
                             args![
-                                arg_ptr(x_row),
-                                arg_ptr(qx_x.as_ref().unwrap().ptr),
-                                arg_ptr(xs_x.as_ref().unwrap().ptr),
-                                arg_i32(1),
+                                arg_ptr(x_c),
+                                arg_ptr(qxb.ptr),
+                                arg_ptr(xsb.ptr),
+                                arg_i32(nr as i32),
                                 arg_i32(ne as i32),
                             ],
                         )?;
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            moe_gate_up_i8_idm_kernel(gu),
+                            n_ff_exp,
+                            n_slots as u32,
+                            32,
+                            args![
+                                arg_ptr(qxb.ptr),
+                                arg_ptr(xsb.ptr),
+                                arg_ptr(gw_ptr),
+                                arg_ptr(uw_ptr),
+                                arg_ptr(hb.ptr),
+                                arg_i32(ne as i32),
+                                arg_i32(n_ff_exp as i32),
+                                arg_i32(at),
+                                arg_i32(wb_flag),
+                                arg_ptr(dsc_ptr),
+                                arg_ptr(ids_c),
+                                arg_ptr(wts_c),
+                                arg_i32(n_slots as i32),
+                                arg_i32(nu as i32),
+                                arg_i64(gate_bstride),
+                                arg_i64(up_bstride),
+                                arg_i32(fused_flag),
+                                arg_i64(up_half_boff),
+                            ],
+                        )?;
+                        dispatch_1d(
+                            pipelines,
+                            ctx.stream,
+                            "quant_i8_32",
+                            (n_slots * (nfu / 32)) as u32,
+                            256,
+                            args![
+                                arg_ptr(hb.ptr),
+                                arg_ptr(hqb.ptr),
+                                arg_ptr(hsb.ptr),
+                                arg_i32(n_slots as i32),
+                                arg_i32(n_ff_exp as i32),
+                            ],
+                        )?;
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            moe_down_i8_idm_kernel(dn),
+                            ne,
+                            n_slots as u32,
+                            32,
+                            args![
+                                arg_ptr(hqb.ptr),
+                                arg_ptr(hsb.ptr),
+                                arg_ptr(dw_ptr),
+                                arg_ptr(yb.ptr),
+                                arg_i32(ne as i32),
+                                arg_i32(n_ff_exp as i32),
+                                arg_ptr(ids_c),
+                                arg_i32(n_slots as i32),
+                                arg_i64(down_bstride),
+                            ],
+                        )?;
+                        // Ordered slot reduction — NOT atomics; see MOE_ID_MULTI's header for why
+                        // the golden hash depends on it.
+                        dispatch_1d(
+                            pipelines,
+                            ctx.stream,
+                            "moe_accum_idm",
+                            (nr * neu) as u32,
+                            256,
+                            args![
+                                arg_ptr(yb.ptr),
+                                arg_ptr(dst_c),
+                                arg_i32(ne as i32),
+                                arg_i32(nr as i32),
+                                arg_i32(nu as i32),
+                            ],
+                        )?;
+                        r0 += nr;
                     }
-                    for k in 0..nu {
-                        let slot = (row * nu + k) as i32;
-                        if let (true, Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb)))) =
-                            (use_i8, native)
-                        {
-                            let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
-                            let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
-                            let up_half_boff = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
-                            let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
-                            let h_ptr = h_buf.as_ref().unwrap().ptr;
-                            dispatch_grid(
-                                pipelines,
-                                ctx.stream,
-                                moe_gate_up_i8_routed_kernel(gu),
-                                n_ff_exp,
-                                1,
-                                32,
-                                args![
-                                    arg_ptr(qx_x.as_ref().unwrap().ptr),
-                                    arg_ptr(xs_x.as_ref().unwrap().ptr),
-                                    arg_ptr(gw_ptr),
-                                    arg_ptr(uw_ptr),
-                                    arg_ptr(h_ptr),
-                                    arg_i32(ne as i32),
-                                    arg_i32(n_ff_exp as i32),
-                                    arg_i32(at),
-                                    arg_i32(wb_flag),
-                                    arg_ptr(dsc_ptr),
-                                    arg_ptr(route_ids.ptr),
-                                    arg_ptr(route_wts.ptr),
-                                    arg_i32(slot),
-                                    arg_i64(gate_bstride),
-                                    arg_i64(up_bstride),
-                                    arg_i32(fused_flag),
-                                    arg_i64(up_half_boff),
-                                ],
-                            )?;
+                } else {
+                    // ── Pre-R8 per-(row, slot) tier. Still the only path for the two A/B comparands
+                    // (`INFR_ROCM_NO_I8`, and a bank pair with no native decode at all). ──
+                    for row in 0..rows {
+                        let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                        let dst_row =
+                            unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                        if use_i8 {
+                            // int8 activation quant of this token's input row (reused across all n_used).
                             dispatch_1d(
                                 pipelines,
                                 ctx.stream,
                                 "quant_i8_32",
-                                (nfu / 32) as u32,
+                                (neu / 32) as u32,
                                 256,
                                 args![
-                                    arg_ptr(h_ptr),
-                                    arg_ptr(hq.as_ref().unwrap().ptr),
-                                    arg_ptr(hs.as_ref().unwrap().ptr),
+                                    arg_ptr(x_row),
+                                    arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                    arg_ptr(xs_x.as_ref().unwrap().ptr),
                                     arg_i32(1),
-                                    arg_i32(n_ff_exp as i32),
-                                ],
-                            )?;
-                            dispatch_grid(
-                                pipelines,
-                                ctx.stream,
-                                moe_down_i8_routed_kernel(dn),
-                                ne,
-                                1,
-                                32,
-                                args![
-                                    arg_ptr(hq.as_ref().unwrap().ptr),
-                                    arg_ptr(hs.as_ref().unwrap().ptr),
-                                    arg_ptr(dw_ptr),
-                                    arg_ptr(dst_row),
                                     arg_i32(ne as i32),
-                                    arg_i32(n_ff_exp as i32),
-                                    arg_ptr(route_ids.ptr),
-                                    arg_i32(slot),
-                                    arg_i64(down_bstride),
                                 ],
                             )?;
-                        } else if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) = native {
-                            let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
-                            let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
-                            let up_half_boff = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
-                            let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
-                            dispatch_1d(
-                                pipelines,
-                                ctx.stream,
-                                moe_expert_routed_kernel(gu, dn)
-                                    .expect("non-int8 native expert without a kernel"),
-                                n_ff_exp,
-                                256,
-                                args![
-                                    arg_ptr(x_row),
-                                    arg_ptr(gw_ptr),
-                                    arg_ptr(uw_ptr),
-                                    arg_ptr(dw_ptr),
-                                    arg_ptr(dst_row),
-                                    arg_i32(ne as i32),
-                                    arg_i32(n_ff_exp as i32),
-                                    arg_i32(at),
-                                    arg_i32(wb_flag),
-                                    arg_ptr(dsc_ptr),
-                                    arg_ptr(route_ids.ptr),
-                                    arg_ptr(route_wts.ptr),
-                                    arg_i32(slot),
-                                    arg_i64(gate_bstride),
-                                    arg_i64(up_bstride),
-                                    arg_i64(down_bstride),
-                                    arg_i32(fused_flag),
-                                    arg_i64(up_half_boff),
-                                ],
-                            )?;
-                        } else {
-                            // f16 dequant-cache fallback: element strides into the __half banks.
-                            let gate_estride = ge_stride as i64;
-                            let up_estride = (nfu * neu) as i64;
-                            let down_estride = (neu * nfu) as i64;
-                            let up_half_eoff = (nfu * neu) as i64;
-                            dispatch_1d(
-                                pipelines,
-                                ctx.stream,
-                                "moe_ffn_expert_routed",
-                                n_ff_exp,
-                                256,
-                                args![
-                                    arg_ptr(x_row),
-                                    arg_ptr(gw_ptr),
-                                    arg_ptr(uw_ptr),
-                                    arg_ptr(dw_ptr),
-                                    arg_ptr(dst_row),
-                                    arg_i32(ne as i32),
-                                    arg_i32(n_ff_exp as i32),
-                                    arg_i32(at),
-                                    arg_i32(wb_flag),
-                                    arg_ptr(dsc_ptr),
-                                    arg_ptr(route_ids.ptr),
-                                    arg_ptr(route_wts.ptr),
-                                    arg_i32(slot),
-                                    arg_i64(gate_estride),
-                                    arg_i64(up_estride),
-                                    arg_i64(down_estride),
-                                    arg_i32(fused_flag),
-                                    arg_i64(up_half_eoff),
-                                ],
-                            )?;
+                        }
+                        for k in 0..nu {
+                            let slot = (row * nu + k) as i32;
+                            if let (true, Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb)))) =
+                                (use_i8, native)
+                            {
+                                let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
+                                let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                                let up_half_boff = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                                let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
+                                let h_ptr = h_buf.as_ref().unwrap().ptr;
+                                dispatch_grid(
+                                    pipelines,
+                                    ctx.stream,
+                                    moe_gate_up_i8_routed_kernel(gu),
+                                    n_ff_exp,
+                                    1,
+                                    32,
+                                    args![
+                                        arg_ptr(qx_x.as_ref().unwrap().ptr),
+                                        arg_ptr(xs_x.as_ref().unwrap().ptr),
+                                        arg_ptr(gw_ptr),
+                                        arg_ptr(uw_ptr),
+                                        arg_ptr(h_ptr),
+                                        arg_i32(ne as i32),
+                                        arg_i32(n_ff_exp as i32),
+                                        arg_i32(at),
+                                        arg_i32(wb_flag),
+                                        arg_ptr(dsc_ptr),
+                                        arg_ptr(route_ids.ptr),
+                                        arg_ptr(route_wts.ptr),
+                                        arg_i32(slot),
+                                        arg_i64(gate_bstride),
+                                        arg_i64(up_bstride),
+                                        arg_i32(fused_flag),
+                                        arg_i64(up_half_boff),
+                                    ],
+                                )?;
+                                dispatch_1d(
+                                    pipelines,
+                                    ctx.stream,
+                                    "quant_i8_32",
+                                    (nfu / 32) as u32,
+                                    256,
+                                    args![
+                                        arg_ptr(h_ptr),
+                                        arg_ptr(hq.as_ref().unwrap().ptr),
+                                        arg_ptr(hs.as_ref().unwrap().ptr),
+                                        arg_i32(1),
+                                        arg_i32(n_ff_exp as i32),
+                                    ],
+                                )?;
+                                dispatch_grid(
+                                    pipelines,
+                                    ctx.stream,
+                                    moe_down_i8_routed_kernel(dn),
+                                    ne,
+                                    1,
+                                    32,
+                                    args![
+                                        arg_ptr(hq.as_ref().unwrap().ptr),
+                                        arg_ptr(hs.as_ref().unwrap().ptr),
+                                        arg_ptr(dw_ptr),
+                                        arg_ptr(dst_row),
+                                        arg_i32(ne as i32),
+                                        arg_i32(n_ff_exp as i32),
+                                        arg_ptr(route_ids.ptr),
+                                        arg_i32(slot),
+                                        arg_i64(down_bstride),
+                                    ],
+                                )?;
+                            } else if let Some(((gu, gu_qpb, gu_bpb), (dn, dn_qpb, dn_bpb))) =
+                                native
+                            {
+                                let gate_bstride = ((ge_stride / gu_qpb) * gu_bpb) as i64;
+                                let up_bstride = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                                let up_half_boff = ((nfu * neu / gu_qpb) * gu_bpb) as i64;
+                                let down_bstride = ((neu * nfu / dn_qpb) * dn_bpb) as i64;
+                                dispatch_1d(
+                                    pipelines,
+                                    ctx.stream,
+                                    moe_expert_routed_kernel(gu, dn)
+                                        .expect("non-int8 native expert without a kernel"),
+                                    n_ff_exp,
+                                    256,
+                                    args![
+                                        arg_ptr(x_row),
+                                        arg_ptr(gw_ptr),
+                                        arg_ptr(uw_ptr),
+                                        arg_ptr(dw_ptr),
+                                        arg_ptr(dst_row),
+                                        arg_i32(ne as i32),
+                                        arg_i32(n_ff_exp as i32),
+                                        arg_i32(at),
+                                        arg_i32(wb_flag),
+                                        arg_ptr(dsc_ptr),
+                                        arg_ptr(route_ids.ptr),
+                                        arg_ptr(route_wts.ptr),
+                                        arg_i32(slot),
+                                        arg_i64(gate_bstride),
+                                        arg_i64(up_bstride),
+                                        arg_i64(down_bstride),
+                                        arg_i32(fused_flag),
+                                        arg_i64(up_half_boff),
+                                    ],
+                                )?;
+                            } else {
+                                // f16 dequant-cache fallback: element strides into the __half banks.
+                                let gate_estride = ge_stride as i64;
+                                let up_estride = (nfu * neu) as i64;
+                                let down_estride = (neu * nfu) as i64;
+                                let up_half_eoff = (nfu * neu) as i64;
+                                dispatch_1d(
+                                    pipelines,
+                                    ctx.stream,
+                                    "moe_ffn_expert_routed",
+                                    n_ff_exp,
+                                    256,
+                                    args![
+                                        arg_ptr(x_row),
+                                        arg_ptr(gw_ptr),
+                                        arg_ptr(uw_ptr),
+                                        arg_ptr(dw_ptr),
+                                        arg_ptr(dst_row),
+                                        arg_i32(ne as i32),
+                                        arg_i32(n_ff_exp as i32),
+                                        arg_i32(at),
+                                        arg_i32(wb_flag),
+                                        arg_ptr(dsc_ptr),
+                                        arg_ptr(route_ids.ptr),
+                                        arg_ptr(route_wts.ptr),
+                                        arg_i32(slot),
+                                        arg_i64(gate_estride),
+                                        arg_i64(up_estride),
+                                        arg_i64(down_estride),
+                                        arg_i32(fused_flag),
+                                        arg_i64(up_half_eoff),
+                                    ],
+                                )?;
+                            }
                         }
                     }
                 }
@@ -3887,6 +4161,7 @@ mod decode_spec_tests {
         }
         // Every `moe_native_fmt` format has BOTH per-format int8 expert kernels — that is what makes
         // the shipping (int8) MoE path total over the covered set even though the cross product is not.
+        let src = crate::kernels::hip_source();
         for dt in [
             DType::Q8_0,
             DType::Q2K,
@@ -3926,7 +4201,111 @@ mod decode_spec_tests {
                 super::moe_down_i8_routed_kernel(s),
                 format!("moe_down_i8_routed_{s}")
             );
+            // R8: the id-indexed multi-slot tier is total over the same set — it IS the shipping
+            // resident path now, so a format in `moe_native_fmt` without an `_idm_` kernel is a
+            // panic on a real model, not a slow fallback.
+            assert_eq!(
+                super::moe_gate_up_i8_idm_kernel(s),
+                format!("moe_gate_up_act_i8_idm_{s}")
+            );
+            assert_eq!(
+                super::moe_down_i8_idm_kernel(s),
+                format!("moe_down_i8_idm_{s}")
+            );
+            // …and each name is actually INSTANTIATED in the module source (the kernels come out
+            // of a token-pasting `GEN_*` macro, so the instantiation LINE is what to look for — a
+            // table entry whose `GEN_*(fmt)` line was never added compiles fine on the host and
+            // fails only on the box, at the launch).
+            assert!(
+                src.contains(&format!("GEN_MOE_GATE_UP_IDM({s})\n")),
+                "moe_gate_up_act_i8_idm_{s} named but not instantiated"
+            );
+            assert!(
+                src.contains(&format!("GEN_MOE_DOWN_IDM({s})\n")),
+                "moe_down_i8_idm_{s} named but not instantiated"
+            );
         }
+    }
+}
+
+/// R8: the id-GEMV's expert address must be a 64-BIT byte offset on a 64-bit pointer.
+///
+/// The Vulkan u64/BDA campaign's finding, transplanted: an expert base computed as an ELEMENT
+/// count scaled inside the kernel wraps 32 bits on a real MoE bank (its `native_gemv_id` STREAMED
+/// build had to move to `uint64_t(ids[slot]) * uint64_t(stride)` after the u32 element-space
+/// multiply went coherent-but-wrong past ~102 Scout-sized slots). HIP pointers are 64-bit and
+/// `long` is 64-bit on AMDGCN, so `base + (long)e * bstride` is 64-bit BY CONSTRUCTION — but only
+/// while `bstride` stays a `long` PARAMETER. Narrow it to `int` and `e * bstride` silently becomes
+/// a 32-bit multiply that wraps at 2 GiB, which llama4-Scout's 16 × 8192 × 5120 Q4_K down bank
+/// (2.7 GiB) clears on its own. Nothing on a CPU-only box would catch that, so it is pinned here
+/// against the emitted source; the host half (`usize` arithmetic widened to `i64`) is checked by
+/// the arithmetic assertions below.
+#[cfg(test)]
+mod moe_id_multi_addressing_tests {
+    /// The stride parameters, exactly as the `_idm_` kernels must declare them.
+    const LONG_PARAMS: [&str; 4] = [
+        "long gate_bstride",
+        "long up_bstride",
+        "long fused_up_half_boff",
+        "long down_bstride",
+    ];
+
+    #[test]
+    fn moe_id_multi_strides_are_64_bit() {
+        let src = crate::kernels::hip_source();
+        for p in LONG_PARAMS {
+            assert!(src.contains(p), "id-GEMV stride param not 64-bit: `{p}`");
+            // The `int` spelling must not appear anywhere — including in the `*_routed_*` twins,
+            // which share the contract.
+            let narrowed = format!("int {}", p.trim_start_matches("long "));
+            assert!(
+                !src.contains(&narrowed),
+                "a 32-bit stride parameter survives: `{narrowed}`"
+            );
+        }
+        // The multiply itself is on the WIDENED id, not on a 32-bit product later cast.
+        for expr in [
+            "gate_base + (long)e * gate_bstride",
+            "up_base + (long)e * up_bstride",
+            "down_base + (long)e * down_bstride",
+        ] {
+            assert!(
+                src.contains(expr),
+                "id-GEMV expert address is not a 64-bit multiply: expected `{expr}`"
+            );
+        }
+        // Per-slot scratch indexing is likewise widened before the multiply — `n_slots * n_ff_exp`
+        // passes 2^31 elements well before VRAM runs out on a long prefill chunk.
+        for expr in [
+            "h_out[(long)slot * nff + o]",
+            "y[(long)slot * ne + d]",
+            "hq + (long)slot * nff",
+        ] {
+            assert!(src.contains(expr), "scratch index not widened: `{expr}`");
+        }
+    }
+
+    /// The host half: every byte stride the executor passes is computed in `usize` and handed over
+    /// as `i64`, and the value is the one the bank layout implies. Reproduces the executor's own
+    /// expressions over llama4-Scout's shape, where the products exceed `u32`.
+    #[test]
+    fn moe_id_multi_host_strides_exceed_u32_without_wrapping() {
+        // Scout: ne = 5120, n_ff_exp = 8192, Q4_K banks (256 elems / 144 bytes per block).
+        let (ne, nff, qpb, bpb) = (5120usize, 8192usize, 256usize, 144usize);
+        let gate_bstride = ((nff * ne / qpb) * bpb) as i64;
+        let down_bstride = ((ne * nff / qpb) * bpb) as i64;
+        assert_eq!(gate_bstride, 23_592_960);
+        assert_eq!(gate_bstride, down_bstride);
+        // Expert 127's base is past 2^31 bytes — the boundary a 32-bit multiply would wrap at.
+        let far = 127i64 * gate_bstride;
+        assert!(
+            far > i64::from(i32::MAX),
+            "test shape no longer probes the boundary"
+        );
+        assert_eq!(far, 2_996_305_920);
+        // The same product taken through i32 (what an `int` stride parameter would do) does NOT
+        // agree — this is the bug the `long` declarations above prevent.
+        assert_ne!(far, i64::from((127i32).wrapping_mul(gate_bstride as i32)));
     }
 }
 

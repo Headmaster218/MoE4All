@@ -51,7 +51,10 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
   ({q80,q2k,q3k,q4k,q5k,q6k,q40,q41,q51,iq4nl,iq4xs,iq2xxs,iq2xs,iq2s,iq3xxs,iq3s,iq1s,iq1m,tq10,tq20,q20,mxfp4,nvfp4}
   — every weight quant except Q5_0, which no shipped GGUF uses for expert banks;
   gate/up × down) + **GPU-side top-k routing** (device-routed, no host
-  readback).
+  readback) + the **id-indexed multi-slot expert GEMV** (R8: all `rows × n_used`
+  slots in ONE dispatch per stage instead of a serialized per-expert host loop —
+  Qwen3-30B-A3B `pp512` 104 → 254 t/s, `tg64` 35 → 42, bit-identical to the loop
+  it replaces).
 - **Memory paging** — all three Vulkan modes: MoE expert LRU cache (host→VRAM,
   copy-stream overlap), KV-cache overflow to host (`INFR_KV_OVERFLOW`),
   dense-weight prefetch ring. 30B MoE, 27 GiB KV contexts, and >VRAM dense
@@ -89,15 +92,15 @@ proof: an EXHAUSTIVE `match` over `DType` that forces every variant to be either
 natively decoded or an explicitly-reasoned exclusion, so this cannot silently
 regress and a new dtype cannot be added without deciding.
 
-**What "complete" does NOT mean.** Three things are still open, and none of them
-is a format gap:
+**SECTION COMPLETE (R8).** The id-indexed MoE expert GEMV tier landed too, so
+every format now has kernels on every tier ROCm has, and the MoE decode path is
+no longer a serialized per-expert host loop. See the R8 bullet below for the
+tier, its bit-identity gate, and where the remaining MoE prefill gap actually
+lives (per-slot weight traffic, not launches).
 
-- **The id-GEMV MoE tier is missing** (the last bullet of this section, R8):
-  Vulkan's `native_id`/`native_idm`/paged-id decode GEMVs for the low-m MoE
-  regime have no ROCm equivalent. ROCm's expert path is the batched/routed
-  `moe_gate_up_act_i8_*`/`moe_down_i8_*` kernels, which ARE total over
-  `moe_native_fmt`, but the low-m shapes they serve are not the shapes an
-  id-GEMV would.
+**What "complete" does NOT mean.** Two things are still open, and neither is a
+format gap:
+
 - **The `moe_ffn_expert_<gu>_<dn>` cross product is deliberately partial** (118
   reachable pairs, not 24²) — an A/B-only path, see that bullet.
 - **The DENSE FLOAT weights (F32/BF16) still take a host convert→f16 at load.**
@@ -105,8 +108,8 @@ is a format gap:
   nothing at run time (see the Bf16 note under R7) — but the one-time load pass
   is real and F16 pays it identically.
 
-Vulkan reference for the remaining item:
-`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`.
+Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
+`gemm.rs`.
 
 - ✅ **R1 — Q5_K LANDED.** `deq_q5k` native decode (+ `linear_q5k`/`embed_q5k`/
   `deqf16_q5k`), `linear_i8_q5k`/`i8acc_q5k` int8 dp4a GEMV, the
@@ -181,7 +184,7 @@ Vulkan reference for the remaining item:
   signed) grid byte straight into dp4a with no ones-dot term, exactly as R4's
   codebook formats do. All five are 256-element super-blocks walked as 8
   sub-blocks × 4 groups × 8 elements; they differ only in the grid index width
-  (8/9/10 bits), the sign source (`ksigns[7b]` for IQ2*XXS/IQ2_XS/IQ3_XXS, raw
+  (8/9/10 bits), the sign source (`ksigns[7b]` for IQ2\*XXS/IQ2_XS/IQ3_XXS, raw
   sign BYTES for IQ2_S/IQ3_S) and whether the 32-element block carries one scale
   or two (IQ2_XS/IQ2_S put a 4-bit magnitude on each half). **The grids are
   generated into the HIP module from `infr_core::iquant_grids`**
@@ -468,7 +471,7 @@ Vulkan reference for the remaining item:
   `{iq1s,iq1m} × {iq1s,iq1m,iq2xxs,iq2s,iq3s,iq4xs,q4k,q6k}` (16, R6 — IQ1
   quants ARE also a legal `dn`, unlike the grid quants: the `dn` set is read off
   the two cached UD-IQ1 mixes, which leave 18 of 28 `ffn_down` tensors at the
-  gate/up type and boost the rest to IQ2_S/IQ3_S, plus the wider bumps a big-MoE
+  gate/up type and boost the rest to IQ2*S/IQ3_S, plus the wider bumps a big-MoE
   IQ1 mix reaches) and the three ternary SELF pairs
   `{(tq10,tq10),(tq20,tq20),(q20,q20)}` (3, R6 — TQ1_0/TQ2_0/Q2_0 are
   whole-model conversion targets for a natively ternary checkpoint, not ftype
@@ -480,31 +483,119 @@ Vulkan reference for the remaining item:
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72 `ffn_{gate,up,down}_exps` MXFP4 and every dense tensor Q8_0). R6's
-  cold-hiprtc re-measurement (backend init + a 1-token bench, `~/.cache/comgr`
-  AND `~/.cache/infr/rocm-module-*.bin` cleared, 3 reps each): **9.06-9.12 s**
-  at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB
-  `g_iq1s` table are added at the same 97 pairs → **11.42-11.56 s** at the
-  shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and
-  the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21
-  would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same
-  way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped
-  118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s
-  at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of
-  the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51
-  s before and after). Absent pairs fall back to the dequant→f16
-  `moe_ffn_expert` path, which costs nothing real: those kernels only run under
-  `INFR_ROCM_NO_I8` (the default int8 expert path uses the per-FORMAT
-  `moe_gate_up_act_i8_<gu>`/`moe_down_i8_<dn>` kernels, still total over
-  `moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a
-  format, extend `MOE_EXPERT_PAIRS` (exec.rs test module) with only the pairs a
-  real GGUF can produce; `moe_expert_pair_tables_agree` pins both mappers to it.
-- **R8 — the `native_id`/`native_idm`/paged-id MoE GEMV family.** Vulkan's
-  id-indexed decode GEMVs for resident + paged small-m MoE. ROCm's expert path
-  is the batched/routed kernels; add the id-GEMV tier for the low-m regime.
-  **This is the one remaining item in §1** now that format coverage is complete
-  at 24/24 — "complete" means every FORMAT has kernels on every existing tier,
-  not that every TIER exists.
+  72
+  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
+  pins both mappers to it.
+- ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
+  (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
+  over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
+
+  **The gap was the MULTI, not the id.** ROCm's Slice-38 `*_routed_*` kernels
+  already resolved the expert bank in-kernel from `route_ids[slot]` — ROCm never
+  lacked id indexing. What it lacked was a dispatch shape: the executor drove
+  them from a host `for row { for k in 0..n_used { … } }` loop, so one MoE layer
+  cost `1 + 3·rows·n_used` launches AND ran the selected experts SERIALLY (all
+  slots shared one `h` scratch, so expert k+1 could not start until expert k's
+  down GEMV retired). At qwen3moe's 48 layers × 8 experts that is ~1150 launches
+  per decoded token, each filling a fraction of the device. At `pp512` it is
+  ~590 000 launches per chunk, which is why ROCm MoE prefill sat at ~100 t/s
+  while the same box does 4500 t/s dense.
+
+  The new kernels take the whole `[rows, n_used]` slot grid in ONE dispatch per
+  stage (`blockIdx.y` = Vulkan's flat `slot_global`, `row = slot / n_used`),
+  with per-block arithmetic IDENTICAL to the `*_routed_*` twin — same `i8acc_*`
+  decode+dot, same `wave_sum32`, same weight fold. Five dispatches per row-chunk
+  regardless of `n_used`.
+  - **Bit-identical to the tier it replaces**, not merely within tolerance:
+    `moe_ffn_id_tier_matches_the_serial_tier_bitwise` runs the same problem at
+    `moe_id_rows = 128` and `= 0` (the tier off) and compares `f32::to_bits`.
+    That is only possible because the down GEMV does NOT `atomicAdd` into `dst`
+    the way the serial kernel does — concurrent slots would make the f32
+    summation ORDER nondeterministic and the golden hash would drift between
+    runs. It writes `y[n_slots, ne]` and `moe_accum_idm` sums the slots in
+    ASCENDING order onto a zero seed, which is exactly the sequence the serial
+    loop's atomics produced against a zeroed `dst`.
+  - **Addressing: a 64-bit BYTE offset on a 64-bit pointer**,
+    `base + (long)expert_id * bstride`, with `bstride` the host-computed
+    per-expert byte stride passed as `i64`. This is the Vulkan u64/BDA finding
+    transplanted (its `native_gemv_id` STREAMED build had to move to
+    `uint64_t(ids[slot]) * uint64_t(stride)` after a u32 element-space multiply
+    went coherent-but-wrong past ~102 Scout-sized slots). HIP pointers are
+    already 64-bit and `long` is 64-bit on AMDGCN, so the multiply is 64-bit BY
+    CONSTRUCTION — but only while `bstride` stays a `long` PARAMETER; narrowed
+    to `int` it wraps at 2 GiB, which Scout's 2.7 GiB Q4_K down bank clears on
+    its own. `moe_id_multi_strides_are_64_bit` pins the declarations and the
+    address expressions against the emitted source, and
+    `moe_id_multi_host_strides_exceed_u32_without_wrapping` pins the host
+    arithmetic at Scout's shape (expert 127's base = 2 996 305 920 B).
+  - **Routing: the id tier takes the RESIDENT int8 expert path at every `m`**,
+    and that is a deliberate departure from Vulkan's `moe_small_m = 8`
+    crossover, not an oversight. Vulkan's threshold chooses between the id tier
+    and a bucket-sorted batched expert GEMM; ROCm HAS NO BATCHED EXPERT PATH, so
+    above a threshold it would fall back to the very loop the id tier replaces,
+    over the SAME per-slot weight traffic (the serial loop already re-reads each
+    routed expert's full bank per `(row, slot)`) — strictly worse at every `m`.
+    Measured, `pp512` on Qwen3-30B-A3B Q4_K_M: **104 t/s** with the tier capped
+    at Vulkan's 8 rows' worth of behaviour (`moe_id_rows = 0`, i.e. the old
+    loop) vs **254 t/s** with the tier on. So `kernels.rocm.moe_id_rows` is a
+    SCRATCH bound (rows per dispatch), not a crossover, and it reuses
+    `infr_core::tier::EnvRows` for the clamp policy rather than a fourth copy of
+    a threshold. Row-chunk sweep at `pp512` (3 reps): 8 → 237.1, 32 → 249.0, 128
+    → **253.3**, unchunked → 261.2 t/s. The default is 128 because the remaining
+    +3% is not free: at `-p 1024` an unchunked (or 512-row) chunk asks ~50-100
+    MiB of pool on top of a 17 GiB weight set and `BufferPool`'s `hipMalloc`
+    FAILS — reproduced, and today that aborts the process. A shape-aware 16 MiB
+    scratch cap sits under the knob so no `ne`/`n_ff_exp`/ `n_used` combination
+    can walk into that through the default (with it, even `moe_id_rows = 1024`
+    runs `pp1024` cleanly at 231.3 t/s).
+  - **The PAGED path deliberately stays on the per-expert loop.** Vulkan needs a
+    device LUT for its paged id-GEMV (`native_gemv_id*.comp`'s `-DPAGED` build
+    reads `lut[window + ids[slot]]`, a per-layer window into a slot-index tape)
+    precisely because a paged bank's slot index is not the model's expert id and
+    its routing happens on the GPU. ROCm's pager routes on the HOST — it must
+    know which experts to page in before it can page them — so it already
+    resolves each slot's arena pointer in Rust and needs no LUT at all. What it
+    would LOSE is Slice 36's copy/compute overlap: the loop exists so expert i's
+    GEMV runs while expert i+1's H2D fill is in flight on the copy stream, and
+    one collapsed dispatch would serialize every fill ahead of all compute. The
+    trade is a page-in (hundreds of µs to ms per expert bank) against ~20
+    launches (~50 µs), so the loop wins. Verified unchanged end to end:
+    Qwen3.6-35B-A3B-UD-IQ3_S through the pager, 6.5 → 6.7 t/s decode (noise),
+    still coherent at `--temp 0`.
+  - Scoped OUT, with the reason: the `INFR_ROCM_NO_I8` path and the dequant→f16
+    fallback keep the serial loop. Both are A/B comparands whose whole job is to
+    be the OTHER path, and neither ships;
+    `moe_ffn_serial_tier_still_matches_cpu_with_i8_off` keeps the first one
+    honest so it cannot rot into a second untested tier.
+
+  Cold hiprtc (backend init + a 1-token bench, `~/.cache/comgr` AND
+  `~/.cache/infr/rocm-module-*.bin` cleared, 3 reps): R7 baseline 14.18-15.58 s
+  → R8 (47 new kernels) 16.07-19.47 s, ~+2 s. Warm-cache start UNCHANGED at
+  0.49-0.52 s.
+
+  Measured (RX 7900 XTX, `INFR_DEV=rocm`, warmed):
+
+  | shape                                | before | after  |
+  | ------------------------------------ | ------ | ------ |
+  | Qwen3-30B-A3B Q4_K_M `tg64`          | 35.1   | 42.1   |
+  | Qwen3-30B-A3B Q4_K_M `pp512`         | 103.9  | 253.7  |
+  | Qwen3-30B-A3B Q4_K_M `pp1024`        | 102.6  | 223.3  |
+  | gemma-4-26B-A4B Q4_K_M chat prefill  | 150    | 323    |
+  | gemma-4-26B-A4B Q4_K_M chat decode   | 31.1   | 35.4   |
+  | Qwen3.6-35B-A3B IQ3_S `tg64` (paged) | 6.5    | 6.7    |
+  | Qwen3-0.6B Q4_K_M `tg64` (control)   | 126.5  | 127.0  |
+  | Qwen3-0.6B Q4_K_M `pp512` (control)  | 4482.7 | 4475.5 |
+
+  Token-identical at `--temp 0` with the tier on vs off, on both resident MoE
+  architectures: Qwen3-30B-A3B over a 37-token generation, and gemma-4-26B-A4B
+  (a different gating/activation shape) over 16.
+
+  What this does NOT fix: the id tier removes the launch and serialization
+  overhead but not the per-slot weight TRAFFIC. A routed expert's bank is still
+  streamed once per `(row, slot)`, so at `pp512` a 128-expert layer re-reads
+  each expert ~32×. The bucket-sorted batched expert GEMM that fixes that
+  (Vulkan's `moe_scatter_reduce` arm) is a separate slice and is where the
+  remaining prefill gap lives.
 
 ## 2. Attention parity
 
@@ -645,10 +736,11 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 
 ## Parity checklist
 
-- [ ] **Quant coverage** — ✅ native decode + int8 + WMMA-prefill for all 24
-      formats (**24/24 after R7**) and ✅ MoE experts for every format a GGUF
-      packs expert banks with; ❌ `native_id`/`idm` MoE GEMV family still
-      missing (R8) — that alone keeps this box unticked
+- [x] **Quant coverage** — ✅ native decode + int8 + WMMA-prefill for all 24
+      formats (**24/24 after R7**), ✅ MoE experts for every format a GGUF packs
+      expert banks with, and ✅ the id-indexed multi-slot MoE expert GEMV
+      (**R8**, total over `moe_native_fmt`). Paged MoE deliberately keeps the
+      per-expert loop for its copy/compute overlap — see R8
 - [ ] **Attention** — WMMA flash prefill; dequant-in-flash; q8_0/Turbo/block KV
       quant
 - [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd

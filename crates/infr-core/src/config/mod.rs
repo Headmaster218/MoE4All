@@ -415,6 +415,17 @@ cfg_struct! {
         /// (bisecting a suspected cache bug); the cache is otherwise self-invalidating on any
         /// source/arch/runtime change.
         module_cache: bool = true,
+        /// Token rows per **id-indexed MoE expert-GEMV** dispatch (R8) — the `moe_*_idm_*` tier's
+        /// batch bound. Every dispatch covers `rows × n_used` expert slots at once; this caps the
+        /// `rows` a single one may carry, so a long prefill chunk is split into several dispatches
+        /// instead of one whose per-slot scratch (`[rows·n_used, n_ff_exp]` + `[rows·n_used, ne]`)
+        /// scales with the chunk.
+        ///
+        /// It is a SCRATCH bound, not a perf crossover (Vulkan's `moe_small_m` is a crossover — it
+        /// picks between the id tier and a bucket-sorted batched GEMM ROCm has no equivalent of;
+        /// see `exec.rs`'s `MOE_ID_ROWS`). `0` is clamped to 1. Has NO env key — set it with
+        /// `--set kernels.rocm.moe_id_rows=…` or the TOML file.
+        moe_id_rows: usize = 128,
     }
 }
 

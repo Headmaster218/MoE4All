@@ -2227,6 +2227,492 @@ fn moe_ffn_iq4xs_gate_q6k_down_experts_matches_cpu() {
     );
 }
 
+// ── R8: the id-indexed multi-slot MoE expert GEMV (`moe_*_idm_*`) ────────────
+//
+// Every `moe_ffn_*_experts_matches_cpu` case above now RUNS on this tier (it took over the
+// resident int8 expert path wholesale), so they are its aggregate gate. These four cases attack
+// what an aggregate tolerance cannot see.
+//
+// The bug this tier invites is a wrong `id → bank slice` mapping. It does not produce garbage: it
+// produces a perfectly plausible FFN output computed by the WRONG expert, and with the usual
+// pseudo-random per-expert banks every expert has about the same magnitude, so an off-by-one lands
+// inside a 6e-2 relative bound about as often as not. So the banks below are built so that expert
+// `e`'s contribution scales as `1.35^(3e)` — an off-by-one expert is a ~2.5× error, and the test
+// PROVES that by re-running the reference with the banks rotated and requiring the GPU to disagree
+// with it.
+
+/// `blocks` Q8_0 blocks whose CODES are identical everywhere and whose per-block f16 scale is
+/// `scale(block / blocks_per_expert)` — i.e. every expert holds the same quantized pattern at its
+/// own magnitude. That factorization is what makes a mis-routed expert a pure scale error, visible
+/// in a single number instead of hidden in a dot product's noise.
+fn q80_per_expert_scaled(
+    blocks: usize,
+    blocks_per_expert: usize,
+    scale: impl Fn(usize) -> f32,
+) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 34];
+    for blk in 0..blocks {
+        let base = blk * 34;
+        let e = blk / blocks_per_expert;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(scale(e)).to_le_bytes());
+        for j in 0..32 {
+            // Code pattern depends on the WITHIN-expert block index only, never on `e`.
+            let wb = blk % blocks_per_expert;
+            w[base + 2 + j] = (((wb * 7 + j * 5) % 251) as i32 - 125) as i8 as u8;
+        }
+    }
+    w
+}
+
+/// The `Op::MoeFfn` runner with the two flags `run_moe` pins off — `fused_gate_up` (gate|up packed
+/// as one `[n_expert, 2*n_ff_exp, ne]` bank, the `fused_up_half_boff` address path) and
+/// `weight_before` (llama4's pre-activation routing-weight fold) — exposed, plus a caller-chosen
+/// backend so the same problem can be run at two different `moe_id_rows`.
+#[allow(clippy::too_many_arguments)]
+fn run_moe_flags(
+    be: &dyn Backend,
+    x: &[f32],
+    router_f32: &[f32],
+    gate_bytes: &[u8],
+    up_bytes: &[u8],
+    down_bytes: &[u8],
+    dt: DType,
+    rows: usize,
+    ne: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_ff_exp: usize,
+    fused_gate_up: bool,
+    weight_before: bool,
+) -> Vec<f32> {
+    let gu_elems = if fused_gate_up {
+        n_expert * 2 * n_ff_exp * ne
+    } else {
+        n_expert * n_ff_exp * ne
+    };
+    let mut g = Graph::new();
+    let xid = g.input(f32d(rows * ne));
+    let rid = g.weight(TensorDesc::new(vec![n_expert * ne], DType::F32));
+    let gid = g.weight(TensorDesc::new(vec![gu_elems], dt));
+    // Fused: `up_exps` is never read (the executor takes the second half of the gate bank), but it
+    // still has to be a bound handle of the right dtype — bind the gate bank itself, as the seam does.
+    let uid = if fused_gate_up {
+        gid
+    } else {
+        g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], dt))
+    };
+    let did = g.weight(TensorDesc::new(vec![n_expert * ne * n_ff_exp], dt));
+    let dst = g.output(f32d(rows * ne));
+    g.push(Op::MoeFfn {
+        x: xid,
+        router_x: xid,
+        router: rid,
+        gate_exps: gid,
+        up_exps: uid,
+        down_exps: did,
+        down_scale: None,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: n_ff_exp as u32,
+        scale: 1.0,
+        act: Activation::Silu,
+        gating: MoeGating::Softmax,
+        norm_w: true,
+        weight_before,
+        fused_gate_up,
+        ep_band: None,
+    });
+    let plan = be.compile(&g).expect("compile");
+
+    let up = |desc_bytes: &[u8], usage| {
+        let b = be.alloc(desc_bytes.len(), usage).expect("alloc");
+        be.upload(b.as_ref(), desc_bytes).unwrap();
+        b
+    };
+    let xb = up(bytemuck::cast_slice(x), BufferUsage::Activations);
+    let rb = up(bytemuck::cast_slice(router_f32), BufferUsage::Weights);
+    let gb = up(gate_bytes, BufferUsage::Weights);
+    let ub = (!fused_gate_up).then(|| up(up_bytes, BufferUsage::Weights));
+    let db = up(down_bytes, BufferUsage::Weights);
+    let ob = be.alloc(rows * ne * 4, BufferUsage::Readback).expect("out");
+
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(rid, rb.as_ref());
+    b.bind(gid, gb.as_ref());
+    if let Some(ub) = &ub {
+        b.bind(uid, ub.as_ref());
+    }
+    b.bind(did, db.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut o = vec![0f32; rows * ne];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// A ROCm backend with `kernels.rocm.moe_id_rows` overridden — the id tier's row-chunk bound.
+fn rocm_id_rows(chunk: usize) -> Option<RocmBackend> {
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.rocm.moe_id_rows = chunk;
+    RocmBackend::new_with(0, std::sync::Arc::new(cfg)).ok()
+}
+
+/// Per-expert magnitudes spanning ~6× over 8 experts, so one expert step is a ~2.5× output change.
+fn expert_scale(e: usize) -> f32 {
+    0.02 * 1.35f32.powi(e as i32)
+}
+
+/// Rotate a per-expert bank by one expert — the "off by one expert" the id tier could produce.
+fn rotate_experts(bytes: &[u8], n_expert: usize) -> Vec<u8> {
+    let per = bytes.len() / n_expert;
+    let mut out = vec![0u8; bytes.len()];
+    for e in 0..n_expert {
+        let src = ((e + 1) % n_expert) * per;
+        out[e * per..(e + 1) * per].copy_from_slice(&bytes[src..src + per]);
+    }
+    out
+}
+
+/// **The id→slice mapping test.** Each of `rows × n_used` slots must read the expert `moe_topk`
+/// picked FOR THAT SLOT — not slot 0's, not the slot index, not a neighbour. Run at both the decode
+/// shape (`rows == 1`, one chunk of one) and a multi-row shape, and each result is required BOTH to
+/// match the CPU reference AND to be far from the reference computed with the expert banks rotated
+/// by one. Without the second half the first is not evidence: it is exactly the tolerance's blind
+/// spot (see the section header).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_id_tier_maps_each_slot_to_its_own_expert() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (ne, n_expert, n_used, n_ff_exp) = (256usize, 8usize, 3usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let up = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let (rgate, rup, rdown) = (
+        rotate_experts(&gate, n_expert),
+        rotate_experts(&up, n_expert),
+        rotate_experts(&down, n_expert),
+    );
+
+    for rows in [1usize, 4] {
+        let x = gen(rows * ne, 3);
+        let router = gen(n_expert * ne, 9);
+        let go = |b: &dyn Backend, g: &[u8], u: &[u8], d: &[u8]| {
+            run_moe_flags(
+                b,
+                &x,
+                &router,
+                g,
+                u,
+                d,
+                DType::Q8_0,
+                rows,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                false,
+                false,
+            )
+        };
+        let want = go(&cpu, &gate, &up, &down);
+        let wrong = go(&cpu, &rgate, &rup, &rdown);
+        let got = go(&be, &gate, &up, &down);
+
+        let ref_mag = maxabs(&want).max(1e-6);
+        let e = maxerr(&want, &got);
+        let e_wrong = maxerr(&wrong, &got);
+        println!(
+            "MoeFfn [id tier, rows={rows}] rel={:e} rel_vs_rotated={:e} max|ref|={ref_mag:e}",
+            e / ref_mag,
+            e_wrong / ref_mag
+        );
+        assert!(
+            ref_mag > 1e-3,
+            "MoeFfn [id tier] reference is all-zero — test is vacuous"
+        );
+        assert!(
+            e / ref_mag < 6e-2,
+            "MoeFfn [id tier, rows={rows}] diverges from CPU: abs={e:e} rel={:e}",
+            e / ref_mag
+        );
+        // The tripwire: the rotated-expert reference must be FAR outside the tolerance the check
+        // above passed at, or that check proved nothing about which expert ran.
+        assert!(
+            e_wrong / ref_mag > 5e-1,
+            "an off-by-one expert would have passed the tolerance — the mapping is untested \
+             (rel_vs_rotated={:e})",
+            e_wrong / ref_mag
+        );
+    }
+}
+
+/// The FUSED gate|up bank (`fused_up_half_boff`) and llama4's `weight_before` fold, on the id
+/// tier. Fused is the one shape where the up-projection's expert address is not
+/// `up_base + e*up_bstride` but `gate_base + e*gate_bstride + half`, i.e. TWO terms that must both
+/// be right — swapping them still reads inside the bank and still produces a finite FFN.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_id_tier_fused_gate_up_and_weight_before_match_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (3usize, 256usize, 6usize, 2usize, 128usize);
+    // Fused: [n_expert, 2*n_ff_exp, ne] — gate rows first, up rows second, per expert. The
+    // per-expert scale ladder rides the WHOLE double-width slice, so a half-offset that lands in
+    // the wrong expert is still a magnitude error.
+    let gu_blocks = n_expert * 2 * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let x = gen(rows * ne, 5);
+    let router = gen(n_expert * ne, 13);
+
+    for weight_before in [false, true] {
+        let go = |b: &dyn Backend| {
+            run_moe_flags(
+                b,
+                &x,
+                &router,
+                &gate,
+                &[],
+                &down,
+                DType::Q8_0,
+                rows,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                true,
+                weight_before,
+            )
+        };
+        let want = go(&cpu);
+        let got = go(&be);
+        let ref_mag = maxabs(&want).max(1e-6);
+        let e = maxerr(&want, &got);
+        println!(
+            "MoeFfn [id tier, fused gate|up, weight_before={weight_before}] rel={:e} max|ref|={ref_mag:e}",
+            e / ref_mag
+        );
+        assert!(ref_mag > 1e-3, "fused id-tier reference is all-zero");
+        assert!(
+            e / ref_mag < 6e-2,
+            "MoeFfn [id tier, fused, weight_before={weight_before}] diverges: abs={e:e} rel={:e}",
+            e / ref_mag
+        );
+    }
+}
+
+/// The ROW-CHUNK arithmetic (`MOE_ID_ROWS`). A chunk is a contiguous window of `rows × n_used`
+/// slots, and the executor advances FIVE pointers per chunk (`x`, `dst`, `route_ids`,
+/// `route_wts`, and implicitly the chunk-local `row = slot / n_used`); getting any of them wrong
+/// mixes tokens, which a per-token comparison catches and an aggregate one may not.
+///
+/// Chunking is also a pure REGROUPING — it changes no per-slot arithmetic and no summation order —
+/// so a 1-row chunk and a whole-batch chunk must agree BIT FOR BIT, not merely within tolerance.
+/// That is a much sharper statement than the CPU comparison and it is the one that would catch a
+/// chunk boundary that dropped or double-counted a row.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_id_tier_row_chunking_is_bit_neutral() {
+    let (Some(be1), Some(be3), Some(be_all)) =
+        (rocm_id_rows(1), rocm_id_rows(3), rocm_id_rows(1024))
+    else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    // 7 rows over a 3-row chunk: 3 + 3 + 1, so the last chunk is SHORT — the case an
+    // `r0 + chunk <= rows` bound would silently drop.
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (7usize, 256usize, 8usize, 3usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let up = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let x = gen(rows * ne, 7);
+    let router = gen(n_expert * ne, 19);
+    let go = |b: &dyn Backend| {
+        run_moe_flags(
+            b,
+            &x,
+            &router,
+            &gate,
+            &up,
+            &down,
+            DType::Q8_0,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            false,
+            false,
+        )
+    };
+
+    let want = go(&cpu);
+    let all = go(&be_all);
+    let ref_mag = maxabs(&want).max(1e-6);
+    let e = maxerr(&want, &all);
+    println!(
+        "MoeFfn [id tier, 7 rows, unchunked] rel={:e} max|ref|={ref_mag:e}",
+        e / ref_mag
+    );
+    assert!(ref_mag > 1e-3, "row-chunk reference is all-zero");
+    assert!(
+        e / ref_mag < 6e-2,
+        "MoeFfn [id tier, unchunked] diverges from CPU: rel={:e}",
+        e / ref_mag
+    );
+
+    for (label, got) in [("chunk=1", go(&be1)), ("chunk=3", go(&be3))] {
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            all.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "id-tier row chunking is not bit-neutral at {label} — the chunk changed the math, \
+             not just the batching"
+        );
+    }
+    // Per-token, not just in aggregate: a chunk-boundary pointer slip mixes whole token rows, and
+    // a max-over-everything comparison against a same-magnitude neighbour can survive it.
+    for r in 0..rows {
+        let (w, g) = (&want[r * ne..(r + 1) * ne], &all[r * ne..(r + 1) * ne]);
+        let rm = maxabs(w).max(1e-6);
+        assert!(
+            maxerr(w, g) / rm < 6e-2,
+            "id-tier row {r} of {rows} does not match the CPU reference (rel={:e}) — a chunk \
+             boundary crossed token rows",
+            maxerr(w, g) / rm
+        );
+    }
+}
+
+/// **The id tier and the pre-R8 serial tier must agree BIT FOR BIT** (`moe_id_rows = 0` selects
+/// the latter).
+///
+/// This is the strongest statement available about R8 and it is deliberately not a tolerance. The
+/// two tiers run the SAME per-slot arithmetic — the same `i8acc_*` decode+dot, the same `wave_sum32`
+/// reduction, the same per-32-block activation quant (block-independent, so batching the quant pass
+/// across slots cannot change a single scale) — and the id tier's `moe_accum_idm` was written to
+/// reproduce the serial loop's `atomicAdd` sequence onto a zeroed `dst` in ascending slot order
+/// rather than to be "equivalent". A float that moves at all here means one of those claims is
+/// wrong, most likely that the concurrent slots are racing on the output after all — the failure
+/// mode that would show up on the box as a golden hash that drifts between runs rather than as a
+/// wrong answer.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_id_tier_matches_the_serial_tier_bitwise() {
+    let (Some(idm), Some(serial)) = (rocm_id_rows(128), rocm_id_rows(0)) else {
+        return;
+    };
+    let (ne, n_expert, n_used, n_ff_exp) = (256usize, 8usize, 4usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let up = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let router = gen(n_expert * ne, 23);
+    // Decode (1) and two prefill shapes, one of them a repeat run to catch a race that only
+    // sometimes reorders.
+    for rows in [1usize, 5, 5] {
+        let x = gen(rows * ne, 11);
+        let go = |b: &dyn Backend| {
+            run_moe_flags(
+                b,
+                &x,
+                &router,
+                &gate,
+                &up,
+                &down,
+                DType::Q8_0,
+                rows,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                false,
+                false,
+            )
+        };
+        let a = go(&idm);
+        let b = go(&serial);
+        assert!(maxabs(&a) > 1e-3, "bitwise tier comparison is vacuous");
+        assert_eq!(
+            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the id tier does not reproduce the serial tier bit-for-bit at rows={rows} \
+             (max_err={:e})",
+            maxerr(&a, &b)
+        );
+    }
+}
+
+/// The id tier must not change what the A/B comparand does. With `kernels.rocm.i8 = false` the
+/// resident path drops back to the pre-R8 per-`(row, slot)` `moe_ffn_expert_routed_*` loop; that
+/// path still has to be there and still has to match the CPU reference, or the switch that exists
+/// to isolate an int8 numerics question has quietly become a second untested tier.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_serial_tier_still_matches_cpu_with_i8_off() {
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.rocm.i8 = false;
+    let Some(be) = RocmBackend::new_with(0, std::sync::Arc::new(cfg)).ok() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (2usize, 256usize, 4usize, 2usize, 256usize);
+    let gate = q4k_blocks(n_expert * n_ff_exp * ne / 256);
+    let up = q4k_blocks(n_expert * n_ff_exp * ne / 256);
+    let down = q6k_blocks(n_expert * ne * n_ff_exp / 256);
+    let x = gen(rows * ne, 3);
+    let router = gen(n_expert * ne, 9);
+    let go = |b: &dyn Backend| {
+        run_moe(
+            b,
+            &x,
+            &router,
+            &gate,
+            &up,
+            &down,
+            DType::Q4K,
+            DType::Q4K,
+            DType::Q6K,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            MoeGating::Softmax,
+            true,
+        )
+    };
+    let want = go(&cpu);
+    let got = go(&be);
+    let ref_mag = maxabs(&want).max(1e-6);
+    let e = maxerr(&want, &got);
+    println!(
+        "MoeFfn [serial tier, i8 off] rel={:e} max|ref|={ref_mag:e}",
+        e / ref_mag
+    );
+    assert!(ref_mag > 1e-3, "serial-tier reference is all-zero");
+    assert!(
+        e / ref_mag < 6e-2,
+        "MoeFfn [serial tier, i8 off] diverges from CPU: rel={:e}",
+        e / ref_mag
+    );
+}
+
 // ── Rope (ggml NORM interleaved RoPE, packed + strided) vs CPU ────────────────
 
 /// Run a single-`Op::Rope` graph on `be` and return the FULL output buffer (length = `x.len()`).

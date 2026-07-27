@@ -105,6 +105,9 @@ fn default_config_matches_documented_defaults() {
     // not pay `hiprtcCompileProgram` (~9.2 s cold / ~0.25 s warm). Like `kernels.cpu.reference` it
     // has NO env key; it is settable only from the file or `--set`.
     assert!(d.kernels.rocm.module_cache);
+    // R8: the id-indexed MoE GEMV tier's row-batch bound. Also env-key-less; `infr-rocm` pins this
+    // default against its own `MOE_ID_ROWS` knob table.
+    assert_eq!(d.kernels.rocm.moe_id_rows, 128);
     assert_eq!(d.serve.max_tokens_cap, 131_072);
     assert_eq!(d.serve.api_key, None);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.

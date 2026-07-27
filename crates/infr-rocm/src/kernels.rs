@@ -251,6 +251,7 @@ const HIP_PARTS: &[&str] = &[
     MOE_FFN_INT8,
     WMMA_PREFILL,
     MOE_ROUTING,
+    MOE_ID_MULTI,
 ];
 
 // One BLOCK per row (grid.x = rows, blockDim.x = RMS_BLOCK). The sum-of-squares is a strided
@@ -5709,6 +5710,171 @@ GEN_MOE_DOWN_ROUTED(tq20)
 GEN_MOE_DOWN_ROUTED(q20)
 GEN_MOE_DOWN_ROUTED(mxfp4)
 GEN_MOE_DOWN_ROUTED(nvfp4)
+"#;
+
+// ── Id-indexed MULTI-SLOT MoE expert GEMV (R8, `*_idm_*`) ────────────────────
+//
+// Vulkan's `native_gemv_id_multi` family, ported to the shape ROCm's `Op::MoeFfn` actually needs.
+// The Slice-38 `*_routed_*` kernels above already resolve the expert bank IN-KERNEL from
+// `route_ids[slot]` — ROCm never lacked *id indexing*. What it lacked is the MULTI: the executor
+// ran them from a host `for row { for k in 0..n_used { … } }` loop, so a decode step issued
+// `1 + 3*rows*n_used` dispatches PER MoE LAYER and, worse, SERIALIZED the selected experts —
+// each slot's gate_up → quant_h → down chain shares one `h` scratch, so expert k+1 cannot start
+// until expert k's down GEMV retires. At qwen3moe's 48 layers × 8 experts that is ~1150 launches
+// per token, each filling a fraction of the device (one wave32 block per output row).
+//
+// These kernels take the WHOLE `[rows, n_used]` slot grid in ONE dispatch: `blockIdx.y` is the
+// flat slot (Vulkan's `slot_global`), split back into `row = slot / n_used` for the activation and
+// used directly to index `route_ids` / the per-slot scratch. Identical arithmetic per block to the
+// `*_routed_*` twin — same `i8acc_##FMT` decode+dot, same wave32 reduction, same weight fold — so
+// the two tiers cannot drift numerically; only the launch geometry changes.
+//
+// THE EXPERT ADDRESS IS A 64-BIT BYTE OFFSET ON A 64-BIT POINTER, `base + (long)e * bstride`,
+// where `bstride` is the host-computed PER-EXPERT BYTE stride (`i64`) — never an element count
+// scaled in the kernel. This is the u64/BDA lesson from the Vulkan campaign (its `native_gemv_id`
+// STREAMED build had to move to `uint64_t(ids[slot]) * uint64_t(stride)` after an element-space
+// u32 multiply wrapped past ~102 Scout-sized slots). HIP pointers are already 64-bit and `long` is
+// 64-bit on AMDGCN, so the multiply is 64-bit by construction — but only because `bstride` is
+// declared `long`: an `int` stride parameter would make `e * bstride` a 32-bit multiply that wraps
+// at 2 GiB of bank, which Scout's 16 × 8192 × 5120 Q4_K down bank (2.7 GiB) reaches. The
+// `moe_id_multi_strides_are_64_bit` test pins the host side of that contract.
+//
+// ACCUMULATION IS NOT ATOMIC. The `*_routed_*` down kernel `atomicAdd`s each slot's contribution
+// into `dst` and is deterministic only because the host loop serializes the slots. Running the
+// slots concurrently would make the f32 summation ORDER run-to-run nondeterministic — a moving
+// golden hash. So `moe_down_i8_idm_*` writes its slot's row into a `[n_slots, ne]` scratch and
+// `moe_accum_idm` sums the `n_used` slots of each row IN ASCENDING SLOT ORDER, which is exactly
+// the order the serial loop's atomics ran in (starting from a zeroed `dst`) — bit-identical, not
+// merely equivalent. Vulkan's small-m arm reaches the same shape (`ybuf` + `moe_accumulate`).
+const MOE_ID_MULTI: &str = r#"
+// Int8-activation dp4a gate+up+activation over ALL (row, slot) pairs. Grid: (nff, n_slots), one
+// wave32 block per (output row, slot). `qx`/`xs` are the int8 quantization of the FULL [rows, ne]
+// activation block (one `quant_i8_32` pass for every token); `h_out` is [n_slots, nff].
+#define GEN_MOE_GATE_UP_IDM(GU) \
+extern "C" __global__ void moe_gate_up_act_i8_idm_##GU( \
+    const signed char* __restrict__ qx,       /* int8(x) [rows, ne] */ \
+    const float* __restrict__ xs,             /* x scales [rows, ne/32] */ \
+    const unsigned char* __restrict__ gate_base, \
+    const unsigned char* __restrict__ up_base, \
+    float* __restrict__ h_out,                /* [n_slots, nff] */ \
+    int ne, int nff, int act_type, int weight_before, const float* __restrict__ dsc_dev, \
+    const int* __restrict__ route_ids, const float* __restrict__ route_wts, \
+    int n_slots, int n_used, \
+    long gate_bstride, long up_bstride, int fused, long fused_up_half_boff) { \
+    int o = blockIdx.x; int slot = blockIdx.y; int tid = threadIdx.x; \
+    if (o >= nff || slot >= n_slots) return; \
+    int row = slot / n_used; \
+    int e = route_ids[slot]; \
+    float weight = route_wts[slot]; \
+    float wg = weight_before ? weight : 1.0f; \
+    float wo = weight_before ? 1.0f : weight; \
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    const unsigned char* gate_w = gate_base + (long)e * gate_bstride; \
+    const unsigned char* up_w = fused ? gate_base + (long)e * gate_bstride + fused_up_half_boff \
+                                      : up_base + (long)e * up_bstride; \
+    int nb = ne >> 5; \
+    const signed char* qxr = qx + (long)row * ne; \
+    const float* xsr = xs + (long)row * nb; \
+    float g = i8acc_##GU(qxr, xsr, gate_w, o, nb, tid); \
+    float u = i8acc_##GU(qxr, xsr, up_w, o, nb, tid); \
+    g = wave_sum32(g); u = wave_sum32(u); \
+    if (tid == 0) { \
+        g *= wg; u *= wg; \
+        float a; \
+        if (act_type == 0) { a = g / (1.0f + expf(-g)); } \
+        else if (act_type == 1) { float x3 = g * g * g; a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); } \
+        else { a = 1.0f / (1.0f + expf(-g)); } \
+        h_out[(long)slot * nff + o] = a * u * wo * dsc; \
+    } \
+}
+GEN_MOE_GATE_UP_IDM(q80)
+GEN_MOE_GATE_UP_IDM(q2k)
+GEN_MOE_GATE_UP_IDM(q3k)
+GEN_MOE_GATE_UP_IDM(q4k)
+GEN_MOE_GATE_UP_IDM(q5k)
+GEN_MOE_GATE_UP_IDM(q6k)
+GEN_MOE_GATE_UP_IDM(q40)
+GEN_MOE_GATE_UP_IDM(q41)
+GEN_MOE_GATE_UP_IDM(q51)
+GEN_MOE_GATE_UP_IDM(iq4nl)
+GEN_MOE_GATE_UP_IDM(iq4xs)
+GEN_MOE_GATE_UP_IDM(iq2xxs)
+GEN_MOE_GATE_UP_IDM(iq2xs)
+GEN_MOE_GATE_UP_IDM(iq2s)
+GEN_MOE_GATE_UP_IDM(iq3xxs)
+GEN_MOE_GATE_UP_IDM(iq3s)
+GEN_MOE_GATE_UP_IDM(iq1s)
+GEN_MOE_GATE_UP_IDM(iq1m)
+GEN_MOE_GATE_UP_IDM(tq10)
+GEN_MOE_GATE_UP_IDM(tq20)
+GEN_MOE_GATE_UP_IDM(q20)
+GEN_MOE_GATE_UP_IDM(mxfp4)
+GEN_MOE_GATE_UP_IDM(nvfp4)
+
+// Int8-activation dp4a down projection over ALL (row, slot) pairs. Grid: (ne, n_slots). Writes
+// y[n_slots, ne] — NOT an atomicAdd into dst; `moe_accum_idm` does the (ordered) reduction.
+#define GEN_MOE_DOWN_IDM(DN) \
+extern "C" __global__ void moe_down_i8_idm_##DN( \
+    const signed char* __restrict__ hq,       /* int8(h) [n_slots, nff] */ \
+    const float* __restrict__ hs,             /* h scales [n_slots, nff/32] */ \
+    const unsigned char* __restrict__ down_base, float* __restrict__ y, /* [n_slots, ne] */ \
+    int ne, int nff, const int* __restrict__ route_ids, int n_slots, long down_bstride) { \
+    int d = blockIdx.x; int slot = blockIdx.y; int tid = threadIdx.x; \
+    if (d >= ne || slot >= n_slots) return; \
+    int e = route_ids[slot]; \
+    const unsigned char* down_w = down_base + (long)e * down_bstride; \
+    int nb = nff >> 5; \
+    const signed char* hqr = hq + (long)slot * nff; \
+    const float* hsr = hs + (long)slot * nb; \
+    float acc = i8acc_##DN(hqr, hsr, down_w, d, nb, tid); \
+    acc = wave_sum32(acc); \
+    if (tid == 0) y[(long)slot * ne + d] = acc; \
+}
+GEN_MOE_DOWN_IDM(q80)
+GEN_MOE_DOWN_IDM(q2k)
+GEN_MOE_DOWN_IDM(q3k)
+GEN_MOE_DOWN_IDM(q4k)
+GEN_MOE_DOWN_IDM(q5k)
+GEN_MOE_DOWN_IDM(q6k)
+GEN_MOE_DOWN_IDM(q40)
+GEN_MOE_DOWN_IDM(q41)
+GEN_MOE_DOWN_IDM(q51)
+GEN_MOE_DOWN_IDM(iq4nl)
+GEN_MOE_DOWN_IDM(iq4xs)
+GEN_MOE_DOWN_IDM(iq2xxs)
+GEN_MOE_DOWN_IDM(iq2xs)
+GEN_MOE_DOWN_IDM(iq2s)
+GEN_MOE_DOWN_IDM(iq3xxs)
+GEN_MOE_DOWN_IDM(iq3s)
+GEN_MOE_DOWN_IDM(iq1s)
+GEN_MOE_DOWN_IDM(iq1m)
+GEN_MOE_DOWN_IDM(tq10)
+GEN_MOE_DOWN_IDM(tq20)
+GEN_MOE_DOWN_IDM(q20)
+GEN_MOE_DOWN_IDM(mxfp4)
+GEN_MOE_DOWN_IDM(nvfp4)
+
+// Ordered reduction of the id-GEMV's per-slot outputs into the token rows. One thread per
+// (row, channel); sums slots 0..n_used-1 IN ORDER onto a 0.0f seed, reproducing the serial loop's
+// `atomicAdd` sequence into a zeroed dst exactly (f32 addition is not associative — see the header).
+// `dst` is ADDED to, not overwritten: the executor zeroes it, and a row whose slots were all
+// dispatched here still reads its own accumulation only.
+extern "C" __global__ void moe_accum_idm(
+    const float* __restrict__ y,   /* [rows, n_used, ne] */
+    float* __restrict__ dst,       /* [rows, ne] */
+    int ne, int rows, int n_used
+) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * ne;
+    if (i >= total) return;
+    int row = (int)(i / ne);
+    int d = (int)(i - (long)row * ne);
+    float acc = 0.0f;
+    for (int k = 0; k < n_used; k++) {
+        acc += y[((long)row * n_used + k) * ne + d];
+    }
+    dst[i] += acc;
+}
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────
