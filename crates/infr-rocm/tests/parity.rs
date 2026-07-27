@@ -5285,3 +5285,362 @@ fn quant_memo_is_dropped_when_the_gemv_rewrites_its_own_source() {
         e / mag
     );
 }
+
+// ── F1c: the two MoE decode folds (`MoeFfn → Add`, `RmsNorm → MoeFfn`) ────────
+//
+// Both are BIT-IDENTITY folds, not tolerance folds, and both are asserted that way: the comparand
+// is the SAME graph run with the fold's own escape hatch cleared, so the two runs differ in exactly
+// one thing — whether the pattern was planned. `assert_eq!` on the raw f32 bits, because anything
+// less would not see the failure these folds could actually produce.
+//
+// For `MoeFfn → Add` that failure is a REASSOCIATED expert sum. R8 (`d787890`) deliberately kept
+// `moe_accum_idm` reducing the slots in ascending order onto a 0.0f seed rather than using
+// atomicAdd, so the result is deterministic and the seam golden depends on it; folding the residual
+// in as a seed (`((h + s0) + s1) …`) instead of at the end (`h + ((s0 + s1) …)`) would still be
+// "correct" to any tolerance and would still move the golden. An `==` comparand catches it.
+
+/// Build a `[RmsNorm →] MoeFfn [→ Add]` graph and run it on `be`, returning the final output.
+/// `pre_norm` prepends the norm the F1c fold elides (the MoE input norm's shape: the SAME tensor
+/// feeds `x` and `router_x`); `residual` appends the in-place residual `Add` the seam emits
+/// (`hidden = hidden + moe_out`), and the returned buffer is then the `Add`'s dst.
+#[allow(clippy::too_many_arguments)]
+fn run_moe_folds(
+    be: &dyn Backend,
+    x: &[f32],
+    router_f32: &[f32],
+    gate_bytes: &[u8],
+    up_bytes: &[u8],
+    down_bytes: &[u8],
+    dt: DType,
+    rows: usize,
+    ne: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_ff_exp: usize,
+    pre_norm: Option<&[u8]>,
+    residual: Option<&[f32]>,
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let xid = g.input(f32d(rows * ne));
+    let rid = g.weight(TensorDesc::new(vec![n_expert * ne], DType::F32));
+    let gid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], dt));
+    let uid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], dt));
+    let did = g.weight(TensorDesc::new(vec![n_expert * ne * n_ff_exp], dt));
+    // The norm's output is an INTERNAL scratch — the live-range bound the shared pass applies only
+    // ever fires on Internal handles, so an Output here would silently un-plan the fold.
+    let nw = pre_norm.map(|_| g.weight(TensorDesc::new(vec![ne], DType::F16)));
+    let moe_in = match nw {
+        Some(w) => {
+            let hn = g.internal(f32d(rows * ne));
+            g.push(Op::RmsNorm {
+                x: xid,
+                weight: w,
+                dst: hn,
+                rows: rows as u32,
+                dim: ne as u32,
+                eps: 1e-6,
+            });
+            hn
+        }
+        None => xid,
+    };
+    // Likewise the MoE's own dst when a residual `Add` follows it.
+    let (moe_dst, resid_id, dst) = match residual {
+        Some(_) => {
+            let sub = g.internal(f32d(rows * ne));
+            let h = g.input(f32d(rows * ne));
+            let out = g.output(f32d(rows * ne));
+            (sub, Some(h), out)
+        }
+        None => {
+            let out = g.output(f32d(rows * ne));
+            (out, None, out)
+        }
+    };
+    g.push(Op::MoeFfn {
+        x: moe_in,
+        router_x: moe_in,
+        router: rid,
+        gate_exps: gid,
+        up_exps: uid,
+        down_exps: did,
+        down_scale: None,
+        dst: moe_dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: n_ff_exp as u32,
+        scale: 1.0,
+        act: Activation::Silu,
+        gating: MoeGating::Softmax,
+        norm_w: true,
+        weight_before: false,
+        fused_gate_up: false,
+        ep_band: None,
+    });
+    if let Some(h) = resid_id {
+        g.push(Op::Add {
+            a: h,
+            b: moe_dst,
+            dst,
+            n: (rows * ne) as u32,
+        });
+    }
+    let plan = be.compile(&g).expect("compile");
+
+    let up = |bytes: &[u8], usage| {
+        let b = be.alloc(bytes.len(), usage).expect("alloc");
+        be.upload(b.as_ref(), bytes).unwrap();
+        b
+    };
+    let xb = up(bytemuck::cast_slice(x), BufferUsage::Activations);
+    let rb = up(bytemuck::cast_slice(router_f32), BufferUsage::Weights);
+    let gb = up(gate_bytes, BufferUsage::Weights);
+    let ub = up(up_bytes, BufferUsage::Weights);
+    let db = up(down_bytes, BufferUsage::Weights);
+    let nb = pre_norm.map(|w| up(w, BufferUsage::Weights));
+    let hb = residual.map(|h| up(bytemuck::cast_slice(h), BufferUsage::Activations));
+    let ob = be.alloc(rows * ne * 4, BufferUsage::Readback).expect("out");
+
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(rid, rb.as_ref());
+    b.bind(gid, gb.as_ref());
+    b.bind(uid, ub.as_ref());
+    b.bind(did, db.as_ref());
+    if let (Some(w), Some(buf)) = (nw, &nb) {
+        b.bind(w, buf.as_ref());
+    }
+    if let (Some(h), Some(buf)) = (resid_id, &hb) {
+        b.bind(h, buf.as_ref());
+    }
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut o = vec![0f32; rows * ne];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// A ROCm backend with one `kernels.rocm` field overridden — the A/B comparand for each fold.
+fn rocm_cfg(f: impl FnOnce(&mut infr_core::config::RocmCfg)) -> Option<RocmBackend> {
+    let mut cfg = infr_core::config::Config::default();
+    f(&mut cfg.kernels.rocm);
+    RocmBackend::new_with(0, std::sync::Arc::new(cfg)).ok()
+}
+
+/// F16 norm weights, ~1.0 with per-channel variation (a flat 1.0 weight would hide a mis-indexed
+/// `weight[i]` in the fused normalize).
+fn f16_norm_weight(n: usize) -> Vec<u8> {
+    let mut w = vec![0u8; n * 2];
+    for i in 0..n {
+        let v = 0.7 + 0.6 * ((i % 7) as f32 / 7.0);
+        w[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+    }
+    w
+}
+
+/// **`MoeFfn → Add` must be bit-identical.** Same graph, fold on vs fold off (`fuse_add`), `==` on
+/// every element — so a residual folded into the accumulate as a SEED (which would reassociate the
+/// ascending-slot sum R8 pinned) fails here rather than in a moved golden hash three slices later.
+/// Run at `n_used = 1..4`: with one slot the sum has no order to lose, so only `n_used > 1` puts
+/// the association under test at all.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_residual_fold_is_bit_identical() {
+    let (Some(on), Some(off)) = (rocm(), rocm_cfg(|c| c.fuse_add = false)) else {
+        return;
+    };
+    let (ne, n_expert, n_ff_exp) = (256usize, 8usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let upw = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, |e| expert_scale(e) * 0.8);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    for n_used in [1usize, 2, 4] {
+        let x = gen(ne, 3);
+        let router = gen(n_expert * ne, 9);
+        let plain = run_moe_folds(
+            &on,
+            &x,
+            &router,
+            &gate,
+            &upw,
+            &down,
+            DType::Q8_0,
+            1,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            None,
+            None,
+        );
+        assert!(
+            maxabs(&plain) > 1e-3,
+            "MoeFfn residual fold [n_used={n_used}] reference is all-zero — test is vacuous"
+        );
+        // Scale the residual to the MoE output's OWN magnitude. A tiny residual would be absorbed
+        // whole into the sum's rounding, and then a reassociated accumulate — the failure this test
+        // exists for — would produce the same bits and pass.
+        let rscale = maxabs(&plain) / maxabs(&gen(ne, 17)).max(1e-6);
+        let resid: Vec<f32> = gen(ne, 17).iter().map(|v| v * rscale).collect();
+        let go = |b: &dyn Backend| {
+            run_moe_folds(
+                b,
+                &x,
+                &router,
+                &gate,
+                &upw,
+                &down,
+                DType::Q8_0,
+                1,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                None,
+                Some(&resid),
+            )
+        };
+        let fused = go(&on);
+        let split = go(&off);
+        // Not a tolerance: the standalone `add` and the folded epilogue must produce the SAME bits.
+        assert_eq!(
+            fused,
+            split,
+            "MoeFfn→Add fold is not bit-identical at n_used={n_used} (max_err={:e}) — the expert \
+             accumulate was reassociated",
+            maxerr(&fused, &split)
+        );
+        // ... and it must actually be the residual that was added, not a dropped or doubled one.
+        let want: Vec<f32> = plain.iter().zip(&resid).map(|(m, r)| r + m).collect();
+        assert_eq!(
+            fused, want,
+            "the folded epilogue did not add the residual exactly once at n_used={n_used}"
+        );
+    }
+}
+
+/// **The declined tier still gets its `Add`.** The shared pass plans `MoeFfn → Add` and ELIDES the
+/// standalone op from the walk; a tier that cannot carry the fold (here `moe_id_rows = 0`, the
+/// pre-R8 per-slot loop whose `atomicAdd` accumulate has no epilogue) must REPLAY it. Without the
+/// replay this test reads back the bare MoE output — the residual silently dropped, in a
+/// configuration no golden covers.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_residual_fold_declined_tier_replays_the_add() {
+    let (Some(loop_tier), Some(off)) = (
+        rocm_cfg(|c| c.moe_id_rows = 0),
+        rocm_cfg(|c| {
+            c.moe_id_rows = 0;
+            c.fuse_add = false;
+        }),
+    ) else {
+        return;
+    };
+    let (ne, n_expert, n_used, n_ff_exp) = (256usize, 8usize, 3usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let upw = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, |e| expert_scale(e) * 0.8);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let x = gen(ne, 3);
+    let router = gen(n_expert * ne, 9);
+    let resid = gen(ne, 17);
+    let go = |b: &dyn Backend| {
+        run_moe_folds(
+            b,
+            &x,
+            &router,
+            &gate,
+            &upw,
+            &down,
+            DType::Q8_0,
+            1,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            None,
+            Some(&resid),
+        )
+    };
+    let planned = go(&loop_tier);
+    let never_planned = go(&off);
+    assert!(
+        maxabs(&never_planned) > 1e-3,
+        "declined-tier replay reference is all-zero — test is vacuous"
+    );
+    assert_eq!(
+        planned, never_planned,
+        "the pre-R8 tier declined the residual fold but did not replay the elided `Add` — the \
+         residual was dropped"
+    );
+}
+
+/// **`RmsNorm → MoeFfn` must be bit-identical.** The fold makes one `rmsnorm_quant_i8_32` produce
+/// BOTH the experts' int8 codes and the f32 row the router GEMV reads; the codes have been
+/// bit-faithful since Slice 32, but the `xn` output is new and it is what the router's expert
+/// SELECTION depends on — a normalized row off by an ulp can flip a top-k tie and change which
+/// experts run, which is a large output change, not a small one. Same graph, fold on vs off
+/// (`fuse_norm`), `==`.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn rmsnorm_moe_fold_is_bit_identical() {
+    let (Some(on), Some(off)) = (rocm(), rocm_cfg(|c| c.fuse_norm = false)) else {
+        return;
+    };
+    let (ne, n_expert, n_used, n_ff_exp) = (256usize, 8usize, 3usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let upw = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, |e| expert_scale(e) * 0.8);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let nw = f16_norm_weight(ne);
+    let x = gen(ne, 5);
+    // The router weights are scaled DOWN so the softmax over `n_expert` stays SOFT. With the raw
+    // generator the `ne`-wide dot saturates (top-1 weight rounds to exactly 1.0, the rest to 0.0)
+    // and the gate weights become a step function of the logits — at which point the routed sum no
+    // longer depends on the normalized row's low bits at all and this test would pass with an `xn`
+    // that is merely CLOSE. Mutation-checked: at this scale a 0.1% perturbation of `xn` fails the
+    // assert below; at the raw scale it does not.
+    let router: Vec<f32> = gen(n_expert * ne, 9).iter().map(|v| v * 0.01).collect();
+    let resid = gen(ne, 17);
+    // Both folds together (the shipping shape: the MoE layer's norm elided AND its residual
+    // folded) and the norm fold alone, so neither is only ever exercised in the other's company.
+    for with_resid in [false, true] {
+        let go = |b: &dyn Backend| {
+            run_moe_folds(
+                b,
+                &x,
+                &router,
+                &gate,
+                &upw,
+                &down,
+                DType::Q8_0,
+                1,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                Some(&nw),
+                with_resid.then_some(&resid[..]),
+            )
+        };
+        let fused = go(&on);
+        let split = go(&off);
+        assert!(
+            maxabs(&split) > 1e-3,
+            "RmsNorm→MoeFfn fold [resid={with_resid}] reference is all-zero — test is vacuous"
+        );
+        assert_eq!(
+            fused,
+            split,
+            "RmsNorm→MoeFfn fold is not bit-identical [resid={with_resid}] (max_err={:e}) — the \
+             normalized row the router reads is not the one the standalone `rmsnorm` wrote",
+            maxerr(&fused, &split)
+        );
+    }
+}

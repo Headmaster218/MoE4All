@@ -885,6 +885,11 @@ fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
             enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
         rmsnorm_linear: None,
+        // F1c's `MoeFfn → Add` fold is ROCm-only for now: this adapter's MoE lowering accumulates
+        // the experts through its own `moe_accumulate`, which has no residual epilogue, so the
+        // pattern stays un-planned here and Vulkan dispatches the standalone `Add` exactly as
+        // before.
+        moe_add: None,
         kv_write: true,
     }
 }

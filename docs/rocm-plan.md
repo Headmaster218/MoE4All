@@ -614,12 +614,12 @@ Vulkan has the full set (`crates/infr-vulkan/src/recorder.rs:4251-6559`).
 ## 3. Fusion breadth
 
 ROCm has RmsNorm→Linear + Linear→Add peepholes (Slice 32), the **F1b**
-sibling-GEMV activation-quant memo (below), plus, since **F1**, the
-capability-gated fusions its executor already implemented but the "start with
-NOTHING fused" bring-up dial in `backend.rs`'s `capabilities()` had never let
-the seam emit. Each was proved against the CPU reference first
-(`crates/infr-rocm/tests/parity.rs`, the "F1 fusion gate" section) and then
-measured on a 7900 XTX:
+sibling-GEMV activation-quant memo and the **F1c** MoE folds (RmsNorm→MoeFfn,
+MoeFfn→Add — both below), plus, since **F1**, the capability-gated fusions its
+executor already implemented but the "start with NOTHING fused" bring-up dial in
+`backend.rs`'s `capabilities()` had never let the seam emit. Each was proved
+against the CPU reference first (`crates/infr-rocm/tests/parity.rs`, the "F1
+fusion gate" section) and then measured on a 7900 XTX:
 
 | capability      | state | evidence                                                                                                                                                                                                                                                                                                |
 | --------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -708,25 +708,102 @@ Dense decode is now 451/token: `linear_i8_q4k` 140 (5 real GEMVs/layer),
   down_proj's from `gated_act`); killing them means an int8-emitting epilogue on
   the producing kernel, i.e. new kernels rather than a peephole.
 
-### MoE, examined but NOT landed (for the next slice)
+### F1c — the two MoE decode folds
 
-Qwen3-30B-A3B is 963/token after F1b, and **96 of those are a standalone
-`rmsnorm` ×48 and `add` ×48** that the dense path does not pay:
+F1b left Qwen3-30B-A3B at 963/token with **96 of those a standalone `rmsnorm`
+×48 and `add` ×48** the dense path does not pay. Both are landed, as two new
+patterns in the **shared** `infr_core::fusion` pass, each behind a
+backend-supplied predicate so Vulkan and Metal are untouched until they opt in
+(both pass `moe_ok: None` / `moe_add: None`; their suites are the gate — 216 +
+27/27 unmoved).
 
-- **`rmsnorm` ×48** — the post-attention norm feeds the **F16** router `Linear`
-  _and_ `Op::MoeFfn`. `plan_rmsnorm_linear` requires every consumer in the
-  norm's live range to be a fusable int8 decode `Linear`; the `MoeFfn` consumer
-  disqualifies the fold outright, and the router's F16 weight would fail
-  `native_i8_fmt` regardless.
-- **`add` ×48** — the MoE residual is `MoeFfn → Add`, so `plan_linear_add`
-  (which matches `Linear → Add`) never sees it. Folding the residual into the
-  `moe_accum_idm` epilogue is the exact analogue of the Linear→Add fold and is
-  the cleanest 48 launches on the board.
+- **`MoeFfn → Add` (`plan_moe_add`)** — the structural twin of `plan_linear_add`
+  (same Internal-dst requirement, same immediately-following-op rule, same
+  live-range bound); only the producer differs. ROCm folds the residual into
+  `moe_accum_idm`, which now takes an optional `res` pointer and writes
+  `dst[i] = res[i] + acc` instead of a standalone `add` over a zeroed scratch.
+  **The R8 summation order is untouched**: `acc` is still the ascending-slot
+  reduction onto a `0.0f` seed and the residual joins it exactly where the
+  elided `add` joined it, so `res + acc` ≡ `add(res, 0.0f + acc)` bit-for-bit —
+  `0.0f + acc == acc` for every value `acc` can take, because a sum seeded at
+  `+0.0` never rounds to `-0.0`, the one case where adding zero is not the
+  identity. Scoped to the R8 tier: the pre-R8 per-slot loop `atomicAdd`s into
+  `dst` and is deterministic only because the host serializes the slots, so
+  seeding it with the residual would re-associate the sum. A tier that declines
+  (paged, `INFR_ROCM_NO_I8`, `moe_id_rows = 0`) **replays** the elided `Add`.
+- **`RmsNorm → MoeFfn` (`RmsNormLinearCfg::moe_ok`)** — F1b's note that the norm
+  feeds "the F16 router `Linear`" was one step off: the router GEMV lives INSIDE
+  `Op::MoeFfn` (`linear_f16`, 48/token), so the norm's only graph consumer is
+  the MoE op itself and there is no F16 `Linear` to disqualify. That makes the
+  fold reachable without touching the router: `rmsnorm_quant_i8_32` gained an
+  optional `xn` output, so ONE pass now produces both the experts' int8 codes
+  and the normalized f32 row the router reads — byte for byte what the
+  standalone `rmsnorm` wrote, from the same expression. The pair `rmsnorm` +
+  `quant_i8_32` becomes one launch. Single-row only (the prefill arm chunks its
+  rows, so one normalize pass cannot serve a router GEMV spanning all of them);
+  a tier that cannot take it replays the elided `rmsnorm`. The `xn` write is its
+  **own** loop rather than a predicated store inside the quantize loop — folded
+  in, it cost the dense path (which passes `xn == 0`) ~1 % of decode, measured.
 
-Both want an `infr_core::fusion` extension, which is shared with Vulkan and
-Metal — out of scope for a ROCm-only slice, and not worth half-landing. The MoE
-`quant_i8_32` ×144 (3/layer: o_proj input, expert gate/up input, expert down
-input) is genuinely three different rows and has nothing for the memo to reuse.
+Both are asserted **bit-identical**, not to a tolerance:
+`moe_residual_fold_is_bit_identical` (`==` vs the same graph with `fuse_add`
+cleared, at `n_used` 1/2/4, residual scaled to the MoE output's own magnitude so
+a re-association cannot hide in the rounding),
+`moe_residual_fold_declined_tier_replays_the_add` (`moe_id_rows = 0`), and
+`rmsnorm_moe_fold_is_bit_identical` (`==` vs `fuse_norm` cleared, with the
+router weights scaled DOWN so the softmax stays soft — at the raw scale the
+top-1 gate saturates to exactly 1.0 and the test would pass with an `xn` that is
+merely close; mutation-checked both ways). Four `infr_core::fusion` unit tests
+pin the opt-in, the expert predicate, the live-range bound and the single-row
+gate. All nine `rocm_seam` goldens hold with qwen3 at `0xfd63781ea3bfa785`, and
+temp-0 output is token-identical before/after on a dense (Qwen3-0.6B), an MoE
+(Qwen3-30B-A3B) and a MoE+DeltaNet (Qwen3.6-35B-A3B) model.
+
+Kernel launches per Qwen3-30B-A3B decode token, F1b → F1c (963 → **867**):
+
+| kernel                        | F1b | F1c     |
+| ----------------------------- | --- | ------- |
+| `linear_i8_q4k`               | 168 | 168     |
+| `quant_i8_32`                 | 144 | **96**  |
+| `qk_norm_rope`                | 96  | 96      |
+| `write_kv`                    | 96  | 96      |
+| `rmsnorm_quant_i8_32`         | 49  | **97**  |
+| `add`                         | 48  | **0**   |
+| `rmsnorm`                     | 48  | **0**   |
+| `attention`                   | 48  | 48      |
+| `linear_f16` (the MoE router) | 48  | 48      |
+| `moe_accum_idm`               | 48  | 48      |
+| `moe_gate_up_act_i8_idm_q4k`  | 48  | 48      |
+| `moe_topk`                    | 48  | 48      |
+| `linear_i8_q6k`               | 25  | 25      |
+| `moe_down_i8_idm_q4k/q6k`     | 48  | 48      |
+| `argmax`                      | 1   | 1       |
+| **total**                     | 963 | **867** |
+
+Measured on a 7900 XTX, interleaved against a binary built from the parent
+commit (`15642b7`), warmed, first burst discarded:
+
+- Qwen3-30B-A3B `tg64 -r 3`: base 44.1/44.2/44.1/44.1/44.2 → **46.2/46.1/46.1/
+  46.1/46.1 (+4.4 %)**. Back-to-back ×8 each way confirms it with no overlap:
+  base 44.1-44.2, F1c 46.1-46.4. (At `-r 2` three of twelve F1c runs dipped to
+  39-43 while base never did; at `-r 3`, and in the ×8 back-to-back batches, the
+  dips vanish — a short-burst artefact of alternating two processes over a 17
+  GiB weight set, not the fold.)
+- Qwen3-30B-A3B `pp512`: **a wash** (252.3/252.5/252.3 → 252.7/252.5/252.4) —
+  both folds are decode-only by construction.
+- Qwen3-0.6B `tg128` (dense control, must be inert): **a wash**
+  (124.0/126.7/124.5/125.2 → 125.1/124.7/124.4/125.0).
+- Qwen3.6-35B-A3B `tg64`: a wash (7.1 → 7.1). That model is VRAM-bound at ~140
+  ms/token; 48 launches are not resolvable there.
+
+### MoE, still open after F1c
+
+Qwen3-30B-A3B is 867/token. The largest remaining MoE-specific item is
+**`quant_i8_32` ×96** — 2 per layer (the expert `h` quantize between gate/up and
+down, and the o*proj input). Neither is sibling-redundant: `h` is produced by
+`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means an int8-emitting epilogue on the producing kernel, not a peephole — the same conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96 /`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48 here, blocked on an f16-out`qk_norm_rope`), and `linear_f16`
+×48 (the MoE router) is a single small GEMV per layer with nothing adjacent to
+absorb it.
 
 ## 4. Device-side sampling
 

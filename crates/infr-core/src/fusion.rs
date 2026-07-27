@@ -7,7 +7,8 @@
 //! rewrite with the backend's own fused-kernel coverage. The result is a [`FusionPlan`] the backend
 //! consumes exactly as it consumed its private `(fused, skip)` pair before.
 //!
-//! Three patterns are covered (the union of what the three backends did):
+//! Four patterns are covered (the union of what the three backends did, plus the MoE analogue of
+//! the first two):
 //!
 //! 1. **`Linear(m==1) → Add(residual)`** ([`FusionCfg::linear_add`]) — fold a decode projection's
 //!    following residual `Add` into the GEMV epilogue (`dst = gemv + residual`), killing the
@@ -16,7 +17,13 @@
 //! 2. **`RmsNorm → Linear(m==1)`** ([`FusionCfg::rmsnorm_linear`]) — elide a standalone `RmsNorm`
 //!    whose normalized output feeds ONLY fusable decode `Linear`s, which normalize their raw input
 //!    row in-kernel instead. ROCm's `input_norm→qkv` / `post_attn_norm→gate/up` int8 fusion.
-//! 3. **`Rope/QkNormRope → WriteKv`** ([`FusionCfg::kv_write`]) — redirect a fused rope kernel's
+//!    Optionally ([`RmsNormLinearCfg::moe_ok`]) a single-row `Op::MoeFfn` also counts as a fusable
+//!    consumer — the MoE arm then normalizes in its own expert-quantize pass.
+//! 3. **`MoeFfn → Add(residual)`** ([`FusionCfg::moe_add`]) — the exact analogue of (1) for the MoE
+//!    sublayer: a pure-MoE FFN's residual `Add` never matched `linear_add` (the producer is
+//!    `Op::MoeFfn`, not `Op::Linear`), so a 48-layer MoE decode paid 48 standalone `add`
+//!    dispatches. Folded into the backend's expert-accumulate epilogue.
+//! 4. **`Rope/QkNormRope → WriteKv`** ([`FusionCfg::kv_write`]) — redirect a fused rope kernel's
 //!    f16 K-row write straight into an f16 KV cache, absorbing the standalone `WriteKv`. Vulkan's
 //!    `kv_write_peephole`, including the SWA ring-wrap guard.
 //!
@@ -45,12 +52,39 @@ pub struct LinearAddCfg<'a> {
     pub enabled: bool,
 }
 
+/// Predicate over an `Op::MoeFfn`'s three expert banks `(gate, up, down)` — a backend's fused-MoE
+/// kernel coverage. Used by both MoE patterns ([`FusionCfg::moe_add`] and
+/// [`RmsNormLinearCfg::moe_ok`]).
+pub type ExpertsOk<'a> = &'a dyn Fn(DType, DType, DType) -> bool;
+
 /// Per-pattern config for [`FusionCfg::rmsnorm_linear`].
 pub struct RmsNormLinearCfg<'a> {
     /// Fuse only when each consuming `Linear`'s weight dtype passes this predicate.
     pub weight_ok: &'a dyn Fn(DType) -> bool,
+    /// When `Some`, a SINGLE-ROW `Op::MoeFfn` reading the normalized row as BOTH its expert input
+    /// `x` and its router input `router_x` also counts as a fusable consumer, provided its expert
+    /// banks pass the predicate — the backend's MoE arm then produces the normalized row itself
+    /// (ROCm folds it into the expert `rmsnorm_quant_i8_32` pass, whose extra f32 output is the
+    /// row the router GEMV reads). `None` = a `MoeFfn` consumer disqualifies the fold, which is
+    /// what every backend did before F1c.
+    ///
+    /// Single-row only, deliberately: the multi-row (prefill) MoE arm chunks its rows, so one
+    /// normalize pass per chunk could not serve a router GEMV that spans every row — and prefill is
+    /// weight-bandwidth-bound, where a saved launch does not show up anyway.
+    pub moe_ok: Option<ExpertsOk<'a>>,
     /// `false` disables this pass entirely (ROCm `kernels.rocm.fuse_norm` /
     /// `INFR_ROCM_NO_FUSE_NORM`).
+    pub enabled: bool,
+}
+
+/// Per-pattern config for [`FusionCfg::moe_add`].
+pub struct MoeAddCfg<'a> {
+    /// Fuse only when the `MoeFfn`'s expert banks pass this predicate — the backend's fused-residual
+    /// expert-accumulate coverage (ROCm: the natively decoded int8 formats on the ordered-accumulate
+    /// R8 tier).
+    pub experts_ok: ExpertsOk<'a>,
+    /// `false` disables this pass entirely — shares ROCm's `kernels.rocm.fuse_add` hatch with
+    /// [`FusionCfg::linear_add`], since it is the same fold on the other producer.
     pub enabled: bool,
 }
 
@@ -61,6 +95,8 @@ pub struct FusionCfg<'a> {
     pub linear_add: Option<LinearAddCfg<'a>>,
     /// `RmsNorm → Linear(m==1)` fusion.
     pub rmsnorm_linear: Option<RmsNormLinearCfg<'a>>,
+    /// `MoeFfn → Add` residual fusion.
+    pub moe_add: Option<MoeAddCfg<'a>>,
     /// `Rope/QkNormRope → WriteKv` fusion (f16 cache only; predicate is fixed f16, so a plain flag).
     pub kv_write: bool,
 }
@@ -71,9 +107,12 @@ pub struct FusionCfg<'a> {
 pub struct FusionPlan {
     /// `Linear` op idx → (residual operand, final `Add` dst). The absorbed `Add` is at `idx + 1`.
     pub linear_add: HashMap<usize, (TensorId, TensorId)>,
-    /// Consuming `Linear` op idx → (raw pre-norm `x`, norm `weight`, `eps`). The elided `RmsNorm`
-    /// op index is in `skip` (it is NOT `idx - 1` in general — one norm can feed several Linears).
+    /// Consuming `Linear` (or, under [`RmsNormLinearCfg::moe_ok`], `MoeFfn`) op idx → (raw pre-norm
+    /// `x`, norm `weight`, `eps`). The elided `RmsNorm` op index is in `skip` (it is NOT `idx - 1`
+    /// in general — one norm can feed several consumers).
     pub rmsnorm_linear: HashMap<usize, (TensorId, TensorId, f32)>,
+    /// `MoeFfn` op idx → (residual operand, final `Add` dst). The absorbed `Add` is at `idx + 1`.
+    pub moe_add: HashMap<usize, (TensorId, TensorId)>,
     /// `Rope`/`QkNormRope` op idx → (KV cache tensor, write row). The absorbed `WriteKv` is at
     /// `idx + 1`.
     pub kv_write: HashMap<usize, (TensorId, usize)>,
@@ -96,7 +135,76 @@ pub fn plan_fusions(graph: &Graph, cfg: &FusionCfg) -> FusionPlan {
     if let Some(c) = cfg.linear_add.as_ref().filter(|c| c.enabled) {
         plan_linear_add(graph, c, &mut plan);
     }
+    if let Some(c) = cfg.moe_add.as_ref().filter(|c| c.enabled) {
+        plan_moe_add(graph, c, &mut plan);
+    }
     plan
+}
+
+/// The `(gate, up, down)` expert-bank dtypes of an `Op::MoeFfn`, for the two `ExpertsOk` predicates.
+fn expert_dtypes(graph: &Graph, op: &Op) -> Option<(DType, DType, DType)> {
+    let Op::MoeFfn {
+        gate_exps,
+        up_exps,
+        down_exps,
+        ..
+    } = *op
+    else {
+        return None;
+    };
+    Some((
+        graph.desc(gate_exps).dtype,
+        graph.desc(up_exps).dtype,
+        graph.desc(down_exps).dtype,
+    ))
+}
+
+/// `MoeFfn(Internal dst, covered expert banks) → Add(residual)`: fold the MoE sublayer's residual
+/// `Add` into the expert-accumulate epilogue. Structurally identical to [`plan_linear_add`] — same
+/// Internal-dst requirement, same immediately-following-op rule (a gemma sandwich `post_ffw` norm
+/// between the two correctly blocks it), same live-range bound — only the producer differs.
+fn plan_moe_add(graph: &Graph, cfg: &MoeAddCfg, plan: &mut FusionPlan) {
+    for (i, op) in graph.ops.iter().enumerate() {
+        let Op::MoeFfn { dst, .. } = *op else {
+            continue;
+        };
+        if !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal) {
+            continue;
+        }
+        let Some((gd, ud, dd)) = expert_dtypes(graph, op) else {
+            continue;
+        };
+        if !(cfg.experts_ok)(gd, ud, dd) {
+            continue;
+        }
+        let Some(Op::Add {
+            a,
+            b,
+            dst: add_dst,
+            n,
+        }) = graph.ops.get(i + 1)
+        else {
+            continue;
+        };
+        // The `Add` must span the WHOLE MoE output, not a slice of it.
+        if *n as usize != graph.desc(dst).numel() {
+            continue;
+        }
+        let residual = if *b == dst && *a != dst {
+            *a
+        } else if *a == dst && *b != dst {
+            *b
+        } else {
+            continue;
+        };
+        // Live-range bound (see module docs): nothing but this `Add` may read the un-added MoE
+        // output before its scratch handle is next rewritten.
+        if !dst_only_read_by_next(graph, i + 2, dst) {
+            continue;
+        }
+        plan.moe_add.insert(i, (residual, *add_dst));
+        plan.skip.insert(i + 1);
+    }
 }
 
 /// `Linear(m==1, Internal dst, covered weight) → Add(residual)`: fold the following residual `Add`
@@ -185,6 +293,26 @@ fn plan_rmsnorm_linear(graph: &Graph, cfg: &RmsNormLinearCfg, plan: &mut FusionP
                         in_f,
                         ..
                     } if *lx == dst && *in_f == dim && (cfg.weight_ok)(graph.desc(*lw).dtype) => {
+                        consumers.push(j);
+                    }
+                    // F1c: a single-row `MoeFfn` that reads the normalized row as BOTH its expert
+                    // input and its router input. Requiring `x == router_x == dst` is not a
+                    // convenience: a backend's MoE arm produces ONE normalized row, so a router
+                    // reading some OTHER tensor would still need the standalone norm's output.
+                    Op::MoeFfn {
+                        x: mx,
+                        router_x,
+                        dst: mdst,
+                        ne,
+                        ..
+                    } if cfg.moe_ok.is_some()
+                        && *mx == dst
+                        && *router_x == dst
+                        && *ne == dim
+                        && graph.desc(*mdst).numel() == dim as usize
+                        && expert_dtypes(graph, &graph.ops[j])
+                            .is_some_and(|(g_, u, d)| (cfg.moe_ok.unwrap())(g_, u, d)) =>
+                    {
                         consumers.push(j);
                     }
                     _ => {
@@ -321,6 +449,7 @@ mod tests {
                         enabled,
                     }),
                     rmsnorm_linear: None,
+                    moe_add: None,
                     kv_write: false,
                 },
             )
@@ -359,5 +488,205 @@ mod tests {
         let off = plan_with(false);
         assert!(off.linear_add.is_empty());
         assert!(off.skip.is_empty());
+    }
+
+    // ── F1c: the two MoE patterns ────────────────────────────────────────────
+
+    /// The MoE decode shape the seam emits: `RmsNorm(hidden) -> MoeFfn(x = router_x = hn)
+    /// -> Add(hidden, sub)`. `tail` appends an extra reader of the MoE dst, to exercise the
+    /// live-range bound.
+    fn moe_graph(tail_reads_moe_dst: bool) -> Graph {
+        let mut g = Graph::new();
+        let hidden = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let nw = g.weight(TensorDesc::new(vec![4], DType::F16));
+        let hn = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let router = g.weight(TensorDesc::new(vec![2, 4], DType::F32));
+        let gate = g.weight(TensorDesc::new(vec![2, 8, 4], DType::Q4K));
+        let up = g.weight(TensorDesc::new(vec![2, 8, 4], DType::Q4K));
+        let down = g.weight(TensorDesc::new(vec![2, 4, 8], DType::Q6K));
+        let sub = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let out = g.output(TensorDesc::new(vec![1, 4], DType::F32));
+        g.push(Op::RmsNorm {
+            x: hidden,
+            weight: nw,
+            dst: hn,
+            rows: 1,
+            dim: 4,
+            eps: 1e-6,
+        });
+        g.push(Op::MoeFfn {
+            x: hn,
+            router_x: hn,
+            router,
+            gate_exps: gate,
+            up_exps: up,
+            down_exps: down,
+            down_scale: None,
+            dst: sub,
+            ne: 4,
+            n_expert: 2,
+            n_used: 2,
+            n_ff_exp: 8,
+            scale: 1.0,
+            act: crate::graph::Activation::Silu,
+            gating: crate::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            fused_gate_up: false,
+            ep_band: None,
+        });
+        g.push(Op::Add {
+            a: hidden,
+            b: sub,
+            dst: out,
+            n: 4,
+        });
+        if tail_reads_moe_dst {
+            // A second consumer of the un-added MoE output: the fold must NOT fire.
+            g.push(Op::Scale {
+                x: sub,
+                dst: out,
+                s: 2.0,
+                n: 4,
+            });
+        }
+        g
+    }
+
+    fn moe_cfg<'a>(
+        experts_ok: ExpertsOk<'a>,
+        weight_ok: &'a dyn Fn(DType) -> bool,
+        moe_norm: bool,
+        moe_add: bool,
+    ) -> FusionCfg<'a> {
+        FusionCfg {
+            linear_add: None,
+            rmsnorm_linear: Some(RmsNormLinearCfg {
+                weight_ok,
+                moe_ok: moe_norm.then_some(experts_ok),
+                enabled: true,
+            }),
+            moe_add: moe_add.then_some(MoeAddCfg {
+                experts_ok,
+                enabled: true,
+            }),
+            kv_write: false,
+        }
+    }
+
+    /// Both F1c patterns fire on the seam's MoE decode shape, and BOTH are opt-in: a backend that
+    /// leaves `moe_ok`/`moe_add` unset gets exactly the pre-F1c plan (nothing), which is what keeps
+    /// Vulkan and Metal on their existing dispatch sequence.
+    #[test]
+    fn moe_patterns_are_opt_in_and_fire_on_the_seam_shape() {
+        let g = moe_graph(false);
+        let all: &dyn Fn(DType) -> bool = &|_| true;
+        let experts: ExpertsOk = &|_, _, _| true;
+
+        // Off (Vulkan/Metal today): the `MoeFfn` consumer disqualifies the norm fold and the
+        // residual `Add` is not planned — all three ops dispatch.
+        let off = plan_fusions(&g, &moe_cfg(experts, all, false, false));
+        assert!(off.rmsnorm_linear.is_empty());
+        assert!(off.moe_add.is_empty());
+        assert!(off.skip.is_empty());
+
+        // On: the `RmsNorm` (op 0) and the `Add` (op 2) are both elided, and the `MoeFfn` (op 1)
+        // absorbs both.
+        let on = plan_fusions(&g, &moe_cfg(experts, all, true, true));
+        assert_eq!(on.rmsnorm_linear.len(), 1);
+        assert!(on.rmsnorm_linear.contains_key(&1));
+        assert_eq!(on.moe_add.len(), 1);
+        assert!(on.moe_add.contains_key(&1));
+        assert_eq!(on.skip, [0usize, 2].into_iter().collect::<HashSet<_>>());
+    }
+
+    /// The expert-bank predicate gates BOTH MoE patterns — a backend whose fused-MoE kernels do not
+    /// cover this quant gets the split ops, not a fold it cannot execute.
+    #[test]
+    fn moe_patterns_respect_the_expert_predicate() {
+        let g = moe_graph(false);
+        let all: &dyn Fn(DType) -> bool = &|_| true;
+        // Rejects the Q6_K down bank (the shape Q4_K_M actually ships).
+        let experts: ExpertsOk = &|gd, _, dd| gd == DType::Q4K && dd == DType::Q4K;
+        let p = plan_fusions(&g, &moe_cfg(experts, all, true, true));
+        assert!(p.rmsnorm_linear.is_empty());
+        assert!(p.moe_add.is_empty());
+        assert!(p.skip.is_empty());
+    }
+
+    /// The live-range bound applies to `MoeFfn → Add` exactly as it does to `Linear → Add`: a second
+    /// reader of the un-added MoE output blocks the fold, because the fold never writes it.
+    #[test]
+    fn moe_add_respects_the_live_range_bound() {
+        let g = moe_graph(true);
+        let all: &dyn Fn(DType) -> bool = &|_| true;
+        let experts: ExpertsOk = &|_, _, _| true;
+        let p = plan_fusions(&g, &moe_cfg(experts, all, true, true));
+        assert!(
+            p.moe_add.is_empty(),
+            "the un-added MoE output has a second reader — folding the Add would leave it unwritten"
+        );
+        assert!(!p.skip.contains(&2), "the Add must still dispatch");
+        // The norm fold is independent and still fires (its own live range is unaffected).
+        assert!(p.rmsnorm_linear.contains_key(&1));
+    }
+
+    /// A multi-row (prefill) `MoeFfn` is NOT a fusable norm consumer — the backends' MoE arms chunk
+    /// their rows, so one normalize pass cannot serve a router GEMV spanning every row. The residual
+    /// fold has no such restriction and still fires.
+    #[test]
+    fn rmsnorm_moe_fold_is_single_row_only() {
+        let mut g = Graph::new();
+        let hidden = g.input(TensorDesc::new(vec![4, 4], DType::F32));
+        let nw = g.weight(TensorDesc::new(vec![4], DType::F16));
+        let hn = g.internal(TensorDesc::new(vec![4, 4], DType::F32));
+        let router = g.weight(TensorDesc::new(vec![2, 4], DType::F32));
+        let gate = g.weight(TensorDesc::new(vec![2, 8, 4], DType::Q4K));
+        let down = g.weight(TensorDesc::new(vec![2, 4, 8], DType::Q4K));
+        let sub = g.internal(TensorDesc::new(vec![4, 4], DType::F32));
+        let out = g.output(TensorDesc::new(vec![4, 4], DType::F32));
+        g.push(Op::RmsNorm {
+            x: hidden,
+            weight: nw,
+            dst: hn,
+            rows: 4,
+            dim: 4,
+            eps: 1e-6,
+        });
+        g.push(Op::MoeFfn {
+            x: hn,
+            router_x: hn,
+            router,
+            gate_exps: gate,
+            up_exps: gate,
+            down_exps: down,
+            down_scale: None,
+            dst: sub,
+            ne: 4,
+            n_expert: 2,
+            n_used: 2,
+            n_ff_exp: 8,
+            scale: 1.0,
+            act: crate::graph::Activation::Silu,
+            gating: crate::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            fused_gate_up: true,
+            ep_band: None,
+        });
+        g.push(Op::Add {
+            a: hidden,
+            b: sub,
+            dst: out,
+            n: 16,
+        });
+        let all: &dyn Fn(DType) -> bool = &|_| true;
+        let experts: ExpertsOk = &|_, _, _| true;
+        let p = plan_fusions(&g, &moe_cfg(experts, all, true, true));
+        assert!(
+            p.rmsnorm_linear.is_empty() && !p.skip.contains(&0),
+            "a 4-row MoeFfn must not elide its input norm"
+        );
+        assert!(p.moe_add.contains_key(&1) && p.skip.contains(&2));
     }
 }

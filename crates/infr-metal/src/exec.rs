@@ -760,6 +760,9 @@ fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
             enabled: true,
         }),
         rmsnorm_linear: None,
+        // F1c's `MoeFfn → Add` fold needs a residual epilogue on the expert accumulate, which this
+        // backend's MoE arm does not have; un-planned, so the standalone `Add` still dispatches.
+        moe_add: None,
         kv_write: false,
     }
 }

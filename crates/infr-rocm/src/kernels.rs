@@ -3640,12 +3640,20 @@ GEN_LINEAR_I8_WDEC(nvfp4)
 // expression — an f32 store/load round-trip is exact, so the register value equals what
 // `quant_i8_32` would have read. The int8 codes + per-32-block scales are therefore bit-identical
 // and the golden hash does not move.
+//
+// F1c: `xn` (optional) additionally writes the NORMALIZED f32 row — the exact bytes the standalone
+// `rmsnorm` would have written, from the same expression at the same point. It exists for the
+// `RmsNorm → MoeFfn` fold, whose MoE arm has a second consumer of the normalized row that is not an
+// int8 GEMV: the f16 router GEMV (`linear_f16`). Writing it here still nets a launch, because the
+// pair it replaces is `rmsnorm` + `quant_i8_32`, and costs nothing extra in traffic — it is the same
+// store the elided `rmsnorm` did. Null on the dense `RmsNorm → Linear` path, which needs codes only.
 const RMSNORM_QUANT_I8: &str = r#"
 extern "C" __global__ void rmsnorm_quant_i8_32(
     const float* __restrict__ x,       // [rows, dim] — RAW pre-norm F32 activation
     const __half* __restrict__ weight, // [dim] — dequantized F16 norm weight
     signed char* __restrict__ qx,      // [rows, dim] — int8 codes
     float* __restrict__ xs,            // [rows, dim/32] — per-32-block scales
+    float* __restrict__ xn,            // [rows, dim] — normalized F32 row (null = don't write)
     int rows,
     int dim,
     float eps
@@ -3687,6 +3695,17 @@ extern "C" __global__ void rmsnorm_quant_i8_32(
             if (v > 127.0f) v = 127.0f;
             if (v < -127.0f) v = -127.0f;
             qr[j] = (signed char)v;
+        }
+        // The optional normalized-row write is its OWN loop, not a predicated store inside the
+        // quantize loop above: folding it in cost the dense `RmsNorm → Linear` path (which passes
+        // `xn == 0` and vastly outnumbers the MoE one) ~1% of decode, measured. This way the null
+        // path's inner loop is byte-for-byte the pre-F1c one and only the MoE caller pays — a
+        // recompute of `nv`, against a whole kernel launch saved.
+        if (xn) {
+            float* nr = xn + (long)row * dim + base;
+            for (int j = 0; j < 32; j++) {
+                nr[j] = xr[base + j] * rms * __half2float(weight[base + j]);
+            }
         }
         xs[(long)row * nblk + blk] = s;
     }
@@ -5859,9 +5878,21 @@ GEN_MOE_DOWN_IDM(nvfp4)
 // `atomicAdd` sequence into a zeroed dst exactly (f32 addition is not associative — see the header).
 // `dst` is ADDED to, not overwritten: the executor zeroes it, and a row whose slots were all
 // dispatched here still reads its own accumulation only.
+//
+// F1c FUSED RESIDUAL. `res` non-null folds the MoE sublayer's following `Op::Add` into this
+// epilogue: `dst[i] = res[i] + acc` instead of a standalone `add` over a zeroed `dst`. The
+// SUMMATION ORDER IS UNTOUCHED — `acc` is still the ascending-slot reduction onto a 0.0f seed, and
+// the residual joins it exactly where the elided `add` kernel joined it (`dst = a + b` with
+// `a` = residual), so this is bit-identical, not merely equivalent:
+//   split : add(res, 0.0f + acc)  fused : res + acc
+// and `0.0f + acc == acc` for every value `acc` can take, because `acc` is seeded at +0.0 and
+// round-to-nearest never produces -0.0 from `+0.0 + v` — the one case where adding zero is not the
+// identity. `res == dst` (the in-place `hidden += moe` the seam emits) is safe: one thread owns
+// element `i`, so its read-then-write has no other writer.
 extern "C" __global__ void moe_accum_idm(
     const float* __restrict__ y,   /* [rows, n_used, ne] */
     float* __restrict__ dst,       /* [rows, ne] */
+    const float* __restrict__ res, /* [rows, ne] fused residual (null = none) */
     int ne, int rows, int n_used
 ) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -5873,7 +5904,8 @@ extern "C" __global__ void moe_accum_idm(
     for (int k = 0; k < n_used; k++) {
         acc += y[((long)row * n_used + k) * ne + d];
     }
-    dst[i] += acc;
+    if (res) dst[i] = res[i] + acc;
+    else dst[i] += acc;
 }
 "#;
 

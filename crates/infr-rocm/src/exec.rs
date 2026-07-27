@@ -1588,7 +1588,7 @@ pub fn execute_graph(
 
 // ── Decode op-fusion peephole (Slice 32) ─────────────────────────────────────
 //
-// Two adjacent-op merges the backend detects on the AGNOSTIC graph (so they apply to every arch),
+// Four adjacent-op merges the backend detects on the AGNOSTIC graph (so they apply to every arch),
 // each with a scalar fallback when the pattern doesn't match:
 //
 //   1. `RmsNorm → Linear` (input_norm→qkv, post_attn_norm→gate/up): elide the standalone `rmsnorm`
@@ -1596,27 +1596,55 @@ pub fn execute_graph(
 //      and int8-quantizes its RAW input row in one `rmsnorm_quant_i8_32` pass (bit-faithful).
 //   2. `Linear → Add(residual)` (o_proj, down_proj): fold the residual Add into the GEMV epilogue
 //      (`dst = gemv + residual`), killing the standalone `add` kernel + its round-trip.
+//   3. F1c `RmsNorm → MoeFfn` (post_attn_norm→experts on a pure-MoE layer): the same fold as (1) for
+//      the MoE sublayer, whose input norm has no `Linear` consumer at all — the router GEMV lives
+//      INSIDE `Op::MoeFfn`. The MoE arm's own `rmsnorm_quant_i8_32` emits both the int8 codes the
+//      experts read and the normalized f32 row the router reads.
+//   4. F1c `MoeFfn → Add(residual)`: the residual folds into the ordered expert-accumulate epilogue
+//      (`moe_accum_idm`), killing the last standalone `add` a pure-MoE decode paid.
 //
-// Both are gated to decode (`m == 1`) int8 GEMVs — the shipping default path (every `native_i8_fmt`
-// format).
+// All four are gated to decode (`m == 1` / one token row) int8 paths — the shipping default (every
+// `native_i8_fmt` / `moe_native_fmt` format).
 // Prefill (m>1, WMMA/rocBLAS) and uncovered formats keep the split ops. Escape hatches:
-// `INFR_ROCM_NO_FUSE_NORM` / `INFR_ROCM_NO_FUSE_ADD`.
+// `INFR_ROCM_NO_FUSE_NORM` / `INFR_ROCM_NO_FUSE_ADD` (each covers its dense AND its MoE fold).
 #[derive(Default)]
 struct DecodeFusion {
-    /// Linear op idx → (raw pre-norm x, norm weight, eps): run `rmsnorm_quant_i8_32` on the raw row
-    /// instead of `quant_i8_32` on the (elided) normalized input.
+    /// Linear/MoeFfn op idx → (raw pre-norm x, norm weight, eps): run `rmsnorm_quant_i8_32` on the
+    /// raw row instead of `quant_i8_32` on the (elided) normalized input.
     norm: HashMap<usize, (TensorId, TensorId, f32)>,
-    /// Linear op idx → (residual operand, add dst): fold the following `Add` into the GEMV epilogue.
+    /// Linear/MoeFfn op idx → (residual operand, add dst): fold the following `Add` into that op's
+    /// write epilogue (the GEMV's, or the MoE expert accumulate's).
     add: HashMap<usize, (TensorId, TensorId)>,
     /// Op indices to elide entirely (the fused-away `RmsNorm` / `Add`).
     skip: HashSet<usize>,
 }
 
-/// Weight-dtype predicate for BOTH decode fusions: a covered int8-decode GEMV format
+/// Weight-dtype predicate for BOTH dense decode fusions: a covered int8-decode GEMV format
 /// (`native_i8_fmt`, i.e. every natively decoded format, or `None` under `INFR_ROCM_NO_I8`). The `rmsnorm→
 /// int8-decode-Linear` and `int8-decode-Linear→Add` folds share it.
 fn fuse_weight_ok(dt: DType, rocm: &infr_core::config::RocmCfg) -> bool {
     native_i8_fmt(dt, rocm).is_some()
+}
+
+/// Expert-bank predicate for BOTH F1c MoE fusions: the R8 id-indexed int8 expert tier
+/// (`moe_*_idm_*`), which is the only one whose accumulate is an ORDERED reduction with an epilogue
+/// to fold into, and the only one whose activation quantize is a single whole-block pass.
+///
+/// `up` is not required to be natively covered on its own: a `fused_gate_up` bank stores gate|up in
+/// ONE tensor (so `up_exps == gate_exps`), and a split bank always stores both at the same type —
+/// the executor's own `native` resolution asserts that. Whatever this predicate lets through, the
+/// executor still re-checks at dispatch time and REPLAYS the elided op if the tier it actually
+/// takes (paged, `INFR_ROCM_NO_I8`, `moe_id_rows = 0`) cannot carry the fold.
+fn fuse_experts_ok(
+    gate: DType,
+    _up: DType,
+    down: DType,
+    rocm: &infr_core::config::RocmCfg,
+) -> bool {
+    moe_i8_enabled(rocm)
+        && MOE_ID_ROWS.clamped(rocm.moe_id_rows) > 0
+        && moe_native_fmt(gate).is_some()
+        && moe_native_fmt(down).is_some()
 }
 
 fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion {
@@ -1628,6 +1656,8 @@ fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion 
     // former `static fn(DType) -> bool`. `FusionCfg::weight_ok` is a `&dyn Fn`, so one binding
     // serves both passes; it is built ONCE per forward, not per op.
     let weight_ok = |dt: DType| fuse_weight_ok(dt, &engine.kernels.rocm);
+    let experts_ok =
+        |g_: DType, u: DType, d: DType| fuse_experts_ok(g_, u, d, &engine.kernels.rocm);
     let cfg = infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
             weight_ok: &weight_ok,
@@ -1637,15 +1667,29 @@ fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion 
         }),
         rmsnorm_linear: Some(infr_core::fusion::RmsNormLinearCfg {
             weight_ok: &weight_ok,
+            // F1c: a single-row `MoeFfn` is a fusable consumer too — ROCm is the one backend whose
+            // MoE arm can produce the normalized row itself.
+            moe_ok: Some(&experts_ok),
             // `INFR_ROCM_NO_FUSE_NORM` (config `kernels.rocm.fuse_norm`), same polarity.
             enabled: engine.kernels.rocm.fuse_norm,
+        }),
+        moe_add: Some(infr_core::fusion::MoeAddCfg {
+            experts_ok: &experts_ok,
+            // Same hatch as the dense `Linear → Add` fold: it is the same rewrite.
+            enabled: engine.kernels.rocm.fuse_add,
         }),
         kv_write: false,
     };
     let plan = infr_core::fusion::plan_fusions(g, &cfg);
+    // Both residual folds land in ONE map: they are keyed by op index and carry the same
+    // `(residual, add dst)` payload, and `run_op` looks the entry up by index without caring whether
+    // the producer was a `Linear` or a `MoeFfn`. The two key sets are disjoint by construction (an
+    // `Add` at `i + 1` has exactly one producer at `i`).
+    let mut add = plan.linear_add;
+    add.extend(plan.moe_add);
     DecodeFusion {
         norm: plan.rmsnorm_linear,
-        add: plan.linear_add,
+        add,
         skip: plan.skip,
     }
 }
@@ -1933,6 +1977,9 @@ fn run_op(
                                             arg_ptr(q_norm.unwrap().1),
                                             arg_ptr(qx.ptr),
                                             arg_ptr(xs.ptr),
+                                            // No normalized-row output: a dense GEMV consumes the
+                                            // int8 codes only (the F1c `xn` arm is the MoE router's).
+                                            arg_ptr(std::ptr::null_mut()),
                                             arg_i32(m as i32),
                                             arg_i32(in_f as i32),
                                             arg_f32(q_eps),
@@ -2985,15 +3032,82 @@ fn run_op(
             let nexp = n_expert as usize;
             let nu = n_used as usize;
             let nfu = n_ff_exp as usize;
-
-            // `x` (and `router_x`, usually the same handle) carry `rows` token rows of `ne`.
-            let x_ptr = ctx.ensure_device(x, g, bindings)?;
-            let rx_ptr = if router_x != x {
-                ctx.ensure_device(router_x, g, bindings)?
-            } else {
-                x_ptr
-            };
             let rows = g.desc(x).numel() / neu;
+
+            // Which expert tier this op will take, resolved BEFORE the input is prepared because
+            // both F1c folds are scoped to the R8 ordered-accumulate int8 tier (see `use_idm`'s
+            // full rationale at its original site below — the exclusions are unchanged).
+            let use_i8 = native.is_some() && moe_i8_enabled(ctx.rocm);
+            let id_rows = MOE_ID_ROWS.clamped(ctx.rocm.moe_id_rows);
+            let use_idm = use_i8 && !is_paged && id_rows > 0;
+
+            // ── F1c `RmsNorm → MoeFfn`: the elided norm's row is produced HERE. ──
+            // The shared pass only plans this for a single-row op whose `x` and `router_x` are both
+            // the norm output, so ONE `rmsnorm_quant_i8_32` serves both consumers: its int8 codes go
+            // to the experts (replacing the `quant_i8_32` the chunk loop would have run) and its
+            // `xn` output is the normalized f32 row the router GEMV reads — byte for byte what the
+            // standalone `rmsnorm` wrote. Net: one launch per MoE layer instead of two.
+            //
+            // A tier that cannot take it (paged, `INFR_ROCM_NO_I8`, `moe_id_rows = 0`) REPLAYS the
+            // elided `rmsnorm` into scratch, so the fold never changes what those paths compute.
+            let (x_ptr, rx_ptr, pre_quant) = match norm_fuse {
+                Some((x_raw, norm_w, eps)) => {
+                    let wnptr = ctx.dequant_weight_or_cache(norm_w, g, bindings)?;
+                    let xrp = ctx.ensure_device(x_raw, g, bindings)?;
+                    let xn = ctx.pool_buf((rows * neu * 4).max(1), false);
+                    if use_idm && rows == 1 {
+                        let qx = ctx.pool_buf((rows * neu).max(1), false);
+                        let xs = ctx.pool_buf((rows * (neu / 32) * 4).max(1), false);
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            "rmsnorm_quant_i8_32",
+                            rows as u32,
+                            1,
+                            256,
+                            args![
+                                arg_ptr(xrp),
+                                arg_ptr(wnptr),
+                                arg_ptr(qx.ptr),
+                                arg_ptr(xs.ptr),
+                                arg_ptr(xn.ptr),
+                                arg_i32(rows as i32),
+                                arg_i32(ne as i32),
+                                arg_f32(eps),
+                            ],
+                        )?;
+                        (xn.ptr, xn.ptr, Some((qx, xs)))
+                    } else {
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            "rmsnorm",
+                            rows as u32,
+                            1,
+                            256,
+                            args![
+                                arg_ptr(xrp),
+                                arg_ptr(wnptr),
+                                arg_ptr(xn.ptr),
+                                arg_i32(rows as i32),
+                                arg_i32(ne as i32),
+                                arg_f32(eps),
+                            ],
+                        )?;
+                        (xn.ptr, xn.ptr, None)
+                    }
+                }
+                None => {
+                    // `x` (and `router_x`, usually the same handle) carry `rows` token rows of `ne`.
+                    let xp = ctx.ensure_device(x, g, bindings)?;
+                    let rxp = if router_x != x {
+                        ctx.ensure_device(router_x, g, bindings)?
+                    } else {
+                        xp
+                    };
+                    (xp, rxp, None)
+                }
+            };
 
             // Per-expert down-projection output scale (diffusion-gemma); 1.0 = none.
             let dsc_vals: Vec<f32> = match down_scale {
@@ -3042,7 +3156,6 @@ fn run_op(
             // activation `h_buf` → `hq`/`hs` (overwritten each expert; the stream serializes the
             // gate_up → quant_h → down chain so the reuse never races). All fully written before read,
             // so `zero = false`.
-            let use_i8 = native.is_some() && moe_i8_enabled(ctx.rocm);
             // ── R8: the id-indexed multi-slot expert GEMV tier (`moe_*_idm_*`). ──
             // Takes over the RESIDENT int8 expert path entirely — every (row, slot) pair in one
             // dispatch per stage instead of the `3 * rows * n_used` serialized launches below.
@@ -3061,8 +3174,9 @@ fn run_op(
             //    comparands whose whole job is to be the OTHER path, and neither ships.
             //  * `kernels.rocm.moe_id_rows = 0` turns the tier off outright — the third A/B
             //    comparand, and the one that isolates R8 itself (see [`MOE_ID_ROWS`]).
-            let id_rows = MOE_ID_ROWS.clamped(ctx.rocm.moe_id_rows);
-            let use_idm = use_i8 && !is_paged && id_rows > 0;
+            //
+            // (`use_i8` / `id_rows` / `use_idm` are resolved above, before the input is prepared —
+            // the F1c norm fold needs to know which tier this op takes.)
             let (qx_x, xs_x, h_buf, hq, hs) = if use_i8 && !use_idm {
                 (
                     Some(ctx.pool_buf(neu.max(1), false)),
@@ -3075,7 +3189,37 @@ fn run_op(
                 (None, None, None, None, None)
             };
 
-            let dd = ctx.zero_dev(rows * neu);
+            // ── F1c `MoeFfn → Add`: the residual folds into the expert-accumulate epilogue. ──
+            // ONLY on the R8 tier. The pre-R8 loop `atomicAdd`s each slot's contribution into `dst`
+            // and is deterministic only because the host serializes the slots — seeding `dst` with
+            // the residual there would re-associate the sum (`((h + s0) + s1)…` instead of
+            // `h + ((s0 + s1)…)`) and move the golden. The R8 tier reduces the slots in
+            // `moe_accum_idm`, which joins the residual ONCE, at the very end, exactly where the
+            // elided `add` joined it — bit-identical (see the kernel's header).
+            //
+            // When the fold is on, `dd` ALIASES the residual stream's live buffer (the `Add`'s dst)
+            // and the accumulate writes the final sum straight into it, so there is no zeroed MoE
+            // scratch and no standalone `add`. Off (or on a tier that cannot take it), `dd` is the
+            // fresh zeroed scratch it always was.
+            let fold_resid = add_fuse.filter(|_| use_idm);
+            let dd = match fold_resid {
+                Some((_, add_dst)) => {
+                    ctx.ensure_device(add_dst, g, bindings)?;
+                    let b = ctx.dev[add_dst.0 as usize].as_ref().unwrap();
+                    crate::RocmBuffer {
+                        ptr: b.ptr,
+                        len: b.len,
+                        owned: false,
+                        host_ptr: std::ptr::null_mut(),
+                        uid: b.uid,
+                    }
+                }
+                None => ctx.zero_dev(rows * neu),
+            };
+            let resid_ptr = match fold_resid {
+                Some((resid, _)) => ctx.ensure_device(resid, g, bindings)?,
+                None => std::ptr::null_mut(),
+            };
 
             // ── RESIDENT path (Slice 38): GPU-side top-k routing, no host readback. ──
             // `moe_topk` reads the router logits (already on-device in `logits_dev`), computes the
@@ -3169,8 +3313,21 @@ fn run_op(
                     // Every byte of each is written before it is read within the chunk (the quant
                     // passes fill `qx`/`xs` and `hq`/`hs` completely, the two GEMVs fill `h`/`y`
                     // completely), so `zero = false` — same argument the per-row scratch makes.
-                    let qxb = ctx.pool_buf((chunk * neu).max(1), false);
-                    let xsb = ctx.pool_buf((chunk * (neu / 32) * 4).max(1), false);
+                    //
+                    // F1c: under the `RmsNorm → MoeFfn` fold the activation is ALREADY int8 — the
+                    // normalize pass above quantized it (that fold is single-row, so there is
+                    // exactly one chunk and `pre_quant`'s buffers are chunk-sized by construction).
+                    let (qxb, xsb, prequantized) = match pre_quant {
+                        Some((qx, xs)) => {
+                            debug_assert_eq!(rows, 1);
+                            (qx, xs, true)
+                        }
+                        None => (
+                            ctx.pool_buf((chunk * neu).max(1), false),
+                            ctx.pool_buf((chunk * (neu / 32) * 4).max(1), false),
+                            false,
+                        ),
+                    };
                     let hb = ctx.pool_buf((max_slots * nfu * 4).max(1), false);
                     let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
                     let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
@@ -3190,21 +3347,23 @@ fn run_op(
                             unsafe { (route_wts.ptr as *mut u8).add(r0 * nu * 4) as *mut c_void };
                         // int8 quant of the chunk's WHOLE activation block in one dispatch — the
                         // per-row loop's `quant_i8_32` with its own `m` finally carrying more
-                        // than 1.
-                        dispatch_1d(
-                            pipelines,
-                            ctx.stream,
-                            "quant_i8_32",
-                            (nr * (neu / 32)) as u32,
-                            256,
-                            args![
-                                arg_ptr(x_c),
-                                arg_ptr(qxb.ptr),
-                                arg_ptr(xsb.ptr),
-                                arg_i32(nr as i32),
-                                arg_i32(ne as i32),
-                            ],
-                        )?;
+                        // than 1. Skipped when the F1c norm fold already produced these codes.
+                        if !prequantized {
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "quant_i8_32",
+                                (nr * (neu / 32)) as u32,
+                                256,
+                                args![
+                                    arg_ptr(x_c),
+                                    arg_ptr(qxb.ptr),
+                                    arg_ptr(xsb.ptr),
+                                    arg_i32(nr as i32),
+                                    arg_i32(ne as i32),
+                                ],
+                            )?;
+                        }
                         dispatch_grid(
                             pipelines,
                             ctx.stream,
@@ -3267,7 +3426,13 @@ fn run_op(
                             ],
                         )?;
                         // Ordered slot reduction — NOT atomics; see MOE_ID_MULTI's header for why
-                        // the golden hash depends on it.
+                        // the golden hash depends on it. `res_c` (null unless the F1c residual fold
+                        // is on) joins the residual in the epilogue, leaving that order untouched.
+                        let res_c = if resid_ptr.is_null() {
+                            std::ptr::null_mut()
+                        } else {
+                            unsafe { (resid_ptr as *mut u8).add(r0 * neu * 4) as *mut c_void }
+                        };
                         dispatch_1d(
                             pipelines,
                             ctx.stream,
@@ -3277,6 +3442,7 @@ fn run_op(
                             args![
                                 arg_ptr(yb.ptr),
                                 arg_ptr(dst_c),
+                                arg_ptr(res_c),
                                 arg_i32(ne as i32),
                                 arg_i32(nr as i32),
                                 arg_i32(nu as i32),
@@ -3665,7 +3831,33 @@ fn run_op(
                     }
                 }
             }
-            ctx.dev[dst.0 as usize] = Some(dd);
+            match (add_fuse, fold_resid) {
+                // Folded: `dd` IS the `Add`'s dst buffer (already mapped in `ctx.dev` by the
+                // `ensure_device` above) and the accumulate wrote the final sum in place. The MoE
+                // op's own `dst` handle stays unpublished — the shared pass's live-range bound
+                // guarantees nothing reads it before it is next rewritten, exactly as for the
+                // dense `Linear → Add` fold.
+                (Some(_), Some(_)) => {}
+                // Planned but declined: this op took a tier whose accumulate has no epilogue to
+                // fold into (paged / `INFR_ROCM_NO_I8` / `moe_id_rows = 0`). The `Add` op was
+                // elided from the walk, so REPLAY it — the same `add` kernel over the same
+                // operands, giving those paths the pre-fusion numbers exactly.
+                (Some((resid, add_dst)), None) => {
+                    let rp = ctx.ensure_device(resid, g, bindings)?;
+                    let ap = ctx.ensure_device(add_dst, g, bindings)?;
+                    let n = rows * neu;
+                    dispatch_1d(
+                        pipelines,
+                        ctx.stream,
+                        "add",
+                        n as u32,
+                        256,
+                        args![arg_ptr(rp), arg_ptr(dd.ptr), arg_ptr(ap), arg_i32(n as i32),],
+                    )?;
+                    ctx.dev[dst.0 as usize] = Some(dd);
+                }
+                (None, _) => ctx.dev[dst.0 as usize] = Some(dd),
+            }
         }
 
         Op::Conv1dSilu {
