@@ -159,6 +159,13 @@ impl RocmWeightRing {
         if slot_bytes == 0 {
             return None;
         }
+        // Round the slot stride to 256 bytes so slot `k` inherits the arena's `hipMalloc`
+        // alignment. The F4 decode GEMV loads Q4_K/Q5_K weights 128 bits at a time and proves that
+        // load's 16-byte alignment from "allocation base + a whole number of blocks" — a staged
+        // bank sits at `slot * slot_bytes`, and `slot_bytes` is the MAX bank length across formats,
+        // which need not be a multiple of 16 (Q6_K's 210-byte blocks, say). Rounding costs at most
+        // 255 bytes per slot and keeps the alignment argument true for every tier.
+        let slot_bytes = slot_bytes.next_multiple_of(256);
         let n = n_slots(paging);
         let mut copy_stream: ffi::hipStream_t = std::ptr::null_mut();
         if unsafe { ffi::hipStreamCreate(&mut copy_stream) } != HIP_SUCCESS {

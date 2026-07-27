@@ -158,6 +158,23 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
     Some((infr_core::decode_spec::block_layout(dt).1, kernel))
 }
 
+/// Output rows ONE wave of an int8 decode GEMV computes — the divisor on the launch's `grid.x`.
+///
+/// F4 (`kernels.rs`, `I8_MROW`): a wave that owns one output row has a single weight stream in
+/// flight and nothing to overlap its latency with. The converted kernels take `I8_MROW` consecutive
+/// rows instead, fetch the shared activation quad once, and issue all the rows' weight loads before
+/// any of the math — worth 772 → 930 GB/s on the Q4_K lm_head shape. Every OTHER kernel in the
+/// family still owns exactly one row and must keep `grid.x == out_f`, so this is a per-kernel fact,
+/// not a global one. The 2 here MUST equal `I8_MROW` in the kernel source —
+/// `mrow_matches_the_kernel_source` pins that, because a mismatch silently skips or double-writes
+/// output rows rather than failing anything loudly.
+fn i8_gemv_mrow(kernel: &str) -> u32 {
+    match kernel {
+        "linear_i8_q4k" | "linear_i8_q5k" => 2,
+        _ => 1,
+    }
+}
+
 /// Dequant-to-f16 kernel name (`deqf16_*`, kernels.rs `DEQUANT_F16`) for a covered dtype — the
 /// weight decoder feeding the Slice-26 rocBLAS f16 prefill GEMM. Same covered set as
 /// [`native_decode_fmt`], which after R7 is ALL 24 weight quants; `None` keeps a format off it
@@ -2188,15 +2205,16 @@ fn run_op(
                                     )?;
                                 }
                                 None => {
-                                    // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m):
-                                    // one wave32 block per (output row, activation row). `resid_ptr`
-                                    // (null unless the Slice-32 residual Add is fused) folds the add
-                                    // into the epilogue.
+                                    // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid =
+                                    // (out_f / rows-per-wave, m): one wave32 block per (group of
+                                    // output rows, activation row). `resid_ptr` (null unless the
+                                    // Slice-32 residual Add is fused) folds the add into the
+                                    // epilogue.
                                     dispatch_grid(
                                         pipelines,
                                         ctx.stream,
                                         i8_kernel,
-                                        out_f,
+                                        out_f.div_ceil(i8_gemv_mrow(i8_kernel)),
                                         m,
                                         32,
                                         args![
@@ -4721,10 +4739,52 @@ mod moe_id_multi_addressing_tests {
 #[cfg(test)]
 mod config_tier_tests {
     use super::{
-        fuse_weight_ok, moe_i8_enabled, native_i8_fmt, native_wmma_fmt, q4k_coop_kernel, wmma_tile,
+        fuse_weight_ok, i8_gemv_mrow, moe_i8_enabled, native_i8_fmt, native_wmma_fmt,
+        q4k_coop_kernel, wmma_tile,
     };
     use infr_core::config::RocmCfg;
     use infr_core::DType;
+
+    /// F4: the host divides `grid.x` by [`i8_gemv_mrow`], the kernel multiplies `blockIdx.x` by its
+    /// own `I8_MROW` — a mismatch would silently skip or double-write output rows, and no parity
+    /// test that runs a whole GEMV can distinguish "wrote row 2 twice" from "never wrote row 3"
+    /// on a zeroed dst. Pin both halves against the kernel source: the constant's value, and the
+    /// exact set of kernels that opted in (every other `linear_i8_*` still owns one row per wave).
+    #[test]
+    fn mrow_matches_the_kernel_source() {
+        let src = crate::kernels::hip_source();
+        assert!(
+            src.contains("#define I8_MROW 2"),
+            "kernel I8_MROW is not 2 — update `i8_gemv_mrow`"
+        );
+        for k in ["linear_i8_q4k", "linear_i8_q5k"] {
+            assert_eq!(i8_gemv_mrow(k), 2, "{k} should be on the mrow grid");
+            assert!(
+                src.contains(&format!("void {k}(")),
+                "{k} is not in the kernel source"
+            );
+        }
+        // Every other covered format keeps `grid.x == out_f`.
+        let cfg = RocmCfg::default();
+        for dt in [
+            DType::Q8_0,
+            DType::Q2K,
+            DType::Q3K,
+            DType::Q6K,
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q5_0,
+            DType::Q5_1,
+            DType::Iq4Nl,
+            DType::Iq4Xs,
+            DType::Iq1S,
+            DType::Tq2_0,
+            DType::Mxfp4,
+        ] {
+            let (_, k) = native_i8_fmt(dt, &cfg).expect("covered by the int8 decode");
+            assert_eq!(i8_gemv_mrow(k), 1, "{k} is one row per wave");
+        }
+    }
 
     fn cfg(f: impl FnOnce(&mut RocmCfg)) -> RocmCfg {
         let mut c = RocmCfg::default();

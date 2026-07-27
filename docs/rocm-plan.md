@@ -1065,6 +1065,88 @@ Started far worse: DeltaNet prefill was 0.0007× (1350× gap) and gemma-3 0.04×
 before the model-specific catastrophes were fixed; decode climbed ~60× over the
 naive baseline. The remaining broad gap is the GEMM/GEMV kernel engineering.
 
+### F4 — 128-bit weight loads + multi-row in the int8 decode GEMV (landed)
+
+The premise going in was that decode was bandwidth-starved. **It is not.** F4
+measured the GEMV in isolation
+(`cargo build --release --features rocm -p infr-rocm --example decode_gemv_bw`),
+which reports effective GB/s = weight bytes ÷ time, and found two separate
+facts.
+
+**1. The kernel was leaving ~2× on the table, and F4 took it.** Effective GB/s,
+`m = 1`, chained 64-deep per `execute` so the dispatch floor is amortized, RX
+7900 XTX (~960 GB/s peak):
+
+| shape (in×out)     | Q4_K before → after | Q5_K before → after | Q6_K (control) |
+| ------------------ | ------------------- | ------------------- | -------------- |
+| `1024×2048` (q)    | 110.7 → **124.7**   | 126.2 → **145.6**   | 98.8 → 97.8    |
+| `1024×3072` (gate) | 96.7 → **179.2**    | 116.3 → **210.4**   | 108.7 → 113.2  |
+| `3072×1024` (down) | 140.9 → **169.7**   | 161.6 → **203.2**   | 85.6 → 85.3    |
+| `1024×151936` (lm) | 456.1 → **933.1**   | 460.9 → **817.6**   | 150.1 → 149.5  |
+
+The lm_head shape is the only one with enough work to escape the dispatch floor,
+so it is the honest kernel number: **456 → 933 GB/s, 97% of peak.**
+
+Two changes, both bit-faithful (goldens unmoved, `rocm_seam` 9/9,
+`shared_decode_parity` 24/24):
+
+- **128-bit weight fetch.** `uint4` loads replace the byte-at-a-time nibble
+  assembly. Alignment is the whole constraint: a `uint4` needs 16 bytes, and
+  every decode-GEMV weight pointer is a `hipMalloc` base (256-aligned, nothing
+  sub-allocates) plus a whole number of BLOCKS — so a block base is 16-aligned
+  exactly when `bpb % 16 == 0`, which of the 24 GGUF strides is true only for
+  **Q4_K (144) and Q5_K (176)**. Within those blocks the header is at +0 and the
+  planes at +16/+48, all multiples of 16. `weight_pager`'s staging slot stride
+  is now rounded to 256 so the spilled tier inherits the same guarantee. No
+  other format is converted — Q6_K's 210 is `2 mod 16`.
+- **Multi-row (`I8_MROW = 2`).** One wave now owns two consecutive output rows,
+  fetches the shared activation quad once, and issues both rows' weight loads
+  before any math — two independent streams per lane instead of one. This is
+  where most of the win is (Q4_K `1024×3072`: 95 → 180 GB/s).
+
+**2. What did NOT pay, with numbers.**
+
+- **Multi-row on Q6_K**: 149 → **145** GB/s on lm_head and **−25%** on the
+  projection shapes. Q6_K's decode is the register-hungriest of the family; a
+  second row's live state costs more occupancy than the extra stream buys. Left
+  at one row per wave.
+- **Multiple waves per workgroup** (8/4/2 waves, one row each, to lift
+  occupancy): Q4_K lm_head 772 (1 wave) → 739 (2) → 741 (4) → **724** (8) GB/s.
+  A monotone small regression. Not landed.
+
+**3. Where the headroom actually is: per-op dispatch cost, not the kernel.** The
+micro-bench's floor — a GEMV whose entire weight is 18 KB — is **~9 µs per
+`Op::Linear`**, and at 131 t/s the 0.6B decodes in 7.6 ms across ~423 ops. The
+floor accounts for roughly half the token. A raw HIP probe puts a null kernel at
+**2.7 µs** back-to-back on one stream and `hipMemsetAsync` at **3.8 µs** — and
+every op's `zero_dev` issues one of those memsets for a `dst` the GEMV fully
+overwrites. That memset alone is ~1.6 ms/token (~20% of decode) of pure
+belt-and-braces. Next levers, biggest first:
+
+1. **Drop the `zero_dev` memset for fully-written `dst`s** (~20% of decode).
+2. **Q6_K decode**, still 149 GB/s = 16% of peak while being 45% of a Q4_K_M
+   model's per-token bytes (its tied `token_embd` lm_head is 128 MB of the 391).
+   Neither F4 lever applies as-is; it needs its own unpack.
+3. Only then more launch-cutting — Slice 31 already probed HIP graphs negative.
+
+Model-level effect of F4 (interleaved vs `24aa5f0`, 3 pairs, first burst
+discarded). Effective GB/s = 390.8 MB of per-token weight bytes × t/s (that GGUF
+is 214.7 MB Q4_K + 175.8 MB Q6_K, and the tied `token_embd` is read in full as
+the output head every token):
+
+| bench               | before            | after             |
+| ------------------- | ----------------- | ----------------- |
+| Qwen3-0.6B tg128    | 128.2/127.9/127.3 | 131.0/130.9/131.2 |
+| — effective         | **50.0 GB/s**     | **51.2 GB/s**     |
+| Qwen3-0.6B pp512    | 4489/4462/4463    | 4494/4481/4465    |
+| Qwen3-30B-A3B tg64  | 42.0/47.4/47.4    | 50.8/50.7/50.7    |
+| Qwen3-30B-A3B pp512 | 253.7/252.9/252.7 | 306.0/305.3/279.5 |
+
+The dense model moves only **+2.8%** because it is dispatch-floor bound and 45%
+of its bytes are Q6_K. The MoE model, whose decode AND prefill both run the
+per-row `i8acc_q4k` GEMV, moves **+7.0% decode and +20.7% prefill** — the same
+kernel change, seen where the kernel is actually the bottleneck.
+
 Close it to llama.cpp HIP. The plateau analysis (Slices 25–28) identified the
 remaining prefill lever as a **cooperative-LDS, async-pipelined int8 mmq**
 (decode-once weight-tile reuse + double-buffered LDS to hide the decode→WMMA

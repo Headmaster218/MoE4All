@@ -2984,6 +2984,70 @@ static __device__ __forceinline__ int idot4(int a, int b, int c) {
     return c;
 }
 
+// ── F4: 128-bit weight/activation loads for the Q4_K/Q5_K decode GEMV ────────────────────────────
+//
+// The decode GEMV is NOT bandwidth bound (it was measuring ~50 GB/s of a ~960 GB/s bus) — it is
+// VMEM-ISSUE bound. Reading a 32-byte nibble plane one byte at a time costs 32 `global_load_ubyte`
+// instructions where two `global_load_dwordx4` would do, and the memory pipe runs out of issue slots
+// long before it runs out of bandwidth. The helpers below fetch a whole 16-byte quad at a time.
+//
+// ALIGNMENT — the reason this covers Q4_K and Q5_K and nothing else. A `uint4` load needs 16-byte
+// alignment or it is at best split back into byte loads and at worst wrong. Every weight pointer a
+// decode GEMV sees is `hipMalloc` base (256-byte aligned; `BufferPool`/`RocmBuffer` never
+// sub-allocate) + a whole number of BLOCKS: the dense path adds `(w_off/qpb)*bpb` with `w_off` a
+// multiple of `qpb`, the MoE path adds `expert*(rows*in_f/qpb)*bpb`, and the paged/staged tiers add
+// `slot*slot_bytes` with `slot_bytes` rounded up to 256 (see `pager.rs` / `weight_pager.rs`). So a
+// block base is 16-byte aligned exactly when `bpb % 16 == 0`, and of the 24 GGUF block strides
+// (18/20/22/24/34/84/110/136/144/176/210/...) only Q4_K's 144 and Q5_K's 176 qualify. Within a
+// block, both formats put their 16-byte header at offset 0 and their nibble planes at a multiple of
+// 16 (Q4_K: qs at +16; Q5_K: qh at +16, qs at +48), so the sub-block quads are aligned too. The
+// int8 activation row is `hipMalloc` base + `row*in_f` + `blk*32` bytes, both multiples of 32.
+//
+// Bit-faithfulness: these are pure re-spellings of the same bytes in the same order — `f16q_lo/hi`
+// assemble the identical `unsigned short` `rf16b` did, `k4q` is `k4` indexed into the header quad,
+// and `(wd >> sh) & 0x0F0F0F0F` is the identical per-byte nibble `q[r] >> 4` / `q[r] & 0xF`. The
+// dot order and the f32 reassociation are untouched, so the goldens do not move.
+
+// ── F4 mrow: output rows computed per wave by the converted decode GEMVs ─────────────────────────
+//
+// One wave used to own ONE output row, so a lane had exactly ONE weight stream in flight and
+// nothing to overlap its latency with. `I8_MROW` consecutive rows per wave give it that many
+// independent streams (the activation quad is fetched once and shared), which is what actually
+// moves the bus: on the 1024x151936 lm_head shape Q4_K goes 772 → 930 GB/s of a 960 GB/s peak, and
+// on 1024x3072 it goes 95 → 180 GB/s. Measured 2 > 4 > 8 on gfx1100 (VGPR pressure) — the sweep and
+// the formats this LOST on (Q6_K) are in docs/rocm-plan.md §9.
+//
+// HOST MIRROR: `exec.rs::i8_gemv_mrow` must return this for every kernel that uses it — the launch
+// grid is `out_f / I8_MROW` blocks, and a mismatch skips or double-writes output rows silently.
+#define I8_MROW 2
+
+__device__ __forceinline__ float f16q_lo(unsigned int wd) {
+    union { unsigned short u; __half h; } cvt;
+    cvt.u = (unsigned short)(wd & 0xFFFFu);
+    return __half2float(cvt.h);
+}
+__device__ __forceinline__ float f16q_hi(unsigned int wd) {
+    union { unsigned short u; __half h; } cvt;
+    cvt.u = (unsigned short)(wd >> 16);
+    return __half2float(cvt.h);
+}
+// Byte `i` (0..3) of a little-endian dword — the `q[...]` the byte-wise decoders indexed.
+__device__ __forceinline__ int qb4(unsigned int wd, int i) {
+    return (int)((wd >> (8 * i)) & 0xFFu);
+}
+// `get_scale_min_k4` read straight out of the Q4_K/Q5_K header quad: `h.y|h.z|h.w` ARE
+// `scales[0..12]` (bytes 4..16 of the block), so `k4(b+4, s)` becomes three register extracts.
+__device__ __forceinline__ void k4q(uint4 h, int s, int* sc, int* mm) {
+    if (s < 4) {
+        *sc = qb4(h.y, s) & 63;          // scales[s]
+        *mm = qb4(h.z, s) & 63;          // scales[s+4]
+    } else {
+        int a = qb4(h.w, s - 4);         // scales[s+4]
+        *sc = (a & 0x0F) | ((qb4(h.y, s - 4) >> 6) << 4);   // | scales[s-4] high 2
+        *mm = (a >> 4)   | ((qb4(h.z, s - 4) >> 6) << 4);   // | scales[s]   high 2
+    }
+}
+
 // ── Q8_0: 32 elems / 34 bytes = [half d][int8 qs[32]]; value = d * qs (signed int8). ──
 extern "C" __global__ void linear_i8_q80(
     const signed char* __restrict__ qx,   // [m, in_f]
@@ -3139,48 +3203,65 @@ extern "C" __global__ void linear_i8_q4k(
     const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
-    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int o0 = blockIdx.x * I8_MROW, row = blockIdx.y, tid = threadIdx.x;
     int nb = in_f >> 5;
     int spr = nb >> 3;             // Q4_K super-blocks (256 elems) per output row
     const signed char* qxr = qx + (long)row * in_f;
     const float* xsr = xs + (long)row * nb;
-    float acc = 0.0f;
-    for (int blk = tid; blk < nb; blk += 32) {
-        long super = (long)o * spr + (blk >> 3);   // global super-block for (output row o, this 32-block)
-        int s = blk & 7;           // sub-block 0..7 (== the 32-block)
-        const unsigned char* b = w + (long)super * 144;
-        float d = rf16b(b);
-        float dmin = rf16b(b + 2);
-        const unsigned char* scales = b + 4;
-        const unsigned char* qs = b + 16;
-        int sc, mm; k4(scales, s, &sc, &mm);
-        const unsigned char* qbase = qs + (s >> 1) * 32;   // nibble byte base
-        int hi = s & 1;                                    // high nibble for odd sub-blocks
-        const int* xp = (const int*)(qxr + blk * 32);
-        int idot = 0, isum = 0;
-        for (int k = 0; k < 8; k++) {
-            const unsigned char* q = qbase + k * 4;
-            int wpack;
-            if (hi) {
-                wpack = (int)(q[0] >> 4) | ((int)(q[1] >> 4) << 8)
-                      | ((int)(q[2] >> 4) << 16) | ((int)(q[3] >> 4) << 24);
-            } else {
-                wpack = (int)(q[0] & 0xF) | ((int)(q[1] & 0xF) << 8)
-                      | ((int)(q[2] & 0xF) << 16) | ((int)(q[3] & 0xF) << 24);
-            }
-            idot = idot4(xp[k], wpack, idot);
-            isum = idot4(xp[k], 0x01010101, isum);
-        }
-        float sx = xsr[blk];
-        acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+    int ov[I8_MROW];
+    float accv[I8_MROW];
+    #pragma unroll
+    for (int r = 0; r < I8_MROW; r++) {
+        ov[r] = (o0 + r < out_f) ? (o0 + r) : o0;   // clamp, not branch: keep the streams uniform
+        accv[r] = 0.0f;
     }
-    acc = wave_sum32(acc);
+    for (int blk = tid; blk < nb; blk += 32) {
+        int s = blk & 7;           // sub-block 0..7 (== the 32-block)
+        unsigned int sh = (unsigned int)(s & 1) * 4u;      // high nibble for odd sub-blocks
+        // The activation quad is fetched ONCE and dotted against all I8_MROW weight rows.
+        const int4* xq = (const int4*)(qxr + blk * 32);
+        int4 xlo = xq[0], xhi = xq[1];
+        int xv[8] = { xlo.x, xlo.y, xlo.z, xlo.w, xhi.x, xhi.y, xhi.z, xhi.w };
+        // F4: three 128-bit loads per row replace 36 byte loads. `144 % 16 == 0` ⇒ the block base
+        // is 16-byte aligned, and `qs` sits at +16 ⇒ so is each 32-byte nibble plane. Issuing all
+        // I8_MROW rows' loads before any of the math is what gives the pipe something to overlap.
+        uint4 hdr[I8_MROW], wlo[I8_MROW], whi[I8_MROW];
+        #pragma unroll
+        for (int r = 0; r < I8_MROW; r++) {
+            const uint4* bq = (const uint4*)(w + ((long)ov[r] * spr + (blk >> 3)) * 144);
+            hdr[r] = bq[0];                                // [d][dmin][scales[12]]
+            const uint4* qq = bq + 1 + (s >> 1) * 2;       // qs + (s/2)*32, the nibble plane
+            wlo[r] = qq[0];
+            whi[r] = qq[1];
+        }
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) isum = idot4(xv[k], 0x01010101, isum);
+        float sx = xsr[blk];
+        #pragma unroll
+        for (int r = 0; r < I8_MROW; r++) {
+            unsigned int wv[8] = { wlo[r].x, wlo[r].y, wlo[r].z, wlo[r].w,
+                                   whi[r].x, whi[r].y, whi[r].z, whi[r].w };
+            int idot = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                idot = idot4(xv[k], (int)((wv[k] >> sh) & 0x0F0F0F0Fu), idot);
+            }
+            int sc, mm; k4q(hdr[r], s, &sc, &mm);
+            float d = f16q_lo(hdr[r].x), dmin = f16q_hi(hdr[r].x);
+            accv[r] += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+        }
+    }
     // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
     // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
     // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
-    if (tid == 0) {
-        long oi = (long)row * out_f + o;
-        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    #pragma unroll
+    for (int r = 0; r < I8_MROW; r++) {
+        float a = wave_sum32(accv[r]);
+        if (tid == 0 && (r == 0 || ov[r] != o0)) {
+            long oi = (long)row * out_f + ov[r];
+            dst[oi] = resid ? (a + resid[oi]) : a;
+        }
     }
 }
 
@@ -3193,46 +3274,72 @@ extern "C" __global__ void linear_i8_q5k(
     const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
-    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int o0 = blockIdx.x * I8_MROW, row = blockIdx.y, tid = threadIdx.x;
     int nb = in_f >> 5;
     int spr = nb >> 3;             // Q5_K super-blocks (256 elems) per output row
     const signed char* qxr = qx + (long)row * in_f;
     const float* xsr = xs + (long)row * nb;
-    float acc = 0.0f;
-    for (int blk = tid; blk < nb; blk += 32) {
-        long super = (long)o * spr + (blk >> 3);   // global super-block for (output row o, this 32-block)
-        int s = blk & 7;           // sub-block 0..7 (== the 32-block) == the qh bit index
-        const unsigned char* b = w + (long)super * 176;
-        float d = rf16b(b);
-        float dmin = rf16b(b + 2);
-        const unsigned char* scales = b + 4;
-        const unsigned char* qh = b + 16;
-        const unsigned char* qs = b + 48;
-        int sc, mm; k4(scales, s, &sc, &mm);
-        const unsigned char* qbase = qs + (s >> 1) * 32;   // nibble byte base
-        int hi = s & 1;                                    // high nibble for odd sub-blocks
-        const int* xp = (const int*)(qxr + blk * 32);
-        int idot = 0, isum = 0;
-        for (int k = 0; k < 8; k++) {
-            int wpack = 0;
-            for (int r = 0; r < 4; r++) {
-                int p = k * 4 + r;
-                int c = (hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)) | (((qh[p] >> s) & 1) << 4);
-                wpack |= c << (r * 8);
-            }
-            idot = idot4(xp[k], wpack, idot);
-            isum = idot4(xp[k], 0x01010101, isum);
-        }
-        float sx = xsr[blk];
-        acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+    int ov[I8_MROW];
+    float accv[I8_MROW];
+    #pragma unroll
+    for (int r = 0; r < I8_MROW; r++) {
+        ov[r] = (o0 + r < out_f) ? (o0 + r) : o0;   // clamp, not branch: keep the streams uniform
+        accv[r] = 0.0f;
     }
-    acc = wave_sum32(acc);
+    for (int blk = tid; blk < nb; blk += 32) {
+        int s = blk & 7;           // sub-block 0..7 (== the 32-block) == the qh bit index
+        unsigned int sh = (unsigned int)(s & 1) * 4u;      // high nibble for odd sub-blocks
+        const int4* xq = (const int4*)(qxr + blk * 32);
+        int4 xlo = xq[0], xhi = xq[1];
+        int xv[8] = { xlo.x, xlo.y, xlo.z, xlo.w, xhi.x, xhi.y, xhi.z, xhi.w };
+        // F4: five 128-bit loads per row replace ~71 byte loads. `176 % 16 == 0` ⇒ the block base
+        // is 16-byte aligned, and qh (+16) / qs (+48) keep every plane on a 16-byte boundary.
+        uint4 hdr[I8_MROW], qh0[I8_MROW], qh1[I8_MROW], wlo[I8_MROW], whi[I8_MROW];
+        #pragma unroll
+        for (int r = 0; r < I8_MROW; r++) {
+            const uint4* bq = (const uint4*)(w + ((long)ov[r] * spr + (blk >> 3)) * 176);
+            hdr[r] = bq[0];                                // [d][dmin][scales[12]]
+            qh0[r] = bq[1];                                // qh[0..32) at b+16
+            qh1[r] = bq[2];
+            const uint4* qq = bq + 3 + (s >> 1) * 2;       // qs (b+48) + (s/2)*32
+            wlo[r] = qq[0];
+            whi[r] = qq[1];
+        }
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) isum = idot4(xv[k], 0x01010101, isum);
+        float sx = xsr[blk];
+        #pragma unroll
+        for (int r = 0; r < I8_MROW; r++) {
+            unsigned int wv[8] = { wlo[r].x, wlo[r].y, wlo[r].z, wlo[r].w,
+                                   whi[r].x, whi[r].y, whi[r].z, whi[r].w };
+            unsigned int hv[8] = { qh0[r].x, qh0[r].y, qh0[r].z, qh0[r].w,
+                                   qh1[r].x, qh1[r].y, qh1[r].z, qh1[r].w };
+            int idot = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                // Per byte: nibble | (bit `s` of qh[p] << 4). `s <= 7`, so the dword shift can only
+                // pull bits from the NEXT byte into positions >= 1 — bit 0 of each byte is exactly
+                // `(qh[p] >> s) & 1`, which is what the 0x01010101 mask keeps.
+                unsigned int wpack = ((wv[k] >> sh) & 0x0F0F0F0Fu)
+                                   | (((hv[k] >> s) & 0x01010101u) << 4);
+                idot = idot4(xv[k], (int)wpack, idot);
+            }
+            int sc, mm; k4q(hdr[r], s, &sc, &mm);
+            float d = f16q_lo(hdr[r].x), dmin = f16q_hi(hdr[r].x);
+            accv[r] += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+        }
+    }
     // Slice-32 fused residual: fold the following Op::Add into the GEMV epilogue when `resid` is
     // bound (null = standalone GEMV, bit-identical to the pre-fusion write). Only lane 0 writes, so
     // the in-place `dst == resid` case is a safe read-then-write of one element (no cross-lane race).
-    if (tid == 0) {
-        long oi = (long)row * out_f + o;
-        dst[oi] = resid ? (acc + resid[oi]) : acc;
+    #pragma unroll
+    for (int r = 0; r < I8_MROW; r++) {
+        float a = wave_sum32(accv[r]);
+        if (tid == 0 && (r == 0 || ov[r] != o0)) {
+            long oi = (long)row * out_f + ov[r];
+            dst[oi] = resid ? (a + resid[oi]) : a;
+        }
     }
 }
 
@@ -3245,6 +3352,11 @@ extern "C" __global__ void linear_i8_q6k(
     const float* __restrict__ resid,       // [m, out_f] residual to fold into the epilogue (null = none)
     int m, int in_f, int out_f
 ) {
+    // F4 measured Q6_K on the mrow path too and it LOST — 149 → 145 GB/s on the lm_head shape and
+    // −25% on the projection shapes. Q6_K's decode is the register-hungriest of the family (two
+    // 16-element sub-blocks, a 4-way region select, a 6-bit reassembly per code), so a second row's
+    // live state costs more occupancy than the extra memory stream buys. It stays one row per wave;
+    // `exec.rs::i8_gemv_mrow` therefore returns 1 for it and `grid.x` stays `out_f`.
     int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
     int nb = in_f >> 5;
     int spr = nb >> 3;             // Q6_K super-blocks (256 elems) per output row
@@ -3875,28 +3987,26 @@ __device__ __forceinline__ float i8acc_q4k(
     for (int blk = tid; blk < nb; blk += 32) {
         long super = (long)o * spr + (blk >> 3);
         int s = blk & 7;
-        const unsigned char* b = w + (long)super * 144;
-        float d = rf16b(b);
-        float dmin = rf16b(b + 2);
-        const unsigned char* scales = b + 4;
-        const unsigned char* qs = b + 16;
-        int sc, mm; k4(scales, s, &sc, &mm);
-        const unsigned char* qbase = qs + (s >> 1) * 32;
-        int hi = s & 1;
-        const int* xp = (const int*)(qxr + blk * 32);
+        // F4: same 128-bit weight fetch as `linear_i8_q4k`. An expert bank starts at a
+        // `hipMalloc` base plus `expert * (rows*in_f/256) * 144` (paged: `slot * stride_bytes`,
+        // and the stride IS that per-expert byte count), so the block base is 16-byte aligned.
+        const uint4* bq = (const uint4*)(w + (long)super * 144);
+        uint4 hdr = bq[0];
+        float d = f16q_lo(hdr.x);
+        float dmin = f16q_hi(hdr.x);
+        int sc, mm; k4q(hdr, s, &sc, &mm);
+        const uint4* qq = bq + 1 + (s >> 1) * 2;
+        uint4 wlo = qq[0], whi = qq[1];
+        unsigned int sh = (unsigned int)(s & 1) * 4u;
+        const int4* xq = (const int4*)(qxr + blk * 32);
+        int4 xlo = xq[0], xhi = xq[1];
+        unsigned int wv[8] = { wlo.x, wlo.y, wlo.z, wlo.w, whi.x, whi.y, whi.z, whi.w };
+        int xv[8] = { xlo.x, xlo.y, xlo.z, xlo.w, xhi.x, xhi.y, xhi.z, xhi.w };
         int idot = 0, isum = 0;
+        #pragma unroll
         for (int k = 0; k < 8; k++) {
-            const unsigned char* q = qbase + k * 4;
-            int wpack;
-            if (hi) {
-                wpack = (int)(q[0] >> 4) | ((int)(q[1] >> 4) << 8)
-                      | ((int)(q[2] >> 4) << 16) | ((int)(q[3] >> 4) << 24);
-            } else {
-                wpack = (int)(q[0] & 0xF) | ((int)(q[1] & 0xF) << 8)
-                      | ((int)(q[2] & 0xF) << 16) | ((int)(q[3] & 0xF) << 24);
-            }
-            idot = idot4(xp[k], wpack, idot);
-            isum = idot4(xp[k], 0x01010101, isum);
+            idot = idot4(xv[k], (int)((wv[k] >> sh) & 0x0F0F0F0Fu), idot);
+            isum = idot4(xv[k], 0x01010101, isum);
         }
         float sx = xsr[blk];
         acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
@@ -3913,26 +4023,28 @@ __device__ __forceinline__ float i8acc_q5k(
     for (int blk = tid; blk < nb; blk += 32) {
         long super = (long)o * spr + (blk >> 3);
         int s = blk & 7;
-        const unsigned char* b = w + (long)super * 176;
-        float d = rf16b(b);
-        float dmin = rf16b(b + 2);
-        const unsigned char* scales = b + 4;
-        const unsigned char* qh = b + 16;
-        const unsigned char* qs = b + 48;
-        int sc, mm; k4(scales, s, &sc, &mm);
-        const unsigned char* qbase = qs + (s >> 1) * 32;
-        int hi = s & 1;
-        const int* xp = (const int*)(qxr + blk * 32);
+        // F4: same 128-bit weight fetch as `linear_i8_q5k` (176 % 16 == 0; qh at +16, qs at +48).
+        const uint4* bq = (const uint4*)(w + (long)super * 176);
+        uint4 hdr = bq[0];
+        float d = f16q_lo(hdr.x);
+        float dmin = f16q_hi(hdr.x);
+        int sc, mm; k4q(hdr, s, &sc, &mm);
+        uint4 qh0 = bq[1], qh1 = bq[2];
+        const uint4* qq = bq + 3 + (s >> 1) * 2;
+        uint4 wlo = qq[0], whi = qq[1];
+        unsigned int sh = (unsigned int)(s & 1) * 4u;
+        const int4* xq = (const int4*)(qxr + blk * 32);
+        int4 xlo = xq[0], xhi = xq[1];
+        unsigned int wv[8] = { wlo.x, wlo.y, wlo.z, wlo.w, whi.x, whi.y, whi.z, whi.w };
+        unsigned int hv[8] = { qh0.x, qh0.y, qh0.z, qh0.w, qh1.x, qh1.y, qh1.z, qh1.w };
+        int xv[8] = { xlo.x, xlo.y, xlo.z, xlo.w, xhi.x, xhi.y, xhi.z, xhi.w };
         int idot = 0, isum = 0;
+        #pragma unroll
         for (int k = 0; k < 8; k++) {
-            int wpack = 0;
-            for (int r = 0; r < 4; r++) {
-                int p = k * 4 + r;
-                int c = (hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F)) | (((qh[p] >> s) & 1) << 4);
-                wpack |= c << (r * 8);
-            }
-            idot = idot4(xp[k], wpack, idot);
-            isum = idot4(xp[k], 0x01010101, isum);
+            unsigned int wpack = ((wv[k] >> sh) & 0x0F0F0F0Fu)
+                               | (((hv[k] >> s) & 0x01010101u) << 4);
+            idot = idot4(xv[k], (int)wpack, idot);
+            isum = idot4(xv[k], 0x01010101, isum);
         }
         float sx = xsr[blk];
         acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
