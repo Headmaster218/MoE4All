@@ -3,10 +3,12 @@
 //! Each kernel is a `__global__` function taking device pointers. Most operate on f16 or f32
 //! buffers — uncovered quantized weights are dequantized to f16 on the host BEFORE they reach a
 //! kernel (see `exec.rs`'s dequant cache), so those kernels stay format-agnostic and simple. The
-//! `NATIVE_DECODE` kernels (Phase 3, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/
-//! IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0) are the exception: they
-//! read the RAW quant bytes and decode each block in-kernel, so no f16 cache is materialized
-//! (VRAM ≈ quant_size).
+//! `NATIVE_DECODE` kernels (Phase 3 — ALL 24 weight quant formats after R7: Q2_K/Q3_K/Q4_K/Q5_K/
+//! Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/
+//! TQ1_0/TQ2_0/Q2_0/MXFP4/NVFP4) are the exception: they read the RAW quant bytes and decode each
+//! block in-kernel, so no f16 cache is materialized (VRAM ≈ quant_size). Only the DENSE float
+//! weight dtypes (F32/BF16 — F16 is already native via `linear_f16`) still take the host
+//! convert→f16 path, which for them is a format cast, not a decode.
 //!
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
 //! `HashMap`. The module is compiled at most ONCE per (source, arch, HIP stack): `Pipelines::build`
@@ -35,6 +37,7 @@ pub fn hip_source() -> String {
     // decode oracle. Both are self-contained (they depend on nothing), so they lead the source;
     // NATIVE_DECODE and every later part that decodes an IQ format is assembled after them.
     s.push_str(&iq4nl_codebook_src());
+    s.push_str(&mxfp4_codebook_src());
     s.push_str(&iquant_grid_src());
     for part in HIP_PARTS {
         s.push_str(part);
@@ -60,8 +63,36 @@ pub fn hip_source() -> String {
 /// dynamically indexed 16-element array lowers to a long select cascade or a scratch spill, while
 /// the 4-way select is a couple of `v_cndmask` and the intra-word extract is a single byte extract.
 fn iq4nl_codebook_src() -> String {
-    let kv = infr_gguf::dequant::KVALUES_IQ4NL;
-    // Little-endian byte order within the word: index `i` lives in byte `i & 3` of word `i >> 2`.
+    kv16_codebook_src(
+        "kv_iq4nl",
+        "IQ4_NL / IQ4_XS",
+        "infr_gguf::dequant::KVALUES_IQ4NL",
+        infr_gguf::dequant::KVALUES_IQ4NL,
+    )
+}
+
+/// Emit the MXFP4 / NVFP4 16-entry signed E2M1 codebook (llama.cpp `kvalues_mxfp4`) as HIP source,
+/// GENERATED from [`infr_gguf::dequant::KVALUES_MXFP4`] — R7's twin of [`iq4nl_codebook_src`], on
+/// the same emitter and for the same reason (one host-side table, no re-typed second copy).
+///
+/// The two fp4 formats are structurally IQ4_NL/IQ4_XS with a DIFFERENT codebook and a different
+/// scale ENCODING: the values `{0,±1,±2,±3,±4,±6,±8,±12}` are the E2M1 float4 levels written out as
+/// exact small integers, so like R4's table they are already the signed int8 dp4a operand and carry
+/// no offset. `kv_mxfp4` and `kv_iq4nl` therefore have identical shape and neither may be used for
+/// the other's format — the entry sets are disjoint apart from the two zeros.
+fn mxfp4_codebook_src() -> String {
+    kv16_codebook_src(
+        "kv_mxfp4",
+        "MXFP4 / NVFP4 (E2M1)",
+        "infr_gguf::dequant::KVALUES_MXFP4",
+        infr_gguf::dequant::KVALUES_MXFP4,
+    )
+}
+
+/// The shared body of the two 16-entry signed-codebook emitters above: pack `kv` 4 signed bytes per
+/// `u32` (index `i` in byte `i & 3` of word `i >> 2`, little-endian) and emit a `__device__` accessor
+/// that reads it back with a 4-way word select + a byte extract.
+fn kv16_codebook_src(fname: &str, family: &str, host_path: &str, kv: [i8; 16]) -> String {
     let w = |n: usize| -> u32 {
         (0..4).fold(0u32, |acc, b| {
             acc | ((kv[n * 4 + b] as u8 as u32) << (8 * b))
@@ -69,9 +100,9 @@ fn iq4nl_codebook_src() -> String {
     };
     let (w0, w1, w2, w3) = (w(0), w(1), w(2), w(3));
     format!(
-        "\n// ── IQ4_NL / IQ4_XS codebook — GENERATED from infr_gguf::dequant::KVALUES_IQ4NL ──\n\
+        "\n// ── {family} codebook — GENERATED from {host_path} ──\n\
          // {kv:?}\n\
-         __device__ __forceinline__ int kv_iq4nl(int idx) {{\n\
+         __device__ __forceinline__ int {fname}(int idx) {{\n\
          \x20   unsigned int w = (idx < 8) ? ((idx < 4) ? {w0:#010x}u : {w1:#010x}u)\n\
          \x20                             : ((idx < 12) ? {w2:#010x}u : {w3:#010x}u);\n\
          \x20   return (int)(signed char)((w >> ((idx & 3) * 8)) & 0xFFu);\n\
@@ -1573,11 +1604,12 @@ extern "C" __global__ void moe_shared_expert_add(
 // only) AND decode streams the compact quant bytes (the dominant decode bandwidth
 // lever, docs/cpu-perf.md). Covered formats: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, the legacy
 // 32-element round quants Q4_0, Q4_1, Q5_0, Q5_1, the codebook 4-bit quants IQ4_NL, IQ4_XS, the
-// grid quants IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, the IQ1 quants IQ1_S, IQ1_M, and the ternary
-// quants TQ1_0, TQ2_0, Q2_0 — 22 of the 24 weight formats (the sets a Q2_K / Q3_K_M / Q4_K_M /
-// Q5_K_M / Q4_0 / Q4_1 / IQ4_XS / IQ4_NL / UD-IQ*_* / TQ*_0 / Q2_0 GGUF uses — unsloth's gemma-3
-// Q4_K_M packs q/k/v + ffn_gate/up as Q5_0; F16 is already native via `linear_f16`). Only MXFP4 and
-// NVFP4 remain on the dequant→f16 fallback.
+// grid quants IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, the IQ1 quants IQ1_S, IQ1_M, the ternary
+// quants TQ1_0, TQ2_0, Q2_0, and the fp4 microscaling quants MXFP4, NVFP4 — ALL 24 weight formats
+// as of R7 (`infr_core::decode_spec::WEIGHT_QUANTS` in full; `native_decode_is_total` in exec.rs
+// pins it). Nothing quantized takes the dequant→f16 fallback any more: what is left on it is the
+// DENSE float dtypes F32/BF16, which have nothing to decode (F16 is already native via
+// `linear_f16`).
 //
 // BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
 // each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
@@ -2044,6 +2076,80 @@ __device__ __forceinline__ float deq_q20(const unsigned char* w, long i) {
     return finc(rf16b(b), code);
 }
 
+// ── FP4 microscaling quants (MXFP4 / NVFP4) ──────────────────────────────────
+// R7's new thing is NOT the value path — the 4-bit field is an index into the fixed 16-entry signed
+// E2M1 codebook `kv_mxfp4` (GENERATED at the head of this module from the host `KVALUES_MXFP4`), so
+// the element is one multiply `d · KV[idx]` with no offset, exactly R4's IQ4_NL shape and `finc`.
+// What is new is the SCALE ENCODING: neither format stores an f16 `d`. Both are decoded here from
+// the host oracle's own definitions (`infr_gguf::dequant::{e8m0_to_fp32_half, ue4m3_to_fp32}`),
+// which is where the two-line functions below come from — not from the OCP/NVIDIA specs, whose
+// "halved" convention llama.cpp folds into the decode differently than a naive reading would.
+//
+//   MXFP4  17 B / 32 elems   [u8 e (E8M0)][u8 qs[16]]        d = 2^(e − 128), ONE scale per 32
+//   NVFP4  36 B / 64 elems   [u8 d[4] (UE4M3)][u8 qs[32]]    FOUR scales, one per 16 elems
+//
+// Nibble packing differs from IQ4_NL in NVFP4's case: MXFP4 keeps the familiar 16-wide split (low
+// nibbles of `qs[0..16]` are elements 0..15, high nibbles 16..31), but NVFP4 splits per 16-element
+// SUB-BLOCK — low nibbles of the sub-block's 8 code bytes are its elements 0..7, high nibbles 8..15.
+//
+// THE E8M0 SCALE IS A PURE POWER OF TWO, which is the property the int8 tier leans on: `d · code`
+// is then exact for every codebook entry (no mantissa bits are consumed), so re-associating the
+// oracle's per-element `d · KV[idx]` into the tier's per-block `d · Σ(KV[idx]·a)` is a re-association
+// and not an approximation — R6's argument for the IQ1 ×8 fold, reached here for free. NVFP4's
+// UE4M3 scale is a genuine FP8 value with a 3-bit mantissa, but its codebook entries are ≤ 4 bits
+// wide, so `d · KV` still needs at most 7 mantissa bits and stays exact in f32 as well.
+
+// E8M0: a BARE 8-bit exponent — no sign, no mantissa — so the value is exactly `2^(x − 128)` over
+// the whole range. Transcribed from `infr_gguf::dequant::e8m0_to_fp32_half` (which mirrors
+// llama.cpp's `ggml_e8m0_to_fp32_half`), INCLUDING its two-case form: for `x ≥ 2` the byte is
+// dropped straight into the f32 exponent field as `x − 1` (biased 127, hence 2^(x−128)), and for
+// `x ∈ {0,1}` — where `x − 1` would be a zero/negative exponent field — the result is the SUBNORMAL
+// `0x00200000 << x`, i.e. 2^-128 and 2^-127. Reproducing both cases is what makes the smallest two
+// scales decode rather than flushing to zero.
+__device__ __forceinline__ float e8m0_half(unsigned int x) {
+    union { unsigned int u; float f; } cvt;
+    cvt.u = (x < 2u) ? (0x00200000u << x) : ((x - 1u) << 23);
+    return cvt.f;
+}
+
+// UE4M3: an UNSIGNED FP8 (4 exponent bits biased 7, 3 mantissa bits) halved, i.e.
+// `0.5 · 2^(e−7) · (1 + m/8)` for `e > 0` and the subnormal `0.5 · m · 2^-9` for `e == 0`, with the
+// two reserved codes 0x00 and 0x7F decoding to 0.0. Transcribed from
+// `infr_gguf::dequant::ue4m3_to_fp32` (llama.cpp's `ggml_ue4m3_to_fp32`) case for case — the `·0.5`
+// tail and the 0x7F hole are both part of the oracle, and dropping either doubles or NaNs a scale.
+__device__ __forceinline__ float ue4m3(unsigned int x) {
+    if (x == 0u || x == 0x7Fu) return 0.0f;
+    int e = (int)((x >> 3) & 0xFu);
+    float man = (float)(x & 7u);
+    float raw = (e == 0) ? (man * exp2f(-9.0f)) : ((1.0f + man / 8.0f) * exp2f((float)(e - 7)));
+    return raw * 0.5f;
+}
+
+// ── MXFP4: 32 elems / 17 bytes = [u8 e][u8 qs[16]]; y = KV[q4] · 2^(e−128). ──
+__device__ __forceinline__ float deq_mxfp4(const unsigned char* w, long i) {
+    long blk = i >> 5;             // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 17;
+    float d = e8m0_half(b[0]);
+    const unsigned char* qs = b + 1;
+    int idx = (within < 16) ? (qs[within] & 0x0F) : (qs[within - 16] >> 4);
+    return finc(d, kv_mxfp4(idx));
+}
+
+// ── NVFP4: 64 elems / 36 bytes = [u8 d[4]][u8 qs[32]]; y = KV[q4] · ue4m3(d[s]). ──
+// Element `p` lives in 16-element sub-block `s = p>>4` at position `within = p&15`; the sub-block's
+// 8 code bytes are `qs[s*8 .. s*8+8]` with the low nibbles as `within` 0..7 and the high nibbles as
+// 8..15 — an 8-wide split, NOT the 16-wide one every other nibble format in this file uses.
+__device__ __forceinline__ float deq_nvfp4(const unsigned char* w, long i) {
+    int p = (int)(i & 63);
+    const unsigned char* b = w + (i >> 6) * 36;   // 64 elements per block
+    int s = p >> 4, within = p & 15;
+    float d = ue4m3(b[s]);
+    const unsigned char* qs = b + 4 + s * 8;
+    int idx = (within < 8) ? (qs[within] & 0x0F) : (qs[within - 8] >> 4);
+    return finc(d, kv_mxfp4(idx));
+}
+
 // ── Per-32-block int8 decode: the `wdec_*` family ────────────────────────────
 // The SHARED body of the dp4a GEMV (`linear_i8_*` / `i8acc_*`) and the WMMA prefill tier: decode
 // 32-block `blk` of output row `col` into 32 SIGNED codes plus the two f32 scales its 16-element
@@ -2065,6 +2171,11 @@ __device__ __forceinline__ float deq_q20(const unsigned char* w, long i) {
 //     per 32. |code| ≤ 9.
 //   * R6's ternary quants — the constant `−1` offset is folded into the stored code directly,
 //     giving `code ∈ {−1,0,+1}` (TQ1_0) or `{−1,0,+1,+2}` (TQ2_0/Q2_0). |code| ≤ 2.
+//   * R7's fp4 quants — the E2M1 codebook entry IS the signed operand, R4's treatment with a
+//     different table. |code| ≤ 12. What makes the re-association EXACT rather than merely
+//     tolerable is the scale: MXFP4's E8M0 is a pure power of two, and NVFP4's 3-bit-mantissa
+//     UE4M3 against a ≤4-bit code still fits f32's 24 bits — so `sc · Σ(code·a)` reproduces the
+//     oracle's `Σ((sc·code)·a)` term for term.
 // The widest of those is 62, so a 32-wide dot against int8 activations stays far inside i32, and
 // every code fits the int8 WMMA operand.
 //
@@ -2253,6 +2364,42 @@ __device__ __forceinline__ void wdec_q20(
     const unsigned char* qs = b + 2 + (blk & 1) * 8;
     for (int p = 0; p < 32; p++) {
         code[p] = (signed char)((int)((qs[p >> 2] >> (2 * (p & 3))) & 3u) - 1);
+    }
+}
+
+// R7 fp4: the codebook value IS the signed code (R4's shape), so the only per-format work is the
+// scale decode and the nibble walk. MXFP4's block IS the 32-element tile (`*s0 == *s1`, one E8M0);
+// NVFP4's is 64 elements like Q2_0 — so `blk>>1` indexes the block and `blk&1` the half — but
+// UNLIKE Q2_0 each half carries TWO scales, one per 16 elements, which is exactly what `s0`/`s1`
+// are for. NVFP4 is the only covered format that uses BOTH the 64-element stride AND the split
+// scale, so it is the one case where passing the same scale twice would be wrong.
+__device__ __forceinline__ void wdec_mxfp4(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * nblk + blk) * 17;
+    float d = e8m0_half(b[0]);
+    *s0 = d; *s1 = d;
+    const unsigned char* qs = b + 1;
+    for (int p = 0; p < 16; p++) {
+        code[p]      = (signed char)kv_mxfp4(qs[p] & 0x0F);
+        code[p + 16] = (signed char)kv_mxfp4(qs[p] >> 4);
+    }
+}
+
+__device__ __forceinline__ void wdec_nvfp4(
+    const unsigned char* __restrict__ w, long col, int nblk, int blk,
+    signed char* code, float* s0, float* s1) {
+    const unsigned char* b = w + (col * (nblk >> 1) + (blk >> 1)) * 36;   // 36 B / 64 elements
+    int half = blk & 1;                    // which 32-element half of the 64-element block
+    *s0 = ue4m3(b[2 * half]);              // elements 0..15  → sub-block 2·half
+    *s1 = ue4m3(b[2 * half + 1]);          // elements 16..31 → sub-block 2·half + 1
+    const unsigned char* qs = b + 4 + half * 16;
+    for (int u = 0; u < 2; u++) {
+        const unsigned char* q = qs + u * 8;
+        for (int j = 0; j < 8; j++) {
+            code[u * 16 + j]     = (signed char)kv_mxfp4(q[j] & 0x0F);
+            code[u * 16 + j + 8] = (signed char)kv_mxfp4(q[j] >> 4);
+        }
     }
 }
 
@@ -2462,6 +2609,8 @@ GEN_LINEAR(iq1m)
 GEN_LINEAR(tq10)
 GEN_LINEAR(tq20)
 GEN_LINEAR(q20)
+GEN_LINEAR(mxfp4)
+GEN_LINEAR(nvfp4)
 GEN_EMBED(q80)
 GEN_EMBED(q2k)
 GEN_EMBED(q3k)
@@ -2484,6 +2633,8 @@ GEN_EMBED(iq1m)
 GEN_EMBED(tq10)
 GEN_EMBED(tq20)
 GEN_EMBED(q20)
+GEN_EMBED(mxfp4)
+GEN_EMBED(nvfp4)
 "#;
 
 // ── Dequant-to-f16 + activation cast (Slice 26, rocBLAS f16 prefill GEMM) ─────
@@ -2524,6 +2675,8 @@ GEN_DEQF16(iq1m)
 GEN_DEQF16(tq10)
 GEN_DEQF16(tq20)
 GEN_DEQF16(q20)
+GEN_DEQF16(mxfp4)
+GEN_DEQF16(nvfp4)
 
 extern "C" __global__ void cast_f32_f16(
     const float* __restrict__ x, __half* __restrict__ out, int n) {
@@ -2714,6 +2867,8 @@ GEN_MOE_FFN(iq1m, q6k)
 GEN_MOE_FFN(tq10, tq10)
 GEN_MOE_FFN(tq20, tq20)
 GEN_MOE_FFN(q20, q20)
+GEN_MOE_FFN(mxfp4, mxfp4)
+GEN_MOE_FFN(nvfp4, nvfp4)
 "#;
 
 // ── Int8-activation dp4a decode GEMV (Phase 4) ───────────────────────────────
@@ -3465,6 +3620,8 @@ GEN_LINEAR_I8_WDEC(iq1m)
 GEN_LINEAR_I8_WDEC(tq10)
 GEN_LINEAR_I8_WDEC(tq20)
 GEN_LINEAR_I8_WDEC(q20)
+GEN_LINEAR_I8_WDEC(mxfp4)
+GEN_LINEAR_I8_WDEC(nvfp4)
 "#;
 
 // ── Fused RMSNorm → int8 activation quant (Slice 32) ──────────────────────────
@@ -3969,6 +4126,8 @@ GEN_I8ACC_WDEC(iq1m)
 GEN_I8ACC_WDEC(tq10)
 GEN_I8ACC_WDEC(tq20)
 GEN_I8ACC_WDEC(q20)
+GEN_I8ACC_WDEC(mxfp4)
+GEN_I8ACC_WDEC(nvfp4)
 
 // Gate+up+activation for one expert: block `o` (0..nff) computes h_out[o] = act(g·wg)·(u·wg)·wo·dsc.
 // `qx`/`xs` are the int8 quantization of the token's input row x[ne] (produced ONCE per token, reused
@@ -4047,6 +4206,8 @@ GEN_MOE_GATE_UP(iq1m)
 GEN_MOE_GATE_UP(tq10)
 GEN_MOE_GATE_UP(tq20)
 GEN_MOE_GATE_UP(q20)
+GEN_MOE_GATE_UP(mxfp4)
+GEN_MOE_GATE_UP(nvfp4)
 GEN_MOE_DOWN(q80)
 GEN_MOE_DOWN(q2k)
 GEN_MOE_DOWN(q3k)
@@ -4068,6 +4229,8 @@ GEN_MOE_DOWN(iq1m)
 GEN_MOE_DOWN(tq10)
 GEN_MOE_DOWN(tq20)
 GEN_MOE_DOWN(q20)
+GEN_MOE_DOWN(mxfp4)
+GEN_MOE_DOWN(nvfp4)
 "#;
 
 // ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5, RM×CN register-tiled — Slice 25) ──
@@ -5150,6 +5313,12 @@ GEN_WMMA_WDEC(wmma_i8_tq20_2x2, 2, 2, tq20)
 GEN_WMMA_WDEC(wmma_i8_q20_1x1, 1, 1, q20)
 GEN_WMMA_WDEC(wmma_i8_q20_2x1, 2, 1, q20)
 GEN_WMMA_WDEC(wmma_i8_q20_2x2, 2, 2, q20)
+GEN_WMMA_WDEC(wmma_i8_mxfp4_1x1, 1, 1, mxfp4)
+GEN_WMMA_WDEC(wmma_i8_mxfp4_2x1, 2, 1, mxfp4)
+GEN_WMMA_WDEC(wmma_i8_mxfp4_2x2, 2, 2, mxfp4)
+GEN_WMMA_WDEC(wmma_i8_nvfp4_1x1, 1, 1, nvfp4)
+GEN_WMMA_WDEC(wmma_i8_nvfp4_2x1, 2, 1, nvfp4)
+GEN_WMMA_WDEC(wmma_i8_nvfp4_2x2, 2, 2, nvfp4)
 "#;
 
 // ── GPU-side MoE top-k routing + device-driven expert dispatch (Slice 38) ────
@@ -5443,6 +5612,8 @@ GEN_MOE_FFN_ROUTED(iq1m, q6k)
 GEN_MOE_FFN_ROUTED(tq10, tq10)
 GEN_MOE_FFN_ROUTED(tq20, tq20)
 GEN_MOE_FFN_ROUTED(q20, q20)
+GEN_MOE_FFN_ROUTED(mxfp4, mxfp4)
+GEN_MOE_FFN_ROUTED(nvfp4, nvfp4)
 
 // Int8-activation dp4a gate+up+activation, device-routed. One wave32 block per nff output row.
 #define GEN_MOE_GATE_UP_ROUTED(GU) \
@@ -5497,6 +5668,8 @@ GEN_MOE_GATE_UP_ROUTED(iq1m)
 GEN_MOE_GATE_UP_ROUTED(tq10)
 GEN_MOE_GATE_UP_ROUTED(tq20)
 GEN_MOE_GATE_UP_ROUTED(q20)
+GEN_MOE_GATE_UP_ROUTED(mxfp4)
+GEN_MOE_GATE_UP_ROUTED(nvfp4)
 
 // Int8-activation dp4a down projection, device-routed. One wave32 block per ne output row.
 #define GEN_MOE_DOWN_ROUTED(DN) \
@@ -5534,6 +5707,8 @@ GEN_MOE_DOWN_ROUTED(iq1m)
 GEN_MOE_DOWN_ROUTED(tq10)
 GEN_MOE_DOWN_ROUTED(tq20)
 GEN_MOE_DOWN_ROUTED(q20)
+GEN_MOE_DOWN_ROUTED(mxfp4)
+GEN_MOE_DOWN_ROUTED(nvfp4)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────
@@ -5840,33 +6015,62 @@ mod codebook_tests {
     /// and require the result to BE `KVALUES_IQ4NL`, and require the emitted text to name the const
     /// it came from. A hardcoded second copy of the table would fail the first check the moment the
     /// host const changed; a wrong shift would fail it immediately.
+    /// R7 extends it to the second table, [`infr_gguf::dequant::KVALUES_MXFP4`] (the E2M1 codebook
+    /// MXFP4 and NVFP4 share), which now rides the same emitter — so this also pins that the two
+    /// emitters really are producing DIFFERENT tables rather than one of them having been wired to
+    /// the wrong host const, a slip nothing else on a CPU-only box would see.
     #[test]
-    fn the_emitted_codebook_unpacks_back_to_the_host_const() {
-        let src = super::iq4nl_codebook_src();
-        assert!(
-            src.contains("GENERATED from infr_gguf::dequant::KVALUES_IQ4NL"),
-            "the emitted table must name its source of truth:\n{src}"
-        );
+    fn the_emitted_codebooks_unpack_back_to_the_host_consts() {
         // The words are emitted as `{:#010x}u` — "0x", exactly 8 hex digits, then the `u` suffix.
         // (Matching that shape skips the `0xFFu` byte mask in the same line.)
-        let words: Vec<u32> = src
-            .split("0x")
-            .skip(1)
-            .filter(|t| {
-                t.len() > 8
-                    && t.as_bytes()[8] == b'u'
-                    && t[..8].bytes().all(|c| c.is_ascii_hexdigit())
-            })
-            .map(|t| u32::from_str_radix(&t[..8], 16).expect("8 hex digits per emitted word"))
-            .collect();
-        assert_eq!(words.len(), 4, "four packed codebook words:\n{src}");
-        let unpacked: Vec<i8> = (0..16)
-            .map(|i: usize| (words[i >> 2] >> ((i & 3) * 8)) as u8 as i8)
-            .collect();
+        let unpack = |src: &str| -> Vec<i8> {
+            let words: Vec<u32> = src
+                .split("0x")
+                .skip(1)
+                .filter(|t| {
+                    t.len() > 8
+                        && t.as_bytes()[8] == b'u'
+                        && t[..8].bytes().all(|c| c.is_ascii_hexdigit())
+                })
+                .map(|t| u32::from_str_radix(&t[..8], 16).expect("8 hex digits per emitted word"))
+                .collect();
+            assert_eq!(words.len(), 4, "four packed codebook words:\n{src}");
+            (0..16)
+                .map(|i: usize| (words[i >> 2] >> ((i & 3) * 8)) as u8 as i8)
+                .collect()
+        };
+        let iq4 = super::iq4nl_codebook_src();
+        assert!(
+            iq4.contains("GENERATED from infr_gguf::dequant::KVALUES_IQ4NL"),
+            "the emitted table must name its source of truth:\n{iq4}"
+        );
+        assert!(
+            iq4.contains("int kv_iq4nl(int idx)"),
+            "accessor name:\n{iq4}"
+        );
         assert_eq!(
-            unpacked,
+            unpack(&iq4),
             infr_gguf::dequant::KVALUES_IQ4NL.to_vec(),
             "emitted codebook must unpack to the host KVALUES_IQ4NL"
+        );
+        let fp4 = super::mxfp4_codebook_src();
+        assert!(
+            fp4.contains("GENERATED from infr_gguf::dequant::KVALUES_MXFP4"),
+            "the emitted table must name its source of truth:\n{fp4}"
+        );
+        assert!(
+            fp4.contains("int kv_mxfp4(int idx)"),
+            "accessor name:\n{fp4}"
+        );
+        assert_eq!(
+            unpack(&fp4),
+            infr_gguf::dequant::KVALUES_MXFP4.to_vec(),
+            "emitted codebook must unpack to the host KVALUES_MXFP4"
+        );
+        assert_ne!(
+            infr_gguf::dequant::KVALUES_IQ4NL,
+            infr_gguf::dequant::KVALUES_MXFP4,
+            "the two codebooks are different tables — neither accessor may serve the other format"
         );
     }
 
@@ -5949,17 +6153,18 @@ mod codebook_tests {
         );
     }
 
-    /// Every kernel the R5/R6 routing tables can name must actually exist in the assembled module.
-    /// `exec.rs` looks kernels up by STRING at dispatch time (`hipModuleGetFunction`), so a
+    /// Every kernel the R5/R6/R7 routing tables can name must actually exist in the assembled
+    /// module. `exec.rs` looks kernels up by STRING at dispatch time (`hipModuleGetFunction`), so a
     /// format registered in `native_i8_fmt`/`native_wmma_fmt`/the MoE mappers but never
     /// instantiated in the source here fails only on the box, on the one model that uses it.
     #[test]
-    fn the_r5_and_r6_wdec_kernels_are_all_instantiated() {
+    fn the_wdec_seam_kernels_are_all_instantiated() {
         let src = super::hip_source();
         for f in [
             // R5 grid quants.
             "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", // R6 IQ1 + ternary quants.
-            "iq1s", "iq1m", "tq10", "tq20", "q20",
+            "iq1s", "iq1m", "tq10", "tq20", "q20", // R7 fp4 microscaling quants.
+            "mxfp4", "nvfp4",
         ] {
             for k in [
                 format!("GEN_LINEAR({f})"),

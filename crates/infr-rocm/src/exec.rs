@@ -1,11 +1,12 @@
 //! Graph execution: walk ops → resolve bound buffers → dispatch HIP kernels.
 //!
 //! Covered quant formats (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/
-//! IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0 — 22 of the 24 weight quants, see
-//! `native_decode_fmt`) are decoded in-kernel from their RAW bytes on the `Linear`/`EmbedGather`
-//! paths — no f16 cache, VRAM ≈ quant_size.
-//! The two uncovered formats (MXFP4, NVFP4) are dequantized to f16 on the host on first touch and
-//! cached by the raw device-pointer address of their bound buffer.
+//! IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0/MXFP4/NVFP4 — ALL 24 weight quants as of
+//! R7, see `native_decode_fmt`) are decoded in-kernel from their RAW bytes on the
+//! `Linear`/`EmbedGather` paths — no f16 cache, VRAM ≈ quant_size.
+//! What is left on the host convert→f16 path (cached by the identity of its bound buffer) is only
+//! the DENSE FLOAT dtypes F32/BF16, which have no quant decode at all — F16 is already native via
+//! `linear_f16`. `native_decode_is_total_over_every_gguf_weight_dtype` pins that split.
 
 use crate::backend::{bucket_bytes, BufferPool};
 use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
@@ -109,6 +110,8 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
         DType::Tq1_0 => ("linear_tq10", "embed_tq10"),
         DType::Tq2_0 => ("linear_tq20", "embed_tq20"),
         DType::Q2_0 => ("linear_q20", "embed_q20"),
+        DType::Mxfp4 => ("linear_mxfp4", "embed_mxfp4"),
+        DType::Nvfp4 => ("linear_nvfp4", "embed_nvfp4"),
         _ => return None,
     };
     let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
@@ -148,6 +151,8 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
         DType::Tq1_0 => "linear_i8_tq10",
         DType::Tq2_0 => "linear_i8_tq20",
         DType::Q2_0 => "linear_i8_q20",
+        DType::Mxfp4 => "linear_i8_mxfp4",
+        DType::Nvfp4 => "linear_i8_nvfp4",
         _ => return None,
     };
     Some((infr_core::decode_spec::block_layout(dt).1, kernel))
@@ -155,8 +160,8 @@ fn native_i8_fmt(dt: DType, rocm: &infr_core::config::RocmCfg) -> Option<(usize,
 
 /// Dequant-to-f16 kernel name (`deqf16_*`, kernels.rs `DEQUANT_F16`) for a covered dtype — the
 /// weight decoder feeding the Slice-26 rocBLAS f16 prefill GEMM. Same covered set as
-/// [`native_decode_fmt`] (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS and the
-/// R5 grid quants IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S); `None` keeps a format off it.
+/// [`native_decode_fmt`], which after R7 is ALL 24 weight quants; `None` keeps a format off it
+/// (only the dense float dtypes land there now, and they have nothing to decode).
 fn deqf16_fmt(dt: DType) -> Option<&'static str> {
     match dt {
         DType::Q8_0 => Some("deqf16_q80"),
@@ -181,6 +186,8 @@ fn deqf16_fmt(dt: DType) -> Option<&'static str> {
         DType::Tq1_0 => Some("deqf16_tq10"),
         DType::Tq2_0 => Some("deqf16_tq20"),
         DType::Q2_0 => Some("deqf16_q20"),
+        DType::Mxfp4 => Some("deqf16_mxfp4"),
+        DType::Nvfp4 => Some("deqf16_nvfp4"),
         _ => None,
     }
 }
@@ -319,6 +326,12 @@ fn native_wmma_fmt(
         (DType::Q2_0, 1, 1) => "wmma_i8_q20_1x1",
         (DType::Q2_0, 2, 2) => "wmma_i8_q20_2x2",
         (DType::Q2_0, _, _) => "wmma_i8_q20_2x1",
+        (DType::Mxfp4, 1, 1) => "wmma_i8_mxfp4_1x1",
+        (DType::Mxfp4, 2, 2) => "wmma_i8_mxfp4_2x2",
+        (DType::Mxfp4, _, _) => "wmma_i8_mxfp4_2x1",
+        (DType::Nvfp4, 1, 1) => "wmma_i8_nvfp4_1x1",
+        (DType::Nvfp4, 2, 2) => "wmma_i8_nvfp4_2x2",
+        (DType::Nvfp4, _, _) => "wmma_i8_nvfp4_2x1",
         _ => return None,
     };
     Some((name, rm, cn))
@@ -393,6 +406,8 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
         DType::Tq1_0 => "tq10",
         DType::Tq2_0 => "tq20",
         DType::Q2_0 => "q20",
+        DType::Mxfp4 => "mxfp4",
+        DType::Nvfp4 => "nvfp4",
         _ => return None,
     };
     let (elems, bytes) = infr_core::decode_spec::block_layout(dt);
@@ -410,7 +425,8 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
 /// * `{q2k, q3k} × {iq4nl}` (2, R4),
 /// * `{iq2xxs, iq2xs, iq2s, iq3xxs, iq3s} × {iq2s, iq3xxs, iq3s, iq4nl, iq4xs, q4k, q6k}` (35, R5),
 /// * `{iq1s, iq1m} × {iq1s, iq1m, iq2xxs, iq2s, iq3s, iq4xs, q4k, q6k}` (16, R6),
-/// * the three ternary SELF pairs `{(tq10,tq10), (tq20,tq20), (q20,q20)}` (3, R6).
+/// * the three ternary SELF pairs `{(tq10,tq10), (tq20,tq20), (q20,q20)}` (3, R6),
+/// * the two fp4 SELF pairs `{(mxfp4,mxfp4), (nvfp4,nvfp4)}` (2, R7).
 ///
 /// **Why not the full cross product** (R2 documented this escape hatch, R3 measured it and took it):
 /// going 6×6 → 9×9 cost **+1.1 s of COLD hiprtc** — backend init plus a 1-token bench with
@@ -461,6 +477,15 @@ fn moe_native_fmt(dt: DType) -> Option<(&'static str, usize, usize)> {
 ///   Bonsai), so every FFN tensor in such a model carries the one type and there is no `ffn_down`
 ///   bump to model. Nothing mixes a ternary bank with any other family in either direction, so the
 ///   three self pairs are the complete reachable set for them.
+/// * The R7 fp4 quants pair only with themselves too, and here the rule is WRITTEN DOWN rather than
+///   inferred: `llama_tensor_get_type` handles `LLAMA_FTYPE_MOSTLY_MXFP4_MOE` before every other
+///   branch as "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0" — one unconditional arm,
+///   no `use_more_bits`, no `ffn_down` bump, so gate/up AND down are the SAME type by construction
+///   and no K-quant or IQ type can appear opposite an fp4 bank. The cached
+///   `ggml-org/gpt-oss-20b-MXFP4` is exactly that: all 72 `ffn_{gate,up,down}_exps` MXFP4, every
+///   dense tensor Q8_0 — i.e. it needs `("mxfp4","mxfp4")` and nothing else. NVFP4 has no ftype of
+///   its own yet and no cached GGUF; it is the same microscaling family with the same
+///   whole-MoE-conversion shape, so it gets the same single self pair.
 ///
 /// An absent pair is not a bug and never panics: `None` here makes the `MoeFfn` arm drop `native`
 /// (see the filter there), so the whole expert takes the correct, slower f16 path. Both this table
@@ -584,6 +609,8 @@ fn moe_expert_kernel(gu: &str, dn: &str) -> Option<&'static str> {
         ("tq10", "tq10") => Some("moe_ffn_expert_tq10_tq10"),
         ("tq20", "tq20") => Some("moe_ffn_expert_tq20_tq20"),
         ("q20", "q20") => Some("moe_ffn_expert_q20_q20"),
+        ("mxfp4", "mxfp4") => Some("moe_ffn_expert_mxfp4_mxfp4"),
+        ("nvfp4", "nvfp4") => Some("moe_ffn_expert_nvfp4_nvfp4"),
         _ => None,
     }
 }
@@ -619,6 +646,8 @@ fn moe_gate_up_i8_kernel(gu: &str) -> &'static str {
         "tq10" => "moe_gate_up_act_i8_tq10",
         "tq20" => "moe_gate_up_act_i8_tq20",
         "q20" => "moe_gate_up_act_i8_q20",
+        "mxfp4" => "moe_gate_up_act_i8_mxfp4",
+        "nvfp4" => "moe_gate_up_act_i8_nvfp4",
         _ => unreachable!("moe_gate_up_i8_kernel: uncovered ({gu})"),
     }
 }
@@ -647,6 +676,8 @@ fn moe_down_i8_kernel(dn: &str) -> &'static str {
         "tq10" => "moe_down_i8_tq10",
         "tq20" => "moe_down_i8_tq20",
         "q20" => "moe_down_i8_q20",
+        "mxfp4" => "moe_down_i8_mxfp4",
+        "nvfp4" => "moe_down_i8_nvfp4",
         _ => unreachable!("moe_down_i8_kernel: uncovered ({dn})"),
     }
 }
@@ -772,6 +803,8 @@ fn moe_expert_routed_kernel(gu: &str, dn: &str) -> Option<&'static str> {
         ("tq10", "tq10") => Some("moe_ffn_expert_routed_tq10_tq10"),
         ("tq20", "tq20") => Some("moe_ffn_expert_routed_tq20_tq20"),
         ("q20", "q20") => Some("moe_ffn_expert_routed_q20_q20"),
+        ("mxfp4", "mxfp4") => Some("moe_ffn_expert_routed_mxfp4_mxfp4"),
+        ("nvfp4", "nvfp4") => Some("moe_ffn_expert_routed_nvfp4_nvfp4"),
         _ => None,
     }
 }
@@ -800,6 +833,8 @@ fn moe_gate_up_i8_routed_kernel(gu: &str) -> &'static str {
         "tq10" => "moe_gate_up_act_i8_routed_tq10",
         "tq20" => "moe_gate_up_act_i8_routed_tq20",
         "q20" => "moe_gate_up_act_i8_routed_q20",
+        "mxfp4" => "moe_gate_up_act_i8_routed_mxfp4",
+        "nvfp4" => "moe_gate_up_act_i8_routed_nvfp4",
         _ => unreachable!("moe_gate_up_i8_routed_kernel: uncovered ({gu})"),
     }
 }
@@ -828,6 +863,8 @@ fn moe_down_i8_routed_kernel(dn: &str) -> &'static str {
         "tq10" => "moe_down_i8_routed_tq10",
         "tq20" => "moe_down_i8_routed_tq20",
         "q20" => "moe_down_i8_routed_q20",
+        "mxfp4" => "moe_down_i8_routed_mxfp4",
+        "nvfp4" => "moe_down_i8_routed_nvfp4",
         _ => unreachable!("moe_down_i8_routed_kernel: uncovered ({dn})"),
     }
 }
@@ -3543,6 +3580,14 @@ mod decode_spec_tests {
             (DType::Tq1_0, 256, 54),
             (DType::Tq2_0, 256, 66),
             (DType::Q2_0, 64, 18),
+            // R7's fp4 microscaling quants. MXFP4 (17 B = ONE E8M0 exponent byte + 16 packed
+            // nibbles) is IQ4_NL's block with a 1-byte scale instead of an f16 — the smallest
+            // header in the covered set. NVFP4 is a 64-ELEMENT block (36 B = 4 UE4M3 scale bytes +
+            // 32 packed nibbles), so like Q2_0 one weight block spans TWO activation 32-blocks —
+            // but with FOUR scales, one per 16 elements, which is the geometry `wdec_nvfp4`'s
+            // `blk>>1` block index, `blk&1` half and per-half `s0`/`s1` pair are built on.
+            (DType::Mxfp4, 32, 17),
+            (DType::Nvfp4, 64, 36),
         ] {
             let (e, b, _, _) = native_decode_fmt(dt).expect("covered by native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} native_decode_fmt geometry");
@@ -3571,20 +3616,142 @@ mod decode_spec_tests {
             (DType::Tq1_0, 256, 54),
             (DType::Tq2_0, 256, 66),
             (DType::Q2_0, 64, 18),
+            (DType::Mxfp4, 32, 17),
+            (DType::Nvfp4, 64, 36),
         ] {
             let (_, e, b) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!((e, b), (elems, bytes), "{dt:?} moe_native_fmt geometry");
         }
-        // Coverage boundary: the formats still awaiting a native kernel stay off the fast path.
-        // After R6 that is only the two FP4 microscaling formats (MXFP4 / NVFP4) — every other
-        // weight quant in `decode_spec::WEIGHT_QUANTS` decodes in-kernel.
-        assert!(native_decode_fmt(DType::Mxfp4).is_none());
-        assert!(native_i8_fmt(DType::Mxfp4, &rocm).is_none());
-        assert!(native_decode_fmt(DType::Nvfp4).is_none());
-        assert!(native_i8_fmt(DType::Nvfp4, &rocm).is_none());
         // Q5_0 is native on the DENSE paths but has no MoE expert kernel — no shipped GGUF packs
         // expert banks as Q5_0, so it stays off the (gate/up × down) cross product.
         assert!(moe_native_fmt(DType::Q5_0).is_none());
+    }
+
+    /// **R7: there is no coverage boundary left.** R1-R6 each maintained an assertion naming the
+    /// weight quants still on the host dequant→f16 fallback; MXFP4 and NVFP4 were the last two, so
+    /// that assertion is replaced by its complement — a TOTALITY check over every `DType` a GGUF
+    /// can carry.
+    ///
+    /// The `match` is deliberately EXHAUSTIVE (no `_` arm): a new `DType` variant does not compile
+    /// until someone decides here whether it is natively decoded or is one of the enumerated
+    /// intentional exclusions, which is the property the old boundary assertion could not give
+    /// (it only listed what was known-missing at the time). Every quant arm additionally requires
+    /// the whole fast-path family — the Phase-3 GEMV/EmbedGather, the int8 dp4a GEMV, the WMMA
+    /// prefill GEMM and the `deqf16_*` rocBLAS feeder — not just `native_decode_fmt`, because a
+    /// format registered in one table and missing from another is exactly the drift that used to
+    /// show up only on the box.
+    #[test]
+    fn native_decode_is_total_over_every_gguf_weight_dtype() {
+        use super::{deqf16_fmt, native_wmma_fmt};
+        let rocm = RocmCfg::default();
+        // Why each excluded dtype is NOT a native-decode gap. Kept as a per-variant string so the
+        // failure message names the reason rather than just the variant.
+        const DENSE_FLOAT: &str =
+            "dense float weight — nothing to decode (F16 rides `linear_f16`; \
+             F32/BF16 are cast to f16 once at first use, a format change, not a quant decode)";
+        const NOT_A_WEIGHT: &str = "never a weight tensor (bias / position payload)";
+        const HOST_CONVERTED: &str =
+            "host-converted to f16 at weight load — no backend ever sees this dtype";
+        const KV_ONLY: &str = "KV-cache-only TurboQuant format — never a GGUF weight";
+        for dt in [
+            DType::F32,
+            DType::F16,
+            DType::Bf16,
+            DType::I32,
+            DType::U32,
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q5_0,
+            DType::Q5_1,
+            DType::Q8_0,
+            DType::Q2K,
+            DType::Q3K,
+            DType::Q4K,
+            DType::Q5K,
+            DType::Q6K,
+            DType::Iq1S,
+            DType::Iq1M,
+            DType::Iq2Xxs,
+            DType::Iq2Xs,
+            DType::Iq2S,
+            DType::Iq3Xxs,
+            DType::Iq3S,
+            DType::Iq4Nl,
+            DType::Iq4Xs,
+            DType::Tq1_0,
+            DType::Tq2_0,
+            DType::I2S,
+            DType::Q2_0,
+            DType::Mxfp4,
+            DType::Nvfp4,
+            DType::Turbo2,
+            DType::Turbo3,
+            DType::Turbo4,
+        ] {
+            // EXHAUSTIVE — adding a `DType` variant breaks this match, which is the point.
+            let excused: Option<&str> = match dt {
+                DType::F32 | DType::F16 | DType::Bf16 => Some(DENSE_FLOAT),
+                DType::I32 | DType::U32 => Some(NOT_A_WEIGHT),
+                DType::I2S => Some(HOST_CONVERTED),
+                DType::Turbo2 | DType::Turbo3 | DType::Turbo4 => Some(KV_ONLY),
+                DType::Q4_0
+                | DType::Q4_1
+                | DType::Q5_0
+                | DType::Q5_1
+                | DType::Q8_0
+                | DType::Q2K
+                | DType::Q3K
+                | DType::Q4K
+                | DType::Q5K
+                | DType::Q6K
+                | DType::Iq1S
+                | DType::Iq1M
+                | DType::Iq2Xxs
+                | DType::Iq2Xs
+                | DType::Iq2S
+                | DType::Iq3Xxs
+                | DType::Iq3S
+                | DType::Iq4Nl
+                | DType::Iq4Xs
+                | DType::Tq1_0
+                | DType::Tq2_0
+                | DType::Q2_0
+                | DType::Mxfp4
+                | DType::Nvfp4 => None,
+            };
+            match excused {
+                Some(why) => assert!(
+                    native_decode_fmt(dt).is_none(),
+                    "{dt:?} is listed as intentionally unsupported ({why}) but native_decode_fmt \
+                     claims it — update the exclusion list or the table"
+                ),
+                None => {
+                    assert!(
+                        native_decode_fmt(dt).is_some(),
+                        "{dt:?} has no native decode kernel and is not excused"
+                    );
+                    assert!(native_i8_fmt(dt, &rocm).is_some(), "{dt:?} int8 dp4a GEMV");
+                    assert!(deqf16_fmt(dt).is_some(), "{dt:?} deqf16_* rocBLAS feeder");
+                    assert!(
+                        native_wmma_fmt(dt, 4096, &rocm).is_some(),
+                        "{dt:?} WMMA prefill GEMM"
+                    );
+                }
+            }
+        }
+        // …and the not-excused set is EXACTLY the shared weight-quant roster, so this test cannot
+        // pass by having quietly excused a real quant.
+        for &dt in infr_core::decode_spec::WEIGHT_QUANTS {
+            assert!(
+                native_decode_fmt(dt).is_some(),
+                "{dt:?} is in decode_spec::WEIGHT_QUANTS but has no native decode kernel"
+            );
+        }
+        assert_eq!(
+            infr_core::decode_spec::WEIGHT_QUANTS.len(),
+            24,
+            "the roster this slice claims to have closed"
+        );
     }
 
     /// The `(gate/up, down)` pairs `kernels.rs` instantiates the cross-product expert kernels for —
@@ -3593,7 +3760,7 @@ mod decode_spec_tests {
         // The K-quant square, then five rectangles and a diagonal: the R3 legacy round quants, the
         // R4 codebook quants, the `convert_incompatible_tensor` K-quant→IQ4_NL down bump, the R5
         // grid quants (gate/up only — see `moe_expert_kernel` for why nothing yields a grid `dn`),
-        // the R6 IQ1 quants (which ARE also a legal `dn`), and the R6 ternary SELF pairs.
+        // the R6 IQ1 quants (which ARE also a legal `dn`), and the R6 ternary + R7 fp4 SELF pairs.
         const K: [&str; 6] = ["q80", "q2k", "q3k", "q4k", "q5k", "q6k"];
         const L: [&str; 3] = ["q40", "q41", "q51"];
         const LD: [&str; 4] = ["q40", "q41", "q51", "q80"];
@@ -3606,7 +3773,10 @@ mod decode_spec_tests {
         const OD: [&str; 8] = [
             "iq1s", "iq1m", "iq2xxs", "iq2s", "iq3s", "iq4xs", "q4k", "q6k",
         ];
-        const T: [&str; 3] = ["tq10", "tq20", "q20"];
+        // The SELF-pair diagonals: R6's ternary trio and R7's fp4 pair. Both families are
+        // whole-model / whole-MoE conversion targets with no `ffn_down` bump, so the diagonal IS
+        // their reachable set.
+        const T: [&str; 5] = ["tq10", "tq20", "q20", "mxfp4", "nvfp4"];
         let mut out = [("", "");
             K.len() * K.len()
                 + L.len() * LD.len()
@@ -3688,15 +3858,15 @@ mod decode_spec_tests {
     #[test]
     fn moe_expert_pair_tables_agree() {
         use super::{moe_expert_kernel, moe_expert_routed_kernel};
-        const ALL: [&str; 22] = [
+        const ALL: [&str; 24] = [
             "q80", "q2k", "q3k", "q4k", "q5k", "q6k", "q40", "q41", "q51", "iq4nl", "iq4xs",
             "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq1s", "iq1m", "tq10", "tq20", "q20",
-            "q50",
+            "mxfp4", "nvfp4", "q50",
         ];
         assert_eq!(
             MOE_EXPERT_PAIRS.len(),
-            116,
-            "6×6 + 3×4 + 2×6 + 2 + 5×7 + 2×8 + 3 instantiated pairs"
+            118,
+            "6×6 + 3×4 + 2×6 + 2 + 5×7 + 2×8 + 5 instantiated pairs"
         );
         for gu in ALL {
             for dn in ALL {
@@ -3739,6 +3909,8 @@ mod decode_spec_tests {
             DType::Tq1_0,
             DType::Tq2_0,
             DType::Q2_0,
+            DType::Mxfp4,
+            DType::Nvfp4,
         ] {
             let (s, _, _) = moe_native_fmt(dt).expect("covered by MoE native decode");
             assert_eq!(

@@ -485,6 +485,59 @@ fn q20_blocks(blocks: usize) -> Vec<u8> {
     infr_testkit::synth_weight(DType::Q2_0, blocks * 64, 0x6105)
 }
 
+// ── R7 fp4 microscaling quants: MXFP4 / NVFP4 ───────────────────────────────
+//
+// These two start from the shared spec-driven builder (LCG payload, `write_scales` for a valid
+// block) and then OVERWRITE the scale bytes with a varying, still-valid encoding — the one place
+// in the suite where a bespoke step earns its keep, because `synth_weight` writes ONE magnitude
+// into every scale slot of every block. That is the right default for a decode sweep, but it makes
+// the two faults R7 can actually have invisible:
+//
+//   * a constant E8M0/UE4M3 byte never exercises the encodings' CASE STRUCTURE — `e8m0_half`'s
+//     subnormal branch for `e ∈ {0,1}` (where the naive `(e−1) << 23` yields ±inf, not 2^(e−128)),
+//     and `ue4m3`'s `e == 0` subnormal branch and its 0x00/0x7F zero holes;
+//   * with all four of a NVFP4 block's sub-scales EQUAL, a kernel that broadcast one scale across
+//     the whole 32-element tile — i.e. dropped the `s0`/`s1` split that is the format's whole
+//     structural difference from MXFP4 — would still match to the last bit.
+//
+// So the scales here are written directly in their wire encoding rather than through a magnitude:
+// the point is to vary the ENCODED byte, and `write_scales` takes an f32 and rounds it.
+//
+// `blocks` means whole native blocks: 32 elements for MXFP4, 64 for NVFP4.
+
+/// MXFP4 blocks with a per-block E8M0 exponent cycling `{126,127,128,129}` → `d ∈ {¼,½,1,2}`, plus
+/// `e = 1` on every 11th block to reach the SUBNORMAL branch. (`e = 1` gives `d = 2^-127`, whose
+/// products round to zero — so what that block pins is not a value but that the branch exists at
+/// all: the common-case formula would make it ±inf and poison the whole dot with a NaN.)
+fn mxfp4_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = infr_testkit::synth_weight(DType::Mxfp4, blocks * 32, 0x7101);
+    for b in 0..blocks {
+        w[b * 17] = if b % 11 == 10 { 1 } else { 126 + (b % 4) as u8 };
+    }
+    w
+}
+
+/// NVFP4 blocks whose FOUR UE4M3 sub-block scales are all different from each other and vary block
+/// to block: code `(e << 3) | m` with `e ∈ {6,7,8}` and a rotating mantissa, i.e.
+/// `d = 0.5 · 2^(e−7) · (1 + m/8) ∈ [0.125, 0.9375]`. Sub-block 3 of every 7th block takes the
+/// reserved code `0x7F`, which the oracle decodes to 0.0 and a kernel that skipped the hole decodes
+/// to ~0.94 — a whole sub-block wrong.
+fn nvfp4_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = infr_testkit::synth_weight(DType::Nvfp4, blocks * 64, 0x7102);
+    for b in 0..blocks {
+        for s in 0..4usize {
+            let e = 6 + ((b + s) % 3) as u8;
+            let m = ((b * 3 + s * 5) % 8) as u8;
+            w[b * 36 + s] = if s == 3 && b % 7 == 6 {
+                0x7F
+            } else {
+                (e << 3) | m
+            };
+        }
+    }
+    w
+}
+
 /// Build `blocks` valid Q6_K blocks (210 B = [ql 128][qh 64][int8 scales 16][f16 d]) with a finite
 /// small `d`, a benign in-range int8 sub-block scale, and patterned ql/qh.
 fn q6k_blocks(blocks: usize) -> Vec<u8> {
@@ -898,6 +951,49 @@ fn linear_i8_q20_matches_cpu() {
     );
 }
 
+// ── R7 fp4 int8 GEMV ─────────────────────────────────────────────────────────
+// Both ride the same `GEN_LINEAR_I8_WDEC` body, so these separate the two `wdec_*` decoders — and
+// specifically the SCALE decode, which is the only genuinely new thing in R7. A mis-decoded E8M0
+// or UE4M3 is a POWER-OF-TWO error: the codes are still right, the result is 2× or ½× (or 2^k×)
+// the reference for every element of a block. That is O(1) relative here, far outside any
+// tolerance — which is exactly why the tolerance is left at the family's usual 1.5e-2.
+
+/// MXFP4 int8 GEMV (R7): the E8M0 shared exponent. `e8m0_half` has a two-case form — the exponent
+/// field is `e − 1` for `e ≥ 2` but a SUBNORMAL bit pattern for `e ∈ {0,1}` — and a kernel that
+/// implemented only the common case flushes the two smallest scales to zero, which this shape
+/// (512-deep, so many blocks) reaches.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_mxfp4_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &mxfp4_blocks(blocks),
+        DType::Mxfp4,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "MXFP4",
+    );
+}
+
+/// NVFP4 int8 GEMV (R7): a 64-element block whose FOUR UE4M3 sub-block scales mean each 32-element
+/// activation block carries two DIFFERENT weight scales — the `ws0`/`ws1` split, exercised here on
+/// top of Q2_0's 64-element stride. A kernel that broadcast one scale over the whole 32-block (the
+/// shape every per-32-scale format on this seam uses) is wrong on half of every block.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_nvfp4_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 64;
+    check_i8_linear(
+        &nvfp4_blocks(blocks),
+        DType::Nvfp4,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "NVFP4",
+    );
+}
+
 /// Q2_K int8 GEMV (R2): 2-bit weight, 4-bit sub-block scale + 4-bit min per 16 elements (so a
 /// 32-elem activation block spans TWO scale sub-blocks) + int8 activation.
 #[test]
@@ -1161,6 +1257,27 @@ fn wmma_tq20_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn wmma_q20_matches_cpu() {
     check_wmma_linear(q20_blocks, DType::Q2_0, 64, 1.5e-2, "Q2_0");
+}
+
+// R7 fp4 quants on the WMMA prefill tier — same `GEN_WMMA_WDEC` body over the same `wdec_*`
+// decoders, so what these add over the GEMV cases is the tiling, and for NVFP4 in particular that
+// the per-16 `ws0`/`ws1` really do reach the two K-tiles of a step in the right order. |code| ≤ 12
+// for both (the widest E2M1 level), comfortably inside the signed int8 WMMA operand.
+
+/// MXFP4 WMMA prefill GEMM (R7).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_mxfp4_matches_cpu() {
+    check_wmma_linear(mxfp4_blocks, DType::Mxfp4, 32, 1.5e-2, "MXFP4");
+}
+
+/// NVFP4 WMMA prefill GEMM (R7) — the only covered format that is BOTH a 64-element block and
+/// split-scale, i.e. the one case where the two K-tiles of one WMMA step come from the same weight
+/// block but must not share a scale.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_nvfp4_matches_cpu() {
+    check_wmma_linear(nvfp4_blocks, DType::Nvfp4, 64, 1.5e-2, "NVFP4");
 }
 
 /// Q2_K WMMA prefill GEMM (R2): 2-bit weight, per-16 sub-block 4-bit scale + 4-bit min (1 K-tile
@@ -2052,6 +2169,43 @@ fn moe_ffn_q20_gate_q20_down_experts_matches_cpu() {
         DType::Q2_0,
         DType::Q2_0,
         "Q2_0/Q2_0/Q2_0",
+    );
+}
+
+/// MXFP4 experts throughout (R7): the ONE cell `gpt-oss` needs, and the whole reachable set for the
+/// format. `llama_tensor_get_type` handles `MXFP4_MOE` as a single unconditional arm — MoE tensors
+/// MXFP4, everything else Q8_0 — so gate/up and down are the same type by construction, and the
+/// cached `gpt-oss-20b-MXFP4` is exactly that shape (all 72 `ffn_*_exps` MXFP4, every dense tensor
+/// Q8_0). This is also the only MoE case in the suite whose per-expert byte offset divides by a
+/// 17-byte block: `(elem_off / 32) * 17`, the only odd block stride in the covered set.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_mxfp4_gate_mxfp4_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    check_moe_experts(
+        &mxfp4_blocks(n_expert * n_ff_exp * ne / 32),
+        &mxfp4_blocks(n_expert * n_ff_exp * ne / 32),
+        &mxfp4_blocks(n_expert * ne * n_ff_exp / 32),
+        DType::Mxfp4,
+        DType::Mxfp4,
+        "MXFP4/MXFP4/MXFP4",
+    );
+}
+
+/// NVFP4 experts throughout (R7): the same self pair for the 64-element, four-sub-block-scale
+/// sibling — no NVFP4 GGUF is cached, so this synthetic cell is the only thing that runs the
+/// format's MoE kernels at all.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_nvfp4_gate_nvfp4_down_experts_matches_cpu() {
+    let (ne, n_expert, n_ff_exp) = (256usize, 4usize, 256usize);
+    check_moe_experts(
+        &nvfp4_blocks(n_expert * n_ff_exp * ne / 64),
+        &nvfp4_blocks(n_expert * n_ff_exp * ne / 64),
+        &nvfp4_blocks(n_expert * ne * n_ff_exp / 64),
+        DType::Nvfp4,
+        DType::Nvfp4,
+        "NVFP4/NVFP4/NVFP4",
     );
 }
 
@@ -3693,6 +3847,38 @@ fn embed_gather_tq20_native_matches_cpu() {
 #[ignore = "requires a ROCm GPU"]
 fn embed_gather_q20_native_matches_cpu() {
     check_embed_native(q20_blocks, DType::Q2_0, 64, "Q2_0");
+}
+
+// ── R7 fp4 quants through the element-wise `embed_*` decode gather ───────────
+//
+// THE load-bearing case for this slice, and more sharply so than for any before it. R7's new thing
+// is a scale ENCODING, and a mis-decoded exponent is a FACTOR-OF-TWO error — a wrong `e8m0_half`
+// case boundary, a dropped `·0.5` in `ue4m3`, an off-by-one exponent bias. Those are not small, but
+// at m=1 they are also not necessarily visible: the int8 GEMV's tolerance is set against a 256-deep
+// dot with partial cancellation, and a coarse relative bound can swallow a factor of two on a
+// subset of blocks. Here every element is compared on its own, against the host oracle's own
+// `e8m0_to_fp32_half` / `ue4m3_to_fp32`, so a wrong power of two has nowhere to hide.
+//
+// These are also the cases that pin `deq_*` against `wdec_*`: the two decoders derive the same
+// scale by different routes (per element vs per 32-block half), and only this path runs `deq_*`.
+
+/// MXFP4 embedding table through `embed_mxfp4` (R7) — the E8M0 exponent byte at offset 0 (where
+/// every other 32-block format has an f16 `d`), the 17-byte stride, and the 16-wide nibble split.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_mxfp4_native_matches_cpu() {
+    check_embed_native(mxfp4_blocks, DType::Mxfp4, 32, "MXFP4");
+}
+
+/// NVFP4 embedding table through `embed_nvfp4` (R7) — the four UE4M3 sub-block scales (including
+/// the 0x00/0x7F holes and the subnormal `e == 0` branch), the 64-element block, and the 8-WIDE
+/// nibble split, which is the one place NVFP4 departs from every other nibble format in the file:
+/// within a 16-element sub-block the low nibbles are elements 0..7, not 0..15. A 16-wide split
+/// decodes plausible weights in the wrong ORDER, which a dot cannot see and this does.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_nvfp4_native_matches_cpu() {
+    check_embed_native(nvfp4_blocks, DType::Nvfp4, 64, "NVFP4");
 }
 
 /// Q2_K embedding table through the native `embed_q2k` in-kernel decode gather (×scale) vs CPU.

@@ -36,10 +36,11 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
   parity-validated; a `rocm_seam` gpu_seam gate (9 models, token-for-token/hash
   vs CPU). Goldens locked.
 - **Decode** — native in-kernel block decode + int8-activation dp4a GEMV for
-  **22 of the 24 weight quants**
-  (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0
-  — only MXFP4/NVFP4 remain on the `dequant→f16` fallback); grid-underfill fixed
-  across attention/WriteKv/GatedAct/RmsNorm/Argmax/QkNormRope; RmsNorm→Linear +
+  **all 24 weight quants**
+  (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/TQ1_0/TQ2_0/Q2_0/MXFP4/NVFP4
+  — nothing quantized is left on the `dequant→f16` fallback, which now serves
+  only the dense float dtypes F32/BF16); grid-underfill fixed across
+  attention/WriteKv/GatedAct/RmsNorm/Argmax/QkNormRope; RmsNorm→Linear +
   Linear→Add fusion. ~1.9 → ~130 t/s (Qwen3-0.6B Q4_K_M, ~60× over naive, ~0.3×
   llama.cpp).
 - **Prefill** — int8 **WMMA** matrix-core GEMM (RM×CN register tiling +
@@ -47,7 +48,8 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
 - **Attention** — split-KV / flash-decoding (10.6× at depth), Causal/SWA/Canvas.
 - **DeltaNet** — chunked/parallel prefill (88×) + column-parallel decode.
 - **MoE** — int8 dp4a experts
-  ({q80,q2k,q3k,q4k,q5k,q6k,q40,q41,q51,iq4nl,iq4xs,iq2xxs,iq2xs,iq2s,iq3xxs,iq3s,iq1s,iq1m,tq10,tq20,q20},
+  ({q80,q2k,q3k,q4k,q5k,q6k,q40,q41,q51,iq4nl,iq4xs,iq2xxs,iq2xs,iq2s,iq3xxs,iq3s,iq1s,iq1m,tq10,tq20,q20,mxfp4,nvfp4}
+  — every weight quant except Q5_0, which no shipped GGUF uses for expert banks;
   gate/up × down) + **GPU-side top-k routing** (device-routed, no host
   readback).
 - **Memory paging** — all three Vulkan modes: MoE expert LRU cache (host→VRAM,
@@ -77,13 +79,34 @@ kernels correct).
 
 ## 1. Quant coverage — fast kernels for ALL 24 formats × all paths
 
-**Nearly closed.** ROCm has native/int8 fast kernels for **22** formats
-(Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/IQ4_XS/IQ2_XXS/IQ2_XS/
-IQ2_S/IQ3_XXS/IQ3_S/**IQ1_S**/**IQ1_M**/**TQ1_0**/**TQ2_0**/**Q2_0**); only
-**MXFP4** and **NVFP4** still fall back to the slow `dequant→f16` GEMV (256
-threads — the pathology that made gemma-3's Q5_0 0.04× before it was covered).
-Vulkan is native on **all 24** + floats, with a full `native_id`/`native_idm`
-MoE-GEMV family (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
+**FORMAT COVERAGE COMPLETE (R7).** ROCm has native decode + int8 dp4a GEMV +
+WMMA prefill + MoE expert kernels for **all 24** weight quant formats —
+`infr_core::decode_spec::WEIGHT_QUANTS` in full. Nothing quantized takes the
+`dequant→f16` fallback any longer (the 256-thread GEMV pathology that made
+gemma-3's Q5_0 0.04× before it was covered).
+`native_decode_is_total_over_every_gguf_weight_dtype` (exec.rs) is the standing
+proof: an EXHAUSTIVE `match` over `DType` that forces every variant to be either
+natively decoded or an explicitly-reasoned exclusion, so this cannot silently
+regress and a new dtype cannot be added without deciding.
+
+**What "complete" does NOT mean.** Three things are still open, and none of them
+is a format gap:
+
+- **The id-GEMV MoE tier is missing** (the last bullet of this section, R8):
+  Vulkan's `native_id`/`native_idm`/paged-id decode GEMVs for the low-m MoE
+  regime have no ROCm equivalent. ROCm's expert path is the batched/routed
+  `moe_gate_up_act_i8_*`/`moe_down_i8_*` kernels, which ARE total over
+  `moe_native_fmt`, but the low-m shapes they serve are not the shapes an
+  id-GEMV would.
+- **The `moe_ffn_expert_<gu>_<dn>` cross product is deliberately partial** (118
+  reachable pairs, not 24²) — an A/B-only path, see that bullet.
+- **The DENSE FLOAT weights (F32/BF16) still take a host convert→f16 at load.**
+  That is a format cast, not a quant decode, and R7 measured that it costs
+  nothing at run time (see the Bf16 note under R7) — but the one-time load pass
+  is real and F16 pays it identically.
+
+Vulkan reference for the remaining item:
+`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`.
 
 - ✅ **R1 — Q5_K LANDED.** `deq_q5k` native decode (+ `linear_q5k`/`embed_q5k`/
   `deqf16_q5k`), `linear_i8_q5k`/`i8acc_q5k` int8 dp4a GEMV, the
@@ -311,22 +334,130 @@ MoE-GEMV family (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
   `0xfd63781ea3bfa785` unmoved. infr-rocm 119 (13 unit + 103 parity + 3 shared),
   workspace 550.
 
-- **Extend native decode GEMV + int8 dp4a + WMMA prefill** to the remaining 2:
-  `MXFP4, NVFP4` (+ `Bf16` weights). Neither is a codebook-of-vectors; both are
-  FP4 microscaling formats (MXFP4's per-32 E8M0 shared exponent, NVFP4's four
-  UE4M3 sub-block scales), so the new work is the scale ENCODING rather than the
-  code layout, and the signed E2M1 table means they join the no-ones-dot `wdec`
-  seam rather than the affine one. Both currently land at ~3e-7 on the f32-exact
-  host path, so they are a perf item, not a correctness one. Reuse
-  `infr_gguf::dequant` for bit-faithful decode; mirror the per-32-block
-  `infr_rocm::kernels::wdec_tq20` + `GEN_LINEAR_I8_WDEC` pattern in
-  `kernels.rs`.
+- ✅ **R7 — MXFP4 + NVFP4 LANDED; quant coverage COMPLETE at 24/24.** The FP4
+  microscaling pair. Neither is a codebook-of-vectors and neither is a new code
+  layout: both index the fixed 16-entry signed **E2M1** table `KVALUES_MXFP4`
+  (`{0,±1,±2,±3,±4,±6,±8,±12}`), so the decoded value is R4's one multiply
+  `d · KV[idx]` with no offset, the table value IS the signed dp4a operand, and
+  both join the no-ones-dot `wdec` seam rather than the affine one — exactly as
+  R6's report predicted. **The new thing is the scale ENCODING**, and it is the
+  whole slice:
+
+  |       | block           | scale                              |
+  | ----- | --------------- | ---------------------------------- |
+  | MXFP4 | 17 B / 32 elems | ONE E8M0 byte, `d = 2^(e − 128)`   |
+  | NVFP4 | 36 B / 64 elems | FOUR UE4M3 bytes, one per 16 elems |
+
+  **E8M0** is a bare 8-bit exponent — no sign, no mantissa — so the value is a
+  pure power of two. Decoded from `infr_gguf::dequant::e8m0_to_fp32_half` (not
+  from the OCP spec), including its two-case form: the byte drops into the f32
+  exponent field as `e − 1` for `e ≥ 2`, but `e ∈ {0,1}` take the SUBNORMAL bit
+  pattern `0x00200000 << e`, where the common-case formula would produce ±inf.
+  **UE4M3** is a genuine FP8 (4 exponent bits biased 7, 3 mantissa bits) HALVED:
+  `0.5 · 2^(e−7) · (1 + m/8)`, with an `e == 0` subnormal branch and the two
+  reserved codes `0x00`/`0x7F` decoding to 0.0. Transcribed from
+  `infr_gguf::dequant::ue4m3_to_fp32` case for case; the `·0.5` tail and the
+  `0x7F` hole are both part of the oracle. Note this codebase's NVFP4 has **no
+  per-tensor second-level scale** — the oracle's block is four per-16 UE4M3
+  scales and nothing else.
+
+  **The power-of-two scale makes the int8 re-association EXACT**, which is the
+  property R6 exploited for IQ1: `sc · Σ(code·a)` reproduces the oracle's
+  `Σ((sc·code)·a)` term for term when `sc·code` consumes no mantissa bits. For
+  NVFP4 the same holds for a different reason — a 3-bit-mantissa scale against a
+  ≤4-bit code needs at most 7 significand bits, well inside f32's 24.
+
+  NVFP4's 64-element block additionally makes it the only covered format that is
+  BOTH a two-activation-blocks-per-header format (Q2_0's `blk>>1` shape) AND
+  split-scale (`s0`/`s1` per 16 elements, IQ2_XS's shape). Its nibble split is
+  also the one departure from every other nibble format in the file: within a
+  16-element sub-block the low nibbles are elements 0..7, not 0..15.
+
+  Landed per format: `infr_rocm::kernels::deq_mxfp4` / `deq_nvfp4` bit-faithful
+  device decode (via R4's `finc` — one multiply, no addend) with their
+  `linear_mxfp4`, `embed_mxfp4` and `deqf16_mxfp4` instantiations; the
+  `linear_i8_mxfp4` / `i8acc_mxfp4` int8 dp4a GEMV;
+  `wmma_i8_mxfp4_{1x1,2x1,2x2}` WMMA prefill (plain tier, same reason as every
+  format after Q4_K); and fp4 MoE experts (gate/up, down, host- and
+  device-routed). All three tiers run off ONE `wdec_mxfp4` / `wdec_nvfp4` per
+  format, so they cannot drift. **The E2M1 codebook is generated into the
+  module** from `infr_gguf::dequant::KVALUES_MXFP4` beside R4's `KVALUES_IQ4NL`
+  — the two now share one emitter (`kv16_codebook_src`), and the unit test
+  unpacks BOTH back to their host consts and asserts the two tables differ, so
+  neither accessor can be wired to the wrong format. Registered in all five
+  routing tables + the MoE name mappers, and `rocm_moe_pageable`
+  (`infr-llama/src/seam/mod.rs`) syncs in the same step — the entry that matters
+  most, since `gpt-oss` ships its expert banks as MXFP4 and nothing else.
+
+  Measured on the RX 7900 XTX (warmed, `-p 0 -n 64 -r 2` / `-p 512 -n 0 -r 2`):
+
+  | model                   | format | decode t/s             | prefill t/s            |
+  | ----------------------- | ------ | ---------------------- | ---------------------- |
+  | Llama-3.2-1B pure MXFP4 | MXFP4  | 4.2 → **66.1** (15.7×) | 243 → **3863** (15.9×) |
+  | Llama-3.2-1B Q4_K_M     | —      | 53.9 → 53.9 (control)  | 3638 → 3648 (control)  |
+
+  MXFP4 now BEATS the Q4_K_M control at decode (66.1 vs 53.9), the expected
+  shape at 4.25 vs 4.58 bpw. **Model provenance matters here**: the only cached
+  MXFP4 GGUF is `ggml-org/gpt-oss-20b-MXFP4`, and **infr does not support the
+  `gpt-oss` architecture**, so it cannot be run end to end at all. The measured
+  model above is `Llama-3.2-1B-Instruct-BF16` locally requantized with
+  `llama-quantize --pure … MXFP4_MOE` (all 113 weight tensors MXFP4, 4.25 bpw) —
+  a real GGUF on a supported arch, not a synthetic. It answers "Paris" at
+  `--temp 0`, IDENTICALLY before and after the slice. **NVFP4 has no GGUF at
+  all** — llama.cpp has no NVFP4 ftype yet and nothing is cached — so it rests
+  entirely on the parity tests.
+
+  **Bf16 weights: no kernel, by measurement.** A BF16 weight is host-converted
+  to f16 once at load and then rides `linear_f16` / the rocBLAS f16 GEMM.
+  Measured on `Llama-3.2-1B-Instruct` in BOTH formats (same model, same 2.36
+  GB): decode **4.2 t/s BF16 vs 4.2 t/s F16**, prefill **~312 vs ~316 t/s** (3
+  reps each, inside noise). So BF16 is already ON the F16 path with no decode
+  penalty, and a native `deq_bf16`/`linear_bf16` would have identical memory
+  traffic (2 B/elem) and identical arithmetic — there is no int8/WMMA tier for a
+  float weight to move to, so it could not be faster. It would also not be
+  numerics-neutral: R1-R7 are all bit-faithful to the `dequant→f16` value, and a
+  native bf16 path is only bit-faithful if it rounds bf16→f16 anyway, at which
+  point it saves nothing but the host pass. The narrowing is close to free in
+  practice — f16 has 11 significand bits to bf16's 8, so **bf16→f16 is EXACT for
+  every value in f16's normal range**; scanning both cached BF16 GGUFs found max
+  |w| = 1.23 (Qwen3-0.6B, 596 M weights) and 1.20 (Llama-3.2-1B, 1.24 G),
+  **zero** overflows, and only 1127 / 3372 weights below 2^-24 (≈2e-6 of the
+  tensor) that flush to zero. **Flagged for the lead, NOT fixed here:** the one
+  real cost is load time — `Llama-3.2-1B` takes 3.53 s (F16) / 3.55 s (BF16) to
+  load+decode 1 token vs 0.76 s for Q8_0, because `dequant_weight_or_cache`
+  round-trips the dense float weights through f32 on the host. F16 pays exactly
+  the same, so the fix is a format-agnostic raw-upload path for the dense
+  floats, not a bf16 quant kernel.
+
+  Parity: shared decode sweep vs `dequant_block` green at the unchanged 2e-2
+  tolerance — MXFP4 2.4e-3/4.0e-3, NVFP4 6.0e-3/5.3e-3 at m=1/m=16, with Q2_K's
+  7.6e-3 still binding. Both had been ~3e-7 on the f32-exact dequant path;
+  landing in the int8 band is itself the evidence the new kernels are the ones
+  running, and it means all 24 formats are now measured against the SAME
+  activation-quant bound with nothing left on the weaker comparison. New
+  int8-GEMV, WMMA, EmbedGather and MoE-expert cases per format. **EmbedGather is
+  the load-bearing one and more sharply so than in any prior slice**: a
+  mis-decoded exponent is a FACTOR-OF-TWO error, which a coarse relative bound
+  over a 256-deep dot can swallow on a subset of blocks but an element-wise
+  comparison cannot. Both land at **effectively 0** (NVFP4 exactly 0; MXFP4
+  1.1e-36 absolute — the subnormal `e = 1` blocks, i.e. proof that branch is
+  live rather than ±inf) against a 2e-3 bound. The fp4 block builders in
+  `tests/parity.rs` deliberately do NOT use `synth_weight`'s constant scale:
+  they overwrite the scale bytes with a varying valid encoding (MXFP4 cycling
+  `e ∈ {126..129}` plus `e = 1` every 11th block; NVFP4 four DIFFERENT
+  sub-scales per block plus a `0x7F` hole), because a constant scale would make
+  both a broken subnormal branch and a broadcast-`s0`-over-`s1` bug invisible.
+  Verified by tripwire: replacing `s1` with `s0` in `wdec_nvfp4` moves the int8
+  GEMV to **rel 0.66** and fails three cases. `rocm_seam` 9/9 with the qwen3
+  golden `0xfd63781ea3bfa785` unmoved. infr-rocm 128 (14 unit + 111 parity + 3
+  shared), workspace 551.
+
 - **MoE experts beyond the current set** — extend `moe_ffn_expert*`/`moe_*_i8*`
   to the remaining formats. The **escape hatch is taken** (R3 measured it, R4
   re-measured it): the Phase-3 `moe_ffn_expert_<gu>_<dn>` cross product is not
   complete over `moe_native_fmt`. Going 6×6 → 9×9 (81 pairs/macro) cost **+1.1 s
   of COLD hiprtc**, so `moe_expert_kernel` and its routed twin return `Option`
-  and only the **reachable** pairs are instantiated — now **116**:
+  and only the **reachable** pairs are instantiated — now **118**:
   `{q80,q2k,q3k,q4k,q5k,q6k}²` (36), `{q40,q41,q51} × {q40,q41,q51,q80}` (12),
   `{iq4nl,iq4xs} × {iq4nl,iq4xs,q4k,q5k,q6k,q80}` (12), `{q2k,q3k} × {iq4nl}`
   (2, llama.cpp's `convert_incompatible_tensor` rewrite),
@@ -342,24 +473,38 @@ MoE-GEMV family (`crates/infr-vulkan/src/linear.rs:136-254`, `gemm.rs`).
   `{(tq10,tq10),(tq20,tq20),(q20,q20)}` (3, R6 — TQ1_0/TQ2_0/Q2_0 are
   whole-model conversion targets for a natively ternary checkpoint, not ftype
   mixes, so there is no `ffn_down` bump to model and nothing mixes them with
-  another family in either direction). R6's cold-hiprtc re-measurement (backend
-  init + a 1-token bench, `~/.cache/comgr` AND `~/.cache/infr/rocm-module-*.bin`
-  cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s**
-  once R6's 60 DENSE kernels + the 16 KiB `g_iq1s` table are added at the same
-  97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38
-  kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature
-  — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s)
-  for nothing. **Warm-cache startup is unchanged.** Absent pairs fall back to
-  the dequant→f16 `moe_ffn_expert` path, which costs nothing real: those kernels
-  only run under `INFR_ROCM_NO_I8` (the default int8 expert path uses the
-  per-FORMAT `moe_gate_up_act_i8_<gu>`/`moe_down_i8_<dn>` kernels, still total
-  over `moe_native_fmt`), and that switch's comparand IS the f16 path. When
-  adding a format, extend `MOE_EXPERT_PAIRS` (exec.rs test module) with only the
-  pairs a real GGUF can produce; `moe_expert_pair_tables_agree` pins both
-  mappers to it.
-- **The `native_id`/`native_idm`/paged-id MoE GEMV family** — Vulkan's
+  another family in either direction) and the two fp4 SELF pairs
+  `{(mxfp4,mxfp4),(nvfp4,nvfp4)}` (2, R7 — here the rule is WRITTEN DOWN rather
+  than inferred: llama.cpp's `llama_tensor_get_type` handles
+  `LLAMA_FTYPE_MOSTLY_MXFP4_MOE` before every other branch as one unconditional
+  arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
+  `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
+  by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
+  72 `ffn_{gate,up,down}_exps` MXFP4 and every dense tensor Q8_0). R6's
+  cold-hiprtc re-measurement (backend init + a 1-token bench, `~/.cache/comgr`
+  AND `~/.cache/infr/rocm-module-*.bin` cleared, 3 reps each): **9.06-9.12 s**
+  at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB
+  `g_iq1s` table are added at the same 97 pairs → **11.42-11.56 s** at the
+  shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and
+  the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21
+  would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same
+  way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped
+  118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s
+  at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of
+  the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51
+  s before and after). Absent pairs fall back to the dequant→f16
+  `moe_ffn_expert` path, which costs nothing real: those kernels only run under
+  `INFR_ROCM_NO_I8` (the default int8 expert path uses the per-FORMAT
+  `moe_gate_up_act_i8_<gu>`/`moe_down_i8_<dn>` kernels, still total over
+  `moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a
+  format, extend `MOE_EXPERT_PAIRS` (exec.rs test module) with only the pairs a
+  real GGUF can produce; `moe_expert_pair_tables_agree` pins both mappers to it.
+- **R8 — the `native_id`/`native_idm`/paged-id MoE GEMV family.** Vulkan's
   id-indexed decode GEMVs for resident + paged small-m MoE. ROCm's expert path
   is the batched/routed kernels; add the id-GEMV tier for the low-m regime.
+  **This is the one remaining item in §1** now that format coverage is complete
+  at 24/24 — "complete" means every FORMAT has kernels on every existing tier,
+  not that every TIER exists.
 
 ## 2. Attention parity
 
@@ -500,9 +645,10 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 
 ## Parity checklist
 
-- [ ] **Quant coverage** — native decode + int8 + WMMA-prefill for all 24
-      formats (**22/24 after R6**; MXFP4 + NVFP4 left); MoE experts for all
-      formats; `native_id`/`idm` MoE GEMV family
+- [ ] **Quant coverage** — ✅ native decode + int8 + WMMA-prefill for all 24
+      formats (**24/24 after R7**) and ✅ MoE experts for every format a GGUF
+      packs expert banks with; ❌ `native_id`/`idm` MoE GEMV family still
+      missing (R8) — that alone keeps this box unticked
 - [ ] **Attention** — WMMA flash prefill; dequant-in-flash; q8_0/Turbo/block KV
       quant
 - [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd
