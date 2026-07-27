@@ -52,11 +52,6 @@ the `infr` inference engine. The top-level project overview lives in the root
   plan to unify shared/device-agnostic host logic across the CPU/Vulkan/Metal/
   ROCm backends (peephole fusion, graph-executor skeleton, chat/session
   wrappers, tiering policy, decode-spec + parity harness) into one seam.
-- [config-plan.md](config-plan.md) — the migration record for replacing the 177
-  `INFR_*` env gates with one layered `Config` (CLI flags > env > config file >
-  defaults), resolved once and passed explicitly, so tests configure behaviour
-  with a struct instead of mutating the process environment. Slice ledger + the
-  per-knob polarity rules; the USER-facing reference is [config.md](config.md).
 - [cuda-plan.md](cuda-plan.md) — phased plan for a native CUDA NVIDIA GPU
   backend (`infr-cuda`), sibling of the ROCm plan; Tensor Cores / cuBLASLt /
   CUDA Graphs, validated on remote NVIDIA hardware. Not yet built.
