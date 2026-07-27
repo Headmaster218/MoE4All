@@ -14,41 +14,47 @@ use infr_core::budget::{mib_bytes, reserve_bytes, spill_report_line, SpillNouns,
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::graph::Graph;
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 /// Terse local shorthand for the shared backend-error constructor.
 use infr_core::error::backend as be;
 
-/// Query one device's properties. A FREE fn, not just [`RocmBackend::prop`]'s body, because
-/// `Pipelines::build` needs the gfx arch to key its on-disk module cache BEFORE a `RocmBackend`
-/// exists to ask. A failed query leaves the zeroed struct (an empty `gcn_arch_name`), which the
-/// cache treats as "unknown arch ⇒ do not cache" rather than guessing.
-pub(crate) fn device_prop(device: c_int) -> ffi::hipDeviceProp_t {
-    let mut props: ffi::hipDeviceProp_t = unsafe { std::mem::zeroed() };
-    unsafe { ffi::hipGetDeviceProperties(&mut props as *mut _ as *mut c_void, device) };
+/// Query one device's properties, through [`ffi::hipDeviceProp_tR0000`] — the layout the linked
+/// `hipGetDeviceProperties` symbol actually fills (see the note beside that struct; the `R0600`
+/// shape this crate used to declare read `multi_processor_count` off `maxThreadsDim[1]`, i.e. 1024
+/// on every device).
+///
+/// A FREE fn, not just [`RocmBackend::prop`]'s body, because `Pipelines::build` needs the gfx arch
+/// to key its on-disk module cache BEFORE a `RocmBackend` exists to ask. A failed query leaves the
+/// zeroed struct (an empty `gcn_arch_name`, a zero CU count), which every caller treats as
+/// "unknown" rather than guessing.
+pub(crate) fn device_prop(device: c_int) -> ffi::hipDeviceProp_tR0000 {
+    let mut props: ffi::hipDeviceProp_tR0000 = unsafe { std::mem::zeroed() };
+    let rc = unsafe { ffi::hipGetDeviceProperties(&mut props, device) };
+    if rc != HIP_SUCCESS {
+        return unsafe { std::mem::zeroed() };
+    }
     props
 }
 
+/// A NUL-terminated `c_char` field as a `String` (`name`, `gcn_arch_name`).
+fn prop_str(field: &[c_char]) -> String {
+    field
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8 as char)
+        .collect()
+}
+
 /// This device's `gcnArchName` (`gfx1100`, `gfx90a:sramecc+:xnack-`, …) — the arch the module
-/// cache keys and names its blob by. Read through [`ffi::hipDeviceProp_tR0000`], the layout the
-/// linked symbol actually fills (see the note beside that struct).
+/// cache keys and names its blob by.
 ///
 /// Empty when the value does not look like an arch at all, which is how a layout that moved under
 /// us degrades: the caller then declines to cache rather than risk one file for two archs.
 pub(crate) fn device_arch_name(device: c_int) -> String {
-    let mut props: ffi::hipDeviceProp_tR0000 = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ffi::hipGetDeviceProperties(&mut props as *mut _ as *mut c_void, device) };
-    if rc != HIP_SUCCESS {
-        return String::new();
-    }
-    let name: String = props
-        .gcn_arch_name
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8 as char)
-        .collect();
+    let name = prop_str(&device_prop(device).gcn_arch_name);
     if name.starts_with("gfx") {
         name
     } else {
@@ -570,6 +576,23 @@ impl RocmBackend {
             return Err(be(format!("hipStreamCreate: rc={rc}")));
         }
 
+        // One-line device banner (stderr), the twin of the Vulkan backend's: which GPU was picked
+        // and what it says about itself — the first thing to check on a portability bug report,
+        // and the reason these numbers are worth reading at all now that they come off the layout
+        // HIP actually writes (they used to say `cu:1024` on every device). `cu` is HIP's
+        // `multiProcessorCount`, which on RDNA counts WORKGROUP PROCESSORS — half the CU count
+        // `rocminfo` prints. Printed on every `RocmBackend::new_with`, no process-wide dedup, so
+        // one line genuinely means one backend construction.
+        let props = device_prop(device);
+        eprintln!(
+            "[infr] GPU: {} ({}) | cu:{} shared:{}KB warp:{} | ROCm/HIP",
+            prop_str(&props.name),
+            prop_str(&props.gcn_arch_name),
+            props.multi_processor_count,
+            props.shared_mem_per_block / 1024,
+            props.warp_size,
+        );
+
         let pipelines = Pipelines::build(device, &cfg)?;
 
         // rocBLAS handle for the OPT-IN f16 prefill GEMM (Slice 26), bound once to our work stream.
@@ -675,7 +698,7 @@ impl RocmBackend {
     }
 
     /// Read a device property field.
-    fn prop(&self) -> ffi::hipDeviceProp_t {
+    fn prop(&self) -> ffi::hipDeviceProp_tR0000 {
         device_prop(self.device)
     }
 
@@ -754,7 +777,10 @@ impl Backend for RocmBackend {
             sg_pref: 0,
             vendor_intel: false,
             integrated: false,
-            compute_units: props.multi_processor_count as u32,
+            // HIP's `multiProcessorCount`. On RDNA it counts WORKGROUP PROCESSORS, not the CUs
+            // `rocminfo` prints (2 CUs per WGP): a 7900 XTX reports 48 for its 96 CUs. Advisory
+            // only — nothing on this backend branches on it (see the field docs).
+            compute_units: props.multi_processor_count.max(0) as u32,
             buffer_device_address: false,
             max_shared_memory_bytes: props.shared_mem_per_block as u32,
             unified_memory: false,

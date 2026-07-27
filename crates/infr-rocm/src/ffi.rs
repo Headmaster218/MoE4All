@@ -18,11 +18,10 @@ extern "C" {
     pub fn hipGetDeviceCount(count: *mut c_int) -> c_int;
     /// Select the active device.
     pub fn hipSetDevice(device: c_int) -> c_int;
-    /// Query device properties into `props` (allocated by caller). Typed `*mut c_void` because
-    /// this crate reads it through TWO layouts — [`hipDeviceProp_t`] and the legacy
-    /// [`hipDeviceProp_tR0000`] the symbol actually fills (see the note beside that struct) — and
-    /// a second `extern` declaration of one symbol with two signatures is a lint error.
-    pub fn hipGetDeviceProperties(props: *mut c_void, device: c_int) -> c_int;
+    /// Query device properties into `props` (allocated by caller). Typed as the LEGACY
+    /// [`hipDeviceProp_tR0000`] because that is the layout the linked symbol actually fills — see
+    /// the note beside that struct; declaring the current `R0600` layout here reads garbage.
+    pub fn hipGetDeviceProperties(props: *mut hipDeviceProp_tR0000, device: c_int) -> c_int;
     /// Allocate `size` bytes of device memory.
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     /// Free device memory.
@@ -254,60 +253,26 @@ pub const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;
 /// (`hipHostGetDevicePointer`) — required for the KV-overflow read-over-PCIe path.
 pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
 
-// ── hipDeviceProp_t (subset we need) ─────────────────────────────────────────
-
-/// Device properties — only the fields the backend reads.
-#[repr(C)]
-pub struct hipDeviceProp_t {
-    pub name: [c_char; 256],
-    pub total_global_mem: usize,
-    pub shared_mem_per_block: usize,
-    pub regs_per_block: c_int,
-    pub warp_size: c_int,
-    pub max_threads_per_block: c_int,
-    pub max_threads_per_multi_processor: c_int,
-    pub multi_processor_count: c_int,
-    pub clock_rate: c_int,
-    pub memory_clock_rate: c_int,
-    pub memory_bus_width: c_int,
-    pub l2_cache_size: c_int,
-    pub max_threads_dim: [c_int; 3],
-    pub max_grid_size: [c_int; 3],
-    pub compute_mode: c_int,
-    pub major: c_int,
-    pub minor: c_int,
-    pub arch: hipDeviceArch_t,
-    // ── padding: the real hipDeviceProp_tR0600 has many fields (~808 bytes)
-    //     between arch (ends at 352) and gcnArchName (at offset 1160).
-    _pad1: [u8; 808],
-    pub gcn_arch_name: [c_char; 256],
-    // Trailing pad to match sizeof(hipDeviceProp_tR0600) = 1472.
-    _pad2: [u8; 56],
-}
-
-#[repr(C)]
-pub struct hipDeviceArch_t {
-    pub has_watchdog: c_int,
-    pub cooperative_launch: c_int,
-}
-
-// ── hipDeviceProp_tR0000 — the LEGACY layout, for `gcnArchName` only ──────────
+// ── hipDeviceProp_tR0000 — the ONLY device-properties layout this crate reads ─
 //
-// The struct above does NOT match what the linked `hipGetDeviceProperties` symbol
-// (`hip_4.2`) actually writes: measured on ROCm 7 / RX 7900 XTX, `gcnArchName` lands at byte
-// 396 (not the 1160 that struct assumes) — i.e. the symbol fills the LEGACY
-// `hipDeviceProp_tR0000`, which ROCm 6+ froze for ABI compatibility when it renamed the current
-// struct to `hipDeviceProp_tR0600`. (`multi_processor_count` above reads 1024 on a 96-CU card
-// for the same reason; that predates this slice and is left alone here — see the RC report.)
+// The linked `hipGetDeviceProperties` symbol (`hip_4.2`) fills the LEGACY layout, which ROCm 6+
+// froze for ABI compatibility when it renamed the current struct to `hipDeviceProp_tR0600`. So
+// that is what is declared here, and it is the only one — a struct shaped like `R0600` reads
+// garbage out of this symbol, field-by-field, with no error to notice.
 //
-// The module cache needs exactly ONE field and must not guess, so this declares the legacy
-// layout it is actually handed. Reading `gcnArchName` through the WRONG layout is not merely
-// useless: a stable-but-wrong token could name one cache file for two different archs. The
-// caller therefore also demands the value start with `gfx` and disables caching otherwise.
+// This crate used to carry exactly such a struct, and it cost real numbers: `multiProcessorCount`
+// read 1024 (it was landing on `maxThreadsDim[1]`) and `Capabilities::compute_units` reported that.
+// Measured on ROCm 7 / RX 7900 XTX, every field below reads coherently (gfx1100, warp 32, 384-bit
+// bus, 6 MiB L2, 48 WGPs) where the `R0600` shape did not.
+//
+// Reading a field through the WRONG layout is not merely useless: `gcnArchName` NAMES the kernel
+// module cache's blob, and a stable-but-wrong token could name one cache file for two different
+// archs. The `gcnArchName` caller therefore also demands the value start with `gfx` and disables
+// caching otherwise.
 
 /// The legacy (`R0000`) device-properties layout, named down to `gcnArchName` and padded past it.
-/// Offsets are asserted below, so a field slipping out of order is a COMPILE error, not a subtly
-/// wrong cache key.
+/// Offsets are asserted below for EVERY field this crate reads, so a future ROCm that moves one is
+/// a COMPILE error rather than a silently wrong capability or cache key.
 #[repr(C)]
 pub struct hipDeviceProp_tR0000 {
     pub name: [c_char; 256],
@@ -345,6 +310,20 @@ pub struct hipDeviceProp_tR0000 {
     _tail: [u8; 820],
 }
 
-// The one offset the module cache depends on, checked at COMPILE time against the layout above.
+// Every field this crate reads — `name`, `shared_mem_per_block`, `warp_size`,
+// `multi_processor_count`, `gcn_arch_name` — pinned at COMPILE time against the layout above, plus
+// the neighbours that fence them in. Offsets measured on ROCm 7 / RX 7900 XTX; if a future ROCm
+// release reshuffles the frozen legacy struct, this fails to BUILD instead of quietly reporting a
+// field that has moved (which is exactly how `compute_units` came to be 1024).
+const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, name) == 0);
+const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, total_global_mem) == 256);
+const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, shared_mem_per_block) == 264);
+const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, warp_size) == 276);
+const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, multi_processor_count) == 336);
+const _: () =
+    assert!(std::mem::offset_of!(hipDeviceProp_tR0000, max_threads_per_multi_processor) == 344);
+const _: () = assert!(
+    std::mem::offset_of!(hipDeviceProp_tR0000, max_shared_memory_per_multi_processor) == 376
+);
 const _: () = assert!(std::mem::offset_of!(hipDeviceProp_tR0000, gcn_arch_name) == 396);
 const _: () = assert!(std::mem::size_of::<hipDeviceProp_tR0000>() == 1472);
