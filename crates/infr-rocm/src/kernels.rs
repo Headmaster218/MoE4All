@@ -461,6 +461,20 @@ extern "C" __global__ void rope(
 "#;
 
 const QK_NORM_ROPE: &str = r#"
+// Store ONE output element of the fused rope. Unfused (`kv == nullptr`) that is the packed f32
+// scratch slot the standalone `write_kv` would then have read; fused (F1d, the `kv_write` peephole)
+// it is the f16 KV-cache slot `write_kv` would have written, cast with the SAME `__float2half` from
+// the SAME f32 value — an f32 register and an f32 round-trip through DRAM hold identical bits, so
+// the cache ends up byte-for-byte what the elided kernel wrote. `kv` is a UNIFORM kernel argument,
+// so this branch is scalar (SGPR): every lane of every wave takes the same side, and the unfused
+// path pays a single s_cbranch, not per-lane divergence.
+static __device__ __forceinline__ void qnr_store(
+    float* __restrict__ dst, __half* __restrict__ kv, long doff, long kvoff, int i, float v
+) {
+    if (kv != nullptr) kv[kvoff + i] = __float2half(v);
+    else               dst[doff + i] = v;
+}
+
 // One WAVE (32 lanes) per (row, head), vs the old one THREAD per head. At decode (rows==1) the old
 // grid launched rows*n_head=n_head threads → ~16 threads on ONE CU each serially running a head_dim
 // RMSNorm sum-of-squares reduction + the per-pair RoPE transcendentals (measured ~17% of decode).
@@ -484,7 +498,10 @@ extern "C" __global__ void qk_norm_rope(
     int rope_dim,                       // first rope_dim elements get RoPE
     float eps,
     float theta,
-    int x_stride       // per-row stride in elements; 0 = packed (n_head * head_dim)
+    int x_stride,      // per-row stride in elements; 0 = packed (n_head * head_dim)
+    __half* __restrict__ kv, // F1d: fused KV-cache write target (null = write the f32 `dst` scratch)
+    int kv_row,        // first cache ROW to write (the absorbed WriteKv's `pos`)
+    int kv_stride      // per-row elements in the cache (= n_head * head_dim when fused)
 ) {
     int head = blockIdx.x;             // one block == one wave == one (row, head)
     int total_heads = rows * n_head;
@@ -499,7 +516,11 @@ extern "C" __global__ void qk_norm_rope(
     // slot — mirrors infr-cpu QkNormRope and the Metal `qknormrope_f32` kernel.
     int head_stride = (x_stride > 0) ? (x_stride / n_head) : head_dim;
     int xoff = (x_stride > 0) ? (r * x_stride + h * head_stride) : (head * head_dim);
-    int doff = head * head_dim;
+    long doff = (long)head * head_dim;
+    // Fused (F1d) write base: cache row `kv_row + r`, head `h` packed within it. The peephole only
+    // fuses when `kv_stride == n_head * head_dim`, so this tiles the cache row exactly the way the
+    // elided `write_kv` (one thread per (row, element) of a packed src) did.
+    long kvoff = (long)(kv_row + r) * kv_stride + (long)h * head_dim;
     // rmsnorm over the head_dim query slice. Run the FULL sequential 0..head_dim sum on every lane
     // (redundant, but bit-identical to the old single-thread sum → `rms` unchanged; the sum is cheap
     // vs the RoPE transcendentals, and the reads broadcast across the wave).
@@ -512,7 +533,7 @@ extern "C" __global__ void qk_norm_rope(
     float rms = 1.0f / sqrtf(ss + eps);
     // Pass-through dims [rope_dim, head_dim): normed (× weight), no rotation. Strided across lanes.
     for (int i = rope_dim + tid; i < head_dim; i += 32) {
-        dst[doff + i] = x[xoff + i] * rms * __half2float(weight[i]);
+        qnr_store(dst, kv, doff, kvoff, i, x[xoff + i] * rms * __half2float(weight[i]));
     }
     // rope (NEOX split-half pairs (i, i+half)) on the first rope_dim elements, from normed values.
     // Each lane owns pairs i = tid, tid+32, … < half and writes BOTH the (i) and (i+half) slot.
@@ -527,8 +548,8 @@ extern "C" __global__ void qk_norm_rope(
         float s = sinf(angle);
         float a = x[xoff + i]        * rms * __half2float(weight[i]);
         float b = x[xoff + i + half] * rms * __half2float(weight[i + half]);
-        dst[doff + i]        = a * c - b * s;
-        dst[doff + i + half] = a * s + b * c;
+        qnr_store(dst, kv, doff, kvoff, i,        a * c - b * s);
+        qnr_store(dst, kv, doff, kvoff, i + half, a * s + b * c);
     }
 }
 "#;

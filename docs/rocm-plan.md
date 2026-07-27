@@ -483,9 +483,26 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72
-  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
-  pins both mappers to it.
+  72 `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's
+  cold-hiprtc re-measurement (backend init + a 1-token
+  bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps
+  each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE
+  kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs →
+  **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost
+  ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s
+  of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7
+  re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00
+  s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2
+  new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor
+  — essentially all of the delta is the dense kernels. **Warm-cache startup is
+  unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the
+  dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only
+  run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the
+  per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total
+  over`moe_native_fmt`), and that switch's comparand IS the f16 path. When
+  adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the
+  pairs a real GGUF can produce;`moe_expert_pair_tables_agree` pins both mappers
+  to it.
 - ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
   (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
   over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
@@ -614,12 +631,13 @@ Vulkan has the full set (`crates/infr-vulkan/src/recorder.rs:4251-6559`).
 ## 3. Fusion breadth
 
 ROCm has RmsNorm→Linear + Linear→Add peepholes (Slice 32), the **F1b**
-sibling-GEMV activation-quant memo and the **F1c** MoE folds (RmsNorm→MoeFfn,
-MoeFfn→Add — both below), plus, since **F1**, the capability-gated fusions its
-executor already implemented but the "start with NOTHING fused" bring-up dial in
-`backend.rs`'s `capabilities()` had never let the seam emit. Each was proved
-against the CPU reference first (`crates/infr-rocm/tests/parity.rs`, the "F1
-fusion gate" section) and then measured on a 7900 XTX:
+sibling-GEMV activation-quant memo, the **F1c** MoE folds (RmsNorm→MoeFfn,
+MoeFfn→Add) and the **F1d** K-write fold (QkNormRope→WriteKv — all below), plus,
+since **F1**, the capability-gated fusions its executor already implemented but
+the "start with NOTHING fused" bring-up dial in `backend.rs`'s `capabilities()`
+had never let the seam emit. Each was proved against the CPU reference first
+(`crates/infr-rocm/tests/parity.rs`, the "F1 fusion gate" section) and then
+measured on a 7900 XTX:
 
 | capability      | state | evidence                                                                                                                                                                                                                                                                                                |
 | --------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -702,7 +720,8 @@ Dense decode is now 451/token: `linear_i8_q4k` 140 (5 real GEMVs/layer),
   plan: the peephole's contract is an **f16** K row written straight into an f16
   cache, and ROCm's `qk_norm_rope` writes a fresh **f32** packed buffer
   (`zero_dev`). Needs an f16-out variant taking the cache pointer + ring row. V
-  has no rope to absorb its write, so the ceiling is 28.
+  has no rope to absorb its write, so the ceiling is 28. → **landed in F1d
+  below**, at exactly that ceiling.
 - **`quant_i8_32` (56) + `gated_act` (28) + `attention` (28)** — the remaining
   quant passes are _not_ sibling-redundant (o_proj's row comes from `attention`,
   down_proj's from `gated_act`); killing them means an int8-emitting epilogue on
@@ -801,9 +820,156 @@ commit (`15642b7`), warmed, first burst discarded:
 Qwen3-30B-A3B is 867/token. The largest remaining MoE-specific item is
 **`quant_i8_32` ×96** — 2 per layer (the expert `h` quantize between gate/up and
 down, and the o*proj input). Neither is sibling-redundant: `h` is produced by
-`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means an int8-emitting epilogue on the producing kernel, not a peephole — the same conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96 /`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48 here, blocked on an f16-out`qk_norm_rope`), and `linear_f16`
-×48 (the MoE router) is a single small GEMV per layer with nothing adjacent to
-absorb it.
+`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means
+an int8-emitting epilogue on the producing kernel, not a peephole — the same
+conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96
+/`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48
+here, blocked on an f16-out`qk_norm_rope` — **taken by F1d below**), and
+`linear_f16` ×48 (the MoE router) is a single small GEMV per layer with nothing
+adjacent to absorb it.
+
+### F1d — the K-write peephole
+
+Both F1b and F1c named `write_kv` next, and the shared pass had planned it since
+the unification (`infr_core::fusion::plan_kv_write`); ROCm just passed
+`kv_write: false`. The blocker was the kernel: the peephole's contract is an f16
+K row written straight into an f16 cache, and `qk_norm_rope` wrote a fresh f32
+packed scratch. It now takes `(kv, kv_row, kv_stride)` and, when they are set,
+casts each rotated element with `__float2half` into the cache row the elided
+`write_kv` would have filled. **Byte-identical, not close**: the value
+expression is untouched and an f32 register holds the same bits an f32
+round-trip through DRAM would have, so the cast sees exactly the input it saw
+before. `kv` is a uniform kernel argument, so the un-fused Q path pays one
+scalar branch, not per-lane divergence — no measurable cost on the dense
+control's `qk_norm_rope` ×56. The elided `WriteKv` also takes with it the K
+scratch entirely: its pooled draw, its zeroing `hipMemsetAsync`, and the
+round-trip.
+
+`FusionCfg::kv_write` has no per-backend predicate hook (its own gate is fixed:
+an Internal f16 rope `dst` feeding an immediately-following `WriteKv` into an
+f16 cache), so ROCm applies its coverage as a **post-filter** — `kv_fuse_ok` in
+`exec.rs` drops every planned entry this backend cannot reproduce exactly and
+**un-skips** its `WriteKv` so the standalone kernel replays. Four gates, each a
+way the fused kernel could differ from the pair it replaces:
+
+1. **`Op::QkNormRope` only.** The shared pass also matches an f16-out `Op::Rope`
+   (llama's K path), but ROCm's `rope` rotates an f32 buffer in place after a
+   DtoD copy — no output pointer to redirect, let alone an f16 one. Those keep
+   the split pair (Llama-3.2-1B is token-identical before/after at ~5 k
+   context).
+2. **The rope must tile the cache row exactly** —
+   `row_stride == n_head * head_dim`, same `rows`. The elided kernel copied
+   `rows × row_stride` packed elements; the fused grid is `rows × n_head` waves
+   of `head_dim`, so any other stride would leave the row's tail unwritten or
+   run into the NEXT position's slot.
+3. **No ring wrap.** `kv_swa_ring: false` means the seam hands ROCm full-context
+   caches and `write_kv` indexes `pos + row` with **no modulo at all**; the
+   shared plan hands back `pos % cap_rows` regardless, because Vulkan's ring
+   caches need it. The fused kernel writes the **plan's** row and the gate is
+   what makes that row equal `pos` — so "the fused variant does exactly what the
+   write path does today" is a checked property, not a comment, and the day ROCm
+   wants ring semantics this gate is what forces `write_kv` to learn them first.
+4. **Live range.** The plan carries no live-range bound for this pattern
+   (Vulkan's record-once decode _requires_ its K write fused, so it cannot
+   afford one), but redirecting the write leaves the rope's `dst` scratch never
+   written — safe only if nothing reads it. Reuses the shared
+   `dst_only_read_by_next`, now `pub`.
+
+Six parity cases, all `==` or poison-exact, all at a **non-zero** write row with
+every other cache row poisoned — a wrong row corrupts a _different_ position's
+attention, which a short greedy check does not see:
+`kv_write_fold_is_bit_identical_at_a_nonzero_row` (fold on vs off over the whole
+cache, `rows` 1 and 4, `pos` 0/1/5/11/12, plus an assert that the un-fused
+control actually filled its row, so the comparison cannot be vacuous),
+`kv_write_fold_lands_on_the_row_the_cpu_writes` (the **absolute** row against
+the CPU backend, so an offset wrong the same way on both sides of that A/B
+cannot survive), and one case per gate:
+`kv_write_fold_declines_a_row_the_write_path_would_not_wrap` (a cache declared 8
+rows and allocated 16, written at `pos = 11`: row 11 must hold the data and row
+3 must still be poison), `kv_write_fold_declines_a_row_stride_it_would_overrun`,
+`kv_write_fold_declines_when_the_rope_dst_is_read_again`, and
+`kv_write_fold_hatch_leaves_the_standalone_write`. Six mutations, all caught:
+dropping `kv_row` from the write offset, dropping the per-head offset, and
+dropping each of gates 2/3/4 or the un-skip.
+
+`kernels.rocm.fuse_kv_write` is the hatch (no env key, following `module_cache`
+— `--set kernels.rocm.fuse_kv_write=false`); it exists because a byte-identity
+claim is only checkable against the un-fused control.
+
+Kernel launches per decode token, F1c → F1d:
+
+| model                       | total         | `write_kv` |
+| --------------------------- | ------------- | ---------- |
+| Qwen3-0.6B Q4_K_M (dense)   | 451 → **423** | 56 → 28    |
+| Qwen3-30B-A3B Q4_K_M (MoE)  | 867 → **819** | 96 → 48    |
+| Qwen3.5-0.8B Q4_K_M (Delta) | 447 → **441** | 12 → 6     |
+
+Exactly the K half, per layer, on every arch; nothing else in either histogram
+moved. Prefill fuses too (Qwen3-0.6B `pp64` graph 560 → 532) — the fold is
+dtype-free and the fused grid is already one wave per (row, head).
+
+Measured on a 7900 XTX, interleaved against a binary built from the parent
+commit (`48d37e4`), warmed, first burst discarded, both binaries stripped of the
+temporary launch-histogram instrumentation:
+
+- Qwen3-0.6B `tg128 -r 2`: base 124.3/124.6/125.3/124.6 and 124.8/124.0/124.3 →
+  **127.4/127.9/128.2/127.8 and 127.7/127.4/127.5 (+2.6 %)**. Two independent
+  bursts, non-overlapping bands.
+- Qwen3-0.6B `tg64 -d 2048 -r 2` (decode at depth — where a ring-row bug would
+  show and a launch saving is diluted by the longer attention): base
+  93.2/93.2/92.9/93.1 → **94.2/94.7/94.9/94.5 (+1.6 %)**.
+- Qwen3-30B-A3B `tg64 -r 2`: base 46.6/46.7/46.8/46.6 → **47.4/47.5/47.4/47.4
+  (+1.6 %)**.
+- `pp512` a wash on both: dense 4443.7/4438.0/4452.8/4461.6 →
+  4477.1/4435.7/4432.9/4469.9; MoE 252.8/252.7/252.7/252.5 →
+  252.8/252.9/252.6/252.3. Prefill is weight-bandwidth-bound; 28 launches out of
+  a 532-launch chunk graph are not resolvable.
+- Qwen3.5-0.8B `tg128`: a wash (18.4/18.4/18.4 → 18.4/18.4/18.3) — 6 saved
+  launches on a 55 ms `deltanet_decode` token.
+
+`rocm_seam` 9/9 with qwen3 at `0xfd63781ea3bfa785` unmoved; `infr-rocm` 151;
+temp-0 output token-identical before/after on Qwen3-0.6B, Qwen3-30B-A3B and
+Qwen3.5-0.8B at a short prompt, and at ~2.8-5 k tokens of context on Qwen3-0.6B,
+Qwen3-30B-A3B, gemma-3-1b (SWA) and Llama-3.2-1B (the `Op::Rope` decline path).
+The shared pass's own gate is clean: `infr-vulkan` 216, `gpu_seam` 27/27 — the
+only `infr_core::fusion` change is making `dst_only_read_by_next` `pub`, which
+alters no plan.
+
+### V is NOT this peephole's to take
+
+The V half of `write_kv` (28 dense / 48 MoE) stays, and deliberately. V's write
+has a producer — but not one this pattern can absorb:
+
+- Its immediate producer is `Op::Linear` (the v projection), or `Op::Copy`
+  (gemma4 full layers, V = the raw K projection), or an `Op::AddBias` /
+  weightless `Op::QkNorm` writing `v` **in place**. None is a rope, and the
+  in-place ones have no output pointer to redirect at all.
+- Absorbing `Linear → WriteKv` is a **different** rewrite: a fifth shared
+  pattern plus an f16-cache-store epilogue on every int8-decode GEMV entry point
+  (12 named `linear_i8_*` kernels plus the macro family), mutually exclusive
+  with the fused-residual epilogue those same kernels already carry, and it must
+  decline the prefill WMMA/rocBLAS arm which does not go through them.
+
+That is a slice, not a peephole, and this one does not speculate about its
+result. What it does establish is the price of a launch on this path: 28 dense
+launches (plus their scratch draw + memset + round-trip) were worth +2.6 % of
+`tg128`, so the V half is worth roughly the same order — enough to justify
+_measuring_ the GEMV-epilogue work, not enough to justify guessing at it.
+
+### Next on this axis after F1d
+
+Dense decode is 423/token: `linear_i8_q4k` 140 (5 real GEMVs/layer),
+`rmsnorm_quant_i8_32` 57, `qk_norm_rope` 56, `quant_i8_32` 56, `linear_i8_q6k`
+29, `attention` 28, `gated_act` 28, `write_kv` 28, `argmax` 1. MoE is 819/token
+with `quant_i8_32` 96 and `write_kv` 48.
+
+The next-largest item that is not the GEMV itself is **`quant_i8_32` — 56 dense
+/ 96 MoE, two per layer** — and the conclusion is unchanged from F1c: neither is
+sibling-redundant (o_proj's row comes from `attention`, down_proj's from
+`gated_act`, the MoE `h` from `moe_gate_up_act_i8_idm_*`), so killing them needs
+an int8-emitting epilogue on the **producing** kernel, not a peephole — the same
+new-kernel work the V write above needs, on the same set of kernels. After that
+the remaining `write_kv` ×28/48 (V) is the next fusable count.
 
 ## 4. Device-side sampling
 

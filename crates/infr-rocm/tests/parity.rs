@@ -5644,3 +5644,444 @@ fn rmsnorm_moe_fold_is_bit_identical() {
         );
     }
 }
+
+// ── F1d: the `QkNormRope → WriteKv` peephole ─────────────────────────────────
+//
+// The fold makes `qk_norm_rope` cast each rotated element to f16 and store it in the KV cache row
+// the elided `write_kv` would have filled. Two things can go wrong and neither shows up in a short
+// greedy check: the VALUE can differ (a different rounding, a dropped norm weight), or the ROW can
+// be wrong — and a wrong row corrupts a DIFFERENT position's attention, which the next token's
+// argmax will happily not notice. Both get their own `==` case below, at a NON-ZERO write position
+// with the rest of the cache poisoned.
+
+/// Run `QkNormRope → WriteKv` on `be` and return the FULL f16 KV cache, downloaded as f32.
+/// The cache is pre-filled with `poison` so a fused write that lands on the wrong row, or that
+/// writes fewer elements than the row holds, is visible as a surviving/destroyed poison value.
+/// `dst` of the rope is an `Internal` f16 handle and the `WriteKv` immediately follows it — the
+/// exact shape `plan_kv_write` matches, so this graph fuses under the default config and splits
+/// under `fuse_kv_write = false`.
+#[allow(clippy::too_many_arguments)]
+fn run_qk_norm_rope_write_kv(
+    be: &dyn Backend,
+    x: &[f32],
+    weight_f16: &[u8],
+    positions: &[i32],
+    rows: usize,
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    eps: f32,
+    cache_rows: usize,
+    decl_rows: usize,
+    row_stride: usize,
+    pos: usize,
+    poison: f32,
+) -> Vec<f32> {
+    let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+    let mut g = Graph::new();
+    let xid = g.input(f32d(x.len()));
+    let wid = g.weight(TensorDesc::new(vec![head_dim], DType::F16));
+    let pid = g.input(TensorDesc::new(vec![positions.len()], DType::I32));
+    // Internal + F16: `plan_kv_write` requires both (it redirects the write, so an Output `dst`
+    // someone else reads back would silently lose its content).
+    let k16 = g.internal(f16d(rows * n_head * head_dim));
+    // `decl_rows` is the cache's DECLARED row capacity (what the shared pass derives its ring
+    // modulo from); `cache_rows` is what is actually allocated and read back. They differ in exactly
+    // one test — the one that pins that ROCm does NOT wrap.
+    let cache = g.input(f16d(decl_rows * row_stride));
+    g.push(Op::QkNormRope {
+        x: xid,
+        weight: wid,
+        positions: pid,
+        dst: k16,
+        rows: rows as u32,
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        rope_dim: rope_dim as u32,
+        theta,
+        eps,
+        freq_factors: None,
+        x_stride: 0,
+    });
+    g.push(Op::WriteKv {
+        src: k16,
+        cache,
+        rows: rows as u32,
+        row_stride: row_stride as u32,
+        pos: pos as u32,
+    });
+    let plan = be.compile(&g).expect("compile");
+
+    let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+    let wb = be.alloc(weight_f16.len(), BufferUsage::Weights).expect("w");
+    be.upload(wb.as_ref(), weight_f16).unwrap();
+    let pbytes: &[u8] = bytemuck::cast_slice(positions);
+    let pb = be
+        .alloc(pbytes.len(), BufferUsage::Activations)
+        .expect("pos");
+    be.upload(pb.as_ref(), pbytes).unwrap();
+    let n_cache = cache_rows * row_stride;
+    let mut poison_bytes = vec![0u8; n_cache * 2];
+    let ph = half::f16::from_f32(poison).to_bits().to_le_bytes();
+    for c in poison_bytes.chunks_exact_mut(2) {
+        c.copy_from_slice(&ph);
+    }
+    let cb = be.alloc(n_cache * 2, BufferUsage::KvCache).expect("cache");
+    be.upload(cb.as_ref(), &poison_bytes).unwrap();
+
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(wid, wb.as_ref());
+    b.bind(pid, pb.as_ref());
+    b.bind(cache, cb.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut raw = vec![0u8; n_cache * 2];
+    be.download(cb.as_ref(), &mut raw).unwrap();
+    raw.chunks_exact(2)
+        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect()
+}
+
+/// **The fused K write is bit-identical to the pair it replaces, at a non-zero row.** Same graph,
+/// fold on vs off (`fuse_kv_write`), `==` over the WHOLE cache — so it also pins that the fused
+/// kernel wrote *only* its own row (every other row must still hold the poison) and that it filled
+/// that row *completely* (no poison left inside it).
+///
+/// `pos` is deliberately not 0: the elided `write_kv` indexes `pos + row` and the fused kernel
+/// indexes `kv_row + r`, and at `pos == 0` those two agree even if one of them ignores the row
+/// offset entirely. Multi-row (`rows > 1`, the prefill shape) is included because the fused kernel
+/// derives its row from `blockIdx.x / n_head` rather than from a thread-linear id.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn kv_write_fold_is_bit_identical_at_a_nonzero_row() {
+    let (Some(on), Some(off)) = (rocm(), rocm_cfg(|c| c.fuse_kv_write = false)) else {
+        return;
+    };
+    let (n_head, head_dim, rope_dim) = (4usize, 64usize, 64usize);
+    let (cache_rows, theta, eps, poison) = (16usize, 10000.0f32, 1e-6f32, -7.5f32);
+    let w = f16_norm_weight(head_dim);
+    let row_stride = n_head * head_dim;
+    for (rows, pos) in [(1usize, 0usize), (1, 1), (1, 11), (4, 5), (4, 12)] {
+        let x = gen(rows * n_head * head_dim, 3 + pos);
+        let positions: Vec<i32> = (0..rows).map(|r| (pos + r) as i32).collect();
+        let go = |b: &dyn Backend| {
+            run_qk_norm_rope_write_kv(
+                b, &x, &w, &positions, rows, n_head, head_dim, rope_dim, theta, eps, cache_rows,
+                cache_rows, row_stride, pos, poison,
+            )
+        };
+        let fused = go(&on);
+        let split = go(&off);
+        let written = &split[pos * row_stride..(pos + rows) * row_stride];
+        assert!(
+            maxabs(written) > 1e-3,
+            "kv_write fold [rows={rows} pos={pos}] reference row is all-zero — test is vacuous"
+        );
+        assert!(
+            written.iter().all(|v| (v - poison).abs() > 1e-6),
+            "kv_write fold [rows={rows} pos={pos}] control left poison INSIDE the written row — \
+             the un-fused write did not fill it, so the comparison proves nothing"
+        );
+        assert_eq!(
+            fused,
+            split,
+            "the fused K write is not bit-identical to `qk_norm_rope`+`write_kv` at rows={rows} \
+             pos={pos} (max_err={:e}) — wrong row, wrong rounding, or a partially written row",
+            maxerr(&fused, &split)
+        );
+        // ...and every row outside [pos, pos+rows) must still be poison in the FUSED run. The `==`
+        // above already implies it, but stated separately this is the assertion that fails loudly
+        // when the row arithmetic is mutated (`kv_row + r` → `r`, `* kv_stride` dropped, …).
+        for r in 0..cache_rows {
+            if (pos..pos + rows).contains(&r) {
+                continue;
+            }
+            let row = &fused[r * row_stride..(r + 1) * row_stride];
+            assert!(
+                row.iter().all(|v| (v - poison).abs() < 1e-6),
+                "the fused K write corrupted cache row {r} (wrote at rows {pos}..{} for rows={rows})",
+                pos + rows
+            );
+        }
+    }
+}
+
+/// **A K row written at a non-zero position is the row attention reads back there.** The case above
+/// compares two ROCm runs against each other; this one pins the ABSOLUTE row against the CPU
+/// reference, so a row offset that is wrong in the same way on both sides of that A/B cannot
+/// survive. The CPU backend runs the identical two-op graph (it never fuses), and the comparison is
+/// the whole cache — poison rows included.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn kv_write_fold_lands_on_the_row_the_cpu_writes() {
+    let Some(on) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (n_head, head_dim, rope_dim) = (4usize, 64usize, 64usize);
+    let (cache_rows, theta, eps, poison) = (16usize, 10000.0f32, 1e-6f32, -7.5f32);
+    let row_stride = n_head * head_dim;
+    let w = f16_norm_weight(head_dim);
+    for (rows, pos) in [(1usize, 9usize), (3, 6)] {
+        let x = gen(rows * n_head * head_dim, 7 + pos);
+        let positions: Vec<i32> = (0..rows).map(|r| (pos + r) as i32).collect();
+        let go = |b: &dyn Backend| {
+            run_qk_norm_rope_write_kv(
+                b, &x, &w, &positions, rows, n_head, head_dim, rope_dim, theta, eps, cache_rows,
+                cache_rows, row_stride, pos, poison,
+            )
+        };
+        let gpu = go(&on);
+        let cpu_out = go(&cpu);
+        let e = maxerr(&gpu, &cpu_out);
+        let mag = maxabs(&cpu_out).max(1e-6);
+        assert!(
+            maxabs(&cpu_out) > 1e-3,
+            "kv_write row reference [rows={rows} pos={pos}] is all-zero — test is vacuous"
+        );
+        assert!(
+            e / mag < 1e-3,
+            "the fused K write does not land where the CPU writes [rows={rows} pos={pos}]: \
+             abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
+/// **The hatch really disables the fold, and the K row still gets written.** `fuse_kv_write = false`
+/// stops the shared pass planning this pattern at all, so nothing is elided and the standalone
+/// `write_kv` runs — the A/B control the two `==` cases above depend on. (The *decline* path, where
+/// the pass DID plan the fold and `kv_fuse_ok` rejected it, must additionally un-skip the elided
+/// op; that is pinned by `kv_write_fold_declines_a_row_the_write_path_would_not_wrap`, which fails
+/// if the un-skip is dropped.)
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn kv_write_fold_hatch_leaves_the_standalone_write() {
+    let Some(off) = rocm_cfg(|c| c.fuse_kv_write = false) else {
+        return;
+    };
+    let (rows, n_head, head_dim, rope_dim, pos) = (1usize, 4usize, 64usize, 64usize, 11usize);
+    let poison = -7.5f32;
+    let w = f16_norm_weight(head_dim);
+    let x = gen(rows * n_head * head_dim, 3);
+    let out = run_qk_norm_rope_write_kv(
+        &off,
+        &x,
+        &w,
+        &[pos as i32],
+        rows,
+        n_head,
+        head_dim,
+        rope_dim,
+        10000.0,
+        1e-6,
+        16,
+        16,
+        n_head * head_dim,
+        pos,
+        poison,
+    );
+    let row_stride = n_head * head_dim;
+    let written = &out[pos * row_stride..(pos + rows) * row_stride];
+    assert!(
+        written.iter().any(|v| (v - poison).abs() > 1e-6),
+        "with the fold hatched off nothing wrote the K row — cache row {pos} is still poison"
+    );
+}
+
+/// **ROCm does NOT wrap, and the fold must not start.** `kv_swa_ring: false` means the seam gives
+/// this backend full-context caches and `write_kv` indexes `pos + row` with no modulo at all — but
+/// the SHARED plan hands back `pos % cap_rows` regardless, because Vulkan's ring caches need it.
+/// `kv_fuse_ok` therefore declines any entry whose planned row is not the raw `pos`.
+///
+/// The shape is built by hand: the cache is DECLARED with 8 rows (so the shared pass plans row
+/// `11 % 8 == 3`) and ALLOCATED with 16 (so the un-wrapped write at row 11 lands inside real
+/// memory). Row 11 must hold the K row and row 3 must still be poison — i.e. the fused path is
+/// bit-identical to the write path it replaces *including where that write path is unusual*.
+/// Deleting the `row != pos` gate inverts both assertions.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn kv_write_fold_declines_a_row_the_write_path_would_not_wrap() {
+    let Some(on) = rocm() else {
+        return;
+    };
+    let (rows, n_head, head_dim, rope_dim, pos) = (1usize, 4usize, 64usize, 64usize, 11usize);
+    let (decl_rows, alloc_rows, poison) = (8usize, 16usize, -7.5f32);
+    let row_stride = n_head * head_dim;
+    let w = f16_norm_weight(head_dim);
+    let x = gen(rows * n_head * head_dim, 3);
+    let out = run_qk_norm_rope_write_kv(
+        &on,
+        &x,
+        &w,
+        &[pos as i32],
+        rows,
+        n_head,
+        head_dim,
+        rope_dim,
+        10000.0,
+        1e-6,
+        alloc_rows,
+        decl_rows,
+        row_stride,
+        pos,
+        poison,
+    );
+    let wrapped = pos % decl_rows;
+    assert!(
+        out[pos * row_stride..(pos + 1) * row_stride]
+            .iter()
+            .any(|v| (v - poison).abs() > 1e-6),
+        "the K row did not land at the un-wrapped row {pos} — the fold took a ring row ROCm's \
+         `write_kv` has never taken"
+    );
+    assert!(
+        out[wrapped * row_stride..(wrapped + 1) * row_stride]
+            .iter()
+            .all(|v| (v - poison).abs() < 1e-6),
+        "the fold wrapped the write to row {wrapped}; ROCm's `write_kv` does not wrap, so this \
+         silently corrupts whatever position actually lives there"
+    );
+}
+
+/// **A rope whose `dst` is still read after the write does not fuse.** The shared plan carries no
+/// live-range bound for this pattern (Vulkan's record-once decode REQUIRES its K write fused, so it
+/// cannot afford one), but eliding the write leaves the rope's `dst` scratch NEVER WRITTEN on ROCm
+/// — the executor would hand a later reader a freshly zeroed buffer. `kv_fuse_ok` gate 4 declines
+/// the fold instead. With the gate removed, `out` reads back all zeros.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn kv_write_fold_declines_when_the_rope_dst_is_read_again() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let (rows, n_head, head_dim, rope_dim, pos) = (1usize, 4usize, 64usize, 64usize, 5usize);
+    let (cache_rows, n) = (16usize, n_head * head_dim);
+    let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+    let w = f16_norm_weight(head_dim);
+    let x = gen(rows * n, 3);
+
+    let mut g = Graph::new();
+    let xid = g.input(f32d(x.len()));
+    let wid = g.weight(TensorDesc::new(vec![head_dim], DType::F16));
+    let pid = g.input(TensorDesc::new(vec![1], DType::I32));
+    let k16 = g.internal(f16d(rows * n));
+    let cache = g.input(f16d(cache_rows * n));
+    let out = g.output(f32d(rows * n));
+    g.push(Op::QkNormRope {
+        x: xid,
+        weight: wid,
+        positions: pid,
+        dst: k16,
+        rows: rows as u32,
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        rope_dim: rope_dim as u32,
+        theta: 10000.0,
+        eps: 1e-6,
+        freq_factors: None,
+        x_stride: 0,
+    });
+    g.push(Op::WriteKv {
+        src: k16,
+        cache,
+        rows: rows as u32,
+        row_stride: n as u32,
+        pos: pos as u32,
+    });
+    // The extra reader: without gate 4 this copies a scratch the fused rope never wrote.
+    g.push(Op::Copy {
+        src: k16,
+        src_off: 0,
+        dst: out,
+        dst_off: 0,
+        n: (rows * n) as u32,
+    });
+    let plan = be.compile(&g).expect("compile");
+
+    let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    be.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let wb = be.alloc(w.len(), BufferUsage::Weights).expect("w");
+    be.upload(wb.as_ref(), &w).unwrap();
+    let pv = [pos as i32];
+    let pbytes: &[u8] = bytemuck::cast_slice(&pv);
+    let pb = be
+        .alloc(pbytes.len(), BufferUsage::Activations)
+        .expect("pos");
+    be.upload(pb.as_ref(), pbytes).unwrap();
+    let cb = be
+        .alloc(cache_rows * n * 2, BufferUsage::KvCache)
+        .expect("cache");
+    let ob = be.alloc(rows * n * 4, BufferUsage::Readback).expect("out");
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(wid, wb.as_ref());
+    b.bind(pid, pb.as_ref());
+    b.bind(cache, cb.as_ref());
+    b.bind(out, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; rows * n];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    assert!(
+        maxabs(&o) > 1e-3,
+        "the rope's `dst` read back as all zeros — the fold elided the write of a scratch that is \
+         still live (live-range gate dropped)"
+    );
+}
+
+/// **A rope that does not tile the cache row exactly does not fuse.** The elided `write_kv` copies
+/// `row_stride` elements per row; the fused kernel instead writes `n_head * head_dim` of them,
+/// because that is the grid it runs. When the two differ, fusing either leaves the tail of the row
+/// unwritten or — as here, with a cache row NARROWER than the rope output — runs off the end of the
+/// row and into the NEXT position's slot, which is the exact "corrupts an unrelated position"
+/// failure a greedy check cannot see. `kv_fuse_ok` gate 2 declines the shape instead.
+///
+/// Nothing the seam emits has `row_stride != n_kv * head_dim`, so this is built by hand: a 4×64
+/// rope feeding a cache whose declared row holds only 128 elements. With the gate, row `pos + 1`
+/// stays poison; without it, the fused write spills into it.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn kv_write_fold_declines_a_row_stride_it_would_overrun() {
+    let Some(on) = rocm() else {
+        return;
+    };
+    let (rows, n_head, head_dim, rope_dim, pos) = (1usize, 4usize, 64usize, 64usize, 5usize);
+    let (cache_rows, row_stride, poison) = (16usize, 128usize, -7.5f32);
+    let w = f16_norm_weight(head_dim);
+    let x = gen(rows * n_head * head_dim, 3);
+    let out = run_qk_norm_rope_write_kv(
+        &on,
+        &x,
+        &w,
+        &[pos as i32],
+        rows,
+        n_head,
+        head_dim,
+        rope_dim,
+        10000.0,
+        1e-6,
+        cache_rows,
+        cache_rows,
+        row_stride,
+        pos,
+        poison,
+    );
+    assert!(
+        out[pos * row_stride..(pos + 1) * row_stride]
+            .iter()
+            .any(|v| (v - poison).abs() > 1e-6),
+        "the declined fold did not replay the elided `WriteKv` — cache row {pos} is still poison"
+    );
+    assert!(
+        out[(pos + 1) * row_stride..(pos + 2) * row_stride]
+            .iter()
+            .all(|v| (v - poison).abs() < 1e-6),
+        "the fused write overran its cache row into row {} — a row stride the fused kernel does \
+         not tile must not fuse",
+        pos + 1
+    );
+}

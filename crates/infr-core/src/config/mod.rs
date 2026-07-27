@@ -418,6 +418,14 @@ cfg_struct! {
         fuse_add: bool = true,
         /// `INFR_ROCM_NO_FUSE_NORM` (inverted) — via `FusionCfg.rmsnorm_linear.enabled`.
         fuse_norm: bool = true,
+        /// F1d: the `QkNormRope → WriteKv` peephole — the rotated f16 K row is written STRAIGHT
+        /// into the KV cache by `qk_norm_rope`, so the standalone `write_kv` never launches.
+        ///
+        /// Has NO env key (following `module_cache`/`moe_id_rows`): clear it with
+        /// `--set kernels.rocm.fuse_kv_write=false` or the TOML file. It exists so the fold's own
+        /// parity case can run the SAME graph with and without it — the fused write is claimed
+        /// BYTE-identical, and that claim is only checkable against the un-fused control.
+        fuse_kv_write: bool = true,
         /// Persist the hiprtc-compiled HIP module to disk
         /// (`infr_core::kernel_cache`, `~/.cache/infr/rocm-module-<arch>.bin`) and reload it at
         /// backend init instead of recompiling. Measured: ~9.2 s cold / ~0.25 s warm of

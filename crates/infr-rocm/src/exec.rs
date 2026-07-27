@@ -1588,7 +1588,7 @@ pub fn execute_graph(
 
 // ── Decode op-fusion peephole (Slice 32) ─────────────────────────────────────
 //
-// Four adjacent-op merges the backend detects on the AGNOSTIC graph (so they apply to every arch),
+// Five adjacent-op merges the backend detects on the AGNOSTIC graph (so they apply to every arch),
 // each with a scalar fallback when the pattern doesn't match:
 //
 //   1. `RmsNorm → Linear` (input_norm→qkv, post_attn_norm→gate/up): elide the standalone `rmsnorm`
@@ -1602,11 +1602,16 @@ pub fn execute_graph(
 //      experts read and the normalized f32 row the router reads.
 //   4. F1c `MoeFfn → Add(residual)`: the residual folds into the ordered expert-accumulate epilogue
 //      (`moe_accum_idm`), killing the last standalone `add` a pure-MoE decode paid.
+//   5. F1d `QkNormRope → WriteKv`: the rotated K row is written STRAIGHT into the f16 KV cache at
+//      the write row by `qk_norm_rope` itself, killing the standalone `write_kv` kernel AND the
+//      whole f32 K scratch (its pooled alloc, its zeroing memset, and the DRAM round-trip).
 //
-// All four are gated to decode (`m == 1` / one token row) int8 paths — the shipping default (every
-// `native_i8_fmt` / `moe_native_fmt` format).
-// Prefill (m>1, WMMA/rocBLAS) and uncovered formats keep the split ops. Escape hatches:
-// `INFR_ROCM_NO_FUSE_NORM` / `INFR_ROCM_NO_FUSE_ADD` (each covers its dense AND its MoE fold).
+// The first four are gated to decode (`m == 1` / one token row) int8 paths — the shipping default
+// (every `native_i8_fmt` / `moe_native_fmt` format).
+// Prefill (m>1, WMMA/rocBLAS) and uncovered formats keep the split ops. (5) is dtype-free and
+// applies to prefill too — the fused kernel's grid is already one wave per (row, head).
+// Escape hatches: `INFR_ROCM_NO_FUSE_NORM` / `INFR_ROCM_NO_FUSE_ADD` (each covers its dense AND its
+// MoE fold), and `kernels.rocm.fuse_kv_write` for (5).
 #[derive(Default)]
 struct DecodeFusion {
     /// Linear/MoeFfn op idx → (raw pre-norm x, norm weight, eps): run `rmsnorm_quant_i8_32` on the
@@ -1615,8 +1620,25 @@ struct DecodeFusion {
     /// Linear/MoeFfn op idx → (residual operand, add dst): fold the following `Add` into that op's
     /// write epilogue (the GEMV's, or the MoE expert accumulate's).
     add: HashMap<usize, (TensorId, TensorId)>,
-    /// Op indices to elide entirely (the fused-away `RmsNorm` / `Add`).
+    /// F1d: `QkNormRope` op idx → the absorbed `WriteKv`'s target. The rope kernel writes the f16
+    /// cache instead of its f32 `dst` scratch.
+    kv: HashMap<usize, KvFuse>,
+    /// Op indices to elide entirely (the fused-away `RmsNorm` / `Add` / `WriteKv`).
     skip: HashSet<usize>,
+}
+
+/// The absorbed `WriteKv`'s target, resolved at plan time (F1d).
+#[derive(Clone, Copy)]
+struct KvFuse {
+    /// The KV cache tensor — always a BOUND buffer (like `Op::WriteKv`'s own `cache`), never a
+    /// `ctx.dev` scratch, so the fused write lands in exactly the allocation the elided kernel used.
+    cache: TensorId,
+    /// First cache ROW to write — the SHARED plan's row, which `kv_fuse_ok` gate 3 has checked
+    /// equals the `WriteKv`'s raw `pos` (the fold is declined outright when a ring cache would have
+    /// made it `pos % cap_rows`, because ROCm's `write_kv` does not wrap).
+    row: u32,
+    /// Per-row elements in the cache (`= n_head * head_dim` of the rope, checked at plan time).
+    stride: u32,
 }
 
 /// Weight-dtype predicate for BOTH dense decode fusions: a covered int8-decode GEMV format
@@ -1678,7 +1700,11 @@ fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion 
             // Same hatch as the dense `Linear → Add` fold: it is the same rewrite.
             enabled: engine.kernels.rocm.fuse_add,
         }),
-        kv_write: false,
+        // F1d. The shared pass has no per-backend predicate hook here (its own gate is fixed: an
+        // Internal f16 rope `dst` feeding an immediately-following `WriteKv` into an f16 cache), so
+        // ROCm's coverage is applied as a POST-FILTER below — `kv_fuse_ok` drops every planned
+        // entry this backend's `qk_norm_rope` cannot reproduce exactly, and un-skips its `WriteKv`.
+        kv_write: engine.kernels.rocm.fuse_kv_write,
     };
     let plan = infr_core::fusion::plan_fusions(g, &cfg);
     // Both residual folds land in ONE map: they are keyed by op index and carry the same
@@ -1687,11 +1713,85 @@ fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion 
     // `Add` at `i + 1` has exactly one producer at `i`).
     let mut add = plan.linear_add;
     add.extend(plan.moe_add);
+    let mut skip = plan.skip;
+    // F1d post-filter: keep only the planned K writes this backend's fused kernel reproduces
+    // EXACTLY, and replay the standalone `write_kv` for the rest (un-skip its op index).
+    let mut kv = HashMap::new();
+    for (i, (cache, row)) in plan.kv_write {
+        match kv_fuse_ok(g, i, cache, row) {
+            Some(f) => {
+                kv.insert(i, f);
+            }
+            None => {
+                skip.remove(&(i + 1));
+            }
+        }
+    }
     DecodeFusion {
         norm: plan.rmsnorm_linear,
         add,
-        skip: plan.skip,
+        kv,
+        skip,
     }
+}
+
+/// F1d coverage filter for one planned `kv_write` entry (rope at op `i`, absorbed `WriteKv` at
+/// `i + 1`). `None` = decline, and the standalone `write_kv` runs as before.
+///
+/// The four gates, each a way the fused kernel could differ from the pair it replaces:
+///
+/// 1. **`Op::QkNormRope` only.** The shared pass also matches an f16-out `Op::Rope` (llama's K path),
+///    but ROCm's `rope` kernel rotates an f32 buffer IN PLACE after a DtoD copy — it has no output
+///    pointer to redirect, let alone an f16 one. Those keep the split pair.
+/// 2. **The rope must tile the cache row exactly**: `row_stride == n_head * head_dim` and the
+///    `WriteKv` must cover the same `rows`. The elided kernel copied `rows × row_stride` packed
+///    elements; the fused kernel's grid is `rows × n_head` waves each owning `head_dim` elements, so
+///    anything else would leave part of the row unwritten.
+/// 3. **NO RING WRAP.** ROCm reports `kv_swa_ring: false`, so the seam gives it full-context caches
+///    and `write_kv` indexes `pos + row` with no modulo at all. The shared plan hands back
+///    `pos % cap_rows`; requiring it to EQUAL `pos` is what makes "the fused variant does what the
+///    write path does today" a checked property rather than a comment. If ROCm ever gains ring
+///    semantics, `write_kv` learns them first and this gate is what forces the question.
+/// 4. **Live range.** The plan carries no live-range bound (Vulkan's record-once decode REQUIRES its
+///    K write fused, so it cannot afford one), but eliding the write leaves the rope's `dst` scratch
+///    unwritten — safe only if nothing reads it before it is next rewritten.
+fn kv_fuse_ok(g: &Graph, i: usize, cache: TensorId, row: usize) -> Option<KvFuse> {
+    let Op::QkNormRope {
+        dst,
+        rows,
+        n_head,
+        head_dim,
+        ..
+    } = g.ops[i]
+    else {
+        return None; // (1)
+    };
+    let Some(&Op::WriteKv {
+        pos,
+        rows: w_rows,
+        row_stride,
+        ..
+    }) = g.ops.get(i + 1)
+    else {
+        return None;
+    };
+    if row_stride != n_head * head_dim || w_rows != rows {
+        return None; // (2)
+    }
+    if row != pos as usize {
+        return None; // (3): the plan wrapped this write; ROCm's write path does not wrap.
+    }
+    if !infr_core::fusion::dst_only_read_by_next(g, i + 2, dst) {
+        return None; // (4)
+    }
+    // The row the fused kernel writes is the PLAN's row, not a locally re-derived `pos` — gate (3)
+    // is what makes those the same number, so dropping it cannot quietly leave a correct write
+    // behind. (`row == pos` there, so the cast is exact.)
+    Some(KvFuse {
+        cache,
+        row: row as u32,
+        stride: row_stride,
+    })
 }
 
 // ── Per-op dispatch ──────────────────────────────────────────────────────────
@@ -1719,6 +1819,7 @@ impl infr_core::exec::OpDispatch for RocmDispatch<'_, '_, '_> {
             self.ctx,
             self.fusion.norm.get(&i).copied(),
             self.fusion.add.get(&i).copied(),
+            self.fusion.kv.get(&i).copied(),
         )
     }
 }
@@ -1734,6 +1835,7 @@ fn run_op(
     ctx: &mut ExecCtx,
     norm_fuse: Option<(TensorId, TensorId, f32)>,
     add_fuse: Option<(TensorId, TensorId)>,
+    kv_fuse: Option<KvFuse>,
 ) -> Result<()> {
     // F1b: the sibling-GEMV quant memo is valid only for the op IMMEDIATELY after the pass that
     // published it. Clearing it here and republishing it from the int8 GEMV branch alone means any
@@ -2400,13 +2502,30 @@ fn run_op(
             // rotation and no strided-source copy (the old copy grabbed a packed prefix of a wider
             // row and then indexed it with the strided stride → out-of-bounds on multi-row prefill).
             // Matches infr-cpu QkNormRope, which always produces a fresh packed `out`.
-            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+            //
+            // F1d: when the `kv_write` peephole absorbed the following `WriteKv`, there is no `out`
+            // at all — the kernel casts each element to f16 and stores it in the KV cache row the
+            // elided `write_kv` would have filled. No scratch draw, no zeroing memset, no round
+            // trip, and `ctx.dev[dst]` deliberately stays unset (nothing may read it — `kv_fuse_ok`
+            // gate 4). The cache is the BOUND buffer, exactly as `Op::WriteKv` takes it.
+            let dd = match kv_fuse {
+                Some(_) => None,
+                None => Some(ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize)),
+            };
+            let (kv_ptr, kv_row, kv_stride) = match kv_fuse {
+                Some(f) => (
+                    rocm_buf(bindings.get(f.cache).expect("rocm: unbound KV cache")).ptr,
+                    f.row,
+                    f.stride,
+                ),
+                None => (std::ptr::null_mut(), 0, 0),
+            };
             let qnr_args = args![
                 arg_ptr(bx_ptr),
                 arg_ptr(wptr),
                 arg_ptr(bp_ptr),
                 arg_ptr(ff_ptr),
-                arg_ptr(dd.ptr),
+                arg_ptr(dd.as_ref().map_or(std::ptr::null_mut(), |d| d.ptr)),
                 arg_i32(rows as i32),
                 arg_i32(n_head as i32),
                 arg_i32(head_dim as i32),
@@ -2414,6 +2533,9 @@ fn run_op(
                 arg_f32(eps),
                 arg_f32(theta),
                 arg_i32(x_stride as i32),
+                arg_ptr(kv_ptr),
+                arg_i32(kv_row as i32),
+                arg_i32(kv_stride as i32),
             ];
             // One 32-lane WAVE per (row, head): grid = rows*n_head blocks of 32 threads. The kernel
             // reads `blockIdx.x` as the head index, so pass total*32 with block=32.
@@ -2425,7 +2547,9 @@ fn run_op(
                 32,
                 qnr_args,
             )?;
-            ctx.dev[dst.0 as usize] = Some(dd);
+            if let Some(d) = dd {
+                ctx.dev[dst.0 as usize] = Some(d);
+            }
         }
         Op::WriteKv {
             src,

@@ -386,7 +386,13 @@ fn plan_kv_write(graph: &Graph, plan: &mut FusionPlan) {
 
 /// Live-range check: from op index `start`, is `dst` read by NOTHING before it is next rewritten?
 /// Returns `true` if `dst` is dead until its next write (or graph end) — the fold is safe.
-fn dst_only_read_by_next(graph: &Graph, start: usize, dst: TensorId) -> bool {
+///
+/// `pub` because a backend post-filtering [`FusionPlan::kv_write`] needs the SAME bound: that plan
+/// carries no live-range guard (Vulkan's record-once decode path REQUIRES its K write fused, so it
+/// cannot be un-fused by a graph-shape test), and a backend that redirects the rope's write into the
+/// cache leaves the rope's `dst` scratch unwritten — safe only if nothing reads it. Sharing this
+/// function keeps that check the same one every other pattern uses.
+pub fn dst_only_read_by_next(graph: &Graph, start: usize, dst: TensorId) -> bool {
     for j in start..graph.ops.len() {
         let (ins, outs) = graph.ops[j].io();
         if ins.contains(&dst) {
