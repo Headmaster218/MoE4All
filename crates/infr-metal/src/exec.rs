@@ -1110,12 +1110,7 @@ fn prefer_attention_flash128(
     head_dim: usize,
     pipeline_ok: bool,
 ) -> bool {
-    f16
-        && rows == 4
-        && n_head >= 16
-        && kv_len >= 64
-        && head_dim == 128
-        && pipeline_ok
+    f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && pipeline_ok
 }
 
 fn select_attention_flash2_kern(
