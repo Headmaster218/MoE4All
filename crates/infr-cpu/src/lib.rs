@@ -578,11 +578,17 @@ impl Backend for CpuBackend {
         // The knobs this interpreter loop consults, read ONCE off the backend's config: the loop
         // below runs them per op (`reference`) or per MoeFfn op (`moe_counts`), so a resolve per
         // iteration would be a cost the env reads never had either (`docs/config-plan.md` R6).
-        let prof_ops = self.cfg.prof.prof_ops;
+        // The shared predicate (`INFR_PROF2` or `INFR_PROF_OPS`, ANDed with warmup suppression) —
+        // this backend used to read `prof.prof_ops` alone, so a bench that suppressed profiling
+        // around its untimed warmup still got that forward in the table.
+        let prof_ops = infr_core::prof::enabled(&self.cfg.prof);
         let reference = self.cfg.kernels.cpu.reference;
         let moe_counts = self.cfg.debug.moe_counts;
         let moe_counts_dump = self.cfg.debug.moe_counts_dump;
-        let mut op_times: HashMap<&'static str, f64> = HashMap::new();
+        // Labeled with the shared grammar (`infr_core::prof::op_label`), so a cpu-vs-GPU
+        // comparison lines up row for row instead of comparing a bare `Linear` against
+        // `Linear m=512 1536x1536 Q4K`.
+        let mut op_times: HashMap<String, (u64, f64)> = HashMap::new();
         for op in &g.ops {
             let __t0 = if prof_ops {
                 Some(std::time::Instant::now())
@@ -2632,17 +2638,21 @@ impl Backend for CpuBackend {
                 }
             }
             if let Some(t0) = __t0 {
-                *op_times.entry(op.kind()).or_insert(0.0) += t0.elapsed().as_secs_f64();
+                let e = op_times
+                    .entry(infr_core::prof::op_label(op, g))
+                    .or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += t0.elapsed().as_secs_f64();
             }
         }
         if prof_ops {
-            let mut v: Vec<_> = op_times.into_iter().collect();
-            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let tot: f64 = v.iter().map(|(_, t)| t).sum();
-            eprintln!("[prof-ops] execute totals ({:.1} ms):", tot * 1000.0);
-            for (k, t) in v {
-                eprintln!("  {k:12} {:7.2} ms  {:5.1}%", t * 1000.0, t / tot * 100.0);
+            // `Unit::Device`: on a host backend the wall time IS the execution time, so these rows
+            // are directly comparable to a GPU backend's and belong in the same exit aggregate.
+            let mut p = infr_core::prof::OpProf::new("cpu", infr_core::prof::Unit::Device);
+            for (label, (calls, secs)) in op_times {
+                p.add_n(label, secs * 1e6, calls);
             }
+            p.flush();
         }
 
         // Write back the buffers the model reads after execute: Outputs (logits) and mutated f32

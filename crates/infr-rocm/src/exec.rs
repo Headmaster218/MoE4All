@@ -305,7 +305,7 @@ impl AttnFlashTiling {
 ///    dims, then `nw` is the largest power of two that still fits — biggest `br` wins, because `br`
 ///    is exactly the factor by which global K/V traffic falls.
 fn attn_flash_tiling(head_dim: usize) -> Option<AttnFlashTiling> {
-    if head_dim == 0 || head_dim % 32 != 0 || head_dim > 256 {
+    if head_dim == 0 || !head_dim.is_multiple_of(32) || head_dim > 256 {
         return None;
     }
     let bc = if head_dim <= 128 { 32 } else { 16 };
@@ -1662,7 +1662,11 @@ pub fn execute_graph(
     // above (it also drives the Slice-37 prefetch schedule). The walk itself (graph order, the
     // Slice-32-elided indices skipped) is the shared `infr_core::exec` skeleton; only `run_op`'s
     // body is per-backend.
-    let mut prof = cfg.kernels.rocm.prof_ops.then(OpProf::new);
+    // Per-op profiling is the shared predicate now (`prof.per_op()` — INFR_PROF2 or INFR_PROF_OPS
+    // — ANDed with the warmup-suppression flag). It used to be `kernels.rocm.prof_ops`, which had
+    // no env var at all and ignored suppression, so every table rocm printed silently included the
+    // bench's untimed warmup forward.
+    let mut prof = infr_core::prof::enabled(&cfg.prof).then(OpProf::new);
     infr_core::exec::run_ops(
         &g.ops,
         &fusion.skip,
@@ -1928,11 +1932,14 @@ fn kv_fuse_ok(g: &Graph, i: usize, cache: TensorId, row: usize) -> Option<KvFuse
     })
 }
 
-// ── Per-op GPU-time profiler (P1) ────────────────────────────────────────────
+// ── Per-op GPU-time profiler (P1; unified onto the shared seam in U3) ────────
 //
 // ROCm had no per-op profiler at all, which is why every perf slice before P1 had to reason about
-// where a token went from launch COUNTS and isolated micro-benches. `kernels.rocm.prof_ops` turns
-// this on.
+// where a token went from launch COUNTS and isolated micro-benches.
+//
+// This type is now only the ACQUISITION half — recording HIP timing events around each op and
+// resolving them to microseconds. The accounting, the label grammar, the report format and the
+// process-wide aggregate all live in `infr_core::prof`, shared with vulkan/metal/cpu.
 //
 // Why HIP events and not a host timer: the ops all queue on ONE stream with no per-op sync (see
 // `execute_graph`), so a host `Instant` around `run_op` measures ENQUEUE, not execution. Putting a
@@ -1940,18 +1947,10 @@ fn kv_fuse_ok(g: &Graph, i: usize, cache: TensorId, row: usize) -> Option<KvFuse
 // the very ~2.7 µs floor F4 measured to every sample. A recorded timing-event pair costs the stream
 // nothing but a timestamp write, and `hipEventElapsedTime` reads the command processor's own
 // clocks AFTER the forward's existing barrier — so the profile is of the shipping schedule.
-//
-// Totals accumulate process-wide, keyed by op kind + the shape that makes the cost, and the table
-// is (re)printed after every forward. A bench run therefore ends with a cumulative table over every
-// forward it did; the LAST one printed is the one to read.
 struct OpProf {
     /// One entry per dispatched op, in walk order: `(label, start, end)`.
     spans: Vec<(String, ffi::hipEvent_t, ffi::hipEvent_t)>,
 }
-
-/// Process-wide totals: label → (dispatches, total GPU ms).
-static PROF_TOTALS: Mutex<Option<std::collections::BTreeMap<String, (u64, f64)>>> =
-    Mutex::new(None);
 
 impl OpProf {
     fn new() -> Self {
@@ -1980,19 +1979,16 @@ impl OpProf {
         }
     }
 
-    /// Read every span (the caller has already synchronized the stream), fold into the process
-    /// totals, print the table, and destroy the events.
+    /// Read every span (the caller has already synchronized the stream), hand the durations to the
+    /// shared collector to account and report, and destroy the events.
     fn flush(self) {
-        let mut guard = PROF_TOTALS.lock().unwrap();
-        let totals = guard.get_or_insert_with(Default::default);
+        let mut p = infr_core::prof::OpProf::new("rocm", infr_core::prof::Unit::Device);
         for (label, start, end) in self.spans {
             let mut ms = 0.0f32;
             if !end.is_null()
                 && unsafe { ffi::hipEventElapsedTime(&mut ms, start, end) } == HIP_SUCCESS
             {
-                let e = totals.entry(label).or_insert((0, 0.0));
-                e.0 += 1;
-                e.1 += ms as f64;
+                p.add(label, ms as f64 * 1000.0);
             }
             unsafe {
                 ffi::hipEventDestroy(start);
@@ -2001,65 +1997,7 @@ impl OpProf {
                 }
             }
         }
-        let mut rows: Vec<_> = totals.iter().collect();
-        rows.sort_by(|a, b| {
-            b.1 .1
-                .partial_cmp(&a.1 .1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let total: f64 = rows.iter().map(|r| r.1 .1).sum();
-        eprintln!("[rocm prof] cumulative GPU time, {total:.2} ms over all forwards so far");
-        eprintln!(
-            "[rocm prof] {:>10} {:>7} {:>9} {:>9}  op",
-            "ms", "share", "count", "us/ea"
-        );
-        for (label, (n, ms)) in rows {
-            let share = if total > 0.0 { ms / total * 100.0 } else { 0.0 };
-            let each = if *n > 0 { ms * 1000.0 / *n as f64 } else { 0.0 };
-            eprintln!("[rocm prof] {ms:>10.2} {share:>6.1}% {n:>9} {each:>9.1}  {label}");
-        }
-    }
-}
-
-/// The profile key for one op: its kind plus the shape that makes its cost. Two dispatches share a
-/// row exactly when they do the same work, so a 28-layer model folds into a handful of rows.
-fn prof_label(op: &Op, g: &Graph) -> String {
-    match *op {
-        Op::Linear {
-            weight,
-            m,
-            in_f,
-            out_f,
-            ..
-        } => format!("Linear m={m} {in_f}x{out_f} {:?}", g.desc(weight).dtype),
-        Op::Attention {
-            rows,
-            kv_len,
-            n_head,
-            n_kv,
-            head_dim,
-            mask,
-            ..
-        } => format!(
-            "Attention rows={rows} kv={kv_len} h={n_head}/{n_kv} d={head_dim} {}",
-            match mask {
-                AttnMask::Causal => "causal",
-                AttnMask::SlidingWindow(_) => "swa",
-                AttnMask::Canvas { .. } => "canvas",
-            }
-        ),
-        Op::MoeFfn {
-            gate_exps,
-            ne,
-            n_expert,
-            n_used,
-            n_ff_exp,
-            ..
-        } => format!(
-            "MoeFfn ne={ne} nff={n_ff_exp} {n_used}/{n_expert} {:?}",
-            g.desc(gate_exps).dtype
-        ),
-        _ => op.kind().to_string(),
+        p.flush();
     }
 }
 
@@ -2086,7 +2024,7 @@ impl infr_core::exec::OpDispatch for RocmDispatch<'_, '_, '_> {
         // (split-KV attention, the MoE expert loop) plus any copy — which is what "where does the
         // forward go" wants, not per-kernel accounting.
         if let Some(p) = self.prof.as_deref_mut() {
-            p.begin(prof_label(op, self.g), self.ctx.stream);
+            p.begin(infr_core::prof::op_label(op, self.g), self.ctx.stream);
         }
         let r = run_op(
             op,

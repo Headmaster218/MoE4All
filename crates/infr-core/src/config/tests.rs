@@ -109,10 +109,9 @@ fn default_config_matches_documented_defaults() {
     // default against its own `MOE_ID_ROWS` knob table.
     assert_eq!(d.kernels.rocm.moe_id_rows, 128);
     // P1: the tiled flash prefill attention kernel ships ON (it replaced the single-wave scalar
-    // one); the per-op GPU-time profiler is diagnostic, so it is OFF by default (it creates a HIP
-    // timing-event pair per dispatch). Both env-key-less like the two above.
+    // one). Env-key-less like the two above. (`kernels.rocm.prof_ops` used to sit here; U3 folded
+    // it into the cross-backend `prof.per_op()` — see `prof_per_op_is_the_one_knob`.)
     assert!(d.kernels.rocm.attn_flash);
-    assert!(!d.kernels.rocm.prof_ops);
     // RM: the Metal `MTLBinaryArchive` pipeline cache is ON by default, for the same reason — a
     // launch should not re-run the driver's AIR → ISA back end for every kernel. Env-key-less too.
     assert!(d.kernels.metal.pipeline_cache);
@@ -872,6 +871,24 @@ fn toml_sections_mirror_the_struct_paths() {
     assert!(!cfg.kernels.vulkan.gemm_warp);
     assert_eq!(cfg.kernels.vulkan.gemv.rm, 4);
     assert_eq!(cfg.multi.pipeline.as_deref(), Some(&[0usize, 1][..]));
+}
+
+/// `prof.per_op()` is THE per-op profiling switch, and both frozen env spellings reach it.
+///
+/// Before U3 each backend had its own: `INFR_PROF2` reached only vulkan, `INFR_PROF_OPS` only the
+/// cpu backend, and rocm's `kernels.rocm.prof_ops` had no env key at all — so whether
+/// `INFR_PROF_OPS=1 infr bench …` profiled anything depended on `--dev`, silently. Any future
+/// backend gates on this accessor (through `infr_core::prof::enabled`, which also ANDs warmup
+/// suppression), never on a knob of its own.
+#[test]
+fn prof_per_op_is_the_one_knob() {
+    let d = Config::default();
+    assert!(!d.prof.per_op(), "diagnostic — off by default");
+
+    for env in ["INFR_PROF2", "INFR_PROF_OPS"] {
+        let cfg = Config::load_from_layers(&[env_layer(&[(env, "1")])]);
+        assert!(cfg.prof.per_op(), "{env} must enable per-op profiling");
+    }
 }
 
 /// `INFR_METAL_PROFILE` is NOT an integer level (§6.12, §10.4): presence turns the profiler on,

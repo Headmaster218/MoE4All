@@ -40,43 +40,38 @@ impl Profile {
         self.forwards += 1;
     }
 
+    /// Print through the shared reporter ([`infr_core::prof::OpProf`]) so this backend's table has
+    /// the same columns, the same sort and the same `[prof:<backend>]` tag as vulkan's, rocm's and
+    /// the cpu backend's — and so its DEVICE rows land in the process-wide exit aggregate and the
+    /// `INFR_PROFILE_OUT` JSON, which they never did before.
+    ///
+    /// Two tables, not one, because Metal measures two different quantities and only one of them is
+    /// device time: the always-available per-op number is host ENCODE wall (ops batch into one
+    /// command buffer, so nothing else is free), while GPU wall per op exists only in the modes
+    /// that pay for it (`INFR_METAL_PROFILE=2` flushes after each op; `=3` samples stage-boundary
+    /// counters). Summing them would be meaningless, so they print as separate units and only the
+    /// device one feeds the aggregate.
     pub fn print_summary(&self) {
         if self.forwards == 0 {
             return;
         }
         let total: Duration = self.per_op.values().map(|(_, d)| *d).sum();
         let total_s = total.as_secs_f64().max(1e-9);
-        let mut rows: Vec<_> = self.per_op.iter().collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1 .1));
-
-        // Per-op GPU wall (populated only in per-op mode): the share of GPU time each op costs.
-        let gpu_total: Duration = self.per_op_gpu.values().copied().sum();
-        let gpu_total_s = gpu_total.as_secs_f64().max(1e-9);
-        let have_gpu = !self.per_op_gpu.is_empty();
 
         eprintln!("\n── infr-metal profile ({} forwards) ──", self.forwards);
-        if have_gpu {
-            eprintln!(
-                "{:<12} {:>8} {:>11} {:>11} {:>7}",
-                "op", "calls", "enc(ms)", "gpu(ms)", "gpu%"
-            );
-            let mut grows: Vec<_> = self.per_op.iter().collect();
-            grows.sort_by(|a, b| self.per_op_gpu.get(b.0).cmp(&self.per_op_gpu.get(a.0)));
-            for (name, (calls, d)) in grows {
-                let enc = d.as_secs_f64() * 1e3;
-                let gpu = self.per_op_gpu.get(name).copied().unwrap_or_default();
-                let gpu_ms = gpu.as_secs_f64() * 1e3;
-                let pct = 100.0 * gpu.as_secs_f64() / gpu_total_s;
-                eprintln!("{name:<12} {calls:>8} {enc:>11.1} {gpu_ms:>11.1} {pct:>6.1}%");
+        if !self.per_op_gpu.is_empty() {
+            let mut p = infr_core::prof::OpProf::new("metal", infr_core::prof::Unit::Device);
+            for (name, d) in &self.per_op_gpu {
+                let calls = self.per_op.get(name).map(|(c, _)| *c).unwrap_or(1);
+                p.add_n(*name, d.as_secs_f64() * 1e6, calls);
             }
-        } else {
-            eprintln!("{:<12} {:>8} {:>11} {:>7}", "op", "calls", "enc(ms)", "%");
-            for (name, (calls, d)) in rows {
-                let ms = d.as_secs_f64() * 1e3;
-                let pct = 100.0 * d.as_secs_f64() / total_s;
-                eprintln!("{name:<12} {calls:>8} {ms:>11.1} {pct:>6.1}%");
-            }
+            p.flush();
         }
+        let mut p = infr_core::prof::OpProf::new("metal", infr_core::prof::Unit::HostEncode);
+        for (name, (calls, d)) in &self.per_op {
+            p.add_n(*name, d.as_secs_f64() * 1e6, *calls);
+        }
+        p.flush();
 
         // The per-op wall above is CPU-side *encode* time (each op appends to the batch). The GPU
         // actually runs at flush (commit + wait), which the batch defers — so report the two

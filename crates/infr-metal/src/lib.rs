@@ -94,8 +94,16 @@ struct ProfileGate {
 }
 
 impl ProfileGate {
+    /// Both suppression mechanisms have to clear: this backend's own RAII counter
+    /// ([`suppress`](Self::suppress), used by the Metal bench setup) AND the process-wide flag the
+    /// other backends' warmup paths set (`infr_llama::with_prof2_suppressed`). They existed
+    /// independently — the shared helper's doc said "the Metal path deliberately does NOT use it" —
+    /// which meant a bench that suppressed through the shared helper still got Metal's untimed
+    /// warmup folded into its profile.
     fn enabled(&self, configured: bool) -> bool {
-        configured && self.suppressions.load(std::sync::atomic::Ordering::Relaxed) == 0
+        configured
+            && !infr_core::prof::suppressed()
+            && self.suppressions.load(std::sync::atomic::Ordering::Relaxed) == 0
     }
 
     fn suppress(&self) -> ProfileSuppression<'_> {
@@ -255,7 +263,10 @@ impl MetalBackend {
             weight_cache: std::sync::Mutex::new(IdCache::default()),
             qui_cache: std::sync::Mutex::new(IdCache::default()),
             weight_pb: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            profiling: cfg.prof.metal_profiling(),
+            // The shared per-op knob (`INFR_PROF2` / `INFR_PROF_OPS`) turns this backend's profiler
+            // on too — it used to answer only to `INFR_METAL_PROFILE`, so the cross-backend
+            // profiling command line silently did nothing here.
+            profiling: cfg.prof.metal_profiling() || cfg.prof.per_op(),
             prof_ops: cfg.prof.metal_prof_ops(),
             counter_set,
             profile_gate: ProfileGate::default(),

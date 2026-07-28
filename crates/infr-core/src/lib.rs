@@ -19,6 +19,9 @@ pub mod iquant_grids;
 pub mod kernel_cache;
 pub mod loader;
 pub mod pager;
+/// The per-op profiling seam every backend reports through — one collector, one label grammar,
+/// one report, one on/off predicate (`prof.per_op()` ANDed with the warmup-suppression flag).
+pub mod prof;
 pub mod progress;
 pub mod shutdown;
 pub mod tensor;

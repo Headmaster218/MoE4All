@@ -457,17 +457,6 @@ cfg_struct! {
         /// kernel's parity case runs the SAME graph both ways, and "matches the single-wave kernel
         /// it replaces" is only checkable against that control.
         attn_flash: bool = true,
-        /// Per-op GPU-time profiling (P1). With this set, `execute_graph` brackets every dispatch
-        /// in a pair of HIP timing events and, after the forward's single stream barrier, prints a
-        /// cumulative `op kind + shape → total ms / share / count` table to stderr. It is the only
-        /// per-op profiler this backend has — ROCm has no `infr-prof` GPU analogue, and the ~2.7 µs
-        /// dispatch floor makes a `hipStreamSynchronize`-per-op timer useless, so the events read
-        /// the command processor's own timestamps instead.
-        ///
-        /// Costs one event pair per op while on (a few ms of `hipEventCreate` per forward), so it
-        /// is DIAGNOSTIC, never a shipping default. Has NO env key, like `module_cache` /
-        /// `moe_id_rows`: `--set kernels.rocm.prof_ops=true` or the TOML file.
-        prof_ops: bool = false,
     }
 }
 
@@ -569,7 +558,10 @@ cfg_struct! {
     ProfCfg / PartialProfCfg {
         /// `INFR_PROF`.
         prof: bool = false,
-        /// `INFR_PROF2`: per-dispatch GPU timestamps.
+        /// `INFR_PROF2`: per-op profiling. Historically vulkan-only (per-dispatch GPU timestamps);
+        /// now an alias for [`prof_ops`](ProfCfg::prof_ops) via
+        /// [`per_op`](ProfCfg::per_op) — read that, never this field, when deciding whether to
+        /// profile.
         prof2: bool = false,
         /// `INFR_PROF2_SHAPES`, ANDed with [`ProfCfg::prof2`] at the site.
         prof2_shapes: bool = false,
@@ -600,6 +592,19 @@ cfg_struct! {
 }
 
 impl ProfCfg {
+    /// Is per-op profiling on? THE predicate every backend gates its profiler on (through
+    /// [`infr_core::prof::enabled`](crate::prof::enabled), which additionally ANDs the
+    /// warmup-suppression flag).
+    ///
+    /// `INFR_PROF2` and `INFR_PROF_OPS` are aliases for one another. They were not: `INFR_PROF2`
+    /// reached only vulkan, `INFR_PROF_OPS` only the cpu backend, and rocm's equivalent
+    /// (`kernels.rocm.prof_ops`) had no environment variable at all — so the same command line
+    /// profiled or silently did nothing depending on `--dev`. Both names stay because the config
+    /// campaign froze env spellings and both are in people's shell history.
+    pub fn per_op(&self) -> bool {
+        self.prof2 || self.prof_ops
+    }
+
     /// `INFR_METAL_PROFILE` is set to ANYTHING (including the empty string) ⇒ the Metal execution
     /// profiler runs. Exactly `std::env::var("INFR_METAL_PROFILE").is_ok()`, which is what
     /// `MetalBackend::new` read (S6).

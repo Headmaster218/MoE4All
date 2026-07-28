@@ -907,7 +907,7 @@ impl<'a> Recorder<'a> {
         let dbgcfg = &backend.cfg().debug;
         let (bda_chunk_elem_cap, bda_chunk_byte_cap) =
             bda_chunk_caps(&backend.cfg().kernels.vulkan);
-        let prof2 = profcfg.prof2 && !persistent && !infr_prof_rt::prof2_suppressed();
+        let prof2 = infr_core::prof::enabled(profcfg) && !persistent;
         let prof2_shapes = prof2 && profcfg.prof2_shapes;
         let query_pool = if prof2 {
             let qp = unsafe {
@@ -8982,27 +8982,16 @@ impl<'a> Recorder<'a> {
         }
         .limits
         .timestamp_period; // ns per tick
-        use std::collections::BTreeMap;
-        let mut by: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
-        let mut total = 0f64;
+                           // Accounted, aggregated and printed by the shared reporter (`infr_core::prof::OpProf`),
+                           // which is where the `gpu_add` fold into the process-wide exit table now happens too — the
+                           // same code path rocm, metal and the cpu backend report through, so the four tables are
+                           // column-for-column comparable.
+        let mut p = infr_core::prof::OpProf::new("vulkan", infr_core::prof::Unit::Device);
         for i in 0..n {
             let us = (ticks[i + 1].wrapping_sub(ticks[i]) as f64) * period as f64 / 1000.0;
-            let e = by.entry(labels[i]).or_insert((0.0, 0));
-            e.0 += us;
-            e.1 += 1;
-            total += us;
+            p.add(labels[i], us);
         }
-        eprintln!("[prof2] per-op GPU time (total {total:.0}us across {n} ops):");
-        let mut rows: Vec<_> = by.into_iter().collect();
-        rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-        for (lbl, (us, cnt)) in rows {
-            infr_prof_rt::gpu_add(lbl, us, cnt as u64);
-            eprintln!(
-                "[prof2]   {lbl:>14}  {us:8.0}us  ({cnt:3} ops, {:.1}us/op, {:.0}%)",
-                us / cnt as f64,
-                100.0 * us / total
-            );
-        }
+        p.flush();
     }
 }
 

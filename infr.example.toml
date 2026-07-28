@@ -183,7 +183,6 @@ fuse_add = true
 fuse_norm = true
 fuse_kv_write = true # QkNormRope writes the K row into the cache (no env twin)
 attn_flash = true    # tiled flash PREFILL attention (no env twin)
-prof_ops = false     # per-op GPU-time table to stderr, diagnostic (no env twin)
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
 # coop_tile = "64x64" # default: unset = the 128x64 tile
 
@@ -232,8 +231,12 @@ ep_p2p = true
 
 [prof]
 prof = false
-prof2 = false # per-dispatch GPU timestamps
-prof2_shapes = false # shape-itemized GEMV/GEMM buckets (needs prof2)
+# prof2 and prof_ops are aliases: either one turns on per-op profiling, on EVERY
+# backend (vulkan / rocm / metal / cpu). One table format, one process-exit
+# aggregate. See docs/perf.md § Profiling.
+prof2 = false
+prof_ops = false
+prof2_shapes = false # vulkan only: shape-itemized GEMV/GEMM buckets
 prof_dec = false
 prof_pf = false
 vram_log = false

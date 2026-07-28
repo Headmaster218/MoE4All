@@ -74,7 +74,7 @@ slices at once.
 2. **Pick the biggest win** — not the most interesting one. Weigh
    `gap × how much anyone runs that config`. A model class at 0.5x beats a model
    at 0.9x. A whole quant family on a slow path beats one shape.
-3. **Profile before designing** — `INFR_PROF2=1` per-op GPU timestamps. Form a
+3. **Profile before designing** — `INFR_PROF_OPS=1` per-op device time. Form a
    hypothesis about the bottleneck _class_ (taxonomy below) and verify it with a
    micro-benchmark before writing the fix. Two campaign lessons: a "kernel math"
    hypothesis turned out to be occupancy (LDS budget), and a "GEMM" hypothesis
@@ -150,48 +150,96 @@ not just ratios (llama.cpp's side drifts with the same heat).
 
 ## Profiling
 
+**One knob, every backend.** `INFR_PROF_OPS=1` (or its alias `INFR_PROF2=1`)
+turns on per-op profiling on Vulkan, ROCm, Metal and the CPU backend alike:
+
 ```bash
-INFR_PROF2=1 infr bench "$M" -p 512 -n 0 -r 1   # per-op GPU timestamps
-INFR_PROF_PF=1 ...                              # per-chunk prefill wall time
+INFR_PROF_OPS=1 infr bench "$M" -p 512 -n 0 -r 1   # per-op device time, any --dev
+INFR_PROF_PF=1  ...                                # per-chunk prefill wall time
 ```
 
-Metal uses `INFR_METAL_PROFILE` instead: `=1` encode/GPU wall split, `=3` per-op
-GPU time from stage-boundary counter samples — **the only honest per-op mode**:
-the decode replay tape re-executes tokens without walking ops, so the flush mode
-(`=2`) silently attributes a sample of one token. `=3` disables the tape for the
-run. Sweep with `--dev MTL0` (llama-bench rejects `Vulkan0` on a Metal box).
-Micro-probes live in `crates/infr-metal/tests/` (`gemv_bw`, `dispatch_overhead`)
-— chained-dispatch numbers there are thermally unstable across back-to-back
-runs; trust e2e benches for accept / revert calls.
+Every backend prints the same table, tagged with its name, sorted by total time:
 
-- `INFR_PROF2` prints one block per submit plus ONE aggregated
-  `INFR_PROF2 GPU report` at process exit (per-label totals summed over every
-  profiled submit — no more awk-summing blocks by hand). **Trust the percentages
-  and per-op relative times; the absolute µs totals can overflow.** The op label
-  breakdown is the primary signal.
-- **Labels are automatic.** Every dispatch is timestamped at the recorder's
-  dispatch chokepoints and labeled with its **kernel name** (the
-  `be.kernel("name", …)` cache key travels on `ComputeKernel`). Adding a stamp
-  call for a new kernel is no longer a thing — a new kernel shows up in the
-  report by existing. Labels are per-dispatch; aggregation by name happens at
-  report time (the old stamp-covers-several-dispatches grouping is gone, which
-  also un-hides dispatches that used to melt into the previous label's bucket).
-  `Recorder::label_next("…")` remains as a one-shot override for kernels whose
-  name alone is ambiguous (e.g. `expert_gateup` vs `expert_down` share one MMQ
-  kernel; the `lin_vocab_out`/`lin_vocab_in` lm_head-vs-projection split).
-  Buffer copies and fills stamp as `copy_buffer` / `zero_fill`.
-- `INFR_PROF2_SHAPES=1` (on top of `INFR_PROF2`) swaps GEMV/GEMM labels for
-  shape-itemized ones (`mmvr:m4:1536x24576`) — per-route, per-projection-shape
-  buckets.
+```
+[prof:rocm]       4.91   27.3%       14     350.7  Linear m=128 3072x1024 Q6K
+[prof:rocm]       2.25   12.5%       28      80.2  Linear m=128 1024x6144 Q4K
+[prof:rocm]       1.14    6.4%       28      40.8  Attention rows=128 kv=128 h=16/8 d=128 causal
+```
+
+and every backend also folds its rows into ONE process-exit aggregate over the
+whole run (`== per-op device report: …`), which is the same report the
+`INFR_PROFILE=1` host function table prints into and the same one
+`INFR_PROFILE_OUT` writes as JSON. So the host section tells you _that_ the GPU
+path waits in `replay_n`; the device section tells you which ops it waited on —
+on any backend, now, rather than only on Vulkan.
+
+This was four separate tools until the U1–U3 unification, and the split cost
+real work: `INFR_PROF_OPS=1` on a GPU run profiled **nothing** (only the CPU
+backend read it), ROCm's equivalent had no env var at all and was reachable only
+through `--set`, and ROCm's and Metal's tables silently included the bench's
+untimed warmup forward. If you are reading an old profile in a commit message
+from before that, its shares are diluted. The seam is
+`crates/infr-core/src/prof.rs`; a source tripwire fails the build if a backend
+reaches past it.
+
+**Labels.** `op kind + the shape that makes the cost`, so two dispatches share a
+row exactly when they do the same work — a 28-layer model folds to a handful of
+rows and `us/ea` means one shape's cost, not an average over shapes that differ
+by 100x. `Linear` carries `m` (which separates decode's GEMV from prefill's GEMM
+on the same weight), `Attention` carries `kv_len` (the whole at-depth story),
+and `MoeFfn` carries its expert geometry. Everything else is the bare op kind.
+
+**Units are not always device time**, and the table says which it is. Metal's
+always-on mode measures host _encode_ wall (`[prof:metal] … host-encode`),
+because its ops batch into one command buffer and nothing finer is free — a
+large encode share is itself the finding. Only `Unit::Device` rows feed the exit
+aggregate, so a host-encode number can never be summed against a device one by
+accident.
+
+### Backend-specific notes
+
+- **Vulkan** labels by **kernel name**, not op kind — its walk is a recorder
+  that lowers one op into several dispatches, so the kernel is the finer, truer
+  unit there. Labels are automatic: the `be.kernel("name", …)` cache key travels
+  on `ComputeKernel`, so a new kernel appears in the report by existing. Buffer
+  copies and fills stamp as `copy_buffer` / `zero_fill`.
+  `Recorder::label_next("…")` overrides one dispatch whose name is ambiguous
+  (`expert_gateup` vs `expert_down` share one MMQ kernel; the
+  `lin_vocab_out`/`lin_vocab_in` lm_head-vs-projection split).
+  `INFR_PROF2_SHAPES=1` swaps GEMV/GEMM labels for shape-itemized ones
+  (`mmvr:m4:1536x24576`) — Vulkan's equivalent of the shared itemizer. **Trust
+  the percentages and per-op relative times; the absolute µs totals can
+  overflow.** Decode's record-once replay tape cannot carry per-replay
+  timestamps (queries are baked at record time), so the replayed decode path
+  reports nothing — set `INFR_SEAM_NO_REPLAY=1` to force the re-recorded path
+  when profiling decode.
+- **ROCm** brackets each op in a HIP timing-event pair on its single stream. A
+  host `Instant` would measure enqueue (the ops queue with no per-op sync), and
+  a `hipStreamSynchronize` per op would measure execution but serialize the
+  pipeline and add F4's ~2.7 µs launch floor to every sample. Costs one event
+  pair per dispatch while on — diagnostic, never a shipping default.
+- **Metal** additionally has `INFR_METAL_PROFILE`: `=1` encode/GPU wall split,
+  `=3` per-op GPU time from stage-boundary counter samples — **the only honest
+  per-op device mode**: the decode replay tape re-executes tokens without
+  walking ops, so the flush mode (`=2`) silently attributes a sample of one
+  token. `=3` disables the tape for the run. Sweep with `--dev MTL0`
+  (llama-bench rejects `Vulkan0` on a Metal box).
+- **CPU** measures host wall per op, which for a host backend _is_ execution
+  time, so its rows are `Unit::Device` and compare directly against a GPU's.
+
 - `infr bench` excludes its untimed warmup + depth-warm turns from the profile
-  (they run with PROF2 suppressed and the exit aggregate is reset after warmup),
-  so the report covers exactly the timed reps.
-- Decode's record-once replay tape cannot carry per-replay timestamps (queries
-  are baked at record time), so the replayed decode path reports nothing — set
-  `INFR_SEAM_NO_REPLAY=1` to force the re-recorded path when profiling decode.
+  on **every** backend (they run suppressed and the exit aggregate is reset
+  after warmup), so the report covers exactly the timed reps. A profile whose
+  `Linear` rows include an `m=1` or `m=8` shape you did not ask for is warmup
+  leaking in.
 - Sum GEMM-ish labels vs elementwise labels vs attention. Then look at **op
   counts**: 50k dispatches per chunk is a finding in itself, regardless of what
   any one op costs.
+- Micro-probes: `crates/infr-vulkan/tests/` (`gemm_bench`, `decode_gemv_bw`,
+  `small_m_bench`, `bandwidth_probe`), `crates/infr-metal/tests/` (`gemv_bw`,
+  `dispatch_overhead`, `moe_bw`), `crates/infr-rocm/examples/decode_gemv_bw.rs`.
+  Chained-dispatch numbers there are thermally unstable across back-to-back
+  runs; trust e2e benches for accept / revert calls.
 - For a suspect GEMM shape, add it to the per-shape micro-bench
   (`crates/infr-vulkan/tests/gemm_bench.rs`) and print µs + TFLOPS. Compare
   against the kernel's known ceiling — a shape far below ceiling is a shape
@@ -269,16 +317,24 @@ config-gated eprintln timers (`prof.prof_dec` / `INFR_PROF_DEC`-style) — build
 with `INFR_PROFILE=1` instead. The existing `prof.*` knobs stay until this
 system has proven itself in a few campaigns, then get removed. (`INFR_PROFILE`
 itself is a BUILD-time input read by `build.rs`, which is why it is one of the
-few `INFR_*` keys that is deliberately not a `Config` field.) GPU-side timing is
-the same idea at the dispatch chokepoint: `INFR_PROF2` device timestamps are
-auto-labeled with the kernel name (no manual stamp calls — see the Profiling
-section above), but stay **runtime**-gated, not build-gated: timestamp queries
-cost nothing when off, and toggling GPU profiling without a rebuild is worth
-keeping. The two compose: run an `INFR_PROFILE=1` build with `INFR_PROF2=1` and
-the exit report prints the host function table AND the GPU op aggregate in one
+few `INFR_*` keys that is deliberately not a `Config` field.) Device-side timing
+is the same idea at each backend's dispatch chokepoint: `INFR_PROF_OPS` per-op
+timing is auto-labeled (no manual stamp calls — see the Profiling section
+above), but stays **runtime**-gated, not build-gated: the instrumentation costs
+nothing when off, and toggling profiling without a rebuild is worth keeping. The
+two compose: run an `INFR_PROFILE=1` build with `INFR_PROF_OPS=1` and the exit
+report prints the host function table AND the per-op device aggregate in one
 output (`INFR_PROFILE_OUT` JSON carries both as `"sites"` + `"gpu"`) — the host
-section tells you _that_ the GPU path waits in `replay_n`; the GPU section tells
-you which ops the GPU spent it on.
+section tells you _that_ the GPU path waits in `replay_n`; the device section
+tells you which ops it spent that time on.
+
+**And do not add a fifth per-op profiler.** A new backend gets the whole thing —
+knob, label grammar, table, exit aggregate, warmup suppression — by calling
+`infr_core::prof::enabled` and handing durations to `OpProf`. The only piece it
+writes itself is how it obtains a duration from its own API, because that part
+genuinely differs (timestamp queries / HIP events / counter samples / host
+clock). `no_backend_feeds_the_aggregate_behind_the_shared_reporter` fails the
+build if it reaches past the seam.
 
 ### CPU profiling (samply)
 
@@ -318,11 +374,11 @@ misses). When the taxonomy question is "bandwidth-bound or compute-bound?", use
 back-of-envelope traffic count (table size × times streamed) has called it
 correctly every time so far.
 
-The existing env-gated profiles (`INFR_PROF_OPS=1` per-op-kind CPU totals +
-per-stage MoE breakdown, `INFR_DIFFUSION_TIME=1` per-denoise-step phases) stay
-useful as cheap first reads — they're already in-tree, run everywhere, and cost
-nothing when off. The rule is only: don't add NEW timer instrumentation when a
-profile would answer the question.
+The env-gated profiles (`INFR_PROF_OPS=1` per-op totals + the per-stage MoE
+breakdown, `INFR_DIFFUSION_TIME=1` per-denoise-step phases) stay useful as cheap
+first reads — they're already in-tree, run everywhere, and cost nothing when
+off. The rule is only: don't add NEW timer instrumentation when a profile would
+answer the question.
 
 ## Bottleneck taxonomy — what the profile means
 

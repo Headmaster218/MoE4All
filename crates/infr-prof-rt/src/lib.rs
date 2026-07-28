@@ -18,12 +18,17 @@
 //! This crate compiles to dead code in default builds — nothing calls it unless a crate was
 //! built with the `infr_profile` cfg (emitted by build.rs when `INFR_PROFILE=1`).
 //!
-//! It ALSO hosts the process-wide **GPU op aggregate** ([`gpu_add`] / [`gpu_reset`]): the Vulkan
-//! recorder's `INFR_PROF2` per-dispatch timestamps feed per-label totals here on every submit,
-//! and the exit report prints them as a separate GPU section (and a `"gpu"` array in the
-//! `INFR_PROFILE_OUT` JSON). This path is runtime-gated (INFR_PROF2), not build-gated — in a
-//! default build with INFR_PROF2 set, the exit report contains only the GPU section; in an
-//! `INFR_PROFILE=1` build it merges with the host function table in one report.
+//! It ALSO hosts the process-wide **per-op device aggregate** ([`gpu_add`] / [`gpu_reset`]): every
+//! backend's per-op profiler folds its per-forward/per-submit rows in here through the shared
+//! reporter ([`infr_core::prof::OpProf`]), and the exit report prints them as a separate device
+//! section (and a `"gpu"` array in the `INFR_PROFILE_OUT` JSON). This path is runtime-gated
+//! (`INFR_PROF2` / `INFR_PROF_OPS`, via `prof.per_op()`), not build-gated — in a default build with
+//! the knob set, the exit report contains only the device section; in an `INFR_PROFILE=1` build it
+//! merges with the host function table in one report.
+//!
+//! Vulkan fed this alone until U3. rocm, metal and the cpu backend each accumulated and printed
+//! their own totals and appeared nowhere in the exit report or the JSON — so "correlate the host
+//! function table against device op time" was accidentally a vulkan-only capability.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -187,13 +192,17 @@ fn global() -> &'static Global {
     })
 }
 
-/// Process-wide GPU op aggregate: label → (total µs, dispatch count). Fed per submit by the
-/// Vulkan recorder's INFR_PROF2 timestamp readback; printed as the GPU section of [`report`].
-/// A Mutex is fine — this is touched once per submit (not per dispatch), profiling runs only.
+/// Process-wide per-op device aggregate: label → (total µs, dispatch count). Fed by every
+/// backend's profiler through the shared reporter; printed as the device section of [`report`].
+/// A Mutex is fine — this is touched once per submit/forward (not per dispatch), profiling only.
 static GPU: Mutex<Vec<(String, f64, u64)>> = Mutex::new(Vec::new());
 
-/// Accumulate `us` GPU-microseconds / `count` dispatches under `label`. Registers the exit
-/// report (idempotent) so a default build with only INFR_PROF2 set still prints the aggregate.
+/// Accumulate `us` device-microseconds / `count` dispatches under `label`. Registers the exit
+/// report (idempotent) so a default build with only the runtime knob set still prints the
+/// aggregate.
+///
+/// Call this through [`infr_core::prof::OpProf::flush`], not directly — that is what keeps every
+/// backend's label grammar, sort order and units consistent.
 pub fn gpu_add(label: &str, us: f64, count: u64) {
     let _ = global(); // ensure the atexit report hook exists
     let mut g = GPU.lock().unwrap();
@@ -444,7 +453,7 @@ pub fn report() {
         let total_n: u64 = gpu.iter().map(|(_, _, n)| n).sum();
         eprintln!();
         eprintln!(
-            "== INFR_PROF2 GPU report: {} ops, {total_n} dispatches, GPU total {} (all submits; warmup excluded where the bench resets) ==",
+            "== per-op device report: {} ops, {total_n} dispatches, device total {} (every backend, all submits; warmup excluded where the bench resets) ==",
             gpu.len(),
             fmt_ns((total_us * 1e3) as u64),
         );

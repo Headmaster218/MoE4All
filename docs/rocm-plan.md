@@ -1293,12 +1293,20 @@ of peak while carrying 45% of a Q4_K_M model's per-token bytes.
 
 **ROCm had no per-op profiler.** Every perf slice up to here reasoned about
 where a token went from launch COUNTS and isolated micro-benches. P1 built one:
-`kernels.rocm.prof_ops` brackets every dispatch in a pair of HIP timing events
-and prints a cumulative `op + shape → ms / share / count` table to stderr after
-each forward. Events, not a host timer, because the ops all queue on ONE stream
-with no per-op sync — an `Instant` around `run_op` measures ENQUEUE, and a
-`hipStreamSynchronize` per op would add F4's ~2.7 µs floor to every sample and
-serialize the schedule it is supposed to be measuring.
+it brackets every dispatch in a pair of HIP timing events and prints an
+`op + shape → ms / share / count` table to stderr. Events, not a host timer,
+because the ops all queue on ONE stream with no per-op sync — an `Instant`
+around `run_op` measures ENQUEUE, and a `hipStreamSynchronize` per op would add
+F4's ~2.7 µs floor to every sample and serialize the schedule it is supposed to
+be measuring.
+
+(P1 shipped this behind `kernels.rocm.prof_ops`, a knob with no env key. The
+U1–U3 unification folded it into the cross-backend `INFR_PROF_OPS` /
+`INFR_PROF2` and the shared reporter in `infr_core::prof` — same HIP-event
+acquisition, but the accounting, label grammar, report format and process-exit
+aggregate are now the ones vulkan/metal/cpu share. It also gained warmup
+suppression, which it did not have: every table P1 printed included the bench's
+untimed warmup forward. See `docs/perf.md` § Profiling.)
 
 **The pp512 profile at `4a88a23`, both models, one forward** (RX 7900 XTX,
 Q4_K_M). This is the artifact nobody had:

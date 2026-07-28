@@ -227,11 +227,10 @@ and these exist to force one off when bisecting a correctness or perf problem.
   module to `~/.cache/infr`) and `moe_id_rows` (token rows per id-indexed MoE
   expert-GEMV dispatch; `0` drops the resident MoE path back to the pre-R8
   per-expert loop), `attn_flash` (the tiled flash PREFILL attention kernel;
-  clear it to route prefill back to the single-wave scalar one) and `prof_ops`
-  (bracket every dispatch in HIP timing events and print a cumulative per-op
-  GPU-time table to stderr — this backend's only per-op profiler,
-  diagnostic-only). None of the last four has an `INFR_*` twin, like
-  `kernels.cpu.reference`.
+  clear it to route prefill back to the single-wave scalar one). None of the
+  last three has an `INFR_*` twin, like `kernels.cpu.reference`. (Per-op
+  profiling used to live here as `prof_ops`; it is now the cross-backend
+  `prof.prof_ops` — see below.)
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
   `repack_mb`, and `reference` (the bit-reference kernel path, which has no
   `INFR_*` twin and never had one).
@@ -245,8 +244,13 @@ devices) and `expert_parallel` (≥ 1); too few devices is a hard error. The thr
 `*_p2p` flags choose GPU-to-GPU transport (`true`, the default) over staging
 through host RAM.
 
-**`[prof]`** — `prof`, `prof2` (per-dispatch GPU timestamps), `prof2_shapes`,
-`prof_dec`, `prof_ops`, `prof_pf`, `vram_log`, `mtp_time`, `diffusion_time`,
+**`[prof]`** — `prof2` and `prof_ops` are **aliases for one another**: either
+one turns on per-op profiling on every backend (vulkan, rocm, metal, cpu), which
+all report through one table format and one process-exit aggregate. Read them
+through `ProfCfg::per_op()`, never as individual fields. Both spellings exist
+because the config campaign froze env names and each reached a different backend
+before the unification. Plus `prof`, `prof2_shapes` (vulkan-only shape
+itemizer), `prof_dec`, `prof_pf`, `vram_log`, `mtp_time`, `diffusion_time`,
 `profile_out` (a JSON report path), and the two Metal profiling knobs.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth) and
