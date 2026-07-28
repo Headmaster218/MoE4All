@@ -1410,14 +1410,22 @@ tier's, unchanged, into the same per-slot destinations, so the two tiers are
 against the `kernels.rocm.moe_bucket = false` control, and the `rocm_seam`
 golden `0xfd63781ea3bfa785` is unmoved.
 
-Interleaved warmed pairs, RX 7900 XTX (raw, first pair discarded):
+Interleaved warmed pairs, RX 7900 XTX (raw, first pair discarded). Independently
+re-measured on merge — the reviewer's numbers, which is why the ratios are a
+notch under the slice's own 1.14×:
 
 | bench                    | base                  | P2                    | ratio     |
 | ------------------------ | --------------------- | --------------------- | --------- |
-| Qwen3-30B-A3B pp512      | 348.3 / 348.5 / 348.6 | 397.0 / 396.0 / 396.1 | **1.14×** |
-| Qwen3-30B-A3B pp2048     | 338.8 / 337.8 / 338.2 | 386.2 / 385.8 / 385.9 | **1.14×** |
-| Qwen3-30B-A3B tg128      | 48.1 / 48.1 / 48.1    | 48.2 / 48.1 / 48.1    | 1.00×     |
-| Qwen3-0.6B pp512 (dense) | 12134 / 12153         | 12188 / 12172         | 1.00×     |
+| Qwen3-30B-A3B pp512      | 347.0 / 348.1 / 347.2 | 391.6 / 391.1 / 391.0 | **1.13×** |
+| Qwen3-30B-A3B pp2048     | 338.8 / 337.6         | 384.7 / 384.6         | **1.14×** |
+| Qwen3-30B-A3B tg128      | 48.9 / 48.1           | 48.9 / 48.7           | 1.00×     |
+| Qwen3-0.6B pp512 (dense) | 12208 / 12401 / 12248 | 12100 / 12206 / 12202 | ~1.00×    |
+
+The dense row is the one to read carefully: its mean is 0.8% DOWN, and both
+orderings (base-first and P2-first) put P2 lower. The ranges overlap (base
+12208–12401 against P2 12100–12226) and this change cannot reach the dense path,
+so it is called noise — but it is noise at the edge of what these pairs resolve,
+not a clean 1.00×.
 
 Decode is untouched by construction: the tier is gated on average bucket
 occupancy ≥ 2 slots/expert, and a decode step's `n_used` slots over `n_expert`
@@ -1425,12 +1433,25 @@ banks is far under it, so `rows = 1` never leaves the id tier.
 
 **Two measurement lessons, both of which cost this slice time.**
 
-- **`INFR_PROF_OPS` is not free on this workload and its attribution is wrong
-  here.** Under the profiler `pp512` reads 173 t/s against 348 t/s clean, and it
-  bills `Op::MoeFfn` 97% of the forward. A `hipDeviceSynchronize`-bracketed
-  stage timer says the whole `MoeFfn` arm is 661 ms of a 1330 ms prefill, and
-  the base→P2 stage delta it predicts (180 ms) matches the wall-clock delta (177
-  ms) to 2%. Rank with the profiler; SIZE with the wall clock.
+- **An 18 GB model's FIRST run is a cold-page-cache run, and it will fool you.**
+  This slice initially reported `INFR_PROF_OPS=1` as costing 2× (173 t/s vs 348
+  clean) and concluded the profiler could not be trusted here. It was measuring
+  the model load, not the profiler. Re-measured warm and interleaved, the
+  profiler costs **0.3%** on this workload — 347.2 / 346.9 profiled against
+  347.9 / 348.0 clean.
+
+  Its attribution is corroborated, not contradicted: at `pp512` the summed
+  per-op device time is **1.472 s against 1.475 s of wall** (512 tok ÷ 347.0
+  t/s) — 99.8% of the forward accounted for, of which `MoeFfn` is 94.5%. When a
+  hand-rolled stage timer disagrees with that, suspect the stage timer's
+  brackets first; a `hipDeviceSynchronize`-delimited region is easy to draw
+  around less than the op actually does.
+
+  The transferable rule is the one `docs/perf.md` already states for A/B pairs
+  and which applies just as hard to a single measurement: **discard the first
+  run of a burst.** On a small model that guards against thermal boost; on a 30
+  B model it also guards against ~18 GB of first-touch page-cache misses.
+
 - **The expert GEMV was never bandwidth-bound**, which is why removing 8× of its
   traffic bought 1.14× and not 8×. After P2 the weight fetch is ~60 GB/s against
   ~960 GB/s of peak — 6%. It is not VALU-bound either (~5% of peak). It is
@@ -1438,24 +1459,24 @@ banks is far under it, so `rows = 1` never leaves the id tier.
   (`MOE_IDB_WAVES`, kept — it is worth ~2%) barely moved it, which rules out the
   workgroups-per-CU occupancy ceiling as the explanation.
 
-Ranked remainder, from the stage timer (per m=512 forward, P2 in place):
+Ranked remainder (per m=512 forward, P2 in place). The intra-`MoeFfn` splits
+below come from this slice's stage timer, whose totals did NOT reconcile with
+the profiler — treat the SHAPE of the finding as the lead and re-measure the
+SIZE before committing a slice to it:
 
-1. **The Q6_K `down` GEMV — 462 ms, 73% of the expert-GEMV cost** against
-   `gate_up`'s 170 ms, while doing HALF the MACs. That is ~5.4× worse per MAC
-   than the Q4_K gate/up decode in the same kernel shape. `i8acc_q6k`'s inner
-   loop selects its nibble/high-bit region with a 4-way `if` chain on `blk & 7`,
-   which is per-LANE divergent inside the wave — all four paths execute. Making
-   that selection arithmetic is bit-identical by construction and is the single
-   biggest lever left on this model. (This is item 2's "Q6K unpack" showing up
-   at MoE prefill, and it is now the larger of the two sites.)
-2. **~590 ms of the 1330 ms prefill is in neither the expert GEMVs nor any op
-   the profiler itemizes** (all other ops together are ~80 ms of device time).
-   Nothing has looked at where it goes; the stage timer above is the tool.
-3. **A real per-expert GEMM.** The bucket list P2 builds is exactly the gather a
+1. **The Q6_K `down` GEMV, ~73% of the expert-GEMV cost** against `gate_up`'s
+   share, while doing HALF the MACs — ~5.4× worse per MAC than the Q4_K gate/up
+   decode in the same kernel shape. The mechanism is concrete and checkable
+   independently of the timing: `i8acc_q6k`'s inner loop selects its
+   nibble/high-bit region with a 4-way `if` chain on `blk & 7`, per-LANE
+   divergent inside the wave, so all four paths execute. Making that selection
+   arithmetic is bit-identical by construction, and it is the same Q6_K unpack
+   weakness F4 found at decode showing up at MoE prefill. Biggest lever left.
+2. **A real per-expert GEMM.** The bucket list P2 builds is exactly the gather a
    WMMA tile wants, so the batched-GEMM version of this is now cheap to reach.
    The size of the prize: the dense `Linear m=512 4096×2048 Q4K` kernel does
    10.3 TMAC/s where the expert GEMV does 0.75 — 13.8×.
-4. **`moe_id_rows` bounds the win.** The bucket is per row-chunk, so 128 rows
+3. **`moe_id_rows` bounds the win.** The bucket is per row-chunk, so 128 rows
    leaves a 4× re-read on the table at pp512 and 16× at pp2048. Raising it is
    blocked by `MOE_ID_SCRATCH_CAP` (16 MiB; ~103 KB of scratch per row on this
    model caps the chunk at 159), so shrinking the `[n_slots, ne]` `y` scratch is
