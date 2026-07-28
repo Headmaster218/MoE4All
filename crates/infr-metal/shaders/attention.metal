@@ -471,8 +471,8 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
     for (uint jj = 0; jj < NQ; jj++) { S[jj] = 0.0f; M[jj] = -MAXFLOAT / 2; }
 
     for (uint ic = lo_min & ~(C - 1u); ic <= abs_max; ic += C) {
-        // Q*K^T — 8 score fragments split across simdgroups (fragment f covers KV rows
-        // ic+8f, columns interleaved so each simdgroup's two fragments are NSG apart)
+        // Q*K^T — C / 8 score fragments split across simdgroups (fragment f covers KV rows
+        // ic+8f, columns interleaved so each simdgroup's fragments are NSG apart)
         {
             device const half* pk = k + ((ulong)(ic + 8u * sgitg) * p.n_kv + kvh) * hd;
             threadgroup float* ps = ss + 8u * sgitg;
