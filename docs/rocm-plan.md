@@ -1106,19 +1106,28 @@ multi-GPU stack across `tp.rs`/`ep.rs`/`pipeline.rs`/`p2p.rs`/`tp_sem.rs`/
 `llama.cpp` HIP t/s — `llama-bench -sm none -mg 0 -fa 1`).** This is the target
 to beat.
 
-**Current, re-measured at `0cd7432` (P3):**
+**Current, re-measured at `00bf77f` (P4):**
 
-| model               | pp512 (infr / llama = ratio) | tg128 (ratio)          |
-| ------------------- | ---------------------------- | ---------------------- |
-| Qwen3-0.6B          | 12218 / 20150 = **0.61×**    | 147 / 384 = **0.38×**  |
-| Qwen3-30B-A3B (MoE) | 773 / 2905 = **0.27×**       | 54.5 / 141 = **0.39×** |
+| model               | pp512 (infr / llama = ratio) | tg128 (ratio)         |
+| ------------------- | ---------------------------- | --------------------- |
+| Qwen3-0.6B Q4_K_M   | 13962 / 20150 = **0.69×**    | 196 / 384 = **0.51×** |
+| Qwen3-0.6B Q6_K     | 7400 / 22033 = **0.34×**     | 199 / 366 = **0.54×** |
+| Qwen3-30B-A3B (MoE) | 771 / 2905 = **0.27×**       | 65 / 141 = **0.46×**  |
+
+Moved this session, all verified by the reviewer's own interleaved pairs: P2
+(MoE bucket sort) 1.13× MoE prefill; P3 (branchless dword-wide Q6_K expert
+decode) 1.97× MoE prefill; P4 (the same fix in the two DENSE Q6_K kernels) 2.05×
+Q6_K prefill, 1.76× Q6_K decode — and, because every Q4_K_M model carries a Q6_K
+`output.weight`, **1.34× on mainline Q4_K_M decode** (146.5 → 196.0). That
+lm_head GEMV alone went 842 → 158 µs.
 
 The oracle is the LOCAL HIP build at
 `~/Projects/mxaddict/llama.cpp/build-hip/bin/llama-bench`, not the system
 `/usr/bin/llama-bench` — the packaged one is broken on this box
 (`undefined symbol: ggml_dsv4_hc_post`, a mismatched `libllama`/`libggml`).
-llama's own pp512 on the dense model carries ±27% run-to-run spread, so treat
-that column's third digit as noise.
+llama's own pp512 on the dense models carries ±25–27% run-to-run spread even at
+`-r 5`, so treat the pp512 ratios as approximate; its tg128 is tight (±1) and
+those ratios are solid.
 
 **Where it was before this campaign** (the numbers this table used to carry, and
 the reason the ratios above are not comparable to any older commit message):
