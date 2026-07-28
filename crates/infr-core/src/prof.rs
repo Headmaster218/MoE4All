@@ -239,14 +239,16 @@ pub fn op_label(op: &Op, g: &Graph) -> String {
         ),
         Op::MoeFfn {
             gate_exps,
+            down_exps,
             ne,
             n_expert,
             n_used,
             n_ff_exp,
             ..
         } => format!(
-            "MoeFfn ne={ne} nff={n_ff_exp} {n_used}/{n_expert} {:?}",
-            g.desc(gate_exps).dtype
+            "MoeFfn ne={ne} nff={n_ff_exp} {n_used}/{n_expert} {:?}/{:?}",
+            g.desc(gate_exps).dtype,
+            g.desc(down_exps).dtype
         ),
         _ => op.kind().to_string(),
     }

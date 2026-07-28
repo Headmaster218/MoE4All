@@ -4358,6 +4358,26 @@ __device__ __forceinline__ float i8acc_q5k(
 }
 
 // Q6_K per-lane int8 dp4a accumulation for output row `o` — mirrors `linear_i8_q6k`.
+//
+// P3: branchless + dword-wide. The value stream is UNCHANGED (see the derivation below); this is
+// the same decode expressed without the per-lane branch and without the byte-at-a-time fetch.
+//
+// The old form cost ~9x per MAC what the Q4_K twin does, which made Q6_K `ffn_down_exps` ~74% of a
+// Q4_K_M MoE pp512 forward (the 24 Q6_K-down layers ran 40.1 ms vs 10.8 ms for the 24 Q4_K-down
+// ones, on an otherwise identical op). Two causes, both fixed here:
+//
+//  1. A 4-way `if (region)` chain per code. `region` derives from `blk`, which is `tid`-strided, so
+//     it is per-LANE divergent inside a wave32 and every lane retired all four arms. `region`
+//     selects (ql byte offset, ql nibble shift, qh bit shift) = (32*(region&1), 4*(region>>1),
+//     2*region) — pure arithmetic, so the chain is pure waste.
+//  2. 16 scalar `global_load_u8` per 16 codes. Unlike `i8acc_q4k`/`i8acc_q5k` (144 % 16 == 0,
+//     176 % 16 == 0) the 210-byte Q6_K super-block is only 2-byte aligned, so a `uint4` cast is
+//     not legal here. `__builtin_memcpy` states the align-1 contract honestly and still lowers to
+//     `global_load_b128` on gfx11, which has unaligned global access — verified in the ISA.
+//
+// The two 16-code halves of a 32-code block share `region` and `half` (their `sub16` differ only in
+// bit 0, and that bit lands entirely in `l0` = 16*hh), so the 32 ql bytes and 32 qh bytes a block
+// needs are two CONTIGUOUS runs — hoisted out of the `hh` loop and fetched as 2x16 B each.
 __device__ __forceinline__ float i8acc_q6k(
     const signed char* __restrict__ qxr, const float* __restrict__ xsr,
     const unsigned char* __restrict__ w, int o, int nb, int tid) {
@@ -4367,37 +4387,35 @@ __device__ __forceinline__ float i8acc_q6k(
         long super = (long)o * spr + (blk >> 3);
         int w32 = blk & 7;
         const unsigned char* b = w + (long)super * 210;
-        const unsigned char* ql = b;
-        const unsigned char* qh = b + 128;
         const signed char* scales = (const signed char*)(b + 192);
         float d = rf16b(b + 208);
         float sx = xsr[blk];
+        // sub16 = w32*2 + hh -> within0 = 32*w32 + 16*hh, so half = within0>>7 = w32>>2 and
+        // region = (within0 & 127)>>5 = w32 & 3, both independent of hh; l0 = 16*hh.
+        int half = w32 >> 2;
+        int region = w32 & 3;
+        unsigned int qlsh = (unsigned int)(region >> 1) * 4u;
+        unsigned int qhsh = (unsigned int)region * 2u;
+        unsigned int qlv[8], qhv[8];
+        __builtin_memcpy(qlv, b + half * 64 + (region & 1) * 32, 32);
+        __builtin_memcpy(qhv, b + 128 + half * 32, 32);
+        #pragma unroll
         for (int hh = 0; hh < 2; hh++) {
-            int sub16 = w32 * 2 + hh;
-            int sc = (int)scales[sub16];
-            int within0 = sub16 * 16;
-            int half = within0 >> 7;
-            int o127 = within0 & 127;
-            int region = o127 >> 5;
-            int l0 = o127 & 31;
-            int qlo = half * 64;
-            int qho = half * 32;
-            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int sc = (int)scales[w32 * 2 + hh];
+            int4 xv = *(const int4*)(qxr + blk * 32 + hh * 16);
+            int xa[4] = { xv.x, xv.y, xv.z, xv.w };
             int idot = 0, isum = 0;
+            #pragma unroll
             for (int k = 0; k < 4; k++) {
-                int code[4];
-                for (int r = 0; r < 4; r++) {
-                    int l = l0 + k * 4 + r;
-                    int c;
-                    if (region == 0)      c = (ql[qlo + l] & 0x0F)       | ((qh[qho + l] & 3) << 4);
-                    else if (region == 1) c = (ql[qlo + 32 + l] & 0x0F)  | (((qh[qho + l] >> 2) & 3) << 4);
-                    else if (region == 2) c = (ql[qlo + l] >> 4)         | (((qh[qho + l] >> 4) & 3) << 4);
-                    else                  c = (ql[qlo + 32 + l] >> 4)    | (((qh[qho + l] >> 6) & 3) << 4);
-                    code[r] = c;
-                }
-                int wpack = code[0] | (code[1] << 8) | (code[2] << 16) | (code[3] << 24);
-                idot = idot4(xp[k], wpack, idot);
-                isum = idot4(xp[k], 0x01010101, isum);
+                // Byte j of the dword form is byte j of the scalar form: `>> qlsh & 0x0F0F0F0F`
+                // keeps bits [8j+qlsh, 8j+qlsh+3] (the selected nibble of byte j) and
+                // `>> qhsh & 0x03030303` keeps bits [8j+qhsh, 8j+qhsh+1] — neither mask lets a
+                // neighbouring byte bleed in, and the `<< 4` of a 0..3 value cannot carry out.
+                unsigned int lw = qlv[hh * 4 + k], hw = qhv[hh * 4 + k];
+                unsigned int wpack = ((lw >> qlsh) & 0x0F0F0F0Fu)
+                                   | (((hw >> qhsh) & 0x03030303u) << 4);
+                idot = idot4(xa[k], (int)wpack, idot);
+                isum = idot4(xa[k], 0x01010101, isum);
             }
             acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-32 * sc)) * sx * (float)isum;
         }
