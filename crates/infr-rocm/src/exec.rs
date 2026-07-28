@@ -18,7 +18,7 @@ use infr_core::graph::{AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant;
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::sync::Mutex;
 
 /// Terse local shorthand for the shared backend-error constructor.
@@ -1197,7 +1197,19 @@ struct ExecCtx<'a> {
     /// F1b sibling-GEMV activation-quant memo — see [`QuantMemo`]. `None` at the start of every
     /// forward and after any op that is not a memo-publishing int8 GEMV.
     qmemo: Option<QuantMemo>,
+    /// F5: force the un-cleared pool draw ([`pool_buf`](ExecCtx::pool_buf) with `zero = false`) to
+    /// fill with the POISON byte instead of leaving the recycled bytes alone. Debug builds do this
+    /// unconditionally; this flag (`debug.poison_uninit`) turns it on in RELEASE too, for hunting a
+    /// read-before-write whose output only shifts when an unrelated change reshuffles the pool.
+    poison: bool,
 }
+
+/// Byte written over an un-cleared pool draw when poisoning is active. `0xFF` in all four bytes is
+/// f32 NaN (and `-1` as i32/i8), so a slot the kernel was supposed to overwrite but did not turns
+/// the whole downstream row into NaN — a LOUD failure in the goldens, instead of the silently
+/// plausible answer a recycled-but-happens-to-be-zero block would produce. Same byte and same
+/// reasoning as `VulkanBackend::alloc_uninit`.
+const POISON_BYTE: c_int = 0xFF;
 
 impl<'a> ExecCtx<'a> {
     fn f16_dev(&self, data: &[u8]) -> crate::RocmBuffer {
@@ -1215,12 +1227,28 @@ impl<'a> ExecCtx<'a> {
     /// `RocmBuffer` is `owned: false` (its `Drop` is a no-op); the allocation is returned to the
     /// pool via `ExecCtx::Drop`. `len` is the LOGICAL byte length (≤ bucket), so downstream
     /// `min(len, …)` copy clamps stay correct.
+    ///
+    /// F5 — the poison. `zero = false` is a CLAIM ("this kernel writes every byte first"), and a
+    /// wrong claim is a silent wrong-answer bug, because the pool hands back a block some earlier
+    /// op already wrote — frequently one that happens to make the output look plausible, or that
+    /// happens to be zero on the first pass. So the un-cleared draw is filled with [`POISON_BYTE`]
+    /// in debug builds (and in release under `debug.poison_uninit`): any byte the kernel then fails
+    /// to write reads back as NaN and the goldens move loudly. The poison is NOT free — it is the
+    /// very memset this slice removes — so release builds skip it, which is exactly why the parity
+    /// suite has to be run in DEBUG for the claim to have been tested at all.
     fn pool_buf(&mut self, bytes: usize, zero: bool) -> crate::RocmBuffer {
         let len = bytes.max(1);
         let bucket = bucket_bytes(len);
         let ptr = self.pool.lock().unwrap().take(bucket);
-        if zero {
-            let rc = unsafe { ffi::hipMemsetAsync(ptr, 0, len, self.stream) };
+        let fill = if zero {
+            Some(0)
+        } else if cfg!(debug_assertions) || self.poison {
+            Some(POISON_BYTE)
+        } else {
+            None
+        };
+        if let Some(byte) = fill {
+            let rc = unsafe { ffi::hipMemsetAsync(ptr, byte, len, self.stream) };
             debug_assert_eq!(rc, HIP_SUCCESS, "hipMemsetAsync(pool zero-on-reuse)");
         }
         self.pooled.push((ptr, bucket));
@@ -1235,13 +1263,29 @@ impl<'a> ExecCtx<'a> {
         }
     }
 
-    /// Zeroed scratch for `n` f32 ELEMENTS (calloc contract). Pooled + async-cleared. Every op
-    /// `dst` uses this: the async memset is near-free (no host sync) and keeping the calloc
-    /// contract universal guarantees the goldens can't move on a partial-write op. Genuinely
-    /// fully-overwritten transient scratch (the int8 `qx`/`xs`, the aliased-copy clone) instead
-    /// calls [`pool_buf`](Self::pool_buf) with `zero = false` to skip even that memset.
+    /// Zeroed scratch for `n` f32 ELEMENTS (calloc contract). Pooled + async-cleared. Reserved for
+    /// the `dst`s that genuinely READ what they were handed: accumulators (`moe_accum_idm`'s
+    /// `dst += acc`, the pre-R8 per-slot `atomicAdd`), partial writes (`Copy`/`CopyStrided`'s
+    /// content-preserving destination, the strided `Rope` clone whose memcpy is length-clamped) and
+    /// unproduced tensors reached by [`ensure_device`](Self::ensure_device).
+    ///
+    /// A `dst` the kernel overwrites in full must use [`uninit_dev`](Self::uninit_dev) instead —
+    /// see F5 in `docs/rocm-plan.md` for why this memset was ~20% of a decode token.
     fn zero_dev(&mut self, n: usize) -> crate::RocmBuffer {
         self.pool_buf((n * 4).max(1), true)
+    }
+
+    /// UN-cleared scratch for `n` f32 ELEMENTS — the same pooled draw as [`zero_dev`](Self::zero_dev)
+    /// without the memset, for a `dst` whose kernel writes every byte before anything reads it.
+    ///
+    /// F5. `hipMemsetAsync` is ~3.8 µs of real GPU work on gfx1100 (a null kernel is 2.7 µs), and
+    /// the 0.6B decodes ~423 ops in 7.6 ms — so clearing a `dst` the GEMV then overwrites cost
+    /// ~1.6 ms/token, ~20% of decode, for nothing. The obligation that comes with calling this is
+    /// exact: EVERY element of `[0, n)` must be stored by the dispatch(es) below, on every shape
+    /// the op can take, before any read. Mirrors `VulkanBackend::alloc_uninit` (and carries the
+    /// same debug poison, see [`pool_buf`](Self::pool_buf)).
+    fn uninit_dev(&mut self, n: usize) -> crate::RocmBuffer {
+        self.pool_buf((n * 4).max(1), false)
     }
 
     fn host_vals(&mut self, id: TensorId, g: &Graph, bindings: &Bindings) -> Result<&[f32]> {
@@ -1296,7 +1340,10 @@ impl<'a> ExecCtx<'a> {
                 p
             }
             TensorKind::Internal | TensorKind::Output => {
-                // Not yet produced — allocate a zero-filled buffer.
+                // Not yet produced — allocate a zero-filled buffer. F5 keeps this calloc: reaching
+                // here means an op wants a tensor NOTHING has written, and the callers that do
+                // (`Copy`/`CopyStrided`'s content-preserving dst, the fused-residual `add_dst`) all
+                // read what they are handed. The CPU reference's `vals[dst]` is zeroed too.
                 let db = self.zero_dev(decl.desc.numel());
                 let p = db.ptr;
                 self.dev[i] = Some(db);
@@ -1540,6 +1587,7 @@ pub fn execute_graph(
         rocblas,
         rocm: &cfg.kernels.rocm,
         qmemo: None,
+        poison: cfg.debug.poison_uninit,
     };
 
     // No per-op sync: the whole op list queues on ONE stream, which serializes device work, so
@@ -1870,7 +1918,9 @@ fn run_op(
         } => {
             let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
             ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * dim as usize);
+            // F5 fully-overwritten: `rmsnorm`'s block per row stores `d[i]` for every
+            // `i = tid, tid+nt, … < dim`, so all `rows * dim` slots land.
+            let dd = ctx.uninit_dev(rows as usize * dim as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             // One block per row; the block reduces the sum-of-squares across a wave.
             dispatch_grid(
@@ -2003,6 +2053,11 @@ fn run_op(
                                 arg_i32((mu * inu) as i32),
                             ],
                         )?;
+                        // F5: `beta = 0` means BLAS does not reference C, so this IS fully written —
+                        // but it is left on the calloc draw deliberately. The arm is opt-in
+                        // (`INFR_ROCM_BLAS=1`), measured a net loss, and ships off, so there is no
+                        // dispatch cost here worth trading against depending on a library's
+                        // handling of `0 * NaN` for the poison build.
                         let dd = ctx.zero_dev(mu * ou);
                         // Column-major rocBLAS: computing Cᵀ[out_f,m] = W[out_f,in_f]·Xᵀ[in_f,m] with
                         // A=W transposed, B=X none yields exactly the row-major dst[m,out_f]. Weight
@@ -2143,7 +2198,12 @@ fn run_op(
                                     uid: b.uid,
                                 }
                             }
-                            None => ctx.zero_dev(mu * ou),
+                            // F5 fully-overwritten: all three arms below tile `dst[m, out_f]`
+                            // exactly — the mrow GEMV writes every `ov[r] < out_f` once (grid
+                            // `ceil(out_f/I8_MROW) × m`, the `ov[r] != o0` guard suppressing the
+                            // clamped duplicate), and the WMMA / coop kernels store every
+                            // `(re < m, col < out_f)` of their tile.
+                            None => ctx.uninit_dev(mu * ou),
                         };
                         // Slice-28: Q4_K prefill (m>1) can OPT IN (`INFR_ROCM_COOP=1`) to the
                         // cooperative decode-once GEMM (multi-warp threadblock, LDS-shared weight
@@ -2267,7 +2327,9 @@ fn run_op(
                     None => (ctx.ensure_device(weight, g, bindings)?, false),
                 };
                 ctx.ensure_device(x, g, bindings)?;
-                let dd = ctx.zero_dev(m as usize * out_f as usize);
+                // F5 fully-overwritten: the native-decode GEMV runs one block per activation row
+                // and stores `dst[row*out_f + o]` for every `o = tid, tid+blockDim, … < out_f`.
+                let dd = ctx.uninit_dev(m as usize * out_f as usize);
                 let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
                 let blk_off = (w_off as usize / qpb) * bpb;
                 let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
@@ -2293,7 +2355,8 @@ fn run_op(
             } else {
                 let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
                 ctx.ensure_device(x, g, bindings)?;
-                let dd = ctx.zero_dev(m as usize * out_f as usize);
+                // F5 fully-overwritten: `linear_f16` is the same one-block-per-row tiling.
+                let dd = ctx.uninit_dev(m as usize * out_f as usize);
                 let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
                 let wptr_off = unsafe { (wptr as *mut u8).add(w_off as usize * 2) as *mut c_void };
                 dispatch_1d(
@@ -2331,7 +2394,9 @@ fn run_op(
             } else {
                 scale
             };
-            let dd = ctx.zero_dev(rows as usize * dim as usize);
+            // F5 fully-overwritten: one thread per row writes `dr[0..dim)` twice over (exp then
+            // normalize), so every one of the `rows * dim` slots is stored.
+            let dd = ctx.uninit_dev(rows as usize * dim as usize);
             let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
             let dd_ptr = dd.ptr;
             dispatch_1d(
@@ -2362,7 +2427,16 @@ fn run_op(
         } => {
             let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
             ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+            // F5: `qk_norm` writes `dst[off + i]`, and `off` is built from the SOURCE stride —
+            // `r * x_stride + h * head_dim`. Packed (`x_stride == 0`) that is exactly the
+            // `rows * n_head * head_dim` dst, tiled once: fully overwritten. Strided it is not the
+            // dst's own layout at all, so rows>1 would leave inter-row gaps unwritten. Only the
+            // packed case takes the un-cleared draw.
+            let dd = if x_stride == 0 {
+                ctx.uninit_dev(rows as usize * n_head as usize * head_dim as usize)
+            } else {
+                ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize)
+            };
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             dispatch_1d(
                 pipelines,
@@ -2396,7 +2470,9 @@ fn run_op(
             let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(gate, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+            // F5 fully-overwritten: one thread per (row, head) writes `dst[head*head_dim + i]` for
+            // every `i < head_dim`; the grid covers all `rows * n_head` heads.
+            let dd = ctx.uninit_dev(rows as usize * n_head as usize * head_dim as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let bg = ctx.dev[gate.0 as usize].as_ref().unwrap();
             dispatch_1d(
@@ -2466,6 +2542,9 @@ fn run_op(
                 // inter-row gaps survive, then rotate in place. A packed input (x_stride == 0)
                 // allocs the natural rows*n_head*head_dim; a strided view needs rows*stride so the
                 // kernel's off = row*stride + h*head_dim stays in bounds for every row.
+                // F5 PARTIAL WRITE — stays calloc. The clone below copies `min(dd.len, src.len)`
+                // bytes, so a source shorter than `rows * stride_elems` leaves a tail the `rope`
+                // dispatch does not write either (it only touches `[0, rope_dim)` of each head).
                 let dd = ctx.zero_dev(rows as usize * stride_elems);
                 unsafe {
                     ffi::hipMemcpyDtoD(
@@ -2528,7 +2607,20 @@ fn run_op(
             // gate 4). The cache is the BOUND buffer, exactly as `Op::WriteKv` takes it.
             let dd = match kv_fuse {
                 Some(_) => None,
-                None => Some(ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize)),
+                // F5: the wave per (row, head) covers `[0, head_dim)` exactly once — the
+                // pass-through loop takes `[rope_dim, head_dim)` strided by 32, the rotation loop
+                // writes both `i` and `i + half` for every `i < half`. That is a full tiling
+                // PROVIDED `rope_dim` is even; an odd one would leave `rope_dim - 1` in neither
+                // loop's range, so it keeps the calloc draw. The write base `doff = head*head_dim`
+                // is the packed dst regardless of `x_stride`, and the grid covers every head.
+                None => {
+                    let n = rows as usize * n_head as usize * head_dim as usize;
+                    Some(if rope_dim % 2 == 0 {
+                        ctx.uninit_dev(n)
+                    } else {
+                        ctx.zero_dev(n)
+                    })
+                }
             };
             let (kv_ptr, kv_row, kv_stride) = match kv_fuse {
                 Some(f) => (
@@ -2610,7 +2702,11 @@ fn run_op(
             pos,
         } => {
             ctx.ensure_device(q, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+            // F5 fully-overwritten: both arms write `dst[head*head_dim + d]` for every `d`
+            // (`attention` partitions the head dims across the wave's lanes with `d < head_dim`;
+            // `attention_split_combine` uses the identical lane partition), over a grid that covers
+            // every `head < rows * n_head`.
+            let dd = ctx.uninit_dev(rows as usize * n_head as usize * head_dim as usize);
             let bk = rocm_buf(bindings.get(k_cache).expect("rocm: unbound K cache"));
             let bv = rocm_buf(bindings.get(v_cache).expect("rocm: unbound V cache"));
             let (bk_ptr, bv_ptr) = (bk.ptr, bv.ptr);
@@ -2729,7 +2825,9 @@ fn run_op(
         } => {
             ctx.ensure_device(gate, g, bindings)?;
             ctx.ensure_device(up, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * nff as usize);
+            // F5 fully-overwritten: one thread per OUTPUT element, `dst[row*nff + i]`, over a grid
+            // of `rows * nff` threads. Only the READ side is ever strided/interleaved.
+            let dd = ctx.uninit_dev(rows as usize * nff as usize);
             let bg = ctx.dev[gate.0 as usize].as_ref().unwrap();
             let bu = ctx.dev[up.0 as usize].as_ref().unwrap();
             let at: i32 = match act {
@@ -2766,7 +2864,8 @@ fn run_op(
             act,
         } => {
             ctx.ensure_device(gu, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * nff as usize);
+            // F5 fully-overwritten: same `gated_act` kernel, same one-thread-per-output tiling.
+            let dd = ctx.uninit_dev(rows as usize * nff as usize);
             let bgu = ctx.dev[gu.0 as usize].as_ref().unwrap();
             let at: i32 = match act {
                 infr_core::graph::Activation::Silu => 0,
@@ -2797,7 +2896,8 @@ fn run_op(
         Op::Add { a, b, dst, n } => {
             ctx.ensure_device(a, g, bindings)?;
             ctx.ensure_device(b, g, bindings)?;
-            let dd = ctx.zero_dev(n as usize);
+            // F5 fully-overwritten: one thread per element, `dst[i] = a[i] + b[i]` for all `i < n`.
+            let dd = ctx.uninit_dev(n as usize);
             let ba = ctx.dev[a.0 as usize].as_ref().unwrap();
             let bb = ctx.dev[b.0 as usize].as_ref().unwrap();
             dispatch_1d(
@@ -2824,7 +2924,8 @@ fn run_op(
         } => {
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(bias, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n as usize);
+            // F5 fully-overwritten: one thread per row writes `dr[0..n)`, grid covers every row.
+            let dd = ctx.uninit_dev(rows as usize * n as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let bb = ctx.dev[bias.0 as usize].as_ref().unwrap();
             dispatch_1d(
@@ -2845,7 +2946,8 @@ fn run_op(
         }
         Op::Scale { x, dst, s, n } => {
             ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(n as usize);
+            // F5 fully-overwritten: one thread per element.
+            let dd = ctx.uninit_dev(n as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             dispatch_1d(
                 pipelines,
@@ -2871,7 +2973,8 @@ fn run_op(
         } => {
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(vec, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n as usize);
+            // F5 fully-overwritten: one thread per row writes `dr[0..n)`, grid covers every row.
+            let dd = ctx.uninit_dev(rows as usize * n as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let bv = ctx.dev[vec.0 as usize].as_ref().unwrap();
             dispatch_1d(
@@ -2892,7 +2995,8 @@ fn run_op(
         }
         Op::Softcap { x, dst, cap, n } => {
             ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(n as usize);
+            // F5 fully-overwritten: one thread per element.
+            let dd = ctx.uninit_dev(n as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             dispatch_1d(
                 pipelines,
@@ -3005,7 +3109,9 @@ fn run_op(
                     )
                 };
             ctx.ensure_device(ids, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * ne as usize);
+            // F5 fully-overwritten: one thread per row writes `dr[0..ne)` — both the f16 gather and
+            // every native-decode `embed_gather_*` variant fill the whole row.
+            let dd = ctx.uninit_dev(rows as usize * ne as usize);
             let bid = ctx.dev[ids.0 as usize].as_ref().unwrap();
             dispatch_1d(
                 pipelines,
@@ -3026,7 +3132,9 @@ fn run_op(
         }
         Op::Argmax { x, dst, n, rows } => {
             ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize);
+            // F5 fully-overwritten: one block per row, and lane 0 of every block stores that row's
+            // index — `rows` blocks, `rows` slots.
+            let dd = ctx.uninit_dev(rows as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             // One block per row; the block reduces the vocab argmax across a wave.
             dispatch_grid(
@@ -3259,7 +3367,10 @@ fn run_op(
 
             // Router logits = router · router_x, one dot per expert: reuse the linear_f16
             // GEMV to produce [rows, n_expert], then read them back for host-side gating.
-            let logits_dev = ctx.zero_dev(rows * nexp);
+            // F5 fully-overwritten: `linear_f16` runs one block per row and stores every
+            // `[row, expert]` of the `[rows, n_expert]` logits — the only consumers (`moe_topk`,
+            // and the paged path's host readback) read exactly that extent.
+            let logits_dev = ctx.uninit_dev(rows * nexp);
             dispatch_1d(
                 pipelines,
                 ctx.stream,
@@ -3356,6 +3467,11 @@ fn run_op(
                         uid: b.uid,
                     }
                 }
+                // F5 ACCUMULATOR — stays calloc, on every tier. The pre-R8 per-(row, slot) loop and
+                // the paged loop `atomicAdd` each expert's contribution into `dst`, and even the R8
+                // tier's `moe_accum_idm` does `dst[i] += acc` when the residual is not folded in
+                // (`res == null`) precisely so the two paths sum in the same order. Its seed must
+                // be +0.0.
                 None => ctx.zero_dev(rows * neu),
             };
             let resid_ptr = match fold_resid {
@@ -4014,7 +4130,9 @@ fn run_op(
             let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(state, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * channels as usize);
+            // F5 fully-overwritten: one thread per row writes `dst[row*channels + c]` for every
+            // channel; the grid covers every row.
+            let dd = ctx.uninit_dev(rows as usize * channels as usize);
             let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let bst = ctx.dev[state.0 as usize].as_ref().unwrap();
             dispatch_1d(
@@ -4115,7 +4233,11 @@ fn run_op(
             let ac = ctx.dequant_weight_or_cache(a_coef, g, bindings)?;
             let dt = ctx.dequant_weight_or_cache(dt_bias, g, bindings)?;
             ctx.ensure_device(state, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n_vhead as usize * head_v as usize);
+            // F5 fully-overwritten: all three arms below store the output of every (row, value
+            // head, value dim) — `deltanet`'s per-head `dr[d]` over the whole `d` loop,
+            // `deltanet_decode`'s thread-per-`d` (grid-stride past `blockDim`), and
+            // `deltanet_chunked`'s `dst[t*n_vhead*vd + vh*vd + d]` for every token of every chunk.
+            let dd = ctx.uninit_dev(rows as usize * n_vhead as usize * head_v as usize);
             let bq = ctx.dev[q.0 as usize].as_ref().unwrap();
             let bk = ctx.dev[k.0 as usize].as_ref().unwrap();
             let bv = ctx.dev[v.0 as usize].as_ref().unwrap();
@@ -4193,7 +4315,8 @@ fn run_op(
             ctx.ensure_device(moe, g, bindings)?;
             ctx.ensure_device(shexp, g, bindings)?;
             ctx.ensure_device(gate, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * n as usize);
+            // F5 fully-overwritten: one thread per row writes `dr[0..n)`.
+            let dd = ctx.uninit_dev(rows as usize * n as usize);
             let bm = ctx.dev[moe.0 as usize].as_ref().unwrap();
             let bs = ctx.dev[shexp.0 as usize].as_ref().unwrap();
             let bg = ctx.dev[gate.0 as usize].as_ref().unwrap();

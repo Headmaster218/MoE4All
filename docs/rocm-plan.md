@@ -1123,7 +1123,8 @@ every op's `zero_dev` issues one of those memsets for a `dst` the GEMV fully
 overwrites. That memset alone is ~1.6 ms/token (~20% of decode) of pure
 belt-and-braces. Next levers, biggest first:
 
-1. **Drop the `zero_dev` memset for fully-written `dst`s** (~20% of decode).
+1. ~~**Drop the `zero_dev` memset for fully-written `dst`s** (~20% of decode).~~
+   — done, F5 below.
 2. **Q6_K decode**, still 149 GB/s = 16% of peak while being 45% of a Q4_K_M
    model's per-token bytes (its tied `token_embd` lm_head is 128 MB of the 391).
    Neither F4 lever applies as-is; it needs its own unpack.
@@ -1146,6 +1147,94 @@ The dense model moves only **+2.8%** because it is dispatch-floor bound and 45%
 of its bytes are Q6_K. The MoE model, whose decode AND prefill both run the
 per-row `i8acc_q4k` GEMV, moves **+7.0% decode and +20.7% prefill** — the same
 kernel change, seen where the kernel is actually the bottleneck.
+
+### F5 — stop zeroing scratch the kernel fully overwrites (landed)
+
+F4's finding, acted on. Every op `dst` was drawn through `zero_dev`, which
+issues a `hipMemsetAsync` on the recycled pool block — **3.8 µs of real GPU work
+each**, and a decode token of the 0.6B took **198** of them. F5 splits the draw
+in two and moves the fully-overwritten `dst`s off the memset.
+
+**The split.** `ExecCtx::uninit_dev` is the same pooled draw without the clear;
+`zero_dev` stays for the `dst`s that genuinely READ what they were handed. The
+obligation on `uninit_dev` is exact — every element must be stored by the
+dispatch below, on every shape the op can take — so the classification was done
+against each kernel's write pattern, not against its name:
+
+| site (`exec.rs`)                                            | fully overwritten?                                                                                                                                        | action                                                                                         |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `RmsNorm`, `Softmax`, `GatedRmsNorm`                        | yes — strided loop over `dim`                                                                                                                             | `uninit_dev`                                                                                   |
+| `Linear` int8/WMMA/coop `dst`                               | yes — the three arms tile `[m, out_f]` exactly                                                                                                            | `uninit_dev`                                                                                   |
+| `Linear` native-decode `dst`, `linear_f16` `dst`            | yes — one block per row, `o` strided over `out_f`                                                                                                         | `uninit_dev`                                                                                   |
+| `Attention` (plain + split-KV combine)                      | yes — lanes own disjoint head dims                                                                                                                        | `uninit_dev`                                                                                   |
+| `GatedAct`, `GatedActFused`                                 | yes — one thread per OUTPUT element                                                                                                                       | `uninit_dev`                                                                                   |
+| `Add`, `AddBias`, `Scale`, `MulVec`, `Softcap`              | yes — elementwise                                                                                                                                         | `uninit_dev`                                                                                   |
+| `EmbedGather`, `Argmax`                                     | yes — one thread per row                                                                                                                                  | `uninit_dev`                                                                                   |
+| `Conv1dSilu`, `DeltaNet` (all 3 arms), `MoeSharedExpertAdd` | yes                                                                                                                                                       | `uninit_dev`                                                                                   |
+| MoE router logits (`linear_f16`)                            | yes                                                                                                                                                       | `uninit_dev`                                                                                   |
+| `QkNorm`                                                    | only when `x_stride == 0` — the kernel indexes `dst` with the SOURCE stride, so a strided row leaves inter-row gaps                                       | `uninit_dev` gated on `x_stride == 0`                                                          |
+| `QkNormRope`                                                | only when `rope_dim` is even — an odd one leaves `rope_dim - 1` in neither the pass-through nor the rotation range                                        | `uninit_dev` gated on `rope_dim % 2 == 0`                                                      |
+| **MoE `dst`** (`zero_dev(rows * neu)`)                      | **NO — accumulator.** The pre-R8 and paged loops `atomicAdd` each slot in; even R8's `moe_accum_idm` does `dst[i] += acc` when the residual is not folded | left `zero_dev`                                                                                |
+| **`ensure_device` unproduced tensor**                       | **NO** — reaching it means `Copy`/`CopyStrided`'s content-preserving dst, which reads what it is handed                                                   | left `zero_dev`                                                                                |
+| **`Rope` strided clone**                                    | **NO** — the DtoD clone copies `min(dd.len, src.len)`, and `rope` only rotates `[0, rope_dim)` of each head                                               | left `zero_dev`                                                                                |
+| rocBLAS `dst` (`INFR_ROCM_BLAS=1`)                          | yes (`beta = 0` ⇒ C unreferenced)                                                                                                                         | left `zero_dev` — opt-in, ships off, nothing to win against depending on a library's `0 * NaN` |
+
+**The poison is what makes the claim testable.** `zero = false` is an assertion
+about a kernel, and a wrong one is a silent wrong-answer bug, because the pool
+hands back a block an earlier op wrote — often one that is accidentally
+plausible, or accidentally zero on a first draw of fresh `hipMalloc` memory. So
+an un-cleared draw is filled with `0xFF` (f32 NaN) in DEBUG builds, and in
+release under `debug.poison_uninit` — same byte, same reasoning as
+`VulkanBackend::alloc_uninit`. The poison is the very memset this slice removes,
+so release skips it; **the parity suite is therefore run in debug as well**, or
+the claim would never have been exercised.
+
+It fires. Deliberately under-dispatching `attention` by one wave (leaving the
+last head's `dst` unwritten — exactly what a misclassification looks like) makes
+the DEBUG `rocm_seam` gemma-3 gate fail loudly:
+
+```
+left:  "Paris."
+right: "Please note:\n\nI am programmed to be helpful."     # debug, poisoned
+right: "- Ab Rb-рс}; <sub>\n\n*   Oy>>& 태イルスער"          # release, stale pool bytes
+```
+
+Reverting the under-dispatch, the debug suite is green — `rocm_seam` 9/9 in BOTH
+debug and release, the qwen3 golden `0xfd63781ea3bfa785` unmoved, and temp-0
+output byte-identical to `bfc18c0` on dense (Qwen3-0.6B), DeltaNet
+(Qwen3.5-0.8B) and MoE (Qwen3-30B-A3B).
+
+**Memsets per decode token, measured** (temporary `AtomicU64` on the fill path,
+removed before commit):
+
+| model               | ops/token | memsets before | after |
+| ------------------- | --------- | -------------- | ----- |
+| Qwen3-0.6B (dense)  | 451       | 198            | **0** |
+| Qwen3-30B-A3B (MoE) | 675       | 290            | **0** |
+
+The MoE reaches 0 as well because the F1c `MoeFfn → Add` fold makes its `dst`
+alias the residual stream, so the accumulator draw is not taken on that path at
+all — the `zero_dev` kept above is for the tiers that do take it.
+
+**Model-level effect** (interleaved vs a `bfc18c0` binary, warmed, first burst
+discarded, 3 pairs):
+
+| bench               | before            | after             |            |
+| ------------------- | ----------------- | ----------------- | ---------- |
+| Qwen3-0.6B tg128    | 129.8/130.7/130.9 | 146.5/146.1/146.6 | **+12.2%** |
+| Qwen3-0.6B pp512    | 4474/4477/4476    | 4552/4558/4556    | +1.8%      |
+| Qwen3-30B-A3B tg64  | 50.7/50.7/50.6    | 53.8/53.5/53.9    | **+6.1%**  |
+| Qwen3-30B-A3B pp512 | 305.4/305.8/289.2 | 306.4/306.2/306.5 | ~flat      |
+
+Decode is where it lands, as predicted: the dense 0.6B is dispatch-floor bound
+and 198 memsets was ~20% of its token. Prefill barely moves because one memset
+amortizes over a 512-row op instead of a 1-row one.
+
+**Next-largest per-dispatch cost.** With the memsets gone the 0.6B token is ~6.8
+ms over ~451 ops — still ~2.7 µs of null-kernel floor per op, so the remaining
+lever of this shape is **cutting op COUNT** (more fusion), not more per-op
+trimming. Ahead of it in size is F4's item 2, **Q6_K decode** at 149 GB/s = 16%
+of peak while carrying 45% of a Q4_K_M model's per-token bytes.
 
 Close it to llama.cpp HIP. The plateau analysis (Slices 25–28) identified the
 remaining prefill lever as a **cooperative-LDS, async-pipelined int8 mmq**
