@@ -16,7 +16,7 @@
 #![cfg(all(target_os = "linux", feature = "rocm"))]
 
 use infr_core::backend::{Backend, Bindings, BufferUsage};
-use infr_core::graph::{Activation, Graph, MoeGating, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
 use infr_core::tensor::TensorDesc;
 use infr_core::DType;
 use infr_rocm::RocmBackend;
@@ -6084,4 +6084,313 @@ fn kv_write_fold_declines_a_row_stride_it_would_overrun() {
          not tile must not fuse",
         pos + 1
     );
+}
+
+// ── P1: the tiled flash PREFILL attention kernel ─────────────────────────────
+//
+// `attention_prefill_flash` replaces the single-wave scalar `attention` on every `rows > 1`
+// dispatch, and it is the ONE op in this backend where a wrong answer is invisible until long
+// context: the plain kernel's bug surface is a head index, while a tiled one adds a query-tile
+// origin, a KV-tile origin, a workgroup-uniform key range derived from the mask, a padded LDS
+// stride, and an online-softmax rescale. All of those are exercised only when there is more than
+// one tile in each direction, so every case below runs multiple tiles, and two of them run at
+// 2048 keys.
+//
+// Two independent gates, because they fail differently:
+//   * vs the CPU reference — catches a wrong ABSOLUTE row/key/head, which an A/B against another
+//     ROCm kernel cannot see if both are wrong the same way;
+//   * vs the plain kernel through `kernels.rocm.attn_flash = false` — the SAME graph, both ways,
+//     so "the tiling reproduces what it replaced" is a checked property and not a comment.
+
+/// Deterministic f16 KV-cache bytes, small magnitude and NOT symmetric across the head dim (a
+/// palindromic cache would hide a mirrored `d` index).
+fn f16_kv(n: usize, salt: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n * 2];
+    for i in 0..n {
+        let f = (((i * 7 + salt * 13) % 23) as f32 - 11.0) * 0.045 + (i % 5) as f32 * 0.01;
+        v[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(f).to_bits().to_le_bytes());
+    }
+    v
+}
+
+/// Run a single-`Op::Attention` graph on `be` and return the downloaded f32 output.
+#[allow(clippy::too_many_arguments)]
+fn run_attention(
+    be: &dyn Backend,
+    q: &[f32],
+    k_bytes: &[u8],
+    v_bytes: &[u8],
+    rows: usize,
+    kv_len: usize,
+    n_head: usize,
+    n_kv: usize,
+    head_dim: usize,
+    mask: AttnMask,
+    pos: usize,
+) -> Vec<f32> {
+    let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+    let mut g = Graph::new();
+    let qid = g.input(f32d(q.len()));
+    let kid = g.input(f16d(kv_len * n_kv * head_dim));
+    let vid = g.input(f16d(kv_len * n_kv * head_dim));
+    let dst = g.output(f32d(rows * n_head * head_dim));
+    g.push(Op::Attention {
+        q: qid,
+        k_cache: kid,
+        v_cache: vid,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: n_head as u32,
+        n_kv: n_kv as u32,
+        head_dim: head_dim as u32,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+        mask,
+        pos: pos as u32,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let qb = be.alloc(q.len() * 4, BufferUsage::Activations).expect("q");
+    be.upload(qb.as_ref(), bytemuck::cast_slice(q)).unwrap();
+    let kb = be.alloc(k_bytes.len(), BufferUsage::KvCache).expect("k");
+    be.upload(kb.as_ref(), k_bytes).unwrap();
+    let vb = be.alloc(v_bytes.len(), BufferUsage::KvCache).expect("v");
+    be.upload(vb.as_ref(), v_bytes).unwrap();
+    let ob = be
+        .alloc(rows * n_head * head_dim * 4, BufferUsage::Readback)
+        .expect("out");
+    let mut b = Bindings::new();
+    b.bind(qid, qb.as_ref());
+    b.bind(kid, kb.as_ref());
+    b.bind(vid, vb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; rows * n_head * head_dim];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// Every prefill shape this slice cares about, as
+/// `(rows, kv_len, n_head, n_kv, head_dim, mask, pos)`. Each entry is here for one reason:
+///
+/// | case | what only it can break |
+/// | ---- | ---------------------- |
+/// | 512×512 GQA d=128 | the shipping qwen3 prefill shape; `n_kv != n_head` pins the GQA head map |
+/// | 2048×2048 d=128 | LONG CONTEXT — 128 query tiles × 64 key tiles, where a tile-origin slip first shows |
+/// | 2048×2048 SWA(384) d=256 | the SWA lower bound `j_lo` AND the wide (gemma-3) head dim, which takes the `bc = 16` tiling |
+/// | 300×300 | rows NOT a multiple of `br` and kv NOT a multiple of `bc` — the two ragged tails |
+/// | 40×160 pos=120 | a non-zero `pos`: the causal diagonal is offset from the tile origin |
+/// | 96×96 Canvas | the third mask arm, whose bound is a lower one like SWA's but unconditional |
+#[allow(clippy::type_complexity)]
+const ATTN_FLASH_CASES: &[(usize, usize, usize, usize, usize, AttnMask, usize)] = &[
+    (512, 512, 8, 2, 128, AttnMask::Causal, 0),
+    (2048, 2048, 4, 4, 128, AttnMask::Causal, 0),
+    (2048, 2048, 2, 1, 256, AttnMask::SlidingWindow(384), 0),
+    (300, 300, 4, 2, 128, AttnMask::Causal, 0),
+    (40, 160, 4, 2, 64, AttnMask::Causal, 120),
+    (96, 96, 2, 2, 128, AttnMask::Canvas { lo: 17 }, 0),
+];
+
+/// **The flash prefill kernel matches the CPU reference on every routed prefill shape**, including
+/// two at 2048 keys and one with a sliding window. Relative tolerance rather than equality: the
+/// tiled kernel accumulates the softmax ONLINE (a running max, rescaled per KV tile) where the
+/// reference takes a global max first, so the two agree to fp rounding, not to the bit.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attention_prefill_flash_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    for &(rows, kv_len, n_head, n_kv, head_dim, mask, pos) in ATTN_FLASH_CASES {
+        let q = gen(rows * n_head * head_dim, rows + head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(
+                b, &q, &k, &v, rows, kv_len, n_head, n_kv, head_dim, mask, pos,
+            )
+        };
+        let gpu = go(&be);
+        let want = go(&cpu);
+        let mag = maxabs(&want);
+        assert!(
+            mag > 1e-3,
+            "attention reference is all-zero for {rows}x{kv_len} h={n_head}/{n_kv} \
+             d={head_dim} {mask:?} pos={pos} — the case is vacuous"
+        );
+        assert!(
+            gpu.iter().all(|v| v.is_finite()),
+            "flash prefill attention produced a non-finite value for {rows}x{kv_len} \
+             h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}"
+        );
+        let e = maxerr(&gpu, &want);
+        println!(
+            "attn-flash {rows}x{kv_len} h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: \
+             max_err={e:e} max|ref|={mag:e} rel={:e}",
+            e / mag
+        );
+        assert!(
+            e / mag < 1e-4,
+            "flash prefill attention diverged from the CPU reference for {rows}x{kv_len} \
+             h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
+/// **The tiling reproduces the single-wave kernel it replaces.** `kernels.rocm.attn_flash = false`
+/// routes the identical graph back to the plain `attention`, so this is the A/B control for the
+/// case above — and it is the one that fails if a future edit to the tiling breaks a shape the CPU
+/// oracle is too slow to be run against at every size.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attention_prefill_flash_matches_the_single_wave_kernel() {
+    let (Some(on), Some(off)) = (rocm(), rocm_cfg(|c| c.attn_flash = false)) else {
+        return;
+    };
+    for &(rows, kv_len, n_head, n_kv, head_dim, mask, pos) in ATTN_FLASH_CASES {
+        let q = gen(rows * n_head * head_dim, rows + head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(
+                b, &q, &k, &v, rows, kv_len, n_head, n_kv, head_dim, mask, pos,
+            )
+        };
+        let flash = go(&on);
+        let plain = go(&off);
+        let e = maxerr(&flash, &plain);
+        let mag = maxabs(&plain).max(1e-6);
+        assert!(
+            e / mag < 1e-4,
+            "flash prefill attention diverged from the plain kernel for {rows}x{kv_len} \
+             h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
+/// **A shape the tiling cannot serve must fall back, not run wrong.** `head_dim = 20` is not a
+/// multiple of 8, so `attn_flash_tiling` declines it and the plain kernel runs; the answer must
+/// still be the CPU's. (This is the gate that turns "the routing predicate is right" into
+/// something a test fails on, rather than a comment above a `%`.)
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attention_prefill_falls_back_for_an_untileable_head_dim() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, kv_len, n_head, n_kv, head_dim) = (48usize, 48usize, 3usize, 3usize, 20usize);
+    let q = gen(rows * n_head * head_dim, 5);
+    let k = f16_kv(kv_len * n_kv * head_dim, 1);
+    let v = f16_kv(kv_len * n_kv * head_dim, 2);
+    let go = |b: &dyn Backend| {
+        run_attention(
+            b,
+            &q,
+            &k,
+            &v,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            AttnMask::Causal,
+            0,
+        )
+    };
+    let gpu = go(&be);
+    let want = go(&cpu);
+    let e = maxerr(&gpu, &want);
+    let mag = maxabs(&want).max(1e-6);
+    assert!(
+        e / mag < 1e-4,
+        "the head_dim={head_dim} fallback diverged from the CPU reference: abs={e:e} rel={:e}",
+        e / mag
+    );
+}
+
+/// **The score reduction TREE is the plain kernel's, and the seam goldens depend on it.** This is
+/// the tightest statement that is actually true, and the gap between it and the 1e-4 oracle gates
+/// above is not cosmetic.
+///
+/// The plain kernel splits a head dim across the 32 lanes, chains an FMA per lane, then butterfly
+/// all-reduces. The flash kernel gives ONE lane the whole dot, so it rebuilds that exact tree in
+/// registers (`g[t]` is lane `t`'s partial; the reduction pairs `t` with `t+16`, then `t+8`, …).
+/// Writing the dot the obvious way instead — a serial sum — is only ~1e-7 off, passes every
+/// tolerance gate in this file, and STILL flipped a near-tie argmax fourteen tokens into the Q8_0
+/// seam run ("I know" → "I remember"). A tolerance alone cannot separate those two: measured on
+/// these shapes the tree is 5.6e-8 relative and the serial sum 1.1e-7, a factor of two.
+///
+/// What DOES separate them is how many outputs land EXACTLY. Matching the tree leaves ≤6% of the
+/// output differing from the plain kernel at all; a serial sum leaves 25–41%. So that is the
+/// assertion, on shapes where the tiled softmax contributes nothing — the whole kv range fits ONE
+/// key tile, so the online rescale is a multiply by exactly zero against a zero accumulator, and
+/// the denominator and P·V sums both run ascending in `j` exactly as the plain kernel's do.
+///
+/// It is not bit-EQUALITY, and that is a property of the REFERENCE rather than of the tiling: the
+/// plain kernel evaluates the same `q·k` dot TWICE — once for the softmax max, once for the
+/// weighted sum — and nothing makes the compiler round two separately-scheduled copies of that
+/// loop identically, so even its own `w` for a single-key row is not exactly 1. The single-pass
+/// kernel is the self-consistent one here; `attention_prefill_flash_matches_cpu` is what pins it
+/// to the oracle.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attention_prefill_flash_keeps_the_plain_kernels_score_tree() {
+    let (Some(on), Some(off)) = (rocm(), rocm_cfg(|c| c.attn_flash = false)) else {
+        return;
+    };
+    // `bc` is 32 for head_dim <= 128 and 16 above it, so 16 keys is one tile for either tiling.
+    for &(rows, kv_len, n_head, n_kv, head_dim, mask, pos) in &[
+        (
+            24usize,
+            16usize,
+            4usize,
+            2usize,
+            128usize,
+            AttnMask::Causal,
+            0usize,
+        ),
+        (24, 16, 2, 1, 256, AttnMask::Causal, 0),
+        (16, 16, 4, 4, 64, AttnMask::SlidingWindow(8), 0),
+        (9, 16, 3, 3, 128, AttnMask::Causal, 0),
+    ] {
+        let q = gen(rows * n_head * head_dim, rows + head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(
+                b, &q, &k, &v, rows, kv_len, n_head, n_kv, head_dim, mask, pos,
+            )
+        };
+        let flash = go(&on);
+        let plain = go(&off);
+        let differing = flash
+            .iter()
+            .zip(&plain)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let frac = differing as f32 / flash.len() as f32;
+        let e = maxerr(&flash, &plain);
+        let mag = maxabs(&plain).max(1e-6);
+        println!(
+            "attn-flash tree {rows}x{kv_len} h={n_head}/{n_kv} d={head_dim} {mask:?}: \
+             inexact {differing}/{} ({:.1}%) max_err={e:e} rel={:e}",
+            flash.len(),
+            frac * 100.0,
+            e / mag
+        );
+        assert!(
+            frac < 0.15 && e / mag < 1e-7,
+            "flash prefill attention no longer reproduces the plain kernel's score reduction \
+             tree for {rows}x{kv_len} h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: \
+             {differing}/{} outputs inexact ({:.1}%), rel={:e} — a serial dot lands at 25-41% \
+             and 1.1e-7, and it moves the seam goldens",
+            flash.len(),
+            frac * 100.0,
+            e / mag
+        );
+    }
 }

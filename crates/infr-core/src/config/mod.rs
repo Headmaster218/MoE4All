@@ -448,6 +448,26 @@ cfg_struct! {
         /// see `exec.rs`'s `MOE_ID_ROWS`). `0` is clamped to 1. Has NO env key — set it with
         /// `--set kernels.rocm.moe_id_rows=…` or the TOML file.
         moe_id_rows: usize = 128,
+        /// P1: the TILED FLASH PREFILL attention kernel (`attention_prefill_flash`) — a workgroup
+        /// owns a tile of query rows, streams the kv range through LDS once, and runs a one-pass
+        /// online softmax, instead of giving every (query row, head) its own wave that re-reads the
+        /// whole K/V cache twice. Clear it to route prefill back to the plain `attention` kernel.
+        ///
+        /// Has NO env key, like `fuse_kv_write` — and it exists for the same reason: the flash
+        /// kernel's parity case runs the SAME graph both ways, and "matches the single-wave kernel
+        /// it replaces" is only checkable against that control.
+        attn_flash: bool = true,
+        /// Per-op GPU-time profiling (P1). With this set, `execute_graph` brackets every dispatch
+        /// in a pair of HIP timing events and, after the forward's single stream barrier, prints a
+        /// cumulative `op kind + shape → total ms / share / count` table to stderr. It is the only
+        /// per-op profiler this backend has — ROCm has no `infr-prof` GPU analogue, and the ~2.7 µs
+        /// dispatch floor makes a `hipStreamSynchronize`-per-op timer useless, so the events read
+        /// the command processor's own timestamps instead.
+        ///
+        /// Costs one event pair per op while on (a few ms of `hipEventCreate` per forward), so it
+        /// is DIAGNOSTIC, never a shipping default. Has NO env key, like `module_cache` /
+        /// `moe_id_rows`: `--set kernels.rocm.prof_ops=true` or the TOML file.
+        prof_ops: bool = false,
     }
 }
 

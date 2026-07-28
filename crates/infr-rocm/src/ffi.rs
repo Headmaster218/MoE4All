@@ -83,6 +83,12 @@ extern "C" {
     pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> c_int;
     /// Make `stream` wait until `event` has been reached (cross-stream ordering, no host sync).
     pub fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: u32) -> c_int;
+    /// GPU-side elapsed milliseconds between two RECORDED timing events (i.e. events created
+    /// WITHOUT [`HIP_EVENT_DISABLE_TIMING`]). Both must have completed — sync the stream first.
+    /// This is what the P1 per-op profiler (`kernels.rocm.prof_ops`) measures each dispatch with:
+    /// it reads the command processor's own timestamps, so it costs no host round-trip per op and
+    /// does not serialize the stream the way a `hipStreamSynchronize` per op would.
+    pub fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, end: hipEvent_t) -> c_int;
     /// Destroy an event.
     pub fn hipEventDestroy(event: hipEvent_t) -> c_int;
     /// Load a code object (PTX-alike, from hiprtc or hipcc) into a module.

@@ -236,6 +236,7 @@ const HIP_PARTS: &[&str] = &[
     ARGMAX,
     WRITE_KV,
     ATTENTION,
+    ATTENTION_FLASH,
     ATTENTION_SPLIT,
     MOE_FFN,
     CONV1D_SILU,
@@ -957,6 +958,309 @@ extern "C" __global__ void attention(
     for (int c = 0; c < npl; c++) {
         int d = (c << 5) + tid;
         if (d < head_dim) dr[d] = acc[c] * inv;
+    }
+}
+"#;
+
+// ── Tiled flash PREFILL attention (P1) ───────────────────────────────────────
+//
+// WHY. The P1 per-op profile (`kernels.rocm.prof_ops`) says prefill attention is **64% of a
+// Qwen3-0.6B pp512 forward** — 2.77 ms of a 116 ms token batch, per layer, 28 layers. The plain
+// `attention` kernel above gives each (query row, head) ONE wave that walks the WHOLE kv range
+// TWICE (a max pass, then an exp/accumulate pass) straight out of global memory, and it evaluates
+// the q·k dot for masked keys before throwing the score away. At pp512 that is
+// `rows × n_head = 8192` waves each streaming ~320 KB of K and V — ~2.6 GB per layer for 2 MB of
+// distinct cache, i.e. the SAME K/V re-read ~1000×. It was never a math problem: the arithmetic is
+// ~1 GFLOP per layer, ~36 µs of this GPU.
+//
+// WHAT. The standard flash tiling, sized for RDNA3's 32-lane wave:
+//
+//   * A workgroup owns a TILE of `br = nw · ATTN_FLASH_QPW` consecutive query rows of ONE head, so
+//     each K/V element it reads is reused by all `br` of them. That is the whole win — global K/V
+//     traffic drops by `br`.
+//   * ONE pass, online softmax: a running (max, denom, accumulator) per query row, rescaled by
+//     `exp(m_old − m_new)` when a tile raises the max. Halves the K reads the two-pass kernel did
+//     and drops the second dot product entirely. This is the same rescale Vulkan's flash kernels
+//     use, and the ROCm qwen3 seam golden is Vulkan's — see the parity notes on the exec routing.
+//   * WHOLE-TILE mask elision. The key range `[j_lo, j_hi)` is clamped once per workgroup from the
+//     tile's own position span, so a causal prefill never launches a single wave at the ~half of
+//     the score matrix that is masked, and a SWA model skips everything below its window. Inside a
+//     tile, a masked lane also skips its dot instead of computing-then-discarding.
+//   * LANE PER KEY for the scores (lane `t` owns key `j0+t` and walks the whole `head_dim`), so a
+//     score needs NO cross-lane reduction at all — the plain kernel paid a 5-`shfl` butterfly per
+//     key. Lane per DIM for the P·V accumulate, with the weight broadcast by one `__shfl`, so that
+//     half needs no reduction either.
+//   * K and V tiles live in LDS at a padded row stride of `head_dim + 2` halves. `head_dim` is a
+//     multiple of 32 on every routed model (`attn_flash_tiling` requires it), so the stride is an
+//     ODD number of 4-byte LDS words and the 32 lanes' strided reads land on 32 distinct banks.
+//   * The score dot is rebuilt in the plain kernel's own reduction tree. That is a CORRECTNESS
+//     requirement, not a detail — see the comment on the loop, and §2 of docs/rocm-plan.md.
+//
+// `ATTN_FLASH_QPW` (query rows per WAVE) is compile-time and the `u` loops are unrolled, because
+// `acc[u][c]` must stay in registers — a runtime bound would spill the accumulator to scratch and
+// undo the point. `nw` (waves per workgroup) and `bc` (keys per tile) are chosen HOST-side from
+// `head_dim` to keep the LDS footprint inside 32 KiB so two workgroups stay co-resident per CU;
+// `exec.rs`'s `attn_flash_tiling` is that policy and falls back to the plain kernel when no
+// configuration fits.
+const ATTENTION_FLASH: &str = r#"
+// Query rows one WAVE owns. Compile-time: `acc[QPW][MAXP2]` is register state, so this is a VGPR
+// dial as much as a reuse dial. Measured at pp512 (head_dim 128, br held at 16): 2 -> 278 us,
+// 4 -> 313, 8 -> 441. More rows per wave reuses the lane's K element more, but the accumulator
+// grows with it and occupancy falls faster than the reuse pays.
+#define ATTN_FLASH_QPW 2
+// head_dim/64 ceiling. A lane owns TWO CONSECUTIVE output dims per step, so it reads V as one
+// `__half2` and stores `dst` as one `float2` — half the LDS reads of a dim-per-lane mapping, and
+// `acc` costs the same registers. 4 covers head_dim <= 256, which is every head dim routed here;
+// `acc[QPW][MAXP2]` is register state allocated in full, so a larger bound is not free.
+#define ATTN_FLASH_MAXP2 4
+
+// Butterfly all-reduce MAX across a 32-lane wave (the `attn_wave_allreduce32` sum's twin).
+static __device__ __forceinline__ float attn_wave_allmax32(float v) {
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off));
+    return v;
+}
+
+extern "C" __global__ void attention_prefill_flash(
+    const float* __restrict__ q,        // [rows, n_head, head_dim]
+    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim]
+    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim]
+    float* __restrict__ dst,            // [rows, n_head, head_dim]
+    int rows,
+    int kv_len,
+    int n_head,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int pos,            // absolute position of query row 0
+    int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
+    int swa_window,
+    int bc,             // keys per KV tile, <= 32 (one lane per key)
+    int n_qtiles        // ceil(rows / br); blockIdx.x = head * n_qtiles + qtile
+) {
+    // 16-byte aligned: the hot loop reads the query tile as `float4`.
+    extern __shared__ __align__(16) float smem[];
+    int nt   = blockDim.x;
+    int nw   = nt >> 5;
+    int br   = nw * ATTN_FLASH_QPW;
+    int kvs  = head_dim + 2;                  // padded LDS row stride, in halves
+    float*  qs = smem;                        // [br][head_dim] f32
+    __half* ks = (__half*)(smem + br * head_dim);
+    __half* vs = ks + bc * kvs;
+
+    int qt   = blockIdx.x % n_qtiles;
+    int h    = blockIdx.x / n_qtiles;
+    if (h >= n_head) return;
+    int kv_h = h * n_kv / n_head;             // GQA head mapping (same as the plain kernel)
+    int r0   = qt * br;
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int wave = tid >> 5;
+
+    // Stage this workgroup's query rows. Rows past `rows` are zeroed and never stored back.
+    for (int i = tid; i < br * head_dim; i += nt) {
+        int rr = i / head_dim;
+        int d  = i - rr * head_dim;
+        int gr = r0 + rr;
+        qs[i] = (gr < rows) ? q[((long)gr * n_head + h) * head_dim + d] : 0.0f;
+    }
+
+    float m[ATTN_FLASH_QPW], l[ATTN_FLASH_QPW];
+    float2 acc[ATTN_FLASH_QPW][ATTN_FLASH_MAXP2];
+    #pragma unroll
+    for (int u = 0; u < ATTN_FLASH_QPW; u++) {
+        m[u] = -1e30f;
+        l[u] = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < ATTN_FLASH_MAXP2; c++) acc[u][c] = make_float2(0.0f, 0.0f);
+    }
+
+    // WORKGROUP-uniform key range: every thread must reach the tile-staging barriers the same
+    // number of times, so the bound comes from the whole query tile, not from one row.
+    int qp_lo = pos + r0;
+    int qp_hi = pos + r0 + br - 1;
+    int j_lo = 0, j_hi = kv_len;
+    if (mask_type == 0) {
+        j_hi = min(kv_len, qp_hi + 1);
+    } else if (mask_type == 1) {
+        j_hi = min(kv_len, qp_hi + 1);
+        j_lo = max(0, qp_lo - swa_window + 1);
+    } else if (mask_type == 2) {
+        j_lo = min(max(0, swa_window), kv_len);
+    }
+    j_lo = (j_lo / bc) * bc;
+
+    for (int j0 = j_lo; j0 < j_hi; j0 += bc) {
+        // Both barriers are needed: the first retires the PREVIOUS iteration's readers before the
+        // tile buffers are overwritten, the second publishes the new tile. (The first also covers
+        // the `qs` staging above on the opening iteration.)
+        __syncthreads();
+        // Stage K and V EIGHT halves (16 B) per thread per step. Element-at-a-time staging was
+        // measured to be the kernel's single biggest cost (~200 of 492 us/layer at pp512): 64
+        // `global_load_ushort` per thread per tile, each wave pulling 64 B — half a cache line —
+        // and far too few in flight to cover the ~500-cycle latency. A `uint4` makes it 8 loads of
+        // a wave-contiguous 512 B. Both alignments hold: `head_dim % 32 == 0` (checked by
+        // `attn_flash_tiling`) makes every cache row 16 B-aligned off a `hipMalloc` base, and the
+        // padded LDS stride stays a whole number of 4-byte words for the 32-bit stores.
+        int nv8 = bc * (head_dim >> 3);
+        for (int i = tid; i < nv8; i += nt) {
+            int jj = i / (head_dim >> 3);
+            int d  = (i - jj * (head_dim >> 3)) << 3;
+            int j  = j0 + jj;
+            uint4 kk = make_uint4(0u, 0u, 0u, 0u), vv = kk;
+            if (j < kv_len) {
+                long off = ((long)j * n_kv + kv_h) * head_dim + d;
+                kk = *(const uint4*)(k_cache + off);
+                vv = *(const uint4*)(v_cache + off);
+            }
+            uint* kd = (uint*)(ks + jj * kvs + d);
+            uint* vd = (uint*)(vs + jj * kvs + d);
+            kd[0] = kk.x; kd[1] = kk.y; kd[2] = kk.z; kd[3] = kk.w;
+            vd[0] = vv.x; vd[1] = vv.y; vd[2] = vv.z; vd[3] = vv.w;
+        }
+        __syncthreads();
+
+        int j = j0 + lane;
+        bool live = (lane < bc) && (j < j_hi) && (j < kv_len);
+
+        // Q·Kᵀ, one query row at a time, in the EXACT reduction order of the `attention` kernel
+        // this replaces — that identity is a correctness requirement, not an aesthetic one. The
+        // plain kernel splits a head dim across the 32 lanes (lane t owning d = t, t+32, …),
+        // chains an FMA per lane, then butterfly all-reduces. Here one lane owns the whole dot, so
+        // the same tree is rebuilt IN REGISTERS: `g[t]` is lane t's partial, and the reduction
+        // below pairs t with t+16, then t+8, … which is exactly what `__shfl_xor` at off=16,8,…
+        // computes. Get this wrong and the difference is invisible in a tolerance test and shows
+        // up as a flipped near-tie argmax fourteen tokens into a greedy run — which is how it
+        // was found (the Q8_0 seam gate split "I know" / "I remember" on a plain serial dot).
+        //
+        // The access pattern survives the reordering: `t` is the INNER loop, so `q` is still read
+        // as a `float4` and `k` as two `__half2` over consecutive `d`, and the 32 `g[t]` chains
+        // are independent — MORE instruction-level parallelism than the per-row `s[u]` chains it
+        // replaced, which is why matching the reference order costs ~4% and not more.
+        float s[ATTN_FLASH_QPW];
+        #pragma unroll
+        for (int u = 0; u < ATTN_FLASH_QPW; u++) s[u] = 0.0f;
+        if (live) {
+            const __half* kr = ks + lane * kvs;
+            const float*  q0 = qs + wave * ATTN_FLASH_QPW * head_dim;
+            #pragma unroll
+            for (int u = 0; u < ATTN_FLASH_QPW; u++) {
+                const float* qr = q0 + u * head_dim;
+                float g[32];
+                #pragma unroll
+                for (int t = 0; t < 32; t++) g[t] = 0.0f;
+                // `head_dim` is a multiple of 32 (`attn_flash_tiling`), so every lane-group block
+                // is whole and no `g[t]` is left a term short.
+                for (int b = 0; b < head_dim; b += 32) {
+                    #pragma unroll
+                    for (int t = 0; t < 32; t += 4) {
+                        int d = b + t;
+                        float4 qv = *(const float4*)(qr + d);
+                        float2 k01 = __half22float2(*(const __half2*)(kr + d));
+                        float2 k23 = __half22float2(*(const __half2*)(kr + d + 2));
+                        // `+=` and not `fmaf`, deliberately: the plain kernel writes
+                        // `part += qreg[c] * __half2float(kr[d])`, and whatever the compiler
+                        // decides to contract that into it must decide the same way here, or the
+                        // two differ by a ULP on exactly the products it fuses in one and not the
+                        // other.
+                        g[t]     += qv.x * k01.x;
+                        g[t + 1] += qv.y * k01.y;
+                        g[t + 2] += qv.z * k23.x;
+                        g[t + 3] += qv.w * k23.y;
+                    }
+                }
+                // `attn_wave_allreduce32`'s tree, unrolled in registers (for t < off, t^off == t+off).
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    #pragma unroll
+                    for (int t = 0; t < off; t++) g[t] += g[t + off];
+                }
+                s[u] = g[0];
+            }
+        }
+
+        float w[ATTN_FLASH_QPW];
+        #pragma unroll
+        for (int u = 0; u < ATTN_FLASH_QPW; u++) {
+            int lr = wave * ATTN_FLASH_QPW + u;
+            int qp = pos + r0 + lr;
+            bool masked = !live;
+            if (!masked) {
+                if (mask_type == 0)      masked = (j > qp);
+                else if (mask_type == 1) masked = (j > qp || j < qp - swa_window + 1);
+                else if (mask_type == 2) masked = (j < swa_window);
+            }
+            float sm = masked ? -1e30f : s[u] * scale;
+            // Online rescale: fold this tile's max into the running one, correcting what is
+            // already accumulated. `m` starts at -1e30, so the first live tile scales the (zero)
+            // accumulator by exp(-1e30 - m_new) = 0 and an all-masked tile by exp(0) = 1.
+            float nm = fmaxf(m[u], attn_wave_allmax32(sm));
+            float corr = expf(m[u] - nm);
+            m[u] = nm;
+            float wu = masked ? 0.0f : expf(sm - nm);
+            // Only the RESCALE happens here. The plain kernel sums the softmax denominator over
+            // `j` ascending, so this one does too — the add lives in the P·V walk below, which
+            // already visits the tile's keys in that order. A butterfly sum here would have been
+            // cheaper and a different number.
+            l[u] *= corr;
+            w[u] = wu;
+            if (corr != 1.0f) {
+                #pragma unroll
+                for (int c = 0; c < ATTN_FLASH_MAXP2; c++) {
+                    acc[u][c].x *= corr;
+                    acc[u][c].y *= corr;
+                }
+            }
+        }
+
+        // P·V. One V row is read once per lane and fanned across all QPW query rows, so the LDS
+        // traffic here is amortized the same way the K reads are.
+        int nj = min(bc, j_hi - j0);
+        for (int jj = 0; jj < nj; jj++) {
+            float wj[ATTN_FLASH_QPW];
+            bool any = false;
+            #pragma unroll
+            for (int u = 0; u < ATTN_FLASH_QPW; u++) {
+                wj[u] = __shfl(w[u], jj);
+                any = any || (wj[u] != 0.0f);
+            }
+            #pragma unroll
+            for (int u = 0; u < ATTN_FLASH_QPW; u++) l[u] += wj[u];
+            if (!any) continue;   // wave-uniform: a fully-masked key contributes exactly nothing
+            const __half* vr = vs + jj * kvs;
+            // NO `break` on the head-dim bound in any of these unrolled `c` loops: an early exit
+            // stops LLVM fully unrolling, `c` stays dynamic, and `acc[u][c]` lands in SCRATCH —
+            // measured at 272 bytes/lane, and it cost ~2x on this kernel. A plain `d < head_dim`
+            // value guard keeps every index a compile-time constant.
+            #pragma unroll
+            for (int c = 0; c < ATTN_FLASH_MAXP2; c++) {
+                int d = (c << 6) + (lane << 1);
+                if (d < head_dim) {
+                    float2 vv = __half22float2(*(const __half2*)(vr + d));
+                    // Same reason as the score dot: `acc[c] += w * __half2float(vr[d])` is how
+                    // the plain kernel spells it.
+                    #pragma unroll
+                    for (int u = 0; u < ATTN_FLASH_QPW; u++) {
+                        acc[u][c].x += wj[u] * vv.x;
+                        acc[u][c].y += wj[u] * vv.y;
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int u = 0; u < ATTN_FLASH_QPW; u++) {
+        int gr = r0 + wave * ATTN_FLASH_QPW + u;
+        if (gr >= rows) continue;
+        float inv = 1.0f / l[u];
+        float* dr = dst + ((long)gr * n_head + h) * head_dim;
+        #pragma unroll
+        for (int c = 0; c < ATTN_FLASH_MAXP2; c++) {
+            int d = (c << 6) + (lane << 1);
+            if (d < head_dim) {
+                *(float2*)(dr + d) = make_float2(acc[u][c].x * inv, acc[u][c].y * inv);
+            }
+        }
     }
 }
 "#;

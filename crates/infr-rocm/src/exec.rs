@@ -252,6 +252,69 @@ const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg 
     rounding: infr_core::tier::ChunkRounding::Up,
 };
 
+/// Query rows one WAVE of `attention_prefill_flash` owns — mirrors the kernel's `ATTN_FLASH_QPW`,
+/// which is compile-time there because `acc[u][c]` is register state. Swept on the pp512 shape at
+/// a fixed `br` of 16: 2 -> 279 us/layer, 4 -> 313, 8 -> 441.
+const ATTN_FLASH_QPW: usize = 2;
+
+/// LDS budget for one `attention_prefill_flash` workgroup. Half of gfx1100's 64 KiB per CU, so two
+/// workgroups stay co-resident; a `head_dim` that cannot be tiled inside it falls back to the plain
+/// `attention` kernel rather than trading occupancy away for the tiling.
+const ATTN_FLASH_LDS: usize = 32 * 1024;
+
+/// The chosen shape of one `attention_prefill_flash` workgroup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttnFlashTiling {
+    /// Waves per workgroup (block = `nw * 32` threads).
+    nw: usize,
+    /// Keys per KV tile, `<= 32` — the kernel gives one LANE one key, so a wider tile has nowhere
+    /// to put the extra keys.
+    bc: usize,
+}
+
+impl AttnFlashTiling {
+    /// Query rows one workgroup owns.
+    fn br(&self) -> usize {
+        self.nw * ATTN_FLASH_QPW
+    }
+    /// Dynamic LDS bytes: the `[br][head_dim]` f32 query tile plus the K and V half tiles at the
+    /// bank-conflict-avoiding `head_dim + 2` row stride. Must match the kernel's own arithmetic.
+    fn smem(&self, head_dim: usize) -> usize {
+        self.br() * head_dim * 4 + 2 * self.bc * (head_dim + 2) * 2
+    }
+}
+
+/// Pick the flash-prefill workgroup shape for `head_dim`, or `None` to keep the plain kernel.
+///
+/// Three hard requirements, each a way the kernel would be wrong or pointless:
+///
+/// 1. **`head_dim % 32 == 0`.** Three separate constraints land here, and the strictest wins. (a) The score
+///    dot is rebuilt in the plain kernel's exact reduction tree — 32 lane-group partials, the
+///    group for `t` taking `d = t, t+32, …` — so a head dim that does not fill every group whole
+///    would need the plain kernel's `d < head_dim` guard to land on the same tree, and the point
+///    of the rebuild is that it is exact. (b) The LDS K/V row stride is `head_dim + 2` HALVES =
+///    `head_dim/2 + 1` 4-byte words, coprime to the 32 banks precisely when it is ODD, i.e. when
+///    `head_dim` is a multiple of 4. (c) The tile staging reads K/V eight halves at a time as a
+///    `uint4`, which needs each cache row 16 B-aligned off the `hipMalloc` base — a multiple of 8.
+///    Every routed head dim is 64/128/256; anything else keeps the plain kernel.
+/// 2. **`head_dim <= 256`.** The kernel's `ATTN_FLASH_MAXP2 = 4` output-dim PAIRS per lane. It is
+///    sized to the models rather than to the plain kernel's 512-wide bound because
+///    `acc[QPW][MAXP2]` is register state, allocated in full whether a head dim reaches it or not;
+///    no model routed here has a head dim above gemma-3's 256.
+/// 3. **The tile fits [`ATTN_FLASH_LDS`].** `bc` drops to 16 for the wide (gemma-3's 256) head
+///    dims, then `nw` is the largest power of two that still fits — biggest `br` wins, because `br`
+///    is exactly the factor by which global K/V traffic falls.
+fn attn_flash_tiling(head_dim: usize) -> Option<AttnFlashTiling> {
+    if head_dim == 0 || head_dim % 32 != 0 || head_dim > 256 {
+        return None;
+    }
+    let bc = if head_dim <= 128 { 32 } else { 16 };
+    [8usize, 4, 2, 1]
+        .into_iter()
+        .map(|nw| AttnFlashTiling { nw, bc })
+        .find(|t| t.smem(head_dim) <= ATTN_FLASH_LDS)
+}
+
 /// Matrix-core (WMMA) int8 prefill GEMM kernel (Phase 5, Slice-25 RM×CN-tiled) for a covered dtype.
 /// Routed only for `m > 1` (prefill); decode (`m == 1`) stays on the `linear_i8_*` GEMV, which WMMA
 /// can't help. Same int8 precision as `native_i8_fmt` (identical activation quant + weight codes),
@@ -1599,6 +1662,7 @@ pub fn execute_graph(
     // above (it also drives the Slice-37 prefetch schedule). The walk itself (graph order, the
     // Slice-32-elided indices skipped) is the shared `infr_core::exec` skeleton; only `run_op`'s
     // body is per-backend.
+    let mut prof = cfg.kernels.rocm.prof_ops.then(OpProf::new);
     infr_core::exec::run_ops(
         &g.ops,
         &fusion.skip,
@@ -1608,6 +1672,7 @@ pub fn execute_graph(
             pipelines,
             fusion: &fusion,
             ctx: &mut ctx,
+            prof: prof.as_mut(),
         },
     )?;
 
@@ -1615,6 +1680,10 @@ pub fn execute_graph(
     // NULL stream, which is NOT ordered against our non-default work stream, so it must observe a
     // completed stream first.
     unsafe { ffi::hipStreamSynchronize(stream) };
+    // P1: the events are all retired now, so this is a pure host-side read of their timestamps.
+    if let Some(p) = prof.take() {
+        p.flush();
+    }
     // Outputs + mutated f32 Inputs; the in-place KV caches are already current in their bound
     // buffers (shared predicate — `infr_core::exec::writes_back`, same set cpu/metal copy back).
     for id in infr_core::exec::write_back_targets(g) {
@@ -1859,6 +1928,141 @@ fn kv_fuse_ok(g: &Graph, i: usize, cache: TensorId, row: usize) -> Option<KvFuse
     })
 }
 
+// ── Per-op GPU-time profiler (P1) ────────────────────────────────────────────
+//
+// ROCm had no per-op profiler at all, which is why every perf slice before P1 had to reason about
+// where a token went from launch COUNTS and isolated micro-benches. `kernels.rocm.prof_ops` turns
+// this on.
+//
+// Why HIP events and not a host timer: the ops all queue on ONE stream with no per-op sync (see
+// `execute_graph`), so a host `Instant` around `run_op` measures ENQUEUE, not execution. Putting a
+// `hipStreamSynchronize` per op instead would measure execution but serialize the pipeline and add
+// the very ~2.7 µs floor F4 measured to every sample. A recorded timing-event pair costs the stream
+// nothing but a timestamp write, and `hipEventElapsedTime` reads the command processor's own
+// clocks AFTER the forward's existing barrier — so the profile is of the shipping schedule.
+//
+// Totals accumulate process-wide, keyed by op kind + the shape that makes the cost, and the table
+// is (re)printed after every forward. A bench run therefore ends with a cumulative table over every
+// forward it did; the LAST one printed is the one to read.
+struct OpProf {
+    /// One entry per dispatched op, in walk order: `(label, start, end)`.
+    spans: Vec<(String, ffi::hipEvent_t, ffi::hipEvent_t)>,
+}
+
+/// Process-wide totals: label → (dispatches, total GPU ms).
+static PROF_TOTALS: Mutex<Option<std::collections::BTreeMap<String, (u64, f64)>>> =
+    Mutex::new(None);
+
+impl OpProf {
+    fn new() -> Self {
+        OpProf { spans: Vec::new() }
+    }
+
+    /// Create a TIMING event (no `HIP_EVENT_DISABLE_TIMING`) and record it on `stream`.
+    fn mark(stream: ffi::hipStream_t) -> ffi::hipEvent_t {
+        let mut ev: ffi::hipEvent_t = std::ptr::null_mut();
+        unsafe {
+            ffi::hipEventCreateWithFlags(&mut ev, 0);
+            ffi::hipEventRecord(ev, stream);
+        }
+        ev
+    }
+
+    fn begin(&mut self, label: String, stream: ffi::hipStream_t) {
+        let start = Self::mark(stream);
+        self.spans.push((label, start, std::ptr::null_mut()));
+    }
+
+    fn end(&mut self, stream: ffi::hipStream_t) {
+        let ev = Self::mark(stream);
+        if let Some(last) = self.spans.last_mut() {
+            last.2 = ev;
+        }
+    }
+
+    /// Read every span (the caller has already synchronized the stream), fold into the process
+    /// totals, print the table, and destroy the events.
+    fn flush(self) {
+        let mut guard = PROF_TOTALS.lock().unwrap();
+        let totals = guard.get_or_insert_with(Default::default);
+        for (label, start, end) in self.spans {
+            let mut ms = 0.0f32;
+            if !end.is_null()
+                && unsafe { ffi::hipEventElapsedTime(&mut ms, start, end) } == HIP_SUCCESS
+            {
+                let e = totals.entry(label).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += ms as f64;
+            }
+            unsafe {
+                ffi::hipEventDestroy(start);
+                if !end.is_null() {
+                    ffi::hipEventDestroy(end);
+                }
+            }
+        }
+        let mut rows: Vec<_> = totals.iter().collect();
+        rows.sort_by(|a, b| {
+            b.1 .1
+                .partial_cmp(&a.1 .1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let total: f64 = rows.iter().map(|r| r.1 .1).sum();
+        eprintln!("[rocm prof] cumulative GPU time, {total:.2} ms over all forwards so far");
+        eprintln!(
+            "[rocm prof] {:>10} {:>7} {:>9} {:>9}  op",
+            "ms", "share", "count", "us/ea"
+        );
+        for (label, (n, ms)) in rows {
+            let share = if total > 0.0 { ms / total * 100.0 } else { 0.0 };
+            let each = if *n > 0 { ms * 1000.0 / *n as f64 } else { 0.0 };
+            eprintln!("[rocm prof] {ms:>10.2} {share:>6.1}% {n:>9} {each:>9.1}  {label}");
+        }
+    }
+}
+
+/// The profile key for one op: its kind plus the shape that makes its cost. Two dispatches share a
+/// row exactly when they do the same work, so a 28-layer model folds into a handful of rows.
+fn prof_label(op: &Op, g: &Graph) -> String {
+    match *op {
+        Op::Linear {
+            weight,
+            m,
+            in_f,
+            out_f,
+            ..
+        } => format!("Linear m={m} {in_f}x{out_f} {:?}", g.desc(weight).dtype),
+        Op::Attention {
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            mask,
+            ..
+        } => format!(
+            "Attention rows={rows} kv={kv_len} h={n_head}/{n_kv} d={head_dim} {}",
+            match mask {
+                AttnMask::Causal => "causal",
+                AttnMask::SlidingWindow(_) => "swa",
+                AttnMask::Canvas { .. } => "canvas",
+            }
+        ),
+        Op::MoeFfn {
+            gate_exps,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            ..
+        } => format!(
+            "MoeFfn ne={ne} nff={n_ff_exp} {n_used}/{n_expert} {:?}",
+            g.desc(gate_exps).dtype
+        ),
+        _ => op.kind().to_string(),
+    }
+}
+
 // ── Per-op dispatch ──────────────────────────────────────────────────────────
 
 /// This backend's hook into the shared op walk ([`infr_core::exec::run_ops`]): the ambient state
@@ -1872,11 +2076,19 @@ struct RocmDispatch<'a, 'b, 'c> {
     pipelines: &'a Pipelines,
     fusion: &'a DecodeFusion,
     ctx: &'a mut ExecCtx<'c>,
+    /// `Some` only under `kernels.rocm.prof_ops` (P1).
+    prof: Option<&'a mut OpProf>,
 }
 
 impl infr_core::exec::OpDispatch for RocmDispatch<'_, '_, '_> {
     fn dispatch(&mut self, i: usize, op: &Op) -> Result<()> {
-        run_op(
+        // The event pair brackets EVERYTHING the op queues — every kernel of a multi-dispatch arm
+        // (split-KV attention, the MoE expert loop) plus any copy — which is what "where does the
+        // forward go" wants, not per-kernel accounting.
+        if let Some(p) = self.prof.as_deref_mut() {
+            p.begin(prof_label(op, self.g), self.ctx.stream);
+        }
+        let r = run_op(
             op,
             self.g,
             self.bindings,
@@ -1885,7 +2097,11 @@ impl infr_core::exec::OpDispatch for RocmDispatch<'_, '_, '_> {
             self.fusion.norm.get(&i).copied(),
             self.fusion.add.get(&i).copied(),
             self.fusion.kv.get(&i).copied(),
-        )
+        );
+        if let Some(p) = self.prof.as_deref_mut() {
+            p.end(self.ctx.stream);
+        }
+        r
     }
 }
 
@@ -2781,6 +2997,43 @@ fn run_op(
                         arg_i32(n_head as i32),
                         arg_i32(head_dim as i32),
                         arg_i32(n_chunks as i32),
+                    ],
+                )?;
+            } else if let Some(t) = (rows > 1 && ctx.rocm.attn_flash)
+                .then(|| attn_flash_tiling(head_dim as usize))
+                .flatten()
+            {
+                // P1: TILED FLASH PREFILL. A workgroup owns `t.br()` consecutive query rows of one
+                // head, streams the kv range in `t.bc`-key tiles through LDS, and runs a one-pass
+                // online softmax — so K/V is read once per query TILE instead of once per query
+                // ROW, and the causal/SWA-masked half of the score matrix is never visited. The
+                // grid is `head * n_qtiles + qtile`, linearized because `dispatch_blocks_smem`
+                // takes a 1-D block count.
+                let br = t.br();
+                let n_qtiles = (rows as usize).div_ceil(br);
+                dispatch_blocks_smem(
+                    pipelines,
+                    ctx.stream,
+                    "attention_prefill_flash",
+                    (n_qtiles * n_head as usize) as u32,
+                    (t.nw * 32) as u32,
+                    t.smem(head_dim as usize) as u32,
+                    args![
+                        arg_ptr(bq_ptr),
+                        arg_ptr(bk_ptr),
+                        arg_ptr(bv_ptr),
+                        arg_ptr(dd_ptr),
+                        arg_i32(rows as i32),
+                        arg_i32(kv_len as i32),
+                        arg_i32(n_head as i32),
+                        arg_i32(n_kv as i32),
+                        arg_i32(head_dim as i32),
+                        arg_f32(scale),
+                        arg_i32(pos as i32),
+                        arg_i32(mt),
+                        arg_i32(swa),
+                        arg_i32(t.bc as i32),
+                        arg_i32(n_qtiles as i32),
                     ],
                 )?;
             } else {
@@ -5006,5 +5259,54 @@ mod config_tier_tests {
             q4k_coop_kernel(&bogus),
             Some(("wmma_i8_q4k_coop_128x64_w8", 128, 64, 256))
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The flash-prefill tiling policy, pinned at every head dim the backend actually sees plus the
+    /// three ways a shape is refused. `br` is the factor by which the kernel divides global K/V
+    /// traffic, so "the widest workgroup that fits" IS the policy, and a regression here is a
+    /// silent perf loss rather than a wrong answer.
+    #[test]
+    fn attn_flash_tiling_picks_the_widest_query_tile_that_fits_lds() {
+        // Refusals: head dims whose padded LDS stride is not an odd word count (bank conflicts)
+        // or whose rows are not 16 B-aligned for the `uint4` stage, one past the kernel's
+        // `ATTN_FLASH_MAXP2` bound, and the degenerate zero.
+        for hd in [0, 4, 20, 100, 320, 512] {
+            assert_eq!(attn_flash_tiling(hd), None, "head_dim {hd} must not tile");
+        }
+        // qwen3 / llama / qwen3moe: the 32-key tile, and the widest workgroup inside the budget.
+        for hd in [64, 96, 128] {
+            let t = attn_flash_tiling(hd).unwrap_or_else(|| panic!("head_dim {hd} must tile"));
+            assert_eq!(t.bc, 32, "head_dim {hd}");
+            assert!(
+                t.smem(hd) <= ATTN_FLASH_LDS,
+                "head_dim {hd} overflows the LDS budget"
+            );
+            // One `nw` up either exceeds the budget or is off the top of the candidate list —
+            // that is what makes this the WIDEST tile rather than merely a fitting one.
+            let wider = AttnFlashTiling {
+                nw: t.nw * 2,
+                bc: t.bc,
+            };
+            assert!(
+                t.nw == 8 || wider.smem(hd) > ATTN_FLASH_LDS,
+                "head_dim {hd}: nw={} left a wider tile on the table",
+                t.nw
+            );
+        }
+        assert_eq!(
+            attn_flash_tiling(128),
+            Some(AttnFlashTiling { nw: 8, bc: 32 })
+        );
+        // gemma-3's 256: the K/V tiles alone would be 33 KiB at bc=32, so the policy narrows the
+        // KEY tile first and only then the query tile.
+        let g = attn_flash_tiling(256).expect("head_dim 256 must tile");
+        assert_eq!((g.bc, g.nw), (16, 4));
+        assert_eq!(g.br(), 8);
+        assert!(g.smem(256) <= ATTN_FLASH_LDS);
     }
 }

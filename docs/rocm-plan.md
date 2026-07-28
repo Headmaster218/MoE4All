@@ -483,26 +483,9 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72 `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's
-  cold-hiprtc re-measurement (backend init + a 1-token
-  bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps
-  each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE
-  kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs →
-  **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost
-  ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s
-  of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7
-  re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00
-  s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2
-  new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor
-  — essentially all of the delta is the dense kernels. **Warm-cache startup is
-  unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the
-  dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only
-  run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the
-  per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total
-  over`moe_native_fmt`), and that switch's comparand IS the f16 path. When
-  adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the
-  pairs a real GGUF can produce;`moe_expert_pair_tables_agree` pins both mappers
-  to it.
+  72
+  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
+  pins both mappers to it.
 - ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
   (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
   over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
@@ -616,11 +599,86 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
 
 ## 2. Attention parity
 
-ROCm has split-KV **decode** attention and a single-wave scalar **prefill**;
-Vulkan has the full set (`crates/infr-vulkan/src/recorder.rs:4251-6559`).
+ROCm has split-KV **decode** attention and, since **P1**, a tiled flash
+**prefill**; Vulkan has the full set
+(`crates/infr-vulkan/src/recorder.rs:4251-6559`).
 
-- **WMMA flash PREFILL** (`attention_prefill_flash`/`_reg`/`_nc_fa` analogue) —
-  move prefill attention onto the matrix cores (currently scalar).
+### P1 — tiled flash prefill attention (landed)
+
+The single-wave scalar prefill is gone. `attention_prefill_flash` gives a
+WORKGROUP a tile of `br` consecutive query rows of one head, streams the kv
+range through LDS in `bc`-key tiles, and runs a one-pass online softmax.
+`kernels.rocm.attn_flash` routes back to the plain kernel (the A/B control its
+parity cases need). What the old kernel did, and why each of those is now gone:
+
+| the plain kernel                                                         | the flash kernel                                                                                                                                                                        |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| one wave per (query row, head), so K and V are re-read once **per row**  | once per query **TILE** — `br = 16` at head_dim 128, so 16× less global traffic                                                                                                         |
+| **two** passes over the whole kv range (a max pass, then exp/accumulate) | one pass, online softmax with an `exp(m_old − m_new)` rescale                                                                                                                           |
+| evaluates the q·k dot for masked keys and throws the score away          | the key range `[j_lo, j_hi)` is clamped per workgroup from the tile's own position span — the masked half of a causal score matrix, and everything below a SWA window, is never visited |
+| a 5-`shfl` butterfly **per key** to reduce the dot                       | LANE PER KEY for scores (no cross-lane reduction at all) and lane per DIM pair for P·V (one `__shfl` broadcast per key)                                                                 |
+| 2-byte `global_load_ushort` per element                                  | `uint4` (8 halves) tile staging — measured as the kernel's single biggest cost before it was vectorized                                                                                 |
+
+**Measured, in isolation** (the shipping shapes, µs per layer; the standalone
+harness is the F4 playbook — build the kernel against a driver and time it away
+from the model):
+
+| shape (rows × kv, head_dim, n_head)  | plain | flash    |           |
+| ------------------------------------ | ----- | -------- | --------- |
+| 512×512, d=128, h=16 (Qwen3-0.6B)    | 2643  | **279**  | **9.5×**  |
+| 2048×2048, d=128, h=16               | 41397 | **3652** | **11.3×** |
+| 512×512, d=256, h=4 (gemma-3-1b)     | 1823  | **273**  | **6.7×**  |
+| 512×512, d=128, h=32 (Qwen3-30B-A3B) | 5975  | **477**  | **12.5×** |
+
+**Tiling policy** (`attn_flash_tiling`, unit-tested). `bc` is 32 keys — one per
+lane — and drops to 16 for head dims above 128; `nw` is then the widest
+workgroup whose LDS tile fits 32 KiB, so two workgroups stay co-resident per CU.
+`br = nw · ATTN_FLASH_QPW` is exactly the factor by which global K/V traffic
+falls, so widest-that-fits IS the policy. `head_dim % 32 != 0` or `> 256` keeps
+the plain kernel. Swept: `QPW` 2 → 279 µs, 4 → 313, 8 → 441 (the accumulator is
+register state, and occupancy falls faster than the K reuse pays); `(nw, bc)`
+over a 5 × 3 grid, with `(8, 32)` the winner at every point on the diagonal.
+
+**The correctness lesson, which cost this slice its longest detour.** The flash
+kernel gives ONE lane the whole `q·k` dot where the plain kernel splits it over
+32 lanes and butterfly-reduces. Written the obvious way — a serial sum — it is
+~1e-7 off, **passes every tolerance gate in `parity.rs` including the CPU-oracle
+comparison at 2048 keys**, and still flips a near-tie argmax fourteen tokens
+into the Q8_0 seam run ("I know" → "I remember"). The fix is to rebuild the
+reference's tree in registers: `g[t]` is lane `t`'s partial, and the reduction
+pairs `t` with `t+16`, then `t+8`, … which is exactly `__shfl_xor` at off=16, 8,
+…. It costs ~4% and it is what keeps the goldens.
+
+It is still not BIT-equality, and that is a property of the reference: the plain
+kernel evaluates the same dot TWICE (max pass, accumulate pass), and nothing
+makes the compiler round two separately-scheduled copies identically — its own
+softmax weight for a single-key row is not exactly 1. So the gate is stated as
+what is measurable: inside one key tile, ≤6% of outputs differ from the plain
+kernel at all, where a serial dot leaves 25–41%
+(`attention_prefill_flash_keeps_the_plain_kernels_score_tree`).
+
+**Correctness evidence.** Four new parity cases + one tiling unit test
+(infr-rocm 152 → 156). vs the CPU reference at rel ≤ 1.3e-7 on six shapes —
+512×512 GQA, **2048×2048 causal**, **2048×2048 SWA(384) at head_dim 256**,
+`rows`/`kv` not multiples of the tile (300×300), a non-zero `pos` (40×160 at
+pos=120), and the `Canvas` mask; plus the plain-kernel A/B on all six, and a
+fallback case (`head_dim = 20`) proving an untileable shape still answers.
+`rocm_seam` **9/9 in BOTH release and debug** with the qwen3 golden
+`0xfd63781ea3bfa785` unmoved; the shared decode-parity sweep unchanged;
+`ROCM_TOL` untouched. Debug matters here for the same reason it did in F5 — the
+`Attention` `dst` is drawn with `uninit_dev`, and the flash arm has to write
+every element of it (it does: `nw` waves × `QPW` rows cover `br`, and the `c`
+blocks cover `head_dim` in lane pairs).
+
+**Still open on this axis:**
+
+- **WMMA.** P1 is a scalar-ALU flash kernel, not a matrix-core one. The profile
+  says that was the right call for THIS step — the plain kernel was losing to
+  redundant memory traffic, not to arithmetic throughput, and 2.6 GB/layer of
+  re-read for 2 MB of distinct cache is not something matrix cores fix. Now that
+  the traffic is gone, the ~1 GFLOP/layer of actual math is the floor, and WMMA
+  is what would approach it: at 279 µs/layer the kernel is still ~5× off its own
+  LDS-throughput bound.
 - **Dequant-in-flash for quantized KV** — read Q4_0/Q4_1/Q5_0/Q5_1 KV inside the
   attention kernel (Vulkan `recorder.rs:4520`), avoiding a dequant prepass.
 - **KV-cache quant store** — q8_0 KV (`store_q8_dyn`), TurboQuant KV
@@ -820,13 +878,9 @@ commit (`15642b7`), warmed, first burst discarded:
 Qwen3-30B-A3B is 867/token. The largest remaining MoE-specific item is
 **`quant_i8_32` ×96** — 2 per layer (the expert `h` quantize between gate/up and
 down, and the o*proj input). Neither is sibling-redundant: `h` is produced by
-`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means
-an int8-emitting epilogue on the producing kernel, not a peephole — the same
-conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96
-/`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48
-here, blocked on an f16-out`qk_norm_rope` — **taken by F1d below**), and
-`linear_f16` ×48 (the MoE router) is a single small GEMV per layer with nothing
-adjacent to absorb it.
+`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means an int8-emitting epilogue on the producing kernel, not a peephole — the same conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96 /`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48 here, blocked on an f16-out`qk_norm_rope`— **taken by F1d below**), and`linear_f16`
+×48 (the MoE router) is a single small GEMV per layer with nothing adjacent to
+absorb it.
 
 ### F1d — the K-write peephole
 
@@ -965,11 +1019,10 @@ with `quant_i8_32` 96 and `write_kv` 48.
 
 The next-largest item that is not the GEMV itself is **`quant_i8_32` — 56 dense
 / 96 MoE, two per layer** — and the conclusion is unchanged from F1c: neither is
-sibling-redundant (o_proj's row comes from `attention`, down_proj's from
-`gated_act`, the MoE `h` from `moe_gate_up_act_i8_idm_*`), so killing them needs
-an int8-emitting epilogue on the **producing** kernel, not a peephole — the same
-new-kernel work the V write above needs, on the same set of kernels. After that
-the remaining `write_kv` ×28/48 (V) is the next fusable count.
+sibling-redundant (o*proj's row comes from `attention`, down_proj's from
+`gated_act`, the MoE `h` from
+`moe_gate_up_act_i8_idm*\*`), so killing them needs an int8-emitting epilogue on the **producing** kernel, not a peephole — the same new-kernel work the V write above needs, on the same set of kernels. After that the remaining `write_kv`
+×28/48 (V) is the next fusable count.
 
 ## 4. Device-side sampling
 
@@ -1161,23 +1214,23 @@ obligation on `uninit_dev` is exact — every element must be stored by the
 dispatch below, on every shape the op can take — so the classification was done
 against each kernel's write pattern, not against its name:
 
-| site (`exec.rs`)                                            | fully overwritten?                                                                                                                                        | action                                                                                         |
-| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `RmsNorm`, `Softmax`, `GatedRmsNorm`                        | yes — strided loop over `dim`                                                                                                                             | `uninit_dev`                                                                                   |
-| `Linear` int8/WMMA/coop `dst`                               | yes — the three arms tile `[m, out_f]` exactly                                                                                                            | `uninit_dev`                                                                                   |
-| `Linear` native-decode `dst`, `linear_f16` `dst`            | yes — one block per row, `o` strided over `out_f`                                                                                                         | `uninit_dev`                                                                                   |
-| `Attention` (plain + split-KV combine)                      | yes — lanes own disjoint head dims                                                                                                                        | `uninit_dev`                                                                                   |
-| `GatedAct`, `GatedActFused`                                 | yes — one thread per OUTPUT element                                                                                                                       | `uninit_dev`                                                                                   |
-| `Add`, `AddBias`, `Scale`, `MulVec`, `Softcap`              | yes — elementwise                                                                                                                                         | `uninit_dev`                                                                                   |
-| `EmbedGather`, `Argmax`                                     | yes — one thread per row                                                                                                                                  | `uninit_dev`                                                                                   |
-| `Conv1dSilu`, `DeltaNet` (all 3 arms), `MoeSharedExpertAdd` | yes                                                                                                                                                       | `uninit_dev`                                                                                   |
-| MoE router logits (`linear_f16`)                            | yes                                                                                                                                                       | `uninit_dev`                                                                                   |
-| `QkNorm`                                                    | only when `x_stride == 0` — the kernel indexes `dst` with the SOURCE stride, so a strided row leaves inter-row gaps                                       | `uninit_dev` gated on `x_stride == 0`                                                          |
-| `QkNormRope`                                                | only when `rope_dim` is even — an odd one leaves `rope_dim - 1` in neither the pass-through nor the rotation range                                        | `uninit_dev` gated on `rope_dim % 2 == 0`                                                      |
-| **MoE `dst`** (`zero_dev(rows * neu)`)                      | **NO — accumulator.** The pre-R8 and paged loops `atomicAdd` each slot in; even R8's `moe_accum_idm` does `dst[i] += acc` when the residual is not folded | left `zero_dev`                                                                                |
-| **`ensure_device` unproduced tensor**                       | **NO** — reaching it means `Copy`/`CopyStrided`'s content-preserving dst, which reads what it is handed                                                   | left `zero_dev`                                                                                |
-| **`Rope` strided clone**                                    | **NO** — the DtoD clone copies `min(dd.len, src.len)`, and `rope` only rotates `[0, rope_dim)` of each head                                               | left `zero_dev`                                                                                |
-| rocBLAS `dst` (`INFR_ROCM_BLAS=1`)                          | yes (`beta = 0` ⇒ C unreferenced)                                                                                                                         | left `zero_dev` — opt-in, ships off, nothing to win against depending on a library's `0 * NaN` |
+| site (`exec.rs`)                                              | fully overwritten?                                                                                                                                        | action                                                                                         |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `RmsNorm`, `Softmax`, `GatedRmsNorm`                          | yes — strided loop over `dim`                                                                                                                             | `uninit_dev`                                                                                   |
+| `Linear` int8/WMMA/coop `dst`                                 | yes — the three arms tile `[m, out_f]` exactly                                                                                                            | `uninit_dev`                                                                                   |
+| `Linear` native-decode `dst`, `linear_f16` `dst`              | yes — one block per row, `o` strided over `out_f`                                                                                                         | `uninit_dev`                                                                                   |
+| `Attention` (plain, split-KV combine, and P1's flash prefill) | yes — lanes own disjoint head dims                                                                                                                        | `uninit_dev`                                                                                   |
+| `GatedAct`, `GatedActFused`                                   | yes — one thread per OUTPUT element                                                                                                                       | `uninit_dev`                                                                                   |
+| `Add`, `AddBias`, `Scale`, `MulVec`, `Softcap`                | yes — elementwise                                                                                                                                         | `uninit_dev`                                                                                   |
+| `EmbedGather`, `Argmax`                                       | yes — one thread per row                                                                                                                                  | `uninit_dev`                                                                                   |
+| `Conv1dSilu`, `DeltaNet` (all 3 arms), `MoeSharedExpertAdd`   | yes                                                                                                                                                       | `uninit_dev`                                                                                   |
+| MoE router logits (`linear_f16`)                              | yes                                                                                                                                                       | `uninit_dev`                                                                                   |
+| `QkNorm`                                                      | only when `x_stride == 0` — the kernel indexes `dst` with the SOURCE stride, so a strided row leaves inter-row gaps                                       | `uninit_dev` gated on `x_stride == 0`                                                          |
+| `QkNormRope`                                                  | only when `rope_dim` is even — an odd one leaves `rope_dim - 1` in neither the pass-through nor the rotation range                                        | `uninit_dev` gated on `rope_dim % 2 == 0`                                                      |
+| **MoE `dst`** (`zero_dev(rows * neu)`)                        | **NO — accumulator.** The pre-R8 and paged loops `atomicAdd` each slot in; even R8's `moe_accum_idm` does `dst[i] += acc` when the residual is not folded | left `zero_dev`                                                                                |
+| **`ensure_device` unproduced tensor**                         | **NO** — reaching it means `Copy`/`CopyStrided`'s content-preserving dst, which reads what it is handed                                                   | left `zero_dev`                                                                                |
+| **`Rope` strided clone**                                      | **NO** — the DtoD clone copies `min(dd.len, src.len)`, and `rope` only rotates `[0, rope_dim)` of each head                                               | left `zero_dev`                                                                                |
+| rocBLAS `dst` (`INFR_ROCM_BLAS=1`)                            | yes (`beta = 0` ⇒ C unreferenced)                                                                                                                         | left `zero_dev` — opt-in, ships off, nothing to win against depending on a library's `0 * NaN` |
 
 **The poison is what makes the claim testable.** `zero = false` is an assertion
 about a kernel, and a wrong one is a silent wrong-answer bug, because the pool
@@ -1236,6 +1289,104 @@ lever of this shape is **cutting op COUNT** (more fusion), not more per-op
 trimming. Ahead of it in size is F4's item 2, **Q6_K decode** at 149 GB/s = 16%
 of peak while carrying 45% of a Q4_K_M model's per-token bytes.
 
+### P1 — the prefill profile, and the flash attention it pointed at (landed)
+
+**ROCm had no per-op profiler.** Every perf slice up to here reasoned about
+where a token went from launch COUNTS and isolated micro-benches. P1 built one:
+`kernels.rocm.prof_ops` brackets every dispatch in a pair of HIP timing events
+and prints a cumulative `op + shape → ms / share / count` table to stderr after
+each forward. Events, not a host timer, because the ops all queue on ONE stream
+with no per-op sync — an `Instant` around `run_op` measures ENQUEUE, and a
+`hipStreamSynchronize` per op would add F4's ~2.7 µs floor to every sample and
+serialize the schedule it is supposed to be measuring.
+
+**The pp512 profile at `4a88a23`, both models, one forward** (RX 7900 XTX,
+Q4_K_M). This is the artifact nobody had:
+
+| Qwen3-0.6B (dense, 28 layers) — 116 ms | ms   | share   | µs/ea |
+| -------------------------------------- | ---- | ------- | ----- |
+| **Attention** rows=512 kv=512 h=16/8   | 77.5 | **67%** | 2768  |
+| `Linear` m=512, all shapes             | 31.6 | 27%     | —     |
+| QkNormRope + RmsNorm + the rest        | ~7   | 6%      | —     |
+
+| Qwen3-30B-A3B (MoE, 48 layers) — ~1.7 s | ms     | share   | µs/ea |
+| --------------------------------------- | ------ | ------- | ----- |
+| **MoeFfn** ne=2048 nff=768 8/128        | 1439.5 | **84%** | 7497  |
+| Attention rows=512 kv=512 h=32/4        | 229.2  | 13%     | 4776  |
+| dense `Linear` m=512 + norms + rope     | ~51    | 3%      | —     |
+
+**The two gaps have DIFFERENT causes, and the brief's ranking was right for one
+of them and wrong for the other.** The dense 7.7× is prefill ATTENTION —
+two-thirds of the forward in one op. The MoE 11.5× is barely attention at all:
+it is the expert GEMV, 84% of the forward, four dispatches per layer at 7.5 ms
+each. Fixing attention was worth 2.7× on the dense model and 1.13× on the MoE.
+
+What the attention number meant, arithmetically: 8192 waves per layer, each
+streaming ~320 KB of K and V for two passes over a kv range half of which is
+masked — **~2.6 GB per layer for 2 MB of distinct cache**, i.e. the same K/V
+read ~1000×. The math underneath is ~1 GFLOP/layer, ~36 µs of this GPU. It was
+never an arithmetic problem, which is why P1 is a tiling/traffic fix and not the
+WMMA kernel §2 had ranked first. §2 has the kernel, the sweeps, and the
+correctness story; the model-level result:
+
+| bench                      | before (3 pairs)  | after             |           |
+| -------------------------- | ----------------- | ----------------- | --------- |
+| Qwen3-0.6B pp512           | 4567/4577/4580    | 12261/12083/12237 | **2.67×** |
+| Qwen3-0.6B pp2048          | 1971/1977/1970    | 8340/8397/8345    | **4.24×** |
+| gemma-3-1b pp512 (SWA)     | 5515/5429/5451    | 8333/8539/8402    | **1.54×** |
+| gemma-3-1b pp2048 (SWA)    | 3461/3447/3446    | 7879/7914/7993    | **2.29×** |
+| Qwen3-30B-A3B pp512        | 306/306/215       | 346/347/347       | **1.13×** |
+| Qwen3-30B-A3B pp2048       | 241/241/241       | 337/337/322       | **1.38×** |
+| Qwen3-0.6B tg128 (control) | 145.5/146.1/145.9 | 146.5/145.6/145.6 | flat      |
+
+Decode is flat by construction: the flash kernel is routed only at `rows > 1`,
+so `rows == 1` still takes split-KV or the plain kernel untouched.
+
+The gain GROWS with prompt length (2.67× → 4.24× dense) because the plain
+kernel's cost is quadratic in kv with a per-ROW constant, and the flash kernel's
+is quadratic with a per-TILE one. That is also the shape of the remaining
+llama.cpp gap: pp2048 was the worse of the two before this slice.
+
+**The profile after P1, and what it ranks next.** Per FORWARD (the profiler
+prints cumulative totals and dispatch counts; these are
+`µs/dispatch × dispatches-per-forward`, and the counts that equal the layer
+count are the one-forward ones):
+
+| Qwen3-0.6B pp512 (28 layers, ~42 ms/forward) | ms/fwd   | share   | µs/ea  |
+| -------------------------------------------- | -------- | ------- | ------ |
+| **`Linear` m=512, all shapes**               | **31.1** | **74%** | 66–592 |
+| — of which 3072×1024 **Q6K** (×14)           | 8.3      | 20%     | 592    |
+| — of which 1024×6144 Q4K (×28)               | 7.3      | 18%     | 262    |
+| **Attention** rows=512 (×28)                 | **8.2**  | **20%** | 294    |
+| QkNormRope, RmsNorm, WriteKv, Add            | ~2.5     | 6%      | 30–46  |
+
+| Qwen3-30B-A3B pp512 (48 layers, ~1.5 s/forward) | ms/fwd     | share   | µs/ea  |
+| ----------------------------------------------- | ---------- | ------- | ------ |
+| **`MoeFfn`** (×192 = 4 row-chunks × 48 layers)  | **1453.8** | **95%** | 7572   |
+| dense `Linear` m=512 (qkv/o, ×192)              | 51.3       | 3%      | 91–421 |
+| Attention rows=512 (×48)                        | 23.6       | 1.5%    | 491    |
+
+Ranked, with sizes:
+
+1. **MoE prefill expert GEMV — 95% of a Qwen3-30B-A3B pp512 forward.** By far
+   the largest single item left anywhere in this backend. R8's report is the
+   lead: each expert bank is re-read ~32× at pp512 because the id-indexed tier
+   dispatches per row-chunk rather than bucketing rows by expert. A batched
+   per-expert GEMM (Vulkan's `moe_small_m` crossover has the shape) is a slice
+   on its own and would be worth up to ~10× on this model's prefill.
+2. **Dense prefill `Linear` — now 74% of a Qwen3-0.6B pp512 forward**, split
+   across shapes, with the Q6K `down_proj` the worst per-dispatch at 592 µs.
+   This is §9's async-pipelined int8 mmq, and Q6K's unpack (F4 item 2) is the
+   same weakness showing up at prefill that it does at decode.
+3. **WMMA for the flash attention.** At 294 µs/layer it is ~5× off its own
+   LDS-throughput bound and ~8× off the arithmetic floor. Smaller than (1) and
+   (2) now, but it is what §2's original ranking was reaching for, and the
+   traffic work that had to come first is done.
+4. **The dense forward's remaining ~2.5 ms of norms/rope/KV-write**, of which
+   `QkNormRope` at 30 µs a dispatch is the largest — a per-element rotation that
+   nothing has ever looked at. Small, but the profiler is why it is visible at
+   all, which is the point of having built it.
+
 Close it to llama.cpp HIP. The plateau analysis (Slices 25–28) identified the
 remaining prefill lever as a **cooperative-LDS, async-pipelined int8 mmq**
 (decode-once weight-tile reuse + double-buffered LDS to hide the decode→WMMA
@@ -1266,8 +1417,9 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       expert banks with, and ✅ the id-indexed multi-slot MoE expert GEMV
       (**R8**, total over `moe_native_fmt`). Paged MoE deliberately keeps the
       per-expert loop for its copy/compute overlap — see R8
-- [ ] **Attention** — WMMA flash prefill; dequant-in-flash; q8_0/Turbo/block KV
-      quant
+- [ ] **Attention** — ✅ tiled flash prefill (**P1**, 6.7–12.5× on the kernel,
+      goldens unmoved); WMMA flash prefill; dequant-in-flash; q8_0/Turbo/block
+      KV quant
 - [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd
 - [ ] **Device-side sampling** — argmax / sample_topk / eb_sample (unblocks
       MTP + DG)

@@ -117,7 +117,7 @@ when the cause is a global config file you forgot about.
 
 ## `--set`
 
-Most of the 177 knobs have no dedicated flag. `--set <config.path>=<value>`
+Most of the 179 knobs have no dedicated flag. `--set <config.path>=<value>`
 reaches all of them, using the same path grammar as the TOML file:
 
 ```bash
@@ -206,7 +206,7 @@ weight pager (prefetch slots, bank size, overflow budgets).
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section — 64 of the 177 keys): capability
+- **`[kernels.vulkan]`** (the biggest section — 64 of the 179 keys): capability
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
   tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
@@ -226,7 +226,11 @@ and these exist to force one off when bisecting a correctness or perf problem.
   prefill, the two fusion gates, `module_cache` (persist the hiprtc-compiled HIP
   module to `~/.cache/infr`) and `moe_id_rows` (token rows per id-indexed MoE
   expert-GEMV dispatch; `0` drops the resident MoE path back to the pre-R8
-  per-expert loop). Neither of the last two has an `INFR_*` twin, like
+  per-expert loop), `attn_flash` (the tiled flash PREFILL attention kernel;
+  clear it to route prefill back to the single-wave scalar one) and `prof_ops`
+  (bracket every dispatch in HIP timing events and print a cumulative per-op
+  GPU-time table to stderr — this backend's only per-op profiler,
+  diagnostic-only). None of the last four has an `INFR_*` twin, like
   `kernels.cpu.reference`.
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
   `repack_mb`, and `reference` (the bit-reference kernel path, which has no

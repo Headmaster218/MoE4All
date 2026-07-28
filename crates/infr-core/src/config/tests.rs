@@ -108,6 +108,11 @@ fn default_config_matches_documented_defaults() {
     // R8: the id-indexed MoE GEMV tier's row-batch bound. Also env-key-less; `infr-rocm` pins this
     // default against its own `MOE_ID_ROWS` knob table.
     assert_eq!(d.kernels.rocm.moe_id_rows, 128);
+    // P1: the tiled flash prefill attention kernel ships ON (it replaced the single-wave scalar
+    // one); the per-op GPU-time profiler is diagnostic, so it is OFF by default (it creates a HIP
+    // timing-event pair per dispatch). Both env-key-less like the two above.
+    assert!(d.kernels.rocm.attn_flash);
+    assert!(!d.kernels.rocm.prof_ops);
     // RM: the Metal `MTLBinaryArchive` pipeline cache is ON by default, for the same reason — a
     // launch should not re-run the driver's AIR → ISA back end for every kernel. Env-key-less too.
     assert!(d.kernels.metal.pipeline_cache);

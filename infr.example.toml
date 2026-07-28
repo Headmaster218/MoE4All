@@ -182,6 +182,8 @@ no_wmma = false
 fuse_add = true
 fuse_norm = true
 fuse_kv_write = true # QkNormRope writes the K row into the cache (no env twin)
+attn_flash = true    # tiled flash PREFILL attention (no env twin)
+prof_ops = false     # per-op GPU-time table to stderr, diagnostic (no env twin)
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
 # coop_tile = "64x64" # default: unset = the 128x64 tile
 
