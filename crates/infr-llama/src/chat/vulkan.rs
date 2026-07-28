@@ -139,8 +139,8 @@ impl ChatModel for DenseSeamChat {
 
     fn warmup(&mut self) -> Result<()> {
         // The shared session warmup (throwaway generate + reset so the first real prompt prefills
-        // clean slots from row 0), wrapped in the INFR_PROF2 suppression the Vulkan recorders need.
-        crate::with_prof2_suppressed(|| self.warmup_session())
+        // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
+        crate::with_profiling_suppressed(|| self.warmup_session())
     }
 
     fn generate(

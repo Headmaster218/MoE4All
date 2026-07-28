@@ -810,24 +810,24 @@ pub struct Recorder<'a> {
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
     /// Debug knobs, resolved ONCE at construction from the backend's `Config` — `debug.no_barrier`,
-    /// `debug.full_barrier`, `prof.prof` (S5b). Per-dispatch paths read these fields, never a config
-    /// tree walk and never the environment.
+    /// `debug.full_barrier`, `prof.stages` (S5b). Per-dispatch paths read these fields, never a
+    /// config tree walk and never the environment.
     no_barrier: bool,
     full_barrier: bool,
-    prof: bool,
-    /// Per-op GPU timestamp profiling (INFR_PROF2): a timestamp before EVERY dispatch — labeled
+    stages: bool,
+    /// Per-op GPU timestamp profiling (INFR_PROF_OPS): a timestamp before EVERY dispatch — labeled
     /// automatically with the dispatched kernel's name at the `dispatch3`/`dispatch_indirect`
     /// chokepoints — plus one at finish. No manual stamp calls; aggregation by label happens at
     /// report time.
-    prof2: bool,
-    /// INFR_PROF2_SHAPES (on top of INFR_PROF2): GEMV/GEMM dispatches get shape-itemized labels
+    prof_ops: bool,
+    /// INFR_PROF_OP_SHAPES (on top of INFR_PROF_OPS): GEMV/GEMM dispatches get shape-itemized labels
     /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
-    prof2_shapes: bool,
+    op_shapes: bool,
     query_pool: vk::QueryPool,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
-    /// One-shot prof2 label override: the NEXT dispatch's timestamp uses this instead of the
+    /// One-shot prof_ops label override: the NEXT dispatch's timestamp uses this instead of the
     /// kernel name, then clears it. Lets a caller attribute a generic kernel (e.g. the lm_head
     /// GEMM vs a projection, expert gate_up vs down) to a distinct bucket without per-op API
     /// plumbing.
@@ -901,15 +901,15 @@ impl<'a> Recorder<'a> {
         const MAX_TS: u32 = Recorder::<'_>::MAX_TS;
         // No per-op profiling on the persistent (replayed) path — the recorder is dropped after
         // recording, so it can't report timestamps for replays.
-        // `prof2_suppressed` is the non-env suppression path (see `infr_prof_rt`): benches /
-        // warmups toggle it around untimed work instead of mutating the `INFR_PROF2` env var.
+        // `profiling_suppressed` is the non-env suppression path (see `infr_prof_rt`): benches /
+        // warmups toggle it around untimed work instead of mutating the `INFR_PROF_OPS` env var.
         let profcfg = &backend.cfg().prof;
         let dbgcfg = &backend.cfg().debug;
         let (bda_chunk_elem_cap, bda_chunk_byte_cap) =
             bda_chunk_caps(&backend.cfg().kernels.vulkan);
-        let prof2 = infr_core::prof::enabled(profcfg) && !persistent;
-        let prof2_shapes = prof2 && profcfg.prof2_shapes;
-        let query_pool = if prof2 {
+        let prof_ops = infr_core::prof::enabled(profcfg) && !persistent;
+        let op_shapes = prof_ops && profcfg.op_shapes;
+        let query_pool = if prof_ops {
             let qp = unsafe {
                 device.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
@@ -936,9 +936,9 @@ impl<'a> Recorder<'a> {
             indirect_pending: std::cell::Cell::new(false),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
-            prof: profcfg.prof,
-            prof2,
-            prof2_shapes,
+            stages: profcfg.stages,
+            prof_ops,
+            op_shapes,
             query_pool,
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
@@ -993,34 +993,34 @@ impl<'a> Recorder<'a> {
         self.suppress.set(on);
     }
 
-    /// Override the label of the NEXT dispatch's timestamp (INFR_PROF2). Consumed once — a
+    /// Override the label of the NEXT dispatch's timestamp (INFR_PROF_OPS). Consumed once — a
     /// pre-set override wins over the automatic kernel-name label AND over the shape itemizers
-    /// below. No-op without prof2.
+    /// below. No-op without prof_ops.
     pub fn label_next(&self, label: &'static str) {
-        if self.prof2 {
+        if self.prof_ops {
             self.next_label.set(Some(label));
         }
     }
 
-    /// Shape-itemize the next GEMV-class dispatch: with INFR_PROF2_SHAPES set (on top of
-    /// INFR_PROF2), its label becomes `kind:mM:in_fxout_f` (e.g. `mmvr:m4:1536x24576`) instead of
+    /// Shape-itemize the next GEMV-class dispatch: with INFR_PROF_OP_SHAPES set (on top of
+    /// INFR_PROF_OPS), its label becomes `kind:mM:in_fxout_f` (e.g. `mmvr:m4:1536x24576`) instead of
     /// the bare kernel name, splitting the bucket per route and per projection shape. This is
     /// what made the E2B pp4 63%-GEMV attribution actionable (llama.cpp's perf logger itemizes
     /// per shape; a flat bucket didn't). A pending `label_next` override wins. The labels leak
     /// one small string per op per record — profiling-only, gated off in production.
     fn label_gemv(&self, kind: &'static str, rows: usize, in_f: usize, out_f: usize) {
-        if self.prof2_shapes && self.next_label.get().is_none() {
+        if self.op_shapes && self.next_label.get().is_none() {
             let s: &'static str =
                 Box::leak(format!("{kind}:m{rows}:{in_f}x{out_f}").into_boxed_str());
             self.next_label.set(Some(s));
         }
     }
 
-    /// Shape-itemize the next GEMM-class dispatch (`kernel:mM:kxn` under INFR_PROF2_SHAPES —
+    /// Shape-itemize the next GEMM-class dispatch (`kernel:mM:kxn` under INFR_PROF_OP_SHAPES —
     /// same rationale as [`label_gemv`](Self::label_gemv)). Profiling-only; the leak is gated
     /// off in production.
     fn label_gemm(&self, kernel: &'static str, m: usize, k: usize, n: usize) {
-        if self.prof2_shapes && self.next_label.get().is_none() {
+        if self.op_shapes && self.next_label.get().is_none() {
             let s: &'static str = Box::leak(format!("{kernel}:m{m}:{k}x{n}").into_boxed_str());
             self.next_label.set(Some(s));
         }
@@ -1079,16 +1079,16 @@ impl<'a> Recorder<'a> {
     /// reserved for the closing timestamp in `finish`) are dropped and counted.
     const MAX_TS: u32 = 65536;
 
-    /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF2.
+    /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF_OPS.
     /// Called automatically at the dispatch chokepoints with the kernel name — op methods no
     /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
     /// kernel name).
     fn stamp(&self, label: &'static str) {
         // Every dispatch funnels through here, so this is also where the recorder counts them —
-        // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF2
+        // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
         // is on.
         self.dispatches.set(self.dispatches.get() + 1);
-        if !self.prof2 {
+        if !self.prof_ops {
             return;
         }
         let label = self.next_label.take().unwrap_or(label);
@@ -1311,10 +1311,10 @@ impl<'a> Recorder<'a> {
         args: vk::Buffer,
         args_off: u64,
     ) {
-        // Auto-label (INFR_PROF2): every dispatch stamps a timestamp tagged with its kernel name
+        // Auto-label (INFR_PROF_OPS): every dispatch stamps a timestamp tagged with its kernel name
         // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
         // before `sync` so a barrier's cost lands in the op it fences (same as the old
-        // stamp-at-op-start convention). One `prof2` branch when profiling is off.
+        // stamp-at-op-start convention). One `prof_ops` branch when profiling is off.
         self.stamp(k.name);
         let n = buffers.len();
         debug_assert!(
@@ -1365,7 +1365,7 @@ impl<'a> Recorder<'a> {
         gy: u32,
         gz: u32,
     ) {
-        // Auto-label (INFR_PROF2): see `dispatch_indirect` — kernel-name timestamp per dispatch.
+        // Auto-label (INFR_PROF_OPS): see `dispatch_indirect` — kernel-name timestamp per dispatch.
         self.stamp(k.name);
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
         // buffers (e.g. rope x==y) so a RAW from a prior op is still seen. Handles are copied into
@@ -8722,7 +8722,7 @@ impl<'a> Recorder<'a> {
     fn free_transient(&self) {
         let device = &self.be.shared.device;
         unsafe {
-            // query_pool is null unless prof2 created one; the null check is equivalent to `prof2`.
+            // query_pool is null unless prof_ops created one; the null check is equivalent to `prof_ops`.
             if self.query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.query_pool, None);
             }
@@ -8738,11 +8738,11 @@ impl<'a> Recorder<'a> {
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;
         let t_record = self.t0.elapsed();
-        if self.prof {
+        if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
         // Final timestamp so the last op has an interval to close.
-        if self.prof2 {
+        if self.prof_ops {
             let idx = self.ts_labels.borrow().len() as u32;
             unsafe {
                 device.cmd_write_timestamp(
@@ -8774,7 +8774,7 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("queue_wait_idle: {e}")));
         }
-        if self.prof {
+        if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
                 t_record.as_secs_f64() * 1e3,
@@ -8783,7 +8783,7 @@ impl<'a> Recorder<'a> {
         }
         // Report BEFORE freeing (report_timestamps reads the query pool); `free_transient` then
         // destroys it. Order matches the old success path.
-        if self.prof2 {
+        if self.prof_ops {
             self.report_timestamps();
         }
         self.free_transient();
@@ -8810,7 +8810,7 @@ impl<'a> Recorder<'a> {
             device
                 .end_command_buffer(self.cmd)
                 .map_err(|e| be(format!("end cmd: {e}")))?;
-            if self.prof2 {
+            if self.prof_ops {
                 device.destroy_query_pool(self.query_pool, None);
             }
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
@@ -8827,7 +8827,7 @@ impl<'a> Recorder<'a> {
     /// command buffer / descriptor pools. The paged-MoE executor uses this to keep staging the
     /// next segment's expert uploads on the CPU while the GPU chews the one just submitted
     /// (`adapter::execute_paged_moe`'s ring rotation). Profiling recorders (INFR_PROF /
-    /// INFR_PROF2) degrade to the blocking [`Self::finish`] — their reports need completed
+    /// INFR_PROF_OPS) degrade to the blocking [`Self::finish`] — their reports need completed
     /// timestamps — and hand back an already-drained segment, so callers need no special case.
     ///
     /// The NEXT recorder on this queue must open with [`Self::seed_barrier`]: hazard tracking is
@@ -8835,7 +8835,7 @@ impl<'a> Recorder<'a> {
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
         let dispatches = self.dispatches.get();
-        if self.prof || self.prof2 {
+        if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
             return Ok(PendingSegment {
@@ -8921,7 +8921,7 @@ impl<'a> Recorder<'a> {
     /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
     /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
     pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
-        if self.prof {
+        if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
         unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
@@ -8956,7 +8956,7 @@ impl<'a> Recorder<'a> {
         }
         if self.ts_dropped.get() > 0 {
             eprintln!(
-                "[prof2] WARNING: {} dispatches past the {}-timestamp query pool went unstamped",
+                "[prof_ops] WARNING: {} dispatches past the {}-timestamp query pool went unstamped",
                 self.ts_dropped.get(),
                 Self::MAX_TS,
             );

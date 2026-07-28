@@ -801,16 +801,16 @@ fn publish_thread_count(cfg: &Config) {
     }
 }
 
-/// `prof.profile_out` → the profiler runtime's report destination (S7).
+/// `prof.out` → the profiler runtime's report destination (S7).
 ///
 /// PERMANENT, like [`publish_thread_count`] and unlike the S1 bridge: `infr-prof-rt` writes its
 /// JSON from a C `atexit` hook that has no receiver and no config to borrow, and it cannot depend
 /// on `infr-core` to fetch one (the dependency runs the other way). So the resolved value is PUSHED
 /// into the reporter here, once, in `main` — a value handed across an API boundary, not laundered
 /// through the environment. `None` leaves the reporter on stderr only, exactly as an unset
-/// `INFR_PROFILE_OUT` did.
+/// `INFR_PROF_OUT` did.
 fn publish_profile_out(cfg: &Config) {
-    infr_prof_rt::set_profile_out(cfg.prof.profile_out.as_deref().and_then(|p| p.to_str()));
+    infr_prof_rt::set_profile_out(cfg.prof.out.as_deref().and_then(|p| p.to_str()));
 }
 
 /// Is `path` a usable LOCAL model: an existing regular FILE whose extension is `.gguf`
@@ -2511,7 +2511,7 @@ fn dg_bench_run(
     // does NOT pass). So the oracle's ~23-step convergence is measured on a rendered
     // `<start_of_turn>user ... <start_of_turn>model` turn, never on the bare sentence. Encoding the
     // bare sentence here (as this used to) fed our side a badly out-of-distribution prompt for an
-    // instruction-tuned model: entropy never settled — `INFR_EB_TRACE=1` showed it oscillating
+    // instruction-tuned model: entropy never settled — `INFR_PROF_DIFFUSION_TRACE=1` showed it oscillating
     // (not monotonically falling) with acceptance stuck near 1/256 for dozens of steps — so infr
     // rode the full step cap on EVERY block while the fork, decoding the SAME text but templated,
     // converged normally. Render the identical single-user-turn template `cmd_run`/

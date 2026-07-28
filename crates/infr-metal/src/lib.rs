@@ -16,7 +16,7 @@
 //! `Op::Linear` weights are kept in the compact factored form (`dequant_factored`: bit-packed
 //! 4/6/8-bit codes + one i16 `(sc, m)` per 16 elems + one f16 `(d, dmin)` per quant block) and
 //! decoded inline by the `linear_quik*` kernels, so the kernels stay format-agnostic and never blow
-//! a quant weight up to f32. `INFR_METAL_PROFILE=1` prints a per-op / GPU-wall breakdown on drop;
+//! a quant weight up to f32. `INFR_PROF_OPS=1` prints a per-op / GPU-wall breakdown on drop;
 //! `=2` isolates per-op GPU wall by flushing after each op (distorts totals); `=3` samples
 //! stage-boundary GPU timestamps per op inside ONE command buffer — true in-context per-op GPU
 //! time (the decode tape is disabled so every token's ops are walked and attributed).
@@ -96,7 +96,7 @@ struct ProfileGate {
 impl ProfileGate {
     /// Both suppression mechanisms have to clear: this backend's own RAII counter
     /// ([`suppress`](Self::suppress), used by the Metal bench setup) AND the process-wide flag the
-    /// other backends' warmup paths set (`infr_llama::with_prof2_suppressed`). They existed
+    /// other backends' warmup paths set (`infr_llama::with_profiling_suppressed`). They existed
     /// independently — the shared helper's doc said "the Metal path deliberately does NOT use it" —
     /// which meant a bench that suppressed through the shared helper still got Metal's untimed
     /// warmup folded into its profile.
@@ -147,18 +147,17 @@ pub struct MetalBackend {
     /// `BufferUsage::Weights`/`HostWeights` allocation advances it (the funnel lives in `alloc`,
     /// so no loader can forget a tensor).
     weight_pb: std::sync::Arc<std::sync::Mutex<Option<indicatif::ProgressBar>>>,
-    /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set (config
-    /// `prof.metal_profile`, resolved through [`ProfCfg::metal_profiling`](
-    /// infr_core::config::ProfCfg::metal_profiling)). `profiling` stays a resolved-once field so
-    /// the hot path skips the `Instant` calls when off.
-    /// `prof_ops` (`INFR_METAL_PROFILE=2`) additionally flushes after each op to attribute GPU wall
-    /// per op — costs the batching, so it's an analysis mode, not the fast path.
+    /// Opt-in execution profiler, on with the cross-backend `prof.ops` (`INFR_PROF_OPS`).
+    /// Resolved-once fields so the hot path skips the `Instant` calls when off.
+    ///
+    /// `flush_per_op` (`prof.metal_device_time=flush`) additionally flushes after each op to
+    /// attribute GPU wall per op — costs the batching, so it's an analysis mode, not the fast path.
     pub(crate) profiling: bool,
-    pub(crate) prof_ops: bool,
-    /// GPU-counter profiling (`INFR_METAL_PROFILE=3`): per-op GPU time from stage-boundary
-    /// timestamp samples — one encoder per op inside ONE command buffer, so the numbers are
-    /// in-context (no per-op flush distortion). `None` when the device lacks stage-boundary
-    /// sampling or the timestamp counter set.
+    pub(crate) flush_per_op: bool,
+    /// GPU-counter profiling (`prof.metal_device_time=counters`): per-op GPU time from
+    /// stage-boundary timestamp samples — one encoder per op inside ONE command buffer, so the
+    /// numbers are in-context (no per-op flush distortion). `None` when the device lacks
+    /// stage-boundary sampling or the timestamp counter set.
     pub(crate) counter_set: Option<metal::CounterSet>,
     profile_gate: ProfileGate,
     /// One (cpu_ns, gpu_ticks) correlation taken at init — with a second one at resolve time,
@@ -228,14 +227,14 @@ impl MetalBackend {
         let device = Device::system_default().ok_or_else(|| be("no Metal device found"))?;
         let counter_set = cfg
             .prof
-            .metal_prof_counters()
+            .metal_counters()
             .then(|| {
                 if !device
                     .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
                 {
                     eprintln!(
-                        "[infr-metal] PROFILE=3: no stage-boundary counter sampling on this \
-                         device — falling back to encode-only profiling"
+                        "[infr-metal] prof.metal_device_time=counters: no stage-boundary counter \
+                         sampling on this device — falling back to encode-only profiling"
                     );
                     return None;
                 }
@@ -263,11 +262,11 @@ impl MetalBackend {
             weight_cache: std::sync::Mutex::new(IdCache::default()),
             qui_cache: std::sync::Mutex::new(IdCache::default()),
             weight_pb: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            // The shared per-op knob (`INFR_PROF2` / `INFR_PROF_OPS`) turns this backend's profiler
-            // on too — it used to answer only to `INFR_METAL_PROFILE`, so the cross-backend
-            // profiling command line silently did nothing here.
-            profiling: cfg.prof.metal_profiling() || cfg.prof.per_op(),
-            prof_ops: cfg.prof.metal_prof_ops(),
+            // The one cross-backend knob (`prof.ops` / `INFR_PROF_OPS`). This backend used to
+            // answer only to `INFR_METAL_PROFILE`, so the cross-backend profiling command line
+            // silently did nothing here.
+            profiling: cfg.prof.ops,
+            flush_per_op: cfg.prof.metal_flush_per_op(),
             counter_set,
             profile_gate: ProfileGate::default(),
             ts_base,

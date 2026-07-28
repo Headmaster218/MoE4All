@@ -56,7 +56,7 @@ impl ChatModel for RocmSeamChat {
     }
 
     fn warmup(&mut self) -> Result<()> {
-        // The shared session warmup, unwrapped (the ROCm backend has no INFR_PROF2 recorder to
+        // The shared session warmup, unwrapped (the ROCm backend has no INFR_PROF_OPS recorder to
         // suppress) — same body Metal uses.
         self.warmup_session()
     }

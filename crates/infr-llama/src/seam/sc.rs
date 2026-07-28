@@ -66,7 +66,7 @@ pub(super) struct SelfCondWeights {
 /// Vulkan denoise path's SC block IN-GRAPH instead (a `sc_embT` device weight + `Op::Softmax` +
 /// `Op::Linear`/`Op::GatedAct` — see the SC subgraph in `build` and `build_sc_embt` below) since
 /// the host matvec here was ~85% of every Vulkan denoise step's wall time (see
-/// `INFR_DIFFUSION_TIME`'s breakdown); Phase-D widened the same in-graph path to Metal (see
+/// `INFR_PROF_STAGES`'s breakdown); Phase-D widened the same in-graph path to Metal (see
 /// `gpu_sc`'s call site below — Metal's Softmax/Linear ops already cover this shape and dtype).
 ///
 /// Phase-A perf: `scw` is the ONE-TIME dequant of the four self-cond tensors (see

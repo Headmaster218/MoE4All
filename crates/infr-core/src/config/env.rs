@@ -381,19 +381,22 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.multi.ep_p2p = presence_inv(get, "INFR_EP_HOST");
 
     // ── prof ─────────────────────────────────────────────────────────────────
-    p.prof.prof = presence(get, "INFR_PROF");
-    p.prof.prof2 = presence(get, "INFR_PROF2");
-    p.prof.prof2_shapes = presence(get, "INFR_PROF2_SHAPES");
-    p.prof.prof_dec = presence(get, "INFR_PROF_DEC");
-    p.prof.prof_ops = presence(get, "INFR_PROF_OPS");
-    p.prof.prof_pf = presence(get, "INFR_PROF_PF");
-    p.prof.profile_out = opt_path(get, "INFR_PROFILE_OUT");
-    p.prof.vram_log = presence(get, "INFR_VRAM_LOG");
-    p.prof.mtp_time = presence(get, "INFR_MTP_TIME");
-    p.prof.diffusion_time = presence(get, "INFR_DIFFUSION_TIME");
-    p.prof.eb_trace = presence(get, "INFR_EB_TRACE");
-    p.prof.metal_profile = opt_text(get, "INFR_METAL_PROFILE");
-    p.prof.metal_prof_debug = presence(get, "INFR_METAL_PROF_DEBUG");
+    // Every key is `INFR_PROF_*`. The old spellings (INFR_PROF, INFR_PROF2, INFR_PROF2_SHAPES,
+    // INFR_PROF_DEC, INFR_PROF_PF, INFR_PROFILE_OUT, INFR_VRAM_LOG, INFR_MTP_TIME,
+    // INFR_DIFFUSION_TIME, INFR_EB_TRACE, INFR_METAL_PROFILE, INFR_METAL_PROF_DEBUG) are dropped
+    // CLEANLY per the project's env policy — no aliases, no warnings, they simply stop being read.
+    p.prof.ops = presence(get, "INFR_PROF_OPS");
+    p.prof.op_shapes = presence(get, "INFR_PROF_OP_SHAPES");
+    p.prof.stages = presence(get, "INFR_PROF_STAGES");
+    p.prof.vram = presence(get, "INFR_PROF_VRAM");
+    p.prof.diffusion_trace = presence(get, "INFR_PROF_DIFFUSION_TRACE");
+    p.prof.out = opt_path(get, "INFR_PROF_OUT");
+    // Unlike its predecessor's exact-literal `"2"`/`"3"` compare, an unrecognized mode here falls
+    // back to the default rather than silently meaning "on, level unrecognized".
+    p.prof.metal_device_time = opt_text(get, "INFR_PROF_METAL_DEVICE_TIME")
+        .flatten()
+        .and_then(|s| s.parse::<super::MetalDeviceTime>().ok());
+    p.prof.metal_debug = presence(get, "INFR_PROF_METAL_DEBUG");
 
     // ── debug ────────────────────────────────────────────────────────────────
     p.debug.bda_chunk = presence(get, "INFR_DEBUG_BDA_CHUNK");

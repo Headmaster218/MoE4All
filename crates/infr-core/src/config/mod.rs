@@ -552,79 +552,107 @@ cfg_struct! {
     }
 }
 
+/// How the Metal backend obtains **device** time per op.
+///
+/// Metal batches every op into one command buffer, so — unlike vulkan's timestamp queries or
+/// rocm's HIP events — per-op device time is never free there. Both non-`Off` modes cost
+/// something, which is why this is a separate axis from [`ProfCfg::ops`] rather than implied by
+/// it: turning per-op profiling on gets you host ENCODE time for free, and you opt in to paying
+/// for device time.
+///
+/// This replaces `INFR_METAL_PROFILE`, which was three exact string literals masquerading as an
+/// integer level (`=1` on, `=2` flush, `=3` counters — so `=20` meant "on, level unrecognized",
+/// not "≥ 2"). Named modes cannot be misread that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetalDeviceTime {
+    /// No device timing: the profile reports host encode wall only. (Still a finding — a large
+    /// encode share IS the per-op command-buffer overhead.)
+    #[default]
+    Off,
+    /// Flush the batch after each op so its GPU wall is isolable. Costs the batching, and the
+    /// decode replay tape re-executes tokens without walking ops, so this silently attributes a
+    /// sample of one token on the decode path — prefer [`Counters`](Self::Counters).
+    Flush,
+    /// Stage-boundary timestamp counter samples: one encoder per op inside ONE command buffer, so
+    /// the numbers are in-context with no per-op flush distortion. Disables the replay tape for
+    /// the run. The honest per-op device mode.
+    Counters,
+}
+
+impl std::str::FromStr for MetalDeviceTime {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" | "0" => Ok(Self::Off),
+            "flush" => Ok(Self::Flush),
+            "counters" | "counter" => Ok(Self::Counters),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for MetalDeviceTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Flush => "flush",
+            Self::Counters => "counters",
+        })
+    }
+}
+
 cfg_struct! {
     /// Profiling and timing output. Setting any of these from the config FILE is announced at
     /// startup (§11 [DECIDE-7]).
+    ///
+    /// These names describe what each knob DOES. They used to not: `prof`, `prof2`,
+    /// `prof2_shapes`, `prof_dec`, `prof_ops`, `prof_pf` were six names carrying no information
+    /// about which of three unrelated features they belonged to, and five separate knobs
+    /// (`prof`, `prof_dec`, `prof_pf`, `mtp_time`, `diffusion_time`) each turned on host-side
+    /// stage timing for ONE pipeline — so "where does the wall time go" meant discovering four
+    /// more switches after you found the first. Every key is now `INFR_PROF_*`, and the three
+    /// features are three knobs: [`ops`](Self::ops) (per-op device profile),
+    /// [`stages`](Self::stages) (host-side stage timing), [`vram`](Self::vram) (memory).
     ProfCfg / PartialProfCfg {
-        /// `INFR_PROF`.
-        prof: bool = false,
-        /// `INFR_PROF2`: per-op profiling. Historically vulkan-only (per-dispatch GPU timestamps);
-        /// now an alias for [`prof_ops`](ProfCfg::prof_ops) via
-        /// [`per_op`](ProfCfg::per_op) — read that, never this field, when deciding whether to
-        /// profile.
-        prof2: bool = false,
-        /// `INFR_PROF2_SHAPES`, ANDed with [`ProfCfg::prof2`] at the site.
-        prof2_shapes: bool = false,
-        /// `INFR_PROF_DEC`.
-        prof_dec: bool = false,
-        /// `INFR_PROF_OPS`.
-        prof_ops: bool = false,
-        /// `INFR_PROF_PF`.
-        prof_pf: bool = false,
-        /// `INFR_PROFILE_OUT`: JSON report path. (`INFR_PROFILE` itself is a BUILD-time input and
-        /// is deliberately NOT config — see [`manifest::NOT_MIGRATED`].)
-        profile_out: Option<PathBuf> = None,
-        /// `INFR_VRAM_LOG`.
-        vram_log: bool = false,
-        /// `INFR_MTP_TIME`.
-        mtp_time: bool = false,
-        /// `INFR_DIFFUSION_TIME`.
-        diffusion_time: bool = false,
-        /// `INFR_EB_TRACE`.
-        eb_trace: bool = false,
-        /// `INFR_METAL_PROFILE`: NOT an integer level. Presence ⇒ profiling; the exact string
-        /// `"2"` ⇒ op profiling; `"3"` ⇒ the counter set. The three booleans are derived in the
-        /// accessor, or the levels stop composing the way they do today.
-        metal_profile: Option<String> = None,
-        /// `INFR_METAL_PROF_DEBUG`.
-        metal_prof_debug: bool = false,
+        /// `INFR_PROF_OPS`: per-op profiling on every backend — vulkan, rocm, metal and cpu. THE
+        /// switch the backends gate on, through [`crate::prof::enabled`] (which also ANDs the
+        /// warmup-suppression flag). See `docs/perf.md` § Profiling.
+        ops: bool = false,
+        /// `INFR_PROF_OP_SHAPES`: itemize per-op labels by SHAPE rather than folding a kind into
+        /// one row. Vulkan-only refinement (it labels by kernel name, so the shared
+        /// `op_label` shape itemizer does not apply); ANDed with [`ops`](Self::ops) at the site.
+        op_shapes: bool = false,
+        /// `INFR_PROF_STAGES`: host-side stage timing — prompt/decode throughput, the decode
+        /// setup-vs-execute split, the per-chunk prefill build/compile/execute split, MTP verify
+        /// time, and diffusion per-step phases. Each section prints only when its pipeline
+        /// actually ran, so one switch covers every model class.
+        stages: bool = false,
+        /// `INFR_PROF_VRAM`: log live VRAM in use after weight load. Memory hygiene, not timing.
+        vram: bool = false,
+        /// `INFR_PROF_DIFFUSION_TRACE`: per-step schedule/entropy trace for diffusion models.
+        /// A sampler trace, not a timing measurement — [`stages`](Self::stages) covers the timing.
+        diffusion_trace: bool = false,
+        /// `INFR_PROF_OUT`: write the exit report as JSON to this path, in addition to stderr.
+        /// (`INFR_PROFILE` — the BUILD-time host-instrumentation input read by `build.rs` — is
+        /// deliberately NOT config; see [`manifest::NOT_MIGRATED`].)
+        out: Option<PathBuf> = None,
+        /// `INFR_PROF_METAL_DEVICE_TIME`: how Metal obtains per-op DEVICE time. See
+        /// [`MetalDeviceTime`].
+        metal_device_time: MetalDeviceTime = MetalDeviceTime::Off,
+        /// `INFR_PROF_METAL_DEBUG`: extra Metal profiler debug output.
+        metal_debug: bool = false,
     }
 }
 
 impl ProfCfg {
-    /// Is per-op profiling on? THE predicate every backend gates its profiler on (through
-    /// [`infr_core::prof::enabled`](crate::prof::enabled), which additionally ANDs the
-    /// warmup-suppression flag).
-    ///
-    /// `INFR_PROF2` and `INFR_PROF_OPS` are aliases for one another. They were not: `INFR_PROF2`
-    /// reached only vulkan, `INFR_PROF_OPS` only the cpu backend, and rocm's equivalent
-    /// (`kernels.rocm.prof_ops`) had no environment variable at all — so the same command line
-    /// profiled or silently did nothing depending on `--dev`. Both names stay because the config
-    /// campaign froze env spellings and both are in people's shell history.
-    pub fn per_op(&self) -> bool {
-        self.prof2 || self.prof_ops
+    /// Does Metal need to flush after each op to isolate its GPU wall?
+    pub fn metal_flush_per_op(&self) -> bool {
+        self.metal_device_time == MetalDeviceTime::Flush
     }
 
-    /// `INFR_METAL_PROFILE` is set to ANYTHING (including the empty string) ⇒ the Metal execution
-    /// profiler runs. Exactly `std::env::var("INFR_METAL_PROFILE").is_ok()`, which is what
-    /// `MetalBackend::new` read (S6).
-    pub fn metal_profiling(&self) -> bool {
-        self.metal_profile.is_some()
-    }
-
-    /// `INFR_METAL_PROFILE` is the EXACT string `"2"` ⇒ flush after each op so its GPU wall is
-    /// isolable. NOT an integer level: `=20` is not `>= 2`, it is simply "profiling on, level
-    /// unrecognized" (§6.12, §10.4). R1-frozen.
-    pub fn metal_prof_ops(&self) -> bool {
-        self.metal_profile.as_deref() == Some("2")
-    }
-
-    /// `INFR_METAL_PROFILE` is the EXACT string `"3"` ⇒ ask the device for the timestamp counter
-    /// set (stage-boundary GPU sampling). Same exact-literal grammar as
-    /// [`metal_prof_ops`](Self::metal_prof_ops); the two are mutually exclusive by construction and
-    /// BOTH additionally imply [`metal_profiling`](Self::metal_profiling).
-    pub fn metal_prof_counters(&self) -> bool {
-        self.metal_profile.as_deref() == Some("3")
+    /// Does Metal need the stage-boundary timestamp counter set?
+    pub fn metal_counters(&self) -> bool {
+        self.metal_device_time == MetalDeviceTime::Counters
     }
 }
 

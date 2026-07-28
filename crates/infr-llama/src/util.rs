@@ -110,20 +110,20 @@ fn emit_decoded_suffix(
 /// Run `f` with per-op GPU profiling suppressed for its duration, restoring the prior state
 /// afterward. Every backend's `warmup()` / startup path (`chat::vulkan`, `chat::diffusion`,
 /// `parallel::init_slots`, `bench_vulkan`) needs this: the per-op profiling recorders read
-/// `INFR_PROF2` at CONSTRUCTION, and a throwaway warmup submit would otherwise pollute a later
+/// `INFR_PROF_OPS` at CONSTRUCTION, and a throwaway warmup submit would otherwise pollute a later
 /// bench's per-op aggregate. Extracted so the call sites can't drift (the Metal path deliberately
 /// does NOT use it — the Metal backend reads its profile env at construction inside the warmup
 /// generate itself; see `chat::metal`).
 ///
-/// Toggles the process-global [`infr_prof_rt::set_prof2_suppressed`] flag (which the Vulkan
-/// recorder ANDs into its `INFR_PROF2` check) rather than mutating the `INFR_PROF2` env var —
+/// Toggles the process-global [`infr_prof_rt::set_profiling_suppressed`] flag (which the Vulkan
+/// recorder ANDs into its `INFR_PROF_OPS` check) rather than mutating the `INFR_PROF_OPS` env var —
 /// mutating the env table around a rayon-parallel forward is a data race, and `set_var` is
 /// `unsafe` under edition 2024.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn with_prof2_suppressed<T>(f: impl FnOnce() -> T) -> T {
-    let prev = infr_prof_rt::set_prof2_suppressed(true);
+pub(crate) fn with_profiling_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    let prev = infr_prof_rt::set_profiling_suppressed(true);
     let r = f();
-    infr_prof_rt::set_prof2_suppressed(prev);
+    infr_prof_rt::set_profiling_suppressed(prev);
     r
 }
 

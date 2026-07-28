@@ -1,4 +1,4 @@
-//! Opt-in execution profiler (`INFR_METAL_PROFILE=1`). Aggregates, across the whole run, the
+//! Opt-in execution profiler (`prof.ops` / `INFR_PROF_OPS`). Aggregates, across the whole run, the
 //! per-op wall time and the commit+wait ("dispatch") wall vs actual GPU-active time, then prints a
 //! summary on drop. This is the evidence for *where* the reference backend spends its time — the
 //! per-op command-buffer barrier, not the arithmetic.
@@ -43,7 +43,7 @@ impl Profile {
     /// Print through the shared reporter ([`infr_core::prof::OpProf`]) so this backend's table has
     /// the same columns, the same sort and the same `[prof:<backend>]` tag as vulkan's, rocm's and
     /// the cpu backend's — and so its DEVICE rows land in the process-wide exit aggregate and the
-    /// `INFR_PROFILE_OUT` JSON, which they never did before.
+    /// `INFR_PROF_OUT` JSON, which they never did before.
     ///
     /// Two tables, not one, because Metal measures two different quantities and only one of them is
     /// device time: the always-available per-op number is host ENCODE wall (ops batch into one

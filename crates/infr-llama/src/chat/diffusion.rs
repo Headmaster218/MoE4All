@@ -181,7 +181,7 @@ impl ChatModel for DiffusionGemmaChat {
         // anyway, and their couple of extra pipelines (canvas attention, softmax) are cheap next
         // to the shared set warmed here. The throwaway tokens pollute the session's cached prefix
         // harmlessly — a real prompt prefix-diffs to 0 and re-prefills from scratch.
-        crate::with_prof2_suppressed(|| -> Result<()> {
+        crate::with_profiling_suppressed(|| -> Result<()> {
             self.ensure_sess(64)?;
             let enc = self
                 .model

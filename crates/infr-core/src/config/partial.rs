@@ -114,6 +114,20 @@ impl ConfigValue for DType {
     }
 }
 
+impl ConfigValue for super::MetalDeviceTime {
+    /// Named modes (`off` / `flush` / `counters`), not an integer level — the predecessor
+    /// (`INFR_METAL_PROFILE`) compared against the exact literals `"2"` and `"3"`, so `=20` read
+    /// as "on, level unrecognized" rather than "≥ 2". An unparseable value is an error here (the
+    /// file/`--set` layers are strict for known keys), which is what makes that class impossible.
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        raw.parse()
+            .map_err(|()| format!("expected off, flush or counters (got {raw:?})"))
+    }
+    fn to_display(&self) -> String {
+        self.to_string()
+    }
+}
+
 impl ConfigValue for Vec<usize> {
     /// The multi-GPU device-list grammar — [`super::parse_device_spec`], the ONE copy (S4 folded
     /// `infr-llama`'s duplicate into it). The per-knob minimum device count is NOT checked here

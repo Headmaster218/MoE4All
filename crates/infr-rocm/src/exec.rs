@@ -1662,7 +1662,7 @@ pub fn execute_graph(
     // above (it also drives the Slice-37 prefetch schedule). The walk itself (graph order, the
     // Slice-32-elided indices skipped) is the shared `infr_core::exec` skeleton; only `run_op`'s
     // body is per-backend.
-    // Per-op profiling is the shared predicate now (`prof.per_op()` — INFR_PROF2 or INFR_PROF_OPS
+    // Per-op profiling is the shared predicate now (`prof.per_op()` — INFR_PROF_OPS or INFR_PROF_OPS
     // — ANDed with the warmup-suppression flag). It used to be `kernels.rocm.prof_ops`, which had
     // no env var at all and ignored suppression, so every table rocm printed silently included the
     // bench's untimed warmup forward.

@@ -1362,7 +1362,7 @@ pub struct MtpHeadSession<'a> {
     /// The embedding table's effective dtype as uploaded (mirrors `wspecs`'s per-weight dtype) —
     /// meaningless when `embed_buf` is `None`.
     embed_dtype: DType,
-    /// Phase 3 perf instrumentation (issue #33, `INFR_MTP_TIME=1` — see
+    /// Phase 3 perf instrumentation (issue #33, `INFR_PROF_STAGES=1` — see
     /// `generate_mtp_spec_vulkan`'s doc on the per-call rebuild cost this is meant to quantify):
     /// cumulative seconds spent building+compiling a fresh [`Graph`] per [`forward`](Self::forward)
     /// call vs executing it, reset by [`take_timing`](Self::take_timing).
@@ -1505,7 +1505,7 @@ impl<'a> MtpHeadSession<'a> {
     }
 
     /// Drain the cumulative build-vs-exec timing since the last call (or construction) —
-    /// `generate_mtp_spec_vulkan`'s `INFR_MTP_TIME=1` breakdown reads this once per spec cycle.
+    /// `generate_mtp_spec_vulkan`'s `INFR_PROF_STAGES=1` breakdown reads this once per spec cycle.
     pub fn take_timing(&mut self) -> (f64, f64) {
         (
             std::mem::take(&mut self.build_secs),
@@ -2235,7 +2235,7 @@ fn run_prime_last(
 
 /// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
 /// run (issue #33, phase 4 — `infr bench`/`infr compare`'s perf-bottleneck visibility pass: this is
-/// the struct return `docs/mtp.md`'s `INFR_MTP_TIME` per-cycle `eprintln!`s are refactored to feed,
+/// the struct return `docs/mtp.md`'s `INFR_PROF_STAGES` per-cycle `eprintln!`s are refactored to feed,
 /// instead of the caller scraping stderr). `draft_secs`/`verify_secs`/`catchup_secs` sum every
 /// cycle's three timed sections (the SAME three the `[mtp cycle N]` debug line prints); the one-time
 /// prompt-prime VERIFY forward is deliberately excluded — it's already `GenStats::prompt_secs`, not
@@ -2372,7 +2372,7 @@ fn generate_mtp_spec_core(
     let ec = model.engine_cfg();
     let ne = cfg.n_embd;
     let n_max = DEFAULT_N_MAX;
-    let time_mtp = ec.prof.mtp_time;
+    let time_mtp = ec.prof.stages;
     // qwen35 DeltaNet spec-decode rollback (default ON; A/B escape via INFR_NO_MTP_CKPT): snapshot
     // the trunk's DeltaNet recurrent state at each clean committed boundary so a partial-accept
     // cycle rolls back to it and re-prefills only the short accepted suffix, instead of qwen35's
@@ -2499,7 +2499,7 @@ fn generate_mtp_spec_core(
     let mut cycle = 0usize;
     let mut total_drafted = 0usize;
     let mut total_accepted = 0usize;
-    // Phase 4 (issue #33): the SAME per-cycle sections `INFR_MTP_TIME`'s `eprintln!` below already
+    // Phase 4 (issue #33): the SAME per-cycle sections `INFR_PROF_STAGES`'s `eprintln!` below already
     // times, summed across the whole run — this is what `MtpTiming`'s return threads out.
     let mut sum_draft_secs = 0.0f64;
     let mut sum_verify_secs = 0.0f64;

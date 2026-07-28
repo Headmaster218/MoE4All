@@ -9,7 +9,7 @@
 //! load-then-store `Relaxed` ops (single writer: the owning thread); the atomics exist only so
 //! the exit-time reporter may read tables of threads that are still alive (rayon workers never
 //! unwind their TLS). The merged report prints to stderr at process exit (`atexit`), sorted by
-//! self time, and is also written as JSON to `$INFR_PROFILE_OUT` if set.
+//! self time, and is also written as JSON to `$INFR_PROF_OUT` if set.
 //!
 //! Metrics per site: call count, inclusive total (recursion-aware: only the outermost frame of
 //! a site on a given thread adds to total), self time (inclusive minus instrumented children),
@@ -21,8 +21,8 @@
 //! It ALSO hosts the process-wide **per-op device aggregate** ([`gpu_add`] / [`gpu_reset`]): every
 //! backend's per-op profiler folds its per-forward/per-submit rows in here through the shared
 //! reporter ([`infr_core::prof::OpProf`]), and the exit report prints them as a separate device
-//! section (and a `"gpu"` array in the `INFR_PROFILE_OUT` JSON). This path is runtime-gated
-//! (`INFR_PROF2` / `INFR_PROF_OPS`, via `prof.per_op()`), not build-gated — in a default build with
+//! section (and a `"gpu"` array in the `INFR_PROF_OUT` JSON). This path is runtime-gated
+//! (`INFR_PROF_OPS` / `INFR_PROF_OPS`, via `prof.per_op()`), not build-gated — in a default build with
 //! the knob set, the exit report contains only the device section; in an `INFR_PROFILE=1` build it
 //! merges with the host function table in one report.
 //!
@@ -222,40 +222,40 @@ pub fn gpu_reset() {
 }
 
 /// Runtime "suppress per-op GPU profiling" flag — the non-env replacement for the old
-/// `INFR_PROF2` env unset/restore dance (which mutated a process-global table around a
+/// `INFR_PROF_OPS` env unset/restore dance (which mutated a process-global table around a
 /// rayon-parallel forward: a data race, and `set_var` is `unsafe` under edition 2024). Set true
 /// around untimed warmup / cache-warming work whose dispatches must not pollute the profile; the
-/// Vulkan recorder ANDs [`prof2_suppressed`] into its `INFR_PROF2` construction check, so those
+/// Vulkan recorder ANDs [`profiling_suppressed`] into its `INFR_PROF_OPS` construction check, so those
 /// submits record no timestamps. A plain `AtomicBool`: set/cleared on the thread that spawns and
 /// joins the parallel region, so its writes happen-before the workers' reads.
-static PROF2_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+static PROFILING_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
-/// Set the [`PROF2_SUPPRESSED`] flag, returning the PRIOR value so the caller can restore it
-/// (supports nesting). See [`prof2_suppressed`].
-pub fn set_prof2_suppressed(v: bool) -> bool {
-    PROF2_SUPPRESSED.swap(v, Relaxed)
+/// Set the [`PROFILING_SUPPRESSED`] flag, returning the PRIOR value so the caller can restore it
+/// (supports nesting). See [`profiling_suppressed`].
+pub fn set_profiling_suppressed(v: bool) -> bool {
+    PROFILING_SUPPRESSED.swap(v, Relaxed)
 }
 
-/// Whether per-op GPU profiling is currently suppressed (see [`set_prof2_suppressed`]). The Vulkan
-/// recorder reads this at construction alongside `INFR_PROF2`.
-pub fn prof2_suppressed() -> bool {
-    PROF2_SUPPRESSED.load(Relaxed)
+/// Whether per-op GPU profiling is currently suppressed (see [`set_profiling_suppressed`]). The Vulkan
+/// recorder reads this at construction alongside `INFR_PROF_OPS`.
+pub fn profiling_suppressed() -> bool {
+    PROFILING_SUPPRESSED.load(Relaxed)
 }
 
-/// Where [`report`] writes its JSON report — the resolved `prof.profile_out` (`INFR_PROFILE_OUT`),
+/// Where [`report`] writes its JSON report — the resolved `prof.out` (`INFR_PROF_OUT`),
 /// PUSHED here at startup by whoever owns the `Config` (S7; `infr-cli`'s `main`, beside
 /// `publish_thread_count`). `None`/empty = no JSON, stderr report only.
 ///
 /// It is report state on this crate's existing process-global reporter, not a `Config` bridge
 /// (R4): the report runs from a C `atexit` hook — `extern "C" fn report_at_exit()` — which has no
 /// receiver, no arguments and no config to borrow, and `infr-prof-rt` cannot depend on `infr-core`
-/// to fetch one (the dependency runs the other way). It sits next to [`PROF2_SUPPRESSED`], which
+/// to fetch one (the dependency runs the other way). It sits next to [`PROFILING_SUPPRESSED`], which
 /// exists for the same reason.
 static PROFILE_OUT: Mutex<Option<String>> = Mutex::new(None);
 
-/// Install the resolved `prof.profile_out`. Call once at startup, before the process can exit.
+/// Install the resolved `prof.out`. Call once at startup, before the process can exit.
 /// An empty path is stored as-is and treated as "no JSON" by [`report`], matching the old
-/// `INFR_PROFILE_OUT=` grammar exactly.
+/// `INFR_PROF_OUT=` grammar exactly.
 pub fn set_profile_out(path: Option<&str>) {
     *PROFILE_OUT.lock().unwrap() = path.map(str::to_owned);
 }
@@ -392,10 +392,10 @@ fn fmt_ns(ns: u64) -> String {
     }
 }
 
-/// Print the merged profile to stderr and, if `INFR_PROFILE_OUT` is set, write the full table
+/// Print the merged profile to stderr and, if `INFR_PROF_OUT` is set, write the full table
 /// as JSON to that path. Two sections, each printed only when it has data: the host function
 /// table (build-time instrumentation, `INFR_PROFILE=1` builds) and the GPU op aggregate
-/// (runtime `INFR_PROF2` timestamps fed via [`gpu_add`]). Runs automatically at process exit;
+/// (runtime `INFR_PROF_OPS` timestamps fed via [`gpu_add`]). Runs automatically at process exit;
 /// may also be called on demand.
 pub fn report() {
     // atexit may fire in odd states; never run twice.
@@ -443,7 +443,7 @@ pub fn report() {
         }
         if rows.len() > TOP {
             eprintln!(
-                "  ... {} more sites (set INFR_PROFILE_OUT=path for the full table as JSON)",
+                "  ... {} more sites (set INFR_PROF_OUT=path for the full table as JSON)",
                 rows.len() - TOP
             );
         }
@@ -475,7 +475,7 @@ pub fn report() {
         if !path.is_empty() {
             match write_json(&path, &rows, &gpu, n_threads, wall_ns) {
                 Ok(()) => eprintln!("profile JSON written to {path}"),
-                Err(e) => eprintln!("failed to write INFR_PROFILE_OUT={path}: {e}"),
+                Err(e) => eprintln!("failed to write INFR_PROF_OUT={path}: {e}"),
             }
         }
     }
@@ -616,7 +616,7 @@ mod tests {
         global().names.lock().unwrap().truncate(saved_len);
     }
 
-    /// `prof.profile_out` reaches the reporter by being PUSHED at startup (S7) — the report itself
+    /// `prof.out` reaches the reporter by being PUSHED at startup (S7) — the report itself
     /// never touches the environment. Round-trips the installed value, including the "unset =
     /// stderr only" state; a non-empty value is what makes [`report`] write its JSON.
     #[test]
@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(profile_out(), None, "nothing installed by default");
         set_profile_out(Some("/tmp/infr-profile.json"));
         assert_eq!(profile_out().as_deref(), Some("/tmp/infr-profile.json"));
-        // The `INFR_PROFILE_OUT=` grammar: an empty path is stored, and `report` treats it as off.
+        // The `INFR_PROF_OUT=` grammar: an empty path is stored, and `report` treats it as off.
         set_profile_out(Some(""));
         assert_eq!(profile_out().as_deref(), Some(""));
         set_profile_out(None);

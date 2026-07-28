@@ -724,7 +724,7 @@ struct Resident {
     /// dst). The absorbed `Add`s are in the walk's skip set, which lives with the walk (`run_graph`'s
     /// local, handed to `infr_core::exec::run_ops`) rather than here — only `run_op` reads `fused`.
     fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
-    /// GPU-counter sampling state (`INFR_METAL_PROFILE=3`): the timestamp sample buffer, the
+    /// GPU-counter sampling state (`prof.metal_device_time=counters`): the timestamp sample buffer, the
     /// next free sample slot, the (op name, start-sample) log for this batch, and the op the
     /// walk is currently encoding (sub-dispatches attribute to their parent op).
     csb: Option<metal::CounterSampleBuffer>,
@@ -804,7 +804,7 @@ impl<const PROF: bool> infr_core::exec::OpDispatch for MetalDispatch<'_, '_, PRO
             }
             let enc = t0.expect("PROF ⇒ t0 taken").elapsed();
             // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
-            let gpu = if self.be.prof_ops {
+            let gpu = if self.be.flush_per_op {
                 let tg = std::time::Instant::now();
                 self.be.flush(self.r);
                 Some(tg.elapsed())
@@ -1645,7 +1645,7 @@ impl MetalBackend {
                         }
                     };
                     let ts = Self::resolve_counters(csb, r.csb_idx);
-                    if self.cfg.prof.metal_prof_debug {
+                    if self.cfg.prof.metal_debug {
                         eprintln!(
                             "ns_per_tick={ns_per_tick:.4} first samples: {:?}",
                             &ts[..8.min(ts.len())]

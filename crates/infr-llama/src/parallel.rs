@@ -189,11 +189,11 @@ impl ParallelSeam {
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
         // The warmup generation both uploads the weights and compiles every lazily-built pipeline,
-        // so the first REAL request pays neither. INFR_PROF2 is suppressed for it (recorders read
+        // so the first REAL request pays neither. INFR_PROF_OPS is suppressed for it (recorders read
         // it at construction; warmup submits would pollute a later bench's per-op aggregate) via the
-        // shared `with_prof2_suppressed` helper.
+        // shared `with_profiling_suppressed` helper.
         let mut slot0: Option<SeamKv> = None;
-        crate::with_prof2_suppressed(|| {
+        crate::with_profiling_suppressed(|| {
             crate::seam::generate_dense_vulkan_session(
                 &self.vk,
                 self.model.gguf(),

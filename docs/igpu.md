@@ -83,7 +83,7 @@ Diagnosis trail:
   submit; the reset FORCE-SIGNALS the fence, so `vkQueueWaitIdle` returns
   _success_ — a killed chunk reports a plausible ~2046 ms and the process only
   dies on the NEXT submit. That is why the failure never pointed at itself.
-  `INFR_PROF2` timestamps confirm the GPU is busy the whole window: a job too
+  `INFR_PROF_OPS` timestamps confirm the GPU is busy the whole window: a job too
   long, NOT a hung shader.
 - **Rows are the wrong knob.** Submit time is nearly flat in rows (a forward is
   757 dispatches + 684 barriers + one weight sweep, none of which shrink with

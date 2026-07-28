@@ -1,6 +1,6 @@
 //! Cold-weight decode GEMV bandwidth at the real Qwen3-8B decode shapes. Rotates through DISTINCT
 //! weight buffers so the aggregate working set exceeds the 96 MiB Infinity Cache — the reported
-//! GB/s is TRUE DRAM bandwidth (the in-model INFR_PROF2 numbers for small tensors are cache-
+//! GB/s is TRUE DRAM bandwidth (the in-model INFR_PROF_OPS numbers for small tensors are cache-
 //! contaminated). A/Bs the RM=1 grid vs the multi-output-row (RM=2/4) grid, and asserts the RM
 //! path is BIT-IDENTICAL to RM=1 (per-row math is unchanged). Run:
 //!   cargo test -p infr-vulkan --test decode_gemv_bw -- --ignored --nocapture
@@ -73,7 +73,7 @@ fn decode_gemv_bw() {
         ("lm_head", 4096, 151936, DType::Q6K),
         // IQ4_XS: same shapes as the Q4_K rows above — codebook-decode ALU-bound-ness (fewer
         // bytes/weight than Q4_K, yet slower) must hold at TRUE (>96 MiB, cache-busting) DRAM
-        // bandwidth too, not just in the small-model INFR_PROF2 numbers (which are cache-warm).
+        // bandwidth too, not just in the small-model INFR_PROF_OPS numbers (which are cache-warm).
         ("q -iq4x", 4096, 4096, DType::Iq4Xs),
         ("k/v-iq4", 4096, 1024, DType::Iq4Xs),
         ("qkv-iq4", 4096, 6144, DType::Iq4Xs),

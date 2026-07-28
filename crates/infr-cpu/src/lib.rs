@@ -578,7 +578,7 @@ impl Backend for CpuBackend {
         // The knobs this interpreter loop consults, read ONCE off the backend's config: the loop
         // below runs them per op (`reference`) or per MoeFfn op (`moe_counts`), so a resolve per
         // iteration would be a cost the env reads never had either (`docs/config-plan.md` R6).
-        // The shared predicate (`INFR_PROF2` or `INFR_PROF_OPS`, ANDed with warmup suppression) —
+        // The shared predicate (`INFR_PROF_OPS` or `INFR_PROF_OPS`, ANDed with warmup suppression) —
         // this backend used to read `prof.prof_ops` alone, so a bench that suppressed profiling
         // around its untimed warmup still got that forward in the table.
         let prof_ops = infr_core::prof::enabled(&self.cfg.prof);

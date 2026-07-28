@@ -304,14 +304,14 @@ fn denoise_block(
     let mut prev_temp_inv = 1.0f32;
     let mut held = 0usize;
     let mut steps_run = 0usize;
-    // Diagnostic (`prof.eb_trace` / INFR_EB_TRACE=1): per-step schedule/entropy trace, kept since it's
-    // small/clean and config-gated (`prof.eb_trace`, read once per BLOCK off the model's engine
+    // Diagnostic (`prof.diffusion_trace` / INFR_PROF_DIFFUSION_TRACE=1): per-step schedule/entropy trace, kept since it's
+    // small/clean and config-gated (`prof.diffusion_trace`, read once per BLOCK off the model's engine
     // config). Grew out of chasing a convergence-speed gap between this sampler and the fork's
     // (root cause turned out to be upstream of this loop — the compare/bench harness feeding an
     // untemplated prompt, see `dg_bench_run`'s `prompt_ids` comment — not the sampler itself, which
     // this trace helped confirm already matches `diffusion.cpp` step-for-step). Useful again next
     // time infr's/the fork's entropy trajectories need diffing.
-    let eb_trace = model.engine_cfg().prof.eb_trace;
+    let eb_trace = model.engine_cfg().prof.diffusion_trace;
 
     // cur_step: S downto 1 (`diffusion.cpp:530`); step_idx = S - cur_step is the 0-based step.
     for cur_step in (1..=s).rev() {

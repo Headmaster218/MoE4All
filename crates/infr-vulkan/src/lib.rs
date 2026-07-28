@@ -978,7 +978,7 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
 /// `BufferUsage::Weights` allocations advance the bar; on drop it finishes and clears it.
 pub struct WeightProgress {
     shared: Arc<VulkanShared>,
-    /// `prof.vram_log` (`INFR_VRAM_LOG`), copied off the backend's `Config` when the scope opens —
+    /// `prof.vram` (`INFR_PROF_VRAM`), copied off the backend's `Config` when the scope opens —
     /// `Drop` holds only the shared state, so the flag rides along rather than being looked up
     /// (S5a; R4 — no global, no second config).
     vram_log: bool,
@@ -994,7 +994,7 @@ impl Drop for WeightProgress {
         if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
             pb.finish_and_clear();
         }
-        // Post-load memory-hygiene visibility (`prof.vram_log`): the LIVE in-use figure right
+        // Post-load memory-hygiene visibility (`prof.vram`): the LIVE in-use figure right
         // after the LAST weight upload — the number the VRAM-audit residual math (in-use minus
         // weights+KV estimate) starts from. The upload staging that ran under this scope was
         // dedicated-allocated (see `Backend::upload`), so by this drop it has fully returned
@@ -2269,7 +2269,7 @@ impl VulkanBackend {
         *self.shared.weight_pb.lock().unwrap() = Some(pb);
         WeightProgress {
             shared: self.shared.clone(),
-            vram_log: self.cfg.prof.vram_log,
+            vram_log: self.cfg.prof.vram,
         }
     }
 

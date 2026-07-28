@@ -105,7 +105,7 @@ pub trait ChatModel {
 
     /// Run a tiny throwaway generation through the real forward so every lazily-built pipeline
     /// compiles NOW instead of on the first user request (a cold Vulkan seam pays seconds of
-    /// pipeline builds otherwise). INFR_PROF2 is suppressed for the duration — recorders read it
+    /// pipeline builds otherwise). INFR_PROF_OPS is suppressed for the duration — recorders read it
     /// at construction, and warmup submits would pollute a later bench's per-op aggregate.
     /// Default: no-op (stateless/CPU backends have nothing to warm).
     fn warmup(&mut self) -> Result<()> {
@@ -120,7 +120,7 @@ pub trait ChatModel {
     /// Deliberately NOT the [`warmup`](Self::warmup) default — that stays a no-op so the stateless
     /// backends and the test mocks are unaffected. A session-backed backend opts in with
     /// `fn warmup(&mut self) -> Result<()> { self.warmup_session() }` (Vulkan wraps the call in
-    /// `with_prof2_suppressed`; Metal deliberately does not — see that helper's doc).
+    /// `with_profiling_suppressed`; Metal deliberately does not — see that helper's doc).
     fn warmup_session(&mut self) -> Result<()> {
         self.generate("Hi", 2, None, &mut |_| {})?;
         self.reset_kv();

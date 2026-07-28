@@ -14,7 +14,7 @@ use super::{as_vk_buf, be, VulkanBackend};
 /// Cached, reusable compute objects for one kernel. All fields are Vulkan handles (Copy).
 #[derive(Clone, Copy)]
 pub(crate) struct ComputeKernel {
-    /// The cache key passed to [`VulkanBackend::kernel`] — the INFR_PROF2 auto-label: every
+    /// The cache key passed to [`VulkanBackend::kernel`] — the INFR_PROF_OPS auto-label: every
     /// recorder dispatch stamps its timestamp with this name (no manual stamp calls).
     pub name: &'static str,
     pub shader: vk::ShaderModule,

@@ -307,19 +307,18 @@ knobs! {
     "INFR_EP_HOST"         => "multi.ep_p2p",          PresenceInv, Ignored, "1",   migrated;
 
     // ── prof (§6.9) ──────────────────────────────────────────────────────────
-    "INFR_PROF"             => "prof.prof",             Presence, Ignored, "1",            migrated;
-    "INFR_PROF2"            => "prof.prof2",            Presence, Ignored, "1",            migrated;
-    "INFR_PROF2_SHAPES"     => "prof.prof2_shapes",     Presence, Ignored, "1",            migrated;
-    "INFR_PROF_DEC"         => "prof.prof_dec",         Presence, Ignored, "1",            migrated;
-    "INFR_PROF_OPS"         => "prof.prof_ops",         Presence, Ignored, "1",            migrated;
-    "INFR_PROF_PF"          => "prof.prof_pf",          Presence, Ignored, "1",            migrated;
-    "INFR_PROFILE_OUT"      => "prof.profile_out",      Path,     Ignored, "/tmp/p.json",  migrated;
-    "INFR_VRAM_LOG"         => "prof.vram_log",         Presence, Ignored, "1",            migrated;
-    "INFR_MTP_TIME"         => "prof.mtp_time",         Presence, Ignored, "1",            migrated;
-    "INFR_DIFFUSION_TIME"   => "prof.diffusion_time",   Presence, Ignored, "1",            migrated;
-    "INFR_EB_TRACE"         => "prof.eb_trace",         Presence, Ignored, "1",            migrated;
-    "INFR_METAL_PROFILE"    => "prof.metal_profile",    Text,     Ignored, "2",            migrated;
-    "INFR_METAL_PROF_DEBUG" => "prof.metal_prof_debug", Presence, Ignored, "1",            migrated;
+    // One `INFR_PROF_*` prefix, and each name says what it does. Thirteen keys became eight: the
+    // per-op profile had four (INFR_PROF2 / INFR_PROF_OPS / INFR_PROF2_SHAPES + rocm's env-less
+    // knob) and host-side stage timing had five, one per pipeline (INFR_PROF, INFR_PROF_DEC,
+    // INFR_PROF_PF, INFR_MTP_TIME, INFR_DIFFUSION_TIME). Old spellings are dropped CLEANLY.
+    "INFR_PROF_OPS"                => "prof.ops",               Presence, Ignored, "1",           migrated;
+    "INFR_PROF_OP_SHAPES"          => "prof.op_shapes",         Presence, Ignored, "1",           migrated;
+    "INFR_PROF_STAGES"             => "prof.stages",            Presence, Ignored, "1",           migrated;
+    "INFR_PROF_VRAM"               => "prof.vram",              Presence, Ignored, "1",           migrated;
+    "INFR_PROF_DIFFUSION_TRACE"    => "prof.diffusion_trace",   Presence, Ignored, "1",           migrated;
+    "INFR_PROF_OUT"                => "prof.out",               Path,     Ignored, "/tmp/p.json", migrated;
+    "INFR_PROF_METAL_DEVICE_TIME"  => "prof.metal_device_time", Text,     Ignored, "counters",    migrated;
+    "INFR_PROF_METAL_DEBUG"        => "prof.metal_debug",       Presence, Ignored, "1",           migrated;
 
     // ── debug (§6.9) ─────────────────────────────────────────────────────────
     "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", migrated;

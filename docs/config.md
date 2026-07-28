@@ -23,7 +23,7 @@ Two consequences worth knowing:
 
 - **Every documented `INFR_*` variable still works.** The campaign that
   introduced `Config` changed _where the value goes_, not what you type. Your
-  existing `INFR_PROF2=1 infr bench …` scripts are unaffected.
+  existing `INFR_PROF_OPS=1 infr bench …` scripts are unaffected.
 - **A flag beats an inherited environment variable**, because the CLI layer sits
   above the env layer. `INFR_CTX=32k infr run … --ctx 8192` runs at 8192.
 
@@ -109,7 +109,7 @@ If the **file** turns on a `prof.*` or `debug.*` knob, infr prints one line at
 startup naming the file and the fields:
 
 ```
-[infr] config: /home/you/.config/infr/config.toml enabled diagnostics: prof.prof2
+[infr] config: /home/you/.config/infr/config.toml enabled diagnostics: prof.ops
 ```
 
 So "why is my server printing timings" is answerable from the command line, even
@@ -244,14 +244,27 @@ devices) and `expert_parallel` (≥ 1); too few devices is a hard error. The thr
 `*_p2p` flags choose GPU-to-GPU transport (`true`, the default) over staging
 through host RAM.
 
-**`[prof]`** — `prof2` and `prof_ops` are **aliases for one another**: either
-one turns on per-op profiling on every backend (vulkan, rocm, metal, cpu), which
-all report through one table format and one process-exit aggregate. Read them
-through `ProfCfg::per_op()`, never as individual fields. Both spellings exist
-because the config campaign froze env names and each reached a different backend
-before the unification. Plus `prof`, `prof2_shapes` (vulkan-only shape
-itemizer), `prof_dec`, `prof_pf`, `vram_log`, `mtp_time`, `diffusion_time`,
-`profile_out` (a JSON report path), and the two Metal profiling knobs.
+**`[prof]`** — every key is `INFR_PROF_*`, and every one is settable three ways
+(env, `--set prof.<name>=…`, or a `[prof]` section in the file):
+
+| knob                | what it does                                                                                                            |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `ops`               | per-op device profiling on EVERY backend — vulkan, rocm, metal, cpu                                                     |
+| `op_shapes`         | itemize per-op labels by shape rather than folding a kind into one row (vulkan)                                         |
+| `stages`            | host-side stage timing: throughput, decode setup-vs-execute, prefill build/compile/execute, MTP verify, diffusion steps |
+| `vram`              | log live VRAM in use after weight load                                                                                  |
+| `out`               | ALSO write the exit report as JSON to this path                                                                         |
+| `diffusion_trace`   | per-step schedule/entropy trace for diffusion models                                                                    |
+| `metal_device_time` | `off` / `flush` / `counters` — how Metal obtains per-op device time                                                     |
+| `metal_debug`       | extra Metal profiler output                                                                                             |
+
+Two consolidations are worth knowing if you have old scripts. Per-op profiling
+answered to a different knob on each backend (`INFR_PROF2` on vulkan,
+`INFR_PROF_OPS` on cpu, an env-less `kernels.rocm.prof_ops` on rocm,
+`INFR_METAL_PROFILE` on metal) — it is all `ops` now. And host-side stage timing
+was five knobs, one per pipeline (`INFR_PROF`, `INFR_PROF_DEC`, `INFR_PROF_PF`,
+`INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`) — it is all `stages`. Old spellings were
+dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth) and
 `max_tokens_cap`. Per-request sampling is not here — it stays on the request.

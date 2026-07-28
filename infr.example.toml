@@ -230,19 +230,21 @@ ep_p2p = true
 # answerable from the command line.
 
 [prof]
-prof = false
-# prof2 and prof_ops are aliases: either one turns on per-op profiling, on EVERY
-# backend (vulkan / rocm / metal / cpu). One table format, one process-exit
-# aggregate. See docs/perf.md § Profiling.
-prof2 = false
-prof_ops = false
-prof2_shapes = false # vulkan only: shape-itemized GEMV/GEMM buckets
-prof_dec = false
-prof_pf = false
-vram_log = false
-mtp_time = false
-# profile_out = "/tmp/infr-profile.json"   # default: unset
-# metal_profile = "2"   # presence = on, "2" = per-op, "3" = counter set
+# Per-op profiling, on EVERY backend (vulkan / rocm / metal / cpu): one table
+# format, one process-exit aggregate. See docs/perf.md § Profiling.
+ops = false
+op_shapes = false # vulkan only: itemize labels by shape instead of by kernel
+# Host-side stage timing — prompt/decode throughput, the decode setup-vs-execute
+# split, the per-chunk prefill build/compile/execute split, MTP verify time and
+# diffusion per-step phases. Each section prints only if its pipeline ran.
+stages = false
+vram = false           # live VRAM in use after weight load
+diffusion_trace = false
+# out = "/tmp/infr-profile.json"   # ALSO write the exit report as JSON
+# How Metal obtains per-op DEVICE time (it is never free there — its ops batch
+# into one command buffer). Named modes, not a level.
+# metal_device_time = "counters"   # off (default) | flush | counters
+metal_debug = false
 
 # ── serve ────────────────────────────────────────────────────────────────────
 

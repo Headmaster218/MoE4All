@@ -1056,7 +1056,7 @@ fn moe_expert_grid_bound_bench() {
     // baseline's ~1.25-1.37ms — register-pressure/occupancy cost, the exact class-3 risk
     // docs/perf.md warns "bigger tiles often lose" for) and TN=4/THREADS=512 (register-neutral:
     // ~1.3-1.35ms, a wash/marginal loss within noise). Neither improved on the baseline BN=64
-    // tile, so down's lower TFLOPS-vs-gate_up efficiency (measured via INFR_PROF2: ~8.1 vs
+    // tile, so down's lower TFLOPS-vs-gate_up efficiency (measured via INFR_PROF_OPS: ~8.1 vs
     // ~10.2 TFLOPS at production counts) is a K-depth ceiling (k=nff=704 → only 22 BLK=32
     // iterations, less loop depth to amortize fixed per-iteration cost), not a tile/occupancy
     // config bug — reverted both variants per docs/perf.md's "a measured wash gets reverted"
@@ -1302,7 +1302,7 @@ fn moe_expert_row_tile_bench_down() {
 /// verify's draft window (m≈6-8 steady state, growing to ~m30-50 under the no-rewind fallback)
 /// runs every dense projection GEMM through `matmul_native_f16a` (n128_ag family: wide-N shapes
 /// like gate_up/vocab-head) or `matmul_native_splitk` (sk_ag family: narrow-N deep-k shapes like
-/// down/o/kv-proj) on the qwen35-4B-UD-Q4_K_XL shapes seen under `INFR_MTP=1 INFR_PROF2_SHAPES=1`.
+/// down/o/kv-proj) on the qwen35-4B-UD-Q4_K_XL shapes seen under `INFR_MTP=1 INFR_PROF_OP_SHAPES=1`.
 /// Sweeps m to find the BM=32/BM=64 crossover and confirm `DENSE_SMALL_TILE_MAX_M` (recorder.rs)
 /// sits on the right side of both the steady-state (m≈7) and no-rewind-tail (m≈30-50) regimes.
 /// `bm(dtype)`: probes the recorder's real gate through `kernels.vulkan.small_bm`
@@ -1500,7 +1500,7 @@ fn bm16_crossover_bench() {
     }
 
     // n128_ag family (matmul_native_f16a) at the qwen35-4B-UD-Q4_K_XL verify's dominant projection
-    // shapes captured via INFR_MTP=1 INFR_PROF2_SHAPES=1 — attn qkv/o (deep-k narrow-n, routed
+    // shapes captured via INFR_MTP=1 INFR_PROF_OP_SHAPES=1 — attn qkv/o (deep-k narrow-n, routed
     // through sk_ag / matmul_native_splitk in production so NOT reachable by BM16, listed here only
     // via the wide gate_up/vocab_head n128_ag shapes that ARE reachable).
     let n128_shapes: &[(&str, infr_core::DType, usize, usize)] = &[

@@ -6,8 +6,9 @@
 //! go", and every backend answered it in its own dialect: vulkan stamped timestamp queries and
 //! printed `[prof2]`, rocm recorded HIP events and printed `[rocm prof]`, metal accumulated host
 //! encode wall and printed `── infr-metal profile`, cpu summed `Instant`s and printed `[prof-ops]`.
-//! Four knobs (`prof.prof2`, `kernels.rocm.prof_ops`, `prof.metal_profile`, `prof.prof_ops`), four
-//! label grammars, four sort orders, four notions of what the total is a percentage OF.
+//! Four knobs (`INFR_PROF2`, `kernels.rocm.prof_ops`, `INFR_METAL_PROFILE`, `INFR_PROF_OPS`), four
+//! label grammars, four sort orders, four notions of what the total is a percentage OF. All four
+//! are now [`ProfCfg::ops`](crate::config::ProfCfg::ops) — one knob, `INFR_PROF_OPS`.
 //!
 //! That is worse than untidy. It cost real work:
 //!
@@ -19,7 +20,7 @@
 //!   itself excluded — rocm's header even said so ("over all forwards so far") without anyone
 //!   reading it as a warning.
 //! * Only vulkan fed [`infr_prof_rt`], so only vulkan appeared in the exit aggregate and in the
-//!   `INFR_PROFILE_OUT` JSON. Correlating a host function table against device op time was a
+//!   `INFR_PROF_OUT` JSON. Correlating a host function table against device op time was a
 //!   vulkan-only capability by accident, not by design.
 //!
 //! ## What is shared and what deliberately is not
@@ -39,9 +40,9 @@
 //!   would measure execution but serialize the pipeline and add F4's ~2.7 µs launch floor to every
 //!   sample.
 //! * metal has no free per-op device timing at all: its ops batch into one command buffer, so
-//!   isolating an op's GPU wall means flushing after it (`INFR_METAL_PROFILE=2`, which costs the
-//!   batching) or sampling stage-boundary counters (`=3`). Its cheap default mode measures host
-//!   ENCODE time, which is a different quantity and is labeled as such.
+//!   isolating an op's GPU wall means flushing after it (`prof.metal_device_time=flush`, which
+//!   costs the batching) or sampling stage-boundary counters (`=counters`). Its cheap default mode
+//!   measures host ENCODE time, which is a different quantity and is labeled as such.
 //! * cpu measures host wall directly, which for a host backend IS the device time.
 //!
 //! So each backend keeps its own timing acquisition and calls [`OpProf::add`] with the result. The
@@ -55,8 +56,8 @@ use std::collections::BTreeMap;
 
 /// Should this backend profile per-op right now?
 ///
-/// The AND with [`infr_prof_rt::prof2_suppressed`] is the part that used to be vulkan-only. Benches
-/// and warmup paths set that flag around untimed work (see `infr_llama::with_prof2_suppressed`), so
+/// The AND with [`infr_prof_rt::profiling_suppressed`] is the part that used to be vulkan-only. Benches
+/// and warmup paths set that flag around untimed work (see `infr_llama::with_profiling_suppressed`), so
 /// a backend that skips this predicate reports a table covering forwards the bench deliberately did
 /// not time.
 ///
@@ -64,7 +65,7 @@ use std::collections::BTreeMap;
 /// is hot enough that a config indirection per op would show.
 #[inline]
 pub fn enabled(cfg: &ProfCfg) -> bool {
-    cfg.per_op() && !suppressed()
+    cfg.ops && !suppressed()
 }
 
 /// Is per-op profiling currently suppressed by a warmup / untimed-work scope?
@@ -73,7 +74,7 @@ pub fn enabled(cfg: &ProfCfg) -> bool {
 /// it already has, and so the whole profiling seam reads from ONE import.
 #[inline]
 pub fn suppressed() -> bool {
-    infr_prof_rt::prof2_suppressed()
+    infr_prof_rt::profiling_suppressed()
 }
 
 /// One profiling session's accumulated per-op time: label → (dispatches, total µs).
@@ -258,35 +259,19 @@ mod tests {
     use crate::graph::{Graph, Op};
     use crate::tensor::{DType, TensorDesc};
 
-    /// Either alias turns per-op profiling on, on EVERY backend. Before the unification
-    /// `INFR_PROF_OPS` reached only the cpu backend and `INFR_PROF2` only vulkan, so the same
-    /// command line profiled or didn't depending on `--dev`.
-    #[test]
-    fn either_env_alias_enables_per_op_profiling() {
-        for set in [
-            |c: &mut Config| c.prof.prof2 = true,
-            |c: &mut Config| c.prof.prof_ops = true,
-        ] {
-            let mut cfg = Config::default();
-            assert!(!cfg.prof.per_op());
-            set(&mut cfg);
-            assert!(cfg.prof.per_op());
-        }
-    }
-
     #[test]
     fn enabled_requires_the_knob_and_clears_under_suppression() {
         let mut cfg = Config::default();
         assert!(!enabled(&cfg.prof), "off by default");
-        cfg.prof.prof_ops = true;
+        cfg.prof.ops = true;
         assert!(enabled(&cfg.prof));
 
         // The warmup path's flag must win over the knob — this AND is what rocm and metal were
         // missing, and it is the difference between a table of the timed reps and a table
         // polluted by the untimed warmup forward.
-        let prev = infr_prof_rt::set_prof2_suppressed(true);
+        let prev = infr_prof_rt::set_profiling_suppressed(true);
         assert!(!enabled(&cfg.prof), "suppression must beat the knob");
-        infr_prof_rt::set_prof2_suppressed(prev);
+        infr_prof_rt::set_profiling_suppressed(prev);
         assert!(enabled(&cfg.prof), "and restore must un-suppress");
     }
 
@@ -374,7 +359,7 @@ mod tests {
     ///
     /// Four backends previously each called their own accounting and their own `eprintln!`, and the
     /// cost was not aesthetic: three of the four silently profiled the bench's untimed warmup, and
-    /// three of the four never appeared in the exit report or the `INFR_PROFILE_OUT` JSON at all.
+    /// three of the four never appeared in the exit report or the `INFR_PROF_OUT` JSON at all.
     /// A fifth backend (cuda and sycl both have plans in `docs/`) would have made it five. This
     /// fails the moment a new one reaches past the seam.
     #[test]

@@ -355,10 +355,10 @@ serialize, a bad blob — all fall back to plain
 is never used; a miss must recompile, not error.
 `--set kernels.metal.pipeline_cache=false` turns it off.
 
-`INFR_PROF` prints the breakdown: library-compile ms, PSO count and ms, archive
-hits vs misses, blob size. `MetalBackend::pipeline_cache_stats()` returns the
-same numbers plus the per-kernel `served` map (name → came from the archive).
-Since nobody on this project has a Metal device, the macOS CI job runs
+`INFR_PROF_STAGES` prints the breakdown: library-compile ms, PSO count and ms,
+archive hits vs misses, blob size. `MetalBackend::pipeline_cache_stats()`
+returns the same numbers plus the per-kernel `served` map (name → came from the
+archive). Since nobody on this project has a Metal device, the macOS CI job runs
 `cargo test -p infr-metal -- --include-ignored --nocapture` so
 `tests/pcache.rs`'s cold-vs-warm table — front end vs back end, side by side —
 lands in the log permanently. If the (uncacheable) front end dominates a warm
@@ -367,16 +367,18 @@ not this cache.
 
 ## Profiling
 
-`INFR_METAL_PROFILE=1`: per-op CPU-encode + GPU commit+wait wall, printed on
-drop. `INFR_METAL_PROFILE=2`: additionally flushes after each op to attribute
-GPU wall per op — costs the batching AND, because the replay tape re-executes
-decode tokens without walking ops, only ever attributes the RECORDED token.
-`INFR_METAL_PROFILE=3` is the honest mode: `MTLCounterSampleBuffer`
-stage-boundary timestamps, one encoder per op inside ONE command buffer — true
-in-context per-op GPU time, with the tape disabled so every token attributes.
-(Apple silicon samples at stage boundaries only, not dispatch boundaries;
-metal-rs 0.33's `resolve_counter_range` returns uninitialized memory, so the
-resolve reads the NSData directly.)
+`INFR_PROF_OPS=1` — the same knob as every other backend — gives per-op
+CPU-encode wall plus the GPU commit+wait total, printed on drop. Device time per
+op is a separate axis, because on Metal it is never free:
+`--set prof.metal_device_time=flush` flushes after each op to attribute GPU wall
+per op — costs the batching AND, because the replay tape re-executes decode
+tokens without walking ops, only ever attributes the RECORDED token.
+`--set prof.metal_device_time=counters` is the honest mode:
+`MTLCounterSampleBuffer` stage-boundary timestamps, one encoder per op inside
+ONE command buffer — true in-context per-op GPU time, with the tape disabled so
+every token attributes. (Apple silicon samples at stage boundaries only, not
+dispatch boundaries; metal-rs 0.33's `resolve_counter_range` returns
+uninitialized memory, so the resolve reads the NSData directly.)
 
 ## Tests
 

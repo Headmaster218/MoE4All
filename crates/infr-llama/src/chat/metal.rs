@@ -79,10 +79,14 @@ impl ChatModel for MetalSeamChat {
     }
 
     fn warmup(&mut self) -> Result<()> {
-        // The shared session warmup, UNWRAPPED (no INFR_METAL_PROFILE / INFR_PROF2 suppression:
-        // the Metal backend reads its profile env at CONSTRUCTION — which happens inside this
-        // first generate — so suppressing here would disable profiling for the whole session,
-        // not just the warmup).
+        // The shared session warmup, UNWRAPPED — no `with_profiling_suppressed` here, unlike the
+        // vulkan/diffusion paths. The Metal backend resolves `prof.ops` at CONSTRUCTION, which
+        // happens inside this first generate, so wrapping the call would resolve `profiling: false`
+        // and disable the profiler for the whole session rather than just the warmup.
+        //
+        // The warmup forward is still excluded from the profile: `ProfileGate::enabled` consults
+        // the process-wide suppression flag at CALL time (and this backend's own RAII counter),
+        // so a bench that suppresses around its untimed turns gets a table of the timed reps.
         self.warmup_session()
     }
 

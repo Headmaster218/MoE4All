@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::manifest::{BadValue, Grammar, KEYS, NOT_KNOBS, NOT_MIGRATED};
-use super::{cli, env, file, Config, ConfigError, ConfigOverrides, PartialConfig, SetPathError};
+use super::{
+    cli, env, file, Config, ConfigError, ConfigOverrides, MetalDeviceTime, PartialConfig,
+    SetPathError,
+};
 
 /// Drive the env layer with a synthetic environment. `recorder.rs`'s
 /// `gemv_knobs_resolve_matches_env_reads` is the working precedent for this shape.
@@ -109,8 +112,8 @@ fn default_config_matches_documented_defaults() {
     // default against its own `MOE_ID_ROWS` knob table.
     assert_eq!(d.kernels.rocm.moe_id_rows, 128);
     // P1: the tiled flash prefill attention kernel ships ON (it replaced the single-wave scalar
-    // one). Env-key-less like the two above. (`kernels.rocm.prof_ops` used to sit here; U3 folded
-    // it into the cross-backend `prof.per_op()` — see `prof_per_op_is_the_one_knob`.)
+    // one). Env-key-less like the two above. (`kernels.rocm.prof_ops` used to sit here; it folded
+    // into the cross-backend `prof.ops` — see `prof_ops_is_the_one_knob_reachable_by_env_set_and_file`.)
     assert!(d.kernels.rocm.attn_flash);
     // RM: the Metal `MTLBinaryArchive` pipeline cache is ON by default, for the same reason — a
     // launch should not re-run the driver's AIR → ISA back end for every kernel. Env-key-less too.
@@ -820,11 +823,11 @@ fn set_path_covers_every_value_grammar() {
 /// the fields — otherwise "why is my server printing timings" is unanswerable.
 #[test]
 fn file_set_diagnostics_are_announced() {
-    let layer = file_layer("[prof]\nprof2 = true\n\n[debug]\npoison_uninit = true\n");
+    let layer = file_layer("[prof]\nops = true\n\n[debug]\npoison_uninit = true\n");
     let line = super::announce_file_diagnostics(&layer, Path::new("/etc/infr/config.toml"))
         .expect("a file that enables diagnostics must announce it");
     assert!(line.contains("/etc/infr/config.toml"), "{line}");
-    assert!(line.contains("prof.prof2"), "{line}");
+    assert!(line.contains("prof.ops"), "{line}");
     assert!(line.contains("debug.poison_uninit"), "{line}");
 
     // A file that touches nothing diagnostic says nothing.
@@ -834,7 +837,7 @@ fn file_set_diagnostics_are_announced() {
         None
     );
     // Neither does one that sets a diagnostic knob to its DEFAULT.
-    let noop = file_layer("[prof]\nprof2 = false\n");
+    let noop = file_layer("[prof]\nops = false\n");
     assert_eq!(
         super::announce_file_diagnostics(&noop, Path::new("infr.toml")),
         None
@@ -873,53 +876,98 @@ fn toml_sections_mirror_the_struct_paths() {
     assert_eq!(cfg.multi.pipeline.as_deref(), Some(&[0usize, 1][..]));
 }
 
-/// `prof.per_op()` is THE per-op profiling switch, and both frozen env spellings reach it.
+/// `prof.ops` is THE per-op profiling switch, on every backend, and it is reachable three ways.
 ///
-/// Before U3 each backend had its own: `INFR_PROF2` reached only vulkan, `INFR_PROF_OPS` only the
+/// Each backend used to have its own: `INFR_PROF2` reached only vulkan, `INFR_PROF_OPS` only the
 /// cpu backend, and rocm's `kernels.rocm.prof_ops` had no env key at all — so whether
 /// `INFR_PROF_OPS=1 infr bench …` profiled anything depended on `--dev`, silently. Any future
-/// backend gates on this accessor (through `infr_core::prof::enabled`, which also ANDs warmup
+/// backend gates on this field (through `infr_core::prof::enabled`, which also ANDs warmup
 /// suppression), never on a knob of its own.
 #[test]
-fn prof_per_op_is_the_one_knob() {
+fn prof_ops_is_the_one_knob_reachable_by_env_set_and_file() {
     let d = Config::default();
-    assert!(!d.prof.per_op(), "diagnostic — off by default");
+    assert!(!d.prof.ops, "diagnostic — off by default");
 
-    for env in ["INFR_PROF2", "INFR_PROF_OPS"] {
-        let cfg = Config::load_from_layers(&[env_layer(&[(env, "1")])]);
-        assert!(cfg.prof.per_op(), "{env} must enable per-op profiling");
-    }
+    // All three layers reach the same field.
+    assert!(
+        Config::load_from_layers(&[env_layer(&[("INFR_PROF_OPS", "1")])])
+            .prof
+            .ops
+    );
+    assert!(
+        Config::load_from_layers(&[cli_layer(&["prof.ops=true"])])
+            .prof
+            .ops
+    );
+    assert!(
+        Config::load_from_layers(&[file_layer("[prof]\nops = true\n")])
+            .prof
+            .ops
+    );
 }
 
-/// `INFR_METAL_PROFILE` is NOT an integer level (§6.12, §10.4): presence turns the profiler on,
-/// and the derived `prof_ops` / counter-set modes compare against the EXACT strings `"2"` and
-/// `"3"`. `=20` is therefore "on, level unrecognized" — not "≥ 2". S6 moved the read onto
-/// `ProfCfg`'s three accessors; this pins the grammar they must reproduce.
+/// **Every** `prof.*` knob is reachable by `--set` (and therefore by the TOML file), with the
+/// documented spelling. The profiling knobs are the ones people reach for from a shell mid-debug,
+/// so a `prof.*` path that only the environment can set is a gap, not a detail.
 #[test]
-fn metal_profile_is_three_exact_literals_not_a_level() {
-    let d = Config::default();
-    assert!(!d.prof.metal_profiling());
-    assert!(!d.prof.metal_prof_ops());
-    assert!(!d.prof.metal_prof_counters());
+fn every_prof_knob_is_reachable_by_set() {
+    let cfg = Config::load_from_layers(&[cli_layer(&[
+        "prof.ops=true",
+        "prof.op_shapes=true",
+        "prof.stages=true",
+        "prof.vram=true",
+        "prof.diffusion_trace=true",
+        "prof.out=/tmp/p.json",
+        "prof.metal_device_time=counters",
+        "prof.metal_debug=true",
+    ])]);
+    assert!(cfg.prof.ops);
+    assert!(cfg.prof.op_shapes);
+    assert!(cfg.prof.stages);
+    assert!(cfg.prof.vram);
+    assert!(cfg.prof.diffusion_trace);
+    assert_eq!(cfg.prof.out.as_deref(), Some(Path::new("/tmp/p.json")));
+    assert_eq!(cfg.prof.metal_device_time, MetalDeviceTime::Counters);
+    assert!(cfg.prof.metal_debug);
+}
 
-    for (value, profiling, ops, counters) in [
-        ("", true, false, false),
-        ("0", true, false, false),
-        ("1", true, false, false),
-        ("2", true, true, false),
-        ("3", true, false, true),
-        ("20", true, false, false),
-        ("banana", true, false, false),
+/// Metal's device-timing mode is NAMED, not an integer level.
+///
+/// Its predecessor `INFR_METAL_PROFILE` compared against the exact string literals `"2"` and
+/// `"3"`, so `=20` silently meant "profiling on, level unrecognized" rather than "≥ 2" — a footgun
+/// the docs had to carry a paragraph about. Named modes remove the class: a value either parses to
+/// a mode or does not.
+#[test]
+fn metal_device_time_is_named_modes_not_a_level() {
+    assert_eq!(
+        Config::default().prof.metal_device_time,
+        MetalDeviceTime::Off
+    );
+
+    for (value, want) in [
+        ("off", MetalDeviceTime::Off),
+        ("flush", MetalDeviceTime::Flush),
+        ("counters", MetalDeviceTime::Counters),
+        ("COUNTERS", MetalDeviceTime::Counters),
     ] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_METAL_PROFILE", value)])]);
-        assert_eq!(cfg.prof.metal_profiling(), profiling, "{value:?} profiling");
-        assert_eq!(cfg.prof.metal_prof_ops(), ops, "{value:?} prof_ops");
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PROF_METAL_DEVICE_TIME", value)])]);
+        assert_eq!(cfg.prof.metal_device_time, want, "{value:?}");
+    }
+
+    // The old grammar's trap: a numeric-looking value is not a level. It does not parse to a mode,
+    // so it leaves the default rather than turning something half-on.
+    for junk in ["2", "3", "20", "banana"] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PROF_METAL_DEVICE_TIME", junk)])]);
         assert_eq!(
-            cfg.prof.metal_prof_counters(),
-            counters,
-            "{value:?} counters"
+            cfg.prof.metal_device_time,
+            MetalDeviceTime::Off,
+            "{junk:?} must not select a mode"
         );
     }
+
+    // `--set` is strict where the env layer is lenient (the file/`--set` rule for known keys).
+    let mut p = PartialConfig::default();
+    assert!(p.set_path("prof.metal_device_time", "2").is_err());
 }
 
 /// The migrated set, pinned key by key. A slice flips its own entries AND updates this list, so
@@ -954,7 +1002,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_CPU_SPIN",
         "INFR_MOE_COUNTS_DEBUG",
         "INFR_MOE_COUNTS_DUMP",
-        "INFR_PROF_OPS",
     ];
 
     /// S4 — `infr-llama`'s seam: the whole `kv`, `spec` and `multi` sections, `device.ubatch*`,
@@ -971,8 +1018,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     const S4: &[&str] = &[
         "INFR_CACHE",
         "INFR_DECODE_CHAIN",
-        "INFR_DIFFUSION_TIME",
-        "INFR_EB_TRACE",
+        "INFR_PROF_STAGES",
+        "INFR_PROF_DIFFUSION_TRACE",
         "INFR_EP_HOST",
         "INFR_EXPERT_PARALLEL",
         "INFR_KV_Q8",
@@ -980,7 +1027,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_TYPE_K",
         "INFR_KV_TYPE_V",
         "INFR_MTP",
-        "INFR_MTP_TIME",
         "INFR_NO_GATED_RMSNORM",
         "INFR_NO_GPU_ARGMAX",
         "INFR_NO_GPU_DRAFT_PROB",
@@ -994,8 +1040,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_QKV_FUSE",
         "INFR_PIPELINE",
         "INFR_PIPELINE_HOST",
-        "INFR_PROF_DEC",
-        "INFR_PROF_PF",
         "INFR_ROCM_EXPERT_BUDGET",
         "INFR_SPEC_DEBUG",
         "INFR_SPEC_DRAFT",
@@ -1028,7 +1072,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_POISON_UNINIT",
         "INFR_SG",
         "INFR_SUBMIT_DISPATCHES",
-        "INFR_VRAM_LOG",
+        "INFR_PROF_VRAM",
     ];
 
     /// S5b — `infr-vulkan`'s PER-OP / PER-DISPATCH tier: everything `recorder.rs`, `adapter.rs` and
@@ -1104,9 +1148,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_PV_WARP",
         "INFR_NO_QK_WARP",
         "INFR_NO_SMALL_BM",
-        "INFR_PROF",
-        "INFR_PROF2",
-        "INFR_PROF2_SHAPES",
+        "INFR_PROF_OPS",
+        "INFR_PROF_OP_SHAPES",
         "INFR_PV_SPLITS",
         "INFR_SEAM_NO_REPLAY",
     ];
@@ -1145,8 +1188,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_METAL_NO_KQUANT_NATIVE",
         "INFR_METAL_NO_Q5K_RT",
         "INFR_METAL_NO_RMSNORM_VEC4",
-        "INFR_METAL_PROFILE",
-        "INFR_METAL_PROF_DEBUG",
+        "INFR_PROF_METAL_DEVICE_TIME",
+        "INFR_PROF_METAL_DEBUG",
         "INFR_PAGER_STATS",
         "INFR_ROCM_BLAS",
         "INFR_ROCM_COOP",
@@ -1176,7 +1219,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_DEBUG_CHAT",
         "INFR_MAX_TOKENS_CAP",
         "INFR_NO_THINK",
-        "INFR_PROFILE_OUT",
+        "INFR_PROF_OUT",
     ];
 
     /// S8 — the CLI's own transitional bridge, and with it the LAST unmigrated knob. The six

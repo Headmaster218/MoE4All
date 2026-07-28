@@ -1302,7 +1302,7 @@ be measuring.
 
 (P1 shipped this behind `kernels.rocm.prof_ops`, a knob with no env key. The
 U1–U3 unification folded it into the cross-backend `INFR_PROF_OPS` /
-`INFR_PROF2` and the shared reporter in `infr_core::prof` — same HIP-event
+`INFR_PROF_OPS` and the shared reporter in `infr_core::prof` — same HIP-event
 acquisition, but the accounting, label grammar, report format and process-exit
 aggregate are now the ones vulkan/metal/cpu share. It also gained warmup
 suppression, which it did not have: every table P1 printed included the bench's

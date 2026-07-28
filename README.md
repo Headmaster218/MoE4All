@@ -189,18 +189,18 @@ infr bench "$M" -p 0 -n 64 -r 3         # decode 64 tokens
 infr bench "$M" -p 0 -n 64 -d 2048      # decode at context depth 2048 (-d warms, untimed)
 ```
 
-**Profile** per-op GPU time (timestamp queries) with `INFR_PROF2=1`. Every
+**Profile** per-op GPU time (timestamp queries) with `INFR_PROF_OPS=1`. Every
 dispatch is timestamped and labeled **automatically with its kernel name** (plus
 a few role overrides like `expert_gateup`/`expert_down`); no manual stamping. It
-prints one block per submit and ONE aggregated `INFR_PROF2 GPU report` at
+prints one block per submit and ONE aggregated `INFR_PROF_OPS GPU report` at
 process exit (per-kernel totals, counts, avg, %GPU over all timed submits —
-warmup runs unprofiled). Add `INFR_PROF2_SHAPES=1` for shape-itemized GEMV/GEMM
-buckets (`mmvr:m4:1536x24576`). Decode's replay tape carries no timestamps —
-profile decode with `INFR_SEAM_NO_REPLAY=1`. Details in
+warmup runs unprofiled). Add `INFR_PROF_OP_SHAPES=1` for shape-itemized
+GEMV/GEMM buckets (`mmvr:m4:1536x24576`). Decode's replay tape carries no
+timestamps — profile decode with `INFR_SEAM_NO_REPLAY=1`. Details in
 [`docs/perf.md`](docs/perf.md).
 
 ```bash
-INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | tail -30   # exit aggregate
+INFR_PROF_OPS=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | tail -30   # exit aggregate
 ```
 
 **Validate Vulkan work** — any change touching `infr-vulkan` (kernels, recorder,
@@ -280,13 +280,13 @@ quarter of the model overflowing). An MoE model whose DENSE part also doesn't
 fit is out of scope and errors clearly.
 
 **Size grammar** — `paging.cache` / `INFR_CACHE` and `device.ctx` / `INFR_CTX` /
-`--ctx` share one value grammar
-(`infr_core::parse_size`): a plain number is the base unit (bytes for
-`INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t` suffixes scale by 1024
-(`INFR_CACHE=19g`, `INFR_CTX=256k`), and `%` resolves against the
-device-appropriate base — available VRAM for the expert cache, the free-VRAM KV
-capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`; on the
-CPU/Metal chat paths a ctx-`%` resolves against the model's trained context).
+`--ctx` share one value grammar (`infr_core::parse_size`): a plain number is the
+base unit (bytes for `INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t`
+suffixes scale by 1024 (`INFR_CACHE=19g`, `INFR_CTX=256k`), and `%` resolves
+against the device-appropriate base — available VRAM for the expert cache, the
+free-VRAM KV capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`;
+on the CPU/Metal chat paths a ctx-`%` resolves against the model's trained
+context).
 
 **Resident-BDA weight arena** — always on; it is the only weight path. Routes
 every weight allocation into one `bufferDeviceAddress` arena and has the kernels
@@ -407,8 +407,8 @@ The single most useful thing learned here: **int8's value is row-count
 dependent, and the two directions are independent policies.** The cost of the
 tier is a per-dispatch activation-quantize pass; the benefit is the unpack ALU
 it saves. At m=1 (decode) the quantize is dead weight amortized over one row, so
-a dtype with a cheap unpack (Q8_0 — at 8 bits the stored byte already IS the
-dp4a operand) _loses_. At m≥3 (prefill) it amortizes hard and every integer
+a dtype with a cheap unpack (Q8*0 — at 8 bits the stored byte already IS the
+dp4a operand) \_loses*. At m≥3 (prefill) it amortizes hard and every integer
 dtype wins, by +21% to +67%. So a dtype can lose decode and win prefill by a
 mile, and infr ships two separate policy sets to say so —
 `mmv_int8_decode_dtypes` (m=1) and `mrow_int8_prefill_dtypes` (m≥3), in
@@ -425,10 +425,10 @@ Q8_0, so taking this trade is parity with the oracle, not a quality regression.)
 **Q3_K stays OFF at decode** — and this is an accuracy result, not a perf one.
 Flipping it broke `gpu_seam_matches_cpu_qwen3_q2k` into **degenerate** output
 (`<think>` repeated to the token limit against the oracle's coherent answer).
-Cause: **GGUFs are mixed** — unsloth's Qwen3-0.6B-**Q2_K** file carries Q3_K
+Cause: **GGUFs are mixed** — unsloth's Qwen3-0.6B-**Q2_K** file carries Q3*K
 tensors — so a "Q3_K" flip silently moved a 0.6B model's layers to int8, where
 accumulated quantization error is worst, and it fell off a coherence cliff. The
-cliff was then isolated to the _decode_ side specifically: the same test run
+cliff was then isolated to the \_decode* side specifically: the same test run
 PREFILL-int8-only stays coherent and matches the CPU oracle token-for-token,
 while DECODE-int8-only reproduces the divergence exactly. So Q3_K's prefill win
 ships and its decode tier does not. **Q5_K** is off at decode on a plain
@@ -448,9 +448,9 @@ wasting a full KV per session, 6.25 GiB on a 14B), and lifted the gemma-family
 multi-turn rows (12B `pp4@d4096` 1.40× → 1.66×: less dead KV to re-scan).
 
 This row's `pp4@d4096` was the table's worst loss at 0.84×; it is now **1.32×**,
-a win. That came from Q5_K's ordinary-prefill int8 tier (footnote ³) — this is a
+a win. That came from Q5*K's ordinary-prefill int8 tier (footnote ³) — this is a
 Q5_K_XL file, and Q5_K's prefill win (+45%) was previously unreachable because
-it was gated behind an off-by-default _decode_ tier. Splitting the two policies
+it was gated behind an off-by-default \_decode* tier. Splitting the two policies
 banked it. Its **decode** was then closed too (0.91×/0.92× → **0.98×/1.00×**) by
 the wide rmsnorm (footnote ⁸) — this model, at 21.9 GiB on a 24 GB card and 57%
 of its GPU time in one Q5_K GEMV, is where that kernel was found. The fix added
@@ -495,11 +495,11 @@ shipped MoE GGUF uses them for expert banks — see `MOE_MMQ_DTYPES`'s exclusion
 doc).
 
 **Prefill is now a WIN** (`c7c3f50`): `pp512` 0.90× → **1.16×**. The gap was
-codebook _staging_, not bandwidth — the discriminator is that this file's Q4_K_M
+codebook _staging_, not bandwidth — the discriminator is that this file's Q4*K_M
 sibling (same architecture, arithmetic experts) runs `expert_gateup` in 46 ms
 while moving **1.76× more weight bytes**. Two causes, in places nobody had
 looked: IQ2_S's scale nibble covers 16 elements, so its mmq k-loop ran at
-`BLK=16` — the _only_ expert kernel doing k/16 passes where
+`BLK=16` — the \_only* expert kernel doing k/16 passes where
 Q4_K/Q6_K/IQ3_S/IQ4_XS all do k/32, i.e. double the barriers, scale staging and
 activation loads for identical dp4a work. Merging it to `BLK=32` is
 bit-identical (the two halves provably share one sub-block index and one scale
@@ -568,17 +568,17 @@ is what turned the entire 8B–27B decode band from losses into wins (Qwen3-8B
 It also corrects a story this README told for a long time. "Decode is
 weight-bandwidth bound" was **measured but incomplete**: `native_q8_0` runs the
 _same_ `native_gemv` kernel at the _same_ m=1 shape and reaches **863 GB/s = 90%
-of the card's ~960 GB/s peak** — that is the real wall — while Q5_K, at 57% of
+of the card's ~960 GB/s peak** — that is the real wall — while Q5*K, at 57% of
 all GPU time, sat at **737 GB/s (77%)**. Same kernel, so the memory system was
-never the difference. Null result from the same slice: the Q5_K _ALU_ hypothesis
-was **falsified** — a SWAR rewrite of its 5-bit rebuild predicted ~22% and
-measured **2.3%** (ACO was already fusing the shift+mask into `v_bfe_u32`); it
-shipped anyway because it is bit-identical and free. The genuine residual is
-**VMEM instruction count** (a Q5_K sub-block issues 16 word loads to Q8_0's 8,
-and a superblock's `qh` bytes get re-read ~3× by its sub-blocks), which needs
-superblock-granular decode — left open. **BF16 decode** (0.87×) is the one row
-none of this can help: it is the only non-integer weight dtype, so there is no
-unpack ALU to save and no weight codes to integer-dot.
+never the difference. Null result from the same slice: the Q5_K \_ALU*
+hypothesis was **falsified** — a SWAR rewrite of its 5-bit rebuild predicted
+~22% and measured **2.3%** (ACO was already fusing the shift+mask into
+`v_bfe_u32`); it shipped anyway because it is bit-identical and free. The
+genuine residual is **VMEM instruction count** (a Q5_K sub-block issues 16 word
+loads to Q8_0's 8, and a superblock's `qh` bytes get re-read ~3× by its
+sub-blocks), which needs superblock-granular decode — left open. **BF16 decode**
+(0.87×) is the one row none of this can help: it is the only non-integer weight
+dtype, so there is no unpack ALU to save and no weight codes to integer-dot.
 
 ⁹ **MoE expert GEMMs: the waste was inside the tile, not in the routing**
 (`6a33065`). The expert GEMMs are **72% of MoE prefill GPU time**. The suspicion

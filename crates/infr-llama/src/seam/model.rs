@@ -1273,12 +1273,12 @@ impl SeamModel {
             )?;
             Ok(stats)
         };
-        // Untimed work must stay out of the INFR_PROF2 profile: the warmup turn's m7 batched
+        // Untimed work must stay out of the INFR_PROF_OPS profile: the warmup turn's m7 batched
         // rows and the depth warm's huge prefill would otherwise dominate/pollute the per-shape
         // aggregate for the tiny timed shape (recorders read the suppression flag at construction,
         // so suppressing around a run() disables their timestamps entirely). Same pattern as
-        // DenseSeamChat::warmup. Routes through `with_prof2_suppressed` — an AtomicBool flag, NOT
-        // an `INFR_PROF2` env mutation, so it never races the rayon-parallel forward inside `run`
+        // DenseSeamChat::warmup. Routes through `with_profiling_suppressed` — an AtomicBool flag, NOT
+        // an `INFR_PROF_OPS` env mutation, so it never races the rayon-parallel forward inside `run`
         // (env is a process-wide table; `set_var` is `unsafe` under edition 2024). `gpu_reset`
         // additionally drops anything profiled before the timed reps (e.g. session-init submits)
         // from the exit aggregate.
@@ -1286,7 +1286,7 @@ impl SeamModel {
                           gen: usize,
                           state: &mut Option<crate::seam::SeamKv>|
          -> Result<crate::GenStats> {
-            crate::with_prof2_suppressed(|| run(prompt_len, gen, state))
+            crate::with_profiling_suppressed(|| run(prompt_len, gen, state))
         };
         // Untimed warmup: uploads the weights and compiles every pipeline the timed reps hit.
         unprofiled(8, 2, &mut state)?;
@@ -1365,12 +1365,12 @@ impl SeamModel {
             )?;
             Ok(stats)
         };
-        // Untimed work stays out of the INFR_PROF2 profile (same reasoning as `bench_vulkan`).
+        // Untimed work stays out of the INFR_PROF_OPS profile (same reasoning as `bench_vulkan`).
         let unprofiled = |prompt_len: usize,
                           gen: usize,
                           state: &mut Option<crate::seam::SeamKv>|
          -> Result<crate::GenStats> {
-            crate::with_prof2_suppressed(|| run(prompt_len, gen, state))
+            crate::with_profiling_suppressed(|| run(prompt_len, gen, state))
         };
         // Untimed warmup: uploads the weights and compiles every kernel the timed reps hit.
         unprofiled(8, 2, &mut state)?;

@@ -156,7 +156,7 @@ and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
   the multi-GPU + backend-bind boilerplate.
 - **`infr-llama` seam/model+weights+sc (all 6 findings)** — TDD, +5 tests.
   `SlotPool::pick` now picks the longest-prefix slot (was first-match, via a
-  pure `pick_continuation`); `bench_vulkan`'s unsafe `INFR_PROF2` env race is
+  pure `pick_continuation`); `bench_vulkan`'s unsafe `INFR_PROF_OPS` env race is
   gone — suppression is a non-env `AtomicBool` in infr-prof-rt that the recorder
   reads (also fixes the warmup callers); `generate_metal_spec` reuses a
   persistent `feed` buffer (was O(n²) `committed.clone()` per round);

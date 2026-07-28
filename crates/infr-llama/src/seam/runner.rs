@@ -3030,11 +3030,11 @@ pub(crate) fn generate_dense_backend(
                 "canvas denoise forward: diffusion-gemma models only"
             ));
         }
-        // Phase-A/B perf: per-step timing, gated on INFR_DIFFUSION_TIME=1 (stderr, one line/step).
+        // Phase-A/B perf: per-step timing, gated on INFR_PROF_STAGES=1 (stderr, one line/step).
         // Phase A found `sc` was ~85% of every step (the host SC matvec); Phase B moved that
         // in-graph on Vulkan, so `sc` now reports only the (cheap) host prep — embed gather, and
         // the temp_inv premultiply on the gpu_sc path — while `exec` absorbs the SC math itself.
-        let time_diffusion = ec.prof.diffusion_time;
+        let time_diffusion = ec.prof.stages;
         let canvas = req.canvas_tokens;
         // Canvas ids index the embedding table (`tok * n_embd`) below — range-check once so an
         // out-of-vocab id is a clean error, not an OOB slice panic.
@@ -3486,13 +3486,13 @@ pub(crate) fn generate_dense_backend(
         // exactly the rows the MTP catch-up driver needs `h` for (docs/mtp.md's `process()`).
         // `h_tap` piggybacks on the SAME graph/execute, just an extra Output + download.
         let want_h = h_out.is_some();
-        // Phase-4 MTP profiling (issue #33, INFR_MTP_TIME=1): split VERIFY's own wall time into
+        // Phase-4 MTP profiling (issue #33, INFR_PROF_STAGES=1): split VERIFY's own wall time into
         // graph-build / plan-compile / execute / download, and report `m` (the rows actually
         // reprocessed) + whether this call is a FULL reprefill (`start == 0` with a nonempty
         // history behind it, i.e. the qwen35 no-rewind fallback fired) vs the cheap incremental
         // suffix-only path. This is the number the MTP perf pass profiles before touching any
         // code — see mtp.rs's `generate_mtp_spec_vulkan_timed` doc on the no-rewind cost.
-        let time_verify = ec.prof.mtp_time;
+        let time_verify = ec.prof.stages;
         let full_reprefill = start == 0 && m > 1;
         // GPU-resident verify accept (issue #31, task #31): per-row Op::Argmax appended to the
         // batched forward — m u32 ids read back instead of the m×vocab f32 logits. Host-logits
@@ -3651,16 +3651,16 @@ pub(crate) fn generate_dense_backend(
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
     let mut logits = vec![0f32; c.vocab];
-    // INFR_PROF=1: report prompt-ingest + decode tok/s to stderr (CPU perf iteration).
-    let prof = ec.prof.prof;
+    // INFR_PROF_STAGES=1: report prompt-ingest + decode tok/s to stderr (CPU perf iteration).
+    let prof = ec.prof.stages;
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
-    // `prof.prof_dec` (INFR_PROF_DEC): split decode per-token wall time into host setup (build
+    // `prof.stages` (INFR_PROF_STAGES): split decode per-token wall time into host setup (build
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
     // EVERY decode step (R6/§10.9).
-    let prof_dec = ec.prof.prof_dec;
+    let prof_dec = ec.prof.stages;
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;
 
@@ -3834,10 +3834,10 @@ pub(crate) fn generate_dense_backend(
             );
             be.execute(pf_plan.as_ref(), &pf_b)
                 .map_err(|e| anyhow!("{e}"))?;
-            // INFR_PROF_PF: split the per-chunk prefill wall time into host graph build, plan
+            // INFR_PROF_STAGES: split the per-chunk prefill wall time into host graph build, plan
             // compile, and execute (record + submit + GPU) — where a small-batch chunk's fixed
             // cost lives decides whether to attack recording or kernels.
-            if ec.prof.prof_pf {
+            if ec.prof.stages {
                 eprintln!(
                     "[pf prof] m={pf_m} build={:.1}ms compile={:.1}ms execute={:.1}ms",
                     t_build.as_secs_f64() * 1e3,
@@ -3867,7 +3867,7 @@ pub(crate) fn generate_dense_backend(
     // without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every ineligible
     // model keep rebuilding + recompiling per token below.
     // INFR_SEAM_NO_REPLAY=1 forces per-token rebuild (the adapter's static path) — slower, but
-    // INFR_PROF2 per-op GPU timestamps work there (the replay path can't report them).
+    // INFR_PROF_OPS per-op GPU timestamps work there (the replay path can't report them).
     // This gate MUST stay a strict subset of the adapter's `decode_eligible` — the plan below
     // bakes pos=0/kv_len=1, which is only correct when the adapter replays it (dyn kernels read
     // the live pos/kv_len); an ineligible graph would silently run the static path with the baked

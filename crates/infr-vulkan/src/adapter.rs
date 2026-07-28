@@ -172,7 +172,7 @@ fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
     // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`) forces the static per-execute path
-    // (INFR_PROF2 timestamps work there; the replay path can't report them). §6.12: ONE field read
+    // (INFR_PROF_OPS timestamps work there; the replay path can't report them). §6.12: ONE field read
     // `is_ok()` here and `!no_replay` in the llama runner — both halves now come off the same
     // `Config` (the runner's moved in S4, this one in S5b).
     if be_.cfg().kernels.vulkan.no_replay {
@@ -1179,7 +1179,7 @@ fn lower_op(
                 *out_f as usize,
                 *w_off as usize,
             );
-            // INFR_PROF2 sub-attribution (no-op otherwise): the vocab-sized GEMMs (lm_head
+            // INFR_PROF_OPS sub-attribution (no-op otherwise): the vocab-sized GEMMs (lm_head
             // logits, out_f = vocab; DiffusionGemma's SC soft-embedding, in_f = vocab) are 10-100x
             // the FLOPs of a per-layer projection but land in the same "matmul_proj" bucket,
             // which made the bucket un-actionable during the DG slice-7 comparative attribution
@@ -5164,7 +5164,7 @@ fn stage_and_window<'a>(
 /// Execute ONE paged `Op::MoeFfn`, recording INLINE into the ambient segment wherever residency
 /// allows — the host-orchestration rework that removed the old per-layer
 /// submit→readback→touch/upload→submit cadence (~4 full-pipeline syncs per layer per ubatch
-/// chunk; INFR_PROF2 measured the GPU ~89% idle on Scout pp512 under it). Three paths:
+/// chunk; INFR_PROF_OPS measured the GPU ~89% idle on Scout pp512 under it). Three paths:
 ///
 ///   - BATCHED chunks (`rows·n_used >= 3·n_expert`): the router readback is dropped entirely —
 ///     routing that wide touches every expert of the layer with overwhelming probability

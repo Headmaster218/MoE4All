@@ -61,12 +61,12 @@ use super::{
 /// computation, the `c.qwen35` branch) — i.e. every partial/zero-accept cycle pays a full
 /// re-prefill of the WHOLE conversation so far. This is an EXISTING limitation of qwen35's KV
 /// reuse (predates MTP; it would bite ANY qwen35 speculative scheme, draft-model or MTP), not
-/// something this phase introduces — see `INFR_MTP_TIME=1`'s per-cycle report for its measured
+/// something this phase introduces — see `INFR_PROF_STAGES=1`'s per-cycle report for its measured
 /// cost, and the accompanying report for whether it's the dominant cost. The head's OWN KV has no
 /// such issue: `MtpHeadSession`'s attention layer is an ordinary per-position cache (`docs/mtp.md`),
 /// so `catch_up` only ever (re)writes the newly-committed rows, never the whole history.
 ///
-/// ## Perf instrumentation (`INFR_MTP_TIME=1`)
+/// ## Perf instrumentation (`INFR_PROF_STAGES=1`)
 /// Prints one line per cycle (`drafted`/`accepted` counts, `draft`/`verify`/`catchup` wall time,
 /// and the `build`/`exec` split `MtpHeadSession` accumulates internally — Phase 2's doc already
 /// flags the head graph as rebuilding + recompiling from scratch every `forward` call, since
@@ -88,7 +88,7 @@ pub fn generate_mtp_spec_vulkan(
     generate_mtp_spec_vulkan_timed(model, head, prompt, max_new, on_piece).map(|(stats, _)| stats)
 }
 
-/// [`generate_mtp_spec_vulkan`] plus the [`MtpTiming`] breakdown `INFR_MTP_TIME=1`'s per-cycle
+/// [`generate_mtp_spec_vulkan`] plus the [`MtpTiming`] breakdown `INFR_PROF_STAGES=1`'s per-cycle
 /// `eprintln!`s already compute — this is that same accounting, returned instead of only printed,
 /// so `infr bench`'s `mtp` segment and `infr compare`'s MTP DECODE section can report the
 /// draft/verify/catchup phase split and alpha without scraping stderr.

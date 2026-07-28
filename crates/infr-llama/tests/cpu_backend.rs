@@ -1883,7 +1883,7 @@ fn mtp_spec_matches_target_only_greedy() {
     );
 }
 
-/// Acceptance-rate report over a longer generation, 2-3 prompts (`INFR_MTP_TIME=1` also prints a
+/// Acceptance-rate report over a longer generation, 2-3 prompts (`INFR_PROF_STAGES=1` also prints a
 /// per-cycle breakdown to stderr — run this test with `-- --nocapture` and that env var set to see
 /// it). Not gated on a specific number (`mtp_head_trunk_acceptance_rate` already sanity-checks the
 /// head's own per-step rate against the oracle's implied ~0.5) — this just surfaces the aggregate
