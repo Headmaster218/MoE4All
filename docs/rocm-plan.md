@@ -483,26 +483,9 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72 `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's
-  cold-hiprtc re-measurement (backend init + a 1-token
-  bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps
-  each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE
-  kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs →
-  **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost
-  ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s
-  of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7
-  re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00
-  s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2
-  new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor
-  — essentially all of the delta is the dense kernels. **Warm-cache startup is
-  unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the
-  dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only
-  run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the
-  per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total
-  over`moe_native_fmt`), and that switch's comparand IS the f16 path. When
-  adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the
-  pairs a real GGUF can produce;`moe_expert_pair_tables_agree` pins both mappers
-  to it.
+  72
+  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
+  pins both mappers to it.
 - ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
   (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
   over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
@@ -895,13 +878,9 @@ commit (`15642b7`), warmed, first burst discarded:
 Qwen3-30B-A3B is 867/token. The largest remaining MoE-specific item is
 **`quant_i8_32` ×96** — 2 per layer (the expert `h` quantize between gate/up and
 down, and the o*proj input). Neither is sibling-redundant: `h` is produced by
-`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means
-an int8-emitting epilogue on the producing kernel, not a peephole — the same
-conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96
-/`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48
-here, blocked on an f16-out`qk_norm_rope`— **taken by F1d below**),
-and`linear_f16` ×48 (the MoE router) is a single small GEMV per layer with
-nothing adjacent to absorb it.
+`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means an int8-emitting epilogue on the producing kernel, not a peephole — the same conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96 /`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48 here, blocked on an f16-out`qk_norm_rope`— **taken by F1d below**), and`linear_f16`
+×48 (the MoE router) is a single small GEMV per layer with nothing adjacent to
+absorb it.
 
 ### F1d — the K-write peephole
 
@@ -1041,10 +1020,9 @@ with `quant_i8_32` 96 and `write_kv` 48.
 The next-largest item that is not the GEMV itself is **`quant_i8_32` — 56 dense
 / 96 MoE, two per layer** — and the conclusion is unchanged from F1c: neither is
 sibling-redundant (o*proj's row comes from `attention`, down_proj's from
-`gated_act`, the MoE `h` from `moe_gate_up_act_i8_idm*\*`), so killing them
-needs an int8-emitting epilogue on the **producing** kernel, not a peephole —
-the same new-kernel work the V write above needs, on the same set of kernels.
-After that the remaining `write_kv` ×28/48 (V) is the next fusable count.
+`gated_act`, the MoE `h` from
+`moe_gate_up_act_i8_idm*\*`), so killing them needs an int8-emitting epilogue on the **producing** kernel, not a peephole — the same new-kernel work the V write above needs, on the same set of kernels. After that the remaining `write_kv`
+×28/48 (V) is the next fusable count.
 
 ## 4. Device-side sampling
 
@@ -1150,6 +1128,12 @@ to beat.
 The `@4096` row is new and it is the one to watch: decode at depth is a
 materially worse ratio than decode at zero depth, which is the signature of the
 attention gap P6 opened up and only partly closed.
+
+The ORACLE drifts ~2% between sessions on the same box (the reviewer measured
+llama tg128 384.3 ± 2.2 / 365.7 ± 1.0 for Q4_K_M / Q6_K where the slice measured
+376 / 359, each with a tight stated spread). Re-measure llama in the same
+sitting as infr before quoting a ratio to two digits; its `pp512` is worse still
+at ±25–27%.
 
 Moved this session, all verified by the reviewer's own interleaved pairs: P2
 (MoE bucket sort) 1.13× MoE prefill; P3 (branchless dword-wide Q6_K expert

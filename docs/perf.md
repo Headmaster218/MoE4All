@@ -239,8 +239,22 @@ accident.
 - **ROCm** brackets each op in a HIP timing-event pair on its single stream. A
   host `Instant` would measure enqueue (the ops queue with no per-op sync), and
   a `hipStreamSynchronize` per op would measure execution but serialize the
-  pipeline and add F4's ~2.7 µs launch floor to every sample. Costs one event
-  pair per dispatch while on — diagnostic, never a shipping default.
+  pipeline and add F4's ~2.7 µs launch floor to every sample.
+
+  **Its overhead scales with DISPATCH COUNT, and on decode that is not small.**
+  Measured on an RX 7900 XTX: **0.3%** on Qwen3-30B-A3B `pp512` (48 profiled ops
+  in the forward — 347.2/346.9 profiled vs 347.9/348.0 clean) but **37%** on
+  Qwen3-0.6B `tg128` (~310 dispatches per token, so ~79 000 event pairs over the
+  run — 134.5 profiled vs 212.2 clean). The cause is that the collector creates
+  and destroys an event pair per span rather than pooling them.
+
+  So: **use it to RANK ops, never to size a total against wall time on a
+  dispatch-heavy workload**, and never quote a profiled t/s. If you need the
+  size of one op on decode, price it by skipping the op and taking the
+  difference in clean runs — that is how P6 established attention was 50% of a
+  d0 token and 79% at d4096. Pooling the events would fix this and has not been
+  done.
+
 - **Metal** needs a second knob for DEVICE time, because batching means it is
   never free there: `--set prof.metal_device_time=counters` samples
   stage-boundary timestamps — **the only honest per-op device mode** — and
