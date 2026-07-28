@@ -57,9 +57,10 @@ order, greedy decode is bit-identical. Prefill-parity test gates at ≤2e-3 rel
 against the old split-KV kernels on 8 shapes × masks.
 
 The remaining decode gap vs llama.cpp HIP (0.65× d0, 0.52× d4096) is still
-substantially attention, but the low-hanging one-pass/one-key-per-lane lever is
-spent. Next: PF (batched prefetch) on top of the new partial to hide the
-remaining K/V memory latency, then WMMA for the prefill flash kernel.
+substantially attention — PF (batched prefetch) on top of the P7 partial would
+hide the remaining K/V memory latency, and WMMA for the prefill flash kernel
+would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
+#4 items below are the next prefill levers.
 
 ### Ranked next work (all measured, not guessed)
 
