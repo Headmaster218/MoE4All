@@ -794,38 +794,64 @@ extern "C" __global__ void embed_gather(
 // the argmax index is bit-identical — only the CU occupancy changes (at m=1 the vocab reduction
 // spreads across a wave instead of one serial thread over 151936 elements).
 const ARGMAX: &str = r#"
-extern "C" __global__ void argmax(
-    const float* __restrict__ x, // [rows, n]
-    float* __restrict__ dst,     // [rows] — u32 bit-pattern in f32 slot
+#define ARGMAX_CHUNK 2048  // floats per block — 8 per thread at bs=256
+
+// Pass 1 — one block per (row, chunk) reduces its chunk to a (value, index) pair.
+extern "C" __global__ void argmax_partial(
+    const float* __restrict__ x,  // [rows, n]
+    float* __restrict__ pval,     // [rows * n_chunks]  chunk max values
+    int* __restrict__ pidx,       // [rows * n_chunks]  chunk max indices
     int rows,
-    int n
+    int n,
+    int n_chunks
 ) {
-    int row = blockIdx.x;
+    int gidx = blockIdx.x;                          // linearised: row * n_chunks + chunk
+    int row = gidx / n_chunks;
     if (row >= rows) return;
+    int chunk = gidx - row * n_chunks;
     int tid = threadIdx.x;
-    int nt = blockDim.x;
-    const float* xr = x + row * n;
-    // Sentinel below any real logit; threads whose strided slice is empty (n < blockDim.x) keep it,
-    // and it loses every reduction step against a real candidate. (hiprtc has no INFINITY macro.)
+    int bs  = blockDim.x;
+
+    int j0 = chunk * ARGMAX_CHUNK;
+    int j1 = j0 + ARGMAX_CHUNK;
+    if (j1 > n) j1 = n;
+    int len = j1 - j0;
+    if (len <= 0) {                           // empty trailing chunk
+        if (tid == 0) { pval[gidx] = -3.402823466e+38f; pidx[gidx] = 0; }
+        return;
+    }
+
+    const float* xr = x + (long)row * n + j0;
+
+    // Cooperative reduce: every thread reads one or more contiguous elements, then tree-reduce
+    // through LDS. Coalesced per warp (32 consecutive floats per step at bs=256).
     float best_val = -3.402823466e+38f;
     int best_idx = 0;
-    for (int i = tid; i < n; i += nt) {
+    for (int i = tid; i < len; i += bs) {
         float v = xr[i];
-        if (v > best_val) {
-            best_val = v;
-            best_idx = i;
-        }
+        if (v > best_val) { best_val = v; best_idx = i; }
     }
+    best_idx += j0;   // restore global index
+
+    // Warp reduce (no barrier, 5 shfl steps)
+    float wv = best_val;
+    int wi = best_idx;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor(wv, off);
+        int oi = __shfl_xor(wi, off);
+        if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+    }
+    // LDS: only warp leaders
     __shared__ float sval[256];
     __shared__ int sidx[256];
-    sval[tid] = best_val;
-    sidx[tid] = best_idx;
+    if (tid % 32 == 0) { sval[tid >> 5] = wv; sidx[tid >> 5] = wi; }
     __syncthreads();
-    for (int s = nt >> 1; s > 0; s >>= 1) {
+    int nw = bs >> 5;
+    for (int s = nw >> 1; s > 0; s >>= 1) {
         if (tid < s) {
             float ov = sval[tid + s];
             int oi = sidx[tid + s];
-            // Keep the strictly-greater value; on a tie keep the LOWER index (first-max rule).
             if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
                 sval[tid] = ov;
                 sidx[tid] = oi;
@@ -833,10 +859,59 @@ extern "C" __global__ void argmax(
         }
         __syncthreads();
     }
-    if (tid == 0) {
-        // Store u32 bit-pattern in an f32 slot (the runner reads as u32)
-        dst[row] = __int_as_float(sidx[0]);
+    if (tid == 0) { pval[gidx] = sval[0]; pidx[gidx] = sidx[0]; }
+}
+
+// Pass 2 — one block per row merges the per-chunk partials.
+extern "C" __global__ void argmax_combine(
+    const float* __restrict__ pval,  // [rows * n_chunks]
+    const int* __restrict__ pidx,    // [rows * n_chunks]
+    float* __restrict__ dst,         // [rows] — u32 bit-pattern in f32 slot
+    int rows,
+    int n_chunks
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;
+    int base = row * n_chunks;
+
+    float best_val = -3.402823466e+38f;
+    int best_idx = 0;
+    for (int i = tid; i < n_chunks; i += bs) {
+        float v = pval[base + i];
+        int idx = pidx[base + i];
+        if (v > best_val || (v == best_val && idx < best_idx)) {
+            best_val = v;
+            best_idx = idx;
+        }
     }
+    // Warp reduce
+    float wv = best_val;
+    int wi = best_idx;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor(wv, off);
+        int oi = __shfl_xor(wi, off);
+        if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+    }
+    __shared__ float sval[256];
+    __shared__ int sidx[256];
+    if (tid % 32 == 0) { sval[tid >> 5] = wv; sidx[tid >> 5] = wi; }
+    __syncthreads();
+    int nw = bs >> 5;
+    for (int s = nw >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s];
+            int oi = sidx[tid + s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
+                sval[tid] = ov;
+                sidx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) dst[row] = __int_as_float(sidx[0]);
 }
 "#;
 

@@ -3491,23 +3491,43 @@ fn run_op(
         }
         Op::Argmax { x, dst, n, rows } => {
             ctx.ensure_device(x, g, bindings)?;
-            // F5 fully-overwritten: one block per row, and lane 0 of every block stores that row's
-            // index — `rows` blocks, `rows` slots.
             let dd = ctx.uninit_dev(rows as usize);
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            // One block per row; the block reduces the vocab argmax across a wave.
-            dispatch_grid(
+            let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+            // P7c: multi-block reduction. n_chunks blocks of 256 threads each process
+            // ARGMAX_CHUNK floats cooperatively, then one block per row merges the partials.
+            // For decode (rows=1, vocab=151936 → 75 blocks) this fills the GPU instead of
+            // stranding the whole 608 KB reduction on one block.
+            const ARGMAX_CHUNK: usize = 2048;
+            let n_chunks = (n as usize).div_ceil(ARGMAX_CHUNK);
+            let pval = ctx.pool_buf(rows as usize * n_chunks * 4, false);
+            let pidx = ctx.pool_buf(rows as usize * n_chunks * 4, false);
+            dispatch_1d(
                 pipelines,
                 ctx.stream,
-                "argmax",
-                rows,
-                1,
+                "argmax_partial",
+                rows as u32 * n_chunks as u32 * 256,
                 256,
                 args![
-                    arg_ptr(bx.ptr),
-                    arg_ptr(dd.ptr),
+                    arg_ptr(bx_ptr),
+                    arg_ptr(pval.ptr),
+                    arg_ptr(pidx.ptr),
                     arg_i32(rows as i32),
                     arg_i32(n as i32),
+                    arg_i32(n_chunks as i32),
+                ],
+            )?;
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "argmax_combine",
+                rows as u32 * 256,
+                256,
+                args![
+                    arg_ptr(pval.ptr),
+                    arg_ptr(pidx.ptr),
+                    arg_ptr(dd.ptr),
+                    arg_i32(rows as i32),
+                    arg_i32(n_chunks as i32),
                 ],
             )?;
             ctx.dev[dst.0 as usize] = Some(dd);
