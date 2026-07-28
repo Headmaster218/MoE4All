@@ -315,6 +315,49 @@ fn attn_flash_tiling(head_dim: usize) -> Option<AttnFlashTiling> {
         .find(|t| t.smem(head_dim) <= ATTN_FLASH_LDS)
 }
 
+/// The pair of P6 batched-prefetch DECODE attention entry points instantiated for one lane count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttnPfKernels {
+    /// Single-wave-per-head kernel (`n_chunks == 1`, i.e. short context).
+    plain: &'static str,
+    /// Split-KV pass 1 (`n_chunks > 1`, every real depth).
+    split_partial: &'static str,
+}
+
+/// Pick the batched-prefetch decode attention kernels for `head_dim`, or `None` to keep the generic
+/// ones.
+///
+/// The selector is `npl = ceil(head_dim / 32)` — the head dims ONE LANE owns, which sizes the
+/// kernels' register staging buffer and so has to be a template parameter (a runtime subscript
+/// sinks that buffer to scratch). Only `npl ∈ {2, 4, 8}` —
+/// head_dim 33..=64, 97..=128 and 225..=256 — are instantiated; those cover every head_dim the
+/// supported models use. Anything else falls back, which is a perf choice and never a correctness
+/// one: the two kernels compute bit-identical results (`attn_pf_falls_back_for_an_uninstantiated_\
+/// lane_count` runs the fallback against the CPU oracle).
+///
+/// `head_dim == 0` is rejected so a degenerate graph cannot select a kernel whose `qreg` loop would
+/// mask every lane off.
+fn attn_pf_npl(head_dim: usize) -> Option<AttnPfKernels> {
+    if head_dim == 0 {
+        return None;
+    }
+    match head_dim.div_ceil(32) {
+        2 => Some(AttnPfKernels {
+            plain: "attention_pf_npl2",
+            split_partial: "attention_split_partial_pf_npl2",
+        }),
+        4 => Some(AttnPfKernels {
+            plain: "attention_pf_npl4",
+            split_partial: "attention_split_partial_pf_npl4",
+        }),
+        8 => Some(AttnPfKernels {
+            plain: "attention_pf_npl8",
+            split_partial: "attention_split_partial_pf_npl8",
+        }),
+        _ => None,
+    }
+}
+
 /// Matrix-core (WMMA) int8 prefill GEMM kernel (Phase 5, Slice-25 RM×CN-tiled) for a covered dtype.
 /// Routed only for `m > 1` (prefill); decode (`m == 1`) stays on the `linear_i8_*` GEMV, which WMMA
 /// can't help. Same int8 precision as `native_i8_fmt` (identical activation quant + weight codes),
@@ -2966,6 +3009,13 @@ fn run_op(
             let kvl = kv_len as usize;
             let chunk_size = infr_core::tier::adaptive_chunk(kvl, &ATTN_SPLIT);
             let n_chunks = infr_core::tier::n_chunks(kvl, chunk_size).max(1);
+            // P6: the batched-prefetch DECODE variant, when one is instantiated for this
+            // head_dim's lane count. `None` ⇒ the generic kernel below. Decode only (`rows == 1`):
+            // prefill fills the grid with `rows*n_head` waves and is not request-starved, and
+            // holding it to the generic kernel keeps pp byte-identical in dispatch structure.
+            let pf = (rows == 1 && ctx.rocm.attn_pf)
+                .then(|| attn_pf_npl(head_dim as usize))
+                .flatten();
             if rows == 1 && n_chunks > 1 {
                 let hd = head_dim as usize;
                 let pm = ctx.pool_buf(heads * n_chunks * 4, false);
@@ -2975,7 +3025,7 @@ fn run_op(
                 dispatch_1d(
                     pipelines,
                     ctx.stream,
-                    "attention_split_partial",
+                    pf.map_or("attention_split_partial", |p| p.split_partial),
                     (heads * n_chunks) as u32 * 32,
                     32,
                     args![
@@ -3059,7 +3109,7 @@ fn run_op(
                 dispatch_1d(
                     pipelines,
                     ctx.stream,
-                    "attention",
+                    pf.map_or("attention", |p| p.plain),
                     rows * n_head * 32,
                     32,
                     args![
@@ -5447,5 +5497,40 @@ mod tests {
         assert_eq!((g.bc, g.nw), (16, 4));
         assert_eq!(g.br(), 8);
         assert!(g.smem(256) <= ATTN_FLASH_LDS);
+    }
+
+    /// **The P6 selector routes exactly the head dims that are instantiated, and nothing else.** A
+    /// `head_dim` whose lane count has no template instantiation would resolve a kernel name that
+    /// is not in the module — a `hipModuleGetFunction` failure at the first decode, not a slow
+    /// path — so the two lists have to be checked against each other rather than kept in step by
+    /// hand. Both directions: every selected name is present in the HIP source, and every
+    /// uninstantiated lane count declines.
+    #[test]
+    fn attn_pf_selects_only_instantiated_kernels() {
+        let src = crate::kernels::hip_source();
+        // head_dim -> the lane count it selects. 32/64 -> npl 1/2, 128 -> 4, 256 -> 8, and the
+        // ragged dims in between (they round UP, and the kernel masks the spare lanes).
+        for hd in [64usize, 40, 128, 100, 256, 225] {
+            let k = attn_pf_npl(hd).unwrap_or_else(|| panic!("head_dim {hd} must select a kernel"));
+            for name in [k.plain, k.split_partial] {
+                assert!(
+                    src.contains(&format!("{name},")),
+                    "head_dim {hd} selects `{name}`, which the module never instantiates"
+                );
+            }
+        }
+        // npl 1, 3, 5, 6 and the degenerate zero have no instantiation and must decline.
+        for hd in [0usize, 20, 32, 96, 160, 190] {
+            assert_eq!(attn_pf_npl(hd), None, "head_dim {hd} must not select");
+        }
+        // The plain and split names must never be crossed — they take different argument lists, so
+        // a swap is a silent stack smash rather than a compile error.
+        for hd in [64usize, 128, 256] {
+            let k = attn_pf_npl(hd).unwrap();
+            assert!(k.plain.starts_with("attention_pf_npl"));
+            assert!(k
+                .split_partial
+                .starts_with("attention_split_partial_pf_npl"));
+        }
     }
 }

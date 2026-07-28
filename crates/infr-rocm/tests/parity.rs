@@ -6340,6 +6340,139 @@ fn attention_prefill_flash_matches_the_single_wave_kernel() {
     }
 }
 
+/// Decode (`rows == 1`) attention shapes that exercise both P6 prefetch arms across every mask and
+/// both instantiated lane counts. The `kv_len` values straddle the split-KV threshold deliberately:
+/// `<= 64` keeps `n_chunks == 1` (the plain `attention_pf_npl*` arm), anything above it splits (the
+/// `attention_split_partial_pf_npl*` arm), and the ragged lengths land partial PF batches so the
+/// tail guard is covered rather than assumed.
+const ATTN_PF_CASES: &[(usize, usize, usize, usize, AttnMask, usize)] = &[
+    // (kv_len, n_head, n_kv, head_dim, mask, pos) — plain arm, npl=4 and npl=2.
+    (1, 16, 8, 128, AttnMask::Causal, 0),
+    (7, 16, 8, 128, AttnMask::Causal, 6),
+    (64, 16, 8, 128, AttnMask::Causal, 63),
+    (33, 8, 2, 64, AttnMask::Causal, 32),
+    // Split arm: n_chunks > 1, including a non-multiple of PF and a non-multiple of the chunk.
+    (65, 16, 8, 128, AttnMask::Causal, 64),
+    (129, 16, 8, 128, AttnMask::Causal, 128),
+    (1000, 16, 8, 128, AttnMask::Causal, 999),
+    (4096, 8, 8, 128, AttnMask::Causal, 4095),
+    (4097, 4, 2, 64, AttnMask::Causal, 4096),
+    // Every mask arm, on both arms of the split.
+    (48, 4, 2, 128, AttnMask::SlidingWindow(16), 47),
+    (600, 4, 2, 128, AttnMask::SlidingWindow(128), 599),
+    (48, 2, 2, 128, AttnMask::Canvas { lo: 9 }, 47),
+    (600, 2, 2, 128, AttnMask::Canvas { lo: 137 }, 599),
+    // npl=8 (head_dim 256) on both arms.
+    (40, 2, 1, 256, AttnMask::Causal, 39),
+    (700, 2, 1, 256, AttnMask::Causal, 699),
+];
+
+/// **The prefetch decode kernels are BIT-IDENTICAL to the kernels they replace** — not "within
+/// tolerance", exactly equal, on every routed decode shape.
+///
+/// That is the whole safety argument for P6 and it has to be tested as equality, because the change
+/// is only allowed to move LOADS. A wave now hoists PF keys' K (and V) rows into registers before
+/// reducing any of them, but each key's `part` is still accumulated over the same `c` order into the
+/// same lane partition and reduced by the same butterfly, so every score has the same bits; the
+/// max is exact and still visited in ascending `j`; `sum` and `acc[c]` are still accumulated
+/// strictly in ascending `j`; and pass 2 reads pass 1's score out of LDS rather than recomputing an
+/// identical one. Nothing in that list is a rounding choice, so anything but `==` here means a real
+/// reordering slipped in — exactly the silent-divergence class that passes a tolerance test and
+/// still changes generated tokens.
+///
+/// `kernels.rocm.attn_pf = false` runs the SAME graph through the generic kernels; that control is
+/// what makes the claim checkable at all.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attn_pf_decode_is_bit_identical_to_the_plain_kernels() {
+    let (Some(on), Some(off)) = (rocm(), rocm_cfg(|c| c.attn_pf = false)) else {
+        return;
+    };
+    for &(kv_len, n_head, n_kv, head_dim, mask, pos) in ATTN_PF_CASES {
+        let q = gen(n_head * head_dim, kv_len + head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(b, &q, &k, &v, 1, kv_len, n_head, n_kv, head_dim, mask, pos)
+        };
+        let pf = go(&on);
+        let plain = go(&off);
+        assert!(
+            maxabs(&plain) > 1e-3,
+            "attention control is all-zero for kv={kv_len} h={n_head}/{n_kv} d={head_dim} \
+             {mask:?} pos={pos} — the case proves nothing"
+        );
+        // Report the FIRST differing element with both bit patterns rather than dumping two
+        // n_head*head_dim vectors — a one-ulp slip and a wholesale reordering look identical in a
+        // `assert_eq!` diff, and they are not the same bug.
+        if let Some((i, (&a, &b))) = pf
+            .iter()
+            .zip(plain.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a.to_bits() != b.to_bits())
+        {
+            panic!(
+                "prefetch decode attention is NOT bit-identical for kv={kv_len} \
+                 h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: \
+                 first diff at [{i}] pf={a:e} ({:#010x}) plain={b:e} ({:#010x}), \
+                 {} of {} elements differ, maxerr={:e}",
+                a.to_bits(),
+                b.to_bits(),
+                pf.iter()
+                    .zip(plain.iter())
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count(),
+                pf.len(),
+                maxerr(&pf, &plain),
+            );
+        }
+    }
+}
+
+/// **A head_dim with no instantiated lane count falls back, and the fallback is right.** `npl` is a
+/// TEMPLATE parameter (a runtime one puts the `kb[PF][NPL]` prefetch buffer in scratch, which is
+/// the memory it exists to hide), so only `npl ∈ {2, 4, 8}` is compiled. `head_dim = 96` is npl=3
+/// and `head_dim = 20` is npl=1: both must decline to the generic kernel and still match the CPU.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attn_pf_falls_back_for_an_uninstantiated_lane_count() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    for &(kv_len, head_dim) in &[(48usize, 96usize), (200, 96), (48, 20), (200, 20)] {
+        let (n_head, n_kv) = (4usize, 2usize);
+        let q = gen(n_head * head_dim, kv_len + head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(
+                b,
+                &q,
+                &k,
+                &v,
+                1,
+                kv_len,
+                n_head,
+                n_kv,
+                head_dim,
+                AttnMask::Causal,
+                kv_len - 1,
+            )
+        };
+        let gpu = go(&be);
+        let want = go(&cpu);
+        let mag = maxabs(&want).max(1e-6);
+        let e = maxerr(&gpu, &want);
+        assert!(
+            e / mag < 1e-4,
+            "uninstantiated-npl decode attention diverged for kv={kv_len} d={head_dim}: \
+             abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
 /// **A shape the tiling cannot serve must fall back, not run wrong.** `head_dim = 20` is not a
 /// multiple of 8, so `attn_flash_tiling` declines it and the plain kernel runs; the answer must
 /// still be the CPU's. (This is the gate that turns "the routing predicate is right" into

@@ -236,6 +236,7 @@ const HIP_PARTS: &[&str] = &[
     ARGMAX,
     WRITE_KV,
     ATTENTION,
+    ATTENTION_PF,
     ATTENTION_FLASH,
     ATTENTION_SPLIT,
     MOE_FFN,
@@ -963,6 +964,190 @@ extern "C" __global__ void attention(
 }
 "#;
 
+// ── P6: batched-prefetch decode attention ────────────────────────────────────
+//
+// WHY. At DECODE the plain `attention` above runs ONE wave per (row, head) — 16 waves for a 16-head
+// model, on a 96-SIMD GPU. Occupancy is not the problem and cannot be: there is no second wave to
+// schedule. The problem is that each wave has exactly ONE memory request in flight at a time: the
+// `j` loop loads key `j`'s K row (npl × 64 B), then immediately blocks on a 5-step `__shfl_xor`
+// butterfly before it may compute the address of key `j+1`. Every iteration is therefore a full
+// memory round trip that nothing hides. Measured on Qwen3-0.6B tg128: attention is 2.57 ms of a
+// 5.09 ms token (50%, profiler-free — priced by skipping the op), reading its K/V at ~3 GB/s
+// against ~960 GB/s of peak.
+//
+// THE FIX is memory-level parallelism, not occupancy: ISSUE PF keys' rows before consuming any of
+// them, so a wave has PF requests outstanding instead of one. Everything else is held fixed.
+//
+// BIT-IDENTICAL BY CONSTRUCTION, and that constraint is what shapes the rest of the design. Only
+// the LOADS move: each key's `part` is still accumulated over the same `c` order into the same lane
+// partition and reduced by the same butterfly, so every score has the same bits; `max_score` is a
+// max (exact, and still visited in `j` order); `sum` and `acc[c]` are still accumulated strictly in
+// ascending `j`. `attn_pf_decode_is_bit_identical_to_the_plain_kernels` pins that as EQUALITY
+// against the `kernels.rocm.attn_pf = false` control.
+//
+// THE STAGING BUFFER MUST BE REGISTERS, and that is why `MAXPL` is a template parameter: a register
+// array has to be indexed by a COMPILE-TIME subscript or LLVM sinks it to scratch (measured: 592
+// bytes/lane, i.e. the prefetch buffer lands in the very memory it exists to hide). The obvious way
+// to dodge that — stage through LDS, where a runtime subscript is free — was built and measured, and
+// the LDS round trip gives back most of the win: tg128 195.7 base / 212.8 registers / 193.1 LDS, and
+// at d4096 84.8 / 106.3 / 92.9. Registers it is. `MAXPL` always EQUALS the live `npl`, because the
+// executor selects the instantiation by `ceil(head_dim/32)`, so the unrolled compute loop covers
+// exactly the dims the generic kernel's rolled one did.
+//
+// THE ONE THING THE OBVIOUS VERSION GETS WRONG, found by the equality test and worth stating because
+// it is invisible from the source:
+//
+//     **Pass 2 must RE-DERIVE each score, not reuse pass 1's.** Caching pass 1's scores would drop
+//     the whole second K read and the second butterfly — worth ~4% of tg128 — and it is the first
+//     thing this kernel tried. It is wrong: the reference kernel computes each score twice and the
+//     two copies are NOT bit-equal (LLVM contracts the two passes' dots differently), while
+//     `max_score` comes from the pass-1 copy and `expf(s - max_score)` from the pass-2 copy.
+//     Reusing one score for both is arithmetically MORE self-consistent and therefore differs from
+//     the reference. Kept as the double computation; the 4% is the price of exactness.
+const ATTENTION_PF: &str = r#"
+// Keys staged per batch = the memory requests a wave keeps in flight. 8 at MAXPL<=4, 4 at MAXPL=8;
+// the product PF*MAXPL is the VGPR cost of a staging buffer. Registers are the cheap resource here
+// — one wave per SIMD leaves the file unspent, and the resource report still allows 16 waves/SIMD.
+// Swept on Qwen3-0.6B tg128: PF=16 measured 213.3 against PF=8's 215.5 (and d4096 107.3 vs 107.6),
+// so the curve is flat past 8 and this sits at the small end of the plateau.
+template <int MAXPL, int PF>
+static __device__ __forceinline__ void attn_pf_body(
+    const float* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    float* __restrict__ dst,
+    int rows, int kv_len, int n_head, int n_kv, int head_dim,
+    float scale, int pos, int mask_type, int swa_window
+) {
+    int head = blockIdx.x;
+    int total_heads = rows * n_head;
+    if (head >= total_heads) return;
+    int tid = threadIdx.x;
+    int r = head / n_head;
+    int h = head % n_head;
+    int kv_h = h * n_kv / n_head;
+    int q_off = head * head_dim;
+    int npl = (head_dim + 31) >> 5;
+
+    float qreg[MAXPL];
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        qreg[c] = (d < head_dim) ? q[q_off + d] : 0.0f;
+    }
+
+    // Pass 1: max over unmasked keys. PF keys' K rows are ISSUED before any is consumed — that is
+    // the whole change, and it is why the wave stops being one-request-in-flight.
+    float max_score = -1e30f;
+    for (int jb = 0; jb < kv_len; jb += PF) {
+        float t[PF][MAXPL];
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                t[u][c] = (j < kv_len && c < npl && d < head_dim) ? __half2float(kr[d]) : 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            float part = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) part += qreg[c] * t[u][c];
+            }
+            float s = attn_wave_allreduce32(part) * scale;
+            bool masked = false;
+            if (mask_type == 0) {
+                masked = (j > pos + r);
+            } else if (mask_type == 1) {
+                int q_pos = pos + r;
+                masked = (j > q_pos || j < q_pos - swa_window + 1);
+            } else if (mask_type == 2) {
+                masked = (j < swa_window);
+            }
+            // `j >= kv_len` is the tail guard: those slots staged zeros and must not vote.
+            if (j < kv_len && !masked && s > max_score) max_score = s;
+        }
+    }
+
+    // Pass 2: exp sum + weighted value sum. K IS re-read and its score RE-DERIVED rather than
+    // carried over from pass 1 — see this kernel's header on why that is load-bearing.
+    float sum = 0.0f;
+    float acc[MAXPL];
+    for (int c = 0; c < npl; c++) acc[c] = 0.0f;
+    for (int jb = 0; jb < kv_len; jb += PF) {
+        float t[PF][MAXPL];
+        float tk[PF][MAXPL];
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            const __half* vr = v_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+            const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                t[u][c] = (j < kv_len && c < npl && d < head_dim) ? __half2float(vr[d]) : 0.0f;
+                tk[u][c] = (j < kv_len && c < npl && d < head_dim) ? __half2float(kr[d]) : 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            if (j >= kv_len) break;
+            float part2 = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) part2 += qreg[c] * tk[u][c];
+            }
+            float s = attn_wave_allreduce32(part2) * scale;
+            bool masked = false;
+            if (mask_type == 0) {
+                masked = (j > pos + r);
+            } else if (mask_type == 1) {
+                int q_pos = pos + r;
+                masked = (j > q_pos || j < q_pos - swa_window + 1);
+            } else if (mask_type == 2) {
+                masked = (j < swa_window);
+            }
+            if (masked) continue;
+            float w = expf(s - max_score);
+            sum += w;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) acc[c] += w * t[u][c];
+            }
+        }
+    }
+    float inv = 1.0f / sum;
+    float* dr = dst + q_off;
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        if (d < head_dim) dr[d] = acc[c] * inv;
+    }
+}
+
+#define ATTN_PF_INST(NAME, MAXPL, PF)                                                   \
+extern "C" __global__ void NAME(                                                      \
+    const float* __restrict__ q, const __half* __restrict__ k_cache,                  \
+    const __half* __restrict__ v_cache, float* __restrict__ dst,                      \
+    int rows, int kv_len, int n_head, int n_kv, int head_dim,                         \
+    float scale, int pos, int mask_type, int swa_window)                              \
+{                                                                                     \
+    attn_pf_body<MAXPL, PF>(q, k_cache, v_cache, dst, rows, kv_len, n_head, n_kv,       \
+                          head_dim, scale, pos, mask_type, swa_window);               \
+}
+
+ATTN_PF_INST(attention_pf_npl2, 2, 8)
+ATTN_PF_INST(attention_pf_npl4, 4, 8)
+ATTN_PF_INST(attention_pf_npl8, 8, 4)
+"#;
+
 // ── Tiled flash PREFILL attention (P1) ───────────────────────────────────────
 //
 // WHY. The P1 per-op profile (`kernels.rocm.prof_ops`) says prefill attention is **64% of a
@@ -1399,6 +1584,159 @@ extern "C" __global__ void attention_split_partial(
         if (d < head_dim) pacc[pbase + d] = acc[c];
     }
 }
+
+// P6: the same batched-prefetch restructure as `attn_pf_body`, applied to the split-KV partial —
+// this is the arm that runs at every real context depth, and it has the identical one-request-in-
+// flight defect (a wave still walks its chunk one key at a time). Chunk-local `max`/`sum`/`acc`
+// keep their exact `j` order and each score is still derived twice, so a chunk's partial is
+// bit-identical to the generic partial's, and the combine that reads it is untouched.
+template <int MAXPL, int PF>
+static __device__ __forceinline__ void attn_split_pf_body(
+    const float* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    float* __restrict__ pm,
+    float* __restrict__ pl,
+    float* __restrict__ pacc,
+    int rows, int kv_len, int n_head, int n_kv, int head_dim,
+    float scale, int pos, int mask_type, int swa_window,
+    int chunk_size, int n_chunks
+) {
+    int gidx = blockIdx.x;
+    int total_heads = rows * n_head;
+    int chunk = gidx % n_chunks;
+    int head = gidx / n_chunks;
+    if (head >= total_heads) return;
+    int tid = threadIdx.x;
+    int r = head / n_head;
+    int h = head % n_head;
+    int kv_h = h * n_kv / n_head;
+    int q_off = head * head_dim;
+    int npl = (head_dim + 31) >> 5;
+
+    float qreg[MAXPL];
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        qreg[c] = (d < head_dim) ? q[q_off + d] : 0.0f;
+    }
+
+    int j0 = chunk * chunk_size;
+    int j1 = j0 + chunk_size;
+    if (j1 > kv_len) j1 = kv_len;
+    int pbase = gidx * head_dim;
+
+    float max_score = -1e30f;
+    for (int jb = j0; jb < j1; jb += PF) {
+        float t[PF][MAXPL];
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                t[u][c] = (j < j1 && c < npl && d < head_dim) ? __half2float(kr[d]) : 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            float part = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) part += qreg[c] * t[u][c];
+            }
+            float s = attn_split_allreduce32(part) * scale;
+            bool masked = false;
+            if (mask_type == 0) {
+                masked = (j > pos + r);
+            } else if (mask_type == 1) {
+                int q_pos = pos + r;
+                masked = (j > q_pos || j < q_pos - swa_window + 1);
+            } else if (mask_type == 2) {
+                masked = (j < swa_window);
+            }
+            if (j < j1 && !masked && s > max_score) max_score = s;
+        }
+    }
+
+    float sum = 0.0f;
+    float acc[MAXPL];
+    for (int c = 0; c < npl; c++) acc[c] = 0.0f;
+    for (int jb = j0; jb < j1; jb += PF) {
+        float t[PF][MAXPL];
+        float tk[PF][MAXPL];
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            const __half* vr = v_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+            const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                t[u][c] = (j < j1 && c < npl && d < head_dim) ? __half2float(vr[d]) : 0.0f;
+                tk[u][c] = (j < j1 && c < npl && d < head_dim) ? __half2float(kr[d]) : 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < PF; u++) {
+            int j = jb + u;
+            if (j >= j1) break;
+            float part2 = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) part2 += qreg[c] * tk[u][c];
+            }
+            float s = attn_split_allreduce32(part2) * scale;
+            bool masked = false;
+            if (mask_type == 0) {
+                masked = (j > pos + r);
+            } else if (mask_type == 1) {
+                int q_pos = pos + r;
+                masked = (j > q_pos || j < q_pos - swa_window + 1);
+            } else if (mask_type == 2) {
+                masked = (j < swa_window);
+            }
+            if (masked) continue;
+            float w = expf(s - max_score);
+            sum += w;
+            #pragma unroll
+            for (int c = 0; c < MAXPL; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) acc[c] += w * t[u][c];
+            }
+        }
+    }
+
+    if (tid == 0) {
+        pm[gidx] = max_score;
+        pl[gidx] = sum;
+    }
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        if (d < head_dim) pacc[pbase + d] = acc[c];
+    }
+}
+
+#define ATTN_SPLIT_PF_INST(NAME, MAXPL, PF)                                              \
+extern "C" __global__ void NAME(                                                       \
+    const float* __restrict__ q, const __half* __restrict__ k_cache,                   \
+    const __half* __restrict__ v_cache, float* __restrict__ pm,                        \
+    float* __restrict__ pl, float* __restrict__ pacc,                                  \
+    int rows, int kv_len, int n_head, int n_kv, int head_dim,                          \
+    float scale, int pos, int mask_type, int swa_window,                               \
+    int chunk_size, int n_chunks)                                                      \
+{                                                                                      \
+    attn_split_pf_body<MAXPL, PF>(q, k_cache, v_cache, pm, pl, pacc, rows, kv_len,       \
+                                n_head, n_kv, head_dim, scale, pos, mask_type,         \
+                                swa_window, chunk_size, n_chunks);                     \
+}
+
+ATTN_SPLIT_PF_INST(attention_split_partial_pf_npl2, 2, 8)
+ATTN_SPLIT_PF_INST(attention_split_partial_pf_npl4, 4, 8)
+ATTN_SPLIT_PF_INST(attention_split_partial_pf_npl8, 8, 4)
 
 // COMBINE of split-KV: one WAVE (32 lanes) per (row, head). Merges the `n_chunks` partials via the
 // standard online-softmax rescale — mm = max_c pm[c]; l = Σ_c pl[c]·exp(pm[c]-mm);

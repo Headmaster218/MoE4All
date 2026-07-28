@@ -483,9 +483,26 @@ Vulkan reference for this section: `crates/infr-vulkan/src/linear.rs:136-254`,
   arm, "MoE tensors (`ne[2] > 1`) → MXFP4, other tensors → Q8_0", with no
   `use_more_bits` and no `ffn_down` bump, so gate/up and down are the same type
   by construction; the cached `ggml-org/gpt-oss-20b-MXFP4` is exactly that — all
-  72
-  `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's cold-hiprtc re-measurement (backend init + a 1-token bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs → **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7 re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00 s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2 new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor — essentially all of the delta is the dense kernels. **Warm-cache startup is unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total over`moe_native_fmt`), and that switch's comparand IS the f16 path. When adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the pairs a real GGUF can produce;`moe_expert_pair_tables_agree`
-  pins both mappers to it.
+  72 `ffn*{gate,up,down}_exps`MXFP4 and every dense tensor Q8_0). R6's
+  cold-hiprtc re-measurement (backend init + a 1-token
+  bench,`~/.cache/comgr`AND`~/.cache/infr/rocm-module-\*.bin`cleared, 3 reps
+  each): **9.06-9.12 s** at R5's 97 pairs → **10.98-11.27 s** once R6's 60 DENSE
+  kernels + the 16 KiB`g_iq1s`table are added at the same 97 pairs →
+  **11.42-11.56 s** at the shipped 116. So the 19 new pairs (38 kernels) cost
+  ~0.4 s (~11 ms each) and the dense kernels — the actual feature — are ~2.0 s
+  of it; the full 21×21 would have added 325 more cells (~3.6 s) for nothing. R7
+  re-measured the same way: **11.45-12.24 s** at R6's 116 pairs → **13.46-14.00
+  s** at the shipped 118, so R7's 28 kernel bodies cost ~**+2.0 s** and its 2
+  new pairs are ~0.02 s at R6's measured ~11 ms/cell, i.e. below the noise floor
+  — essentially all of the delta is the dense kernels. **Warm-cache startup is
+  unchanged** (0.50-0.51 s before and after). Absent pairs fall back to the
+  dequant→f16`moe_ffn_expert`path, which costs nothing real: those kernels only
+  run under`INFR_ROCM_NO_I8`(the default int8 expert path uses the
+  per-FORMAT`moe_gate_up_act_i8_<gu>`/`moe*down_i8*<dn>`kernels, still total
+  over`moe_native_fmt`), and that switch's comparand IS the f16 path. When
+  adding a format, extend `MOE_EXPERT_PAIRS`(exec.rs test module) with only the
+  pairs a real GGUF can produce;`moe_expert_pair_tables_agree` pins both mappers
+  to it.
 - ✅ **R8 — the id-indexed MULTI-SLOT MoE expert GEMV LANDED**
   (`moe_gate_up_act_i8_idm_*` / `moe_down_i8_idm_*` / `moe_accum_idm`, total
   over `moe_native_fmt`'s 23 formats). **§1 IS NOW CLOSED.**
@@ -878,9 +895,13 @@ commit (`15642b7`), warmed, first burst discarded:
 Qwen3-30B-A3B is 867/token. The largest remaining MoE-specific item is
 **`quant_i8_32` ×96** — 2 per layer (the expert `h` quantize between gate/up and
 down, and the o*proj input). Neither is sibling-redundant: `h` is produced by
-`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means an int8-emitting epilogue on the producing kernel, not a peephole — the same conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96 /`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48 here, blocked on an f16-out`qk_norm_rope`— **taken by F1d below**), and`linear_f16`
-×48 (the MoE router) is a single small GEMV per layer with nothing adjacent to
-absorb it.
+`moe_gate_up_act_i8_idm*\*`and o_proj's row by`attention`, so killing them means
+an int8-emitting epilogue on the producing kernel, not a peephole — the same
+conclusion §3 reached for the dense `quant_i8_32`×56. After that,`write_kv`×96
+/`qk_norm_rope`×96 are the shared dense item (28 fusable on the dense arch, 48
+here, blocked on an f16-out`qk_norm_rope`— **taken by F1d below**),
+and`linear_f16` ×48 (the MoE router) is a single small GEMV per layer with
+nothing adjacent to absorb it.
 
 ### F1d — the K-write peephole
 
@@ -1020,9 +1041,10 @@ with `quant_i8_32` 96 and `write_kv` 48.
 The next-largest item that is not the GEMV itself is **`quant_i8_32` — 56 dense
 / 96 MoE, two per layer** — and the conclusion is unchanged from F1c: neither is
 sibling-redundant (o*proj's row comes from `attention`, down_proj's from
-`gated_act`, the MoE `h` from
-`moe_gate_up_act_i8_idm*\*`), so killing them needs an int8-emitting epilogue on the **producing** kernel, not a peephole — the same new-kernel work the V write above needs, on the same set of kernels. After that the remaining `write_kv`
-×28/48 (V) is the next fusable count.
+`gated_act`, the MoE `h` from `moe_gate_up_act_i8_idm*\*`), so killing them
+needs an int8-emitting epilogue on the **producing** kernel, not a peephole —
+the same new-kernel work the V write above needs, on the same set of kernels.
+After that the remaining `write_kv` ×28/48 (V) is the next fusable count.
 
 ## 4. Device-side sampling
 
@@ -1046,9 +1068,19 @@ Vulkan's `RecordedCmd`/`replay_n`/`_dyn`-param record-once decode
 (`recorder.rs:9049-9169`) submits the whole decode graph n times in one submit.
 **But a HIP-graph probe (Slice 31) showed graph replay does NOT cut ROCm's
 launch floor** — most of the ~10 µs/dispatch is real per-kernel GPU work, not
-launch overhead. So the record-once tape's benefit on ROCm is **uncertain**;
-probe/measure before building. (GPU-side MoE routing, Slice 38, removed the
-per-layer host sync that would otherwise block a tape.)
+launch overhead.
+
+**P6 closed this question with a direct measurement: a record-once tape is worth
+~0.4%.** `INFR_PROF_STAGES=1` prices the per-token host rebuild this tape would
+eliminate — graph build + compile + bind — at **0.021 ms against a 4.98 ms
+`execute`**. Separately, phase timers put the host op-walk at 0.41 ms while the
+host then WAITS 4.50 ms, so the host already runs ahead of the GPU and the tape
+would remove time that is not on the critical path. The remaining out-of-kernel
+cost is device-side dispatch turnaround (~2.6 µs each, measured in situ by
+null-kernel injection), which a tape does not touch. **Do not build it for
+throughput.** (GPU-side MoE routing, Slice 38, removed the per-layer host sync
+that would otherwise block a tape, so it stays cheap to build if wanted for
+another reason.)
 
 ## 6. DeltaNet variants
 
@@ -1106,13 +1138,18 @@ multi-GPU stack across `tp.rs`/`ep.rs`/`pipeline.rs`/`p2p.rs`/`tp_sem.rs`/
 `llama.cpp` HIP t/s — `llama-bench -sm none -mg 0 -fa 1`).** This is the target
 to beat.
 
-**Current, re-measured at `00bf77f` (P4):**
+**Current, re-measured after P6:**
 
-| model               | pp512 (infr / llama = ratio) | tg128 (ratio)         |
-| ------------------- | ---------------------------- | --------------------- |
-| Qwen3-0.6B Q4_K_M   | 13962 / 20150 = **0.69×**    | 196 / 384 = **0.51×** |
-| Qwen3-0.6B Q6_K     | 7400 / 22033 = **0.34×**     | 199 / 366 = **0.54×** |
-| Qwen3-30B-A3B (MoE) | 771 / 2905 = **0.27×**       | 65 / 141 = **0.46×**  |
+| model               | pp512 (infr / llama = ratio) | tg128 (ratio)          |
+| ------------------- | ---------------------------- | ---------------------- |
+| Qwen3-0.6B Q4_K_M   | 13925 / 20150 = **0.69×**    | 213 / 376 = **0.57×**  |
+| Qwen3-0.6B Q6_K     | 7400 / 22033 = **0.34×**     | 216 / 359 = **0.60×**  |
+| Qwen3-30B-A3B (MoE) | 787 / 2905 = **0.27×**       | 68.6 / 141 = **0.49×** |
+| — Q4_K_M tg128@4096 | —                            | 106 / 305 = **0.35×**  |
+
+The `@4096` row is new and it is the one to watch: decode at depth is a
+materially worse ratio than decode at zero depth, which is the signature of the
+attention gap P6 opened up and only partly closed.
 
 Moved this session, all verified by the reviewer's own interleaved pairs: P2
 (MoE bucket sort) 1.13× MoE prefill; P3 (branchless dword-wide Q6_K expert
@@ -1525,12 +1562,123 @@ engineering.
 
 ---
 
+### P6 — where decode's non-kernel time actually goes, and the attention it pointed at (landed)
+
+**The lead was that ~28% of a decode token is outside kernels, across 310
+dispatches — a graph problem. That is real but small, and it is not where decode
+is losing.** Three measurements, in the order that made the previous conclusion
+untenable:
+
+1. **Host-side graph rebuild is a rounding error.** `INFR_PROF_STAGES=1` splits
+   the decode step: `setup(build+compile+bind)` is **0.021 ms/tok** against
+   `exec` 4.98 ms. A runner-level record-once tape (the ROCm analogue of
+   Vulkan's `RecordedCmd`) is therefore worth **0.4%**, not the structural win
+   §5 hoped for. That question is now closed on measurement rather than
+   estimate.
+
+2. **The out-of-kernel time is DEVICE-side dispatch turnaround, and it is ~16%,
+   not 28%.** Phase timers inside `execute_graph` put the host op-walk at 0.41
+   ms — the host issues all 310 launches then waits 4.50 ms, i.e. it runs AHEAD
+   of the GPU and never starves it. To price a dispatch IN SITU rather than
+   extrapolating from a micro-probe, a null kernel was injected after every op
+   and the slope taken: +310 dispatches/token cost +0.82 ms and +0.76 ms at
+   K=1,2 ⇒ **~2.6 µs of DEVICE time per dispatch**, so 310 dispatches ≈ 0.81 ms
+   ≈ 16% of a 5.09 ms token. That corroborates Slice 31's ~3 µs floor from a
+   completely different direction and confirms its verdict: HIP graphs address
+   only the (already-cheap) host half.
+
+3. **Attention is 50% of the token at depth 0 and 79% at depth 4096 — and the
+   per-op profiler HIDES it.** `Op::Attention` is labelled per kv depth, so it
+   appears as 128 separate rows of ≤0.45% each and never enters a top-N table;
+   the brief's ranked profile omitted it entirely for that reason. Aggregated it
+   is 44% of profiled device time. Priced profiler-free by skipping the op:
+   tg128 goes **196.5 → 397.0 t/s** at d0 (attention = 2.57 ms of 5.09 ms) and
+   **84.9 → 400.8** at d4096 (9.28 ms of 11.78 ms). The corollary is the useful
+   part: **everything else — all 282 non-attention dispatches, every GEMV, the
+   lm_head, the argmax, and all the dispatch turnaround — totals 2.52 ms,
+   against llama.cpp's ENTIRE 2.66 ms token.** Non-attention decode is already
+   at parity. The whole 0.51× decode ratio is attention.
+
+**The defect.** Both decode attention kernels walk kv **one key at a time**:
+load key `j`'s K row (npl × 64 B), then block on a 5-step `__shfl_xor` butterfly
+before the address of `j+1` can even be formed. That is ONE memory request in
+flight per wave, and at decode there are only 16 waves (plain arm) to 512 (split
+arm) on 96 SIMDs — no second wave exists to hide the latency. Measured K/V read
+rate: ~3 GB/s against ~960 GB/s of peak.
+
+**The fix** (`attention_pf_npl*`, `attention_split_partial_pf_npl*`, gated by
+`kernels.rocm.attn_pf`): stage `PF` keys' rows into registers before consuming
+any of them, so a wave keeps PF requests outstanding. Nothing else moves.
+
+**Bit-identical, and getting there was the whole slice.** Interleaved pairs,
+raw:
+
+| bench                         | base (attn_pf=false)  | P6                    | ratio     |
+| ----------------------------- | --------------------- | --------------------- | --------- |
+| Qwen3-0.6B Q4_K_M tg128       | 195.7 / 187.9 / 195.8 | 213.3 / 206.2 / 213.5 | **1.09×** |
+| Qwen3-0.6B Q4_K_M tg128@d4096 | 84.8                  | 106.3                 | **1.25×** |
+| Qwen3-0.6B Q6_K tg128         | 198.2 / 193.6 / 198.4 | 215.6 / 216.2 / 216.0 | **1.10×** |
+| Qwen3-30B-A3B tg128           | 65.6 / 65.7 / 65.9    | 68.8 / 68.3 / 68.6    | **1.04×** |
+| Qwen3-0.6B Q4_K_M pp512       | 13882 / 13857 / 14073 | 13925 / 13868 / 13751 | 1.00×     |
+| Qwen3-30B-A3B pp512           | 785.9 / 784.6 / 785.6 | 787.4 / 786.2 / 786.7 | 1.00×     |
+
+Prefill is untouched by construction (the variants are gated on `rows == 1`).
+
+**Two traps the equality test caught, neither visible from the source.** Both
+cost real performance to avoid, and both are the reason this slice took the
+shape it did.
+
+- **Pass 2 must RE-DERIVE each score, not reuse pass 1's.** Caching pass 1's
+  scores in LDS deletes the second K read and the second butterfly outright and
+  measured **+4%** (215.1 → 223.9 tg128) — and it is WRONG. The reference kernel
+  computes each score twice and the two copies are not bit-equal (LLVM contracts
+  the two passes' dots differently), while `max_score` comes from the pass-1
+  copy and `expf(s - max_score)` from the pass-2 copy. Reusing one score for
+  both is arithmetically MORE self-consistent and therefore differs from the
+  reference. The 4% is the price of exactness and it was paid.
+- **Stage in registers, not LDS.** A register array needs a compile-time
+  subscript or LLVM sinks it to scratch (592 bytes/lane — the prefetch buffer
+  lands in the memory it exists to hide), which is why `MAXPL` is a template
+  parameter. Staging through LDS dodges that and was built and measured: it
+  gives back most of the win (tg128 195.7 base / **212.8 registers** / 193.1
+  LDS; d4096 84.8 / **106.3** / 92.9).
+
+Pinned by `attn_pf_decode_is_bit_identical_to_the_plain_kernels` — EQUALITY, not
+tolerance, over 15 decode shapes covering both arms, all three masks, both
+instantiated lane counts and the ragged tails — against the
+`kernels.rocm.attn_pf = false` control running the same graph. Golden
+`0xfd63781ea3bfa785` unmoved; 161 `infr-rocm` + 9 `rocm_seam` pass.
+
+**Ranked remainder, biggest first.** Attention is still ~46% of a d0 token and
+~75% at d4096 after this, so it stays the lever:
+
+1. **One-pass online-softmax decode attention.** The two-pass structure reads K
+   twice and runs the butterfly twice for nothing but a global max. The split-KV
+   partial already has the online-softmax machinery; extending it to
+   `n_chunks == 1` would halve K traffic. **This moves the golden** (the rescale
+   reorders the accumulation) — it needs a deliberate re-bless, which is why P6
+   did not take it.
+2. **Raise the wave count at short context.** `ATTN_SPLIT.min_chunk = 64` means
+   kv ≤ 64 runs `n_chunks == 1` — 16 waves on 96 SIMDs. A smaller floor would
+   split earlier. Also golden-moving (different chunking ⇒ different combine).
+3. **One key per LANE instead of one key per WAVE.** The prefill flash kernel
+   already uses that layout; it removes the per-key cross-lane reduce entirely.
+   The largest win available and the largest rewrite; golden-moving.
+4. **`Argmax` is 114 µs/token** for a 608 KB reduction over the 151936-wide
+   vocab — ~2% of the token, and ~180× off what that read should cost.
+   Self-contained, and only tie-breaking has to be preserved.
+5. **Dispatch count**, worth 2.6 µs each: `QkNormRope` is 2/layer (56/token) and
+   q/k/v are 3 separate GEMVs sharing one activation. Fusing both would cut 84
+   of 310 dispatches ≈ 4% — real, but an order below attention.
+
 ## Tricks that may NOT port (measure before adopting)
 
 Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 
-- **HIP graphs / record-once tape** — probed negative (Slice 31): ROCm's
-  per-dispatch cost is real GPU work, not launch overhead graphs can hide.
+- **HIP graphs / record-once tape** — probed negative twice. Slice 31: ROCm's
+  per-dispatch cost is real GPU work, not launch overhead graphs can hide. P6:
+  the host-side rebuild a tape would remove is 0.021 ms of a 4.98 ms token
+  (0.4%), and the host already runs ahead of the device.
 - **BDA arena addressing** — HIP raw pointers may make it redundant (evaluate).
 - **rocBLAS f16 prefill** — measured _worse_ end-to-end than int8 WMMA (dequant
   tax + VRAM blowup, Slice 26); kept opt-in only.
@@ -1551,7 +1699,7 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 - [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd
 - [ ] **Device-side sampling** — argmax / sample_topk / eb_sample (unblocks
       MTP + DG)
-- [ ] **Decode-replay tape** — evaluate benefit, build if it wins
+- [x] **Decode-replay tape** — evaluated (P6): worth ~0.4%, NOT built
 - [ ] **DeltaNet** — split/strided variants where they help
 - [ ] **Memory** — BDA/staging/ReBAR/UMA/VRAM-guard where beneficial
 - [ ] **Multi-GPU** — device pool, tensor-parallel, expert-parallel,

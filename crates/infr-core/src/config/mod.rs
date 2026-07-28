@@ -474,6 +474,20 @@ cfg_struct! {
         /// kernel's parity case runs the SAME graph both ways, and "matches the single-wave kernel
         /// it replaces" is only checkable against that control.
         attn_flash: bool = true,
+        /// P6: the batched-prefetch DECODE attention kernels (`attention_pf_npl*` /
+        /// `attention_split_partial_pf_npl*`) — a wave stages PF keys' K (or V) rows in registers
+        /// before consuming any of them, so it keeps PF memory requests in flight instead of one.
+        /// At decode there is one wave per (row, head[, chunk]) and no second wave to hide latency,
+        /// so this is the only lever that reaches it; the arithmetic is untouched (same lane
+        /// partition, same butterfly, same ascending-`j` accumulation), only the LOADS move.
+        ///
+        /// Taken only when `rows == 1` and `ceil(head_dim/32) ∈ {2, 4, 8}` — the instantiated lane
+        /// counts. Every other shape, and all of prefill, keeps the generic kernels.
+        ///
+        /// Has NO env key, like `attn_flash`/`moe_bucket`, and for the same reason: the parity case
+        /// runs the SAME graph both ways, and "bit-identical to the plain kernel" is only checkable
+        /// against that control. Clear it with `--set kernels.rocm.attn_pf=false`.
+        attn_pf: bool = true,
     }
 }
 
