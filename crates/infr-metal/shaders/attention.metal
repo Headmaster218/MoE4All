@@ -421,7 +421,7 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
 // P rounds through f32 shared and enters the V MMA as an f32 fragment against half V fragments.
 // Tail KV blocks read up to 7 rows past the causal limit (same in-buffer contract as above);
 // 8-row blocks entirely past it are skipped, so reads never go further.
-template<uint hd, uint NSG>   // compile-time head_dim + simdgroup count: fully unrolled, exact shared sizing
+template<uint hd, uint NSG, uint C> // compile-time shape: fully unrolled, exact shared sizing
 kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
                                device const half*  k   [[buffer(1)]],
                                device const half*  v   [[buffer(2)]],
@@ -430,7 +430,8 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
                                uint3  tgpig [[threadgroup_position_in_grid]],
                                ushort sgitg [[simdgroup_index_in_threadgroup]],
                                ushort tiisg [[thread_index_in_simdgroup]]) {
-    constexpr uint QT = 8, C = 64, NQ = QT / NSG, SH = C;
+    constexpr uint QT = 8, NQ = QT / NSG, SH = C;
+    constexpr uint NP = C / 64u;                  // score pairs owned per lane
     threadgroup half  sq[QT * hd];    // Q tile (rows x hd, half)
     threadgroup float so[QT * hd];    // O accumulator (rows x hd, f32)
     threadgroup float ss[QT * SH];    // scores, then P, per KV block (rows x C, f32)
@@ -499,19 +500,31 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
             uint j = jj * NSG + sgitg;
             uint absr = abs0 + j;   // rows past p.rows compute junk, never stored
             uint lor = (p.window > 0u && absr + 1u > p.window) ? (absr + 1u - p.window) : 0u;
-            threadgroup float2* ss2 = (threadgroup float2*)(ss + j * SH);
-            float2 s2 = ss2[tiisg] * p.scale;
-            uint c0 = ic + 2u * tiisg;
-            bool v0 = (c0 >= lor) && (c0 <= absr);
-            bool v1 = (c0 + 1u >= lor) && (c0 + 1u <= absr);
             float m = M[jj];
-            float mnew = simd_max(max(m, max(v0 ? s2.x : -MAXFLOAT / 2, v1 ? s2.y : -MAXFLOAT / 2)));
+            threadgroup float2* ss2 = (threadgroup float2*)(ss + j * SH);
+            float2 scores[NP];
+            bool2 valid[NP];
+            float local_max = m;
+            for (uint kk = 0; kk < NP; kk++) {
+                scores[kk] = ss2[tiisg + 32u * kk] * p.scale;
+                uint c0 = ic + 64u * kk + 2u * tiisg;
+                valid[kk] = bool2((c0 >= lor) && (c0 <= absr),
+                                  (c0 + 1u >= lor) && (c0 + 1u <= absr));
+                local_max = max(local_max,
+                                max(valid[kk].x ? scores[kk].x : -MAXFLOAT / 2,
+                                    valid[kk].y ? scores[kk].y : -MAXFLOAT / 2));
+            }
+            float mnew = simd_max(local_max);
             float ms = exp(m - mnew);
-            float pw0 = v0 ? exp(s2.x - mnew) : 0.0f;
-            float pw1 = v1 ? exp(s2.y - mnew) : 0.0f;
-            S[jj] = S[jj] * ms + simd_sum(pw0 + pw1);
+            float local_sum = 0.0f;
+            for (uint kk = 0; kk < NP; kk++) {
+                float2 pw = float2(valid[kk].x ? exp(scores[kk].x - mnew) : 0.0f,
+                                   valid[kk].y ? exp(scores[kk].y - mnew) : 0.0f);
+                ss2[tiisg + 32u * kk] = pw;
+                local_sum += pw.x + pw.y;
+            }
+            S[jj] = S[jj] * ms + simd_sum(local_sum);
             M[jj] = mnew;
-            ss2[tiisg] = float2(pw0, pw1);
             threadgroup float4* so4 = (threadgroup float4*)so + j * hd4;
             for (uint i = tiisg; i < hd4; i += 32u) so4[i] *= ms;
         }
@@ -565,11 +578,14 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
     }
 }
 
-typedef decltype(attnflash2_f16kv_t<64, 4>) attnflash2_t;
-template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64, 4>;
-template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128, 4>;
+typedef decltype(attnflash2_f16kv_t<64, 4, 64>) attnflash2_t;
+template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64, 4, 64>;
+template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128, 4, 64>;
 // hd=256 (gemma): sq 4KB + so 8KB + ss 2KB = 14KB shared, 8 O fragments per simdgroup.
-template [[host_name("attnflash2_f16kv_hd256")]] kernel attnflash2_t attnflash2_f16kv_t<256, 4>;
+template [[host_name("attnflash2_f16kv_hd256")]] kernel attnflash2_t attnflash2_f16kv_t<256, 4, 64>;
+typedef decltype(attnflash2_f16kv_t<128, 4, 128>) attnflash2_c128_t;
+template [[host_name("attnflash2_c128_f16kv_hd128")]]
+kernel attnflash2_c128_t attnflash2_f16kv_t<128, 4, 128>;
 
 // ---- Vector flash attention for decode (f16 KV cache, hd 64 or 128, one query row per
 // threadgroup): the llama.cpp `kernel_flash_attn_ext_vec` structure. NSG simdgroups each own

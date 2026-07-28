@@ -79,6 +79,14 @@ fn iq4nl_has_a_native_four_row_decode_body() {
 }
 
 #[test]
+fn four_row_attention_has_a_wide_kv_chunk() {
+    let src = include_str!("../shaders/attention.metal");
+    asserts_token_seq(src, "template<uint hd, uint NSG, uint C>");
+    asserts_token_seq(src, "constexpr uint NP = C / 64u");
+    asserts_token_seq(src, "host_name(\"attnflash2_c128_f16kv_hd128\")");
+}
+
+#[test]
 fn moe_cmm_masks_inactive_matrix_row_fragments() {
     // Partial expert tiles must skip dead 8-row fragments instead of running the full MMA and
     // discarding half of it (see moe.metal). `row_base` is derived from `sgid` alone, which is

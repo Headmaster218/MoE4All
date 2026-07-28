@@ -377,6 +377,50 @@ mod tests {
     }
 
     #[test]
+    fn attention_flash128_policy_is_exact() {
+        assert_eq!(
+            select_attention_flash2_kern(
+                true,
+                4,
+                16,
+                4096,
+                128,
+                Some("attnflash2_f16kv_hd128"),
+                true,
+            ),
+            Some("attnflash2_c128_f16kv_hd128"),
+        );
+        assert_eq!(
+            select_attention_flash2_kern(
+                true,
+                4,
+                16,
+                4096,
+                128,
+                Some("attnflash2_f16kv_hd128"),
+                false,
+            ),
+            Some("attnflash2_f16kv_hd128"),
+        );
+        assert_eq!(
+            select_attention_flash2_kern(true, 4, 16, 4096, 128, None, false),
+            None,
+        );
+        assert_eq!(
+            select_attention_flash2_kern(
+                true,
+                8,
+                16,
+                4096,
+                128,
+                Some("attnflash2_f16kv_hd128"),
+                true,
+            ),
+            Some("attnflash2_f16kv_hd128"),
+        );
+    }
+
+    #[test]
     fn q5k_row_tile_policy_is_limited_to_four_rows() {
         for m in [1usize, 2, 3, 5] {
             assert!(!prefer_q5k_rt("linear_q5k", m, true));
@@ -1056,6 +1100,38 @@ fn prefer_attention_flash(
         && kv_len >= 64
         && head_dim.is_multiple_of(8)
         && (head_dim <= 128 || flash2_ok)
+}
+
+fn prefer_attention_flash128(
+    f16: bool,
+    rows: usize,
+    n_head: usize,
+    kv_len: usize,
+    head_dim: usize,
+    pipeline_ok: bool,
+) -> bool {
+    f16
+        && rows == 4
+        && n_head >= 16
+        && kv_len >= 64
+        && head_dim == 128
+        && pipeline_ok
+}
+
+fn select_attention_flash2_kern(
+    f16: bool,
+    rows: usize,
+    n_head: usize,
+    kv_len: usize,
+    head_dim: usize,
+    standard: Option<&'static str>,
+    c128_ok: bool,
+) -> Option<&'static str> {
+    if prefer_attention_flash128(f16, rows, n_head, kv_len, head_dim, c128_ok) {
+        Some("attnflash2_c128_f16kv_hd128")
+    } else {
+        standard
+    }
 }
 
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
@@ -4103,18 +4179,34 @@ impl MetalBackend {
                 // (fully unrolled QK/PV loops) and needs a 128-thread threadgroup
                 // (pipeline-cap gated like the split kernels); other head sizes keep the
                 // single-simdgroup flash.
-                let flash2_kern = match hd {
+                let standard_flash2_kern = match hd {
                     64 => Some("attnflash2_f16kv_hd64"),
                     128 => Some("attnflash2_f16kv_hd128"),
                     256 => Some("attnflash2_f16kv_hd256"),
                     _ => None,
                 };
-                let flash2_ok = flash2_kern.is_some_and(|kn| {
+                let standard_flash2_kern = standard_flash2_kern.filter(|kn| {
                     self.pipelines
                         .get(kn)
                         .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
                         .unwrap_or(false)
                 });
+                let flash2_c128_ok = hd == 128
+                    && self
+                        .pipelines
+                        .get("attnflash2_c128_f16kv_hd128")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                        .unwrap_or(false);
+                let flash2_kern = select_attention_flash2_kern(
+                    f16,
+                    rows,
+                    nh,
+                    kv_len,
+                    hd,
+                    standard_flash2_kern,
+                    flash2_c128_ok,
+                );
+                let flash2_ok = flash2_kern.is_some();
                 // hd > 128 has no single-simdgroup flash fallback (its register accumulator
                 // tops out at 128), so the wide gate only opens there when flash2 itself can run.
                 let flash = prefer_attention_flash(f16, rows, nh, kv_len, hd, flash2_ok);
