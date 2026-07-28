@@ -10,8 +10,8 @@ use std::time::Duration;
 pub(crate) struct Profile {
     /// op name → (call count, total wall time spent in `run_op` for that op)
     per_op: HashMap<&'static str, (u64, Duration)>,
-    /// op name → total GPU wall (commit+wait) attributed to that op — only populated in per-op
-    /// mode (`INFR_METAL_PROFILE=2`), where the batch is flushed after each op so its GPU time is
+    /// op name → total GPU wall (commit+wait) attributed to that op — only populated under
+    /// `prof.metal_device_time=flush`, where the batch is flushed after each op so its GPU time is
     /// isolable. Costs the batching, so it's for analysis, not the fast path.
     per_op_gpu: HashMap<&'static str, Duration>,
     /// total wall time inside `dispatch()` (commit + GPU schedule + wait), summed over all ops
@@ -48,9 +48,9 @@ impl Profile {
     /// Two tables, not one, because Metal measures two different quantities and only one of them is
     /// device time: the always-available per-op number is host ENCODE wall (ops batch into one
     /// command buffer, so nothing else is free), while GPU wall per op exists only in the modes
-    /// that pay for it (`INFR_METAL_PROFILE=2` flushes after each op; `=3` samples stage-boundary
-    /// counters). Summing them would be meaningless, so they print as separate units and only the
-    /// device one feeds the aggregate.
+    /// that pay for it (`prof.metal_device_time=flush` flushes after each op; `=counters` samples
+    /// stage-boundary counters). Summing them would be meaningless, so they print as separate units
+    /// and only the device one feeds the aggregate.
     pub fn print_summary(&self) {
         if self.forwards == 0 {
             return;
