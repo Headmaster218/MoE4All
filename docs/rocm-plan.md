@@ -41,7 +41,7 @@ Oracle is the LOCAL build at
 | ------------------- | ------------------------- | --------------------- |
 | Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 255 / 384 = **0.66×** |
 | Qwen3-0.6B Q6_K     | 10700 / 22033 = **0.49×** | — / 366 = **—**       |
-| Qwen3-30B-A3B (MoE) | 787 / 2905 = **0.27×**    | — / 141 = **—**       |
+| Qwen3-30B-A3B (MoE) | 775 / 2905 = **0.27×**    | — / 141 = **—**       |
 | — Q4_K_M tg128@4096 | —                         | 157 / 305 = **0.52×** |
 
 Started at 0.17× / 0.19× (dense) and 0.036× / 0.23× (MoE); before that, DeltaNet
@@ -76,13 +76,10 @@ would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
 3. **`Attention` — 21.8% of Q4_K_M `pp512`.** P1's own remainder: the flash
    kernel is ~5× off its LDS-throughput bound and ~8× off the arithmetic floor.
    WMMA for it is the lever.
-4. **MoE prefill** — P7e probed software-pipelined Q4_K gate/up (PF=4 block
-   prefetch): **-14.7% regression**. Register pressure from staging 4 blocks'
-   weights into registers outweighs the memory-level-parallelism gain. With 3.1M
-   waves per dispatch, the GPU's hardware scheduler already hides latency (same
-   pattern as P6's tape finding). Next: multi-column-per-wave to reduce wave
-   count and increase work per wave — the idm kernel's 768 cols × 4096 slots =
-   3.1M waves is the real bottleneck, not per-wave pipeline depth.
+4. **MoE prefill** — P7f CN=2 column tiling: +10.9% pp512 (699→775). The
+   bottleneck was wave count (768 × n_slots = 3.1M waves/dispatch, each doing
+   ~64 blocks of dp4a). Two columns per wave halves the grid and increases work
+   per wave. Next: CN=4 for Q4_K, CN=2 for Q6_K down, CN=2 for the batched arm.
 5. **~~`Argmax`~~** — P7c: multi-block two-pass reduction, 117.6→13.6 µs (8.6×),
    decode +2.1%. Self-contained; tie-breaking preserved (parity test + seam
    gate).
@@ -434,6 +431,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P7b   | —         | vectorised `copy_strided` (float4 per row) — **Q6_K pp512 1.51×**                    |
 | P7c   | —         | multi-block two-pass argmax — **8.6×** per disch, decode +2.1%                       |
 | P7e   | —         | MoE PF4 block-prefetch gate/up — **-14.7%**, register pressure                       |
+| P7f   | —         | MoE CN=2 column tiling gate/up — **+10.9%** MoE pp512 (699→775)                      |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
