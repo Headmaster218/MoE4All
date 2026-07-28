@@ -747,11 +747,22 @@ extern "C" __global__ void copy_strided(
     int rows,
     int n
 ) {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.x;                    // one block per row
     if (r >= rows) return;
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;                  // threads per row, min(n, 256)
     const float* sr = src + src_off + r * src_stride;
     float* dr = dst + dst_off + r * dst_stride;
-    for (int i = 0; i < n; i++) {
+    // Vectorised float4 portion — each thread copies 16 B per iteration, so n=2048 takes
+    // 2 iterations per thread at bs=256 (down from 2048 serial iterations on the old kernel).
+    int nf4 = n >> 2;
+    for (int i = tid; i < nf4; i += bs) {
+        float4 v = *(const float4*)(sr + (i << 2));
+        *(float4*)(dr + (i << 2)) = v;
+    }
+    // Scalar tail (0-3 elements).
+    int nn = nf4 << 2;
+    for (int i = nn + tid; i < n; i += bs) {
         dr[i] = sr[i];
     }
 }

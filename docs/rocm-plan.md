@@ -40,7 +40,7 @@ Oracle is the LOCAL build at
 | model               | pp512 (infr / llama)      | tg128                 |
 | ------------------- | ------------------------- | --------------------- |
 | Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 248 / 384 = **0.65×** |
-| Qwen3-0.6B Q6_K     | 7400 / 22033 = **0.34×**  | — / 366 = **—**       |
+| Qwen3-0.6B Q6_K     | 10700 / 22033 = **0.49×** | — / 366 = **—**       |
 | Qwen3-30B-A3B (MoE) | 787 / 2905 = **0.27×**    | — / 141 = **—**       |
 | — Q4_K_M tg128@4096 | —                         | 157 / 305 = **0.52×** |
 
@@ -68,9 +68,10 @@ remaining K/V memory latency, then WMMA for the prefill flash kernel.
    prefetch) on top of the new partial ($attn_pf$ flag — the register-staging
    machinery is already there, but needs an LDS-staged-Q-aware rewrite), then
    WMMA prefill flash.
-2. **`CopyStrided` — 36% of Q6_K `pp512`** (84 dispatches × 307 µs) and **absent
-   entirely from Q4_K_M**. Q6_K-specific, and nothing about it is arithmetic, so
-   it is likely a layout/elision problem rather than a kernel one.
+2. **~~`CopyStrided`~~** — P7b: 302 µs→10 µs per dispatch (30×), Q6_K pp512
+   7.4k→10.7k (+51%). One-thread-per-row serial copy replaced with per-row
+   vectorised float4 parallelisation. Absent from Q4_K_M (mixed dtypes → no
+   fused QKV → no CopyStrided).
 3. **`Attention` — 21.8% of Q4_K_M `pp512`.** P1's own remainder: the flash
    kernel is ~5× off its LDS-throughput bound and ~8× off the arithmetic floor.
    WMMA for it is the lever.
@@ -421,6 +422,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P4    | `00bf77f` | same fix in the DENSE Q6_K kernels — **2.05× Q6_K pp, 1.34× mainline Q4_K_M decode** |
 | P6    | `f796557` | batched-prefetch decode attention — 1.10× d0, **1.24× @d4096**                       |
 | P7    | —         | one-pass online-softmax + one-key-per-lane split-KV — **1.16× d0, 1.48× @d4096**     |
+| P7b   | —         | vectorised `copy_strided` (float4 per row) — **Q6_K pp512 1.51×**                    |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
@@ -496,7 +498,8 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       goldens unmoved); ✅ batched-prefetch decode attention (**P6**, bit-exact
       against `attn_pf=false`); ✅ **one-pass online-softmax +
       one-key-per-lane** split-KV (**P7**, 1.16× d0 / 1.48× @d4096, golden
-      unmoved). Still open: WMMA flash prefill; PF on top of P7;
+      unmoved); ✅ **vectorised `copy_strided`** (**P7b**, 30× kernel speedup,
+      Q6_K pp512 1.51×). Still open: WMMA flash prefill; PF on top of P7;
       dequant-in-flash; q8_0/Turbo/block KV quant
 - [x] **Quant unpack** — ✅ branchless dword-wide Q6_K in the MoE expert decode
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the

@@ -3425,12 +3425,17 @@ fn run_op(
                 .as_ref()
                 .map(|b| b.ptr)
                 .unwrap_or_else(|| ctx.dev[src.0 as usize].as_ref().unwrap().ptr);
+            // P7b: parallelise within each row (one block per row, blockDim.x threads per row)
+            // instead of the old one-thread-per-row. A single-lane serial loop over n=2048
+            // floats has exactly one memory request in flight; bs=min(n,256) threads per row
+            // with float4 loads brings n/bs × 4 iterations per thread and n concurrent requests.
+            let bs = (n as u32).min(256);
             dispatch_1d(
                 pipelines,
                 ctx.stream,
                 "copy_strided",
-                rows,
-                256,
+                rows * bs,
+                bs,
                 args![
                     arg_ptr(src_ptr),
                     arg_i32(src_off as i32),
