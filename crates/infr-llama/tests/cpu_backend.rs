@@ -3608,6 +3608,20 @@ mod rocm_seam_gate {
         seam_rocm_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
     }
 
+    /// Qwen3-0.6B Q4_K_M through the ROCm seam WITH P7 split-KV flash decode
+    /// (`attn_split_flash = true`). HASH golden — the online-softmax rescale moves the hash from
+    /// `0xfd63781ea3bfa785`. Captured with `INFR_BLESS=1` after manual coherency verification.
+    const QWEN3_ROCM_P7_GOLDEN: &[(&str, usize, u64)] =
+        &[("The capital of France is", 32, 0xfd63781ea3bfa785)];
+    #[test]
+    #[ignore = "requires a ROCm GPU: run with --include-ignored on a ROCm box"]
+    fn seam_rocm_matches_cpu_qwen3_p7() {
+        let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+        let mut _tlk = test_serial_lock();
+        let model = model_cfg(&path, |c| c.kernels.rocm.attn_split_flash = true);
+        check_gpu_golden(|p, n| rocm_gen(&model, p, n), QWEN3_ROCM_P7_GOLDEN);
+    }
+
     /// Qwen3-0.6B at IQ4_XS (non-linear 4-bit codebook quant) through the ROCm seam. Since R4 this
     /// is the NATIVE path end to end: `linear_i8_iq4xs` at decode, `wmma_i8_iq4xs_*` at prefill,
     /// `embed_iq4xs` on the embedding gather — all reading the raw quant bytes with the codebook

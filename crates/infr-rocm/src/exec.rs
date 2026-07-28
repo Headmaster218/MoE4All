@@ -3022,32 +3022,66 @@ fn run_op(
                 let pl = ctx.pool_buf(heads * n_chunks * 4, false);
                 let pacc = ctx.pool_buf(heads * n_chunks * hd * 4, false);
                 // Pass 1: one wave per (row, head, chunk).
-                dispatch_1d(
-                    pipelines,
-                    ctx.stream,
-                    pf.map_or("attention_split_partial", |p| p.split_partial),
-                    (heads * n_chunks) as u32 * 32,
-                    32,
-                    args![
-                        arg_ptr(bq_ptr),
-                        arg_ptr(bk_ptr),
-                        arg_ptr(bv_ptr),
-                        arg_ptr(pm.ptr),
-                        arg_ptr(pl.ptr),
-                        arg_ptr(pacc.ptr),
-                        arg_i32(rows as i32),
-                        arg_i32(kv_len as i32),
-                        arg_i32(n_head as i32),
-                        arg_i32(n_kv as i32),
-                        arg_i32(head_dim as i32),
-                        arg_f32(scale),
-                        arg_i32(pos as i32),
-                        arg_i32(mt),
-                        arg_i32(swa),
-                        arg_i32(chunk_size as i32),
-                        arg_i32(n_chunks as i32),
-                    ],
-                )?;
+                // P7: one-pass online-softmax + one-key-per-lane when `attn_split_flash` is on
+                // and head_dim is a multiple of 32 (the lane-per-key tile requires it).
+                // The args are identical — only the internal algorithm differs.
+                let use_flash = ctx.rocm.attn_split_flash && hd % 32 == 0;
+                if use_flash {
+                    dispatch_blocks_smem(
+                        pipelines,
+                        ctx.stream,
+                        "attention_split_partial_flash",
+                        (heads * n_chunks) as u32,
+                        32,
+                        (hd * 4) as u32, // smem: head_dim floats for Q staging
+                        args![
+                            arg_ptr(bq_ptr),
+                            arg_ptr(bk_ptr),
+                            arg_ptr(bv_ptr),
+                            arg_ptr(pm.ptr),
+                            arg_ptr(pl.ptr),
+                            arg_ptr(pacc.ptr),
+                            arg_i32(rows as i32),
+                            arg_i32(kv_len as i32),
+                            arg_i32(n_head as i32),
+                            arg_i32(n_kv as i32),
+                            arg_i32(head_dim as i32),
+                            arg_f32(scale),
+                            arg_i32(pos as i32),
+                            arg_i32(mt),
+                            arg_i32(swa),
+                            arg_i32(chunk_size as i32),
+                            arg_i32(n_chunks as i32),
+                        ],
+                    )?;
+                } else {
+                    dispatch_1d(
+                        pipelines,
+                        ctx.stream,
+                        pf.map_or("attention_split_partial", |p| p.split_partial),
+                        (heads * n_chunks) as u32 * 32,
+                        32,
+                        args![
+                            arg_ptr(bq_ptr),
+                            arg_ptr(bk_ptr),
+                            arg_ptr(bv_ptr),
+                            arg_ptr(pm.ptr),
+                            arg_ptr(pl.ptr),
+                            arg_ptr(pacc.ptr),
+                            arg_i32(rows as i32),
+                            arg_i32(kv_len as i32),
+                            arg_i32(n_head as i32),
+                            arg_i32(n_kv as i32),
+                            arg_i32(head_dim as i32),
+                            arg_f32(scale),
+                            arg_i32(pos as i32),
+                            arg_i32(mt),
+                            arg_i32(swa),
+                            arg_i32(chunk_size as i32),
+                            arg_i32(n_chunks as i32),
+                        ],
+                    )?;
+                }
                 // Combine: one wave per (row, head), fixed chunk order → deterministic reduction.
                 dispatch_1d(
                     pipelines,

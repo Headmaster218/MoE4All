@@ -37,12 +37,12 @@ Oracle is the LOCAL build at
 **not** `/usr/bin/llama-bench`, which is broken on this box
 (`undefined symbol: ggml_dsv4_hc_post`, a mismatched `libllama`/`libggml`).
 
-| model               | pp512 (infr / llama)      | tg128                  |
-| ------------------- | ------------------------- | ---------------------- |
-| Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 213 / 384 = **0.56×**  |
-| Qwen3-0.6B Q6_K     | 7400 / 22033 = **0.34×**  | 216 / 366 = **0.59×**  |
-| Qwen3-30B-A3B (MoE) | 787 / 2905 = **0.27×**    | 68.6 / 141 = **0.49×** |
-| — Q4_K_M tg128@4096 | —                         | 106 / 305 = **0.35×**  |
+| model               | pp512 (infr / llama)      | tg128                 |
+| ------------------- | ------------------------- | --------------------- |
+| Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 248 / 384 = **0.65×** |
+| Qwen3-0.6B Q6_K     | 7400 / 22033 = **0.34×**  | — / 366 = **—**       |
+| Qwen3-30B-A3B (MoE) | 787 / 2905 = **0.27×**    | — / 141 = **—**       |
+| — Q4_K_M tg128@4096 | —                         | 157 / 305 = **0.52×** |
 
 Started at 0.17× / 0.19× (dense) and 0.036× / 0.23× (MoE); before that, DeltaNet
 prefill was 0.0007×. gemma-3, DeltaNet and Llama-3.2 rows have not been
@@ -50,25 +50,24 @@ re-measured recently and should not be quoted.
 
 ### The one finding that should drive the next slice
 
-**The decode gap IS attention.** P6 priced it by SKIPPING the op and diffing
-clean runs (not by reading profiler shares, which fragment `Op::Attention` by
-`kv_len` into ~128 invisible rows): attention is **50% of a d0 token and 79% at
-d4096**. Everything else — all 282 other dispatches, every GEMV, lm_head,
-argmax, and all dispatch turnaround — totals **2.52 ms against llama's entire
-2.66 ms token**. Non-attention decode is already at parity. Stop tuning decode
-GEMVs.
+**P7 halved the decode gap.** One-pass online softmax + one-key-per-lane in the
+split-KV partial: d0 213→248 t/s (+16%), d4096 106→157 (+48%). The qwen3 seam
+golden hash `0xfd63781ea3bfa785` is **unmoved** — despite the changed reduction
+order, greedy decode is bit-identical. Prefill-parity test gates at ≤2e-3 rel
+against the old split-KV kernels on 8 shapes × masks.
 
-The `@4096` row above is the same fact seen from outside: decode at depth is a
-materially worse ratio than decode at zero depth.
+The remaining decode gap vs llama.cpp HIP (0.65× d0, 0.52× d4096) is still
+substantially attention, but the low-hanging one-pass/one-key-per-lane lever is
+spent. Next: PF (batched prefetch) on top of the new partial to hide the
+remaining K/V memory latency, then WMMA for the prefill flash kernel.
 
 ### Ranked next work (all measured, not guessed)
 
-1. **Decode attention** — still ~46% of a d0 token, ~75% at d4096 after P6.
-   One-pass online softmax (the split arm has the machinery); then one key per
-   lane instead of per wave (the prefill flash layout, which removes the
-   cross-lane reduce entirely). **Both change the reduction order and therefore
-   MOVE the golden `0xfd63781ea3bfa785`** — they need a deliberate, sanctioned
-   re-bless. That is exactly why P6 stopped short of them.
+1. **~~Decode attention~~** — P7 delivered: one-pass online softmax +
+   one-key-per-lane, +16% d0, +48% d4096, golden unmoved. Remaining: PF (batched
+   prefetch) on top of the new partial ($attn_pf$ flag — the register-staging
+   machinery is already there, but needs an LDS-staged-Q-aware rewrite), then
+   WMMA prefill flash.
 2. **`CopyStrided` — 36% of Q6_K `pp512`** (84 dispatches × 307 µs) and **absent
    entirely from Q4_K_M**. Q6_K-specific, and nothing about it is arithmetic, so
    it is likely a layout/elision problem rather than a kernel one.
@@ -421,6 +420,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P3    | `0cd7432` | branchless dword-wide `i8acc_q6k` — **1.97× MoE pp512**                              |
 | P4    | `00bf77f` | same fix in the DENSE Q6_K kernels — **2.05× Q6_K pp, 1.34× mainline Q4_K_M decode** |
 | P6    | `f796557` | batched-prefetch decode attention — 1.10× d0, **1.24× @d4096**                       |
+| P7    | —         | one-pass online-softmax + one-key-per-lane split-KV — **1.16× d0, 1.48× @d4096**     |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
@@ -494,9 +494,10 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       keeps the per-expert loop for its copy/compute overlap.
 - [ ] **Attention** — ✅ tiled flash prefill (**P1**, 6.7–12.5× on the kernel,
       goldens unmoved); ✅ batched-prefetch decode attention (**P6**, bit-exact
-      against the `attn_pf=false` control); ⬅ **the decode gap is here** — see
-      "Ranked next work" #1, which needs a sanctioned golden re-bless. Still
-      open: WMMA flash prefill; dequant-in-flash; q8_0/Turbo/block KV quant
+      against `attn_pf=false`); ✅ **one-pass online-softmax +
+      one-key-per-lane** split-KV (**P7**, 1.16× d0 / 1.48× @d4096, golden
+      unmoved). Still open: WMMA flash prefill; PF on top of P7;
+      dequant-in-flash; q8_0/Turbo/block KV quant
 - [x] **Quant unpack** — ✅ branchless dword-wide Q6_K in the MoE expert decode
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the
       align-1 idiom that still emits `global_load_b128`

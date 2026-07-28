@@ -488,6 +488,13 @@ cfg_struct! {
         /// runs the SAME graph both ways, and "bit-identical to the plain kernel" is only checkable
         /// against that control. Clear it with `--set kernels.rocm.attn_pf=false`.
         attn_pf: bool = true,
+        /// P7: one-pass online-softmax + one-key-per-lane split-KV decode attention
+        /// (`attention_split_partial_flash`). Replaces the two-pass, lane-per-dim partial with a
+        /// one-pass online-softmax variant where each lane owns one full key (no cross-lane
+        /// allreduce). The combine kernel is unchanged; the partial output is the same shape.
+        /// The qwen3 seam golden hash is UNMOVED (0xfd63781ea3bfa785) despite the changed
+        /// reduction order — greedy decode is identical.
+        attn_split_flash: bool = true,
     }
 }
 

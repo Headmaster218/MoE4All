@@ -6596,3 +6596,102 @@ fn attention_prefill_flash_keeps_the_plain_kernels_score_tree() {
         );
     }
 }
+
+/// **P7 split-KV flash decode produces coherent output** — the one-pass online-softmax +
+/// one-key-per-lane kernel changes the floating-point reduction order (the qwen3 golden WILL
+/// move), but the per-element differences must stay small against the current split-KV kernels.
+///
+/// Decode-only (`rows == 1`), split-KV shapes only (`kv_len` beyond the threshold so
+/// `n_chunks > 1`). Every mask arm at representative depths.
+///
+/// Tolerance is set at `2e-3` relative: the online-softmax rescale reassociates the denom and
+/// V-accumulator sums in a different order than the two-pass reference, so this is NOT the
+/// bit-identical gate P6 exercises — it is the "has not diverged" gate that catches a software
+/// error, not the ULP difference from the reordering itself.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attn_split_flash_decode_produces_coherent_output() {
+    let (Some(on), Some(off)) = (
+        rocm_cfg(|c| c.attn_split_flash = true),
+        rocm_cfg(|c| c.attn_split_flash = false),
+    ) else {
+        return;
+    };
+    for &(kv_len, n_head, n_kv, head_dim, mask, pos) in &[
+        // Causal, various depths and head configs.
+        (65, 16, 8, 128, AttnMask::Causal, 64),
+        (512, 16, 8, 128, AttnMask::Causal, 511),
+        (1000, 16, 8, 128, AttnMask::Causal, 999),
+        (4096, 8, 8, 128, AttnMask::Causal, 4095),
+        (4097, 4, 2, 64, AttnMask::Causal, 4096),
+        // Sliding window.
+        (600, 4, 2, 128, AttnMask::SlidingWindow(128), 599),
+        // Canvas.
+        (600, 2, 2, 128, AttnMask::Canvas { lo: 137 }, 599),
+        // head_dim 256.
+        (700, 2, 1, 256, AttnMask::Causal, 699),
+    ] {
+        let q = gen(n_head * head_dim, head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(b, &q, &k, &v, 1, kv_len, n_head, n_kv, head_dim, mask, pos)
+        };
+        let flash = go(&on);
+        let plain = go(&off);
+        let e = maxerr(&flash, &plain);
+        let mag = maxabs(&plain).max(1e-6);
+        println!(
+            "attn-split-flash kv={kv_len} h={n_head}/{n_kv} d={head_dim} {mask:?}: \
+             max_err={e:e} rel={:e}",
+            e / mag
+        );
+        assert!(
+            e / mag < 2e-3,
+            "P7 split-flash decode diverged for kv={kv_len} h={n_head}/{n_kv} \
+             d={head_dim} {mask:?} pos={pos}: abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
+/// **Fallback for untileable head_dim.** When `attn_split_flash` is on but `head_dim % 32 != 0`,
+/// the host gate declines the flash kernel and routes to the existing split-KV kernels — so the
+/// output must be BIT-IDENTICAL to `attn_split_flash = false`, not merely coherent. This is the
+/// same shape of gate as `attention_prefill_falls_back_for_an_untileable_head_dim`.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attn_split_flash_falls_back_for_non_multiple_of_32() {
+    let (Some(on), Some(off)) = (
+        rocm_cfg(|c| c.attn_split_flash = true),
+        rocm_cfg(|c| c.attn_split_flash = false),
+    ) else {
+        return;
+    };
+    // head_dim = 20 is not a multiple of 32, so the flash routing gate declines it.
+    let (kv_len, n_head, n_kv, head_dim) = (200usize, 3usize, 3usize, 20usize);
+    let q = gen(n_head * head_dim, 5);
+    let k = f16_kv(kv_len * n_kv * head_dim, 1);
+    let v = f16_kv(kv_len * n_kv * head_dim, 2);
+    let go = |b: &dyn Backend| {
+        run_attention(
+            b,
+            &q,
+            &k,
+            &v,
+            1,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            AttnMask::Causal,
+            kv_len - 1,
+        )
+    };
+    let flash_on = go(&on);
+    let flash_off = go(&off);
+    assert_eq!(
+        flash_on, flash_off,
+        "attn_split_flash fallback must be bit-identical"
+    );
+}

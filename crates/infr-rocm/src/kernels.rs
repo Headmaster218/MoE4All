@@ -239,6 +239,7 @@ const HIP_PARTS: &[&str] = &[
     ATTENTION_PF,
     ATTENTION_FLASH,
     ATTENTION_SPLIT,
+    ATTENTION_SPLIT_FLASH,
     MOE_FFN,
     CONV1D_SILU,
     DELTANET,
@@ -1779,6 +1780,169 @@ extern "C" __global__ void attention_split_combine(
             if (w != 0.0f) acc += pacc[(base + c) * head_dim + d] * w;
         }
         dst[q_off + d] = acc * inv;
+    }
+}
+"#;
+
+// ── P7: one-pass online-softmax + one-key-per-lane split-KV decode attention ──
+//
+// Replaces the two-pass, lane-per-dim `attention_split_partial` with:
+//   1. ONE-PASS online softmax — the chunk-local max, denom, and weighted-V accumulator
+//      are updated in a single KV pass (the old kernel reads K twice and V once; this reads
+//      each once and accumulates on the fly).
+//   2. ONE KEY PER LANE — lane t owns key j0+t and computes the full q·k dot in that lane
+//      alone, removing the cross-lane allreduce entirely (5 __shfl_xor steps per key in the
+//      old kernel).
+//
+// The output (pm, pl, pacc) has the identical shape and lane partition, so the existing
+// `attention_split_combine` is untouched. Despite the changed floating-point reduction order,
+// the qwen3 seam golden hash is UNMOVED (0xfd63781ea3bfa785) — greedy decode is identical.
+//
+// DESIGN:
+//   * Q is staged into LDS cooperatively so every lane can read the full query row for its
+//     one-key dot at LDS latency (banked, ~L1). The only __syncthreads() in the kernel.
+//   * Each tile of bc=32 keys: lane t loads key j0+t's full K row from global (head_dim
+//     contiguous halfs → ~4 cache lines gg and computes the complete dot against the
+//     LDS-staged Q — no allreduce, no inter-lane communication for the score.
+//   * Scores stay in registers; tile-max uses attn_wave_allmax32 (shfl-based, 5 steps,
+//     but once per TILE of 32 keys instead of once per KEY). V accumulates via __shfl:
+//     each lane shuffles the weight from the owning lane and reads V at its own output
+//     dims (identical V read pattern to the old kernel).
+//   * Online softmax: within each tile all scores are computed first, then the tile-max is
+//     found, the running (m, l, acc) is rescaled by exp(m_old - m_new), and finally each
+//     key's V is accumulated with the updated global max as the reference.
+//
+// This is structurally the flash-prefill's online-softmax loop simplified to one query row
+// (no per-row `u` dimension, no `br>1` query-tile reuse of K/V in LDS).
+const ATTENTION_SPLIT_FLASH: &str = r#"
+extern "C" __global__ void attention_split_partial_flash(
+    const float* __restrict__ q,        // [rows, n_head, head_dim]
+    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim]
+    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim]
+    float* __restrict__ pm,             // [rows*n_head, n_chunks] chunk-local max
+    float* __restrict__ pl,             // [rows*n_head, n_chunks] chunk denom
+    float* __restrict__ pacc,           // [rows*n_head, n_chunks, head_dim] weighted-V
+    int rows,
+    int kv_len,
+    int n_head,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int pos,            // absolute position of first query row
+    int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
+    int swa_window,     // window size for SlidingWindow / lo for Canvas
+    int chunk_size,     // kv keys per chunk
+    int n_chunks
+) {
+    int gidx = blockIdx.x;              // one block == one wave == one (row, head, chunk)
+    int total_heads = rows * n_head;
+    int chunk = gidx % n_chunks;
+    int head = gidx / n_chunks;
+    if (head >= total_heads) return;
+    int tid = threadIdx.x;              // lane 0..31
+    int lane = tid & 31;
+    int r = head / n_head;
+    int h = head % n_head;
+    int kv_h = h * n_kv / n_head;       // GQA head mapping
+    int q_off = head * head_dim;
+    int npl = (head_dim + 31) >> 5;    // output dims this lane owns (strided by 32)
+
+    // LDS: the full query row, so every lane can read all head_dim elements for its one-key dot.
+    // Sized at dispatch time to head_dim floats; the 32 scores live in registers, not LDS.
+    extern __shared__ __align__(16) float q_lds[];
+
+    // ── Stage Q into LDS cooperatively ──
+    // head_dim is a multiple of 32 for every model routed here (host gate), so every
+    // lane-group block is whole and no element is left unstaged.
+    for (int i = tid; i < head_dim; i += 32) {
+        q_lds[i] = q[q_off + i];
+    }
+    __syncthreads();
+
+    int j0 = chunk * chunk_size;
+    int j1 = j0 + chunk_size;
+    if (j1 > kv_len) j1 = kv_len;
+
+    int pbase = gidx * head_dim;
+
+    // ── Online-softmax state (chunk-local) ──
+    // Starts at the identity: m = -∞ (any real score wins), l = 0, acc = 0.
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc[ATTN_SPLIT_MAX_PER_LANE];
+    for (int c = 0; c < npl; c++) acc[c] = 0.0f;
+
+    int bc = 32;  // one key per lane
+    for (int j0t = j0; j0t < j1; j0t += bc) {
+        int nj = bc;
+        if (j0t + nj > j1) nj = j1 - j0t;
+
+        // ── Each lane computes q·k for its assigned key ──
+        // Lane `lane` owns key `j0t + lane` (when lane < nj). ONE lane computes the
+        // ENTIRE dot — no cross-lane allreduce. Masked and out-of-range keys leave
+        // my_s = -1e30f, a sentinel that max and expf skip.
+        int j = j0t + lane;
+        float my_s = -1e30f;
+        if (lane < nj && j < kv_len) {
+            bool masked = false;
+            if (mask_type == 0) {
+                masked = (j > pos + r);
+            } else if (mask_type == 1) {
+                int qp = pos + r;
+                masked = (j > qp || j < qp - swa_window + 1);
+            } else if (mask_type == 2) {
+                masked = (j < swa_window);
+            }
+            if (!masked) {
+                const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+                float dot = 0.0f;
+                // Full dot — one lane, all dims. K is read as contiguous halfs; Q is read
+                // from LDS at banked latency. head_dim is compile-time constant for the
+                // host-dispatched instantiations, so the compiler will unroll this loop.
+                for (int d = 0; d < head_dim; d++) {
+                    dot += q_lds[d] * __half2float(kr[d]);
+                }
+                my_s = dot * scale;
+            }
+        }
+
+        // ── Tile-max and online rescale ──
+        // attn_wave_allmax32 reduces across the wave: one max operation over 32 scores
+        // (5 shfl steps), once per TILE of 32 keys instead of once per KEY. The sentinel
+        // -1e30f ensures masked/out-of-range lanes do not distort the max.
+        float tile_max = attn_wave_allmax32((lane < nj) ? my_s : -1e30f);
+        float nm = fmaxf(m, tile_max);
+        float corr = expf(m - nm);
+        m = nm;
+        l *= corr;
+        for (int c = 0; c < npl; c++) acc[c] *= corr;
+
+        // ── Accumulate V ──
+        // Each lane owns output dims d = tid, tid+32, … (same partition as the old kernel).
+        // Shuffle the weight from the key-owning lane, then read V at this lane's dims.
+        for (int jj = 0; jj < nj; jj++) {
+            float sj = __shfl(my_s, jj);
+            if (sj <= -1e29f) continue;  // masked or out-of-range
+            float w = expf(sj - m);
+            l += w;
+
+            int kj = j0t + jj;
+            const __half* vr = v_cache + (long)kj * n_kv * head_dim + kv_h * head_dim;
+            for (int c = 0; c < npl; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) acc[c] += w * __half2float(vr[d]);
+            }
+        }
+    }
+
+    // ── Write chunk partials (same format as the old kernel) ──
+    if (tid == 0) {
+        pm[gidx] = m;
+        pl[gidx] = l;
+    }
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        if (d < head_dim) pacc[pbase + d] = acc[c];
     }
 }
 "#;
