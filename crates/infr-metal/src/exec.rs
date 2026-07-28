@@ -385,8 +385,8 @@ mod tests {
                 16,
                 4096,
                 128,
-                Some("attnflash2_f16kv_hd128"),
-                true,
+                || true,
+                || Some("attnflash2_f16kv_hd128"),
             ),
             Some("attnflash2_c128_f16kv_hd128"),
         );
@@ -397,15 +397,17 @@ mod tests {
                 16,
                 4096,
                 128,
-                Some("attnflash2_f16kv_hd128"),
-                false,
+                || false,
+                || Some("attnflash2_f16kv_hd128"),
             ),
             Some("attnflash2_f16kv_hd128"),
         );
         assert_eq!(
-            select_attention_flash2_kern(true, 4, 16, 4096, 128, None, false),
+            select_attention_flash2_kern(true, 4, 16, 4096, 128, || false, || None),
             None,
         );
+
+        let mut probed = false;
         assert_eq!(
             select_attention_flash2_kern(
                 true,
@@ -413,11 +415,15 @@ mod tests {
                 16,
                 4096,
                 128,
-                Some("attnflash2_f16kv_hd128"),
-                true,
+                || {
+                    probed = true;
+                    true
+                },
+                || Some("attnflash2_f16kv_hd128"),
             ),
             Some("attnflash2_f16kv_hd128"),
         );
+        assert!(!probed, "non-four-row shapes must not build the C128 PSO");
     }
 
     #[test]
@@ -1108,13 +1114,13 @@ fn select_attention_flash2_kern(
     n_head: usize,
     kv_len: usize,
     head_dim: usize,
-    standard: Option<&'static str>,
-    c128_ok: bool,
+    c128_pipeline_ok: impl FnOnce() -> bool,
+    standard_pipeline: impl FnOnce() -> Option<&'static str>,
 ) -> Option<&'static str> {
-    if f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && c128_ok {
+    if f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && c128_pipeline_ok() {
         Some("attnflash2_c128_f16kv_hd128")
     } else {
-        standard
+        standard_pipeline()
     }
 }
 
@@ -4169,26 +4175,26 @@ impl MetalBackend {
                     256 => Some("attnflash2_f16kv_hd256"),
                     _ => None,
                 };
-                let standard_flash2_kern = standard_flash2_kern.filter(|kn| {
-                    self.pipelines
-                        .get(kn)
-                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                        .unwrap_or(false)
-                });
-                let flash2_c128_ok = hd == 128
-                    && self
-                        .pipelines
-                        .get("attnflash2_c128_f16kv_hd128")
-                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                        .unwrap_or(false);
                 let flash2_kern = select_attention_flash2_kern(
                     f16,
                     rows,
                     nh,
                     kv_len,
                     hd,
-                    standard_flash2_kern,
-                    flash2_c128_ok,
+                    || {
+                        self.pipelines
+                            .get("attnflash2_c128_f16kv_hd128")
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                            .unwrap_or(false)
+                    },
+                    || {
+                        standard_flash2_kern.filter(|kn| {
+                            self.pipelines
+                                .get(kn)
+                                .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                                .unwrap_or(false)
+                        })
+                    },
                 );
                 let flash2_ok = flash2_kern.is_some();
                 // hd > 128 has no single-simdgroup flash fallback (its register accumulator
