@@ -82,8 +82,11 @@ would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
 5. **~~`Argmax`~~** — P7c: multi-block two-pass reduction, 117.6→13.6 µs (8.6×),
    decode +2.1%. Self-contained; tie-breaking preserved (parity test + seam
    gate).
-6. **Dispatch count** — 310/token at ~2.6 µs each. Fusing `QkNormRope` (2/layer)
-   and q/k/v would cut 84 of 310 ≈ 4%. Real, but an order below attention.
+6. **~~Dispatch count~~** — P7d probe: fused Q+K QkNormRope into one kernel
+   launch (56→28 dispatches), but register pressure cost offset the dispatch
+   savings. Net **-1.6% regression** at decode. Per-dispatch cost is real GPU
+   work (Slice 31, P6 confirmed), not launch overhead, so merging kernels
+   doesn't help. Not built.
 
 ### Measurement traps that have already cost this campaign time
 
@@ -449,6 +452,10 @@ has the full reasoning. The code is the authority on mechanism.
 - **P6** — said decode was launch-bound with 28% out-of-kernel. Out-of-kernel
   was 16%, host graph rebuild was 0.021 ms of a 4.98 ms token, and the real
   answer was that attention is half the token.
+- **P7d** — predicted ~4% decode win from fusing Q+K QkNormRope (56→28
+  dispatches). Delivered **-1.6% regression**: the dispatch savings (~73 µs)
+  were offset by register pressure from doing both Q and K in one wave.
+  Per-dispatch cost is real GPU work (Slice 31, P6), not launch overhead.
 
 **Correctness lessons worth keeping:**
 
@@ -507,7 +514,9 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 - [x] **Quant unpack** — ✅ branchless dword-wide Q6_K in the MoE expert decode
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the
       align-1 idiom that still emits `global_load_b128`
-- [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd
+- [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd. Q+K
+      QkNormRope dispatch fusion probed and **regressed** (P7d, -1.6% — not
+      built)
 - [ ] **Device-side sampling** — ✅ argmax (**P7c**, 8.6×); sample_topk /
       eb_sample (unblocks MTP + DG)
 - [x] **Decode-replay tape** — evaluated (P6): worth ~0.4%, NOT built
