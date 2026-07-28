@@ -29,7 +29,7 @@ pub struct Pipelines {
     /// there is no cache this run (`kernels.metal.pipeline_cache = false`, a device without binary
     /// archive support, no writable cache dir). `None` is the pre-RM behaviour exactly.
     archive: Option<ArchiveCache>,
-    /// `prof.prof` (`INFR_PROF`): print the compile/cache breakdown on drop.
+    /// `prof.stages` (`INFR_PROF_STAGES`): print the compile/cache breakdown on drop.
     prof: bool,
     stats: Mutex<PipelineCacheStats>,
 }
@@ -38,7 +38,7 @@ pub struct Pipelines {
 ///
 /// **This is the measurement hook.** Metal cannot be run on the Linux dev box, so the evidence that
 /// the cache is (or is not) earning its keep has to be readable from a Mac or the macOS CI log —
-/// either off the `INFR_PROF` summary this feeds, or programmatically via
+/// either off the `INFR_PROF_STAGES` summary this feeds, or programmatically via
 /// [`MetalBackend::pipeline_cache_stats`](crate::MetalBackend::pipeline_cache_stats), which is what
 /// `tests/pcache.rs` asserts on. Counters are kept unconditionally (two `Instant`s against a
 /// pipeline creation that costs milliseconds is free); only the printing is gated.
@@ -127,7 +127,7 @@ impl Pipelines {
     /// Compile the MSL library and open this device's persisted pipeline archive.
     ///
     /// `cfg` is the backend's [`Config`] (`kernels.metal.pipeline_cache` gates the archive,
-    /// `prof.prof` the timing line) — handed in rather than read from the environment, like every
+    /// `prof.stages` the timing line) — handed in rather than read from the environment, like every
     /// other knob this backend takes.
     pub fn build(device: &Device, cfg: &Config) -> Result<Self> {
         let opts = metal::CompileOptions::new();
@@ -144,7 +144,7 @@ impl Pipelines {
         let lib_wall = t0.elapsed();
 
         let archive = ArchiveCache::open(device, &src, cfg);
-        let prof = cfg.prof.prof;
+        let prof = cfg.prof.stages;
         if prof {
             match archive.as_ref() {
                 Some(a) => eprintln!(

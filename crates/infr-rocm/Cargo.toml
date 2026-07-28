@@ -61,3 +61,11 @@ required-features = ["rocm"]
 name = "graph_probe"
 path = "examples/graph_probe.rs"
 required-features = ["rocm"]
+
+# Gated: F4's isolated int8 decode-GEMV bandwidth probe. It names `RocmBackend`,
+# which only EXISTS under this feature — without the gate `cargo test` /
+# `cargo clippy --all-targets` on a non-ROCm host (i.e. CI) fails to compile it.
+[[example]]
+name = "decode_gemv_bw"
+path = "examples/decode_gemv_bw.rs"
+required-features = ["rocm"]
