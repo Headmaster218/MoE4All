@@ -4080,11 +4080,18 @@ fn run_op(
                                 ],
                             )?;
                         } else {
+                            // P7f: Q4_K CN=2 column tiling — two output columns per wave
+                            // instead of one, halving the wave count on the idm tier.
+                            let (gu_kernel, gu_grid_x) = if gu == "q4k" {
+                                ("moe_gate_up_act_i8_idm_q4k_cn2", n_ff_exp.div_ceil(2))
+                            } else {
+                                (moe_gate_up_i8_idm_kernel(gu), n_ff_exp)
+                            };
                             dispatch_grid(
                                 pipelines,
                                 ctx.stream,
-                                moe_gate_up_i8_idm_kernel(gu),
-                                n_ff_exp,
+                                gu_kernel,
+                                gu_grid_x,
                                 n_slots as u32,
                                 32,
                                 args![
@@ -5250,6 +5257,13 @@ mod decode_spec_tests {
                 src.contains(&format!("GEN_MOE_GATE_UP_IDM({s})\n")),
                 "moe_gate_up_act_i8_idm_{s} named but not instantiated"
             );
+            // P7f: Q4_K CN=2 variant — standalone kernel, not a macro instantiation.
+            if s == "q4k" {
+                assert!(
+                    src.contains("moe_gate_up_act_i8_idm_q4k_cn2"),
+                    "moe_gate_up_act_i8_idm_q4k_cn2 not found in kernel source"
+                );
+            }
             assert!(
                 src.contains(&format!("GEN_MOE_DOWN_IDM({s})\n")),
                 "moe_down_i8_idm_{s} named but not instantiated"

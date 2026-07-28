@@ -6916,6 +6916,141 @@ GEN_MOE_GATE_UP_IDM(q20)
 GEN_MOE_GATE_UP_IDM(mxfp4)
 GEN_MOE_GATE_UP_IDM(nvfp4)
 
+// P7f: Q4_K idm gate/up with CN=2 column tiling — each 32-thread wave processes TWO output
+// columns instead of one, halving the wave count (3.1M → 1.57M for nff=768, n_slots=4096).
+// The activation row is shared between both columns; only the weight reads double per block.
+// Same arithmetic as moe_gate_up_act_i8_idm_q4k — bit-identical to the CN=1 kernel because
+// each (column, slot) pair is computed exactly once by exactly one wave.
+extern "C" __global__ void moe_gate_up_act_i8_idm_q4k_cn2(
+    const signed char* __restrict__ qx, const float* __restrict__ xs,
+    const unsigned char* __restrict__ gate_base,
+    const unsigned char* __restrict__ up_base,
+    float* __restrict__ h_out,
+    int ne, int nff, int act_type, int weight_before, const float* __restrict__ dsc_dev,
+    const int* __restrict__ route_ids, const float* __restrict__ route_wts,
+    int n_slots, int n_used,
+    long gate_bstride, long up_bstride, int fused, long fused_up_half_boff
+) {
+    int o_pair = blockIdx.x; int slot = blockIdx.y; int tid = threadIdx.x;
+    int o0 = o_pair * 2;
+    if (o0 >= nff || slot >= n_slots) return;
+    int o1 = o0 + 1;
+    bool col1_live = (o1 < nff);
+    int row = slot / n_used;
+    int e = route_ids[slot];
+    float weight = route_wts[slot];
+    float wg = weight_before ? weight : 1.0f;
+    float wo = weight_before ? 1.0f : weight;
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f;
+    const unsigned char* gate_w = gate_base + (long)e * gate_bstride;
+    const unsigned char* up_w = fused ? gate_base + (long)e * gate_bstride + fused_up_half_boff
+                                      : up_base + (long)e * up_bstride;
+    int nb = ne >> 5;
+    int spr = nb >> 3;
+    const signed char* qxr = qx + (long)row * ne;
+    const float* xsr = xs + (long)row * nb;
+
+    // CN=2: two independent dot products per weight (gate, up) → 4 accumulators.
+    float g0 = 0.0f, g1 = 0.0f, u0 = 0.0f, u1 = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        int s = blk & 7;
+        unsigned int sh = (unsigned int)(s & 1) * 4u;
+        // Activation — shared across both columns.
+        const int4* xq = (const int4*)(qxr + blk * 32);
+        int4 xlo = xq[0], xhi = xq[1];
+        int xv[8] = { xlo.x, xlo.y, xlo.z, xlo.w, xhi.x, xhi.y, xhi.z, xhi.w };
+        float sx = xsr[blk];
+
+        // ── Column 0: gate ──
+        {
+            long super0 = (long)o0 * spr + (blk >> 3);
+            const uint4* b0 = (const uint4*)(gate_w + super0 * 144);
+            uint4 hdr0 = b0[0];
+            float d0 = f16q_lo(hdr0.x), dmin0 = f16q_hi(hdr0.x);
+            int sc0, mm0; k4q(hdr0, s, &sc0, &mm0);
+            const uint4* qq0 = b0 + 1 + (s >> 1) * 2;
+            uint4 wlo0 = qq0[0], whi0 = qq0[1];
+            unsigned int wv0[8] = { wlo0.x,wlo0.y,wlo0.z,wlo0.w, whi0.x,whi0.y,whi0.z,whi0.w };
+            int idot0 = 0, isum0 = 0;
+            for (int k = 0; k < 8; k++) {
+                idot0 = idot4(xv[k], (int)((wv0[k] >> sh) & 0x0F0F0F0Fu), idot0);
+                isum0 = idot4(xv[k], 0x01010101, isum0);
+            }
+            g0 += (d0 * (float)sc0) * sx * (float)idot0 + (dmin0 * (float)(-mm0)) * sx * (float)isum0;
+        }
+        // ── Column 1: gate ──
+        if (col1_live) {
+            long super1 = (long)o1 * spr + (blk >> 3);
+            const uint4* b1 = (const uint4*)(gate_w + super1 * 144);
+            uint4 hdr1 = b1[0];
+            float d1 = f16q_lo(hdr1.x), dmin1 = f16q_hi(hdr1.x);
+            int sc1, mm1; k4q(hdr1, s, &sc1, &mm1);
+            const uint4* qq1 = b1 + 1 + (s >> 1) * 2;
+            uint4 wlo1 = qq1[0], whi1 = qq1[1];
+            unsigned int wv1[8] = { wlo1.x,wlo1.y,wlo1.z,wlo1.w, whi1.x,whi1.y,whi1.z,whi1.w };
+            int idot1 = 0, isum1 = 0;
+            for (int k = 0; k < 8; k++) {
+                idot1 = idot4(xv[k], (int)((wv1[k] >> sh) & 0x0F0F0F0Fu), idot1);
+                isum1 = idot4(xv[k], 0x01010101, isum1);
+            }
+            g1 += (d1 * (float)sc1) * sx * (float)idot1 + (dmin1 * (float)(-mm1)) * sx * (float)isum1;
+        }
+        // ── Column 0: up (same activation, different weight bank) ──
+        {
+            long super0 = (long)o0 * spr + (blk >> 3);
+            const uint4* b0 = (const uint4*)(up_w + super0 * 144);
+            uint4 hdr0 = b0[0];
+            float d0 = f16q_lo(hdr0.x), dmin0 = f16q_hi(hdr0.x);
+            int sc0, mm0; k4q(hdr0, s, &sc0, &mm0);
+            const uint4* qq0 = b0 + 1 + (s >> 1) * 2;
+            uint4 wlo0 = qq0[0], whi0 = qq0[1];
+            unsigned int wv0[8] = { wlo0.x,wlo0.y,wlo0.z,wlo0.w, whi0.x,whi0.y,whi0.z,whi0.w };
+            int idot0 = 0, isum0 = 0;
+            for (int k = 0; k < 8; k++) {
+                idot0 = idot4(xv[k], (int)((wv0[k] >> sh) & 0x0F0F0F0Fu), idot0);
+                isum0 = idot4(xv[k], 0x01010101, isum0);
+            }
+            u0 += (d0 * (float)sc0) * sx * (float)idot0 + (dmin0 * (float)(-mm0)) * sx * (float)isum0;
+        }
+        // ── Column 1: up ──
+        if (col1_live) {
+            long super1 = (long)o1 * spr + (blk >> 3);
+            const uint4* b1 = (const uint4*)(up_w + super1 * 144);
+            uint4 hdr1 = b1[0];
+            float d1 = f16q_lo(hdr1.x), dmin1 = f16q_hi(hdr1.x);
+            int sc1, mm1; k4q(hdr1, s, &sc1, &mm1);
+            const uint4* qq1 = b1 + 1 + (s >> 1) * 2;
+            uint4 wlo1 = qq1[0], whi1 = qq1[1];
+            unsigned int wv1[8] = { wlo1.x,wlo1.y,wlo1.z,wlo1.w, whi1.x,whi1.y,whi1.z,whi1.w };
+            int idot1 = 0, isum1 = 0;
+            for (int k = 0; k < 8; k++) {
+                idot1 = idot4(xv[k], (int)((wv1[k] >> sh) & 0x0F0F0F0Fu), idot1);
+                isum1 = idot4(xv[k], 0x01010101, isum1);
+            }
+            u1 += (d1 * (float)sc1) * sx * (float)idot1 + (dmin1 * (float)(-mm1)) * sx * (float)isum1;
+        }
+    }
+    g0 = wave_sum32(g0); u0 = wave_sum32(u0);
+    if (col1_live) { g1 = wave_sum32(g1); u1 = wave_sum32(u1); }
+    if (tid == 0) {
+        // Column 0
+        float g = g0 * wg, up = u0 * wg;
+        float a;
+        if (act_type == 0) a = g / (1.0f + expf(-g));
+        else if (act_type == 1) { float x3=g*g*g; a=0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); }
+        else a = 1.0f / (1.0f + expf(-g));
+        h_out[(long)slot * nff + o0] = a * up * wo * dsc;
+        // Column 1
+        if (col1_live) {
+            g = g1 * wg; up = u1 * wg;
+            if (act_type == 0) a = g / (1.0f + expf(-g));
+            else if (act_type == 1) { float x3=g*g*g; a=0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); }
+            else a = 1.0f / (1.0f + expf(-g));
+            h_out[(long)slot * nff + o1] = a * up * wo * dsc;
+        }
+    }
+}
+
 // Int8-activation dp4a down projection over ALL (row, slot) pairs. Grid: (ne, n_slots). Writes
 // y[n_slots, ne] — NOT an atomicAdd into dst; `moe_accum_idm` does the (ordered) reduction.
 #define GEN_MOE_DOWN_IDM(DN) \
