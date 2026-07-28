@@ -514,9 +514,12 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 - [x] **Quant unpack** — ✅ branchless dword-wide Q6_K in the MoE expert decode
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the
       align-1 idiom that still emits `global_load_b128`
-- [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd. Q+K
-      QkNormRope dispatch fusion probed and **regressed** (P7d, -1.6% — not
-      built)
+- [x] **Fusion** — ✅ GatedActFused (Slice 32), ✅ QkNormRope→KV-write (F1d), ✅
+      RmsNormAdd (Slice 32), ✅ GatedRmsNorm (F1), ✅ Conv1dSilu, ✅
+      RmsNorm→(Linear|MoeFfn) (Slice 32), ✅ MoeFfn→Add (F1c), ✅ Combined
+      gate/up weight upload. Q+K dispatch fusion probed negative (P7d, -1.6%).
+      Missing vs Vulkan: `e2b_gate` (E2B only), `mul_sigmoid` (gemma4),
+      **`matmul_mmq_experts`** — all-expert MoE GEMM (plan #4)
 - [ ] **Device-side sampling** — ✅ argmax (**P7c**, 8.6×); sample_topk /
       eb_sample (unblocks MTP + DG)
 - [x] **Decode-replay tape** — evaluated (P6): worth ~0.4%, NOT built
