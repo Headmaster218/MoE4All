@@ -1376,12 +1376,9 @@ count are the one-forward ones):
 
 Ranked, with sizes:
 
-1. **MoE prefill expert GEMV — 95% of a Qwen3-30B-A3B pp512 forward.** By far
-   the largest single item left anywhere in this backend. R8's report is the
-   lead: each expert bank is re-read ~32× at pp512 because the id-indexed tier
-   dispatches per row-chunk rather than bucketing rows by expert. A batched
-   per-expert GEMM (Vulkan's `moe_small_m` crossover has the shape) is a slice
-   on its own and would be worth up to ~10× on this model's prefill.
+1. ~~**MoE prefill expert GEMV.**~~ **LANDED as P2** — see below. The ~32×
+   re-read was confirmed and removed; it was worth +14%, not ~10×, because the
+   GEMV was never bandwidth-bound.
 2. **Dense prefill `Linear` — now 74% of a Qwen3-0.6B pp512 forward**, split
    across shapes, with the Q6K `down_proj` the worst per-dispatch at 592 µs.
    This is §9's async-pipelined int8 mmq, and Q6K's unpack (F4 item 2) is the
@@ -1394,6 +1391,75 @@ Ranked, with sizes:
    `QkNormRope` at 30 µs a dispatch is the largest — a per-element rotation that
    nothing has ever looked at. Small, but the profiler is why it is visible at
    all, which is the point of having built it.
+
+### P2 — bucket-sorted batched per-expert MoE GEMV (`moe_*_idb_*`)
+
+**The lead was right about the traffic and wrong about the payoff.** Confirmed
+by counting bytes on Qwen3-30B-A3B Q4_K_M `pp512`: 4096 slots (512 rows ×
+`n_used` 8) over 128 experts, each slot re-reading its expert's whole bank (1.69
+MiB Q4_K gate+up + 1.23 MiB Q6_K down = 2.92 MiB), is **12.5 GB of weight fetch
+per layer against 391 MB distinct — exactly 32×**.
+
+The fix is the one the lead named: an LDS counting sort (`moe_bucket_sort`, one
+workgroup) buckets the chunk's slots by expert, and the GEMV grid becomes
+`(output row, expert)` instead of `(output row, slot)`, each block looping over
+its bucket. The bank is then read once per ROW-CHUNK, so at the shipped
+`moe_id_rows = 128` the re-read drops 32× → 4×. The arithmetic is the R8 id
+tier's, unchanged, into the same per-slot destinations, so the two tiers are
+**bit-identical** — pinned by `moe_ffn_bucket_tier_matches_the_id_tier_bitwise`
+against the `kernels.rocm.moe_bucket = false` control, and the `rocm_seam`
+golden `0xfd63781ea3bfa785` is unmoved.
+
+Interleaved warmed pairs, RX 7900 XTX (raw, first pair discarded):
+
+| bench                    | base                  | P2                    | ratio     |
+| ------------------------ | --------------------- | --------------------- | --------- |
+| Qwen3-30B-A3B pp512      | 348.3 / 348.5 / 348.6 | 397.0 / 396.0 / 396.1 | **1.14×** |
+| Qwen3-30B-A3B pp2048     | 338.8 / 337.8 / 338.2 | 386.2 / 385.8 / 385.9 | **1.14×** |
+| Qwen3-30B-A3B tg128      | 48.1 / 48.1 / 48.1    | 48.2 / 48.1 / 48.1    | 1.00×     |
+| Qwen3-0.6B pp512 (dense) | 12134 / 12153         | 12188 / 12172         | 1.00×     |
+
+Decode is untouched by construction: the tier is gated on average bucket
+occupancy ≥ 2 slots/expert, and a decode step's `n_used` slots over `n_expert`
+banks is far under it, so `rows = 1` never leaves the id tier.
+
+**Two measurement lessons, both of which cost this slice time.**
+
+- **`INFR_PROF_OPS` is not free on this workload and its attribution is wrong
+  here.** Under the profiler `pp512` reads 173 t/s against 348 t/s clean, and it
+  bills `Op::MoeFfn` 97% of the forward. A `hipDeviceSynchronize`-bracketed
+  stage timer says the whole `MoeFfn` arm is 661 ms of a 1330 ms prefill, and
+  the base→P2 stage delta it predicts (180 ms) matches the wall-clock delta (177
+  ms) to 2%. Rank with the profiler; SIZE with the wall clock.
+- **The expert GEMV was never bandwidth-bound**, which is why removing 8× of its
+  traffic bought 1.14× and not 8×. After P2 the weight fetch is ~60 GB/s against
+  ~960 GB/s of peak — 6%. It is not VALU-bound either (~5% of peak). It is
+  latency-bound on a decode chain, and packing 4 wave32s into one workgroup
+  (`MOE_IDB_WAVES`, kept — it is worth ~2%) barely moved it, which rules out the
+  workgroups-per-CU occupancy ceiling as the explanation.
+
+Ranked remainder, from the stage timer (per m=512 forward, P2 in place):
+
+1. **The Q6_K `down` GEMV — 462 ms, 73% of the expert-GEMV cost** against
+   `gate_up`'s 170 ms, while doing HALF the MACs. That is ~5.4× worse per MAC
+   than the Q4_K gate/up decode in the same kernel shape. `i8acc_q6k`'s inner
+   loop selects its nibble/high-bit region with a 4-way `if` chain on `blk & 7`,
+   which is per-LANE divergent inside the wave — all four paths execute. Making
+   that selection arithmetic is bit-identical by construction and is the single
+   biggest lever left on this model. (This is item 2's "Q6K unpack" showing up
+   at MoE prefill, and it is now the larger of the two sites.)
+2. **~590 ms of the 1330 ms prefill is in neither the expert GEMVs nor any op
+   the profiler itemizes** (all other ops together are ~80 ms of device time).
+   Nothing has looked at where it goes; the stage timer above is the tool.
+3. **A real per-expert GEMM.** The bucket list P2 builds is exactly the gather a
+   WMMA tile wants, so the batched-GEMM version of this is now cheap to reach.
+   The size of the prize: the dense `Linear m=512 4096×2048 Q4K` kernel does
+   10.3 TMAC/s where the expert GEMV does 0.75 — 13.8×.
+4. **`moe_id_rows` bounds the win.** The bucket is per row-chunk, so 128 rows
+   leaves a 4× re-read on the table at pp512 and 16× at pp2048. Raising it is
+   blocked by `MOE_ID_SCRATCH_CAP` (16 MiB; ~103 KB of scratch per row on this
+   model caps the chunk at 159), so shrinking the `[n_slots, ne]` `y` scratch is
+   what would unlock it.
 
 Close it to llama.cpp HIP. The plateau analysis (Slices 25–28) identified the
 remaining prefill lever as a **cooperative-LDS, async-pipelined int8 mmq**
@@ -1422,9 +1488,10 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
 
 - [x] **Quant coverage** — ✅ native decode + int8 + WMMA-prefill for all 24
       formats (**24/24 after R7**), ✅ MoE experts for every format a GGUF packs
-      expert banks with, and ✅ the id-indexed multi-slot MoE expert GEMV
-      (**R8**, total over `moe_native_fmt`). Paged MoE deliberately keeps the
-      per-expert loop for its copy/compute overlap — see R8
+      expert banks with, ✅ the id-indexed multi-slot MoE expert GEMV (**R8**,
+      total over `moe_native_fmt`) and ✅ its bucket-sorted batched twin
+      (**P2**, total over the same set, bit-identical). Paged MoE deliberately
+      keeps the per-expert loop for its copy/compute overlap — see R8
 - [ ] **Attention** — ✅ tiled flash prefill (**P1**, 6.7–12.5× on the kernel,
       goldens unmoved); WMMA flash prefill; dequant-in-flash; q8_0/Turbo/block
       KV quant

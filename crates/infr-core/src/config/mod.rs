@@ -448,6 +448,23 @@ cfg_struct! {
         /// see `exec.rs`'s `MOE_ID_ROWS`). `0` is clamped to 1. Has NO env key — set it with
         /// `--set kernels.rocm.moe_id_rows=…` or the TOML file.
         moe_id_rows: usize = 128,
+        /// P2: the BUCKET-SORTED BATCHED per-expert MoE GEMV (`moe_*_idb_*`). The R8 id tier's
+        /// grid is `(output row, slot)`, so each of the `rows × n_used` slots re-reads its
+        /// expert's whole bank — 32× of redundant weight traffic on Qwen3-30B-A3B `pp512`. This
+        /// sorts the slots into per-expert buckets and gives each expert ONE block per output row
+        /// that loops over its bucket, so the bank is read once per row-chunk.
+        ///
+        /// It is a SHAPE gate, not a numerics one: the batched kernels run the id tier's
+        /// arithmetic unchanged and write the same per-slot destinations, so the two are
+        /// bit-identical. The executor only takes it when the buckets are worth having (average
+        /// occupancy ≥ 2 slots/expert — decode, at `n_used` slots over `n_expert` banks, never
+        /// qualifies) and `n_expert` fits the sort's LDS histogram.
+        ///
+        /// Has NO env key, like `fuse_kv_write`/`moe_id_rows`: clear it with
+        /// `--set kernels.rocm.moe_bucket=false` or the TOML file. It exists so the tier's parity
+        /// case can run the SAME graph both ways — "bit-identical to the id tier" is only
+        /// checkable against that control.
+        moe_bucket: bool = true,
         /// P1: the TILED FLASH PREFILL attention kernel (`attention_prefill_flash`) — a workgroup
         /// owns a tile of query rows, streams the kv range through LDS once, and runs a one-pass
         /// online softmax, instead of giving every (query row, head) its own wave that re-reads the

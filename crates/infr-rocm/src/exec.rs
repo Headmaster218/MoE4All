@@ -1044,6 +1044,85 @@ fn moe_down_i8_idm_kernel(dn: &str) -> &'static str {
     }
 }
 
+/// Widest `n_expert` the P2 bucket sort's LDS histogram holds — mirrors `MOE_BUCKET_MAX_EXPERT`
+/// in `kernels.rs`. Wider MoEs keep the id tier (the sort would need dynamic shared memory).
+const MOE_BUCKET_MAX_EXPERT: usize = 1024;
+
+/// Wave32s per P2 batched-tier workgroup — mirrors `MOE_IDB_WAVES` in `kernels.rs`.
+///
+/// Each wave still owns ONE output row and runs the id tier's arithmetic; this only packs several
+/// of them into one workgroup. It is an OCCUPANCY knob: a 32-thread (one-wave) workgroup hits the
+/// hardware's workgroups-per-CU limit long before its waves-per-SIMD limit, so the single-wave
+/// grid the id tier uses cannot keep enough waves resident to hide the decode+load latency.
+const MOE_IDB_WAVES: u32 = 4;
+
+/// Minimum AVERAGE bucket occupancy (`n_slots / n_expert`) for the P2 batched tier to be worth
+/// taking. The batched grid is `(output row, expert)` — it launches a block per expert whether or
+/// not any token routed there, so below ~2 slots an expert the empty blocks cost more than the
+/// saved weight traffic returns. Decode (`n_used` slots over `n_expert` banks) is always well
+/// under this, which is how the tier stays a PREFILL change.
+const MOE_BUCKET_MIN_OCC: usize = 2;
+
+/// Bucket-sorted batched twin of [`moe_gate_up_i8_idm_kernel`] (P2).
+fn moe_gate_up_i8_idb_kernel(gu: &str) -> &'static str {
+    match gu {
+        "q80" => "moe_gate_up_act_i8_idb_q80",
+        "q2k" => "moe_gate_up_act_i8_idb_q2k",
+        "q3k" => "moe_gate_up_act_i8_idb_q3k",
+        "q4k" => "moe_gate_up_act_i8_idb_q4k",
+        "q5k" => "moe_gate_up_act_i8_idb_q5k",
+        "q6k" => "moe_gate_up_act_i8_idb_q6k",
+        "q40" => "moe_gate_up_act_i8_idb_q40",
+        "q41" => "moe_gate_up_act_i8_idb_q41",
+        "q51" => "moe_gate_up_act_i8_idb_q51",
+        "iq4nl" => "moe_gate_up_act_i8_idb_iq4nl",
+        "iq4xs" => "moe_gate_up_act_i8_idb_iq4xs",
+        "iq2xxs" => "moe_gate_up_act_i8_idb_iq2xxs",
+        "iq2xs" => "moe_gate_up_act_i8_idb_iq2xs",
+        "iq2s" => "moe_gate_up_act_i8_idb_iq2s",
+        "iq3xxs" => "moe_gate_up_act_i8_idb_iq3xxs",
+        "iq3s" => "moe_gate_up_act_i8_idb_iq3s",
+        "iq1s" => "moe_gate_up_act_i8_idb_iq1s",
+        "iq1m" => "moe_gate_up_act_i8_idb_iq1m",
+        "tq10" => "moe_gate_up_act_i8_idb_tq10",
+        "tq20" => "moe_gate_up_act_i8_idb_tq20",
+        "q20" => "moe_gate_up_act_i8_idb_q20",
+        "mxfp4" => "moe_gate_up_act_i8_idb_mxfp4",
+        "nvfp4" => "moe_gate_up_act_i8_idb_nvfp4",
+        _ => unreachable!("moe_gate_up_i8_idb_kernel: uncovered ({gu})"),
+    }
+}
+
+/// Bucket-sorted batched twin of [`moe_down_i8_idm_kernel`] (P2).
+fn moe_down_i8_idb_kernel(dn: &str) -> &'static str {
+    match dn {
+        "q80" => "moe_down_i8_idb_q80",
+        "q2k" => "moe_down_i8_idb_q2k",
+        "q3k" => "moe_down_i8_idb_q3k",
+        "q4k" => "moe_down_i8_idb_q4k",
+        "q5k" => "moe_down_i8_idb_q5k",
+        "q6k" => "moe_down_i8_idb_q6k",
+        "q40" => "moe_down_i8_idb_q40",
+        "q41" => "moe_down_i8_idb_q41",
+        "q51" => "moe_down_i8_idb_q51",
+        "iq4nl" => "moe_down_i8_idb_iq4nl",
+        "iq4xs" => "moe_down_i8_idb_iq4xs",
+        "iq2xxs" => "moe_down_i8_idb_iq2xxs",
+        "iq2xs" => "moe_down_i8_idb_iq2xs",
+        "iq2s" => "moe_down_i8_idb_iq2s",
+        "iq3xxs" => "moe_down_i8_idb_iq3xxs",
+        "iq3s" => "moe_down_i8_idb_iq3s",
+        "iq1s" => "moe_down_i8_idb_iq1s",
+        "iq1m" => "moe_down_i8_idb_iq1m",
+        "tq10" => "moe_down_i8_idb_tq10",
+        "tq20" => "moe_down_i8_idb_tq20",
+        "q20" => "moe_down_i8_idb_q20",
+        "mxfp4" => "moe_down_i8_idb_mxfp4",
+        "nvfp4" => "moe_down_i8_idb_nvfp4",
+        _ => unreachable!("moe_down_i8_idb_kernel: uncovered ({dn})"),
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -3781,6 +3860,32 @@ fn run_op(
                     let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
                     let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
                     let yb = ctx.pool_buf((max_slots * neu * 4).max(1), false);
+                    // ── P2: the bucket-sorted BATCHED arm. ──
+                    // R8 fixed the launch count and left the WEIGHT TRAFFIC alone: its
+                    // `(output row, slot)` grid re-reads an expert's whole bank once per slot, so
+                    // Qwen3-30B-A3B `pp512` moves 12.5 GB of expert weights per layer against
+                    // 391 MB of distinct bytes — a 32× re-read (`rows·n_used / n_expert`), and
+                    // `Op::MoeFfn` measured 97.1% of the forward because of it. Bucketing the
+                    // slots by expert and giving each expert ONE block per output row collapses
+                    // that to once per ROW-CHUNK. Same kernels' arithmetic, same per-slot
+                    // destinations, so the outputs are bit-identical (see MOE_ID_BUCKET's header).
+                    //
+                    // `nexp` bounds are the sort's LDS histogram; the occupancy floor keeps the
+                    // empty `(row, expert)` blocks from outweighing the saved traffic, and is what
+                    // leaves DECODE (`nu` slots over `nexp` banks) on the id tier untouched.
+                    let use_idb = ctx.rocm.moe_bucket
+                        && nexp > 0
+                        && nexp <= MOE_BUCKET_MAX_EXPERT
+                        && chunk * nu >= nexp * MOE_BUCKET_MIN_OCC;
+                    let (bslot, eoff, ecnt) = if use_idb {
+                        (
+                            Some(ctx.pool_buf((max_slots * 4).max(4), false)),
+                            Some(ctx.pool_buf(nexp * 4, false)),
+                            Some(ctx.pool_buf(nexp * 4, false)),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
                     let mut r0 = 0usize;
                     while r0 < rows {
                         let nr = chunk.min(rows - r0);
@@ -3813,34 +3918,88 @@ fn run_op(
                                 ],
                             )?;
                         }
-                        dispatch_grid(
-                            pipelines,
-                            ctx.stream,
-                            moe_gate_up_i8_idm_kernel(gu),
-                            n_ff_exp,
-                            n_slots as u32,
-                            32,
-                            args![
-                                arg_ptr(qxb.ptr),
-                                arg_ptr(xsb.ptr),
-                                arg_ptr(gw_ptr),
-                                arg_ptr(uw_ptr),
-                                arg_ptr(hb.ptr),
-                                arg_i32(ne as i32),
-                                arg_i32(n_ff_exp as i32),
-                                arg_i32(at),
-                                arg_i32(wb_flag),
-                                arg_ptr(dsc_ptr),
-                                arg_ptr(ids_c),
-                                arg_ptr(wts_c),
-                                arg_i32(n_slots as i32),
-                                arg_i32(nu as i32),
-                                arg_i64(gate_bstride),
-                                arg_i64(up_bstride),
-                                arg_i32(fused_flag),
-                                arg_i64(up_half_boff),
-                            ],
-                        )?;
+                        // P2: the chunk's slots sorted into per-expert buckets, once, ahead of
+                        // both GEMVs — the gate/up and down arms walk the SAME bucket list. The
+                        // last chunk of a prefill can be short, so the occupancy floor is re-checked
+                        // per chunk rather than assumed from `chunk`.
+                        let batched = use_idb && n_slots >= nexp * MOE_BUCKET_MIN_OCC;
+                        if batched {
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "moe_bucket_sort",
+                                256,
+                                256,
+                                args![
+                                    arg_ptr(ids_c),
+                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
+                                    arg_ptr(eoff.as_ref().unwrap().ptr),
+                                    arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_i32(n_slots as i32),
+                                    arg_i32(nexp as i32),
+                                ],
+                            )?;
+                        }
+                        if batched {
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_gate_up_i8_idb_kernel(gu),
+                                n_ff_exp.div_ceil(MOE_IDB_WAVES),
+                                nexp as u32,
+                                32 * MOE_IDB_WAVES,
+                                args![
+                                    arg_ptr(qxb.ptr),
+                                    arg_ptr(xsb.ptr),
+                                    arg_ptr(gw_ptr),
+                                    arg_ptr(uw_ptr),
+                                    arg_ptr(hb.ptr),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_i32(wb_flag),
+                                    arg_ptr(dsc_ptr),
+                                    arg_ptr(wts_c),
+                                    arg_i32(nu as i32),
+                                    arg_i64(gate_bstride),
+                                    arg_i64(up_bstride),
+                                    arg_i32(fused_flag),
+                                    arg_i64(up_half_boff),
+                                    arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_ptr(eoff.as_ref().unwrap().ptr),
+                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
+                                ],
+                            )?;
+                        } else {
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_gate_up_i8_idm_kernel(gu),
+                                n_ff_exp,
+                                n_slots as u32,
+                                32,
+                                args![
+                                    arg_ptr(qxb.ptr),
+                                    arg_ptr(xsb.ptr),
+                                    arg_ptr(gw_ptr),
+                                    arg_ptr(uw_ptr),
+                                    arg_ptr(hb.ptr),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i32(at),
+                                    arg_i32(wb_flag),
+                                    arg_ptr(dsc_ptr),
+                                    arg_ptr(ids_c),
+                                    arg_ptr(wts_c),
+                                    arg_i32(n_slots as i32),
+                                    arg_i32(nu as i32),
+                                    arg_i64(gate_bstride),
+                                    arg_i64(up_bstride),
+                                    arg_i32(fused_flag),
+                                    arg_i64(up_half_boff),
+                                ],
+                            )?;
+                        }
                         dispatch_1d(
                             pipelines,
                             ctx.stream,
@@ -3855,25 +4014,48 @@ fn run_op(
                                 arg_i32(n_ff_exp as i32),
                             ],
                         )?;
-                        dispatch_grid(
-                            pipelines,
-                            ctx.stream,
-                            moe_down_i8_idm_kernel(dn),
-                            ne,
-                            n_slots as u32,
-                            32,
-                            args![
-                                arg_ptr(hqb.ptr),
-                                arg_ptr(hsb.ptr),
-                                arg_ptr(dw_ptr),
-                                arg_ptr(yb.ptr),
-                                arg_i32(ne as i32),
-                                arg_i32(n_ff_exp as i32),
-                                arg_ptr(ids_c),
-                                arg_i32(n_slots as i32),
-                                arg_i64(down_bstride),
-                            ],
-                        )?;
+                        if batched {
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_down_i8_idb_kernel(dn),
+                                ne.div_ceil(MOE_IDB_WAVES),
+                                nexp as u32,
+                                32 * MOE_IDB_WAVES,
+                                args![
+                                    arg_ptr(hqb.ptr),
+                                    arg_ptr(hsb.ptr),
+                                    arg_ptr(dw_ptr),
+                                    arg_ptr(yb.ptr),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_i64(down_bstride),
+                                    arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_ptr(eoff.as_ref().unwrap().ptr),
+                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
+                                ],
+                            )?;
+                        } else {
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                moe_down_i8_idm_kernel(dn),
+                                ne,
+                                n_slots as u32,
+                                32,
+                                args![
+                                    arg_ptr(hqb.ptr),
+                                    arg_ptr(hsb.ptr),
+                                    arg_ptr(dw_ptr),
+                                    arg_ptr(yb.ptr),
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp as i32),
+                                    arg_ptr(ids_c),
+                                    arg_i32(n_slots as i32),
+                                    arg_i64(down_bstride),
+                                ],
+                            )?;
+                        }
                         // Ordered slot reduction — NOT atomics; see MOE_ID_MULTI's header for why
                         // the golden hash depends on it. `res_c` (null unless the F1c residual fold
                         // is on) joins the residual in the epilogue, leaving that order untouched.
@@ -4962,6 +5144,25 @@ mod decode_spec_tests {
             assert!(
                 src.contains(&format!("GEN_MOE_DOWN_IDM({s})\n")),
                 "moe_down_i8_idm_{s} named but not instantiated"
+            );
+            // P2: the bucket-sorted batched tier is total over the SAME set for the same reason —
+            // the executor picks it on shape alone (occupancy + `n_expert`), never on format, so a
+            // format that reached `use_idb` without an `_idb_` kernel is a panic on a real model.
+            assert_eq!(
+                super::moe_gate_up_i8_idb_kernel(s),
+                format!("moe_gate_up_act_i8_idb_{s}")
+            );
+            assert_eq!(
+                super::moe_down_i8_idb_kernel(s),
+                format!("moe_down_i8_idb_{s}")
+            );
+            assert!(
+                src.contains(&format!("GEN_MOE_GATE_UP_IDB({s})\n")),
+                "moe_gate_up_act_i8_idb_{s} named but not instantiated"
+            );
+            assert!(
+                src.contains(&format!("GEN_MOE_DOWN_IDB({s})\n")),
+                "moe_down_i8_idb_{s} named but not instantiated"
             );
         }
     }

@@ -253,6 +253,7 @@ const HIP_PARTS: &[&str] = &[
     WMMA_PREFILL,
     MOE_ROUTING,
     MOE_ID_MULTI,
+    MOE_ID_BUCKET,
 ];
 
 // One BLOCK per row (grid.x = rows, blockDim.x = RMS_BLOCK). The sum-of-squares is a strided
@@ -6344,6 +6345,190 @@ extern "C" __global__ void moe_accum_idm(
     if (res) dst[i] = res[i] + acc;
     else dst[i] += acc;
 }
+"#;
+
+// ── Bucket-sorted BATCHED per-expert MoE GEMV (P2, `*_idb_*`) ────────────────
+//
+// The R8 `*_idm_*` tier above fixed the LAUNCH count; it did not fix the WEIGHT TRAFFIC. Its grid
+// is `(out_row, slot)`, so every one of the `rows * n_used` slots re-reads its expert's whole bank
+// independently. Measured on Qwen3-30B-A3B Q4_K_M `pp512` (`INFR_PROF_OPS=1`): 4096 slots over
+// 128 experts is a **32× re-read** — 12.5 GB of weight fetch per layer against 391 MB of distinct
+// bytes, at 59.7 ms a layer (97.1% of the whole forward, 2.86 s of a 2.95 s pp512).
+//
+// This tier BUCKETS THE SLOTS BY EXPERT and gives each expert ONE block per output row, which
+// loops over its whole bucket. The grid is `(out_row, expert)` instead of `(out_row, slot)`, so an
+// expert's bank row is fetched from memory ONCE per row-chunk and reused across every token routed
+// to it — the re-read collapses from `rows * n_used / n_expert` to 1 within a chunk (Vulkan's
+// `moe_small_m` batched arm, which is what its crossover picks above m=8).
+//
+// THE ARITHMETIC IS THE `*_idm_*` ARITHMETIC, UNCHANGED. Same `i8acc_##FMT` decode+dot, same
+// `wave_sum32`, same epilogue, same per-slot destination (`h_out[slot]` / `y[slot]`) — only WHICH
+// block computes a given `(out_row, slot)` pair moves, and each pair is still computed exactly
+// once by exactly one wave. Nothing is summed across slots here (`moe_accum_idm` still owns the
+// ordered reduction), so the bucket ORDER is invisible to the result: it may come out of an atomic
+// scatter in any order and the output is still bit-identical to both the id tier and the pre-R8
+// serial tier. `moe_ffn_bucket_tier_matches_the_id_tier_bitwise` pins that.
+//
+// The sort is ONE workgroup, `moe_bucket_sort` — an LDS histogram over `route_ids`, a serial
+// exclusive scan by lane 0, then an LDS-atomic scatter. `n_expert` is bounded by
+// `MOE_BUCKET_MAX_EXPERT` because the histogram is STATIC LDS (a dynamic-shared launch would need
+// its own dispatch helper for one tiny kernel); the executor keeps the id tier for anything wider.
+const MOE_ID_BUCKET: &str = r#"
+#define MOE_BUCKET_MAX_EXPERT 1024
+#define MOE_IDB_WAVES 4
+
+// Counting sort of the `[n_slots]` expert ids into per-expert buckets. One workgroup.
+//   ecnt[e]  = number of slots routed to expert e
+//   eoff[e]  = exclusive prefix sum of ecnt (the bucket's start in `bslot`)
+//   bslot[p] = the slot index at sorted position p
+// Order WITHIN a bucket is unspecified (LDS-atomic scatter) and deliberately so — every consumer
+// writes its result at the slot's own address, so no reduction order depends on it.
+extern "C" __global__ void moe_bucket_sort(
+    const int* __restrict__ route_ids, /* [n_slots] */
+    int* __restrict__ ecnt,            /* [n_expert] */
+    int* __restrict__ eoff,            /* [n_expert] */
+    int* __restrict__ bslot,           /* [n_slots] */
+    int n_slots, int n_expert
+) {
+    __shared__ int cnt[MOE_BUCKET_MAX_EXPERT];
+    __shared__ int cur[MOE_BUCKET_MAX_EXPERT];
+    int tid = threadIdx.x;
+    for (int e = tid; e < n_expert; e += blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    for (int s = tid; s < n_slots; s += blockDim.x) atomicAdd(&cnt[route_ids[s]], 1);
+    __syncthreads();
+    if (tid == 0) {
+        int run = 0;
+        for (int e = 0; e < n_expert; e++) { cur[e] = run; run += cnt[e]; }
+    }
+    __syncthreads();
+    for (int e = tid; e < n_expert; e += blockDim.x) { ecnt[e] = cnt[e]; eoff[e] = cur[e]; }
+    __syncthreads();
+    for (int s = tid; s < n_slots; s += blockDim.x) {
+        int e = route_ids[s];
+        bslot[atomicAdd(&cur[e], 1)] = s;
+    }
+}
+
+// Gate+up+activation, batched over one expert's bucket. Grid: (nff, n_expert); one wave32 block
+// per (output row, expert), looping over the bucket. The expert's gate/up row `o` is loaded once
+// for the whole bucket instead of once per slot.
+#define GEN_MOE_GATE_UP_IDB(GU) \
+extern "C" __global__ void moe_gate_up_act_i8_idb_##GU( \
+    const signed char* __restrict__ qx,       /* int8(x) [rows, ne] */ \
+    const float* __restrict__ xs,             /* x scales [rows, ne/32] */ \
+    const unsigned char* __restrict__ gate_base, \
+    const unsigned char* __restrict__ up_base, \
+    float* __restrict__ h_out,                /* [n_slots, nff] */ \
+    int ne, int nff, int act_type, int weight_before, const float* __restrict__ dsc_dev, \
+    const float* __restrict__ route_wts, int n_used, \
+    long gate_bstride, long up_bstride, int fused, long fused_up_half_boff, \
+    const int* __restrict__ bslot, const int* __restrict__ eoff, const int* __restrict__ ecnt) { \
+    int tid = threadIdx.x & 31; \
+    int o = blockIdx.x * MOE_IDB_WAVES + (int)(threadIdx.x >> 5); int e = blockIdx.y; \
+    if (o >= nff) return; \
+    int cnt = ecnt[e]; \
+    if (cnt <= 0) return; \
+    int off = eoff[e]; \
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    const unsigned char* gate_w = gate_base + (long)e * gate_bstride; \
+    const unsigned char* up_w = fused ? gate_base + (long)e * gate_bstride + fused_up_half_boff \
+                                      : up_base + (long)e * up_bstride; \
+    int nb = ne >> 5; \
+    for (int i = 0; i < cnt; i++) { \
+        int slot = bslot[off + i]; \
+        int row = slot / n_used; \
+        float weight = route_wts[slot]; \
+        float wg = weight_before ? weight : 1.0f; \
+        float wo = weight_before ? 1.0f : weight; \
+        const signed char* qxr = qx + (long)row * ne; \
+        const float* xsr = xs + (long)row * nb; \
+        float g = i8acc_##GU(qxr, xsr, gate_w, o, nb, tid); \
+        float u = i8acc_##GU(qxr, xsr, up_w, o, nb, tid); \
+        g = wave_sum32(g); u = wave_sum32(u); \
+        if (tid == 0) { \
+            g *= wg; u *= wg; \
+            float a; \
+            if (act_type == 0) { a = g / (1.0f + expf(-g)); } \
+            else if (act_type == 1) { float x3 = g * g * g; a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3))); } \
+            else { a = 1.0f / (1.0f + expf(-g)); } \
+            h_out[(long)slot * nff + o] = a * u * wo * dsc; \
+        } \
+    } \
+}
+GEN_MOE_GATE_UP_IDB(q80)
+GEN_MOE_GATE_UP_IDB(q2k)
+GEN_MOE_GATE_UP_IDB(q3k)
+GEN_MOE_GATE_UP_IDB(q4k)
+GEN_MOE_GATE_UP_IDB(q5k)
+GEN_MOE_GATE_UP_IDB(q6k)
+GEN_MOE_GATE_UP_IDB(q40)
+GEN_MOE_GATE_UP_IDB(q41)
+GEN_MOE_GATE_UP_IDB(q51)
+GEN_MOE_GATE_UP_IDB(iq4nl)
+GEN_MOE_GATE_UP_IDB(iq4xs)
+GEN_MOE_GATE_UP_IDB(iq2xxs)
+GEN_MOE_GATE_UP_IDB(iq2xs)
+GEN_MOE_GATE_UP_IDB(iq2s)
+GEN_MOE_GATE_UP_IDB(iq3xxs)
+GEN_MOE_GATE_UP_IDB(iq3s)
+GEN_MOE_GATE_UP_IDB(iq1s)
+GEN_MOE_GATE_UP_IDB(iq1m)
+GEN_MOE_GATE_UP_IDB(tq10)
+GEN_MOE_GATE_UP_IDB(tq20)
+GEN_MOE_GATE_UP_IDB(q20)
+GEN_MOE_GATE_UP_IDB(mxfp4)
+GEN_MOE_GATE_UP_IDB(nvfp4)
+
+// Down projection, batched over one expert's bucket. Grid: (ne, n_expert). Writes y[slot] exactly
+// as `moe_down_i8_idm_*` does — `moe_accum_idm` still owns the ordered reduction.
+#define GEN_MOE_DOWN_IDB(DN) \
+extern "C" __global__ void moe_down_i8_idb_##DN( \
+    const signed char* __restrict__ hq,       /* int8(h) [n_slots, nff] */ \
+    const float* __restrict__ hs,             /* h scales [n_slots, nff/32] */ \
+    const unsigned char* __restrict__ down_base, float* __restrict__ y, /* [n_slots, ne] */ \
+    int ne, int nff, long down_bstride, \
+    const int* __restrict__ bslot, const int* __restrict__ eoff, const int* __restrict__ ecnt) { \
+    int tid = threadIdx.x & 31; \
+    int d = blockIdx.x * MOE_IDB_WAVES + (int)(threadIdx.x >> 5); int e = blockIdx.y; \
+    if (d >= ne) return; \
+    int cnt = ecnt[e]; \
+    if (cnt <= 0) return; \
+    int off = eoff[e]; \
+    const unsigned char* down_w = down_base + (long)e * down_bstride; \
+    int nb = nff >> 5; \
+    for (int i = 0; i < cnt; i++) { \
+        int slot = bslot[off + i]; \
+        const signed char* hqr = hq + (long)slot * nff; \
+        const float* hsr = hs + (long)slot * nb; \
+        float acc = i8acc_##DN(hqr, hsr, down_w, d, nb, tid); \
+        acc = wave_sum32(acc); \
+        if (tid == 0) y[(long)slot * ne + d] = acc; \
+    } \
+}
+GEN_MOE_DOWN_IDB(q80)
+GEN_MOE_DOWN_IDB(q2k)
+GEN_MOE_DOWN_IDB(q3k)
+GEN_MOE_DOWN_IDB(q4k)
+GEN_MOE_DOWN_IDB(q5k)
+GEN_MOE_DOWN_IDB(q6k)
+GEN_MOE_DOWN_IDB(q40)
+GEN_MOE_DOWN_IDB(q41)
+GEN_MOE_DOWN_IDB(q51)
+GEN_MOE_DOWN_IDB(iq4nl)
+GEN_MOE_DOWN_IDB(iq4xs)
+GEN_MOE_DOWN_IDB(iq2xxs)
+GEN_MOE_DOWN_IDB(iq2xs)
+GEN_MOE_DOWN_IDB(iq2s)
+GEN_MOE_DOWN_IDB(iq3xxs)
+GEN_MOE_DOWN_IDB(iq3s)
+GEN_MOE_DOWN_IDB(iq1s)
+GEN_MOE_DOWN_IDB(iq1m)
+GEN_MOE_DOWN_IDB(tq10)
+GEN_MOE_DOWN_IDB(tq20)
+GEN_MOE_DOWN_IDB(q20)
+GEN_MOE_DOWN_IDB(mxfp4)
+GEN_MOE_DOWN_IDB(nvfp4)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────

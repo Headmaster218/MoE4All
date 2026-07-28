@@ -2658,6 +2658,75 @@ fn moe_ffn_id_tier_matches_the_serial_tier_bitwise() {
     }
 }
 
+/// **P2's bucket-sorted batched tier must agree with the id tier BIT FOR BIT**
+/// (`kernels.rocm.moe_bucket = false` selects the latter).
+///
+/// Same standard, and for the same reason, as `moe_ffn_id_tier_matches_the_serial_tier_bitwise`
+/// above: the batched kernels were written to run the id tier's arithmetic UNCHANGED — the same
+/// `i8acc_*` decode+dot, the same `wave_sum32`, the same epilogue — with only the mapping from
+/// blocks to `(output row, slot)` pairs moved, and each pair still computed exactly once by
+/// exactly one wave into the slot's own destination. Nothing is summed across slots in either
+/// GEMV, so the bucket ORDER (an LDS-atomic scatter, deliberately unspecified) cannot reach the
+/// result. A float that moves here means one of those claims is wrong — most likely that a slot
+/// was dropped or double-counted by the counting sort, which is exactly the failure a tolerance
+/// comparison would hide when the two experts involved have similar magnitudes.
+///
+/// `rows = 5` with 8 experts and `n_used = 4` puts 20 slots in 8 buckets — over the executor's
+/// occupancy floor, so the batched tier is actually taken; `rows = 1` is under it, which pins that
+/// the gate falls back cleanly rather than launching an empty grid.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_bucket_tier_matches_the_id_tier_bitwise() {
+    let bucket_cfg = |on: bool| {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.rocm.moe_bucket = on;
+        RocmBackend::new_with(0, std::sync::Arc::new(cfg)).ok()
+    };
+    let (Some(idb), Some(idm)) = (bucket_cfg(true), bucket_cfg(false)) else {
+        return;
+    };
+    let (ne, n_expert, n_used, n_ff_exp) = (256usize, 8usize, 4usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 32;
+    let dn_blocks = n_expert * ne * n_ff_exp / 32;
+    let gate = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let up = q80_per_expert_scaled(gu_blocks, gu_blocks / n_expert, expert_scale);
+    let down = q80_per_expert_scaled(dn_blocks, dn_blocks / n_expert, expert_scale);
+    let router = gen(n_expert * ne, 23);
+    // Below the occupancy floor (1), over it (5), and a repeat of the latter — a counting sort
+    // that raced would reorder only sometimes.
+    for rows in [1usize, 5, 5] {
+        let x = gen(rows * ne, 11);
+        let go = |b: &dyn Backend| {
+            run_moe_flags(
+                b,
+                &x,
+                &router,
+                &gate,
+                &up,
+                &down,
+                DType::Q8_0,
+                rows,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                false,
+                false,
+            )
+        };
+        let a = go(&idb);
+        let b = go(&idm);
+        assert!(maxabs(&a) > 1e-3, "bitwise tier comparison is vacuous");
+        assert_eq!(
+            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the bucketed tier does not reproduce the id tier bit-for-bit at rows={rows} \
+             (max_err={:e})",
+            maxerr(&a, &b)
+        );
+    }
+}
+
 /// The id tier must not change what the A/B comparand does. With `kernels.rocm.i8 = false` the
 /// resident path drops back to the pre-R8 per-`(row, slot)` `moe_ffn_expert_routed_*` loop; that
 /// path still has to be there and still has to match the CPU reference, or the switch that exists

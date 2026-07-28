@@ -111,6 +111,9 @@ fn default_config_matches_documented_defaults() {
     // R8: the id-indexed MoE GEMV tier's row-batch bound. Also env-key-less; `infr-rocm` pins this
     // default against its own `MOE_ID_ROWS` knob table.
     assert_eq!(d.kernels.rocm.moe_id_rows, 128);
+    // P2: the bucket-sorted batched per-expert MoE GEMV ships ON — it is the id tier's grid with
+    // the 32× weight re-read taken out, and bit-identical to it. Env-key-less like the rest.
+    assert!(d.kernels.rocm.moe_bucket);
     // P1: the tiled flash prefill attention kernel ships ON (it replaced the single-wave scalar
     // one). Env-key-less like the two above. (`kernels.rocm.prof_ops` used to sit here; it folded
     // into the cross-backend `prof.ops` — see `prof_ops_is_the_one_knob_reachable_by_env_set_and_file`.)
