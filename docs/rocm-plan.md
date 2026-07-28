@@ -39,7 +39,7 @@ Oracle is the LOCAL build at
 
 | model               | pp512 (infr / llama)      | tg128                 |
 | ------------------- | ------------------------- | --------------------- |
-| Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 248 / 384 = **0.65×** |
+| Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 255 / 384 = **0.66×** |
 | Qwen3-0.6B Q6_K     | 10700 / 22033 = **0.49×** | — / 366 = **—**       |
 | Qwen3-30B-A3B (MoE) | 787 / 2905 = **0.27×**    | — / 141 = **—**       |
 | — Q4_K_M tg128@4096 | —                         | 157 / 305 = **0.52×** |
@@ -79,8 +79,9 @@ would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
 4. **MoE prefill** needs the async/double-buffered LDS pipeline — structural,
    not another unpack fix. P2 established the expert GEMV is latency-bound at
    ~6% of peak bandwidth and ~5% of peak VALU, so traffic work is spent.
-5. **`Argmax`** — 114 µs/token for a 608 KB reduction, ~180× off roofline.
-   Self-contained; only tie-breaking must be preserved.
+5. **~~`Argmax`~~** — P7c: multi-block two-pass reduction, 117.6→13.6 µs (8.6×),
+   decode +2.1%. Self-contained; tie-breaking preserved (parity test + seam
+   gate).
 6. **Dispatch count** — 310/token at ~2.6 µs each. Fusing `QkNormRope` (2/layer)
    and q/k/v would cut 84 of 310 ≈ 4%. Real, but an order below attention.
 
@@ -424,6 +425,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P6    | `f796557` | batched-prefetch decode attention — 1.10× d0, **1.24× @d4096**                       |
 | P7    | —         | one-pass online-softmax + one-key-per-lane split-KV — **1.16× d0, 1.48× @d4096**     |
 | P7b   | —         | vectorised `copy_strided` (float4 per row) — **Q6_K pp512 1.51×**                    |
+| P7c   | —         | multi-block two-pass argmax — **8.6×** per disch, decode +2.1%                       |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
@@ -506,8 +508,8 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the
       align-1 idiom that still emits `global_load_b128`
 - [ ] **Fusion** — GatedActFused (dense), QkNormRope+KV-write, RmsNormAdd
-- [ ] **Device-side sampling** — argmax / sample_topk / eb_sample (unblocks
-      MTP + DG)
+- [ ] **Device-side sampling** — ✅ argmax (**P7c**, 8.6×); sample_topk /
+      eb_sample (unblocks MTP + DG)
 - [x] **Decode-replay tape** — evaluated (P6): worth ~0.4%, NOT built
 - [ ] **DeltaNet** — split/strided variants where they help
 - [ ] **Memory** — BDA/staging/ReBAR/UMA/VRAM-guard where beneficial
