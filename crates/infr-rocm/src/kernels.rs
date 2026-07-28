@@ -1897,8 +1897,9 @@ extern "C" __global__ void attention_split_partial_flash(
                 const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
                 float dot = 0.0f;
                 // Full dot — one lane, all dims. K is read as contiguous halfs; Q is read
-                // from LDS at banked latency. head_dim is compile-time constant for the
-                // host-dispatched instantiations, so the compiler will unroll this loop.
+                // from LDS at banked latency. head_dim is a runtime argument here (the kernel
+                // is compiled once via hiprtc, not per-head_dim), so this is a guarded loop,
+                // not unrolled — tight enough that it doesn't matter.
                 for (int d = 0; d < head_dim; d++) {
                     dot += q_lds[d] * __half2float(kr[d]);
                 }

@@ -3609,8 +3609,8 @@ mod rocm_seam_gate {
     }
 
     /// Qwen3-0.6B Q4_K_M through the ROCm seam WITH P7 split-KV flash decode
-    /// (`attn_split_flash = true`). HASH golden — the online-softmax rescale moves the hash from
-    /// `0xfd63781ea3bfa785`. Captured with `INFR_BLESS=1` after manual coherency verification.
+    /// (`attn_split_flash = true`). HASH golden — the change is safe, greedy decode is
+    /// identical (same hash `0xfd63781ea3bfa785` as the old split-KV path).
     const QWEN3_ROCM_P7_GOLDEN: &[(&str, usize, u64)] =
         &[("The capital of France is", 32, 0xfd63781ea3bfa785)];
     #[test]

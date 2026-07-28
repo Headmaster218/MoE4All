@@ -6598,8 +6598,8 @@ fn attention_prefill_flash_keeps_the_plain_kernels_score_tree() {
 }
 
 /// **P7 split-KV flash decode produces coherent output** — the one-pass online-softmax +
-/// one-key-per-lane kernel changes the floating-point reduction order (the qwen3 golden WILL
-/// move), but the per-element differences must stay small against the current split-KV kernels.
+/// one-key-per-lane kernel changes the floating-point reduction order compared to the old
+/// split-KV partial, but the per-element differences must stay small.
 ///
 /// Decode-only (`rows == 1`), split-KV shapes only (`kv_len` beyond the threshold so
 /// `n_chunks > 1`). Every mask arm at representative depths.
