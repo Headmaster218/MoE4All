@@ -3662,6 +3662,23 @@ extern "C" __global__ void linear_i8_q6k(
     // 16-element sub-blocks, a 4-way region select, a 6-bit reassembly per code), so a second row's
     // live state costs more occupancy than the extra memory stream buys. It stays one row per wave;
     // `exec.rs::i8_gemv_mrow` therefore returns 1 for it and `grid.x` stays `out_f`.
+    //
+    // P4: branchless + dword-wide, the same rewrite P3 applied to the MoE twin `i8acc_q6k` (see the
+    // derivation there). The value stream is UNCHANGED — this is the same decode without the
+    // per-lane branch and without the byte-at-a-time fetch:
+    //
+    //  1. The 4-way `if (region)` chain was per-LANE divergent (`region` derives from `blk`, which
+    //     is `tid`-strided), so every lane retired all four arms. The selection is pure arithmetic:
+    //     (ql byte offset, ql nibble shift, qh bit shift) = (32*(region&1), 4*(region>>1), 2*region).
+    //  2. 16 scalar `global_load_u8` per 16 codes. Unlike `linear_i8_q4k`/`_q5k` (144 % 16 == 0,
+    //     176 % 16 == 0) the 210-byte Q6_K super-block is only 2-byte aligned, so a `uint4` cast is
+    //     not legal here. `__builtin_memcpy` states the align-1 contract honestly and still lowers
+    //     to `global_load_b128` on gfx11, which has unaligned global access.
+    //
+    // That matters far more here than the instruction count suggests: consecutive lanes decode
+    // consecutive `blk`, whose super-blocks are `spr*210` bytes apart, so every byte load is a fully
+    // address-divergent 32-line L1 request. Cutting 32 byte loads to 2 b128 cuts the line requests
+    // with them.
     int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
     int nb = in_f >> 5;
     int spr = nb >> 3;             // Q6_K super-blocks (256 elems) per output row
@@ -3672,38 +3689,38 @@ extern "C" __global__ void linear_i8_q6k(
         long super = (long)o * spr + (blk >> 3);   // global super-block for (output row o, this 32-block)
         int w32 = blk & 7;         // which 32-block within the super
         const unsigned char* b = w + (long)super * 210;
-        const unsigned char* ql = b;
-        const unsigned char* qh = b + 128;
         const signed char* scales = (const signed char*)(b + 192);
         float d = rf16b(b + 208);
         float sx = xsr[blk];
+        // sub16 = w32*2 + hh -> within0 = 32*w32 + 16*hh, so half = within0>>7 = w32>>2 and
+        // region = (within0 & 127)>>5 = w32 & 3, both independent of hh; l0 = 16*hh. The 32-block's
+        // two 16-code halves therefore share region/half, so the 32 ql bytes and 32 qh bytes it
+        // needs are two CONTIGUOUS runs — hoisted out of the `hh` loop and fetched as 2x16 B each.
+        int half = w32 >> 2;
+        int region = w32 & 3;
+        unsigned int qlsh = (unsigned int)(region >> 1) * 4u;
+        unsigned int qhsh = (unsigned int)region * 2u;
+        unsigned int qlv[8], qhv[8];
+        __builtin_memcpy(qlv, b + half * 64 + (region & 1) * 32, 32);
+        __builtin_memcpy(qhv, b + 128 + half * 32, 32);
         // The 32-block spans two 16-element sub-blocks, each with its own int8 scale.
+        #pragma unroll
         for (int hh = 0; hh < 2; hh++) {
-            int sub16 = w32 * 2 + hh;      // 0..15
-            int sc = (int)scales[sub16];
-            int within0 = sub16 * 16;      // first element (0..255)
-            int half = within0 >> 7;       // 0..1 (which 128-half)
-            int o127 = within0 & 127;
-            int region = o127 >> 5;        // 0..3
-            int l0 = o127 & 31;            // 0 or 16 within the region
-            int qlo = half * 64;
-            int qho = half * 32;
-            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int sc = (int)scales[w32 * 2 + hh];
+            int4 xv = *(const int4*)(qxr + blk * 32 + hh * 16);
+            int xa[4] = { xv.x, xv.y, xv.z, xv.w };
             int idot = 0, isum = 0;
+            #pragma unroll
             for (int k = 0; k < 4; k++) {  // 4 groups of 4 = 16
-                int code[4];
-                for (int r = 0; r < 4; r++) {
-                    int l = l0 + k * 4 + r;
-                    int c;
-                    if (region == 0)      c = (ql[qlo + l] & 0x0F)       | ((qh[qho + l] & 3) << 4);
-                    else if (region == 1) c = (ql[qlo + 32 + l] & 0x0F)  | (((qh[qho + l] >> 2) & 3) << 4);
-                    else if (region == 2) c = (ql[qlo + l] >> 4)         | (((qh[qho + l] >> 4) & 3) << 4);
-                    else                  c = (ql[qlo + 32 + l] >> 4)    | (((qh[qho + l] >> 6) & 3) << 4);
-                    code[r] = c;
-                }
-                int wpack = code[0] | (code[1] << 8) | (code[2] << 16) | (code[3] << 24);
-                idot = idot4(xp[k], wpack, idot);
-                isum = idot4(xp[k], 0x01010101, isum);
+                // Byte j of the dword form is byte j of the scalar form: `>> qlsh & 0x0F0F0F0F`
+                // keeps bits [8j+qlsh, 8j+qlsh+3] (the selected nibble of byte j) and
+                // `>> qhsh & 0x03030303` keeps bits [8j+qhsh, 8j+qhsh+1] — neither mask lets a
+                // neighbouring byte bleed in, and the `<< 4` of a 0..3 value cannot carry out.
+                unsigned int lw = qlv[hh * 4 + k], hw = qhv[hh * 4 + k];
+                unsigned int wpack = ((lw >> qlsh) & 0x0F0F0F0Fu)
+                                   | (((hw >> qhsh) & 0x03030303u) << 4);
+                idot = idot4(xa[k], (int)wpack, idot);
+                isum = idot4(xa[k], 0x01010101, isum);
             }
             acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-32 * sc)) * sx * (float)isum;
         }
@@ -4773,6 +4790,27 @@ static __device__ __forceinline__ i4v pack16(const signed char* p) {
     return v;
 }
 
+// Decode one Q6_K K-tile (16 codes, 0..63) straight into a packed K-fragment. `ql`/`qh` point at the
+// 16-byte contiguous low-nibble and high-bit runs this tile needs; `qlsh`/`qhsh` are the region's
+// nibble/bit shifts (see GEN_WMMA_Q6K). Byte j of each dword is byte j of the scalar form:
+// `>> qlsh & 0x0F0F0F0F` keeps bits [8j+qlsh, 8j+qlsh+3] and `>> qhsh & 0x03030303` keeps bits
+// [8j+qhsh, 8j+qhsh+1] — neither mask lets a neighbouring byte bleed in, and the `<< 4` of a 0..3
+// value cannot carry out, so this is byte-identical to the per-code reassembly it replaces.
+// The 210-byte super-block is only 2-byte aligned so a `uint4` cast is illegal; `__builtin_memcpy`
+// states the align-1 contract and still lowers to `global_load_b128` on gfx11.
+static __device__ __forceinline__ i4v q6k_tile16(const unsigned char* ql, const unsigned char* qh,
+                                                 unsigned int qlsh, unsigned int qhsh) {
+    unsigned int lv[4], hv[4];
+    __builtin_memcpy(lv, ql, 16);
+    __builtin_memcpy(hv, qh, 16);
+    i4v v;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        v[k] = (int)(((lv[k] >> qlsh) & 0x0F0F0F0Fu) | (((hv[k] >> qhsh) & 0x03030303u) << 4));
+    }
+    return v;
+}
+
 // Load the A K-fragment (16 int8 of activation row `row_in` at absolute element offset `koff`),
 // or zero if this lane's input row is past the m-edge. `koff` already includes `row_in*in_f`.
 static __device__ __forceinline__ i4v load_a(const signed char* qx, int row_in, int m, long koff) {
@@ -4948,6 +4986,19 @@ extern "C" __global__ void NAME( \
 }
 
 // ── Q6_K: 256/super-block, 16 sub-blocks of 16 (= 1 K-tile each), int8 scale, code 0..63. ──
+//
+// P4: branchless + dword-wide, the dense-prefill twin of the P3 rewrite of `i8acc_q6k`. The value
+// stream is UNCHANGED. Two differences from the GEMV form, both from `sb` being the loop counter:
+//
+//  - `region`/`h128`/`l0` derive from `sb` alone, so unlike the GEMV they are WAVE-UNIFORM here and
+//    the `if (region)` chain was a scalar branch, not a divergent one. It is still recomputed per
+//    output-column tile for no reason, so it is hoisted out of the `c` loop and made arithmetic:
+//    (ql byte offset, ql nibble shift, qh bit shift) = (32*(region&1), 4*(region>>1), 2*region).
+//  - The real cost was 32 scalar `global_load_u8` per 16 codes (16 ql + 16 qh). Consecutive lanes
+//    hold consecutive `col`, whose super-blocks are `spr*210` bytes apart, so each of those was a
+//    fully address-divergent 16-line L1 request (lanes 0-15 and 16-31 share `col`). A K-tile needs
+//    one contiguous 16-byte ql run and one contiguous 16-byte qh run, so this is 2 `global_load_b128`
+//    — see `q6k_tile16`. Per column tile the VMEM goes 34 -> 4 (the `d`/scale loads remain).
 #define GEN_WMMA_Q6K(NAME, RM, CN) \
 extern "C" __global__ void NAME( \
     const signed char* __restrict__ qx, const float* __restrict__ xs, \
@@ -4962,42 +5013,32 @@ extern "C" __global__ void NAME( \
     int n16 = in_f >> 4; \
     float acc[RM][CN][8]; \
     for (int r = 0; r < (RM); r++) for (int c = 0; c < (CN); c++) for (int e = 0; e < 8; e++) acc[r][c][e] = 0.0f; \
-    signed char wc[CN][16]; \
+    i4v wc[CN]; \
     float wsc[CN], wmn[CN]; \
     const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101}; \
     for (int sb = 0; sb < n16; sb++) { \
         int blk32 = sb >> 1; \
+        int w32 = blk32 & 7; \
+        int sub16 = w32 * 2 + (sb & 1); \
+        /* within0 = sub16*16 = 32*w32 + 16*(sb&1), so h128 = within0>>7 = w32>>2, */ \
+        /* region = (within0 & 127)>>5 = w32 & 3, and l0 = within0 & 31 = 16*(sb&1). */ \
+        int h128 = w32 >> 2; \
+        int region = w32 & 3; \
+        int l0 = (sb & 1) * 16; \
+        unsigned int qlsh = (unsigned int)(region >> 1) * 4u; \
+        unsigned int qhsh = (unsigned int)region * 2u; \
+        int qlo = h128 * 64 + (region & 1) * 32 + l0; \
+        int qho = 128 + h128 * 32 + l0; \
         for (int c = 0; c < (CN); c++) { \
             int col = col_base + c * 16 + (lane & 15); \
             if (col < out_f) { \
-                long super = (long)col * spr + (blk32 >> 3); \
-                int w32 = blk32 & 7; \
-                int hh = sb & 1; \
-                int sub16 = w32 * 2 + hh; \
-                const unsigned char* b = w + super * 210; \
-                const unsigned char* ql = b; \
-                const unsigned char* qh = b + 128; \
-                const signed char* scales = (const signed char*)(b + 192); \
+                const unsigned char* b = w + ((long)col * spr + (blk32 >> 3)) * 210; \
                 float d = rf16b(b + 208); \
-                int sc = (int)scales[sub16]; \
+                int sc = (int)((const signed char*)(b + 192))[sub16]; \
                 wsc[c] = d * (float)sc; \
                 wmn[c] = d * (float)(-32 * sc); \
-                int within0 = sub16 * 16; \
-                int h128 = within0 >> 7; \
-                int o127 = within0 & 127; \
-                int region = o127 >> 5; \
-                int l0 = o127 & 31; \
-                int qlo = h128 * 64, qho = h128 * 32; \
-                for (int rr = 0; rr < 16; rr++) { \
-                    int l = l0 + rr; \
-                    int cc; \
-                    if (region == 0)      cc = (ql[qlo + l] & 0x0F)      | ((qh[qho + l] & 3) << 4); \
-                    else if (region == 1) cc = (ql[qlo + 32 + l] & 0x0F) | (((qh[qho + l] >> 2) & 3) << 4); \
-                    else if (region == 2) cc = (ql[qlo + l] >> 4)        | (((qh[qho + l] >> 4) & 3) << 4); \
-                    else                  cc = (ql[qlo + 32 + l] >> 4)   | (((qh[qho + l] >> 6) & 3) << 4); \
-                    wc[c][rr] = (signed char)cc; \
-                } \
-            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; for (int rr = 0; rr < 16; rr++) wc[c][rr] = 0; } \
+                wc[c] = q6k_tile16(b + qlo, b + qho, qlsh, qhsh); \
+            } else { wsc[c] = 0.0f; wmn[c] = 0.0f; wc[c] = (i4v){0, 0, 0, 0}; } \
         } \
         for (int r = 0; r < (RM); r++) { \
             int row_in = row_base + r * 16 + (lane & 15); \
@@ -5005,7 +5046,7 @@ extern "C" __global__ void NAME( \
             i4v a = load_a(qx, row_in, m, koff); \
             i8v sumacc = wmma_dot(a, ones, (i8v){0,0,0,0,0,0,0,0}); \
             for (int c = 0; c < (CN); c++) { \
-                i8v dotacc = wmma_dot(a, pack16(wc[c]), (i8v){0,0,0,0,0,0,0,0}); \
+                i8v dotacc = wmma_dot(a, wc[c], (i8v){0,0,0,0,0,0,0,0}); \
                 for (int e = 0; e < 8; e++) { \
                     int re = row_base + r * 16 + 2 * e + half; \
                     float axs = (re < m) ? xs[(long)re * nblk + blk32] : 0.0f; \
