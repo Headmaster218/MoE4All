@@ -1102,21 +1102,44 @@ multi-GPU stack across `tp.rs`/`ep.rs`/`pipeline.rs`/`p2p.rs`/`tp_sem.rs`/
 
 ## 9. Perf endgame — ≥1.0× per model × quant
 
-**Measured baseline (RX 7900 XTX / gfx1100, Q4_K_M, r=3, resident; `infr` t/s ÷
+**Measured baseline (RX 7900 XTX / gfx1100, Q4_K_M, resident; `infr` t/s ÷
 `llama.cpp` HIP t/s — `llama-bench -sm none -mg 0 -fa 1`).** This is the target
-to beat, captured after the current campaign:
+to beat.
 
-| model                   | pp512 (infr / llama = ratio) | tg128 (ratio)           |
-| ----------------------- | ---------------------------- | ----------------------- |
-| Qwen3-0.6B              | 3975 / 22822 = **0.17×**     | 72 / 383 = **0.19×**    |
-| gemma-3-1b              | 4755 / 18855 = **0.25×**     | 69 / 275 = **0.25×**    |
-| Qwen3.5-0.8B (DeltaNet) | 1198 / 17909 = **0.067×**    | 12.6 / 305 = **0.041×** |
-| Llama-3.2-1B            | 3674 / 17643 = **0.21×**     | 51 / 450 = **0.11×**    |
-| Qwen3-30B-A3B (MoE)     | 104 / 2878 = **0.036×**      | 33 / 141 = **0.23×**    |
+**Current, re-measured at `0cd7432` (P3):**
 
-Started far worse: DeltaNet prefill was 0.0007× (1350× gap) and gemma-3 0.04×
-before the model-specific catastrophes were fixed; decode climbed ~60× over the
-naive baseline. The remaining broad gap is the GEMM/GEMV kernel engineering.
+| model               | pp512 (infr / llama = ratio) | tg128 (ratio)          |
+| ------------------- | ---------------------------- | ---------------------- |
+| Qwen3-0.6B          | 12218 / 20150 = **0.61×**    | 147 / 384 = **0.38×**  |
+| Qwen3-30B-A3B (MoE) | 773 / 2905 = **0.27×**       | 54.5 / 141 = **0.39×** |
+
+The oracle is the LOCAL HIP build at
+`~/Projects/mxaddict/llama.cpp/build-hip/bin/llama-bench`, not the system
+`/usr/bin/llama-bench` — the packaged one is broken on this box
+(`undefined symbol: ggml_dsv4_hc_post`, a mismatched `libllama`/`libggml`).
+llama's own pp512 on the dense model carries ±27% run-to-run spread, so treat
+that column's third digit as noise.
+
+**Where it was before this campaign** (the numbers this table used to carry, and
+the reason the ratios above are not comparable to any older commit message):
+
+| model                   | pp512 (old)           | tg128 (old)         |
+| ----------------------- | --------------------- | ------------------- |
+| Qwen3-0.6B              | 3975 / 22822 = 0.17×  | 72 / 383 = 0.19×    |
+| gemma-3-1b              | 4755 / 18855 = 0.25×  | 69 / 275 = 0.25×    |
+| Qwen3.5-0.8B (DeltaNet) | 1198 / 17909 = 0.067× | 12.6 / 305 = 0.041× |
+| Llama-3.2-1B            | 3674 / 17643 = 0.21×  | 51 / 450 = 0.11×    |
+| Qwen3-30B-A3B (MoE)     | 104 / 2878 = 0.036×   | 33 / 141 = 0.23×    |
+
+So dense prefill went 0.17× → 0.61× and MoE prefill 0.036× → 0.27× (a 7.4×
+improvement on the worst row). gemma-3, DeltaNet and Llama-3.2 have NOT been
+re-measured since; their rows are stale and should not be quoted.
+
+Started far worse still: DeltaNet prefill was 0.0007× (1350× gap) and gemma-3
+0.04× before the model-specific catastrophes were fixed; decode climbed ~60×
+over the naive baseline. **The remaining gap is now decode-led** — both models
+sit at ~0.38-0.39× tg128 while prefill has pulled ahead — plus MoE prefill,
+which is still the single worst row.
 
 ### F4 — 128-bit weight loads + multi-row in the int8 decode GEMV (landed)
 
