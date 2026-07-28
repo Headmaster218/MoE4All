@@ -1102,17 +1102,6 @@ fn prefer_attention_flash(
         && (head_dim <= 128 || flash2_ok)
 }
 
-fn prefer_attention_flash128(
-    f16: bool,
-    rows: usize,
-    n_head: usize,
-    kv_len: usize,
-    head_dim: usize,
-    pipeline_ok: bool,
-) -> bool {
-    f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && pipeline_ok
-}
-
 fn select_attention_flash2_kern(
     f16: bool,
     rows: usize,
@@ -1122,7 +1111,7 @@ fn select_attention_flash2_kern(
     standard: Option<&'static str>,
     c128_ok: bool,
 ) -> Option<&'static str> {
-    if prefer_attention_flash128(f16, rows, n_head, kv_len, head_dim, c128_ok) {
+    if f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && c128_ok {
         Some("attnflash2_c128_f16kv_hd128")
     } else {
         standard

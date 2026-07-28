@@ -495,7 +495,7 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // online softmax — rows split across simdgroups, 2 scores (one float2) per lane
+        // online softmax — rows split across simdgroups, C / 32 scores (float2s) per lane
         for (uint jj = 0; jj < NQ; jj++) {
             uint j = jj * NSG + sgitg;
             uint absr = abs0 + j;   // rows past p.rows compute junk, never stored
