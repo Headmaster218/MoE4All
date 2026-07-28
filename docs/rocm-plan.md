@@ -76,9 +76,13 @@ would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
 3. **`Attention` — 21.8% of Q4_K_M `pp512`.** P1's own remainder: the flash
    kernel is ~5× off its LDS-throughput bound and ~8× off the arithmetic floor.
    WMMA for it is the lever.
-4. **MoE prefill** needs the async/double-buffered LDS pipeline — structural,
-   not another unpack fix. P2 established the expert GEMV is latency-bound at
-   ~6% of peak bandwidth and ~5% of peak VALU, so traffic work is spent.
+4. **MoE prefill** — P7e probed software-pipelined Q4_K gate/up (PF=4 block
+   prefetch): **-14.7% regression**. Register pressure from staging 4 blocks'
+   weights into registers outweighs the memory-level-parallelism gain. With 3.1M
+   waves per dispatch, the GPU's hardware scheduler already hides latency (same
+   pattern as P6's tape finding). Next: multi-column-per-wave to reduce wave
+   count and increase work per wave — the idm kernel's 768 cols × 4096 slots =
+   3.1M waves is the real bottleneck, not per-wave pipeline depth.
 5. **~~`Argmax`~~** — P7c: multi-block two-pass reduction, 117.6→13.6 µs (8.6×),
    decode +2.1%. Self-contained; tie-breaking preserved (parity test + seam
    gate).
@@ -429,6 +433,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P7    | —         | one-pass online-softmax + one-key-per-lane split-KV — **1.16× d0, 1.48× @d4096**     |
 | P7b   | —         | vectorised `copy_strided` (float4 per row) — **Q6_K pp512 1.51×**                    |
 | P7c   | —         | multi-block two-pass argmax — **8.6×** per disch, decode +2.1%                       |
+| P7e   | —         | MoE PF4 block-prefetch gate/up — **-14.7%**, register pressure                       |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
@@ -456,6 +461,11 @@ has the full reasoning. The code is the authority on mechanism.
   dispatches). Delivered **-1.6% regression**: the dispatch savings (~73 µs)
   were offset by register pressure from doing both Q and K in one wave.
   Per-dispatch cost is real GPU work (Slice 31, P6), not launch overhead.
+- **P7e** — predicted PF=4 block prefetch would hide MoE GEMV memory latency.
+  Delivered **-14.7% regression**: staging 4 super-blocks' weights into
+  registers (32 uint4 per lane) caused register spilling to scratch. With 3.1M
+  waves per dispatch, the hardware scheduler already hides latency — the
+  bottleneck is wave count, not per-wave pipeline depth.
 
 **Correctness lessons worth keeping:**
 
