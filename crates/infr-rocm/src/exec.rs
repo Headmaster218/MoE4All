@@ -3152,6 +3152,24 @@ fn run_op(
                 // until WMMA intrinsics land; gated behind `attn_flash_wmma` (default off)
                 // so the P1 scalar flash still handles all default prefill traffic.
                 let n_qtiles = (rows as usize).div_ceil(64);
+
+                // Convert Q from f32 to f16 for the WMMA kernel.
+                let q_elems = rows as usize * n_head as usize * head_dim as usize;
+                let q_f16 = ctx.pool_buf(q_elems * 2, false);
+                let bq_f16_ptr = q_f16.ptr;
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "convert_f32_to_f16",
+                    q_elems as u32,
+                    256,
+                    args![
+                        arg_ptr(bq_ptr),
+                        arg_ptr(bq_f16_ptr),
+                        arg_i32(q_elems as i32),
+                    ],
+                )?;
+
                 dispatch_blocks_smem(
                     pipelines,
                     ctx.stream,
@@ -3160,7 +3178,7 @@ fn run_op(
                     256,
                     0,
                     args![
-                        arg_ptr(bq_ptr),
+                        arg_ptr(bq_f16_ptr),
                         arg_ptr(bk_ptr),
                         arg_ptr(bv_ptr),
                         arg_ptr(dd_ptr),

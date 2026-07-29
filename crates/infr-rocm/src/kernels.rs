@@ -238,6 +238,7 @@ const HIP_PARTS: &[&str] = &[
     ATTENTION,
     ATTENTION_PF,
     ATTENTION_FLASH,
+    CONVERT_F32_TO_F16,
     ATTENTION_FLASH_WMMA,
     ATTENTION_SPLIT,
     ATTENTION_SPLIT_FLASH,
@@ -1956,6 +1957,21 @@ extern "C" __global__ void attention_prefill_flash(
 }
 "#;
 
+// ── f32→f16 Q conversion for WMMA prefill attention ──────────────────────────
+//
+// Converts the f32 Q tensor to f16 before the WMMA attention kernel
+// reads it. One element per thread, direct __float2half cast.
+const CONVERT_F32_TO_F16: &str = r#"
+extern "C" __global__ void convert_f32_to_f16(
+    const float* __restrict__ src,
+    __half* __restrict__ dst,
+    int n  // total element count = rows * n_head * head_dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+"#;
+
 // ── WMMA f16 flash prefill attention ──────────────────────────────────────────
 //
 // A 256-thread (8-wave) prefill attention kernel built for the f16 WMMA pipeline.
@@ -1999,7 +2015,7 @@ static __device__ __forceinline__ float attn_wmma_allsum32(float v) {
 }
 
 extern "C" __global__ void attention_prefill_flash_wmma(
-    const float* __restrict__ q,       // [rows, n_head, head_dim] f32
+    const __half* __restrict__ q,      // [rows, n_head, head_dim] f16 (pre-converted)
     const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] f16
     const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim] f16
     float* __restrict__ dst,            // [rows, n_head, head_dim]
@@ -2081,12 +2097,12 @@ extern "C" __global__ void attention_prefill_flash_wmma(
             for (int u = 0; u < ATTN_WMMA_QPR; u++) {
                 int qr = q_base + u;
                 if (qr >= rows) continue;
-                const float* qr_ptr = q + ((long)qr * n_head + h) * head_dim;
+                const __half* qr_ptr = q + ((long)qr * n_head + h) * head_dim;
                 float dot = 0.0f;
                 // TODO: replace with WMMA intrinsics — load 16 f16 elements from
                 // qr_ptr and kr as half16 fragments, then WMMA into float8.
                 for (int d = 0; d < head_dim; d++) {
-                    dot += qr_ptr[d] * __half2float(kr[d]);
+                    dot += __half2float(qr_ptr[d]) * __half2float(kr[d]);
                 }
                 s[u] = dot;
             }

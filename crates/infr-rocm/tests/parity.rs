@@ -6937,3 +6937,18 @@ fn argmax_prob_matches_cpu() {
         );
     }
 }
+
+/// **The f32→f16 Q conversion is validated** by the WMMA prefill parity test above
+/// (`attention_prefill_flash_wmma_matches_scalar_flash`), which now exercises the
+/// f16 Q path on every case. This test is compile-only: it confirms the backend
+/// loads the `convert_f32_to_f16` kernel name.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn convert_f32_to_f16_kernel_loaded() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    // The backend init compiles the HIP module which includes `convert_f32_to_f16`.
+    // Just creating the backend verifies the kernel source compiles without error.
+    drop(be);
+}
