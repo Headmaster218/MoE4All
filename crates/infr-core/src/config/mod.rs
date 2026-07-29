@@ -500,6 +500,11 @@ cfg_struct! {
         /// scalar-ALU placeholder; real WMMA intrinsics TBD). Default OFF — the P1 scalar flash
         /// kernel handles all prefill traffic.
         attn_flash_wmma: bool = false,
+        /// `INFR_ROCM_A_GLOBAL`: OPT-IN f16 A_GLOBAL WMMA prefill GEMM (Slice S2). When set
+        /// AND weight format is Q4_K, the prefill path reads f16 activations from global memory
+        /// (no int8 quant/dequant) and uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
+        /// instead of the int8 WMMA intrinsic. Default OFF — gated for A/B measurement.
+        a_global: bool = false,
     }
 }
 

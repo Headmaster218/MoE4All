@@ -2375,17 +2375,7 @@ fn run_op(
                         ctx.dev[dst.0 as usize] = Some(dd);
                     }
                     None => {
-                        // Int8-activation dp4a path: quantize the `m×in_f` activation to int8 ONCE
-                        // (`quant_i8_32`, per-32-block scale), then integer-dot against the decoded
-                        // weight codes (scale-after). `bpb == bpb_i8` (same layout). The int8 codes /
-                        // scales are drawn from the scratch pool (fully written before any read → `out`,
-                        // un-cleared) and stay live until end-of-forward, so the async GEMM/GEMV that
-                        // reads them never races a pool reuse.
-                        let nb = inu / 32; // in_f is 32-aligned for every covered format
-
-                        // F1b: resolve the exact (row, norm) this projection would quantize BEFORE
-                        // drawing scratch, so a sibling GEMV over the same pair can bind the memo
-                        // instead of re-running a pass that writes provably the same bytes.
+                        // ── Resolve the activation device pointer (shared by both paths) ──
                         let (q_src, q_norm, q_eps) = match norm_fuse {
                             Some((x_raw, norm_w, eps)) => {
                                 let wnptr = ctx.dequant_weight_or_cache(norm_w, g, bindings)?;
@@ -2394,196 +2384,271 @@ fn run_op(
                             }
                             None => ((x, bx_ptr), None, 0.0),
                         };
-                        let qkey = QuantKey {
-                            src: q_src,
-                            norm: q_norm,
-                            eps_bits: q_eps.to_bits(),
-                            m,
-                            in_f,
-                        };
-                        let hit = qmemo_prev.filter(|p| p.key == qkey);
-                        let (qx_ptr, xs_ptr) = match hit {
-                            // Sibling projection off the same activation row: the previous GEMV's
-                            // codes/scales ARE this one's, bit for bit. Skip the pass.
-                            Some(p) => (p.qx, p.xs),
-                            None => {
-                                let qx = ctx.pool_buf((mu * inu).max(1), false);
-                                let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
-                                if norm_fuse.is_some() {
-                                    // Slice-32 RmsNorm→Linear: one block per row reduces the
-                                    // sum-of-squares over the RAW row, then int8-quantizes the
-                                    // normalized row in registers (bit-identical to `rmsnorm` then
-                                    // `quant_i8_32`), killing the `rmsnorm` launch + the
-                                    // normalized-activation DRAM round-trip.
-                                    dispatch_grid(
-                                        pipelines,
-                                        ctx.stream,
-                                        "rmsnorm_quant_i8_32",
-                                        m,
-                                        1,
-                                        256,
-                                        args![
-                                            arg_ptr(q_src.1),
-                                            arg_ptr(q_norm.unwrap().1),
-                                            arg_ptr(qx.ptr),
-                                            arg_ptr(xs.ptr),
-                                            // No normalized-row output: a dense GEMV consumes the
-                                            // int8 codes only (the F1c `xn` arm is the MoE router's).
-                                            arg_ptr(std::ptr::null_mut()),
-                                            arg_i32(m as i32),
-                                            arg_i32(in_f as i32),
-                                            arg_f32(q_eps),
-                                        ],
-                                    )?;
-                                } else {
-                                    dispatch_1d(
-                                        pipelines,
-                                        ctx.stream,
-                                        "quant_i8_32",
-                                        (mu * nb) as u32,
-                                        256,
-                                        args![
-                                            arg_ptr(q_src.1),
-                                            arg_ptr(qx.ptr),
-                                            arg_ptr(xs.ptr),
-                                            arg_i32(m as i32),
-                                            arg_i32(in_f as i32),
-                                        ],
-                                    )?;
+                        // ── f16 A_GLOBAL WMMA prefill (Slice S2) ──────────────────────
+                        // OPT-IN behind `INFR_ROCM_A_GLOBAL=1`. Skip int8 quant entirely —
+                        // convert f32 activations to f16 and multiply directly with
+                        // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`. Q4_K only.
+                        if m > 1 && wdt == DType::Q4K && ctx.rocm.a_global && !ctx.rocm.no_wmma {
+                            // Convert f32 activations → f16 (one element per thread).
+                            let a_elems = mu * inu;
+                            let a_f16 = ctx.pool_buf(a_elems * 2, false);
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "convert_f32_to_f16",
+                                a_elems as u32,
+                                256,
+                                args![
+                                    arg_ptr(q_src.1),
+                                    arg_ptr(a_f16.ptr),
+                                    arg_i32(a_elems as i32),
+                                ],
+                            )?;
+                            // Allocate output (same as the int8 path's fully-overwritten dst).
+                            let dd = match add_fuse {
+                                Some((_, add_dst)) => {
+                                    ctx.ensure_device(add_dst, g, bindings)?;
+                                    let b = ctx.dev[add_dst.0 as usize].as_ref().unwrap();
+                                    crate::RocmBuffer {
+                                        ptr: b.ptr,
+                                        len: b.len,
+                                        owned: false,
+                                        host_ptr: std::ptr::null_mut(),
+                                        uid: b.uid,
+                                    }
                                 }
-                                (qx.ptr, xs.ptr)
+                                None => ctx.uninit_dev(mu * ou),
+                            };
+                            // Grid = (ceil(out_f/32), ceil(m/32)), one wave32 per 32×32 tile.
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                "wmma_f16_q4k_2x2",
+                                out_f.div_ceil(32),
+                                m.div_ceil(32),
+                                32,
+                                args![
+                                    arg_ptr(a_f16.ptr),
+                                    arg_ptr(wptr_off),
+                                    arg_ptr(dd.ptr),
+                                    arg_i32(m as i32),
+                                    arg_i32(in_f as i32),
+                                    arg_i32(out_f as i32),
+                                ],
+                            )?;
+                            let dd_ptr = dd.ptr;
+                            if add_fuse.is_none() {
+                                ctx.dev[dst.0 as usize] = Some(dd);
                             }
-                        };
-                        // Slice-32 Linear→Add: when the following residual Add is fused in, the GEMV
-                        // writes (and adds) straight into the residual stream's live buffer — no
-                        // fresh zeroed dst, no standalone `add`. `resid_ptr` is null otherwise, so
-                        // the GEMV epilogue is bit-identical to the pre-fusion write.
-                        let resid_ptr = match add_fuse {
-                            Some((resid, _)) => ctx.ensure_device(resid, g, bindings)?,
-                            None => std::ptr::null_mut(),
-                        };
-                        let dd = match add_fuse {
-                            Some((_, add_dst)) => {
-                                ctx.ensure_device(add_dst, g, bindings)?;
-                                let b = ctx.dev[add_dst.0 as usize].as_ref().unwrap();
-                                crate::RocmBuffer {
-                                    ptr: b.ptr,
-                                    len: b.len,
-                                    owned: false,
-                                    host_ptr: std::ptr::null_mut(),
-                                    uid: b.uid,
-                                }
+                            // No qmemo: the f16 path has no int8 codes to reuse.
+                            // But we MUST clear any stale memo so a later GEMV over the same
+                            // row does not pick up int8 codes that were never written this pass.
+                            if dd_ptr != q_src.1 {
+                                ctx.qmemo = None;
                             }
-                            // F5 fully-overwritten: all three arms below tile `dst[m, out_f]`
-                            // exactly — the mrow GEMV writes every `ov[r] < out_f` once (grid
-                            // `ceil(out_f/I8_MROW) × m`, the `ov[r] != o0` guard suppressing the
-                            // clamped duplicate), and the WMMA / coop kernels store every
-                            // `(re < m, col < out_f)` of their tile.
-                            None => ctx.uninit_dev(mu * ou),
-                        };
-                        // Slice-28: Q4_K prefill (m>1) can OPT IN (`INFR_ROCM_COOP=1`) to the
-                        // cooperative decode-once GEMM (multi-warp threadblock, LDS-shared weight
-                        // tile). It is bit-faithful to `wmma_i8_q4k_2x1` (goldens hold) but measured
-                        // a regression on gfx1100 (see `q4k_coop_kernel`), so the DEFAULT stays the
-                        // Slice-27 pipe. When not opted in, this falls through to the pipe / GEMV.
-                        let coop = (m > 1 && wdt == DType::Q4K && !ctx.rocm.no_wmma && ctx.rocm.i8)
-                            .then(|| q4k_coop_kernel(ctx.rocm))
-                            .flatten();
-                        match coop {
-                            Some((coop_kernel, bm, bn, threads)) => {
-                                // Grid = (ceil(out_f/BN), ceil(m/BM)); one multi-warp threadblock per
-                                // BM×BN output tile decodes its BN-column weight tile into LDS once and
-                                // reuses it across all BM rows. m/out_f edges are masked in-kernel.
-                                dispatch_grid(
-                                    pipelines,
-                                    ctx.stream,
-                                    coop_kernel,
-                                    out_f.div_ceil(bn),
-                                    m.div_ceil(bm),
-                                    threads,
-                                    args![
-                                        arg_ptr(qx_ptr),
-                                        arg_ptr(xs_ptr),
-                                        arg_ptr(wptr_off),
-                                        arg_ptr(dd.ptr),
-                                        arg_i32(m as i32),
-                                        arg_i32(in_f as i32),
-                                        arg_i32(out_f as i32),
-                                    ],
-                                )?;
-                            }
-                            None => match (m > 1)
-                                .then(|| native_wmma_fmt(wdt, out_f, ctx.rocm))
-                                .flatten()
-                            {
-                                Some((wmma_kernel, rm, cn)) => {
-                                    // Prefill (m>1), BLAS disabled: matrix-core int8 GEMM. Grid =
-                                    // (ceil(out_f/(16*CN)), ceil(m/(16*RM))), one wave32 block per
-                                    // 16*RM × 16*CN output tile — reuses each A fragment across the CN
-                                    // weight-column tiles and each decoded weight tile across the RM row
-                                    // tiles. Bit-identical f32 accumulation to the Slice-15 kernel.
-                                    dispatch_grid(
-                                        pipelines,
-                                        ctx.stream,
-                                        wmma_kernel,
-                                        out_f.div_ceil(16 * cn),
-                                        m.div_ceil(16 * rm),
-                                        32,
-                                        args![
-                                            arg_ptr(qx_ptr),
-                                            arg_ptr(xs_ptr),
-                                            arg_ptr(wptr_off),
-                                            arg_ptr(dd.ptr),
-                                            arg_i32(m as i32),
-                                            arg_i32(in_f as i32),
-                                            arg_i32(out_f as i32),
-                                        ],
-                                    )?;
-                                }
+                        } else {
+                            // Int8-activation dp4a path: quantize the `m×in_f` activation to int8 ONCE
+                            // (`quant_i8_32`, per-32-block scale), then integer-dot against the decoded
+                            // weight codes (scale-after). `bpb == bpb_i8` (same layout). The int8 codes /
+                            // scales are drawn from the scratch pool (fully written before any read → `out`,
+                            // un-cleared) and stay live until end-of-forward, so the async GEMM/GEMV that
+                            // reads them never races a pool reuse.
+                            let nb = inu / 32; // in_f is 32-aligned for every covered format
+
+                            // F1b: (q_src, q_norm, q_eps) resolved above — shared by both the f16
+                            // and int8 paths so the quant memo key is consistent.
+                            let qkey = QuantKey {
+                                src: q_src,
+                                norm: q_norm,
+                                eps_bits: q_eps.to_bits(),
+                                m,
+                                in_f,
+                            };
+                            let hit = qmemo_prev.filter(|p| p.key == qkey);
+                            let (qx_ptr, xs_ptr) = match hit {
+                                // Sibling projection off the same activation row: the previous GEMV's
+                                // codes/scales ARE this one's, bit for bit. Skip the pass.
+                                Some(p) => (p.qx, p.xs),
                                 None => {
-                                    // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid =
-                                    // (out_f / rows-per-wave, m): one wave32 block per (group of
-                                    // output rows, activation row). `resid_ptr` (null unless the
-                                    // Slice-32 residual Add is fused) folds the add into the
-                                    // epilogue.
+                                    let qx = ctx.pool_buf((mu * inu).max(1), false);
+                                    let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
+                                    if norm_fuse.is_some() {
+                                        // Slice-32 RmsNorm→Linear: one block per row reduces the
+                                        // sum-of-squares over the RAW row, then int8-quantizes the
+                                        // normalized row in registers (bit-identical to `rmsnorm` then
+                                        // `quant_i8_32`), killing the `rmsnorm` launch + the
+                                        // normalized-activation DRAM round-trip.
+                                        dispatch_grid(
+                                            pipelines,
+                                            ctx.stream,
+                                            "rmsnorm_quant_i8_32",
+                                            m,
+                                            1,
+                                            256,
+                                            args![
+                                                arg_ptr(q_src.1),
+                                                arg_ptr(q_norm.unwrap().1),
+                                                arg_ptr(qx.ptr),
+                                                arg_ptr(xs.ptr),
+                                                // No normalized-row output: a dense GEMV consumes the
+                                                // int8 codes only (the F1c `xn` arm is the MoE router's).
+                                                arg_ptr(std::ptr::null_mut()),
+                                                arg_i32(m as i32),
+                                                arg_i32(in_f as i32),
+                                                arg_f32(q_eps),
+                                            ],
+                                        )?;
+                                    } else {
+                                        dispatch_1d(
+                                            pipelines,
+                                            ctx.stream,
+                                            "quant_i8_32",
+                                            (mu * nb) as u32,
+                                            256,
+                                            args![
+                                                arg_ptr(q_src.1),
+                                                arg_ptr(qx.ptr),
+                                                arg_ptr(xs.ptr),
+                                                arg_i32(m as i32),
+                                                arg_i32(in_f as i32),
+                                            ],
+                                        )?;
+                                    }
+                                    (qx.ptr, xs.ptr)
+                                }
+                            };
+                            // Slice-32 Linear→Add: when the following residual Add is fused in, the GEMV
+                            // writes (and adds) straight into the residual stream's live buffer — no
+                            // fresh zeroed dst, no standalone `add`. `resid_ptr` is null otherwise, so
+                            // the GEMV epilogue is bit-identical to the pre-fusion write.
+                            let resid_ptr = match add_fuse {
+                                Some((resid, _)) => ctx.ensure_device(resid, g, bindings)?,
+                                None => std::ptr::null_mut(),
+                            };
+                            let dd = match add_fuse {
+                                Some((_, add_dst)) => {
+                                    ctx.ensure_device(add_dst, g, bindings)?;
+                                    let b = ctx.dev[add_dst.0 as usize].as_ref().unwrap();
+                                    crate::RocmBuffer {
+                                        ptr: b.ptr,
+                                        len: b.len,
+                                        owned: false,
+                                        host_ptr: std::ptr::null_mut(),
+                                        uid: b.uid,
+                                    }
+                                }
+                                // F5 fully-overwritten: all three arms below tile `dst[m, out_f]`
+                                // exactly — the mrow GEMV writes every `ov[r] < out_f` once (grid
+                                // `ceil(out_f/I8_MROW) × m`, the `ov[r] != o0` guard suppressing the
+                                // clamped duplicate), and the WMMA / coop kernels store every
+                                // `(re < m, col < out_f)` of their tile.
+                                None => ctx.uninit_dev(mu * ou),
+                            };
+                            // Slice-28: Q4_K prefill (m>1) can OPT IN (`INFR_ROCM_COOP=1`) to the
+                            // cooperative decode-once GEMM (multi-warp threadblock, LDS-shared weight
+                            // tile). It is bit-faithful to `wmma_i8_q4k_2x1` (goldens hold) but measured
+                            // a regression on gfx1100 (see `q4k_coop_kernel`), so the DEFAULT stays the
+                            // Slice-27 pipe. When not opted in, this falls through to the pipe / GEMV.
+                            let coop =
+                                (m > 1 && wdt == DType::Q4K && !ctx.rocm.no_wmma && ctx.rocm.i8)
+                                    .then(|| q4k_coop_kernel(ctx.rocm))
+                                    .flatten();
+                            match coop {
+                                Some((coop_kernel, bm, bn, threads)) => {
+                                    // Grid = (ceil(out_f/BN), ceil(m/BM)); one multi-warp threadblock per
+                                    // BM×BN output tile decodes its BN-column weight tile into LDS once and
+                                    // reuses it across all BM rows. m/out_f edges are masked in-kernel.
                                     dispatch_grid(
                                         pipelines,
                                         ctx.stream,
-                                        i8_kernel,
-                                        out_f.div_ceil(i8_gemv_mrow(i8_kernel)),
-                                        m,
-                                        32,
+                                        coop_kernel,
+                                        out_f.div_ceil(bn),
+                                        m.div_ceil(bm),
+                                        threads,
                                         args![
                                             arg_ptr(qx_ptr),
                                             arg_ptr(xs_ptr),
                                             arg_ptr(wptr_off),
                                             arg_ptr(dd.ptr),
-                                            arg_ptr(resid_ptr),
                                             arg_i32(m as i32),
                                             arg_i32(in_f as i32),
                                             arg_i32(out_f as i32),
                                         ],
                                     )?;
                                 }
-                            },
-                        }
-                        let dd_ptr = dd.ptr;
-                        // When the residual Add is fused, `dd` aliases the residual stream buffer
-                        // (already mapped in `ctx.dev` via `ensure_device(add_dst)`) and the result
-                        // is written in place — nothing to remap. Otherwise publish the fresh dst.
-                        if add_fuse.is_none() {
-                            ctx.dev[dst.0 as usize] = Some(dd);
-                        }
-                        // F1b: publish the memo for the next op — UNLESS this GEMV just wrote the
-                        // very row it quantized (the fused-residual epilogue writes into the
-                        // residual stream, which is also the input norm's `x`). In that case the
-                        // codes no longer describe the row and the memo must not survive.
-                        if dd_ptr != q_src.1 {
-                            ctx.qmemo = Some(QuantMemo {
-                                key: qkey,
-                                qx: qx_ptr,
-                                xs: xs_ptr,
-                            });
+                                None => match (m > 1)
+                                    .then(|| native_wmma_fmt(wdt, out_f, ctx.rocm))
+                                    .flatten()
+                                {
+                                    Some((wmma_kernel, rm, cn)) => {
+                                        // Prefill (m>1), BLAS disabled: matrix-core int8 GEMM. Grid =
+                                        // (ceil(out_f/(16*CN)), ceil(m/(16*RM))), one wave32 block per
+                                        // 16*RM × 16*CN output tile — reuses each A fragment across the CN
+                                        // weight-column tiles and each decoded weight tile across the RM row
+                                        // tiles. Bit-identical f32 accumulation to the Slice-15 kernel.
+                                        dispatch_grid(
+                                            pipelines,
+                                            ctx.stream,
+                                            wmma_kernel,
+                                            out_f.div_ceil(16 * cn),
+                                            m.div_ceil(16 * rm),
+                                            32,
+                                            args![
+                                                arg_ptr(qx_ptr),
+                                                arg_ptr(xs_ptr),
+                                                arg_ptr(wptr_off),
+                                                arg_ptr(dd.ptr),
+                                                arg_i32(m as i32),
+                                                arg_i32(in_f as i32),
+                                                arg_i32(out_f as i32),
+                                            ],
+                                        )?;
+                                    }
+                                    None => {
+                                        // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid =
+                                        // (out_f / rows-per-wave, m): one wave32 block per (group of
+                                        // output rows, activation row). `resid_ptr` (null unless the
+                                        // Slice-32 residual Add is fused) folds the add into the
+                                        // epilogue.
+                                        dispatch_grid(
+                                            pipelines,
+                                            ctx.stream,
+                                            i8_kernel,
+                                            out_f.div_ceil(i8_gemv_mrow(i8_kernel)),
+                                            m,
+                                            32,
+                                            args![
+                                                arg_ptr(qx_ptr),
+                                                arg_ptr(xs_ptr),
+                                                arg_ptr(wptr_off),
+                                                arg_ptr(dd.ptr),
+                                                arg_ptr(resid_ptr),
+                                                arg_i32(m as i32),
+                                                arg_i32(in_f as i32),
+                                                arg_i32(out_f as i32),
+                                            ],
+                                        )?;
+                                    }
+                                },
+                            }
+                            let dd_ptr = dd.ptr;
+                            // When the residual Add is fused, `dd` aliases the residual stream buffer
+                            // (already mapped in `ctx.dev` via `ensure_device(add_dst)`) and the result
+                            // is written in place — nothing to remap. Otherwise publish the fresh dst.
+                            if add_fuse.is_none() {
+                                ctx.dev[dst.0 as usize] = Some(dd);
+                            }
+                            // F1b: publish the memo for the next op — UNLESS this GEMV just wrote the
+                            // very row it quantized (the fused-residual epilogue writes into the
+                            // residual stream, which is also the input norm's `x`). In that case the
+                            // codes no longer describe the row and the memo must not survive.
+                            if dd_ptr != q_src.1 {
+                                ctx.qmemo = Some(QuantMemo {
+                                    key: qkey,
+                                    qx: qx_ptr,
+                                    xs: xs_ptr,
+                                });
+                            }
                         }
                     }
                 }

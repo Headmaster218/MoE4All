@@ -1317,6 +1317,24 @@ fn wmma_q6k_matches_cpu() {
     check_wmma_linear(q6k_blocks, DType::Q6K, 256, 3e-2, "Q6_K");
 }
 
+// ── f16 A_GLOBAL WMMA prefill parity (Slice S2) ────────────────────────────────
+//
+// OPT-IN behind `INFR_ROCM_A_GLOBAL=1`. The f16 WMMA path reads f16 activations
+// directly from global memory (no int8 quant) and decodes Q4_K weights to f16 for
+// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`. This eliminates the int8 quant/
+// dequant tax, so the f16 path should be MORE accurate than the int8 WMMA tier
+// (no activation quantization noise). The tolerance is the same 3e-2 as the int8
+// Q4_K WMMA test — the f16 path clears it with margin.
+
+/// f16 A_GLOBAL WMMA prefill GEMM vs CPU f32 reference, Q4_K.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_f16_q4k_a_global_matches_cpu() {
+    std::env::set_var("INFR_ROCM_A_GLOBAL", "1");
+    // a_global only fires for m>1 (prefill) + Q4_K.
+    check_wmma_linear(q4k_blocks, DType::Q4K, 256, 3e-2, "Q4_K f16 A_GLOBAL");
+}
+
 // ── EmbedGather (gather + dequant embedding rows, ×scale) vs CPU ─────────────
 
 /// Run a single-`Op::EmbedGather` graph on `be`: `dst[r, :] = dequant(table[ids[r], :]) * scale`.

@@ -256,6 +256,7 @@ const HIP_PARTS: &[&str] = &[
     RMSNORM_QUANT_I8,
     MOE_FFN_INT8,
     WMMA_PREFILL,
+    WMMA_F16_Q4K,
     MOE_ROUTING,
     MOE_ID_MULTI,
     MOE_ID_BUCKET,
@@ -7321,6 +7322,133 @@ GEN_WMMA_WDEC(wmma_i8_mxfp4_2x2, 2, 2, mxfp4)
 GEN_WMMA_WDEC(wmma_i8_nvfp4_1x1, 1, 1, nvfp4)
 GEN_WMMA_WDEC(wmma_i8_nvfp4_2x1, 2, 1, nvfp4)
 GEN_WMMA_WDEC(wmma_i8_nvfp4_2x2, 2, 2, nvfp4)
+"#;
+
+// ── f16 A_GLOBAL WMMA prefill GEMM for Q4_K (Slice S2) ────────────────────────
+//
+// OPT-IN behind `INFR_ROCM_A_GLOBAL=1`. Reads f16 activations directly from global
+// memory (no int8 quant) and decodes Q4_K weights to f16 for matrix multiply via
+// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`. This eliminates the int8 quant/
+// dequant tax — the largest single-multiplier advantage Vulkan has over ROCm.
+//
+// Tile geometry: single-wave (32 threads), RM×CN = 2×2 → 32×32 output per block.
+// BK=32: two WMMA K-steps of 16 per K-iteration, matching one Q4_K sub-block.
+// Accumulators live in AccVGPR (separate register file on gfx11), so this does
+// NOT increase architectural VGPR pressure.
+//
+// Caller must pre-convert f32 activations to f16 via `convert_f32_to_f16` before
+// dispatch. Weights are read raw from the GGUF Q4_K quant buffer — no f16 cache.
+//
+// The f32 accumulation order matches the per-element sum of the int8 WMMA path
+// (where `axs * (wsc·dot + wmn·sum)` = `Σ (axs·d·sc·code + axs·dmin·(-mm))`),
+// so the min-term is baked into the decoded f16 weight values as a simple
+// `wsc·code + wmn` and the WMMA f16×f16 multiply-accumulate reproduces it.
+const WMMA_F16_Q4K: &str = r#"
+typedef __fp16   half16 __attribute__((ext_vector_type(16)));
+typedef float    float8 __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void wmma_f16_q4k_2x2(
+    const __half* __restrict__ A,     // f16 activations [m, in_f] (row-major, pre-converted)
+    const unsigned char* __restrict__ w, // Q4_K weights [out_f, in_f/256, 144]
+    float* __restrict__ dst,           // f32 output [m, out_f]
+    int m, int in_f, int out_f
+) {
+    int lane = threadIdx.x;
+    int half = lane >> 4;             // 0 or 1 — which half of the 32-row tile this lane writes
+    int r = lane & 15;                // 0..15 — lane's A row / B col within a 16×16 WMMA tile
+
+    int col_base = blockIdx.x * 32;
+    int row_base = blockIdx.y * 32;
+
+    // out_f is the packed N, in_f the packed K, both guaranteed 32-aligned by the
+    // int8 WMMA path's `I8_QB` + the caller's dispatch-time assert — see exec.rs.
+    int nblk = in_f >> 5;             // number of BK=32 K-steps (= in_f/32)
+    int spr  = nblk >> 3;             // super-blocks per output column (= nblk/8)
+
+    // 4 WMMA accumulators: one per (RM, CN) tile pair. float8 per WMMA call.
+    float8 acc[2][2];
+    for (int rm = 0; rm < 2; rm++)
+        for (int cn = 0; cn < 2; cn++)
+            for (int e = 0; e < 8; e++)
+                acc[rm][cn][e] = 0.0f;
+
+    // ── K-step loop ─────────────────────────────────────────────────────────
+    for (int blk = 0; blk < nblk; blk++) {
+        int koff = blk << 5;          // blk * 32
+
+        // Decode 16 columns × 32 K-values of Q4_K weights into f16.
+        // b_frag[CN][2][16]: per column tile × per K-half × 16 f16 elements.
+        half16 b0_cn[2];  // first 16 K of each column tile
+        half16 b1_cn[2];  // next  16 K of each column tile
+        for (int cn = 0; cn < 2; cn++) {
+            int col = col_base + cn * 16 + r;
+            if (col < out_f) {
+                long super = (long)col * spr + (blk >> 3);
+                int s = blk & 7;
+                const unsigned char* bp = w + super * 144;
+                float d = rf16b(bp), dmin = rf16b(bp + 2);
+                int sc, mm; k4(bp + 4, s, &sc, &mm);
+                float wsc = d * (float)sc;
+                float wmn = dmin * (float)(-mm);
+                const unsigned char* qbase = bp + 16 + (s >> 1) * 32;
+                int hi = s & 1;
+                for (int kk = 0; kk < 16; kk++) {
+                    int code0 = hi ? (qbase[kk]      >> 4) : (qbase[kk]      & 0x0F);
+                    int code1 = hi ? (qbase[kk + 16] >> 4) : (qbase[kk + 16] & 0x0F);
+                    b0_cn[cn][kk] = __float2half(wsc * (float)code0 + wmn);
+                    b1_cn[cn][kk] = __float2half(wsc * (float)code1 + wmn);
+                }
+            } else {
+                for (int kk = 0; kk < 16; kk++) {
+                    b0_cn[cn][kk] = __float2half(0.0f);
+                    b1_cn[cn][kk] = __float2half(0.0f);
+                }
+            }
+        }
+
+        // Load 32 f16 A values for each of the two row tiles.
+        // a_frag[RM][2][16]: per row tile × per K-half × 16 f16 elements.
+        half16 a0_rm[2];
+        half16 a1_rm[2];
+        for (int rm = 0; rm < 2; rm++) {
+            int arow = row_base + rm * 16 + r;
+            if (arow < m) {
+                long aoff = (long)arow * in_f + koff;
+                for (int kk = 0; kk < 16; kk++) {
+                    a0_rm[rm][kk] = A[aoff + kk];
+                    a1_rm[rm][kk] = A[aoff + 16 + kk];
+                }
+            } else {
+                for (int kk = 0; kk < 16; kk++) {
+                    a0_rm[rm][kk] = __float2half(0.0f);
+                    a1_rm[rm][kk] = __float2half(0.0f);
+                }
+            }
+        }
+
+        // 8 WMMA calls: 2 row tiles × 2 col tiles × 2 K-steps.
+        for (int rm = 0; rm < 2; rm++) {
+            for (int cn = 0; cn < 2; cn++) {
+                acc[rm][cn] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    a0_rm[rm], b0_cn[cn], acc[rm][cn]);
+                acc[rm][cn] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    a1_rm[rm], b1_cn[cn], acc[rm][cn]);
+            }
+        }
+    }
+
+    // ── Epilogue ─────────────────────────────────────────────────────────────
+    for (int rm = 0; rm < 2; rm++) {
+        for (int cn = 0; cn < 2; cn++) {
+            for (int e = 0; e < 8; e++) {
+                int re = row_base + rm * 16 + 2 * e + half;
+                int col = col_base + cn * 16 + r;
+                if (re < m && col < out_f)
+                    dst[(long)re * out_f + col] = acc[rm][cn][e];
+            }
+        }
+    }
+}
 "#;
 
 // ── GPU-side MoE top-k routing + device-driven expert dispatch (Slice 38) ────
