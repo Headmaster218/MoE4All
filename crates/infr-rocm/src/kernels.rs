@@ -238,6 +238,7 @@ const HIP_PARTS: &[&str] = &[
     ATTENTION,
     ATTENTION_PF,
     ATTENTION_FLASH,
+    ATTENTION_FLASH_WMMA,
     ATTENTION_SPLIT,
     ATTENTION_SPLIT_FLASH,
     MOE_FFN,
@@ -1949,6 +1950,210 @@ extern "C" __global__ void attention_prefill_flash(
             int d = (c << 6) + (lane << 1);
             if (d < head_dim) {
                 *(float2*)(dr + d) = make_float2(acc[u][c].x * inv, acc[u][c].y * inv);
+            }
+        }
+    }
+}
+"#;
+
+// ── WMMA f16 flash prefill attention ──────────────────────────────────────────
+//
+// A 256-thread (8-wave) prefill attention kernel built for the f16 WMMA pipeline.
+// The tile geometry matches Vulkan's cooperative-matrix kernel: br = 64, bc = 64,
+// 8 warps in a 4×2 grid, each warp owning 16 query rows (wr*16..wr*16+15) and
+// 32 key columns (wc*32..wc*32+31) per KV tile. Every warp computes its own
+// online-softmax independently — no cross-warp reduction needed because the
+// query-row groups are disjoint.
+//
+// K/V are read DIRECTLY from global memory (no LDS staging, no __syncthreads for
+// K/V copy), matching the WMMA path's design goal of avoiding the LDS copy that
+// the scalar flash kernel uses. Q is f16 (post qk_norm_rope), read directly from
+// global.
+//
+// The dot products and P·V accumulate use scalar __half2float loads and f32 FMA
+// as a placeholder. TODO: replace with WMMA intrinsics for full perf — the
+// intrinsic family is `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` with half16
+// A/B fragments (`typedef __fp16 half16 __attribute__((ext_vector_type(16)))`)
+// and float8 C fragments. See `examples/wmma_probe.rs` for the proven fragment
+// layout. WMMA accumulators live in AccVGPR (separate register file on gfx11),
+// not architectural VGPR, so this does NOT trigger VGPR-is-the-wall problems.
+//
+// Gated behind `ctx.rocm.no_wmma` in exec.rs — when WMMA is disabled, the
+// existing `attention_prefill_flash` scalar kernel takes over.
+const ATTENTION_FLASH_WMMA: &str = r#"
+// Compile-time tile geometry (mirrors Vulkan's cooperative-matrix kernel).
+#define ATTN_WMMA_BR  64
+#define ATTN_WMMA_BC  64
+#define ATTN_WMMA_NW   8   // 8 warps = 256 threads
+#define ATTN_WMMA_QPR 16   // query rows per warp row (wr = wave>>1)
+#define ATTN_WMMA_KCW 32   // key columns per warp column (wc = wave&1)
+
+static __device__ __forceinline__ float attn_wmma_allmax32(float v) {
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off));
+    return v;
+}
+
+static __device__ __forceinline__ float attn_wmma_allsum32(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+    return v;
+}
+
+extern "C" __global__ void attention_prefill_flash_wmma(
+    const float* __restrict__ q,       // [rows, n_head, head_dim] f32
+    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] f16
+    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim] f16
+    float* __restrict__ dst,            // [rows, n_head, head_dim]
+    int rows,
+    int kv_len,
+    int n_head,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int pos,            // absolute position of query row 0
+    int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
+    int swa_window,
+    int bc,             // unused — bc is fixed at ATTN_WMMA_BC
+    int n_qtiles        // ceil(rows / ATTN_WMMA_BR); blockIdx.x = head * n_qtiles + qtile
+) {
+    int tid   = threadIdx.x;
+    int lane  = tid & 31;
+    int wave  = tid >> 5;
+    int wr    = wave >> 1;              // warp row 0..3
+    int wc    = wave & 1;              // warp col 0..1
+    int bdim  = ATTN_WMMA_BR;          // 64
+    int bkdim = ATTN_WMMA_BC;          // 64
+
+    int qt    = blockIdx.x % n_qtiles;
+    int h     = blockIdx.x / n_qtiles;
+    if (h >= n_head) return;
+    int kv_h  = h * n_kv / n_head;     // GQA head mapping
+    int r0    = qt * bdim;
+
+    // Online softmax state: per query row this warp owns (QPR = 16 rows).
+    float m[ATTN_WMMA_QPR], l[ATTN_WMMA_QPR];
+    // Accumulator: per query row, lane `i` owns output dims i, i+32, i+64, …
+    int npl = (head_dim + 31) >> 5;     // partials per lane
+    // Stack-allocate accumulators per partial: each lane stores npl floats per query row.
+    // QPR * npl fits easily within register budget at typical head_dim.
+    float acc[ATTN_WMMA_QPR][16];       // max npl ≤ 8 for head_dim ≤ 256; 16 is safe ceiling
+    #pragma unroll
+    for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+        m[u] = -1e30f;
+        l[u] = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < 16; c++) acc[u][c] = 0.0f;
+    }
+
+    // WORKGROUP-uniform key range — same mask logic as the scalar flash kernel.
+    int qp_lo = pos + r0;
+    int qp_hi = pos + r0 + bdim - 1;
+    int j_lo = 0, j_hi = kv_len;
+    if (mask_type == 0) {
+        j_hi = min(kv_len, qp_hi + 1);
+    } else if (mask_type == 1) {
+        j_hi = min(kv_len, qp_hi + 1);
+        j_lo = max(0, qp_lo - swa_window + 1);
+    } else if (mask_type == 2) {
+        j_lo = min(max(0, swa_window), kv_len);
+    }
+    j_lo = (j_lo / bkdim) * bkdim;
+
+    for (int j0 = j_lo; j0 < j_hi; j0 += bkdim) {
+        // Each lane in this warp owns ONE key in the current KV tile:
+        // key index = j0 + wc*ATTN_WMMA_KCW + lane
+        int j = j0 + wc * ATTN_WMMA_KCW + lane;
+        bool live = (j < j_hi) && (j < kv_len);
+
+        // ── Q·Kᵀ score computation ──
+        // One lane = one key; compute dot products against all 16 query rows
+        // this warp owns. TODO: replace with WMMA intrinsics for full perf —
+        // load Q as half16 A-fragment, K as half16 B-fragment (transposed),
+        // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)`.
+        float s[ATTN_WMMA_QPR];
+        #pragma unroll
+        for (int u = 0; u < ATTN_WMMA_QPR; u++) s[u] = 0.0f;
+
+        if (live) {
+            int k_off = ((long)j * n_kv + kv_h) * head_dim;
+            const __half* kr = k_cache + k_off;
+            int q_base = r0 + wr * ATTN_WMMA_QPR;
+            #pragma unroll
+            for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+                int qr = q_base + u;
+                if (qr >= rows) continue;
+                const float* qr_ptr = q + ((long)qr * n_head + h) * head_dim;
+                float dot = 0.0f;
+                // TODO: replace with WMMA intrinsics — load 16 f16 elements from
+                // qr_ptr and kr as half16 fragments, then WMMA into float8.
+                for (int d = 0; d < head_dim; d++) {
+                    dot += qr_ptr[d] * __half2float(kr[d]);
+                }
+                s[u] = dot;
+            }
+        }
+
+        // ── Online softmax (scalar, warp-local) ──
+        float w[ATTN_WMMA_QPR];
+        #pragma unroll
+        for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+            int qr = r0 + wr * ATTN_WMMA_QPR + u;
+            bool masked = !live;
+            if (!masked) {
+                int qp = pos + qr;
+                if (mask_type == 0)      masked = (j > qp);
+                else if (mask_type == 1) masked = (j > qp || j < qp - swa_window + 1);
+                else if (mask_type == 2) masked = (j < swa_window);
+            }
+            float sm = masked ? -1e30f : s[u] * scale;
+            float nm = fmaxf(m[u], attn_wmma_allmax32(sm));
+            float corr = expf(m[u] - nm);
+            m[u] = nm;
+            float wu = masked ? 0.0f : expf(sm - nm);
+            l[u] *= corr;
+            w[u] = wu;
+            if (corr != 1.0f) {
+                #pragma unroll
+                for (int c = 0; c < npl; c++) acc[u][c] *= corr;
+            }
+        }
+
+        // Accumulate the softmax denominator (the plain kernel sums over j ascending).
+        #pragma unroll
+        for (int u = 0; u < ATTN_WMMA_QPR; u++) l[u] += w[u];
+
+        // ── P·V accumulation ──
+        // Each lane contributes its key's weight to the V projection for all
+        // 16 query rows this warp owns.
+        // TODO: replace with WMMA intrinsics — pack weights to f16, load V as
+        // half16 fragment, WMMA accumulate into float8.
+        if (live) {
+            const __half* vr = v_cache + ((long)j * n_kv + kv_h) * head_dim;
+            #pragma unroll
+            for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+                if (w[u] == 0.0f) continue;
+                #pragma unroll
+                for (int c = 0; c < npl; c++) {
+                    int d = (c << 5) + lane;
+                    if (d < head_dim) {
+                        acc[u][c] += w[u] * __half2float(vr[d]);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Write output ──
+    #pragma unroll
+    for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+        int qr = r0 + wr * ATTN_WMMA_QPR + u;
+        if (qr >= rows) continue;
+        float inv = (l[u] > 0.0f) ? (1.0f / l[u]) : 0.0f;
+        float* dr = dst + ((long)qr * n_head + h) * head_dim;
+        #pragma unroll
+        for (int c = 0; c < npl; c++) {
+            int d = (c << 5) + lane;
+            if (d < head_dim) {
+                dr[d] = acc[u][c] * inv;
             }
         }
     }

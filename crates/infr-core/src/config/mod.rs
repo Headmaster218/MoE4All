@@ -495,6 +495,11 @@ cfg_struct! {
         /// The qwen3 seam golden hash is UNMOVED (0xfd63781ea3bfa785) despite the changed
         /// reduction order — greedy decode is identical.
         attn_split_flash: bool = true,
+        /// P8: WMMA f16 flash prefill attention (br=64 bc=64, 8-warps). OPT-IN gated behind
+        /// `INFR_ROCM_NO_WMMA` — both must be clear for the kernel to fire (it is still a
+        /// scalar-ALU placeholder; real WMMA intrinsics TBD). Default OFF — the P1 scalar flash
+        /// kernel handles all prefill traffic.
+        attn_flash_wmma: bool = false,
     }
 }
 

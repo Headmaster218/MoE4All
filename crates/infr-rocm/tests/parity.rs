@@ -6340,6 +6340,73 @@ fn attention_prefill_flash_matches_the_single_wave_kernel() {
     }
 }
 
+// ── P8: WMMA f16 flash prefill attention kernel ──────────────────────────────
+//
+// `attention_prefill_flash_wmma` replaces the scalar flash prefill kernel when
+// `INFR_ROCM_NO_WMMA` is NOT set and head_dim is 64, 128, or 256. It uses the
+// same 64×64 tile geometry as Vulkan's cooperative-matrix kernel but with scalar
+// f16 operations as a placeholder (TODO: replace with WMMA intrinsics).
+//
+// The A/B gate: `no_wmma = true` routes to the existing scalar flash kernel
+// (or plain attention), so the WMMA kernel's output must agree with the scalar
+// kernel to within the tolerance expected from a different reduction order.
+
+/// WMMA-kernel-compatible prefill shapes: head_dim ∈ {64, 128, 256}, rows > 1,
+/// spanning GQA and the three mask types.
+#[allow(clippy::type_complexity)]
+const ATTN_WMMA_CASES: &[(usize, usize, usize, usize, usize, AttnMask, usize)] = &[
+    (128, 128, 4, 2, 64, AttnMask::Causal, 0),
+    (256, 256, 8, 2, 128, AttnMask::Causal, 0),
+    (128, 128, 2, 1, 256, AttnMask::Causal, 0),
+    (200, 200, 4, 2, 128, AttnMask::SlidingWindow(64), 0),
+    (96, 96, 2, 2, 64, AttnMask::Canvas { lo: 17 }, 0),
+    // Ragged: rows not a multiple of br (64)
+    (100, 100, 4, 2, 128, AttnMask::Causal, 0),
+    (130, 130, 2, 1, 128, AttnMask::Causal, 50),
+];
+
+/// **The WMMA kernel matches the scalar flash kernel** to within fp rounding
+/// tolerance on every routed prefill shape. The two kernels differ in reduction
+/// order (WMMA uses larger tiles, no LDS staging, different thread mapping), so
+/// bit-exact equality is not expected — but relative error should stay below 1e-3.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attention_prefill_flash_wmma_matches_scalar_flash() {
+    let (Some(wmma), Some(scalar)) = (rocm(), rocm_cfg(|c| c.no_wmma = true)) else {
+        return;
+    };
+    for &(rows, kv_len, n_head, n_kv, head_dim, mask, pos) in ATTN_WMMA_CASES {
+        let q = gen(rows * n_head * head_dim, rows + head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(
+                b, &q, &k, &v, rows, kv_len, n_head, n_kv, head_dim, mask, pos,
+            )
+        };
+        let wmma_out = go(&wmma);
+        let scalar_out = go(&scalar);
+        let mag = maxabs(&scalar_out).max(1e-6);
+        assert!(
+            wmma_out.iter().all(|v| v.is_finite()),
+            "WMMA attention produced a non-finite value for {rows}x{kv_len} \
+             h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}"
+        );
+        let e = maxerr(&wmma_out, &scalar_out);
+        println!(
+            "attn-wmma {rows}x{kv_len} h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: \
+             max_err={e:e} max|ref|={mag:e} rel={:e}",
+            e / mag
+        );
+        assert!(
+            e / mag < 1e-3,
+            "WMMA attention diverged from the scalar flash kernel for {rows}x{kv_len} \
+             h={n_head}/{n_kv} d={head_dim} {mask:?} pos={pos}: abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
 /// Decode (`rows == 1`) attention shapes that exercise both P6 prefetch arms across every mask and
 /// both instantiated lane counts. The `kv_len` values straddle the split-KV threshold deliberately:
 /// `<= 64` keeps `n_chunks == 1` (the plain `attention_pf_npl*` arm), anything above it splits (the

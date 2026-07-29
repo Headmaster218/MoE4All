@@ -3142,6 +3142,41 @@ fn run_op(
                         arg_i32(n_qtiles as i32),
                     ],
                 )?;
+            } else if rows > 1
+                && ctx.rocm.attn_flash_wmma
+                && !ctx.rocm.no_wmma
+                && matches!(head_dim as usize, 64 | 128 | 256)
+            {
+                // P8: WMMA f16 flash prefill (OPT-IN). 256 threads (8 warps 4×2),
+                // br=64 bc=64, K/V read directly from global. Scalar-ALU placeholder
+                // until WMMA intrinsics land; gated behind `attn_flash_wmma` (default off)
+                // so the P1 scalar flash still handles all default prefill traffic.
+                let n_qtiles = (rows as usize).div_ceil(64);
+                dispatch_blocks_smem(
+                    pipelines,
+                    ctx.stream,
+                    "attention_prefill_flash_wmma",
+                    (n_qtiles * n_head as usize) as u32,
+                    256,
+                    0,
+                    args![
+                        arg_ptr(bq_ptr),
+                        arg_ptr(bk_ptr),
+                        arg_ptr(bv_ptr),
+                        arg_ptr(dd_ptr),
+                        arg_i32(rows as i32),
+                        arg_i32(kv_len as i32),
+                        arg_i32(n_head as i32),
+                        arg_i32(n_kv as i32),
+                        arg_i32(head_dim as i32),
+                        arg_f32(scale),
+                        arg_i32(pos as i32),
+                        arg_i32(mt),
+                        arg_i32(swa),
+                        arg_i32(64),
+                        arg_i32(n_qtiles as i32),
+                    ],
+                )?;
             } else {
                 // One 32-lane WAVE per (row, head): grid = rows*n_head blocks of 32 threads. The
                 // kernel reads `blockIdx.x` as the head index, so pass heads*32 with block=32.
