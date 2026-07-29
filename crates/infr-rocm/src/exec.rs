@@ -3532,8 +3532,97 @@ fn run_op(
             )?;
             ctx.dev[dst.0 as usize] = Some(dd);
         }
-        Op::ArgmaxProb { .. } => return Err(be("ArgmaxProb: Phase 2")),
-        Op::Sample { .. } => return Err(be("Sample: Phase 2")),
+        Op::ArgmaxProb {
+            x,
+            dst_id,
+            dst_prob,
+            n,
+        } => {
+            ctx.ensure_device(x, g, bindings)?;
+            let dd_id = ctx.uninit_dev(1);
+            let dd_prob = ctx.uninit_dev(1);
+            const ARGMAX_CHUNK: usize = 2048;
+            let n_chunks = (n as usize).div_ceil(ARGMAX_CHUNK);
+            let part = ctx.pool_buf(n_chunks * 3 * 4, false);
+            let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "argmax_prob_partial",
+                n_chunks as u32 * 256,
+                256,
+                args![
+                    arg_ptr(bx_ptr),
+                    arg_ptr(part.ptr),
+                    arg_i32(n as i32),
+                    arg_i32(n_chunks as i32),
+                ],
+            )?;
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "argmax_prob_combine",
+                256,
+                256,
+                args![
+                    arg_ptr(part.ptr),
+                    arg_ptr(dd_id.ptr),
+                    arg_ptr(dd_prob.ptr),
+                    arg_i32(n_chunks as i32),
+                ],
+            )?;
+            ctx.dev[dst_id.0 as usize] = Some(dd_id);
+            ctx.dev[dst_prob.0 as usize] = Some(dd_prob);
+        }
+        Op::Sample {
+            x,
+            u,
+            dst,
+            n,
+            top_k,
+            temp,
+            top_p,
+        } => {
+            ctx.ensure_device(x, g, bindings)?;
+            ctx.ensure_device(u, g, bindings)?;
+            let dd = ctx.uninit_dev(1);
+            let top_k = top_k as usize;
+            let n_chunks: usize = 256; // fixed: 256 workgroups of 256 threads
+            let cand_bytes = n_chunks * top_k * 2 * 4; // values + idx pairs, 4 bytes each
+            let cand = ctx.pool_buf(cand_bytes, false);
+            let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+            let bu_ptr = ctx.dev[u.0 as usize].as_ref().unwrap().ptr;
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "sample_topk_partial",
+                n_chunks as u32 * 256,
+                256,
+                args![
+                    arg_ptr(bx_ptr),
+                    arg_ptr(cand.ptr),
+                    arg_i32(n as i32),
+                    arg_i32(top_k as i32),
+                ],
+            )?;
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "sample_topk_combine",
+                256,
+                256,
+                args![
+                    arg_ptr(cand.ptr),
+                    arg_ptr(bu_ptr),
+                    arg_ptr(dd.ptr),
+                    arg_i32((n_chunks * top_k) as i32),
+                    arg_i32(top_k as i32),
+                    arg_i32(temp.to_bits() as i32),
+                    arg_i32(top_p.to_bits() as i32),
+                ],
+            )?;
+            ctx.dev[dst.0 as usize] = Some(dd);
+        }
 
         Op::MoeFfn {
             x,

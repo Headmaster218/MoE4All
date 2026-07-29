@@ -6695,3 +6695,136 @@ fn attn_split_flash_falls_back_for_non_multiple_of_32() {
         "attn_split_flash fallback must be bit-identical"
     );
 }
+
+// ── Op::Sample & Op::ArgmaxProb — GPU-resident sampling ──────────────────────
+
+/// `Op::Sample` on ROCm picks the same token as the CPU reference across a full
+/// Qwen3-shaped vocab (151936 elements) for multiple (top_k, temp, u) combos.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn sample_topk_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let n = 151936usize; // Qwen3 vocab size
+                         // Synthetic logits with a few stacked peaks so the test exercises the
+                         // top-k select + softmax + nucleus path (not just the argmax shortcut).
+    let mut x = gen(n, 42);
+    // Plant a unique global maximum so the argmax is unambiguous at low temp.
+    x[n / 3] = 12.0;
+    // Plant a second peak to exercise top-k > 1.
+    x[n / 2 + 7] = 11.5;
+    for &(top_k, temp, top_p, u) in &[
+        (2u32, 1e-6f32, 1.0, 0.0), // essentially greedy → argmax
+        (2, 0.8, 0.9, 0.5),
+        (16, 0.8, 0.9, 0.25),
+        (40, 0.8, 0.9, 0.75),
+        (64, 1.2, 0.95, 0.1),
+    ] {
+        let run = |b: &dyn Backend| -> u32 {
+            let mut g = Graph::new();
+            let xid = f32_in(&mut g, n);
+            let uid = g.input(f32d(1));
+            let dst = g.output(f32d(1));
+            g.push(Op::Sample {
+                x: xid,
+                u: uid,
+                dst,
+                n: n as u32,
+                top_k,
+                temp,
+                top_p,
+            });
+            let plan = b.compile(&g).expect("compile");
+            let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+            b.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let ub = b.alloc(4, BufferUsage::Activations).expect("u");
+            b.upload(ub.as_ref(), bytemuck::cast_slice(&[u])).unwrap();
+            let ob = b.alloc(4, BufferUsage::Readback).expect("out");
+            let mut bd = Bindings::new();
+            bd.bind(xid, xb.as_ref());
+            bd.bind(uid, ub.as_ref());
+            bd.bind(dst, ob.as_ref());
+            b.execute(plan.as_ref(), &bd).expect("execute");
+            let mut o = vec![0u32; 1];
+            b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                .unwrap();
+            o[0]
+        };
+        let c = run(&cpu);
+        let r = run(&be);
+        println!(
+            "Sample n={n} top_k={top_k} temp={temp} top_p={top_p} u={u} \
+             cpu={c} rocm={r}"
+        );
+        assert_eq!(
+            c, r,
+            "Sample n={n} top_k={top_k} temp={temp} top_p={top_p} u={u} \
+             diverged (cpu={c} rocm={r})"
+        );
+    }
+}
+
+/// `Op::ArgmaxProb` on ROCm matches the CPU reference for the argmax id AND the
+/// softmax top-1 probability (within 1e-4 relative).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn argmax_prob_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    for n in [1024usize, 151936, 257, 4096] {
+        let mut x = gen(n, 77);
+        // Plant a clear unique maximum so argmax is unambiguous.
+        x[n / 4] = 8.0;
+
+        let run = |b: &dyn Backend| -> (u32, f32) {
+            let mut g = Graph::new();
+            let xid = f32_in(&mut g, n);
+            let dst_id = g.output(f32d(1));
+            let dst_prob = g.output(f32d(1));
+            g.push(Op::ArgmaxProb {
+                x: xid,
+                dst_id,
+                dst_prob,
+                n: n as u32,
+            });
+            let plan = b.compile(&g).expect("compile");
+            let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+            b.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let ob_id = b.alloc(4, BufferUsage::Readback).expect("oid");
+            let ob_prob = b.alloc(4, BufferUsage::Readback).expect("oprob");
+            let mut bd = Bindings::new();
+            bd.bind(xid, xb.as_ref());
+            bd.bind(dst_id, ob_id.as_ref());
+            bd.bind(dst_prob, ob_prob.as_ref());
+            b.execute(plan.as_ref(), &bd).expect("execute");
+            let mut oid = vec![0u32; 1];
+            b.download(ob_id.as_ref(), bytemuck::cast_slice_mut(&mut oid))
+                .unwrap();
+            let mut oprob = vec![0f32; 1];
+            b.download(ob_prob.as_ref(), bytemuck::cast_slice_mut(&mut oprob))
+                .unwrap();
+            (oid[0], oprob[0])
+        };
+        let (c_id, c_prob) = run(&cpu);
+        let (r_id, r_prob) = run(&be);
+        println!(
+            "ArgmaxProb n={n} cpu_id={c_id} rocm_id={r_id} \
+             cpu_prob={c_prob:e} rocm_prob={r_prob:e}"
+        );
+        assert_eq!(
+            c_id, r_id,
+            "ArgmaxProb n={n}: id mismatch (cpu={c_id} rocm={r_id})"
+        );
+        let abs = (c_prob - r_prob).abs();
+        let rel = if c_prob > 0.0 { abs / c_prob } else { abs };
+        assert!(
+            rel < 1e-4,
+            "ArgmaxProb n={n}: prob tolerance exceeded \
+             cpu={c_prob:e} rocm={r_prob:e} rel={rel:e}"
+        );
+    }
+}

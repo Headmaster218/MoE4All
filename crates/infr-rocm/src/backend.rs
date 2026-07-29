@@ -819,8 +819,12 @@ impl Backend for RocmBackend {
             // slower than the 4 KB/token upload it saves) with pp512 +0.2% and the MoE flat. Turning
             // it on needs an exact-f32 sibling of the `deq_*` family first, and then a reason to.
             embed_gather: false,
-            // Phase 2 (`Op::Sample`/`Op::ArgmaxProb` return "Phase 2" from the executor).
-            gpu_sample: false,
+            // Device-side stochastic sampling — 4 bytes read back per token instead of
+            // the [vocab] logits download + host sampler, and the gpu_sample path is in the
+            // same launch as the model (no separate cpu→gpu sync).  `sample_topk_matches_cpu`
+            // verifies bit-identical sampling against the CPU reference across the full
+            // Qwen3 vocab (151936).
+            gpu_sample: true,
             // The `argmax` kernel is one block per row (`grid.x = rows`) and breaks ties by lowest
             // index through its shared-memory reduce, so it reproduces the reference first-max rule
             // exactly — `argmax_multirow_matches_cpu` checks id-for-id against the CPU at a real
@@ -830,7 +834,7 @@ impl Backend for RocmBackend {
             // because it is TRUE — the m×vocab verify readback is a bug waiting for the first ROCm
             // `MtpHeadSession`, not something to rediscover then.
             argmax_rows: true,
-            argmax_prob: false,
+            argmax_prob: true,
             // Fused per-head RMSNorm + SiLU z-gate (qwen35 DeltaNet): one dispatch instead of
             // `QkNorm`→`GatedAct`. BIT-IDENTICAL, not merely close — `gated_rmsnorm_matches_cpu`
             // measures max_err 0.0 between the fused op and the split pair on ROCm AND on the CPU.

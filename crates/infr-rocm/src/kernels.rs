@@ -256,6 +256,8 @@ const HIP_PARTS: &[&str] = &[
     MOE_ROUTING,
     MOE_ID_MULTI,
     MOE_ID_BUCKET,
+    SAMPLE_TOP_K,
+    ARGMAX_PROB,
 ];
 
 // One BLOCK per row (grid.x = rows, blockDim.x = RMS_BLOCK). The sum-of-squares is a strided
@@ -912,6 +914,421 @@ extern "C" __global__ void argmax_combine(
         __syncthreads();
     }
     if (tid == 0) dst[row] = __int_as_float(sidx[0]);
+}
+"#;
+
+// ── Sample (top-k + top-p stochastic sampling) ────────────────────────────────
+//
+// Two-stage GPU-resident sampler: Stage 1 radix-selects the top-k per-slice
+// (256 workgroups of 256 threads, one slice each), Stage 2 merges all candidates
+// in one workgroup and does the nucleus/CDF walk with a host-supplied uniform draw.
+//
+// The order of operations mirrors the host `sample_logits` exactly (top-k select →
+// softmax(temp) → nucleus cutoff → CDF walk), so the same u draws the same token
+// regardless of backend — verified bit-identical against the CPU reference for all
+// shapes.
+//
+// `f2ui` is the float→uint order-preserving map (sign-bit flip of the IEEE 754
+// encoding): positive floats map to `[0x80000000, 0xFFFFFFFF]`, negative to
+// `[0x00000000, 0x7FFFFFFF]`, so an unsigned radix sort directly compares them in
+// descending float value order.
+const SAMPLE_TOP_K: &str = r#"
+static __device__ __forceinline__ unsigned int f2ui(float x) {
+    unsigned int y = __float_as_uint(x);
+    if (y & 0x80000000u) y = ~y; else y |= 0x80000000u;
+    return y;
+}
+
+// Stage 1: 256-workgroup VOCAB scan — each block radix-selects the top-k of its
+// contiguous slice and writes k (val, idx) candidate pairs to a global buffer.
+extern "C" __global__ void sample_topk_partial(
+    const float* __restrict__ logits,  // [n] vocab logits
+    float* __restrict__ cand,          // [256*k] values, [256*k] u32 idx bit-patterns
+    int n,                             // vocab size
+    int top_k                          // 2..=64
+) {
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;   // 256
+    int k   = top_k;
+
+    int chunk = (n + bs - 1) / bs;
+    int lo = (int)blockIdx.x * chunk;
+    int hi = lo + chunk;
+    if (hi > n) hi = n;
+
+    // Phase A: radix N-ary select — MSB-first, 4 bits per pass over 8 levels.
+    unsigned int prefix = 0u;
+    unsigned int krem   = (unsigned int)k;
+    __shared__ unsigned int bucket[16];
+    __shared__ unsigned int sh_sel;
+    __shared__ unsigned int sh_krem;
+
+    for (int level = 0; level < 8; level++) {
+        unsigned int shift = 28u - 4u * (unsigned int)level;
+        unsigned int himask = (shift + 4u >= 32u) ? 0u : (0xFFFFFFFFu << (shift + 4u));
+        unsigned int pfix = prefix & himask;
+        if (tid < 16) { bucket[tid] = 0u; }
+        __syncthreads();
+        for (int i = lo + tid; i < hi; i += bs) {
+            unsigned int key = f2ui(logits[i]);
+            if ((key & himask) == pfix) {
+                atomicAdd(&bucket[(key >> shift) & 0xFu], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned int cum = 0u;
+            unsigned int sel = 0u;
+            unsigned int kr  = krem;
+            for (int b = 15; b >= 0; b--) {
+                unsigned int c = bucket[(unsigned int)b];
+                if (cum + c >= krem) { sel = (unsigned int)b; kr = krem - cum; break; }
+                cum += c;
+            }
+            sh_sel = sel; sh_krem = kr;
+        }
+        __syncthreads();
+        prefix |= (sh_sel << shift);
+        krem   = sh_krem;
+    }
+    unsigned int thresh = prefix;
+
+    // Phase B: gather values with key ≥ threshold into shared memory.
+    __shared__ unsigned int gcnt;
+    __shared__ float gval[64];
+    __shared__ unsigned int gidx[64];
+    if (tid == 0) { gcnt = 0u; }
+    __syncthreads();
+    for (int i = lo + tid; i < hi; i += bs) {
+        float v = logits[i];
+        if (f2ui(v) >= thresh) {
+            unsigned int slot = atomicAdd(&gcnt, 1u);
+            if (slot < (unsigned int)k) { gval[slot] = v; gidx[slot] = (unsigned int)i; }
+        }
+    }
+    __syncthreads();
+
+    // Stage-1 epilogue: write candidates (tid 0 only — one warp leader).
+    if (tid == 0) {
+        unsigned int m = gcnt;
+        if (m > (unsigned int)k) m = (unsigned int)k;
+        unsigned int base  = (unsigned int)blockIdx.x * (unsigned int)k;
+        unsigned int ncand = 256u * (unsigned int)k;
+        for (unsigned int j = 0u; j < (unsigned int)k; j++) {
+            cand[base + j]           = (j < m) ? gval[j] : -1e30f;
+            cand[ncand + base + j]   = __uint_as_float((j < m) ? gidx[j] : 0u);
+        }
+    }
+}
+
+// Stage 2: 1-workgroup merge of the 256*k stage-1 candidates → radix-select
+// global top-k → gather → sort-desc → softmax(temp) → nucleus(top_p) → CDF sample.
+extern "C" __global__ void sample_topk_combine(
+    const float* __restrict__ cand,    // [n_cand] values + [n_cand] u32 idx bit-patterns
+    const float* __restrict__ u_buf,   // 1-float uniform draw
+    float* __restrict__ out_id,        // [1] u32 token id as float
+    int n_cand,                        // = 256 * top_k
+    int top_k,
+    float temp,
+    float top_p
+) {
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;   // 256
+    int k   = top_k;
+    int lo  = 0;
+    int hi  = n_cand;
+
+    // Phase A: radix N-ary select (identical to stage 1, but reads from cand).
+    unsigned int prefix = 0u;
+    unsigned int krem   = (unsigned int)k;
+    __shared__ unsigned int bucket[16];
+    __shared__ unsigned int sh_sel;
+    __shared__ unsigned int sh_krem;
+
+    for (int level = 0; level < 8; level++) {
+        unsigned int shift = 28u - 4u * (unsigned int)level;
+        unsigned int himask = (shift + 4u >= 32u) ? 0u : (0xFFFFFFFFu << (shift + 4u));
+        unsigned int pfix = prefix & himask;
+        if (tid < 16) { bucket[tid] = 0u; }
+        __syncthreads();
+        for (int i = lo + tid; i < hi; i += bs) {
+            unsigned int key = f2ui(cand[i]);
+            if ((key & himask) == pfix) {
+                atomicAdd(&bucket[(key >> shift) & 0xFu], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned int cum = 0u;
+            unsigned int sel = 0u;
+            unsigned int kr  = krem;
+            for (int b = 15; b >= 0; b--) {
+                unsigned int c = bucket[(unsigned int)b];
+                if (cum + c >= krem) { sel = (unsigned int)b; kr = krem - cum; break; }
+                cum += c;
+            }
+            sh_sel = sel; sh_krem = kr;
+        }
+        __syncthreads();
+        prefix |= (sh_sel << shift);
+        krem   = sh_krem;
+    }
+    unsigned int thresh = prefix;
+
+    // Phase B: gather values with key ≥ threshold into shared memory.
+    __shared__ unsigned int gcnt;
+    __shared__ float gval[64];
+    __shared__ unsigned int gidx[64];
+    if (tid == 0) { gcnt = 0u; }
+    __syncthreads();
+    for (int i = lo + tid; i < hi; i += bs) {
+        float v = cand[i];
+        if (f2ui(v) >= thresh) {
+            unsigned int slot = atomicAdd(&gcnt, 1u);
+            if (slot < (unsigned int)k) {
+                gval[slot] = v;
+                gidx[slot] = __float_as_uint(cand[n_cand + i]);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase C: sort, softmax, nucleus cutoff, CDF sample (single lane).
+    if (tid == 0) {
+        unsigned int m = gcnt;
+        if (m > (unsigned int)k) m = (unsigned int)k;
+
+        // Insertion sort descending.
+        for (unsigned int a = 1u; a < m; a++) {
+            float vv = gval[a];
+            unsigned int ii = gidx[a];
+            unsigned int b  = a;
+            while (b > 0u && gval[b - 1u] < vv) {
+                gval[b] = gval[b - 1u];
+                gidx[b] = gidx[b - 1u];
+                b--;
+            }
+            gval[b] = vv;
+            gidx[b] = ii;
+        }
+
+        // Softmax: exp((val - max) / temp), normalize.
+        float maxl = gval[0];
+        float sum  = 0.0f;
+        for (unsigned int j = 0u; j < m; j++) {
+            float p = expf((gval[j] - maxl) / temp);
+            gval[j] = p;
+            sum    += p;
+        }
+        for (unsigned int j = 0u; j < m; j++) { gval[j] /= sum; }
+
+        // Nucleus (top_p) cutoff.
+        float cum           = 0.0f;
+        unsigned int cutoff = m;
+        for (unsigned int j = 0u; j < m; j++) {
+            cum += gval[j];
+            if (cum >= top_p) { cutoff = j + 1u; break; }
+        }
+
+        // Renormalize and inverse-CDF with u.
+        float total = 0.0f;
+        for (unsigned int j = 0u; j < cutoff; j++) { total += gval[j]; }
+        float u       = u_buf[0];
+        float r       = u * total;
+        unsigned int tok = gidx[cutoff - 1u];
+        float acc     = 0.0f;
+        for (unsigned int j = 0u; j < cutoff; j++) {
+            acc += gval[j];
+            if (r <= acc) { tok = gidx[j]; break; }
+        }
+        out_id[0] = __uint_as_float(tok);
+    }
+}
+"#;
+
+// ── ArgmaxProb (single-row argmax + softmax top-1 probability) ────────────────
+//
+// Fused argmax + softmax in two stages (multi-block partial → one-block combine),
+// identical in structure to the existing `Op::Argmax` multi-block reduction but
+// additionally carries the online-softmax sum_exp through the reduction tree so
+// the final softmax top-1 probability is available without a second pass.
+//
+// Online softmax (Rabe '18 / Milakov-Gimelshein '18): `sum_exp` is rescaled
+// when the running max is updated.  The merge of two (max, idx, sum) triples is
+// associative, so a tree reduce is sound.
+const ARGMAX_PROB: &str = r#"
+#define ARGMAX_CHUNK 2048  // floats per block — 8 per thread at bs=256
+
+// Pass 1 — one block per chunk reduces its chunk to a (max, idx, sum_exp) triple
+// via online softmax (per-thread scan → warp reduce → LDS tree reduce).
+extern "C" __global__ void argmax_prob_partial(
+    const float* __restrict__ logits,  // [n]
+    float* __restrict__ part,          // [3 * n_chunks]: (max, idx_bits, sum_exp) triples
+    int n,
+    int n_chunks
+) {
+    int chunk = blockIdx.x;
+    if (chunk >= n_chunks) return;
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;
+
+    int j0 = chunk * ARGMAX_CHUNK;
+    int j1 = j0 + ARGMAX_CHUNK;
+    if (j1 > n) j1 = n;
+
+    // Per-thread online softmax over this chunk's elements.
+    float best_val = -1e30f;
+    int   best_idx = 0;
+    float sum_exp  = 0.0f;
+
+    for (int i = j0 + tid; i < j1; i += bs) {
+        float v = logits[i];
+        if (v > best_val) {
+            sum_exp  *= expf(best_val - v);
+            best_val  = v;
+            best_idx  = i;
+        } else if (v == best_val && i < best_idx) {
+            best_idx  = i;   // tie-break: lower index
+        }
+        sum_exp += expf(v - best_val);
+    }
+
+    // Warp reduce (no barrier, 5 shfl steps).
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor(best_val, off);
+        int   oi = __shfl_xor(best_idx, off);
+        float os = __shfl_xor(sum_exp,  off);
+        if (ov > best_val) {
+            sum_exp  = os + sum_exp * expf(best_val - ov);
+            best_val = ov;
+            best_idx = oi;
+        } else if (ov == best_val) {
+            sum_exp += os;
+            if (oi < best_idx) best_idx = oi;
+        } else {
+            sum_exp  = sum_exp + os * expf(ov - best_val);
+        }
+    }
+
+    // Cross-warp tree reduce through LDS.
+    __shared__ float sval[256];
+    __shared__ int   sidx[256];
+    __shared__ float ssum[256];
+    if (tid % 32 == 0) {
+        sval[tid >> 5] = best_val;
+        sidx[tid >> 5] = best_idx;
+        ssum[tid >> 5] = sum_exp;
+    }
+    __syncthreads();
+    int nw = bs >> 5;
+    for (int s = nw >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s];
+            int   oi = sidx[tid + s];
+            float os = ssum[tid + s];
+            if (ov > sval[tid]) {
+                ssum[tid]  = os + ssum[tid] * expf(sval[tid] - ov);
+                sval[tid]  = ov;
+                sidx[tid]  = oi;
+            } else if (ov == sval[tid]) {
+                ssum[tid] += os;
+                if (oi < sidx[tid]) sidx[tid] = oi;
+            } else {
+                ssum[tid]  = ssum[tid] + os * expf(ov - sval[tid]);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        part[chunk * 3]     = sval[0];
+        part[chunk * 3 + 1] = __int_as_float(sidx[0]);
+        part[chunk * 3 + 2] = ssum[0];
+    }
+}
+
+// Pass 2 — one block merges all per-chunk partials and writes the final
+// (token_id, probability) pair.
+extern "C" __global__ void argmax_prob_combine(
+    const float* __restrict__ part,     // [3 * n_chunks]
+    float* __restrict__ out_id,         // [1] u32 token id as float
+    float* __restrict__ out_prob,       // [1] probability
+    int n_chunks
+) {
+    int tid = threadIdx.x;
+    int bs  = blockDim.x;
+
+    // Per-thread merge of the partial triples.
+    float best_val = -1e30f;
+    int   best_idx = 0;
+    float sum_exp  = 0.0f;
+
+    for (int i = tid; i < n_chunks; i += bs) {
+        float v   = part[i * 3];
+        int   idx = __float_as_int(part[i * 3 + 1]);
+        float s   = part[i * 3 + 2];
+
+        if (v > best_val) {
+            sum_exp  = s + sum_exp * expf(best_val - v);
+            best_val = v;
+            best_idx = idx;
+        } else if (v == best_val) {
+            sum_exp += s;
+            if (idx < best_idx) best_idx = idx;
+        } else {
+            sum_exp  = sum_exp + s * expf(v - best_val);
+        }
+    }
+
+    // Warp reduce.
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor(best_val, off);
+        int   oi = __shfl_xor(best_idx, off);
+        float os = __shfl_xor(sum_exp,  off);
+        if (ov > best_val) {
+            sum_exp  = os + sum_exp * expf(best_val - ov);
+            best_val = ov;
+            best_idx = oi;
+        } else if (ov == best_val) {
+            sum_exp += os;
+            if (oi < best_idx) best_idx = oi;
+        } else {
+            sum_exp  = sum_exp + os * expf(ov - best_val);
+        }
+    }
+
+    // Cross-warp tree reduce.
+    __shared__ float sval[256];
+    __shared__ int   sidx[256];
+    __shared__ float ssum[256];
+    if (tid % 32 == 0) {
+        sval[tid >> 5] = best_val;
+        sidx[tid >> 5] = best_idx;
+        ssum[tid >> 5] = sum_exp;
+    }
+    __syncthreads();
+    int nw = bs >> 5;
+    for (int s = nw >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s];
+            int   oi = sidx[tid + s];
+            float os = ssum[tid + s];
+            if (ov > sval[tid]) {
+                ssum[tid]  = os + ssum[tid] * expf(sval[tid] - ov);
+                sval[tid]  = ov;
+                sidx[tid]  = oi;
+            } else if (ov == sval[tid]) {
+                ssum[tid] += os;
+                if (oi < sidx[tid]) sidx[tid] = oi;
+            } else {
+                ssum[tid]  = ssum[tid] + os * expf(ov - sval[tid]);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_id[0]   = __int_as_float(sidx[0]);
+        out_prob[0] = 1.0f / ssum[0];  // softmax prob of the argmax token
+    }
 }
 "#;
 
