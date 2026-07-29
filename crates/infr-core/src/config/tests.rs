@@ -1157,7 +1157,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SEAM_NO_REPLAY",
     ];
 
-    /// S6 — `infr-metal` (20) + `infr-rocm` (13). Both backends are now `INFR_*`-free.
+    /// S6 — `infr-metal` (20) + `infr-rocm` (14). Both backends are now `INFR_*`-free.
     ///
     /// Metal: `MetalBackend::new_with(cfg)`, and `exec.rs` reads `self.metal()` (a borrow of the
     /// backend's `Config`) at each selector. Fifteen of the twenty are `INFR_METAL_NO_*`
@@ -1197,6 +1197,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_ROCM_BLAS",
         "INFR_ROCM_COOP",
         "INFR_ROCM_COOP_TILE",
+        "INFR_ROCM_MMQ",
         "INFR_ROCM_NO_I8",
         "INFR_ROCM_NO_PIPE",
         "INFR_ROCM_NO_WMMA",

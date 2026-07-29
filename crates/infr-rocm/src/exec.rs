@@ -4247,6 +4247,16 @@ fn run_op(
                     let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
                     let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
                     let yb = ctx.pool_buf((max_slots * neu * 4).max(1), false);
+                    // S5: MMQ GEMM scratch — double the output columns (gate+up raw dots)
+                    let mmq_tmp = if use_mmq {
+                        Some(ctx.pool_buf((max_slots * nfu * 2 * 4).max(4), false))
+                    } else {
+                        None
+                    };
+                    // ── S5: MMQ decode-once-reuse MoE GEMM (opt-in, Q4_K only) ──
+                    // Each expert's weight column tile decoded ONCE into LDS and reused
+                    // across all routing rows, eliminating per-wave re-decode overhead.
+                    let use_mmq = ctx.rocm.mmq && gu == "q4k";
                     // ── P2: the bucket-sorted BATCHED arm. ──
                     // R8 fixed the launch count and left the WEIGHT TRAFFIC alone: its
                     // `(output row, slot)` grid re-reads an expert's whole bank once per slot, so
@@ -4264,7 +4274,8 @@ fn run_op(
                         && nexp > 0
                         && nexp <= MOE_BUCKET_MAX_EXPERT
                         && chunk * nu >= nexp * MOE_BUCKET_MIN_OCC;
-                    let (bslot, eoff, ecnt) = if use_idb {
+                    // MMQ always needs bucket-sorted data; force bucket alloc when MMQ.
+                    let (bslot, eoff, ecnt) = if use_mmq || use_idb {
                         (
                             Some(ctx.pool_buf((max_slots * 4).max(4), false)),
                             Some(ctx.pool_buf(nexp * 4, false)),
@@ -4309,8 +4320,10 @@ fn run_op(
                         // both GEMVs — the gate/up and down arms walk the SAME bucket list. The
                         // last chunk of a prefill can be short, so the occupancy floor is re-checked
                         // per chunk rather than assumed from `chunk`.
-                        let batched = use_idb && n_slots >= nexp * MOE_BUCKET_MIN_OCC;
-                        if batched {
+                        let batched = (use_mmq || use_idb) && n_slots >= nexp * MOE_BUCKET_MIN_OCC;
+                        // S5: MMQ always needs bucket-sorted data — sort even when
+                        // batched occupancy floor isn't met (decode with few slots).
+                        if use_mmq || batched {
                             dispatch_1d(
                                 pipelines,
                                 ctx.stream,
@@ -4327,7 +4340,58 @@ fn run_op(
                                 ],
                             )?;
                         }
-                        if batched {
+                        if use_mmq {
+                            // S5: MMQ GEMM — one workgroup per (expert, column tile)
+                            let mmq_col_tiles = (n_ff_exp as u32 * 2).div_ceil(64); // BN=64
+                            dispatch_grid(
+                                pipelines,
+                                ctx.stream,
+                                "moe_mmq_up_i8_q4k",
+                                mmq_col_tiles,
+                                nexp as u32,
+                                128,
+                                args![
+                                    arg_ptr(qxb.ptr),
+                                    arg_ptr(xsb.ptr),
+                                    arg_ptr(gw_ptr),
+                                    arg_ptr(uw_ptr),
+                                    arg_ptr(mmq_tmp.as_ref().unwrap().ptr),
+                                    arg_i32(n_ff_exp as i32),     // n_ff
+                                    arg_i32(n_ff_exp as i32 * 2), // n_ff_exp = n_ff * 2
+                                    arg_i32(n_slots as i32),
+                                    arg_i32(nexp as i32),
+                                    arg_ptr(eoff.as_ref().unwrap().ptr),
+                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
+                                    arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_i64(gate_bstride),
+                                    arg_i64(up_bstride),
+                                    arg_i32(neu as i32), // act_bytes = ne (K dim)
+                                ],
+                            )?;
+                            // Elementwise activation + gate*up multiply → hb
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                "moe_act_mul_q4k",
+                                nexp as u32,
+                                256,
+                                args![
+                                    arg_ptr(mmq_tmp.as_ref().unwrap().ptr),
+                                    arg_ptr(hb.ptr),
+                                    arg_i32(n_ff_exp as i32),     // n_ff
+                                    arg_i32(n_ff_exp as i32 * 2), // n_ff_exp = n_ff * 2
+                                    arg_i32(n_slots as i32),
+                                    arg_i32(nexp as i32),
+                                    arg_ptr(eoff.as_ref().unwrap().ptr),
+                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
+                                    arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_ptr(wts_c),
+                                    arg_ptr(dsc_ptr),
+                                    arg_i32(at),
+                                    arg_i32(wb_flag),
+                                ],
+                            )?;
+                        } else if batched {
                             dispatch_grid(
                                 pipelines,
                                 ctx.stream,

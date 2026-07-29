@@ -7096,3 +7096,80 @@ fn store_q8_produces_valid_planar_q8_0() {
         );
     }
 }
+
+/// S5: MMQ decode-once-reuse MoE GEMM for Q4_K gate/up matches the id-indexed
+/// multi-slot path within tolerance. Small synthetic MoE: 4 experts, 16 rows,
+/// 128 n_ff. The MMQ kernel decodes each expert's Q4_K weight column tile ONCE
+/// into LDS and reuses across all rows; the id-indexed kernel re-decodes per
+/// (column, slot) pair. The two paths must agree within the same relative
+/// tolerance as the CPU comparison.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_mmq_q4k_gate_up_matches_id_tier() {
+    let Some(be_no_mmq) = rocm() else {
+        return;
+    };
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.rocm.mmq = true;
+    let be_mmq = match RocmBackend::new_with(0, std::sync::Arc::new(cfg)) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (16usize, 256usize, 4usize, 3usize, 128usize);
+    let gu_blocks = n_expert * n_ff_exp * ne / 256;
+    let gate = q4k_blocks(gu_blocks);
+    let up = q4k_blocks(gu_blocks);
+    let dn_blocks = n_expert * ne * n_ff_exp / 256;
+    let down = q4k_blocks(dn_blocks);
+    let x = gen(rows * ne, 7);
+    let router = gen(n_expert * ne, 13);
+
+    let go = |b: &dyn Backend| {
+        run_moe(
+            b,
+            &x,
+            &router,
+            &gate,
+            &up,
+            &down,
+            DType::Q4K,
+            DType::Q4K,
+            DType::Q4K,
+            rows,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            MoeGating::Softmax,
+            true,
+        )
+    };
+
+    let want = go(&be_no_mmq);
+    let got = go(&be_mmq);
+    let ref_mag = maxabs(&want).max(1e-6);
+    let e = maxerr(&want, &got);
+    println!(
+        "MoeFfn [mmq vs id tier] rel={:e} max|ref|={ref_mag:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "MMQ reference is all-zero (id tier produced no output)"
+    );
+    assert!(
+        e / ref_mag < 6e-2,
+        "MoeFfn [mmq q4k] diverges from id tier: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+
+    // Also verify against CPU reference
+    let cpu_out = go(&cpu);
+    let e_cpu = maxerr(&want, &cpu_out);
+    assert!(
+        e_cpu / ref_mag < 6e-2,
+        "id tier itself diverges from CPU (test invalid): abs={e_cpu:e} rel={:e}",
+        e_cpu / ref_mag
+    );
+}

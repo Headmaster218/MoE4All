@@ -346,6 +346,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     r.blas = presence(get, "INFR_ROCM_BLAS");
     r.fuse_add = presence_inv(get, "INFR_ROCM_NO_FUSE_ADD");
     r.fuse_norm = presence_inv(get, "INFR_ROCM_NO_FUSE_NORM");
+    r.mmq = presence(get, "INFR_ROCM_MMQ");
 
     // ── kernels.cpu ──────────────────────────────────────────────────────────
     p.kernels.cpu.spin = num(get, "INFR_CPU_SPIN");

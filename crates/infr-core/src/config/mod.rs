@@ -505,6 +505,11 @@ cfg_struct! {
         /// (no int8 quant/dequant) and uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
         /// instead of the int8 WMMA intrinsic. Default OFF — gated for A/B measurement.
         a_global: bool = false,
+        /// `INFR_ROCM_MMQ`: OPT-IN MMQ decode-once MoE GEMM for Q4_K gate/up
+        /// (Slice S5). When set AND Q4_K format: dispatches `moe_mmq_up_i8_q4k`
+        /// instead of the id-indexed multi-slot kernel. Default OFF for A/B
+        /// measurement.
+        mmq: bool = false,
     }
 }
 

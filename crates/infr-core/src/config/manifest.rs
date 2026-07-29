@@ -273,6 +273,7 @@ knobs! {
     "INFR_ROCM_BLAS"         => "kernels.rocm.blas",      Presence,    Ignored, "1",     migrated;
     "INFR_ROCM_NO_FUSE_ADD"  => "kernels.rocm.fuse_add",  PresenceInv, Ignored, "1",     migrated;
     "INFR_ROCM_NO_FUSE_NORM" => "kernels.rocm.fuse_norm", PresenceInv, Ignored, "1",     migrated;
+    "INFR_ROCM_MMQ"          => "kernels.rocm.mmq",        Presence,    Ignored, "1",     migrated;
 
     // ── kernels.cpu (§6.7) ───────────────────────────────────────────────────
     "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", migrated;

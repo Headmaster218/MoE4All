@@ -261,6 +261,7 @@ const HIP_PARTS: &[&str] = &[
     MOE_ROUTING,
     MOE_ID_MULTI,
     MOE_ID_BUCKET,
+    MOE_MMQ_Q4K,
     SAMPLE_TOP_K,
     ARGMAX_PROB,
 ];
@@ -8488,7 +8489,241 @@ GEN_MOE_DOWN_IDB(mxfp4)
 GEN_MOE_DOWN_IDB(nvfp4)
 "#;
 
-// ── Module cache ─────────────────────────────────────────────────────────────
+const MOE_MMQ_Q4K: &str = r#"
+// ── MMQ (decode-once-reuse) all-expert MoE GEMM for Q4_K gate+up ────────────
+//
+// S5: One threadblock per (expert, column-tile) pair. Each expert's Q4_K weight
+// columns for the tile are decoded ONCE into LDS per K-step, then reused across
+// all routing token rows hitting that expert. Eliminates the per-wave re-decode
+// overhead of the id-indexed multi-slot path (rows/expert × re-decode).
+//
+// Tile: BM=32 rows, BN=64 columns, BK=32 K-elements. 128 threads; TM=4, TN=4
+// per thread (16 float accumulators). Gate+up combined: columns 0..n_ff-1 read
+// from gw, columns n_ff..2*n_ff-1 read from uw. Output is raw dot products
+// (no activation — `moe_act_mul_q4k` follows).
+//
+// Grid: (n_ff_exp / BN, n_exp), blockDim = 128.
+// Per-expert activation buckets (bslot/eoff/ecnt) from `moe_bucket_sort`.
+#define MMQ_BM 32
+#define MMQ_BN 64
+#define MMQ_BK 32
+#define MMQ_TM 4
+#define MMQ_TN 4
+#define MMQ_THREADS ((MMQ_BM / MMQ_TM) * (MMQ_BN / MMQ_TN)) // 8 * 16 = 128
+#define MMQ_WPB (MMQ_BK / 4) // 8 packed int32 words per 32-block
+#define MMQ_SP  (MMQ_WPB + 1) // 9 — stride with padding for bank conflicts
+
+extern "C" __global__ void __launch_bounds__(MMQ_THREADS, 1)
+moe_mmq_up_i8_q4k(
+    const signed char* __restrict__ qx,    // packed int8 activations [n_slots, act_bytes]
+    const float* __restrict__ xs,           // per-block scales [n_slots, act_bytes/32]
+    const unsigned char* __restrict__ gw,   // stacked Q4_K gate weights [nexp, gate_stride]
+    const unsigned char* __restrict__ uw,   // stacked Q4_K up weights [nexp, up_stride]
+    float* __restrict__ h,                  // output [n_slots, n_ff * 2]
+    int n_ff,                               // intermediate FF dim (per gate or up)
+    int n_ff_exp,                           // output dim = n_ff * 2
+    int n_slots,                            // TOTAL activation slots (routed rows count)
+    int n_exp,                              // number of experts
+    const int* __restrict__ eoff,           // [n_exp+1] offsets into sorted activations
+    const int* __restrict__ ecnt,           // [n_exp] counts per expert
+    const int* __restrict__ bslot,          // [n_slots] slot → global slot index
+    int gate_stride,                        // bytes per expert's gate slice
+    int up_stride,                          // bytes per expert's up slice
+    int act_bytes                           // stride for activations (ne padded to 32)
+) {
+    int e = blockIdx.y;
+    int col_tile = blockIdx.x;
+    int BT = col_tile * MMQ_BN; // first output column of this tile
+    if (BT >= n_ff_exp) return;
+
+    int cnt = ecnt[e];
+    if (cnt <= 0) return;
+    int off = eoff[e];
+
+    int tid = threadIdx.x;
+    int tr = tid / (MMQ_BN / MMQ_TN); // thread row index [0, BM/TM)
+    int tc = tid % (MMQ_BN / MMQ_TN); // thread col index [0, BN/TN)
+
+    int nb = n_ff >> 5;  // K-blocks per weight row
+    int spr = nb >> 3;   // super-blocks per weight row
+
+    __shared__ unsigned int As[MMQ_BM * MMQ_SP];
+    __shared__ unsigned int Bs[MMQ_BN * MMQ_SP];
+    __shared__ float Bdl[MMQ_BN];
+    __shared__ float Bmm[MMQ_BN];
+
+    float acc[MMQ_TM][MMQ_TN];
+    #pragma unroll
+    for (int i = 0; i < MMQ_TM; i++)
+        #pragma unroll
+        for (int j = 0; j < MMQ_TN; j++)
+            acc[i][j] = 0.0f;
+
+    const unsigned char* gate_w = gw + (long)e * gate_stride;
+    const unsigned char* up_w   = uw + (long)e * up_stride;
+
+    for (int blk = 0; blk < nb; blk++) {
+
+        // ── 1. Stage activations: BM rows × WPB packed words ──
+        for (int idx = tid; idx < MMQ_BM * MMQ_WPB; idx += MMQ_THREADS) {
+            int r = idx / MMQ_WPB;
+            int p = idx % MMQ_WPB;
+            int slot = (r < cnt) ? bslot[off + r] : 0;
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)slot * act_bytes))[blk * MMQ_WPB + p];
+        }
+
+        // ── 2. Decode weights: BN columns × sub-block scale/min + packed codes ──
+        for (int idx = tid; idx < MMQ_BN; idx += MMQ_THREADS) {
+            int c = idx;
+            int out_col = BT + c;
+            // Determine weight bank and weight row
+            const unsigned char* wb;
+            int wcol;
+            if (out_col < n_ff) {
+                wb = gate_w; wcol = out_col;
+            } else {
+                wb = up_w;   wcol = out_col - n_ff;
+            }
+            long super = (long)wcol * spr + (blk >> 3);
+            int s = blk & 7;
+            unsigned int sh = (unsigned int)(s & 1) * 4u;
+            // Q4_K block = 144 bytes, 16-byte aligned → uint4 loads safe
+            const uint4* bq = (const uint4*)(wb + super * 144);
+            uint4 hdr = bq[0];
+            float d = f16q_lo(hdr.x);
+            float dmin = f16q_hi(hdr.x);
+            int sc, mm_val; k4q(hdr, s, &sc, &mm_val);
+            Bdl[c] = d * (float)sc;
+            Bmm[c] = dmin * (float)mm_val;
+
+            const uint4* qq = bq + 1 + (s >> 1) * 2;
+            uint4 wlo = qq[0], whi = qq[1];
+            unsigned int wv[8] = { wlo.x, wlo.y, wlo.z, wlo.w, whi.x, whi.y, whi.z, whi.w };
+            #pragma unroll
+            for (int p = 0; p < MMQ_WPB; p++) {
+                Bs[c * MMQ_SP + p] = (wv[p] >> sh) & 0x0F0F0F0Fu;
+            }
+        }
+        __syncthreads();
+
+        // ── 3. TM×TN dp4a loop ──
+        // One liveness check per row-stripe: rows past cnt are fully dead
+        // (activation loads were 0, dot products null, barrier still reached).
+        {
+            // Each row in [tr*TM, tr*TM+TM) may be past cnt.
+            int r0 = tr * MMQ_TM;
+            bool alive[MMQ_TM];
+            #pragma unroll
+            for (int i = 0; i < MMQ_TM; i++) alive[i] = (r0 + i) < cnt;
+
+            int qsum[MMQ_TM][MMQ_TN];
+            int asum[MMQ_TM];
+            #pragma unroll
+            for (int i = 0; i < MMQ_TM; i++) {
+                asum[i] = 0;
+                #pragma unroll
+                for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = 0;
+            }
+            #pragma unroll
+            for (int p = 0; p < MMQ_WPB; p++) {
+                int bv[MMQ_TN];
+                #pragma unroll
+                for (int j = 0; j < MMQ_TN; j++)
+                    bv[j] = (int)Bs[(tc * MMQ_TN + j) * MMQ_SP + p];
+                #pragma unroll
+                for (int i = 0; i < MMQ_TM; i++) {
+                    int av = (int)As[(r0 + i) * MMQ_SP + p];
+                    if (alive[i]) {
+                        asum[i] = idot4(av, 0x01010101, asum[i]);
+                        #pragma unroll
+                        for (int j = 0; j < MMQ_TN; j++)
+                            qsum[i][j] = idot4(av, bv[j], qsum[i][j]);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < MMQ_TM; i++) {
+                if (!alive[i]) continue;
+                int slot = bslot[off + r0 + i];
+                float sx = xs[(long)slot * nb + blk];
+                #pragma unroll
+                for (int j = 0; j < MMQ_TN; j++) {
+                    int c = tc * MMQ_TN + j;
+                    acc[i][j] += Bdl[c] * sx * (float)qsum[i][j]
+                               - Bmm[c] * sx * (float)asum[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── 4. Write output ──
+    #pragma unroll
+    for (int i = 0; i < MMQ_TM; i++) {
+        int r = tr * MMQ_TM + i;
+        if (r >= cnt) continue;
+        int slot = bslot[off + r];
+        #pragma unroll
+        for (int j = 0; j < MMQ_TN; j++) {
+            int out_col = BT + tc * MMQ_TN + j;
+            if (out_col >= n_ff_exp) continue;
+            h[(long)slot * n_ff_exp + out_col] = acc[i][j];
+        }
+    }
+}
+
+// Elementwise activation + gate*up multiply for MMQ output.
+// Reads raw dot products from src: gate_dot in cols [0, n_ff), up_dot in cols [n_ff, 2*n_ff).
+// Writes activated silu(gate)*up*weight*dsc to dst at cols [0, n_ff).
+// Grid: (n_exp, 1) — one workgroup per expert, 256 threads.
+// Processes bucket-sorted slots.
+extern "C" __global__ void moe_act_mul_q4k(
+    const float* __restrict__ src,          // [n_slots, n_ff*2] raw GEMM output
+    float* __restrict__ dst,                // [n_slots, n_ff] activated output
+    int n_ff,
+    int n_ff_exp,                           // = n_ff * 2
+    int n_slots,
+    int n_exp,
+    const int* __restrict__ eoff,
+    const int* __restrict__ ecnt,
+    const int* __restrict__ bslot,
+    const float* __restrict__ route_wts,    // [n_slots] per-slot routing weight
+    const float* __restrict__ dsc_dev,      // [n_exp] per-expert scale (null = 1.0)
+    int act_type,                            // 0=silu, 1=gelu, 2=sigmoid
+    int weight_before                        // llama4 pre-activation routing-weight fold
+) {
+    int e = blockIdx.x;
+    int tid = threadIdx.x;
+    int cnt = ecnt[e];
+    if (cnt <= 0) return;
+    int off = eoff[e];
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f;
+
+    for (int i = tid; i < cnt; i += blockDim.x) {
+        int slot = bslot[off + i];
+        float weight = route_wts[slot];
+        float wg = weight_before ? weight : 1.0f;
+        float wo = weight_before ? 1.0f : weight;
+        for (int col = 0; col < n_ff; col++) {
+            float g = src[(long)slot * n_ff_exp + col];
+            float u = src[(long)slot * n_ff_exp + col + n_ff];
+            g *= wg;
+            float a;
+            if (act_type == 0) {
+                a = g / (1.0f + expf(-g));  // silu = x*sigmoid(x)
+            } else if (act_type == 1) {
+                float x3 = g * g * g;
+                a = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * x3)));
+            } else {
+                a = 1.0f / (1.0f + expf(-g));  // sigmoid
+            }
+            dst[(long)slot * n_ff + col] = a * u * wo * dsc;
+        }
+    }
+}
+
+"#;
 
 /// hiprtc options, ONE list feeding both the compile call and the disk cache's key — a flag that
 /// changed the generated code but not the key would let a stale code object be reloaded.
