@@ -435,6 +435,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P7c   | —         | multi-block two-pass argmax — **8.6×** per disch, decode +2.1%                       |
 | P7e   | —         | MoE PF4 block-prefetch gate/up — **-14.7%**, register pressure                       |
 | P7f   | —         | MoE CN=2 column tiling Q4_K gate/up — **+12.9%** MoE pp512 (699→790)                 |
+| P7h   | —         | WMMA RM=4 tile (dense), KICK=2 ILP (attention flash) — both **flat/regress**, VGPR   |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
@@ -467,6 +468,12 @@ has the full reasoning. The code is the authority on mechanism.
   registers (32 uint4 per lane) caused register spilling to scratch. With 3.1M
   waves per dispatch, the hardware scheduler already hides latency — the
   bottleneck is wave count, not per-wave pipeline depth.
+- **P7h** — predicted RM=4 WMMA tiling would improve weight reuse for wide-N
+  GEMMs. Delivered **-33% regression**: 4× the row accumulators (32 VGPR) plus
+  weight-decoding temporaries hit the spill threshold. The existing 2×1/2×2
+  auto-tier is at the register-occupancy optimum. KICK=2 ILP in the attention
+  flash kernel was flat — doubling the per-lane accumulator pool (32→64) spares
+  too much VGPR for marginal LDS-latency hiding.
 
 **Correctness lessons worth keeping:**
 
