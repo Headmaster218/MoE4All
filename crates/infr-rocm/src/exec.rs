@@ -246,8 +246,8 @@ fn wmma_tile(out_f: u32, rocm: &infr_core::config::RocmCfg) -> (u32, u32) {
 /// better and changing it re-shapes every decode dispatch. See
 /// [`infr_core::tier::ChunkRounding`].
 const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
-    target_chunks: 32,
-    min_chunk: 64,
+    target_chunks: 64,
+    min_chunk: 32,
     max_chunk: 512,
     rounding: infr_core::tier::ChunkRounding::Up,
 };
