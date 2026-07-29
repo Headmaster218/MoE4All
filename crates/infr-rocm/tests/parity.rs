@@ -6696,6 +6696,48 @@ fn attn_split_flash_falls_back_for_non_multiple_of_32() {
     );
 }
 
+/// **HD-templated instantiations produce coherent output.** When
+/// `attn_split_flash` is on and `head_dim` is 128 or 256, the host gate
+/// selects the HD-templated kernel (`attention_split_partial_flash_hd128`
+/// or `_hd256`), which uses a vectorized K load. The result must be
+/// coherent with the non-flash split-KV path — the vectorization is a pure
+/// load-width change, not an arithmetic reordering.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn attn_split_flash_hd_instantiations_produce_coherent_output() {
+    let (Some(on), Some(off)) = (
+        rocm_cfg(|c| c.attn_split_flash = true),
+        rocm_cfg(|c| c.attn_split_flash = false),
+    ) else {
+        return;
+    };
+    for &(kv_len, n_head, n_kv, head_dim, mask, pos) in &[
+        (200, 4, 2, 128, AttnMask::Causal, 199),
+        (500, 2, 1, 256, AttnMask::Causal, 499),
+    ] {
+        let q = gen(n_head * head_dim, head_dim);
+        let k = f16_kv(kv_len * n_kv * head_dim, 1);
+        let v = f16_kv(kv_len * n_kv * head_dim, 2);
+        let go = |b: &dyn Backend| {
+            run_attention(b, &q, &k, &v, 1, kv_len, n_head, n_kv, head_dim, mask, pos)
+        };
+        let flash = go(&on);
+        let plain = go(&off);
+        let e = maxerr(&flash, &plain);
+        let mag = maxabs(&plain).max(1e-6);
+        println!(
+            "attn-split-flash-hd kv={kv_len} d={head_dim} {mask:?}: \
+             max_err={e:e} rel={:e}",
+            e / mag
+        );
+        assert!(
+            e / mag < 2e-3,
+            "HD-templated kernel diverged for hd={head_dim}: abs={e:e} rel={:e}",
+            e / mag
+        );
+    }
+}
+
 // ── Op::Sample & Op::ArgmaxProb — GPU-resident sampling ──────────────────────
 
 /// `Op::Sample` on ROCm picks the same token as the CPU reference across a full

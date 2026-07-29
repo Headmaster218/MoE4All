@@ -2449,6 +2449,154 @@ extern "C" __global__ void attention_split_partial_flash(
         if (d < head_dim) pacc[pbase + d] = acc[c];
     }
 }
+
+// ── HD-templated variant: vectorized K load for head_dim 128 / 256 ──
+//
+// The generic kernel above reads K element-at-a-time inside a runtime-
+// bounded loop that the JIT compiler cannot unroll or auto-vectorize.
+// At head_dim=128 that is 128 `global_load_ushort` per lane per key —
+// the same bottleneck the prefill flash kernel fixed by staging K with
+// `uint4` (see `ATTENTION_FLASH` header).
+//
+// This template replaces `head_dim` with a compile-time constant `HD`
+// so the K-load loop fully unrolls and the compiler can issue wide
+// `global_load_b128` instead of scalar `global_load_ushort`.
+// The template is instantiated for HD=128 and HD=256 — the only head
+// dims the host gate routes to the flash path.
+template <int HD>
+static __device__ __forceinline__ void attn_split_flash_body(
+    const float* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    float* __restrict__ pm,
+    float* __restrict__ pl,
+    float* __restrict__ pacc,
+    int rows, int kv_len, int n_head, int n_kv, int head_dim,
+    float scale, int pos, int mask_type, int swa_window,
+    int chunk_size, int n_chunks
+) {
+    int gidx = blockIdx.x;
+    int total_heads = rows * n_head;
+    int chunk = gidx % n_chunks;
+    int head = gidx / n_chunks;
+    if (head >= total_heads) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int r = head / n_head;
+    int h = head % n_head;
+    int kv_h = h * n_kv / n_head;
+    int q_off = head * head_dim;
+    int npl = (head_dim + 31) >> 5;
+
+    extern __shared__ __align__(16) float q_lds[];
+
+    for (int i = tid; i < head_dim; i += 32) {
+        q_lds[i] = q[q_off + i];
+    }
+    __syncthreads();
+
+    int j0 = chunk * chunk_size;
+    int j1 = j0 + chunk_size;
+    if (j1 > kv_len) j1 = kv_len;
+
+    int pbase = gidx * head_dim;
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc[ATTN_SPLIT_MAX_PER_LANE];
+    for (int c = 0; c < npl; c++) acc[c] = 0.0f;
+
+    int bc = 32;
+    for (int j0t = j0; j0t < j1; j0t += bc) {
+        int nj = bc;
+        if (j0t + nj > j1) nj = j1 - j0t;
+
+        int j = j0t + lane;
+        float my_s = -1e30f;
+        if (lane < nj && j < kv_len) {
+            bool masked = false;
+            if (mask_type == 0) {
+                masked = (j > pos + r);
+            } else if (mask_type == 1) {
+                int qp = pos + r;
+                masked = (j > qp || j < qp - swa_window + 1);
+            } else if (mask_type == 2) {
+                masked = (j < swa_window);
+            }
+            if (!masked) {
+                const __half* kr = k_cache + (long)j * n_kv * head_dim + kv_h * head_dim;
+                float dot = 0.0f;
+                // Vectorized K load: 8 halfs per iteration via uint4, same
+                // pattern as the prefill flash kernel's Q·K dot (rhs read
+                // from LDS there, from global here — same conversion chain).
+                // The compiler unrolls the HD-constant loop and lowers the
+                // four `__half2` dereferences to one `global_load_b128`.
+                #pragma unroll
+                for (int d = 0; d < HD; d += 8) {
+                    uint4 kblock = *(const uint4*)(kr + d);
+                    float2 k01 = __half22float2(*(const __half2*)(kr + d));
+                    float2 k23 = __half22float2(*(const __half2*)(kr + d + 2));
+                    float2 k45 = __half22float2(*(const __half2*)(kr + d + 4));
+                    float2 k67 = __half22float2(*(const __half2*)(kr + d + 6));
+                    dot += q_lds[d+0] * k01.x + q_lds[d+1] * k01.y
+                         + q_lds[d+2] * k23.x + q_lds[d+3] * k23.y
+                         + q_lds[d+4] * k45.x + q_lds[d+5] * k45.y
+                         + q_lds[d+6] * k67.x + q_lds[d+7] * k67.y;
+                }
+                my_s = dot * scale;
+            }
+        }
+
+        float tile_max = attn_wave_allmax32((lane < nj) ? my_s : -1e30f);
+        float nm = fmaxf(m, tile_max);
+        float corr = expf(m - nm);
+        m = nm;
+        l *= corr;
+        for (int c = 0; c < npl; c++) acc[c] *= corr;
+
+        for (int jj = 0; jj < nj; jj++) {
+            float sj = __shfl(my_s, jj);
+            if (sj <= -1e29f) continue;
+            float w = expf(sj - m);
+            l += w;
+
+            int kj = j0t + jj;
+            const __half* vr = v_cache + (long)kj * n_kv * head_dim + kv_h * head_dim;
+            for (int c = 0; c < npl; c++) {
+                int d = (c << 5) + tid;
+                if (d < head_dim) acc[c] += w * __half2float(vr[d]);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        pm[gidx] = m;
+        pl[gidx] = l;
+    }
+    for (int c = 0; c < npl; c++) {
+        int d = (c << 5) + tid;
+        if (d < head_dim) pacc[pbase + d] = acc[c];
+    }
+}
+
+#define ATTN_SPLIT_FLASH_INST(NAME, HD)                                          \
+extern "C" __global__ void NAME(                                                 \
+    const float* __restrict__ q,                                                 \
+    const __half* __restrict__ k_cache,                                          \
+    const __half* __restrict__ v_cache,                                          \
+    float* __restrict__ pm,                                                      \
+    float* __restrict__ pl,                                                      \
+    float* __restrict__ pacc,                                                    \
+    int rows, int kv_len, int n_head, int n_kv, int head_dim,                    \
+    float scale, int pos, int mask_type, int swa_window,                         \
+    int chunk_size, int n_chunks)                                                \
+{                                                                                \
+    attn_split_flash_body<HD>(q, k_cache, v_cache, pm, pl, pacc, rows, kv_len,   \
+                              n_head, n_kv, head_dim, scale, pos, mask_type,     \
+                              swa_window, chunk_size, n_chunks);                 \
+}
+ATTN_SPLIT_FLASH_INST(attention_split_partial_flash_hd128, 128)
+ATTN_SPLIT_FLASH_INST(attention_split_partial_flash_hd256, 256)
 "#;
 
 const MOE_FFN: &str = r#"

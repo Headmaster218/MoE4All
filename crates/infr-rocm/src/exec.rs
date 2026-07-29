@@ -3027,10 +3027,15 @@ fn run_op(
                 // The args are identical — only the internal algorithm differs.
                 let use_flash = ctx.rocm.attn_split_flash && hd % 32 == 0;
                 if use_flash {
+                    let flash_kernel = match hd {
+                        128 => "attention_split_partial_flash_hd128",
+                        256 => "attention_split_partial_flash_hd256",
+                        _ => "attention_split_partial_flash",
+                    };
                     dispatch_blocks_smem(
                         pipelines,
                         ctx.stream,
-                        "attention_split_partial_flash",
+                        flash_kernel,
                         (heads * n_chunks) as u32,
                         32,
                         (hd * 4) as u32, // smem: head_dim floats for Q staging
