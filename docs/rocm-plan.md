@@ -78,11 +78,11 @@ reference (shader or recorder function) and the gap.
 
 | technique                  | Vulkan ref                                 | ROCm state                                                  |
 | -------------------------- | ------------------------------------------ | ----------------------------------------------------------- |
-| **store_q8** (Q8_0 KV)     | `recorder.rs:5162` / `store_q8.comp`       | missing — only f16 WriteKv                                  |
+| **store_q8** (Q8_0 KV)     | `recorder.rs:5162` / `store_q8.comp`       | missing — only f16 WriteKv; Q8_0 read path ready            |
 | **store_turbo**            | `recorder.rs:5298` / `quant_turbo.comp`    | missing                                                     |
 | **store_kv_dense**         | `recorder.rs:5345`                         | missing                                                     |
 | **dequant_kv_f16 prepass** | `recorder.rs:5377` / `dequant_kv_f16.comp` | missing — no way to read quantized KV in attention          |
-| **q8_0/Turbo/blk seam**    | `runner.rs:450-457`                        | "rocm" not in any of `kv_q8_backend`/`kv_turbo_ok`/`blk_ok` |
+| **q8_0/Turbo/blk seam**    | `runner.rs:450-457`                        | ✅ `kv_q8_backend` threaded; `kv_turbo_ok`/`blk_ok` not yet |
 
 **Impact**: Q8_0 halves KV VRAM (doubles usable context length). Q4_0 quarters
 it. Vulkan gates these behind seam flags that ROCm currently fails — the runner
@@ -90,12 +90,12 @@ downgrades ROCm to f16 KV regardless of config.
 
 #### B. Inline KV decode in attention (skip dequant prepass)
 
-| technique                      | Vulkan ref                                           | ROCm state                                                |
-| ------------------------------ | ---------------------------------------------------- | --------------------------------------------------------- |
-| **Q8_0 in attn_partial**       | `attn_partial.comp:136-158` (-DKQ8/-DVQ8)            | missing — would need planar decode in flash loop          |
-| **Q4_0/Q4_1/Q5_0/Q5_1 inline** | `attn_partial.comp:69-121` (-DKMAINLINE/-DVMAINLINE) | missing — skip prepass, decode block scale once per block |
-| **Flash-stage Dequant**        | `recorder.rs:4399` / `FlashStage::Dequant(dt)`       | missing — routes through staged builds                    |
-| **Flash-warp Dequant**         | `attn_flash_warp.comp`                               | no WMMA flash kernel yet                                  |
+| technique                      | Vulkan ref                                           | ROCm state                                                                    |
+| ------------------------------ | ---------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **Q8_0 in attn_partial**       | `attn_partial.comp:136-158` (-DKQ8/-DVQ8)            | ✅ in `attention_prefill_flash` (q8kv_decode); needs store_q8 to produce data |
+| **Q4_0/Q4_1/Q5_0/Q5_1 inline** | `attn_partial.comp:69-121` (-DKMAINLINE/-DVMAINLINE) | missing — skip prepass, decode block scale once per block                     |
+| **Flash-stage Dequant**        | `recorder.rs:4399` / `FlashStage::Dequant(dt)`       | missing — routes through staged builds                                        |
+| **Flash-warp Dequant**         | `attn_flash_warp.comp`                               | no WMMA flash kernel yet                                                      |
 
 **Impact**: Vulkan's inline decode avoids a full f16-scratch write+read for
 every quantized KV cache read — a 2× bandwidth savings at decode depth where
@@ -670,8 +670,9 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       unmoved); ✅ **tuned split-KV chunking** (tgt_chunks=64, d0 +19%); ✅
       **vectorised `copy_strided`** (**P7b**, 30× kernel speedup, Q6_K pp512
       1.51×); ✅ **WMMA placeholder kernel** (br=64 bc=64, f16 Q conversion,
-      opt-in). Still open: WMMA f16 intrinsics; dequant-in-flash for Q8_0/Q4_0
-      KV; q8_0/Turbo/block KV quant store+load
+      opt-in). Still open: WMMA f16 intrinsics for Q·K + P·V;
+      Q4_0/Q4_1/Q5_0/Q5_1 inline KV decode; `store_q8` kernel for Q8_0 KV write;
+      split-KV coopmat decode (attn_flash_partial)
 - [x] **Quant unpack** — ✅ branchless dword-wide Q6_K in the MoE expert decode
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the
       align-1 idiom that still emits `global_load_b128`
@@ -689,17 +690,18 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       entropy-bound sampler), `eb_sample_reduce` (Backend trait method)
 - [x] **Decode-replay tape** — evaluated (P6): worth ~0.4%, NOT built
 - [ ] **KV-cache quantization** — missing: `store_q8`/`store_q8_dyn` (Q8_0 KV
-      write), `store_turbo` (TurboQuant), `store_kv_dense`; `dequant_kv_f16`
-      prepass; seam gate `"rocm"` not threaded into `kv_q8_backend`/`blk_ok`
+      write), `store_turbo` (TurboQuant), `store_kv_dense`; ✅ seam gate
+      `"rocm"` threaded into `kv_q8_backend`; `kv_turbo_ok`/`blk_ok` not yet
 - [ ] **f16 A_GLOBAL + wide-tile GEMM** — missing: pre-convert activations to
       f16 via `store_f16`; WMMA kernel reading f16 A fragments from global (no
       As staging, 3 WGs/CU instead of 2); BM=64/32/16 row-tile ladder for
       small-m batched prefill
 - [ ] **WMMA flash attention** — kernel body in place (scalar placeholder),
       needs `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` for Q·K + P·V
-- [ ] **Inline KV decode** — Q8_0 planar decode in flash attention K+V staging
-      loop (skip `dequant_kv_f16` prepass); Q4_0/Q4_1/Q5_0/Q5_1 block-amortized
-      inline decoders (`dqv4` pattern from Vulkan's `attn_partial.comp`)
+- [ ] **Inline KV decode** — ✅ Q8_0 planar decode in flash attention K+V
+      staging loop (`q8kv_decode`, committed); remaining: Q4_0/Q4_1/Q5_0/Q5_1
+      block-amortized inline decoders (`dqv4` pattern from Vulkan's
+      `attn_partial.comp`)
 - [ ] **MMQ all-expert MoE GEMM** — decode-once-reuse threadblock pattern
       (`matmul_mmq_experts`) replacing per-expert × per-token scalar GEMV
 - [ ] **DeltaNet** — split/strided variants where they help
