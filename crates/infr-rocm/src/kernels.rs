@@ -236,6 +236,7 @@ const HIP_PARTS: &[&str] = &[
     ARGMAX,
     WRITE_KV,
     STORE_Q8,
+    STORE_KV_Q4_0,
     ATTENTION,
     ATTENTION_PF,
     ATTENTION_FLASH,
@@ -1412,6 +1413,62 @@ extern "C" __global__ void store_q8(
 }
 "#;
 
+const STORE_KV_Q4_0: &str = r#"
+// Q4_0 GGUF KV-cache quantizer: one 32-lane wave per 32-element block. Each element is quantized
+// to a 4-bit unsigned code = round(v / d) + 8 where d = block_amax / 7 (matches ggml-quants.c
+// quantize_row_q4_0). The GGUF block packs 32 elements into 18 bytes: [f16 d (2 B)][u8 qs (16 B)]
+// — low nibble of qs[p] is element p, high nibble is element p+16.
+//   n       = total source elements to quantize (rows * row_stride)
+//   off     = base element offset into the cache (= pos * row_stride)
+//   cap     = total cache element capacity (cached buffer's declared element count)
+//   src_off = base element offset into src (0 = start of src)
+extern "C" __global__ void store_kv_q4_0(
+    const float* __restrict__ src,
+    uint8_t* __restrict__ cache,
+    int n,
+    int off,
+    int cap,
+    int src_off
+) {
+    int blk = blockIdx.x;              // 0 .. n/32-1
+    int t   = threadIdx.x;             // 0 .. 31
+    int gid = blk * 32 + t;            // global element index within the n-element span
+    if (gid >= n) return;
+
+    float v = src[src_off + gid];
+    float av = fabsf(v);
+
+    // Subgroup max reduction across 32 lanes (butterfly, same as store_q8).
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1)
+        av = fmaxf(av, __shfl_xor(av, s));
+
+    // Q4_0: d = block_amax / 7 (ggml-quants.c quantize_row_q4_0).
+    float d = av / 7.0f;
+    float inv = (av > 0.0f) ? (1.0f / d) : 0.0f;
+    int code = (int)roundf(v * inv) + 8;
+    code = code < 0 ? 0 : (code > 15 ? 15 : code);
+
+    // Pack: lanes 0..15 write their own low nibble plus lane t+16's high nibble.
+    int code_high = __shfl_xor(code, 16);
+    if (t < 16) {
+        int block = off / 32 + blk;
+        int byte_off = block * 18 + 2 + t;           // qs region
+        cache[byte_off] = (uint8_t)(code | (code_high << 4));
+    }
+
+    // Lane 0 writes the f16 scale d at the block header.
+    if (t == 0) {
+        int block = off / 32 + blk;
+        int byte_off = block * 18;
+        union { unsigned short u; __half h; } sbits;
+        sbits.h = __float2half(d);
+        cache[byte_off]     = (uint8_t)(sbits.u & 0xFF);
+        cache[byte_off + 1] = (uint8_t)(sbits.u >> 8);
+    }
+}
+"#;
+
 const ATTENTION: &str = r#"
 // Max head_dim/32 dims a single lane owns (runner gates decode to head_dim <= 512 → 16).
 #define ATTN_MAX_PER_LANE 16
@@ -1789,10 +1846,25 @@ static __device__ __forceinline__ float q8kv_decode(const uint* codes, int idx, 
     return d * (float)code;
 }
 
+// Decode one element from Q4_0 GGUF block KV cache. Blocks are 18 bytes: [f16 d (2 B)][u8 qs (16 B)]
+// where low nibble of qs[p] = element p, high nibble = element p+16.
+// The caller casts `k_cache` (or `v_cache`) to `const unsigned char*`.
+static __device__ __forceinline__ float q40kv_decode(const unsigned char* cache, int idx) {
+    int blk = idx >> 5;                          // block = element / 32
+    int within = idx & 31;                       // position within block
+    const unsigned char* b = cache + blk * 18;   // 18 bytes per Q4_0 GGUF block
+    // Read f16 scale from block header (little-endian, alignment-safe).
+    union { unsigned short u; __half h; } cv;
+    cv.u = (unsigned short)b[0] | ((unsigned short)b[1] << 8);
+    float d = __half2float(cv.h);
+    int code = (within < 16) ? (b[2 + within] & 0x0F) : (b[2 + within - 16] >> 4);
+    return d * (float)(code - 8);
+}
+
 extern "C" __global__ void attention_prefill_flash(
     const float* __restrict__ q,        // [rows, n_head, head_dim]
-    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0 (cast to uint*)
-    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0 (cast to uint*)
+    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0/Q4_0 (cast as needed)
+    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0/Q4_0 (cast as needed)
     float* __restrict__ dst,            // [rows, n_head, head_dim]
     int rows,
     int kv_len,
@@ -1803,8 +1875,8 @@ extern "C" __global__ void attention_prefill_flash(
     int pos,            // absolute position of query row 0
     int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
     int swa_window,
-    int k_dtype,        // 0=F16, 1=Q8_0
-    int v_dtype,        // 0=F16, 1=Q8_0
+    int k_dtype,        // 0=F16, 1=Q8_0, 2=Q4_0
+    int v_dtype,        // 0=F16, 1=Q8_0, 2=Q4_0
     int k_cap,          // total K buffer elements (for scale offset; same cap for V)
     int bc,             // keys per KV tile, <= 32 (one lane per key)
     int n_qtiles        // ceil(rows / br); blockIdx.x = head * n_qtiles + qtile
@@ -1883,7 +1955,7 @@ extern "C" __global__ void attention_prefill_flash(
                 long off = ((long)j * n_kv + kv_h) * head_dim + d;
                 if (k_dtype == 0) {
                     kk = *(const uint4*)(k_cache + off);
-                } else {
+                } else if (k_dtype == 1) {
                     // Q8_0: decode eight elements at positions d..d+7 into eight f16 packed as uint4.
                     unsigned short kh[8];
                     const uint* kq8 = (const uint*)k_cache;
@@ -1897,16 +1969,44 @@ extern "C" __global__ void attention_prefill_flash(
                         ((uint)kh[3] << 16) | (uint)kh[2],
                         ((uint)kh[5] << 16) | (uint)kh[4],
                         ((uint)kh[7] << 16) | (uint)kh[6]);
+                } else {
+                    // Q4_0 GGUF: decode eight elements into eight f16 packed as uint4.
+                    unsigned short kh[8];
+                    const unsigned char* kbytes = (const unsigned char*)k_cache;
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
+                        kh[e] = __float2half(q40kv_decode(kbytes, (int)idx));
+                    }
+                    kk = make_uint4(
+                        ((uint)kh[1] << 16) | (uint)kh[0],
+                        ((uint)kh[3] << 16) | (uint)kh[2],
+                        ((uint)kh[5] << 16) | (uint)kh[4],
+                        ((uint)kh[7] << 16) | (uint)kh[6]);
                 }
                 if (v_dtype == 0) {
                     vv = *(const uint4*)(v_cache + off);
-                } else {
+                } else if (v_dtype == 1) {
                     unsigned short vh[8];
                     const uint* vq8 = (const uint*)v_cache;
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
                         long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
                         vh[e] = __float2half(q8kv_decode(vq8, (int)idx, k_cap));
+                    }
+                    vv = make_uint4(
+                        ((uint)vh[1] << 16) | (uint)vh[0],
+                        ((uint)vh[3] << 16) | (uint)vh[2],
+                        ((uint)vh[5] << 16) | (uint)vh[4],
+                        ((uint)vh[7] << 16) | (uint)vh[6]);
+                } else {
+                    // Q4_0 GGUF: decode eight elements into eight f16 packed as uint4.
+                    unsigned short vh[8];
+                    const unsigned char* vbytes = (const unsigned char*)v_cache;
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
+                        vh[e] = __float2half(q40kv_decode(vbytes, (int)idx));
                     }
                     vv = make_uint4(
                         ((uint)vh[1] << 16) | (uint)vh[0],

@@ -3036,6 +3036,29 @@ fn run_op(
                         arg_i32(0), // src_off
                     ],
                 )?;
+            } else if cache_dtype == DType::Q4_0 {
+                // Q4_0 GGUF KV cache: quantize f32 → 4-bit codes + f16 scale per 32-element
+                // block. The reader (`q40kv_decode` inline in the attention flash kernel)
+                // reads this exact GGUF block layout.
+                let n = (rows * row_stride) as i32;
+                let off = (pos as i32) * (row_stride as i32);
+                let cap = g.desc(cache).shape[0] as i32;
+                let total = n as u32;
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "store_kv_q4_0",
+                    total,
+                    32,
+                    args![
+                        arg_ptr(bs.ptr),
+                        arg_ptr(bc.ptr),
+                        arg_i32(n),
+                        arg_i32(off),
+                        arg_i32(cap),
+                        arg_i32(0), // src_off
+                    ],
+                )?;
             } else {
                 dispatch_1d(
                     pipelines,
@@ -3084,10 +3107,12 @@ fn run_op(
             // uses it to locate the Q8_0 scale section at offset cap/4 uint32 words.
             let k_dtype = match g.desc(k_cache).dtype {
                 DType::Q8_0 => 1,
-                _ => 0, // F16 (or other: the inline path only handles F16 and Q8_0)
+                DType::Q4_0 => 2,
+                _ => 0, // F16 (or other: the inline path handles F16, Q8_0, Q4_0)
             };
             let v_dtype = match g.desc(v_cache).dtype {
                 DType::Q8_0 => 1,
+                DType::Q4_0 => 2,
                 _ => 0,
             };
             let k_cap = g.desc(k_cache).shape[0] as i32;
