@@ -2947,21 +2947,47 @@ fn run_op(
             ctx.ensure_device(src, g, bindings)?;
             let bs = ctx.dev[src.0 as usize].as_ref().unwrap();
             let bc = rocm_buf(bindings.get(cache).expect("rocm: unbound KV cache"));
-            dispatch_1d(
-                pipelines,
-                ctx.stream,
-                "write_kv",
-                rows * row_stride, // one thread per (row, element): decode fans across CUs
-                256,
-                args![
-                    arg_ptr(bs.ptr),
-                    arg_ptr(bc.ptr),
-                    arg_i32(pos as i32),
-                    arg_i32(rows as i32),
-                    arg_i32(row_stride as i32),
-                    arg_i32(0), // src_stride (0 = packed = row_stride)
-                ],
-            )?;
+            let cache_dtype = g.desc(cache).dtype;
+            if cache_dtype == DType::Q8_0 {
+                // Q8_0 planar KV cache: quantize f32 → int8 codes + f16 scales, one 32-lane
+                // wave per 32-element block. The reader (`q8kv_decode` inline in the attention
+                // flash kernel) reads this exact planar layout.
+                let n = (rows * row_stride) as i32;
+                let off = (pos as i32) * (row_stride as i32);
+                let cap = g.desc(cache).shape[0] as i32;
+                let total = n as u32;
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "store_q8",
+                    total,
+                    32,
+                    args![
+                        arg_ptr(bs.ptr),
+                        arg_ptr(bc.ptr),
+                        arg_i32(n),
+                        arg_i32(off),
+                        arg_i32(cap),
+                        arg_i32(0), // src_off
+                    ],
+                )?;
+            } else {
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "write_kv",
+                    rows * row_stride, // one thread per (row, element): decode fans across CUs
+                    256,
+                    args![
+                        arg_ptr(bs.ptr),
+                        arg_ptr(bc.ptr),
+                        arg_i32(pos as i32),
+                        arg_i32(rows as i32),
+                        arg_i32(row_stride as i32),
+                        arg_i32(0), // src_stride (0 = packed = row_stride)
+                    ],
+                )?;
+            }
         }
         Op::Attention {
             q,

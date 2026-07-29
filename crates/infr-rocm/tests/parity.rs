@@ -6952,3 +6952,129 @@ fn convert_f32_to_f16_kernel_loaded() {
     // Just creating the backend verifies the kernel source compiles without error.
     drop(be);
 }
+
+// ── store_q8: planar Q8_0 KV cache roundtrip ─────────────────────────────────
+
+/// Run `WriteKv` on a Q8_0-typed cache and return the raw cache bytes.
+fn run_store_q8(
+    be: &dyn Backend,
+    src: &[f32],
+    rows: u32,
+    row_stride: u32,
+    pos: u32,
+    cap_elems: usize,
+) -> Vec<u8> {
+    let q8d = |n: usize| TensorDesc::new(vec![n], DType::Q8_0);
+    let mut g = Graph::new();
+    let sid = g.input(TensorDesc::new(vec![src.len()], DType::F32));
+    let cid = g.input(q8d(cap_elems));
+    g.push(Op::WriteKv {
+        src: sid,
+        cache: cid,
+        rows,
+        row_stride,
+        pos,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let sb = be
+        .alloc(src.len() * 4, BufferUsage::Activations)
+        .expect("src");
+    be.upload(sb.as_ref(), bytemuck::cast_slice(src)).unwrap();
+    // Q8_0 byte size: cap_elems codes (1 B each) + cap_elems/16 scales (2 B for f16, 2 per 32-elem block)
+    let cache_bytes = cap_elems + cap_elems / 16 * 2;
+    let cb = be.alloc(cache_bytes, BufferUsage::KvCache).expect("cache");
+    let mut b = Bindings::new();
+    b.bind(sid, sb.as_ref());
+    b.bind(cid, cb.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut raw = vec![0u8; cache_bytes];
+    be.download(cb.as_ref(), &mut raw).unwrap();
+    raw
+}
+
+/// Verify `store_q8` produces a valid planar Q8_0 layout: codes in [-127,127],
+/// scales consistent within each 32-element block, and dequantized values
+/// within Q8_0 precision of the source f32.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn store_q8_produces_valid_planar_q8_0() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    // 32-aligned row for a typical head_dim=128, n_kv=4 → row_stride=512
+    let row_stride: u32 = 512;
+    let rows: u32 = 2;
+    let pos: u32 = 0;
+    let cap_elems: usize = 16 * row_stride as usize; // 16 rows
+    let n = (rows * row_stride) as usize;
+    let src: Vec<f32> = (0..n)
+        .map(|i| ((i as i32 * 7 + 3) % 101) as f32 * 0.1 - 5.0)
+        .collect();
+    let raw = run_store_q8(&be, &src, rows, row_stride, pos, cap_elems);
+
+    // Verify codes region: each code is a byte in [0, cap_elems)
+    let n_blocks = n / 32;
+    for blk in 0..n_blocks {
+        // Compute per-block amax from source
+        let mut amax: f32 = 0.0;
+        for t in 0..32 {
+            let v = src[blk * 32 + t];
+            amax = amax.max(v.abs());
+        }
+        let d = amax / 127.0;
+        let inv = if amax > 0.0 { 1.0 / d } else { 0.0 };
+        for t in 0..32 {
+            let elem = blk * 32 + t;
+            let code = raw[elem] as i8;
+            assert!(code >= -127, "code at elem {elem} below -127: {code}");
+            let v = src[elem];
+            let expected_q = (v * inv).round() as i32;
+            let diff = (code as i32 - expected_q).abs();
+            assert!(
+                diff <= 1,
+                "code mismatch at elem {elem}: got {code}, expected ~{expected_q} (v={v}, d={d:e})"
+            );
+        }
+        // Verify scale: f16 bytes at cap_elems + blk*2
+        let sb = cap_elems + blk * 2;
+        let scale_bits = u16::from_le_bytes([raw[sb], raw[sb + 1]]);
+        let scale_f16 = half::f16::from_bits(scale_bits).to_f32();
+        let rel = (scale_f16 - d).abs() / d.max(1e-8);
+        assert!(
+            rel < 0.001 || (scale_f16 - d).abs() < 1e-5,
+            "scale mismatch at block {blk}: got {scale_f16:e}, expected {d:e}"
+        );
+        // Dequant roundtrip: each element's q8kv_decode value ≈ original
+        for t in 0..32 {
+            let elem = blk * 32 + t;
+            let code = raw[elem] as i8;
+            let deq = scale_f16 * (code as f32);
+            let v = src[elem];
+            let diff = (deq - v).abs();
+            assert!(
+                diff <= d.max(1e-6) + 1e-5,
+                "dequant mismatch at elem {elem}: deq={deq:e}, src={v:e}, d={d:e}, diff={diff:e}"
+            );
+        }
+    }
+
+    // Verify rest of cache (beyond written region) is untouched (zeroed by alloc).
+    // The Q8_0 cache is calloc'd so unwritten elements hold zero codes and zero scales.
+    for i in n..cap_elems {
+        assert_eq!(
+            raw[i], 0u8,
+            "unwritten code byte at offset {i} is non-zero: {}",
+            raw[i]
+        );
+    }
+    let scales_start = cap_elems;
+    let scales_end = cap_elems + cap_elems / 16 * 2;
+    let written_scales = n / 32 * 2;
+    for i in scales_start + written_scales..scales_end {
+        assert_eq!(
+            raw[i], 0u8,
+            "unwritten scale byte at offset {i} is non-zero: {}",
+            raw[i]
+        );
+    }
+}

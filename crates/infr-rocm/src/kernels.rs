@@ -235,6 +235,7 @@ const HIP_PARTS: &[&str] = &[
     EMBED_GATHER,
     ARGMAX,
     WRITE_KV,
+    STORE_Q8,
     ATTENTION,
     ATTENTION_PF,
     ATTENTION_FLASH,
@@ -1356,6 +1357,57 @@ extern "C" __global__ void write_kv(
     int cache_row = row_offset + row;
     cache[(long)cache_row * cache_stride + i] =
         __float2half(src[(long)row * effective_src_stride + i]);
+}
+"#;
+
+const STORE_Q8: &str = r#"
+// Planar Q8_0 KV-cache quantizer: one 32-lane wave per 32-element block. Each element is quantized
+// to a signed int8 code = round(v / d) where d = block_amax / 127. The planar layout (matching the
+// inline `q8kv_decode` reader in the attention flash kernel) packs all int8 codes in bytes [0, cap)
+// and all f16 scales in bytes [cap, cap + cap/16) — one f16 per 32-element block.
+//   n       = total source elements to quantize (rows * row_stride)
+//   off     = base element offset into the cache (= pos * row_stride)
+//   cap     = total cache element capacity (cached buffer's declared element count)
+//   src_off = base element offset into src (0 = start of src)
+extern "C" __global__ void store_q8(
+    const float* __restrict__ src,
+    uint8_t* __restrict__ cache,
+    int n,
+    int off,
+    int cap,
+    int src_off
+) {
+    int blk = blockIdx.x;              // 0 .. n/32-1
+    int t   = threadIdx.x;             // 0 .. 31
+    int gid = blk * 32 + t;            // global element index within the n-element span
+    if (gid >= n) return;
+
+    float v = src[src_off + gid];
+    float av = fabsf(v);
+
+    // Subgroup max reduction across 32 lanes (butterfly, same as attn_wave_allmax32).
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1)
+        av = fmaxf(av, __shfl_xor(av, s));
+
+    float d = av / 127.0f;
+    float inv = (av > 0.0f) ? (1.0f / d) : 0.0f;
+    int q = (int)roundf(v * inv);
+    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+
+    // Planar code: byte at the element's global index.
+    int elem = off + gid;
+    cache[elem] = (uint8_t)(q & 0xFF);
+
+    // Lane 0 writes the per-block f16 scale into the scales region.
+    if (t == 0) {
+        int block = off / 32 + blk;            // global block index
+        int sb = cap + block * 2;              // scale byte offset
+        union { unsigned short u; __half h; } sbits;
+        sbits.h = __float2half(d);
+        cache[sb]     = (uint8_t)(sbits.u & 0xFF);
+        cache[sb + 1] = (uint8_t)(sbits.u >> 8);
+    }
 }
 "#;
 
