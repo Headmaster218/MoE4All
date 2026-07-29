@@ -1712,10 +1712,34 @@ static __device__ __forceinline__ float attn_wave_allmax32(float v) {
     return v;
 }
 
+// Decode one element from planar Q8_0 layout: codes as int8[cap] then f16 scales[cap/32], packed
+// as uint32 words (4 codes or 2 scales per u32). The caller passes `k_cache` reinterpreted as
+// `const uint*` — the SAME base pointer, just read through a different type.
+//
+// Layout (each `[]` is one u32):
+//   codes:  4*cap/4 packed int8 codes                               word [0          .. cap/4-1]
+//   scales: 2*cap/64 packed f16 scales = 1 scale per 32-element block  word [cap/4 .. cap/4+cap/64-1]
+static __device__ __forceinline__ float q8kv_decode(const uint* codes, int idx, int cap) {
+    int i4 = idx >> 2;                           // u32 word index in codes section
+    uint cw = codes[i4];
+    int lane = idx & 3;                          // 0..3 within the u32
+    int code = (int)(signed char)((cw >> (lane * 8)) & 0xFF);
+    int bk = idx >> 5;                           // block = element / 32
+    int scale_word_idx = (cap >> 2) + (bk >> 1); // scales at cap/4, 2 scales/u32
+    uint sw = codes[scale_word_idx];
+    float d;
+    if (bk & 1) {
+        d = __half2float((__half)((unsigned short)(sw >> 16)));
+    } else {
+        d = __half2float((__half)((unsigned short)(sw & 0xFFFFu)));
+    }
+    return d * (float)code;
+}
+
 extern "C" __global__ void attention_prefill_flash(
     const float* __restrict__ q,        // [rows, n_head, head_dim]
-    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim]
-    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim]
+    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0 (cast to uint*)
+    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0 (cast to uint*)
     float* __restrict__ dst,            // [rows, n_head, head_dim]
     int rows,
     int kv_len,
@@ -1726,6 +1750,9 @@ extern "C" __global__ void attention_prefill_flash(
     int pos,            // absolute position of query row 0
     int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
     int swa_window,
+    int k_dtype,        // 0=F16, 1=Q8_0
+    int v_dtype,        // 0=F16, 1=Q8_0
+    int k_cap,          // total K buffer elements (for scale offset; same cap for V)
     int bc,             // keys per KV tile, <= 32 (one lane per key)
     int n_qtiles        // ceil(rows / br); blockIdx.x = head * n_qtiles + qtile
 ) {
@@ -1801,8 +1828,39 @@ extern "C" __global__ void attention_prefill_flash(
             uint4 kk = make_uint4(0u, 0u, 0u, 0u), vv = kk;
             if (j < kv_len) {
                 long off = ((long)j * n_kv + kv_h) * head_dim + d;
-                kk = *(const uint4*)(k_cache + off);
-                vv = *(const uint4*)(v_cache + off);
+                if (k_dtype == 0) {
+                    kk = *(const uint4*)(k_cache + off);
+                } else {
+                    // Q8_0: decode eight elements at positions d..d+7 into eight f16 packed as uint4.
+                    unsigned short kh[8];
+                    const uint* kq8 = (const uint*)k_cache;
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
+                        kh[e] = __float2half(q8kv_decode(kq8, (int)idx, k_cap));
+                    }
+                    kk = make_uint4(
+                        ((uint)kh[1] << 16) | (uint)kh[0],
+                        ((uint)kh[3] << 16) | (uint)kh[2],
+                        ((uint)kh[5] << 16) | (uint)kh[4],
+                        ((uint)kh[7] << 16) | (uint)kh[6]);
+                }
+                if (v_dtype == 0) {
+                    vv = *(const uint4*)(v_cache + off);
+                } else {
+                    unsigned short vh[8];
+                    const uint* vq8 = (const uint*)v_cache;
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
+                        vh[e] = __float2half(q8kv_decode(vq8, (int)idx, k_cap));
+                    }
+                    vv = make_uint4(
+                        ((uint)vh[1] << 16) | (uint)vh[0],
+                        ((uint)vh[3] << 16) | (uint)vh[2],
+                        ((uint)vh[5] << 16) | (uint)vh[4],
+                        ((uint)vh[7] << 16) | (uint)vh[6]);
+                }
             }
             uint* kd = (uint*)(ks + jj * kvs + d);
             uint* vd = (uint*)(vs + jj * kvs + d);

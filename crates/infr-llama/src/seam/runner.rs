@@ -447,7 +447,7 @@ pub(crate) fn generate_dense_backend(
     // (`crate::seam::kv_q8_layout_ok`) — one function, so a pinned q8 can never be gated back to
     // f16 here against an estimate that priced it at q8.
     let kv_align_ok = crate::seam::kv_q8_layout_ok(c);
-    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
+    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan" | "rocm");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
     // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
     let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")

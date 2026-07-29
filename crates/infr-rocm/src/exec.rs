@@ -2988,6 +2988,18 @@ fn run_op(
             let (bk_ptr, bv_ptr) = (bk.ptr, bv.ptr);
             let bq_ptr = ctx.dev[q.0 as usize].as_ref().unwrap().ptr;
             let dd_ptr = dd.ptr;
+            // KV quant state: dtype encodes any quantized format (Q8_0, block, turbo), and k_cap
+            // is the total element count (rows * n_kv * head_dim) per layer — the flash kernel
+            // uses it to locate the Q8_0 scale section at offset cap/4 uint32 words.
+            let k_dtype = match g.desc(k_cache).dtype {
+                DType::Q8_0 => 1,
+                _ => 0, // F16 (or other: the inline path only handles F16 and Q8_0)
+            };
+            let v_dtype = match g.desc(v_cache).dtype {
+                DType::Q8_0 => 1,
+                _ => 0,
+            };
+            let k_cap = g.desc(k_cache).shape[0] as i32;
             let (mt, swa): (i32, i32) = match mask {
                 AttnMask::Causal => (0, 0),
                 AttnMask::SlidingWindow(w) => (1, w as i32),
@@ -3138,6 +3150,9 @@ fn run_op(
                         arg_i32(pos as i32),
                         arg_i32(mt),
                         arg_i32(swa),
+                        arg_i32(k_dtype),
+                        arg_i32(v_dtype),
+                        arg_i32(k_cap),
                         arg_i32(t.bc as i32),
                         arg_i32(n_qtiles as i32),
                     ],
