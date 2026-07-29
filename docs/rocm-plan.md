@@ -77,10 +77,10 @@ would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
    kernel is ~5× off its LDS-throughput bound and ~8× off the arithmetic floor.
    WMMA for it is the lever.
 4. **MoE prefill** — P7f CN=2 column tiling Q4_K gate/up: +12.9% pp512
-   (699→790). Two columns per wave halves the grid (3.1M → 1.57M waves, each
-   doing twice the work). CN=4 gate/up and CN=2 Q6K down probed flat — GPU
-   saturated. Next: CN=2 for the batched arm, then CN=2 for remaining down
-   formats.
+   (699→790). CN=4, Q6K down CN=2, Q4K down CN=2 all flat — GPU saturated. The
+   only CN=2 win was gate/up (3.1M→1.57M waves at nff=768). Down at ne=2048
+   still has 4.2M waves after CN=2 — no wave shortage. Batched arm at ~12k waves
+   too low for CN=2 to help. Next: attention prefill WMMA (#3).
 5. **~~`Argmax`~~** — P7c: multi-block two-pass reduction, 117.6→13.6 µs (8.6×),
    decode +2.1%. Self-contained; tie-breaking preserved (parity test + seam
    gate).
