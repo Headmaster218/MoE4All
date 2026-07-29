@@ -73,9 +73,11 @@ would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
    7.4k→10.7k (+51%). One-thread-per-row serial copy replaced with per-row
    vectorised float4 parallelisation. Absent from Q4_K_M (mixed dtypes → no
    fused QKV → no CopyStrided).
-3. **`Attention` — 21.8% of Q4_K_M `pp512`.** P1's own remainder: the flash
-   kernel is ~5× off its LDS-throughput bound and ~8× off the arithmetic floor.
-   WMMA for it is the lever.
+3. **`Attention` — 21.8% of Q4_K_M `pp512`.** P7g re-swept QPW at current perf:
+   2→279 is still optimal, 3→313, 4→313 (flat from P1). f16 WMMA needs a
+   fundamental restructure (16-row tile vs current 2-QPW-per-wave lane-per-key
+   design — ~87% tile waste). Next: profile the P·V reduction loop and LDS
+   staging to find a narrower lever.
 4. **MoE prefill** — P7f CN=2 column tiling Q4_K gate/up: +12.9% pp512
    (699→790). CN=4, Q6K down CN=2, Q4K down CN=2 all flat — GPU saturated. The
    only CN=2 win was gate/up (3.1M→1.57M waves at nff=768). Down at ne=2048
