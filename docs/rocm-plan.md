@@ -31,66 +31,207 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
 
 ## Where we stand (read this first)
 
-**RX 7900 XTX / gfx1100, at `743ec94`.** `infr` t/s ÷ `llama.cpp` HIP t/s.
+**RX 7900 XTX / gfx1100, at `06f6088`.** `infr` t/s ÷ `llama.cpp` HIP t/s.
 Oracle is the LOCAL build at
 `~/Projects/mxaddict/llama.cpp/build-hip/bin/llama-bench -sm none -mg 0 -fa 1` —
 **not** `/usr/bin/llama-bench`, which is broken on this box
 (`undefined symbol: ggml_dsv4_hc_post`, a mismatched `libllama`/`libggml`).
 
-| model               | pp512 (infr / llama)      | tg128                 |
-| ------------------- | ------------------------- | --------------------- |
-| Qwen3-0.6B Q4_K_M   | 13931 / 20150 = **0.69×** | 255 / 384 = **0.66×** |
-| Qwen3-0.6B Q6_K     | 10700 / 22033 = **0.49×** | — / 366 = **—**       |
-| Qwen3-30B-A3B (MoE) | 790 / 2905 = **0.27×**    | — / 141 = **—**       |
-| — Q4_K_M tg128@4096 | —                         | 157 / 305 = **0.52×** |
+| model               | pp512 (infr / llama)      | tg128 (d0)            | tg128 @ d4096         |
+| ------------------- | ------------------------- | --------------------- | --------------------- |
+| Qwen3-0.6B Q4_K_M   | 14212 / 21714 = **0.66×** | 305 / 384 = **0.79×** | 174 / 307 = **0.57×** |
+| Qwen3-0.6B Q6_K     | — / 22033 = **—**         | — / 366 = **—**       | —                     |
+| Qwen3-30B-A3B (MoE) | 784 / 2905 = **0.27×**    | — / 141 = **—**       | —                     |
+
+infr-Vulkan baseline (same model, same GPU): pp512 31525, tg128 689,
+tg128@d4096 473. Vulkan delivers **2.2×** our prefill and **2.3×** our decode
+throughput.
 
 Started at 0.17× / 0.19× (dense) and 0.036× / 0.23× (MoE); before that, DeltaNet
 prefill was 0.0007×. gemma-3, DeltaNet and Llama-3.2 rows have not been
 re-measured recently and should not be quoted.
 
-### The one finding that should drive the next slice
+### Per-op profile (pp512, Qwen3-0.6B Q4_K_M, 7900 XTX)
 
-**P7 halved the decode gap.** One-pass online softmax + one-key-per-lane in the
-split-KV partial: d0 213→248 t/s (+16%), d4096 106→157 (+48%). The qwen3 seam
-golden hash `0xfd63781ea3bfa785` is **unmoved** — despite the changed reduction
-order, greedy decode is bit-identical. Prefill-parity test gates at ≤2e-3 rel
-against the old split-KV kernels on 8 shapes × masks.
+| op                           | infr-ROCm | Vulkan  | ratio |
+| ---------------------------- | --------- | ------- | ----- |
+| Attention (flash)            | 288.0 µs  | 90.4 µs | 3.2×  |
+| Linear Q4K 1024×6144 gate/up | 253.6 µs  | 65.8 µs | 3.9×  |
+| Linear Q6K 3072×1024 down    | 284.3 µs  | 44.6 µs | 6.4×  |
+| Linear Q4K 1024×2048 q/k/v   | 116.7 µs  | 31.1 µs | 3.8×  |
+| Linear Q4K 1024×1024         | 63.1 µs   | 31.1 µs | 2.0×  |
+| QkNormRope                   | 25.4 µs   | 5.1 µs  | 5.0×  |
+| RmsNorm                      | 13.1 µs   | 6.0 µs  | 2.2×  |
+| WriteKv                      | 10.6 µs   | 4.6 µs  | 2.3×  |
 
-The remaining decode gap vs llama.cpp HIP (0.65× d0, 0.52× d4096) is still
-substantially attention — PF (batched prefetch) on top of the P7 partial would
-hide the remaining K/V memory latency, and WMMA for the prefill flash kernel
-would close the prefill gap (still at ~5× off LDS-throughput bound). The #3 and
-#4 items below are the next prefill levers.
+Started at 0.17× / 0.19× (dense) and 0.036× / 0.23× (MoE); before that, DeltaNet
+prefill was 0.0007×. gemma-3, DeltaNet and Llama-3.2 rows have not been
+re-measured recently and should not be quoted.
 
-### Ranked next work (all measured, not guessed)
+### Vulkan-perf parity audit: techniques not yet ported
 
-1. **~~Decode attention~~** — P7 delivered: one-pass online softmax +
-   one-key-per-lane, +16% d0, +48% d4096, golden unmoved. Remaining: PF (batched
-   prefetch) on top of the new partial ($attn_pf$ flag — the register-staging
-   machinery is already there, but needs an LDS-staged-Q-aware rewrite), then
-   WMMA prefill flash.
-2. **~~`CopyStrided`~~** — P7b: 302 µs→10 µs per dispatch (30×), Q6_K pp512
-   7.4k→10.7k (+51%). One-thread-per-row serial copy replaced with per-row
-   vectorised float4 parallelisation. Absent from Q4_K_M (mixed dtypes → no
-   fused QKV → no CopyStrided).
-3. **`Attention` — 21.8% of Q4_K_M `pp512`.** P7g re-swept QPW at current perf:
-   2→279 is still optimal, 3→313, 4→313 (flat from P1). f16 WMMA needs a
-   fundamental restructure (16-row tile vs current 2-QPW-per-wave lane-per-key
-   design — ~87% tile waste). Next: profile the P·V reduction loop and LDS
-   staging to find a narrower lever.
-4. **MoE prefill** — P7f CN=2 column tiling Q4_K gate/up: +12.9% pp512
-   (699→790). CN=4, Q6K down CN=2, Q4K down CN=2 all flat — GPU saturated. The
-   only CN=2 win was gate/up (3.1M→1.57M waves at nff=768). Down at ne=2048
-   still has 4.2M waves after CN=2 — no wave shortage. Batched arm at ~12k waves
-   too low for CN=2 to help. Next: attention prefill WMMA (#3).
-5. **~~`Argmax`~~** — P7c: multi-block two-pass reduction, 117.6→13.6 µs (8.6×),
-   decode +2.1%. Self-contained; tie-breaking preserved (parity test + seam
-   gate).
-6. **~~Dispatch count~~** — P7d probe: fused Q+K QkNormRope into one kernel
-   launch (56→28 dispatches), but register pressure cost offset the dispatch
-   savings. Net **-1.6% regression** at decode. Per-dispatch cost is real GPU
-   work (Slice 31, P6 confirmed), not launch overhead, so merging kernels
-   doesn't help. Not built.
+A comprehensive audit of every kernel family Vulkan ships that ROCm does not —
+or ships in a weaker form. Ordered roughly by value. Each item names the Vulkan
+reference (shader or recorder function) and the gap.
+
+#### A. KV-cache quantization (VRAM + bandwidth)
+
+| technique                  | Vulkan ref                                 | ROCm state                                                  |
+| -------------------------- | ------------------------------------------ | ----------------------------------------------------------- |
+| **store_q8** (Q8_0 KV)     | `recorder.rs:5162` / `store_q8.comp`       | missing — only f16 WriteKv                                  |
+| **store_turbo**            | `recorder.rs:5298` / `quant_turbo.comp`    | missing                                                     |
+| **store_kv_dense**         | `recorder.rs:5345`                         | missing                                                     |
+| **dequant_kv_f16 prepass** | `recorder.rs:5377` / `dequant_kv_f16.comp` | missing — no way to read quantized KV in attention          |
+| **q8_0/Turbo/blk seam**    | `runner.rs:450-457`                        | "rocm" not in any of `kv_q8_backend`/`kv_turbo_ok`/`blk_ok` |
+
+**Impact**: Q8_0 halves KV VRAM (doubles usable context length). Q4_0 quarters
+it. Vulkan gates these behind seam flags that ROCm currently fails — the runner
+downgrades ROCm to f16 KV regardless of config.
+
+#### B. Inline KV decode in attention (skip dequant prepass)
+
+| technique                      | Vulkan ref                                           | ROCm state                                                |
+| ------------------------------ | ---------------------------------------------------- | --------------------------------------------------------- |
+| **Q8_0 in attn_partial**       | `attn_partial.comp:136-158` (-DKQ8/-DVQ8)            | missing — would need planar decode in flash loop          |
+| **Q4_0/Q4_1/Q5_0/Q5_1 inline** | `attn_partial.comp:69-121` (-DKMAINLINE/-DVMAINLINE) | missing — skip prepass, decode block scale once per block |
+| **Flash-stage Dequant**        | `recorder.rs:4399` / `FlashStage::Dequant(dt)`       | missing — routes through staged builds                    |
+| **Flash-warp Dequant**         | `attn_flash_warp.comp`                               | no WMMA flash kernel yet                                  |
+
+**Impact**: Vulkan's inline decode avoids a full f16-scratch write+read for
+every quantized KV cache read — a 2× bandwidth savings at decode depth where
+attention is K/V-read-bound. Combined with Q8_0 store, this halves decode
+attention's global memory traffic (half the bytes, no prepass round-trip).
+
+#### C. WMMA/matrix-core attention for prefill AND decode
+
+| technique                                | Vulkan ref                                     | ROCm state                                        |
+| ---------------------------------------- | ---------------------------------------------- | ------------------------------------------------- |
+| **attn_flash_warp** (coopmat)            | `attn_flash_warp.comp` (BM=64, BN=64, 8 warps) | scalar placeholder `attention_prefill_flash_wmma` |
+| **attn_qk_warp** (coopmat Q·K)           | `attn_qk_warp.comp`                            | missing                                           |
+| **attn_pv_warp** (coopmat P·V)           | `attn_pv_warp.comp`                            | missing                                           |
+| **attn_flash_partial** (split-K+coopmat) | `attn_flash_partial.comp`                      | missing — decode uses scalar lane-per-key P7      |
+| **attn_softmax** (cluster softmax)       | `attn_softmax.comp`                            | missing — uses scalar wave_allmax                 |
+
+**Impact**: 3.2× gap on prefill attention (288 vs 90 µs). Vulkan uses WMMA for
+both Q·K _and_ P·V, with 4× wider tiles (BM=64 vs br=16). The decode at depth is
+also attention-bound — a coopmat split-K partial+combine would match Vulkan's
+decode attention speed.
+
+#### D. F16-activation GEMM (A_GLOBAL family)
+
+| technique                        | Vulkan ref                                              | ROCm state                                           |
+| -------------------------------- | ------------------------------------------------------- | ---------------------------------------------------- |
+| **matmul_native_f16a** (n128_ag) | `recorder.rs:2110` / `native_gemm_warp.comp` -DA_GLOBAL | missing — ROCm uses int8 quantized activations       |
+| **BM=32/16 small-m tiles**       | `recorder.rs:70-101`                                    | missing — only 2×1/2×2 RM×CN tiles                   |
+| **Split-K for narrow-N GEMM**    | `recorder.rs:2209` / `matmul_native_splitk`             | implicit via WMMA tile grid, but no explicit split-K |
+| **BF16 coopmat**                 | `recorder.rs:2531` / `native_gemm_warp.comp` -DBF16CM   | missing                                              |
+| **FMA fallback (no coopmat)**    | `recorder.rs:2905` / `native_gemm_fma.comp`             | ROCm has scalar dequant→f16 fallback                 |
+
+**Impact**: Vulkan's A_GLOBAL path pre-converts f32 activations to f16 via
+`store_f16`, then the GEMM reads f16 activations directly from global (no
+staging). This halves the BM×BK LDS for activations (to zero), letting 3
+workgroups fit per CU instead of 2. Combined with the BM=64 tile, this is why
+Vulkan's Q4_K gate/up GEMM is 3.9× faster (65.8 vs 253.6 µs).
+
+#### E. MMQ (decode-once-reuse) all-expert MoE GEMM
+
+| technique                    | Vulkan ref                                    | ROCm state                                            |
+| ---------------------------- | --------------------------------------------- | ----------------------------------------------------- |
+| **matmul_mmq_experts**       | `recorder.rs:7867` / `native_gemm_mmq_*.comp` | missing — ROCm uses id-multi GEMV (serial per-expert) |
+| **matmul_mmq_experts_paged** | `recorder.rs:7975`                            | missing                                               |
+| **moe_scatter_reduce**       | `recorder.rs:8048`                            | missing — needed for MMQ output scatter               |
+
+**Impact**: Vulkan's MMQ decodes each expert's weight ONCE into LDS, then all
+tokens (rows) that hit that expert share the decode — the llama.cpp threadblock
+pattern. ROCm's id-multi GEMV re-decodes weights for every expert × token,
+wasting compute. This is the largest MoE prefill lever.
+
+#### F. QkNormRope + WriteKv (full peephole)
+
+| technique                       | Vulkan ref                                                | ROCm state                                 |
+| ------------------------------- | --------------------------------------------------------- | ------------------------------------------ |
+| **qk_norm_rope_interleaved_at** | `recorder.rs:5466` (fused QK norm + rope + K write + BDA) | F1d only fused QkNormRope→WriteKv (K half) |
+| V-write (Linear→WriteKv)        | `recorder.rs` write_kv peephole                           | missing — V goes through separate WriteKv  |
+
+**Impact**: Vulkan's interleaved shader merges Q/K norm, RoPE, K cache store AND
+sends the address as a BDA pointer — all in one dispatch. ROCm's F1d only folds
+the K half (QkNormRope→WriteKv). The V-write is still a separate dispatch per
+layer.
+
+#### G. DeltaNet variants
+
+| technique                  | Vulkan ref         | ROCm state |
+| -------------------------- | ------------------ | ---------- |
+| **deltanet_chunked_split** | `recorder.rs:6801` | missing    |
+| **deltanet_seq_split**     | `recorder.rs:6928` | missing    |
+| **deltanet_strided**       | `recorder.rs:6671` | missing    |
+
+**Impact**: Vulkan's split/strided variants fill the GPU better at different
+depth×state-size ratios. ROCm only has the basic chunked prefill +
+column-parallel decode.
+
+#### H. Model-specific fusion (gemma4/E2B)
+
+| technique                | Vulkan ref                              | ROCm state |
+| ------------------------ | --------------------------------------- | ---------- |
+| **e2b_gate**             | `recorder.rs:1831` / `e2b_gate.comp`    | missing    |
+| **mul_sigmoid** (gemma4) | `recorder.rs:7203` / `mul_sigmoid.comp` | missing    |
+
+**Impact**: `e2b_gate` is a fused Linear(f32)+GatedAct(gelu, stride) for E2B
+models. `mul_sigmoid` is gemma4's per-layer output gate. Both are small
+capability items — the models work via separate op dispatch, but each dispatch
+is 2-3 µs of device turnaround on ROCm.
+
+#### I. DiffusionGemma in-graph sampler
+
+| technique            | Vulkan ref                               | ROCm state                                  |
+| -------------------- | ---------------------------------------- | ------------------------------------------- |
+| **dg_eb_sample**     | `recorder.rs:7661` / `dg_eb_sample.comp` | missing — DiffusionGemma uses host fallback |
+| **eb_sample_reduce** | `Backend` trait default                  | not implemented                             |
+
+**Impact**: DiffusionGemma's denoise loop does a per-canvas-row entropy-bound
+sampler — argmax, entropy, CDF-sample. On Vulkan this stays in-graph (no host
+round-trip). On ROCm it falls back to full host download+compute, costing one
+PCIe round-trip per denoise step.
+
+#### J. MMQ per-format GEMMs (wider set than WMMA)
+
+Vulkan ships 18 MMQ format specializations (`native_gemm_mmq_*.comp`): q2k, q3k,
+q4k, q5k, q6k, q8_0, q4_0, q4_1, q5_0, q5_1, iq2_s, iq3_s, iq4_nl, iq4_xs, q2_0,
+mxfp4, nvfp4. ROCm's WMMA family covers these but only as single-wave scalar
+WMMA — not the multi-warp threadblock LDS-shared decode-once pattern Vulkan's
+MMQ uses. For formats other than Q4_K (which has the Slice-27 pipe), ROCm's
+re-decode-every-row overhead is the full Vulkan gap.
+
+#### K. Memory machinery (probed negative or low-priority)
+
+| technique                | Vulkan ref                | ROCm state                                           |
+| ------------------------ | ------------------------- | ---------------------------------------------------- |
+| HIP graphs / replay tape | probed twice: -36%        | **DO NOT PORT** — per-dispatch cost is real GPU work |
+| BDA arena addressing     | `alloc_arena_bda`         | HIP raw pointers likely make this redundant          |
+| Staging ring             | `StagingRing`             | missing — lower priority                             |
+| ReBAR                    | `Backing::Vram`           | evaluate on APU hardware                             |
+| rocBLAS f16 prefill      | measured worse (Slice 26) | **DO NOT PORT** — dequant tax + VRAM blowup          |
+| Cooperative decode-once  | regressed (Slice 28)      | only wins with double-buffered async pipeline        |
+
+### Ranked next work (top 5, by estimated value)
+
+1. **KV-cache quantization (Q8_0)** — `store_q8` kernel + seam gate threading.
+   Halves KV VRAM, unlocks double context length. `qk_norm_rope` already writes
+   f16 K, so only V needs the store kernel.
+2. **f16 A_GLOBAL GEMM** — pre-convert activations to f16, eliminate the int8
+   quant/dequant tax on the GEMM path. This is Vulkan's largest
+   single-multiplier advantage (2-4× on every GEMM). Requires `store_f16` for
+   activations + a new WMMA kernel that reads f16 A fragments directly from
+   global.
+3. **WMMA flash attention (intrinsics)** — replace the scalar placeholder with
+   real `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`. The kernel body and
+   dispatch are already in place.
+4. **Inline KV decode in attention** — Q8_0 (and later Q4_0/Q4_1/Q5_0/Q5_1)
+   decode inside the flash loop. Skips the dequant prepass round-trip.
+5. **MMQ all-expert MoE GEMM** — decode-once-reuse for MoE expert weights,
+   matching the llama.cpp MMQ threadblock pattern already shipped on Vulkan in
+   `matmul_mmq_experts`.
 
 ### Measurement traps that have already cost this campaign time
 
@@ -526,27 +667,48 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       goldens unmoved); ✅ batched-prefetch decode attention (**P6**, bit-exact
       against `attn_pf=false`); ✅ **one-pass online-softmax +
       one-key-per-lane** split-KV (**P7**, 1.16× d0 / 1.48× @d4096, golden
-      unmoved); ✅ **vectorised `copy_strided`** (**P7b**, 30× kernel speedup,
-      Q6_K pp512 1.51×). Still open: WMMA flash prefill; PF on top of P7;
-      dequant-in-flash; q8_0/Turbo/block KV quant
+      unmoved); ✅ **tuned split-KV chunking** (tgt_chunks=64, d0 +19%); ✅
+      **vectorised `copy_strided`** (**P7b**, 30× kernel speedup, Q6_K pp512
+      1.51×); ✅ **WMMA placeholder kernel** (br=64 bc=64, f16 Q conversion,
+      opt-in). Still open: WMMA f16 intrinsics; dequant-in-flash for Q8_0/Q4_0
+      KV; q8_0/Turbo/block KV quant store+load
 - [x] **Quant unpack** — ✅ branchless dword-wide Q6_K in the MoE expert decode
       (**P3**) and the two dense kernels (**P4**); `__builtin_memcpy` is the
       align-1 idiom that still emits `global_load_b128`
 - [x] **Fusion** — ✅ GatedActFused (Slice 32), ✅ QkNormRope→KV-write (F1d), ✅
       RmsNormAdd (Slice 32), ✅ GatedRmsNorm (F1), ✅ Conv1dSilu, ✅
       RmsNorm→(Linear|MoeFfn) (Slice 32), ✅ MoeFfn→Add (F1c), ✅ Combined
-      gate/up weight upload. Q+K dispatch fusion probed negative (P7d, -1.6%).
-      Missing vs Vulkan: `e2b_gate` (E2B only), `mul_sigmoid` (gemma4),
-      **`matmul_mmq_experts`** — all-expert MoE GEMM (plan #4)
-- [ ] **Device-side sampling** — ✅ argmax (**P7c**, 8.6×); sample_topk /
-      eb_sample (unblocks MTP + DG)
+      gate/up weight upload; ✅ **WMMA 2×2 tile threshold lowered** to N≥1024
+      (+2.2% pp512). Q+K dispatch fusion probed negative (P7d, -1.6%). Missing
+      vs Vulkan: `e2b_gate` (E2B only), `mul_sigmoid` (gemma4), **V-write
+      peephole** (Linear→WriteKv epilogue on GEMV), **f16 A_GLOBAL GEMM** (skip
+      int8 quant/dequant, pre-convert activations to f16)
+- [x] **Device-side sampling** — ✅ argmax (**P7c**, 8.6×); ✅ **`Op::Sample`**
+      (two-stage radix-select + nucleus/CDF); ✅ **`Op::ArgmaxProb`** (two-stage
+      online-softmax reduction). Missing: `dg_eb_sample` (DiffusionGemma
+      entropy-bound sampler), `eb_sample_reduce` (Backend trait method)
 - [x] **Decode-replay tape** — evaluated (P6): worth ~0.4%, NOT built
+- [ ] **KV-cache quantization** — missing: `store_q8`/`store_q8_dyn` (Q8_0 KV
+      write), `store_turbo` (TurboQuant), `store_kv_dense`; `dequant_kv_f16`
+      prepass; seam gate `"rocm"` not threaded into `kv_q8_backend`/`blk_ok`
+- [ ] **f16 A_GLOBAL + wide-tile GEMM** — missing: pre-convert activations to
+      f16 via `store_f16`; WMMA kernel reading f16 A fragments from global (no
+      As staging, 3 WGs/CU instead of 2); BM=64/32/16 row-tile ladder for
+      small-m batched prefill
+- [ ] **WMMA flash attention** — kernel body in place (scalar placeholder),
+      needs `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` for Q·K + P·V
+- [ ] **Inline KV decode** — Q8_0 planar decode in flash attention K+V staging
+      loop (skip `dequant_kv_f16` prepass); Q4_0/Q4_1/Q5_0/Q5_1 block-amortized
+      inline decoders (`dqv4` pattern from Vulkan's `attn_partial.comp`)
+- [ ] **MMQ all-expert MoE GEMM** — decode-once-reuse threadblock pattern
+      (`matmul_mmq_experts`) replacing per-expert × per-token scalar GEMV
 - [ ] **DeltaNet** — split/strided variants where they help
 - [ ] **Memory** — BDA/staging/ReBAR/UMA/VRAM-guard where beneficial
 - [ ] **Multi-GPU** — device pool, tensor-parallel, expert-parallel,
       pipeline-parallel, P2P, external semaphores, all-reduce (RCCL)
-- [ ] **Perf ≥1.0×** — async-pipelined mmq prefill + mmvq decode; sweep vs
-      llama.cpp HIP
+- [ ] **Perf ≥1.0×** — remaining 2.2× prefill / 2.3× decode gap to Vulkan
+      primarily from three families: f16 A_GLOBAL GEMM (~2-4×), WMMA attention
+      (~3.2×), and MMQ all-expert MoE (~3-5× for MoE models)
 
 ## Cross-backend note
 
