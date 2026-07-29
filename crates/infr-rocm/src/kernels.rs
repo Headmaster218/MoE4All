@@ -2108,6 +2108,9 @@ extern "C" __global__ void convert_f32_to_f16(
 // Gated behind `ctx.rocm.no_wmma` in exec.rs — when WMMA is disabled, the
 // existing `attention_prefill_flash` scalar kernel takes over.
 const ATTENTION_FLASH_WMMA: &str = r#"
+typedef __fp16   half16 __attribute__((ext_vector_type(16)));
+typedef float    float8 __attribute__((ext_vector_type(8)));
+
 // Compile-time tile geometry (mirrors Vulkan's cooperative-matrix kernel).
 #define ATTN_WMMA_BR  64
 #define ATTN_WMMA_BC  64
@@ -2160,8 +2163,6 @@ extern "C" __global__ void attention_prefill_flash_wmma(
     float m[ATTN_WMMA_QPR], l[ATTN_WMMA_QPR];
     // Accumulator: per query row, lane `i` owns output dims i, i+32, i+64, …
     int npl = (head_dim + 31) >> 5;     // partials per lane
-    // Stack-allocate accumulators per partial: each lane stores npl floats per query row.
-    // QPR * npl fits easily within register budget at typical head_dim.
     float acc[ATTN_WMMA_QPR][16];       // max npl ≤ 8 for head_dim ≤ 256; 16 is safe ceiling
     #pragma unroll
     for (int u = 0; u < ATTN_WMMA_QPR; u++) {
@@ -2185,84 +2186,133 @@ extern "C" __global__ void attention_prefill_flash_wmma(
     }
     j_lo = (j_lo / bkdim) * bkdim;
 
-    for (int j0 = j_lo; j0 < j_hi; j0 += bkdim) {
-        // Each lane in this warp owns ONE key in the current KV tile:
-        // key index = j0 + wc*ATTN_WMMA_KCW + lane
-        int j = j0 + wc * ATTN_WMMA_KCW + lane;
-        bool live = (j < j_hi) && (j < kv_len);
+    int q_base = r0 + wr * ATTN_WMMA_QPR;
+    int ksteps = (head_dim + 15) >> 4;   // ceil(head_dim/16)
 
-        // ── Q·Kᵀ score computation ──
-        // One lane = one key; compute dot products against all 16 query rows
-        // this warp owns. TODO: replace with WMMA intrinsics for full perf —
-        // load Q as half16 A-fragment, K as half16 B-fragment (transposed),
-        // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)`.
+    for (int j0 = j_lo; j0 < j_hi; j0 += bkdim) {
+        int key_start = j0 + wc * ATTN_WMMA_KCW;
+
+        // ── Q·Kᵀ score computation (WMMA) ──
+        // 16 query rows × 16 keys per group, head_dim/16 K-steps.
+        // Two WMMA calls per K-step (one per key group), float8 accumulators.
+        float8 qk_acc[2];
+        #pragma unroll
+        for (int g = 0; g < 2; g++) {
+            #pragma unroll
+            for (int e = 0; e < 8; e++) qk_acc[g][e] = 0.0f;
+        }
+
+        #pragma unroll
+        for (int ks = 0; ks < ksteps; ks++) {
+            int d0 = ks << 4;
+            bool partial = (ks == ksteps - 1 && (head_dim & 15));
+
+            // A fragment: Q[16 query rows][16 dims], row-major.
+            half16 a_frag;
+            int arow = q_base + (lane & 15);
+            if (arow < rows && !partial) {
+                const __half* qp = q + ((long)arow * n_head + h) * head_dim + d0;
+                #pragma unroll
+                for (int kk = 0; kk < 16; kk++) a_frag[kk] = qp[kk];
+            } else {
+                #pragma unroll
+                for (int kk = 0; kk < 16; kk++) a_frag[kk] = __float2half(0.0f);
+            }
+
+            // B fragment: K[16 keys per group][16 dims], column-major.
+            #pragma unroll
+            for (int g = 0; g < 2; g++) {
+                int j_key = key_start + g * 16 + (lane & 15);
+                half16 b_frag;
+                if (j_key < kv_len && j_key < j_hi && !partial) {
+                    const __half* kp = k_cache + ((long)j_key * n_kv + kv_h) * head_dim + d0;
+                    #pragma unroll
+                    for (int kk = 0; kk < 16; kk++) b_frag[kk] = kp[kk];
+                } else {
+                    #pragma unroll
+                    for (int kk = 0; kk < 16; kk++) b_frag[kk] = __float2half(0.0f);
+                }
+                qk_acc[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    a_frag, b_frag, qk_acc[g]);
+            }
+        }
+
+        // Extract per-lane scores from WMMA output.
+        // qk_acc[g] is a 16×16 score matrix; D[row][col] lives in lane
+        // `col + (row&1)*16`, element `row>>1`.
+        // Each lane l owns one key (at position l in the 32-key warp window).
+        // For that key, we need scores for all 16 query rows.
+        int my_col   = lane & 15;
+        int my_group = lane >> 4;       // 0 or 1
         float s[ATTN_WMMA_QPR];
         #pragma unroll
-        for (int u = 0; u < ATTN_WMMA_QPR; u++) s[u] = 0.0f;
+        for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+            int src_lane = my_col + (u & 1) * 16;
+            int elem     = u >> 1;
+            if (src_lane == lane) {
+                s[u] = qk_acc[my_group][elem];
+            } else {
+                s[u] = __shfl(qk_acc[my_group][elem], src_lane);
+            }
+        }
 
-        if (live) {
-            int k_off = ((long)j * n_kv + kv_h) * head_dim;
-            const __half* kr = k_cache + k_off;
-            int q_base = r0 + wr * ATTN_WMMA_QPR;
+        // ── Online softmax (warp-local) + P·V (scalar broadcast) ──
+        // Softmax: per-query-row max across all 32 keys via allmax32.
+        // P·V: broadcast each key's score → softmax → accumulate V.
+        // The two are fused: we broadcast scores, apply softmax inline,
+        // then accumulate weighted V. This avoids an intermediate w[] array.
+        int nj = ATTN_WMMA_KCW;   // 32 keys per warp
+        if (j0 + nj > j_hi) nj = j_hi - j0;
+        for (int jj = 0; jj < nj; jj++) {
+            int j_key = key_start + jj;
+            if (j_key >= kv_len) continue;
+
+            // Broadcast this key's scores to all lanes.
+            float sj[ATTN_WMMA_QPR];
+            #pragma unroll
+            for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+                sj[u] = __shfl(s[u], jj);
+            }
+
+            // Online softmax: find tile-max, rescale, compute weight.
+            bool any = false;
+            float wj[ATTN_WMMA_QPR];
             #pragma unroll
             for (int u = 0; u < ATTN_WMMA_QPR; u++) {
                 int qr = q_base + u;
-                if (qr >= rows) continue;
-                const __half* qr_ptr = q + ((long)qr * n_head + h) * head_dim;
-                float dot = 0.0f;
-                // TODO: replace with WMMA intrinsics — load 16 f16 elements from
-                // qr_ptr and kr as half16 fragments, then WMMA into float8.
-                for (int d = 0; d < head_dim; d++) {
-                    dot += __half2float(qr_ptr[d]) * __half2float(kr[d]);
+                bool masked = false;
+                if (mask_type == 0)      masked = (j_key > pos + qr);
+                else if (mask_type == 1) masked = (j_key > pos + qr || j_key < pos + qr - swa_window + 1);
+                else if (mask_type == 2) masked = (j_key < swa_window);
+                float sm = masked ? -1e30f : sj[u] * scale;
+                float nm = fmaxf(m[u], attn_wmma_allmax32(sm));
+                float corr = expf(m[u] - nm);
+                m[u] = nm;
+                l[u] *= corr;
+                float wu = masked ? 0.0f : expf(sm - nm);
+                wj[u] = wu;
+                any = any || (wu != 0.0f);
+                if (corr != 1.0f) {
+                    #pragma unroll
+                    for (int c = 0; c < npl; c++) acc[u][c] *= corr;
                 }
-                s[u] = dot;
             }
-        }
+            if (!any) continue;
 
-        // ── Online softmax (scalar, warp-local) ──
-        float w[ATTN_WMMA_QPR];
-        #pragma unroll
-        for (int u = 0; u < ATTN_WMMA_QPR; u++) {
-            int qr = r0 + wr * ATTN_WMMA_QPR + u;
-            bool masked = !live;
-            if (!masked) {
-                int qp = pos + qr;
-                if (mask_type == 0)      masked = (j > qp);
-                else if (mask_type == 1) masked = (j > qp || j < qp - swa_window + 1);
-                else if (mask_type == 2) masked = (j < swa_window);
-            }
-            float sm = masked ? -1e30f : s[u] * scale;
-            float nm = fmaxf(m[u], attn_wmma_allmax32(sm));
-            float corr = expf(m[u] - nm);
-            m[u] = nm;
-            float wu = masked ? 0.0f : expf(sm - nm);
-            l[u] *= corr;
-            w[u] = wu;
-            if (corr != 1.0f) {
-                #pragma unroll
-                for (int c = 0; c < npl; c++) acc[u][c] *= corr;
-            }
-        }
-
-        // Accumulate the softmax denominator (the plain kernel sums over j ascending).
-        #pragma unroll
-        for (int u = 0; u < ATTN_WMMA_QPR; u++) l[u] += w[u];
-
-        // ── P·V accumulation ──
-        // Each lane contributes its key's weight to the V projection for all
-        // 16 query rows this warp owns.
-        // TODO: replace with WMMA intrinsics — pack weights to f16, load V as
-        // half16 fragment, WMMA accumulate into float8.
-        if (live) {
-            const __half* vr = v_cache + ((long)j * n_kv + kv_h) * head_dim;
+            // Accumulate softmax denominator.
             #pragma unroll
-            for (int u = 0; u < ATTN_WMMA_QPR; u++) {
-                if (w[u] == 0.0f) continue;
-                #pragma unroll
-                for (int c = 0; c < npl; c++) {
-                    int d = (c << 5) + lane;
-                    if (d < head_dim) {
-                        acc[u][c] += w[u] * __half2float(vr[d]);
+            for (int u = 0; u < ATTN_WMMA_QPR; u++) l[u] += wj[u];
+
+            // Weighted V accumulation: each lane reads V at its own dims.
+            const __half* vr = v_cache + ((long)j_key * n_kv + kv_h) * head_dim;
+            #pragma unroll
+            for (int c = 0; c < npl; c++) {
+                int d = (c << 5) + lane;
+                if (d < head_dim) {
+                    float vv = __half2float(vr[d]);
+                    #pragma unroll
+                    for (int u = 0; u < ATTN_WMMA_QPR; u++) {
+                        acc[u][c] += wj[u] * vv;
                     }
                 }
             }
@@ -2272,7 +2322,7 @@ extern "C" __global__ void attention_prefill_flash_wmma(
     // ── Write output ──
     #pragma unroll
     for (int u = 0; u < ATTN_WMMA_QPR; u++) {
-        int qr = r0 + wr * ATTN_WMMA_QPR + u;
+        int qr = q_base + u;
         if (qr >= rows) continue;
         float inv = (l[u] > 0.0f) ? (1.0f / l[u]) : 0.0f;
         float* dr = dst + ((long)qr * n_head + h) * head_dim;
