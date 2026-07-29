@@ -233,7 +233,7 @@ fn wmma_tile(out_f: u32, rocm: &infr_core::config::RocmCfg) -> (u32, u32) {
     if let Some(t) = wmma_tile_forced(rocm) {
         return t;
     }
-    if out_f >= 2048 {
+    if out_f >= 1024 {
         (2, 2)
     } else {
         (2, 1)
