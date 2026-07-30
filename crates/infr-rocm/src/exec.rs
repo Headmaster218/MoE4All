@@ -1197,6 +1197,36 @@ fn mmq_up_kernel(gu: &str) -> Option<&'static str> {
     })
 }
 
+/// Activation kernel name for MMQ raw gate+up → silu(gate)*up + route-weight + scale.
+fn mmq_act_kernel(gu: &str) -> &'static str {
+    match gu {
+        "q4k" => "moe_act_mul_q4k",
+        "q6k" => "moe_act_mul_q6k",
+        "q5k" => "moe_act_mul_q5k",
+        "q80" => "moe_act_mul_q80",
+        "q2k" => "moe_act_mul_q2k",
+        "q3k" => "moe_act_mul_q3k",
+        "iq2xxs" => "moe_act_mul_iq2xxs",
+        "iq2xs" => "moe_act_mul_iq2xs",
+        "iq2s" => "moe_act_mul_iq2s",
+        "iq3xxs" => "moe_act_mul_iq3xxs",
+        "iq3s" => "moe_act_mul_iq3s",
+        "iq1s" => "moe_act_mul_iq1s",
+        "iq1m" => "moe_act_mul_iq1m",
+        "tq10" => "moe_act_mul_tq10",
+        "tq20" => "moe_act_mul_tq20",
+        "q20" => "moe_act_mul_q20",
+        "mxfp4" => "moe_act_mul_mxfp4",
+        "nvfp4" => "moe_act_mul_nvfp4",
+        "iq4nl" => "moe_act_mul_iq4nl",
+        "iq4xs" => "moe_act_mul_iq4xs",
+        "q40" => "moe_act_mul_q40",
+        "q41" => "moe_act_mul_q41",
+        "q51" => "moe_act_mul_q51",
+        _ => "moe_act_mul_q4k", // unreachable: mmq_up_kernel gates first
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -4374,15 +4404,24 @@ fn run_op(
                             false,
                         ),
                     };
-                    let hb = ctx.pool_buf((max_slots * nfu * 4).max(1), false);
-                    let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
-                    let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
-                    let yb = ctx.pool_buf((max_slots * neu * 4).max(1), false);
-                    // ── S5: MMQ decode-once-reuse MoE GEMM (opt-in, Q4_K only) ──
+                    // ── S5: MMQ decode-once-reuse MoE GEMM (opt-in) ──
                     // Each expert's weight column tile decoded ONCE into LDS and reused
                     // across all routing rows, eliminating per-wave re-decode overhead.
                     let mmq_kernel = mmq_up_kernel(gu);
-                    let use_mmq = ctx.rocm.mmq && mmq_kernel.is_some();
+                    let use_mmq = ctx.rocm.mmq && mmq_kernel.is_some() && fused_gate_up;
+                    let hb = ctx.pool_buf(
+                        (max_slots * nfu * if use_mmq { 2 } else { 1 } * 4).max(1),
+                        false,
+                    );
+                    // MMQ activation output buffer — silu(gate)*up applied, n_ff_exp columns.
+                    let ab = if use_mmq {
+                        Some(ctx.pool_buf((max_slots * nfu * 4).max(1), false))
+                    } else {
+                        None
+                    };
+                    let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
+                    let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
+                    let yb = ctx.pool_buf((max_slots * neu * 4).max(1), false);
                     // ── P2: the bucket-sorted BATCHED arm. ──
                     // R8 fixed the launch count and left the WEIGHT TRAFFIC alone: its
                     // `(output row, slot)` grid re-reads an expert's whole bank once per slot, so
@@ -4468,10 +4507,11 @@ fn run_op(
                         }
                         if use_mmq {
                             // S5: MMQ GEMM — one workgroup per (expert, column tile).
-                            // Outputs raw gate+up dot products to hb (pre-activation), matching
-                            // what the existing quant/down pipeline expects — the down kernel
-                            // applies silu(gate)*up internally.
-                            let mmq_col_tiles = (n_ff_exp as u32).div_ceil(64); // BN=64
+                            // Outputs raw gate+up dot products: cols [0, n_ff_exp) = gate,
+                            // cols [n_ff_exp, 2*n_ff_exp) = up. Then `moe_act_mul_*` applies
+                            // silu(gate)*up + route weight + scale → activated [n_slots, n_ff_exp].
+                            let n_ff_exp2 = (n_ff_exp * 2) as u32; // combined gate+up output cols
+                            let mmq_col_tiles = n_ff_exp2.div_ceil(64); // BN=64
                             dispatch_grid(
                                 pipelines,
                                 ctx.stream,
@@ -4484,18 +4524,47 @@ fn run_op(
                                     arg_ptr(xsb.ptr),
                                     arg_ptr(gw_ptr),
                                     arg_ptr(uw_ptr),
-                                    arg_ptr(hb.ptr), // output: raw gate+up [n_slots, n_ff_exp]
-                                    arg_i32(ne as i32), // n_ff = intermediate FF dim (K)
-                                    arg_i32(n_ff_exp as i32), // n_ff_exp = combined gate+up output dim (N)
+                                    arg_ptr(hb.ptr), // raw gate+up [n_slots, 2*n_ff_exp]
+                                    arg_i32(ne as i32),
+                                    arg_i32(n_ff_exp2 as i32),
                                     arg_i32(n_slots as i32),
                                     arg_i32(nexp as i32),
                                     arg_ptr(eoff.as_ref().unwrap().ptr),
                                     arg_ptr(ecnt.as_ref().unwrap().ptr),
                                     arg_ptr(bslot.as_ref().unwrap().ptr),
-                                    arg_i32(nu as i32), // n_used (slots per token row)
+                                    arg_i32(nu as i32),
                                     arg_i64(gate_bstride),
                                     arg_i64(up_bstride),
-                                    arg_i32(neu as i32), // act_bytes = ne padded to 32
+                                    arg_i32(neu as i32),
+                                ],
+                            )?;
+                            // Apply activation: silu(gate)*up + route weight + per-expert scale.
+                            let act_kernel = mmq_act_kernel(gu);
+                            let act_flag: i32 = match act {
+                                Activation::Silu => 0,
+                                Activation::Gelu => 1,
+                                Activation::Sigmoid => 2,
+                            };
+                            dispatch_1d(
+                                pipelines,
+                                ctx.stream,
+                                act_kernel,
+                                nexp as u32 * 256,
+                                256,
+                                args![
+                                    arg_ptr(hb.ptr),                   // src: raw gate+up [n_slots, 2*n_ff_exp]
+                                    arg_ptr(ab.as_ref().unwrap().ptr), // dst: activated [n_slots, n_ff_exp]
+                                    arg_i32(n_ff_exp as i32),          // n_ff (per-gate dim)
+                                    arg_i32(n_ff_exp2 as i32),         // n_ff_exp = 2*n_ff
+                                    arg_i32(n_slots as i32),
+                                    arg_i32(nexp as i32),
+                                    arg_ptr(eoff.as_ref().unwrap().ptr),
+                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
+                                    arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_ptr(wts_c),   // route_wts
+                                    arg_ptr(dsc_ptr), // per-expert scale (null = 1.0)
+                                    arg_i32(act_flag),
+                                    arg_i32(wb_flag),
                                 ],
                             )?;
                         } else if batched {
@@ -4565,6 +4634,11 @@ fn run_op(
                                 ],
                             )?;
                         }
+                        let src_act = if use_mmq {
+                            ab.as_ref().unwrap().ptr
+                        } else {
+                            hb.ptr
+                        };
                         dispatch_1d(
                             pipelines,
                             ctx.stream,
@@ -4572,7 +4646,7 @@ fn run_op(
                             (n_slots * (nfu / 32)) as u32,
                             256,
                             args![
-                                arg_ptr(hb.ptr),
+                                arg_ptr(src_act),
                                 arg_ptr(hqb.ptr),
                                 arg_ptr(hsb.ptr),
                                 arg_i32(n_slots as i32),

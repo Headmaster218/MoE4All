@@ -31,25 +31,34 @@ through `crates/infr-llama/src/{chat/rocm.rs,seam/}`. The cross-backend seam
 
 ## Where we stand (read this first)
 
-**RX 7900 XTX / gfx1100, at `06f6088`.** `infr` t/s ÷ `llama.cpp` HIP t/s.
-Oracle is the LOCAL build at
+**RX 7900 XTX / gfx1100, at `7151dfb` (2026-07-30).** `infr` t/s ÷ `llama.cpp`
+HIP t/s. Oracle is the LOCAL build at
 `~/Projects/mxaddict/llama.cpp/build-hip/bin/llama-bench -sm none -mg 0 -fa 1` —
 **not** `/usr/bin/llama-bench`, which is broken on this box
 (`undefined symbol: ggml_dsv4_hc_post`, a mismatched `libllama`/`libggml`).
 
-| model               | pp512 (infr / llama)      | tg128 (d0)            | tg128 @ d4096         |
-| ------------------- | ------------------------- | --------------------- | --------------------- |
-| Qwen3-0.6B Q4_K_M   | 14212 / 21714 = **0.66×** | 305 / 384 = **0.79×** | 174 / 307 = **0.57×** |
-| Qwen3-0.6B Q6_K     | — / 22033 = **—**         | — / 366 = **—**       | —                     |
-| Qwen3-30B-A3B (MoE) | 784 / 2905 = **0.27×**    | — / 141 = **—**       | —                     |
+| model                   | pp512 (infr / llama)      | tg128 (d0)            | tg128 @ d4096         |
+| ----------------------- | ------------------------- | --------------------- | --------------------- |
+| Qwen3-0.6B Q4_K_M       | 13943 / 22597 = **0.62×** | 301 / 384 = **0.78×** | 173 / 306 = **0.56×** |
+| Qwen3-0.6B Q6_K         | 11113 / 21750 = **0.51×** | 309 / 360 = **0.86×** | 175 / 295 = **0.59×** |
+| Qwen3.5-0.8B (DeltaNet) | 1433 / 17941 = **0.08×**  | 22 / 305 = **0.07×**  | 21 / 300 = **0.07×**  |
+| gemma-3-1b Q4_K_M       | 9890 / 18955 = **0.52×**  | 205 / 273 = **0.75×** | 136 / 269 = **0.51×** |
+| gemma-4-E2B Q4_K_M      | 2304 / 8516 = **0.27×**   | 68 / 170 = **0.40×**  | —                     |
+| Qwen3-30B-A3B (MoE)     | 780 / 2874 = **0.27×**    | 82 / 141 = **0.58×**  | —                     |
 
-infr-Vulkan baseline (same model, same GPU): pp512 31525, tg128 689,
-tg128@d4096 473. Vulkan delivers **2.2×** our prefill and **2.3×** our decode
-throughput.
+> **MoE pp512 crash fixed** — root cause: MMQ kernel assumed fused gate+up (all
+> columns from one weight bank) but qwen3moe has separate gate/up banks. Fixed
+> by gating `use_mmq` on `fused_gate_up`. Also fixed: the MMQ path was missing
+> the `moe_act_mul` activation kernel call (raw gate+up dot products were never
+> silu(gate)*up'd), and the combined output dim was wrong (single-gate dim
+> instead of 2×). These were correctness bugs; throughput was never real.
+
+infr-Vulkan baseline (same GPU, Qwen3-0.6B Q4_K_M): pp512 31525, tg128 689,
+tg128@d4096 473. Vulkan delivers **2.3×** our prefill and **2.3×** our decode
+throughput on this model.
 
 Started at 0.17× / 0.19× (dense) and 0.036× / 0.23× (MoE); before that, DeltaNet
-prefill was 0.0007×. gemma-3, DeltaNet and Llama-3.2 rows have not been
-re-measured recently and should not be quoted.
+prefill was 0.0007×. All rows re-measured 2026-07-30 at `7151dfb`.
 
 ### Per-op profile (pp512, Qwen3-0.6B Q4_K_M, 7900 XTX)
 
@@ -64,9 +73,65 @@ re-measured recently and should not be quoted.
 | RmsNorm                      | 13.1 µs   | 6.0 µs  | 2.2×  |
 | WriteKv                      | 10.6 µs   | 4.6 µs  | 2.3×  |
 
-Started at 0.17× / 0.19× (dense) and 0.036× / 0.23× (MoE); before that, DeltaNet
-prefill was 0.0007×. gemma-3, DeltaNet and Llama-3.2 rows have not been
-re-measured recently and should not be quoted.
+### Per-op profile — Qwen3.5-0.8B DeltaNet (pp512 + tg128, 7900 XTX, 2026-07-30)
+
+**Prefill (pp512):** 1.24s device time over 420 dispatches.
+
+| op                       | ms     | share | note                         |
+| ------------------------ | ------ | ----- | ---------------------------- |
+| DeltaNet                 | 1051.0 | 85.1% | chunked recurrence, 18 calls |
+| Conv1dSilu               | 146.8  | 11.9% | depth-1 1D conv, 18 calls    |
+| All Linear (Q4K/Q5K/Q6K) | ~27.3  | ~2.2% | 120 dispatches               |
+| Everything else          | ~10.1  | ~0.8% |                              |
+
+**Decode (tg128):** 48.4 ms device time over 326 dispatches.
+
+| op                       | ms   | share | note                            |
+| ------------------------ | ---- | ----- | ------------------------------- |
+| Conv1dSilu               | 42.8 | 88.4% | **dominant** — 2.4 ms/call × 18 |
+| DeltaNet                 | 1.1  | 2.3%  | per-token recurrence            |
+| All Linear (Q4K/Q5K/Q6K) | ~2.6 | ~5.4% | 120 dispatches                  |
+| Vocab proj (Q6K 248k)    | 0.4  | 0.8%  |                                 |
+
+**Finding:** llama.cpp is 12-14× faster overall. The DeltaNet recurrence
+(prefill) and Conv1dSilu (decode) are the two bottlenecks — each dominates its
+phase. Vulkan has `deltanet_chunked_split` / `deltanet_seq_split` / strided
+variants (`recorder.rs:6643-6960`) that adapt the grid to depth×state-size; ROCm
+only has the basic chunked prefill + column-parallel decode. The `Conv1dSilu`
+decode bottleneck (88%) is surprising — a depth-1 convolution at m=1 shouldn't
+cost this much; investigate whether it's CPU-bound or running a naive GPU
+kernel.
+
+### Per-op profile — gemma-4-E2B (pp512 + tg128, 7900 XTX, 2026-07-30)
+
+**Prefill (pp512):** 206.0 ms device time over 710 dispatches.
+
+| op                               | ms   | share | note                  |
+| -------------------------------- | ---- | ----- | --------------------- |
+| Attention d=512 causal           | 39.2 | 19.0% | 7 calls               |
+| Linear Q4K 1536×24576 gate/up    | 33.0 | 16.0% | 20 calls, wide-N GEMM |
+| Linear F32 256×1536 (E2B gate)   | 20.6 | 10.0% | 35 calls, no fusion   |
+| Linear Q6K 12288×1536 down       | 17.1 | 8.3%  | 10 calls              |
+| Linear BF16 1536×8960 (lm_head)  | 16.2 | 7.9%  | 1 call, BF16 path     |
+| Linear F32 1536×256 (E2B output) | 14.4 | 7.0%  | 35 calls, no fusion   |
+| Attention d=256 SWA              | 13.5 | 6.6%  | 28 calls              |
+| Linear Q4K 1536×12288 gate/up    | 10.9 | 5.3%  | 15 calls              |
+
+**Decode (tg128):** 14.9 ms device time over 608 dispatches.
+
+| op                               | ms  | share | note                |
+| -------------------------------- | --- | ----- | ------------------- |
+| Linear F32 1536×256 (E2B gate)   | 2.8 | 18.9% | 35 calls, no fusion |
+| Linear F32 256×1536 (E2B output) | 2.4 | 16.0% | 35 calls, no fusion |
+| Linear BF16 1536×8960 (lm_head)  | 2.0 | 13.6% | 1 call, BF16 path   |
+| Linear Q4K 1536×24576 gate/up    | 0.8 | 5.4%  | 20 calls            |
+| QkNormRope                       | 0.8 | 5.2%  | 50 calls            |
+
+**Finding:** E2B F32 gate+output ops are 35% of decode (no fusion — Vulkan's
+`e2b_gate.comp` fuses `Linear(f32)+GatedAct(gelu,stride)`). `mul_sigmoid`
+(gemma4 per-layer output gate) also missing. Attention d=512 (causal) is 19% of
+prefill — WMMA intrinsics would help here. The BF16 lm_head is 8% pp / 14%
+decode — single op, but runs on the scalar fallback path for BF16 GEMM.
 
 ### Vulkan-perf parity audit: techniques not yet ported
 
@@ -214,24 +279,40 @@ re-decode-every-row overhead is the full Vulkan gap.
 | rocBLAS f16 prefill      | measured worse (Slice 26) | **DO NOT PORT** — dequant tax + VRAM blowup          |
 | Cooperative decode-once  | regressed (Slice 28)      | only wins with double-buffered async pipeline        |
 
-### Ranked next work (top 5, by estimated value)
+### Ranked next work (top 5, by measured gap — updated 2026-07-30 sweep)
 
-1. **KV-cache quantization (Q8_0)** — `store_q8` kernel + seam gate threading.
-   Halves KV VRAM, unlocks double context length. `qk_norm_rope` already writes
-   f16 K, so only V needs the store kernel.
-2. **f16 A_GLOBAL GEMM** — pre-convert activations to f16, eliminate the int8
-   quant/dequant tax on the GEMM path. This is Vulkan's largest
-   single-multiplier advantage (2-4× on every GEMM). Requires `store_f16` for
-   activations + a new WMMA kernel that reads f16 A fragments directly from
-   global.
-3. **WMMA flash attention (intrinsics)** — replace the scalar placeholder with
-   real `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`. The kernel body and
-   dispatch are already in place.
-4. **Inline KV decode in attention** — Q8_0 (and later Q4_0/Q4_1/Q5_0/Q5_1)
-   decode inside the flash loop. Skips the dequant prepass round-trip.
-5. **MMQ all-expert MoE GEMM** — decode-once-reuse for MoE expert weights,
-   matching the llama.cpp MMQ threadblock pattern already shipped on Vulkan in
-   `matmul_mmq_experts`.
+1. **DeltaNet (Conv1dSilu + recurrence) — 0.07–0.08×, the single worst gap.**
+   Profile says: prefill `DeltaNet` op is 85.1% (1051 ms @ pp512), decode
+   `Conv1dSilu` is 88.4% (42.8 ms @ tg128). Two separate bottlenecks:
+   - Prefill: the chunked DeltaNet recurrence kernel is 12-14× slower than
+     llama.cpp's equivalent. Vulkan has `deltanet_chunked_split` and
+     `deltanet_seq_split` variants for different shape regimes — none ported.
+   - Decode: the `Conv1dSilu` per-token convolution dominates at 2.4 ms/token vs
+     llama.cpp's ~3.3 ms/token total. This is a depth-1 1D conv that runs on CPU
+     in some backends — investigate whether it is CPU-bound on ROCm. **This is
+     the #1 ROI target by a wide margin** (12-14× gap vs 2-4× for everything
+     else).
+2. **gemma-4-E2B — 0.27× pp512, 0.40× tg128.** Profile says:
+   - Prefill: attention d=512 (19%), wide Q4_K GEMMs (16%), F32 E2B gates (17%)
+   - Decode: F32 E2B gate+out Linear ops **35%** (no `e2b_gate` fusion —
+     Vulkan's `e2b_gate.comp` fuses `Linear(f32)+GatedAct(gelu,stride)` into one
+     dispatch), lm_head BF16 (14%, 2.0 ms — vocab projection on F32/BF16 path is
+     slow)
+   - Missing `mul_sigmoid` (gemma4 per-layer output gate, `recorder.rs:7203`)
+     **Fusing the E2B gate would cut ~35% of decode time.**
+3. **f16 A_GLOBAL GEMM (dense prefill) — 0.51–0.62× on dense pp512.** Still
+   Vulkan's largest single multiplier (2-4×) — pre-convert activations to f16,
+   eliminate int8 quant/dequant tax. Q4_K_M pp512 only improved from 0.66× to
+   0.62× since `06f6088` despite P4's Q6_K branchless fix.
+4. **WMMA flash attention — attention is 19% of E2B pp512, 29% (estimated) of
+   dense pp512.** Scalar placeholder kernel exists
+   (`attention_prefill_flash_wmma` with br=64 bc=64); needs real
+   `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` intrinsics for Q·K + P·V.
+5. **MoE prefill crash fix + MMQ verification.** The MoE model crashes on
+   prefill at `7151dfb` (Memory access fault). Likely a regression from the MMQ
+   MoE GEMM commits (`c9f088a`–`7151dfb`). Fix before any MoE perf work. Once
+   fixed, re-measure: decode is 0.42× (was —, so new baseline exists), prefill
+   must be restored to last-known 787 t/s (0.28×).
 
 ### Measurement traps that have already cost this campaign time
 
@@ -577,6 +658,7 @@ has the full reasoning. The code is the authority on mechanism.
 | P7e   | —         | MoE PF4 block-prefetch gate/up — **-14.7%**, register pressure                       |
 | P7f   | —         | MoE CN=2 column tiling Q4_K gate/up — **+12.9%** MoE pp512 (699→790)                 |
 | P7h   | —         | WMMA RM=4 tile (dense), KICK=2 ILP (attention flash) — both **flat/regress**, VGPR   |
+| S1    | `7151dfb` | full-model sweep: DeltaNet 0.07×, E2B 0.27×, dense Q4_K 0.62×, MoE prefill crash     |
 
 **The briefs were wrong every time, and how they were wrong is the pattern:**
 
@@ -702,15 +784,27 @@ Confirmed or suspected non-wins on RDNA3/HIP — do not port blindly:
       staging loop (`q8kv_decode`, committed); remaining: Q4_0/Q4_1/Q5_0/Q5_1
       block-amortized inline decoders (`dqv4` pattern from Vulkan's
       `attn_partial.comp`)
-- [ ] **MMQ all-expert MoE GEMM** — decode-once-reuse threadblock pattern
-      (`matmul_mmq_experts`) replacing per-expert × per-token scalar GEMV
-- [ ] **DeltaNet** — split/strided variants where they help
+- [ ] **MMQ all-expert MoE GEMM** — ✅ gate+up kernels for all 23 quant formats
+      landed (`c9f088a`–`7151dfb`). ✅ correctness bugs fixed (missing
+      `moe_act_mul` activation + wrong combined output dim + fused-gate-up-only
+      assumption). Currently ACTIVATED only for `fused_gate_up` models
+      (diffusion-gemma); the non-fused path (qwen3moe) uses the idm/idb tier.
+      The MMQ kernel needs a non-fused variant reading gate/up from separate
+      weight banks to cover qwen3moe.
+- [ ] **DeltaNet** — split/strided variants where they help. **Highest ROI
+      target**: 0.07–0.08× across all metrics, Conv1dSilu is 88% of decode,
+      DeltaNet op is 85% of prefill. Vulkan's `deltanet_chunked_split` /
+      `deltanet_seq_split` / strided variants all missing.
+- [ ] **E2B/gemma4 fusion** — missing `e2b_gate` (fused Linear(f32)+GatedAct,
+      Vulkan `e2b_gate.comp`; 35% of decode) and `mul_sigmoid` (gemma4 per-layer
+      output gate; Vulkan `mul_sigmoid.comp`). 0.27× pp512, 0.40× tg128.
 - [ ] **Memory** — BDA/staging/ReBAR/UMA/VRAM-guard where beneficial
 - [ ] **Multi-GPU** — device pool, tensor-parallel, expert-parallel,
       pipeline-parallel, P2P, external semaphores, all-reduce (RCCL)
-- [ ] **Perf ≥1.0×** — remaining 2.2× prefill / 2.3× decode gap to Vulkan
-      primarily from three families: f16 A_GLOBAL GEMM (~2-4×), WMMA attention
-      (~3.2×), and MMQ all-expert MoE (~3-5× for MoE models)
+- [ ] **Perf ≥1.0×** — remaining gap to llama.cpp: DeltaNet 0.07–0.08× (the
+      emergency), gemma-4-E2B 0.27–0.40×, dense Q4_K_M 0.56–0.78×, MoE decode
+      0.42×. The three primary levers are: DeltaNet kernel variants, f16
+      A_GLOBAL GEMM (2-4× on every GEMM), and WMMA attention intrinsics (~3.2×).
 
 ## Cross-backend note
 
