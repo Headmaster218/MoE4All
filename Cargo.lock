@@ -1249,7 +1249,6 @@ dependencies = [
  "infr-metal",
  "infr-prof",
  "infr-prof-rt",
- "infr-rocm",
  "infr-vulkan",
  "llguidance",
  "rayon",
@@ -1286,20 +1285,6 @@ dependencies = [
 [[package]]
 name = "infr-prof-rt"
 version = "0.0.0"
-
-[[package]]
-name = "infr-rocm"
-version = "0.0.0"
-dependencies = [
- "bytemuck",
- "half",
- "indicatif",
- "infr-core",
- "infr-cpu",
- "infr-gguf",
- "infr-testkit",
- "rayon",
-]
 
 [[package]]
 name = "infr-server"
