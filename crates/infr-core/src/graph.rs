@@ -2,7 +2,7 @@
 //!
 //! The model layer builds a [`Graph`] — an explicit, ordered list of semantic [`Op`]s over
 //! typed [`TensorId`] handles — and a [`crate::backend::Backend`] compiles + executes it
-//! however it likes (Vulkan SPIR-V, CPU loops, Metal, MLX). See docs/plan.md
+//! however it likes (Vulkan SPIR-V, CPU loops, Metal MSL). See docs/plan.md
 //! "The backend abstraction".
 //!
 //! ## Why an op-list, not a pure DAG

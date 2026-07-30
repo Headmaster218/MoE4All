@@ -2995,7 +2995,7 @@ fn diffusion_gemma_decode_matches_oracle() {
 //   * each session bound the device it was pinned to (device_name matches the enumeration),
 //   * both produce coherent greedy output (both answer "Paris"), concurrently,
 //   * the Vulkan1 (iGPU on this box) session's VRAM DROPS after it loads — its weights/KV landed on
-//     device 1, not device 0 (confirmed programmatically here; `Metal.smi` confirms it live).
+//     device 1, not device 0 (confirmed programmatically here; a vendor VRAM tool confirms it live).
 //
 // `#[ignore]` (needs real GPUs) and self-skips when fewer than two Vulkan devices are present, so it
 // is a no-op on a single-GPU box. Run on the two-GPU box with:

@@ -68,7 +68,7 @@
 //!
 //! Markers are keyed PER-INSTANCE (`<path>.seeded.<pid>-<nonce>`) and a marker is only stale if its
 //! PROCESS is GONE, so neither a second `infr` running concurrently (a `serve` alongside a CLI run)
-//! NOR a sibling backend in the same process (an MTP bench loop, a Vulkan+ROCm parity run) is
+//! NOR a sibling backend in the same process (an MTP bench loop, a Vulkan+CPU parity run) is
 //! mistaken for a crashed one — and one instance's clean [`disarm`](KernelCache::disarm) only
 //! removes ITS OWN marker, never a live sibling's.
 //!

@@ -21,16 +21,16 @@
 //! - [`SpillTally`] / [`SpillCounts`] / [`spill_report_line`] — the VRAM-first placement
 //!   bookkeeping and its banner. The counters and the message SKELETON are shared; every noun and
 //!   every device-specific clause is passed in ([`SpillNouns`]), and so is the byte formatter,
-//!   because Vulkan and Metal round MiB differently and the banner text must not move.
+//!   because a backend's MiB rounding is user-visible text that must not move.
 //!
 //! What is deliberately NOT here (device facts that only look shared):
 //!
-//! - The placement itself. Whether VRAM has room is `vram_budget_fits` (Vulkan's live
-//!   `VK_EXT_memory_budget` heap probe minus a guard headroom) — different questions with
-//!   different answers. Only the cumulative *cap* gate
-//!   ([`SpillTally::admits`]), which is pure arithmetic over the tally, is shared.
-//! - The human-readable byte formatter. Vulkan prints MiB to one decimal; unifying
-//!   them would move user-visible text for no behavioral gain, so [`spill_report_line`] takes the
+//! - The placement itself. Whether VRAM has room is a device question (Vulkan's live
+//!   `VK_EXT_memory_budget` heap probe minus a guard headroom, in `vram_budget_fits`). Only the
+//!   cumulative *cap* gate ([`SpillTally::admits`]), which is pure arithmetic over the tally, is
+//!   shared.
+//! - The human-readable byte formatter. Vulkan prints MiB to one decimal; unifying the spellings
+//!   would move user-visible text for no behavioral gain, so [`spill_report_line`] takes the
 //!   formatter as a parameter instead.
 //! - The per-format GATES (`kv_align_ok`, which backends have a Q8 KV kernel, TurboQuant's
 //!   `head_dim % 128`). Those are capabilities, and they stay at the seam that knows the backend.
@@ -114,8 +114,8 @@ pub fn kv_bytes_per_elem(dt: DType) -> f64 {
 // ── grammars + accessors shared by the spill knobs ───────────────────────────
 
 /// The boolean-flag grammar every overflow knob uses, over an explicit value: `Some(v)` with `v`
-/// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_OVERFLOW`,
-/// `INFR_VULKAN_WEIGHT_OVERFLOW`.) NOT the same as the `is_ok()` presence grammar, where an empty
+/// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_OVERFLOW`.)
+/// NOT the same as the `is_ok()` presence grammar, where an empty
 /// value is ON — `config::env`'s `flag` reader calls this so the difference survives the
 /// migration; the read sites take the resolved `bool` off their backend's `Config`.
 pub fn flag_from(raw: Option<&str>) -> bool {

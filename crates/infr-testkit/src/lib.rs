@@ -30,7 +30,7 @@
 //! ```
 //!
 //! Use [`sweep_linear`] instead when the backend keys a dequantized-weight cache by the weight
-//! buffer's raw device ADDRESS () — it takes a closure that mints a fresh backend per
+//! buffer's raw device ADDRESS — it takes a closure that mints a fresh backend per
 //! case, so a recycled VRAM address cannot serve the previous format's rows out of a stale cache.
 //!
 //! Every device-side entry point takes `&dyn Backend`, so the harness needs no GPU-specific API
@@ -68,7 +68,7 @@ pub fn gen_f32(n: usize, salt: usize) -> Vec<f32> {
 /// These are NOT arbitrary: a synthetic weight has to land in a realistic magnitude band or the
 /// parity comparison degenerates. Formats whose codes are wide (Q8_0's ±127, IQ3_S's grid) take a
 /// small `d`; the low-bit-width ternary/codebook formats take a larger one. Values match the
-/// magnitudes the pre-existing the Metal and CPU parity suites had converged on independently, so
+/// magnitudes the pre-existing Metal and CPU parity suites had converged on independently, so
 /// moving those suites onto the harness does not change what they measure.
 pub fn synth_scales(dtype: DType) -> (f32, f32) {
     match dtype {

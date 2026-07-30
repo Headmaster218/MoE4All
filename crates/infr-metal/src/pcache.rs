@@ -1,6 +1,5 @@
 //! On-disk `MTLBinaryArchive` persistence — the Metal-specific SHELL around
-//! [`infr_core::kernel_cache::KernelCache`], the same seam `infr-vulkan/src/pcache.rs` and
-//! `infr-metal/src/kernels.rs` ride on.
+//! [`infr_core::kernel_cache::KernelCache`], the same seam `infr-vulkan/src/pcache.rs` rides on.
 //!
 //! # What this caches, and what it does NOT
 //!
@@ -152,7 +151,7 @@ impl ArchiveCache {
         if !supports_binary_archives(device) {
             return None;
         }
-        // Like Vulkan (and unlike ROCm) this file is REWRITTEN throughout the run, so a temp-dir
+        // Like Vulkan, this file is REWRITTEN throughout the run, so a temp-dir
         // fallback is not worth it: report "no persistence available" instead.
         infr_core::kernel_cache::cache_dir()?;
         let token = pcache_blob::device_token(device.name());

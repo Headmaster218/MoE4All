@@ -867,7 +867,7 @@ fn toml_sections_mirror_the_struct_paths() {
 /// `prof.ops` is THE per-op profiling switch, on every backend, and it is reachable three ways.
 ///
 /// Each backend used to have its own: `INFR_PROF2` reached only vulkan, `INFR_PROF_OPS` only the
-/// cpu backend, and the Metal prof knob had no env key at all — so whether
+/// cpu backend, and `INFR_METAL_PROFILE` only metal — so whether
 /// `INFR_PROF_OPS=1 infr bench …` profiled anything depended on `--dev`, silently. Any future
 /// backend gates on this field (through `infr_core::prof::enabled`, which also ANDs warmup
 /// suppression), never on a knob of its own.
@@ -1039,7 +1039,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// five loud keys, and `device.dev` reaches `pick_default_device` as a parameter.
     ///
     /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — the Vulkan pager reads it
-    /// from `Config` now, but `infr-Metal.'s pager still reads the environment until S6; and the
+    /// from `Config` now, and the rest of the pager plumbing landed in S6; and the
     /// whole recorder/adapter/gemm hot-path tier, which is S5b.
     const S5A: &[&str] = &[
         "INFR_CM_8X8",

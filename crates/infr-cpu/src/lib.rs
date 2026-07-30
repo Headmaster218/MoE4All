@@ -2658,7 +2658,7 @@ impl Backend for CpuBackend {
         // Write back the buffers the model reads after execute: Outputs (logits) and mutated f32
         // Inputs (conv/recurrent state). KV caches were written in place by `WriteKv`, so they're
         // skipped — no full-cache copy. Weights are read-only; positions are I32, unchanged. The
-        // predicate is the shared `infr_core::exec::writes_back` (metal select the same set).
+        // predicate is the shared `infr_core::exec::writes_back` (metal selects the same set).
         for id in infr_core::exec::write_back_targets(g) {
             if let Some(buf) = bindings.get(id) {
                 let mut d = cpu_buf(buf).owned();

@@ -452,8 +452,7 @@ pub(crate) fn generate_dense_backend(
     // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
     let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
         && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
-    // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal + ROCm (ROCm
-    // decodes Q4_0 inline in the attention flash kernel, same as Q8_0); need 32-block alignment.
+    // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
     let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
     // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
     // own f32 attention), bf16 reads via a cast→f16 prepass.
@@ -1052,7 +1051,7 @@ pub(crate) fn generate_dense_backend(
             // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
             // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
             // conv/S state and re-prefill from scratch. ALWAYS zero — a stateful backend's warmup
-            // generation (CPU is a no-op, but ROCm/Vulkan run a throwaway "Hi") dirties these
+            // generation (CPU is a no-op, but Vulkan/Metal run a throwaway "Hi") dirties these
             // persistent buffers while leaving `cached` empty, so an `is_empty` guard here would
             // wrongly skip the reset and the first real prompt would inherit the warmup's state.
             let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();

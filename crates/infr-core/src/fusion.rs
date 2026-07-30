@@ -13,7 +13,7 @@
 //! 1. **`Linear(m==1) → Add(residual)`** ([`FusionCfg::linear_add`]) — fold a decode projection's
 //!    following residual `Add` into the GEMV epilogue (`dst = gemv + residual`), killing the
 //!    standalone `Add` kernel and the round-trip of the un-added projection. The decode
-//!    `o_proj`/`down_proj` shape. Vulkan/Metal all did this.
+//!    `o_proj`/`down_proj` shape. Vulkan and Metal both did this.
 //! 2. **`RmsNorm → Linear(m==1)`** ([`FusionCfg::rmsnorm_linear`]) — elide a standalone `RmsNorm`
 //!    whose normalized output feeds ONLY fusable decode `Linear`s, which normalize their raw input
 //!    row in-kernel instead.

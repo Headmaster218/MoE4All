@@ -806,7 +806,7 @@ fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
     infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
             weight_ok: &LINEAR_ADD_WEIGHT_OK,
-            // No escape hatch on this backend (Vulkan/ROCm each have one); always planned.
+            // No escape hatch on this backend (Vulkan has one); always planned.
             enabled: true,
         }),
         rmsnorm_linear: None,
@@ -2090,7 +2090,7 @@ impl MetalBackend {
 
         // Write back Outputs (and mutated f32 Inputs, e.g. recurrent state) to their bound buffers;
         // the in-place KV caches are already current. Shared predicate — `infr_core::exec::
-        // writes_back`, the same set cpumetal copy back.
+        // writes_back`, the same set the cpu backend copies back.
         for id in infr_core::exec::write_back_targets(g) {
             let i = id.0 as usize;
             if bindings.get(id).is_some() {

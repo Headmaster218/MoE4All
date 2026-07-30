@@ -371,13 +371,13 @@ output (`INFR_PROF_OUT` JSON carries both as `"sites"` + `"gpu"`) — the host
 section tells you _that_ the GPU path waits in `replay_n`; the device section
 tells you which ops it spent that time on.
 
-**And do not add a fifth per-op profiler.** A new backend gets the whole thing —
+**And do not add another per-op profiler.** A new backend gets the whole thing —
 knob, label grammar, table, exit aggregate, warmup suppression — by calling
 `infr_core::prof::enabled` and handing durations to `OpProf`. The only piece it
 writes itself is how it obtains a duration from its own API, because that part
-genuinely differs (timestamp queries / HIP events / counter samples / host
-clock). `no_backend_feeds_the_aggregate_behind_the_shared_reporter` fails the
-build if it reaches past the seam.
+genuinely differs (timestamp queries / counter samples / host clock).
+`no_backend_feeds_the_aggregate_behind_the_shared_reporter` fails the build if
+it reaches past the seam.
 
 ### CPU profiling (samply)
 

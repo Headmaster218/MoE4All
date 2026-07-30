@@ -1,5 +1,5 @@
 //! **The** block-decode spec: one named description of every GGUF block format's on-disk geometry
-//! and scale layout, that the three shader families (GLSL / MSL / HIP) and the host decoder are
+//! and scale layout, that the two shader families (GLSL / MSL) and the host decoder are
 //! *checked against* instead of each carrying its own copy of the numbers.
 //!
 //! Precedent: [`crate::iquant_grids`] already single-sources the IQ codebooks (cpu/metal read them
@@ -129,7 +129,7 @@ pub struct BlockSpec {
     /// (the value IS the datum) and for `I2S`, whose only scale is per-TENSOR, not per-block.
     pub scales: &'static [ScaleSlot],
     /// Lowercase kernel-suffix name, as the backends spell it (`q4k`, `iq4_xs`, …). The name the
-    /// GLSL/MSL/HIP decoders are keyed by.
+    /// GLSL/MSL decoders are keyed by.
     pub name: &'static str,
 }
 

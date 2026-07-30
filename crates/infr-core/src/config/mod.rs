@@ -369,7 +369,7 @@ cfg_struct! {
         /// compiled from MSL, so the ~340 KB front-end compile in `Pipelines::build` still runs
         /// every launch (see `infr-metal/src/pcache.rs`).
         ///
-        /// Has NO env key, like [`CpuCfg::reference`] and [`CpuCfg::reference`] — settable
+        /// Has NO env key, like [`CpuCfg::reference`] — settable
         /// with `--set kernels.metal.pipeline_cache=false` or the TOML file. Clear it to force
         /// cold pipeline creation (bisecting a suspected cache bug); the cache is otherwise
         /// self-invalidating on any source / device / OS / compile-option change.
@@ -469,8 +469,8 @@ cfg_struct! {
 
 /// How the Metal backend obtains **device** time per op.
 ///
-/// Metal batches every op into one command buffer, so — unlike vulkan's timestamp queries or
-/// Metal.s HIP events — per-op device time is never free there. Both non-`Off` modes cost
+/// Metal batches every op into one command buffer, so — unlike vulkan's timestamp queries —
+/// per-op device time is never free there. Both non-`Off` modes cost
 /// something, which is why this is a separate axis from [`ProfCfg::ops`] rather than implied by
 /// it: turning per-op profiling on gets you host ENCODE time for free, and you opt in to paying
 /// for device time.

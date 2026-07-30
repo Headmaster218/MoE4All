@@ -1,7 +1,7 @@
 //! The compute backend seam — the ONLY device-aware trait. Everything above is generic over it.
 //!
 //! Object-safe on purpose so the engine can hold `Arc<dyn Backend>` and stay blind to whether
-//! Vulkan / CPU / CUDA / ROCm / Metal / MLX is underneath. See docs/plan.md.
+//! Vulkan / CPU / Metal is underneath. See docs/plan.md.
 //!
 //! ## Execution model
 //!
@@ -460,7 +460,7 @@ impl<'a> Bindings<'a> {
     }
 }
 
-/// A compute device. Implementations: `infr-vulkan`, `infr-cpu`, later CUDA / ROCm / Metal / MLX.
+/// A compute device. Implementations: `infr-vulkan`, `infr-cpu`, `infr-metal`.
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     fn capabilities(&self) -> Capabilities;

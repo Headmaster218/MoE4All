@@ -3,9 +3,9 @@
 //!
 //! `tests/parity.rs` already asserts per-format quant `Linear` parity, but it does so through ~60
 //! hand-written tests over a per-suite family of `synth_q4k`/`synth_q6k`/`synth_mxfp4`/… builders
-//! that ROCm's suite independently re-implements. This file gets the same coverage as ONE sweep,
-//! from `infr_core::decode_spec` via `infr_testkit::synth_weight` — so a new quant format is
-//! covered on cpu / Metal / metal / vulkan the moment it is added to the spec, with no fourth copy
+//! that each backend's suite independently re-implements. This file gets the same coverage as ONE
+//! sweep, from `infr_core::decode_spec` via `infr_testkit::synth_weight` — so a new quant format is
+//! covered on cpu / metal / vulkan the moment it is added to the spec, with no third copy
 //! of the block layouts.
 //!
 //! It also closes a real gap in the existing suite: the per-format tests each pick one or two
@@ -26,13 +26,13 @@ use infr_testkit::{sweep_linear_on, weight_quant_cases, LinearCase};
 ///
 /// Metal decodes the raw GGUF block in-kernel for every one of the 24 weight formats
 /// (`weight_qui`'s `native_kern` table) and accumulates in float, so the gap here is the decode's
-/// own f16/half-precision scale arithmetic plus f32 reassociation — the same two lossy stages the
-/// ROCm sweep bounds at `2e-2`, which is why this carries the identical figure.
+/// own f16/half-precision scale arithmetic plus f32 reassociation — the same two lossy stages a
+/// GPU decode sweep is conventionally bounded at (`2e-2`), which is why this carries that figure.
 ///
 /// It is deliberately NOT tighter than that: this sweep's job is COVERAGE (all 24 formats × two
 /// m-tiers from one source), and the existing per-format tests in `tests/parity.rs` already hold
 /// Metal to a considerably tighter `1e-3` on the shapes they pick. Tighten this once it has been
-/// measured on a Mac — the author of this slice has ROCm/Vulkan hardware only, so the number
+/// measured on a Mac — the author of this slice has Vulkan hardware only, so the number
 /// chosen here is the defensible upper bound rather than a measured one.
 const METAL_TOL: f32 = 2e-2;
 

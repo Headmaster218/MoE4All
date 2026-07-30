@@ -117,7 +117,7 @@ when the cause is a global config file you forgot about.
 
 ## `--set`
 
-Most of the 179 knobs have no dedicated flag. `--set <config.path>=<value>`
+Most of the 155 knobs have no dedicated flag. `--set <config.path>=<value>`
 reaches all of them, using the same path grammar as the TOML file:
 
 ```bash
@@ -198,15 +198,14 @@ spills KV to system RAM when VRAM runs out.
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
-hit/miss/eviction counts. The `_*` half of the section is the backend's weight
-pager (prefetch slots, bank size, overflow budgets).
+hit/miss/eviction counts.
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section — 64 of the 179 keys): capability
+- **`[kernels.vulkan]`** (the biggest section — 62 of the 155 keys): capability
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
   tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
@@ -220,16 +219,7 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so
   a launch does not re-run the driver's AIR → GPU-ISA back end for every kernel;
   the MSL → AIR front end is not cacheable and still runs every launch). Like
-  `kernels..module_cache` it has no `INFR_*` twin.
-- **`[kernels.]`** — `wmma_tile` (`1x1`/`2x1`/`2x2`), `no_wmma`, the int8 (`i8`)
-  and software-pipelined (`pipe`) kernels, opt-in `coop` and `blas` prefill, the
-  two fusion gates, `module_cache` (persist the hiprtc-compiled HIP module to
-  `~/.cache/infr`) and `moe_id_rows` (token rows per id-indexed MoE expert-GEMV
-  dispatch; `0` drops the resident MoE path back to the pre-R8 per-expert loop),
-  `attn_flash` (the tiled flash PREFILL attention kernel; clear it to route
-  prefill back to the single-wave scalar one). None of the last three has an
-  `INFR_*` twin, like `kernels.cpu.reference`. (Per-op profiling used to live
-  here as `prof_ops`; it is now the cross-backend `prof.prof_ops` — see below.)
+  `kernels.cpu.reference` it has no `INFR_*` twin.
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
   `repack_mb`, and `reference` (the bit-reference kernel path, which has no
   `INFR_*` twin and never had one).
@@ -259,11 +249,10 @@ through host RAM.
 
 Two consolidations are worth knowing if you have old scripts. Per-op profiling
 answered to a different knob on each backend (`INFR_PROF2` on vulkan,
-`INFR_PROF_OPS` on cpu, an env-less `kernels..prof_ops` on ,
-`INFR_METAL_PROFILE` on metal) — it is all `ops` now. And host-side stage timing
-was five knobs, one per pipeline (`INFR_PROF`, `INFR_PROF_DEC`, `INFR_PROF_PF`,
-`INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`) — it is all `stages`. Old spellings were
-dropped cleanly and are simply no longer read.
+`INFR_PROF_OPS` on cpu, `INFR_METAL_PROFILE` on metal) — it is all `ops` now.
+And host-side stage timing was five knobs, one per pipeline (`INFR_PROF`,
+`INFR_PROF_DEC`, `INFR_PROF_PF`, `INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`) — it is
+all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth) and
 `max_tokens_cap`. Per-request sampling is not here — it stays on the request.

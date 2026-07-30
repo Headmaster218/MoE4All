@@ -2,11 +2,11 @@
 //!
 //! Every backend runs the same *shape* around its per-op bodies — provision a working slot for each
 //! [`TensorId`], walk `plan.graph.ops` in order eliding the fusion-skipped indices, then copy the
-//! handles the caller reads back to their bound buffers. That structure was re-derived four times
-//! (cpu `infr-cpu/src/lib.rs`, metal `Resident`/`run_graph`,
+//! handles the caller reads back to their bound buffers. That structure was re-derived once per
+//! backend (cpu `infr-cpu/src/lib.rs`, metal `Resident`/`run_graph`,
 //! vulkan `execute_static`/`record_decode_replay`), and the pieces that MUST agree between them — which
 //! [`TensorKind`]s are materialized, which are mutated in place, which are written back, and what
-//! "the ops the executor actually dispatches" means — were four independent copies of the same
+//! "the ops the executor actually dispatches" means — were three independent copies of the same
 //! three predicates. This module hosts those ONCE.
 //!
 //! ## What is shared and what deliberately is not
@@ -24,12 +24,12 @@
 //!
 //! NOT shared, on purpose:
 //!
-//! * **The residency CONTAINER.** The four disagree on it for real reasons, not drift: cpu keeps a
+//! * **The residency CONTAINER.** The three disagree on it for real reasons, not drift: cpu keeps a
 //!   host-only `Vec<Vec<f32>>`; metal keeps both PLUS a `loc: Vec<Loc>` host/device tracker
 //!   (43 sites); vulkan has no per-op residency at all (its `Internal` scratch is
 //!   allocated up front by `alloc_scratch` and the walk only records into a command buffer). A
 //!   common container would have to be either the LCD (dropping metal's `loc`) or the union (an
-//!   unused `loc` on ...) — and either way every one of the ~240 `vals`/`dev`/`loc` accesses in
+//!   unused `loc` on cpu) — and either way every one of the ~240 `vals`/`dev`/`loc` accesses in
 //!   the per-op bodies would be rewritten. Behavior-neutral in principle, a rewrite in fact.
 //! * **The per-op bodies / a per-op trait method.** The `match Op::` arm sets are parallel, but the
 //!   arms need wildly different ambient state (vulkan's `lower_op` threads 15 extra parameters —

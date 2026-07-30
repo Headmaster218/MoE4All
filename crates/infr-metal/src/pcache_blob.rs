@@ -138,9 +138,10 @@ impl KeyInputs<'_> {
 /// `MTLDevice.name` → a file-name token, so a Mac with two GPUs (an Intel Mac's iGPU + dGPU) never
 /// hands one device the other's compiled pipelines.
 ///
-/// The escape is INJECTIVE, not merely "safe" — the same lesson `infr-Metal.'s `sanitize_arch`
-/// learned the hard way, where folding every non-alphanumeric to `_` made `gfx90a:xnack+` and
-/// `gfx90a:xnack-` name ONE file. Alphanumerics pass through lowercased; everything else
+/// The escape is INJECTIVE, not merely "safe": folding every non-alphanumeric to `_` would let two
+/// device names that differ only in punctuation (a trailing `+` vs `-`) collide onto ONE file —
+/// exactly the wrong-blob-for-the-device bug this token exists to prevent. Alphanumerics pass
+/// through lowercased; everything else
 /// (including `_` itself, so no input can forge another's escape) becomes `_<hex>`.
 ///
 /// An empty result means "no usable device name" and the caller declines to cache rather than

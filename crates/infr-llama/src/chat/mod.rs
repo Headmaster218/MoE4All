@@ -110,7 +110,7 @@ pub trait ChatModel {
         Ok(())
     }
 
-    /// The warmup body every session-backed backend (Vulkan/Metal/ROCm) copy-pasted: a two-token
+    /// The warmup body every session-backed backend (Vulkan/Metal) copy-pasted: a two-token
     /// throwaway generation to force the lazy session open + every pipeline compiled, then
     /// [`reset_kv`](Self::reset_kv) so the warmup tokens are dropped and the first REAL prompt
     /// prefills clean slots from row 0 instead of forking off a garbage prefix.
@@ -144,7 +144,7 @@ pub trait ChatModel {
 
 /// Drop a lazily-opened seam session's materialized tokens, if it has been opened yet — the body
 /// every session-backed [`ChatModel::reset_kv`] (and warmup discard) copy-pasted. Generic over the
-/// backend/extension pairing so ONE implementation serves Vulkan, Metal and ROCm; a chat whose
+/// backend/extension pairing so ONE implementation serves Vulkan and Metal; a chat whose
 /// session is still `None` has nothing to reset (its first `generate` opens a clean one).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn reset_session<B, X>(session: &mut Option<crate::seam::model::DenseSession<B, X>>) {
@@ -155,7 +155,7 @@ pub(crate) fn reset_session<B, X>(session: &mut Option<crate::seam::model::Dense
 
 /// The user's `device.ctx` (`INFR_CTX`) override in the shared size grammar (`8192`, `256k`,
 /// `50%`), unresolved. Vulkan wants the raw [`infr_core::SizeSpec`] (it routes `Bytes`/`Percent`
-/// to different VRAM-fit constructors); Metal/ROCm resolve it through [`cfg_ctx`]. `None` = no
+/// to different VRAM-fit constructors); Metal resolves it through [`cfg_ctx`]. `None` = no
 /// override.
 ///
 /// Takes the borrowed engine config each chat already owns through its [`crate::SeamModel`] (S7) —
@@ -168,9 +168,8 @@ pub(crate) fn cfg_ctx_spec(cfg: &crate::EngineConfig) -> Option<infr_core::SizeS
 
 /// [`cfg_ctx_spec`] resolved to a token count: a percentage resolves against the model's TRAINED
 /// context, since these paths have no VRAM-fit calc to take a fraction of. `None` = no override —
-/// the caller supplies its own default. Shared by the Metal and ROCm chats, whose `ensure_session`
-/// bodies were byte-identical — plus the diffusion-gemma chat, whose own copy of the resolve this
-/// replaced.
+/// the caller supplies its own default. Shared by the Metal chat and the diffusion-gemma chat,
+/// whose own copy of the resolve this replaced.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn cfg_ctx(cfg: &crate::EngineConfig, n_ctx_train: usize) -> Option<usize> {
     cfg_ctx_spec(cfg).map(|s| s.resolve(n_ctx_train as u64) as usize)
@@ -509,7 +508,7 @@ mod tests {
 
     /// `device.ctx` (`INFR_CTX`) reaches the session-backed chats off the `Config` their
     /// `SeamModel` carries — never `std::env::var` (S7, R7). Both halves of the knob: the raw
-    /// `SizeSpec` the Vulkan chat routes on, and the token count Metal/ROCm/diffusion resolve.
+    /// `SizeSpec` the Vulkan chat routes on, and the token count Metal/diffusion resolve.
     #[test]
     fn ctx_override_comes_from_the_config() {
         let mut cfg = crate::EngineConfig::default();

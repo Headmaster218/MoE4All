@@ -97,7 +97,7 @@ enum Backend {
 /// removed cleanly (no aliases) — use `INFR_DEV=metal`/`cpu`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BackendEnv {
-    /// The device spec (`VulkanN`/`metal`/`cpu`/`Metal.N]`), if non-empty.
+    /// The device spec (`VulkanN`/`metal`/`cpu`), if non-empty.
     dev: Option<String>,
 }
 
@@ -217,7 +217,7 @@ impl DeviceOpts {
     /// layer beats the env layer in the fold; an UNSET `--dev` specifies nothing, so the inherited
     /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "first discrete GPU,
     /// else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
-    /// `vulkan*`/`metal`/`cpu`/`Metal.`, case-insensitive) and a garbage `--dev` still fails fast
+    /// `vulkan*`/`metal`/`cpu`, case-insensitive) and a garbage `--dev` still fails fast
     /// here, before anything is loaded. The deprecated `INFR_METAL`/`INFR_CPU` are still not
     /// written and still not read.
     fn overrides(&self, layer: &mut PartialConfig) -> anyhow::Result<()> {

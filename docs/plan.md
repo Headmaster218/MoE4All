@@ -19,8 +19,8 @@ and the compute shaders (SPIR-V).
 
 A from-the-metal inference server where **the server and model code never know
 which GPU API is running underneath**. We ship a Vulkan backend first (covers
-AMD/NVIDIA/Intel, and Apple via MoltenVK), then add native CUDA / Metal backends
-later **without touching any layer above the backend**.
+AMD/NVIDIA/Intel, and Apple via MoltenVK), then a native Metal backend **without
+touching any layer above the backend**.
 
 The whole architecture is organized around four pluggable seams so that "add a
 GPU", "add a model", "add a format", or "add a decode style" each means
@@ -34,10 +34,10 @@ Deliberately narrow, to ship something real on the author's hardware first.
 
 | Dimension    | MVP                                           | Later                                 |
 | ------------ | --------------------------------------------- | ------------------------------------- |
-| Format       | **GGUF**                                      | safetensors, MLX                      |
+| Format       | **GGUF**                                      | safetensors                           |
 | Model source | **HuggingFace + Ollama pull**, or local path  | other registries, mirrors             |
 | Model        | **DiffusionGemma** (diffusion decode)         | Llama / Qwen / Gemma (autoregressive) |
-| GPU backend  | **Vulkan** (`ash` + SPIR-V) on **AMD (RADV)** | CUDA, native Metal                    |
+| GPU backend  | **Vulkan** (`ash` + SPIR-V) on **AMD (RADV)** | native Metal                          |
 | Decode       | **diffusion** (block denoise)                 | autoregressive (greedy / sampling)    |
 | API          | **OpenAI-compatible HTTP** (streaming)        | embeddings, batching, multi-model     |
 
@@ -118,7 +118,7 @@ Bottom-up. Each named trait is the seam where future variants plug in.
 ├────────────────────────────────────────────────────────────────────┤
 │ loader      trait WeightSource     -> Gguf  (safetensors later)      │
 ├────────────────────────────────────────────────────────────────────┤
-│ compute     trait Backend          -> Vulkan (CUDA / Metal …) │  the ONLY GPU-aware layer
+│ compute     trait Backend          -> Vulkan / Metal / CPU    │  the ONLY GPU-aware layer
 ├────────────────────────────────────────────────────────────────────┤
 │ shaders     SPIR-V (reused / ported from ggml-vulkan)                │  not Rust
 └────────────────────────────────────────────────────────────────────┘
@@ -137,13 +137,12 @@ generic `B: Backend`) and otherwise treats it as opaque.
 > (`infr-vulkan`), and a Metal backend (`infr-metal`).
 
 The hard requirement still holds: _the server does not know what's running
-behind it, and a new driver (CUDA / Metal / MLX) can be dropped in without
-changing anything above `compute`._ The seam is drawn at the level of **semantic
-tensor ops**: the model builds an ordered op-list (`Graph`) over typed tensor
-handles; each backend compiles + executes it however it likes (Vulkan SPIR-V,
-CPU loops, later cuBLAS / rocBLAS / Metal / MLX). The as-built trait, op set,
-and the dtype-awareness decision live in the `infr-core` source (`graph.rs`,
-`backend.rs`).
+behind it, and a new driver can be dropped in without changing anything above
+`compute`._ The seam is drawn at the level of **semantic tensor ops**: the model
+builds an ordered op-list (`Graph`) over typed tensor handles; each backend
+compiles + executes it however it likes (Vulkan SPIR-V, CPU loops, Metal MSL).
+The as-built trait, op set, and the dtype-awareness decision live in the
+`infr-core` source (`graph.rs`, `backend.rs`).
 
 ---
 
@@ -284,7 +283,7 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
     layout); see [`docs/perf.md`](perf.md).
 12. ✅ **Backend-agnostic refactor + second backend** — DONE. The op-list seam
     (`crates/infr-core`) runs on CPU (`infr-cpu`), Vulkan (`infr-vulkan`), and
-    Metal (`infr-metal`); CUDA / MLX remain future backends behind the same
+    Metal (`infr-metal`) — the three supported backends, all behind the same
     `Backend` trait.
 
 ---
@@ -398,7 +397,7 @@ for these GEMMs. The items below are NOT yet tried.
 All paths are on the author's machine; treat them as the source of truth.
 
 - **`~/Projects/llama.cpp`** — checked out on branch **`diffusiongemma`** (PR
-  `ggml-org/llama.cpp#24423`), already built with HIP. Key files:
+  `ggml-org/llama.cpp#24423`). Key files:
   - `src/llama-model.cpp` + `src/llama-arch.cpp` — the `diffusion-gemma`
     architecture graph (embeddings → 30 layers w/ SWA-vs-full attention
     selection, MoE FFN, RoPE, RMSNorm → output). **The canonical forward to

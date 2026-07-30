@@ -34,8 +34,8 @@
 //!   to consume it (in `lib.rs`), and the device-lost verdict on drop.
 //! - **The DEBOUNCED mid-run saves.** Unique to Vulkan: the driver's cache GROWS during a run as
 //!   new pipelines are created, so the file must be rewritten periodically for a long-lived
-//!   process that never drops cleanly (a `serve` under SIGKILL). s artifact is produced once,
-//!   whole, at init — it has nothing to re-save.
+//!   process that never drops cleanly (a `serve` under SIGKILL). Metal's binary archive, by
+//!   contrast, is produced once, whole, at init — it has nothing to re-save.
 //!
 //! `kernels.vulkan.pipeline_cache_disk = false` disables persistence (the in-process cache handle
 //! still works).
@@ -148,7 +148,7 @@ impl PcachePersist {
         }
     }
 
-    /// Is a mid-run save due? Vulkan-only bookkeeping — see the module doc for why legacy backends had no
+    /// Is a mid-run save due? Vulkan-only bookkeeping — see the module doc for why Metal has no
     /// equivalent. Split out so a unit test can exercise the debounce without a live device.
     fn save_due(&self) -> bool {
         self.last_save.lock().unwrap().elapsed().as_secs() >= SAVE_DEBOUNCE_SECS
@@ -230,7 +230,7 @@ mod tests {
     }
 
     /// The mid-run save debounce — the one piece of this that stayed Vulkan-specific (the driver's
-    /// cache grows during a run; s artifact is produced whole at init). A freshly-constructed
+    /// cache grows during a run; Metal's archive is produced whole at init). A freshly-constructed
     /// handle is NOT due, so a burst of pipeline creations writes the file once, not once per
     /// pipeline.
     #[test]

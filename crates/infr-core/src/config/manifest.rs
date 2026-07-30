@@ -286,8 +286,8 @@ knobs! {
 
     // ── prof (§6.9) ──────────────────────────────────────────────────────────
     // One `INFR_PROF_*` prefix, and each name says what it does. Thirteen keys became eight: the
-    // per-op profile had four (INFR_PROF2 / INFR_PROF_OPS / INFR_PROF2_SHAPES + Metal.s env-less
-    // knob) and host-side stage timing had five, one per pipeline (INFR_PROF, INFR_PROF_DEC,
+    // per-op profile had four (INFR_PROF2 / INFR_PROF_OPS / INFR_PROF2_SHAPES / INFR_METAL_PROFILE)
+    // and host-side stage timing had five, one per pipeline (INFR_PROF, INFR_PROF_DEC,
     // INFR_PROF_PF, INFR_MTP_TIME, INFR_DIFFUSION_TIME). Old spellings are dropped CLEANLY.
     "INFR_PROF_OPS"                => "prof.ops",               Presence, Ignored, "1",           migrated;
     "INFR_PROF_OP_SHAPES"          => "prof.op_shapes",         Presence, Ignored, "1",           migrated;

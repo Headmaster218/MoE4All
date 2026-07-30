@@ -2,18 +2,18 @@
 //!
 //! ## Why this exists
 //!
-//! Per-op profiling was re-invented four times. Every backend could answer "where did the forward
-//! go", and every backend answered it in its own dialect: vulkan stamped timestamp queries and
-//! printed `[prof2]`, metal accumulated host
+//! Per-op profiling was re-invented once per backend. Every backend could answer "where did the
+//! forward go", and every backend answered it in its own dialect: vulkan stamped timestamp queries
+//! and printed `[prof2]`, metal accumulated host
 //! encode wall and printed `── infr-metal profile`, cpu summed `Instant`s and printed `[prof-ops]`.
-//! Four knobs (`INFR_PROF2`, `INFR_METAL_PROFILE`, `INFR_PROF_OPS`), four
-//! label grammars, four sort orders, four notions of what the total is a percentage OF. All four
+//! Three knobs (`INFR_PROF2`, `INFR_METAL_PROFILE`, `INFR_PROF_OPS`), three
+//! label grammars, three sort orders, three notions of what the total is a percentage OF. All three
 //! are now [`ProfCfg::ops`](crate::config::ProfCfg::ops) — one knob, `INFR_PROF_OPS`.
 //!
 //! That is worse than untidy. It cost real work:
 //!
 //! * Metal's table counted the **untimed warmup forward**. Only vulkan honored the
-//!   suppression flag, so on the other the published share was diluted by work the bench
+//!   suppression flag, so on the others the published share was diluted by work the bench
 //!   itself excluded.
 //! * Only vulkan fed [`infr_prof_rt`], so only vulkan appeared in the exit aggregate and in the
 //!   `INFR_PROF_OUT` JSON. Correlating a host function table against device op time was a
@@ -27,7 +27,7 @@
 //! including the warmup-suppression AND).
 //!
 //! NOT shared, on purpose: **how a backend obtains a duration.** Those differ for hardware reasons,
-//! not drift, and flattening them would silently degrade three of the four:
+//! not drift, and flattening them would silently degrade two of the three:
 //!
 //! * vulkan writes `BOTTOM_OF_PIPE` timestamps into a query pool and reads the whole pool back
 //!   after the submit completes.
@@ -351,10 +351,9 @@ mod tests {
     /// single place that folds into the process-wide aggregate, so it is also the single place that
     /// decides the label grammar, the sort order, the columns and the units.
     ///
-    /// Four backends previously each called their own accounting and their own `eprintln!`, and the
-    /// cost was not aesthetic: three of the four silently profiled the bench's untimed warmup, and
-    /// three of the four never appeared in the exit report or the `INFR_PROF_OUT` JSON at all.
-    /// A fifth backend (cuda and sycl both have plans in `docs/`) would have made it five. This
+    /// Each backend previously called its own accounting and its own `eprintln!`, and the
+    /// cost was not aesthetic: all but vulkan silently profiled the bench's untimed warmup, and
+    /// all but vulkan never appeared in the exit report or the `INFR_PROF_OUT` JSON at all. This
     /// fails the moment a new one reaches past the seam.
     #[test]
     fn no_backend_feeds_the_aggregate_behind_the_shared_reporter() {

@@ -11,8 +11,8 @@ GPU.
 ## Goal
 
 A from-the-metal inference server that works across AMD / NVIDIA / Intel
-(Vulkan) and Apple (MoltenVK), with native backends addable later behind a
-`Compute` trait.
+(Vulkan) and Apple (native Metal), plus a CPU reference — three backends behind
+one `Backend` trait.
 
 ## Status
 
@@ -784,7 +784,7 @@ server   axum + SSE  ->  OpenAI /v1
 chat     ChatModel        (autoregressive dense/MoE/qwen35; DiffusionGemma's block-diffusion loop)
 runtime  SeamModel        tensors, KV cache, command/descriptor management (the unified runner)
 loader   WeightSource     (Gguf; safetensors later)
-compute  Backend          (Vulkan via ash + SPIR-V; reference Metal via MSL; CUDA later)
+compute  Backend          (Vulkan via ash + SPIR-V; native Metal via MSL; CPU reference)
 ```
 
 ## Documentation

@@ -11,8 +11,6 @@
 //! silently wrong weights, no error anywhere. (This backend has already been bitten by exactly that
 //! recycling: see the `Backend::compile` note about the decode-replay tape's
 //! bound-buffer-address fingerprint colliding across the MTP head's per-draft-step recompiles.)
-//! The ROCm backend hit the same class of bug on `hipMalloc` addresses and fixed it the same way
-//! (`MetalBuffer::uid`).
 //!
 //! So every allocation is stamped with a [`next_buffer_uid`] serial that is process-unique and
 //! never reused, and a cache hit is served only when the stored uid matches the bound buffer's.
