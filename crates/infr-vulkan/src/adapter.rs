@@ -713,17 +713,13 @@ fn mrow_int8_dtype_ok(
 /// see `native_mmv_mrow.comp`'s header) instead of the legacy `native_mmv_mw.comp`
 /// (warp-per-row, reassociation-tolerant only)?
 ///
-/// AMD: YES, always, for every dtype `mmv_mw_choice` gates on — this is the fix for the
-/// mmv_mw/mrow gap (README footnote 3) and what makes flipping Q4_K's decode tier on safe for
-/// `mtp_spec_matches_target_only_greedy`.
-///
-/// Intel: NO — kept on the pre-existing `native_mmv_mw.comp` route (SG=16 pinning, WARPS-tuned
-/// occupancy) unconditionally. Intel has no MTP-symmetry requirement driving this task (Intel
-/// isn't gated into `mrow_int8_dtype_ok`'s asymmetric set the way AMD's Q4_K/Q6_K/IQ4_XS are) and
-/// there is no Intel GPU in this validation environment to re-measure the unified path on, so the
-/// already-shipped, already-tuned Intel kernel is left untouched rather than swapped blind.
-fn unified_mmv_row1(caps: &infr_core::backend::Capabilities) -> bool {
-    !caps.vendor_intel
+/// YES, always, for every vendor and every dtype `mmv_mw_choice` gates on — the unified kernel
+/// exists for all dtypes, is bit-identical by construction (proved by `mmv_row1_bit_identical`),
+/// and paths not covered by `mmv_mw_choice` (Intel's legacy set, any future dtype) fall through
+/// the same gate. The Intel-specific carve-out was removed as part of the capability-first
+/// architecture: new hardware needs no vendor quirk here.
+fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
+    true
 }
 
 fn mmv_mw_choice(
@@ -6121,9 +6117,9 @@ mod tests {
                 "{dt:?} ordinary-prefill mrow must stay on"
             );
         }
-        // Intel is untouched by this task (no Intel GPU in this environment to re-validate the
-        // unified path on) — still the legacy per-vendor mmv_mw route.
-        assert!(!unified_mmv_row1(&intel));
+        // Intel now takes the same unified rows=1 path (unconditional, part of the
+        // capability-first architecture).
+        assert!(unified_mmv_row1(&intel));
     }
 
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every
