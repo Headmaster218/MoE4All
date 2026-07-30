@@ -1,14 +1,9 @@
 //! A shared on-disk cache for COMPILED KERNEL ARTIFACTS — the backend-agnostic half of what
-//! `infr-vulkan/src/pcache.rs` grew for `vkPipelineCache`, now also carrying the ROCm hiprtc code
-//! object.
+//! `infr-vulkan/src/pcache.rs` grew for `vkPipelineCache`.
 //!
 //! Every GPU backend pays the same tax: turning our kernel source into machine code is expensive,
 //! one-time, and re-runs on every process launch unless somebody writes the result down. Measured
-//! on this box: ~5 s of `vkCreateComputePipelines` across a cold DG forward's kernel set (Vulkan),
-//! and ~9.2 s of `hiprtcCompileProgram` on a cold comgr cache — plus ~0.25 s of hiprtc even when
-//! comgr's own lower-level cache is hot, on EVERY launch (ROCm). The artifacts differ; the
-//! bookkeeping around them does not, and that bookkeeping is the part that is easy to get subtly,
-//! dangerously wrong. So it lives here, once.
+//! on this box: ~5 s of `vkCreateComputePipelines` across a cold DG forward's kernel set (Vulkan).
 //!
 //! # What a cached artifact is allowed to do
 //!
@@ -23,8 +18,7 @@
 //!
 //! - **The KEY.** [`open`](KernelCache::open) takes an opaque byte string that is compared
 //!   VERBATIM on load. The caller folds in everything that would make an old artifact wrong:
-//!   Vulkan carries `driverVersion ++ pipelineCacheUUID ++ SHADER_SET_FINGERPRINT`, ROCm carries
-//!   `FNV(hip_source()) ++ gfx arch ++ HIP runtime/driver version ++ compile options`. A mismatch
+//!   Vulkan carries `driverVersion ++ pipelineCacheUUID ++ SHADER_SET_FINGERPRINT`. A mismatch
 //!   discards the file WHOLESALE, which is also why the key is not a hash we compute for the
 //!   caller: only the caller knows what its artifact depends on.
 //! - **The ENVELOPE.** `magic ++ format_version ++ key_len ++ payload_len ++ payload_hash`, so a
@@ -80,8 +74,8 @@
 //!
 //! # Disabled
 //!
-//! A cache opened with `enabled = false` (`kernels.vulkan.pipeline_cache_disk = false`,
-//! `kernels.rocm.module_cache = false`) is a TOTAL no-op: it never creates the cache directory,
+//! A cache opened with `enabled = false` (`kernels.vulkan.pipeline_cache_disk = false`)
+//! is a TOTAL no-op: it never creates the cache directory,
 //! never reads, never writes, never sweeps. Every method returns the miss/OK answer immediately.
 
 use std::io::Write;
@@ -175,8 +169,8 @@ pub struct KernelCache {
 impl KernelCache {
     /// Open the per-device artifact file `<cache dir>/<file_name>`.
     ///
-    /// `file_name` must be unique per DEVICE-CLASS (Vulkan keys it by `vendor_id`/`device_id`,
-    /// ROCm by gfx arch) so a multi-GPU box never hands one device another's binaries. `magic`
+    /// `file_name` must be unique per DEVICE-CLASS (Vulkan keys it by `vendor_id`/`device_id`)
+    /// so a multi-GPU box never hands one device another's binaries. `magic`
     /// identifies the producer AND its layout version. `key` is whatever makes an old artifact
     /// wrong; it is compared verbatim, never interpreted.
     ///
@@ -648,8 +642,8 @@ mod tests {
     }
 
     /// A DISABLED cache is a total no-op: it never creates its directory and every method answers
-    /// immediately. (`kernels.vulkan.pipeline_cache_disk = false`, `kernels.rocm.module_cache =
-    /// false` must not leave a trace on a box that opted out.)
+    /// immediately. (`kernels.vulkan.pipeline_cache_disk = false` must not leave a trace on a box
+    /// that opted out.)
     #[test]
     fn a_disabled_cache_never_touches_the_filesystem() {
         let dir = tmp_dir("disabled");

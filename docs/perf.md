@@ -175,7 +175,7 @@ not just ratios (llama.cpp's side drifts with the same heat).
 ## Profiling
 
 **One knob, every backend.** `INFR_PROF_OPS=1` turns on per-op profiling on
-Vulkan, ROCm, Metal and the CPU backend alike:
+Vulkan, Metal and the CPU backend alike:
 
 ```bash
 INFR_PROF_OPS=1    infr bench "$M" -p 512 -n 0 -r 1  # per-op device time, any --dev
@@ -208,9 +208,9 @@ found the first.
 Every backend prints the same table, tagged with its name, sorted by total time:
 
 ```
-[prof:rocm]       4.91   27.3%       14     350.7  Linear m=128 3072x1024 Q6K
-[prof:rocm]       2.25   12.5%       28      80.2  Linear m=128 1024x6144 Q4K
-[prof:rocm]       1.14    6.4%       28      40.8  Attention rows=128 kv=128 h=16/8 d=128 causal
+[prof:vulkan]     4.91   27.3%       14     350.7  Linear m=128 3072x1024 Q6K
+[prof:vulkan]     2.25   12.5%       28      80.2  Linear m=128 1024x6144 Q4K
+[prof:vulkan]     1.14    6.4%       28      40.8  Attention rows=128 kv=128 h=16/8 d=128 causal
 ```
 
 and every backend also folds its rows into ONE process-exit aggregate over the
@@ -222,12 +222,11 @@ on any backend, now, rather than only on Vulkan.
 
 This was four separate tools until the U1–U3 unification, and the split cost
 real work: `INFR_PROF_OPS=1` on a GPU run profiled **nothing** (only the CPU
-backend read it — Vulkan answered to `INFR_PROF2`), ROCm's equivalent had no env
-var at all and was reachable only through `--set`, and ROCm's and Metal's tables
-silently included the bench's untimed warmup forward. **If you are reading a
-profile quoted in a commit message from before that, its shares are diluted.**
-The seam is `crates/infr-core/src/prof.rs`; a source tripwire fails the build if
-a backend reaches past it.
+backend read it — Vulkan answered to `INFR_PROF2`), and Metal's tables silently
+included the bench's untimed warmup forward. **If you are reading a profile
+quoted in a commit message from before that, its shares are diluted.** The seam
+is `crates/infr-core/src/prof.rs`; a source tripwire fails the build if a
+backend reaches past it.
 
 **Labels.** `op kind + the shape that makes the cost`, so two dispatches share a
 row exactly when they do the same work — a 28-layer model folds to a handful of
@@ -260,25 +259,6 @@ accident.
   timestamps (queries are baked at record time), so the replayed decode path
   reports nothing — set `INFR_SEAM_NO_REPLAY=1` to force the re-recorded path
   when profiling decode.
-- **ROCm** brackets each op in a HIP timing-event pair on its single stream. A
-  host `Instant` would measure enqueue (the ops queue with no per-op sync), and
-  a `hipStreamSynchronize` per op would measure execution but serialize the
-  pipeline and add F4's ~2.7 µs launch floor to every sample.
-
-  **Its overhead scales with DISPATCH COUNT, and on decode that is not small.**
-  Measured on an RX 7900 XTX: **0.3%** on Qwen3-30B-A3B `pp512` (48 profiled ops
-  in the forward — 347.2/346.9 profiled vs 347.9/348.0 clean) but **37%** on
-  Qwen3-0.6B `tg128` (~310 dispatches per token, so ~79 000 event pairs over the
-  run — 134.5 profiled vs 212.2 clean). The cause is that the collector creates
-  and destroys an event pair per span rather than pooling them.
-
-  So: **use it to RANK ops, never to size a total against wall time on a
-  dispatch-heavy workload**, and never quote a profiled t/s. If you need the
-  size of one op on decode, price it by skipping the op and taking the
-  difference in clean runs — that is how P6 established attention was 50% of a
-  d0 token and 79% at d4096. Pooling the events would fix this and has not been
-  done.
-
 - **Metal** needs a second knob for DEVICE time, because batching means it is
   never free there: `--set prof.metal_device_time=counters` samples
   stage-boundary timestamps — **the only honest per-op device mode** — and
@@ -300,9 +280,9 @@ accident.
   any one op costs.
 - Micro-probes: `crates/infr-vulkan/tests/` (`gemm_bench`, `decode_gemv_bw`,
   `small_m_bench`, `bandwidth_probe`), `crates/infr-metal/tests/` (`gemv_bw`,
-  `dispatch_overhead`, `moe_bw`), `crates/infr-rocm/examples/decode_gemv_bw.rs`.
-  Chained-dispatch numbers there are thermally unstable across back-to-back
-  runs; trust e2e benches for accept / revert calls.
+  `dispatch_overhead`, `moe_bw`). Chained-dispatch numbers there are thermally
+  unstable across back-to-back runs; trust e2e benches for accept / revert
+  calls.
 - For a suspect GEMM shape, add it to the per-shape micro-bench
   (`crates/infr-vulkan/tests/gemm_bench.rs`) and print µs + TFLOPS. Compare
   against the kernel's known ceiling — a shape far below ceiling is a shape

@@ -1,6 +1,6 @@
 //! On-disk `MTLBinaryArchive` persistence — the Metal-specific SHELL around
 //! [`infr_core::kernel_cache::KernelCache`], the same seam `infr-vulkan/src/pcache.rs` and
-//! `infr-rocm/src/kernels.rs` ride on.
+//! `infr-metal/src/kernels.rs` ride on.
 //!
 //! # What this caches, and what it does NOT
 //!
@@ -26,7 +26,7 @@
 //!
 //! # Shape: the archive GROWS during a run
 //!
-//! Metal's archive behaves like Vulkan's `vkPipelineCache`, not like ROCm's code object: PSOs are
+//! Metal's archive behaves like Vulkan's `vkPipelineCache`, not like a code object: PSOs are
 //! created LAZILY (`Pipelines::get` on first use of each kernel), so the artifact is not finished
 //! at init. The lifecycle therefore mirrors `infr-vulkan/src/pcache.rs` exactly — seed at
 //! [`Pipelines::build`](crate::shaders::Pipelines::build), add each pipeline as it is created, save

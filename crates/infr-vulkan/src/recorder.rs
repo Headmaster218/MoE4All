@@ -8984,7 +8984,7 @@ impl<'a> Recorder<'a> {
         .timestamp_period; // ns per tick
                            // Accounted, aggregated and printed by the shared reporter (`infr_core::prof::OpProf`),
                            // which is where the `gpu_add` fold into the process-wide exit table now happens too — the
-                           // same code path rocm, metal and the cpu backend report through, so the four tables are
+                           // same code path metal and the cpu backend report through, so the three tables are
                            // column-for-column comparable.
         let mut p = infr_core::prof::OpProf::new("vulkan", infr_core::prof::Unit::Device);
         for i in 0..n {

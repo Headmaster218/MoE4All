@@ -5,7 +5,7 @@
 //! hand-written tests over a per-suite family of `synth_q4k`/`synth_q6k`/`synth_mxfp4`/… builders
 //! that ROCm's suite independently re-implements. This file gets the same coverage as ONE sweep,
 //! from `infr_core::decode_spec` via `infr_testkit::synth_weight` — so a new quant format is
-//! covered on cpu / rocm / metal / vulkan the moment it is added to the spec, with no fourth copy
+//! covered on cpu / Metal / metal / vulkan the moment it is added to the spec, with no fourth copy
 //! of the block layouts.
 //!
 //! It also closes a real gap in the existing suite: the per-format tests each pick one or two

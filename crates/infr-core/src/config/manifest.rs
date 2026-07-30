@@ -155,17 +155,6 @@ knobs! {
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
-    "INFR_ROCM_EXPERT_BUDGET"   => "paging.rocm_expert_budget",        Size,     Ignored, "4g",  migrated;
-    "INFR_ROCM_WEIGHT_PREFETCH_SLOTS" => "paging.rocm_prefetch_slots", Int,      Ignored, "6",   migrated;
-    "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB"
-        => "paging.rocm_prefetch_max_bank_mb", Int, Ignored, "512", migrated;
-    "INFR_ROCM_WEIGHT_PREFETCH_OFF"   => "paging.rocm_prefetch_off",   Presence, Ignored, "1",   migrated;
-    "INFR_ROCM_WEIGHT_PREFETCH_STATS" => "paging.rocm_prefetch_stats", Presence, Ignored, "1",   migrated;
-    "INFR_ROCM_WEIGHT_OVERFLOW" => "paging.rocm_weight_overflow",      Flag,     Ignored, "1",   migrated;
-    "INFR_ROCM_WEIGHT_VRAM_MB"  => "paging.rocm_weight_vram_mb",       Mib,      Ignored, "512", migrated;
-    "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB"
-        => "paging.rocm_weight_reserve_mb", Mib, Ignored, "128", migrated;
-    "INFR_ROCM_PAGER_NOOVERLAP" => "paging.rocm_no_overlap",           Presence, Ignored, "1",   migrated;
 
     // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
     "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", migrated;
@@ -263,18 +252,6 @@ knobs! {
     "INFR_METAL_NODELTA"          => "kernels.metal.deltanet",      PresenceInv, Ignored, "1", migrated;
     "INFR_METAL_NOMOE"            => "kernels.metal.moe",           PresenceInv, Ignored, "1", migrated;
 
-    // ── kernels.rocm (§6.7) ──────────────────────────────────────────────────
-    "INFR_ROCM_WMMA_TILE"    => "kernels.rocm.wmma_tile", Text,        Ignored, "2x2",   migrated;
-    "INFR_ROCM_NO_WMMA"      => "kernels.rocm.no_wmma",   Presence,    Ignored, "1",     migrated;
-    "INFR_ROCM_NO_I8"        => "kernels.rocm.i8",        PresenceInv, Ignored, "1",     migrated;
-    "INFR_ROCM_NO_PIPE"      => "kernels.rocm.pipe",      PresenceInv, Ignored, "1",     migrated;
-    "INFR_ROCM_COOP"         => "kernels.rocm.coop",      Presence,    Ignored, "1",     migrated;
-    "INFR_ROCM_COOP_TILE"    => "kernels.rocm.coop_tile", Text,        Ignored, "64x64", migrated;
-    "INFR_ROCM_BLAS"         => "kernels.rocm.blas",      Presence,    Ignored, "1",     migrated;
-    "INFR_ROCM_NO_FUSE_ADD"  => "kernels.rocm.fuse_add",  PresenceInv, Ignored, "1",     migrated;
-    "INFR_ROCM_NO_FUSE_NORM" => "kernels.rocm.fuse_norm", PresenceInv, Ignored, "1",     migrated;
-    "INFR_ROCM_MMQ"          => "kernels.rocm.mmq",        Presence,    Ignored, "1",     migrated;
-
     // ── kernels.cpu (§6.7) ───────────────────────────────────────────────────
     "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", migrated;
     "INFR_CPU_NO_SPINPOOL" => "kernels.cpu.spinpool",  SetNotZeroInv, Ignored, "1",    migrated;
@@ -309,7 +286,7 @@ knobs! {
 
     // ── prof (§6.9) ──────────────────────────────────────────────────────────
     // One `INFR_PROF_*` prefix, and each name says what it does. Thirteen keys became eight: the
-    // per-op profile had four (INFR_PROF2 / INFR_PROF_OPS / INFR_PROF2_SHAPES + rocm's env-less
+    // per-op profile had four (INFR_PROF2 / INFR_PROF_OPS / INFR_PROF2_SHAPES + Metal.s env-less
     // knob) and host-side stage timing had five, one per pipeline (INFR_PROF, INFR_PROF_DEC,
     // INFR_PROF_PF, INFR_MTP_TIME, INFR_DIFFUSION_TIME). Old spellings are dropped CLEANLY.
     "INFR_PROF_OPS"                => "prof.ops",               Presence, Ignored, "1",           migrated;

@@ -149,25 +149,6 @@ cfg_struct! {
         ring: Option<SizeSpec> = None,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
-        /// `INFR_ROCM_EXPERT_BUDGET`.
-        rocm_expert_budget: Option<SizeSpec> = None,
-        /// `INFR_ROCM_WEIGHT_PREFETCH_SLOTS`. `None` = `DEFAULT_N_SLOTS` (4), floored at 2 by the
-        /// accessor.
-        rocm_prefetch_slots: Option<usize> = None,
-        /// `INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB`. `None` = `DEFAULT_MAX_BANK_MB` (256).
-        rocm_prefetch_max_bank_mb: Option<usize> = None,
-        /// `INFR_ROCM_WEIGHT_PREFETCH_OFF`.
-        rocm_prefetch_off: bool = false,
-        /// `INFR_ROCM_WEIGHT_PREFETCH_STATS`.
-        rocm_prefetch_stats: bool = false,
-        /// `INFR_ROCM_WEIGHT_OVERFLOW` (`budget::flag_from` grammar).
-        rocm_weight_overflow: bool = false,
-        /// `INFR_ROCM_WEIGHT_VRAM_MB`, in MiB.
-        rocm_weight_vram_mb: Option<u64> = None,
-        /// `INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB`, in MiB. `None` = `max(12%, 2 GiB)`.
-        rocm_weight_reserve_mb: Option<u64> = None,
-        /// `INFR_ROCM_PAGER_NOOVERLAP`.
-        rocm_no_overlap: bool = false,
     }
 }
 
@@ -388,128 +369,11 @@ cfg_struct! {
         /// compiled from MSL, so the ~340 KB front-end compile in `Pipelines::build` still runs
         /// every launch (see `infr-metal/src/pcache.rs`).
         ///
-        /// Has NO env key, like [`RocmCfg::module_cache`] and [`CpuCfg::reference`] — settable
+        /// Has NO env key, like [`CpuCfg::reference`] and [`CpuCfg::reference`] — settable
         /// with `--set kernels.metal.pipeline_cache=false` or the TOML file. Clear it to force
         /// cold pipeline creation (bisecting a suspected cache bug); the cache is otherwise
         /// self-invalidating on any source / device / OS / compile-option change.
         pipeline_cache: bool = true,
-    }
-}
-
-cfg_struct! {
-    /// ROCm kernel-tier selection. The ROCm paging/overflow half lives in [`PagingCfg`].
-    RocmCfg / PartialRocmCfg {
-        /// `INFR_ROCM_WMMA_TILE`: exactly `"1x1"`, `"2x1"` or `"2x2"`; anything else is treated
-        /// as unset by the accessor (the shape-driven auto tier).
-        wmma_tile: Option<String> = None,
-        /// `INFR_ROCM_NO_WMMA`: presence forces the GEMV path.
-        no_wmma: bool = false,
-        /// `INFR_ROCM_NO_I8` (inverted): the int8 kernel family.
-        i8: bool = true,
-        /// `INFR_ROCM_NO_PIPE` (inverted): the software-pipelined Q4_K WMMA kernel.
-        pipe: bool = true,
-        /// `INFR_ROCM_COOP`: OPT-IN cooperative decode-once Q4_K prefill GEMM.
-        coop: bool = false,
-        /// `INFR_ROCM_COOP_TILE`. `None`/unrecognized = the `128x64` tile.
-        coop_tile: Option<String> = None,
-        /// `INFR_ROCM_BLAS`: OPT-IN rocBLAS prefill.
-        blas: bool = false,
-        /// `INFR_ROCM_NO_FUSE_ADD` (inverted) — via `FusionCfg.linear_add.enabled`.
-        fuse_add: bool = true,
-        /// `INFR_ROCM_NO_FUSE_NORM` (inverted) — via `FusionCfg.rmsnorm_linear.enabled`.
-        fuse_norm: bool = true,
-        /// F1d: the `QkNormRope → WriteKv` peephole — the rotated f16 K row is written STRAIGHT
-        /// into the KV cache by `qk_norm_rope`, so the standalone `write_kv` never launches.
-        ///
-        /// Has NO env key (following `module_cache`/`moe_id_rows`): clear it with
-        /// `--set kernels.rocm.fuse_kv_write=false` or the TOML file. It exists so the fold's own
-        /// parity case can run the SAME graph with and without it — the fused write is claimed
-        /// BYTE-identical, and that claim is only checkable against the un-fused control.
-        fuse_kv_write: bool = true,
-        /// Persist the hiprtc-compiled HIP module to disk
-        /// (`infr_core::kernel_cache`, `~/.cache/infr/rocm-module-<arch>.bin`) and reload it at
-        /// backend init instead of recompiling. Measured: ~9.2 s cold / ~0.25 s warm of
-        /// `hiprtcCompileProgram` on EVERY launch without it.
-        ///
-        /// Has NO env key and never had one — the config campaign removed them; this follows
-        /// `CpuCfg::reference`'s model (a typed field the caller chooses), settable with
-        /// `--set kernels.rocm.module_cache=false` or the TOML file. Clear it to force a compile
-        /// (bisecting a suspected cache bug); the cache is otherwise self-invalidating on any
-        /// source/arch/runtime change.
-        module_cache: bool = true,
-        /// Token rows per **id-indexed MoE expert-GEMV** dispatch (R8) — the `moe_*_idm_*` tier's
-        /// batch bound. Every dispatch covers `rows × n_used` expert slots at once; this caps the
-        /// `rows` a single one may carry, so a long prefill chunk is split into several dispatches
-        /// instead of one whose per-slot scratch (`[rows·n_used, n_ff_exp]` + `[rows·n_used, ne]`)
-        /// scales with the chunk.
-        ///
-        /// It is a SCRATCH bound, not a perf crossover (Vulkan's `moe_small_m` is a crossover — it
-        /// picks between the id tier and a bucket-sorted batched GEMM ROCm has no equivalent of;
-        /// see `exec.rs`'s `MOE_ID_ROWS`). `0` is clamped to 1. Has NO env key — set it with
-        /// `--set kernels.rocm.moe_id_rows=…` or the TOML file.
-        moe_id_rows: usize = 128,
-        /// P2: the BUCKET-SORTED BATCHED per-expert MoE GEMV (`moe_*_idb_*`). The R8 id tier's
-        /// grid is `(output row, slot)`, so each of the `rows × n_used` slots re-reads its
-        /// expert's whole bank — 32× of redundant weight traffic on Qwen3-30B-A3B `pp512`. This
-        /// sorts the slots into per-expert buckets and gives each expert ONE block per output row
-        /// that loops over its bucket, so the bank is read once per row-chunk.
-        ///
-        /// It is a SHAPE gate, not a numerics one: the batched kernels run the id tier's
-        /// arithmetic unchanged and write the same per-slot destinations, so the two are
-        /// bit-identical. The executor only takes it when the buckets are worth having (average
-        /// occupancy ≥ 2 slots/expert — decode, at `n_used` slots over `n_expert` banks, never
-        /// qualifies) and `n_expert` fits the sort's LDS histogram.
-        ///
-        /// Has NO env key, like `fuse_kv_write`/`moe_id_rows`: clear it with
-        /// `--set kernels.rocm.moe_bucket=false` or the TOML file. It exists so the tier's parity
-        /// case can run the SAME graph both ways — "bit-identical to the id tier" is only
-        /// checkable against that control.
-        moe_bucket: bool = true,
-        /// P1: the TILED FLASH PREFILL attention kernel (`attention_prefill_flash`) — a workgroup
-        /// owns a tile of query rows, streams the kv range through LDS once, and runs a one-pass
-        /// online softmax, instead of giving every (query row, head) its own wave that re-reads the
-        /// whole K/V cache twice. Clear it to route prefill back to the plain `attention` kernel.
-        ///
-        /// Has NO env key, like `fuse_kv_write` — and it exists for the same reason: the flash
-        /// kernel's parity case runs the SAME graph both ways, and "matches the single-wave kernel
-        /// it replaces" is only checkable against that control.
-        attn_flash: bool = true,
-        /// P6: the batched-prefetch DECODE attention kernels (`attention_pf_npl*` /
-        /// `attention_split_partial_pf_npl*`) — a wave stages PF keys' K (or V) rows in registers
-        /// before consuming any of them, so it keeps PF memory requests in flight instead of one.
-        /// At decode there is one wave per (row, head[, chunk]) and no second wave to hide latency,
-        /// so this is the only lever that reaches it; the arithmetic is untouched (same lane
-        /// partition, same butterfly, same ascending-`j` accumulation), only the LOADS move.
-        ///
-        /// Taken only when `rows == 1` and `ceil(head_dim/32) ∈ {2, 4, 8}` — the instantiated lane
-        /// counts. Every other shape, and all of prefill, keeps the generic kernels.
-        ///
-        /// Has NO env key, like `attn_flash`/`moe_bucket`, and for the same reason: the parity case
-        /// runs the SAME graph both ways, and "bit-identical to the plain kernel" is only checkable
-        /// against that control. Clear it with `--set kernels.rocm.attn_pf=false`.
-        attn_pf: bool = true,
-        /// P7: one-pass online-softmax + one-key-per-lane split-KV decode attention
-        /// (`attention_split_partial_flash`). Replaces the two-pass, lane-per-dim partial with a
-        /// one-pass online-softmax variant where each lane owns one full key (no cross-lane
-        /// allreduce). The combine kernel is unchanged; the partial output is the same shape.
-        /// The qwen3 seam golden hash is UNMOVED (0xfd63781ea3bfa785) despite the changed
-        /// reduction order — greedy decode is identical.
-        attn_split_flash: bool = true,
-        /// P8: WMMA f16 flash prefill attention (br=64 bc=64, 8-warps). OPT-IN gated behind
-        /// `INFR_ROCM_NO_WMMA` — both must be clear for the kernel to fire (it is still a
-        /// scalar-ALU placeholder; real WMMA intrinsics TBD). Default OFF — the P1 scalar flash
-        /// kernel handles all prefill traffic.
-        attn_flash_wmma: bool = false,
-        /// `INFR_ROCM_A_GLOBAL`: OPT-IN f16 A_GLOBAL WMMA prefill GEMM (Slice S2). When set
-        /// AND weight format is Q4_K, the prefill path reads f16 activations from global memory
-        /// (no int8 quant/dequant) and uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
-        /// instead of the int8 WMMA intrinsic. Default OFF — gated for A/B measurement.
-        a_global: bool = false,
-        /// `INFR_ROCM_MMQ`: OPT-IN MMQ decode-once MoE GEMM for Q4_K gate/up
-        /// (Slice S5). When set AND Q4_K format: dispatches `moe_mmq_up_i8_q4k`
-        /// instead of the id-indexed multi-slot kernel. Default ON after +22.6% pp512
-        /// measurement on Qwen3-30B-A3B (957 vs 784 t/s).
-        mmq: bool = true,
     }
 }
 
@@ -539,8 +403,6 @@ cfg_struct! {
             vulkan: VulkanCfg => PartialVulkanCfg,
             /// Metal (`infr-metal`).
             metal: MetalCfg => PartialMetalCfg,
-            /// ROCm (`infr-rocm`).
-            rocm: RocmCfg => PartialRocmCfg,
             /// CPU (`infr-cpu`).
             cpu: CpuCfg => PartialCpuCfg,
         }
@@ -608,7 +470,7 @@ cfg_struct! {
 /// How the Metal backend obtains **device** time per op.
 ///
 /// Metal batches every op into one command buffer, so — unlike vulkan's timestamp queries or
-/// rocm's HIP events — per-op device time is never free there. Both non-`Off` modes cost
+/// Metal.s HIP events — per-op device time is never free there. Both non-`Off` modes cost
 /// something, which is why this is a separate axis from [`ProfCfg::ops`] rather than implied by
 /// it: turning per-op profiling on gets you host ENCODE time for free, and you opt in to paying
 /// for device time.
@@ -667,7 +529,7 @@ cfg_struct! {
     /// features are three knobs: [`ops`](Self::ops) (per-op device profile),
     /// [`stages`](Self::stages) (host-side stage timing), [`vram`](Self::vram) (memory).
     ProfCfg / PartialProfCfg {
-        /// `INFR_PROF_OPS`: per-op profiling on every backend — vulkan, rocm, metal and cpu. THE
+        /// `INFR_PROF_OPS`: per-op profiling on every backend — vulkan, metal and cpu. THE
         /// switch the backends gate on, through [`crate::prof::enabled`] (which also ANDs the
         /// warmup-suppression flag). See `docs/perf.md` § Profiling.
         ops: bool = false,
@@ -880,7 +742,7 @@ impl Config {
     /// what remains is `CpuBackend::new` / `CpuBackend::reference`, the env-sourced TWINS of
     /// `new_with`/`reference_with` that a library caller may legitimately want (infallible is
     /// right there — CPU owns none of the loud keys). The Vulkan bridge went away in S5a and the
-    /// ROCm one in S6, when `VulkanBackend::new_with(cfg)` / `RocmBackend::new_with(device_id,
+    /// Metal one similarly, when `MetalBackend::new_with(device_id,
     /// cfg)` became the real constructors.
     ///
     /// It is NOT `Config::load`: no file layer (these knobs were env-only before the migration, so
@@ -889,7 +751,7 @@ impl Config {
     /// an unmigrated read site still produces for itself (R1) — a rejected layer falls back to
     /// `Config::default()`.
     ///
-    /// That infallibility is exactly why `VulkanBackend::new`, `RocmBackend::new` and
+    /// That infallibility is exactly why `VulkanBackend::new` and
     /// `MetalBackend::new` do NOT use this: all five loud keys are `Config`-sourced now, so
     /// swallowing the layer error there would silently drop an `INFR_SG` /
     /// `INFR_SUBMIT_DISPATCHES` / device-list rejection a caller gets today. They build the same

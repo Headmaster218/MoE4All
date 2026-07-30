@@ -70,13 +70,6 @@ fn opt_num<T: std::str::FromStr>(get: Get, key: &str) -> Option<Option<T>> {
     num::<T>(get, key).map(Some)
 }
 
-/// [`opt_num`] for the read sites that TRIM before parsing (`infr-rocm`'s two weight-prefetch
-/// sizing knobs did `v.trim().parse()`), so `" 6 "` keeps meaning `6` rather than falling back to
-/// the default. Same trim [`opt_mib`] applies.
-fn opt_num_trimmed<T: std::str::FromStr>(get: Get, key: &str) -> Option<Option<T>> {
-    get(key).and_then(|v| v.trim().parse().ok()).map(Some)
-}
-
 /// A MiB-valued knob (`budget::mib_from`'s trim-and-parse). Stored in MiB; the byte conversion
 /// belongs to the accessor (R5).
 fn opt_mib(get: Get, key: &str) -> Option<Option<u64>> {
@@ -93,11 +86,6 @@ fn opt_size(get: Get, key: &str) -> Option<Option<SizeSpec>> {
 /// A free-string knob behind an `Option<String>` field.
 fn opt_text(get: Get, key: &str) -> Option<Option<String>> {
     get(key).map(Some)
-}
-
-/// A free-string knob whose read site trims (`INFR_ROCM_*_TILE`).
-fn opt_text_trimmed(get: Get, key: &str) -> Option<Option<String>> {
-    get(key).map(|v| Some(v.trim().to_string()))
 }
 
 /// A filesystem-path knob behind an `Option<PathBuf>` field.
@@ -205,18 +193,6 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.cache = opt_size(get, "INFR_CACHE");
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
-    p.paging.rocm_expert_budget = opt_size(get, "INFR_ROCM_EXPERT_BUDGET");
-    // Both read sites trimmed before parsing; keep that (R1). The `max(2)` slot floor is POLICY and
-    // stays at `weight_pager`'s accessor (R5).
-    p.paging.rocm_prefetch_slots = opt_num_trimmed(get, "INFR_ROCM_WEIGHT_PREFETCH_SLOTS");
-    p.paging.rocm_prefetch_max_bank_mb =
-        opt_num_trimmed(get, "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB");
-    p.paging.rocm_prefetch_off = presence(get, "INFR_ROCM_WEIGHT_PREFETCH_OFF");
-    p.paging.rocm_prefetch_stats = presence(get, "INFR_ROCM_WEIGHT_PREFETCH_STATS");
-    p.paging.rocm_weight_overflow = flag(get, "INFR_ROCM_WEIGHT_OVERFLOW");
-    p.paging.rocm_weight_vram_mb = opt_mib(get, "INFR_ROCM_WEIGHT_VRAM_MB");
-    p.paging.rocm_weight_reserve_mb = opt_mib(get, "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB");
-    p.paging.rocm_no_overlap = presence(get, "INFR_ROCM_PAGER_NOOVERLAP");
 
     // ── kernels.vulkan ───────────────────────────────────────────────────────
     let v = &mut p.kernels.vulkan;
@@ -334,19 +310,6 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     m.lmhead_mrv_uncapped = presence(get, "INFR_METAL_LMHEAD_MRV");
     m.deltanet = presence_inv(get, "INFR_METAL_NODELTA");
     m.moe = presence_inv(get, "INFR_METAL_NOMOE");
-
-    // ── kernels.rocm ─────────────────────────────────────────────────────────
-    let r = &mut p.kernels.rocm;
-    r.wmma_tile = opt_text_trimmed(get, "INFR_ROCM_WMMA_TILE");
-    r.no_wmma = presence(get, "INFR_ROCM_NO_WMMA");
-    r.i8 = presence_inv(get, "INFR_ROCM_NO_I8");
-    r.pipe = presence_inv(get, "INFR_ROCM_NO_PIPE");
-    r.coop = presence(get, "INFR_ROCM_COOP");
-    r.coop_tile = opt_text_trimmed(get, "INFR_ROCM_COOP_TILE");
-    r.blas = presence(get, "INFR_ROCM_BLAS");
-    r.fuse_add = presence_inv(get, "INFR_ROCM_NO_FUSE_ADD");
-    r.fuse_norm = presence_inv(get, "INFR_ROCM_NO_FUSE_NORM");
-    r.mmq = presence(get, "INFR_ROCM_MMQ");
 
     // ── kernels.cpu ──────────────────────────────────────────────────────────
     p.kernels.cpu.spin = num(get, "INFR_CPU_SPIN");

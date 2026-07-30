@@ -78,8 +78,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kv.slots, 4);
     assert!(d.kv.ring);
     assert!(!d.kv.force_q8);
-    assert_eq!(d.paging.rocm_prefetch_slots, None);
-    assert_eq!(d.paging.rocm_prefetch_max_bank_mb, None);
+
     // §6.5 / §10.2: the mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
     assert!(d.kernels.vulkan.mmv);
     assert!(!d.kernels.vulkan.mmv_decode);
@@ -104,20 +103,6 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kernels.cpu.spinpool);
     assert_eq!(d.kernels.cpu.repack_mb, 4096);
     assert!(!d.kernels.cpu.reference);
-    // §6.7: the ROCm hiprtc module cache is ON by default — the whole point is that a launch does
-    // not pay `hiprtcCompileProgram` (~9.2 s cold / ~0.25 s warm). Like `kernels.cpu.reference` it
-    // has NO env key; it is settable only from the file or `--set`.
-    assert!(d.kernels.rocm.module_cache);
-    // R8: the id-indexed MoE GEMV tier's row-batch bound. Also env-key-less; `infr-rocm` pins this
-    // default against its own `MOE_ID_ROWS` knob table.
-    assert_eq!(d.kernels.rocm.moe_id_rows, 128);
-    // P2: the bucket-sorted batched per-expert MoE GEMV ships ON — it is the id tier's grid with
-    // the 32× weight re-read taken out, and bit-identical to it. Env-key-less like the rest.
-    assert!(d.kernels.rocm.moe_bucket);
-    // P1: the tiled flash prefill attention kernel ships ON (it replaced the single-wave scalar
-    // one). Env-key-less like the two above. (`kernels.rocm.prof_ops` used to sit here; it folded
-    // into the cross-backend `prof.ops` — see `prof_ops_is_the_one_knob_reachable_by_env_set_and_file`.)
-    assert!(d.kernels.rocm.attn_flash);
     // RM: the Metal `MTLBinaryArchive` pipeline cache is ON by default, for the same reason — a
     // launch should not re-run the driver's AIR → ISA back end for every kernel. Env-key-less too.
     assert!(d.kernels.metal.pipeline_cache);
@@ -882,7 +867,7 @@ fn toml_sections_mirror_the_struct_paths() {
 /// `prof.ops` is THE per-op profiling switch, on every backend, and it is reachable three ways.
 ///
 /// Each backend used to have its own: `INFR_PROF2` reached only vulkan, `INFR_PROF_OPS` only the
-/// cpu backend, and rocm's `kernels.rocm.prof_ops` had no env key at all — so whether
+/// cpu backend, and the Metal prof knob had no env key at all — so whether
 /// `INFR_PROF_OPS=1 infr bench …` profiled anything depended on `--dev`, silently. Any future
 /// backend gates on this field (through `infr_core::prof::enabled`, which also ANDs warmup
 /// suppression), never on a knob of its own.
@@ -989,11 +974,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MOE_SMALL_M",
         "INFR_NO_FUSE_ADD",
         "INFR_PAGER_RING",
-        "INFR_ROCM_NO_FUSE_ADD",
-        "INFR_ROCM_NO_FUSE_NORM",
-        "INFR_ROCM_WEIGHT_OVERFLOW",
-        "INFR_ROCM_WEIGHT_OVERFLOW_RESERVE_MB",
-        "INFR_ROCM_WEIGHT_VRAM_MB",
     ];
 
     /// S3 — `infr-cpu`: the three `kernels.cpu` knobs plus the three diagnostics its interpreter
@@ -1008,7 +988,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     ];
 
     /// S4 — `infr-llama`'s seam: the whole `kv`, `spec` and `multi` sections, `device.ubatch*`,
-    /// `paging.cache` + `paging.rocm_expert_budget` (both read ONLY in the seam's placement
+    /// `paging.cache` (read ONLY in the seam's placement
     /// binders), the two graph-shape gates, and the seam's own `prof.*` diagnostics.
     ///
     /// NOT here, deliberately: `sampling.*` — the SEAM reads it from `Config` now
@@ -1043,7 +1023,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_QKV_FUSE",
         "INFR_PIPELINE",
         "INFR_PIPELINE_HOST",
-        "INFR_ROCM_EXPERT_BUDGET",
         "INFR_SPEC_DEBUG",
         "INFR_SPEC_DRAFT",
         "INFR_SPEC_K",
@@ -1060,7 +1039,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// five loud keys, and `device.dev` reaches `pick_default_device` as a parameter.
     ///
     /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — the Vulkan pager reads it
-    /// from `Config` now, but `infr-rocm`'s pager still reads the environment until S6; and the
+    /// from `Config` now, but `infr-Metal.'s pager still reads the environment until S6; and the
     /// whole recorder/adapter/gemm hot-path tier, which is S5b.
     const S5A: &[&str] = &[
         "INFR_CM_8X8",
@@ -1089,7 +1068,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// This also closes the three §6.12 two-crate knobs (`delta_strided`, `no_replay`, `gpu_pos` —
     /// the `infr-llama` halves moved in S4) and `prof.prof`, which S4 had to leave behind.
     ///
-    /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — `infr-rocm`'s pager still
+    /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — the pager still
     /// reads the environment until S6; `prof.profile_out` (`infr-prof-rt`) and `debug.chat`
     /// (`infr-chat`) are S7.
     const S5B: &[&str] = &[
@@ -1157,7 +1136,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SEAM_NO_REPLAY",
     ];
 
-    /// S6 — `infr-metal` (20) + `infr-rocm` (14). Both backends are now `INFR_*`-free.
+    /// S6 — `infr-metal` (20). The backend is now `INFR_*`-free.
     ///
     /// Metal: `MetalBackend::new_with(cfg)`, and `exec.rs` reads `self.metal()` (a borrow of the
     /// backend's `Config`) at each selector. Fifteen of the twenty are `INFR_METAL_NO_*`
@@ -1165,13 +1144,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// read-both-ways pair collapsed onto ONE positive field each; `INFR_METAL_PROFILE` is the
     /// three-derived-boolean literal grammar (`is_ok()` / `== "2"` / `== "3"`), NOT an int level.
     ///
-    /// ROCm: `RocmBackend::new_with(device_id, cfg)` — which DELETES S2's `Config::load_from_env()`
-    /// bridge — plus `ExecCtx` borrowing `&RocmCfg` for the whole forward (R6). The int8-coverage
-    /// predicate the two decode fusions share became a closure over that borrow instead of a
-    /// `static fn(DType) -> bool`, because `INFR_ROCM_NO_I8` now reaches it as a value.
-    ///
-    /// `INFR_PAGER_STATS` is here at last: S5a moved the Vulkan pager and S5b left the key
-    /// unflipped because `infr-rocm`'s `pager.rs` still read the environment. It does not now.
+    /// `INFR_PAGER_STATS` is here at last: S5a moved the Vulkan pager.
     const S6: &[&str] = &[
         "INFR_METAL_LMHEAD_MRV",
         "INFR_METAL_NODELTA",
@@ -1194,19 +1167,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PROF_METAL_DEVICE_TIME",
         "INFR_PROF_METAL_DEBUG",
         "INFR_PAGER_STATS",
-        "INFR_ROCM_BLAS",
-        "INFR_ROCM_COOP",
-        "INFR_ROCM_COOP_TILE",
-        "INFR_ROCM_MMQ",
-        "INFR_ROCM_NO_I8",
-        "INFR_ROCM_NO_PIPE",
-        "INFR_ROCM_NO_WMMA",
-        "INFR_ROCM_PAGER_NOOVERLAP",
-        "INFR_ROCM_WEIGHT_PREFETCH_MAX_BANK_MB",
-        "INFR_ROCM_WEIGHT_PREFETCH_OFF",
-        "INFR_ROCM_WEIGHT_PREFETCH_SLOTS",
-        "INFR_ROCM_WEIGHT_PREFETCH_STATS",
-        "INFR_ROCM_WMMA_TILE",
     ];
 
     /// S7 — the last four crates. `device.ctx` moved to the session-backed chats (`chat/mod.rs`'s

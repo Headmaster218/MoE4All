@@ -19,8 +19,7 @@
 //! - [`linear_tier`] / [`MultiRowBand`] — the dense `Linear` m-ladder: single-row decode GEMV,
 //!   the small-m multi-row GEMV band(s), the tiled prefill GEMM.
 //! - [`adaptive_chunk`] / [`cap_chunk_count`] / [`baked_chunk`] / [`n_chunks`] — the flash-decoding
-//!   (split-K) attention chunk policy shared by Vulkan's `attn_partial` and ROCm's
-//!   `attention_split_partial`.
+//!   (split-K) attention chunk policy shared by Vulkan's `attn_partial`.
 //!
 //! What is deliberately NOT here (device-specific facts that only LOOK like duplicates):
 //!
@@ -157,16 +156,11 @@ pub fn linear_tier(m: usize, out_f: usize, bands: &[MultiRowBand]) -> LinearTier
 
 /// Rounding used when deriving the adaptive attention chunk size from a KV span.
 ///
-/// The two shipping backends differ here by one op and it is OBSERVABLE (`span = 2049`,
-/// target 32: floor → 64, ceil → 65 ⟹ a different `n_chunks` and a different partials layout), so
-/// it is config, not a shared constant. Vulkan floors, ROCm ceils; neither has been shown better
-/// and neither may be changed without re-measuring both.
+/// `Down` — `span / target_chunks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkRounding {
-    /// `span / target_chunks` — Vulkan's `attn_partial` policy.
+    /// `span / target_chunks`.
     Down,
-    /// `span.div_ceil(target_chunks)` — ROCm's `attention_split_partial` policy.
-    Up,
 }
 
 /// Flash-decoding (split-K) attention chunk policy: aim for ~`target_chunks` chunks per head, each
@@ -194,10 +188,7 @@ pub struct AttnSplitCfg {
 /// result through [`cap_chunk_count`].
 pub fn adaptive_chunk(span: usize, cfg: &AttnSplitCfg) -> usize {
     let target = cfg.target_chunks.max(1);
-    let base = match cfg.rounding {
-        ChunkRounding::Down => span / target,
-        ChunkRounding::Up => span.div_ceil(target),
-    };
+    let base = span / target;
     base.clamp(cfg.min_chunk, cfg.max_chunk)
 }
 
@@ -239,13 +230,6 @@ mod tests {
         min_chunk: 64,
         max_chunk: 512,
         rounding: ChunkRounding::Down,
-    };
-    /// ROCm's twin — same window, ceil rounding (see [`ChunkRounding`]).
-    const ROCM_SPLIT: AttnSplitCfg = AttnSplitCfg {
-        target_chunks: 32,
-        min_chunk: 64,
-        max_chunk: 512,
-        rounding: ChunkRounding::Up,
     };
     /// Vulkan `attn_combine.comp`'s `shared float wexp[1024]`.
     const VK_MAX_CHUNKS: usize = 1024;
@@ -331,7 +315,7 @@ mod tests {
         };
         assert_eq!(linear_tier(1, 4096, &[band]), LinearTier::Decode);
         assert_eq!(linear_tier(1, 4096, &[]), LinearTier::Decode);
-        // No bands ⟹ every m > 1 shape is the GEMM (ROCm's ladder).
+        // No bands ⟹ every m > 1 shape is the GEMM.
         for m in [2usize, 8, 64, 1024] {
             assert_eq!(linear_tier(m, 4096, &[]), LinearTier::Gemm);
         }
@@ -449,19 +433,9 @@ mod tests {
         for span in [16_384usize, 16_385, 1 << 20] {
             assert_eq!(adaptive_chunk(span, &VK_SPLIT), 512, "span {span}");
         }
-        // Inside the ramp the two roundings differ by at most one key — the documented
-        // Vulkan/ROCm divergence. Guard it so a "cleanup" that unifies them has to face it.
         assert_eq!(adaptive_chunk(4096, &VK_SPLIT), 128);
-        assert_eq!(adaptive_chunk(4096, &ROCM_SPLIT), 128); // exact multiple: identical
         assert_eq!(adaptive_chunk(2049, &VK_SPLIT), 64);
-        assert_eq!(adaptive_chunk(2049, &ROCM_SPLIT), 65);
         assert_eq!(adaptive_chunk(4097, &VK_SPLIT), 128);
-        assert_eq!(adaptive_chunk(4097, &ROCM_SPLIT), 129);
-        for span in [0usize, 1, 33, 2049, 4097, 16_385, 1 << 20] {
-            let d = adaptive_chunk(span, &VK_SPLIT);
-            let u = adaptive_chunk(span, &ROCM_SPLIT);
-            assert!(u >= d && u - d <= 1, "span {span}: down={d} up={u}");
-        }
     }
 
     #[test]

@@ -198,8 +198,8 @@ spills KV to system RAM when VRAM runs out.
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
-hit/miss/eviction counts. The `rocm_*` half of the section is the ROCm backend's
-weight pager (prefetch slots, bank size, overflow budgets).
+hit/miss/eviction counts. The `_*` half of the section is the backend's weight
+pager (prefetch slots, bank size, overflow budgets).
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a
@@ -220,17 +220,16 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so
   a launch does not re-run the driver's AIR → GPU-ISA back end for every kernel;
   the MSL → AIR front end is not cacheable and still runs every launch). Like
-  `kernels.rocm.module_cache` it has no `INFR_*` twin.
-- **`[kernels.rocm]`** — `wmma_tile` (`1x1`/`2x1`/`2x2`), `no_wmma`, the int8
-  (`i8`) and software-pipelined (`pipe`) kernels, opt-in `coop` and `blas`
-  prefill, the two fusion gates, `module_cache` (persist the hiprtc-compiled HIP
-  module to `~/.cache/infr`) and `moe_id_rows` (token rows per id-indexed MoE
-  expert-GEMV dispatch; `0` drops the resident MoE path back to the pre-R8
-  per-expert loop), `attn_flash` (the tiled flash PREFILL attention kernel;
-  clear it to route prefill back to the single-wave scalar one). None of the
-  last three has an `INFR_*` twin, like `kernels.cpu.reference`. (Per-op
-  profiling used to live here as `prof_ops`; it is now the cross-backend
-  `prof.prof_ops` — see below.)
+  `kernels..module_cache` it has no `INFR_*` twin.
+- **`[kernels.]`** — `wmma_tile` (`1x1`/`2x1`/`2x2`), `no_wmma`, the int8 (`i8`)
+  and software-pipelined (`pipe`) kernels, opt-in `coop` and `blas` prefill, the
+  two fusion gates, `module_cache` (persist the hiprtc-compiled HIP module to
+  `~/.cache/infr`) and `moe_id_rows` (token rows per id-indexed MoE expert-GEMV
+  dispatch; `0` drops the resident MoE path back to the pre-R8 per-expert loop),
+  `attn_flash` (the tiled flash PREFILL attention kernel; clear it to route
+  prefill back to the single-wave scalar one). None of the last three has an
+  `INFR_*` twin, like `kernels.cpu.reference`. (Per-op profiling used to live
+  here as `prof_ops`; it is now the cross-backend `prof.prof_ops` — see below.)
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
   `repack_mb`, and `reference` (the bit-reference kernel path, which has no
   `INFR_*` twin and never had one).
@@ -249,7 +248,7 @@ through host RAM.
 
 | knob                | what it does                                                                                                            |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `ops`               | per-op device profiling on EVERY backend — vulkan, rocm, metal, cpu                                                     |
+| `ops`               | per-op device profiling on EVERY backend — vulkan, metal, cpu                                                           |
 | `op_shapes`         | itemize per-op labels by shape rather than folding a kind into one row (vulkan)                                         |
 | `stages`            | host-side stage timing: throughput, decode setup-vs-execute, prefill build/compile/execute, MTP verify, diffusion steps |
 | `vram`              | log live VRAM in use after weight load                                                                                  |
@@ -260,7 +259,7 @@ through host RAM.
 
 Two consolidations are worth knowing if you have old scripts. Per-op profiling
 answered to a different knob on each backend (`INFR_PROF2` on vulkan,
-`INFR_PROF_OPS` on cpu, an env-less `kernels.rocm.prof_ops` on rocm,
+`INFR_PROF_OPS` on cpu, an env-less `kernels..prof_ops` on ,
 `INFR_METAL_PROFILE` on metal) — it is all `ops` now. And host-side stage timing
 was five knobs, one per pipeline (`INFR_PROF`, `INFR_PROF_DEC`, `INFR_PROF_PF`,
 `INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`) — it is all `stages`. Old spellings were
@@ -310,7 +309,7 @@ let cfg = Arc::new(Config { kv: infr_core::config::KvCfg { slots: 8, ..Default::
 ```
 
 Backends take it at construction (`VulkanBackend::new_with(cfg)`,
-`RocmBackend::new_with(device_id, cfg)`, `CpuBackend::new_with(cfg)`), and
+`Backend::new_with(device_id, cfg)`, `CpuBackend::new_with(cfg)`), and
 `Config::load_from_env()` is the defaults-plus-environment fold for a caller
 that wants the environment honoured but no config file.
 

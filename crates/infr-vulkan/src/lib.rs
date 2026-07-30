@@ -593,7 +593,7 @@ fn kv_overflow_enabled(cfg: &infr_core::config::Config) -> bool {
 
 /// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
 /// skeleton every spill class shares). The spill clause is Vulkan-specific twice over: the host
-/// bytes are ordinary host-visible memory (not page-locked, as on ROCm) and attention reaches them
+/// bytes are ordinary host-visible memory (not page-locked) and attention reaches them
 /// by DEVICE ADDRESS, which is the fact that makes off-device KV work at all here.
 const KV_SPILL: SpillNouns<'static> = SpillNouns {
     env: "INFR_KV_OVERFLOW",

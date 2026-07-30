@@ -21,7 +21,7 @@
 # ── device ───────────────────────────────────────────────────────────────────
 
 [device]
-# Device for the forward: "Vulkan0"/"Vulkan1"/…, "metal", "cpu", "rocm[N]".
+# Device for the forward: "Vulkan0"/"Vulkan1"/…, "metal", "cpu".
 # Same grammar as `--dev` / INFR_DEV. Default: unset = first discrete Vulkan GPU.
 # dev = "Vulkan0"
 
@@ -119,14 +119,6 @@ overflow = false
 # Print per-pool hit/miss/eviction counts at exit.
 stats = false
 
-# ROCm weight paging (feature `rocm` only).
-rocm_prefetch_off = false
-rocm_prefetch_stats = false
-rocm_no_overlap = false
-# rocm_expert_budget = "4g"          # default: unset
-# rocm_prefetch_slots = 4            # default: unset = 4, floored at 2
-# rocm_prefetch_max_bank_mb = 256    # default: unset = 256
-
 # ── kernels ──────────────────────────────────────────────────────────────────
 #
 # Backend-independent graph-shape gates. Everything under [kernels.*] is a
@@ -149,7 +141,6 @@ bf16_coopmat = false
 
 # GEMM / GEMV tiers.
 gemm_warp = true
-mmq = true
 mmv = true
 mrow = true
 moe_small_m = 8 # clamped to 0..=64 by the accessor
@@ -173,16 +164,7 @@ spinpool = true
 repack_mb = 4096 # repack-cache budget, MiB
 reference = false # bit-reference kernels (no env twin)
 
-[kernels.rocm]
-i8 = true
-pipe = true
-coop = false
-blas = false
-no_wmma = false
-fuse_add = true
-fuse_norm = true
-fuse_kv_write = true # QkNormRope writes the K row into the cache (no env twin)
-attn_flash = true    # tiled flash PREFILL attention (no env twin)
+# ── Profiling ──────────────────────────────────────────────────────────────────
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
 # coop_tile = "64x64" # default: unset = the 128x64 tile
 
@@ -230,7 +212,7 @@ ep_p2p = true
 # answerable from the command line.
 
 [prof]
-# Per-op profiling, on EVERY backend (vulkan / rocm / metal / cpu): one table
+# Per-op profiling, on EVERY backend (vulkan / metal / cpu): one table
 # format, one process-exit aggregate. See docs/perf.md § Profiling.
 ops = false
 op_shapes = false # vulkan only: itemize labels by shape instead of by kernel

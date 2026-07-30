@@ -1,6 +1,6 @@
 //! Shared peephole graph-rewrite fusion pass.
 //!
-//! Every GPU backend (Vulkan, Metal, ROCm) independently re-implemented the SAME device-agnostic
+//! Every GPU backend (Vulkan, Metal) independently re-implemented the SAME device-agnostic
 //! peephole rewrites over the [`Graph`] IR — matching adjacent ops and folding them into one fused
 //! kernel dispatch. This module hosts that logic ONCE; each backend supplies a [`FusionCfg`] naming
 //! which patterns it can fuse and, per pattern, a `fn(DType) -> bool` predicate intersecting the
@@ -13,10 +13,10 @@
 //! 1. **`Linear(m==1) → Add(residual)`** ([`FusionCfg::linear_add`]) — fold a decode projection's
 //!    following residual `Add` into the GEMV epilogue (`dst = gemv + residual`), killing the
 //!    standalone `Add` kernel and the round-trip of the un-added projection. The decode
-//!    `o_proj`/`down_proj` shape. Vulkan/Metal/ROCm all did this.
+//!    `o_proj`/`down_proj` shape. Vulkan/Metal all did this.
 //! 2. **`RmsNorm → Linear(m==1)`** ([`FusionCfg::rmsnorm_linear`]) — elide a standalone `RmsNorm`
 //!    whose normalized output feeds ONLY fusable decode `Linear`s, which normalize their raw input
-//!    row in-kernel instead. ROCm's `input_norm→qkv` / `post_attn_norm→gate/up` int8 fusion.
+//!    row in-kernel instead.
 //!    Optionally ([`RmsNormLinearCfg::moe_ok`]) a single-row `Op::MoeFfn` also counts as a fusable
 //!    consumer — the MoE arm then normalizes in its own expert-quantize pass.
 //! 3. **`MoeFfn → Add(residual)`** ([`FusionCfg::moe_add`]) — the exact analogue of (1) for the MoE
@@ -29,10 +29,9 @@
 //!
 //! ## Live-range bounding (a correctness fix, applied to ALL backends)
 //!
-//! ROCm's copy bounds every candidate to the fused `dst`'s LIVE RANGE — the scratch `dst` handle
-//! is recycled across layers, so eliding a standalone write is only safe if nothing OTHER than the
-//! absorbing op reads `dst` before it is next rewritten. This guard is folded in for every backend
-//! (per the unification plan): on the graphs the seam emits a fused Linear/RmsNorm `dst` is
+//! The live-range bound guards that the fused `dst`'s scratch handle is not consumed
+//! by anything other than the absorbing op before it is next rewritten.
+//! On the graphs the seam emits a fused Linear/RmsNorm `dst` is
 //! single-use, so it never un-fuses a real pair — it only prevents an unsafe fold. Keeping it
 //! everywhere means the shared pass is correct for any future graph, not just today's.
 
@@ -44,11 +43,10 @@ use std::collections::{HashMap, HashSet};
 pub struct LinearAddCfg<'a> {
     /// Fuse only when the `Linear` weight's dtype passes this predicate — the backend's
     /// fused-residual-GEMV kernel coverage (e.g. Vulkan `native_dense_supported || F16`, Metal's
-    /// legacy+Q4K/Q6K list, ROCm's int8-decode set).
+    /// legacy+Q4K/Q6K list).
     pub weight_ok: &'a dyn Fn(DType) -> bool,
     /// `false` disables this pass entirely — the backend's escape hatch, taken off ITS config
-    /// (Vulkan `kernels.vulkan.fuse_add` / `INFR_NO_FUSE_ADD`, ROCm `kernels.rocm.fuse_add` /
-    /// `INFR_ROCM_NO_FUSE_ADD`). A backend with no hatch passes `true`.
+    /// (Vulkan `kernels.vulkan.fuse_add` / `INFR_NO_FUSE_ADD`). A backend with no hatch passes `true`.
     pub enabled: bool,
 }
 
@@ -63,28 +61,23 @@ pub struct RmsNormLinearCfg<'a> {
     pub weight_ok: &'a dyn Fn(DType) -> bool,
     /// When `Some`, a SINGLE-ROW `Op::MoeFfn` reading the normalized row as BOTH its expert input
     /// `x` and its router input `router_x` also counts as a fusable consumer, provided its expert
-    /// banks pass the predicate — the backend's MoE arm then produces the normalized row itself
-    /// (ROCm folds it into the expert `rmsnorm_quant_i8_32` pass, whose extra f32 output is the
-    /// row the router GEMV reads). `None` = a `MoeFfn` consumer disqualifies the fold, which is
+    /// banks pass the predicate — the backend's MoE arm then produces the normalized row itself.
     /// what every backend did before F1c.
     ///
     /// Single-row only, deliberately: the multi-row (prefill) MoE arm chunks its rows, so one
     /// normalize pass per chunk could not serve a router GEMV that spans every row — and prefill is
     /// weight-bandwidth-bound, where a saved launch does not show up anyway.
     pub moe_ok: Option<ExpertsOk<'a>>,
-    /// `false` disables this pass entirely (ROCm `kernels.rocm.fuse_norm` /
-    /// `INFR_ROCM_NO_FUSE_NORM`).
+    /// `false` disables this pass entirely.
     pub enabled: bool,
 }
 
 /// Per-pattern config for [`FusionCfg::moe_add`].
 pub struct MoeAddCfg<'a> {
     /// Fuse only when the `MoeFfn`'s expert banks pass this predicate — the backend's fused-residual
-    /// expert-accumulate coverage (ROCm: the natively decoded int8 formats on the ordered-accumulate
-    /// R8 tier).
+    /// expert-accumulate coverage.
     pub experts_ok: ExpertsOk<'a>,
-    /// `false` disables this pass entirely — shares ROCm's `kernels.rocm.fuse_add` hatch with
-    /// [`FusionCfg::linear_add`], since it is the same fold on the other producer.
+    /// `false` disables this pass entirely.
     pub enabled: bool,
 }
 
@@ -464,30 +457,21 @@ mod tests {
         // Shipped default: the fold is planned and the standalone `Add` is elided.
         let d = Config::default();
         assert!(d.kernels.vulkan.fuse_add);
-        assert!(d.kernels.rocm.fuse_add);
-        assert!(d.kernels.rocm.fuse_norm);
         let on = plan_with(d.kernels.vulkan.fuse_add);
         assert_eq!(on.linear_add.len(), 1);
         assert!(on.skip.contains(&1));
 
-        // The three `NO_FUSE` keys clear their POSITIVE field on PRESENCE — value irrelevant,
+        // The `NO_FUSE` keys clear their POSITIVE field on PRESENCE — value irrelevant,
         // including `=0` (the presence-inv truth table).
         for raw in ["", "0", "1"] {
-            for (key, which) in [
-                ("INFR_NO_FUSE_ADD", 0usize),
-                ("INFR_ROCM_NO_FUSE_ADD", 1),
-                ("INFR_ROCM_NO_FUSE_NORM", 2),
-            ] {
-                let layer =
-                    crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
-                let cfg = Config::load_from_layers(&[layer]);
-                let field = match which {
-                    0 => cfg.kernels.vulkan.fuse_add,
-                    1 => cfg.kernels.rocm.fuse_add,
-                    _ => cfg.kernels.rocm.fuse_norm,
-                };
-                assert!(!field, "{key}={raw:?} must clear its fusion field");
-            }
+            let layer =
+                crate::config::env::parse(&|k| (k == "INFR_NO_FUSE_ADD").then(|| raw.to_string()))
+                    .expect("INFR_NO_FUSE_ADD");
+            let cfg = Config::load_from_layers(&[layer]);
+            assert!(
+                !cfg.kernels.vulkan.fuse_add,
+                "INFR_NO_FUSE_ADD={raw:?} must clear its fusion field"
+            );
         }
 
         // Cleared field => nothing planned, nothing skipped: both ops dispatch.

@@ -3,8 +3,8 @@
 //! Every backend runs the same *shape* around its per-op bodies — provision a working slot for each
 //! [`TensorId`], walk `plan.graph.ops` in order eliding the fusion-skipped indices, then copy the
 //! handles the caller reads back to their bound buffers. That structure was re-derived four times
-//! (cpu `infr-cpu/src/lib.rs`, metal `Resident`/`run_graph`, rocm `ExecCtx`/`execute_graph`, vulkan
-//! `execute_static`/`record_decode_replay`), and the pieces that MUST agree between them — which
+//! (cpu `infr-cpu/src/lib.rs`, metal `Resident`/`run_graph`,
+//! vulkan `execute_static`/`record_decode_replay`), and the pieces that MUST agree between them — which
 //! [`TensorKind`]s are materialized, which are mutated in place, which are written back, and what
 //! "the ops the executor actually dispatches" means — were four independent copies of the same
 //! three predicates. This module hosts those ONCE.
@@ -17,26 +17,23 @@
 //!   load a bound `Input`, or leave alone).
 //! * [`writes_back`]/[`write_back_targets`] — the post-walk write-back predicate.
 //! * [`live_ops`] — THE definition of the executor's walk: graph order, fusion-skipped indices
-//!   elided. Anything that must stay in lockstep with the walk (rocm's dense-weight prefetch
-//!   schedule) iterates the same function rather than re-spelling the filter.
+//!   elided. Anything that must stay in lockstep with the walk iterates
+//!   the same function rather than re-spelling the filter.
 //! * [`OpDispatch`]/[`run_ops`] — the walk as a driver, for the backends whose per-op body is
 //!   already one function. Generic (`impl OpDispatch`), so the per-op call stays static dispatch.
 //!
 //! NOT shared, on purpose:
 //!
 //! * **The residency CONTAINER.** The four disagree on it for real reasons, not drift: cpu keeps a
-//!   host-only `Vec<Vec<f32>>`; rocm keeps `dev: Vec<Option<RocmBuffer>>` + a lazily-filled
-//!   `vals: Vec<Option<Vec<f32>>>`; metal keeps both PLUS a `loc: Vec<Loc>` host/device tracker
-//!   (43 sites) that rocm has no analogue for, because metal's `ensure_device` uploads the host
-//!   mirror and rocm's never does; vulkan has no per-op residency at all (its `Internal` scratch is
+//!   host-only `Vec<Vec<f32>>`; metal keeps both PLUS a `loc: Vec<Loc>` host/device tracker
+//!   (43 sites); vulkan has no per-op residency at all (its `Internal` scratch is
 //!   allocated up front by `alloc_scratch` and the walk only records into a command buffer). A
 //!   common container would have to be either the LCD (dropping metal's `loc`) or the union (an
-//!   unused `loc` on rocm) — and either way every one of the ~240 `vals`/`dev`/`loc` accesses in
+//!   unused `loc` on ...) — and either way every one of the ~240 `vals`/`dev`/`loc` accesses in
 //!   the per-op bodies would be rewritten. Behavior-neutral in principle, a rewrite in fact.
 //! * **The per-op bodies / a per-op trait method.** The `match Op::` arm sets are parallel, but the
 //!   arms need wildly different ambient state (vulkan's `lower_op` threads 15 extra parameters —
-//!   recorder, scratch, pool, dyn-attn contexts, mmv memo, streamed-weight substitution; rocm's
-//!   takes the two per-op fusion payloads). A 27-method trait would move ~10k lines for no line
+//!   recorder, scratch, pool, dyn-attn contexts, mmv memo, streamed-weight substitution). A 27-method trait would move ~10k lines for no line
 //!   saved and would have to carry every backend's ambient state in its `Self`.
 //! * **Vulkan's walk.** It is a RECORDER, not an interpreter: no host values, no residency
 //!   transitions, and its loop carries five device concerns between ops (submit splitter, shutdown
@@ -97,7 +94,7 @@ pub fn provisions(graph: &Graph) -> impl Iterator<Item = (TensorId, &TensorDecl,
 /// its bound buffer and whose copy would be O(max_ctx). Non-f32 `Input`s (the i32 positions) are
 /// read-only by construction.
 ///
-/// Identical in the cpu, metal and rocm executors; hoisted so a change can't land in one of them.
+/// Identical in the cpu and metal executors; hoisted so a change can't land in one of them.
 #[inline]
 pub fn writes_back(
     kind: TensorKind,
@@ -129,9 +126,7 @@ pub fn write_back_targets(graph: &Graph) -> impl Iterator<Item = TensorId> + '_ 
 ///
 /// This is THE definition of "the walk" — the fusion pass ([`crate::fusion`]) hands back a `skip`
 /// set of absorbed ops, and anything that must stay in lockstep with the dispatch order iterates
-/// this, not its own `enumerate().filter()`. (rocm's dense-weight prefetch ring is the reason that
-/// matters: its schedule is built by a SEPARATE pass whose cursor has to track the op walk exactly,
-/// or a staged bank is handed to the wrong `Linear`.)
+/// this, not its own `enumerate().filter()`.
 ///
 /// Zero-cost: a borrowed iterator adapter, monomorphized and inlined, no allocation — the same
 /// `HashSet::contains` per op the hand-written loops did.
@@ -160,7 +155,7 @@ pub trait OpDispatch {
 /// per-op call is static dispatch and inlines exactly as the hand-written loop did.
 ///
 /// Per-op profiling / error cleanup belongs in the implementor's [`OpDispatch::dispatch`] — the
-/// backends differ there (metal seals its open encoder before unwinding; rocm does not), and
+/// backends differ there (metal seals its open encoder before unwinding), and
 /// putting it here would either flatten that or cost a per-op branch.
 #[inline]
 pub fn run_ops<D: OpDispatch>(ops: &[Op], skip: &HashSet<usize>, d: &mut D) -> Result<()> {
@@ -245,7 +240,7 @@ mod tests {
     }
 
     /// `writes_back` reproduces the inline predicate
-    /// `Output || (Input && F32 && !direct)` — the byte-identical copy in cpu/metal/rocm.
+    /// `Output || (Input && F32 && !direct)` — the byte-identical copy in cpu/metal.
     #[test]
     fn write_back_targets_match_inline_predicate() {
         let g = kinds_graph();

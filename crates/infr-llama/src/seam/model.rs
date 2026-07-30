@@ -103,15 +103,13 @@ fn open_backend(
 }
 
 /// A persistent seam session: the backend it owns, the conversation [`SlotPool`], and the context
-/// window its generations are sized to. ONE struct for every GPU backend — Vulkan, Metal and ROCm
-/// used to declare three byte-identical copies of this shape (candidate E of
-/// `docs/backend-unification-plan.md`) differing only in the backend field's type.
+/// window its generations are sized to.
 ///
 /// `B` is the backend (it is only ever passed to the seam as `&dyn Backend`, so no bound is needed
-/// here); `X` is per-backend extension state — `()` where a backend needs none (Metal, ROCm),
+/// here); `X` is per-backend extension state — `()` where a backend needs none (Metal),
 /// Vulkan's per-session [placement pins](crate::seam::PlacementPins) otherwise. Each backend names
-/// its own concrete pairing through a type alias ([`DenseVulkanSession`], [`DenseMetalSession`],
-/// [`DenseRocmSession`]) so every call site is unchanged.
+/// its own concrete pairing through a type alias ([`DenseVulkanSession`], [`DenseMetalSession`])
+/// so every call site is unchanged.
 pub struct DenseSession<B, X = ()> {
     pub(crate) be: B,
     pub(crate) pool: SlotPool,
@@ -325,28 +323,6 @@ impl SlotPool {
 /// replay.
 #[cfg(target_os = "macos")]
 pub type DenseMetalSession = DenseSession<infr_metal::MetalBackend>;
-
-/// ROCm seam session — the AMD-GPU twin of [`DenseMetalSession`]: owns the
-/// backend and the conversation [`SlotPool`], so every later
-/// [`SeamModel::generate_rocm_session`] call prefills only the suffix that differs from its
-/// slot's previous turn, and concurrent conversations (serve) each keep their own KV slot off
-/// the one shared weight upload.
-#[cfg(all(target_os = "linux", feature = "rocm"))]
-pub type DenseRocmSession = DenseSession<infr_rocm::RocmBackend>;
-
-/// ROCm seam session placeholder — an empty stub for when the `rocm` feature is not active.
-/// The CLI surfaces the feature gate via [`SeamModel::rocm_session`]; nothing ever constructs
-/// one, so its `reset_cache` (the only method callers reach for) is a no-op.
-#[cfg(not(all(target_os = "linux", feature = "rocm")))]
-pub struct DenseRocmSession {
-    _max_ctx: usize,
-}
-
-#[cfg(not(all(target_os = "linux", feature = "rocm")))]
-impl DenseRocmSession {
-    /// Forget every slot's materialized tokens (buffers stay — discards warmup).
-    pub fn reset_cache(&mut self) {}
-}
 
 /// Estimated KV-cache bytes per element for one side (K or V), from the same config the runner
 /// honors (`kv.type_k`/`kv.type_v`, legacy `kv.force_q8`). ESTIMATE ONLY — the runner additionally
@@ -934,25 +910,6 @@ impl SeamModel {
         )
     }
 
-    /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s ROCm twin, for the CPU/ROCm cross-backend
-    /// parity check (`docs/rocm-plan.md` Phase 2). Used by the BitNet model-level gate, whose base
-    /// weights are not portable to a token-for-token greedy compare, so it locks the last-row logits
-    /// (top token + whole-vocab cosine) exactly like the Vulkan BitNet gate.
-    #[cfg(all(target_os = "linux", feature = "rocm"))]
-    pub fn prefill_logits_rocm(&self, tokens: &[u32], dev_idx: u32) -> Result<Vec<f32>> {
-        let rocm = infr_rocm::RocmBackend::new_with(dev_idx as i32, self.ecfg.clone())
-            .map_err(|e| anyhow!("rocm init: {e}"))?;
-        crate::seam::verify_dense_rocm(
-            &rocm,
-            &self.gguf,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            tokens,
-        )
-    }
-
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
     /// `docs/diffusion-gemma.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
     /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated
@@ -1320,105 +1277,6 @@ impl SeamModel {
         Ok(samples)
     }
 
-    /// The AMD-GPU twin of [`bench_vulkan`](Self::bench_vulkan): same pp/tg/pg + depth
-    /// methodology (dummy token ids, fixed-count `INFR_IGNORE_EOS` semantics, untimed
-    /// warmup + depth-warm, `-p`/`-n`/`-d`/`-r` honored), routed through the ROCm seam's
-    /// persistent session so the timed reps hit the resident weight upload / KV cache. Weights
-    /// upload once (the untimed warmup); each rep resets the KV, warms it back to `depth`
-    /// untimed, then times exactly the requested pp / tg / pg shape.
-    #[cfg(all(target_os = "linux", feature = "rocm"))]
-    pub fn bench_rocm(
-        &self,
-        n_prompt: usize,
-        n_gen: usize,
-        depth: usize,
-        pg: Option<(usize, usize)>,
-        reps: usize,
-        dev_idx: u32,
-    ) -> Result<Vec<f64>> {
-        let rocm = infr_rocm::RocmBackend::new_with(dev_idx as i32, self.ecfg.clone())
-            .map_err(|e| anyhow!("rocm init: {e}"))?;
-        let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
-        // +16: identical rationale to `bench_vulkan` — the untimed 8+2 warmup turn shares the
-        // session, so size the KV for it even when the measured shape is tiny.
-        let want = depth + p_eff.max(1) + g_eff + 16;
-        let dummy = |n: usize| -> Vec<u32> { (0..n.max(1)).map(|i| (i % 100) as u32).collect() };
-        let mut state: Option<crate::seam::SeamKv> = None;
-        let run = |prompt_len: usize,
-                   gen: usize,
-                   state: &mut Option<crate::seam::SeamKv>|
-         -> Result<crate::GenStats> {
-            let (_, stats) = crate::seam::generate_dense_rocm_session(
-                &rocm,
-                &self.gguf,
-                &self.cfg,
-                &self.ecfg,
-                self.embd(),
-                self.per_layer_embd.as_ref(),
-                &dummy(prompt_len),
-                gen,
-                |_| {},
-                state,
-                want,
-                None, // constraint
-                None, // req: bench is a sole sequence — env sampling, no gate
-            )?;
-            Ok(stats)
-        };
-        // Untimed work stays out of the INFR_PROF_OPS profile (same reasoning as `bench_vulkan`).
-        let unprofiled = |prompt_len: usize,
-                          gen: usize,
-                          state: &mut Option<crate::seam::SeamKv>|
-         -> Result<crate::GenStats> {
-            crate::with_profiling_suppressed(|| run(prompt_len, gen, state))
-        };
-        // Untimed warmup: uploads the weights and compiles every kernel the timed reps hit.
-        unprofiled(8, 2, &mut state)?;
-        infr_prof_rt::gpu_reset();
-        let mut samples = Vec::with_capacity(reps);
-        for _ in 0..reps.max(1) {
-            if let Some(st) = state.as_mut() {
-                st.reset();
-            }
-            if depth > 0 {
-                unprofiled(depth, 0, &mut state)?; // warm the cache to `depth` (untimed)
-            }
-            if let Some((p, g)) = pg {
-                // coding-agent turn: prompt ingest + reply generation timed together.
-                let s = run(depth + p, g, &mut state)?;
-                samples.push((p + g) as f64 / (s.prompt_secs + s.decode_secs).max(1e-9));
-            } else if n_gen > 0 {
-                // decode at depth: 1-token suffix feeds the loop, the timed part is the decode.
-                let s = run(depth + 1, n_gen, &mut state)?;
-                samples.push(n_gen as f64 / s.decode_secs.max(1e-9));
-            } else {
-                // +1: same suffix-accounting as `bench_vulkan` — exactly `n_prompt` rows
-                // batch-prefill (positions depth..depth+n_prompt), matching `llama-bench -p N`.
-                let s = run(depth + n_prompt + 1, 0, &mut state)?;
-                samples.push(n_prompt as f64 / s.prompt_secs.max(1e-9));
-            }
-        }
-        Ok(samples)
-    }
-
-    /// ROCm bench placeholder — errors when the `rocm` feature is not active so the CLI can
-    /// surface it as a build-time feature gate.
-    #[cfg(not(all(target_os = "linux", feature = "rocm")))]
-    pub fn bench_rocm(
-        &self,
-        _n_prompt: usize,
-        _n_gen: usize,
-        _depth: usize,
-        _pg: Option<(usize, usize)>,
-        _reps: usize,
-        _dev_idx: u32,
-    ) -> Result<Vec<f64>> {
-        anyhow::bail!(
-            "ROCm backend not compiled — build with `cargo build --features rocm` \
-             on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md)"
-        )
-    }
-
     /// Open a persistent Metal seam session (the Apple-GPU twin of
     /// [`vulkan_session`](Self::vulkan_session)): weights uploaded ONCE, KV sized to `max_ctx`,
     /// later calls prefill only the un-cached suffix.
@@ -1433,90 +1291,6 @@ impl SeamModel {
             cfg: self.ecfg.clone(),
             ext: (),
         })
-    }
-
-    /// Open a persistent ROCm seam session: weights uploaded ONCE, KV sized to `max_ctx`,
-    /// later calls prefill only the un-cached suffix.
-    #[cfg(all(target_os = "linux", feature = "rocm"))]
-    pub fn rocm_session(&self, max_ctx: usize, dev_idx: u32) -> Result<DenseRocmSession> {
-        let rocm = infr_rocm::RocmBackend::new_with(dev_idx as i32, self.ecfg.clone())
-            .map_err(|e| anyhow!("rocm init: {e}"))?;
-        Ok(DenseRocmSession {
-            be: rocm,
-            pool: SlotPool::new(),
-            max_ctx,
-            cfg: self.ecfg.clone(),
-            ext: (),
-        })
-    }
-
-    /// Open a persistent ROCm seam session: returns an error when the `rocm` feature is not
-    /// active — the CLI surfaces it as a feature-gate message.
-    #[cfg(not(all(target_os = "linux", feature = "rocm")))]
-    pub fn rocm_session(&self, _max_ctx: usize, _dev_idx: u32) -> Result<DenseRocmSession> {
-        anyhow::bail!(
-            "ROCm backend not compiled — build with `cargo build --features rocm` \
-             on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"
-        )
-    }
-
-    /// Greedy generation on the ROCm seam through a persistent session (see
-    /// [`rocmsession`](Self::rocmsession)). `stats.n_prompt` reports the tokens actually
-    /// PREFILLED (the un-cached suffix) — the TTFT-honest count.
-    #[cfg(all(target_os = "linux", feature = "rocm"))]
-    pub fn generate_rocm_session(
-        &self,
-        session: &mut DenseRocmSession,
-        prompt: &str,
-        max_new: usize,
-        req: Option<&crate::sampling::RequestCtx>,
-        on_piece: impl FnMut(&str),
-    ) -> Result<crate::GenStats> {
-        self.generate_rocm_session_constrained(session, prompt, max_new, None, req, on_piece)
-    }
-
-    /// [`generate_rocm_session`](Self::generate_rocm_session) with an optional llguidance
-    /// grammar constraint (serve's forced tool_choice) applied to the decode.
-    #[cfg(all(target_os = "linux", feature = "rocm"))]
-    pub fn generate_rocm_session_constrained(
-        &self,
-        session: &mut DenseRocmSession,
-        prompt: &str,
-        max_new: usize,
-        constraint: Option<&mut crate::grammar::Constraint>,
-        req: Option<&crate::sampling::RequestCtx>,
-        mut on_piece: impl FnMut(&str),
-    ) -> Result<crate::GenStats> {
-        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
-        let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
-        let slot = session
-            .pool
-            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
-        let (_generated, stats) = crate::seam::generate_dense_rocm_session(
-            &session.be,
-            &self.gguf,
-            &self.cfg,
-            &session.cfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &prompt_tokens,
-            max_new,
-            |id| {
-                crate::util::stream_token(
-                    &self.tokenizer,
-                    &mut acc,
-                    &mut printed,
-                    id,
-                    &mut on_piece,
-                )
-            },
-            &mut session.pool.slots[slot],
-            session.max_ctx,
-            constraint,
-            req,
-        )?;
-        Ok(stats)
     }
 
     /// Greedy generation on the Metal seam through a persistent session (see

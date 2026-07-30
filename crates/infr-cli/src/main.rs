@@ -85,11 +85,6 @@ enum Backend {
     Metal,
     /// The CPU reference backend (`device.dev = "cpu"` / `INFR_DEV=cpu`).
     Cpu,
-    /// AMD GPU through the ROCm/HIP stack (`INFR_DEV=rocm` or `INFR_DEV=rocmN`).
-    /// `Some("rocm1")` pins a device index; `None` = device 0. Note the index is glued to the
-    /// name — [`parse_rocm_device`] strips the `rocm` prefix and parses the rest, so a separator
-    /// (`rocm:1`) parses as device 0.
-    Rocm(Option<String>),
 }
 
 /// The INHERITED half of the device decision, so the backend DECISION
@@ -102,7 +97,7 @@ enum Backend {
 /// removed cleanly (no aliases) — use `INFR_DEV=metal`/`cpu`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BackendEnv {
-    /// The device spec (`VulkanN`/`metal`/`cpu`/`rocm[N]`), if non-empty.
+    /// The device spec (`VulkanN`/`metal`/`cpu`/`Metal.N]`), if non-empty.
     dev: Option<String>,
 }
 
@@ -129,10 +124,8 @@ fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
         Ok(Backend::Metal)
     } else if lower == "cpu" {
         Ok(Backend::Cpu)
-    } else if lower == "rocm" || lower.starts_with("rocm") && lower.len() > 4 {
-        Ok(Backend::Rocm(Some(d.trim().to_string())))
     } else {
-        anyhow::bail!("expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, `metal`, `cpu`, or `rocm`");
+        anyhow::bail!("expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, `metal`, or `cpu`");
     }
 }
 
@@ -169,11 +162,11 @@ fn selected_backend(cfg: &Config) -> anyhow::Result<Backend> {
 /// with, so the S1 bridge no longer re-publishes `INFR_DEV`.
 fn dev_spec_of(backend: &Backend) -> String {
     match backend {
-        Backend::Vulkan(Some(d)) | Backend::Rocm(Some(d)) => d.clone(),
+        Backend::Vulkan(Some(d)) => d.clone(),
         // Unreachable from `parse_dev_spec` (it always carries the spec) — spelled out so a future
         // parser change cannot silently publish the wrong device.
         Backend::Vulkan(None) => "vulkan".to_string(),
-        Backend::Rocm(None) => "rocm".to_string(),
+
         Backend::Metal => "metal".to_string(),
         Backend::Cpu => "cpu".to_string(),
     }
@@ -224,7 +217,7 @@ impl DeviceOpts {
     /// layer beats the env layer in the fold; an UNSET `--dev` specifies nothing, so the inherited
     /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "first discrete GPU,
     /// else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
-    /// `vulkan*`/`metal`/`cpu`/`rocm*`, case-insensitive) and a garbage `--dev` still fails fast
+    /// `vulkan*`/`metal`/`cpu`/`Metal.`, case-insensitive) and a garbage `--dev` still fails fast
     /// here, before anything is loaded. The deprecated `INFR_METAL`/`INFR_CPU` are still not
     /// written and still not read.
     fn overrides(&self, layer: &mut PartialConfig) -> anyhow::Result<()> {
@@ -1011,7 +1004,6 @@ fn build_chat_model(
             match backend {
                 Backend::Cpu => "cpu backend",
                 Backend::Metal => "metal backend",
-                Backend::Rocm(_) => "rocm backend",
                 Backend::Vulkan(_) => "vulkan seam",
             }
         );
@@ -1019,27 +1011,10 @@ fn build_chat_model(
         return Ok(match backend {
             Backend::Cpu => Box::new(infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)),
             Backend::Metal => Box::new(infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)),
-            Backend::Rocm(_) => {
-                // Phase 0: diffusion-gemma on ROCm is not yet implemented.
-                anyhow::bail!(
-                    "ROCm diffusion-gemma not yet implemented — \
-                     see docs/rocm-plan.md Phase 2"
-                );
-            }
             Backend::Vulkan(_) => Box::new(infr_llama::chat::DiffusionGemmaChat::new(loaded)),
         });
     }
     match &backend {
-        Backend::Rocm(rocm_spec) => {
-            let dev_idx = rocm_spec.as_deref().map(parse_rocm_device).unwrap_or(0);
-            eprintln!(
-                "[rocm backend — dense/MoE forward on AMD GPU via ROCm/HIP, persistent KV session]"
-            );
-            Ok(Box::new(infr_llama::chat::RocmSeamChat::new(
-                infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
-                dev_idx,
-            )?))
-        }
         Backend::Metal => {
             eprintln!(
                 "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
@@ -1122,7 +1097,7 @@ fn cmd_run(
             );
         };
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
-            anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
+            anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
         }
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
@@ -1145,7 +1120,7 @@ fn cmd_run(
             );
         };
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
-            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
+            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
         }
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
@@ -1169,7 +1144,7 @@ fn cmd_run(
             );
         };
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
-            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=rocm / diffusion-gemma");
+            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
         }
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
@@ -2055,23 +2030,6 @@ fn cmd_bench(
             cfg,
         );
     }
-    // ROCm (set by `--dev rocm[:N]` / `INFR_DEV=rocm`): bench the dense/MoE forward on the AMD
-    // GPU through the ROCm seam — same pp/tg/pg + depth methodology as the Vulkan/Metal/CPU arms,
-    // directly comparable to `llama-bench` on a HIP build. Device index parsed from the spec.
-    if let Backend::Rocm(rocm_spec) = &backend {
-        let dev_idx = rocm_spec.as_deref().map(parse_rocm_device).unwrap_or(0);
-        let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-        let samples = model.bench_rocm(n_prompt, n_gen, depth, pg, reps, dev_idx)?;
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if n_gen > 0 {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
-        print_bench_avg(&samples, &label, depth, "", reps, json);
-        return Ok(());
-    }
     // `--dev VulkanN` is `device.dev` on this `cfg`, which the seam hands to
     // `VulkanBackend::new_with` when it picks the physical device; the prefill chunk
     // (`-u`/`device.ubatch`) rides the same config. Nothing to set here — straight to the seam.
@@ -2856,19 +2814,6 @@ fn compare_infr_dev(dev: &str) -> &str {
     } else {
         dev
     }
-}
-
-/// Parse a ROCm device spec (`rocm0`, `rocm1`, …, or bare `rocm`) into a device index.
-fn parse_rocm_device(spec: &str) -> u32 {
-    let lower = spec.to_ascii_lowercase();
-    lower
-        .strip_prefix("rocm")
-        // `rocm1` and `rocm:1` both mean device 1 — the separator spelling was documented for
-        // years and silently parsed as device 0 (the `.parse()` failed and fell through to the
-        // `unwrap_or`), so accept it rather than keep pointing users at a lie.
-        .map(|s| s.strip_prefix(':').unwrap_or(s))
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0)
 }
 
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
@@ -3752,14 +3697,14 @@ fn cmd_serve(
         ));
     }
 
-    // ── the SERIALISED path: CPU / Metal / ROCm / diffusion-gemma ────────────────────────────
+    // ── the SERIALISED path: CPU / Metal / diffusion-gemma ────────────────────────────
     // These have no multi-slot engine (one `&mut` ChatModel, one KV session), so concurrent
     // requests would only queue behind a Mutex. Warn ONLY when the user EXPLICITLY asked for
     // parallelism (`--parallel N>1`) — the default (unset) must stay silent, since every
-    // CPU/Metal/ROCm/diffusion serve would otherwise print a spurious "ignored" note.
+    // CPU/Metal/diffusion serve would otherwise print a spurious "ignored" note.
     if matches!(parallel_explicit, Some(n) if n > 1) {
         eprintln!(
-            "note: --parallel {} ignored on the CPU/Metal/ROCm/diffusion backends (no multi-slot \
+            "note: --parallel {} ignored on the CPU/Metal/diffusion backends (no multi-slot \
              engine); serving 1 request at a time. The Vulkan seam is the concurrent engine.",
             parallel_explicit.unwrap()
         );

@@ -1,7 +1,7 @@
 //! Shared KV-cache / VRAM-budget arithmetic.
 //!
 //! Deciding *where* a KV cache or a weight bank lives is two separable things: the device half
-//! (`vkCreateBuffer` vs `hipMalloc`, the memory type, the arena, the staging ring) and a
+//! (`vkCreateBuffer`, the memory type, the arena, the staging ring) and a
 //! device-INDEPENDENT half — how many bytes a KV format costs, which `INFR_*` knob spells what,
 //! the cumulative-cap gate the VRAM-first spill applies, and the one-shot placement banner. The
 //! second half was re-derived per backend (and, inside `infr-vulkan`, per multi-device wrapper)
@@ -21,15 +21,15 @@
 //! - [`SpillTally`] / [`SpillCounts`] / [`spill_report_line`] — the VRAM-first placement
 //!   bookkeeping and its banner. The counters and the message SKELETON are shared; every noun and
 //!   every device-specific clause is passed in ([`SpillNouns`]), and so is the byte formatter,
-//!   because Vulkan and ROCm round MiB differently and the banner text must not move.
+//!   because Vulkan and Metal round MiB differently and the banner text must not move.
 //!
 //! What is deliberately NOT here (device facts that only look shared):
 //!
 //! - The placement itself. Whether VRAM has room is `vram_budget_fits` (Vulkan's live
-//!   `VK_EXT_memory_budget` heap probe minus a guard headroom) vs `hipMemGetInfo` minus a reserve
-//!   — different questions with different answers. Only the cumulative *cap* gate
+//!   `VK_EXT_memory_budget` heap probe minus a guard headroom) — different questions with
+//!   different answers. Only the cumulative *cap* gate
 //!   ([`SpillTally::admits`]), which is pure arithmetic over the tally, is shared.
-//! - The human-readable byte formatter. Vulkan prints MiB to one decimal, ROCm to two; unifying
+//! - The human-readable byte formatter. Vulkan prints MiB to one decimal; unifying
 //!   them would move user-visible text for no behavioral gain, so [`spill_report_line`] takes the
 //!   formatter as a parameter instead.
 //! - The per-format GATES (`kv_align_ok`, which backends have a Q8 KV kernel, TurboQuant's
@@ -115,7 +115,7 @@ pub fn kv_bytes_per_elem(dt: DType) -> f64 {
 
 /// The boolean-flag grammar every overflow knob uses, over an explicit value: `Some(v)` with `v`
 /// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_OVERFLOW`,
-/// `INFR_ROCM_WEIGHT_OVERFLOW`.) NOT the same as the `is_ok()` presence grammar, where an empty
+/// `INFR_VULKAN_WEIGHT_OVERFLOW`.) NOT the same as the `is_ok()` presence grammar, where an empty
 /// value is ON — `config::env`'s `flag` reader calls this so the difference survives the
 /// migration; the read sites take the resolved `bool` off their backend's `Config`.
 pub fn flag_from(raw: Option<&str>) -> bool {
@@ -138,7 +138,7 @@ pub fn mib_from(raw: Option<&str>) -> Option<u64> {
 /// that allocate AFTER the spilled class (per-forward activation scratch, dequant caches, BLAS
 /// workspace, a paged-MoE arena) still have room. Default 12% of total VRAM floored at 2 GiB —
 /// enough for a several-hundred-row prefill on a large-vocab model — overridden by the knob's
-/// config field (`kv.overflow_reserve_mb` / `paging.rocm_weight_reserve_mb`, in MiB).
+/// config field (`kv.overflow_reserve_mb`, in MiB).
 ///
 /// Over-reserving costs residency; under-reserving OOMs mid-forward in an allocator that is
 /// infallible by contract, so the floor is deliberate.
@@ -157,7 +157,7 @@ pub fn reserve_from(total_vram: u64, raw: Option<&str>) -> u64 {
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
 
-/// Resident/spilled counters for one VRAM-first placement class (the KV cache, or ROCm's dense
+/// Resident/spilled counters for one VRAM-first placement class (the KV cache, or the dense
 /// weight banks). Bumped from `alloc` on whichever arm won, drained once by the banner.
 ///
 /// All-zero (the `Default`) means the flag was off or nothing of that class was allocated — both
@@ -234,9 +234,7 @@ pub struct SpillNouns<'a> {
     /// Clause closing the all-resident line, after `"none spilled; "` (`"no PCIe KV reads."`).
     pub resident_note: &'a str,
     /// Clause closing the partial-spill line, after `"in "` — the placement AND who reads it over
-    /// PCIe (`"SYSTEM RAM — attention reads those K/V over PCIe ..."`). Device-specific: ROCm's
-    /// host allocations are page-locked and Vulkan's KV reads are by device address, and the
-    /// existing wording of each is user-visible.
+    /// PCIe (`"SYSTEM RAM — attention reads those K/V over PCIe ..."`). Device-specific.
     pub spill_note: &'a str,
 }
 
@@ -419,20 +417,14 @@ mod tests {
     fn kv_overflow_config_field_follows_the_flag_grammar() {
         use crate::config::Config;
         for (raw, want) in [("", false), ("0", false), ("1", true), ("true", true)] {
-            for key in ["INFR_KV_OVERFLOW", "INFR_ROCM_WEIGHT_OVERFLOW"] {
-                let layer =
-                    crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
-                let cfg = Config::load_from_layers(&[layer]);
-                let got = match key {
-                    "INFR_KV_OVERFLOW" => cfg.kv.overflow,
-                    _ => cfg.paging.rocm_weight_overflow,
-                };
-                assert_eq!(got, want, "{key}={raw:?}");
-            }
+            let key = "INFR_KV_OVERFLOW";
+            let layer =
+                crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kv.overflow, want, "{key}={raw:?}");
         }
-        // Unset ⇒ the shipped default, off — both spill classes.
+        // Unset ⇒ the shipped default, off.
         assert!(!Config::default().kv.overflow);
-        assert!(!Config::default().paging.rocm_weight_overflow);
     }
 
     /// MiB → bytes, with `0` distinct from unset (it forces whole-host placement) — over explicit
@@ -463,20 +455,17 @@ mod tests {
         assert_eq!(mib_bytes(Some(512)), Some(512 * 1024 * 1024));
         // Unset ⇒ no cap on either class; set ⇒ the MiB count, byte-converted at the site.
         assert_eq!(Config::default().kv.overflow_vram_mb, None);
-        assert_eq!(Config::default().paging.rocm_weight_vram_mb, None);
         let layer = crate::config::env::parse(&|k| match k {
             "INFR_KV_OVERFLOW_VRAM_MB" => Some("  512  ".to_string()),
-            "INFR_ROCM_WEIGHT_VRAM_MB" => Some("0".to_string()),
             _ => None,
         })
         .expect("env layer");
         let cfg = Config::load_from_layers(&[layer]);
         assert_eq!(mib_bytes(cfg.kv.overflow_vram_mb), Some(512 * 1024 * 1024));
-        assert_eq!(mib_bytes(cfg.paging.rocm_weight_vram_mb), Some(0));
     }
 
-    /// 12% of total, floored at 2 GiB, override in MiB — verbatim from ROCm's two inline copies
-    /// (`kv_overflow_vram_reserve` / `weight_overflow_vram_reserve`), over [`reserve_from`] so the
+    /// 12% of total, floored at 2 GiB, override in MiB — verbatim from the inline copy
+    /// (`kv_overflow_vram_reserve`), over [`reserve_from`] so the
     /// case sweep needs no environment.
     #[test]
     fn reserve_from_matches_the_inline_formula() {
@@ -493,8 +482,8 @@ mod tests {
         assert_eq!(reserve_from(24 * GIB, Some("abc")), 24 * GIB / 100 * 12);
     }
 
-    /// The same policy driven off the CONFIG field (MiB) instead of a string — what the two ROCm
-    /// reserve sites now call. `reserve_from` is the string spelling of exactly this.
+    /// The same policy driven off the CONFIG field (MiB) instead of a string.
+    /// `reserve_from` is the string spelling of exactly this.
     #[test]
     fn reserve_bytes_takes_the_override_from_the_config() {
         use crate::config::Config;
@@ -503,10 +492,9 @@ mod tests {
         assert_eq!(reserve_bytes(8 * GIB, None), 2 * GIB);
         assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
         assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
-        // Unset in the shipped config ⇒ the formula, for both spill classes.
+        // Unset in the shipped config ⇒ the formula.
         let d = Config::default();
         assert_eq!(d.kv.overflow_reserve_mb, None);
-        assert_eq!(d.paging.rocm_weight_reserve_mb, None);
         let layer = crate::config::env::parse(&|k| {
             (k == "INFR_KV_OVERFLOW_RESERVE_MB").then(|| "128".to_string())
         })
@@ -552,8 +540,7 @@ mod tests {
         assert_eq!(c.total_bufs(), 3);
     }
 
-    /// The banner, byte-for-byte against the three pre-hoist `eprintln!`s (Vulkan KV, ROCm KV,
-    /// ROCm weights). This text is what a user reads to tell a partial spill from a slow run.
+    /// The banner, byte-for-byte against the pre-hoist `eprintln!` (Vulkan KV).
     #[test]
     fn spill_report_line_reproduces_the_inline_banners() {
         /// Vulkan's `fmt_bytes` (MiB to one decimal).
@@ -575,14 +562,6 @@ mod tests {
             spill_note: "SYSTEM RAM — attention reads those K/V over PCIe by device address \
                          (PCIe-bound on the spilled layers). Spilled KV bytes are exempt from the \
                          VRAM budget guard.",
-        };
-        const ROCM_WT: SpillNouns = SpillNouns {
-            env: "INFR_ROCM_WEIGHT_OVERFLOW",
-            noun: "weight banks",
-            resident_note: "no PCIe weight reads.",
-            spill_note: "page-locked SYSTEM RAM — the native Linear/EmbedGather GEMV reads those \
-                         over PCIe (PCIe-bound on the spilled banks). Spilled weights are exempt \
-                         from VRAM.",
         };
 
         // Nothing allocated (or the flag off, which leaves the tally at zero) ⇒ no line.
@@ -615,19 +594,6 @@ mod tests {
              remaining 16 (1.00 GiB) in SYSTEM RAM — attention reads those K/V over PCIe by \
              device address (PCIe-bound on the spilled layers). Spilled KV bytes are exempt from \
              the VRAM budget guard."
-        );
-
-        assert_eq!(
-            spill_report_line(all_resident, &ROCM_WT, vk_fmt).unwrap(),
-            "[infr] INFR_ROCM_WEIGHT_OVERFLOW: all 56 weight banks (3.00 GiB) fit in VRAM — none \
-             spilled; no PCIe weight reads."
-        );
-        assert_eq!(
-            spill_report_line(split, &ROCM_WT, vk_fmt).unwrap(),
-            "[infr] INFR_ROCM_WEIGHT_OVERFLOW: 40 of 56 weight banks (3.00 GiB resident) in VRAM, \
-             the remaining 16 (1.00 GiB) in page-locked SYSTEM RAM — the native \
-             Linear/EmbedGather GEMV reads those over PCIe (PCIe-bound on the spilled banks). \
-             Spilled weights are exempt from VRAM."
         );
     }
 }

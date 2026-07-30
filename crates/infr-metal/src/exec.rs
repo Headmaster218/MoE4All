@@ -2090,7 +2090,7 @@ impl MetalBackend {
 
         // Write back Outputs (and mutated f32 Inputs, e.g. recurrent state) to their bound buffers;
         // the in-place KV caches are already current. Shared predicate — `infr_core::exec::
-        // writes_back`, the same set cpu/rocm copy back.
+        // writes_back`, the same set cpumetal copy back.
         for id in infr_core::exec::write_back_targets(g) {
             let i = id.0 as usize;
             if bindings.get(id).is_some() {

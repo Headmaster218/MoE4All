@@ -447,14 +447,14 @@ pub(crate) fn generate_dense_backend(
     // (`crate::seam::kv_q8_layout_ok`) — one function, so a pinned q8 can never be gated back to
     // f16 here against an estimate that priced it at q8.
     let kv_align_ok = crate::seam::kv_q8_layout_ok(c);
-    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan" | "rocm");
+    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
     // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
     let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
         && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal + ROCm (ROCm
     // decodes Q4_0 inline in the attention flash kernel, same as Q8_0); need 32-block alignment.
-    let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal" | "rocm") && kv_align_ok;
+    let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
     // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
     // own f32 attention), bf16 reads via a cast→f16 prepass.
     let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");

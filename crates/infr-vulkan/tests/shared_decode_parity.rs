@@ -2,7 +2,7 @@
 //! candidate H).
 //!
 //! Vulkan already has ~75 `*_matches_host` tests, so this file is not closing a coverage hole the
-//! way the ROCm/Metal ones do. Its jobs are:
+//! way the Metal ones do. Its jobs are:
 //!
 //! 1. **Pin the dense-Linear dtype ROSTER against the decode spec.** `linear::native_dense_dtypes`
 //!    claims every one of `infr_core::decode_spec::WEIGHT_QUANTS`; this sweep actually runs all 24
@@ -28,11 +28,11 @@ use infr_vulkan::VulkanBackend;
 /// (`out_f` 8/32) the tier policy keeps every format on the f32-exact GEMV rather than the int8
 /// dp4a decode kernels, so no activation quantization enters the comparison at all.
 ///
-/// The bound is nonetheless set at the same `2e-2` ceiling the ROCm sweep carries, deliberately:
+/// The bound is nonetheless set at the same `2e-2` ceiling the Metal sweep carries, deliberately:
 /// the m-tier and per-dtype int8 routing (`adapter::mmv_int8_decode_dtypes`,
 /// `infr_core::tier::linear_tier`) is a POLICY that legitimately moves, and when a shape here
 /// lands on `quant_q8` → `linear_mmv_mw`/`linear_mmv_mrow` its error jumps to the ~5e-3 band that
-/// int8 activations cost (that is exactly what the ROCm sweep measures on the same formats). A
+/// int8 activations cost (that is exactly what the Metal sweep measures on the same formats). A
 /// tighter number would turn a deliberate tier change into a spurious parity failure. What this
 /// sweep is for is the DECODE — and a mis-decoded format lands at O(1) relative, four orders of
 /// magnitude above the ceiling.

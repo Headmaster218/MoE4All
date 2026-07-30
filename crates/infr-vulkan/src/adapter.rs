@@ -885,7 +885,7 @@ fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
             enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
         rmsnorm_linear: None,
-        // F1c's `MoeFfn → Add` fold is ROCm-only for now: this adapter's MoE lowering accumulates
+        // F1c's `MoeFfn → Add` fold is Metal-only for now: this adapter's MoE lowering accumulates
         // the experts through its own `moe_accumulate`, which has no residual epilogue, so the
         // pattern stays un-planned here and Vulkan dispatches the standalone `Add` exactly as
         // before.
@@ -6304,7 +6304,7 @@ mod tests {
     ///
     /// **On the shared harness** (backend-unification candidate H): the graph build stays here —
     /// it IS what the test is about — but the bind/alloc/upload/compile/execute/download ladder and
-    /// the host oracle now come from `infr-testkit`, which cpu/rocm/metal drive the same way. Same
+    /// the host oracle now come from `infr-testkit`, which cpuMetal/metal drive the same way. Same
     /// shapes, same reference, same tolerance; ~20 lines of boilerplate gone.
     ///
     /// Follow-up: the other ~70 `*_matches_host` tests in this crate can move the same way, but

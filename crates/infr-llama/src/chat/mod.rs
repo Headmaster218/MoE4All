@@ -24,14 +24,12 @@ use anyhow::Result;
 mod cpu;
 mod diffusion;
 mod metal;
-mod rocm;
 mod vulkan;
 
 pub use cpu::CpuDenseChat;
 pub use diffusion::DiffusionGemmaChat;
 #[cfg(target_os = "macos")]
 pub use metal::{MetalSeamChat, SpecMetalChat};
-pub use rocm::RocmSeamChat;
 pub use vulkan::DenseSeamChat;
 
 /// The two arch-specific primitives the shared [`Chat`] drives. Object-safe: no generics, callbacks

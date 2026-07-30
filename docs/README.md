@@ -44,20 +44,6 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 ## Roadmaps & history
 
-- [rocm-plan.md](rocm-plan.md) — the native ROCm/HIP AMD GPU backend
-  (`infr-rocm`), **built**: correctness + real perf + all three paging modes.
-  Now a ROCm↔Vulkan feature-parity tracker (all-quant fast kernels, attention,
-  fusion, device sampling, multi-GPU, ≥1.0× endgame).
-- [backend-unification-plan.md](backend-unification-plan.md) — audit + staged
-  plan to unify shared/device-agnostic host logic across the CPU/Vulkan/Metal/
-  ROCm backends (peephole fusion, graph-executor skeleton, chat/session
-  wrappers, tiering policy, decode-spec + parity harness) into one seam.
-- [cuda-plan.md](cuda-plan.md) — phased plan for a native CUDA NVIDIA GPU
-  backend (`infr-cuda`), sibling of the ROCm plan; Tensor Cores / cuBLASLt /
-  CUDA Graphs, validated on remote NVIDIA hardware. Not yet built.
-- [sycl-plan.md](sycl-plan.md) — phased plan for a native Intel oneAPI/SYCL GPU
-  backend (`infr-sycl`) on the Level Zero + SPIR-V substrate; XMX / oneDNN,
-  validated on remote Intel Arc hardware. Not yet built.
 - [plan.md](plan.md) — the original master project plan (historical). Most of it
   shipped against autoregressive decoders; kept for context.
 - [train.md](train.md) — LLM training support plan (not yet built).

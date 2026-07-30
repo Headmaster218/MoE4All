@@ -336,12 +336,12 @@ them is cacheable:
   new kernels appear, and re-serialized (debounced, and on drop).
 
 The archive grows lazily during a run, so the lifecycle is Vulkan's
-(`infr-vulkan/src/pcache.rs`), not ROCm's whole-artifact-at-init one; the bytes
-go through the shared `infr_core::kernel_cache` seam, which owns the envelope,
-the payload checksum, the atomic+durable write and the poisoned-blob tripwire.
-The payload additionally carries a manifest of the function names inside the
-archive — without it every launch would re-`add` (and so re-compile) every
-kernel, and the cache would cost exactly what it saves.
+(`infr-vulkan/src/pcache.rs`); the bytes go through the shared
+`infr_core::kernel_cache` seam, which owns the envelope, the payload checksum,
+the atomic+durable write and the poisoned-blob tripwire. The payload
+additionally carries a manifest of the function names inside the archive —
+without it every launch would re-`add` (and so re-compile) every kernel, and the
+cache would cost exactly what it saves.
 
 The key is
 `FNV(msl_source()) ++ source length ++ device name ++ MTLDevice.architecture.name ++ NSProcessInfo.operatingSystemVersionString ++ fast-math`,

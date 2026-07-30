@@ -11,8 +11,8 @@
 //!
 //! **Everything that is not Vulkan lives in `infr-core`'s [`KernelCache`]** — the envelope, the
 //! payload checksum, the atomic+durable write, and THE TRIPWIRE that caught a hung shader binary
-//! sitting in this very file (read that module's doc; it is the design rationale, and the ROCm
-//! module cache is the second consumer). What stays here is what only Vulkan knows:
+//! sitting in this very file (read that module's doc; it is the design rationale). What stays
+//! here is what only Vulkan knows:
 //!
 //! - **The KEY** (compared verbatim by `KernelCache`): `driverVersion ++ pipelineCacheUUID ++
 //!   SHADER_SET_FINGERPRINT`.
@@ -34,7 +34,7 @@
 //!   to consume it (in `lib.rs`), and the device-lost verdict on drop.
 //! - **The DEBOUNCED mid-run saves.** Unique to Vulkan: the driver's cache GROWS during a run as
 //!   new pipelines are created, so the file must be rewritten periodically for a long-lived
-//!   process that never drops cleanly (a `serve` under SIGKILL). ROCm's artifact is produced once,
+//!   process that never drops cleanly (a `serve` under SIGKILL). s artifact is produced once,
 //!   whole, at init — it has nothing to re-save.
 //!
 //! `kernels.vulkan.pipeline_cache_disk = false` disables persistence (the in-process cache handle
@@ -148,7 +148,7 @@ impl PcachePersist {
         }
     }
 
-    /// Is a mid-run save due? Vulkan-only bookkeeping — see the module doc for why ROCm has no
+    /// Is a mid-run save due? Vulkan-only bookkeeping — see the module doc for why legacy backends had no
     /// equivalent. Split out so a unit test can exercise the debounce without a live device.
     fn save_due(&self) -> bool {
         self.last_save.lock().unwrap().elapsed().as_secs() >= SAVE_DEBOUNCE_SECS
@@ -230,7 +230,7 @@ mod tests {
     }
 
     /// The mid-run save debounce — the one piece of this that stayed Vulkan-specific (the driver's
-    /// cache grows during a run; ROCm's artifact is produced whole at init). A freshly-constructed
+    /// cache grows during a run; s artifact is produced whole at init). A freshly-constructed
     /// handle is NOT due, so a burst of pipeline creations writes the file once, not once per
     /// pipeline.
     #[test]

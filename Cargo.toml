@@ -4,7 +4,6 @@ members = [
     "crates/infr-core",
     "crates/infr-vulkan",
     "crates/infr-metal",
-    "crates/infr-rocm",
     "crates/infr-hub",
     "crates/infr-gguf",
     "crates/infr-cpu",
@@ -29,7 +28,6 @@ repository = "https://github.com/kryptic-sh/infr"
 infr-core = { path = "crates/infr-core" }
 infr-vulkan = { path = "crates/infr-vulkan" }
 infr-metal = { path = "crates/infr-metal" }
-infr-rocm = { path = "crates/infr-rocm" }
 infr-hub = { path = "crates/infr-hub" }
 infr-gguf = { path = "crates/infr-gguf" }
 infr-cpu = { path = "crates/infr-cpu" }

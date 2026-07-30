@@ -18,8 +18,7 @@
 //!
 //! The spec is only worth having if it is *load-bearing*, so it is wired both ways:
 //! `infr_gguf::block_layout` and `dequant_factored`'s geometry now read from [`block_layout`],
-//! ROCm's `native_decode_fmt`/`native_i8_fmt`/`moe_native_fmt` derive their block geometry from it
-//! instead of re-spelling `(256, 144)`, and `infr-testkit`'s parity harness synthesizes valid
+//! and `infr-testkit`'s parity harness synthesizes valid
 //! blocks for EVERY weight quant purely from [`BlockSpec`] — so a wrong offset here fails a test
 //! rather than sitting unread.
 //!
@@ -375,8 +374,7 @@ pub const fn block_spec(dtype: DType) -> BlockSpec {
 
 /// `(elements_per_block, bytes_per_block)` for `dtype` — the single source of truth every other
 /// block-geometry table in the workspace now reads (`infr_gguf::block_layout` re-exports it,
-/// `dequant_factored` sizes its blocks with it, ROCm's kernel tables derive their `(elems, bytes)`
-/// from it).
+/// `dequant_factored` sizes its blocks with it).
 pub const fn block_layout(dtype: DType) -> (usize, usize) {
     let s = block_spec(dtype);
     (s.block_elems, s.block_bytes)

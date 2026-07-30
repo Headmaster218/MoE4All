@@ -4,21 +4,17 @@
 //!
 //! Per-op profiling was re-invented four times. Every backend could answer "where did the forward
 //! go", and every backend answered it in its own dialect: vulkan stamped timestamp queries and
-//! printed `[prof2]`, rocm recorded HIP events and printed `[rocm prof]`, metal accumulated host
+//! printed `[prof2]`, metal accumulated host
 //! encode wall and printed `── infr-metal profile`, cpu summed `Instant`s and printed `[prof-ops]`.
-//! Four knobs (`INFR_PROF2`, `kernels.rocm.prof_ops`, `INFR_METAL_PROFILE`, `INFR_PROF_OPS`), four
+//! Four knobs (`INFR_PROF2`, `INFR_METAL_PROFILE`, `INFR_PROF_OPS`), four
 //! label grammars, four sort orders, four notions of what the total is a percentage OF. All four
 //! are now [`ProfCfg::ops`](crate::config::ProfCfg::ops) — one knob, `INFR_PROF_OPS`.
 //!
 //! That is worse than untidy. It cost real work:
 //!
-//! * `INFR_PROF_OPS=1` on a GPU run profiled **nothing** — only the cpu backend read that knob —
-//!   while `kernels.rocm.prof_ops` had no environment variable at all and could only be reached
-//!   through `--set` or the TOML file.
-//! * rocm's and metal's tables counted the **untimed warmup forward**. Only vulkan honored the
-//!   suppression flag, so on the other two every published share was diluted by work the bench
-//!   itself excluded — rocm's header even said so ("over all forwards so far") without anyone
-//!   reading it as a warning.
+//! * Metal's table counted the **untimed warmup forward**. Only vulkan honored the
+//!   suppression flag, so on the other the published share was diluted by work the bench
+//!   itself excluded.
 //! * Only vulkan fed [`infr_prof_rt`], so only vulkan appeared in the exit aggregate and in the
 //!   `INFR_PROF_OUT` JSON. Correlating a host function table against device op time was a
 //!   vulkan-only capability by accident, not by design.
@@ -35,10 +31,6 @@
 //!
 //! * vulkan writes `BOTTOM_OF_PIPE` timestamps into a query pool and reads the whole pool back
 //!   after the submit completes.
-//! * rocm records a HIP timing-event pair per op on its single stream. A host `Instant` there would
-//!   measure ENQUEUE (the ops queue without a per-op sync), and a per-op `hipStreamSynchronize`
-//!   would measure execution but serialize the pipeline and add F4's ~2.7 µs launch floor to every
-//!   sample.
 //! * metal has no free per-op device timing at all: its ops batch into one command buffer, so
 //!   isolating an op's GPU wall means flushing after it (`prof.metal_device_time=flush`, which
 //!   costs the batching) or sampling stage-boundary counters (`=counters`). Its cheap default mode
@@ -47,8 +39,8 @@
 //!
 //! So each backend keeps its own timing acquisition and calls [`OpProf::add`] with the result. The
 //! unit is microseconds everywhere — the conversion belongs at the acquisition site, where the
-//! clock's native unit is known (vulkan ticks × `timestamp_period`, rocm's `hipEventElapsedTime`
-//! milliseconds, host `Duration`s).
+//! clock's native unit is known (vulkan ticks × `timestamp_period`,
+//! host `Duration`s).
 
 use crate::config::ProfCfg;
 use crate::graph::{AttnMask, Graph, Op};
@@ -79,7 +71,7 @@ pub fn suppressed() -> bool {
 
 /// One profiling session's accumulated per-op time: label → (dispatches, total µs).
 ///
-/// Scope is the backend's choice — vulkan folds one per submit, rocm and metal one per forward, cpu
+/// Scope is the backend's choice — vulkan folds one per submit and metal one per forward, cpu
 /// one per `execute`. Whatever the scope, [`flush`](Self::flush) pushes the rows into the
 /// process-wide aggregate, so the exit report is over the whole run regardless.
 pub struct OpProf {
@@ -97,7 +89,7 @@ pub struct OpProf {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unit {
     /// Time the DEVICE spent executing the op, from the device's own clocks (vulkan timestamp
-    /// queries, rocm HIP events, metal's flush/counter modes). The number to optimize against.
+    /// queries, metal's flush/counter modes). The number to optimize against.
     Device,
     /// Time the HOST spent encoding/submitting the op. Metal's cheap default mode and the cpu
     /// backend both report this — for cpu it IS the execution time; for metal it is emphatically
@@ -204,7 +196,7 @@ impl OpProf {
 /// shape's cost, not an average over shapes that differ by 100x).
 ///
 /// The three itemized variants are the ones where the shape IS the cost, and they are the three
-/// that have been the answer in every ROCm perf slice so far: `Linear`'s `m` separates decode's
+/// that have been the answer in every profiled perf slice so far: `Linear`'s `m` separates decode's
 /// GEMV from prefill's GEMM on the same weight, `Attention`'s `kv_len` is the whole at-depth story,
 /// and `MoeFfn`'s expert geometry is what a 30B-A3B forward is made of. Everything else falls back
 /// to the bare op kind — a norm is a norm.
@@ -268,7 +260,7 @@ mod tests {
         cfg.prof.ops = true;
         assert!(enabled(&cfg.prof));
 
-        // The warmup path's flag must win over the knob — this AND is what rocm and metal were
+        // The warmup path's flag must win over the knob — this AND is what metal was
         // missing, and it is the difference between a table of the timed reps and a table
         // polluted by the untimed warmup forward.
         let prev = infr_prof_rt::set_profiling_suppressed(true);
@@ -426,8 +418,7 @@ mod tests {
     }
 
     /// The point of itemizing: the SAME op kind at two different shapes must not share a row, or
-    /// prefill's GEMM hides inside decode's GEMV average. This is the property the ROCm P1 profile
-    /// depended on to separate `Attention` at kv=512 from kv=2048.
+    /// prefill's GEMM hides inside decode's GEMV average.
     #[test]
     fn op_label_separates_the_same_kind_at_different_shapes() {
         let (g, ops) = label_graph();

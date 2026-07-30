@@ -26,7 +26,7 @@
 //! the knob set, the exit report contains only the device section; in an `INFR_PROFILE=1` build it
 //! merges with the host function table in one report.
 //!
-//! Vulkan fed this alone until U3. rocm, metal and the cpu backend each accumulated and printed
+//! Vulkan fed this alone until U3. metal and the cpu backend each accumulated and printed
 //! their own totals and appeared nowhere in the exit report or the JSON — so "correlate the host
 //! function table against device op time" was accidentally a vulkan-only capability.
 

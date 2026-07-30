@@ -41,7 +41,7 @@ impl Profile {
     }
 
     /// Print through the shared reporter ([`infr_core::prof::OpProf`]) so this backend's table has
-    /// the same columns, the same sort and the same `[prof:<backend>]` tag as vulkan's, rocm's and
+    /// the same columns, the same sort and the same `[prof:<backend>]` tag as vulkan's and
     /// the cpu backend's — and so its DEVICE rows land in the process-wide exit aggregate and the
     /// `INFR_PROF_OUT` JSON, which they never did before.
     ///
