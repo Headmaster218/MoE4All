@@ -1923,16 +1923,15 @@ impl VulkanBackend {
         }
 
         // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
-        // Vendor by vendorID, NOT by subgroup range (Xe2 SKUs report minSubgroupSize 8 or 16
-        // depending on the part — size-sniffing would misclassify Battlemage).
+        // Capability-driven: any device whose smallest pinnable subgroup is ≤16 likely has
+        // SIMD8/SIMD16 EUs (Intel Arc, future small-subgroup GPUs) where pinning the decode
+        // GEMV family at 32 starves per-lane registers (llama.cpp pins 16 for mul_mat_vec
+        // on Intel for exactly this). `max(16, subgroup_min)` keeps this Battlemage-proof
+        // (min=8 SKUs still get 16, never 8 — the kernels' lane math is only built for 16/32).
+        // Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default kernel/pipeline
+        // set there is byte-identical to before this field existed.
         let vendor_intel = props.vendor_id == 0x8086;
-        // Intel EUs are SIMD8/SIMD16: pinning the decode GEMV family at 32 makes ANV compile
-        // SIMD32 shaders whose per-lane register budget starves those kernels (llama.cpp pins 16
-        // for mul_mat_vec on Intel for exactly this). `max(16, subgroup_min)` keeps this
-        // Battlemage-proof (min=8 SKUs still get 16, never 8 — the kernels' lane math is only
-        // built for 16/32). Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default
-        // kernel/pipeline set there is byte-identical to before this field existed.
-        let sg_default = if vendor_intel && subgroup_min <= 16 {
+        let sg_default = if subgroup_min <= 16 {
             16u32.max(subgroup_min)
         } else {
             32
