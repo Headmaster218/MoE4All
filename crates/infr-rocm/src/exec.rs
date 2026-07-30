@@ -4350,7 +4350,8 @@ fn run_op(
                     // ── S5: MMQ decode-once-reuse MoE GEMM (opt-in, Q4_K only) ──
                     // Each expert's weight column tile decoded ONCE into LDS and reused
                     // across all routing rows, eliminating per-wave re-decode overhead.
-                    let use_mmq = ctx.rocm.mmq && gu == "q4k";
+                    let use_mmq =
+                        ctx.rocm.mmq && (gu == "q4k" || gu == "q6k" || gu == "q5k" || gu == "q80");
                     // ── P2: the bucket-sorted BATCHED arm. ──
                     // R8 fixed the launch count and left the WEIGHT TRAFFIC alone: its
                     // `(output row, slot)` grid re-reads an expert's whole bank once per slot, so
@@ -4440,10 +4441,17 @@ fn run_op(
                             // what the existing quant/down pipeline expects — the down kernel
                             // applies silu(gate)*up internally.
                             let mmq_col_tiles = (n_ff_exp as u32).div_ceil(64); // BN=64
+                            let mmq_up_kernel = match gu {
+                                "q4k" => "moe_mmq_up_i8_q4k",
+                                "q6k" => "moe_mmq_up_i8_q6k",
+                                "q5k" => "moe_mmq_up_i8_q5k",
+                                "q80" => "moe_mmq_up_i8_q80",
+                                _ => unreachable!("mmq gu={gu}"),
+                            };
                             dispatch_grid(
                                 pipelines,
                                 ctx.stream,
-                                "moe_mmq_up_i8_q4k",
+                                mmq_up_kernel,
                                 mmq_col_tiles,
                                 nexp as u32,
                                 128,
