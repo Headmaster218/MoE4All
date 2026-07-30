@@ -1166,6 +1166,37 @@ fn moe_down_i8_idb_kernel(dn: &str) -> &'static str {
     }
 }
 
+/// MMQ decode-once-reuse gate+up kernel name for a covered format suffix.
+/// Returns `None` when MMQ is not yet implemented for this format.
+fn mmq_up_kernel(gu: &str) -> Option<&'static str> {
+    Some(match gu {
+        "q4k" => "moe_mmq_up_i8_q4k",
+        "q6k" => "moe_mmq_up_i8_q6k",
+        "q5k" => "moe_mmq_up_i8_q5k",
+        "q80" => "moe_mmq_up_i8_q80",
+        "q2k" => "moe_mmq_up_i8_q2k",
+        "q3k" => "moe_mmq_up_i8_q3k",
+        "iq2xxs" => "moe_mmq_up_i8_iq2xxs",
+        "iq2xs" => "moe_mmq_up_i8_iq2xs",
+        "iq2s" => "moe_mmq_up_i8_iq2s",
+        "iq3xxs" => "moe_mmq_up_i8_iq3xxs",
+        "iq3s" => "moe_mmq_up_i8_iq3s",
+        "iq1s" => "moe_mmq_up_i8_iq1s",
+        "iq1m" => "moe_mmq_up_i8_iq1m",
+        "tq10" => "moe_mmq_up_i8_tq10",
+        "tq20" => "moe_mmq_up_i8_tq20",
+        "q20" => "moe_mmq_up_i8_q20",
+        "mxfp4" => "moe_mmq_up_i8_mxfp4",
+        "nvfp4" => "moe_mmq_up_i8_nvfp4",
+        "iq4nl" => "moe_mmq_up_i8_iq4nl",
+        "iq4xs" => "moe_mmq_up_i8_iq4xs",
+        "q40" => "moe_mmq_up_i8_q40",
+        "q41" => "moe_mmq_up_i8_q41",
+        "q51" => "moe_mmq_up_i8_q51",
+        _ => return None,
+    })
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -4350,8 +4381,8 @@ fn run_op(
                     // ── S5: MMQ decode-once-reuse MoE GEMM (opt-in, Q4_K only) ──
                     // Each expert's weight column tile decoded ONCE into LDS and reused
                     // across all routing rows, eliminating per-wave re-decode overhead.
-                    let use_mmq =
-                        ctx.rocm.mmq && (gu == "q4k" || gu == "q6k" || gu == "q5k" || gu == "q80");
+                    let mmq_kernel = mmq_up_kernel(gu);
+                    let use_mmq = ctx.rocm.mmq && mmq_kernel.is_some();
                     // ── P2: the bucket-sorted BATCHED arm. ──
                     // R8 fixed the launch count and left the WEIGHT TRAFFIC alone: its
                     // `(output row, slot)` grid re-reads an expert's whole bank once per slot, so
@@ -4441,17 +4472,10 @@ fn run_op(
                             // what the existing quant/down pipeline expects — the down kernel
                             // applies silu(gate)*up internally.
                             let mmq_col_tiles = (n_ff_exp as u32).div_ceil(64); // BN=64
-                            let mmq_up_kernel = match gu {
-                                "q4k" => "moe_mmq_up_i8_q4k",
-                                "q6k" => "moe_mmq_up_i8_q6k",
-                                "q5k" => "moe_mmq_up_i8_q5k",
-                                "q80" => "moe_mmq_up_i8_q80",
-                                _ => unreachable!("mmq gu={gu}"),
-                            };
                             dispatch_grid(
                                 pipelines,
                                 ctx.stream,
-                                mmq_up_kernel,
+                                mmq_kernel.unwrap(),
                                 mmq_col_tiles,
                                 nexp as u32,
                                 128,

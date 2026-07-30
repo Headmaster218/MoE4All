@@ -265,6 +265,9 @@ const HIP_PARTS: &[&str] = &[
     MOE_MMQ_Q6K,
     MOE_MMQ_Q5K,
     MOE_MMQ_Q80,
+    MOE_MMQ_Q2K,
+    MOE_MMQ_Q3K,
+    MOE_MMQ_WDEC,
     SAMPLE_TOP_K,
     ARGMAX_PROB,
     E2B_GATE,
@@ -9466,6 +9469,715 @@ extern "C" __global__ void moe_act_mul_q80(
         }
     }
 }
+
+"#;
+
+// ── MMQ (decode-once-reuse) all-expert MoE GEMM for Q2_K gate+up ────────────
+//
+// Q2_K: 84 bytes/super-block. 2-bit codes (0..3), 16-elem sub-blocks with
+// independent 4-bit scale/min. Each BK=32 K-step covers two sub-blocks.
+// Code expansion: each 16-byte qs run packs 4×2-bit codes per byte at shift `sh`;
+// the 16 codes are expanded to 4 uint32 words (one code per byte) for dp4a.
+const MOE_MMQ_Q2K: &str = r#"
+// Expand 16 Q2_K qs bytes at shift `sh` into 4 uint32 words (codes 0..3 packed per byte).
+static __device__ __forceinline__ void q2k_expand16(
+    const unsigned char* qb, unsigned int sh, unsigned int* out) {
+    #pragma unroll
+    for (int p = 0; p < 4; p++) {
+        unsigned int w = 0u;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            w |= ((unsigned int)(qb[p * 4 + r] >> sh) & 3u) << (r * 8);
+        out[p] = w;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
+moe_mmq_up_i8_q2k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ gw,
+    const unsigned char* __restrict__ uw,
+    float* __restrict__ h,
+    int n_ff,
+    int n_ff_exp,
+    int n_slots,
+    int n_exp,
+    const int* __restrict__ eoff,
+    const int* __restrict__ ecnt,
+    const int* __restrict__ bslot,
+    int nu,
+    long gate_stride,
+    long up_stride,
+    int act_bytes
+) {
+    int e = blockIdx.y;
+    int col_tile = blockIdx.x;
+    int BT = col_tile * MMQ_BN;
+    if (BT >= n_ff_exp) return;
+
+    int cnt = ecnt[e];
+    if (cnt <= 0) return;
+    int off = eoff[e];
+
+    int tid = threadIdx.x;
+    int tr = tid / (MMQ_BN / MMQ_TN);
+    int tc = tid % (MMQ_BN / MMQ_TN);
+
+    int nb = n_ff >> 5;
+    int spr = nb >> 3;
+
+    __shared__ unsigned int As[MMQ_BM * MMQ_SP];
+    __shared__ unsigned int Bs[MMQ_BN * MMQ_SP];
+    __shared__ float Bdl0[MMQ_BN], Bmm0[MMQ_BN];
+    __shared__ float Bdl1[MMQ_BN], Bmm1[MMQ_BN];
+
+    float acc[MMQ_TM][MMQ_TN];
+    #pragma unroll
+    for (int i = 0; i < MMQ_TM; i++)
+        #pragma unroll
+        for (int j = 0; j < MMQ_TN; j++)
+            acc[i][j] = 0.0f;
+
+    const unsigned char* gate_w = gw + (long)e * gate_stride;
+
+    for (int blk = 0; blk < nb; blk++) {
+
+        // ── 1. Stage activations ──
+        for (int idx = tid; idx < MMQ_BM * MMQ_WPB; idx += 128) {
+            int r = idx / MMQ_WPB;
+            int p = idx % MMQ_WPB;
+            int slot = (r < cnt) ? bslot[off + r] : 0;
+            int arow = (r < cnt) ? (slot / nu) : 0;
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)arow * act_bytes))[blk * MMQ_WPB + p];
+        }
+
+        // ── 2. Decode weights ──
+        int w32 = blk & 7;
+        for (int idx = tid; idx < MMQ_BN; idx += 128) {
+            int c = idx;
+            int out_col = BT + c;
+            long super = (long)out_col * spr + (blk >> 3);
+            const unsigned char* b = gate_w + super * 84;
+            const unsigned char* scs = b;
+            const unsigned char* qs = b + 16;
+            float d = rf16b(b + 80), dmin = rf16b(b + 82);
+
+            for (int hh = 0; hh < 2; hh++) {
+                int g = w32 * 2 + hh;
+                int sc = scs[g] & 0x0F;
+                int mm = scs[g] >> 4;
+                float bdl = d * (float)sc, bmm = dmin * (float)mm; // note: formula is d*sc*code + dmin*(-mm)
+                if (hh == 0) { Bdl0[c] = bdl; Bmm0[c] = bmm; }
+                else        { Bdl1[c] = bdl; Bmm1[c] = bmm; }
+                const unsigned char* qb = qs + (g >> 3) * 32 + (g & 1) * 16;
+                unsigned int sh = 2u * ((unsigned int)((g >> 1) & 3));
+                q2k_expand16(qb, sh, &Bs[c * MMQ_SP + hh * 4]);
+            }
+        }
+        __syncthreads();
+
+        // ── 3. TM×TN dp4a loop ──
+        {
+            int r0 = tr * MMQ_TM;
+            bool alive[MMQ_TM];
+            #pragma unroll
+            for (int i = 0; i < MMQ_TM; i++) alive[i] = (r0 + i) < cnt;
+
+            #pragma unroll
+            for (int hh = 0; hh < 2; hh++) {
+                int p0 = hh * 4;
+                int qsum[MMQ_TM][MMQ_TN], asum[MMQ_TM];
+                #pragma unroll
+                for (int i = 0; i < MMQ_TM; i++) {
+                    asum[i] = 0;
+                    #pragma unroll
+                    for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = 0;
+                }
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    int bv[MMQ_TN];
+                    #pragma unroll
+                    for (int j = 0; j < MMQ_TN; j++)
+                        bv[j] = (int)Bs[(tc * MMQ_TN + j) * MMQ_SP + p0 + p];
+                    #pragma unroll
+                    for (int i = 0; i < MMQ_TM; i++) {
+                        int av = (int)As[(r0 + i) * MMQ_SP + p0 + p];
+                        if (alive[i]) {
+                            asum[i] = idot4(av, 0x01010101, asum[i]);
+                            #pragma unroll
+                            for (int j = 0; j < MMQ_TN; j++)
+                                qsum[i][j] = idot4(av, bv[j], qsum[i][j]);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int i = 0; i < MMQ_TM; i++) {
+                    if (!alive[i]) continue;
+                    int slot = bslot[off + r0 + i];
+                    int arow = slot / nu;
+                    float sx = xs[(long)arow * nb + blk];
+                    #pragma unroll
+                    for (int j = 0; j < MMQ_TN; j++) {
+                        int c = tc * MMQ_TN + j;
+                        float bdl = (hh == 0) ? Bdl0[c] : Bdl1[c];
+                        float bmm = (hh == 0) ? Bmm0[c] : Bmm1[c];
+                        acc[i][j] += bdl * sx * (float)qsum[i][j]
+                                   - bmm * sx * (float)asum[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── 4. Write output ──
+    #pragma unroll
+    for (int i = 0; i < MMQ_TM; i++) {
+        int r = tr * MMQ_TM + i;
+        if (r >= cnt) continue;
+        int slot = bslot[off + r];
+        #pragma unroll
+        for (int j = 0; j < MMQ_TN; j++) {
+            int out_col = BT + tc * MMQ_TN + j;
+            if (out_col >= n_ff_exp) continue;
+            h[(long)slot * n_ff_exp + out_col] = acc[i][j];
+        }
+    }
+}
+
+// Elementwise activation for Q2_K MMQ output.
+extern "C" __global__ void moe_act_mul_q2k(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int n_ff, int n_ff_exp, int n_slots, int n_exp,
+    const int* __restrict__ eoff, const int* __restrict__ ecnt,
+    const int* __restrict__ bslot,
+    const float* __restrict__ route_wts, const float* __restrict__ dsc_dev,
+    int act_type, int weight_before
+) {
+    int e = blockIdx.x; int tid = threadIdx.x;
+    int cnt = ecnt[e]; if (cnt <= 0) return; int off = eoff[e];
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f;
+    for (int i = tid; i < cnt; i += blockDim.x) {
+        int slot = bslot[off + i];
+        float weight = route_wts[slot];
+        float wg = weight_before ? weight : 1.0f;
+        float wo = weight_before ? 1.0f : weight;
+        for (int col = 0; col < n_ff; col++) {
+            float g = src[(long)slot * n_ff_exp + col];
+            float u = src[(long)slot * n_ff_exp + col + n_ff];
+            g *= wg;
+            float a;
+            if (act_type == 0) { a = g / (1.0f + expf(-g)); }
+            else if (act_type == 1) { float x3 = g*g*g; a = 0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); }
+            else { a = 1.0f/(1.0f+expf(-g)); }
+            dst[(long)slot * n_ff + col] = a * u * wo * dsc;
+        }
+    }
+}
+
+"#;
+
+// ── MMQ (decode-once-reuse) all-expert MoE GEMM for Q3_K gate+up ────────────
+//
+// Q3_K: 110 bytes/super-block. 3-bit codes (0..7) = 2 qs bits + 1 hmask bit.
+// Same two-subblock pattern as Q2_K/Q6_K. Scale from packed sc6 at +96;
+// min term is -4·sc (constant per sub-block, no separate dmin).
+const MOE_MMQ_Q3K: &str = r#"
+extern "C" __global__ void __launch_bounds__(128, 1)
+moe_mmq_up_i8_q3k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ gw,
+    const unsigned char* __restrict__ uw,
+    float* __restrict__ h,
+    int n_ff,
+    int n_ff_exp,
+    int n_slots,
+    int n_exp,
+    const int* __restrict__ eoff,
+    const int* __restrict__ ecnt,
+    const int* __restrict__ bslot,
+    int nu,
+    long gate_stride,
+    long up_stride,
+    int act_bytes
+) {
+    int e = blockIdx.y;
+    int col_tile = blockIdx.x;
+    int BT = col_tile * MMQ_BN;
+    if (BT >= n_ff_exp) return;
+
+    int cnt = ecnt[e];
+    if (cnt <= 0) return;
+    int off = eoff[e];
+
+    int tid = threadIdx.x;
+    int tr = tid / (MMQ_BN / MMQ_TN);
+    int tc = tid % (MMQ_BN / MMQ_TN);
+
+    int nb = n_ff >> 5;
+    int spr = nb >> 3;
+
+    __shared__ unsigned int As[MMQ_BM * MMQ_SP];
+    __shared__ unsigned int Bs[MMQ_BN * MMQ_SP];
+    __shared__ float Bdl0[MMQ_BN], Bmm0[MMQ_BN];
+    __shared__ float Bdl1[MMQ_BN], Bmm1[MMQ_BN];
+
+    float acc[MMQ_TM][MMQ_TN];
+    #pragma unroll
+    for (int i = 0; i < MMQ_TM; i++)
+        #pragma unroll
+        for (int j = 0; j < MMQ_TN; j++)
+            acc[i][j] = 0.0f;
+
+    const unsigned char* gate_w = gw + (long)e * gate_stride;
+
+    for (int blk = 0; blk < nb; blk++) {
+
+        // ── 1. Stage activations ──
+        for (int idx = tid; idx < MMQ_BM * MMQ_WPB; idx += 128) {
+            int r = idx / MMQ_WPB;
+            int p = idx % MMQ_WPB;
+            int slot = (r < cnt) ? bslot[off + r] : 0;
+            int arow = (r < cnt) ? (slot / nu) : 0;
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)arow * act_bytes))[blk * MMQ_WPB + p];
+        }
+
+        // ── 2. Decode weights ──
+        int w32 = blk & 7;
+        for (int idx = tid; idx < MMQ_BN; idx += 128) {
+            int c = idx;
+            int out_col = BT + c;
+            long super = (long)out_col * spr + (blk >> 3);
+            const unsigned char* b = gate_w + super * 110;
+            const unsigned char* hm = b;
+            const unsigned char* qs = b + 32;
+            float d = rf16b(b + 108);
+            // Q3_K packed scales at +96: 12 bytes, 6-bit per scale via q3k_sc6
+            const unsigned char* scp = b + 96;
+
+            for (int hh = 0; hh < 2; hh++) {
+                int g = w32 * 2 + hh;
+                // q3k_sc6 reproduces deq_q3k's scale extraction inline
+                int sc = q3k_sc6(scp, g);
+                float bdl = d * (float)sc;
+                float bmm = d * (float)(4 * sc); // min term: -4sc, applied as -bmm*isum
+                if (hh == 0) { Bdl0[c] = bdl; Bmm0[c] = bmm; }
+                else        { Bdl1[c] = bdl; Bmm1[c] = bmm; }
+                const unsigned char* qb = qs + (g >> 3) * 32 + (g & 1) * 16;
+                const unsigned char* hb = hm + (g & 1) * 16;
+                unsigned int sh = 2u * ((unsigned int)((g >> 1) & 3));
+                unsigned int hsh = (unsigned int)(g >> 1);
+                // Expand: 4 uint32, each packing 4×3-bit codes (0..7) per byte
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    unsigned int w = 0u;
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        unsigned int code = ((unsigned int)(qb[p*4+r] >> sh) & 3u)
+                                          | (((unsigned int)(hb[p*4+r] >> hsh) & 1u) << 2);
+                        w |= code << (r * 8);
+                    }
+                    Bs[c * MMQ_SP + hh * 4 + p] = w;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ── 3. TM×TN dp4a loop ──
+        {
+            int r0 = tr * MMQ_TM;
+            bool alive[MMQ_TM];
+            #pragma unroll
+            for (int i = 0; i < MMQ_TM; i++) alive[i] = (r0 + i) < cnt;
+
+            #pragma unroll
+            for (int hh = 0; hh < 2; hh++) {
+                int p0 = hh * 4;
+                int qsum[MMQ_TM][MMQ_TN], asum[MMQ_TM];
+                #pragma unroll
+                for (int i = 0; i < MMQ_TM; i++) {
+                    asum[i] = 0;
+                    #pragma unroll
+                    for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = 0;
+                }
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    int bv[MMQ_TN];
+                    #pragma unroll
+                    for (int j = 0; j < MMQ_TN; j++)
+                        bv[j] = (int)Bs[(tc * MMQ_TN + j) * MMQ_SP + p0 + p];
+                    #pragma unroll
+                    for (int i = 0; i < MMQ_TM; i++) {
+                        int av = (int)As[(r0 + i) * MMQ_SP + p0 + p];
+                        if (alive[i]) {
+                            asum[i] = idot4(av, 0x01010101, asum[i]);
+                            #pragma unroll
+                            for (int j = 0; j < MMQ_TN; j++)
+                                qsum[i][j] = idot4(av, bv[j], qsum[i][j]);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int i = 0; i < MMQ_TM; i++) {
+                    if (!alive[i]) continue;
+                    int slot = bslot[off + r0 + i];
+                    int arow = slot / nu;
+                    float sx = xs[(long)arow * nb + blk];
+                    #pragma unroll
+                    for (int j = 0; j < MMQ_TN; j++) {
+                        int c = tc * MMQ_TN + j;
+                        float bdl = (hh == 0) ? Bdl0[c] : Bdl1[c];
+                        float bmm = (hh == 0) ? Bmm0[c] : Bmm1[c];
+                        acc[i][j] += bdl * sx * (float)qsum[i][j]
+                                   - bmm * sx * (float)asum[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── 4. Write output ──
+    #pragma unroll
+    for (int i = 0; i < MMQ_TM; i++) {
+        int r = tr * MMQ_TM + i;
+        if (r >= cnt) continue;
+        int slot = bslot[off + r];
+        #pragma unroll
+        for (int j = 0; j < MMQ_TN; j++) {
+            int out_col = BT + tc * MMQ_TN + j;
+            if (out_col >= n_ff_exp) continue;
+            h[(long)slot * n_ff_exp + out_col] = acc[i][j];
+        }
+    }
+}
+
+// Elementwise activation for Q3_K MMQ output.
+extern "C" __global__ void moe_act_mul_q3k(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int n_ff, int n_ff_exp, int n_slots, int n_exp,
+    const int* __restrict__ eoff, const int* __restrict__ ecnt,
+    const int* __restrict__ bslot,
+    const float* __restrict__ route_wts, const float* __restrict__ dsc_dev,
+    int act_type, int weight_before
+) {
+    int e = blockIdx.x; int tid = threadIdx.x;
+    int cnt = ecnt[e]; if (cnt <= 0) return; int off = eoff[e];
+    float dsc = dsc_dev ? dsc_dev[e] : 1.0f;
+    for (int i = tid; i < cnt; i += blockDim.x) {
+        int slot = bslot[off + i];
+        float weight = route_wts[slot];
+        float wg = weight_before ? weight : 1.0f;
+        float wo = weight_before ? 1.0f : weight;
+        for (int col = 0; col < n_ff; col++) {
+            float g = src[(long)slot * n_ff_exp + col];
+            float u = src[(long)slot * n_ff_exp + col + n_ff];
+            g *= wg;
+            float a;
+            if (act_type == 0) { a = g / (1.0f + expf(-g)); }
+            else if (act_type == 1) { float x3 = g*g*g; a = 0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); }
+            else { a = 1.0f/(1.0f+expf(-g)); }
+            dst[(long)slot * n_ff + col] = a * u * wo * dsc;
+        }
+    }
+}
+
+"#;
+
+// ── MMQ wdec_* family (12 formats), IQ4 (2), legacy (3) ──
+const MOE_MMQ_WDEC: &str = r#"
+// ── MMQ (decode-once-reuse) all-expert MoE GEMM — wdec_* family ─────────────
+//
+// Covers ALL formats on the `wdec_*` seam: IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S
+// (R5 grid), IQ1_S/IQ1_M (R6), TQ1_0/TQ2_0/Q2_0 (R6 ternary), MXFP4/NVFP4 (R7 fp4).
+//
+// Each `wdec_##FMT(w, col, nb, blk, codes, &ws0, &ws1)` returns:
+//   - codes[32]: 32 signed int8 weight codes
+//   - ws0, ws1: half-scales for the first/second 16-code halves
+//
+// The codes are already signed, so the MMQ dp4a needs no isum/min term — just
+// two per-half scale multiplies. This is the same structure as Q8_0's MMQ but
+// with TWO independent half-scales per 32-block.
+//
+// Grid: (n_ff_exp / BN, n_exp), blockDim = 128. Bucket-sorted slots.
+#define GEN_MMQ_WDEC(FMT, SUFFIX) \
+extern "C" __global__ void __launch_bounds__(128, 1) \
+moe_mmq_up_i8_##SUFFIX( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ gw, const unsigned char* __restrict__ uw, \
+    float* __restrict__ h, int n_ff, int n_ff_exp, int n_slots, int n_exp, \
+    const int* __restrict__ eoff, const int* __restrict__ ecnt, \
+    const int* __restrict__ bslot, int nu, long gate_stride, long up_stride, int act_bytes) { \
+    int e = blockIdx.y; int col_tile = blockIdx.x; int BT = col_tile * MMQ_BN; \
+    if (BT >= n_ff_exp) return; \
+    int cnt = ecnt[e]; if (cnt <= 0) return; int off = eoff[e]; \
+    int tid = threadIdx.x; int tr = tid / (MMQ_BN / MMQ_TN); int tc = tid % (MMQ_BN / MMQ_TN); \
+    int nb = n_ff >> 5; \
+    __shared__ unsigned int As[MMQ_BM * MMQ_SP]; \
+    __shared__ unsigned int Bs[MMQ_BN * MMQ_SP]; \
+    __shared__ float Bdl0[MMQ_BN], Bdl1[MMQ_BN]; \
+    float acc[MMQ_TM][MMQ_TN]; \
+    for (int i = 0; i < MMQ_TM; i++) for (int j = 0; j < MMQ_TN; j++) acc[i][j] = 0.0f; \
+    const unsigned char* gate_w = gw + (long)e * gate_stride; \
+    for (int blk = 0; blk < nb; blk++) { \
+        for (int idx = tid; idx < MMQ_BM * MMQ_WPB; idx += 128) { \
+            int r = idx / MMQ_WPB; int p = idx % MMQ_WPB; \
+            int slot = (r < cnt) ? bslot[off + r] : 0; \
+            int arow = (r < cnt) ? (slot / nu) : 0; \
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)arow * act_bytes))[blk * MMQ_WPB + p]; \
+        } \
+        for (int idx = tid; idx < MMQ_BN; idx += 128) { \
+            int c = idx; int out_col = BT + c; \
+            signed char codes[32]; float ws0, ws1; \
+            wdec_##FMT(gate_w, out_col, nb, blk, codes, &ws0, &ws1); \
+            Bdl0[c] = ws0; Bdl1[c] = ws1; \
+            for (int p = 0; p < 4; p++) { \
+                Bs[c * MMQ_SP + p] = *(const unsigned int*)(codes + p*4); \
+                Bs[c * MMQ_SP + 4 + p] = *(const unsigned int*)(codes + 16 + p*4); \
+            } \
+        } \
+        __syncthreads(); \
+        { int r0 = tr * MMQ_TM; bool alive[MMQ_TM]; \
+        for (int i = 0; i < MMQ_TM; i++) alive[i] = (r0 + i) < cnt; \
+        for (int hh = 0; hh < 2; hh++) { \
+            int qsum[MMQ_TM][MMQ_TN]; \
+            for (int i = 0; i < MMQ_TM; i++) for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = 0; \
+            for (int p = 0; p < 4; p++) { \
+                int bv[MMQ_TN]; \
+                for (int j = 0; j < MMQ_TN; j++) bv[j] = (int)Bs[(tc*MMQ_TN+j)*MMQ_SP + hh*4 + p]; \
+                for (int i = 0; i < MMQ_TM; i++) { int av = (int)As[(r0+i)*MMQ_SP + hh*4 + p]; \
+                    if (alive[i]) for (int j = 0; j < MMQ_TN; j++) \
+                        qsum[i][j] = idot4(av, bv[j], qsum[i][j]); } \
+            } \
+            for (int i = 0; i < MMQ_TM; i++) { if (!alive[i]) continue; \
+                int slot = bslot[off + r0 + i]; int arow = slot / nu; \
+                float sx = xs[(long)arow * nb + blk]; \
+                for (int j = 0; j < MMQ_TN; j++) { int c = tc * MMQ_TN + j; \
+                    float bdl = (hh == 0) ? Bdl0[c] : Bdl1[c]; \
+                    acc[i][j] += bdl * sx * (float)qsum[i][j]; } } } \
+        } __syncthreads(); } \
+    for (int i = 0; i < MMQ_TM; i++) { int r = tr * MMQ_TM + i; if (r >= cnt) continue; \
+        int slot = bslot[off + r]; \
+        for (int j = 0; j < MMQ_TN; j++) { int out_col = BT + tc * MMQ_TN + j; \
+            if (out_col < n_ff_exp) h[(long)slot * n_ff_exp + out_col] = acc[i][j]; } } \
+} \
+extern "C" __global__ void moe_act_mul_##SUFFIX( \
+    const float* __restrict__ src, float* __restrict__ dst, \
+    int n_ff, int n_ff_exp, int n_slots, int n_exp, \
+    const int* __restrict__ eoff, const int* __restrict__ ecnt, \
+    const int* __restrict__ bslot, \
+    const float* __restrict__ route_wts, const float* __restrict__ dsc_dev, \
+    int act_type, int weight_before) { \
+    int e = blockIdx.x; int tid = threadIdx.x; int cnt = ecnt[e]; if (cnt <= 0) return; \
+    int off = eoff[e]; float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    for (int i = tid; i < cnt; i += blockDim.x) { \
+        int slot = bslot[off + i]; float w = route_wts[slot]; \
+        float wg = weight_before ? w : 1.0f; float wo = weight_before ? 1.0f : w; \
+        for (int col = 0; col < n_ff; col++) { \
+            float g = src[(long)slot * n_ff_exp + col]; \
+            float u = src[(long)slot * n_ff_exp + col + n_ff]; g *= wg; \
+            float a; if (act_type == 0) { a = g / (1.0f + expf(-g)); } \
+            else if (act_type == 1) { float x3 = g*g*g; a = 0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); } \
+            else { a = 1.0f/(1.0f+expf(-g)); } \
+            dst[(long)slot * n_ff + col] = a * u * wo * dsc; } } }
+
+// R5 grid quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S)
+GEN_MMQ_WDEC(iq2xxs, iq2xxs)
+GEN_MMQ_WDEC(iq2xs, iq2xs)
+GEN_MMQ_WDEC(iq2s, iq2s)
+GEN_MMQ_WDEC(iq3xxs, iq3xxs)
+GEN_MMQ_WDEC(iq3s, iq3s)
+// R6 IQ1 quants
+GEN_MMQ_WDEC(iq1s, iq1s)
+GEN_MMQ_WDEC(iq1m, iq1m)
+// R6 ternary quants (TQ1_0, TQ2_0, Q2_0)
+GEN_MMQ_WDEC(tq10, tq10)
+GEN_MMQ_WDEC(tq20, tq20)
+GEN_MMQ_WDEC(q20, q20)
+// R7 fp4 microscaling quants (MXFP4, NVFP4)
+GEN_MMQ_WDEC(mxfp4, mxfp4)
+GEN_MMQ_WDEC(nvfp4, nvfp4)
+
+// ── MMQ IQ4_NL / IQ4_XS (codebook 4-bit, signed codes, single 32-elem scale) ──
+#define GEN_MMQ_IQ4(SUFFIX, XS) \
+extern "C" __global__ void __launch_bounds__(128, 1) \
+moe_mmq_up_i8_##SUFFIX( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ gw, const unsigned char* __restrict__ uw, \
+    float* __restrict__ h, int n_ff, int n_ff_exp, int n_slots, int n_exp, \
+    const int* __restrict__ eoff, const int* __restrict__ ecnt, \
+    const int* __restrict__ bslot, int nu, long gate_stride, long up_stride, int act_bytes) { \
+    int e = blockIdx.y; int col_tile = blockIdx.x; int BT = col_tile * MMQ_BN; \
+    if (BT >= n_ff_exp) return; \
+    int cnt = ecnt[e]; if (cnt <= 0) return; int off = eoff[e]; \
+    int tid = threadIdx.x; int tr = tid / (MMQ_BN / MMQ_TN); int tc = tid % (MMQ_BN / MMQ_TN); \
+    int nb = n_ff >> 5; int spr = nb >> 3; \
+    __shared__ unsigned int As[MMQ_BM * MMQ_SP]; \
+    __shared__ unsigned int Bs[MMQ_BN * MMQ_SP]; \
+    __shared__ float Bdl[MMQ_BN]; \
+    float acc[MMQ_TM][MMQ_TN]; \
+    for (int i = 0; i < MMQ_TM; i++) for (int j = 0; j < MMQ_TN; j++) acc[i][j] = 0.0f; \
+    const unsigned char* gate_w = gw + (long)e * gate_stride; \
+    for (int blk = 0; blk < nb; blk++) { \
+        for (int idx = tid; idx < MMQ_BM * MMQ_WPB; idx += 128) { \
+            int r = idx / MMQ_WPB; int p = idx % MMQ_WPB; \
+            int slot = (r < cnt) ? bslot[off + r] : 0; \
+            int arow = (r < cnt) ? (slot / nu) : 0; \
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)arow * act_bytes))[blk * MMQ_WPB + p]; \
+        } \
+        for (int idx = tid; idx < MMQ_BN; idx += 128) { \
+            int c = idx; int out_col = BT + c; \
+            const unsigned char* b; float dsc; \
+            if (XS) { \
+                b = gate_w + ((long)out_col * spr + (blk >> 3)) * 136; \
+                int ib = blk & 7; \
+                unsigned int sh = (unsigned int)b[2] | ((unsigned int)b[3] << 8); \
+                int lo = (b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F; \
+                int hi = (int)((sh >> (2 * ib)) & 3u); \
+                dsc = rf16b(b) * (float)((lo | (hi << 4)) - 32); \
+                b += 8 + 16 * ib; \
+            } else { \
+                b = gate_w + ((long)out_col * nb + blk) * 18; \
+                dsc = rf16b(b); b += 2; \
+            } \
+            Bdl[c] = dsc; \
+            signed char code[32]; \
+            for (int p = 0; p < 16; p++) { \
+                code[p]     = (signed char)kv_iq4nl(b[p] & 0x0F); \
+                code[p+16] = (signed char)kv_iq4nl(b[p] >> 4); \
+            } \
+            for (int p = 0; p < 8; p++) Bs[c * MMQ_SP + p] = *(const unsigned int*)(code + p*4); \
+        } \
+        __syncthreads(); \
+        { int r0 = tr * MMQ_TM; bool alive[MMQ_TM]; \
+        for (int i = 0; i < MMQ_TM; i++) alive[i] = (r0 + i) < cnt; \
+        int qsum[MMQ_TM][MMQ_TN]; \
+        for (int i = 0; i < MMQ_TM; i++) for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = 0; \
+        for (int p = 0; p < 8; p++) { \
+            int bv[MMQ_TN]; for (int j = 0; j < MMQ_TN; j++) bv[j] = (int)Bs[(tc*MMQ_TN+j)*MMQ_SP+p]; \
+            for (int i = 0; i < MMQ_TM; i++) { int av = (int)As[(r0+i)*MMQ_SP+p]; \
+                if (alive[i]) for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = idot4(av, bv[j], qsum[i][j]); } \
+        } \
+        for (int i = 0; i < MMQ_TM; i++) { if (!alive[i]) continue; \
+            int slot = bslot[off + r0 + i]; int arow = slot / nu; \
+            float sx = xs[(long)arow * nb + blk]; \
+            for (int j = 0; j < MMQ_TN; j++) { int c = tc * MMQ_TN + j; \
+                acc[i][j] += Bdl[c] * sx * (float)qsum[i][j]; } } } \
+        __syncthreads(); } \
+    for (int i = 0; i < MMQ_TM; i++) { int r = tr * MMQ_TM + i; if (r >= cnt) continue; \
+        int slot = bslot[off + r]; \
+        for (int j = 0; j < MMQ_TN; j++) { int out_col = BT + tc * MMQ_TN + j; \
+            if (out_col < n_ff_exp) h[(long)slot * n_ff_exp + out_col] = acc[i][j]; } } \
+} \
+extern "C" __global__ void moe_act_mul_##SUFFIX( \
+    const float* __restrict__ src, float* __restrict__ dst, \
+    int n_ff, int n_ff_exp, int n_slots, int n_exp, \
+    const int* __restrict__ eoff, const int* __restrict__ ecnt, const int* __restrict__ bslot, \
+    const float* __restrict__ route_wts, const float* __restrict__ dsc_dev, \
+    int act_type, int weight_before) { \
+    int e = blockIdx.x; int tid = threadIdx.x; int cnt = ecnt[e]; if (cnt <= 0) return; \
+    int off = eoff[e]; float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    for (int i = tid; i < cnt; i += blockDim.x) { \
+        int slot = bslot[off + i]; float w = route_wts[slot]; \
+        float wg = weight_before ? w : 1.0f; float wo = weight_before ? 1.0f : w; \
+        for (int col = 0; col < n_ff; col++) { \
+            float g = src[(long)slot * n_ff_exp + col]; float u = src[(long)slot * n_ff_exp + col + n_ff]; g *= wg; \
+            float a; if (act_type == 0) { a = g/(1.0f+expf(-g)); } \
+            else if (act_type == 1) { float x3 = g*g*g; a = 0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); } \
+            else { a = 1.0f/(1.0f+expf(-g)); } \
+            dst[(long)slot * n_ff + col] = a * u * wo * dsc; } } }
+
+GEN_MMQ_IQ4(iq4nl, 0)
+GEN_MMQ_IQ4(iq4xs, 1)
+
+// ── MMQ legacy round quants: Q4_0, Q4_1, Q5_1 (min-carrying) ──
+//
+// Q4_0: 20 bytes/block = [d(2)][codes(16 padded)] — nibble codes, no min.
+// Q4_1/Q5_1: 24 bytes/block = [d(2)][min(2)][codes(16 padded)] + Q5_1 has qh at +20.
+#define GEN_MMQ_Q40(SUFFIX) \
+extern "C" __global__ void __launch_bounds__(128, 1) \
+moe_mmq_up_i8_##SUFFIX( \
+    const signed char* __restrict__ qx, const float* __restrict__ xs, \
+    const unsigned char* __restrict__ gw, const unsigned char* __restrict__ uw, \
+    float* __restrict__ h, int n_ff, int n_ff_exp, int n_slots, int n_exp, \
+    const int* __restrict__ eoff, const int* __restrict__ ecnt, \
+    const int* __restrict__ bslot, int nu, long gate_stride, long up_stride, int act_bytes) { \
+    int e = blockIdx.y; int col_tile = blockIdx.x; int BT = col_tile * MMQ_BN; \
+    if (BT >= n_ff_exp) return; \
+    int cnt = ecnt[e]; if (cnt <= 0) return; int off = eoff[e]; \
+    int tid = threadIdx.x; int tr = tid / (MMQ_BN / MMQ_TN); int tc = tid % (MMQ_BN / MMQ_TN); \
+    int nb = n_ff >> 5; \
+    __shared__ unsigned int As[MMQ_BM * MMQ_SP]; \
+    __shared__ unsigned int Bs[MMQ_BN * MMQ_SP]; \
+    __shared__ float Bdl[MMQ_BN]; \
+    float acc[MMQ_TM][MMQ_TN]; \
+    for (int i = 0; i < MMQ_TM; i++) for (int j = 0; j < MMQ_TN; j++) acc[i][j] = 0.0f; \
+    const unsigned char* gate_w = gw + (long)e * gate_stride; \
+    for (int blk = 0; blk < nb; blk++) { \
+        for (int idx = tid; idx < MMQ_BM * MMQ_WPB; idx += 128) { \
+            int r = idx / MMQ_WPB; int p = idx % MMQ_WPB; \
+            int slot = (r < cnt) ? bslot[off + r] : 0; \
+            int arow = (r < cnt) ? (slot / nu) : 0; \
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)arow * act_bytes))[blk * MMQ_WPB + p]; \
+        } \
+        for (int idx = tid; idx < MMQ_BN; idx += 128) { \
+            int c = idx; int out_col = BT + c; \
+            const unsigned char* b = gate_w + ((long)out_col * nb + blk) * 20; \
+            Bdl[c] = rf16b(b); \
+            const unsigned char* qs = b + 2; \
+            for (int p = 0; p < 8; p++) { \
+                unsigned int wd = 0u; \
+                for (int r = 0; r < 4; r++) { \
+                    unsigned int byte = (unsigned int)qs[p*2+r/2]; \
+                    wd |= ((byte >> (4*(r&1))) & 0x0Fu) << (r*8); \
+                } \
+                Bs[c * MMQ_SP + p] = wd; \
+            } \
+        } \
+        __syncthreads(); \
+        { int r0 = tr * MMQ_TM; bool alive[MMQ_TM]; \
+        for (int i = 0; i < MMQ_TM; i++) alive[i] = (r0 + i) < cnt; \
+        int qsum[MMQ_TM][MMQ_TN]; \
+        for (int i = 0; i < MMQ_TM; i++) for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = 0; \
+        for (int p = 0; p < 8; p++) { \
+            int bv[MMQ_TN]; for (int j = 0; j < MMQ_TN; j++) bv[j] = (int)Bs[(tc*MMQ_TN+j)*MMQ_SP+p]; \
+            for (int i = 0; i < MMQ_TM; i++) { int av = (int)As[(r0+i)*MMQ_SP+p]; \
+                if (alive[i]) for (int j = 0; j < MMQ_TN; j++) qsum[i][j] = idot4(av, bv[j], qsum[i][j]); } \
+        } \
+        for (int i = 0; i < MMQ_TM; i++) { if (!alive[i]) continue; \
+            int slot = bslot[off + r0 + i]; int arow = slot / nu; \
+            float sx = xs[(long)arow * nb + blk]; \
+            for (int j = 0; j < MMQ_TN; j++) { int c = tc * MMQ_TN + j; \
+                acc[i][j] += Bdl[c] * sx * (float)qsum[i][j]; } } } \
+        __syncthreads(); } \
+    for (int i = 0; i < MMQ_TM; i++) { int r = tr * MMQ_TM + i; if (r >= cnt) continue; \
+        int slot = bslot[off + r]; \
+        for (int j = 0; j < MMQ_TN; j++) { int out_col = BT + tc * MMQ_TN + j; \
+            if (out_col < n_ff_exp) h[(long)slot * n_ff_exp + out_col] = acc[i][j]; } } \
+} \
+extern "C" __global__ void moe_act_mul_##SUFFIX( \
+    const float* __restrict__ src, float* __restrict__ dst, \
+    int n_ff, int n_ff_exp, int n_slots, int n_exp, \
+    const int* __restrict__ eoff, const int* __restrict__ ecnt, const int* __restrict__ bslot, \
+    const float* __restrict__ route_wts, const float* __restrict__ dsc_dev, \
+    int act_type, int weight_before) { \
+    int e = blockIdx.x; int tid = threadIdx.x; int cnt = ecnt[e]; if (cnt <= 0) return; \
+    int off = eoff[e]; float dsc = dsc_dev ? dsc_dev[e] : 1.0f; \
+    for (int i = tid; i < cnt; i += blockDim.x) { \
+        int slot = bslot[off + i]; float w = route_wts[slot]; \
+        float wg = weight_before ? w : 1.0f; float wo = weight_before ? 1.0f : w; \
+        for (int col = 0; col < n_ff; col++) { \
+            float g = src[(long)slot * n_ff_exp + col]; float u = src[(long)slot * n_ff_exp + col + n_ff]; g *= wg; \
+            float a; if (act_type == 0) { a = g/(1.0f+expf(-g)); } \
+            else if (act_type == 1) { float x3 = g*g*g; a = 0.5f*g*(1.0f+tanhf(0.7978845608f*(g+0.044715f*x3))); } \
+            else { a = 1.0f/(1.0f+expf(-g)); } \
+            dst[(long)slot * n_ff + col] = a * u * wo * dsc; } } }
+
+GEN_MMQ_Q40(q40)
+GEN_MMQ_Q40(q41)
+GEN_MMQ_Q40(q51)
 
 "#;
 
