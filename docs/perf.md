@@ -90,6 +90,30 @@ slices at once.
 7. **Commit with the numbers** — before/after t/s and ratio in the commit
    message. Update the perf log in project memory/docs.
 
+## Model sourcing — Hugging Face cache + `infr pull`
+
+Models live in the Hugging Face cache (`~/.cache/huggingface/hub/`), which
+`infr` reads directly — no need to symlink or copy. Two ways to get a model
+there:
+
+```bash
+# Pull from huggingface.co/org/repo (picks the most-used quant):
+infr pull unsloth/Qwen3-0.6B-GGUF
+
+# Or place a .gguf anywhere in the cache manually:
+# ~/.cache/huggingface/hub/models--unsloth--<name>/snapshots/<hash>/model.gguf
+```
+
+`infr` and `llama-bench` resolve model paths normally, so a symlink in a
+per-campaign directory or the path straight from the cache both work:
+
+```bash
+infr bench ~/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/<hash>/Qwen3-0.6B-Q4_K_M.gguf -p 512 -n 0 -r 3
+```
+
+The `scripts/perf-sweep.sh` accepts any path — symlink a set of models into a
+single directory to keep the repeated sweep list short.
+
 ## Benchmarking & comparing
 
 The README "Benchmarking & profiling" section has the full command reference.
