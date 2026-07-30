@@ -739,6 +739,62 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         _ => None,
     }
 }
+
+/// FUSE_QUANT twin of [`native_mmv_mrow_variant_kernel_name`] — inline activation quantization,
+/// opt-in behind INFR_MMV_FUSE_QUANT=1. Q4_K/Q6_K only, m4=true + res combos only (decode).
+pub(crate) fn native_mmv_mrow_variant_fuseq_kernel_name(
+    dtype: infr_core::DType,
+    o4: bool,
+    _m4: bool,
+    res: bool,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match (dtype, o4, res) {
+        (Q4K, false, false) => "native_mmv_mrow_q4k_m4_fuseq",
+        (Q4K, true, false) => "native_mmv_mrow_q4k_o4_m4_fuseq",
+        (Q4K, false, true) => "native_mmv_mrow_q4k_m4_res_fuseq",
+        (Q4K, true, true) => "native_mmv_mrow_q4k_o4_m4_res_fuseq",
+        (Q6K, false, false) => "native_mmv_mrow_q6k_m4_fuseq",
+        (Q6K, true, false) => "native_mmv_mrow_q6k_o4_m4_fuseq",
+        (Q6K, false, true) => "native_mmv_mrow_q6k_m4_res_fuseq",
+        (Q6K, true, true) => "native_mmv_mrow_q6k_o4_m4_res_fuseq",
+        _ => return None,
+    })
+}
+
+/// FUSE_QUANT twin of [`native_mmv_mrow_variant_spv`] — kernel-cache name + SPIR-V for the
+/// inline-activation-quantization variants. Q4_K/Q6_K only, m4+res combos only (decode).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_mrow_variant_fuseq_spv(
+    dtype: infr_core::DType,
+    o4: bool,
+    _m4: bool,
+    res: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, o4, res) {
+        (Q4K, false, false) => v!("native_mmv_mrow_q4k_m4_fuseq"),
+        (Q4K, true, false) => v!("native_mmv_mrow_q4k_o4_m4_fuseq"),
+        (Q4K, false, true) => v!("native_mmv_mrow_q4k_m4_res_fuseq"),
+        (Q4K, true, true) => v!("native_mmv_mrow_q4k_o4_m4_res_fuseq"),
+        (Q6K, false, false) => v!("native_mmv_mrow_q6k_m4_fuseq"),
+        (Q6K, true, false) => v!("native_mmv_mrow_q6k_o4_m4_fuseq"),
+        (Q6K, false, true) => v!("native_mmv_mrow_q6k_m4_res_fuseq"),
+        (Q6K, true, true) => v!("native_mmv_mrow_q6k_o4_m4_res_fuseq"),
+        _ => None,
+    }
+}
 /// SPIR-V (kernel-cache name + words) for [`native_mmv_mrow_m16_kernel_name`]'s pick — the rows 9..=16
 /// tier; the sole weight build. Production dispatches it via
 /// [`crate::recorder::Recorder::linear_mmv_mrow`].

@@ -240,6 +240,9 @@ cfg_struct! {
         mmv_mw: Option<bool> = None,
         /// `INFR_MMV_MW_WARPS`.
         mmv_mw_warps: Option<usize> = None,
+        /// `INFR_MMV_FUSE_QUANT` — fuse the per-Linear `quant_q8` dispatch into the decode
+        /// GEMV kernel (inline f32→int8 quantization per 32-block). Q4_K/Q6_K only, opt-in.
+        mmv_fuse_quant: bool = false,
         /// `INFR_NO_MROW` (inverted).
         mrow: bool = true,
         /// `INFR_NO_MROW16` (inverted).

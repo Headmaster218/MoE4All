@@ -1101,6 +1101,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_COOPMAT_BDA",
         "INFR_KV_INLINE",
         "INFR_MMV_DECODE",
+        "INFR_MMV_FUSE_QUANT",
         "INFR_MMV_MW",
         "INFR_MMV_MW_WARPS",
         "INFR_MROWS_ATTN",

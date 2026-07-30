@@ -3542,6 +3542,59 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// FUSE_QUANT variant of [`Self::linear_mmv_mrow`] — reads f32 activations directly and
+    /// quantizes per 32-block inline, saving the separate `quant_q8` dispatch. Same push layout
+    /// and BDA weight convention, but bindings are reduced (no qa/dact/sact buffers).
+    /// Opt-in behind INFR_MMV_FUSE_QUANT=1; Q4_K/Q6_K only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mrow_fuseq(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer, // [rows, in_f] f32 activations
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        debug_assert!(
+            (1..=4).contains(&rows),
+            "FUSE_QUANT is decode-only (rows<=4)"
+        );
+        debug_assert!(
+            residual.is_none() || rows == 1,
+            "fused residual is decode-only (rows=1)"
+        );
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
+        let o4 = in_f < 2048 && self.vk().mmv_o4;
+        let m4 = rows <= 4;
+        let res = residual.is_some();
+        let (name, spv) = crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, m4, res)
+            .expect("FUSE_QUANT SPIR-V");
+        let nbind: usize = if res { 3 } else { 2 };
+        let k = self.be.kernel(name, spv, nbind, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
+        let mut bufs = vec![Self::vkb(x)];
+        if let Some(r) = residual {
+            bufs.push(Self::vkb(r));
+        }
+        bufs.push(Self::vkb(y));
+        // FILLER: the fused kernel has only 2-3 bindings but the BDA-read weight's SSBO slot
+        // (binding 0) must still be a legal descriptor. x is already at binding 0 — ok.
+        self.dispatch_wide(k, &bufs, 1, &push, groups);
+    }
+
     /// Native-block dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_native(

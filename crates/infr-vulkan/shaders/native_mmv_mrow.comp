@@ -53,14 +53,31 @@ layout(push_constant) uniform PC {
 // int8 activations as uvec4 (in_f % 32 == 0 -> every sub-block is two aligned uvec4s): 2 wide
 // loads per (row, sub-block) instead of 8 scalar u32 ones - the inner loop is load-issue heavy
 // (8 qa loads + 8 dp4a per row per output).
+#ifdef FUSE_QUANT
+// Fused activation quantization: read f32 activations directly (binding 0), quantize per 32-block
+// inline — no separate `quant_q8` dispatch, no `dact`/`sact` scratch buffers. Binding 0 replaces
+// bindings 1-3; bindings 4+5 shift left (residual->1, y->2). The recorder passes the same buffer
+// for the unused slots so the binding count stays fixed.
+layout(binding = 0) readonly buffer ABuf { float a[]; }; // [m, k]
+#else
 layout(binding = 1) readonly buffer QA { uvec4 qa4[]; };        // int8 activations [m, in_f/16]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [m, nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [m, nblk]
+#endif
 #ifdef USE_RES
+#ifdef FUSE_QUANT
+layout(binding = 1) readonly buffer RB2 { float r_buf[]; };     // residual [out_f] — rows=1 only
+layout(binding = 2) buffer YB { float y_buf[]; };
+#else
 layout(binding = 4) readonly buffer RB2 { float r_buf[]; };     // residual [out_f] — rows=1 only
 layout(binding = 5) buffer YB { float y_buf[]; };
+#endif
+#else
+#ifdef FUSE_QUANT
+layout(binding = 1) buffer YB { float y_buf[]; };
 #else
 layout(binding = 4) buffer YB { float y_buf[]; };
+#endif
 #endif
 
 // Row-tile cap: -DMRV=4 builds the rows<=4 specialization (half the dead per-sub-block row
@@ -549,8 +566,34 @@ void wdec2k(uint gelem, out uint qp[8], out float dl0, out float ml0, out float 
 }
 #endif
 
+#ifdef FUSE_QUANT
+// Inline per-32-block symmetric int8 activation quantization: read 32 f32 elements, compute amax,
+// quantize to int8, output packed words aw[8] and per-block da/sa. Same numerics as quant_q8.comp
+// (amax/127 scale, round-to-nearest, clamp [−127,127], sa = Σ(d·q)). Shared by OUTS4 and non-OUTS4.
+void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
+    float amax = 0.0;
+    float vals[32];
+    for (uint i = 0u; i < 32u; i++) {
+        float v = a[row * pc.in_f + s * 32u + i];
+        vals[i] = v;
+        amax = max(amax, abs(v));
+    }
+    da = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / da : 0.0;
+    sa = 0.0;
+    for (uint j = 0u; j < 8u; j++) {
+        int packed = 0;
+        for (uint b = 0u; b < 4u; b++) {
+            int q = clamp(int(round(vals[j * 4u + b] * inv)), -127, 127);
+            packed |= (q & 0xFF) << (b * 8u);
+            sa += da * float(q);
+        }
+        aw[j] = packed;
+    }
+}
+#endif
+
 #ifdef OUTS4
-// Small-in_f shape (-DOUTS4, host-gated to in_f < 2048): 4 outputs × 16 K-lanes per workgroup
 // (grid = ceil(out_f/4)). The 2-output layout leaves 64 − nsub lanes IDLE when nsub < 64 (E2B's
 // in_f=1536 gate_up: 48 sub-blocks → 25% of the wg dead, one loop iteration); splitting the wg
 // 4×16 keeps every lane on a sub-block. Reduction: shared tree over each output's 16 lanes.
@@ -581,11 +624,18 @@ void main() {
 #endif
         for (uint r = 0u; r < MR; r++) {
             if (r < pc.rows) {
+#ifdef FUSE_QUANT
+                int aw[8]; float da; float sa;
+                fuse_quant(r, s, aw, da, sa);
+                uvec4 a0 = uvec4(uint(aw[0]), uint(aw[1]), uint(aw[2]), uint(aw[3]));
+                uvec4 a1 = uvec4(uint(aw[4]), uint(aw[5]), uint(aw[6]), uint(aw[7]));
+#else
                 float da = float(dact[r * nsub + s]);
                 float sa = float(sact[r * nsub + s]);
                 uint qb = r * in_fq + s * 2u;
                 uvec4 a0 = qa4[qb];
                 uvec4 a1 = qa4[qb + 1u];
+#endif
 #ifdef ARM_SINGLE_DP
                 int dp = 0;
                 dp = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dp);
@@ -688,6 +738,10 @@ void main() {
 #endif
         for (uint r = 0u; r < MR; r++) {
             if (r < pc.rows) {
+#ifdef FUSE_QUANT
+                int aw[8]; float da; float sa;
+                fuse_quant(r, s, aw, da, sa);
+#else
                 float da = float(dact[r * nsub + s]);
                 float sa = float(sact[r * nsub + s]);
                 uint qb = r * in_fq + s * 2u;
@@ -695,6 +749,7 @@ void main() {
                 uvec4 av1 = qa4[qb + 1u];
                 int aw[8] = int[8](int(av0.x), int(av0.y), int(av0.z), int(av0.w),
                                    int(av1.x), int(av1.y), int(av1.z), int(av1.w));
+#endif
 #ifdef ARM_SINGLE_DP
                 int dp0 = 0; int dp1 = 0;
                 for (uint j = 0u; j < 8u; j++) {

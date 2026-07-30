@@ -220,6 +220,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ the vendor default.
     v.mmv_mw = get("INFR_MMV_MW").map(|s| Some(s != "0"));
     v.mmv_mw_warps = opt_num(get, "INFR_MMV_MW_WARPS");
+    v.mmv_fuse_quant = presence(get, "INFR_MMV_FUSE_QUANT");
     v.mrow = presence_inv(get, "INFR_NO_MROW");
     v.mrow16 = presence_inv(get, "INFR_NO_MROW16");
     v.f32_mrow = presence_inv(get, "INFR_NO_F32_MROW");

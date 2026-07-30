@@ -181,6 +181,7 @@ knobs! {
     "INFR_NO_MMV_O4"        => "kernels.vulkan.mmv_o4",         PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_MW"           => "kernels.vulkan.mmv_mw",         TriState,    Ignored, "0",  migrated;
     "INFR_MMV_MW_WARPS"     => "kernels.vulkan.mmv_mw_warps",   Int,         Ignored, "4",  migrated;
+    "INFR_MMV_FUSE_QUANT"   => "kernels.vulkan.mmv_fuse_quant", Presence,    Ignored, "1",  migrated;
     "INFR_NO_MROW"          => "kernels.vulkan.mrow",           PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MROW16"        => "kernels.vulkan.mrow16",         PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_F32_MROW"      => "kernels.vulkan.f32_mrow",       PresenceInv, Ignored, "1",  migrated;

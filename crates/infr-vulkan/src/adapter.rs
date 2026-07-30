@@ -1161,6 +1161,12 @@ fn lower_op(
                     if let Some(warps) =
                         mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
                     {
+                        // FUSE_QUANT opt-in: inline activation quantization, skip the
+                        // separate quant_q8 dispatch.
+                        if be_.cfg().kernels.vulkan.mmv_fuse_quant {
+                            rec.linear_mmv_mrow_fuseq(dt, w, 0, xb, Some(rr), yf, 1, in_f, out_f);
+                            return Ok(());
+                        }
                         let nblk = in_f / 32;
                         let qa = pooled(pool, be_, "mmv_qa", in_f)?;
                         let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
@@ -1737,6 +1743,12 @@ fn lower_op(
                     None
                 };
                 if let Some(warps) = mw {
+                    // FUSE_QUANT opt-in: inline activation quantization, skip the
+                    // separate quant_q8 dispatch.
+                    if be_.cfg().kernels.vulkan.mmv_fuse_quant {
+                        rec.linear_mmv_mrow_fuseq(dt, w, w_off, xb, None, y, 1, in_f, out_f);
+                        return Ok(());
+                    }
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmv_qa", in_f)?;
                     let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;

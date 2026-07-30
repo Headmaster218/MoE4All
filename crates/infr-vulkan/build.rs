@@ -1740,6 +1740,63 @@ fn main() {
             "native_mmv_mrow_q5k_m16",
             &["-DFMT_Q5K", "-DMRV=16"],
         ),
+        // FUSE_QUANT variants — inline the activation quantization into the GEMV kernel,
+        // saving the separate quant_q8 dispatch. Opt-in behind INFR_MMV_FUSE_QUANT=1.
+        // Decode only (m4=true, rows<=4); Q4_K/Q6_K only (the two dtypes on the decode
+        // int8 default set that use this kernel). m4+o4+res combos; no non-m4 or non-res
+        // variants needed (decode always sets m4=true, and res is for the fused-add peephole).
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_m4_fuseq",
+            &["-DFMT_Q4K", "-DMRV=4", "-DFUSE_QUANT"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_o4_m4_fuseq",
+            &["-DFMT_Q4K", "-DOUTS4", "-DMRV=4", "-DFUSE_QUANT"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_m4_res_fuseq",
+            &["-DFMT_Q4K", "-DMRV=4", "-DFUSE_QUANT", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_o4_m4_res_fuseq",
+            &[
+                "-DFMT_Q4K",
+                "-DOUTS4",
+                "-DMRV=4",
+                "-DFUSE_QUANT",
+                "-DUSE_RES",
+            ],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_m4_fuseq",
+            &["-DFMT_Q6K", "-DMRV=4", "-DFUSE_QUANT"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_o4_m4_fuseq",
+            &["-DFMT_Q6K", "-DOUTS4", "-DMRV=4", "-DFUSE_QUANT"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_m4_res_fuseq",
+            &["-DFMT_Q6K", "-DMRV=4", "-DFUSE_QUANT", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_o4_m4_res_fuseq",
+            &[
+                "-DFMT_Q6K",
+                "-DOUTS4",
+                "-DMRV=4",
+                "-DFUSE_QUANT",
+                "-DUSE_RES",
+            ],
+        ),
         // LEGACY 32-BLOCK int8 mrow tier — Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL. The dp4a *GEMM*
         // (native_gemm_mmq_*) has covered these for a while; the dp4a *GEMV* did not, so decode and
         // small-m prefill fell to the f32 dequant path for every non-k-quant integer file. Their
