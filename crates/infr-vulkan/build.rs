@@ -2593,6 +2593,13 @@ fn main() {
             "native_gemm_warp_q4k_n128_ag",
             &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL"],
         ),
+        // BK=32 NARROW_N measurement variant — halves per-stage shared memory
+        // (10 KB vs 18 KB) and doubles barriers. Hypothesized higher occupancy.
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_ag_bk32",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL", "-DBK32"],
+        ),
         (
             "native_gemm_warp",
             "native_gemm_warp_q4k_sk_ag",
