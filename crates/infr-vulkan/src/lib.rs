@@ -1930,7 +1930,6 @@ impl VulkanBackend {
         // (min=8 SKUs still get 16, never 8 — the kernels' lane math is only built for 16/32).
         // Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default kernel/pipeline
         // set there is byte-identical to before this field existed.
-        let vendor_intel = props.vendor_id == 0x8086;
         let sg_default = if subgroup_min <= 16 {
             16u32.max(subgroup_min)
         } else {
@@ -2000,7 +1999,6 @@ impl VulkanBackend {
             subgroup_min,
             subgroup_max,
             sg_pref,
-            vendor_intel,
             integrated,
             compute_units,
             buffer_device_address: has_bda,

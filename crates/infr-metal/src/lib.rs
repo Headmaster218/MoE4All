@@ -350,7 +350,6 @@ impl Backend for MetalBackend {
             subgroup_min: 0,
             subgroup_max: 0,
             sg_pref: 0, // Vulkan-only shader-pick field; Metal exec arms pick their own kernels
-            vendor_intel: false,
             // Apple GPUs ARE integrated in the memory sense (`unified_memory` below says so), but
             // `integrated` here means "submits must stay under a GPU watchdog TDR" — the Vulkan/
             // amdgpu `gfx`-ring reset this guards against. Metal has no equivalent for compute and

@@ -469,7 +469,6 @@ impl Backend for CpuBackend {
             subgroup_min: 0,
             subgroup_max: 0,
             sg_pref: 0, // no subgroup pinning on the scalar interpreter
-            vendor_intel: false,
             // Device-class fields: there is no GPU here, so no watchdog and nothing to bound.
             // (`integrated` means "an iGPU whose submits must stay under a TDR" — NOT "shares
             // system memory", which is what `unified_memory` below already says.)

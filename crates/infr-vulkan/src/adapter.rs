@@ -5915,12 +5915,10 @@ mod tests {
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
         let amd = infr_core::backend::Capabilities {
             i8_dot: true,
-            vendor_intel: false,
             ..Default::default()
         };
         let intel = infr_core::backend::Capabilities {
             i8_dot: true,
-            vendor_intel: true,
             ..Default::default()
         };
         // `kernels.vulkan.mmv_mw`, the tri-state (§10.3): `None` = unset (the shipping default),
