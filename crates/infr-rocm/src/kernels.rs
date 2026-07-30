@@ -264,6 +264,7 @@ const HIP_PARTS: &[&str] = &[
     MOE_MMQ_Q4K,
     SAMPLE_TOP_K,
     ARGMAX_PROB,
+    E2B_GATE,
 ];
 
 // One BLOCK per row (grid.x = rows, blockDim.x = RMS_BLOCK). The sum-of-squares is a strided
@@ -395,6 +396,41 @@ extern "C" __global__ void linear_f16(
         }
         dst[row * out_f + o] = acc;
     }
+}
+"#;
+
+// E2B per-layer inp_gate: fused f32 GEMV + GELU activation × strided up-read.
+// `dst[r,o] = gelu(sum_k x[r,k] * w[o,k]) * up[up_off + r*up_stride + o]`.
+// Bit-identical to separate Linear(f32 → f16) + GatedAct(gelu, stride) — the only fusion is
+// the dispatch count (one kernel launch instead of two).
+// One thread per output element (rows * out_f); each thread serially computes the dot product
+// over in_f (same tiling as the `linear_f16` scalar fallback).
+const E2B_GATE: &str = r#"
+extern "C" __global__ void e2b_gate(
+    const float* __restrict__ x,      // [rows, in_f] f32
+    const __half* __restrict__ w,     // [out_f, in_f] f16 (dequantized)
+    const float* __restrict__ up,     // up buffer
+    float* __restrict__ dst,          // [rows, out_f] f32
+    int rows, int in_f, int out_f,
+    int up_off, int up_stride
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * out_f;
+    if (tid >= total) return;
+    int r = tid / out_f;
+    int o = tid % out_f;
+    float acc = 0.0f;
+    const float* xr = x + r * in_f;
+    const __half* wr = w + o * in_f;
+    for (int i = 0; i < in_f; i++) {
+        acc += xr[i] * __half2float(wr[i]);
+    }
+    // GELU activation (tanh approximation — matches the Vulkan `e2b_gate` shader and the
+    // existing `gated_act` act_type=1 path).
+    float x3 = acc * acc * acc;
+    float gelu = 0.5f * acc * (1.0f + tanhf(0.7978845608f * (acc + 0.044715f * x3)));
+    float u = up[up_off + r * up_stride + o];
+    dst[r * out_f + o] = gelu * u;
 }
 "#;
 
@@ -1862,6 +1898,48 @@ static __device__ __forceinline__ float q40kv_decode(const unsigned char* cache,
     return d * (float)(code - 8);
 }
 
+// Q4_1: 32 elements, 24 bytes/block. [d(2B)][min(2B)][codes(16B)]. value = d*code + min, code∈[0,15].
+static __device__ __forceinline__ float q41kv_decode(const unsigned char* cache, int idx) {
+    int blk = idx >> 5, within = idx & 31;
+    const unsigned char* b = cache + blk * 24;
+    union { unsigned short u; __half h; } cv;
+    cv.u = (unsigned short)b[0] | ((unsigned short)b[1] << 8);
+    float d = __half2float(cv.h);
+    cv.u = (unsigned short)b[2] | ((unsigned short)b[3] << 8);
+    float m = __half2float(cv.h);
+    int code = (within < 16) ? (b[4 + within] & 0x0F) : (b[4 + within - 16] >> 4);
+    return d * (float)code + m;
+}
+
+// Q5_0: 32 elements, 22 bytes/block. [d(2B)][ql(16B)][qh(4B)]. value = d*(code - 16), code∈[0,31].
+// ql = low nibble, qh = high bit (1 bit/element, packed as 8 bits/byte in bytes 18..21).
+static __device__ __forceinline__ float q50kv_decode(const unsigned char* cache, int idx) {
+    int blk = idx >> 5, within = idx & 31;
+    const unsigned char* b = cache + blk * 22;
+    union { unsigned short u; __half h; } cv;
+    cv.u = (unsigned short)b[0] | ((unsigned short)b[1] << 8);
+    float d = __half2float(cv.h);
+    int ql = (within < 16) ? (b[2 + within] & 0x0F) : (b[2 + within - 16] >> 4);
+    int qh = (b[18 + (within >> 3)] >> (within & 7)) & 1;
+    int code = (qh << 4) | ql;
+    return d * (float)(code - 16);
+}
+
+// Q5_1: 32 elements, 24 bytes/block. [d(2B)][min(2B)][ql(16B)][qh(4B)]. value = d*code + min.
+static __device__ __forceinline__ float q51kv_decode(const unsigned char* cache, int idx) {
+    int blk = idx >> 5, within = idx & 31;
+    const unsigned char* b = cache + blk * 24;
+    union { unsigned short u; __half h; } cv;
+    cv.u = (unsigned short)b[0] | ((unsigned short)b[1] << 8);
+    float d = __half2float(cv.h);
+    cv.u = (unsigned short)b[2] | ((unsigned short)b[3] << 8);
+    float m = __half2float(cv.h);
+    int ql = (within < 16) ? (b[4 + within] & 0x0F) : (b[4 + within - 16] >> 4);
+    int qh = (b[20 + (within >> 3)] >> (within & 7)) & 1;
+    int code = (qh << 4) | ql;
+    return d * (float)code + m;
+}
+
 extern "C" __global__ void attention_prefill_flash(
     const float* __restrict__ q,        // [rows, n_head, head_dim]
     const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] — f16 or Q8_0/Q4_0 (cast as needed)
@@ -1876,8 +1954,8 @@ extern "C" __global__ void attention_prefill_flash(
     int pos,            // absolute position of query row 0
     int mask_type,      // 0=Causal, 1=SlidingWindow, 2=Canvas
     int swa_window,
-    int k_dtype,        // 0=F16, 1=Q8_0, 2=Q4_0
-    int v_dtype,        // 0=F16, 1=Q8_0, 2=Q4_0
+    int k_dtype,        // 0=F16, 1=Q8_0, 2=Q4_0, 3=Q4_1, 4=Q5_0, 5=Q5_1
+    int v_dtype,        // 0=F16, 1=Q8_0, 2=Q4_0, 3=Q4_1, 4=Q5_0, 5=Q5_1
     int k_cap,          // total K buffer elements (for scale offset; same cap for V)
     int bc,             // keys per KV tile, <= 32 (one lane per key)
     int n_qtiles        // ceil(rows / br); blockIdx.x = head * n_qtiles + qtile
@@ -1971,13 +2049,16 @@ extern "C" __global__ void attention_prefill_flash(
                         ((uint)kh[5] << 16) | (uint)kh[4],
                         ((uint)kh[7] << 16) | (uint)kh[6]);
                 } else {
-                    // Q4_0 GGUF: decode eight elements into eight f16 packed as uint4.
+                    // k_dtype 2..5: Q4_0/Q4_1/Q5_0/Q5_1 GGUF block decoders.
                     unsigned short kh[8];
                     const unsigned char* kbytes = (const unsigned char*)k_cache;
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
                         long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
-                        kh[e] = __float2half(q40kv_decode(kbytes, (int)idx));
+                        if      (k_dtype == 2) kh[e] = __float2half(q40kv_decode(kbytes, (int)idx));
+                        else if (k_dtype == 3) kh[e] = __float2half(q41kv_decode(kbytes, (int)idx));
+                        else if (k_dtype == 4) kh[e] = __float2half(q50kv_decode(kbytes, (int)idx));
+                        else                    kh[e] = __float2half(q51kv_decode(kbytes, (int)idx));
                     }
                     kk = make_uint4(
                         ((uint)kh[1] << 16) | (uint)kh[0],
@@ -2001,13 +2082,16 @@ extern "C" __global__ void attention_prefill_flash(
                         ((uint)vh[5] << 16) | (uint)vh[4],
                         ((uint)vh[7] << 16) | (uint)vh[6]);
                 } else {
-                    // Q4_0 GGUF: decode eight elements into eight f16 packed as uint4.
+                    // v_dtype 2..5: Q4_0/Q4_1/Q5_0/Q5_1 GGUF block decoders.
                     unsigned short vh[8];
                     const unsigned char* vbytes = (const unsigned char*)v_cache;
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
                         long idx = ((long)j * n_kv + kv_h) * head_dim + d + e;
-                        vh[e] = __float2half(q40kv_decode(vbytes, (int)idx));
+                        if      (v_dtype == 2) vh[e] = __float2half(q40kv_decode(vbytes, (int)idx));
+                        else if (v_dtype == 3) vh[e] = __float2half(q41kv_decode(vbytes, (int)idx));
+                        else if (v_dtype == 4) vh[e] = __float2half(q50kv_decode(vbytes, (int)idx));
+                        else                    vh[e] = __float2half(q51kv_decode(vbytes, (int)idx));
                     }
                     vv = make_uint4(
                         ((uint)vh[1] << 16) | (uint)vh[0],

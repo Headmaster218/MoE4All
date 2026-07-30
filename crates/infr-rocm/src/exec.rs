@@ -14,7 +14,7 @@ use crate::kernels::Pipelines;
 use half::f16;
 use infr_core::backend::{Bindings, GraphPlan, Plan};
 use infr_core::error::Result;
-use infr_core::graph::{AttnMask, Graph, Op, TensorKind};
+use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant;
 use std::collections::{HashMap, HashSet};
@@ -1883,8 +1883,10 @@ struct DecodeFusion {
     /// F1d: `QkNormRope` op idx → the absorbed `WriteKv`'s target. The rope kernel writes the f16
     /// cache instead of its f32 `dst` scratch.
     kv: HashMap<usize, KvFuse>,
-    /// Op indices to elide entirely (the fused-away `RmsNorm` / `Add` / `WriteKv`).
+    /// Op indices to elide entirely (the fused-away `RmsNorm` / `Add` / `WriteKv` / `GatedAct`).
     skip: HashSet<usize>,
+    /// E2B per-layer inp_gate: Linear op index → elided GatedAct's payload.
+    e2b_gate: HashMap<usize, E2bGateFuse>,
 }
 
 /// The absorbed `WriteKv`'s target, resolved at plan time (F1d).
@@ -1899,6 +1901,16 @@ struct KvFuse {
     row: u32,
     /// Per-row elements in the cache (`= n_head * head_dim` of the rope, checked at plan time).
     stride: u32,
+}
+
+/// Fused E2B per-layer inp_gate: `Linear` (f32 weight, m ≤ 4) → `GatedAct` (Gelu, strided)
+/// collapsed into one `e2b_gate` dispatch. The GatedAct at `i+1` is elided; when `run_op`
+/// reaches the `Linear` at `i`, it dispatches `e2b_gate` with the up buffer pointers instead.
+#[derive(Clone, Copy)]
+struct E2bGateFuse {
+    up: TensorId,
+    up_off: u32,
+    up_stride: u32,
 }
 
 /// Weight-dtype predicate for BOTH dense decode fusions: a covered int8-decode GEMV format
@@ -1987,11 +1999,60 @@ fn decode_fusion(g: &Graph, engine: &infr_core::config::Config) -> DecodeFusion 
             }
         }
     }
+    // E2B per-layer inp_gate peephole: Linear(f32, m ≤ 4) → GatedAct(Gelu, strided up)
+    // collapses into one `e2b_gate` dispatch. The pattern only fires for E2B models
+    // where the weight is f32, m is small (decode or a micro-prefill), and the up buffer
+    // carries a per-row stride.
+    let mut e2b_gate = HashMap::new();
+    for i in 0..g.ops.len().saturating_sub(1) {
+        if skip.contains(&i) || skip.contains(&(i + 1)) {
+            continue;
+        }
+        let Op::Linear { weight, dst, m, .. } = g.ops[i] else {
+            continue;
+        };
+        if g.desc(weight).dtype != DType::F32 || m > 4 {
+            continue;
+        }
+        let Op::GatedAct {
+            gate,
+            up,
+            dst: ga_dst,
+            act,
+            up_off,
+            up_stride,
+            gate_stride,
+            gate_block_width,
+            ..
+        } = g.ops[i + 1]
+        else {
+            continue;
+        };
+        if act != Activation::Gelu
+            || gate != dst
+            || ga_dst != dst
+            || up_stride == 0
+            || gate_stride != 0
+            || gate_block_width != 0
+        {
+            continue;
+        }
+        e2b_gate.insert(
+            i,
+            E2bGateFuse {
+                up,
+                up_off,
+                up_stride,
+            },
+        );
+        skip.insert(i + 1);
+    }
     DecodeFusion {
         norm: plan.rmsnorm_linear,
         add,
         kv,
         skip,
+        e2b_gate,
     }
 }
 
@@ -2157,6 +2218,7 @@ impl infr_core::exec::OpDispatch for RocmDispatch<'_, '_, '_> {
             self.fusion.norm.get(&i).copied(),
             self.fusion.add.get(&i).copied(),
             self.fusion.kv.get(&i).copied(),
+            self.fusion.e2b_gate.get(&i).copied(),
         );
         if let Some(p) = self.prof.as_deref_mut() {
             p.end(self.ctx.stream);
@@ -2177,6 +2239,7 @@ fn run_op(
     norm_fuse: Option<(TensorId, TensorId, f32)>,
     add_fuse: Option<(TensorId, TensorId)>,
     kv_fuse: Option<KvFuse>,
+    e2b_fuse: Option<E2bGateFuse>,
 ) -> Result<()> {
     // F1b: the sibling-GEMV quant memo is valid only for the op IMMEDIATELY after the pass that
     // published it. Clearing it here and republishing it from the int8 GEMV branch alone means any
@@ -2693,6 +2756,37 @@ fn run_op(
                 if wt_staged {
                     weight_staged_done(ctx)?;
                 }
+            } else if let Some(f) = e2b_fuse {
+                // E2B per-layer inp_gate fusion: `e2b_gate` combines Linear(f32→f16)
+                // + GatedAct(gelu, stride) into one kernel dispatch. The up buffer
+                // is resolved here; w_off must be 0 (the peephole only fires when
+                // weight dtype is F32 with no concatenated upload).
+                let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
+                ctx.ensure_device(x, g, bindings)?;
+                ctx.ensure_device(f.up, g, bindings)?;
+                // F5 fully-overwritten: same one-thread-per-output tiling as `linear_f16`.
+                let dd = ctx.uninit_dev(m as usize * out_f as usize);
+                let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
+                let bu = ctx.dev[f.up.0 as usize].as_ref().unwrap();
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "e2b_gate",
+                    m * out_f,
+                    256,
+                    args![
+                        arg_ptr(bx.ptr),
+                        arg_ptr(wptr),
+                        arg_ptr(bu.ptr),
+                        arg_ptr(dd.ptr),
+                        arg_i32(m as i32),
+                        arg_i32(in_f as i32),
+                        arg_i32(out_f as i32),
+                        arg_i32(f.up_off as i32),
+                        arg_i32(f.up_stride as i32),
+                    ],
+                )?;
+                ctx.dev[dst.0 as usize] = Some(dd);
             } else {
                 let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
                 ctx.ensure_device(x, g, bindings)?;
@@ -3108,11 +3202,17 @@ fn run_op(
             let k_dtype = match g.desc(k_cache).dtype {
                 DType::Q8_0 => 1,
                 DType::Q4_0 => 2,
-                _ => 0, // F16 (or other: the inline path handles F16, Q8_0, Q4_0)
+                DType::Q4_1 => 3,
+                DType::Q5_0 => 4,
+                DType::Q5_1 => 5,
+                _ => 0, // F16 (or other: the inline path handles F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1)
             };
             let v_dtype = match g.desc(v_cache).dtype {
                 DType::Q8_0 => 1,
                 DType::Q4_0 => 2,
+                DType::Q4_1 => 3,
+                DType::Q5_0 => 4,
+                DType::Q5_1 => 5,
                 _ => 0,
             };
             let k_cap = g.desc(k_cache).shape[0] as i32;
