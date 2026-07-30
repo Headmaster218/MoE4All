@@ -507,9 +507,9 @@ cfg_struct! {
         a_global: bool = false,
         /// `INFR_ROCM_MMQ`: OPT-IN MMQ decode-once MoE GEMM for Q4_K gate/up
         /// (Slice S5). When set AND Q4_K format: dispatches `moe_mmq_up_i8_q4k`
-        /// instead of the id-indexed multi-slot kernel. Default OFF for A/B
-        /// measurement.
-        mmq: bool = false,
+        /// instead of the id-indexed multi-slot kernel. Default ON after +22.6% pp512
+        /// measurement on Qwen3-30B-A3B (957 vs 784 t/s).
+        mmq: bool = true,
     }
 }
 
