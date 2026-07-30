@@ -215,6 +215,9 @@ cfg_struct! {
         gemm_warp: bool = true,
         /// `INFR_GEMM_WIDE_TILE`.
         gemm_wide_tile: bool = false,
+        /// `INFR_GEMM_DIRECT_A` — fuse the store_f16 pass into the A_GLOBAL warp GEMM by
+        /// reading f32 activations directly and casting to f16 in As staging (opt-in).
+        gemm_direct_a: bool = false,
         /// `INFR_NO_SMALL_BM` (inverted).
         small_bm: bool = true,
         /// `INFR_NO_BM16` (inverted).

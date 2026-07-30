@@ -867,7 +867,16 @@ fn native_warp_gemm(
     // A_GLOBAL: convert A to f16 ONCE (a cheap cast-copy — the warp kernels rounded A to f16 in
     // their staging loop anyway, so numerics are identical) and let the warptiles coopMatLoad it
     // straight from global. Dropping the As stage shrinks LDS to Bs-only → higher occupancy.
-    let use_ag = out_f.is_multiple_of(128)
+    // INFR_GEMM_DIRECT_A=1: skip the store_f16 pass — the _direct kernel variants read f32
+    // activations directly and cast to f16 in As staging (saves one dispatch + barrier per GEMM
+    // at the cost of reintroducing As shared memory).
+    let direct_a = be_.cfg().kernels.vulkan.gemm_direct_a;
+    let use_direct = direct_a
+        && out_f.is_multiple_of(128)
+        && in_f.is_multiple_of(32)
+        && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some();
+    let use_ag = !use_direct
+        && out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
         && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
         && be_.cfg().kernels.vulkan.gemm_warp;
@@ -900,6 +909,8 @@ fn native_warp_gemm(
             splits,
             a16.is_some(),
         );
+    } else if use_direct {
+        rec.matmul_native_f32a(dt, xb, w_addr, w_off, out, m, in_f, out_f);
     } else if let Some(k16) = &a16 {
         rec.matmul_native_f16a(dt, pool[k16].as_ref(), w_addr, w_off, out, m, in_f, out_f);
     } else {

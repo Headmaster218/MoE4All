@@ -2849,6 +2849,74 @@ fn main() {
             "native_gemm_warp_q8_0_n128_ag_bm16",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM16"],
         ),
+        // A_DIRECT variants — eliminate the separate store_f16 dispatch by reading f32 activations
+        // directly and staging them to As with an f32→f16 cast. The same tile shapes as the n128_ag
+        // family (BM=64/32/16), but coopMatLoad from As instead of from global. Saves the dispatch
+        // + barrier per GEMM at the cost of As staging (shared memory + stage loop). Opt-in behind
+        // INFR_GEMM_DIRECT_A=1; the default A_GLOBAL path is unchanged.
+        // BM=64 (standard):
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_direct",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_DIRECT"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_direct",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_DIRECT"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_direct",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_DIRECT"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_direct",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_DIRECT"],
+        ),
+        // BM=32 (small-tile):
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_direct_bm32",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_DIRECT", "-DBM32"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_direct_bm32",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_DIRECT", "-DBM32"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_direct_bm32",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_DIRECT", "-DBM32"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_direct_bm32",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_DIRECT", "-DBM32"],
+        ),
+        // BM=16 (min-tile):
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_direct_bm16",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_DIRECT", "-DBM16"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_direct_bm16",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_DIRECT", "-DBM16"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_direct_bm16",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_DIRECT", "-DBM16"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_direct_bm16",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_DIRECT", "-DBM16"],
+        ),
         // 8x8x16-fragment `_cm8` builds — Intel Arc/ANV XMX, which enumerates f16 coopmat ONLY at
         // M=8,N=8,K=16 (no 16x16x16 config; all default coopmat kernels stay dark there). Runtime
         // selection requires the device to enumerate the 8x8x16 f16 shape AND `INFR_CM_8X8=1`

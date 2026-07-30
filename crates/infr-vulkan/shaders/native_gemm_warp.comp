@@ -140,7 +140,12 @@ layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint are
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 #endif
 #endif
-#ifdef A_GLOBAL
+#ifdef A_DIRECT
+// A read directly as f32 from the caller's activation buffer (no separate store_f16 pass):
+// staged to As with an f32→f16 cast, then coopMatLoad from As. Saves one dispatch + barrier
+// per GEMM at the cost of re-adding As shared memory and its stage loop.
+layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+#elif defined(A_GLOBAL)
 // A pre-converted to f16 by the caller (one store_f16 pass, padded to the row tile): A fragments
 // coopMatLoad straight from global — no As staging, no As LDS. LDS shrinks to Bs-only
 // (~20 KB → 3 workgroups/WGP instead of 2), which is the occupancy the f32-staging tile lacks.
@@ -153,7 +158,7 @@ layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF 
 #endif
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
-#ifndef A_GLOBAL
+#if !defined(A_GLOBAL) || defined(A_DIRECT)
 shared CMTYPE As[BM * SAK];
 #endif
 shared CMTYPE Bs[BN * SBK];
@@ -201,7 +206,7 @@ void main() {
 #else
     for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
 #endif
-#ifndef A_GLOBAL
+#if !defined(A_GLOBAL) || defined(A_DIRECT)
         for (uint idx = li; idx < BM * BK; idx += THREADS) {
             uint r = idx / BK;
             uint cc = idx % BK;
@@ -224,7 +229,10 @@ void main() {
         [[unroll]] for (uint kf = 0u; kf < BK; kf += CM_K) {
             coopmat<CMTYPE, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> af[CMS_M];
             [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
-#ifdef A_GLOBAL
+#if defined(A_DIRECT)
+                coopMatLoad(af[i], As, (warp_r * WM + i * CM_M) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+#elif defined(A_GLOBAL)
                 coopMatLoad(af[i], a, (wgRow + warp_r * WM + i * CM_M) * pc.k + k0 + kf, pc.k,
                             gl_CooperativeMatrixLayoutRowMajor);
 #else

@@ -2199,6 +2199,72 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// [`matmul_native_f16a`](Self::matmul_native_f16a) with f32 activations read directly — no
+    /// separate `store_f16` pass. The `_direct` kernel variants stage f32→f16 to As shared memory
+    /// and coopMatLoad from there. Same tile shapes as the n128_ag family (BM=64/32/16, BN=128,
+    /// BK=64). Requires `n%128==0`, `k%32==0`, and that the `_direct` SPIR-V exists for `dtype`
+    /// (`native_gemm_warp_n128_direct_kernel_name(dtype).is_some()`). Numerics: the f32→f16 cast
+    /// is the same rounding the old `store_f16` pass did, so the GEMM is bit-identical to the
+    /// store_f16 + n128_ag path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_native_f32a(
+        &self,
+        dtype: infr_core::DType,
+        a: &dyn Buffer, // [M, K] f32 activations (NOT pre-converted)
+        w_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        // Same tile-selection as the A_GLOBAL path: n128 always (wide_grid gate irrelevant here —
+        // the _direct variants are only n128, and wide_grid≥128 never fires at the m these hit).
+        let wide_grid = m.div_ceil(64) * (n / 256).max(1);
+        let use_wide = n.is_multiple_of(256) && wide_grid >= 128 && self.vk().gemm_wide_tile;
+        // Small-m batched prefill: same crossover constants as the A_GLOBAL path.
+        let small_bm = !use_wide && m <= DENSE_SMALL_TILE_MAX_M && self.vk().small_bm;
+        let bm16 = small_bm && m <= DENSE_SMALL_TILE_MAX_M16 && self.vk().bm16;
+        let bm16 = bm16
+            .then(|| crate::gemm::native_gemm_warp_n128_direct_bm16_kernel_name(dtype))
+            .flatten();
+        let bm32 = small_bm
+            .then(|| crate::gemm::native_gemm_warp_n128_direct_bm32_kernel_name(dtype))
+            .flatten();
+        let (name, bm): (&str, usize) = if let Some(name) = bm16 {
+            (name, 16)
+        } else if let Some(name) = bm32 {
+            (name, 32)
+        } else {
+            (
+                crate::gemm::native_gemm_warp_n128_direct_kernel_name(dtype)
+                    .expect("_direct kernel name"),
+                64,
+            )
+        };
+        self.label_gemm(name, m, k, n);
+        let (kname, kspv) = crate::gemm::native_gemm_spv(name);
+        let push_size: u32 = 24;
+        let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(bm) * (n / 128)) as u32;
+        self.dispatch(
+            kern,
+            // Binding 0 is the f32 activation buffer; binding 1 filler bound to a (inert, the
+            // weight is read by device address); binding 2 is the output.
+            &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
+            1,
+            &push[..push_size as usize],
+            groups,
+        );
+    }
+
     /// SPLIT-K narrow-warptile GEMM: `splits` k-partials into `partials` ([splits, mpad, n] f32),
     /// then the deterministic fixed-order reduce into `c`. The occupancy fix for narrow-n GEMMs
     /// with deep k (o/down projections: n = n_embd, k = 2-3·n_embd — 64 workgroups on a 96-wg

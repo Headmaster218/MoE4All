@@ -1537,6 +1537,53 @@ pub(crate) fn native_gemm_warp_n128_ag_bm16_kernel_name(
     })
 }
 
+/// Kernel-cache NAME for the A_DIRECT n128 warptile (NARROW_N + A_DIRECT, BM=64/32/16) — f32
+/// activations read directly, staged to As with f32→f16 cast. Same tile shapes as the n128_ag
+/// family; replaces the store_f16 + n128_ag dispatch pair. Opt-in behind INFR_GEMM_DIRECT_A=1.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_direct_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => "native_gemm_warp_q4k_n128_direct",
+        Q5K => "native_gemm_warp_q5k_n128_direct",
+        Q6K => "native_gemm_warp_q6k_n128_direct",
+        Q8_0 => "native_gemm_warp_q8_0_n128_direct",
+        _ => return None,
+    })
+}
+
+/// A_DIRECT BM=32 variant — see [`native_gemm_warp_n128_direct_kernel_name`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_direct_bm32_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => "native_gemm_warp_q4k_n128_direct_bm32",
+        Q5K => "native_gemm_warp_q5k_n128_direct_bm32",
+        Q6K => "native_gemm_warp_q6k_n128_direct_bm32",
+        Q8_0 => "native_gemm_warp_q8_0_n128_direct_bm32",
+        _ => return None,
+    })
+}
+
+/// A_DIRECT BM=16 variant — see [`native_gemm_warp_n128_direct_kernel_name`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_direct_bm16_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => "native_gemm_warp_q4k_n128_direct_bm16",
+        Q5K => "native_gemm_warp_q5k_n128_direct_bm16",
+        Q6K => "native_gemm_warp_q6k_n128_direct_bm16",
+        Q8_0 => "native_gemm_warp_q8_0_n128_direct_bm16",
+        _ => return None,
+    })
+}
+
 /// Kernel-cache NAME for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
