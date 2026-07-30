@@ -649,42 +649,26 @@ fn mmv_mw_choice(
     if !in_f.is_multiple_of(32) || in_f * out_f < (2usize << 20) {
         return None;
     }
-    // Default WARPS is per-(vendor, dtype): Intel keeps 8 (pre-existing, measured good for all four
-    // Intel dtypes). AMD Q4_K defaults to 1 — the dispatch-shape sweep winner (README footnote 3:
-    // llama.cpp's rm_kq_int=1 shape, one output row per workgroup / single-subgroup reduce, beats
-    // {4,8} and beats the f32 path). AMD Q2_K stays at 8, its already-measured/shipped shape — not
-    // re-swept here, so left untouched rather than assumed to share Q4_K's optimum.
-    let default_warps = if caps.vendor_intel || dt != infr_core::DType::Q4K {
-        8u32
-    } else {
+    // Default WARPS is per-dtype: Q4_K defaults to 1 (llama.cpp's rm_kq_int=1 shape — one output
+    // row per workgroup / single-subgroup reduce, the dispatch-shape sweep winner on AMD). Every
+    // other dtype defaults to 8. Q4_K warps=1 beats {4,8} and beats the f32 path. Overrideable
+    // via INFR_MMV_MW_WARPS for A/B.
+    let default_warps = if dt == infr_core::DType::Q4K {
         1u32
+    } else {
+        8u32
     };
     let warps = vk
         .mmv_mw_warps
         .and_then(|w| u32::try_from(w).ok())
         .unwrap_or(default_warps);
-    // SPIR-V existence gate — per ROUTE, not one-size-fits-all: AMD dispatches
-    // `linear_mmv_mrow(rows=1)` (see [`unified_mmv_row1`]) and never touches `native_mmv_mw.comp`,
-    // so gating AMD on the mmv_mw build set would make an mrow-only dtype permanently
-    // decode-INELIGIBLE for want of an Intel kernel it would never dispatch. That is exactly the
-    // legacy 32-block set (Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL): `native_mmv_mrow` builds, no mmv_mw
-    // ones (Intel's decode kernel was never extended to them — no Intel GPU here to measure on).
-    //
-    // Intel keeps the mmv_mw gate. sg16=false probe: the SG=16 twin set is identical per (dtype,
-    // res, warps), so base existence is the correct gate on every device. {1,2,16} are Q4_K-only
-    // dispatch-shape sweep builds (see README footnote 3 / native_mmv_mw_kernel_name) — not part of
-    // the shipped {4,8} policy set for Q6_K/Q2_K/Q3_K, only reachable via INFR_MMV_MW_WARPS.
-    let have_spv = if unified_mmv_row1(caps) {
-        // Same (o4, m4=true, res=false) probe the rows=1 dispatch resolves — see
-        // `Recorder::linear_mmv_mrow`'s variant selection (decode is always m4). This probes the
-        // NON-residual build only; the o4/m4 twins exist for every plain-build dtype, but the `_res`
-        // twin does NOT (Iq4Xs has none — see `native_mmv_mrow_res_supported`), so a residual decode
-        // must consult that predicate, not assume a plain build implies a res build.
-        crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some()
-    } else {
-        matches!(warps, 1 | 2 | 4 | 8 | 16)
-            && crate::gemm::native_mmv_mw_kernel_name(dt, false, warps, false).is_some()
-    };
+    // SPIR-V existence gate: unified rows=1 path probes the mrow variant for every dtype. All
+    // dtypes in the unified decode set have an mrow build; the mmv_mw route is retired (Intel
+    // specific dtypes Q3_K/Q5_K that had only mmv_mw builds are no longer in the default set,
+    // and INFR_MMV_MW=1 still force-opt-in them — they just fall through here as None since
+    // they lack mrow builds).
+    let have_spv =
+        crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some();
     have_spv.then_some(warps)
 }
 
