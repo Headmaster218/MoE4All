@@ -4247,12 +4247,6 @@ fn run_op(
                     let hqb = ctx.pool_buf((max_slots * nfu).max(1), false);
                     let hsb = ctx.pool_buf((max_slots * (nfu / 32) * 4).max(1), false);
                     let yb = ctx.pool_buf((max_slots * neu * 4).max(1), false);
-                    // S5: MMQ GEMM scratch — double the output columns (gate+up raw dots)
-                    let mmq_tmp = if use_mmq {
-                        Some(ctx.pool_buf((max_slots * nfu * 2 * 4).max(4), false))
-                    } else {
-                        None
-                    };
                     // ── S5: MMQ decode-once-reuse MoE GEMM (opt-in, Q4_K only) ──
                     // Each expert's weight column tile decoded ONCE into LDS and reused
                     // across all routing rows, eliminating per-wave re-decode overhead.
@@ -4341,8 +4335,11 @@ fn run_op(
                             )?;
                         }
                         if use_mmq {
-                            // S5: MMQ GEMM — one workgroup per (expert, column tile)
-                            let mmq_col_tiles = (n_ff_exp as u32 * 2).div_ceil(64); // BN=64
+                            // S5: MMQ GEMM — one workgroup per (expert, column tile).
+                            // Outputs raw gate+up dot products to hb (pre-activation), matching
+                            // what the existing quant/down pipeline expects — the down kernel
+                            // applies silu(gate)*up internally.
+                            let mmq_col_tiles = (n_ff_exp as u32).div_ceil(64); // BN=64
                             dispatch_grid(
                                 pipelines,
                                 ctx.stream,
@@ -4355,40 +4352,18 @@ fn run_op(
                                     arg_ptr(xsb.ptr),
                                     arg_ptr(gw_ptr),
                                     arg_ptr(uw_ptr),
-                                    arg_ptr(mmq_tmp.as_ref().unwrap().ptr),
-                                    arg_i32(n_ff_exp as i32),     // n_ff
-                                    arg_i32(n_ff_exp as i32 * 2), // n_ff_exp = n_ff * 2
+                                    arg_ptr(hb.ptr), // output: raw gate+up [n_slots, n_ff_exp]
+                                    arg_i32(ne as i32), // n_ff = intermediate FF dim (K)
+                                    arg_i32(n_ff_exp as i32), // n_ff_exp = combined gate+up output dim (N)
                                     arg_i32(n_slots as i32),
                                     arg_i32(nexp as i32),
                                     arg_ptr(eoff.as_ref().unwrap().ptr),
                                     arg_ptr(ecnt.as_ref().unwrap().ptr),
                                     arg_ptr(bslot.as_ref().unwrap().ptr),
+                                    arg_i32(nu as i32), // n_used (slots per token row)
                                     arg_i64(gate_bstride),
                                     arg_i64(up_bstride),
-                                    arg_i32(neu as i32), // act_bytes = ne (K dim)
-                                ],
-                            )?;
-                            // Elementwise activation + gate*up multiply → hb
-                            dispatch_1d(
-                                pipelines,
-                                ctx.stream,
-                                "moe_act_mul_q4k",
-                                nexp as u32,
-                                256,
-                                args![
-                                    arg_ptr(mmq_tmp.as_ref().unwrap().ptr),
-                                    arg_ptr(hb.ptr),
-                                    arg_i32(n_ff_exp as i32),     // n_ff
-                                    arg_i32(n_ff_exp as i32 * 2), // n_ff_exp = n_ff * 2
-                                    arg_i32(n_slots as i32),
-                                    arg_i32(nexp as i32),
-                                    arg_ptr(eoff.as_ref().unwrap().ptr),
-                                    arg_ptr(ecnt.as_ref().unwrap().ptr),
-                                    arg_ptr(bslot.as_ref().unwrap().ptr),
-                                    arg_ptr(wts_c),
-                                    arg_ptr(dsc_ptr),
-                                    arg_i32(at),
-                                    arg_i32(wb_flag),
+                                    arg_i32(neu as i32), // act_bytes = ne padded to 32
                                 ],
                             )?;
                         } else if batched {

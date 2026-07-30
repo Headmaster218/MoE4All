@@ -1374,7 +1374,7 @@ const STORE_Q8: &str = r#"
 //   src_off = base element offset into src (0 = start of src)
 extern "C" __global__ void store_q8(
     const float* __restrict__ src,
-    uint8_t* __restrict__ cache,
+    unsigned char* __restrict__ cache,
     int n,
     int off,
     int cap,
@@ -1400,7 +1400,7 @@ extern "C" __global__ void store_q8(
 
     // Planar code: byte at the element's global index.
     int elem = off + gid;
-    cache[elem] = (uint8_t)(q & 0xFF);
+    cache[elem] = (unsigned char)(q & 0xFF);
 
     // Lane 0 writes the per-block f16 scale into the scales region.
     if (t == 0) {
@@ -1408,8 +1408,8 @@ extern "C" __global__ void store_q8(
         int sb = cap + block * 2;              // scale byte offset
         union { unsigned short u; __half h; } sbits;
         sbits.h = __float2half(d);
-        cache[sb]     = (uint8_t)(sbits.u & 0xFF);
-        cache[sb + 1] = (uint8_t)(sbits.u >> 8);
+        cache[sb]     = (unsigned char)(sbits.u & 0xFF);
+        cache[sb + 1] = (unsigned char)(sbits.u >> 8);
     }
 }
 "#;
@@ -1425,7 +1425,7 @@ const STORE_KV_Q4_0: &str = r#"
 //   src_off = base element offset into src (0 = start of src)
 extern "C" __global__ void store_kv_q4_0(
     const float* __restrict__ src,
-    uint8_t* __restrict__ cache,
+    unsigned char* __restrict__ cache,
     int n,
     int off,
     int cap,
@@ -1455,7 +1455,7 @@ extern "C" __global__ void store_kv_q4_0(
     if (t < 16) {
         int block = off / 32 + blk;
         int byte_off = block * 18 + 2 + t;           // qs region
-        cache[byte_off] = (uint8_t)(code | (code_high << 4));
+        cache[byte_off] = (unsigned char)(code | (code_high << 4));
     }
 
     // Lane 0 writes the f16 scale d at the block header.
@@ -1464,8 +1464,8 @@ extern "C" __global__ void store_kv_q4_0(
         int byte_off = block * 18;
         union { unsigned short u; __half h; } sbits;
         sbits.h = __float2half(d);
-        cache[byte_off]     = (uint8_t)(sbits.u & 0xFF);
-        cache[byte_off + 1] = (uint8_t)(sbits.u >> 8);
+        cache[byte_off]     = (unsigned char)(sbits.u & 0xFF);
+        cache[byte_off + 1] = (unsigned char)(sbits.u >> 8);
     }
 }
 "#;
@@ -2230,9 +2230,9 @@ static __device__ __forceinline__ float attn_wmma_allsum32(float v) {
 }
 
 extern "C" __global__ void attention_prefill_flash_wmma(
-    const __half* __restrict__ q,      // [rows, n_head, head_dim] f16 (pre-converted)
-    const __half* __restrict__ k_cache, // [kv_len, n_kv, head_dim] f16
-    const __half* __restrict__ v_cache, // [kv_len, n_kv, head_dim] f16
+    const __half* __restrict__ q_h,    // [rows, n_head, head_dim] f16 (pre-converted)
+    const __half* __restrict__ k_h,    // [kv_len, n_kv, head_dim] f16
+    const __half* __restrict__ v_h,    // [kv_len, n_kv, head_dim] f16
     float* __restrict__ dst,            // [rows, n_head, head_dim]
     int rows,
     int kv_len,
@@ -2246,6 +2246,12 @@ extern "C" __global__ void attention_prefill_flash_wmma(
     int bc,             // unused — bc is fixed at ATTN_WMMA_BC
     int n_qtiles        // ceil(rows / ATTN_WMMA_BR); blockIdx.x = head * n_qtiles + qtile
 ) {
+    // Cast f16 buffers to __fp16 for WMMA fragment compatibility.
+    const __fp16* __restrict__ q = (const __fp16*)q_h;
+    const __fp16* __restrict__ k_cache = (const __fp16*)k_h;
+    const __fp16* __restrict__ v_cache = (const __fp16*)v_h;
+    // Reinterpret-cast helper for float→f16 conversion.
+    union { __half h; __fp16 f; } fp16x;
     int tid   = threadIdx.x;
     int lane  = tid & 31;
     int wave  = tid >> 5;
@@ -2312,12 +2318,12 @@ extern "C" __global__ void attention_prefill_flash_wmma(
             half16 a_frag;
             int arow = q_base + (lane & 15);
             if (arow < rows && !partial) {
-                const __half* qp = q + ((long)arow * n_head + h) * head_dim + d0;
+                const __fp16* qp = q + ((long)arow * n_head + h) * head_dim + d0;
                 #pragma unroll
                 for (int kk = 0; kk < 16; kk++) a_frag[kk] = qp[kk];
             } else {
                 #pragma unroll
-                for (int kk = 0; kk < 16; kk++) a_frag[kk] = __float2half(0.0f);
+                for (int kk = 0; kk < 16; kk++) a_frag[kk] = 0;
             }
 
             // B fragment: K[16 keys per group][16 dims], column-major.
@@ -2326,12 +2332,12 @@ extern "C" __global__ void attention_prefill_flash_wmma(
                 int j_key = key_start + g * 16 + (lane & 15);
                 half16 b_frag;
                 if (j_key < kv_len && j_key < j_hi && !partial) {
-                    const __half* kp = k_cache + ((long)j_key * n_kv + kv_h) * head_dim + d0;
+                    const __fp16* kp = k_cache + ((long)j_key * n_kv + kv_h) * head_dim + d0;
                     #pragma unroll
                     for (int kk = 0; kk < 16; kk++) b_frag[kk] = kp[kk];
                 } else {
                     #pragma unroll
-                    for (int kk = 0; kk < 16; kk++) b_frag[kk] = __float2half(0.0f);
+                    for (int kk = 0; kk < 16; kk++) b_frag[kk] = 0;
                 }
                 qk_acc[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
                     a_frag, b_frag, qk_acc[g]);
@@ -2405,7 +2411,7 @@ extern "C" __global__ void attention_prefill_flash_wmma(
             for (int u = 0; u < ATTN_WMMA_QPR; u++) l[u] += wj[u];
 
             // Weighted V accumulation: each lane reads V at its own dims.
-            const __half* vr = v_cache + ((long)j_key * n_kv + kv_h) * head_dim;
+            const __half* vr = (const __half*)v_cache + ((long)j_key * n_kv + kv_h) * head_dim;
             #pragma unroll
             for (int c = 0; c < npl; c++) {
                 int d = (c << 5) + lane;
@@ -7504,6 +7510,10 @@ extern "C" __global__ void wmma_f16_q4k_2x2(
     float* __restrict__ dst,           // f32 output [m, out_f]
     int m, int in_f, int out_f
 ) {
+    // Cast f16 activations to __fp16 for WMMA fragment compatibility.
+    const __fp16* __restrict__ Af = (const __fp16*)A;
+    // Reinterpret-cast helper for float→f16 conversion.
+    union { __half h; __fp16 f; } fp16x;
     int lane = threadIdx.x;
     int half = lane >> 4;             // 0 or 1 — which half of the 32-row tile this lane writes
     int r = lane & 15;                // 0..15 — lane's A row / B col within a 16×16 WMMA tile
@@ -7546,13 +7556,15 @@ extern "C" __global__ void wmma_f16_q4k_2x2(
                 for (int kk = 0; kk < 16; kk++) {
                     int code0 = hi ? (qbase[kk]      >> 4) : (qbase[kk]      & 0x0F);
                     int code1 = hi ? (qbase[kk + 16] >> 4) : (qbase[kk + 16] & 0x0F);
-                    b0_cn[cn][kk] = __float2half(wsc * (float)code0 + wmn);
-                    b1_cn[cn][kk] = __float2half(wsc * (float)code1 + wmn);
+                    fp16x.h = __float2half(wsc * (float)code0 + wmn);
+                    b0_cn[cn][kk] = fp16x.f;
+                    fp16x.h = __float2half(wsc * (float)code1 + wmn);
+                    b1_cn[cn][kk] = fp16x.f;
                 }
             } else {
                 for (int kk = 0; kk < 16; kk++) {
-                    b0_cn[cn][kk] = __float2half(0.0f);
-                    b1_cn[cn][kk] = __float2half(0.0f);
+                    b0_cn[cn][kk] = 0;
+                    b1_cn[cn][kk] = 0;
                 }
             }
         }
@@ -7566,13 +7578,13 @@ extern "C" __global__ void wmma_f16_q4k_2x2(
             if (arow < m) {
                 long aoff = (long)arow * in_f + koff;
                 for (int kk = 0; kk < 16; kk++) {
-                    a0_rm[rm][kk] = A[aoff + kk];
-                    a1_rm[rm][kk] = A[aoff + 16 + kk];
+                    a0_rm[rm][kk] = Af[aoff + kk];
+                    a1_rm[rm][kk] = Af[aoff + 16 + kk];
                 }
             } else {
                 for (int kk = 0; kk < 16; kk++) {
-                    a0_rm[rm][kk] = __float2half(0.0f);
-                    a1_rm[rm][kk] = __float2half(0.0f);
+                    a0_rm[rm][kk] = 0;
+                    a1_rm[rm][kk] = 0;
                 }
             }
         }
@@ -8527,8 +8539,9 @@ moe_mmq_up_i8_q4k(
     const int* __restrict__ eoff,           // [n_exp+1] offsets into sorted activations
     const int* __restrict__ ecnt,           // [n_exp] counts per expert
     const int* __restrict__ bslot,          // [n_slots] slot → global slot index
-    int gate_stride,                        // bytes per expert's gate slice
-    int up_stride,                          // bytes per expert's up slice
+    int nu,                                 // n_used — tokens routed per token (slots per token row)
+    long gate_stride,                       // bytes per expert's gate slice (64-bit: can exceed INT32_MAX at expert 127)
+    long up_stride,                         // bytes per expert's up slice
     int act_bytes                           // stride for activations (ne padded to 32)
 ) {
     int e = blockIdx.y;
@@ -8560,7 +8573,7 @@ moe_mmq_up_i8_q4k(
             acc[i][j] = 0.0f;
 
     const unsigned char* gate_w = gw + (long)e * gate_stride;
-    const unsigned char* up_w   = uw + (long)e * up_stride;
+    // up_w not used — fused gate+up combined bank, `gate_w` covers all columns.
 
     for (int blk = 0; blk < nb; blk++) {
 
@@ -8569,26 +8582,22 @@ moe_mmq_up_i8_q4k(
             int r = idx / MMQ_WPB;
             int p = idx % MMQ_WPB;
             int slot = (r < cnt) ? bslot[off + r] : 0;
-            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)slot * act_bytes))[blk * MMQ_WPB + p];
+            int arow = (r < cnt) ? (slot / nu) : 0;
+            As[r * MMQ_SP + p] = ((const unsigned int*)(qx + (long)arow * act_bytes))[blk * MMQ_WPB + p];
         }
 
         // ── 2. Decode weights: BN columns × sub-block scale/min + packed codes ──
         for (int idx = tid; idx < MMQ_BN; idx += MMQ_THREADS) {
             int c = idx;
             int out_col = BT + c;
-            // Determine weight bank and weight row
-            const unsigned char* wb;
-            int wcol;
-            if (out_col < n_ff) {
-                wb = gate_w; wcol = out_col;
-            } else {
-                wb = up_w;   wcol = out_col - n_ff;
-            }
-            long super = (long)wcol * spr + (blk >> 3);
+            // Fused gate+up: the combined weight bank stores all n_ff_exp columns
+            // contiguously; out_col is the absolute column index in [0, n_ff_exp).
+            // `gate_w` is the bank base; column stride is `spr` super-blocks per row.
+            long super = (long)out_col * spr + (blk >> 3);
             int s = blk & 7;
             unsigned int sh = (unsigned int)(s & 1) * 4u;
             // Q4_K block = 144 bytes, 16-byte aligned → uint4 loads safe
-            const uint4* bq = (const uint4*)(wb + super * 144);
+            const uint4* bq = (const uint4*)(gate_w + super * 144);
             uint4 hdr = bq[0];
             float d = f16q_lo(hdr.x);
             float dmin = f16q_hi(hdr.x);
@@ -8646,7 +8655,8 @@ moe_mmq_up_i8_q4k(
             for (int i = 0; i < MMQ_TM; i++) {
                 if (!alive[i]) continue;
                 int slot = bslot[off + r0 + i];
-                float sx = xs[(long)slot * nb + blk];
+                int arow = slot / nu;
+                float sx = xs[(long)arow * nb + blk];
                 #pragma unroll
                 for (int j = 0; j < MMQ_TN; j++) {
                     int c = tc * MMQ_TN + j;
