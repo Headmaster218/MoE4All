@@ -2313,8 +2313,8 @@ mod spec_accept_stochastic_tests {
         let q_dists = vec![q_dist];
         let p_dists = vec![p_dist.clone(), p_dist];
         // A fixed, non-env-dependent seed (not `sampling::seed_rng()`, which falls back to a
-        // wall-clock seed and would make this test flaky under parallel `cargo test`). Must be odd
-        // (the xorshift64 state must be nonzero and `seed_rng()` always ORs in `1`).
+        // wall-clock seed and would make this test flaky under parallel `cargo test`). Any NONZERO
+        // value will do — zero is xorshift64's forbidden fixed point (see `legal_xorshift_state`).
         let mut rng_a = 1u64;
         let mut rng_b = 1u64;
         let a = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng_a);

@@ -118,6 +118,27 @@ unsafe fn as_vk_buf(b: &dyn Buffer) -> &VkBuffer {
     &*(b as *const dyn Buffer as *const () as *const VkBuffer)
 }
 
+/// Bounds-check ONE side of a device transfer: `bytes` must fit inside a buffer's LOGICAL extent
+/// ([`VkBuffer::size`] — what the caller asked for, and what [`Buffer::len_bytes`] reports).
+///
+/// `size`, NOT the underlying `vk::Buffer`'s extent, is the right bound. A resident-BDA sub-tensor
+/// (`Backing::BdaSub`) shares one big arena `vk::Buffer` with its neighbours and lives at
+/// `sub_offset` inside it, so the whole-object extent would happily "validate" a transfer that runs
+/// straight over the next sub-tensor. Every transfer path already folds `sub_offset` into its copy
+/// region and then moves exactly `bytes`, so `bytes <= size` is precisely the condition that keeps
+/// the touched range `[sub_offset, sub_offset + bytes)` inside this tensor's own slice of the block.
+///
+/// `op`/`role` only shape the message (`upload`'s wording, which predates this helper, is the
+/// template): "upload: 64 bytes into a 32-byte buffer".
+fn check_extent(op: &str, role: &str, bytes: usize, size: usize) -> Result<()> {
+    if bytes > size {
+        return Err(be(format!(
+            "{op}: {bytes} bytes {role} a {size}-byte buffer"
+        )));
+    }
+    Ok(())
+}
+
 // ── device class (process-global) ─────────────────────────────────────────────
 
 /// The class of the Vulkan device this PROCESS opened — see [`device_class`].
@@ -3262,6 +3283,12 @@ impl Backend for VulkanBackend {
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
         // Safety: every buffer from this backend is a VkBuffer.
         let (s, d) = unsafe { (as_vk_buf(src), as_vk_buf(dst)) };
+        // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
+        // An oversize `bytes` here is a `vkCmdCopyBuffer` region that runs off the end of the source
+        // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
+        // silent clobber of whatever sub-tensor happens to sit next in the arena block.
+        check_extent("copy_buffer", "out of", bytes, s.size)?;
+        check_extent("copy_buffer", "into", bytes, d.size)?;
         let (sb, db) = (s.buffer, d.buffer);
         // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
         // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
@@ -3284,13 +3311,9 @@ impl Backend for VulkanBackend {
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
         // Safety: every buffer from this backend is a VkBuffer.
         let vk_dst = unsafe { as_vk_buf(dst) };
-        if src.len() > vk_dst.size {
-            return Err(be(format!(
-                "upload: {} bytes into a {}-byte buffer",
-                src.len(),
-                vk_dst.size
-            )));
-        }
+        // Same guard as `download`/`copy_buffer`, same wording — this one is the original, the
+        // helper just stops the three from drifting apart again.
+        check_extent("upload", "into", src.len(), vk_dst.size)?;
 
         // ── Direct write: any PERSISTENTLY MAPPED destination ─────────────────────────────────
         // Host-visible staging/readback buffers, AND a UMA overflow-spill buffer (`Backing::Vram`):
@@ -3359,6 +3382,13 @@ impl Backend for VulkanBackend {
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
         // Safety: every buffer from this backend is a VkBuffer.
         let vk_src = unsafe { as_vk_buf(src) };
+        // The mirror of `upload`'s guard, and it is the one with TEETH: the mapped fast path below
+        // is a raw `copy_nonoverlapping` of `dst.len()` bytes out of the mapping, so an oversize
+        // `dst` is an out-of-bounds READ — undefined behaviour that hands the caller whatever
+        // happens to follow the buffer (another tensor, another allocation) instead of failing.
+        // The staging path's failure is tamer but still wrong: a `vkCmdCopyBuffer` whose `size`
+        // overruns the source.
+        check_extent("download", "out of", dst.len(), vk_src.size)?;
 
         if let Some(ptr) = vk_src.mapped_ptr() {
             // Host-visible (Readback or Staging): direct read from the persistently-mapped pointer.
@@ -3558,6 +3588,39 @@ mod tests {
                 "must not truncate the tail of size {size}"
             );
         }
+    }
+
+    /// The transfer bounds guard shared by `upload`/`download`/`copy_buffer` (no GPU needed — this
+    /// is why the check is a free function over two `usize`s instead of inline in each method).
+    ///
+    /// `download` used to have NO guard at all: it `copy_nonoverlapping`'d `dst.len()` bytes out of
+    /// the source's mapping, so an oversize host slice read past the end of the buffer. `copy_buffer`
+    /// checked neither side. The boundary that matters is `bytes == size` — a full-buffer transfer is
+    /// legal and every real caller sits exactly there.
+    #[test]
+    fn check_extent_rejects_only_out_of_bounds_transfers() {
+        // In-bounds, including the exact-fit and empty edges: never an error.
+        for bytes in [0usize, 1, 31, 32] {
+            assert!(
+                check_extent("download", "out of", bytes, 32).is_ok(),
+                "{bytes} bytes out of a 32-byte buffer is in bounds"
+            );
+        }
+        // One past the end, and the pathological ask.
+        assert!(check_extent("download", "out of", 33, 32).is_err());
+        assert!(check_extent("copy_buffer", "into", usize::MAX, 32).is_err());
+        // A zero-length buffer accepts only a zero-length transfer.
+        assert!(check_extent("upload", "into", 0, 0).is_ok());
+        assert!(check_extent("upload", "into", 1, 0).is_err());
+        // The message keeps `upload`'s long-standing wording (it is the template the other two
+        // callers were written to match), so a failure reads the same whichever path raised it.
+        let msg = check_extent("upload", "into", 64, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("upload: 64 bytes into a 32-byte buffer"),
+            "unexpected message: {msg}"
+        );
     }
 
     /// `INFR_DEV` index resolution (no GPU needed). Now the SINGLE device-selection env, it can hold

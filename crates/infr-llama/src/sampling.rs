@@ -286,12 +286,31 @@ impl Drop for GatePass<'_> {
 /// byte-identically no matter how many other requests are in flight.
 pub(crate) fn resolve_seed(req: Option<&RequestCtx>, cfg: &infr_core::config::SamplingCfg) -> u64 {
     match req.and_then(|r| r.sampling.seed) {
-        // xorshift64 state must be nonzero, but `s | 1` collapses adjacent seeds (`2k` and `2k+1`
-        // map to the SAME odd state → "different seed, same result"). Only the degenerate `0` needs
-        // remapping; every other seed passes through untouched so distinct seeds stay distinct.
-        Some(0) => 0x9E37_79B9_7F4A_7C15,
-        Some(s) => s,
+        Some(s) => legal_xorshift_state(s),
         None => seed_rng(cfg),
+    }
+}
+
+/// Turn an arbitrary `u64` into a LEGAL xorshift64 state, changing as little as possible.
+///
+/// xorshift64 has exactly one forbidden state — `0`, which is a fixed point (it shifts/xors back to
+/// itself forever, so every "random" draw is the same value). The obvious guard, `s | 1`, does fix
+/// that, but at the cost of collapsing the seed space in half: `2k` and `2k+1` both map to the SAME
+/// odd state, so `--seed 2` and `--seed 3` produced byte-identical output. That is a silent
+/// correctness bug for anyone sweeping seeds — half their runs are duplicates of the other half.
+///
+/// So only `0` is remapped (to the golden-ratio constant, an arbitrary but well-mixed nonzero
+/// state); every other seed passes through untouched and distinct seeds stay distinct.
+///
+/// Both seed entry points ([`resolve_seed`]'s per-request seed and [`seed_rng`]'s process-wide
+/// `sampling.seed`/wall-clock seed) MUST route through this one helper — when they each had their
+/// own copy of the policy they drifted, and the process-config path kept the `| 1` collapse long
+/// after the per-request path was fixed.
+fn legal_xorshift_state(seed: u64) -> u64 {
+    if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
     }
 }
 
@@ -373,14 +392,18 @@ impl Penalties {
 ///
 /// `sampling.seed` is deliberately an `Option`: the knob has TWO defaults in the tree (this
 /// wall-clock one, and `42` in the CLI/diffusion paths) and BOTH stay at their own site (§6.12).
+///
+/// The result goes through [`legal_xorshift_state`], exactly as [`resolve_seed`] does — so
+/// `INFR_SEED=2` and `INFR_SEED=3` are DIFFERENT streams, and the wall-clock fallback can never
+/// hand back xorshift's forbidden zero state either.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn seed_rng(cfg: &infr_core::config::SamplingCfg) -> u64 {
-    cfg.seed.unwrap_or_else(|| {
+    legal_xorshift_state(cfg.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15)
-    }) | 1
+    }))
 }
 
 /// Advance the xorshift64 state and return a uniform draw in [0, 1) — the factored-out RNG step
@@ -616,8 +639,12 @@ mod tests {
         assert_eq!((r.temp, r.top_k, r.top_p), (s.temp, s.top_k, s.top_p));
     }
 
-    /// `sampling.seed` reaches the RNG, and an unset seed still yields a usable (nonzero, odd)
-    /// xorshift state from the wall clock.
+    /// `sampling.seed` reaches the RNG, and an unset seed still yields a usable (nonzero) xorshift
+    /// state from the wall clock.
+    ///
+    /// `47` alone was never enough of a pin: it is ODD, so it survived the old `| 1` untouched and
+    /// this test passed while `INFR_SEED=2`/`3` were silently the same stream. The `2` vs `3` and
+    /// `Some(0)` cases below are what actually hold the PROCESS-config path to the seed policy.
     #[test]
     fn seed_comes_off_the_config() {
         let pinned = infr_core::config::SamplingCfg {
@@ -629,8 +656,24 @@ mod tests {
         // A per-request seed still WINS over the process config (§5.1's unchanged precedence).
         let ctx = RequestCtx::new(cfg(1.0, 7));
         assert_eq!(resolve_seed(Some(&ctx), &pinned), 7);
-        // Unset: nonzero (xorshift's forbidden state) and odd.
-        assert!(seed_rng(&scfg()) % 2 == 1);
+        // Adjacent PROCESS seeds must NOT collapse onto one state (the `| 1` bug: 2|1 == 3|1 == 3).
+        let seeded = |s: u64| {
+            seed_rng(&infr_core::config::SamplingCfg {
+                seed: Some(s),
+                ..Default::default()
+            })
+        };
+        assert_ne!(
+            seeded(2),
+            seeded(3),
+            "`--seed 2` and `--seed 3` must differ"
+        );
+        assert_eq!((seeded(2), seeded(3)), (2, 3), "only 0 is remapped");
+        // Seed 0 is xorshift's forbidden fixed point, so it (and ONLY it) is remapped.
+        assert_ne!(seeded(0), 0, "seed 0 must be remapped off the zero state");
+        // Unset: the wall-clock fallback is remapped too, so it can never be the zero state. It is
+        // NOT guaranteed odd any more — oddness was an artifact of the collapsing `| 1`.
+        assert_ne!(seed_rng(&scfg()), 0);
     }
 
     /// **The regression test for the thread-local.**
@@ -788,6 +831,32 @@ mod tests {
             0,
             "seed 0 must be remapped off the zero state"
         );
+
+        // ── The PROCESS-config path (`INFR_SEED` / `--seed`), which the first fix MISSED ─────────
+        // `resolve_seed` delegates its `None` (no per-request seed) arm to `seed_rng`, and `seed_rng`
+        // kept its own `| 1` long after the per-request arm stopped collapsing. So a `run`/`bench`
+        // invocation — which has no `RequestCtx` at all and rides exactly this arm — still drew the
+        // same tokens for `--seed 2` and `--seed 3`. Drive the config path end to end, not just the
+        // request path.
+        let draw_cfg = |seed: u64| -> Vec<u32> {
+            let cfg = infr_core::config::SamplingCfg {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            let mut rng = resolve_seed(None, &cfg);
+            (0..16)
+                .map(|_| sample_logits(&logits, s, &mut rng))
+                .collect()
+        };
+        assert_ne!(
+            draw_cfg(2),
+            draw_cfg(3),
+            "adjacent PROCESS seeds must differ (`seed_rng`'s `| 1` collapsed 2 and 3)"
+        );
+        assert_eq!(draw_cfg(2), draw_cfg(2), "a pinned seed stays reproducible");
+        // And the process path agrees with the request path for the same seed — one policy, one
+        // helper, so `--seed 2` and a request's `"seed": 2` cannot diverge.
+        assert_eq!(draw_cfg(2), draw(2), "both entry points share the remap");
     }
 
     fn resolve_seed_of(seed: u64) -> u64 {
