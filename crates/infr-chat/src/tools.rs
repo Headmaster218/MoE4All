@@ -88,16 +88,39 @@ fn remove_spans(text: &str, mut spans: Vec<(usize, usize)>) -> String {
     out
 }
 
+/// Hard ceiling on `{`/`[` nesting in [`parse_value`].
+///
+/// This parser runs on model OUTPUT, and in `infr serve` that output is steerable by whoever
+/// sent the request — "reply with `<|tool_call>call:x{a:{a:{a:…`" is enough. Without a ceiling
+/// each `{` costs the attacker one byte and us one stack frame, so a single HTTP request
+/// stack-overflows the server process (SIGSEGV, not a catchable panic — every other in-flight
+/// request dies with it). 64 is far above any real tool schema, whose arguments are one or two
+/// levels of object/array; legitimate calls never reach it.
+const MAX_VALUE_DEPTH: usize = 64;
+
 /// Recursive-descent value parser — mirrors `_parse_value` in the Python shim.
 ///
 /// `s` has already had `<|"|>` replaced with `"`.
-fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
+///
+/// Returns `None` — and only ever `None` — when nesting would exceed [`MAX_VALUE_DEPTH`];
+/// every other malformation stays lenient-by-design (partial objects, missing quotes and
+/// unterminated strings all yield a best-effort `Value`, as callers rely on). `None`
+/// propagates all the way out so the caller drops the whole call instead of acting on a
+/// truncated one. Note the degradation could NOT be "return `Value::Null` in place and stop
+/// consuming": the array arm loops `while` the cursor hasn't reached `]`, so a value that
+/// returns without advancing `i` spins forever pushing `Null`s — a hang and an OOM in place
+/// of the stack overflow. Propagating `None` is the only exit that terminates every loop.
+fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
     // skip whitespace
     while i < s.len() && matches!(s[i], b' ' | b'\n' | b'\t' | b'\r') {
         i += 1;
     }
     if i >= s.len() {
-        return (Value::Null, i);
+        return Some((Value::Null, i));
+    }
+    // Refuse before descending into a container, so the frame budget is checked once per level.
+    if matches!(s[i], b'{' | b'[') && depth >= MAX_VALUE_DEPTH {
+        return None;
     }
     match s[i] {
         b'{' => {
@@ -112,12 +135,64 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                     if i < s.len() {
                         i += 1;
                     }
-                    return (Value::Object(obj), i);
+                    return Some((Value::Object(obj), i));
                 }
-                // find colon for key:value
-                let colon = match s[i..].iter().position(|&b| b == b':') {
-                    Some(p) => i + p,
-                    None => return (Value::Object(obj), i),
+                // Find the `key:` separator, bounded by this object's own punctuation.
+                //
+                // An unbounded `position(|b| b == b':')` scans past the closing `}` into
+                // unrelated text, so a body like `{foo} see http://x` produced the key
+                // "foo} see http" and resumed the value parse mid-token — a tool call that
+                // LOOKS well-formed but carries a garbage argument name, which is worse than
+                // a rejected parse because the caller acts on it. Stop at the first `}` or
+                // `,` seen before any colon, and stay quote-aware so a quoted key may still
+                // legitimately contain those bytes (`{"a,b": 1}`).
+                let mut j = i;
+                let mut quote: Option<u8> = None;
+                let mut colon: Option<usize> = None;
+                let mut stop: Option<usize> = None;
+                while j < s.len() {
+                    let b = s[j];
+                    match quote {
+                        Some(q) => {
+                            if b == b'\\' {
+                                j += 2; // skip the escaped byte, whatever it is
+                                continue;
+                            }
+                            if b == q {
+                                quote = None;
+                            }
+                        }
+                        None => match b {
+                            b'"' | b'\'' => quote = Some(b),
+                            b':' => {
+                                colon = Some(j);
+                                break;
+                            }
+                            b'}' | b',' => {
+                                stop = Some(j);
+                                break;
+                            }
+                            _ => {}
+                        },
+                    }
+                    j += 1;
+                }
+                let colon = match colon {
+                    Some(c) => c,
+                    // `}` closes the object; `,` ends a valueless (malformed) entry — drop it
+                    // and carry on with the next one rather than scanning onward for a colon.
+                    None => {
+                        let at = stop.unwrap_or(s.len());
+                        if at < s.len() && s[at] == b'}' {
+                            return Some((Value::Object(obj), at + 1));
+                        }
+                        if at >= s.len() {
+                            // No colon and no punctuation left: nothing parseable remains.
+                            return Some((Value::Object(obj), i));
+                        }
+                        i = at + 1;
+                        continue;
+                    }
                 };
                 let raw_key = String::from_utf8_lossy(&s[i..colon])
                     .trim()
@@ -125,7 +200,7 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                     .trim_matches('\'')
                     .to_owned();
                 i = colon + 1;
-                let (val, ni) = parse_value(s, i);
+                let (val, ni) = parse_value(s, i, depth + 1)?;
                 i = ni;
                 obj.insert(raw_key, val);
             }
@@ -141,9 +216,9 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                     if i < s.len() {
                         i += 1;
                     }
-                    return (Value::Array(arr), i);
+                    return Some((Value::Array(arr), i));
                 }
-                let (val, ni) = parse_value(s, i);
+                let (val, ni) = parse_value(s, i, depth + 1)?;
                 i = ni;
                 arr.push(val);
             }
@@ -203,7 +278,7 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                 }
             }
             let text = String::from_utf8_lossy(&buf).into_owned();
-            (Value::String(text), i)
+            Some((Value::String(text), i))
         }
         _ => {
             // bareword / number / bool / null — read until delimiter
@@ -215,7 +290,9 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
             let tok = String::from_utf8_lossy(&s[i..j]);
             let tok = tok.trim();
             i = j;
-            match tok {
+            // Leaf values are always parseable (lenient by design) — only the container arms
+            // above can return `None`, and only on depth overflow.
+            Some(match tok {
                 "true" => (Value::Bool(true), i),
                 "false" => (Value::Bool(false), i),
                 "null" => (Value::Null, i),
@@ -233,7 +310,7 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                         (Value::String(tok.to_owned()), i)
                     }
                 }
-            }
+            })
         }
     }
 }
@@ -275,7 +352,14 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         }
         // Replace the model's string-quote escape with real double-quotes
         let argstr = body[brace..].replace("<|\"|>", "\"");
-        let (val, _) = parse_value(argstr.as_bytes(), 0);
+        // `None` ⇒ the arguments nested past `MAX_VALUE_DEPTH`. Drop the call entirely rather
+        // than reporting the truncated prefix as a successful `ToolCall`: the caller executes
+        // what it is handed, and a call whose arguments we refused to finish parsing is not
+        // one we can vouch for. The block's span is already queued for removal above, so the
+        // markup still never leaks into `clean`.
+        let Some((val, _)) = parse_value(argstr.as_bytes(), 0, 0) else {
+            continue;
+        };
         let arguments = match val {
             Value::Object(_) => val,
             other => {
@@ -817,6 +901,99 @@ mod tests {
             "dangling opener leaked: {clean:?}"
         );
         assert!(clean.contains("Answer text"));
+    }
+
+    // --- depth / scan-bound hardening ------------------------------------
+
+    /// Deeply nested arguments must not recurse `parse_value` off the stack. In `infr serve`
+    /// the model's output is steerable by the requesting client, so this body is one HTTP
+    /// request away; without the ceiling it is a SIGSEGV that takes the whole process down.
+    /// The call is dropped rather than reported with truncated arguments, and the markup
+    /// still never leaks into `clean`.
+    #[test]
+    fn parse_tool_calls_deeply_nested_object_is_rejected() {
+        let depth = 50_000;
+        let mut body = String::from("<|tool_call>call:x{");
+        for _ in 0..depth {
+            body.push_str("a:{");
+        }
+        body.push_str("}".repeat(depth + 1).as_str());
+        body.push_str("<tool_call|>");
+
+        let (clean, calls) = parse_tool_calls(&body);
+        assert!(
+            calls.is_empty(),
+            "over-deep arguments must not yield a ToolCall, got {calls:?}"
+        );
+        assert!(
+            !clean.contains("tool_call"),
+            "tool-call markup leaked into clean: {clean:?}"
+        );
+    }
+
+    /// Same for arrays — `[` recurses through the other container arm, and a value that
+    /// bailed without advancing the cursor there would spin the array loop forever, so this
+    /// also pins that the rejection terminates rather than hangs.
+    #[test]
+    fn parse_tool_calls_deeply_nested_array_is_rejected() {
+        let depth = 50_000;
+        let mut body = String::from("<|tool_call>call:x{a:");
+        body.push_str("[".repeat(depth).as_str());
+        body.push_str("]".repeat(depth).as_str());
+        body.push_str("}<tool_call|>");
+
+        let (_, calls) = parse_tool_calls(&body);
+        assert!(
+            calls.is_empty(),
+            "over-deep array arguments must not yield a ToolCall, got {calls:?}"
+        );
+    }
+
+    /// Nesting that stays under the ceiling is untouched — the guard must not cost leniency
+    /// for the one or two levels real tool schemas use.
+    #[test]
+    fn parse_tool_calls_moderate_nesting_still_parses() {
+        let text = r#"<|tool_call>call:q{a:{b:{c:{d:[1,2,[3]]}}}}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["a"]["b"]["c"]["d"], json!([1, 2, [3]]));
+    }
+
+    /// A valueless entry (`{foo}`) followed by a colon somewhere later in the body must not
+    /// make the key scan swallow everything up to that far-away colon. Before the bound the
+    /// key came out as `foo} note` and the value parse resumed mid-token, producing a call
+    /// that LOOKS well-formed but carries a garbage argument — worse than no parse, because
+    /// the caller acts on it.
+    #[test]
+    fn parse_tool_calls_key_scan_stops_at_closing_brace() {
+        let text = "<|tool_call>call:f{foo} note: see http://example.com<tool_call|>";
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(
+            calls[0].arguments,
+            json!({}),
+            "no garbage key may be invented from text past the closing brace"
+        );
+    }
+
+    /// The same bound at a `,`: a valueless entry is dropped and the following well-formed
+    /// pair still parses, instead of the key scan running through the comma to a later colon.
+    #[test]
+    fn parse_tool_calls_key_scan_stops_at_comma() {
+        let text = r#"<|tool_call>call:f{foo,bar:<|"|>ok<|"|>}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({"bar": "ok"}));
+    }
+
+    /// The scan is quote-aware, so a quoted key containing `,` or `}` is still one key.
+    #[test]
+    fn parse_tool_calls_quoted_key_with_punctuation() {
+        let text = r#"<|tool_call>call:f{"a,b}c":<|"|>v<|"|>}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({"a,b}c": "v"}));
     }
 
     #[test]

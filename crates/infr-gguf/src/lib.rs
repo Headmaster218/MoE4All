@@ -25,6 +25,20 @@ use std::{collections::HashMap, fs::File, path::Path, sync::Arc};
 const GGUF_MAGIC: u32 = 0x46554747; // b"GGUF" little-endian
 const DEFAULT_ALIGNMENT: usize = 32; // GGUF_DEFAULT_ALIGNMENT
 
+/// Hard ceiling on how deeply metadata ARRAY values (GGUF type 9) may nest.
+///
+/// `read_meta_value` is recursive: an ARRAY reads an `elem_type` and then parses `count`
+/// values of that type, and `elem_type` may itself be ARRAY. Each nesting level costs the
+/// attacker only 12 bytes of file (u32 elem_type + u64 count) but one full stack frame of
+/// ours, so a ~1 MB crafted GGUF nests ~85 000 deep and blows the stack — a SIGSEGV/abort
+/// the caller cannot catch, not a `Result` it can report. Since `Gguf::open` is reachable
+/// from "open this model I downloaded", that is a remote DoS on the whole process.
+///
+/// 64 is far above anything real: GGUF metadata in the wild is at most 2 levels deep
+/// (arrays of strings, arrays of arrays for token-type tables), and llama.cpp's own reader
+/// uses a comparable bound. Well-formed files never see this guard.
+const MAX_META_DEPTH: usize = 64;
+
 // ─── public struct ────────────────────────────────────────────────────────────
 
 /// A parsed, mmap-backed GGUF file.
@@ -181,8 +195,18 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
-    /// Recursively parse a metadata value given its GGUF type tag.
+    /// Parse a metadata value given its GGUF type tag.
+    ///
+    /// Entry point for a top-level KV value; the recursion (nested ARRAYs) runs through
+    /// [`Self::read_meta_value_at_depth`], which refuses to nest past [`MAX_META_DEPTH`].
     fn read_meta_value(&mut self, vtype: u32) -> Result<MetaValue> {
+        self.read_meta_value_at_depth(vtype, 0)
+    }
+
+    /// Recursively parse a metadata value given its GGUF type tag, tracking how many ARRAY
+    /// levels deep we already are so a crafted file cannot recurse us off the stack. See
+    /// [`MAX_META_DEPTH`] for why the ceiling exists and why 64 is safe for real files.
+    fn read_meta_value_at_depth(&mut self, vtype: u32, depth: usize) -> Result<MetaValue> {
         match vtype {
             0 => Ok(MetaValue::U64(self.read_u8()? as u64)), // UINT8
             1 => Ok(MetaValue::I64(self.read_i8()? as i64)), // INT8
@@ -195,13 +219,22 @@ impl<'a> Reader<'a> {
             8 => Ok(MetaValue::Str(self.read_gguf_str()?)),  // STRING
             9 => {
                 // ARRAY: u32 elem_type, u64 count, then count × elem
+                // Refuse before descending: an ARRAY-of-ARRAY chain costs 12 bytes per level
+                // on disk and one stack frame here, so without this the parse dies by
+                // stack overflow (uncatchable) instead of returning an error.
+                if depth >= MAX_META_DEPTH {
+                    return Err(Error::Loader(format!(
+                        "GGUF: metadata array nesting exceeds the maximum depth of {MAX_META_DEPTH} at offset {}",
+                        self.pos
+                    )));
+                }
                 let elem_type = self.read_u32()?;
                 let count = self.read_u64()? as usize;
                 // Clamp the reservation: an attacker-controlled `count` on a tiny file
                 // must not trigger a multi-GB `with_capacity` abort before we read.
                 let mut arr = Vec::with_capacity(count.min(self.remaining()));
                 for _ in 0..count {
-                    arr.push(self.read_meta_value(elem_type)?);
+                    arr.push(self.read_meta_value_at_depth(elem_type, depth + 1)?);
                 }
                 Ok(MetaValue::Arr(arr))
             }
@@ -713,6 +746,72 @@ mod tests {
         assert!(
             matches!(err, Err(Error::Loader(_))),
             "huge kv_count should be Error::Loader, got {err:?}"
+        );
+    }
+
+    /// A metadata ARRAY whose element type is itself ARRAY recurses `read_meta_value`. Each
+    /// level costs the file only 12 bytes (u32 elem_type + u64 count), so a small crafted
+    /// file nests tens of thousands deep and overflows the stack — a SIGSEGV/abort the
+    /// caller cannot catch, and reachable from "open this downloaded model". The depth
+    /// ceiling must turn that into a plain `Error::Loader`.
+    #[test]
+    fn deeply_nested_metadata_array_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, 0); // tensor_count
+        push_u64(&mut b, 1); // kv_count
+        push_gguf_str(&mut b, "bomb");
+        push_u32(&mut b, 9); // value type = ARRAY
+                             // Each pair opens one more ARRAY level holding exactly one element, which is itself
+                             // an ARRAY: 8192 levels in ~96 KB of file.
+        for _ in 0..8192 {
+            push_u32(&mut b, 9); // elem_type = ARRAY
+            push_u64(&mut b, 1); // count = 1
+        }
+        // Innermost terminator (never reached — the guard fires long before).
+        push_u32(&mut b, 0); // elem_type = UINT8
+        push_u64(&mut b, 0); // count = 0
+
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => assert!(
+                msg.contains("nesting"),
+                "should fail on the depth guard, not incidentally on EOF: {msg}"
+            ),
+            other => panic!("deeply nested array should be Error::Loader, got {other:?}"),
+        }
+    }
+
+    /// The depth guard must not change well-formed files: real GGUF metadata nests arrays
+    /// (e.g. an array of arrays of ints), so a 2-level value still parses to the same
+    /// `MetaValue::Arr` tree it did before the ceiling existed.
+    #[test]
+    fn shallow_nested_metadata_array_still_parses() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, 0); // tensor_count
+        push_u64(&mut b, 1); // kv_count
+        push_gguf_str(&mut b, "nested");
+        push_u32(&mut b, 9); // value type = ARRAY
+        push_u32(&mut b, 9); // elem_type = ARRAY
+        push_u64(&mut b, 2); // 2 inner arrays
+        for _ in 0..2 {
+            push_u32(&mut b, 4); // elem_type = UINT32
+            push_u64(&mut b, 1); // 1 element
+            push_u32(&mut b, 7);
+        }
+        let tmp = write_temp_gguf(&b);
+        let gguf = Gguf::open(tmp.path()).expect("2-level nesting must still parse");
+        let Some(MetaValue::Arr(outer)) = gguf.metadata().kv.get("nested") else {
+            panic!("expected an array value");
+        };
+        assert_eq!(outer.len(), 2, "outer array should hold 2 inner arrays");
+        assert!(
+            matches!(&outer[0], MetaValue::Arr(inner) if inner.len() == 1),
+            "inner element should be a 1-element array"
         );
     }
 
