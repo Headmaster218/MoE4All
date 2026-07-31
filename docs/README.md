@@ -52,3 +52,6 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 - [audit.md](audit.md) — module-by-module codebase audit for bugs, correctness,
   perf, DRY, and YAGNI.
+- [code-review.md](code-review.md) — risk-prioritised whole-tree review
+  (2026-08-01): correctness bugs, security/robustness gaps, `unsafe` soundness,
+  DRY, and YAGNI, each with a file:line and a suggested fix.
