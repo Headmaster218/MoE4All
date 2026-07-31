@@ -15,7 +15,9 @@ use std::{
     io::{Read, Write},
     os::unix::fs::symlink,
     os::unix::io::AsRawFd,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
 };
 use tracing::{debug, info};
 
@@ -91,7 +93,14 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
 /// Download one file (or reuse its content-addressed blob) into `snap` as a symlink into `blobs`.
 /// Returns the snapshot symlink path. HEADs for the LFS sha256 so a present blob is relinked without
 /// a download and a fresh download is verified against it.
+///
+/// `filename` is an HF `rfilename` and may name a SUBDIRECTORY (`UD-Q4_K_XL/model.gguf`, how
+/// unsloth ships its Dynamic quants), so the link's parent is created first — otherwise `symlink`
+/// fails ENOENT and the whole pull dies. It is validated by [`is_safe_relative`] before any join:
+/// the name comes from a remote API response, and a `..` component in it would make `snap.join`
+/// plant a symlink anywhere the user can write.
 fn fetch_and_link(blobs: &Path, snap: &Path, repo: &str, filename: &str) -> Result<PathBuf> {
+    let filename = check_relative(filename)?;
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
     let want = head_lfs_sha(repo, filename).ok().flatten();
     let hex = match &want {
@@ -101,7 +110,7 @@ fn fetch_and_link(blobs: &Path, snap: &Path, repo: &str, filename: &str) -> Resu
         }
         _ => {
             download_to_blob(
-                &http_client()?,
+                http_client()?,
                 &url,
                 token().as_deref(),
                 blobs,
@@ -112,10 +121,63 @@ fn fetch_and_link(blobs: &Path, snap: &Path, repo: &str, filename: &str) -> Resu
         }
     };
     let link = snap.join(filename);
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).map_err(Error::from)?; // subdirectory rfilename
+    }
     let _ = fs::remove_file(&link); // replace a stale/dangling link
-    symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
-    debug!("linked {link:?} -> blobs/{hex}");
+    let target = blob_link_target(filename, &hex);
+    symlink(&target, &link).map_err(Error::from)?;
+    debug!("linked {link:?} -> {target}");
     Ok(link)
+}
+
+/// The RELATIVE symlink target stored in a snapshot for the blob `hex`, as `huggingface_hub` writes
+/// it: enough `..` segments to climb from the link's own directory back to `models--<org>--<repo>/`,
+/// then `blobs/<hex>`.
+///
+/// `snapshots/<commit>/<file>` is two levels down from the repo dir → `../../blobs/<hex>`; every
+/// extra directory in `rel` (`snapshots/<commit>/UD-Q4_K_XL/<file>`) adds one more `..`. Hardcoding
+/// `../../` — as this used to — silently produces a DANGLING link for a subdirectory GGUF, which
+/// reads as "not cached" and re-downloads multiple GB on every run. The link must also stay valid
+/// when the whole hub dir is moved, and stay byte-identical to what `huggingface_hub` / llama.cpp
+/// would write, since the two share this cache (see the module header).
+pub(crate) fn blob_link_target(rel: &str, hex: &str) -> String {
+    // Depth of the link BELOW the repo dir = 2 (`snapshots/<commit>`) + directories inside `rel`.
+    let dirs = Path::new(rel).components().count().saturating_sub(1);
+    let mut target = String::new();
+    for _ in 0..(2 + dirs) {
+        target.push_str("../");
+    }
+    target.push_str("blobs/");
+    target.push_str(hex);
+    target
+}
+
+/// True when `name` may be `join`ed onto a local directory without escaping it: non-empty, relative,
+/// and built purely of ordinary path components. Subdirectories are ALLOWED (`UD-Q4_K_XL/m.gguf` is
+/// a real HF `rfilename`); `..`, `.`, a leading `/`, and a Windows prefix/drive are not.
+///
+/// The check is component-based rather than a substring scan on purpose: `Path`'s own parser is what
+/// `join` will use, so agreeing with it is correct by construction, and a name like `a..b.gguf` (no
+/// `..` component) is not falsely rejected. Every snapshot-side path here is built from a filename
+/// the remote model API handed us, so an unvalidated join is an arbitrary-file-write primitive for
+/// a malicious or compromised API response.
+fn is_safe_relative(name: &str) -> bool {
+    !name.is_empty()
+        && Path::new(name)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// [`is_safe_relative`] as a guard, naming the rejected value so a genuinely odd repo is debuggable.
+fn check_relative(name: &str) -> Result<&str> {
+    if is_safe_relative(name) {
+        Ok(name)
+    } else {
+        Err(Error::Other(format!(
+            "refusing unsafe remote filename {name:?}: must be a relative path with no '..' components"
+        )))
+    }
 }
 
 /// HEAD the resolve URL to read the file's LFS sha256 (HF's `X-Linked-Etag`) WITHOUT downloading the
@@ -126,13 +188,8 @@ fn fetch_and_link(blobs: &Path, snap: &Path, repo: &str, filename: &str) -> Resu
 /// would defeat both the relink fast-path and integrity verification. Redirects are disabled because
 /// the sha header is on huggingface.co's 302, not the CDN's final 200.
 fn head_lfs_sha(repo: &str, filename: &str) -> Result<Option<String>> {
-    let client = Client::builder()
-        .user_agent("infr-hub/0.1")
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| Error::Other(format!("building HTTP client: {e}")))?;
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
-    let mut req = client.head(&url);
+    let mut req = head_client()?.head(&url);
     if let Some(t) = token() {
         req = req.bearer_auth(t);
     }
@@ -153,11 +210,71 @@ fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn http_client() -> Result<Client> {
-    Client::builder()
-        .user_agent("infr-hub/0.1")
+// ---------------------------------------------------------------------------
+// Shared HTTP clients
+//
+// THREE process-wide clients, each built once (a `Client` owns a connection pool + TLS config;
+// building one per request means a fresh TLS handshake per shard — 40 of them for a 40-shard model).
+//
+// The timeout split is deliberate and is the part a later reader is most likely to "fix" wrongly:
+//
+//   * `connect_timeout` on ALL of them — a server that never completes the TCP/TLS handshake must
+//     not hang `infr pull` (and `infr run`'s auto-pull) forever with no recovery but Ctrl-C, which
+//     is exactly what reqwest's default of NO timeout does.
+//   * a total `timeout` ONLY on the metadata/HEAD clients. `Client::timeout` bounds the WHOLE
+//     request including reading the body, so putting it on the download client would abort every
+//     multi-GB model download that legitimately takes longer than the limit. Metadata requests are
+//     a few KB, so a total bound is right there and wrong on the download path. A stalled *body*
+//     mid-download is not fatal here anyway: the partial is kept and the next run resumes it.
+// ---------------------------------------------------------------------------
+
+/// TCP+TLS handshake budget. Generous enough for a slow link, short enough to fail rather than hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-request budget for the small (few-KB) metadata calls: the model API GET and the LFS HEAD.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The client used for BODY transfers (model blobs, companions). No total timeout — see above.
+fn http_client() -> Result<&'static Client> {
+    static CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
+    shared(&CLIENT, "download", |b| b)
+}
+
+/// The client used for the HF model API (`/api/models/...`). Redirects follow the default policy;
+/// only the HEAD path depends on seeing the 302 itself.
+fn api_client() -> Result<&'static Client> {
+    static CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
+    shared(&CLIENT, "API", |b| b.timeout(METADATA_TIMEOUT))
+}
+
+/// The client used by [`head_lfs_sha`]. Redirects stay DISABLED — load-bearing: the `X-Linked-Etag`
+/// sha256 is on huggingface.co's 302, not on the CDN's final 200, so following the redirect loses it.
+fn head_client() -> Result<&'static Client> {
+    static CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
+    shared(&CLIENT, "HEAD", |b| {
+        b.timeout(METADATA_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+    })
+}
+
+/// Build-once accessor for one of the shared clients. The build result (including a failure) is
+/// cached, so a broken TLS backend reports the same error every time instead of being retried per
+/// request; the error is returned, never panicked, so a pull can still fail gracefully.
+fn shared(
+    cell: &'static OnceLock<std::result::Result<Client, String>>,
+    what: &str,
+    extra: impl FnOnce(reqwest::blocking::ClientBuilder) -> reqwest::blocking::ClientBuilder,
+) -> Result<&'static Client> {
+    cell.get_or_init(|| {
+        extra(
+            Client::builder()
+                .user_agent("infr-hub/0.1")
+                .connect_timeout(CONNECT_TIMEOUT),
+        )
         .build()
-        .map_err(|e| Error::Other(format!("building HTTP client: {e}")))
+        .map_err(|e| e.to_string())
+    })
+    .as_ref()
+    .map_err(|e| Error::Other(format!("building HTTP {what} client: {e}")))
 }
 
 fn token() -> Option<String> {
@@ -208,7 +325,7 @@ fn pull_repo(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
 fn repo_info(repo: &str, sel: Option<&str>) -> Result<(String, String, Vec<String>)> {
     let url = format!("https://huggingface.co/api/models/{repo}");
     debug!("GET {url}");
-    let mut req = http_client()?.get(&url);
+    let mut req = api_client()?.get(&url);
     if let Some(t) = token() {
         req = req.bearer_auth(t);
     }
@@ -242,6 +359,11 @@ fn repo_info(repo: &str, sel: Option<&str>) -> Result<(String, String, Vec<Strin
             None => format!("no .gguf files found in {repo}"),
         })
     })?;
+    // Reject a traversing `rfilename` at the boundary where it enters the system, before it is ever
+    // joined onto a local path (`shard_set` derives more names from it, all sharing its directory).
+    check_relative(&file)?;
+    // Same for the commit: it names `snapshots/<commit>/` and comes from the same response.
+    check_relative(&info.sha)?;
     Ok((info.sha, file, names))
 }
 
@@ -261,6 +383,11 @@ fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) 
         if !siblings.iter().any(|s| s == name) {
             continue; // repo doesn't ship it
         }
+        // Belt-and-braces: COMPANIONS is a compile-time list of plain filenames, but this is a join
+        // of a name that was matched against remote data — keep the guard where the join is.
+        if check_relative(name).is_err() {
+            continue;
+        }
         let link = snap.join(name);
         if link.exists() {
             continue; // already cached
@@ -268,11 +395,11 @@ fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) 
         let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
         // Companions are small (often non-LFS) convenience files; download best-effort, unverified.
         let dl = http_client()
-            .and_then(|c| download_to_blob(&c, &url, token().as_deref(), blobs, name, None));
+            .and_then(|c| download_to_blob(c, &url, token().as_deref(), blobs, name, None));
         match dl {
             Ok((_, hex, _)) => {
                 let _ = fs::remove_file(&link);
-                match symlink(format!("../../blobs/{hex}"), &link) {
+                match symlink(blob_link_target(name, &hex), &link) {
                     Ok(()) => info!("hf:{repo}: cached companion {name}"),
                     Err(e) => debug!("hf:{repo}: companion {name} symlink failed: {e}"),
                 }
@@ -315,7 +442,7 @@ fn download_to_blob(
     } else {
         debug!("no expected sha256 for {label}; download will not be integrity-checked");
     }
-    let stem = sanitise(label);
+    let stem = temp_stem(label);
     let tmp = blobs.join(format!(".dl-{stem}"));
     let meta = blobs.join(format!(".dl-{stem}.meta")); // stored If-Range validator for the partial
 
@@ -548,6 +675,23 @@ fn write_text(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The per-download temp/lock stem for `label` (an HF `rfilename`): the readable [`sanitise`]d name
+/// plus a short digest of the FULL original.
+///
+/// The digest is what makes it INJECTIVE, and that is the point. `sanitise` alone maps `/` to `_`,
+/// so `UD-Q4_K_XL/m.gguf` and `UD-Q4_K_XL_m.gguf` — both plausible in one repo now that
+/// subdirectory `rfilename`s are supported — collide on the same `.dl-` partial and the same
+/// `.lock`. The `flock` serialises them so there is no interleaved write, but the SECOND download
+/// then "resumes" onto the first file's partial bytes. That splice is caught by the final sha256
+/// only for an LFS file; a non-LFS file has no `expected_sha` and its verification is skipped
+/// entirely, so the corrupt splice would be committed as a blob. The readable prefix is kept so a
+/// leftover partial in `blobs/` is still identifiable by eye.
+fn temp_stem(label: &str) -> String {
+    let digest = Sha256::digest(label.as_bytes());
+    let short: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{short}", sanitise(label))
+}
+
 /// Replace characters unsafe in a filename with `_`.
 fn sanitise(s: &str) -> String {
     s.chars()
@@ -633,6 +777,72 @@ mod tests {
         let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "flock should succeed once the holder drops");
         unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) };
+    }
+
+    /// The `..` depth of a snapshot symlink target must follow the file's OWN depth, or the link
+    /// dangles: `snapshots/<commit>/<file>` is 2 below the repo dir, `snapshots/<commit>/<dir>/<file>`
+    /// is 3. Verified end-to-end (an actual dangling-vs-readable link) in store.rs's
+    /// `resolve_subdirectory_gguf_is_cached`.
+    #[test]
+    fn blob_link_target_depth_follows_filename() {
+        assert_eq!(
+            blob_link_target("model.gguf", SHA_A),
+            format!("../../blobs/{SHA_A}")
+        );
+        assert_eq!(
+            blob_link_target("UD-Q4_K_XL/model.gguf", SHA_A),
+            format!("../../../blobs/{SHA_A}")
+        );
+        assert_eq!(
+            blob_link_target("a/b/model.gguf", SHA_A),
+            format!("../../../../blobs/{SHA_A}")
+        );
+    }
+
+    /// Subdirectories WORK, traversal does NOT — one rule, both directions. The names come from a
+    /// remote API response, so a `..` component reaching `Path::join` is an arbitrary-file-write.
+    #[test]
+    fn safe_relative_allows_subdirs_rejects_traversal() {
+        for ok in [
+            "model.gguf",
+            "UD-Q4_K_XL/model.gguf",
+            "a/b/c/model.gguf",
+            "weird..name.gguf",   // `..` in a component is not a `..` component
+            "-leading-dash.gguf", // odd but harmless
+            "a/./b.gguf",         // `Path` normalises an interior `.` away; still inside `snap`
+        ] {
+            assert!(is_safe_relative(ok), "{ok} should be accepted");
+            assert!(check_relative(ok).is_ok());
+        }
+        for bad in [
+            "",
+            "..",
+            "../evil.gguf",
+            "a/../../evil.gguf",
+            "/etc/cron.d/evil",
+            ".",
+            "./model.gguf",
+        ] {
+            assert!(!is_safe_relative(bad), "{bad:?} should be rejected");
+            let err = check_relative(bad).unwrap_err().to_string();
+            assert!(err.contains("unsafe remote filename"), "{err}");
+        }
+    }
+
+    /// `sanitise` maps `/` to `_`, so the sanitised name ALONE is not a unique temp/lock key once
+    /// subdirectory filenames exist: `a/b.gguf` and `a_b.gguf` would share a `.dl-` partial and one
+    /// would resume onto the other's bytes (undetectable for a non-LFS file, which is never
+    /// sha-verified). The appended digest of the full name is what separates them.
+    #[test]
+    fn temp_stem_is_collision_free() {
+        assert_ne!(temp_stem("a/b.gguf"), temp_stem("a_b.gguf"));
+        assert_eq!(sanitise("a/b.gguf"), sanitise("a_b.gguf")); // …the collision it protects against
+        assert_eq!(temp_stem("a/b.gguf"), temp_stem("a/b.gguf")); // stable → resume still works
+        assert!(
+            temp_stem("UD-Q4_K_XL/m.gguf").starts_with("UD-Q4_K_XL_m.gguf-"),
+            "readable prefix is kept for debuggability: {}",
+            temp_stem("UD-Q4_K_XL/m.gguf")
+        );
     }
 
     #[test]
