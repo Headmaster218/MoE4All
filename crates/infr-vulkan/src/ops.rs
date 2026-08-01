@@ -402,9 +402,10 @@ impl VulkanBackend {
 
         let vk_bufs: Vec<vk::Buffer> = bufs
             .iter()
-            .map(|b| unsafe { as_vk_buf(b.as_ref()) }.buffer)
-            .chain(std::iter::once(unsafe { as_vk_buf(out.as_ref()) }.buffer))
-            .collect();
+            .map(|b| b.as_ref())
+            .chain(std::iter::once(out.as_ref()))
+            .map(|b| as_vk_buf(b).map(|v| v.buffer))
+            .collect::<Result<Vec<_>>>()?;
         let binding = self.eager_bind(&k, &vk_bufs)?;
 
         let shared = &self.shared;

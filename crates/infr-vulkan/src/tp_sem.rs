@@ -316,16 +316,16 @@ impl VulkanBackend {
                     let barriers: Vec<vk::BufferMemoryBarrier> = acquire_external
                         .iter()
                         .map(|b| {
-                            vk::BufferMemoryBarrier::default()
+                            Ok(vk::BufferMemoryBarrier::default()
                                 .src_access_mask(vk::AccessFlags::empty())
                                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                                 .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
                                 .dst_queue_family_index(qf)
-                                .buffer(as_vk_buf(*b).buffer)
+                                .buffer(as_vk_buf(*b)?.buffer)
                                 .offset(0)
-                                .size(vk::WHOLE_SIZE)
+                                .size(vk::WHOLE_SIZE))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                     device.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -337,8 +337,7 @@ impl VulkanBackend {
                     );
                 }
                 for &(src, dst, bytes) in copies {
-                    // Safety: every buffer from this backend is a VkBuffer.
-                    let (s, d) = (as_vk_buf(src), as_vk_buf(dst));
+                    let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
                     let region = vk::BufferCopy {
                         src_offset: s.sub_offset as u64,
                         dst_offset: d.sub_offset as u64,
@@ -351,16 +350,16 @@ impl VulkanBackend {
                     let barriers: Vec<vk::BufferMemoryBarrier> = release_external
                         .iter()
                         .map(|b| {
-                            vk::BufferMemoryBarrier::default()
+                            Ok(vk::BufferMemoryBarrier::default()
                                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                                 .dst_access_mask(vk::AccessFlags::empty())
                                 .src_queue_family_index(qf)
                                 .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                                .buffer(as_vk_buf(*b).buffer)
+                                .buffer(as_vk_buf(*b)?.buffer)
                                 .offset(0)
-                                .size(vk::WHOLE_SIZE)
+                                .size(vk::WHOLE_SIZE))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                     device.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,

@@ -298,6 +298,18 @@ pub fn block_layout(dtype: DType) -> (usize, usize) {
     infr_core::decode_spec::block_layout(dtype)
 }
 
+/// Bytes for `numel` elements of `dtype`, ROUNDED UP to a whole number of blocks.
+///
+/// `numel` is required to be a whole number of blocks — every real caller either owns a whole
+/// tensor (validated at load, see [`Gguf::open`]'s `block_elems` check) or deliberately sizes a
+/// block-aligned PREFIX. The rounding is what happens if that precondition is ever broken, and the
+/// direction matters: plain `(numel / be) * bb` TRUNCATES, so a numel one element short of a block
+/// boundary silently reports a SHORT byte count — for `Q4_K` with `numel = 100` it reports ZERO —
+/// and every bounds check downstream (`resolve` against the file size, a `&b[..pb]` prefix slice)
+/// then passes trivially while dequant/upload code works from a slice that doesn't cover the data
+/// it is about to address. Rounding up can only ever produce a range that is too LARGE, which the
+/// same bounds checks catch loudly instead. `debug_assert` states the contract so a new caller that
+/// breaks it trips in tests rather than inheriting the rounding.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
     // i2_s stores `numel/4` bytes of 2-bit ternary codes followed by ONE per-tensor f32 scale (see
@@ -306,15 +318,34 @@ fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
     // the readable tensor bytes end after the scale). Size the slice to include it so
     // `dequant_codebook` can read the scale from the tail.
     if dtype == DType::I2S {
-        return numel / 4 + 4;
+        debug_assert!(
+            numel.is_multiple_of(4),
+            "i2_s packs 4 ternary codes per byte; numel {numel} is not a multiple of 4"
+        );
+        return numel.div_ceil(4) + 4;
     }
     let (be, bb) = block_layout(dtype);
-    (numel / be) * bb
+    debug_assert!(
+        numel.is_multiple_of(be),
+        "{dtype:?} blocks hold {be} elements; numel {numel} is not a whole number of blocks"
+    );
+    numel.div_ceil(be) * bb
 }
 
 /// Bytes occupied by `numel` elements of `dtype` in its GGUF block layout (`numel` must be a whole
 /// number of blocks). Public helper so backends can size a block-aligned prefix (e.g. a quantized
 /// KV cache: dequant only the first `kv_len` rows).
+///
+/// This is the second entry point into [`tensor_nbytes`] — the first being tensor sizing in
+/// [`Gguf::open`], which REJECTS a misaligned `numel` outright. This one cannot: its callers pass a
+/// prefix length they computed themselves, so there is no tensor name to name and no `Result` in
+/// the signatures of the CPU kernels that call it (`kvquant::quantize_row`, the KV dequant prefix
+/// in `infr-cpu`, the seam runner's per-row weight stride). Making it fallible would push a
+/// `Result` into those hot loops for a condition their own callers already guarantee — the
+/// block-quant KV path is gated on `kv_q8_layout_ok`, and a weight row is `n_embd` elements wide.
+/// The contract is instead enforced by `tensor_nbytes`'s `debug_assert` plus its round-UP
+/// behaviour, so a violation is a loud test failure or an out-of-range slice panic, never a
+/// silently short buffer.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn nbytes(dtype: DType, numel: usize) -> usize {
     tensor_nbytes(dtype, numel)
@@ -435,6 +466,35 @@ impl Gguf {
                             "GGUF: tensor '{name}' shape {shape:?} overflows usize"
                         ))
                     })?;
+                // A quantised tensor's element count MUST be a whole number of blocks — llama.cpp
+                // checks `ne[0] % blck_size == 0` at load for the same reason. Without this a
+                // crafted or corrupt file (say Q4_K with numel = 100, i.e. 0 whole 256-element
+                // blocks) sizes the tensor at FEWER bytes than the data it describes; `resolve`'s
+                // file-size bounds check then passes trivially on that short-or-empty range and
+                // dequant/upload code proceeds to address elements the slice does not cover. This
+                // is the load-time place to catch it: the tensor's name and shape are still in
+                // hand, so the error can say WHICH tensor is malformed instead of surfacing later
+                // as an unexplained out-of-range panic (or worse, plausible-looking garbage) deep
+                // in a backend.
+                if dtype == DType::I2S {
+                    // i2_s packs 4 ternary codes per byte and carries a single trailing f32 scale;
+                    // a numel that isn't a multiple of 4 has no whole-byte code layout at all
+                    // (numel = 3 would size to 4 bytes: all scale, no codes).
+                    if !numel.is_multiple_of(4) {
+                        return Err(Error::Loader(format!(
+                            "GGUF: tensor '{name}' shape {shape:?} has {numel} elements, not a \
+                             multiple of 4 (i2_s packs 4 2-bit codes per byte)"
+                        )));
+                    }
+                } else {
+                    let (block_elems, _) = block_layout(dtype);
+                    if !numel.is_multiple_of(block_elems) {
+                        return Err(Error::Loader(format!(
+                            "GGUF: tensor '{name}' shape {shape:?} has {numel} elements, not a \
+                             whole number of {dtype:?} blocks ({block_elems} elements per block)"
+                        )));
+                    }
+                }
                 let nbytes = tensor_nbytes(dtype, numel);
                 tensors.push(TensorInfo {
                     name,
@@ -813,6 +873,90 @@ mod tests {
             matches!(&outer[0], MetaValue::Arr(inner) if inner.len() == 1),
             "inner element should be a 1-element array"
         );
+    }
+
+    // ── block-alignment hardening ─────────────────────────────────────────────
+
+    /// A GGUF holding exactly one tensor of `ggml_type` with the given 1-D length, and `data_len`
+    /// bytes of zeros in the data region. The round-trip fixture uses F32 (`block_elems == 1`), so
+    /// it structurally cannot express a misaligned element count — this builder takes the ggml type
+    /// so a quantised one can.
+    fn build_typed_fixture(ggml_type: u32, dim0: u64, data_len: usize) -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, 1); // tensor_count
+        push_u64(&mut b, 0); // kv_count
+        push_gguf_str(&mut b, "tensor0");
+        push_u32(&mut b, 1); // n_dims
+        push_u64(&mut b, dim0);
+        push_u32(&mut b, ggml_type);
+        push_u64(&mut b, 0); // offset = 0
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        b.resize(b.len() + data_len, 0);
+        b
+    }
+
+    /// A quantised tensor whose element count is not a whole number of blocks must be rejected at
+    /// LOAD. `(numel / block_elems) * block_bytes` truncates, so Q4_K with numel = 100 sizes to
+    /// ZERO bytes; `resolve`'s file-size bounds check then passes vacuously and the backend
+    /// dequants from an empty slice. llama.cpp validates `ne[0] % blck_size == 0` at load for
+    /// exactly this reason.
+    #[test]
+    fn misaligned_quant_numel_errors() {
+        // ggml type 12 = Q4_K: 256 elements per 144-byte block. 100 is not a whole block.
+        let b = build_typed_fixture(12, 100, 144);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => {
+                assert!(
+                    msg.contains("tensor0") && msg.contains("256"),
+                    "error should name the tensor and its block size: {msg}"
+                );
+            }
+            other => panic!("misaligned quant numel should be Error::Loader, got {other:?}"),
+        }
+    }
+
+    /// The alignment guard must not reject legitimate quantised tensors: one whole Q4_K block
+    /// (256 elements → 144 bytes) still opens and sizes exactly.
+    #[test]
+    fn block_aligned_quant_numel_still_opens() {
+        let b = build_typed_fixture(12, 256, 144);
+        let tmp = write_temp_gguf(&b);
+        let gguf = Gguf::open(tmp.path()).expect("one whole Q4_K block must open");
+        let t = &gguf.tensors()[0];
+        assert_eq!(t.dtype, DType::Q4K);
+        assert_eq!(t.nbytes, 144, "one Q4_K block is 144 bytes");
+        assert_eq!(gguf.tensor_bytes("tensor0").expect("bytes").len(), 144);
+    }
+
+    /// i2_s has no `block_layout` block to divide by — it packs 4 2-bit codes per byte plus ONE
+    /// trailing per-tensor f32 scale. `numel = 3` would size to 4 bytes: all scale, no codes.
+    #[test]
+    fn misaligned_i2s_numel_errors() {
+        // ggml type 36 = GGML_TYPE_I2_S.
+        let b = build_typed_fixture(36, 3, 64);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => assert!(
+                msg.contains("tensor0") && msg.contains("i2_s"),
+                "error should name the tensor and the i2_s packing: {msg}"
+            ),
+            other => panic!("misaligned i2_s numel should be Error::Loader, got {other:?}"),
+        }
+    }
+
+    /// The F32 round-trip fixture (`block_elems == 1`) must be unaffected — every element count is
+    /// trivially a whole number of blocks for an unquantised dtype.
+    #[test]
+    fn unquantised_numel_is_never_rejected() {
+        let tmp = write_temp_gguf(&build_fixture());
+        Gguf::open(tmp.path()).expect("F32 tensors have no block-alignment constraint");
     }
 
     // ── gated real-model test (skipped offline) ───────────────────────────────

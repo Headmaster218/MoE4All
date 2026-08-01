@@ -214,8 +214,7 @@ impl GpuPager {
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
-                // Safety: `ring` was allocated by this same backend (session-owned Staging).
-                let base = unsafe { as_vk_buf(ring) }
+                let base = as_vk_buf(ring)?
                     .mapped_ptr()
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
                 par_copy_to_mapped(bytes, unsafe { base.add(ring_off) });
@@ -281,8 +280,7 @@ impl GpuPager {
                     "dense block bytes ({total}) exceed the pool's slot stride ({})",
                     self.slot_bytes
                 );
-                // Safety: `ring` was allocated by this same backend (session-owned Staging).
-                let base = unsafe { as_vk_buf(ring) }
+                let base = as_vk_buf(ring)?
                     .mapped_ptr()
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
                 let mut off = ring_off;
@@ -386,8 +384,7 @@ fn copy_into_slot(
     slot: u32,
     len: usize,
 ) -> Result<()> {
-    // Safety: every buffer this pager holds was allocated by this same `VulkanBackend`.
-    let (s, d) = unsafe { (as_vk_buf(src), as_vk_buf(dst)) };
+    let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
     let (sb, db) = (s.buffer, d.buffer);
     let dst_offset = slot as u64 * len as u64;
     let shared = Arc::clone(&vk.shared);
@@ -860,9 +857,9 @@ impl MoePagerSession {
         let window = self.pools[*pool]
             .pager
             .lut_words(src.layer_base as usize, n_expert);
-        // Safety: the tape is session-owned Staging (persistently mapped) and the region written
-        // is fresh this drain cycle — no in-flight reader can see a partial window.
-        let base = unsafe { as_vk_buf(self.tape.as_ref()) }
+        // The tape is session-owned Staging (persistently mapped) and the region written is
+        // fresh this drain cycle — no in-flight reader can see a partial window.
+        let base = as_vk_buf(self.tape.as_ref())?
             .mapped_ptr()
             .ok_or_else(|| be("pager LUT tape is not persistently mapped"))?;
         unsafe {

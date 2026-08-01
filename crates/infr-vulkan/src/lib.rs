@@ -108,14 +108,40 @@ fn resolve_infr_dev_index(spec: Option<&str>, device_names: &[String]) -> Result
     Ok(Some(idx))
 }
 
-/// Downcast `&dyn Buffer` → `&VkBuffer`.
+/// Downcast `&dyn Buffer` → `&VkBuffer`, CHECKED.
 ///
-/// # Safety
-/// Must only be called with buffers returned by `VulkanBackend::alloc`.
+/// This used to be an `unsafe fn` that reinterpreted the trait object's data pointer
+/// (`b as *const dyn Buffer as *const () as *const VkBuffer`) with no type check at all, its
+/// "must only be called with buffers returned by `VulkanBackend::alloc`" contract enforced purely
+/// by convention at ~30 call sites. The `Buffer` trait carries `as_any`, so the check is one
+/// `TypeId` comparison — and there are now several other `Buffer` impls a `&dyn Buffer` can
+/// legitimately be (`TpBuffer`, `EpBuffer`, `PipelineBuffer`, `infr-cpu`'s `CpuBuffer`,
+/// `infr-metal`'s `MetalBuffer`). `infr multi` hosts several backends in ONE process and the MTP
+/// draft path can mix them, so a mis-routed buffer is no longer a hypothetical: unchecked, it reads
+/// a foreign struct's first fields as a `vk::Buffer` handle plus offsets and hands them to the
+/// driver — undiagnosable memory corruption or a device loss, arbitrarily far from the routing bug.
+/// Checked, it is an ordinary backend error naming the operation.
+///
+/// Hot path: this runs per dispatch, so the success path must stay a `TypeId` compare and nothing
+/// else — the message is built in the failure branch only (`ok_or_else`), never formatted eagerly.
+/// `&dyn Buffer` exposes no type name, so the error reports what it CAN see (the logical extent and
+/// whether the buffer carries a device address) plus the impls it plausibly was.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-unsafe fn as_vk_buf(b: &dyn Buffer) -> &VkBuffer {
-    // Fat pointer (data_ptr, vtable_ptr) → thin data_ptr → &VkBuffer.
-    &*(b as *const dyn Buffer as *const () as *const VkBuffer)
+fn as_vk_buf(b: &dyn Buffer) -> Result<&VkBuffer> {
+    b.as_any().downcast_ref::<VkBuffer>().ok_or_else(|| {
+        be(format!(
+            "vulkan: buffer was not allocated by this VulkanBackend ({} bytes, device_addr={}) — \
+             it is some other `Buffer` impl (a TpBuffer/EpBuffer/PipelineBuffer wrapper, or another \
+             backend's buffer entirely). Unwrap it to the underlying VkBuffer before handing it to \
+             a Vulkan op.",
+            b.len_bytes(),
+            if b.device_addr().is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+        ))
+    })
 }
 
 /// Bounds-check ONE side of a device transfer: `bytes` must fit inside a buffer's LOGICAL extent
@@ -3281,8 +3307,7 @@ impl Backend for VulkanBackend {
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
     /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
-        // Safety: every buffer from this backend is a VkBuffer.
-        let (s, d) = unsafe { (as_vk_buf(src), as_vk_buf(dst)) };
+        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
         // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
         // An oversize `bytes` here is a `vkCmdCopyBuffer` region that runs off the end of the source
         // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
@@ -3309,8 +3334,7 @@ impl Backend for VulkanBackend {
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
-        // Safety: every buffer from this backend is a VkBuffer.
-        let vk_dst = unsafe { as_vk_buf(dst) };
+        let vk_dst = as_vk_buf(dst)?;
         // Same guard as `download`/`copy_buffer`, same wording — this one is the original, the
         // helper just stops the three from drifting apart again.
         check_extent("upload", "into", src.len(), vk_dst.size)?;
@@ -3380,8 +3404,7 @@ impl Backend for VulkanBackend {
     /// site does — `execute`/`replay` end in `queue_wait_idle`; the buffers are HOST_COHERENT so
     /// the write is visible with no explicit invalidate).
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
-        // Safety: every buffer from this backend is a VkBuffer.
-        let vk_src = unsafe { as_vk_buf(src) };
+        let vk_src = as_vk_buf(src)?;
         // The mirror of `upload`'s guard, and it is the one with TEETH: the mapped fast path below
         // is a raw `copy_nonoverlapping` of `dst.len()` bytes out of the mapping, so an oversize
         // `dst` is an out-of-bounds READ — undefined behaviour that hands the caller whatever
@@ -3550,6 +3573,42 @@ fn select_coopmat_shape(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    /// A `Buffer` impl that is NOT a `VkBuffer` — stands in for what the multi-backend paths can
+    /// actually hand a Vulkan op (another backend's buffer, or a `TpBuffer`/`EpBuffer` wrapper).
+    struct ForeignBuffer {
+        size: usize,
+    }
+    impl Buffer for ForeignBuffer {
+        fn len_bytes(&self) -> usize {
+            self.size
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// `as_vk_buf` must REJECT a buffer this backend did not allocate. Before the checked downcast
+    /// it reinterpreted any `&dyn Buffer`'s data pointer as a `VkBuffer` — a foreign struct's
+    /// leading bytes became a `vk::Buffer` handle and offsets, which then went to the driver. Since
+    /// `infr multi` hosts several backends in one process (and the MTP draft path can mix them),
+    /// this is a reachable mis-route, and it must be an `Error::Backend` rather than memory
+    /// corruption. Needs no GPU: the downcast is pure type identity.
+    #[test]
+    fn as_vk_buf_rejects_a_foreign_buffer() {
+        let foreign = ForeignBuffer { size: 4096 };
+        let err = as_vk_buf(&foreign).map(|_| ());
+        match err {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("not allocated by this VulkanBackend") && msg.contains("4096"),
+                    "error should say the buffer is foreign and report what it could see: {msg}"
+                );
+            }
+            Ok(()) => panic!("a non-VkBuffer must not downcast to &VkBuffer"),
+        }
+    }
 
     /// Finding #2: the device-local zero-init fill must cover the WHOLE logical extent, not the old
     /// `size / 4 * 4` truncation that left the trailing 1-3 bytes of a non-multiple-of-4 buffer

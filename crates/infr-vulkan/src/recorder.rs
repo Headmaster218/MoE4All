@@ -14,7 +14,7 @@ use ash::vk;
 use infr_core::{backend::Buffer, error::Result};
 
 use super::ops::ComputeKernel;
-use super::{as_vk_buf, be, Backing, VulkanBackend};
+use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
@@ -1409,8 +1409,31 @@ impl<'a> Recorder<'a> {
     /// range fits `u32` (checked below): a tensor whose range would exceed 4 GiB cannot be bound at
     /// all (`maxStorageBufferRange` caps it) and must go via the `-DSTREAMED` device-address twin
     /// instead — see `Buffer::device_addr`'s doc and `Backing::BdaSub`.
+    /// `&dyn Buffer` → `&VkBuffer` for the recorder's binding/handle helpers, PANICKING on a
+    /// foreign buffer.
+    ///
+    /// The crate-level [`as_vk_buf`] is fallible (a checked `Any` downcast) precisely so a
+    /// mis-routed buffer — `infr multi` runs several backends in one process — is a clean error
+    /// instead of a reinterpreted pointer handed to the driver. The recorder cannot take that
+    /// `Result` all the way out: `vkb` alone appears at ~360 sites, nearly all of them inside
+    /// `&[vk::DescriptorBufferInfo]` array literals in dispatch bodies, and there is no error
+    /// channel in that expression position. So the fallibility stops HERE, in one place, and turns
+    /// into a panic that carries `as_vk_buf`'s full message.
+    ///
+    /// That is still the whole point of the change: the failure moves from silent memory
+    /// corruption (a foreign struct's leading bytes read as a `vk::Buffer` handle + offsets, then
+    /// dispatched — undiagnosable, arbitrarily far from the routing bug) to an immediate, named
+    /// abort at the exact buffer that was mis-routed. Cost on the success path is one `TypeId`
+    /// compare; the message is only formatted in the failure branch.
+    fn vk_of(b: &dyn Buffer) -> &VkBuffer {
+        match as_vk_buf(b) {
+            Ok(v) => v,
+            Err(e) => panic!("recorder: {e}"),
+        }
+    }
+
     fn vkb(b: &dyn Buffer) -> vk::DescriptorBufferInfo {
-        let vb = unsafe { as_vk_buf(b) };
+        let vb = Self::vk_of(b);
         let Backing::BdaSub(block) = &vb.backing else {
             return vk::DescriptorBufferInfo {
                 buffer: vb.buffer,
@@ -1444,7 +1467,7 @@ impl<'a> Recorder<'a> {
     /// buffer, keeping the no-chunk fast path byte-identical. Never called on a resident-BDA weight
     /// sub-tensor (those are read by 64-bit address, not bound).
     fn vkb_off(b: &dyn Buffer, elem_off: usize) -> vk::DescriptorBufferInfo {
-        let vb = unsafe { as_vk_buf(b) };
+        let vb = Self::vk_of(b);
         debug_assert!(
             !matches!(vb.backing, Backing::BdaSub(_)),
             "vkb_off is for ordinary activation buffers, not resident-BDA weight sub-tensors"
@@ -1540,7 +1563,7 @@ impl<'a> Recorder<'a> {
     /// arithmetic (a resident-BDA sub-tensor's logical byte 0 lives at `sub_offset` within the
     /// shared arena block; `args` is always ordinary scratch, so `dispatch_indirect` skips it).
     fn vk_handle(b: &dyn Buffer) -> vk::Buffer {
-        unsafe { as_vk_buf(b) }.buffer
+        Self::vk_of(b).buffer
     }
 
     /// Pinned subgroup size for the decode GEMV/reduction family (`caps.sg_pref`: 16 on Intel,
@@ -6625,8 +6648,8 @@ impl<'a> Recorder<'a> {
         // this is the plain copy it always was.
         let src_h = Self::vk_handle(src);
         let dst_h = Self::vk_handle(dst);
-        let src_sub = unsafe { as_vk_buf(src) }.sub_offset;
-        let dst_sub = unsafe { as_vk_buf(dst) }.sub_offset;
+        let src_sub = Self::vk_of(src).sub_offset;
+        let dst_sub = Self::vk_of(dst).sub_offset;
         self.sync(&[src_h], &[dst_h], true);
         self.dirty_transfer.set(true);
         unsafe {
@@ -7819,7 +7842,7 @@ impl<'a> Recorder<'a> {
         // at byte 0 would clobber whatever tensor sits at the block's front — same rule as
         // `fill_buf`'s arena arm in lib.rs.
         let buf_h = Self::vk_handle(buf);
-        let sub = unsafe { as_vk_buf(buf) }.sub_offset;
+        let sub = Self::vk_of(buf).sub_offset;
         self.sync(&[], &[buf_h], true);
         unsafe {
             self.be

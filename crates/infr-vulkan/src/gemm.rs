@@ -3284,10 +3284,19 @@ impl VulkanBackend {
         self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))
             .unwrap();
 
+        // `expect` matches the surrounding `unwrap`s: this is a `#[doc(hidden)]` bench helper
+        // returning `f64`, and it downcasts buffers IT just allocated three lines up, so a failure
+        // here is impossible short of a refactor bug — and the bench harness has no error channel.
         let bufs = [
-            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
+            as_vk_buf(buf_a.as_ref())
+                .expect("bench buffer is a VkBuffer")
+                .buffer,
+            as_vk_buf(buf_b.as_ref())
+                .expect("bench buffer is a VkBuffer")
+                .buffer,
+            as_vk_buf(buf_c.as_ref())
+                .expect("bench buffer is a VkBuffer")
+                .buffer,
         ];
         let binding = self.eager_bind(&kern, &bufs).unwrap();
 
@@ -3336,10 +3345,19 @@ impl VulkanBackend {
             .unwrap();
         self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))
             .unwrap();
+        // `expect` matches the surrounding `unwrap`s: this is a `#[doc(hidden)]` bench helper
+        // returning `f64`, and it downcasts buffers IT just allocated three lines up, so a failure
+        // here is impossible short of a refactor bug — and the bench harness has no error channel.
         let bufs = [
-            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
+            as_vk_buf(buf_a.as_ref())
+                .expect("bench buffer is a VkBuffer")
+                .buffer,
+            as_vk_buf(buf_b.as_ref())
+                .expect("bench buffer is a VkBuffer")
+                .buffer,
+            as_vk_buf(buf_c.as_ref())
+                .expect("bench buffer is a VkBuffer")
+                .buffer,
         ];
         let binding = self.eager_bind(&kern, &bufs).unwrap();
         let mut push = [0u8; 12];
@@ -3396,9 +3414,9 @@ impl VulkanBackend {
         self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))?;
 
         let bufs = [
-            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
+            as_vk_buf(buf_a.as_ref())?.buffer,
+            as_vk_buf(buf_b.as_ref())?.buffer,
+            as_vk_buf(buf_c.as_ref())?.buffer,
         ];
         let binding = self.eager_bind(&kern, &bufs)?;
 

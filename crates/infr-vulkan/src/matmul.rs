@@ -204,9 +204,9 @@ impl VulkanBackend {
         self.upload(buf_b.as_ref(), b_bytes)?;
 
         // Raw Vulkan buffer handles (needed for descriptor writes and barrier).
-        let vk_a = unsafe { as_vk_buf(buf_a.as_ref()) }.buffer;
-        let vk_b = unsafe { as_vk_buf(buf_b.as_ref()) }.buffer;
-        let vk_c = unsafe { as_vk_buf(buf_c.as_ref()) }.buffer;
+        let vk_a = as_vk_buf(buf_a.as_ref())?.buffer;
+        let vk_b = as_vk_buf(buf_b.as_ref())?.buffer;
+        let vk_c = as_vk_buf(buf_c.as_ref())?.buffer;
 
         // ── update descriptor set ──────────────────────────────────────────────
         let buf_infos = [

@@ -106,7 +106,29 @@ impl Pager {
     /// within-batch safety note) — the pager can't check that itself (it doesn't know about
     /// batches), so a caller sizing `n_slots` from a VRAM budget must clamp it to at least that
     /// floor and error out earlier if the budget can't cover even one batch.
+    ///
+    /// # Panics
+    /// If `n_slots == 0`. A zero-slot pager cannot satisfy even a one-block batch, so there is no
+    /// correct behaviour to fall back to: the first `touch` would find `free` empty, scan an empty
+    /// `lru` for a victim, and die inside [`Self::take_slot`] on an `expect` about a `position()`
+    /// index — a panic that describes the wrong thing entirely, several frames away from the
+    /// mistake. Clamping to 1 instead would be worse than either: it manufactures a pager that
+    /// silently misses on EVERY touch and evicts the block the caller resolved a moment ago,
+    /// violating the within-batch safety invariant above for any batch wider than one block —
+    /// precisely the coherent-but-wrong failure this module refuses elsewhere (see `take_slot`'s
+    /// batch-overflow assert). The contract quoted above already makes the FLOOR the caller's job,
+    /// so a 0 here is a caller bug that must surface at the mistake. The one in-tree caller
+    /// (`infr-vulkan`'s `validate_pager_dims`) already rejects a 0-slot budget with a clean `Err`
+    /// before constructing anything, so this can only fire for a NEW caller that skipped that step
+    /// — never on a shipping path. `new` also runs once per pool at model load, so a check here
+    /// costs nothing measurable.
     pub fn new(n_slots: usize) -> Self {
+        assert!(
+            n_slots >= 1,
+            "pager: n_slots must be at least 1 (a zero-slot pager can never satisfy a touch) — \
+             size the slot count from the paging budget and reject a budget that can't hold one \
+             dispatch batch BEFORE constructing the pager"
+        );
         Self {
             n_slots,
             resident: HashMap::with_capacity(n_slots),
@@ -236,10 +258,26 @@ impl Pager {
             // back to pop_front would silently evict a batch sibling mid-flight (the
             // coherent-but-wrong class); fail loudly instead when batches are in use.
             .unwrap_or_else(|| {
+                // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
+                // was asked for, say why it cannot be tolerated rather than degraded, and name the
+                // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
+                // seam splits proportionally into per-pool slot counts, so raising it is what makes
+                // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
+                // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
+                // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
+                // streaming path opens a fresh batch around each single `schedule` call, so both
+                // shipping callers satisfy the floor by construction — reaching this means an
+                // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
+                // the floor.
                 assert!(
                     self.cur_epoch == 0,
-                    "pager: a single batch touched more blocks than n_slots={} — within-batch \
-                     eviction safety is unsatisfiable (sizing floor violated)",
+                    "pager: a single dispatch batch touched more distinct blocks than the \
+                     n_slots={} this cache holds — within-batch eviction safety is unsatisfiable. \
+                     Refusing to degrade: evicting a block this same batch already resolved \
+                     doesn't fail cleanly, it feeds the dispatch another block's bytes (silent \
+                     wrong output, not an error). Raise the paging budget (INFR_CACHE) so every \
+                     pool gets at least one slot per block a batch touches, or leave it unset to \
+                     take the auto budget, which is sized to that floor.",
                     self.n_slots
                 );
                 0 // epoch never used (legacy caller): plain LRU
@@ -556,6 +594,31 @@ mod tests {
         for id in 0..3u32 {
             p.touch_cold(id);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "n_slots must be at least 1")]
+    fn zero_slot_pager_is_rejected_at_construction() {
+        // A 0-slot pager used to build fine and then die on the FIRST touch, inside `take_slot`,
+        // with `expect("index from position()")` — a message about a `VecDeque` index that says
+        // nothing about the actual mistake (a paging budget that couldn't buy a single slot). The
+        // guard must fire in the constructor, at the mistake.
+        let _ = Pager::new(0);
+    }
+
+    #[test]
+    fn one_slot_pager_is_the_smallest_legal_one() {
+        // The guard's boundary: 1 slot is a legitimate (if maximally thrashy) configuration and
+        // must keep working — `slot_reuse_after_eviction_is_exact` relies on it.
+        let mut p = Pager::new(1);
+        assert_eq!(p.n_slots(), 1);
+        assert_eq!(
+            p.touch(1),
+            Resolution::Miss {
+                slot: 0,
+                evicted: None
+            }
+        );
     }
 
     #[test]
