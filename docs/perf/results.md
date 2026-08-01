@@ -401,9 +401,17 @@ columns are wins.
 **A loss the table does not show.** `infr compare`'s deep-context turn shapes
 (16k–32k KV, beyond this table's 4096) still lose on the MoE rows and get
 **monotonically worse with depth** — Qwen3-30B-A3B `pg8192,512`: 0.88× @8k,
-0.80× @16k, **0.74× @32k**. The published table tops out at d4096 and so
-flatters us at exactly the shape a long-lived agent session actually reaches.
-Untriaged; likely the most valuable open item here.
+0.80× @16k, **0.74× @32k** (re-measured 2026-08-02: 0.878 / 0.787 / 0.727). The
+published table tops out at d4096 and so flatters us at exactly the shape a
+long-lived agent session actually reaches.
+
+Now triaged — it is **decode**, not prefill. Splitting that turn: `pp512` holds
+1.05× / 0.98× / 0.91× across the three depths while `tg128` falls 0.84× / 0.76×
+/ **0.60×**. `attn_partial` is 59% of decode GPU time at d32768 and the
+bottleneck is its per-key `subgroupAdd`, not KV bandwidth — GQA head-grouping
+cuts the traffic 8× and measures 1.87× SLOWER. The full numbers, the three
+measurements that pin it, and the kernel design that would actually fix it are
+backlog **B7**.
 
 **DiffusionGemma** (`dg-step`) beats the reference fork at 1.23× (this sweep;
 previously 1.18×).

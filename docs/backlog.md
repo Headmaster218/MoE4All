@@ -139,6 +139,69 @@ when `-r > 1` so a benchmark at least measures one tier consistently. Until then
 `infr bench -u/--ubatch <N>` is the workaround, and prefill numbers should be
 reported as a median of several runs rather than a single value.
 
+### B7 — decode attention at depth is ALU-bound, and the fix is a different kernel
+
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; campaign-sized, needs a
+decision to start
+
+The largest remaining gap to llama.cpp is decode at depth, not prefill.
+Qwen3-30B-A3B Q4_K_M on a 7900 XTX against `llama-bench c629da5`:
+
+| depth | `pp512` infr/llama  | `tg128` infr/llama |
+| ----- | ------------------- | ------------------ |
+| 8192  | 1771.7 / 1692.9 t/s | 138.7 / 165.1 t/s  |
+| 16384 | 1145.4 / 1174.8     | 106.5 / 140.3      |
+| 32768 | 670.3 / 738.3       | **66.9 / 112.1**   |
+
+Prefill holds near parity; decode falls to **0.60×** and is what drags the
+`pg8192,512` turn to 0.73× @32k. Per-token cost over 8k→32k (a 2.25 GiB KV
+delta) rises **+7.74 ms** for infr against **+2.86 ms** for llama.cpp — an
+effective KV rate of ~291 GB/s vs ~787 GB/s.
+
+`attn_partial_bda` is **59% of decode GPU time** at d32768 (177 µs per
+layer-token, 3072 dispatches) and `attn_combine` another 8%. It scales exactly
+linearly — 44.2 µs @ d8192 → 177 µs @ d32768, 4.0× for 4× the KV, no fixed
+overhead.
+
+**The bottleneck is the per-key subgroup reduction, not bandwidth.** The kernel
+gives each 32-lane wave one key and reduces its 128-dim dot with a
+`subgroupAdd`, so the cross-lane reduction ALU scales with keys×heads. Three
+measurements pin it:
+
+- **GQA head-grouping LOSES.** One workgroup per (KV-head, chunk) covering all
+  `g = nh/nkv` query heads cuts K/V traffic 8× (537 MB → 67 MB per layer-token,
+  the re-read the per-query-head grid pays). Measured **329 µs vs 177 µs**, i.e.
+  1.87× SLOWER while moving an eighth of the bytes. Grouping serializes 8
+  cross-lane reductions into one wave that previously ran on 8 CUs in parallel;
+  the re-read was nearly free, served out of Infinity Cache.
+- **It is not workgroup starvation either.** Re-running the grouped kernel at
+  matched parallelism (chunk 64 → 2048 workgroups, same as the per-head grid)
+  measured **359 µs** — worse still, and `attn_combine` went 24.5 → 146 µs on
+  the 8× larger `pacc`.
+- **Fewer keys per workgroup also loses.** Halving `ATTN_SPLIT.max_chunk` to 256
+  on the UNGROUPED kernel (4096 workgroups) measured **314 µs** vs 177 µs. The
+  shipped 512/2048 point is a real optimum between per-workgroup fixed cost and
+  latency hiding.
+
+So neither traffic nor occupancy is the lever, and the whole GQA-grouping
+approach is **declined** on this kernel structure — do not re-try it as written.
+(The experiment was reverted; the tree is unchanged. It did reach bit-identical
+parity with `attn_partial`, so the approach was correct, just slower.)
+
+**What would actually work** is the design `recorder.rs`'s
+`attention_kv_split_impl` already names in its rows-batched comment — "the
+LDS-staged K-TILE kernel (per-thread full dots, no cross-lane reductions), which
+is how llama.cpp wins that cell". Stage a K tile in LDS with coalesced global
+reads, then let each lane compute a whole 128-dim dot from LDS, so the
+`subgroupAdd` per key disappears entirely. GQA grouping is then worth revisiting
+_on top of that_, because with `g` query heads as the M dimension a decode step
+becomes an `8×128 @ 128×chunk` GEMM with enough M to use the matrix cores —
+which is what llama.cpp's `gqa_ratio` flash-decode path does.
+
+That is a new kernel plus its own parity suite across the `attn_partial` variant
+matrix (static / replay / SWA-ring / Q8 / mainline-inline), so it is a campaign,
+not a slice.
+
 ---
 
 ## Withdrawn
