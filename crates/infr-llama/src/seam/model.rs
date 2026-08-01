@@ -1254,7 +1254,21 @@ impl SeamModel {
                 st.reset();
             }
             if depth > 0 {
-                unprofiled(depth, 0, &mut state)?; // warm the cache to `depth` (untimed)
+                // `depth + 1`, for the SAME reason the timed prefill below adds one: at `gen == 0`
+                // the decode loop breaks before feeding the frontier token, so a warm of `n` tokens
+                // materializes only `n - 1` KV rows and records exactly those as resident (see
+                // `resident_after_gen` — it deliberately stopped recording un-written rows, because
+                // the next turn would otherwise attend a stale/zero row).
+                //
+                // Warming with a bare `depth` therefore left the cache one row SHORT, and the timed
+                // run silently absorbed that row: `pp4 @ d4096` batch-prefilled positions
+                // `depth-1 ..= depth+4` — five rows — while still dividing by `n_prompt = 4`. Shape
+                // profiling shows it plainly (`mrow_streamed:m5:...` where it must be `m4`), and it
+                // under-reported this shape by ~20% against the pre-`a8b1809` numbers even though
+                // per-row throughput had IMPROVED. Feeding one extra token here leaves exactly
+                // `depth` rows resident, so the timed window holds precisely the work it reports —
+                // llama-bench's `-d` semantics.
+                unprofiled(depth + 1, 0, &mut state)?; // warm the cache to `depth` (untimed)
             }
             if let Some((p, g)) = pg {
                 // coding-agent turn: prompt ingest + reply generation timed together.
