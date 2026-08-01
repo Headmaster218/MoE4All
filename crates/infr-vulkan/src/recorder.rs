@@ -5946,6 +5946,36 @@ impl<'a> Recorder<'a> {
         } else {
             (p1name, p1spv)
         };
+        // B7 slice 3a — DECODE-ONLY pass 1 (`attn_decode.comp`). Same grid, same chunk policy, same
+        // pm/pl/pacc layout, same 60-byte BDA push, same 6 bindings, so this is a pure kernel swap;
+        // pass 2 below is untouched. It is `attn_partial_bda`'s hd=128 f16 inner loop with every
+        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KB LDS (occupancy 12 →
+        // 16 waves/SIMD). The reduction is the same plain `subgroupAdd`, so the output is
+        // BIT-identical — `tests/attn_decode_parity.rs` asserts that on raw bits.
+        //
+        // Every condition below is an arm the specialized kernel does not have. The ring-cache one
+        // is subtler than the rest: `attn_partial` maps position j to cache row `j % (cap/(nkv*hd))`
+        // whenever `cap` is nonzero, and `attn_decode` assumes the identity. `window == 0` already
+        // implies a full-context (non-ring) cache — only sliding-window layers are allocated as
+        // rings (`seam::mod`'s `window + ubatch` sizing) — but the row bound is checked rather than
+        // inferred, since a wrong answer here is silent garbage rather than a crash.
+        let (p1name, p1spv) = if !batched
+            && !crate::gemm::attn_decode_disabled(self.vk())
+            && bda
+            && kv_ml.is_none()
+            && !k_q8
+            && !v_q8
+            && rows == 1
+            && hd == 128
+            && window == 0
+            && canvas_lo.is_none()
+            && chunk <= 512
+            && (cap == 0 || pos < cap / (nkv * hd))
+        {
+            ("attn_decode", crate::gemm::attn_decode_spv())
+        } else {
+            (p1name, p1spv)
+        };
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };
@@ -6714,6 +6744,26 @@ impl<'a> Recorder<'a> {
                 "attn_partial_dynac_bda",
                 crate::gemm::attn_partial_dynac_bda_spv(),
             ),
+        };
+        // B7 slice 3a — DECODE-ONLY pass 1 on the REPLAY path (`attn_decode.comp -DUSE_PARAMS
+        // -DSELF_CHUNK`). This is the one that matters end-to-end: real decode replays a recorded
+        // tape, so a specialization wired only into the static path above measures as zero gain.
+        // Its SELF_CHUNK arm re-derives the identical adaptive chunk (`max(pc.chunk,
+        // min(max(span/32,64),512))`) from the live kv_len, so the `attn_live` prologue's indirect
+        // grid — nh·live workgroups, one per (query head, chunk) — is unchanged and the prologue
+        // needs no edit. `chunk <= 512` keeps the derived chunk inside the kernel's `sc[512]` slab
+        // (the policy's own `min(.., 512)` only binds above the baked floor). `window == 0` excludes
+        // both SWA and, with it, the ring cache whose row modulo the specialization drops.
+        let (p1name, p1spv) = if !crate::gemm::attn_decode_disabled(self.vk())
+            && bda
+            && !q8
+            && hd == 128
+            && window == 0
+            && chunk <= 512
+        {
+            ("attn_decode_dynac", crate::gemm::attn_decode_dynac_spv())
+        } else {
+            (p1name, p1spv)
         };
         // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
         // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are

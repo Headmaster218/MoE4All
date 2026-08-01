@@ -1,0 +1,225 @@
+#version 460
+// DECODE-ONLY specialization of `attn_partial.comp`'s split-K pass 1 (docs/backlog.md B7, slice 3a).
+//
+// WHY THIS FILE EXISTS: `attn_partial.comp` is one shader serving eight jobs — decode and prefill,
+// hd 128/256/512, full-causal and sliding-window, ring and full-context caches, canvas denoise, f16
+// and planar-Q8 and mainline-inline quant KV, one query row and small-m row batches. All of those
+// arms are compiled into every build of it, and the hd=128 f16 BDA decode build (`attn_partial_bda`)
+// pays for them in REGISTERS: `RADV_DEBUG=shaderstats` reports 120 VGPRs (zero spills) where this
+// file's identical inner loop needs 96, and in LDS: `sc[1024]` against the 512 keys a decode chunk
+// can actually hold. On RDNA3 a wave32 SIMD has 1536 VGPRs, so 120 caps occupancy at 12 waves/SIMD
+// while 96 reaches the 16-wave hardware maximum. B7's width sweep measured that difference alone
+// (`attn_partial_dsplit.comp` at width 32 — the SAME key→lane mapping, the SAME 4-key software
+// pipeline, the SAME reduction) at 1.09x @ d8192/chunk256 and 1.06x @ d32768/chunk512.
+//
+// SO: no algorithmic change. Every statement of the QK loop, the softmax reduction and the P·V pass
+// below is COPIED from `attn_partial.comp`'s `hd4 == 32` / `hd4 <= 32` arms with the runtime `hd4`
+// folded to its literal 32, the ring `RROW()` folded to the identity, and the window/canvas/Q8/
+// mainline/hd-256/hd-512/small-m arms deleted. In particular the reduction stays a PLAIN
+// `subgroupAdd` (`OpGroupNonUniformFAdd ... Reduce`), never a clustered one: the clustered form
+// makes ACO build a different reduction tree, and the point of this slice is that the output is
+// BIT-IDENTICAL to `attn_partial_bda`, so no golden moves and no accuracy question arises.
+// `tests/attn_decode_parity.rs` asserts that on raw bits, and gemm.rs's
+// `attn_decode_reduction_is_not_clustered` reads the Operation word out of the compiled SPIR-V.
+// (Measured caveat: on RADV/RDNA3 a FULL-WIDTH cluster happens to lower to the same tree, so the
+// clustered spelling did not actually move a bit here — but that is a driver accident, not a
+// guarantee, and the guard is cheap.)
+//
+// SPECIALIZED HARD (the host gate in `Recorder::attention_kv_split_impl` /
+// `attention_kv_split_dynac_impl` falls back to `attn_partial` for anything else):
+//   rows == 1 (decode) · hd == 128 · f16 K and V read by device address (KV_BDA, always on here) ·
+//   full causal (`window == 0`) · no canvas · no planar-Q8 · no mainline-inline quant KV ·
+//   no SWA ring cache (window == 0 ⟹ the cache is full-context, so row j is at row j) ·
+//   chunk <= 512 (the `sc[]` score slab).
+//
+// The grid (one workgroup per query head × chunk, g heads sharing a kv-head/chunk kept CONSECUTIVE),
+// the adaptive chunk policy, the pm/pl/pacc layout and pass 2 (`attn_combine` / `attn_combine_live`)
+// are all `attn_partial`'s unchanged — this is a drop-in for pass 1 only, and the `attn_live`
+// prologue that writes the indirect grid needs no change because the grid shape is the same.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// EXACTLY `attn_partial.comp`'s `-DKV_BDA` push block (15 words = 60 B) so the recorder's existing
+// packing is reused verbatim and the two kernels are interchangeable at the dispatch site.
+// `window`/`cap`/`rows` are the specialization's zeros; `pos` is dead under USE_PARAMS. The block is
+// declared unconditionally: vkCreateComputePipelines validates the range against the declared Block
+// SIZE, not per-member static use (VUID-VkComputePipelineCreateInfo-layout-10069).
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;
+    uint pos; uint rows;
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+} pc;
+#include "kv_addr.glsl"
+
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [1, nh, 128] as vec4
+layout(binding = 1) readonly buffer KB { uint ku_inert[]; }; // INERT (hazard edge only, never read)
+layout(binding = 2) readonly buffer VB { uint vu_inert[]; }; // INERT
+#ifdef USE_PARAMS
+// Record-once decode replay: kv_len comes from the host-updated params SSBO so the command buffer
+// replays across tokens. Outputs shift to 4/5/6 (params takes 3) to stay output-last — the same
+// binding shuffle `attn_partial.comp` does under -DUSE_PARAMS.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 4) buffer PM { float pm[]; };
+layout(binding = 5) buffer PL { float pl[]; };
+layout(binding = 6) buffer PACC { float pacc[]; };
+#else
+layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
+layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
+layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, 128]
+#endif
+
+// 512, not attn_partial's 1024: a decode chunk is capped at 512 keys by `ATTN_SPLIT.max_chunk` (and
+// by the SELF_CHUNK policy's own `min(.., 512)`), and the host gate refuses a larger `chunk`. Halving
+// the slab takes the workgroup's LDS from 4.75 KB to 2.75 KB, which is what stops LDS from capping
+// occupancy below the 16 waves/SIMD the 96-VGPR footprint allows.
+shared float sc[512];
+shared float red[64];
+shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-occupancy V pass)
+
+// f16 K/V vec4 by device address: one f16vec4 (8 B) = two adjacent u32 words = ONE KV2 b64 read with
+// a saddr scalar base. Character-for-character `attn_partial.comp`'s KV_BDA `kread4`/`vread4`.
+vec4 kread4(uint i4) {
+    uvec2 w = KV2(k_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+vec4 vread4(uint i4) {
+    uvec2 w = KV2(v_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    // Wave-uniform K/V cache base pointers, set ONCE (kv_addr.glsl) → saddr scalar-base loads.
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+    uint hd = pc.hd;    // always 128 (host-gated); kept as the push read so `scale`'s default is
+                        // computed from the SAME expression attn_partial uses — a compile-time
+                        // `sqrt(128.0)` fold is not guaranteed to equal the runtime `sqrt(float(hd))`.
+    uint g = pc.nh / pc.nkv;
+    // scale > 0 → caller-supplied (gemma4 uses 1.0, QK-norm controls magnitude); else 1/√hd default.
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
+#ifdef SELF_CHUNK
+    // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, so derive the
+    // SAME adaptive policy the `attn_live` prologue and `attn_partial`'s SELF_CHUNK arm use (~32
+    // chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len. The
+    // prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup → (head, chunk)
+    // decomposition must use the live count, NOT pc.n_chunks (only the pm/pl/pacc scratch stride).
+    // window == 0 here, so the window start `lo` is 0 and the chunked span is the whole cache.
+    uint kv_len = p_kvlen;
+    uint qpos1 = kv_len;
+    uint span = kv_len;
+    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+    uint live = (span + chunkv - 1u) / chunkv;
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % live;
+    uint kvh = rest / live;
+    uint h = kvh * g + hh;
+    uint j0 = c * chunkv;
+    uint j1 = min(j0 + chunkv, kv_len);
+#else
+    // Static path: rows == 1, so the single query row is at absolute position `pos` and its causal
+    // end is pos+1. window == 0 and no canvas → the chunk-grid base and the mask floor are both 0.
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
+    uint qpos1 = pc.pos + 1u;
+    uint j0 = c * pc.chunk;
+    uint j1 = min(c * pc.chunk + pc.chunk, qpos1);
+#endif
+
+    // ── QK via subgroup reduction ────────────────────────────────────────────────────────────────
+    // The 32 lanes of a wave cooperate on ONE key's 128-dim dot: lane owns head-dim vec4 `lane`
+    // (contiguous → one 512-byte coalesced segment per key), partial-dots, plain `subgroupAdd`.
+    // Four keys are software-pipelined so all four independent loads issue before the dependent
+    // reductions. hd4 == 32 means ONE loop-invariant q vec4 per lane, held in a register.
+    uint sg = gl_SubgroupID;             // 0..1
+    uint lane = gl_SubgroupInvocationID;  // 0..31
+    uint nsg = gl_NumSubgroups;           // 2 (local_size 64, requiredSubgroupSize 32)
+    vec4 qreg = vec4(q4[h * 32u + lane]);
+    float lmax = -3.0e38;
+    uint j = j0 + sg;
+    uint kb = pc.nkv * 32u;
+    for (; j + 3u * nsg < j1; j += 4u * nsg) {
+        vec4 a0 = kread4(j * kb + kvh * 32u + lane);
+        vec4 a1 = kread4((j + nsg) * kb + kvh * 32u + lane);
+        vec4 a2 = kread4((j + 2u * nsg) * kb + kvh * 32u + lane);
+        vec4 a3 = kread4((j + 3u * nsg) * kb + kvh * 32u + lane);
+        float d0 = subgroupAdd(dot(qreg, a0)) * scale;
+        float d1 = subgroupAdd(dot(qreg, a1)) * scale;
+        float d2 = subgroupAdd(dot(qreg, a2)) * scale;
+        float d3 = subgroupAdd(dot(qreg, a3)) * scale;
+        if (lane == 0u) {
+            sc[j - j0] = d0;
+            sc[j + nsg - j0] = d1;
+            sc[j + 2u * nsg - j0] = d2;
+            sc[j + 3u * nsg - j0] = d3;
+        }
+        lmax = max(max(max(max(lmax, d0), d1), d2), d3);
+    }
+    for (; j < j1; j += nsg) {
+        float part = dot(qreg, kread4((j * pc.nkv + kvh) * 32u + lane));
+        float d = subgroupAdd(part) * scale;
+        if (lane == 0u) { sc[j - j0] = d; }
+        lmax = max(lmax, d);
+    }
+    red[t] = lmax;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] = max(red[t], red[t + s]); }
+        barrier();
+    }
+    float m = red[0];
+    barrier();
+
+    // exp(s - m) → sc, sum l
+    float lsum = 0.0;
+    for (uint jj = j0 + t; jj < j1; jj += 64u) {
+        float p = exp(sc[jj - j0] - m);
+        sc[jj - j0] = p;
+        lsum += p;
+    }
+    red[t] = lsum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    float l = red[0];
+
+    // ── P·V ──────────────────────────────────────────────────────────────────────────────────────
+    // Each lane owns dim-vec4 `lane` and the TWO subgroups split the key range (one wide coalesced
+    // load per key, 2-key software pipeline); the partials meet through `vsh`.
+    vec4 acc = vec4(0.0);
+    uint vbase = kvh * 32u + lane;
+    uint jv = j0 + sg;
+    for (; jv + nsg < j1; jv += 2u * nsg) {
+        vec4 b0 = vread4(jv * kb + vbase);
+        vec4 b1 = vread4((jv + nsg) * kb + vbase);
+        acc += sc[jv - j0] * b0;
+        acc += sc[jv + nsg - j0] * b1;
+    }
+    for (; jv < j1; jv += nsg) {
+        acc += sc[jv - j0] * vread4(jv * kb + vbase);
+    }
+    if (sg == 1u) { vsh[lane] = acc; }
+    barrier();
+    uint pbase = (h * pc.n_chunks + c) * 128u;
+    if (sg == 0u) {
+        acc += vsh[lane];
+        pacc[pbase + 4u * lane] = acc.x;
+        pacc[pbase + 4u * lane + 1u] = acc.y;
+        pacc[pbase + 4u * lane + 2u] = acc.z;
+        pacc[pbase + 4u * lane + 3u] = acc.w;
+    }
+    if (t == 0u) {
+        pm[h * pc.n_chunks + c] = m;
+        pl[h * pc.n_chunks + c] = l;
+    }
+}

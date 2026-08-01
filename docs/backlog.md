@@ -141,8 +141,12 @@ reported as a median of several runs rather than a single value.
 
 ### B7 — decode attention at depth: three designs measured; a mid-depth win found
 
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; next step is two
-contained slices (ship the specialization; then width by workgroup count)
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; slice 3a (the
+specialization) has LANDED — what remains open is width by workgroup count
+
+Note the `tg128` numbers in the table below are the PRE-slice-3a baselines
+(`INFR_NO_ATTN_DECODE=1` reproduces them exactly); see "What slice 3a bought" at
+the end of this entry for the shipped figures.
 
 The largest remaining gap to llama.cpp is decode at depth, not prefill.
 Qwen3-30B-A3B Q4_K_M on a 7900 XTX against `llama-bench c629da5`:
@@ -283,27 +287,63 @@ So llama.cpp's `d_split = 8` is right for ITS configuration, not universally —
 and **the original B7 target (d32768) remains a negative**: nothing beats the
 shipped kernel there except the free specialization.
 
-**Next slice.** Two independent pieces, in this order:
+**What slice 3a bought (LANDED).** `shaders/attn_decode.comp` — the hd=128 f16
+BDA decode arm of `attn_partial`, copied statement for statement, with the
+window / canvas / SWA-ring / Q8 / mainline-inline / hd-256 / hd-512 / small-m
+arms deleted and `sc[1024]` cut to `sc[512]`. Two builds (static and
+`-DUSE_PARAMS -DSELF_CHUNK` replay), selected in
+`Recorder::attention_kv_split_impl` / `attention_kv_split_dynac_impl`;
+`INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode`) forces `attn_partial`
+back. `RADV_DEBUG=shaderstats`: **96 VGPRs / 3072 B LDS** against
+`attn_partial_bda`'s **120 / 5120**, zero spills either way.
 
-- **(a) Ship the specialization.** A decode-only `attn_partial` variant at w=32
-  is a ~6–9% win at every depth with the summation order unchanged. Lowest risk
-  in the campaign.
-- **(b) Width by workgroup count.** Choose `w` from `nh * n_chunks` against the
-  device CU count rather than from depth directly (the monotone relationship is
-  in workgroups, not kv_len). Needs validating on shapes the probe never covered
-  — it only tested `nh=32 nkv=4 hd=128`. Also unmeasured: d2048/d4096, which is
-  where the published `tg64@d4096` column sits and where a win would show up in
-  the table.
+Qwen3-30B-A3B Q4_K_M, `infr bench -p 0 -n 128 -r 3`, legs alternated twice:
 
-Expected end-to-end, this model: d8192 tg128 +12% (0.84× → ~0.95× vs llama.cpp),
-d32768 only +3% (0.60× → ~0.62×). Worth having, but it does NOT close the
-headline deep-context gap — treat (a)+(b) as a mid-depth win, not a fix for B7's
+| depth | ON            | OFF (= the table above) | gain      |
+| ----- | ------------- | ----------------------- | --------- |
+| 4096  | 169.9 / 169.5 | 163.2 / 162.8           | **1.04×** |
+| 8192  | 147.4 / 147.2 | 138.4 / 138.3           | **1.06×** |
+| 32768 | 71.9 / 71.7   | 66.5 / 66.4             | **1.08×** |
+
+Independently re-measured on the same box (separate alternated run): 170.4 /
+163.1 = 1.045×, 148.1 / 138.5 = 1.069×, 72.3 / 67.1 = 1.078×. The OFF legs land
+on the pre-slice baselines recorded at the top of this entry (138.9 and 66.9),
+which is what makes the A/B trustworthy — the knob really is reverting to the
+old kernel and not just perturbing it.
+
+The output is **BIT-identical** —
+`crates/infr-vulkan/tests/attn_decode_parity.rs` asserts raw `f32` bits over
+nine shapes × both call paths, and no `gpu_seam_matches_cpu*` golden moved. B7's
+earlier claim that the drift came from `ClusteredReduce` is WRONG, or at least
+incomplete: making all five of `attn_decode`'s reductions
+`subgroupClusteredAdd(., 32u)` still produced bit-identical output on RADV/RDNA3
+(a full-width cluster lowers to the same tree), and so did swapping the runtime
+`sqrt(float(pc.hd))` for a constant-folded `sqrt(128.0)`. **The
+`attn_partial_dsplit` probe's 9.6e-7 at w=32 is therefore unexplained** — worth
+ten minutes before slice (b) leans on that probe's numbers again.
+
+Also: `dsplit_bench`'s "SHIPPED reference" leg now measures `attn_decode`, not
+`attn_partial_bda`, because it calls `attention_kv_split_at`. Re-run it under
+`INFR_NO_ATTN_DECODE=1` to compare against the old baseline.
+
+**Still open — (b) width by workgroup count.** Choose `w` from `nh * n_chunks`
+against the device CU count rather than from depth directly (the monotone
+relationship is in workgroups, not kv_len). Needs validating on shapes the probe
+never covered — it only tested `nh=32 nkv=4 hd=128`. Note the width sweep's
+per-width numbers were measured against the OLD reference, so its ratios now
+overstate the remaining headroom by the 4–8% slice 3a already took.
+
+This does NOT close the headline deep-context gap: at d32768 the model is still
+~0.64× llama.cpp's tg128. Treat (b) as a mid-depth lever, not a fix for B7's
 opening table.
 
-Note the output is not bit-identical (worst 1.18e-6 relative, 9.6e-7 at w=32 —
-glslang emits `ClusteredReduce` where the shipped kernel gets `Reduce`, so ACO
-builds a different tree). Landing either piece needs the `gpu_seam_matches_cpu*`
-goldens run, and possibly re-blessed.
+**Not covered by slice 3a, deliberately** — each falls back to `attn_partial`
+and would need its own specialization if it ever became hot: sliding-window
+(gemma's SWA layers; its global layers DO take the fast path), hd 256/512
+(gemma4, qwen35), planar-Q8 and mainline-inline quant KV, the DiffusionGemma
+canvas mask, rows > 1 (small-m spec-verify and prefill), the bound-SSBO
+(non-BDA) dispatch, and `chunk > 512` (only reachable at spans above ~524k keys
+under `INFR_KV_OVERFLOW`).
 
 ---
 

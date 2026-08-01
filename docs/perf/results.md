@@ -407,11 +407,18 @@ long-lived agent session actually reaches.
 
 Now triaged — it is **decode**, not prefill. Splitting that turn: `pp512` holds
 1.05× / 0.98× / 0.91× across the three depths while `tg128` falls 0.84× / 0.76×
-/ **0.60×**. `attn_partial` is 59% of decode GPU time at d32768 and the
-bottleneck is its per-key `subgroupAdd`, not KV bandwidth — GQA head-grouping
-cuts the traffic 8× and measures 1.87× SLOWER. The full numbers, the three
-measurements that pin it, and the kernel design that would actually fix it are
-backlog **B7**.
+/ **0.60×**. `attn_partial` is 59% of decode GPU time at d32768. Three designs
+were measured against it and two are declined outright (GQA head-grouping 1.87×
+slower, an LDS-staged K-tile 2.7× slower); backlog **B7** carries the numbers.
+
+**The decode-at-depth cells are now stale by 4–8%.** A decode-only
+specialization of the split-K kernel (`attn_decode.comp`) landed after this
+snapshot. It is bit-identical to what the table measured — same summation order,
+no golden moved — so it changed speed only: Qwen3-30B-A3B `tg128` 163.1 → 170.4
+t/s @d4096, 138.5 → 148.1 @d8192, 67.1 → 72.3 @d32768 (`INFR_NO_ATTN_DECODE=1`
+restores the old kernel). The `tg128` column in the table above is depth-0 and
+is NOT affected — shallow decode runs a different kernel (`attention_kv`)
+entirely. Regenerate the table to pick the rest up.
 
 **DiffusionGemma** (`dg-step`) beats the reference fork at 1.23× (this sweep;
 previously 1.18×).

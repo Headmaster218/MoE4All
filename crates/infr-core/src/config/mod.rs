@@ -280,6 +280,10 @@ cfg_struct! {
         /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
         /// field (§4).
         no_attn_hd_spec: bool = false,
+        /// `INFR_NO_ATTN_DECODE` (inverted) — the decode-only split-K pass-1 specialization
+        /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
+        /// the decode fast path; the output is bit-identical either way, so this is an A/B knob.
+        attn_decode: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.

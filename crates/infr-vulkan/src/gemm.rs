@@ -3156,6 +3156,20 @@ dyn_spv!(
     attn_partial_mrows_c256_bda_spv,
     "attn_partial_mrows_c256_bda"
 );
+// B7 slice 3a: DECODE-ONLY specialization of the split-K pass 1 (`attn_decode.comp`) — the same
+// hd=128 f16-BDA inner loop `attn_partial_bda` runs, with every non-decode arm deleted so it fits
+// 96 VGPRs instead of 120 and 2.75 KB of LDS instead of 4.75 KB. Bit-identical output (the
+// reduction stays a plain `subgroupAdd`). Selected in `Recorder::attention_kv_split_impl` /
+// `attention_kv_split_dynac_impl` when the shape qualifies; `INFR_NO_ATTN_DECODE=1`
+// (`kernels.vulkan.attn_decode`) forces `attn_partial` back for the A/B.
+dyn_spv!(attn_decode_spv, "attn_decode");
+dyn_spv!(attn_decode_dynac_spv, "attn_decode_dynac");
+/// `INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode` = false) — keep the general
+/// `attn_partial` builds on the decode fast path so the specialization can be A/B'd against the
+/// kernel it replaces with one env var and one binary.
+pub(crate) fn attn_decode_disabled(vk: &infr_core::config::VulkanCfg) -> bool {
+    !vk.attn_decode
+}
 // PROBE (B7 slice 1): LDS-staged K-tile decode pass 1 — one whole 128-dim dot per THREAD out of
 // shared memory instead of attn_partial's per-key cross-lane `subgroupAdd`. Reachable ONLY from
 // `Recorder::attention_kv_split_ktile_at`, whose only caller is tests/attn_ktile_probe.rs.
@@ -3472,6 +3486,60 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never
+    /// a clustered one. `attn_partial_dsplit.comp` (the width probe) spells the same width-32
+    /// reduction as `subgroupClusteredAdd(., 32)`, and glslang emits `ClusteredReduce` for it;
+    /// ACO then builds a different reduction tree and the output drifts ~1e-6 from
+    /// `attn_partial`'s — enough to need every `gpu_seam_matches_cpu*` golden re-blessed.
+    /// `attn_decode.comp` must stay on `subgroupAdd` so the bits match exactly.
+    ///
+    /// Checked in the SPIR-V rather than trusted from the source, because the two spellings are a
+    /// one-word edit apart and nothing else would notice: `OpGroupNonUniformFAdd` (opcode 350)
+    /// carries its Operation right after the scope <id> — 0 = Reduce, 3 = ClusteredReduce.
+    #[test]
+    fn attn_decode_reduction_is_not_clustered() {
+        const OP_GROUP_NON_UNIFORM_FADD: u16 = 350;
+        const REDUCE: u32 = 0;
+        // A SPIR-V module is a 5-word header then a stream of instructions; word 0 of each is
+        // (wordcount << 16) | opcode.
+        fn reduce_ops(spv: &[u32]) -> Vec<u32> {
+            let mut ops = Vec::new();
+            let mut i = 5usize;
+            while i < spv.len() {
+                let wc = (spv[i] >> 16) as usize;
+                assert!(
+                    wc > 0 && i + wc <= spv.len(),
+                    "malformed SPIR-V at word {i}"
+                );
+                if (spv[i] & 0xffff) as u16 == OP_GROUP_NON_UNIFORM_FADD {
+                    // [0] opcode, [1] result type, [2] result id, [3] scope, [4] Operation
+                    ops.push(spv[i + 4]);
+                }
+                i += wc;
+            }
+            ops
+        }
+        for (name, spv) in [
+            ("attn_decode", attn_decode_spv()),
+            ("attn_decode_dynac", attn_decode_dynac_spv()),
+            // The kernels being matched, so the invariant is pinned to a real reference rather
+            // than to a remembered fact about them.
+            ("attn_partial_bda", attn_partial_bda_spv()),
+            ("attn_partial_dynac_bda", attn_partial_dynac_bda_spv()),
+        ] {
+            let ops = reduce_ops(spv);
+            assert!(
+                !ops.is_empty(),
+                "{name}: found no OpGroupNonUniformFAdd at all — this check matched nothing"
+            );
+            assert!(
+                ops.iter().all(|&o| o == REDUCE),
+                "{name}: subgroup float add is not a plain Reduce (operations {ops:?}); \
+                 3 = ClusteredReduce, which changes the reduction tree and breaks bit-identity"
+            );
+        }
+    }
 
     fn cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0f32; m * n];

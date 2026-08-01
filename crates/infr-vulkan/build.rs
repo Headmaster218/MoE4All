@@ -183,6 +183,18 @@ fn main() {
             "attn_dsplit_w32_wg128",
             &["-DDSW=32", "-DDWG=128"],
         ),
+        // B7 slice 3a — DECODE-ONLY specialization of the split-K pass 1 (`INFR_NO_ATTN_DECODE=1`
+        // falls the whole thing back to `attn_partial`). Same kernel source in the two form-factors
+        // production dispatches: the STATIC push-constant build (Recorder::attention_kv_split_impl,
+        // used under INFR_SEAM_NO_REPLAY and by small-m callers at rows==1) and the record-once
+        // SELF_CHUNK replay build (attention_kv_split_dynac_impl, what real decode runs). K/V are
+        // always read by device address, so there is no bound-SSBO twin — the host gate requires it.
+        ("attn_decode", "attn_decode", &[]),
+        (
+            "attn_decode",
+            "attn_decode_dynac",
+            &["-DUSE_PARAMS", "-DSELF_CHUNK"],
+        ),
         // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
         // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
         // Q4/Q5 decode moves ¼ the traffic vs the dequant→f16 prepass + f16-scratch read. K and V

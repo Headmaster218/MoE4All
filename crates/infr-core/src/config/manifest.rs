@@ -201,6 +201,7 @@ knobs! {
     "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  migrated;
     "INFR_PV_SPLITS"      => "kernels.vulkan.pv_splits",        Int,              Ignored, "2",  migrated;
     "INFR_NO_ATTN_HD"     => "kernels.vulkan.no_attn_hd_spec",  Presence,         Ignored, "1",  migrated;
+    "INFR_NO_ATTN_DECODE" => "kernels.vulkan.attn_decode",      PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  migrated;
     "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;
 

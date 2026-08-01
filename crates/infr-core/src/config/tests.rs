@@ -1177,6 +1177,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MMV_MW_WARPS",
         "INFR_MROWS_ATTN",
         "INFR_NOBARRIER",
+        "INFR_NO_ATTN_DECODE",
         "INFR_NO_ATTN_HD",
         "INFR_NO_BM16",
         "INFR_NO_DN_CHUNK",

@@ -1091,6 +1091,26 @@ impl VulkanBackend {
         &self.cfg
     }
 
+    /// Names of every compute kernel this backend has BUILT so far — the `kernel`/`kernel_sg`
+    /// cache keys, which are also the `INFR_PROF_OPS` labels. Sorted.
+    ///
+    /// For tests that need to assert WHICH kernel a dispatch path selected. A parity test between
+    /// two kernel variants is vacuous if the selector quietly sent both legs to the same one, and
+    /// nothing else in the API makes that observable: the choice happens inside `Recorder` and
+    /// leaves no trace in the output (which is the whole point when the variants agree bitwise).
+    pub fn built_kernel_names(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self
+            .shared
+            .kernels
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
     /// device + compute queue with the required extensions/features, set up the allocator.
     /// `Err` on Apple (Vulkan is unsupported there — use the Metal backend), `Ok(())` everywhere
