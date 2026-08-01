@@ -658,6 +658,12 @@ const KV_SPILL: SpillNouns<'static> = SpillNouns {
 /// alone, never the real VRAM guard. Ignored when `INFR_KV_OVERFLOW` is off.
 ///
 /// Carried on the `Config` in MiB (`kv.overflow_vram_mb`); the byte conversion is this accessor's.
+///
+/// KEEP (reviewed 2026-08-01, docs/code-review.md Y4). One read site, and a YAGNI sweep flagged it
+/// as measurement scaffolding. It stays for the same reason as `debug.poison_uninit`: it costs
+/// nothing when unset, and it is what makes a partial-spill placement reproducible on hardware
+/// where the model would otherwise fit — i.e. what lets a placement bug be re-created on a machine
+/// that is not the one that hit it. The feature it serves is opt-in either way.
 fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
     infr_core::budget::mib_bytes(cfg.kv.overflow_vram_mb)
 }
@@ -3292,6 +3298,13 @@ impl Backend for VulkanBackend {
         // `debug.poison_uninit` (`INFR_POISON_UNINIT=1`) forces the poison in release too — for
         // hunting layout-sensitive read-before-write bugs whose output shifts with unrelated code
         // changes.
+        //
+        // KEEP (reviewed 2026-08-01, docs/code-review.md Y3). This knob has exactly one read site —
+        // the line below — and a YAGNI sweep flagged it as scaffolding. It stays: it costs one
+        // branch on an allocation path that runs at load, nothing at all when unset, and it is the
+        // only way to reproduce a read-before-write bug in a RELEASE build, where the debug poison
+        // is compiled out and the symptom moves with unrelated code. YAGNI is about unused
+        // abstraction; this is used, just rarely. Do not delete it for being one line.
         let buf = self.make_alloc(bytes, usage)?;
         #[cfg(debug_assertions)]
         self.fill_buf(&buf, 0xFF)?;
