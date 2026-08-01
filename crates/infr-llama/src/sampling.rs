@@ -349,6 +349,15 @@ impl Penalties {
 
     /// Patch `logits` in place for the tokens generated so far. Order matches llama.cpp's
     /// `penalties` sampler: repeat (multiplicative, sign-aware) then presence/frequency (additive).
+    ///
+    /// Every logits access is CHECKED (`get_mut`), and an id at or past `logits.len()` is skipped.
+    /// The row is full-vocab on the trunk decode path, so today no id can be out of range — but the
+    /// history this walks is generated ids, and the row it patches is whatever slice the caller
+    /// hands over: an lm-head slice, or the MTP draft head's (possibly smaller) vocab. Indexing
+    /// raw turned "the draft head has a narrower vocab than the trunk" into a mid-generation panic.
+    /// Skipping is the right failure mode because a penalty is a soft PREFERENCE, not a
+    /// correctness constraint: an id outside the row cannot be sampled from that row at all, so
+    /// dropping its nudge changes nothing about the outcome, while panicking kills a live request.
     pub(crate) fn apply(&self, logits: &mut [f32]) {
         if self.repeat != 1.0 && self.last_n > 0 {
             // llama.cpp's `penalties` sampler scales each DISTINCT id in the window ONCE — a token
@@ -359,7 +368,9 @@ impl Penalties {
                 if !seen.insert(t) {
                     continue;
                 }
-                let l = &mut logits[t as usize];
+                let Some(l) = logits.get_mut(t as usize) else {
+                    continue; // id past the end of this row — unsamplable here, so nothing to bias
+                };
                 *l = if *l > 0.0 {
                     *l / self.repeat
                 } else {
@@ -369,7 +380,9 @@ impl Penalties {
         }
         if self.presence != 0.0 || self.frequency != 0.0 {
             for (&t, &n) in &self.counts {
-                logits[t as usize] -= self.presence + self.frequency * n as f32;
+                if let Some(l) = logits.get_mut(t as usize) {
+                    *l -= self.presence + self.frequency * n as f32;
+                }
             }
         }
     }
@@ -536,8 +549,24 @@ fn truncated_softmax(
 
 /// Sample a token id from `logits` per `s`. Greedy if `temp<=0`/`top_k==1`; else temperature +
 /// top-k + top-p (nucleus). `rng` is an xorshift64 state advanced in place.
+///
+/// An EMPTY `logits` returns token `0` and trips a `debug_assert!`, exactly as its sibling
+/// [`sample_from_dist`] does for an empty distribution — the two are the crate's only "draw an id"
+/// entry points and they must not disagree about the degenerate input. Before the guard the two
+/// paths through this function failed in two DIFFERENT wrong ways on an empty slice: the sampled
+/// path ran `truncated_softmax`'s `top_k==0` arm over an empty heap and then panicked on
+/// `idx[idx.len() - 1]`, while the greedy path silently returned [`argmax`]'s `0`. A real vocab is
+/// never empty, so the `debug_assert!` is what states that: it makes the "can't happen" LOUD in
+/// tests and under `infr`'s debug builds, while release keeps the sibling's total behaviour rather
+/// than aborting a live request over a slice a caller mis-sliced. The MTP speculative path calls
+/// this with caller-computed per-position slices, so "the caller built the slice" is the case that
+/// motivates a defined answer at all.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
+    if logits.is_empty() {
+        debug_assert!(false, "sample_logits over an empty logits row");
+        return 0; // empty support: nothing to draw (caller-guaranteed not to happen)
+    }
     if s.temp <= 0.0 || s.top_k == 1 {
         return argmax(logits) as u32;
     }
@@ -585,9 +614,15 @@ pub(crate) fn truncated_dist(logits: &[f32], s: Sampler) -> Vec<(u32, f32)> {
 /// Draw one id from a normalized `(id, prob)` distribution (as returned by [`truncated_dist`])
 /// using the shared xorshift64 uniform draw — the stochastic MTP accept rule's residual/bonus
 /// sampling (`crate::seam::model::spec_accept_stochastic`).
+///
+/// Empty distribution ⇒ token `0` plus a `debug_assert!`, the same contract [`sample_logits`]
+/// states for an empty logits row. Keep the two arms identical; they are the crate's two "draw an
+/// id" entry points, and a caller that hits the degenerate case should not get a panic from one
+/// and a `0` from the other depending on which one it happened to call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn sample_from_dist(dist: &[(u32, f32)], rng: &mut u64) -> u32 {
     let Some(&(last_id, _)) = dist.last() else {
+        debug_assert!(false, "sample_from_dist over an empty distribution");
         return 0; // empty distribution: nothing to draw (caller-guaranteed not to happen)
     };
     let r = next_uniform(rng);
@@ -795,6 +830,86 @@ mod tests {
         // id 5 penalized ONCE: 8/2 = 4  (the per-occurrence bug would give 8 / 2^3 = 1).
         assert_eq!(logits[5], 4.0, "distinct id must be penalized exactly once");
         assert_eq!(logits[7], 2.0, "id seen once: 4/2 = 2");
+    }
+
+    /// A generated id at or past the end of the logits row must be SKIPPED, not indexed. The trunk
+    /// row is full-vocab so this cannot fire there, but `apply` patches whatever slice it is given
+    /// (an lm-head slice, the MTP draft head's narrower vocab), and the raw `logits[t as usize]`
+    /// turned that into a panic in the middle of a live generation. Both penalty arms are checked:
+    /// the multiplicative repeat one and the additive presence/frequency one.
+    #[test]
+    fn penalties_skip_ids_past_the_end_of_the_logits_row() {
+        let ctx = RequestCtx::new(RequestSampling {
+            repeat_penalty: 2.0,
+            repeat_last_n: 64,
+            presence_penalty: 1.0,
+            frequency_penalty: 0.5,
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+        p.observe(1); // in range
+        p.observe(4); // exactly one past the end of a 4-wide row
+        p.observe(9_999); // far past the end
+        p.observe(u32::MAX); // and the id that would index past isize::MAX on a 32-bit host
+        let mut logits = vec![0.0f32; 4];
+        logits[1] = 8.0;
+        p.apply(&mut logits); // must not panic
+                              // The in-range id still gets the full llama.cpp treatment: repeat (8/2 = 4) then
+                              // presence+frequency (-(1.0 + 0.5*1) = -1.5).
+        assert_eq!(logits[1], 2.5, "in-range id must still be penalized");
+        assert_eq!(logits[0], 0.0, "untouched ids stay untouched");
+        assert_eq!(logits.len(), 4, "the row is not resized");
+    }
+
+    /// An empty support is "can't happen" (a real vocab is never empty), so the two draw entry
+    /// points must at least AGREE about what "can't happen" does. They didn't: `sample_from_dist`
+    /// returned `0`, while `sample_logits` either panicked on `idx[idx.len() - 1]` (the sampled
+    /// path, whose heap came back empty) or silently returned `argmax`'s `0` (the greedy path) —
+    /// three behaviours across two functions and two arms. Now all three trip a `debug_assert!`
+    /// (loud here and in debug builds) and fall back to token `0` in release, so a caller that
+    /// mis-slices — the MTP speculative path builds its own per-position slices — gets a defined
+    /// answer instead of a killed request.
+    #[test]
+    fn empty_support_behaves_the_same_in_both_draw_paths() {
+        // The three `catch_unwind`s below expect a panic in debug builds. No panic-hook fiddling to
+        // hide their backtraces: `set_hook` is PROCESS-global and `cargo test` runs tests on
+        // parallel threads, so silencing it here would also swallow the backtrace of any genuinely
+        // failing test that happened to panic at the same moment. libtest already captures each
+        // test's stderr and prints it only on failure, so the backtraces cost nothing anyway.
+        let greedy = std::panic::catch_unwind(|| {
+            let mut rng = 1u64;
+            let s = Sampler {
+                temp: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+            };
+            sample_logits(&[], s, &mut rng)
+        });
+        let sampled = std::panic::catch_unwind(|| {
+            let mut rng = 1u64;
+            let s = Sampler {
+                temp: 1.0,
+                top_k: 0,
+                top_p: 0.95,
+            };
+            sample_logits(&[], s, &mut rng)
+        });
+        let from_dist = std::panic::catch_unwind(|| {
+            let mut rng = 1u64;
+            sample_from_dist(&[], &mut rng)
+        });
+
+        if cfg!(debug_assertions) {
+            // Debug: all three are loud. The greedy arm is the one that used to pass silently.
+            assert!(greedy.is_err(), "greedy arm must assert on an empty row");
+            assert!(sampled.is_err(), "sampled arm must assert on an empty row");
+            assert!(from_dist.is_err(), "empty distribution must assert");
+        } else {
+            // Release: all three take the sibling's total fallback, none of them panic.
+            assert_eq!(greedy.ok(), Some(0));
+            assert_eq!(sampled.ok(), Some(0));
+            assert_eq!(from_dist.ok(), Some(0));
+        }
     }
 
     /// **Finding 4 — adjacent seeds must produce distinct streams.** `seed | 1` collapsed `2k` and

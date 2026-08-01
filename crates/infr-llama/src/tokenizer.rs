@@ -119,6 +119,25 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     Ok(tok)
 }
 
+/// The global ordering of reconstructed SPM merge candidates, keyed by `(score, id_l, id_r)`:
+/// score DESCENDING (a higher GGUF score is an EARLIER merge), ties broken by `(id_l, id_r)`
+/// ASCENDING. That exact ordering is load-bearing — it is what reproduces HF `SpmConverter`'s
+/// merge ranking, and flipping either half silently re-tokenizes every prompt on a llama/gemma3
+/// GGUF (no merges array, so the ranks come from here). Factored out of
+/// [`build_spm_tokenizer`] only so a test can pin it without a model file.
+///
+/// Scores compare with [`f64::total_cmp`], NOT `partial_cmp().unwrap_or(Equal)`. A NaN score — a
+/// corrupt or hand-edited `tokenizer.ggml.scores` — makes the `unwrap_or(Equal)` comparator
+/// non-transitive (NaN is "equal" to everything, but the things it ties with are not equal to each
+/// other), and Rust's sort DETECTS that and panics with "user-provided comparison function does not
+/// correctly implement a total order". So a bad score used to abort model load inside the sort with
+/// an error about our comparator instead of about the file. `total_cmp` is a genuine total order
+/// over every f64 including NaN, so the sort completes and the corrupt entry merely ranks
+/// consistently (NaN sorts to one end) rather than taking the process down.
+fn spm_merge_order(a: (f64, u32, u32), b: (f64, u32, u32)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2)))
+}
+
 /// Build a SentencePiece (Unigram) tokenizer from a GGUF's embedded vocab (`tokenizer.ggml.model
 /// == "llama"`, used by llama/gemma). The token strings + `scores` become the Unigram lattice;
 /// `<0xXX>` byte tokens (token_type 6) are handled by Unigram byte-fallback; CONTROL tokens
@@ -174,11 +193,7 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
                     }
                 }
             }
-            cand.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then((a.1, a.2).cmp(&(b.1, b.2)))
-            });
+            cand.sort_by(|a, b| spm_merge_order((a.0, a.1, a.2), (b.0, b.1, b.2)));
             cand.into_iter()
                 .map(|(_, _, _, l, r)| (l.to_string(), r.to_string()))
                 .collect()
@@ -247,6 +262,69 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 mod tokenizer_tests {
     use super::*;
     use crate::sampling::{sample_logits, Sampler};
+
+    /// The SPM merge ranking, pinned in both halves and made NaN-proof.
+    ///
+    /// Two things are asserted, and they pull in opposite directions:
+    ///
+    /// 1. The ORDER must not move. Score descending, `(id_l, id_r)` ascending on ties — that is
+    ///    HF `SpmConverter`'s ranking, and every llama/gemma3 GGUF (no `tokenizer.ggml.merges`)
+    ///    tokenizes through it. A flip here is a silent re-tokenization of every prompt.
+    /// 2. A NaN score must not panic the sort. `partial_cmp().unwrap_or(Equal)` is non-transitive
+    ///    in the presence of NaN, and `sort_by` detects that and panics with "user-provided
+    ///    comparison function does not correctly implement a total order" — so one corrupt entry
+    ///    in `tokenizer.ggml.scores` used to abort model load. The full sort below is the actual
+    ///    regression test: it is exactly the call site's `sort_by`, and it panics under the old
+    ///    comparator.
+    #[test]
+    fn spm_merge_order_is_a_total_order_and_keeps_its_direction() {
+        use std::cmp::Ordering::{Greater, Less};
+        // Higher score sorts FIRST (earlier merge), regardless of ids.
+        assert_eq!(spm_merge_order((-1.0, 9, 9), (-2.0, 0, 0)), Less);
+        assert_eq!(spm_merge_order((-2.0, 0, 0), (-1.0, 9, 9)), Greater);
+        // Equal scores: lower (id_l, id_r) sorts first, id_l dominating id_r.
+        assert_eq!(spm_merge_order((-1.0, 3, 7), (-1.0, 4, 0)), Less);
+        assert_eq!(spm_merge_order((-1.0, 3, 7), (-1.0, 3, 8)), Less);
+        assert_eq!(
+            spm_merge_order((-1.0, 3, 7), (-1.0, 3, 7)),
+            std::cmp::Ordering::Equal
+        );
+
+        // A candidate list with NaN scores sprinkled through it. Two properties of this data are
+        // deliberate and BOTH are needed to reproduce the panic:
+        //
+        //   * scores are not monotone in `(id_l, id_r)` — a real candidate list isn't either, since
+        //     a candidate carries the MERGED piece's score alongside the two SPLIT pieces' ids. On
+        //     monotone data the old comparator's id tiebreak happens to agree with the scores and
+        //     no cycle forms, so the sort completes and the bug hides.
+        //   * enough elements that the sort actually runs its merge (n >= ~32); the insertion sort
+        //     used for tiny slices does not detect the violation.
+        //
+        // Under `partial_cmp().unwrap_or(Equal)` a NaN ties with every finite score, the id
+        // tiebreak then decides those pairs, and `NaN > y`, `y > z`, `z > NaN` becomes reachable —
+        // a cycle. `sort_by` detects it and panics. Verified: this exact shape panics with the old
+        // comparator at every n >= 32.
+        let n = 128u32;
+        let mut cand: Vec<(f64, u32, u32)> = (0..n)
+            .map(|i| {
+                let score = if i % 16 == 7 {
+                    f64::NAN
+                } else {
+                    -(((i as f64) * 7.0) % 31.0)
+                };
+                (score, i, n - i)
+            })
+            .collect();
+        cand.sort_by(|a, b| spm_merge_order(*a, *b));
+        // Nothing dropped, and the finite entries keep their descending-score order among
+        // themselves (NaN sorts to one end and does not interleave).
+        assert_eq!(cand.len(), n as usize, "no candidate may be dropped");
+        let finite: Vec<f64> = cand.iter().map(|c| c.0).filter(|s| !s.is_nan()).collect();
+        assert!(
+            finite.windows(2).all(|w| w[0] >= w[1]),
+            "finite scores must stay descending: {finite:?}"
+        );
+    }
 
     // Validate the GGUF-derived tokenizer against the HF tokenizer.json sidecar (same model).
     // Skips if the test model isn't present.

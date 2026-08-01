@@ -124,8 +124,17 @@ pub fn flag_from(raw: Option<&str>) -> bool {
 
 /// A MiB-valued knob's CONFIG field in bytes. (`Some(0)` stays `Some(0)` — the diagnostic caps use
 /// it to mean "nothing resident", which is NOT the same as "no cap".)
+///
+/// The multiply SATURATES. The input is a `u64` MiB count straight off a config file or
+/// `INFR_KV_OVERFLOW_VRAM_MB`, and anything above ~17.6 trillion MiB overflows the byte product —
+/// a value a user can type and `parse::<u64>()` happily accepts. Wrapping is the dangerous
+/// direction here, not panicking: in release the product wraps to a SMALL number, so "cap
+/// placement at an absurdly high value" silently becomes "cap at a few bytes", which forces the
+/// entire class to host and looks like a mysteriously slow run rather than a bad knob. Saturating
+/// at `u64::MAX` keeps the only sane reading of a huge cap — effectively no cap — and it can never
+/// be reached by real bytes, so the gate behaves exactly as "uncapped" downstream.
 pub fn mib_bytes(mib: Option<u64>) -> Option<u64> {
-    mib.map(|mb| mb * 1024 * 1024)
+    mib.map(|mb| mb.saturating_mul(1024 * 1024))
 }
 
 /// The MiB grammar over an explicit string — the env spelling of [`mib_bytes`], `None` when absent
@@ -216,10 +225,21 @@ impl SpillTally {
     /// `Some(0)` forces the whole class to host, which is how the whole-host path stays
     /// reproducible on a model that would otherwise fit entirely. The cap gates PLACEMENT only,
     /// never the real VRAM guard.
+    ///
+    /// The running total + `bytes` SATURATES, for the same reason [`mib_bytes`] does: a wrapped
+    /// sum is a SMALL sum, and a small sum passes a cap it should have failed — the tally would
+    /// keep admitting buffers into VRAM after the cap was blown. Saturating turns the degenerate
+    /// input into a refusal (spill to host), which is the safe side of this gate. `u64::MAX` bytes
+    /// is not a real allocation, so no honest caller is affected either way.
     pub fn admits(&self, cap: Option<u64>, bytes: u64) -> bool {
         match cap {
             None => true,
-            Some(cap) => self.vram_bytes.load(Ordering::Relaxed) + bytes <= cap,
+            Some(cap) => {
+                self.vram_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(bytes)
+                    <= cap
+            }
         }
     }
 }
@@ -506,6 +526,36 @@ mod tests {
         );
     }
 
+    /// A MiB count large enough to overflow the byte product must SATURATE, not wrap.
+    ///
+    /// `u64` MiB values this big are typeable and `parse::<u64>()`-able (a fat-fingered
+    /// `INFR_KV_OVERFLOW_VRAM_MB`, a config file with a placeholder), and the wrapped result is
+    /// actively harmful: `2^44` MiB wraps to exactly `0`, i.e. the LOUDEST possible cap turns into
+    /// "nothing may stay resident" and the whole class goes to host. In debug the same expression
+    /// panics instead. Both are worse than clamping to "effectively no cap".
+    #[test]
+    fn mib_bytes_saturates_instead_of_wrapping() {
+        const MIB: u64 = 1024 * 1024;
+        // The last MiB count that still fits, and the first that does not.
+        let last_exact = u64::MAX / MIB; // 17_592_186_044_415
+        assert_eq!(mib_bytes(Some(last_exact)), Some(last_exact * MIB));
+        assert_eq!(mib_bytes(Some(last_exact + 1)), Some(u64::MAX));
+        // `2^44` MiB is the pathological one: `2^44 * 2^20 == 2^64`, which WRAPS to 0.
+        assert_eq!(mib_bytes(Some(1 << 44)), Some(u64::MAX));
+        assert_eq!(mib_bytes(Some(u64::MAX)), Some(u64::MAX));
+        // A saturated cap behaves as "no cap" at the gate it feeds — no real byte count reaches it.
+        let t = SpillTally::default();
+        t.record_vram(1 << 40);
+        assert!(t.admits(mib_bytes(Some(u64::MAX)), 1 << 40));
+        // And the ordinary values are untouched by the change.
+        assert_eq!(mib_bytes(None), None);
+        assert_eq!(mib_bytes(Some(0)), Some(0));
+        assert_eq!(mib_bytes(Some(512)), Some(512 * MIB));
+        // `reserve_bytes` reads the same helper, so its override saturates too rather than
+        // wrapping to a tiny (or zero) reserve, which would under-reserve and OOM mid-forward.
+        assert_eq!(reserve_bytes(24 * 1024 * MIB, Some(u64::MAX)), u64::MAX);
+    }
+
     /// The cumulative cap admits up to and including the cap, and `Some(0)` admits nothing —
     /// the whole-host reproducibility case.
     #[test]
@@ -538,6 +588,28 @@ mod tests {
             }
         );
         assert_eq!(c.total_bufs(), 3);
+    }
+
+    /// The cap gate's `resident + bytes` must SATURATE. A wrapped sum is a small sum, and a small
+    /// sum passes a cap it should have failed — the tally would go on admitting buffers into VRAM
+    /// after the cap was already blown (and in debug it panics outright inside a placement
+    /// decision). Saturating refuses, which is the safe side: the buffer spills to host.
+    #[test]
+    fn spill_tally_cap_saturates_instead_of_wrapping() {
+        let t = SpillTally::default();
+        t.record_vram(1 << 40);
+        // `(1<<40) + u64::MAX` wraps to `(1<<40) - 1`, which would sneak under a modest cap.
+        assert!(!t.admits(Some(1 << 41), u64::MAX));
+        assert!(!t.admits(Some(u64::MAX - 1), u64::MAX));
+        // An uncapped tally never consults the sum at all, so it still admits anything.
+        assert!(t.admits(None, u64::MAX));
+        // A cap of exactly `u64::MAX` (what a saturated `mib_bytes` produces) still admits, since
+        // the saturated sum compares equal to it.
+        assert!(t.admits(Some(u64::MAX), u64::MAX));
+        // Right at the boundary with no saturation involved: the honest arithmetic is unchanged.
+        let u = SpillTally::default();
+        u.record_vram(u64::MAX - 10);
+        assert!(u.admits(Some(u64::MAX), 10));
     }
 
     /// The banner, byte-for-byte against the pre-hoist `eprintln!` (Vulkan KV).
