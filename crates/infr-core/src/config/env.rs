@@ -70,8 +70,9 @@ fn opt_num<T: std::str::FromStr>(get: Get, key: &str) -> Option<Option<T>> {
     num::<T>(get, key).map(Some)
 }
 
-/// A MiB-valued knob (`budget::mib_from`'s trim-and-parse). Stored in MiB; the byte conversion
-/// belongs to the accessor (R5).
+/// A MiB-valued knob: trimmed, then a plain `u64` count — so a float, a negative or an empty value
+/// leaves the knob unspecified (`mib_and_size_string_spellings`). Stored in MiB; the byte
+/// conversion belongs to the accessor ([`crate::budget::mib_bytes`], R5).
 fn opt_mib(get: Get, key: &str) -> Option<Option<u64>> {
     get(key)
         .and_then(|v| v.trim().parse::<u64>().ok())

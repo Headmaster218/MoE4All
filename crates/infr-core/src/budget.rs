@@ -137,12 +137,6 @@ pub fn mib_bytes(mib: Option<u64>) -> Option<u64> {
     mib.map(|mb| mb.saturating_mul(1024 * 1024))
 }
 
-/// The MiB grammar over an explicit string — the env spelling of [`mib_bytes`], `None` when absent
-/// or unparseable.
-pub fn mib_from(raw: Option<&str>) -> Option<u64> {
-    mib_bytes(raw.and_then(|v| v.trim().parse::<u64>().ok()))
-}
-
 /// VRAM headroom a VRAM-first spill keeps free below the live free-byte figure, so the consumers
 /// that allocate AFTER the spilled class (per-forward activation scratch, dequant caches, BLAS
 /// workspace, a paged-MoE arena) still have room. Default 12% of total VRAM floored at 2 GiB —
@@ -156,12 +150,6 @@ pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
         return bytes;
     }
     (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
-}
-
-/// [`reserve_bytes`] over an explicit override STRING — the env spelling of the same policy, kept
-/// so the grammar (MiB, trimmed, unparseable ⇒ the default formula) is pinned in one place.
-pub fn reserve_from(total_vram: u64, raw: Option<&str>) -> u64 {
-    reserve_bytes(total_vram, raw.and_then(|v| v.trim().parse::<u64>().ok()))
 }
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
@@ -448,20 +436,21 @@ mod tests {
     }
 
     /// MiB → bytes, with `0` distinct from unset (it forces whole-host placement) — over explicit
-    /// values via [`mib_from`], no environment.
+    /// values, no environment.
+    ///
+    /// This used to run over a `&str` façade (`mib_from`), which existed only so this sweep could
+    /// avoid the process environment — something [`mib_bytes`] already allows. The STRING half of
+    /// the grammar (trim, reject a float / a negative / an empty value) belongs to
+    /// `config::env`'s `opt_mib` now and is pinned there; what is left here is the arithmetic.
     #[test]
     fn mib_grammar() {
-        assert_eq!(mib_from(None), None);
-        for (raw, want) in [
-            ("0", Some(0)),
-            ("1", Some(1024 * 1024)),
-            ("  512  ", Some(512 * 1024 * 1024)),
-            ("", None),
-            ("abc", None),
-            ("-1", None),
-            ("1.5", None),
+        assert_eq!(mib_bytes(None), None);
+        for (mib, want) in [
+            (0u64, Some(0u64)),
+            (1, Some(1024 * 1024)),
+            (512, Some(512 * 1024 * 1024)),
         ] {
-            assert_eq!(mib_from(Some(raw)), want, "raw={raw:?}");
+            assert_eq!(mib_bytes(Some(mib)), want, "mib={mib}");
         }
     }
 
@@ -485,25 +474,28 @@ mod tests {
     }
 
     /// 12% of total, floored at 2 GiB, override in MiB — verbatim from the inline copy
-    /// (`kv_overflow_vram_reserve`), over [`reserve_from`] so the
-    /// case sweep needs no environment.
+    /// (`kv_overflow_vram_reserve`), over explicit values so the case sweep needs no environment.
+    ///
+    /// This used to run over a `&str` façade (`reserve_from`) purely to keep the environment out of
+    /// the sweep, which [`reserve_bytes`] already does. An unparseable override is `None` by the
+    /// time it reaches here — `config::env` decides that — and `None` is the first case below, so
+    /// the deleted `Some("abc")` row is the same assertion spelled twice.
     #[test]
-    fn reserve_from_matches_the_inline_formula() {
+    fn reserve_bytes_matches_the_inline_formula() {
         const GIB: u64 = 1024 * 1024 * 1024;
         // Below the crossover (2 GiB / 0.12 ≈ 16.67 GiB) the floor wins.
-        assert_eq!(reserve_from(8 * GIB, None), 2 * GIB);
-        assert_eq!(reserve_from(16 * GIB, None), 2 * GIB);
+        assert_eq!(reserve_bytes(8 * GIB, None), 2 * GIB);
+        assert_eq!(reserve_bytes(16 * GIB, None), 2 * GIB);
         // Above it, 12% — computed as `total / 100 * 12`, the shipped (truncating) order.
-        assert_eq!(reserve_from(24 * GIB, None), 24 * GIB / 100 * 12);
-        assert_eq!(reserve_from(0, None), 2 * GIB);
+        assert_eq!(reserve_bytes(24 * GIB, None), 24 * GIB / 100 * 12);
+        assert_eq!(reserve_bytes(0, None), 2 * GIB);
         // The override wins outright, including below the floor and at zero.
-        assert_eq!(reserve_from(24 * GIB, Some("128")), 128 * 1024 * 1024);
-        assert_eq!(reserve_from(24 * GIB, Some("0")), 0);
-        assert_eq!(reserve_from(24 * GIB, Some("abc")), 24 * GIB / 100 * 12);
+        assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
+        assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
     }
 
-    /// The same policy driven off the CONFIG field (MiB) instead of a string.
-    /// `reserve_from` is the string spelling of exactly this.
+    /// The same policy driven off the CONFIG field (MiB) — the plumbing, where the test above is
+    /// the formula.
     #[test]
     fn reserve_bytes_takes_the_override_from_the_config() {
         use crate::config::Config;

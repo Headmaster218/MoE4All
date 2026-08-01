@@ -35,6 +35,51 @@ dead scaffolding.
 | **M** | user-visible bug, missing hardening, or a real robustness gap |
 | **L** | nit, latent risk, or cleanup                                  |
 
+## Status (updated 2026-08-01, after the fix pass)
+
+**Fixed** (seven commits: `2367e34`, `d626a9d`, `93986ce`, `f8637cc`, `b991de4`,
+`d7ce3d3`, and the cleanup commit): **C1–C9**, **S1–S5**, **U1**, **D1–D5**,
+**Y1**, **Y2**, and nits **N1**, **N8**, **N11**.
+
+**Still open.** Split by why, because the reasons differ:
+
+_Needs a product decision (will not be fixed by a reviewer):_
+
+- **Y3** (`INFR_POISON_UNINIT`) and **Y4** (`INFR_KV_OVERFLOW_VRAM_MB`'s
+  placement cap) — "has this debugging knob earned its keep?"
+- **S6** — gating `/v1/models` behind the API key changes behaviour for anyone
+  scraping it.
+- **S7** — non-streaming disconnect cancellation and rate limiting are a design
+  task, not a patch.
+- **N10** — `INFR_DN_CHUNK_SCAN`'s inverted polarity is R1-frozen.
+- **C10** below — needs a decision on what `TpBuffer::len_bytes()` means.
+
+_Simply not done yet (no blocker, just not in the six slices):_ **S8**, **U2**,
+**U3**, **N2**, **N3**, **N4**, **N5**, **N6**, **N7**, **N9**, **N12**,
+**N13**.
+
+### C10 (H) — tensor-parallel KV checkpoints are double-sharded
+
+`crates/infr-llama/src/seam/weights.rs:315`, `:321`, `:344`, `:350`, `:494`,
+`:500` · `crates/infr-vulkan/src/tp.rs:127`, `:664`
+
+Surfaced by C2's new bounds guard, which turns it from a silent overrun into an
+error. `TpBuffer::len_bytes()` already reports the **per-rank** size
+(`self.bufs[0].len_bytes()`), but `TensorParallelBackend::alloc` shards
+`BufferUsage::KvCache` again (`let per = bytes / w`). So
+`be.alloc(self.kbufs[l].len_bytes(), KvCache)` allocates checkpoint buffers of
+`full/W²` per rank, and the following
+`copy_buffer(..., bytes = self.kbufs[l].len_bytes())` moves `full/W` into them —
+a `W`-fold overrun on every rank. `seed_from`'s KV prefix copy has the same
+shape, computing `bytes` from full unsharded geometry.
+
+Gated behind opt-in `INFR_TENSOR_PARALLEL` / `--tensor-parallel` with ≥2
+devices, so no default path is affected — which is why the guard landing first
+is the right order. The fix is to settle whether `TpBuffer::len_bytes()` reports
+the logical (full) or per-rank extent and make `alloc`, the checkpoint sizing,
+and `seed_from` agree on that one answer; today two of the three assume
+different things.
+
 ---
 
 ## 1. Correctness bugs

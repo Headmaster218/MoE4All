@@ -2,7 +2,7 @@
 //! Mechanically split out of `lib.rs` (no logic change).
 use crate::{LLAMA4_PRE_RE, QWEN2_PRE_RE};
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::loader::MetaValue;
+use infr_core::loader::{MetaValue, Metadata};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
 use tokenizers::decoders::byte_fallback::ByteFallback;
@@ -16,6 +16,68 @@ use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::{AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer};
+
+/// The `tokenizer.ggml.merges` line grammar: each entry is `"left right"`, ONE space, and the
+/// right half may itself contain spaces (SPM pieces are `▁`-prefixed, but a byte-level BPE piece
+/// can be a literal space) — hence `splitn(2, ' ')`, not `split`. Entries that are not strings, or
+/// that have no space at all, are dropped rather than erroring: a merge we cannot read is one the
+/// BPE simply never applies, which degrades tokenization instead of refusing to load the model.
+///
+/// Single-sources the grammar for both tokenizer families. `build_tokenizer` (gpt2 BPE) and
+/// `build_spm_tokenizer` (gemma4's explicit merges) each spelled this expression out; a fix to one
+/// copy — the `splitn` bound in particular — silently did not reach the other, and the two families
+/// would then disagree about what a merge line means while both claiming to read the same key.
+fn parse_merges(arr: &[MetaValue]) -> Vec<(String, String)> {
+    arr.iter()
+        .filter_map(|m| {
+            let s = m.as_str()?;
+            let mut it = s.splitn(2, ' ');
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// Register `tokenizer.ggml.token_type` 3 (CONTROL) and 4 (USER_DEFINED) tokens on `tok`, matching
+/// HF: control tokens are SPECIAL (`AddedToken::from(s, true)`), user-defined ones are normal added
+/// tokens. Both encode atomically; only the special ones are dropped by
+/// `decode(.., skip_special=true)`, which is why `<think>`/`</think>` (type 4) must NOT be special —
+/// the reasoning block has to stay visible in the output for the reasoning split to find it.
+///
+/// Absent `token_type` ⇒ nothing to register. The empty-vec guards are kept because `add_tokens` /
+/// `add_special_tokens` on an empty slice still bump the tokenizer's added-vocab bookkeeping, and
+/// the ORDER (added before specials) is load-bearing: a string appearing in both lists must end up
+/// special, and the later call wins.
+///
+/// This is the single copy of a policy that used to be written out verbatim in both
+/// [`build_tokenizer`] and [`build_spm_tokenizer`]. The two copies were already drifting in their
+/// comments about which type meant what, and any new token_type the GGUF spec grows would have had
+/// to be added twice — with the SPM family (which loads llama/gemma) the easy one to miss.
+fn register_token_types(md: &Metadata, toks: &[MetaValue], tok: &mut Tokenizer) {
+    let Some(types) = md
+        .get("tokenizer.ggml.token_type")
+        .and_then(MetaValue::as_arr)
+    else {
+        return;
+    };
+    let mut specials = Vec::new();
+    let mut added = Vec::new();
+    for (i, ty) in types.iter().enumerate() {
+        let Some(s) = toks.get(i).and_then(MetaValue::as_str) else {
+            continue;
+        };
+        match ty.as_u64() {
+            Some(3) => specials.push(AddedToken::from(s.to_string(), true)),
+            Some(4) => added.push(AddedToken::from(s.to_string(), false)),
+            _ => {}
+        }
+    }
+    if !added.is_empty() {
+        tok.add_tokens(&added);
+    }
+    if !specials.is_empty() {
+        tok.add_special_tokens(&specials);
+    }
+}
 
 /// Build an HF `Tokenizer` from the GGUF's embedded vocab (`tokenizer.ggml.*`). Supports the
 /// GPT-2 byte-level BPE family (Qwen/Llama-3/SmolLM etc., `tokenizer.ggml.model == "gpt2"`):
@@ -45,17 +107,11 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         .enumerate()
         .filter_map(|(i, t)| t.as_str().map(|s| (s.to_string(), i as u32)))
         .collect();
-    let merges: Vec<(String, String)> = md
-        .get("tokenizer.ggml.merges")
-        .and_then(MetaValue::as_arr)
-        .context("gguf missing tokenizer.ggml.merges")?
-        .iter()
-        .filter_map(|m| {
-            let s = m.as_str()?;
-            let mut it = s.splitn(2, ' ');
-            Some((it.next()?.to_string(), it.next()?.to_string()))
-        })
-        .collect();
+    let merges = parse_merges(
+        md.get("tokenizer.ggml.merges")
+            .and_then(MetaValue::as_arr)
+            .context("gguf missing tokenizer.ggml.merges")?,
+    );
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
         .build()
@@ -89,33 +145,9 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
     }
     tok.with_decoder(Some(ByteLevelDecoder::default()));
-    // Add control (type 3, e.g. <|im_end|>) as SPECIAL tokens and user-defined (type 4, e.g.
-    // <think>) as NORMAL added tokens — matching HF. Both encode atomically, but only special ones
-    // are dropped by `decode(.., skip_special=true)`; keeping <think>/</think> non-special means
-    // the reasoning block stays visible (and markable) in the output.
-    if let Some(types) = md
-        .get("tokenizer.ggml.token_type")
-        .and_then(MetaValue::as_arr)
-    {
-        let mut specials = Vec::new();
-        let mut added = Vec::new();
-        for (i, ty) in types.iter().enumerate() {
-            let Some(s) = toks.get(i).and_then(MetaValue::as_str) else {
-                continue;
-            };
-            match ty.as_u64() {
-                Some(3) => specials.push(AddedToken::from(s.to_string(), true)),
-                Some(4) => added.push(AddedToken::from(s.to_string(), false)),
-                _ => {}
-            }
-        }
-        if !added.is_empty() {
-            tok.add_tokens(&added);
-        }
-        if !specials.is_empty() {
-            tok.add_special_tokens(&specials);
-        }
-    }
+    // Control (type 3, e.g. <|im_end|>) as SPECIAL, user-defined (type 4, e.g. <think>) as normal
+    // added tokens — see [`register_token_types`].
+    register_token_types(md, toks, &mut tok);
     Ok(tok)
 }
 
@@ -167,13 +199,7 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     // score (descending = earliest), ties broken by piece ids; greedy BPE over these reproduces SPM.
     let merges: Vec<(String, String)> =
         if let Some(arr) = md.get("tokenizer.ggml.merges").and_then(MetaValue::as_arr) {
-            arr.iter()
-                .filter_map(|m| {
-                    let s = m.as_str()?;
-                    let mut it = s.splitn(2, ' ');
-                    Some((it.next()?.to_string(), it.next()?.to_string()))
-                })
-                .collect()
+            parse_merges(arr)
         } else {
             let scores = md
                 .get("tokenizer.ggml.scores")
@@ -231,30 +257,8 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     ]);
     tok.with_decoder(Some(dec));
     // CONTROL tokens (type 3, e.g. <bos>/<start_of_turn>/<end_of_turn>) encode atomically as
-    // special; USER_DEFINED (type 4) as normal added tokens — matching HF.
-    if let Some(types) = md
-        .get("tokenizer.ggml.token_type")
-        .and_then(MetaValue::as_arr)
-    {
-        let mut specials = Vec::new();
-        let mut added = Vec::new();
-        for (i, ty) in types.iter().enumerate() {
-            let Some(s) = toks.get(i).and_then(MetaValue::as_str) else {
-                continue;
-            };
-            match ty.as_u64() {
-                Some(3) => specials.push(AddedToken::from(s.to_string(), true)),
-                Some(4) => added.push(AddedToken::from(s.to_string(), false)),
-                _ => {}
-            }
-        }
-        if !added.is_empty() {
-            tok.add_tokens(&added);
-        }
-        if !specials.is_empty() {
-            tok.add_special_tokens(&specials);
-        }
-    }
+    // special; USER_DEFINED (type 4) as normal added tokens — see [`register_token_types`].
+    register_token_types(md, toks, &mut tok);
     Ok(tok)
 }
 

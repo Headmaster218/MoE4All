@@ -289,6 +289,48 @@ fn bad_value_is_an_error_not_a_silent_default() {
     }
 }
 
+/// The `Mib` and `Size` STRING spellings, at the layer that owns them.
+///
+/// These cases arrived here from `budget.rs`'s `mib_grammar` and `pager.rs`'s
+/// `ring_bytes_clamp_boundaries_and_override_grammar`, which used to reach them through `&str`
+/// façades (`budget::mib_from`, `pager::ring_bytes_from`) that existed only so those sweeps could
+/// stay off the process environment. The façades are gone — the value-taking functions were always
+/// environment-free — and the string half of the grammar is the env layer's job, so the spellings
+/// are pinned where the parsing actually happens.
+///
+/// `banana` is not repeated here: [`bad_value_is_an_error_not_a_silent_default`] already sweeps it
+/// across every value-carrying knob. What is here is the spellings that fail for a DIFFERENT reason
+/// than "not a number at all" — a float and a negative for a `u64` MiB count, the empty value, and
+/// a size suffix (`GiB`) that reads like the grammar but is not it. Each must leave the field
+/// unspecified rather than half-parse.
+#[test]
+fn mib_and_size_string_spellings() {
+    let d = Config::default();
+    // Mib: trimmed, then `u64` — so a float, a negative and an empty value are all "not specified".
+    for raw in ["", "1.5", "-1"] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_KV_OVERFLOW_VRAM_MB", raw)])]);
+        assert_eq!(
+            cfg.kv.overflow_vram_mb, d.kv.overflow_vram_mb,
+            "INFR_KV_OVERFLOW_VRAM_MB={raw:?} must not specify a cap"
+        );
+    }
+    // …and the accepted spelling, whitespace and all, reaches the field in MiB.
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_KV_OVERFLOW_VRAM_MB", "  512  ")])]);
+    assert_eq!(cfg.kv.overflow_vram_mb, Some(512));
+
+    // Size: `1GiB` is NOT the shared grammar's spelling (`1g` is) — it must read as unset, not as
+    // a `1`-byte ring.
+    for raw in ["", "1GiB"] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", raw)])]);
+        assert_eq!(
+            cfg.paging.ring, d.paging.ring,
+            "INFR_PAGER_RING={raw:?} must not specify a ring size"
+        );
+    }
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "1g")])]);
+    assert_eq!(cfg.paging.ring, Some(super::SizeSpec::Bytes(1 << 30)));
+}
+
 /// The device-list grammar, inherited from `infr_llama::seam::parse_device_spec` when S4 deleted
 /// that duplicate — these are its `seam_helper_tests` cases, moved to the surviving copy.
 #[test]

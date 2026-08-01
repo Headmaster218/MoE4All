@@ -319,12 +319,6 @@ pub fn ring_bytes(pager_budget: u64, ring: Option<crate::SizeSpec>) -> usize {
     (pager_budget / 8).clamp(256 * MIB, 2048 * MIB) as usize
 }
 
-/// [`ring_bytes`] over the raw `INFR_PAGER_RING` STRING — the env spelling of the same policy
-/// (`crate::parse_size`, then the clamp), pinned here so the grammar has one home.
-pub fn ring_bytes_from(pager_budget: u64, raw: Option<&str>) -> usize {
-    ring_bytes(pager_budget, raw.and_then(crate::parse_size))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,49 +326,51 @@ mod tests {
     /// The ring clamp's boundaries, pinning the pre-hoist inline expression
     /// `(budget / 8).clamp(256 MiB, 2048 MiB)` — the seam subtracts this from the pager budget
     /// before splitting arena shares, so a moved edge silently re-sizes every MoE arena — plus the
-    /// `INFR_PAGER_RING` override grammar. Driven through [`ring_bytes_from`], which takes the
-    /// override as a plain string: no process-environment mutation, so this cannot race another
-    /// test in the shared binary.
+    /// override's fall-through rule.
+    ///
+    /// Driven through [`ring_bytes`] itself, over resolved [`SizeSpec`] values. It used to go
+    /// through a `&str` façade (`ring_bytes_from`) so the sweep could avoid the process
+    /// environment, which the value-taking function already allows; the SPELLINGS it exercised
+    /// (`1g`, `512m`, a bare byte count, and the unparseable `banana` / `1GiB`) are
+    /// `crate::parse_size`'s grammar and are pinned by `parse_size_grammar` and by
+    /// `config`'s `mib_and_size_string_spellings` — everything unparseable arrives here as `None`.
     #[test]
     fn ring_bytes_clamp_boundaries_and_override_grammar() {
         const MIB: u64 = 1024 * 1024;
         // Below the floor's crossover (8 x 256 MiB = 2 GiB of budget) the floor wins — including
         // the `0` budget the pager passes when it has no budget figure at all.
-        assert_eq!(ring_bytes_from(0, None), 256 * MIB as usize);
-        assert_eq!(ring_bytes_from(2048 * MIB, None), 256 * MIB as usize);
+        assert_eq!(ring_bytes(0, None), 256 * MIB as usize);
+        assert_eq!(ring_bytes(2048 * MIB, None), 256 * MIB as usize);
         // Exactly at the crossover, and just past it, the eighth wins.
-        assert_eq!(
-            ring_bytes_from(2048 * MIB + 8, None),
-            (256 * MIB + 1) as usize
-        );
+        assert_eq!(ring_bytes(2048 * MIB + 8, None), (256 * MIB + 1) as usize);
         // At the ceiling's crossover (8 x 2 GiB) and beyond, the ceiling wins.
-        assert_eq!(
-            ring_bytes_from(16 * 1024 * MIB, None),
-            (2048 * MIB) as usize
-        );
-        assert_eq!(
-            ring_bytes_from(64 * 1024 * MIB, None),
-            (2048 * MIB) as usize
-        );
+        assert_eq!(ring_bytes(16 * 1024 * MIB, None), (2048 * MIB) as usize);
+        assert_eq!(ring_bytes(64 * 1024 * MIB, None), (2048 * MIB) as usize);
 
-        // The override in the shared size grammar; anything unparseable or zero falls through to
-        // the policy (a `0` ring would mean "never stage a slot").
-        for (raw, want) in [
-            ("1g", Some(1024 * MIB as usize)),
-            ("512m", Some(512 * MIB as usize)),
-            ("3221225472", Some(3 * 1024 * MIB as usize)), // plain bytes
-            ("0", None),
-            ("", None),
-            ("banana", None),
-            ("1GiB", None), // not the shared grammar's spelling — treated as unset
+        // An explicit override wins outright; a ZERO one (or an absent/unparseable one, which the
+        // config layer turns into `None`) falls through to the policy — a `0` ring would mean
+        // "never stage a slot".
+        let bytes = crate::SizeSpec::Bytes;
+        for (spec, want) in [
+            (Some(bytes(1024 * MIB)), Some(1024 * MIB as usize)),
+            (Some(bytes(512 * MIB)), Some(512 * MIB as usize)),
+            (Some(bytes(3_221_225_472)), Some(3 * 1024 * MIB as usize)),
+            (Some(bytes(0)), None),
+            (None, None),
         ] {
-            let got = ring_bytes_from(64 * 1024 * MIB, Some(raw));
+            let got = ring_bytes(64 * 1024 * MIB, spec);
             match want {
-                Some(w) => assert_eq!(got, w, "raw={raw:?}"),
+                Some(w) => assert_eq!(got, w, "spec={spec:?}"),
                 // Falls through to the policy, which caps at 2 GiB on this budget.
-                None => assert_eq!(got, (2048 * MIB) as usize, "raw={raw:?}"),
+                None => assert_eq!(got, (2048 * MIB) as usize, "spec={spec:?}"),
             }
         }
+        // A PERCENT override resolves against a zero base (the ring has no base to scale), so it
+        // is zero and falls through too — the same arm the `0` case above takes.
+        assert_eq!(
+            ring_bytes(64 * 1024 * MIB, Some(crate::SizeSpec::Percent(0.5))),
+            (2048 * MIB) as usize
+        );
     }
 
     /// The override as the read sites now take it: a `paging.ring` field off the backend's

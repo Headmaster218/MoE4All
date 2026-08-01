@@ -1,12 +1,10 @@
-//! Parsing model OUTPUT back into structured pieces — channel splitting (reasoning vs answer),
-//! `<|tool_call>…<tool_call|>` block parsing, and inbound message normalisation. Pure logic, no IO.
+//! Parsing model OUTPUT back into structured pieces — channel splitting (reasoning vs answer)
+//! and `<|tool_call>…<tool_call|>` block parsing. Pure logic, no IO.
 //!
 //! Reference: `~/Projects/scratch/dgemma-openai-server.py` (Python shim).
 //! Token formats: docs/plan.md "DiffusionGemma spec".
 
 use serde_json::Value;
-
-use crate::ChatMessage;
 
 // ---------------------------------------------------------------------------
 // Channel splitting
@@ -387,6 +385,18 @@ const HERMES_CLOSE: &str = "</tool_call>";
 /// render). Returns `(clean, calls)`: `clean` is the text with all tool-call blocks removed; `calls`
 /// the parsed invocations. The body is real JSON, so it's parsed with serde (no hand-rolled scanner);
 /// `arguments` is accepted as either an object or a JSON string and normalised to a `Value`.
+///
+/// A tool-call block's MARKUP never reaches `clean`, whether or not its body parsed — the same
+/// policy [`parse_tool_calls`] applies to the pipe-marker dialect. Two cases used to leak it, and
+/// both are model output the user then saw verbatim as if it were prose:
+/// - an unterminated `<tool_call>` (the turn hit the token budget mid-call) — the dangling opener
+///   and everything after it is dropped, exactly as the pipe-marker parser drops its own;
+/// - a body that failed to parse as either dialect — the span is removed even though no call is
+///   produced. Emitting nothing is the honest outcome for a call we could not read; emitting the
+///   raw `<tool_call>…</tool_call>` as assistant content is not.
+///
+/// Note the span is queued BEFORE the body is parsed, so the two cases share one rule instead of
+/// the removal being conditional on the parse succeeding.
 pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -395,14 +405,16 @@ pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         let open_abs = from + open;
         let body_start = open_abs + HERMES_OPEN.len();
         let Some(close_rel) = text[body_start..].find(HERMES_CLOSE) else {
+            // Unterminated opener: strip the dangling markup through end-of-text.
+            spans.push((open_abs, text.len()));
             break;
         };
         let body = text[body_start..body_start + close_rel].trim();
         let close_abs = body_start + close_rel + HERMES_CLOSE.len();
         from = close_abs;
+        spans.push((open_abs, close_abs));
         if let Some(call) = parse_hermes_body(body) {
             calls.push(call);
-            spans.push((open_abs, close_abs));
         }
     }
     let clean = remove_spans(text, spans);
@@ -572,20 +584,6 @@ pub fn split_think(text: &str) -> (String, String) {
         }
     }
     (reasoning.trim().to_owned(), content.trim().to_owned())
-}
-
-// ---------------------------------------------------------------------------
-// Message normalisation
-// ---------------------------------------------------------------------------
-
-/// Copy inbound [`ChatMessage`]s for feeding into the chat template.
-///
-/// Currently a straight clone — every field (`content`, `tool_calls`, `tool_call_id`, `name`) is
-/// carried through verbatim for the agentic round-trip. Kept as a named seam so any future
-/// normalisation (e.g. flattening multimodal content arrays, which live upstream today) has one
-/// place to land.
-pub fn normalize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    messages.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +762,33 @@ mod tests {
         assert!(calls.is_empty());
     }
 
+    /// An unterminated `<tool_call>` (the turn ran out of budget mid-call) must not leak its opener
+    /// into `clean` — the same guarantee `parse_tool_calls_dangling_opener_stripped` pins for the
+    /// pipe-marker dialect. The hermes parser used to just `break`, so the user was shown the raw
+    /// markup and the half-written JSON as if the model had said it.
+    #[test]
+    fn hermes_dangling_opener_stripped() {
+        let text = "Answer text.<tool_call>{\"name\":\"foo\",\"argum";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert!(calls.is_empty());
+        assert!(!clean.contains("tool_call"), "dangling opener: {clean:?}");
+        assert_eq!(clean, "Answer text.");
+    }
+
+    /// A body that parses as NEITHER dialect still produces no call — that half is
+    /// `hermes_malformed_body_is_skipped` — but the block's markup is now removed as well. A call
+    /// we could not read is worth nothing; the raw `<tool_call>…</tool_call>` shown to the user as
+    /// assistant prose is worse than nothing.
+    #[test]
+    fn hermes_unparseable_body_markup_is_stripped() {
+        let text = "Sure.<tool_call>not json</tool_call>Done.";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert!(calls.is_empty());
+        assert!(!clean.contains("tool_call"), "markup leaked: {clean:?}");
+        assert!(!clean.contains("not json"), "body leaked: {clean:?}");
+        assert_eq!(clean, "Sure.Done.");
+    }
+
     // --- split_think -----------------------------------------------------
 
     #[test]
@@ -786,31 +811,6 @@ mod tests {
         let (r, c) = split_think("plain answer");
         assert_eq!(r, "");
         assert_eq!(c, "plain answer");
-    }
-
-    // --- normalize_messages ----------------------------------------------
-
-    #[test]
-    fn normalize_messages_passthrough() {
-        let msgs = vec![
-            ChatMessage {
-                role: "user".to_owned(),
-                content: "hello".to_owned(),
-                ..Default::default()
-            },
-            ChatMessage {
-                role: "assistant".to_owned(),
-                content: "hi".to_owned(),
-                tool_call_id: Some("tc_1".to_owned()),
-                name: Some("my_fn".to_owned()),
-                ..Default::default()
-            },
-        ];
-        let out = normalize_messages(&msgs);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].role, "user");
-        assert_eq!(out[1].tool_call_id.as_deref(), Some("tc_1"));
-        assert_eq!(out[1].name.as_deref(), Some("my_fn"));
     }
 
     #[test]

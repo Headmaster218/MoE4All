@@ -2731,19 +2731,14 @@ fn cmd_compare_sweep(
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 lv = mb.llama(np, ng, &args);
             }
-            let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
-                eprintln!("infr bench failed ({short} {metric_label}): {e:#}");
-                "ERR".into()
-            });
-            let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
-            let ratio = match (iv.as_ref().ok(), lv) {
-                (Some(&i), Some(l)) if l > 0.0 => {
-                    rows.push((short.to_string(), metric_label.clone(), i, l));
-                    format!("{:.2}x", i / l)
-                }
-                _ => "-".into(),
-            };
-            println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
+            print_sweep_cell(
+                short,
+                &metric_label,
+                iv,
+                lv,
+                &format!("infr bench failed ({short} {metric_label})"),
+                &mut rows,
+            );
         }
         // mtp column (issue #33, phase 4): infr-vs-llama at the SAME tg128 shape above, but with
         // both tools' MTP spec decode on — MTP-capable models only (the cell costs one llama-cli
@@ -2756,19 +2751,14 @@ fn cmd_compare_sweep(
         if infr_llama::mtp::mtp_enabled() && mb.has_mtp_head() {
             let iv = mb.infr_mtp(&["-p", "0", "-n", "128"]);
             let lv = mb.llama_cli_mtp(128);
-            let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
-                eprintln!("infr mtp bench failed ({short}): {e:#}");
-                "ERR".into()
-            });
-            let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
-            let ratio = match (iv.as_ref().ok(), lv) {
-                (Some(&i), Some(l)) if l > 0.0 => {
-                    rows.push((short.to_string(), metric_label.clone(), i, l));
-                    format!("{:.2}x", i / l)
-                }
-                _ => "-".into(),
-            };
-            println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
+            print_sweep_cell(
+                short,
+                &metric_label,
+                iv,
+                lv,
+                &format!("infr mtp bench failed ({short})"),
+                &mut rows,
+            );
         } else {
             println!(
                 "{short:<22} {metric_label:<10} | {:>9} | {:>9} | {:>10}",
@@ -3297,6 +3287,43 @@ fn dg_compare_measure(mb: &ModelBench) -> (anyhow::Result<DgBenchResult>, Option
     let infr = mb.dg_infr(DG_N_GEN);
     let llama = mb.llama_diffusion(DG_N_GEN);
     (infr, llama)
+}
+
+/// One `infr vs llama` cell of the comparison sweep: format both sides, print the table row, and
+/// feed the ranked summary.
+///
+/// The row's LAYOUT is the point of this helper. The sweep's output is diffed against archived runs
+/// (`docs/`-committed sweep tables), so the column widths and the three fallbacks —
+/// `ERR` when infr's run failed, `NA` when llama-bench produced nothing, `-` for a ratio that has
+/// no two finite numbers to divide — are a stable format, not a cosmetic choice. `cmd_compare_sweep`
+/// wrote this block out twice (once for the four standard metrics, once for the `mtp128` column)
+/// and the two copies could drift a space apart without any test noticing; they are one copy now.
+///
+/// Only rows where BOTH sides produced a positive number are pushed to `rows`: the summary ranks by
+/// `infr/llama`, and a missing side has no ratio to rank. `err_ctx` is the caller's stderr prefix
+/// for a failed infr run (the standard cells name the metric, the MTP cell does not) — it is
+/// diagnostic text on stderr, deliberately NOT part of the archived table on stdout.
+fn print_sweep_cell(
+    short: &str,
+    metric_label: &str,
+    iv: anyhow::Result<f64>,
+    lv: Option<f64>,
+    err_ctx: &str,
+    rows: &mut Vec<(String, String, f64, f64)>,
+) {
+    let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
+        eprintln!("{err_ctx}: {e:#}");
+        "ERR".into()
+    });
+    let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
+    let ratio = match (iv.as_ref().ok(), lv) {
+        (Some(&i), Some(l)) if l > 0.0 => {
+            rows.push((short.to_string(), metric_label.to_string(), i, l));
+            format!("{:.2}x", i / l)
+        }
+        _ => "-".into(),
+    };
+    println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
 }
 
 /// `cmd_compare_sweep`'s DG rows: `dg-step` (in-step-parallel ratio — the real gap metric, feeds

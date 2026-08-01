@@ -1101,12 +1101,23 @@ impl Drop for DoneGuard {
     }
 }
 
+/// The OpenAI error envelope — `{"error": {"message": .., "type": ..}}` — that every failure this
+/// server reports is wrapped in, whether it leaves as an HTTP body or as an SSE frame.
+///
+/// This is a WIRE format: clients (the OpenAI SDKs, `curl | jq .error.message`) match on the outer
+/// key and on `type`, and two tests pin the shape. It was spelled out inline at three call sites,
+/// two of which were character-for-character identical; the third ([`param_error`]) adds `param` and
+/// `code` on top rather than being a different envelope. Building the common two fields here means
+/// a renamed key cannot reach only some of the responses.
+fn error_body(msg: &str, ty: &str) -> serde_json::Value {
+    serde_json::json!({"error": {"message": msg, "type": ty}})
+}
+
 /// A terminal SSE error frame: `data: {"error":{...}}`. Distinguishable from a normal
 /// `chat.completion.chunk` and from `[DONE]`, so a client can tell a mid-stream failure apart from a
 /// clean completion (audit finding 1).
 fn sse_error_event(msg: &str) -> Event {
-    let body = serde_json::json!({"error": {"message": msg, "type": "server_error"}});
-    Event::default().data(body.to_string())
+    Event::default().data(error_body(msg, "server_error").to_string())
 }
 
 /// Serialize a delta payload into an SSE event carrying a `chat.completion.chunk`.
@@ -1134,19 +1145,22 @@ fn sse_chunk(
 }
 
 fn json_error(status: StatusCode, msg: String) -> Response {
-    let body = serde_json::json!({"error": {"message": msg, "type": "server_error"}});
-    (status, Json(body)).into_response()
+    (status, Json(error_body(&msg, "server_error"))).into_response()
 }
 
 /// OpenAI-shaped 400 for a bad request parameter (`invalid_request_error`, with the offending
 /// `param` named). NOT a clamp and NOT a panic — see [`GenParams::from_request`].
+///
+/// Two fields on top of the shared [`error_body`], and they are deliberately absent from the
+/// server-error responses rather than emitted as nulls there: `param` only means something when a
+/// specific request field is at fault, and OpenAI's own 5xx bodies carry neither. `code` is always
+/// null — we mint no error codes — but it is present because SDKs read `error.code` on a 400.
+/// Appending them keeps the key order (`message`, `type`, `param`, `code`) the responses have
+/// always had; `serde_json`'s `preserve_order` makes that order observable on the wire.
 fn param_error(param: Option<&str>, msg: String) -> Response {
-    let body = serde_json::json!({"error": {
-        "message": msg,
-        "type": "invalid_request_error",
-        "param": param,
-        "code": serde_json::Value::Null,
-    }});
+    let mut body = error_body(&msg, "invalid_request_error");
+    body["error"]["param"] = serde_json::json!(param);
+    body["error"]["code"] = serde_json::Value::Null;
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
