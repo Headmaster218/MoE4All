@@ -139,10 +139,10 @@ when `-r > 1` so a benchmark at least measures one tier consistently. Until then
 `infr bench -u/--ubatch <N>` is the workaround, and prefill numbers should be
 reported as a median of several runs rather than a single value.
 
-### B7 — decode attention at depth: two designs tested and declined, third identified
+### B7 — decode attention at depth: three designs measured; a mid-depth win found
 
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; next step is a contained
-slice (a `d_split` sweep), not a new kernel
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; next step is two
+contained slices (ship the specialization; then width by workgroup count)
 
 The largest remaining gap to llama.cpp is decode at depth, not prefill.
 Qwen3-30B-A3B Q4_K_M on a 7900 XTX against `llama-bench c629da5`:
@@ -245,14 +245,65 @@ key's dot:
 | k-tile probe  | 1       | 0               | 32                      | yes (sank it) |
 | **llama.cpp** | **8**   | **3**           | **4**                   | **no**        |
 
-**Next slice:** parameterize the existing `attn_partial` QK loop's reduction
-width instead of writing another kernel — 8 lanes × 16 dims per key with a
-`subgroupClusteredAdd(x, 8)`, 4 keys resident per wave — and sweep `d_split`
-over {1,2,4,8,16,32}. That is a contained change to one loop with the grid,
-scratch layout and `attn_combine` all unchanged, so it A/Bs directly against the
-shipped kernel. It is also the first hypothesis here with positive evidence
-behind it rather than a theory. Keep the V pass as-is initially (lane owns a
-dim-vec4 — already coalesced, already reduction-free).
+**The `d_split` sweep was run** (`shaders/attn_partial_dsplit.comp`,
+`tests/attn_dsplit_probe.rs` — a parameterized decode-only copy; the grid, chunk
+policy, `pm`/`pl`/`pacc` layout and `attn_combine` are all unchanged, so it A/Bs
+directly). Width × workgroup size, per-dispatch µs, reference measured in the
+same harness. Read the rows at PRODUCTION's chunk: `adaptive_chunk` picks 256 at
+d8192 and 512 at d32768, so ch=512-at-d8192 is a configuration production never
+dispatches.
+
+| leg                | d8192 ch=256 (1024 wg) | d32768 ch=512 (2048 wg) |
+| ------------------ | ---------------------- | ----------------------- |
+| shipped reference  | 53.3                   | **179.9**               |
+| w=1 wg=64          | 47.3 (1.13×)           | 306.9 (0.59×)           |
+| w=2 wg=64          | 41.9 (1.27×)           | 273.4 (0.66×)           |
+| **w=4 wg=64**      | **36.6 (1.46×)**       | 212.6 (0.85×)           |
+| w=8 wg=64 (llama)  | 37.2 (1.43×)           | 209.8 (0.86×)           |
+| w=16 wg=64         | 39.5 (1.35×)           | 201.6 (0.89×)           |
+| w=32 wg=64 (ctrl)  | 49.0 (1.09×)           | **170.3 (1.06×)**       |
+| w=8 wg=128 (llama) | 50.2 (1.06×)           | 243.1 (0.74×)           |
+
+Two SEPARABLE findings, and the `w=32` control is what separates them:
+
+1. **Specialization is free ~6–9% at every depth, with no algorithmic change.**
+   `w=32` reproduces the shipped mapping exactly yet beats it (1.09× / 1.06×),
+   because the probe is a decode-only copy — no window/canvas/ring/Q8/hd-256/512
+   arms — and allocates **96 VGPRs against `attn_partial_bda`'s 120**
+   (`RADV_DEBUG=shaderstats`), so more waves fit per SIMD. Zero spills in all 12
+   builds, so this is occupancy, not spill relief.
+2. **Narrow width wins only where workgroup parallelism is short**, and the
+   effect is monotone in workgroup count: 512 wg → best 2.01×, 1024 wg → 1.46×,
+   2048 wg → every width loses. Width substitutes keys-in-flight-per-wave for
+   workgroups. At depth the kernel is already at ~3.0 TB/s (537 MB / 180 µs =
+   Infinity-Cache rate), and splitting a wave's contiguous 512-byte K read into
+   `32/w` separate segments costs more than the shallower reduction saves.
+
+So llama.cpp's `d_split = 8` is right for ITS configuration, not universally —
+and **the original B7 target (d32768) remains a negative**: nothing beats the
+shipped kernel there except the free specialization.
+
+**Next slice.** Two independent pieces, in this order:
+
+- **(a) Ship the specialization.** A decode-only `attn_partial` variant at w=32
+  is a ~6–9% win at every depth with the summation order unchanged. Lowest risk
+  in the campaign.
+- **(b) Width by workgroup count.** Choose `w` from `nh * n_chunks` against the
+  device CU count rather than from depth directly (the monotone relationship is
+  in workgroups, not kv_len). Needs validating on shapes the probe never covered
+  — it only tested `nh=32 nkv=4 hd=128`. Also unmeasured: d2048/d4096, which is
+  where the published `tg64@d4096` column sits and where a win would show up in
+  the table.
+
+Expected end-to-end, this model: d8192 tg128 +12% (0.84× → ~0.95× vs llama.cpp),
+d32768 only +3% (0.60× → ~0.62×). Worth having, but it does NOT close the
+headline deep-context gap — treat (a)+(b) as a mid-depth win, not a fix for B7's
+opening table.
+
+Note the output is not bit-identical (worst 1.18e-6 relative, 9.6e-7 at w=32 —
+glslang emits `ClusteredReduce` where the shipped kernel gets `Reduce`, so ACO
+builds a different tree). Landing either piece needs the `gpu_seam_matches_cpu*`
+goldens run, and possibly re-blessed.
 
 ---
 

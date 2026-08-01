@@ -141,6 +141,48 @@ fn main() {
             "attn_ktile_w64_dw32",
             &["-DKWG=64", "-DKDW=32"],
         ),
+        // PROBE (B7 slice 2, tests/attn_dsplit_probe.rs only — NOTHING in production dispatches
+        // these): attn_partial's hd==128 QK loop with the subgroup-reduction WIDTH as a build-time
+        // constant. `-DDSW=w` makes w lanes cooperate on one key (128/w dims each, reduced with
+        // subgroupClusteredAdd(., w)) so 32/w keys are in flight per wave; DSW=32 is the shipped
+        // behaviour, DSW=1 the k-tile probe's per-thread dot, DSW=8 what llama.cpp picks for this
+        // shape on RDNA3. `-DDWG=128` is the second axis: llama.cpp's 4-wave workgroup vs our 2.
+        ("attn_partial_dsplit", "attn_dsplit_w1", &["-DDSW=1"]),
+        ("attn_partial_dsplit", "attn_dsplit_w2", &["-DDSW=2"]),
+        ("attn_partial_dsplit", "attn_dsplit_w4", &["-DDSW=4"]),
+        ("attn_partial_dsplit", "attn_dsplit_w8", &["-DDSW=8"]),
+        ("attn_partial_dsplit", "attn_dsplit_w16", &["-DDSW=16"]),
+        ("attn_partial_dsplit", "attn_dsplit_w32", &["-DDSW=32"]),
+        (
+            "attn_partial_dsplit",
+            "attn_dsplit_w1_wg128",
+            &["-DDSW=1", "-DDWG=128"],
+        ),
+        (
+            "attn_partial_dsplit",
+            "attn_dsplit_w2_wg128",
+            &["-DDSW=2", "-DDWG=128"],
+        ),
+        (
+            "attn_partial_dsplit",
+            "attn_dsplit_w4_wg128",
+            &["-DDSW=4", "-DDWG=128"],
+        ),
+        (
+            "attn_partial_dsplit",
+            "attn_dsplit_w8_wg128",
+            &["-DDSW=8", "-DDWG=128"],
+        ),
+        (
+            "attn_partial_dsplit",
+            "attn_dsplit_w16_wg128",
+            &["-DDSW=16", "-DDWG=128"],
+        ),
+        (
+            "attn_partial_dsplit",
+            "attn_dsplit_w32_wg128",
+            &["-DDSW=32", "-DDWG=128"],
+        ),
         // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
         // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
         // Q4/Q5 decode moves ¼ the traffic vs the dequant→f16 prepass + f16-scratch read. K and V

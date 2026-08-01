@@ -3163,6 +3163,21 @@ dyn_spv!(attn_ktile_w64_spv, "attn_ktile_w64");
 dyn_spv!(attn_ktile_w64_nopad_spv, "attn_ktile_w64_nopad");
 dyn_spv!(attn_ktile_w128_spv, "attn_ktile_w128");
 dyn_spv!(attn_ktile_w64_dw32_spv, "attn_ktile_w64_dw32");
+// PROBE (B7 slice 2): attn_partial's hd==128 QK loop with a build-time reduction WIDTH — w lanes
+// per key via `subgroupClusteredAdd(., w)`, 32/w keys in flight per wave. Reachable ONLY from
+// `Recorder::attention_kv_split_dsplit_at`, whose only caller is tests/attn_dsplit_probe.rs.
+dyn_spv!(attn_dsplit_w1_spv, "attn_dsplit_w1");
+dyn_spv!(attn_dsplit_w2_spv, "attn_dsplit_w2");
+dyn_spv!(attn_dsplit_w4_spv, "attn_dsplit_w4");
+dyn_spv!(attn_dsplit_w8_spv, "attn_dsplit_w8");
+dyn_spv!(attn_dsplit_w16_spv, "attn_dsplit_w16");
+dyn_spv!(attn_dsplit_w32_spv, "attn_dsplit_w32");
+dyn_spv!(attn_dsplit_w1_wg128_spv, "attn_dsplit_w1_wg128");
+dyn_spv!(attn_dsplit_w2_wg128_spv, "attn_dsplit_w2_wg128");
+dyn_spv!(attn_dsplit_w4_wg128_spv, "attn_dsplit_w4_wg128");
+dyn_spv!(attn_dsplit_w8_wg128_spv, "attn_dsplit_w8_wg128");
+dyn_spv!(attn_dsplit_w16_wg128_spv, "attn_dsplit_w16_wg128");
+dyn_spv!(attn_dsplit_w32_wg128_spv, "attn_dsplit_w32_wg128");
 // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF block
 // format INLINE (native_decode `dq()` via `dq_addr`=k_addr/v_addr) instead of the dequant→f16
 // prepass — the decode-side twin of dequant-in-flash. Per-format `-DKMAINLINE -DVMAINLINE -DFMT_*`
