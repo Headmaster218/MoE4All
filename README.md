@@ -309,64 +309,86 @@ compare) and throughput is measured against the system `llama.cpp` build with
 `infr compare`.
 
 **Throughput vs llama.cpp** — ratios are `infr / llama.cpp` (**>1.0 = infr is
-faster**); r=3, 2026-07-13 snapshot (commit `2b3a943`, every model×quant in the
-local cache, oracle `llama-bench` **b9957** on every row). Hardware: **AMD
-Radeon RX 7900 XTX** (RDNA3, 24 GB, Vulkan / RADV, Mesa). `pp512` = 512-token
-prefill throughput, `tg128` = 128-token decode throughput, `tg64@d4096` = decode
-at 4096 KV depth, `pp4@d4096` = short-turn prefill at 4096 KV depth (the
-multi-turn serve shape). **`pp512` is run-to-run noisy (±5%)** — infr's default
-prefill is nondeterministic in its tier/chunk choice (a known open issue), so
-treat small `pp512` deltas as noise, not signal.
+faster**); r=3, 2026-08-01 snapshot (commit `691c0dc`, every model×quant in the
+local cache, oracle `llama-bench` **`00f5442`** on every row, Vulkan build).
+Hardware: **AMD Radeon RX 7900 XTX** (RDNA3, 24 GB, Vulkan / RADV, Mesa).
+`pp512` = 512-token prefill throughput, `tg128` = 128-token decode throughput,
+`tg64@d4096` = decode at 4096 KV depth, `pp4@d4096` = short-turn prefill at 4096
+KV depth (the multi-turn serve shape). **`pp512` is run-to-run noisy (±5%)** —
+infr's default prefill is nondeterministic in its tier/chunk choice (a known
+open issue), so treat small `pp512` deltas as noise, not signal.
 
-| Model                 | Quant       | pp512     | tg128     | tg64@d4096 | pp4@d4096  |
-| --------------------- | ----------- | --------- | --------- | ---------- | ---------- |
-| Qwen3-0.6B            | Q2_K        | **1.17×** | **1.51×** | **1.35×**  | **2.09×**  |
-| Qwen3-0.6B            | IQ4_XS      | **1.21×** | **1.13×** | **1.19×**  | **1.99×**  |
-| Qwen3-0.6B            | Q4_0        | **1.18×** | **1.31×** | **1.28×**  | **2.16×**  |
-| Qwen3-0.6B            | Q4_K_M      | **1.27×** | **1.16×** | **1.21×**  | **2.07×**  |
-| Qwen3-0.6B            | Q5_K_M      | **1.21×** | **1.19×** | **1.23×**  | **2.07×**  |
-| Qwen3-0.6B            | Q6_K¹       | **1.23×** | **1.06×** | **1.14×**  | **1.82×**  |
-| Qwen3-0.6B            | Q8_0        | **1.33×** | **1.17×** | **1.19×**  | **1.86×**  |
-| Qwen3-0.6B            | BF16⁸       | **1.09×** | 0.87×     | 0.93×      | **1.78×**  |
-| Qwen3.5-0.8B          | Q4_K_M      | **1.43×** | **1.13×** | **1.07×**  | **1.93×**  |
-| Gemma-3-1B            | Q2_K        | **1.16×** | **1.14×** | **1.05×**  | **1.10×**  |
-| Gemma-3-1B            | Q4_K_M      | **1.06×** | **1.25×** | **1.13×**  | **1.26×**  |
-| Gemma-3-1B            | Q8_0        | **1.44×** | **1.24×** | **1.14×**  | **1.06×**  |
-| Llama-3.2-1B          | Q4_K_M      | 1.00×     | **1.04×** | 0.91×      | **1.12×**  |
-| Llama-3.2-1B          | Q8_0        | **1.04×** | **1.03×** | 0.93×      | **1.10×**  |
-| Qwen3-1.7B            | Q4_K_M      | **1.11×** | **1.13×** | **1.16×**  | **1.84×**  |
-| Qwen3.5-4B (MTP)²     | Q4_K_M      | **1.24×** | **1.02×** | **1.02×**  | **1.63×**  |
-| Qwen3.5-4B (MTP)²     | UD-Q4_K_XL  | **1.23×** | **1.03×** | **1.03×**  | **1.67×**  |
-| Gemma-4-E2B           | Q4_K_M      | **1.14×** | **1.07×** | 0.99×      | **1.05×**  |
-| Qwen3-8B              | Q4_K_M      | **1.28×** | **1.02×** | 1.00×      | **1.47×**  |
-| Ornith-1.0-9B         | Q4_K_M      | **1.29×** | **1.04×** | **1.04×**  | **1.73×**  |
-| Qwen3.5-9B            | Q4_K_M      | **1.28×** | **1.04×** | **1.04×**  | **1.64×**  |
-| Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.32×** | 1.00×     | 1.00×      | **1.70×**  |
-| Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.29×** | **1.01×** | **1.01×**  | **1.66×**  |
-| Gemma-3-12B           | Q4_K_M      | **1.25×** | **1.12×** | **1.14×**  | **1.85×**  |
-| Gemma-4-12B           | Q4_K_M      | **1.27×** | **1.12×** | **1.11×**  | **1.80×**  |
-| Qwen3-14B             | Q2_K³       | **1.22×** | 0.85×     | 0.81×      | **1.49×**  |
-| Qwen3-14B             | Q4_K_M      | **1.12×** | **1.02×** | 0.95×      | **1.33×**  |
-| Qwen3-14B             | Q8_0        | **1.15×** | **1.05×** | 1.00×      | **1.16×⁷** |
-| Gemma-4-26B-A4B (MoE) | UD-Q4_K_M⁹  | **1.15×** | **1.13×** | **1.14×**  | **1.54×**  |
-| Qwen3.6-27B           | Q4_K_M      | **1.15×** | **1.03×** | **1.02×**  | **1.35×**  |
-| Qwen3-30B-A3B (MoE)   | Q4_K_M⁹     | **1.08×** | 0.99×     | 0.95×      | **1.18×**  |
-| Gemma-4-31B           | UD-Q5_K_XL⁴ | 0.98×     | 0.98×     | 1.00×      | **1.32×**  |
-| Ornith-1.0-35B        | Q4_K_M⁵     | **1.03×** | **1.04×** | **1.05×**  | **1.70×**  |
-| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁶   | **1.15×** | 0.93×     | 0.94×      | **1.46×**  |
-| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.20×** | **1.03×** | **1.04×**  | **1.60×**  |
+> **The oracle moved, so these ratios are NOT comparable to the 2026-07-13 table
+> they replace.** That snapshot was taken against `llama-bench` **b9957**; this
+> one against **`00f5442`**, three weeks of upstream Vulkan work later. Most
+> ratios fell, and almost none of that is infr slowing down — an infr-vs-infr
+> A/B across the same commit range (`2b3a943` → HEAD, same GPU, alternated
+> order, 30 s cooldowns) has infr FASTER on every metric it moved: `pp512`
+> +9–19%, `tg128` +0.3–4.7%, `tg64@d4096` +0.6–3.7%, `pp4@d4096` +5%. Where a
+> row lost ground, llama.cpp gained more than we did. Read a drop here as "they
+> closed the gap", not "we regressed" — and if you need the latter question
+> answered, run the infr-vs-infr comparison, not this table.
 
-**Both prefill columns are clean.** `pp4@d4096` (the multi-turn serve shape)
-wins on **every row**, 1.05× to 2.16×. `pp512` wins on every row but one —
-Gemma-4-31B at 0.98×, inside the ±5% noise band. Prefill used to carry losses on
-the MoE rows, the DeltaNet rows and the grid i-quants; the four kernel slices
-below (footnotes ⁵, ⁶, ⁸, ⁹) closed all of them.
+| Model                 | Quant       | pp512     | tg128     | tg64@d4096 | pp4@d4096 |
+| --------------------- | ----------- | --------- | --------- | ---------- | --------- |
+| Qwen3-0.6B            | Q2_K        | 0.95×     | **1.40×** | **1.23×**  | **2.04×** |
+| Qwen3-0.6B            | IQ4_XS      | 0.93×     | **1.17×** | **1.12×**  | **1.96×** |
+| Qwen3-0.6B            | Q4_0        | 0.91×     | **1.29×** | **1.16×**  | **2.15×** |
+| Qwen3-0.6B            | Q4_K_M      | **1.17×** | **1.19×** | **1.13×**  | **2.01×** |
+| Qwen3-0.6B            | Q5_K_M      | 0.92×     | **1.23×** | **1.15×**  | **1.86×** |
+| Qwen3-0.6B            | Q6_K¹       | **1.16×** | **1.05×** | **1.04×**  | **1.68×** |
+| Qwen3-0.6B            | Q8_0        | 0.98×     | **1.13×** | **1.09×**  | **1.76×** |
+| Qwen3-0.6B            | BF16⁸       | 0.94×     | 0.99×     | 0.98×      | **1.79×** |
+| Qwen3.5-0.8B          | Q4_K_M      | **1.19×** | **1.14×** | **1.08×**  | **1.84×** |
+| Gemma-3-1B            | Q2_K        | 0.89×     | **1.05×** | 0.98×      | **1.14×** |
+| Gemma-3-1B            | Q4_K_M      | 0.83×     | **1.18×** | **1.09×**  | **1.11×** |
+| Gemma-3-1B            | Q8_0        | **1.32×** | **1.13×** | **1.06×**  | 0.82×     |
+| Llama-3.2-1B          | Q4_K_M      | **1.07×** | **1.08×** | 0.94×      | **1.15×** |
+| Llama-3.2-1B          | Q8_0        | **1.04×** | 1.00×     | 0.90×      | 0.85×     |
+| Qwen3-1.7B            | Q4_K_M      | **1.14×** | **1.12×** | **1.11×**  | **1.69×** |
+| Qwen3.5-4B (MTP)²     | Q4_K_M      | **1.28×** | **1.03×** | **1.02×**  | **1.20×** |
+| Qwen3.5-4B (MTP)²     | UD-Q4_K_XL  | **1.29×** | **1.03×** | **1.02×**  | **1.34×** |
+| Gemma-4-E2B           | Q4_K_M      | **1.19×** | **1.06×** | 0.98×      | **1.05×** |
+| Qwen3-8B              | Q4_K_M      | **1.39×** | **1.02×** | 0.99×      | **1.04×** |
+| Ornith-1.0-9B         | Q4_K_M      | **1.40×** | **1.05×** | **1.05×**  | **1.21×** |
+| Qwen3.5-9B            | Q4_K_M      | **1.40×** | **1.06×** | **1.06×**  | **1.14×** |
+| Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.41×** | **1.01×** | **1.01×**  | **1.11×** |
+| Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.39×** | **1.01×** | **1.01×**  | **1.13×** |
+| Gemma-3-12B           | Q4_K_M      | **1.32×** | **1.13×** | **1.14×**  | **1.63×** |
+| Gemma-4-12B           | Q4_K_M      | **1.34×** | **1.13×** | **1.11×**  | **1.55×** |
+| Qwen3-14B             | Q2_K³       | **1.23×** | 0.91×     | 0.85×      | 0.89×     |
+| Qwen3-14B             | Q4_K_M      | **1.22×** | **1.01×** | 0.94×      | 0.89×     |
+| Qwen3-14B             | Q8_0        | **1.17×** | 0.99×     | 0.95×      | 0.81×     |
+| Gemma-4-26B-A4B (MoE) | UD-Q4_K_M⁹  | **1.10×** | **1.05×** | **1.07×**  | **1.37×** |
+| Qwen3.6-27B           | Q4_K_M      | **1.26×** | **1.03×** | 0.99×      | **1.07×** |
+| Qwen3-30B-A3B (MoE)   | Q4_K_M⁹     | **1.07×** | 0.97×     | 0.91×      | 0.80×     |
+| Gemma-4-31B           | UD-Q5_K_XL⁴ | **1.08×** | **1.03×** | **1.04×**  | **1.08×** |
+| Ornith-1.0-35B        | Q4_K_M⁵     | **1.01×** | **1.03×** | **1.02×**  | **1.16×** |
+| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁶   | 0.87×     | 0.91×     | 0.91×      | 0.88×     |
+| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.18×** | 0.99×     | 0.99×      | **1.33×** |
 
-**Decode is now a win or a tie on 30 of 35 rows.** The five that remain are
-named in "Where infr loses". The big lever was NOT a GEMV kernel: `rmsnorm` was
-dispatching a **single workgroup** at decode (footnote ⁸), which cost ~9% of all
-decode GPU time on every model with hidden ≥ 2048. Fixing that one kernel turned
-the whole mid/large decode band (8B–27B) from losses into wins.
+**`pp4@d4096` (the multi-turn serve shape) is still the standout**, winning 28
+of 35 rows and reaching 2.15×. It is where infr's short-turn-at-depth path is
+genuinely ahead, and the small-model rows (1.7×–2.15× on Qwen3-0.6B) are the
+clearest wins in the table. The 7 losses cluster on **Qwen3-14B (all three
+quants, 0.81×–0.89×) and Qwen3-30B-A3B (0.80×)**, plus Qwen3.6-35B-A3B UD-IQ3_S,
+and the two Q8_0 small models — a mid/large-dense and MoE band worth a look.
+
+**`pp512` has become a size-dependent split**, and this is the biggest change
+since the previous snapshot. Sub-2B rows mostly LOSE (Gemma-3-1B Q4_K_M 0.83× is
+the worst in the table; six of the eight Qwen3-0.6B quants sit at 0.91×–0.98×),
+while the 4B–14B band wins decisively (1.17×–1.41×, peaking on the 8B/9B rows)
+and 26B+ narrows back toward parity (1.01×–1.26×). Upstream's small-model Vulkan
+prefill got materially faster; ours did too (+9–19% infr-vs-infr) but by less.
+
+**Decode is a win or a tie on 29 of 35 rows at `tg128`**, and on 22 of 35 at
+`tg64@d4096` — the at-depth column is the softer of the two, with 13 rows now
+below 1.0 (worst: Qwen3-14B Q2_K at 0.85×). Both decode columns lose ground
+mainly on the same mid/large band that `pp4@d4096` does.
+
+Taken together the losses concentrate in one place — **Qwen3-14B and the larger
+MoE rows** — rather than spreading evenly, which makes them a tractable target
+rather than a broad deficit.
 
 ¹ **Q6_K now decodes on the int8 tier too** (`f82d74e` + `de987d7`). It was the
 last format still unpacking its `ql`/`qh` bit-planes **byte-at-a-time** (8
@@ -654,28 +676,37 @@ assertion is correct; re-enabling MTP means making it pass again, which needs an
 accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
 tight), not faster kernels.
 
-**Where infr loses.** Prefill is clean; **all five remaining losses are
-decode**, and they are now specific rows rather than a broad band:
+**Where infr loses.** 35 losses across 140 cells, and they are **not** spread
+evenly — three clusters account for almost all of them:
 
-- **Qwen3-14B Q2_K** (0.85× / **0.81×**) — the worst row in the table by a clear
-  margin, and the one to fix next. Successive levers have lifted it (0.74×/0.72×
-  → 0.81×/0.78× via the int8 tier, → 0.85×/0.81× via the wide rmsnorm) without
-  closing it. It is the only row whose gap has never been root-caused to a named
-  kernel; it deserves its own profile rather than another inherited hypothesis.
-- **The IQ3_S MoE** (0.93× / 0.94×) — **fully diagnosed, deliberately not
-  fixed**: ~50 ms of its 505 ms decode is per-workgroup re-staging of the
-  codebook into LDS (footnote ⁶). Making the codebook L2-resident should close
-  essentially the whole gap, but it touches every grid GEMV variant and all 7
-  grid dtypes, so it is a campaign, not a slice.
-- **BF16** (0.87× / 0.93×) — the only non-integer weight dtype in the table, so
-  no unpack ALU to save and no weight codes to integer-dot. Structurally out of
-  reach of everything that fixed the other rows.
-- **Qwen3-30B-A3B** (0.99× / 0.95×) and **Qwen3-14B Q4_K_M** (0.95× at depth) —
-  what is left of the old mid/large band after the rmsnorm fix. Both are now
-  within a few percent, and both are `tg64@d4096`-only (their `tg128` is a win
-  or a tie), which points at attention/KV at depth rather than the GEMV.
-- **Llama-3.2-1B / Gemma-4-E2B `tg64@d4096`** (0.91–0.99×) — isolated
-  small-model rows; their other three columns are wins.
+- **Qwen3-14B, every quant, every column** — the densest loss cluster in the
+  table and the one to fix next. Q2_K is worst (`tg64@d4096` **0.85×**, `tg128`
+  0.91×, `pp4@d4096` 0.89×), but Q4_K_M and Q8_0 lose the same two columns, and
+  Q8_0's `pp4@d4096` is **0.81×**. Successive levers have lifted Q2_K
+  (0.74×/0.72× → 0.81×/0.78× via the int8 tier, → 0.85×/0.81× via the wide
+  rmsnorm) without closing it. It is still the only row whose gap has never been
+  root-caused to a named kernel; it deserves its own profile rather than another
+  inherited hypothesis.
+- **The larger MoE rows** — Qwen3-30B-A3B loses three of four columns
+  (`pp4@d4096` **0.80×**, the worst cell in the table), and Qwen3.6-35B-A3B
+  UD-IQ3_S loses all four (0.87×–0.91×). The IQ3_S gap is **fully diagnosed and
+  deliberately not fixed**: ~50 ms of its decode is per-workgroup re-staging of
+  the codebook into LDS (footnote ⁶). Making the codebook L2-resident should
+  close essentially the whole gap, but it touches every grid GEMV variant and
+  all 7 grid dtypes, so it is a campaign, not a slice.
+- **Small-model `pp512`** — six of eight Qwen3-0.6B quants and two Gemma-3-1B
+  rows (worst 0.83×). This cluster is NEW since the last snapshot and is
+  upstream-driven: llama.cpp's small-model Vulkan prefill improved more than
+  ours did over the same period. Note `pp512` carries a ±5% noise band, so the
+  0.95×–0.98× members of this group are close to a tie; the 0.83×–0.93× ones are
+  not.
+
+Two structural rows sit outside those clusters: **BF16** (`pp512` 0.94×, decode
+~0.98–0.99×) is the only non-integer weight dtype in the table, so there is no
+unpack ALU to save and no weight codes to integer-dot — out of reach of
+everything that fixed the other rows. And **Llama-3.2-1B `tg64@d4096`**
+(0.90×–0.94×) remains an isolated small-model decode-at-depth row whose other
+columns are wins.
 
 **A loss the table does not show.** `infr compare`'s deep-context turn shapes
 (16k–32k KV, beyond this table's 4096) still lose on the MoE rows and get
