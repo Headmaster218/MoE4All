@@ -309,9 +309,36 @@ impl SpinPool {
             // SAFETY: each task writes only its own slot.
             unsafe { base.get().add(i).write(std::mem::MaybeUninit::new(f(i))) };
         });
-        // SAFETY: all n slots initialized (run returns only after every task completed; a panic
-        // in `f` propagates out of `run` before we get here).
-        unsafe { std::mem::transmute::<Vec<std::mem::MaybeUninit<T>>, Vec<T>>(out) }
+        // SAFETY: all n slots are initialized. `run` returns only after every task completed, and
+        // if any task panicked `run` re-panics before we get here, so the rebuild below is only
+        // reached on the all-written path.
+        //
+        // LEAK ON PANIC (not UB, but not free either): `run` catches each task's panic
+        // individually and only re-panics once ALL tasks have finished — so by the time that panic
+        // unwinds through here, the non-panicking tasks have already written their slots. `out` is
+        // still typed `Vec<MaybeUninit<T>>`, and dropping a `MaybeUninit<T>` is a no-op, so every
+        // `T` that WAS constructed leaks its destructor. That is not free at the call sites this
+        // has: `T` is `Q8`/`Q8x32`, each holding several heap `Vec`s, so an aborted quantize of an
+        // m-row activation leaks up to m of them. It is a real leak, not merely a lost value —
+        // fixing it would mean tracking which indices were written and dropping those in place.
+        // The old comment claimed only that a panic "propagates out of `run` before we get here",
+        // which is true but says nothing about what the already-written slots cost on that path.
+        //
+        // The rebuild is done via `from_raw_parts` rather than
+        // `transmute::<Vec<MaybeUninit<T>>, Vec<T>>`: `Vec` is not `repr(C)`, so transmuting
+        // between two instantiations of it is not a language guarantee even though
+        // `MaybeUninit<T>` and `T` have identical layout — the compiler is free to lay out
+        // `Vec<A>` and `Vec<B>` differently. Taking the pointer/len/capacity apart and handing
+        // them back to `Vec::from_raw_parts` is the sanctioned form and relies only on the
+        // documented `MaybeUninit<T>`-to-`T` layout equivalence. (`Vec::into_raw_parts` is still
+        // unstable, hence the manual `forget`.)
+        let (ptr, len, cap) = (out.as_mut_ptr(), out.len(), out.capacity());
+        std::mem::forget(out);
+        // SAFETY: `ptr`/`len`/`cap` come straight from a `Vec<MaybeUninit<T>>` that we have
+        // `forget`ten (so it will not also free the allocation), `MaybeUninit<T>` has the same
+        // size and alignment as `T`, and all `len` elements are initialized per the argument
+        // above — so the allocation is valid to reinterpret as a `Vec<T>` of the same capacity.
+        unsafe { Vec::from_raw_parts(ptr as *mut T, len, cap) }
     }
 }
 

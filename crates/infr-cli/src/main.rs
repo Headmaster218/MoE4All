@@ -790,6 +790,17 @@ fn specified_by_the_layers(overrides: &ConfigOverrides) -> anyhow::Result<Partia
 /// stand-in for one. Must run before any parallel work spins the pool up, hence: in `main`.
 fn publish_thread_count(cfg: &Config) {
     if let Some(t) = cfg.device.threads {
+        // TODO(edition-2024): `std::env::set_var` becomes an `unsafe fn` in edition 2024, so THIS
+        // call is the migration point for this crate — bumping the edition will not compile until
+        // it is wrapped in `unsafe { .. }` with the argument below written out as its SAFETY note.
+        // Why it is sound today, and will still be sound then: `set_var` is only UB when it races
+        // another thread reading or writing the environment (glibc's `setenv` can reallocate
+        // `environ` out from under a concurrent `getenv`). This runs from `main`, in the
+        // single-threaded prologue, BEFORE rayon's global pool is built, before any backend
+        // spawns a worker, and before any tokio runtime exists — the same placement requirement
+        // the doc comment above already imposes for the value to be picked up at all. Do not move
+        // this call later to satisfy anything else; the correctness argument and the
+        // does-it-work-at-all argument are the same argument.
         std::env::set_var("RAYON_NUM_THREADS", t.to_string());
     }
 }

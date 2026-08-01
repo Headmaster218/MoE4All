@@ -8,6 +8,92 @@ use infr_core::graph::Activation;
 use infr_gguf::dequant::{
     e8m0_to_fp32_half, k4, rdf16, ue4m3_to_fp32, KVALUES_IQ4NL, KVALUES_MXFP4,
 };
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{__m256i, __m512i, _mm256_loadu_si256, _mm512_loadu_si512};
+
+/// Load the 32 bytes starting at ELEMENT offset `off` of `s` into a ymm register.
+///
+/// WHY THIS EXISTS. Every wide load in this file used to be written inline as
+/// `_mm256_loadu_si256(s[off..].as_ptr() as *const __m256i)`, and the runtime dispatchers above
+/// them carry the comment "pointer bounds checked by slice indexing". Only half of that is true.
+/// The feature half is real — `is_x86_feature_detected!` gates the call. The bounds half is FALSE:
+/// `s[off..]` is a `RangeFrom` index, so it panics only when the START of the load is out of
+/// bounds. It says nothing whatsoever about the 32 bytes the intrinsic then reads past that point.
+/// The slice type is erased into a raw pointer one token later, and from there the load width is
+/// invisible to the compiler.
+///
+/// The loads are all in bounds today, but only because the block geometry happens to work out
+/// exactly, with ZERO slack. Q6_K is the sharpest example: its `qh` sub-slice is exactly 64 bytes,
+/// and the `half == 1` load reads `qh[32..]` — precisely the last 32 bytes, not one to spare. Any
+/// future change to a block layout (a header field added, a sub-block count changed, a format
+/// packed differently) turns that into a read of the NEXT block's bytes, which produces silently
+/// wrong dot products with no crash and no test failure outside the parity suite; or, on the last
+/// block of a tensor backed by an mmap, a read past the mapping and a SIGSEGV. Nothing in the old
+/// expression could catch either case.
+///
+/// Routing every load through this helper makes the geometry a CHECKED invariant instead of an
+/// unwritten one: the `debug_assert!` fires in debug and test builds — which is where the whole
+/// per-format kernel parity suite runs — the moment a load would read past the end of the slice it
+/// was handed, and it compiles to nothing in release. The `s[off..]` indexing is deliberately kept
+/// verbatim rather than replaced with `add(off)`, so the release-mode start-of-load bounds check,
+/// and therefore the emitted code, is byte-for-byte what it was before this helper existed.
+///
+/// `off` counts ELEMENTS of `T`, exactly matching the index that was already written at the call
+/// site, so no call site had to change its arithmetic. The width check is done in bytes because
+/// the bases in this file are not all `&[u8]`: activations are `&[i8]` and Q6_K's per-16 sub-block
+/// sums are `&[i32]`, where 32 bytes is 32 elements and 8 elements respectively.
+///
+/// `#[inline]` rather than `#[inline(always)]`: rustc rejects `#[inline(always)]` on a
+/// `#[target_feature]` function outright (rust-lang/rust#145574), and `#[target_feature]` is the
+/// part that actually matters here — without it the avx-gated intrinsic cannot be inlined into
+/// this wrapper and every load would degrade into a real call. With it, the callee feature set is
+/// a subset of every caller's (`avx` ⊆ `avx2` ⊆ `avx512bw`), so LLVM inlines it to the bare
+/// `vmovups` at each site.
+///
+/// # Safety
+/// `avx` must be available. Every caller is inside an `avx2`/`avx512*` `#[target_feature]`
+/// function, all of which imply it.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn load256<T>(s: &[T], off: usize) -> __m256i {
+    debug_assert!(
+        off * size_of::<T>() + 32 <= size_of_val(s),
+        "load256 reads out of bounds: offset {off} elems ({} bytes) + 32 bytes > slice of {} elems \
+         ({} bytes) — block geometry changed and the load width no longer fits",
+        off * size_of::<T>(),
+        s.len(),
+        size_of_val(s)
+    );
+    _mm256_loadu_si256(s[off..].as_ptr() as *const __m256i)
+}
+
+/// Load the 64 bytes starting at ELEMENT offset `off` of `s` into a zmm register.
+///
+/// The 512-bit twin of [`load256`] — see that function for the full rationale. The failure mode is
+/// the same and strictly worse here: a `RangeFrom` slice index bounds only the first byte, while
+/// this intrinsic reads SIXTY-FOUR, so a layout change that leaves a block one 32-byte chunk short
+/// silently pulls in the following block (wrong output, no crash) or walks off the end of the
+/// tensor mapping (SIGSEGV). The `debug_assert!` turns that from an invisible geometry assumption
+/// into a test-suite failure at the exact load that broke.
+///
+/// # Safety
+/// `avx512f` must be available. Every caller is inside an `avx512bw` `#[target_feature]` function,
+/// which implies it.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn load512<T>(s: &[T], off: usize) -> __m512i {
+    debug_assert!(
+        off * size_of::<T>() + 64 <= size_of_val(s),
+        "load512 reads out of bounds: offset {off} elems ({} bytes) + 64 bytes > slice of {} elems \
+         ({} bytes) — block geometry changed and the load width no longer fits",
+        off * size_of::<T>(),
+        s.len(),
+        size_of_val(s)
+    );
+    _mm512_loadu_si512(s[off..].as_ptr() as *const __m512i)
+}
 
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
 /// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
@@ -91,7 +177,7 @@ unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let hi = s % 2 == 1;
             let half = s / 2;
             // 32-byte nibble chunk shared by sub-blocks `2*half` (lo) and `2*half+1` (hi).
-            let nibbles = _mm256_loadu_si256(qs[half * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(qs, half * 32);
             // Unpack nibbles: low or high 4 bits of each byte → u8 values 0–15.
             let q4 = if hi {
                 _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo)
@@ -99,7 +185,7 @@ unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
                 _mm256_and_si256(nibbles, mask_lo)
             };
             // Load 32 signed Q8 bytes for this sub-block.
-            let q8v = _mm256_loadu_si256(q8b[s * 32..].as_ptr() as *const __m256i);
+            let q8v = load256(q8b, s * 32);
             // maddubs: a=u8 (q4, 0–15), b=i8 (q8) → 16×i16 pair-sums. No i16 overflow:
             // max pair = 15·127 + 15·127 = 3810 < 32767.
             let prod = _mm256_maddubs_epi16(q4, q8v);
@@ -142,13 +228,13 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let (sc_e, m_e) = k4(2 * k, scales);
             let (sc_o, m_o) = k4(2 * k + 1, scales);
             // Load 32 nibble bytes serving both sub-blocks 2k (low) and 2k+1 (high).
-            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(qs, k * 32);
             let lo_nib = _mm256_and_si256(nibbles, mask_lo); // sub-block 2k  (u8, 0–15)
             let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo); // sub-block 2k+1
                                                                                    // Pack into zmm: lower 256 = lo_nib (for 2k), upper 256 = hi_nib (for 2k+1).
             let q4_zmm = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo_nib), hi_nib);
             // Load 64 Q8 bytes: [2k*32..(2k+1)*32] in lower, [(2k+1)*32..(2k+2)*32] in upper.
-            let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+            let q8_zmm = load512(q8b, k * 64);
             // maddubs 512-bit: u8(q4)×i8(q8) → 32×i16 pair-sums.
             let prod = _mm512_maddubs_epi16(q4_zmm, q8_zmm);
             // madd with 1: widen 32×i16 → 16×i32.
@@ -260,11 +346,11 @@ unsafe fn vec_dot_q2k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let mut sd = 0i32;
         for n in 0..2usize {
             // 32 code bytes shared by the 4 shifts (sub-blocks 8n..8n+8).
-            let mut cur = _mm256_loadu_si256(qs[n * 32..].as_ptr() as *const __m256i);
+            let mut cur = load256(qs, n * 32);
             for k in 0..4usize {
                 // (cur & 3) = the 2-bit codes at the current shift, one per byte (0–3).
                 let q2 = _mm256_and_si256(cur, mask_03);
-                let q8v = _mm256_loadu_si256(q8b[n * 128 + k * 32..].as_ptr() as *const __m256i);
+                let q8v = load256(q8b, n * 128 + k * 32);
                 // maddubs: u8(0–3) × i8 → 16×i16 pair-sums (max |pair| = 2·3·127 = 762, no overflow).
                 let prod = _mm256_maddubs_epi16(q2, q8v);
                 let sum32 = _mm256_madd_epi16(prod, ones);
@@ -311,13 +397,13 @@ unsafe fn vec_dot_q2k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let dmin = rdf16(&blk[82..84]);
         let q8b = &q8.qs[b * 256..b * 256 + 256];
         // qs[0..64] = both n halves contiguous → one zmm.
-        let mut cur = _mm512_loadu_si512(qs.as_ptr() as *const __m512i);
+        let mut cur = load512(qs, 0);
         let mut sd = 0i32;
         for k in 0..4usize {
             let q2 = _mm512_and_si512(cur, mask_03);
             // q8 for n=0 (lower 256) and n=1 (upper 256), 32 bytes each, non-contiguous.
-            let q8_lo = _mm256_loadu_si256(q8b[k * 32..].as_ptr() as *const __m256i);
-            let q8_hi = _mm256_loadu_si256(q8b[128 + k * 32..].as_ptr() as *const __m256i);
+            let q8_lo = load256(q8b, k * 32);
+            let q8_hi = load256(q8b, 128 + k * 32);
             let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_lo), q8_hi);
             let prod = _mm512_maddubs_epi16(q2, q8_z);
             let sum32 = _mm512_madd_epi16(prod, ones512);
@@ -445,9 +531,9 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let base = half * 128;
 
             // Load qh (32 bytes) and the two ql halves for this block-half.
-            let qh_ymm = _mm256_loadu_si256(qh[qho..].as_ptr() as *const __m256i);
-            let ql_lo = _mm256_loadu_si256(ql[qlo..].as_ptr() as *const __m256i);
-            let ql_hi = _mm256_loadu_si256(ql[qlo + 32..].as_ptr() as *const __m256i);
+            let qh_ymm = load256(qh, qho);
+            let ql_lo = load256(ql, qlo);
+            let ql_hi = load256(ql, qlo + 32);
 
             // (qh >> 2) & 0x03 per byte — reused in col2 and col6 reconstructions.
             // Trick: _mm256_srli_epi16(v, 2) shifts 16-bit lanes; masking with 0x03 per byte
@@ -488,7 +574,7 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             // (sub-block `sco+ci*2+1`). Reduction order matches scalar sub=0..16, ensuring
             // bit-identical f32 accumulation.
             for (ci, q6_col) in [q6_c0, q6_c2, q6_c4, q6_c6].iter().enumerate() {
-                let q8_ymm = _mm256_loadu_si256(q8b[base + ci * 32..].as_ptr() as *const __m256i);
+                let q8_ymm = load256(q8b, base + ci * 32);
 
                 // maddubs: q6_u8 (0–63) × q8_i8 → 16×i16 pair-sums. Each pair sums two adjacent
                 // products, so the bound is 2·63·127 = 16002 (min −16128 at q8 = −128), < 32767.
@@ -552,17 +638,17 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let q8b = &q8.qs[b * 256..b * 256 + 256];
 
         // qh is 64 contiguous bytes: h0 in bits 0-255, h1 in bits 256-511 → one zmm load.
-        let qh_z = _mm512_loadu_si512(qh.as_ptr() as *const __m512i);
+        let qh_z = load512(qh, 0);
 
         // ql_lo_z: lower 256 = ql[0..32] (h0_lo), upper 256 = ql[64..96] (h1_lo).
         // ql_hi_z: lower 256 = ql[32..64] (h0_hi), upper 256 = ql[96..128] (h1_hi).
         // h0 and h1 slices are non-contiguous (separated by 32 bytes), so 2 ymm loads + insert.
-        let ql_lo_h0 = _mm256_loadu_si256(ql[0..].as_ptr() as *const __m256i);
-        let ql_lo_h1 = _mm256_loadu_si256(ql[64..].as_ptr() as *const __m256i);
+        let ql_lo_h0 = load256(ql, 0);
+        let ql_lo_h1 = load256(ql, 64);
         let ql_lo_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_lo_h0), ql_lo_h1);
 
-        let ql_hi_h0 = _mm256_loadu_si256(ql[32..].as_ptr() as *const __m256i);
-        let ql_hi_h1 = _mm256_loadu_si256(ql[96..].as_ptr() as *const __m256i);
+        let ql_hi_h0 = load256(ql, 32);
+        let ql_hi_h1 = load256(ql, 96);
         let ql_hi_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_hi_h0), ql_hi_h1);
 
         // Same byte-wise shift/mask tricks as AVX2 but on 512-bit registers.
@@ -591,8 +677,8 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 
         for (ci, q6_col_z) in [q6_c0_z, q6_c2_z, q6_c4_z, q6_c6_z].iter().enumerate() {
             // q8 for h0 column ci: q8b[ci*32..ci*32+32]; h1: q8b[128+ci*32..128+ci*32+32].
-            let q8_h0 = _mm256_loadu_si256(q8b[ci * 32..].as_ptr() as *const __m256i);
-            let q8_h1 = _mm256_loadu_si256(q8b[128 + ci * 32..].as_ptr() as *const __m256i);
+            let q8_h0 = load256(q8b, ci * 32);
+            let q8_h1 = load256(q8b, 128 + ci * 32);
             let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_h0), q8_h1);
 
             // 512-bit dot: maddubs → madd.
@@ -756,11 +842,11 @@ unsafe fn vec_dot_q3k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let sc = q3k_scales(&blk[96..108]);
         let d = rdf16(&blk[108..110]);
         let q8b = &q8.qs[b * 256..b * 256 + 256];
-        let hmask_ymm = _mm256_loadu_si256(hmask.as_ptr() as *const __m256i);
+        let hmask_ymm = load256(hmask, 0);
         let mut isum = 0i32;
         for n in 0..2usize {
             // 32 code bytes shared by the 4 shifts (sub-blocks 8n..8n+8).
-            let mut cur = _mm256_loadu_si256(qs[n * 32..].as_ptr() as *const __m256i);
+            let mut cur = load256(qs, n * 32);
             for k in 0..4usize {
                 let m = 1u8 << (n * 4 + k);
                 // low 2 bits of the current shift; high bit selected from hmask plane m → value 4.
@@ -769,7 +855,7 @@ unsafe fn vec_dot_q3k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
                 let iszero = _mm256_cmpeq_epi8(hbit, zero);
                 let high4 = _mm256_andnot_si256(iszero, four);
                 let q3 = _mm256_or_si256(low2, high4); // codes 0..7
-                let q8v = _mm256_loadu_si256(q8b[n * 128 + k * 32..].as_ptr() as *const __m256i);
+                let q8v = load256(q8b, n * 128 + k * 32);
                 // maddubs: u8(0–7) × i8 → 16×i16 pair-sums (|pair| ≤ 2·7·127 = 1778, no overflow).
                 let prod = _mm256_maddubs_epi16(q3, q8v);
                 let sum32 = _mm256_madd_epi16(prod, ones_i16);
@@ -810,8 +896,8 @@ unsafe fn vec_dot_q3k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let d = rdf16(&blk[108..110]);
         let q8b = &q8.qs[b * 256..b * 256 + 256];
         // qs[0..64] = both n halves contiguous → one zmm. hmask[0..32] broadcast to both lanes.
-        let mut cur = _mm512_loadu_si512(qs.as_ptr() as *const __m512i);
-        let hmask_ymm = _mm256_loadu_si256(hmask.as_ptr() as *const __m256i);
+        let mut cur = load512(qs, 0);
+        let hmask_ymm = load256(hmask, 0);
         let hmask_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(hmask_ymm), hmask_ymm);
         let mut isum = 0i32;
         for k in 0..4usize {
@@ -824,8 +910,8 @@ unsafe fn vec_dot_q3k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let high4 = _mm512_maskz_mov_epi8(hset, four); // → 4 where set, else 0
             let q3 = _mm512_or_si512(low2, high4);
             // q8 for n=0 (lower 256) and n=1 (upper 256), 32 bytes each, non-contiguous.
-            let q8_lo = _mm256_loadu_si256(q8b[k * 32..].as_ptr() as *const __m256i);
-            let q8_hi = _mm256_loadu_si256(q8b[128 + k * 32..].as_ptr() as *const __m256i);
+            let q8_lo = load256(q8b, k * 32);
+            let q8_hi = load256(q8b, 128 + k * 32);
             let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_lo), q8_hi);
             let prod = _mm512_maddubs_epi16(q3, q8_z);
             let sum32 = _mm512_madd_epi16(prod, ones512);
@@ -954,7 +1040,7 @@ unsafe fn vec_dot_iq4xs_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             // codes ymm: low lane = lo nibbles (elems 0–15), high lane = hi nibbles (elems 16–31).
             let codes = _mm256_inserti128_si256::<1>(lo, _mm256_castsi256_si128(hi));
             let w = _mm256_shuffle_epi8(table, codes); // 32 signed i8 codebook weights
-            let a = _mm256_loadu_si256(q8b[ib * 32..].as_ptr() as *const __m256i);
+            let a = load256(q8b, ib * 32);
             // Q8_0 sign trick: |w| unsigned × sign(w)·a signed → maddubs. Pair sum ≤ 2·127·127 < 2^15.
             let w_abs = _mm256_abs_epi8(w);
             let a_signed = _mm256_sign_epi8(a, w);
@@ -995,7 +1081,7 @@ unsafe fn vec_dot_iq4xs_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         for k in 0..4usize {
             let ib = 2 * k;
             // 32 code bytes covering sub-blocks ib (low lane) and ib+1 (high lane).
-            let codes32 = _mm256_loadu_si256(qs[ib * 16..].as_ptr() as *const __m256i);
+            let codes32 = load256(qs, ib * 16);
             let lo = _mm256_and_si256(codes32, mask_0f); // lanes: [lo(ib), lo(ib+1)]
             let hi = _mm256_and_si256(_mm256_srli_epi16(codes32, 4), mask_0f); // [hi(ib), hi(ib+1)]
                                                                                // Reorder 128-bit lanes into [lo(ib), hi(ib)] and [lo(ib+1), hi(ib+1)].
@@ -1004,7 +1090,7 @@ unsafe fn vec_dot_iq4xs_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let codes_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low256), up256);
             let w_z = _mm512_shuffle_epi8(table_z, codes_z); // 64 signed weights
                                                              // 64 contiguous activation bytes = [a(ib) | a(ib+1)], lanes align with w_z.
-            let a_z = _mm512_loadu_si512(q8b[ib * 32..].as_ptr() as *const __m512i);
+            let a_z = load512(q8b, ib * 32);
             // Sign trick at ymm level (no _mm512_sign_epi8), then repack into zmm.
             let w0 = _mm512_castsi512_si256(w_z);
             let w1 = _mm512_extracti64x4_epi64::<1>(w_z);
@@ -1087,8 +1173,8 @@ unsafe fn vec_dot_q8_0_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let wb = b * 8 + s;
             let blk = &row[wb * bpr..wb * bpr + bpr];
             let d_w = rdf16(&blk[0..2]);
-            let qw = _mm256_loadu_si256(blk[2..].as_ptr() as *const __m256i);
-            let qx = _mm256_loadu_si256(q8.qs[b * 256 + s * 32..].as_ptr() as *const __m256i);
+            let qw = load256(blk, 2);
+            let qx = load256(&q8.qs, b * 256 + s * 32);
             // sign trick: qx_signed = sign(qw) * qx;  abs(qw) stays unsigned
             let qw_abs = _mm256_abs_epi8(qw);
             let qx_signed = _mm256_sign_epi8(qx, qw);
@@ -1124,10 +1210,10 @@ unsafe fn vec_dot_q8_0_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let d_w0 = rdf16(&row[wb0 * bpr..wb0 * bpr + 2]);
             let d_w1 = rdf16(&row[wb1 * bpr..wb1 * bpr + 2]);
             // Load weight i8 bytes (32 each, non-contiguous due to f16 header)
-            let qw0 = _mm256_loadu_si256(row[wb0 * bpr + 2..].as_ptr() as *const __m256i);
-            let qw1 = _mm256_loadu_si256(row[wb1 * bpr + 2..].as_ptr() as *const __m256i);
+            let qw0 = load256(row, wb0 * bpr + 2);
+            let qw1 = load256(row, wb1 * bpr + 2);
             // Load 64 contiguous activation bytes as zmm (s0*32 and s1*32 are adjacent)
-            let qx_z = _mm512_loadu_si512(q8.qs[b * 256 + s0 * 32..].as_ptr() as *const __m512i);
+            let qx_z = load512(&q8.qs, b * 256 + s0 * 32);
             // Sign trick at ymm level (no avx512 sign_epi8)
             let qx0 = _mm512_castsi512_si256(qx_z);
             let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
@@ -1230,7 +1316,7 @@ unsafe fn vec_dot_q5k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let qh = &blk[16..48];
         let ql = &blk[48..176];
         let q8b = &q8.qs[b * 256..b * 256 + 256];
-        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let qh_ymm = load256(qh, 0);
         let (mut sd, mut sm) = (0i32, 0i32);
         let mut u1 = 1u8;
         let mut u2 = 2u8;
@@ -1238,7 +1324,7 @@ unsafe fn vec_dot_q5k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let (sc_e, m_e) = k4(2 * j, scales);
             let (sc_o, m_o) = k4(2 * j + 1, scales);
             // Unpack nibbles from ql[j*32..+32]
-            let nibbles = _mm256_loadu_si256(ql[j * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(ql, j * 32);
             let lo_nib = _mm256_and_si256(nibbles, mask_lo);
             let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
             // High-bit extraction: if (qh[l] & u) != 0 → add 16 to that element.
@@ -1252,8 +1338,8 @@ unsafe fn vec_dot_q5k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             let q5_e = _mm256_or_si256(lo_nib, high_e);
             let q5_o = _mm256_or_si256(hi_nib, high_o);
             // Load Q8 activation bytes for both sub-blocks
-            let q8_e = _mm256_loadu_si256(q8b[2 * j * 32..].as_ptr() as *const __m256i);
-            let q8_o = _mm256_loadu_si256(q8b[(2 * j + 1) * 32..].as_ptr() as *const __m256i);
+            let q8_e = load256(q8b, 2 * j * 32);
+            let q8_o = load256(q8b, (2 * j + 1) * 32);
             // maddubs: q5 is u8 (0..31), q8 is i8 → direct, no sign trick needed
             let prod_e = _mm256_maddubs_epi16(q5_e, q8_e);
             let sum32_e = _mm256_madd_epi16(prod_e, ones);
@@ -1296,14 +1382,14 @@ unsafe fn vec_dot_q5k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let qh = &blk[16..48];
         let ql = &blk[48..176];
         let q8b = &q8.qs[b * 256..b * 256 + 256];
-        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let qh_ymm = load256(qh, 0);
         let (mut sd, mut sm) = (0i32, 0i32);
         let mut u1 = 1u8;
         let mut u2 = 2u8;
         for k in 0..4usize {
             let (sc_e, m_e) = k4(2 * k, scales);
             let (sc_o, m_o) = k4(2 * k + 1, scales);
-            let nibbles = _mm256_loadu_si256(ql[k * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(ql, k * 32);
             let lo_nib = _mm256_and_si256(nibbles, mask_lo);
             let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
             // High-bit extraction per bit pair
@@ -1319,7 +1405,7 @@ unsafe fn vec_dot_q5k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             // Pack into zmm: lower 256 = even sub-block, upper 256 = odd sub-block
             let q5_zmm = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q5_e), q5_o);
             // 64 contiguous Q8 activation bytes for this pair
-            let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+            let q8_zmm = load512(q8b, k * 64);
             let prod = _mm512_maddubs_epi16(q5_zmm, q8_zmm);
             let sum32_z = _mm512_madd_epi16(prod, ones512);
             let lo_ymm = _mm512_castsi512_si256(sum32_z);
@@ -1426,7 +1512,7 @@ unsafe fn q4k_decode_row(
         // Unpack 4 nibble pairs with SIMD, store lo then hi in contiguous slots.
         let flat = &mut q4_flat[b * 256..b * 256 + 256];
         for k in 0..4usize {
-            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(qs, k * 32);
             let lo_nib = _mm256_and_si256(nibbles, mask_lo); // sub-block 2k
             let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo); // sub-block 2k+1
             _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, lo_nib);
@@ -1471,8 +1557,8 @@ unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let flat = &q4_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for s in 0..8usize {
-                let q4 = _mm256_loadu_si256(flat[s * 32..].as_ptr() as *const __m256i);
-                let q8v = _mm256_loadu_si256(q8b[s * 32..].as_ptr() as *const __m256i);
+                let q4 = load256(flat, s * 32);
+                let q8v = load256(q8b, s * 32);
                 let prod = _mm256_maddubs_epi16(q4, q8v);
                 let sum32 = _mm256_madd_epi16(prod, ones);
                 let iprod = hadd_i32_ymm(sum32);
@@ -1526,8 +1612,8 @@ unsafe fn vec_dot_q4k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
                 let (sc_e, m_e) = (sc_arr[b][2 * k], m_arr[b][2 * k]);
                 let (sc_o, m_o) = (sc_arr[b][2 * k + 1], m_arr[b][2 * k + 1]);
                 // flat[k*64..k*64+64]: lower 256 = sub-block 2k, upper 256 = sub-block 2k+1
-                let q4_zmm = _mm512_loadu_si512(flat[k * 64..].as_ptr() as *const __m512i);
-                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let q4_zmm = load512(flat, k * 64);
+                let q8_zmm = load512(q8b, k * 64);
                 let prod = _mm512_maddubs_epi16(q4_zmm, q8_zmm);
                 let sum32 = _mm512_madd_epi16(prod, ones512);
                 let lo_ymm = _mm512_castsi512_si256(sum32);
@@ -1584,8 +1670,8 @@ unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             for k in 0..4usize {
                 let (sc_e, m_e) = (sc_arr[b][2 * k], m_arr[b][2 * k]);
                 let (sc_o, m_o) = (sc_arr[b][2 * k + 1], m_arr[b][2 * k + 1]);
-                let q4_zmm = _mm512_loadu_si512(flat[k * 64..].as_ptr() as *const __m512i);
-                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let q4_zmm = load512(flat, k * 64);
+                let q8_zmm = load512(q8b, k * 64);
                 let sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q4_zmm, q8_zmm);
                 let lo_ymm = _mm512_castsi512_si256(sum32);
                 let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
@@ -1670,7 +1756,7 @@ unsafe fn vec_dot_q4k_batch2_avx512bw(
         }
         let fa = &mut flat_a[b * 256..b * 256 + 256];
         for k in 0..4usize {
-            let nibs = _mm256_loadu_si256(qs_a[k * 32..].as_ptr() as *const __m256i);
+            let nibs = load256(qs_a, k * 32);
             let lo = _mm256_and_si256(nibs, mask_lo);
             let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
             _mm256_storeu_si256(fa[k * 64..].as_mut_ptr() as *mut __m256i, lo);
@@ -1690,7 +1776,7 @@ unsafe fn vec_dot_q4k_batch2_avx512bw(
         }
         let fb = &mut flat_b[b * 256..b * 256 + 256];
         for k in 0..4usize {
-            let nibs = _mm256_loadu_si256(qs_b[k * 32..].as_ptr() as *const __m256i);
+            let nibs = load256(qs_b, k * 32);
             let lo = _mm256_and_si256(nibs, mask_lo);
             let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
             _mm256_storeu_si256(fb[k * 64..].as_mut_ptr() as *mut __m256i, lo);
@@ -1717,17 +1803,17 @@ unsafe fn vec_dot_q4k_batch2_avx512bw(
                 let (scb_o, mb_o) = (sc_b[b][2 * k + 1], m_b[b][2 * k + 1]);
 
                 // Load q8 ONCE for this pair (shared by both row A and row B).
-                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let q8_zmm = load512(q8b, k * 64);
 
                 // Row A dot
-                let qa_zmm = _mm512_loadu_si512(fa[k * 64..].as_ptr() as *const __m512i);
+                let qa_zmm = load512(fa, k * 64);
                 let prod_a = _mm512_maddubs_epi16(qa_zmm, q8_zmm);
                 let sum32_a = _mm512_madd_epi16(prod_a, ones512);
                 let lo_a = _mm512_castsi512_si256(sum32_a);
                 let hi_a = _mm512_extracti64x4_epi64::<1>(sum32_a);
 
                 // Row B dot (q8_zmm reused, no reload)
-                let qb_zmm = _mm512_loadu_si512(fb[k * 64..].as_ptr() as *const __m512i);
+                let qb_zmm = load512(fb, k * 64);
                 let prod_b = _mm512_maddubs_epi16(qb_zmm, q8_zmm);
                 let sum32_b = _mm512_madd_epi16(prod_b, ones512);
                 let lo_b = _mm512_castsi512_si256(sum32_b);
@@ -1793,7 +1879,7 @@ unsafe fn vec_dot_q4k_batch2_vnni(
         }
         let fa = &mut flat_a[b * 256..b * 256 + 256];
         for k in 0..4usize {
-            let nibs = _mm256_loadu_si256(qs_a[k * 32..].as_ptr() as *const __m256i);
+            let nibs = load256(qs_a, k * 32);
             let lo = _mm256_and_si256(nibs, mask_lo);
             let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
             _mm256_storeu_si256(fa[k * 64..].as_mut_ptr() as *mut __m256i, lo);
@@ -1812,7 +1898,7 @@ unsafe fn vec_dot_q4k_batch2_vnni(
         }
         let fb = &mut flat_b[b * 256..b * 256 + 256];
         for k in 0..4usize {
-            let nibs = _mm256_loadu_si256(qs_b[k * 32..].as_ptr() as *const __m256i);
+            let nibs = load256(qs_b, k * 32);
             let lo = _mm256_and_si256(nibs, mask_lo);
             let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
             _mm256_storeu_si256(fb[k * 64..].as_mut_ptr() as *mut __m256i, lo);
@@ -1837,14 +1923,14 @@ unsafe fn vec_dot_q4k_batch2_vnni(
                 let (scb_e, mb_e) = (sc_b[b][2 * k], m_b[b][2 * k]);
                 let (scb_o, mb_o) = (sc_b[b][2 * k + 1], m_b[b][2 * k + 1]);
 
-                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let q8_zmm = load512(q8b, k * 64);
 
-                let qa_zmm = _mm512_loadu_si512(fa[k * 64..].as_ptr() as *const __m512i);
+                let qa_zmm = load512(fa, k * 64);
                 let sum32_a = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qa_zmm, q8_zmm);
                 let lo_a = _mm512_castsi512_si256(sum32_a);
                 let hi_a = _mm512_extracti64x4_epi64::<1>(sum32_a);
 
-                let qb_zmm = _mm512_loadu_si512(fb[k * 64..].as_ptr() as *const __m512i);
+                let qb_zmm = load512(fb, k * 64);
                 let sum32_b = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qb_zmm, q8_zmm);
                 let lo_b = _mm512_castsi512_si256(sum32_b);
                 let hi_b = _mm512_extracti64x4_epi64::<1>(sum32_b);
@@ -1931,7 +2017,7 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
             }
             let f = &mut flats[i][b * 256..b * 256 + 256];
             for k in 0..4usize {
-                let nibs = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+                let nibs = load256(qs, k * 32);
                 let lo = _mm256_and_si256(nibs, mask_lo);
                 let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
                 _mm256_storeu_si256(f[k * 64..].as_mut_ptr() as *mut __m256i, lo);
@@ -1970,7 +2056,7 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
 
             for k in 0..4usize {
                 // ── ONE activation load for pair k, shared by all 8 weight rows ──
-                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let q8_zmm = load512(q8b, k * 64);
                 let isum_e = q8.bsums[b * 8 + 2 * k];
                 let isum_o = q8.bsums[b * 8 + 2 * k + 1];
 
@@ -1978,8 +2064,7 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
                 for i in 0..8usize {
                     let (sc_e, ma_e) = (sc_arr[i][b][2 * k], m_arr[i][b][2 * k]);
                     let (sc_o, ma_o) = (sc_arr[i][b][2 * k + 1], m_arr[i][b][2 * k + 1]);
-                    let qi_zmm =
-                        _mm512_loadu_si512(flats[i][b * 256 + k * 64..].as_ptr() as *const __m512i);
+                    let qi_zmm = load512(&flats[i], b * 256 + k * 64);
                     let prod = _mm512_maddubs_epi16(qi_zmm, q8_zmm);
                     let sum32 = _mm512_madd_epi16(prod, ones512);
                     let lo_ymm = _mm512_castsi512_si256(sum32);
@@ -2073,7 +2158,7 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
                     m_arr[i][b][s] = mv;
                 }
                 for k in 0..4usize {
-                    let nibs = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+                    let nibs = load256(qs, k * 32);
                     let lo = _mm256_and_si256(nibs, mask_lo);
                     let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
                     _mm256_storeu_si256(tmp[i][k * 64..].as_mut_ptr() as *mut __m256i, lo);
@@ -2156,9 +2241,7 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
             for s in 0..8usize {
                 let mut acc = _mm512_setzero_si512();
                 for g in 0..4usize {
-                    let w = _mm512_loadu_si512(
-                        ilv[b * 2048 + s * 256 + g * 64..].as_ptr() as *const __m512i
-                    );
+                    let w = load512(&ilv, b * 2048 + s * 256 + g * 64);
                     // q8b is &[i8]; read the 8 activation bytes as one little-endian qword.
                     let a = _mm512_set1_epi64(
                         (q8b[s * 32 + g * 8..].as_ptr() as *const i64).read_unaligned(),
@@ -2333,9 +2416,9 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let qlo = half * 64;
             let qho = half * 32;
 
-            let qh_ymm = _mm256_loadu_si256(qh[qho..].as_ptr() as *const __m256i);
-            let ql_lo = _mm256_loadu_si256(ql[qlo..].as_ptr() as *const __m256i);
-            let ql_hi = _mm256_loadu_si256(ql[qlo + 32..].as_ptr() as *const __m256i);
+            let qh_ymm = load256(qh, qho);
+            let ql_lo = load256(ql, qlo);
+            let ql_hi = load256(ql, qlo + 32);
 
             let qh_sr2 = _mm256_and_si256(_mm256_srli_epi16(qh_ymm, 2), mask_03);
 
@@ -2380,10 +2463,8 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
                 let base = half * 128;
 
                 for ci in 0..4usize {
-                    let q6_ymm =
-                        _mm256_loadu_si256(flat[half * 128 + ci * 32..].as_ptr() as *const __m256i);
-                    let q8_ymm =
-                        _mm256_loadu_si256(q8b[base + ci * 32..].as_ptr() as *const __m256i);
+                    let q6_ymm = load256(flat, half * 128 + ci * 32);
+                    let q8_ymm = load256(q8b, base + ci * 32);
 
                     let prod = _mm256_maddubs_epi16(q6_ymm, q8_ymm);
                     let sum32 = _mm256_madd_epi16(prod, ones_i16);
@@ -2442,13 +2523,13 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
         let flat = &mut q6_flat[b * 256..b * 256 + 256];
 
         // qh is 64 contiguous bytes for both halves → single zmm load.
-        let qh_z = _mm512_loadu_si512(qh.as_ptr() as *const __m512i);
+        let qh_z = load512(qh, 0);
 
-        let ql_lo_h0 = _mm256_loadu_si256(ql[0..].as_ptr() as *const __m256i);
-        let ql_lo_h1 = _mm256_loadu_si256(ql[64..].as_ptr() as *const __m256i);
+        let ql_lo_h0 = load256(ql, 0);
+        let ql_lo_h1 = load256(ql, 64);
         let ql_lo_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_lo_h0), ql_lo_h1);
-        let ql_hi_h0 = _mm256_loadu_si256(ql[32..].as_ptr() as *const __m256i);
-        let ql_hi_h1 = _mm256_loadu_si256(ql[96..].as_ptr() as *const __m256i);
+        let ql_hi_h0 = load256(ql, 32);
+        let ql_hi_h1 = load256(ql, 96);
         let ql_hi_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_hi_h0), ql_hi_h1);
 
         let qh_sr2_z = _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_03_z);
@@ -2500,10 +2581,10 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     macro_rules! q6k_sumi16 {
         ($q8:expr, $b:expr, $w0:expr, $w1:expr, $w2:expr, $w3:expr) => {{
             let qs = &$q8.qs[$b * 256..$b * 256 + 256];
-            let a0 = _mm512_loadu_si512(qs.as_ptr() as *const __m512i);
-            let a1 = _mm512_loadu_si512(qs[64..].as_ptr() as *const __m512i);
-            let a2 = _mm512_loadu_si512(qs[128..].as_ptr() as *const __m512i);
-            let a3 = _mm512_loadu_si512(qs[192..].as_ptr() as *const __m512i);
+            let a0 = load512(qs, 0);
+            let a1 = load512(qs, 64);
+            let a2 = load512(qs, 128);
+            let a3 = load512(qs, 192);
             // dpbusd: one op per 64-byte chunk instead of the maddubs+madd pair —
             // integer-exact both ways (u8≤63 × i8 groups can't saturate the i16 pairs).
             let z = _mm512_setzero_si512();
@@ -2529,7 +2610,7 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     // that used to dominate this kernel's critical path.
     macro_rules! q6k_epilogue {
         ($q8:expr, $b:expr, $sumi_z:expr, $scales_z:expr, $sumf:expr) => {{
-            let bs = _mm512_loadu_si512($q8.bsums16[$b * 16..].as_ptr() as *const __m512i);
+            let bs = load512(&$q8.bsums16, $b * 16);
             let corr = _mm512_sub_epi32($sumi_z, _mm512_slli_epi32::<5>(bs));
             let isum = _mm512_reduce_add_epi32(_mm512_mullo_epi32(corr, $scales_z));
             $sumf += d_arr[$b] * $q8.d[$b] * isum as f32;
@@ -2542,10 +2623,10 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
         let (mut sumf_a, mut sumf_b) = (0f32, 0f32);
         for b in 0..nb {
             let flat = &q6_flat[b * 256..b * 256 + 256];
-            let w0 = _mm512_loadu_si512(flat.as_ptr() as *const __m512i);
-            let w1 = _mm512_loadu_si512(flat[64..].as_ptr() as *const __m512i);
-            let w2 = _mm512_loadu_si512(flat[128..].as_ptr() as *const __m512i);
-            let w3 = _mm512_loadu_si512(flat[192..].as_ptr() as *const __m512i);
+            let w0 = load512(flat, 0);
+            let w1 = load512(flat, 64);
+            let w2 = load512(flat, 128);
+            let w3 = load512(flat, 192);
             let sc_z = _mm512_cvtepi8_epi32(_mm_loadu_si128(
                 scales_arr[b * 16..].as_ptr() as *const __m128i
             ));
@@ -2563,10 +2644,10 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
         let mut sumf = 0f32;
         for b in 0..nb {
             let flat = &q6_flat[b * 256..b * 256 + 256];
-            let w0 = _mm512_loadu_si512(flat.as_ptr() as *const __m512i);
-            let w1 = _mm512_loadu_si512(flat[64..].as_ptr() as *const __m512i);
-            let w2 = _mm512_loadu_si512(flat[128..].as_ptr() as *const __m512i);
-            let w3 = _mm512_loadu_si512(flat[192..].as_ptr() as *const __m512i);
+            let w0 = load512(flat, 0);
+            let w1 = load512(flat, 64);
+            let w2 = load512(flat, 128);
+            let w3 = load512(flat, 192);
             let sc_z = _mm512_cvtepi8_epi32(_mm_loadu_si128(
                 scales_arr[b * 16..].as_ptr() as *const __m128i
             ));
@@ -2707,8 +2788,8 @@ unsafe fn vec_dot_iq4xs_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mu
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             let mut isum = 0i32;
             for ib in 0..8usize {
-                let w = _mm256_loadu_si256(w_flat[b * 256 + ib * 32..].as_ptr() as *const __m256i);
-                let a = _mm256_loadu_si256(q8b[ib * 32..].as_ptr() as *const __m256i);
+                let w = load256(&w_flat, b * 256 + ib * 32);
+                let a = load256(q8b, ib * 32);
                 let w_abs = _mm256_abs_epi8(w);
                 let a_signed = _mm256_sign_epi8(a, w);
                 let prod = _mm256_maddubs_epi16(w_abs, a_signed);
@@ -3907,8 +3988,8 @@ unsafe fn vec_dot_q8_0_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
         for b in 0..nb_super {
             let d8 = q8.d[b];
             for s in 0..8usize {
-                let qw = _mm256_loadu_si256(qw_flat[b * 256 + s * 32..].as_ptr() as *const __m256i);
-                let qx = _mm256_loadu_si256(q8.qs[b * 256 + s * 32..].as_ptr() as *const __m256i);
+                let qw = load256(&qw_flat, b * 256 + s * 32);
+                let qx = load256(&q8.qs, b * 256 + s * 32);
                 let qw_abs = _mm256_abs_epi8(qw);
                 let qx_signed = _mm256_sign_epi8(qx, qw);
                 let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
@@ -3952,13 +4033,10 @@ unsafe fn vec_dot_q8_0_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: 
             for k in 0..4usize {
                 let s0 = 2 * k;
                 let s1 = 2 * k + 1;
-                let qw0 =
-                    _mm256_loadu_si256(qw_flat[b * 256 + s0 * 32..].as_ptr() as *const __m256i);
-                let qw1 =
-                    _mm256_loadu_si256(qw_flat[b * 256 + s1 * 32..].as_ptr() as *const __m256i);
+                let qw0 = load256(&qw_flat, b * 256 + s0 * 32);
+                let qw1 = load256(&qw_flat, b * 256 + s1 * 32);
                 // Load 64 contiguous activation bytes
-                let qx_z =
-                    _mm512_loadu_si512(q8.qs[b * 256 + s0 * 32..].as_ptr() as *const __m512i);
+                let qx_z = load512(&q8.qs, b * 256 + s0 * 32);
                 let qx0 = _mm512_castsi512_si256(qx_z);
                 let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
                 let qw_abs0 = _mm256_abs_epi8(qw0);
@@ -4101,12 +4179,12 @@ unsafe fn vec_dot_q5k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             sc_arr[b][s] = sc;
             m_arr[b][s] = mv;
         }
-        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let qh_ymm = load256(qh, 0);
         let flat = &mut q5_flat[b * 256..b * 256 + 256];
         let mut u1 = 1u8;
         let mut u2 = 2u8;
         for k in 0..4usize {
-            let nibbles = _mm256_loadu_si256(ql[k * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(ql, k * 32);
             let lo_nib = _mm256_and_si256(nibbles, mask_lo);
             let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
             let u1v = _mm256_set1_epi8(u1 as i8);
@@ -4134,10 +4212,10 @@ unsafe fn vec_dot_q5k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             for j in 0..4usize {
                 let (sc_e, m_e) = (sc_arr[b][2 * j], m_arr[b][2 * j]);
                 let (sc_o, m_o) = (sc_arr[b][2 * j + 1], m_arr[b][2 * j + 1]);
-                let q5_e = _mm256_loadu_si256(flat[j * 64..].as_ptr() as *const __m256i);
-                let q5_o = _mm256_loadu_si256(flat[j * 64 + 32..].as_ptr() as *const __m256i);
-                let q8_e = _mm256_loadu_si256(q8b[2 * j * 32..].as_ptr() as *const __m256i);
-                let q8_o = _mm256_loadu_si256(q8b[(2 * j + 1) * 32..].as_ptr() as *const __m256i);
+                let q5_e = load256(flat, j * 64);
+                let q5_o = load256(flat, j * 64 + 32);
+                let q8_e = load256(q8b, 2 * j * 32);
+                let q8_o = load256(q8b, (2 * j + 1) * 32);
                 let prod_e = _mm256_maddubs_epi16(q5_e, q8_e);
                 let sum32_e = _mm256_madd_epi16(prod_e, ones);
                 let iprod_e = hadd_i32_ymm(sum32_e);
@@ -4186,12 +4264,12 @@ unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             sc_arr[b][s] = sc;
             m_arr[b][s] = mv;
         }
-        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let qh_ymm = load256(qh, 0);
         let flat = &mut q5_flat[b * 256..b * 256 + 256];
         let mut u1 = 1u8;
         let mut u2 = 2u8;
         for k in 0..4usize {
-            let nibbles = _mm256_loadu_si256(ql[k * 32..].as_ptr() as *const __m256i);
+            let nibbles = load256(ql, k * 32);
             let lo_nib = _mm256_and_si256(nibbles, mask_lo);
             let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
             let u1v = _mm256_set1_epi8(u1 as i8);
@@ -4220,8 +4298,8 @@ unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
                 let (sc_e, m_e) = (sc_arr[b][2 * k], m_arr[b][2 * k]);
                 let (sc_o, m_o) = (sc_arr[b][2 * k + 1], m_arr[b][2 * k + 1]);
                 // flat[k*64..+64]: lower 32B = even sub-block, upper 32B = odd
-                let q5_zmm = _mm512_loadu_si512(flat[k * 64..].as_ptr() as *const __m512i);
-                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let q5_zmm = load512(flat, k * 64);
+                let q8_zmm = load512(q8b, k * 64);
                 let prod = _mm512_maddubs_epi16(q5_zmm, q8_zmm);
                 let sum32_z = _mm512_madd_epi16(prod, ones512);
                 let lo_ymm = _mm512_castsi512_si256(sum32_z);
@@ -4342,8 +4420,8 @@ unsafe fn vec_dot_q2k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let flat = &q2_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for c in 0..8usize {
-                let f = _mm256_loadu_si256(flat[c * 32..].as_ptr() as *const __m256i);
-                let a = _mm256_loadu_si256(q8b[c * 32..].as_ptr() as *const __m256i);
+                let f = load256(flat, c * 32);
+                let a = load256(q8b, c * 32);
                 let prod = _mm256_maddubs_epi16(f, a);
                 let sum32 = _mm256_madd_epi16(prod, ones);
                 let iprod_lo = hadd_i32_xmm(_mm256_castsi256_si128(sum32));
@@ -4380,8 +4458,8 @@ unsafe fn vec_dot_q2k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             let flat = &q2_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for cp in 0..4usize {
-                let f = _mm512_loadu_si512(flat[cp * 64..].as_ptr() as *const __m512i);
-                let a = _mm512_loadu_si512(q8b[cp * 64..].as_ptr() as *const __m512i);
+                let f = load512(flat, cp * 64);
+                let a = load512(q8b, cp * 64);
                 let prod = _mm512_maddubs_epi16(f, a);
                 let sum32 = _mm512_madd_epi16(prod, ones512);
                 let lo_ymm = _mm512_castsi512_si256(sum32);
@@ -4426,8 +4504,8 @@ unsafe fn vec_dot_q2k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let flat = &q2_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for cp in 0..4usize {
-                let f = _mm512_loadu_si512(flat[cp * 64..].as_ptr() as *const __m512i);
-                let a = _mm512_loadu_si512(q8b[cp * 64..].as_ptr() as *const __m512i);
+                let f = load512(flat, cp * 64);
+                let a = load512(q8b, cp * 64);
                 let sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), f, a);
                 let lo_ymm = _mm512_castsi512_si256(sum32);
                 let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
@@ -4648,8 +4726,8 @@ unsafe fn vec_dot_q3k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let flat = &q3_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for c in 0..8usize {
-                let f = _mm256_loadu_si256(flat[c * 32..].as_ptr() as *const __m256i);
-                let a = _mm256_loadu_si256(q8b[c * 32..].as_ptr() as *const __m256i);
+                let f = load256(flat, c * 32);
+                let a = load256(q8b, c * 32);
                 let prod = _mm256_maddubs_epi16(f, a);
                 let sum32 = _mm256_madd_epi16(prod, ones);
                 let iprod_lo = hadd_i32_xmm(_mm256_castsi256_si128(sum32));
@@ -4684,8 +4762,8 @@ unsafe fn vec_dot_q3k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             let flat = &q3_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for cp in 0..4usize {
-                let f = _mm512_loadu_si512(flat[cp * 64..].as_ptr() as *const __m512i);
-                let a = _mm512_loadu_si512(q8b[cp * 64..].as_ptr() as *const __m512i);
+                let f = load512(flat, cp * 64);
+                let a = load512(q8b, cp * 64);
                 let prod = _mm512_maddubs_epi16(f, a);
                 let sum32 = _mm512_madd_epi16(prod, ones512);
                 let lo_ymm = _mm512_castsi512_si256(sum32);
@@ -4725,8 +4803,8 @@ unsafe fn vec_dot_q3k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let flat = &q3_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for cp in 0..4usize {
-                let f = _mm512_loadu_si512(flat[cp * 64..].as_ptr() as *const __m512i);
-                let a = _mm512_loadu_si512(q8b[cp * 64..].as_ptr() as *const __m512i);
+                let f = load512(flat, cp * 64);
+                let a = load512(q8b, cp * 64);
                 let sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), f, a);
                 let lo_ymm = _mm512_castsi512_si256(sum32);
                 let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
@@ -4799,9 +4877,9 @@ unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let qw0 = _mm256_loadu_si256(row[b0 * bpr + 2..].as_ptr() as *const __m256i);
-            let qw1 = _mm256_loadu_si256(row[b1 * bpr + 2..].as_ptr() as *const __m256i);
-            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let qw0 = load256(row, b0 * bpr + 2);
+            let qw1 = load256(row, b1 * bpr + 2);
+            let qx_z = load512(&q8.qs, b0 * 32);
             let qx0 = _mm512_castsi512_si256(qx_z);
             let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
             let qw_abs0 = _mm256_abs_epi8(qw0);
@@ -4820,8 +4898,8 @@ unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let qw = _mm256_loadu_si256(row[b * bpr + 2..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let qw = load256(row, b * bpr + 2);
+            let q8v = load256(&q8.qs, b * 32);
             let qw_abs = _mm256_abs_epi8(qw);
             let qx_signed = _mm256_sign_epi8(q8v, qw);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qw_abs, qx_signed);
@@ -4906,8 +4984,8 @@ unsafe fn vec_dot_q8_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let qw = _mm256_loadu_si256(row[b * bpr + 2..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let qw = load256(row, b * bpr + 2);
+            let q8v = load256(&q8.qs, b * 32);
             let qw_abs = _mm256_abs_epi8(qw);
             let qx_signed = _mm256_sign_epi8(q8v, qw);
             let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
@@ -4941,10 +5019,10 @@ unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize,
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let qw0 = _mm256_loadu_si256(row[b0 * bpr + 2..].as_ptr() as *const __m256i);
-            let qw1 = _mm256_loadu_si256(row[b1 * bpr + 2..].as_ptr() as *const __m256i);
+            let qw0 = load256(row, b0 * bpr + 2);
+            let qw1 = load256(row, b1 * bpr + 2);
             // b0/b1 activation bytes are contiguous (`Q8x32::qs` is laid out `[b*32..b*32+32]`).
-            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let qx_z = load512(&q8.qs, b0 * 32);
             let qx0 = _mm512_castsi512_si256(qx_z);
             let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
             let qw_abs0 = _mm256_abs_epi8(qw0);
@@ -4966,8 +5044,8 @@ unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize,
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let qw = _mm256_loadu_si256(row[b * bpr + 2..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let qw = load256(row, b * bpr + 2);
+            let q8v = load256(&q8.qs, b * 32);
             let qw_abs = _mm256_abs_epi8(qw);
             let qx_signed = _mm256_sign_epi8(q8v, qw);
             let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
@@ -5087,7 +5165,7 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
             let mut acc = _mm512_setzero_si512();
             let q8b = &q8.qs[b * 32..b * 32 + 32];
             for g in 0..4usize {
-                let w = _mm512_loadu_si512(ilv[b * 256 + g * 64..].as_ptr() as *const __m512i);
+                let w = load512(&ilv, b * 256 + g * 64);
                 let a = _mm512_set1_epi64((q8b[g * 8..].as_ptr() as *const i64).read_unaligned());
                 acc = _mm512_dpbusd_epi32(acc, w, a);
             }
@@ -5193,8 +5271,8 @@ unsafe fn vec_dot_q5_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let prod = _mm256_maddubs_epi16(code, q8v);
             let sum32 = _mm256_madd_epi16(prod, ones);
             let iprod = hadd_i32_ymm(sum32);
@@ -5220,8 +5298,8 @@ unsafe fn vec_dot_q5_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
-            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let code_z = load512(&flat, b0 * 32);
+            let qx_z = load512(&q8.qs, b0 * 32);
             let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
             let lo_ymm = _mm512_castsi512_si256(sum32_z);
             let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
@@ -5232,8 +5310,8 @@ unsafe fn vec_dot_q5_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
             let iprod = hadd_i32_ymm(sum32);
             sumf += d_arr[b] * q8.d[b] * (iprod as f32 - 16.0 * q8.bsum[b] as f32);
@@ -5339,8 +5417,8 @@ unsafe fn vec_dot_q4_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let prod = _mm256_maddubs_epi16(code, q8v);
             let sum32 = _mm256_madd_epi16(prod, ones);
             let iprod = hadd_i32_ymm(sum32);
@@ -5366,8 +5444,8 @@ unsafe fn vec_dot_q4_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
-            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let code_z = load512(&flat, b0 * 32);
+            let qx_z = load512(&q8.qs, b0 * 32);
             let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
             let lo_ymm = _mm512_castsi512_si256(sum32_z);
             let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
@@ -5378,8 +5456,8 @@ unsafe fn vec_dot_q4_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
             let iprod = hadd_i32_ymm(sum32);
             sumf += d_arr[b] * q8.d[b] * (iprod as f32 - 8.0 * q8.bsum[b] as f32);
@@ -5489,8 +5567,8 @@ unsafe fn vec_dot_q2_0_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &
             let d = d_arr[b];
             for sub in 0..2 {
                 let s = 2 * b + sub;
-                let code = _mm256_loadu_si256(flat[s * 32..].as_ptr() as *const __m256i);
-                let q8v = _mm256_loadu_si256(q8.qs[s * 32..].as_ptr() as *const __m256i);
+                let code = load256(&flat, s * 32);
+                let q8v = load256(&q8.qs, s * 32);
                 let prod = _mm256_maddubs_epi16(code, q8v);
                 let sum32 = _mm256_madd_epi16(prod, ones);
                 let iprod = hadd_i32_ymm(sum32);
@@ -5518,8 +5596,8 @@ unsafe fn vec_dot_q2_0_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &
         for b in 0..nb {
             let d = d_arr[b];
             let (s0, s1) = (2 * b, 2 * b + 1);
-            let code_z = _mm512_loadu_si512(flat[s0 * 32..].as_ptr() as *const __m512i);
-            let qx_z = _mm512_loadu_si512(q8.qs[s0 * 32..].as_ptr() as *const __m512i);
+            let code_z = load512(&flat, s0 * 32);
+            let qx_z = load512(&q8.qs, s0 * 32);
             let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
             let lo_ymm = _mm512_castsi512_si256(sum32_z);
             let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
@@ -5636,8 +5714,8 @@ unsafe fn vec_dot_q4_1_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let prod = _mm256_maddubs_epi16(code, q8v);
             let sum32 = _mm256_madd_epi16(prod, ones);
             let iprod = hadd_i32_ymm(sum32);
@@ -5663,8 +5741,8 @@ unsafe fn vec_dot_q4_1_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
-            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let code_z = load512(&flat, b0 * 32);
+            let qx_z = load512(&q8.qs, b0 * 32);
             let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
             let lo_ymm = _mm512_castsi512_si256(sum32_z);
             let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
@@ -5675,8 +5753,8 @@ unsafe fn vec_dot_q4_1_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
             let iprod = hadd_i32_ymm(sum32);
             sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
@@ -5790,8 +5868,8 @@ unsafe fn vec_dot_q5_1_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let prod = _mm256_maddubs_epi16(code, q8v);
             let sum32 = _mm256_madd_epi16(prod, ones);
             let iprod = hadd_i32_ymm(sum32);
@@ -5817,8 +5895,8 @@ unsafe fn vec_dot_q5_1_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
-            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let code_z = load512(&flat, b0 * 32);
+            let qx_z = load512(&q8.qs, b0 * 32);
             let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
             let lo_ymm = _mm512_castsi512_si256(sum32_z);
             let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
@@ -5829,8 +5907,8 @@ unsafe fn vec_dot_q5_1_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
-            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let code = load256(&flat, b * 32);
+            let q8v = load256(&q8.qs, b * 32);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
             let iprod = hadd_i32_ymm(sum32);
             sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
@@ -5951,8 +6029,8 @@ unsafe fn vec_dot_iq4nl_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, ou
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let w = _mm256_loadu_si256(w_flat[b * 32..].as_ptr() as *const __m256i);
-            let a = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let w = load256(&w_flat, b * 32);
+            let a = load256(&q8.qs, b * 32);
             let w_abs = _mm256_abs_epi8(w);
             let a_signed = _mm256_sign_epi8(a, w);
             let prod = _mm256_maddubs_epi16(w_abs, a_signed);
@@ -5982,8 +6060,8 @@ unsafe fn vec_dot_iq4nl_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, ou
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let w_z = _mm512_loadu_si512(w_flat[b0 * 32..].as_ptr() as *const __m512i);
-            let a_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let w_z = load512(&w_flat, b0 * 32);
+            let a_z = load512(&q8.qs, b0 * 32);
             // Sign trick at ymm level (no _mm512_sign_epi8), then repack into zmm.
             let w0 = _mm512_castsi512_si256(w_z);
             let w1 = _mm512_extracti64x4_epi64::<1>(w_z);
@@ -6007,8 +6085,8 @@ unsafe fn vec_dot_iq4nl_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, ou
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let w = _mm256_loadu_si256(w_flat[b * 32..].as_ptr() as *const __m256i);
-            let a = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let w = load256(&w_flat, b * 32);
+            let a = load256(&q8.qs, b * 32);
             let w_abs = _mm256_abs_epi8(w);
             let a_signed = _mm256_sign_epi8(a, w);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w_abs, a_signed);
@@ -6128,8 +6206,8 @@ unsafe fn vec_dot_mxfp4_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, ou
     for (r, q8) in q8s.iter().enumerate() {
         let mut sumf = 0f32;
         for b in 0..nb {
-            let w = _mm256_loadu_si256(w_flat[b * 32..].as_ptr() as *const __m256i);
-            let a = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let w = load256(&w_flat, b * 32);
+            let a = load256(&q8.qs, b * 32);
             let w_abs = _mm256_abs_epi8(w);
             let a_signed = _mm256_sign_epi8(a, w);
             let prod = _mm256_maddubs_epi16(w_abs, a_signed);
@@ -6157,8 +6235,8 @@ unsafe fn vec_dot_mxfp4_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, ou
         let mut sumf = 0f32;
         for k in 0..pairs {
             let (b0, b1) = (2 * k, 2 * k + 1);
-            let w_z = _mm512_loadu_si512(w_flat[b0 * 32..].as_ptr() as *const __m512i);
-            let a_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let w_z = load512(&w_flat, b0 * 32);
+            let a_z = load512(&q8.qs, b0 * 32);
             // Sign trick at ymm level (no _mm512_sign_epi8), then repack into zmm.
             let w0 = _mm512_castsi512_si256(w_z);
             let w1 = _mm512_extracti64x4_epi64::<1>(w_z);
@@ -6182,8 +6260,8 @@ unsafe fn vec_dot_mxfp4_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, ou
         }
         if nb % 2 == 1 {
             let b = nb - 1;
-            let w = _mm256_loadu_si256(w_flat[b * 32..].as_ptr() as *const __m256i);
-            let a = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let w = load256(&w_flat, b * 32);
+            let a = load256(&q8.qs, b * 32);
             let w_abs = _mm256_abs_epi8(w);
             let a_signed = _mm256_sign_epi8(a, w);
             let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w_abs, a_signed);
@@ -6318,8 +6396,8 @@ unsafe fn vec_dot_nvfp4_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: 
             for u in 0..2usize {
                 let t = 2 * b + u; // Q8x32 activation sub-block
                 let s0 = 2 * u; // NVFP4 sub-blocks s0 (elems 0..15) and s0+1 (16..31) of this 32-block
-                let w = _mm256_loadu_si256(w_flat[b * 64 + s0 * 16..].as_ptr() as *const __m256i);
-                let a = _mm256_loadu_si256(q8.qs[t * 32..].as_ptr() as *const __m256i);
+                let w = load256(&w_flat, b * 64 + s0 * 16);
+                let a = load256(&q8.qs, t * 32);
                 let w_abs = _mm256_abs_epi8(w);
                 let a_signed = _mm256_sign_epi8(a, w);
                 let prod = _mm256_maddubs_epi16(w_abs, a_signed);

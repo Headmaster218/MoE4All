@@ -851,6 +851,39 @@ pub struct Recorder<'a> {
     bda_chunk_byte_cap: u64,
 }
 
+/// Intern a profiling shape label, leaking each DISTINCT string at most ONCE and handing back the
+/// same `&'static str` for every later occurrence.
+///
+/// WHY AN INTERNER AND NOT `Box::leak`. The timestamp-label plumbing wants a `&'static str`, and
+/// the obvious way to satisfy that from a `format!` is `Box::leak`. But the shape itemizers that
+/// build these labels ([`Recorder::label_gemv`] / [`Recorder::label_gemm`]) run at RECORD time,
+/// not at graph-build time: `execute_static` re-walks `for op in &graph.ops` and re-records every
+/// dispatch on EVERY execute. A per-call `Box::leak` therefore leaked one small string per op per
+/// forward pass — on a ~400-op graph at 50 tok/s that is ~20k leaked strings a second, on the
+/// order of tens of MB per minute, growing without bound for as long as the profile runs. The
+/// `next_label.get().is_none()` guard did not help: it only skips labels that an explicit
+/// `label_next` already claimed, it is not a shape registry.
+///
+/// The set of DISTINCT shape strings a model produces is tiny and fixed — a few dozen, one per
+/// (kernel, m, k, n) combination in the graph — so interning turns an unbounded per-token leak
+/// into a bounded one-time cost, while keeping the `&'static str` the label plumbing needs.
+///
+/// The `Mutex` is fine here: this function is only ever reached under INFR_PROF_OP_SHAPES. The
+/// non-profiling path never calls it, never formats a string, and never touches this lock —
+/// callers check `self.op_shapes` first. A poisoned lock is recovered rather than propagated: a
+/// panic elsewhere must not turn profiling into a second, unrelated crash.
+fn intern_label(s: String) -> &'static str {
+    static INTERN: std::sync::LazyLock<std::sync::Mutex<HashSet<&'static str>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    let mut set = INTERN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&hit) = set.get(s.as_str()) {
+        return hit;
+    }
+    let leaked: &'static str = Box::leak(s.into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Recorder<'a> {
     pub(crate) fn new(backend: &'a VulkanBackend) -> Result<Self> {
@@ -1006,22 +1039,21 @@ impl<'a> Recorder<'a> {
     /// INFR_PROF_OPS), its label becomes `kind:mM:in_fxout_f` (e.g. `mmvr:m4:1536x24576`) instead of
     /// the bare kernel name, splitting the bucket per route and per projection shape. This is
     /// what made the E2B pp4 63%-GEMV attribution actionable (llama.cpp's perf logger itemizes
-    /// per shape; a flat bucket didn't). A pending `label_next` override wins. The labels leak
-    /// one small string per op per record — profiling-only, gated off in production.
+    /// per shape; a flat bucket didn't). A pending `label_next` override wins. Profiling-only:
+    /// without `op_shapes` this does nothing at all — no format, no lock, no allocation.
     fn label_gemv(&self, kind: &'static str, rows: usize, in_f: usize, out_f: usize) {
         if self.op_shapes && self.next_label.get().is_none() {
-            let s: &'static str =
-                Box::leak(format!("{kind}:m{rows}:{in_f}x{out_f}").into_boxed_str());
+            let s = intern_label(format!("{kind}:m{rows}:{in_f}x{out_f}"));
             self.next_label.set(Some(s));
         }
     }
 
     /// Shape-itemize the next GEMM-class dispatch (`kernel:mM:kxn` under INFR_PROF_OP_SHAPES —
-    /// same rationale as [`label_gemv`](Self::label_gemv)). Profiling-only; the leak is gated
-    /// off in production.
+    /// same rationale as [`label_gemv`](Self::label_gemv)). Profiling-only; zero work when
+    /// `op_shapes` is off.
     fn label_gemm(&self, kernel: &'static str, m: usize, k: usize, n: usize) {
         if self.op_shapes && self.next_label.get().is_none() {
-            let s: &'static str = Box::leak(format!("{kernel}:m{m}:{k}x{n}").into_boxed_str());
+            let s = intern_label(format!("{kernel}:m{m}:{k}x{n}"));
             self.next_label.set(Some(s));
         }
     }
