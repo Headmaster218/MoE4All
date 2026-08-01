@@ -108,6 +108,37 @@ worse version of solved infrastructure.
 traffic with no proxy in front. That is a different product decision, not a
 missing feature.
 
+### B6 — prefill throughput is not reproducible run-to-run
+
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; needs a decision on
+where to pin the tier
+
+Running the full 35-row sweep twice against the SAME infr binary (`691c0dc`),
+with llama.cpp absolutes moving under 1%, the two prefill columns disagree with
+themselves:
+
+| column       | mean abs Δ between runs | worst row | rows moving >5% |
+| ------------ | ----------------------- | --------- | --------------- |
+| `tg128`      | 0.8%                    | 3.0%      | 0 / 35          |
+| `tg64@d4096` | 0.7%                    | 2.2%      | 0 / 35          |
+| `pp512`      | 6.8%                    | **34.5%** | 10 / 35         |
+| `pp4@d4096`  | 7.7%                    | **31.7%** | **19 / 35**     |
+
+Decode is solid; prefill is not. The cause is the documented tier/chunk
+nondeterminism — a short prefill can land on a different kernel tier between
+runs — and it bites hardest where the prefill is shortest (the sub-2B models)
+and on the IQ3_S MoE (+34.5%).
+
+This is not cosmetic. It moved `pp512` from 26/35 wins to 34/35 between two runs
+of one binary, and it means a prefill A/B under ~10% cannot be trusted without
+repeats. The previous snapshot's "small-model `pp512` cluster" finding turned
+out to be this variance, not a real deficit.
+
+**To do:** make the tier/chunk choice deterministic for a given shape, or pin it
+when `-r > 1` so a benchmark at least measures one tier consistently. Until then
+`infr bench -u/--ubatch <N>` is the workaround, and prefill numbers should be
+reported as a median of several runs rather than a single value.
+
 ---
 
 ## Withdrawn

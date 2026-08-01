@@ -178,15 +178,19 @@ a per-request OpenAI `temperature`/`top_p` still overrides them. See
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /
 RADV), every validated model × quant, both engines on matched flags. Headline:
 
-- **`pp4@d4096`** — multi-turn ingest, the shape a coding agent actually runs —
-  is infr's strongest column, up to **2.15×**.
-- **Prefill** wins the 4B–14B band decisively (**1.17×–1.41×** at `pp512`).
-- **Decode** is a win or a tie on most rows; losses concentrate on Qwen3-14B and
-  the larger MoEs.
+- **Decode** — the reproducible half — wins **29 of 35** rows at `tg128` and
+  **24 of 35** at `tg64@d4096`.
+- **`pp4@d4096`** (multi-turn ingest, the shape a coding agent actually runs) is
+  the strongest column, roughly **1.5–2×** on the small and mid models.
+- Losses concentrate on **Qwen3-14B and the larger MoEs**, mostly at depth.
 
 **The full table, the per-row footnotes, and an honest account of where infr
-loses are in [`docs/perf/results.md`](docs/perf/results.md).** Ratios move with
-_both_ engines, so read that file's provenance block before comparing snapshots.
+loses are in [`docs/perf/results.md`](docs/perf/results.md).** Two caveats live
+there and both matter: ratios move with _both_ engines, so snapshots taken
+against different `llama-bench` builds are not comparable; and infr's
+**prefill** columns vary up to ~30% run-to-run on an identical binary (a known
+tier/chunk nondeterminism), so quote prefill to one significant figure and
+decode as written.
 
 To reproduce or extend the numbers — `infr bench` / `infr compare --sweep`
 flag-for-flag against `llama-bench`, plus per-op GPU profiling — see
