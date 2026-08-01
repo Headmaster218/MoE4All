@@ -367,6 +367,15 @@ pub enum BufferUsage {
 pub trait ProgressScope: Send {}
 
 pub trait Buffer: Send + Sync {
+    /// The LOGICAL extent of the tensor this buffer holds — the byte count the model asked for —
+    /// NOT a per-device shard of it. A multi-device wrapper that splits one logical buffer across
+    /// `W` devices (`infr-vulkan`'s `TpBuffer` of kind `Kv`/`Weight`) must report the SUM over its
+    /// per-rank buffers and shard byte counts at its own `alloc`/`copy_buffer` boundary, exactly
+    /// once. The rule exists because backend-agnostic callers mix the two sources: `SeamKv`'s MTP
+    /// checkpoint sizes an alloc from `len_bytes()` while `seed_from` derives its copy length from
+    /// the model config. When `len_bytes()` returned the per-rank size, the first double-sharded
+    /// (`full/W²` buffers) and the second did not shard at all (a `W`-fold overrun) — both only
+    /// caught because Vulkan's `check_extent` bounds-checks every transfer.
     fn len_bytes(&self) -> usize;
     /// Downcast hook so a backend can recover its concrete buffer type from a `&dyn Buffer`
     /// bound by the model (every buffer a backend sees was allocated by itself).

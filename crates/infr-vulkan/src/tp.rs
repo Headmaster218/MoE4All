@@ -124,8 +124,25 @@ impl TpBuffer {
 }
 
 impl Buffer for TpBuffer {
+    /// The LOGICAL tensor size (see [`Buffer::len_bytes`]), NOT rank 0's slice: a sharded buffer
+    /// reports the SUM over its per-rank buffers, so a caller above the seam sees the same byte
+    /// count it would on a single device. Only [`TensorParallelBackend`] itself divides by the
+    /// world, and only in [`TensorParallelBackend::shard_bytes`].
+    ///
+    /// This USED to return `bufs[0].len_bytes()` (the per-rank slice), which broke both callers
+    /// that mix buffer-derived and config-derived byte counts: `SeamKv::mtp_snapshot_delta` fed
+    /// `len_bytes()` back into `alloc(KvCache)`, which sharded the ALREADY-sharded size into
+    /// `full/W²` buffers, and then copied `full/W` bytes into them. Summing here is what makes the
+    /// alloc/copy round trip (`shard_bytes(tp.len_bytes()) == per-rank size`) hold.
+    ///
+    /// The sum — rather than `bufs[0].len_bytes() * W` — so a ragged split (if one is ever allowed)
+    /// reports what the ranks actually hold instead of an idealized multiple.
     fn len_bytes(&self) -> usize {
-        self.bufs[0].len_bytes()
+        match self.kind {
+            // A replica's per-rank buffer IS the whole logical tensor (every rank holds all of it).
+            TpKind::Replica => self.bufs[0].len_bytes(),
+            TpKind::Kv | TpKind::Weight(_) => self.bufs.iter().map(|b| b.len_bytes()).sum(),
+        }
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -264,6 +281,26 @@ impl TensorParallelBackend {
             },
             Err(_) => TpRole::Replicated,
         }
+    }
+
+    /// Turn a LOGICAL KV byte count (what a caller above the seam names — see
+    /// [`Buffer::len_bytes`]) into the per-rank byte count. THE one place the world divides a byte
+    /// count: `alloc`, `alloc_uninit` and `copy_buffer` all route through it, so the size a KV
+    /// buffer is allocated at and the length later copied into it cannot disagree by construction.
+    /// (They did: the two alloc arms each carried their own inline copy of this check while
+    /// `copy_buffer` forwarded `bytes` to every rank unsharded, a `W`-fold overrun per rank.)
+    ///
+    /// KV is sharded by head: each rank stores 1/W of every row (its heads' K/V), which is exactly
+    /// `bytes/W` of a `[ctx, kvrow]` cache since `kvrow` is divisible by W. Non-divisible is an
+    /// ERROR, never a truncation — the case that reaches it is a quantized KV whose per-row padding
+    /// is not aligned to the head split, where `bytes/W != kv_fmt_bytes(fmt, elems/W)` and no
+    /// division is right.
+    ///
+    /// The arithmetic lives in the free [`shard_kv_bytes`] so it is testable without `W` physical
+    /// devices (a `TensorParallelBackend` cannot be built without them, and TP needs >= 2 GPUs, so
+    /// none of this runs in CI otherwise).
+    fn shard_bytes(&self, bytes: usize) -> Result<usize> {
+        shard_kv_bytes(bytes, self.world())
     }
 
     /// Whether a bound tensor is a per-rank KV shard (its activation state starts SHARDED).
@@ -603,6 +640,19 @@ fn shard_n_head(op: &mut Op, w: u32, i: usize) -> Result<()> {
     Ok(())
 }
 
+/// The pure core of [`TensorParallelBackend::shard_bytes`] — logical KV byte count → per-rank byte
+/// count over a `w`-way world. Split out from the method purely so it can be unit-tested without
+/// opening `w` physical Vulkan devices.
+fn shard_kv_bytes(bytes: usize, w: usize) -> Result<usize> {
+    if !bytes.is_multiple_of(w) {
+        return Err(be(format!(
+            "tp: KV cache byte count {bytes} not divisible by world {w} (a quantized KV padding \
+             not aligned to the head split) — use the default f16 KV under TP"
+        )));
+    }
+    Ok(bytes / w)
+}
+
 /// Divide a dim field by the world, erroring (not truncating) on a non-divisible dim.
 fn shard_dim(v: u32, w: u32, op: usize, what: &str) -> Result<u32> {
     if !v.is_multiple_of(w) {
@@ -645,16 +695,11 @@ impl Backend for TensorParallelBackend {
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
             BufferUsage::KvCache => {
-                // KV is sharded by head: each rank stores 1/W of every row (its heads' K/V), which
-                // is exactly bytes/W of a [ctx, kvrow] cache since kvrow is divisible by W.
+                // `bytes` is the LOGICAL (full-width) cache size; shard_bytes takes it to this
+                // rank's heads' slice. The resulting TpBuffer reports the logical size again from
+                // len_bytes(), so a caller that re-allocs from it does NOT shard a second time.
                 let w = self.world();
-                if !bytes.is_multiple_of(w) {
-                    return Err(be(format!(
-                        "tp: KV cache alloc {bytes} bytes not divisible by world {w} (a quantized \
-                         KV padding not aligned to the head split) — use the default f16 KV under TP"
-                    )));
-                }
-                let per = bytes / w;
+                let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
                 for r in 0..w {
                     bufs.push(self.ranks[r].alloc(per, usage)?);
@@ -674,12 +719,7 @@ impl Backend for TensorParallelBackend {
         match usage {
             BufferUsage::KvCache => {
                 let w = self.world();
-                if !bytes.is_multiple_of(w) {
-                    return Err(be(format!(
-                        "tp: KV cache alloc_uninit {bytes} bytes not divisible by world {w}"
-                    )));
-                }
-                let per = bytes / w;
+                let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
                 for r in 0..w {
                     bufs.push(self.ranks[r].alloc_uninit(per, usage)?);
@@ -714,14 +754,48 @@ impl Backend for TensorParallelBackend {
         self.ranks[0].download(tp.on(0)?, dst)
     }
 
+    /// `bytes` is a LOGICAL length (see [`Buffer::len_bytes`]) — the caller names the full-width
+    /// tensor, whether it read the count off a buffer (`SeamKv::mtp_snapshot_delta`) or computed it
+    /// from the model config (`SeamKv::seed_from`, `p * n_kv * head_dim` — full, unsharded
+    /// geometry). Only the config-derived case forces the issue: there is no buffer to ask, so the
+    /// sharding MUST happen here. It did not, and every rank was handed a full-width length for a
+    /// `full/W`-sized buffer — a `W`-fold overrun, today an error from `check_extent` rather than
+    /// silent corruption of whatever VRAM followed the cache.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
         let (s, d) = (as_tp(src)?, as_tp(dst)?);
         if s.bufs.len() != d.bufs.len() {
             return Err(be("tp: copy_buffer between mismatched TpBuffers"));
         }
+        // A replica→shard (or shard→replica) copy would need a scatter/gather, not a per-rank
+        // memcpy, and the two sides' per-rank lengths differ — reject instead of copying the wrong
+        // number of bytes onto each rank.
+        if s.kind != d.kind {
+            return Err(be(format!(
+                "tp: copy_buffer between TpBuffers of different kinds ({:?} → {:?}) — a copy \
+                 across shard layouts is not a per-rank copy",
+                s.kind, d.kind
+            )));
+        }
+        let per_rank = match s.kind {
+            // Every rank holds the whole tensor: the logical length IS each rank's length.
+            TpKind::Replica => bytes,
+            // Each rank holds its heads' 1/W slice, so each rank copies 1/W of the logical length.
+            TpKind::Kv => self.shard_bytes(bytes)?,
+            // No caller copies a weight today, and the divisor is ROLE-dependent (a column-parallel
+            // weight splits its output rows, a row-parallel one its input columns — a prefix copy
+            // of `bytes` logical bytes is a different per-rank range in each case, and for a
+            // row-parallel weight is not even contiguous per rank). Refusing beats guessing.
+            TpKind::Weight(role) => {
+                return Err(be(format!(
+                    "tp: copy_buffer of a {role:?}-parallel weight shard is not supported — the \
+                     per-rank byte range of a logical prefix depends on the weight's device role, \
+                     so there is no single correct divisor; weights are filled by the binder"
+                )))
+            }
+        };
         // Same-layout copy on every rank (KV fork/seed within a rank, replica→replica).
         for (i, b) in self.ranks.iter().enumerate() {
-            b.copy_buffer(s.on(i)?, d.on(i)?, bytes)?;
+            b.copy_buffer(s.on(i)?, d.on(i)?, per_rank)?;
         }
         Ok(())
     }
@@ -782,5 +856,104 @@ impl Backend for TensorParallelBackend {
 
     fn kv_overflow_report(&self) {
         infr_core::backend::kv_overflow_report_each(&self.ranks);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device-free stand-in for a per-rank inner buffer. TP needs >= 2 physical GPUs, so the real
+    /// path can never run in CI; the byte accounting these tests pin is pure, so it is exercised
+    /// over stubs instead.
+    struct StubBuf(usize);
+
+    impl Buffer for StubBuf {
+        fn len_bytes(&self) -> usize {
+            self.0
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn device_addr(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn bufs(lens: &[usize]) -> Vec<Box<dyn Buffer>> {
+        lens.iter()
+            .map(|&n| Box::new(StubBuf(n)) as Box<dyn Buffer>)
+            .collect()
+    }
+
+    #[test]
+    fn len_bytes_is_the_logical_size_replica_is_one_buf_shards_sum() {
+        // A replica: every rank holds the WHOLE tensor, so the logical size is one buffer's size —
+        // NOT 4 * 1024. Summing a replica would report W× the tensor.
+        let rep = TpBuffer {
+            kind: TpKind::Replica,
+            bufs: bufs(&[1024, 1024, 1024, 1024]),
+        };
+        assert_eq!(rep.len_bytes(), 1024);
+
+        // A KV shard: each rank holds its heads' slice, so the logical size is the SUM. Reporting
+        // bufs[0] here is the bug — the caller then re-shards an already-sharded size.
+        let kv = TpBuffer {
+            kind: TpKind::Kv,
+            bufs: bufs(&[256, 256, 256, 256]),
+        };
+        assert_eq!(kv.len_bytes(), 1024);
+
+        // Same for a sliced weight, whichever device role it carries.
+        for role in [TpRole::Column, TpRole::Row] {
+            let wt = TpBuffer {
+                kind: TpKind::Weight(role),
+                bufs: bufs(&[300, 300]),
+            };
+            assert_eq!(wt.len_bytes(), 600);
+        }
+    }
+
+    #[test]
+    fn sharded_len_bytes_sums_rather_than_multiplying_rank_zero() {
+        // Sum, not `bufs[0] * W`: a ragged split must report what the ranks actually hold.
+        let kv = TpBuffer {
+            kind: TpKind::Kv,
+            bufs: bufs(&[100, 200, 300]),
+        };
+        assert_eq!(kv.len_bytes(), 600);
+    }
+
+    #[test]
+    fn shard_bytes_divides_and_rejects_an_unaligned_quantized_kv_size() {
+        assert_eq!(shard_kv_bytes(4096, 2).expect("divisible"), 2048);
+        assert_eq!(shard_kv_bytes(4096, 4).expect("divisible"), 1024);
+        assert_eq!(shard_kv_bytes(0, 4).expect("zero is divisible"), 0);
+        assert_eq!(shard_kv_bytes(777, 1).expect("world 1 divides all"), 777);
+
+        // Not divisible ⇒ error, never a truncating divide. The message must keep naming the case
+        // that reaches it, since the fix is a KV-format change and not anything about the model.
+        let e = shard_kv_bytes(4098, 4).expect_err("4098 is not a multiple of 4");
+        let msg = e.to_string();
+        assert!(msg.contains("4098"), "{msg}");
+        assert!(msg.contains("quantized KV padding"), "{msg}");
+    }
+
+    #[test]
+    fn kv_alloc_copy_round_trip_reshards_exactly_once() {
+        // THE invariant that makes the bug impossible to reintroduce, and the one
+        // `SeamKv::mtp_snapshot_delta` got wrong: it reads `len_bytes()` off a KV buffer and hands
+        // it straight back to `alloc(KvCache)` / `copy_buffer`, both of which shard. Feeding a
+        // sharded buffer's logical size back through the shard must land on the per-rank size
+        // again — not on `full/W²`.
+        for w in [1usize, 2, 4, 8] {
+            let per = 512usize;
+            let kv = TpBuffer {
+                kind: TpKind::Kv,
+                bufs: bufs(&vec![per; w]),
+            };
+            assert_eq!(kv.len_bytes(), per * w);
+            assert_eq!(shard_kv_bytes(kv.len_bytes(), w).expect("divisible"), per);
+        }
     }
 }

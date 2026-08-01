@@ -52,13 +52,18 @@ _Needs a product decision (will not be fixed by a reviewer):_
 - **S7** — non-streaming disconnect cancellation and rate limiting are a design
   task, not a patch.
 - **N10** — `INFR_DN_CHUNK_SCAN`'s inverted polarity is R1-frozen.
-- **C10** below — needs a decision on what `TpBuffer::len_bytes()` means.
 
 _Simply not done yet (no blocker, just not in the six slices):_ **S8**, **U2**,
 **U3**, **N2**, **N3**, **N4**, **N5**, **N6**, **N7**, **N9**, **N12**,
 **N13**.
 
-### C10 (H) — tensor-parallel KV checkpoints are double-sharded
+### C10 (H) — tensor-parallel KV checkpoints are double-sharded — FIXED
+
+Resolved by making `Buffer::len_bytes()` mean the LOGICAL extent and having
+`TensorParallelBackend` shard byte counts at its own boundary exactly once (one
+`shard_bytes` helper shared by `alloc`, `alloc_uninit` and `copy_buffer`). The
+six `seam/weights.rs` call sites were left untouched — that they keep working
+unchanged is the point of the rule. Original diagnosis below.
 
 `crates/infr-llama/src/seam/weights.rs:315`, `:321`, `:344`, `:350`, `:494`,
 `:500` · `crates/infr-vulkan/src/tp.rs:127`, `:664`
