@@ -37,25 +37,40 @@ dead scaffolding.
 
 ## Status (updated 2026-08-01, after the fix pass)
 
-**Fixed** (seven commits: `2367e34`, `d626a9d`, `93986ce`, `f8637cc`, `b991de4`,
-`d7ce3d3`, and the cleanup commit): **C1–C9**, **S1–S5**, **U1**, **D1–D5**,
-**Y1**, **Y2**, and nits **N1**, **N8**, **N11**.
+**Fixed** — everything except the five below: **C1–C10**, **S1–S5**, **S8**,
+**U1–U3**, **D1–D5**, **Y1**, **Y2**, and nits **N1–N6**, **N8**, **N9**,
+**N11–N13**.
 
-**Still open.** Split by why, because the reasons differ:
+**Withdrawn — the finding was wrong.** **N7** claimed the VRAM guard's
+check-then-act races under `serve --parallel`. It does not: weights and KV are
+allocated at startup and `init_slots` is a sequential loop. The only `alloc`
+reachable during serving is the MTP h-tap `Staging` buffer at `n_embd * 4` (~16
+KB), below the guard's 1 MiB `CHECK_MIN` and skipped by design. **N2**'s
+performance half was also wrong (~8 call sites, not "millions of compares");
+only its duplicate-tensor-name half was real, and that is fixed.
 
-_Needs a product decision (will not be fixed by a reviewer):_
+**Still open — each needs a product decision, not a patch:**
 
 - **Y3** (`INFR_POISON_UNINIT`) and **Y4** (`INFR_KV_OVERFLOW_VRAM_MB`'s
-  placement cap) — "has this debugging knob earned its keep?"
-- **S6** — gating `/v1/models` behind the API key changes behaviour for anyone
-  scraping it.
-- **S7** — non-streaming disconnect cancellation and rate limiting are a design
-  task, not a patch.
-- **N10** — `INFR_DN_CHUNK_SCAN`'s inverted polarity is R1-frozen.
+  placement cap). _Suggestion: keep both._ Each has one production read site and
+  costs nothing when unset; YAGNI is about unused abstraction, and these are
+  used, just rarely.
+- **S6** — gating `/v1/models` behind the API key. _Suggestion: gate it, leave
+  `/health` open._
+- **S7** — non-streaming disconnect cancellation and rate limiting. _Suggestion:
+  add a per-request wall-clock deadline; leave rate limiting to a reverse
+  proxy._
+- **N10** — `INFR_DN_CHUNK_SCAN`'s inverted polarity, R1-frozen. Fold into the
+  next breaking sweep.
+- **Residual from U3:** 16 `_mm_loadu_si128` (128-bit) sites in
+  `infr-cpu/src/kernels.rs` still take the raw intrinsic. Same class as the 171
+  converted ones, deliberately out of that slice's scope.
 
-_Simply not done yet (no blocker, just not in the six slices):_ **S8**, **U2**,
-**U3**, **N2**, **N3**, **N4**, **N5**, **N6**, **N7**, **N9**, **N12**,
-**N13**.
+**Coverage gap worth knowing:** 63 of the 171 converted SIMD load sites are in
+the `*_vnni` kernel family, which the dev box cannot execute (no `avx512vnni`),
+so their new `debug_assert`s are compiled but unexercised. They need a VNNI
+runner. The avx2 tier _was_ verified, by temporarily stubbing the 37 `avx512bw`
+gates to `false`.
 
 ### C10 (H) — tensor-parallel KV checkpoints are double-sharded — FIXED
 
