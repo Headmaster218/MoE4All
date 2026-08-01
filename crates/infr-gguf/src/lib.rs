@@ -25,6 +25,26 @@ use std::{collections::HashMap, fs::File, path::Path, sync::Arc};
 const GGUF_MAGIC: u32 = 0x46554747; // b"GGUF" little-endian
 const DEFAULT_ALIGNMENT: usize = 32; // GGUF_DEFAULT_ALIGNMENT
 
+/// Upper bound on `general.alignment`.
+///
+/// The lower bound (positive, power of two) is not enough on its own: `1 << 62` satisfies
+/// both and then makes `r.pos.div_ceil(alignment) * alignment` overflow — a panic in a debug
+/// build, a wrapped-to-garbage `data_region_start` in a release one, which silently reads
+/// every tensor from the wrong file offset. 16 MiB is arbitrary-but-justified: the spec's
+/// default (and every real producer) uses 32, GPU/page-level constraints top out in the
+/// kilobytes, so this is ~19 binary orders of magnitude of headroom over anything legitimate,
+/// while keeping `div_ceil(a) * a` far below `usize::MAX` for any in-file cursor position.
+const MAX_ALIGNMENT: usize = 16 << 20;
+
+/// Maximum number of dimensions a GGUF tensor may declare — ggml's `GGML_MAX_DIMS`.
+///
+/// `n_dims` is read straight from the file as a `u32`. Without this bound a bogus value just
+/// runs the shape loop until `read_u64` hits EOF, so a malformed file reports "unexpected end
+/// of file" instead of the actual defect, and a value near `u32::MAX` spends the whole read
+/// budget getting there. Naming the real problem at the point it is detectable is the whole
+/// win; the reservation is already clamped by `r.remaining()`, so this is about diagnostics.
+const MAX_TENSOR_DIMS: usize = 4;
+
 /// Hard ceiling on how deeply metadata ARRAY values (GGUF type 9) may nest.
 ///
 /// `read_meta_value` is recursive: an ARRAY reads an `elem_type` and then parses `count`
@@ -431,6 +451,17 @@ impl Gguf {
                     "GGUF: invalid general.alignment {alignment} (must be a positive power of two)"
                 )));
             }
+            // …and bound it from ABOVE too. A power-of-two check alone still admits values like
+            // `1 << 62`, and `pos.div_ceil(alignment) * alignment` then overflows the multiply —
+            // a panic in debug, a silently wrapped (tiny or zero) `data_region_start` in release,
+            // which points every tensor at the wrong bytes. Real GGUF files use 32; the cap is set
+            // several orders of magnitude above that so no plausible producer is rejected, while
+            // still leaving `div_ceil * alignment` unable to come near `usize::MAX`.
+            if alignment > MAX_ALIGNMENT {
+                return Err(Error::Loader(format!(
+                    "GGUF: invalid general.alignment {alignment} (exceeds the {MAX_ALIGNMENT}-byte cap)"
+                )));
+            }
 
             // ── tensor info entries ───────────────────────────────────────────
             // Collect raw fields first (name, shape, ggml_type, offset); then
@@ -441,6 +472,11 @@ impl Gguf {
             for _ in 0..tensor_count {
                 let name = r.read_gguf_str()?;
                 let n_dims = r.read_u32()? as usize;
+                if n_dims > MAX_TENSOR_DIMS {
+                    return Err(Error::Loader(format!(
+                        "GGUF: tensor '{name}' declares {n_dims} dimensions (max {MAX_TENSOR_DIMS})"
+                    )));
+                }
                 let mut shape = Vec::with_capacity(n_dims.min(r.remaining()));
                 for _ in 0..n_dims {
                     shape.push(r.read_u64()? as usize);
@@ -503,6 +539,27 @@ impl Gguf {
                     offset,
                     nbytes,
                 });
+            }
+
+            // Duplicate tensor names are malformed input and must not be silently accepted.
+            // `resolve` looks a tensor up with a linear `find`, so with two entries sharing a
+            // name the FIRST always wins and the second is unreachable — different offsets,
+            // different shapes, possibly a different dtype, and nothing anywhere reports that
+            // half the file was ignored. Rejecting at load is the only place the ambiguity is
+            // visible; afterwards every consumer just gets a plausible-looking answer. One
+            // `HashSet` pass over the (few thousand, at most) names costs nothing measurable.
+            {
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::with_capacity(tensors.len());
+                for t in &tensors {
+                    if !seen.insert(t.name.as_str()) {
+                        return Err(Error::Loader(format!(
+                            "GGUF: duplicate tensor name '{}' — the file declares it more than \
+                             once, so which entry a lookup resolves to is ambiguous",
+                            t.name
+                        )));
+                    }
+                }
             }
 
             (metadata, tensors, data_region_start)
@@ -774,6 +831,109 @@ mod tests {
             matches!(err, Err(Error::Loader(_))),
             "non-pow2 alignment should be Error::Loader, got {err:?}"
         );
+    }
+
+    /// An absurdly LARGE alignment is a power of two and so passes the lower-bound checks,
+    /// but `pos.div_ceil(alignment) * alignment` then overflows: a panic in debug, a wrapped
+    /// `data_region_start` (every tensor read from the wrong offset) in release. It must be
+    /// rejected with an `Error::Loader` naming the value and the cap.
+    #[test]
+    fn oversized_alignment_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 0);
+        push_u64(&mut b, 1);
+        push_gguf_str(&mut b, "general.alignment");
+        push_u32(&mut b, 10); // GGUF_TYPE_UINT64
+        push_u64(&mut b, 1u64 << 62); // power of two, but nonsense
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        let Err(Error::Loader(msg)) = err else {
+            panic!("oversized alignment should be Error::Loader, got {err:?}");
+        };
+        assert!(msg.contains(&(1u64 << 62).to_string()), "{msg}");
+        assert!(msg.contains(&MAX_ALIGNMENT.to_string()), "{msg}");
+    }
+
+    /// `n_dims` is an unbounded `u32` on disk but ggml caps a tensor at `GGML_MAX_DIMS` = 4.
+    /// Without the check the shape loop just runs until EOF, so the reported error is
+    /// "unexpected end of file" rather than the actual defect.
+    #[test]
+    fn oversized_n_dims_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 1); // tensor_count = 1
+        push_u64(&mut b, 0); // kv_count = 0
+        push_gguf_str(&mut b, "tensor0");
+        push_u32(&mut b, 5); // n_dims = 5 > GGML_MAX_DIMS
+        for _ in 0..5 {
+            push_u64(&mut b, 2);
+        }
+        push_u32(&mut b, 0); // F32
+        push_u64(&mut b, 0); // offset
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        let Err(Error::Loader(msg)) = err else {
+            panic!("n_dims > 4 should be Error::Loader, got {err:?}");
+        };
+        assert!(msg.contains("tensor0") && msg.contains('5'), "{msg}");
+    }
+
+    /// The boundary of the rule above: `GGML_MAX_DIMS` = 4 dimensions is LEGAL and must still
+    /// load. Pins the cap as `> 4`, not `>= 4`.
+    #[test]
+    fn four_dims_is_accepted() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 1); // tensor_count
+        push_u64(&mut b, 0); // kv_count
+        push_gguf_str(&mut b, "tensor0");
+        push_u32(&mut b, 4); // n_dims = GGML_MAX_DIMS
+        for d in [4u64, 1, 1, 1] {
+            push_u64(&mut b, d);
+        }
+        push_u32(&mut b, 0); // F32
+        push_u64(&mut b, 0); // offset
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        b.extend_from_slice(&[0u8; 16]);
+        let tmp = write_temp_gguf(&b);
+        let gguf = Gguf::open(tmp.path()).expect("4-dim tensor must load");
+        assert_eq!(gguf.tensors()[0].shape, vec![4, 1, 1, 1]);
+    }
+
+    /// Two tensors sharing a name make `resolve`'s linear `find` silently serve the first and
+    /// leave the second unreachable. That is malformed input being accepted, so `open` rejects
+    /// it and names the duplicate.
+    #[test]
+    fn duplicate_tensor_name_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 2); // tensor_count = 2
+        push_u64(&mut b, 0); // kv_count = 0
+        for offset in [0u64, 16] {
+            push_gguf_str(&mut b, "tensor0"); // same name twice
+            push_u32(&mut b, 1); // n_dims
+            push_u64(&mut b, 4); // dim[0]
+            push_u32(&mut b, 0); // F32
+            push_u64(&mut b, offset);
+        }
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        b.extend_from_slice(&[0u8; 32]);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        let Err(Error::Loader(msg)) = err else {
+            panic!("duplicate tensor name should be Error::Loader, got {err:?}");
+        };
+        assert!(msg.contains("tensor0"), "{msg}");
+        assert!(msg.contains("duplicate"), "{msg}");
     }
 
     /// A huge `tensor_count` on a tiny file must error gracefully — no multi-GB

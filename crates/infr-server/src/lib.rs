@@ -2049,6 +2049,36 @@ mod tests {
         assert_eq!(flatten_content(&Some(serde_json::Value::Null)), "");
     }
 
+    /// CHARACTERIZATION TEST — pins current behaviour, does not ask for a change.
+    ///
+    /// OpenAI's schema says `content` is a string or an array of content parts. A number, a
+    /// bool or an object is a client bug. `flatten_content`'s fallback arm renders such a value
+    /// with `Value::to_string()` (its JSON form) and feeds that to the prompt rather than
+    /// erroring or dropping it. That leniency is DELIBERATE: a chat request that is merely
+    /// sloppily typed still produces a sensible completion instead of a 400, and the rendered
+    /// form is at least visible to the user in the echoed prompt rather than silently vanishing.
+    ///
+    /// It is pinned here because nothing else pins it: the arm is a one-liner a future refactor
+    /// could plausibly "tidy" into `String::new()` or a rejection, silently changing what every
+    /// such request produces. If this test fails, the change was intentional or it was not —
+    /// decide, don't just re-bless.
+    ///
+    /// Note the exact rendering: `Value::to_string` is compact JSON, so a string INSIDE an
+    /// object keeps its quotes, and `null` never reaches this arm (it is handled above).
+    #[test]
+    fn flatten_content_non_string_renders_json_leniently() {
+        use serde_json::json;
+        assert_eq!(flatten_content(&Some(json!(42))), "42");
+        assert_eq!(flatten_content(&Some(json!(-1.5))), "-1.5");
+        assert_eq!(flatten_content(&Some(json!(true))), "true");
+        assert_eq!(flatten_content(&Some(json!(false))), "false");
+        assert_eq!(flatten_content(&Some(json!({"a": 1}))), r#"{"a":1}"#);
+        assert_eq!(
+            flatten_content(&Some(json!({"a": "b", "c": [1, 2]}))),
+            r#"{"a":"b","c":[1,2]}"#
+        );
+    }
+
     // --- make_id uniqueness (audit finding 4) ------------------------------
 
     #[test]

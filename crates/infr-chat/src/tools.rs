@@ -500,6 +500,15 @@ pub fn parse_any_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     if !calls.is_empty() {
         return (clean, calls);
     }
+    // The bare-JSON arm returns an EMPTY `clean` while the two arms above preserve the
+    // surrounding prose through their own `clean`. That asymmetry is deliberate, not an
+    // oversight: the other two dialects delimit the call with markers, so text outside the
+    // markers is genuine assistant prose that must survive. Llama-3.x has no markers — its
+    // template instructs the model to make the WHOLE response the JSON object, and
+    // `parse_bare_json_call` only matches when the entire trimmed body is that object. So
+    // by construction there is no surrounding text to preserve here: everything `text`
+    // holds IS the call, and echoing it back as content would print the raw JSON to the
+    // user on top of dispatching the call.
     if let Some(call) = parse_bare_json_call(text) {
         return (String::new(), vec![call]);
     }

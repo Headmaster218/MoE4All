@@ -116,6 +116,7 @@ fn fetch_and_link(blobs: &Path, snap: &Path, repo: &str, filename: &str) -> Resu
                 blobs,
                 filename,
                 want.as_deref(),
+                None, // model blobs are legitimately multi-GB — never capped
             )?
             .1
         }
@@ -373,11 +374,37 @@ fn repo_info(repo: &str, sel: Option<&str>) -> Result<(String, String, Vec<Strin
 /// tiny: only files the engine actually consumes belong here.
 const COMPANIONS: &[&str] = &["generation_config.json"];
 
+/// Hard ceiling on a companion download, enforced DURING streaming (see [`stream_into`]).
+///
+/// A companion is the one file in the snapshot that may legitimately arrive unverified: HF only
+/// advertises an `X-Linked-Etag` sha256 for LFS objects, and a small `generation_config.json` is
+/// usually stored as a plain (non-LFS) blob, so there is nothing to check the body against. Without
+/// a cap, "unverified" also means "unbounded": a hostile mirror, a misrouted redirect or simply a
+/// broken proxy answering with a multi-GB body writes all of it into the user's HF cache before
+/// anyone notices, and the failure is disk exhaustion, not a bad config.
+///
+/// 1 MiB is chosen as generous-but-finite. The real files are under 2 KB (a handful of sampling
+/// keys), so this is ~500x headroom — no plausible companion is ever refused — while bounding the
+/// worst case to a single megabyte of wasted I/O that is then deleted. The cap deliberately does
+/// NOT apply to the model blob path: a GGUF is legitimately multi-GB and is sha256-verified.
+const MAX_COMPANION_BYTES: u64 = 1 << 20;
+
 /// Download any [`COMPANIONS`] the repo lists into `snap` (the GGUF's snapshot dir, so they sit
 /// beside it), content-addressed + symlinked exactly like the GGUF. Idempotent (skips a present
 /// link) and STRICTLY NON-FATAL: a companion that's absent, unlisted, or fails to download never
 /// fails the model pull — it's a convenience, not a requirement. `siblings` is the repo file list
 /// already fetched by [`repo_info`], so an absent companion costs zero network calls.
+///
+/// A companion is HEADed for its LFS sha256 exactly like the GGUF ([`fetch_and_link`]) and the
+/// digest is passed through to the download, so an LFS companion is integrity-checked to the same
+/// standard as the model blob it sits next to. That symmetry is the point: `generation_config.json`
+/// feeds the CLI's sampling defaults (temperature/top_k/top_p), and having ONE unverified file in
+/// a snapshot whose every other byte is content-addressed is the gap, not the blast radius. A
+/// NON-LFS companion has no `X-Linked-Etag` and therefore stays unverified — that is expected and
+/// fine, and [`MAX_COMPANION_BYTES`] is what keeps that case bounded.
+///
+/// Both new failure modes stay inside the non-fatal contract: a sha mismatch or an over-cap body
+/// is a `debug!` and a skipped companion, never a failed model pull.
 fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) {
     for &name in COMPANIONS {
         if !siblings.iter().any(|s| s == name) {
@@ -393,9 +420,22 @@ fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) 
             continue; // already cached
         }
         let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
-        // Companions are small (often non-LFS) convenience files; download best-effort, unverified.
-        let dl = http_client()
-            .and_then(|c| download_to_blob(c, &url, token().as_deref(), blobs, name, None));
+        // Same integrity path as the GGUF: HEAD for the LFS sha256 and hand it to the download so
+        // the body is verified (and a present blob relinked without a transfer). `Ok(None)` = the
+        // file is not LFS, so no digest exists; a HEAD transport error degrades to the same
+        // unverified-but-capped path rather than skipping the companion.
+        let want = head_lfs_sha(repo, name).ok().flatten();
+        let dl = http_client().and_then(|c| {
+            download_to_blob(
+                c,
+                &url,
+                token().as_deref(),
+                blobs,
+                name,
+                want.as_deref(),
+                Some(MAX_COMPANION_BYTES),
+            )
+        });
         match dl {
             Ok((_, hex, _)) => {
                 let _ = fs::remove_file(&link);
@@ -422,6 +462,15 @@ fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) 
 /// verified against it before the blob is committed — a mismatch discards the temp and errors (a
 /// corrupt/truncated body, or a resume of a stale partial from a since-changed file, must never be
 /// linked as the model). `None` (non-LFS file / no digest available) proceeds without verification.
+///
+/// `max_bytes` caps the FINAL size of the file (resumed prefix included) and is enforced INSIDE the
+/// streaming loop, so an over-long body is aborted mid-transfer instead of after it has already
+/// landed on disk — the whole point of a cap on an unverified download. `None` means uncapped and
+/// is what the model-blob path passes: a GGUF is legitimately multi-GB, and its integrity comes
+/// from `expected_sha` instead. See [`MAX_COMPANION_BYTES`] for the only capped caller. The
+/// advertised `Content-Length` is checked first as a courtesy (fail before writing a byte) but is
+/// never trusted on its own — it is attacker-controlled and may be absent under chunked encoding,
+/// which is exactly why the loop counts for itself.
 fn download_to_blob(
     client: &Client,
     url: &str,
@@ -429,6 +478,7 @@ fn download_to_blob(
     blobs: &Path,
     label: &str,
     expected_sha: Option<&str>,
+    max_bytes: Option<u64>,
 ) -> Result<(PathBuf, String, u64)> {
     fs::create_dir_all(blobs).map_err(Error::from)?;
     // Content-addressed short-circuit: if we already know the sha and hold that blob, we're done.
@@ -497,6 +547,16 @@ fn download_to_blob(
     let remaining = resp.content_length();
     let total = remaining.map(|r| if resuming { have + r } else { r });
 
+    // Cheap pre-flight: refuse an announced size over the cap before opening the temp file at all.
+    // Advisory only — the loop below is the enforcement (see the fn docs).
+    if let (Some(cap), Some(t)) = (max_bytes, total) {
+        if over_cap(t, max_bytes) {
+            return Err(Error::Other(format!(
+                "{label}: advertised size {t} bytes exceeds the {cap}-byte cap"
+            )));
+        }
+    }
+
     // Persist the validator for a FUTURE resume — before streaming, so an interrupt mid-body still
     // leaves a usable `If-Range` for the next attempt. On a 206 the stored validator still matches
     // (the server accepted it), so only refresh it on a fresh/200 body.
@@ -525,11 +585,27 @@ fn download_to_blob(
     let pb = progress::bar(total, label, Unit::Bytes);
     pb.set_position(start);
 
-    if let Err(e) = stream_into(resp, &mut file, &pb) {
-        pb.abandon_with_message(format!("⚠ {label} interrupted (resumable)"));
-        return Err(Error::Other(format!(
-            "download failed (partial kept for resume): {e}"
-        )));
+    match stream_into(resp, &mut file, &pb, max_bytes, start) {
+        Ok(()) => {}
+        // Over the cap: the body is not something we will ever accept, so the partial is DELETED
+        // rather than kept. Keeping it would leave up-to-cap bytes in the cache forever and make
+        // the next attempt resume from a prefix that is already at the limit.
+        Err(StreamError::TooLarge { cap }) => {
+            pb.abandon_with_message(format!("⚠ {label} exceeds {cap} bytes"));
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&meta);
+            return Err(Error::Other(format!(
+                "{label}: body exceeds the {cap}-byte cap; download aborted"
+            )));
+        }
+        // A transport failure is transient: keep the partial so the next call resumes it.
+        Err(StreamError::Io(e)) => {
+            pb.abandon_with_message(format!("⚠ {label} interrupted (resumable)"));
+            return Err(Error::Other(format!(
+                "download failed (partial kept for resume): {e}"
+            )));
+        }
     }
     drop(file); // flush + close before re-reading for the digest
 
@@ -643,23 +719,64 @@ fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<()> {
     Ok(())
 }
 
+/// The size-cap predicate, shared by the `Content-Length` pre-flight and the streaming loop so the
+/// two can never disagree about the boundary. `None` = uncapped (the model-blob path). The
+/// comparison is STRICTLY greater: a body of exactly `cap` bytes is accepted, so a cap chosen as
+/// "the largest size I will tolerate" means what it says.
+fn over_cap(total: u64, cap: Option<u64>) -> bool {
+    matches!(cap, Some(c) if total > c)
+}
+
+/// Why the streaming loop fails, because the two outcomes need OPPOSITE cleanup: an I/O error is
+/// transient and the partial is kept so the next call resumes it, while an over-cap body is a
+/// response we will never accept and its partial must be deleted. Collapsing both into
+/// `io::Error` would leave up-to-cap junk in the blob dir after every rejected download.
+enum StreamError {
+    Io(std::io::Error),
+    TooLarge { cap: u64 },
+}
+
+impl From<std::io::Error> for StreamError {
+    fn from(e: std::io::Error) -> Self {
+        StreamError::Io(e)
+    }
+}
+
 /// Stream the response body into `file`, advancing the progress bar. The digest is computed in a
 /// single final pass over the completed file (see [`download_to_blob`]), not here.
+///
+/// `cap` (when set) bounds the file's FINAL size — `written` seeds the counter with the bytes a
+/// resume already has on disk, so a cap can't be walked past one resumed chunk at a time. The
+/// check is per read, BEFORE the buffer is written, so at most one 64 KiB chunk beyond the limit
+/// is ever touched and nothing over-long reaches the disk. Doing this here rather than after
+/// `stream_into` returns is the whole point: a hostile or broken endpoint answering an unverified
+/// request with an endless body must be cut off mid-transfer, not measured once it has already
+/// filled the user's cache.
 fn stream_into(
     mut resp: Response,
     file: &mut fs::File,
     pb: &ProgressBar,
-) -> std::result::Result<(), std::io::Error> {
+    cap: Option<u64>,
+    written: u64,
+) -> std::result::Result<(), StreamError> {
+    let mut total = written;
     let mut buf = [0u8; 1 << 16];
     loop {
         let n = resp.read(&mut buf)?;
         if n == 0 {
             break;
         }
+        total = total.saturating_add(n as u64);
+        if over_cap(total, cap) {
+            return Err(StreamError::TooLarge {
+                cap: cap.unwrap_or(u64::MAX),
+            });
+        }
         file.write_all(&buf[..n])?;
         pb.inc(n as u64);
     }
-    file.flush()
+    file.flush()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +960,30 @@ mod tests {
             "readable prefix is kept for debuggability: {}",
             temp_stem("UD-Q4_K_XL/m.gguf")
         );
+    }
+
+    /// The cap boundary, pinned once for both the `Content-Length` pre-flight and the streaming
+    /// loop (they share this predicate on purpose — a mismatch between them would mean a body
+    /// rejected in one place and accepted in the other).
+    #[test]
+    fn over_cap_boundary() {
+        // Uncapped (the model-blob path): nothing is ever too large.
+        assert!(!over_cap(0, None));
+        assert!(!over_cap(u64::MAX, None));
+        // Strictly greater — exactly at the cap is accepted.
+        assert!(!over_cap(1023, Some(1024)));
+        assert!(!over_cap(1024, Some(1024)));
+        assert!(over_cap(1025, Some(1024)));
+        // A resumed prefix already at the cap means the very next byte trips it.
+        assert!(over_cap(MAX_COMPANION_BYTES + 1, Some(MAX_COMPANION_BYTES)));
+    }
+
+    /// The companion cap is generous relative to what these files actually are (~2 KB of
+    /// sampling keys) but finite — the point is bounding an UNVERIFIED download, not policing a
+    /// plausible size. Pinned so a later edit to the constant is a deliberate decision.
+    #[test]
+    fn companion_cap_is_generous_but_finite() {
+        assert_eq!(MAX_COMPANION_BYTES, 1 << 20); // ~500x a real generation_config.json
     }
 
     #[test]
