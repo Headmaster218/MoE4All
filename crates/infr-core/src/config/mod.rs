@@ -611,6 +611,17 @@ cfg_struct! {
         api_key: Option<String> = None,
         /// `INFR_MAX_TOKENS_CAP`: must be a positive integer, else the default.
         max_tokens_cap: u32 = 131_072,
+        /// `INFR_REQUEST_TIMEOUT_SECS`: per-request wall-clock deadline, in seconds. `0` (the
+        /// default) means NO deadline.
+        ///
+        /// OFF by default on purpose. `max_tokens_cap` bounds a request in TOKENS, which is a
+        /// budget the client asked for; this bounds it in TIME, which the client did not. A
+        /// deadline that fires mid-generation truncates a legitimate long reply — a slow model
+        /// answering a hard prompt looks exactly like a stuck one from out here — so shipping a
+        /// default would silently cut off answers that work today. It is the operator's explicit
+        /// decision, made once they know their model's token rate and what a `--parallel` slot is
+        /// worth to them.
+        request_timeout_secs: u64 = 0,
     }
 }
 

@@ -3,10 +3,14 @@
 //! Reference for the wire mapping (streaming, `reasoning_content`, tool_calls): the working
 //! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/plan.md "server".
 //!
-//! Routes:
-//!   GET  /health                -> 200 OK
-//!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] }
-//!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream
+//! Routes (`auth` = gated by `serve.api_key` when one is configured — see [`auth_gate`]):
+//!   GET  /health                -> 200 OK                                              (open)
+//!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
+//!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!
+//! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
+//! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
+//! [`request_timeout`]). Both are `serve.*` config, never read from the environment here.
 //!
 //! Delta mapping:
 //!   `Delta::Reasoning`  -> `delta.reasoning_content`
@@ -20,7 +24,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -718,11 +722,30 @@ async fn shutdown_latched() {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Deliberately UNAUTHENTICATED, even when `serve.api_key` is configured. A load balancer, a
+/// container orchestrator or an uptime probe has to reach this without holding the operator's
+/// bearer token, and the response is a bare 200 with no body: it discloses nothing about the model
+/// set, the config, or the machine. Every route that DOES disclose something is gated — see
+/// [`auth_gate`].
 async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-async fn models_handler(State(state): State<AppState>) -> Json<ModelsResponse> {
+/// The hosted model list — GATED by the same bearer check as `/v1/chat/completions`.
+///
+/// This endpoint enumerates every model id the process is serving. With `serve.api_key` set the
+/// operator has said the server is not open to whoever can reach the port, and an unauthenticated
+/// caller must not be able to inventory what is hosted (which names to try, how many devices are
+/// behind it, which private fine-tune is loaded) — that is reconnaissance, and it used to be free.
+///
+/// Returns a [`Response`] rather than `Json<ModelsResponse>` purely so the 401 can share the body
+/// shape the chat handler returns; the 200 body is byte-identical to what it has always been.
+/// With auth DISABLED (the default) [`auth_gate`] returns `None` and this is the same open endpoint
+/// as before — the localhost experience does not change.
+async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
     Json(ModelsResponse {
         object: "list",
         data: state
@@ -735,6 +758,7 @@ async fn models_handler(State(state): State<AppState>) -> Json<ModelsResponse> {
             })
             .collect(),
     })
+    .into_response()
 }
 
 async fn chat_completions_handler(
@@ -742,17 +766,10 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    // Optional bearer auth: enforced ONLY when `serve.api_key` (INFR_API_KEY) is configured.
-    // Default = open (existing localhost usage is unaffected). Checked before any work, so an
-    // unauthenticated request cannot even reach model routing / slot admission.
-    if let Some(key) = configured_api_key(&state.cfg) {
-        let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-        if !authorize(Some(key), auth) {
-            return json_error(
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid Authorization bearer token".into(),
-            );
-        }
+    // Optional bearer auth, checked before any work, so an unauthenticated request cannot even
+    // reach model routing / slot admission.
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
     }
     // Malformed JSON / wrong types: an OpenAI-shaped 400, not axum's default 422 text body.
     let Json(req) = match body {
@@ -784,6 +801,9 @@ async fn chat_completions_handler(
     let model_id = entry.id.to_string();
     let cid = make_id();
     let created = unix_ts();
+    // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
+    // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
+    let deadline = request_timeout(&state.cfg);
 
     if req.stream {
         streaming(
@@ -795,6 +815,7 @@ async fn chat_completions_handler(
             cid,
             model_id,
             created,
+            deadline,
         )
         .await
     } else {
@@ -807,6 +828,7 @@ async fn chat_completions_handler(
             cid,
             model_id,
             created,
+            deadline,
         )
         .await
     }
@@ -826,6 +848,7 @@ async fn non_streaming(
     cid: String,
     model_id: String,
     created: i64,
+    deadline: Option<Duration>,
 ) -> Response {
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -839,7 +862,15 @@ async fn non_streaming(
     let engine_arc = entry.engine.clone();
     let cid_blk = cid.clone();
 
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
+    // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
+    // `spawn_blocking` task early. There is still no client-disconnect signal on this path (the
+    // whole reply is buffered, so no send can fail), which is precisely why the deadline matters
+    // most here — a client that hung up cannot be noticed, and burns its slot to completion.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_blk = cancel.clone();
+
+    let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         // The permit is MOVED into the blocking task and dropped when it ends: a slot is held for
         // exactly the generation, and the next queued request is admitted the moment it frees.
         let _permit = permit;
@@ -851,18 +882,13 @@ async fn non_streaming(
         let mut content = String::new();
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
 
-        // No client-disconnect signal on the non-streaming path (the whole reply is buffered), so
-        // this latch stays false here; generation is still bounded by EOS/stop/max_tokens and the
-        // process shutdown latch, exactly as before. It exists to satisfy the shared trait.
-        let cancel = AtomicBool::new(false);
-
         let outcome = engine
             .chat(
                 &messages,
                 tools.as_ref(),
                 tool_choice.as_deref(),
                 &params,
-                &cancel,
+                &cancel_blk,
                 &mut |delta| match delta {
                     Delta::Reasoning(t) => reasoning.push_str(&t),
                     Delta::Content(t) => content.push_str(&t),
@@ -880,18 +906,60 @@ async fn non_streaming(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok((reasoning, content, tool_calls, outcome))
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|r| r);
+    });
+
+    // The deadline, and the ONE thing about it that is easy to get wrong.
+    //
+    // `tokio::time::timeout(d, handle).await` returning `Err` and being propagated to the client is
+    // NOT a fix: the blocking task is not cancellable, so it would keep decoding, keep holding its
+    // `OwnedSemaphorePermit`, and the `--parallel` slot — the entire reason for having a deadline —
+    // would stay occupied while we reported failure. So the timeout is used only to WAKE US: on
+    // expiry we latch the abort flag the generator polls and then go back to awaiting the SAME
+    // join. The task ends at its next token boundary, the permit drops, and we still have every
+    // delta it produced before then, which is what the client gets.
+    //
+    // No watchdog TASK on this path (unlike [`streaming`]): the handler is already awaiting the
+    // join, so the timer can live inside its own future. Nothing to spawn means nothing to tear
+    // down — the `Timeout` future is dropped by the `.await` that resolves it, whichever way it
+    // went, and a request that finishes in 5 ms under an hour-long deadline leaves nothing behind.
+    let mut deadline_hit = false;
+    let joined = match deadline {
+        None => handle.await,
+        Some(d) => match tokio::time::timeout(d, &mut handle).await {
+            Ok(joined) => joined,
+            Err(_elapsed) => {
+                deadline_hit = true;
+                cancel.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    timeout_s = d.as_secs(),
+                    "request deadline hit — returning the partial completion"
+                );
+                handle.await
+            }
+        },
+    };
+    let result = joined.map_err(anyhow::Error::from).and_then(|r| r);
 
     match result {
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Ok((reasoning, content, tool_calls, outcome)) => {
-            let finish = if tool_calls.is_empty() {
-                outcome.finish
-            } else {
+            // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
+            // (a 500 would throw away work it can use) and `finish_reason` says "length", which is
+            // OpenAI's reason for a completion that ran out of budget.
+            //
+            // It has to be decided here because the generator cannot know. From inside the decode
+            // loop, the latch we set is indistinguishable from any other abort, so it reports a
+            // clean `Finish::Stop` — and "stop" tells the client the model finished its thought,
+            // which would be a lie. Only the handler that armed the deadline knows it fired.
+            //
+            // A tool call still wins, as it does for every other reason: the call was emitted
+            // whole, and a client that gets `tool_calls` can act on it.
+            let finish = if !tool_calls.is_empty() {
                 Finish::ToolCalls
+            } else if deadline_hit {
+                Finish::Length
+            } else {
+                outcome.finish
             }
             .as_str();
             Json(ChatCompletionResponse {
@@ -948,6 +1016,7 @@ async fn streaming(
     cid: String,
     model_id: String,
     created: i64,
+    deadline: Option<Duration>,
 ) -> Response {
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -979,9 +1048,24 @@ async fn streaming(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_cb = cancel.clone();
 
+    // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
+    // — the SSE response is returned as soon as the stream exists — so the timer needs its own
+    // task, and that task needs an off switch. [`arm_deadline`] hands back a sender whose DROP is
+    // that switch; it is moved into the blocking closure below, so the watchdog dies with the
+    // generation (normally or by panic) instead of accumulating one sleeper per request.
+    //
+    // `deadline_hit` is separate from `cancel` because `cancel` is ALSO latched by a client
+    // disconnect, and the finish chunk must not report a timeout as a hangup or vice versa.
+    let deadline_hit = Arc::new(AtomicBool::new(false));
+    let deadline_hit_cb = deadline_hit.clone();
+    let done_tx = deadline.map(|d| arm_deadline(d, cancel.clone(), deadline_hit.clone()));
+
     tokio::task::spawn_blocking(move || {
         // Held for exactly this generation; freed for the next queued request on return.
         let _permit = permit;
+        // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
+        // deadline was configured, in which case there is no watchdog to disarm.
+        let _done_tx = done_tx;
         // Guarantees `[DONE]` is ALWAYS the final frame — including when the decode closure panics
         // (Drop runs while unwinding), so a strict SSE client never hangs waiting for a sentinel
         // that a panic swallowed (audit finding 1).
@@ -1051,8 +1135,13 @@ async fn streaming(
 
         match res {
             Ok(outcome) => {
+                // Same honesty rule as the non-streaming path: the generator saw only an abort and
+                // reports `Stop`, so the deadline has to relabel it "length" — the budget ran out,
+                // the model did not finish. A tool call still wins.
                 let finish = if saw_tool_call {
                     Finish::ToolCalls
+                } else if deadline_hit_cb.load(Ordering::Relaxed) {
+                    Finish::Length
                 } else {
                     outcome.finish
                 };
@@ -1205,6 +1294,68 @@ fn clamp_max_tokens(requested: Option<u32>, cap: u32) -> Option<u32> {
     requested.map(|v| v.min(cap))
 }
 
+/// The configured per-request wall-clock deadline, or `None` for "unbounded" — which is the
+/// DEFAULT (`serve.request_timeout_secs` = 0) and today's behaviour.
+///
+/// `0` and unset are the same thing on purpose: the knob's whole grammar is "seconds, or 0 for no
+/// deadline", so an operator can disarm a deadline a config file set by exporting
+/// `INFR_REQUEST_TIMEOUT_SECS=0` — a `None`-only spelling could not express that from the
+/// environment (see the env layer's note on why this knob is NOT `.filter(|v| v > 0)`).
+///
+/// Why a deadline exists at all: nothing else bounds how long one request may occupy a `--parallel`
+/// slot. `max_tokens_cap` bounds TOKENS, and its 128k default is many hours on a slow model; on the
+/// non-streaming path a client that has already gone away cannot even be detected (there is no send
+/// to fail), so it burns its slot to completion. Why it is OFF by default: firing mid-generation
+/// truncates a legitimate long reply, and only the operator knows their model's token rate.
+fn request_timeout(cfg: &Config) -> Option<Duration> {
+    let secs = cfg.serve.request_timeout_secs;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Arm a wall-clock deadline over a generation that OUTLIVES the handler — i.e. the streaming path,
+/// where the SSE response is returned immediately and the `spawn_blocking` task keeps producing
+/// into a channel with nobody awaiting its join.
+///
+/// **It sets the generator's abort latch; it does not cancel anything.** `spawn_blocking` tasks are
+/// NOT cancellable: `tokio::time::timeout` around a `JoinHandle` only stops the caller waiting —
+/// the blocking thread runs on, still holding its `OwnedSemaphorePermit`, so the slot the deadline
+/// exists to reclaim is exactly the thing that is not reclaimed. Latching `cancel` instead drives
+/// the mechanism the decode loop already polls (see [`ChatGenerator::chat`]): the generator stops at
+/// its next token boundary, returns normally, and the permit drops on the way out.
+///
+/// `hit` is a SECOND flag rather than a re-read of `cancel`, because `cancel` is also latched by a
+/// client disconnect — the finish reason must say "the budget ran out", not "the socket died". It
+/// is stored BEFORE `cancel` so a decode loop that observes the abort and returns instantly still
+/// finds the label set.
+///
+/// **Teardown.** The returned [`oneshot::Sender`](tokio::sync::oneshot::Sender) is the "generation
+/// finished" signal: move it into the blocking task and let it DROP there. A dropped sender
+/// resolves the receiver (with `Err`), the `select!` takes that arm, and the watchdog task ends —
+/// so a server that has served a million requests holds zero sleeping tasks. Drop is the right
+/// trigger rather than an explicit `send`: it also fires while UNWINDING from a panic inside the
+/// decode closure, which an explicit send at the end of the happy path would skip, leaking one task
+/// per panicking request. (`JoinHandle::abort` would work too, but the handler would then have to
+/// own and remember to abort a handle across two exit paths; a value whose destructor IS the signal
+/// cannot be forgotten.)
+fn arm_deadline(
+    d: Duration,
+    cancel: Arc<AtomicBool>,
+    hit: Arc<AtomicBool>,
+) -> tokio::sync::oneshot::Sender<()> {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(d) => {
+                hit.store(true, Ordering::Relaxed);
+                cancel.store(true, Ordering::Relaxed);
+                tracing::warn!(timeout_s = d.as_secs(), "request deadline hit — aborting generation");
+            }
+            _ = done_rx => {}
+        }
+    });
+    done_tx
+}
+
 /// Optional bearer-token gate. `expected` is the configured API key (`INFR_API_KEY`), or `None`
 /// when auth is DISABLED — in which case every request is allowed (default; preserves existing
 /// localhost usage). When a key IS configured, the request must carry
@@ -1238,6 +1389,31 @@ fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
             .map(str::trim)
             .is_some_and(|tok| bool::from(tok.as_bytes().ct_eq(key.as_bytes()))),
     }
+}
+
+/// The optional bearer gate every PROTECTED route runs first: `Some(401)` when the request must be
+/// refused, `None` when it may proceed.
+///
+/// Enforced ONLY when `serve.api_key` (`INFR_API_KEY`) is configured; with no key this returns
+/// `None` for everything, so the default localhost server stays open exactly as it was.
+///
+/// It exists as ONE function because the gate is a policy, not a line of handler code: when
+/// `/v1/models` was left ungated, an unauthenticated caller could still enumerate every hosted
+/// model id off a server whose operator had set a key. A second handler spelling the check inline
+/// is how that happens again, and a third would drift on the message or the status. The 401 body is
+/// the shared [`error_body`] envelope, so it deserializes the same as every other failure this
+/// server reports.
+///
+/// `/health` deliberately does NOT call this — see [`health_handler`].
+fn auth_gate(cfg: &Config, headers: &HeaderMap) -> Option<Response> {
+    let key = configured_api_key(cfg)?;
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+    (!authorize(Some(key), auth)).then(|| {
+        json_error(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid Authorization bearer token".into(),
+        )
+    })
 }
 
 /// The configured API key, or `None` when `serve.api_key` (`INFR_API_KEY`) is unset OR EMPTY —
@@ -2313,6 +2489,278 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/v1/models` enumerates what the process is hosting, so a configured key must gate it too —
+    /// otherwise anyone who can reach the port learns every model id for free, on a server whose
+    /// operator explicitly said it is not open. `/health` must stay OPEN through the same config: a
+    /// load balancer holds no bearer token, and a bare 200 discloses nothing.
+    #[tokio::test]
+    async fn configured_api_key_gates_models_but_never_health() {
+        let mut cfg = Config::default();
+        cfg.serve.api_key = Some("s3cret".into());
+        let state = AppState::headless("test-model", Arc::new(cfg));
+        let get = |uri: &str, auth: Option<&str>| {
+            let mut b = Request::builder().uri(uri);
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+
+        // No bearer => 401, in the same envelope the chat handler returns.
+        let resp = build_router(state.clone())
+            .oneshot(get("/v1/models", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "server_error");
+        assert_eq!(
+            v["error"]["message"],
+            "missing or invalid Authorization bearer token"
+        );
+        // …and the model list did NOT leak into the error body.
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("test-model"),
+            "a 401 must not disclose the model set: {bytes:?}"
+        );
+
+        // Wrong bearer => still 401.
+        let resp = build_router(state.clone())
+            .oneshot(get("/v1/models", Some("Bearer wrong")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Right bearer => the unchanged 200 body.
+        let resp = build_router(state.clone())
+            .oneshot(get("/v1/models", Some("Bearer s3cret")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"][0]["id"], "test-model");
+        assert_eq!(v["data"][0]["object"], "model");
+        assert_eq!(v["data"][0]["owned_by"], "local");
+
+        // /health is open both ways.
+        for auth in [None, Some("Bearer s3cret")] {
+            let resp = build_router(state.clone())
+                .oneshot(get("/health", auth))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "auth={auth:?}");
+        }
+    }
+
+    // --- per-request wall-clock deadline ------------------------------------
+
+    /// `serve.request_timeout_secs` is OFF (unbounded) by default, and `0` explicitly means the
+    /// same thing — a deadline truncates legitimate long replies, so it is opt-in only.
+    #[test]
+    fn request_timeout_is_off_by_default_and_zero_means_unbounded() {
+        let mut cfg = Config::default();
+        assert_eq!(request_timeout(&cfg), None, "default => no deadline");
+
+        cfg.serve.request_timeout_secs = 0;
+        assert_eq!(request_timeout(&cfg), None, "0 => no deadline");
+
+        cfg.serve.request_timeout_secs = 300;
+        assert_eq!(request_timeout(&cfg), Some(Duration::from_secs(300)));
+    }
+
+    /// A generator that never stops on its own: it emits one delta and then polls `cancel` until
+    /// something latches it — exactly the shape of a real decode loop, and the only way to test
+    /// that the deadline reaches the abort mechanism rather than just abandoning the join. Returns
+    /// `Finish::Stop`, because that is what a real generator reports when it is aborted: it cannot
+    /// tell WHY the flag was set, which is why the handler has to relabel.
+    struct LoopGen;
+    impl ChatGenerator for LoopGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            cancel: &AtomicBool,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("partial".into()));
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    /// One entry hosting `gen`, routed as `"m"` — the handler-level fixture the deadline tests
+    /// need, since `non_streaming`/`streaming` take a `ModelEntry` and a deadline directly (the
+    /// knob is in whole SECONDS, so driving these through the router could not stay sub-second).
+    fn deadline_entry(generator: Arc<dyn ChatGenerator>) -> ModelEntry {
+        AppState::new(generator, "m", 1, Arc::new(Config::default())).route("m")
+    }
+
+    fn user_msg() -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }]
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The non-streaming deadline: it fires, the client still gets what was generated, and the
+    /// finish reason is `length` — NOT a 500, and not the `stop` the generator itself reported.
+    #[tokio::test]
+    async fn non_streaming_deadline_returns_partial_content_as_length() {
+        let started = std::time::Instant::now();
+        let resp = non_streaming(
+            deadline_entry(Arc::new(LoopGen)),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            "cid".into(),
+            "m".into(),
+            0,
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "a deadline is not a failure");
+        let v = body_json(resp).await;
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+        assert_eq!(
+            v["choices"][0]["message"]["content"], "partial",
+            "the partial completion must survive the deadline"
+        );
+        // The handler kept awaiting the join after latching the abort, so by the time it answered
+        // the blocking task had really ended — and with it, its slot permit.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not stop the generator"
+        );
+    }
+
+    /// The permit is genuinely back: the entry admits `--parallel 1` at a time, so a SECOND request
+    /// on the same entry can only be served if the first one's blocking task actually ended. If the
+    /// deadline had merely timed out the join and left the task running, this would hang.
+    #[tokio::test]
+    async fn deadline_frees_the_slot_for_the_next_request() {
+        let entry = deadline_entry(Arc::new(LoopGen));
+        for _ in 0..2 {
+            let resp = non_streaming(
+                entry.clone(),
+                user_msg(),
+                None,
+                None,
+                GenParams::default(),
+                "cid".into(),
+                "m".into(),
+                0,
+                Some(Duration::from_millis(100)),
+            )
+            .await;
+            assert_eq!(
+                body_json(resp).await["choices"][0]["finish_reason"],
+                "length"
+            );
+        }
+        assert_eq!(
+            entry.slots.available_permits(),
+            1,
+            "the slot must be back after a deadline hit"
+        );
+    }
+
+    /// A request that finishes well inside its deadline is untouched: real content, the
+    /// generator's OWN finish reason, and no relabelling.
+    #[tokio::test]
+    async fn generation_inside_the_deadline_is_untouched() {
+        let resp = non_streaming(
+            deadline_entry(Arc::new(EchoGen("alpha"))),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            "cid".into(),
+            "m".into(),
+            0,
+            Some(Duration::from_secs(30)),
+        )
+        .await;
+        let v = body_json(resp).await;
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["choices"][0]["message"]["content"], "from:alpha");
+    }
+
+    /// The streaming deadline: the deltas already sent are kept, the finish chunk says `length`,
+    /// and `[DONE]` still closes the stream.
+    #[tokio::test]
+    async fn streaming_deadline_finishes_with_length() {
+        let resp = streaming(
+            deadline_entry(Arc::new(LoopGen)),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            "cid".into(),
+            "m".into(),
+            0,
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("partial"), "partial content lost: {text}");
+        assert!(
+            text.contains("\"finish_reason\":\"length\""),
+            "a deadline hit must finish as `length`: {text}"
+        );
+        assert!(
+            !text.contains("\"finish_reason\":\"stop\""),
+            "the generator's `stop` must not reach the wire: {text}"
+        );
+        assert!(text.contains("[DONE]"), "sentinel missing: {text}");
+    }
+
+    /// The watchdog must not outlive its request. Dropping the "generation finished" sender — which
+    /// is what the blocking task does when it returns, or unwinds — has to end the timer task, or a
+    /// long-lived server accumulates one sleeping task per request. Asserted by waiting PAST the
+    /// deadline and finding the flags still clear.
+    #[tokio::test]
+    async fn dropping_the_done_signal_disarms_the_watchdog() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hit = Arc::new(AtomicBool::new(false));
+        let done_tx = arm_deadline(Duration::from_millis(50), cancel.clone(), hit.clone());
+        drop(done_tx); // the generation finished first
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !cancel.load(Ordering::Relaxed) && !hit.load(Ordering::Relaxed),
+            "a disarmed watchdog must never fire"
+        );
+
+        // …and one that is NOT disarmed does fire, on both flags (so the finish reason can tell a
+        // deadline apart from a client disconnect, which latches only `cancel`).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hit = Arc::new(AtomicBool::new(false));
+        let _done_tx = arm_deadline(Duration::from_millis(50), cancel.clone(), hit.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(cancel.load(Ordering::Relaxed) && hit.load(Ordering::Relaxed));
     }
 
     // --- finish-reason mapping: Err is an error frame, never `stop` (finding 1) ---

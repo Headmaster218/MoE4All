@@ -314,6 +314,9 @@ knobs! {
     // ── serve (§6.9) ─────────────────────────────────────────────────────────
     "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", migrated;
     "INFR_MAX_TOKENS_CAP" => "serve.max_tokens_cap", Int,  Ignored, "4096",    migrated;
+    // `0`/unset = no deadline, so the env layer does NOT filter non-positive values the way
+    // `INFR_MAX_TOKENS_CAP` does — see `ServeCfg::request_timeout_secs`.
+    "INFR_REQUEST_TIMEOUT_SECS" => "serve.request_timeout_secs", Int, Ignored, "300", migrated;
 }
 
 /// `INFR_*` keys that exist in `crates/*/src` (or a `build.rs`) and deliberately do NOT become

@@ -108,6 +108,9 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kernels.metal.pipeline_cache);
     assert_eq!(d.serve.max_tokens_cap, 131_072);
     assert_eq!(d.serve.api_key, None);
+    // A per-request wall-clock deadline is OFF unless the operator asks for one: it truncates a
+    // legitimate slow reply, so it cannot be a shipped default (§6.9).
+    assert_eq!(d.serve.request_timeout_secs, 0);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
@@ -480,6 +483,32 @@ fn non_presence_grammars_are_preserved() {
             .api_key
             .as_deref(),
         Some("k")
+    );
+    // `INFR_REQUEST_TIMEOUT_SECS=0` is a VALUE ("no deadline"), not a bad one: it must survive the
+    // layer so it can turn a file-configured deadline back off. Its sibling `INFR_MAX_TOKENS_CAP=0`
+    // is the opposite — non-positive there is nonsense and is dropped back to the default.
+    for (value, want) in [("0", 0u64), ("300", 300)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_REQUEST_TIMEOUT_SECS", value)])]);
+        assert_eq!(
+            cfg.serve.request_timeout_secs, want,
+            "INFR_REQUEST_TIMEOUT_SECS={value:?}"
+        );
+    }
+    assert_eq!(
+        Config::load_from_layers(&[
+            file_layer("[serve]\nrequest_timeout_secs = 120\n"),
+            env_layer(&[("INFR_REQUEST_TIMEOUT_SECS", "0")]),
+        ])
+        .serve
+        .request_timeout_secs,
+        0,
+        "an explicit 0 in the environment must disarm a deadline set by the file"
+    );
+    assert_eq!(
+        Config::load_from_layers(&[env_layer(&[("INFR_MAX_TOKENS_CAP", "0")])])
+            .serve
+            .max_tokens_cap,
+        131_072
     );
 }
 
@@ -1221,6 +1250,13 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     ///
     /// NOT here: `INFR_DIFFUSION_VISUAL`, which §6.10 sends to a plain clap flag rather than to
     /// `Config` — it stays in `manifest::NOT_MIGRATED`.
+    ///
+    /// `INFR_REQUEST_TIMEOUT_SECS` was never migrated — it was BORN on `Config`, after the
+    /// campaign, and its only read site is `infr-server`'s `AppState`. A knob with no legacy
+    /// `std::env::var` site is still `migrated` (the flag means "the read site takes the value
+    /// from a `Config`", which is trivially true), so it has to be listed in some slice or this
+    /// test fails. It joins the slice that owns its section — `serve.*` is S7's — rather than
+    /// growing a ninth, empty-by-construction one for post-campaign additions.
     const S7: &[&str] = &[
         "INFR_API_KEY",
         "INFR_CTX",
@@ -1228,6 +1264,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MAX_TOKENS_CAP",
         "INFR_NO_THINK",
         "INFR_PROF_OUT",
+        "INFR_REQUEST_TIMEOUT_SECS",
     ];
 
     /// S8 — the CLI's own transitional bridge, and with it the LAST unmigrated knob. The six

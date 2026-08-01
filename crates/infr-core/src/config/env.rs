@@ -380,6 +380,10 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // An EMPTY value means "no auth", not "unset" — the site is `.filter(|k| !k.is_empty())`.
     p.serve.api_key = get("INFR_API_KEY").map(|k| if k.is_empty() { None } else { Some(k) });
     p.serve.max_tokens_cap = num::<u32>(get, "INFR_MAX_TOKENS_CAP").filter(|&v| v > 0);
+    // NO `> 0` filter here, unlike the cap above: `0` is a MEANINGFUL value for this knob ("no
+    // deadline"), not a bad one. Dropping it would make `INFR_REQUEST_TIMEOUT_SECS=0` mean "the
+    // layer said nothing", so it could not turn a deadline back OFF over a config file that set one.
+    p.serve.request_timeout_secs = num::<u64>(get, "INFR_REQUEST_TIMEOUT_SECS");
 
     Ok(p)
 }

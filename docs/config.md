@@ -254,8 +254,12 @@ And host-side stage timing was five knobs, one per pipeline (`INFR_PROF`,
 `INFR_PROF_DEC`, `INFR_PROF_PF`, `INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`) — it is
 all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
-**`[serve]`** — `api_key` (bearer token; an **empty** value means no auth) and
-`max_tokens_cap`. Per-request sampling is not here — it stays on the request.
+**`[serve]`** — `api_key` (bearer token; an **empty** value means no auth — it
+gates `/v1/chat/completions` and `/v1/models`, never `/health`),
+`max_tokens_cap`, and `request_timeout_secs` (per-request wall-clock deadline in
+seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
+slow reply, so it is opt-in). Per-request sampling is not here — it stays on the
+request.
 
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,
