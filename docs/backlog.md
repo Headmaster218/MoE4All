@@ -139,10 +139,10 @@ when `-r > 1` so a benchmark at least measures one tier consistently. Until then
 `infr bench -u/--ubatch <N>` is the workaround, and prefill numbers should be
 reported as a median of several runs rather than a single value.
 
-### B7 — decode attention at depth is ALU-bound, and the fix is a different kernel
+### B7 — decode attention at depth: two designs tested and declined, third identified
 
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; campaign-sized, needs a
-decision to start
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; next step is a contained
+slice (a `d_split` sweep), not a new kernel
 
 The largest remaining gap to llama.cpp is decode at depth, not prefill.
 Qwen3-30B-A3B Q4_K_M on a 7900 XTX against `llama-bench c629da5`:
@@ -188,19 +188,71 @@ approach is **declined** on this kernel structure — do not re-try it as writte
 (The experiment was reverted; the tree is unchanged. It did reach bit-identical
 parity with `attn_partial`, so the approach was correct, just slower.)
 
-**What would actually work** is the design `recorder.rs`'s
-`attention_kv_split_impl` already names in its rows-batched comment — "the
-LDS-staged K-TILE kernel (per-thread full dots, no cross-lane reductions), which
-is how llama.cpp wins that cell". Stage a K tile in LDS with coalesced global
-reads, then let each lane compute a whole 128-dim dot from LDS, so the
-`subgroupAdd` per key disappears entirely. GQA grouping is then worth revisiting
-_on top of that_, because with `g` query heads as the M dimension a decode step
-becomes an `8×128 @ 128×chunk` GEMM with enough M to use the matrix cores —
-which is what llama.cpp's `gqa_ratio` flash-decode path does.
+- **The LDS-staged K-tile kernel LOSES too, badly.** This is the design
+  `recorder.rs`'s `attention_kv_split_impl` names in its rows-batched comment
+  ("per-thread full dots, no cross-lane reductions, which is how llama.cpp wins
+  that cell"). Built and measured as an unwired probe
+  (`tests/attn_ktile_probe.rs`, `shaders/attn_ktile.comp`), per-dispatch µs at
+  `nh=32 nkv=4 hd=128 chunk=512`, reference measured in the same harness:
 
-That is a new kernel plus its own parity suite across the `attn_partial` variant
-matrix (static / replay / SWA-ring / Q8 / mainline-inline), so it is a campaign,
-not a slice.
+  | leg                             | d8192 | d32768    |
+  | ------------------------------- | ----- | --------- |
+  | shipped `attention_kv_split_at` | 69.8  | **183.9** |
+  | k-tile, 64-key tile, 17 KB LDS  | 127.7 | 493.9     |
+  | k-tile, same but unpadded rows  | 147.3 | 535.4     |
+  | k-tile, 128-key tile, 34 KB LDS | 190.1 | 687.2     |
+  | k-tile, 64-key half-depth, 9 KB | 127.9 | **381.9** |
+
+  Best config is **2.7× slower** at d32768. It is not an implementation miss:
+  the ISA confirms the design did what it set out to do — `attn_partial_bda` has
+  54 cross-lane ops, all four k-tile builds have **0**, with ACO fusing the
+  f16→f32 conversion into 140 `v_fma_mix_f32` per shader. The reduction is gone
+  and it is still 2.7× down, because **the LDS transpose that buys its removal
+  costs more than the reduction saved**. The K tile has ZERO data reuse (each
+  staged key row is read by exactly one thread), so LDS is pure coalescing
+  overhead — every K byte written once and read once — plus an occupancy loss.
+  Time is monotone in LDS budget: 34 KB → 687 µs, 17 KB → 494, 9 KB → 382.
+
+So the reduction ALU is real but is not the lever either, and **both the
+GQA-grouping and the LDS-K-tile approaches are declined** — do not re-try either
+as written. (GQA grouping was reverted; the k-tile survives as an unwired probe
+because it is the measurement rig for the next attempt. Both reached agreement
+with the reference — GQA bit-identically, k-tile to 9.6e-7 relative.)
+
+**What the oracle actually does.** Rather than guess a third time, read
+llama.cpp's own decode path (`ggml/src/ggml-vulkan/ggml-vulkan.cpp`,
+`get_fa_tuning_params_scalar`). For our shape on RDNA3 — hsk=hsv=128, n_rows=1,
+f16 KV — it resolves to:
+
+- `path = FA_SCALAR`. Coopmat is **deliberately avoided at decode**: "scalar is
+  faster than coopmat when N==1" forces `FA_COOPMAT1/2` → `FA_SCALAR` at
+  `n_rows == 1`. This kills the matrix-core / `gqa_ratio` idea previously
+  proposed here — the oracle does not use matrix cores for decode.
+- `shmem_staging = 0` on AMD (it is set only for NVIDIA). The oracle does
+  **not** stage K/V in shared memory on this hardware, independently
+  corroborating the k-tile negative above.
+- `block_rows = 1`, `block_cols = 64`, `workgroup_size = 128` (4 subgroups of
+  32).
+- **`d_split = min(min(subgroup_size, 8), D_lsb/4) = 8`.**
+
+`d_split` is the parameter that matters and it is the one thing none of the
+three experiments varied. It is the width of the group that cooperates on ONE
+key's dot:
+
+| design        | d_split | reduction steps | keys in flight per wave | needs LDS?    |
+| ------------- | ------- | --------------- | ----------------------- | ------------- |
+| shipped       | 32      | 5               | 1                       | no            |
+| k-tile probe  | 1       | 0               | 32                      | yes (sank it) |
+| **llama.cpp** | **8**   | **3**           | **4**                   | **no**        |
+
+**Next slice:** parameterize the existing `attn_partial` QK loop's reduction
+width instead of writing another kernel — 8 lanes × 16 dims per key with a
+`subgroupClusteredAdd(x, 8)`, 4 keys resident per wave — and sweep `d_split`
+over {1,2,4,8,16,32}. That is a contained change to one loop with the grid,
+scratch layout and `attn_combine` all unchanged, so it A/Bs directly against the
+shipped kernel. It is also the first hypothesis here with positive evidence
+behind it rather than a theory. Keep the V pass as-is initially (lane owns a
+dim-vec4 — already coalesced, already reduction-free).
 
 ---
 

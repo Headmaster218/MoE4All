@@ -3156,6 +3156,13 @@ dyn_spv!(
     attn_partial_mrows_c256_bda_spv,
     "attn_partial_mrows_c256_bda"
 );
+// PROBE (B7 slice 1): LDS-staged K-tile decode pass 1 — one whole 128-dim dot per THREAD out of
+// shared memory instead of attn_partial's per-key cross-lane `subgroupAdd`. Reachable ONLY from
+// `Recorder::attention_kv_split_ktile_at`, whose only caller is tests/attn_ktile_probe.rs.
+dyn_spv!(attn_ktile_w64_spv, "attn_ktile_w64");
+dyn_spv!(attn_ktile_w64_nopad_spv, "attn_ktile_w64_nopad");
+dyn_spv!(attn_ktile_w128_spv, "attn_ktile_w128");
+dyn_spv!(attn_ktile_w64_dw32_spv, "attn_ktile_w64_dw32");
 // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF block
 // format INLINE (native_decode `dq()` via `dq_addr`=k_addr/v_addr) instead of the dequant→f16
 // prepass — the decode-side twin of dequant-in-flash. Per-format `-DKMAINLINE -DVMAINLINE -DFMT_*`

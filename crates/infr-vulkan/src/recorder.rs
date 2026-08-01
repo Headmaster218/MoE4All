@@ -6024,6 +6024,111 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// PROBE (B7 slice 1) — LDS-staged **K-tile** flash-decoding pass 1 + the stock `attn_combine`.
+    ///
+    /// Measurement-only alternative to [`Self::attention_kv_split_at`]'s pass 1: `attn_ktile.comp`
+    /// stages a tile of K in shared memory with coalesced global reads and gives each THREAD a
+    /// whole 128-dim dot, so `attn_partial`'s per-key cross-lane `subgroupAdd` — 59% of decode GPU
+    /// time at d32768 — disappears. It writes `pm`/`pl`/`pacc` in exactly `attn_partial`'s layout,
+    /// so pass 2 is the same `attn_combine` dispatch byte for byte.
+    ///
+    /// **Nothing in production calls this**, and nothing should until the probe shows a win: the
+    /// only caller is `tests/attn_ktile_probe.rs`. `cfg` picks the tile configuration (0 = 64-key
+    /// tile, 1 = 64-key unpadded LDS rows [bank-conflict A/B], 2 = 128-key tile, 3 = 64-key tile
+    /// staging half the head dim per pass).
+    ///
+    /// Specialization asserted below (the kernel handles nothing else — `attention_kv_split_at`
+    /// remains the general path): `hd == 128`, `rows == 1`, f16 K/V by device address, causal,
+    /// `window == 0`, no canvas, no Q8, no ring cache, `chunk <= 512`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_ktile_at(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        cfg: u32,
+    ) {
+        assert_eq!(hd, 128, "attn_ktile probe is hd=128 only");
+        assert!(chunk <= 512, "attn_ktile probe: sc[] holds 512 keys");
+        assert!(nh.is_multiple_of(nkv), "attn_ktile probe: nh % nkv != 0");
+        let (p1name, p1spv) = match cfg {
+            0 => ("attn_ktile_w64", crate::gemm::attn_ktile_w64_spv()),
+            1 => (
+                "attn_ktile_w64_nopad",
+                crate::gemm::attn_ktile_w64_nopad_spv(),
+            ),
+            2 => ("attn_ktile_w128", crate::gemm::attn_ktile_w128_spv()),
+            3 => (
+                "attn_ktile_w64_dw32",
+                crate::gemm::attn_ktile_w64_dw32_spv(),
+            ),
+            _ => panic!("attn_ktile probe: unknown cfg {cfg}"),
+        };
+        // Same 60-byte `-DKV_BDA` push block attn_partial uses, packed identically (the shader
+        // reuses that layout verbatim); `window`/`cap`/`rows` stay 0 — the probe's specialization.
+        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 60, 32);
+        let mut p1 = [0u8; 60];
+        p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p1[28..32].copy_from_slice(&scale.to_ne_bytes());
+        p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
+        p1[44..48].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+        p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+        p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+        p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch3(
+            k1,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(pm),
+                Self::vkb(pl),
+                Self::vkb(pacc),
+            ],
+            3,
+            &p1,
+            (nh * n_chunks) as u32,
+            1,
+            1,
+        );
+        // pass 2: the STOCK combine, unchanged (rows == 1).
+        let k2 = self
+            .be
+            .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
+        let ntile = 4u32;
+        let mut p2 = [0u8; 16];
+        p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p2[12..16].copy_from_slice(&ntile.to_ne_bytes());
+        self.dispatch(
+            k2,
+            &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), Self::vkb(o)],
+            1,
+            &p2,
+            nh as u32 * ntile,
+        );
+    }
+
     // ---- Record-once decode variants (`_dyn`) ----
     // These read the per-token `pos`/`kv_len` from a host-updated `params` SSBO ([pos, kv_len] u32)
     // instead of push constants, so the decode command buffer can be recorded once and replayed every

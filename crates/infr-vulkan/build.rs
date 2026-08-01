@@ -123,6 +123,24 @@ fn main() {
             "attn_partial_mrows_c256_bda",
             &["-DSC_MAX=256u", "-DKV_BDA"],
         ),
+        // PROBE (B7 slice 1, tests/attn_ktile_probe.rs only — NOTHING in production dispatches
+        // these): LDS-staged K-tile flash-decoding pass 1, one whole 128-dim dot per THREAD out of
+        // shared memory, so attn_partial's per-key `subgroupAdd` disappears. Four configurations:
+        // two workgroup/tile sizes (64 and 128 keys), a half-depth stage (KDW=32 → half the LDS,
+        // two dim passes per tile) and a KPAD=0 build whose only purpose is to MEASURE the LDS
+        // bank-conflict penalty the padding avoids.
+        ("attn_ktile", "attn_ktile_w64", &["-DKWG=64"]),
+        (
+            "attn_ktile",
+            "attn_ktile_w64_nopad",
+            &["-DKWG=64", "-DKPAD=0"],
+        ),
+        ("attn_ktile", "attn_ktile_w128", &["-DKWG=128"]),
+        (
+            "attn_ktile",
+            "attn_ktile_w64_dw32",
+            &["-DKWG=64", "-DKDW=32"],
+        ),
         // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
         // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
         // Q4/Q5 decode moves ¼ the traffic vs the dequant→f16 prepass + f16-scratch read. K and V
