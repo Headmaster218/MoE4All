@@ -445,29 +445,28 @@ pub(crate) fn argmax(v: &[f32]) -> usize {
     bi
 }
 
-/// A `(logit, id)` node ordered by logit for the top-p max-heap — the `top_k==0` path pops ids in
-/// descending-logit order lazily instead of sorting the whole (~150K) vocab. `total_cmp` gives a
-/// total order over floats (so `-inf` masked logits sort last, never into the nucleus).
-struct HeapItem {
-    key: f32,
-    idx: usize,
-}
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.key.total_cmp(&other.key) == std::cmp::Ordering::Equal
-    }
-}
-impl Eq for HeapItem {}
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.total_cmp(&other.key)
-    }
-}
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
+/// How many candidates the `top_k == 0` nucleus probe selects on its first pass.
+///
+/// A `top_p` nucleus is the smallest DESCENDING prefix whose mass reaches `top_p`, so the right
+/// size is "however deep the model's uncertainty goes at this position", not "vocab". At the
+/// shipped Llama defaults (temp 0.6, top_p 0.9) on a 128256-entry vocab a measured, deliberately
+/// peaked logit row needs **18** entries; pushing to top_p 0.95 needs **23**. Even pathologically
+/// flat rows only run into the thousands. 1024 is ~50x the measured need, and deliberately so:
+/// the two error directions cost wildly different amounts. Over-shooting K costs one `k log k`
+/// sort of the surplus (measured at n = 128256: K=1024 is ~18µs/call slower than K=256, 526 vs
+/// 508), while under-shooting costs a whole extra O(n) `select_nth_unstable_by` pass over the
+/// vocab (~200µs). So err generous — a K that is 4x too big is an order of magnitude cheaper than
+/// one widening, and the widening below is there for the rows no fixed K could have covered.
+const NUCLEUS_PROBE_K: usize = 1024;
+
+/// Widening factor when [`NUCLEUS_PROBE_K`] candidates did not reach `top_p`.
+///
+/// `top_p = 1.0` legitimately wants the WHOLE vocab (and a near-uniform row wants it even at
+/// top_p 0.9), so the widening path is live code, not a defensive branch — it just has to get
+/// there in few passes, because each pass re-runs the O(n) selection. Doubling takes 8 passes to
+/// cross 128256 from 1024; ×8 takes 2 (1024 → 8192 → n, see the `n / 2` snap below). Measured at
+/// n = 128256 / top_p = 1.0: ×2 = 4.54ms per call, ×8 = 3.22ms, old heap = 5.27ms.
+const NUCLEUS_WIDEN: usize = 8;
 
 /// Build the truncated, normalized sampling support shared by [`sample_logits`] and
 /// [`truncated_dist`]: top-k select, temperature softmax, normalize, then the top-p (nucleus)
@@ -478,7 +477,7 @@ impl PartialOrd for HeapItem {
 ///
 /// `temp` is clamped to a positive value (callers only reach this for `temp>0`; the clamp is a
 /// div-by-zero guard). When `top_k==0` the support is the whole vocab, but instead of sorting all
-/// of it the nucleus is popped from a max-heap only as deep as `top_p` requires.
+/// of it only a bounded [`NUCLEUS_PROBE_K`] prefix is selected and sorted, widened on demand.
 fn truncated_softmax(
     logits: &[f32],
     temp: f32,
@@ -522,28 +521,68 @@ fn truncated_softmax(
         probs.truncate(cutoff);
         (idx, probs)
     } else {
-        // top_k==0: softmax denominator over ALL logits (O(n) scan, no sort), then pop the nucleus
-        // prefix from a max-heap — only as deep as top_p needs, avoiding the full-vocab sort.
+        // top_k==0 — the DEFAULT for the whole Llama-3.x/4 family, which mirrors Meta's published
+        // generation_config (temp 0.6, top_p 0.9, top_k off). `top_k == 0` fails BOTH of the
+        // decode loop's GPU gates in `seam::runner` (`gpu_sample` wants `(2..=64)`, `gpu_argmax`
+        // wants `temp <= 0 || top_k == 1`), so every Llama decode with default sampling lands
+        // here, once per token, on the host. It is worth the care.
+        //
+        // The two O(n) passes below are LOAD-BEARING and stay: `maxl` for the exp shift, and `sum`
+        // as the TRUE full-vocab softmax denominator. Restricting `sum` to the selected candidates
+        // would renormalize over a subset and silently change every probability (and hence the
+        // sampled token, and `truncated_dist`'s MTP accept ratios). Note the index-order summation
+        // is also what makes this arm bit-identical to what shipped before.
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
-        let mut heap: std::collections::BinaryHeap<HeapItem> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| HeapItem { key: l, idx: i })
-            .collect();
-        let mut idx = Vec::new();
-        let mut probs = Vec::new();
-        let mut cum = 0.0;
-        while let Some(HeapItem { key, idx: i }) = heap.pop() {
-            let p = ((key - maxl) / temp).exp() / sum;
-            idx.push(i);
-            probs.push(p);
-            cum += p;
-            if cum >= top_p {
-                break;
+
+        // What is NOT load-bearing is materializing an order over the whole vocab. This used to
+        // build a `BinaryHeap<HeapItem>` of every entry — 128256 × 16B = 2.0 MiB allocated and
+        // heapified per token — and then pop ~18 of them. Now: one bounded partial selection.
+        //
+        // Ordering is descending by logit with ties broken by ASCENDING INDEX. `total_cmp` gives a
+        // total order over floats (so `-inf` masked logits sort last, never into the nucleus), and
+        // the index tiebreak makes the result fully DETERMINISTIC — the old heap popped
+        // equal-keyed items in whatever order heapification happened to leave them, and
+        // `select_nth_unstable_by`/`sort_unstable_by` are unstable too, so without it two tokens
+        // with bit-identical logits could swap places between runs or rustc versions. Tied entries
+        // carry identical probabilities, so this changes `probs`/`cum`/the cutoff not at all; it
+        // only pins WHICH of two indistinguishable ids comes back.
+        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b));
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut k = NUCLEUS_PROBE_K.min(n); // clamp: n may be smaller than the probe
+        loop {
+            if k < n {
+                order.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
             }
+            order[..k].sort_unstable_by(cmp); // descending by logit, ties by index
+            let mut probs: Vec<f32> = Vec::with_capacity(k);
+            let mut cum = 0.0f32;
+            let mut reached = false;
+            for &i in &order[..k] {
+                let p = ((logits[i] - maxl) / temp).exp() / sum;
+                probs.push(p);
+                cum += p;
+                if cum >= top_p {
+                    reached = true;
+                    break;
+                }
+            }
+            if reached || k == n {
+                // `reached`: `probs` already stops at the cutoff. `k == n`: the nucleus is the
+                // whole vocab (top_p = 1.0, or a flat enough row) and `probs` holds all of it —
+                // which is exactly what the heap returned when it popped itself empty. Never
+                // truncate the nucleus short of `top_p`; that would drop mass the draw expects.
+                let idx = order[..probs.len()].to_vec();
+                return (idx, probs);
+            }
+            // Widen. Snapping to `n` once the next step would land past the halfway mark avoids a
+            // near-full selection followed immediately by a full one.
+            k = if k.saturating_mul(NUCLEUS_WIDEN) >= n / 2 {
+                n
+            } else {
+                k * NUCLEUS_WIDEN
+            };
         }
-        (idx, probs)
     }
 }
 
@@ -1074,6 +1113,234 @@ mod tests {
             }
         }
         idx[cutoff - 1] as u32
+    }
+
+    /// Deterministic pseudo-random logits, generated from `seed` with the file's OWN xorshift step
+    /// ([`next_uniform`]) — no `rand` dependency, so every case below reproduces byte-for-byte on
+    /// every host and every rustc.
+    ///
+    /// `grid` controls TIES: `0` leaves the raw draws (distinct with overwhelming probability),
+    /// anything else quantizes onto a coarse lattice so equal logits are common — see the tie
+    /// caveat on [`randomized_differential_against_reference_full_sort`]. `mask` sprinkles `-inf`
+    /// entries, the shape a grammar constraint or a logit bias produces (and a second, adversarial
+    /// source of ties, all of them at the very bottom of the order).
+    fn seeded_logits(n: usize, seed: u64, spread: f32, grid: u32, mask: bool) -> Vec<f32> {
+        let mut rng = legal_xorshift_state(seed);
+        (0..n)
+            .map(|i| {
+                let u = next_uniform(&mut rng); // drawn unconditionally: masking must not shift the stream
+                if mask && n >= 8 && i % 3 == 1 {
+                    return f32::NEG_INFINITY;
+                }
+                let x = (u - 0.5) * 2.0 * spread;
+                if grid == 0 {
+                    x
+                } else {
+                    (x * grid as f32).round() / grid as f32
+                }
+            })
+            .collect()
+    }
+
+    fn has_duplicate_logits(logits: &[f32]) -> bool {
+        let mut v: Vec<f32> = logits.to_vec();
+        v.sort_by(f32::total_cmp);
+        v.windows(2).any(|w| w[0].total_cmp(&w[1]).is_eq())
+    }
+
+    /// **The randomized differential test for the bounded-nucleus rewrite.** Thousands of
+    /// (vocab size × temp × top_p × top_k × logit shape × seed) combinations, each asserted against
+    /// [`reference_full_sort`] — the byte-for-byte pre-refactor algorithm. The two pinned
+    /// characterization tests above cover two hand-picked rows; this covers the corners that
+    /// actually break a partial-selection rewrite: `n` below the probe size (1, 2, 7 — the clamp),
+    /// `n` far above it (4096), `top_p = 1.0` (the whole vocab, so the widening path must run to
+    /// completion), `top_p = 0.01` (a one-token nucleus), `-inf` masked rows, and heavy ties.
+    ///
+    /// **Tie caveat — what is and is not asserted.** The old implementation popped a `BinaryHeap`
+    /// whose order among EQUAL keys is unspecified, and `reference_full_sort` sorts with
+    /// `sort_unstable_by`, which is likewise free to permute ties. The new code breaks ties by
+    /// ascending index, so on a row with duplicate logits the two implementations can legitimately
+    /// disagree about WHICH of two equal-logit tokens comes back. That disagreement is not a
+    /// defect and it is not papered over by dropping the tied cases (they are the ones most likely
+    /// to expose a real selection bug), so for rows that contain duplicates the assertion is
+    /// weakened to exactly what IS guaranteed: the returned token has the same LOGIT — hence the
+    /// same probability — as the reference's. That guarantee is tight, not hand-wavy: tied logits
+    /// produce bit-identical `probs`, so `cum`, the nucleus cutoff, `total`, and the index `j` the
+    /// draw lands on are all unchanged by tie order; only `idx[j]` can differ. Rows with distinct
+    /// logits (the common case, and every real logit row) get the full `assert_eq!` on the token id.
+    #[test]
+    fn randomized_differential_against_reference_full_sort() {
+        let mut cases = 0usize;
+        let mut tied_rows = 0usize;
+        let mut tie_swaps = 0usize;
+        let mut widened = 0usize;
+        for &n in &[1usize, 2, 7, 17, 64, 255, 1024, 4096] {
+            for &seed in &[1u64, 7, 12_345] {
+                for &temp in &[0.05f32, 0.6, 1.0, 2.5] {
+                    for &top_p in &[0.01f32, 0.3, 0.9, 1.0] {
+                        for &(grid, mask, spread) in
+                            &[(0u32, false, 6.0f32), (2, false, 6.0), (0, true, 3.0)]
+                        {
+                            // Cycle top_k so the untouched top-k arm rides along, but keep the
+                            // rewritten `top_k == 0` arm the majority of the sweep.
+                            let top_k = [0usize, 0, 0, 3, 20, 1][cases % 6];
+                            let logits = seeded_logits(n, seed, spread, grid, mask);
+                            let s = Sampler { temp, top_k, top_p };
+                            let mut rng = legal_xorshift_state(seed ^ 0xA5A5_5A5A);
+                            let mut rng_ref = rng;
+                            let got = sample_logits(&logits, s, &mut rng);
+                            let want = reference_full_sort(&logits, s, &mut rng_ref);
+                            let what = format!(
+                                "n={n} seed={seed} temp={temp} top_p={top_p} top_k={top_k} grid={grid} mask={mask}"
+                            );
+                            assert_eq!(
+                                rng, rng_ref,
+                                "{what}: both paths must consume exactly one RNG draw"
+                            );
+                            if has_duplicate_logits(&logits) {
+                                tied_rows += 1;
+                                assert_eq!(
+                                    logits[got as usize].total_cmp(&logits[want as usize]),
+                                    std::cmp::Ordering::Equal,
+                                    "{what}: tied row, but the token drawn has a DIFFERENT logit"
+                                );
+                                if got != want {
+                                    tie_swaps += 1;
+                                }
+                            } else {
+                                assert_eq!(got, want, "{what}: sampled token changed");
+                            }
+                            if top_k == 0
+                                && truncated_softmax(&logits, temp, 0, top_p).0.len()
+                                    > NUCLEUS_PROBE_K
+                            {
+                                widened += 1;
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases >= 200, "sweep must be broad: only {cases} cases");
+        assert!(tied_rows > 0, "the tied-logit flavour never fired");
+        assert!(
+            widened > 0,
+            "no case exceeded the {NUCLEUS_PROBE_K}-candidate probe — the widening path was never \
+             exercised by this sweep"
+        );
+        // Informational, not asserted either way: how often the index tiebreak picked a different
+        // (equal-probability) token than the heap's arbitrary order would have.
+        eprintln!("{cases} cases, {tied_rows} tied rows, {tie_swaps} tie swaps, {widened} widened");
+    }
+
+    /// The support oracle for the widening path: full sort, no bounded probe, no widening — but
+    /// otherwise arithmetically IDENTICAL to `truncated_softmax`'s `top_k == 0` arm (same
+    /// index-order `sum`, same descending-with-index-tiebreak order, same accumulation), so the
+    /// comparison below can be an exact `assert_eq!` on both `idx` AND `probs`, not a tolerance.
+    fn reference_support(logits: &[f32], temp: f32, top_p: f32) -> (Vec<usize>, Vec<f32>) {
+        let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b)));
+        let (mut idx, mut probs, mut cum) = (Vec::new(), Vec::new(), 0.0f32);
+        for &i in &order {
+            let p = ((logits[i] - maxl) / temp).exp() / sum;
+            idx.push(i);
+            probs.push(p);
+            cum += p;
+            if cum >= top_p {
+                break;
+            }
+        }
+        (idx, probs)
+    }
+
+    /// **The widening path, end to end.** `top_p = 1.0` on a flat row needs EVERY entry, so the
+    /// `NUCLEUS_PROBE_K` probe must widen (×`NUCLEUS_WIDEN`, then snap to `n`) rather than hand
+    /// back a truncated nucleus — silently truncating would drop mass the draw expects and, via
+    /// [`truncated_dist`], change MTP's speculative accept ratios. Rows are sized to land on both
+    /// sides of the probe and of one widening step, including exact-boundary sizes.
+    #[test]
+    fn nucleus_widening_reaches_the_full_vocab() {
+        let mut saw_full = false;
+        let mut saw_widened = false;
+        for &n in &[
+            NUCLEUS_PROBE_K - 1,
+            NUCLEUS_PROBE_K,
+            NUCLEUS_PROBE_K + 1,
+            NUCLEUS_PROBE_K * NUCLEUS_WIDEN + 1, // one widening step is not enough
+            NUCLEUS_PROBE_K * 12 + 7,            // needs the snap-to-n step too
+        ] {
+            for &(temp, top_p) in &[(1.0f32, 1.0f32), (0.6, 0.999), (1.0, 0.9)] {
+                // Perfectly flat: every token carries the same mass, so the nucleus is as deep as
+                // `top_p` demands and nothing about the row lets the probe get lucky.
+                let flat = vec![0.0f32; n];
+                assert_eq!(
+                    truncated_softmax(&flat, temp, 0, top_p),
+                    reference_support(&flat, temp, top_p),
+                    "flat n={n} temp={temp} top_p={top_p}: bounded probe != full sort"
+                );
+                let got = truncated_softmax(&flat, temp, 0, top_p).0;
+                saw_full |= got.len() == n;
+                saw_widened |= got.len() > NUCLEUS_PROBE_K;
+
+                // And the same on a random row, where the widening lands mid-tail.
+                let rnd = seeded_logits(n, 99, 2.0, 0, false);
+                assert_eq!(
+                    truncated_softmax(&rnd, temp, 0, top_p),
+                    reference_support(&rnd, temp, top_p),
+                    "random n={n} temp={temp} top_p={top_p}: bounded probe != full sort"
+                );
+                saw_widened |= truncated_softmax(&rnd, temp, 0, top_p).0.len() > NUCLEUS_PROBE_K;
+            }
+        }
+        assert!(
+            saw_widened,
+            "no row exceeded the {NUCLEUS_PROBE_K}-candidate probe — widening untested"
+        );
+        assert!(
+            saw_full,
+            "no row pulled in the WHOLE vocab — the snap-to-n leg of the widening is untested"
+        );
+    }
+
+    /// `truncated_dist` shares `truncated_softmax`, and it RENORMALIZES over the returned support —
+    /// so a support the rewrite got wrong would silently reweight MTP's speculative accept rule
+    /// (`spec_accept_stochastic`'s `p(x)/q(x)`) rather than fail loudly. Pin it directly: same
+    /// support as the oracle, and a proper distribution (sums to 1) over it.
+    #[test]
+    fn truncated_dist_support_matches_the_full_sort_oracle() {
+        for &n in &[1usize, 7, 300, NUCLEUS_PROBE_K + 5, NUCLEUS_PROBE_K * 9] {
+            for &(temp, top_p) in &[(0.6f32, 0.9f32), (0.8, 0.95), (1.0, 1.0), (0.6, 0.01)] {
+                let logits = seeded_logits(n, 2_024, 5.0, 0, false);
+                let s = Sampler {
+                    temp,
+                    top_k: 0,
+                    top_p,
+                };
+                let (want_idx, want_probs) = reference_support(&logits, temp, top_p);
+                let got = truncated_dist(&logits, s);
+                assert_eq!(
+                    got.iter().map(|&(i, _)| i as usize).collect::<Vec<_>>(),
+                    want_idx,
+                    "n={n} temp={temp} top_p={top_p}: MTP support drifted"
+                );
+                let total: f32 = want_probs.iter().sum();
+                for (k, (&(_, p), &w)) in got.iter().zip(want_probs.iter()).enumerate() {
+                    assert_eq!(
+                        p,
+                        w / total,
+                        "n={n} temp={temp} top_p={top_p}: prob {k} drifted"
+                    );
+                }
+                let mass: f32 = got.iter().map(|&(_, p)| p).sum();
+                assert!(
+                    (mass - 1.0).abs() < 1e-3,
+                    "n={n} temp={temp} top_p={top_p}: renormalized mass {mass} != 1"
+                );
+            }
+        }
     }
 
     /// The baton is mutually exclusive (only one sequence records on the GPU at a time) and FIFO
