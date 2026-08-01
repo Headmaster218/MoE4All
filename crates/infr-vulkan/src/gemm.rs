@@ -3164,11 +3164,66 @@ dyn_spv!(
 // (`kernels.vulkan.attn_decode`) forces `attn_partial` back for the A/B.
 dyn_spv!(attn_decode_spv, "attn_decode");
 dyn_spv!(attn_decode_dynac_spv, "attn_decode_dynac");
+// B7 slice 3b: the same kernel, widened by build-time specialization to the two exclusions that
+// actually cost throughput — sliding-window layers (gemma3/gemma4 run SWA on most layers, and their
+// SWA caches are RINGS: position j at row j % (cap/(nkv*hd))) and hd 256/512 (gemma4's per-layer
+// head dims, qwen3.5). `-DSWA` always ships with `-DRING`, since the modulo is the identity on a
+// full-context cache and one build then covers both.
+dyn_spv!(attn_decode_swa_spv, "attn_decode_swa");
+dyn_spv!(attn_decode_swa_dynac_spv, "attn_decode_swa_dynac");
+dyn_spv!(attn_decode_hd256_spv, "attn_decode_hd256");
+dyn_spv!(attn_decode_hd256_dynac_spv, "attn_decode_hd256_dynac");
+dyn_spv!(attn_decode_hd256_swa_spv, "attn_decode_hd256_swa");
+dyn_spv!(
+    attn_decode_hd256_swa_dynac_spv,
+    "attn_decode_hd256_swa_dynac"
+);
+dyn_spv!(attn_decode_hd512_spv, "attn_decode_hd512");
+dyn_spv!(attn_decode_hd512_dynac_spv, "attn_decode_hd512_dynac");
+dyn_spv!(attn_decode_hd512_swa_spv, "attn_decode_hd512_swa");
+dyn_spv!(
+    attn_decode_hd512_swa_dynac_spv,
+    "attn_decode_hd512_swa_dynac"
+);
 /// `INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode` = false) — keep the general
 /// `attn_partial` builds on the decode fast path so the specialization can be A/B'd against the
 /// kernel it replaces with one env var and one binary.
 pub(crate) fn attn_decode_disabled(vk: &infr_core::config::VulkanCfg) -> bool {
     !vk.attn_decode
+}
+
+/// The decode-only split-K pass-1 build for `(hd, swa, dynac)`, or `None` when no member of the
+/// family covers the shape (the caller then keeps its general `attn_partial` selection).
+///
+/// `swa` is `window > 0`: those builds carry BOTH the window mask floor and the ring-row modulo,
+/// so they are correct on a ring cache and on a full-context one. `hd` must be exactly 128, 256 or
+/// 512 — every other head dim keeps `attn_partial`'s runtime `hd4` loops.
+pub(crate) fn attn_decode_kernel(
+    hd: usize,
+    swa: bool,
+    dynac: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    Some(match (hd, swa, dynac) {
+        (128, false, false) => ("attn_decode", attn_decode_spv()),
+        (128, false, true) => ("attn_decode_dynac", attn_decode_dynac_spv()),
+        (128, true, false) => ("attn_decode_swa", attn_decode_swa_spv()),
+        (128, true, true) => ("attn_decode_swa_dynac", attn_decode_swa_dynac_spv()),
+        (256, false, false) => ("attn_decode_hd256", attn_decode_hd256_spv()),
+        (256, false, true) => ("attn_decode_hd256_dynac", attn_decode_hd256_dynac_spv()),
+        (256, true, false) => ("attn_decode_hd256_swa", attn_decode_hd256_swa_spv()),
+        (256, true, true) => (
+            "attn_decode_hd256_swa_dynac",
+            attn_decode_hd256_swa_dynac_spv(),
+        ),
+        (512, false, false) => ("attn_decode_hd512", attn_decode_hd512_spv()),
+        (512, false, true) => ("attn_decode_hd512_dynac", attn_decode_hd512_dynac_spv()),
+        (512, true, false) => ("attn_decode_hd512_swa", attn_decode_hd512_swa_spv()),
+        (512, true, true) => (
+            "attn_decode_hd512_swa_dynac",
+            attn_decode_hd512_swa_dynac_spv(),
+        ),
+        _ => return None,
+    })
 }
 // PROBE (B7 slice 1): LDS-staged K-tile decode pass 1 — one whole 128-dim dot per THREAD out of
 // shared memory instead of attn_partial's per-key cross-lane `subgroupAdd`. Reachable ONLY from
@@ -3520,14 +3575,20 @@ mod tests {
             }
             ops
         }
-        for (name, spv) in [
-            ("attn_decode", attn_decode_spv()),
-            ("attn_decode_dynac", attn_decode_dynac_spv()),
-            // The kernels being matched, so the invariant is pinned to a real reference rather
-            // than to a remembered fact about them.
-            ("attn_partial_bda", attn_partial_bda_spv()),
-            ("attn_partial_dynac_bda", attn_partial_dynac_bda_spv()),
-        ] {
+        let mut family: Vec<(&'static str, &'static [u32])> = Vec::new();
+        for hd in [128usize, 256, 512] {
+            for swa in [false, true] {
+                for dynac in [false, true] {
+                    family.push(attn_decode_kernel(hd, swa, dynac).expect("family member"));
+                }
+            }
+        }
+        assert_eq!(family.len(), 12, "the attn_decode family lost a member");
+        // The kernels being matched, so the invariant is pinned to a real reference rather
+        // than to a remembered fact about them.
+        family.push(("attn_partial_bda", attn_partial_bda_spv()));
+        family.push(("attn_partial_dynac_bda", attn_partial_dynac_bda_spv()));
+        for (name, spv) in family {
             let ops = reduce_ops(spv);
             assert!(
                 !ops.is_empty(),

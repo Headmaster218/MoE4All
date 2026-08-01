@@ -5953,29 +5953,40 @@ impl<'a> Recorder<'a> {
         // 16 waves/SIMD). The reduction is the same plain `subgroupAdd`, so the output is
         // BIT-identical — `tests/attn_decode_parity.rs` asserts that on raw bits.
         //
-        // Every condition below is an arm the specialized kernel does not have. The ring-cache one
-        // is subtler than the rest: `attn_partial` maps position j to cache row `j % (cap/(nkv*hd))`
-        // whenever `cap` is nonzero, and `attn_decode` assumes the identity. `window == 0` already
-        // implies a full-context (non-ring) cache — only sliding-window layers are allocated as
-        // rings (`seam::mod`'s `window + ubatch` sizing) — but the row bound is checked rather than
-        // inferred, since a wrong answer here is silent garbage rather than a crash.
-        let (p1name, p1spv) = if !batched
+        // Every condition below is an arm no member of the specialized family has. Two axes ARE
+        // covered (slice 3b): the head dim, via the `hd` argument to `attn_decode_kernel` (128 /
+        // 256 / 512 have their own builds, anything else falls back), and sliding-window, via the
+        // `-DSWA -DRING` builds.
+        //
+        // The ring-cache condition is the subtle one: `attn_partial` maps position j to cache row
+        // `j % (cap/(nkv*hd))` whenever `cap` is nonzero, and the NON-`SWA` builds assume the
+        // identity. `window == 0` already implies a full-context (non-ring) cache — only
+        // sliding-window layers are allocated as rings (`seam::mod`'s `window + ubatch` sizing) —
+        // but the row bound is checked rather than inferred, since a wrong answer here is silent
+        // garbage rather than a crash. `window > 0` needs no such check: those builds carry the
+        // modulo, which is the identity when the cache happens to be full-context.
+        let ring_safe = window > 0 || cap == 0 || pos < cap / (nkv * hd);
+        let fast = if !batched
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
             && kv_ml.is_none()
             && !k_q8
             && !v_q8
             && rows == 1
-            && hd == 128
-            && window == 0
             && canvas_lo.is_none()
             && chunk <= 512
-            && (cap == 0 || pos < cap / (nkv * hd))
+            && ring_safe
+            // INFR_NO_ATTN_HD=1 exists to A/B the hd 256/512 specialization against the general
+            // runtime-hd4 loops; the family's hd256/hd512 builds ARE that specialization, so honor
+            // the knob by falling back to `attn_partial_nohd_bda` for those dims. hd == 128 is
+            // unaffected by NO_HD_SPEC either way.
+            && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
-            ("attn_decode", crate::gemm::attn_decode_spv())
+            crate::gemm::attn_decode_kernel(hd, window > 0, false)
         } else {
-            (p1name, p1spv)
+            None
         };
+        let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };
@@ -6752,19 +6763,26 @@ impl<'a> Recorder<'a> {
         // min(max(span/32,64),512))`) from the live kv_len, so the `attn_live` prologue's indirect
         // grid — nh·live workgroups, one per (query head, chunk) — is unchanged and the prologue
         // needs no edit. `chunk <= 512` keeps the derived chunk inside the kernel's `sc[512]` slab
-        // (the policy's own `min(.., 512)` only binds above the baked floor). `window == 0` excludes
-        // both SWA and, with it, the ring cache whose row modulo the specialization drops.
-        let (p1name, p1spv) = if !crate::gemm::attn_decode_disabled(self.vk())
+        // (the policy's own `min(.., 512)` only binds above the baked floor).
+        //
+        // Slice 3b widens this to `window > 0` (the `-DSWA -DRING` builds: the window mask floor
+        // AND the ring row modulo an SWA layer's `window + ubatch`-row cache needs — this path
+        // cannot check the row bound the static gate does, because the replayed kv_len is not known
+        // at record time, so covering the ring is a precondition for covering SWA at all) and to
+        // hd 256/512 (the `-DDHD4=64/128` builds). Anything else still falls back.
+        let fast = if !crate::gemm::attn_decode_disabled(self.vk())
             && bda
             && !q8
-            && hd == 128
-            && window == 0
             && chunk <= 512
+            // INFR_NO_ATTN_HD=1 A/Bs the hd 256/512 specialization; the family's hd256/hd512
+            // builds ARE it, so leave those dims on `attn_partial_dynac_nohd_bda` when it is set.
+            && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
-            ("attn_decode_dynac", crate::gemm::attn_decode_dynac_spv())
+            crate::gemm::attn_decode_kernel(hd, window > 0, true)
         } else {
-            (p1name, p1spv)
+            None
         };
+        let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
         // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
         // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are
         // dead code under `-DUSE_PARAMS` (never read in the compiled SPIR-V for this variant, see

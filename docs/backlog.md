@@ -313,7 +313,7 @@ old kernel and not just perturbing it.
 
 The output is **BIT-identical** —
 `crates/infr-vulkan/tests/attn_decode_parity.rs` asserts raw `f32` bits over
-nine shapes × both call paths, and no `gpu_seam_matches_cpu*` golden moved. B7's
+every shape × both call paths, and no `gpu_seam_matches_cpu*` golden moved. B7's
 earlier claim that the drift came from `ClusteredReduce` is WRONG, or at least
 incomplete: making all five of `attn_decode`'s reductions
 `subgroupClusteredAdd(., 32u)` still produced bit-identical output on RADV/RDNA3
@@ -337,13 +337,84 @@ This does NOT close the headline deep-context gap: at d32768 the model is still
 ~0.64× llama.cpp's tg128. Treat (b) as a mid-depth lever, not a fix for B7's
 opening table.
 
-**Not covered by slice 3a, deliberately** — each falls back to `attn_partial`
-and would need its own specialization if it ever became hot: sliding-window
-(gemma's SWA layers; its global layers DO take the fast path), hd 256/512
-(gemma4, qwen35), planar-Q8 and mainline-inline quant KV, the DiffusionGemma
-canvas mask, rows > 1 (small-m spec-verify and prefill), the bound-SSBO
-(non-BDA) dispatch, and `chunk > 512` (only reachable at spans above ~524k keys
-under `INFR_KV_OVERFLOW`).
+**What slice 3b bought (LANDED) — coverage, not speed.** The two exclusions that
+cost real models throughput are gone: **sliding-window** (`-DSWA -DRING`) and
+**hd 256 / 512** (`-DDHD4=64/128`). Widened as a FAMILY of build-time
+specializations, never one runtime-branching kernel — `attn_decode.comp` now
+compiles into 12 builds (3 head dims × causal/SWA × static/replay). `-DSWA`
+always ships with `-DRING`: an SWA layer's cache is a ring of
+`round64(window + ubatch)` rows, so the build carries `j % rcap`, which is the
+identity on a full-context cache and lets the host gate skip any cap reasoning.
+The static gate keeps its `pos < cap/(nkv*hd)` row bound for the CAUSAL builds
+only (they still assume the identity); the replay gate cannot check it at all
+(kv_len is not known at record time), which is exactly why covering the ring was
+a precondition for covering SWA there.
+
+`RADV_DEBUG=shaderstats` (fresh `XDG_CACHE_HOME`,
+`MESA_SHADER_CACHE_DISABLE=1`), all 12 builds: **96 VGPRs / 3072 B LDS, zero
+spills** — identical to slice 3a's and against `attn_partial_bda`'s /
+`attn_partial_dynac_bda`'s **120 / 5120** and `attn_partial_nohd_bda`'s **120 /
+5120**. So every variant is meaningfully leaner than the arm it replaces; none
+was withheld. (Dropping `vsh[32]` for hd 256/512 does not show up — LDS
+granularity rounds 2304 B back to 3072.)
+
+`infr bench -p 0 -n 128 -r 3`, legs alternated twice, f16 KV (the bench default
+at these depths; note `infr run` at gemma's full 131072 ctx auto-quants KV to
+q8_0, and a q8 cache does not take this path at all):
+
+| model                 | depth | ON            | OFF           | gain       |
+| --------------------- | ----- | ------------- | ------------- | ---------- |
+| gemma-3-12b (hd256)   | 4096  | 86.3 / 86.1   | 85.9 / 85.7   | 1.005×     |
+| gemma-3-12b           | 8192  | 83.8 / 83.9   | 83.4 / 83.5   | 1.005×     |
+| gemma-4-12b (256/512) | 4096  | 84.9 / 84.8   | 84.2 / 84.3   | 1.008×     |
+| gemma-4-12b           | 8192  | 82.3 / 82.3   | 81.4 / 81.5   | **1.010×** |
+| Qwen3-30B-A3B (ctrl)  | 4096  | 170.0 / 170.1 | 163.6 / 163.0 | 1.041×     |
+| Qwen3-30B-A3B (ctrl)  | 8192  | 147.5 / 147.6 | 138.3 / 138.3 | 1.067×     |
+
+The Qwen control reproduces slice 3a's 1.04× / 1.06× to within noise, so the
+shipped hd=128 causal gate was not perturbed.
+
+Independently re-measured on the same box: gemma-3-12b 86.3 / 85.9 @d4096 and
+83.8 / 83.5 @d8192; Qwen control 148.4 / 139.0 @d8192 (1.068×). The gemma
+profile above was re-run too and confirms both halves of the explanation —
+attention pass 1 is 8.8% of decode GPU time, and `attn_decode_hd256_swa` is flat
+at 18.1 → 17.8 µs from d4096 to d8192 while `attn_decode_hd256` grows 40.1 →
+77.9 µs.
+
+**Judgement: this slice is coverage insurance, not throughput.** Roughly 0.5% on
+gemma is barely above measurement noise, and it cost 12 shader builds and ~240
+lines of `#ifdef`. It ships because it is bit-identical, uniformly leaner, and
+removes a "some layers fast, some not" inconsistency that would confuse the next
+profile — not because it moved a number worth quoting.
+
+**The gemma gain is ~0.5–1%, an order of magnitude below Qwen's, and the reason
+is share, not kernel quality.** `INFR_PROF_OPS=1 INFR_SEAM_NO_REPLAY=1` on
+gemma-3-12b @d4096: `native_mmv_mrow_q4k_m4` is 55% of decode GPU time and the
+whole attention pass 1 is 8.7% (`attn_decode_hd256_swa` 5.9% over 40 layers,
+`attn_decode_hd256` 2.6–5.7% over 8). Gemma's SWA layers are **window-capped** —
+17.8 µs/layer at d4096 AND at d8192 — so 40 of 48 layers do not grow with depth
+and the lever cannot grow with it either. Do not expect this to improve at
+d32768; the global layers are the only part that scales. gemma-4-12b @d4096 is
+the same picture with `attn_decode_hd512` (47.5 µs × 8 global layers) in place
+of hd256.
+
+**One measured trap, worth remembering.** The hd 256/512 QK tail loop must keep
+`attn_partial`'s redundant `if (r < hd4)` guard AND read `hd4` from the push
+constant at runtime. With `hd4` folded to the build-time literal the guard
+vanishes, ACO fuses `part + dot(..)` across the terms into one FMA chain, and
+the chunk score moves 1 ULP — which `attn_combine`'s `exp(m_c - M)` weight then
+turns into 136/2048 non-identical outputs on
+`hd256 swa513 kv1500 ring1024 single-key chunk`. The comment in the shader says
+so; do not "clean it up".
+
+**Still falling back after 3b** — each would need its own family member:
+planar-Q8 and mainline-inline quant KV (this is what gemma runs by DEFAULT at
+full context, so widening it is the biggest remaining coverage hole), the
+DiffusionGemma canvas mask, `rows > 1` (small-m spec-verify and prefill), the
+bound-SSBO (non-BDA) dispatch, `chunk > 512` (only reachable above ~524k keys
+under `INFR_KV_OVERFLOW`), head dims other than 128/256/512, and a RING cache on
+a `window == 0` layer (unreachable today — only SWA layers are allocated as
+rings — and the static gate's row bound rejects it rather than assuming).
 
 ---
 

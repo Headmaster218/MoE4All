@@ -195,6 +195,66 @@ fn main() {
             "attn_decode_dynac",
             &["-DUSE_PARAMS", "-DSELF_CHUNK"],
         ),
+        // B7 slice 3b — the same decode-only kernel widened to the shapes that were falling back,
+        // as a FAMILY of build-time specializations (one kernel handling every axis at runtime is
+        // just `attn_partial` again, and the whole win was deleting arms). Two axes:
+        //   `-DSWA -DRING`  sliding-window layers (gemma3/gemma4 run SWA on most layers) INCLUDING
+        //                   the ring cache those layers allocate (`window + ubatch` rows, position
+        //                   j at row `j % rcap`). SWA always pairs with RING: the modulo is the
+        //                   identity on a full-context cache, so one build covers both and the
+        //                   host gate needs no cap reasoning.
+        //   `-DDHD4=64/128` hd 256 / 512 (gemma4's per-layer head dims, qwen3.5) — `attn_partial`'s
+        //                   dedicated hd4==64 / hd4==128 arms, ported with literal strides.
+        ("attn_decode", "attn_decode_swa", &["-DSWA", "-DRING"]),
+        (
+            "attn_decode",
+            "attn_decode_swa_dynac",
+            &["-DSWA", "-DRING", "-DUSE_PARAMS", "-DSELF_CHUNK"],
+        ),
+        ("attn_decode", "attn_decode_hd256", &["-DDHD4=64"]),
+        (
+            "attn_decode",
+            "attn_decode_hd256_dynac",
+            &["-DDHD4=64", "-DUSE_PARAMS", "-DSELF_CHUNK"],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_swa",
+            &["-DDHD4=64", "-DSWA", "-DRING"],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_swa_dynac",
+            &[
+                "-DDHD4=64",
+                "-DSWA",
+                "-DRING",
+                "-DUSE_PARAMS",
+                "-DSELF_CHUNK",
+            ],
+        ),
+        ("attn_decode", "attn_decode_hd512", &["-DDHD4=128"]),
+        (
+            "attn_decode",
+            "attn_decode_hd512_dynac",
+            &["-DDHD4=128", "-DUSE_PARAMS", "-DSELF_CHUNK"],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd512_swa",
+            &["-DDHD4=128", "-DSWA", "-DRING"],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd512_swa_dynac",
+            &[
+                "-DDHD4=128",
+                "-DSWA",
+                "-DRING",
+                "-DUSE_PARAMS",
+                "-DSELF_CHUNK",
+            ],
+        ),
         // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
         // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
         // Q4/Q5 decode moves ¼ the traffic vs the dequant→f16 prepass + f16-scratch read. K and V
