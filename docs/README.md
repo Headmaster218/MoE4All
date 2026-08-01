@@ -54,4 +54,8 @@ the `infr` inference engine. The top-level project overview lives in the root
   perf, DRY, and YAGNI.
 - [code-review.md](code-review.md) — risk-prioritised whole-tree review
   (2026-08-01): correctness bugs, security/robustness gaps, `unsafe` soundness,
-  DRY, and YAGNI, each with a file:line and a suggested fix.
+  DRY, and YAGNI, each with a file:line and a suggested fix. All findings are
+  resolved; residual work is in the backlog.
+- [backlog.md](backlog.md) — triaged work that is deliberately not done, with
+  why (blocked on hardware, scoped out, or declined), plus withdrawn findings
+  recorded so they are not rediscovered.

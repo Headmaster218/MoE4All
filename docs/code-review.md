@@ -49,28 +49,24 @@ KB), below the guard's 1 MiB `CHECK_MIN` and skipped by design. **N2**'s
 performance half was also wrong (~8 call sites, not "millions of compares");
 only its duplicate-tensor-name half was real, and that is fixed.
 
-**Still open — each needs a product decision, not a patch:**
+**Decided.** The four items that needed a product call have been made:
 
 - **Y3** (`INFR_POISON_UNINIT`) and **Y4** (`INFR_KV_OVERFLOW_VRAM_MB`'s
-  placement cap). _Suggestion: keep both._ Each has one production read site and
-  costs nothing when unset; YAGNI is about unused abstraction, and these are
-  used, just rarely.
-- **S6** — gating `/v1/models` behind the API key. _Suggestion: gate it, leave
-  `/health` open._
-- **S7** — non-streaming disconnect cancellation and rate limiting. _Suggestion:
-  add a per-request wall-clock deadline; leave rate limiting to a reverse
-  proxy._
-- **N10** — `INFR_DN_CHUNK_SCAN`'s inverted polarity, R1-frozen. Fold into the
-  next breaking sweep.
-- **Residual from U3:** 16 `_mm_loadu_si128` (128-bit) sites in
-  `infr-cpu/src/kernels.rs` still take the raw intrinsic. Same class as the 171
-  converted ones, deliberately out of that slice's scope.
+  placement cap) — **KEPT**. Each costs nothing when unset and is the only way
+  to reproduce a bug class on a machine that is not the one that hit it. The
+  reasoning now lives at both knobs in `infr-vulkan/src/lib.rs` so a future
+  YAGNI sweep does not re-open it.
+- **S6** — **DONE**. `/v1/models` is behind the API key; `/health` stays open.
+- **S7** — **DONE in part**. `serve.request_timeout_secs` bounds how long one
+  request holds a slot, driving the existing `cancel` latch so the permit
+  actually drops. Rate limiting was deliberately declined — see backlog **B5**.
+- **N10** — **DEFERRED** to the next breaking sweep; see backlog **B1**.
 
-**Coverage gap worth knowing:** 63 of the 171 converted SIMD load sites are in
-the `*_vnni` kernel family, which the dev box cannot execute (no `avx512vnni`),
-so their new `debug_assert`s are compiled but unexercised. They need a VNNI
-runner. The avx2 tier _was_ verified, by temporarily stubbing the 37 `avx512bw`
-gates to `false`.
+**Nothing from this review is left unresolved.** The residual work it surfaced —
+the 16 unconverted 128-bit SIMD loads, the unexercised VNNI bounds assertions,
+and tensor-parallel's lack of automated coverage — is tracked in
+[backlog.md](backlog.md) as **B2**, **B3** and **B4**, since each is blocked on
+hardware or scoped out of the slice that found it rather than merely unfinished.
 
 ### C10 (H) — tensor-parallel KV checkpoints are double-sharded — FIXED
 
