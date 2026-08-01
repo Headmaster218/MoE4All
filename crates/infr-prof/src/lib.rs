@@ -1,4 +1,4 @@
-//! `#[infr_prof::instrument]` — build-time profiling injection (see docs/perf.md).
+//! `#[infr_prof::instrument]` — build-time profiling injection (see docs/perf/playbook.md).
 //!
 //! Applied (always behind `#[cfg_attr(infr_profile, ...)]`) to a `fn`, an `impl` block, or an
 //! inline `mod`, it rewrites EVERY function inside to open an `infr_prof_rt` span on entry and

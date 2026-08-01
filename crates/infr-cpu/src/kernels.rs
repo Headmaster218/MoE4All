@@ -6550,7 +6550,7 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Gated-FFN activation applied to the gate value.
-// per-call leaf, too small to probe (see docs/perf.md)
+// per-call leaf, too small to probe (see docs/perf/playbook.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
 pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
     match act {

@@ -349,7 +349,7 @@ fn denoise_block(
                 //
                 // Perf (profiled via samply: this loop's `exp`/`ln` calls — glibc's correctly-rounded
                 // expf/logf helper, `f32subf64x` — were >25% of ALL sampled thread-time on a 256-row
-                // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/perf.md's
+                // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/perf/playbook.md's
                 // class-5 "host-in-the-loop" entry — the motivation for slice 3's GPU reducer below).
                 // The original computed `exp(raw*temp_inv - m)` TWICE per vocab element (once to
                 // accumulate `z_sum`, again — bit-for-bit the same value, since `exp` is a pure

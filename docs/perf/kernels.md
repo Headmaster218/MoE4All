@@ -59,12 +59,12 @@ any backend.** Floats (`F16` / `F32` / `Bf16`) are native everywhere too.
   (scalar → AVX2 → AVX-512BW → AVX-512-VNNI `dpbusd`), with up to 8-row
   cache-blocking tiles. Grid/codebook formats expand the grid row to signed i8
   once, then reuse the per-sub-block scale × int-dot. Ternary folds `(digit−1)`
-  into signed i8 + a single-scale int dot. See `docs/cpu-perf.md` for the
-  per-format landing history and measured speedups.
+  into signed i8 + a single-scale int dot. See `cpu.md` for the per-format
+  landing history and measured speedups.
 - **Vulkan** (`infr-vulkan`) — two families: `dqblk`-decode f16 coopmat GEMM for
   prefill (wide `m`), and dp4a `mmq` integer GEMV for decode (`m=1`). The int8
   `mmq` path (each thread owns its accumulator → scale-after for free) is the
-  principled integer route; see `docs/perf.md` for why fp8/int8/bf16 _coopmat_
+  principled integer route; see `playbook.md` for why fp8/int8/bf16 _coopmat_
   operand swaps were measured and rejected in favour of the f16 coopmat GEMM.
 - **Metal** (`infr-metal`) — `DEC16_<DT>` decode macros bake 16 consecutive
   weight elements into `wk[16]` per 16-element block index, instantiated across
@@ -76,4 +76,4 @@ any backend.** Floats (`F16` / `F32` / `Bf16`) are native everywhere too.
 
 This doc tracks **coverage** (does a native kernel exist). For **throughput**
 work — ratios vs llama.cpp, the optimization playbook, the bottleneck taxonomy —
-see `docs/perf.md` (GPU / general) and `docs/cpu-perf.md` (CPU backend).
+see `playbook.md` (GPU / general) and `cpu.md` (CPU backend).

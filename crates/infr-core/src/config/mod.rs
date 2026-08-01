@@ -537,7 +537,7 @@ cfg_struct! {
     ProfCfg / PartialProfCfg {
         /// `INFR_PROF_OPS`: per-op profiling on every backend — vulkan, metal and cpu. THE
         /// switch the backends gate on, through [`crate::prof::enabled`] (which also ANDs the
-        /// warmup-suppression flag). See `docs/perf.md` § Profiling.
+        /// warmup-suppression flag). See `docs/perf/playbook.md` § Profiling.
         ops: bool = false,
         /// `INFR_PROF_OP_SHAPES`: itemize per-op labels by SHAPE rather than folding a kind into
         /// one row. Vulkan-only refinement (it labels by kernel name, so the shared

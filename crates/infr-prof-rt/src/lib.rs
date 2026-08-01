@@ -1,5 +1,5 @@
 //! Runtime for the `INFR_PROFILE=1` build-time instrumentation (see `infr-prof` and
-//! docs/perf.md § "Build-time auto-instrumentation").
+//! docs/perf/playbook.md § "Build-time auto-instrumentation").
 //!
 //! `#[infr_prof::instrument]` rewrites every `fn` it covers to open a [`Site`]-keyed span at
 //! entry via [`enter`]; the returned RAII [`Guard`] closes the span on any exit path (`?`,

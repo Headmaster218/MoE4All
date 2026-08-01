@@ -68,7 +68,7 @@ IQ4_XS.
 CPU, Vulkan, and Metal now each have a native fast kernel for **every** weight
 quant format infr supports (24/24) — no format falls back to dequant→float on
 any backend. The full matrix and per-backend decode strategy moved to its own
-doc: **`docs/kernels.md`**. (CPU closed its last gap with ternary `TQ1_0`
+doc: **`kernels.md`**. (CPU closed its last gap with ternary `TQ1_0`
 `6336df3`/`b7a4201`; TriLM-3.9B TQ2_0 prefill 16.5→131.9 t/s ≈ 8×.)
 
 ## Context: two regimes, two different bottlenecks

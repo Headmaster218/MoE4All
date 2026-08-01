@@ -114,7 +114,7 @@ opt-level = 3
 opt-level = 3
 
 # Line tables (not full debug info) in release so sampling profilers (samply/perf — see
-# docs/perf.md) can attribute samples into inlined kernels. Debug info never affects codegen,
+# docs/perf/playbook.md) can attribute samples into inlined kernels. Debug info never affects codegen,
 # so release perf and the bit-exact goldens are unchanged; only the binary grows.
 [profile.release]
 debug = "line-tables-only"

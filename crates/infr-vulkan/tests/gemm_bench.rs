@@ -896,7 +896,7 @@ fn decode_attn_variants_bench() {
 /// DiffusionGemma slice 6: probe how much of `matmul_mmq_experts`'s cost at DG's shapes is
 /// GENUINE compute vs the fixed worst-case grid (`rows` bound = canvas tokens = 256, so
 /// `gx = ceil(rows/64)*(n/64)` is the SAME regardless of the real per-expert counts — early-exit
-/// workgroups are supposed to be nearly free per docs/perf.md's class-4 precedent). Varies ONLY
+/// workgroups are supposed to be nearly free per docs/perf/playbook.md's class-4 precedent). Varies ONLY
 /// the `rows` bound argument (grid-sizing only, never read by the shader for real row ranges)
 /// against a FIXED, realistic packed layout (128 experts, 2048 pairs, ~16 rows/expert average —
 /// the canvas-256/n_used-8 arithmetic) to isolate "cost of the bound" from "cost of the real
@@ -1054,12 +1054,12 @@ fn moe_expert_grid_bound_bench() {
     // A BN=128 tile (halving down's 44 N-tiles to 22, matching gate_up's grid granularity) was
     // probed here at both TN=8 (doubles the per-thread accumulator: 1.3-1.6ms, a clear LOSS vs
     // baseline's ~1.25-1.37ms — register-pressure/occupancy cost, the exact class-3 risk
-    // docs/perf.md warns "bigger tiles often lose" for) and TN=4/THREADS=512 (register-neutral:
+    // docs/perf/playbook.md warns "bigger tiles often lose" for) and TN=4/THREADS=512 (register-neutral:
     // ~1.3-1.35ms, a wash/marginal loss within noise). Neither improved on the baseline BN=64
     // tile, so down's lower TFLOPS-vs-gate_up efficiency (measured via INFR_PROF_OPS: ~8.1 vs
     // ~10.2 TFLOPS at production counts) is a K-depth ceiling (k=nff=704 → only 22 BLK=32
     // iterations, less loop depth to amortize fixed per-iteration cost), not a tile/occupancy
-    // config bug — reverted both variants per docs/perf.md's "a measured wash gets reverted"
+    // config bug — reverted both variants per docs/perf/playbook.md's "a measured wash gets reverted"
     // rule rather than landing a wash.
 }
 

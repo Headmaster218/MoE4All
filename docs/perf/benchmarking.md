@@ -23,7 +23,7 @@ process exit (per-kernel totals, counts, avg, %GPU over all timed submits —
 warmup runs unprofiled). Add `INFR_PROF_OP_SHAPES=1` for shape-itemized
 GEMV/GEMM buckets (`mmvr:m4:1536x24576`). Decode's replay tape carries no
 timestamps — profile decode with `INFR_SEAM_NO_REPLAY=1`. Details in
-[`docs/perf.md`](playbook.md).
+[`playbook.md`](playbook.md).
 
 ```bash
 INFR_PROF_OPS=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | tail -30   # exit aggregate

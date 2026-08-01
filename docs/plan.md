@@ -7,7 +7,7 @@
 > refactor it anticipated has since shipped: the op-list IR + `Backend` trait
 > live in `crates/infr-core` (`graph.rs`, `backend.rs`) and run on CPU
 > (`infr-cpu`), Vulkan (`infr-vulkan`), and Metal (`infr-metal`). Current perf
-> state: [`docs/perf.md`](perf.md).
+> state: [`docs/perf/playbook.md`](perf.md).
 
 Pure-Rust LLM inference engine. Vulkan-first, designed to run on any mainstream
 GPU. The only non-Rust surface is the GPU driver (called through thin Rust FFI)
@@ -280,7 +280,7 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
 9. ✅ **`infr run`** — terminal chat (streaming, reasoning split).
 10. ✅ **`infr serve`** — axum OpenAI server (streaming, tool-call bridge).
 11. 🔄 **Perf pass** — ongoing (coopmat/dp4a tuning, record-once decode, KV
-    layout); see [`docs/perf.md`](perf.md).
+    layout); see [`docs/perf/playbook.md`](perf.md).
 12. ✅ **Backend-agnostic refactor + second backend** — DONE. The op-list seam
     (`crates/infr-core`) runs on CPU (`infr-cpu`), Vulkan (`infr-vulkan`), and
     Metal (`infr-metal`) — the three supported backends, all behind the same
@@ -324,9 +324,9 @@ gemma4 mem-shared MTP mode (see [`mtp.md`](mtp.md) "Later").
 ## Vulkan / GPU features to investigate
 
 Leads surfaced from the 2026-07 RDNA4 coopmat exploration (RX 9060 XT / Navi 44,
-Mesa 26.1.4). Context on what's already been ruled out: `docs/perf.md` "Coopmat
-operand tiers" — on coopmat **v1**, no operand swap (fp8/bf16/int8) beats f16
-for these GEMMs. The items below are NOT yet tried.
+Mesa 26.1.4). Context on what's already been ruled out: `docs/perf/playbook.md`
+"Coopmat operand tiers" — on coopmat **v1**, no operand swap (fp8/bf16/int8)
+beats f16 for these GEMMs. The items below are NOT yet tried.
 
 1. **`VK_NV_cooperative_matrix2` (coopmat2) — TESTED, negative (2026-07-09).**
    Was the promising lead: its `coopMatPerElementNV` applies a per-block rank-1
@@ -372,10 +372,11 @@ for these GEMMs. The items below are NOT yet tried.
    it lands, it could route the decode GEMVs through the matrix unit. Nothing to
    do until RADV ships it.
 3. **bf16-coopmat rate on a future Mesa** — RDNA4's `bfloat16_t` WMMA currently
-   runs ~12-27% slower than `float16_t` on the same kernel (see `docs/perf.md`);
-   likely RADV codegen immaturity for the newer path. Re-check on a future Mesa:
-   if it reaches f16 rate, native bf16 (already built, opt-in
-   `INFR_BF16_COOPMAT`) becomes a free-accuracy default for bf16 models.
+   runs ~12-27% slower than `float16_t` on the same kernel (see
+   `docs/perf/playbook.md`); likely RADV codegen immaturity for the newer path.
+   Re-check on a future Mesa: if it reaches f16 rate, native bf16 (already
+   built, opt-in `INFR_BF16_COOPMAT`) becomes a free-accuracy default for bf16
+   models.
 
 ---
 

@@ -213,7 +213,7 @@ ep_p2p = true
 
 [prof]
 # Per-op profiling, on EVERY backend (vulkan / metal / cpu): one table
-# format, one process-exit aggregate. See docs/perf.md § Profiling.
+# format, one process-exit aggregate. See docs/perf/playbook.md § Profiling.
 ops = false
 op_shapes = false # vulkan only: itemize labels by shape instead of by kernel
 # Host-side stage timing — prompt/decode throughput, the decode setup-vs-execute
