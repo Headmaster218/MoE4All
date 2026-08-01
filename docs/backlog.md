@@ -416,6 +416,166 @@ under `INFR_KV_OVERFLOW`), head dims other than 128/256/512, and a RING cache on
 a `window == 0` layer (unreachable today — only SWA layers are allocated as
 rings — and the static gate's row bound rejects it rather than assuming).
 
+### B8 — the activation/scratch reserve is not path-aware
+
+**Tag:** measured 2026-08-02 · **Blocked on:** a design choice between the two
+options below
+
+`seam::dense_act_reserve` estimates how much VRAM to hold back for activations.
+It is the term that made `kv_fit_ctx_fmt` claim gemma-3-12b's trained window
+would not fit at f16 (~11 GiB reserved at the default 1024-row chunk), which
+triggered a KV auto-quant that measurement showed was unnecessary. The immediate
+inconsistency — reserving for a 1024-row chunk that placement then abandons for
+512 — is being fixed separately. **This entry is about the reserve's ACCURACY,
+which is a different problem and is not fixed by that.**
+
+Measured ground truth, gemma-3-12b Q4_K_M f16 KV @ctx 131072 with a real 120k
+prefill (peak sampled from `/sys/class/drm/card1/device/mem_info_vram_used`):
+
+| term        | MiB        | source                                              |
+| ----------- | ---------- | --------------------------------------------------- |
+| peak VRAM   | 17 506     | measured                                            |
+| weights     | 6 962      | GGUF size on disk                                   |
+| KV cache    | ~8 672     | 8 global × 8192 B/tok × 131072 + 40 SWA × 1536 rows |
+| **scratch** | **~1 872** | residual                                            |
+
+(The 40/8 SWA/global split is confirmed from a decode profile: 1280
+`attn_decode_hd256_swa` dispatches over 32 tokens = 40 layers, 256 = 8.)
+
+The reserve has exactly ONE path branch today:
+
+```rust
+let attn_s = if cfg.swa_window == 0 && cfg.max_head_dim() == 128 { 0 } else { /* full want_ctx */ };
+```
+
+Two things are wrong with it. It is far too coarse — real dispatch picks between
+flash / non-flash-coopmat / `nc_fa` / split-K **per layer**, on hd, mask, row
+count, kv length, KV dtype and coopmat capability — and the comment above it
+asserts "gemma3-12b: full layers are Causal+hd128 = flash", which a profile
+disproves: gemma-3-12b is hd **256** on every layer and takes the pessimistic
+branch. Terms a correct accounting has to price, none expressible as a constant:
+
+- **non-flash score tile** — `rows × n_head × kv × 4`; 3.9 GiB at 512×16×120064,
+  and **zero** on the flash path.
+- **split-K partials** `pm`/`pl`/`pacc` — `[rows, nh, n_chunks, hd]`; the
+  adapter's own comment notes ~1 GB at 1024 rows × 32 chunks × hd 256.
+- **KV dequant f16 scratch** — only for the prepass formats (q4_0/q4_1/q5_0/
+  q5_1/iq4_nl); zero for f16 and for native planar-Q8.
+- flash `po`/`pm`/`pl` pools, MoE expert scratch / pager arenas, GEMM output row
+  padding, rmsnorm and quantize temporaries.
+
+**Do NOT replace it with a flat pad.** A constant was proposed (KV + 128 MiB)
+and withdrawn on the numbers above: 128 MiB under-reserves the measured 1 872
+MiB by ~15×, at a 512-row chunk, and scratch scales with both chunk height and
+path.
+
+**Two designs, pick one:**
+
+1. **Shared tier predicate + drift test.** Extract the attention-tier selection
+   the adapter already performs into one predicate that BOTH the dispatch gate
+   and the estimator consume, then price each tier's buffers. Precedent in this
+   repo: `infr_core::tensor::MOE_MMQ_DTYPES` as the single source both the
+   graph-build and adapter gates derive from, guarded by `moe_mmq_drift_test`.
+   Cheaper, but it is still two consumers of one fact and only the drift test
+   stops them separating.
+2. **Derive from the plan.** The adapter already allocates every scratch buffer
+   through a named pool while recording the graph, so a dry-run graph build for
+   the intended shape yields the exact total with no duplicated logic and
+   nothing to drift. Exact by construction rather than by maintenance. More
+   plumbing, and potentially circular — the plan depends on the ctx being sized
+   — so it likely needs a fixed-point or a two-pass build.
+
+### B9 — audit bare `println!`/`eprintln!` onto `tracing`
+
+**Tag:** raised 2026-08-02 · **Blocked on:** nothing; needs the policy below
+agreed before a mechanical sweep
+
+Diagnostics are emitted with bare `eprintln!` across the tree, so they carry no
+level, no structured fields, and no filtering — `infr serve` in particular is
+near-silent while running. A `tracing` subscriber already exists and covers
+every subcommand (`infr-cli`'s `main()`: `tracing_subscriber::fmt()` with
+`EnvFilter::try_from_default_env()` defaulting to `info`), so converting is safe
+— messages will not vanish. `infr-llama` and `infr-server` already declare
+`tracing`; `infr-llama`'s is currently unused.
+
+Scope, counted by splitting each `src/` file at its first `#[cfg(test)]`:
+
+| crate        | production | in-test (leave alone) |
+| ------------ | ---------- | --------------------- |
+| infr-cli     | 64         | 0                     |
+| infr-llama   | 33         | 10                    |
+| infr-metal   | 13         | 1                     |
+| infr-vulkan  | 11         | 55                    |
+| infr-prof-rt | 11         | 0                     |
+| infr-core    | 8          | 3                     |
+| infr-cpu     | 3          | 6                     |
+| infr-chat    | 2          | 0                     |
+| infr-testkit | 1          | 0                     |
+| **total**    | **146**    | **75**                |
+
+Note infr-vulkan looks like the worst offender on a naive grep (66) and is
+actually 11 — 55 of them are in-crate test output.
+
+**Policy — this is not a blanket conversion. Four categories:**
+
+- **Diagnostics → `tracing`.** Everything in the library crates (infr-core,
+  infr-vulkan, infr-llama, infr-cpu, infr-metal, infr-gguf, infr-hub): a library
+  should never write to the process's streams directly. Levels: `warn!` for
+  degradations the user should know about (auto-quant, clamps, fallbacks),
+  `info!` for lifecycle, `debug!`/`trace!` for the rest.
+- **Program OUTPUT stays `println!`.** Generated tokens, `infr bench` result
+  tables, `--json` output, `infr devices` listings. This is the CLI's contract
+  and is piped by users; routing it through a filterable logger would break it.
+- **In-crate test modules stay as they are** (75 sites) — that is test output.
+- **`build.rs` stays** (17 sites) — `cargo:rerun-if-changed` etc. are a build
+  protocol, not logging.
+
+**Two hard carve-outs, both load-bearing:**
+
+- **The SIGINT/SIGTERM handler must keep raw `write(2)`**
+  (`infr-cli/src/main.rs`'s `on_signal`). It is async-signal-safe by
+  construction; `tracing` allocates and takes locks, so converting it
+  reintroduces exactly the deadlock-against-an-interrupted-`print!` that the
+  comment there warns about.
+- **The token-streaming path** deliberately avoids taking the stdout lock for
+  the same reason — check before touching anything near it.
+
+**To do:** agree the policy, then sweep crate by crate (library crates first,
+they are the clear-cut cases), and add a lint or a test that fails on a new bare
+`println!`/`eprintln!` outside the sanctioned categories — otherwise this decays
+straight back.
+
+### B10 — `infr serve` has no request or throughput logging
+
+**Tag:** raised 2026-08-02 · **Blocked on:** two product questions below
+
+`infr serve` is near-silent while running: it logs `infr-server listening` at
+startup, a drain message at shutdown, and two `warn!`s. There is no per-request
+record and no throughput signal, so a running server gives no way to see what it
+is doing or how fast.
+
+**To do:**
+
+- **Per-request**, at INFO: one line on arrival (route, model, prompt tokens,
+  `max_tokens`, streaming or not, slot/session id) and one on completion (prompt
+  and generated token counts, prefill tok/s, decode tok/s, total ms, finish
+  reason). Errors and the existing deadline-abort at WARN.
+- **Periodic throughput**, every ~5 s: prefill tok/s, decode tok/s, tokens
+  generated, active and queued requests, KV slot occupancy — covering the
+  interval, not cumulative.
+- Interval and verbosity through the existing `serve.*` / `INFR_*` config
+  conventions, not a new mechanism.
+
+**Open questions (need the owner's call):**
+
+1. Should the periodic line emit when the server is IDLE? A heartbeat proves the
+   process is alive; the alternative (emit only when there was activity in the
+   interval) keeps an idle server's log clean. Default assumption if unanswered:
+   activity-only.
+2. Should request logging include a prompt preview? Useful for debugging, but it
+   puts user prompt text into logs — a privacy decision, not a technical one.
+   Default assumption if unanswered: no preview, token counts only.
+
 ---
 
 ## Withdrawn
