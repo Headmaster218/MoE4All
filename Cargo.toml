@@ -59,6 +59,12 @@ rayon = "1"
 # under tokio and indicatif/console — a direct dep here costs nothing new.
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
+# Constant-time equality for the `serve` bearer-token check (`infr_server::authorize`). `str`'s
+# `==` bails on the first differing byte, which over a network is a byte-at-a-time timing oracle on
+# `INFR_API_KEY`; `subtle::ConstantTimeEq` is the purpose-built primitive (no_std, no deps, and its
+# comparisons are written to survive the optimizer). Already in the lockfile under sha2/rustls, so
+# a direct dep costs no new compilation unit.
+subtle = "2"
 axum = "0.7"
 tower-http = { version = "0.6", features = ["trace"] }
 # `env`: the CLI-presentation knob `INFR_DIFFUSION_VISUAL` is a plain clap flag
@@ -69,7 +75,10 @@ clap_complete = "4"
 clap_complete_nushell = "4"
 clap_mangen = "0.3"
 # preserve_order: see serde_json below — template values must keep map key order end-to-end.
-minijinja = { version = "2", features = ["preserve_order"] }
+# fuel: the chat template is attacker-supplied (it ships inside the DOWNLOADED model's GGUF), so
+# `infr_chat::template` bounds every render with `Environment::set_fuel` — without this feature the
+# setter does not exist and a template with a nested loop renders forever. See CHAT_TEMPLATE_FUEL.
+minijinja = { version = "2", features = ["preserve_order", "fuel"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 # `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

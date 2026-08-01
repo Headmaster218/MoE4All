@@ -23,10 +23,51 @@ type SharedEnv = Arc<minijinja::Environment<'static>>;
 static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Instruction budget for ONE render ([`minijinja::Environment::set_fuel`], per-render, not
+/// per-process).
+///
+/// The chat template is UNTRUSTED INPUT: it arrives as `tokenizer.chat_template` inside a GGUF
+/// somebody published, and infr executes it on every prompt. Unbounded, a template that loops —
+/// `{% for i in range(100000) %}{% for j in range(100000) %}x{% endfor %}{% endfor %}` is 10^10
+/// instructions — pins a core forever on the FIRST prompt. Under `infr serve` that render happens
+/// in a `spawn_blocking` while the request still holds its `--parallel` slot permit, so the hang
+/// also costs a generation slot that never comes back. (minijinja's own 100_000-element cap on
+/// `range()` does not help: nested loops multiply, and macro recursion sidesteps it entirely.)
+///
+/// 100M is picked from measured consumption of the real templates this repo renders — Llama-3.x
+/// (`tojson(indent=4)`, list slicing), Qwen3/Qwen3.6 tool-calling, and gemma-4's, the worst of the
+/// bunch because it runs a backward pre-scan over prior messages FOR each message and so costs
+/// ~3.5·n² for n messages:
+///
+/// | render                                    | fuel used  | margin  |
+/// | ----------------------------------------- | ---------- | ------- |
+/// | 2 messages, no tools (any template)       |    150-420 | ~250000x |
+/// | 2 messages, 16 tools (gemma-4, worst)     |     10_071 |   ~9900x |
+/// | 100 turns, 16 tools (gemma-4, worst)      |    181_440 |    ~550x |
+/// | 1000 turns, 32 tools (gemma-4, worst)     | 14_336_388 |      ~7x |
+/// | 4001 messages, 64 tools (gemma-4, worst)  | 56_672_684 |    ~1.8x |
+///
+/// The bottom row is a 276 KB prompt — past any context window infr serves — and it still renders.
+/// The ceiling is also self-limiting in wall-clock terms: minijinja runs ~90M instructions/sec in
+/// release, so a render that actually exhausts 100M fuel has already burned a full CPU-second
+/// building a PROMPT, which is itself the pathology, not the work.
+///
+/// Symptom when the limit IS hit: `tmpl.render` returns `minijinja::Error` with
+/// `ErrorKind::OutOfFuel` ("ran out of fuel"), which [`render_core`] wraps as
+/// [`TemplateError::Render`] — so `serve` answers with the template error message and `infr run`
+/// falls back to [`chatml`](crate::chatml), exactly as for any other malformed template. Nothing
+/// hangs and no slot leaks.
+pub(crate) const CHAT_TEMPLATE_FUEL: u64 = 100_000_000;
+
 /// Build a minijinja `Environment` with the full infr jinja surface (pycompat, `raise_exception`,
-/// `strftime_now`, `tojson` with `indent=`) and the given chat template compiled under `"chat"`.
+/// `strftime_now`, `tojson` with `indent=`), a [`CHAT_TEMPLATE_FUEL`] execution bound, and the
+/// given chat template compiled under `"chat"`.
 fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinja::Error> {
     let mut env = minijinja::Environment::new();
+    // Bound the render before anything else — see CHAT_TEMPLATE_FUEL for why an untrusted template
+    // must never be handed an unbounded interpreter. The tracker is created per render, so the
+    // budget is not consumed across the cached environment's lifetime.
+    env.set_fuel(Some(CHAT_TEMPLATE_FUEL));
     // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
     // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -76,15 +117,26 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
 }
 
 /// Fetch (or build + cache) the compiled `Environment` for `template`.
+///
+/// ONE lock acquisition covers both the lookup and the insert. Split across two (get, drop, build,
+/// re-lock, insert) the miss path is a race: under `serve --parallel N` the first N requests for a
+/// freshly loaded model arrive together, all miss, all parse the (16 KB, for gemma-4) template, and
+/// the last insert overwrites the rest — N-1 parses thrown away, and N distinct `Arc`s briefly
+/// handed out for what is documented to be a shared compiled environment.
+///
+/// The cost of holding the lock across the fallible `build_env` is that concurrent FIRST renders
+/// serialize behind one parse. That is the intended trade: it happens once per distinct template
+/// (i.e. once per model, per process) and one parse is precisely what the shared cache exists to
+/// buy. `entry().or_insert_with` cannot express this — the closure has no way to return the
+/// `minijinja::Error` a malformed template produces, and swallowing it would cache a bad
+/// environment or panic — so the check-then-insert stays explicit inside a single `lock()` scope.
 fn cached_env(template: &str) -> Result<SharedEnv, minijinja::Error> {
-    if let Some(env) = ENV_CACHE.lock().unwrap().get(template) {
+    let mut cache = ENV_CACHE.lock().unwrap();
+    if let Some(env) = cache.get(template) {
         return Ok(env.clone());
     }
     let env: SharedEnv = Arc::new(build_env(template)?);
-    ENV_CACHE
-        .lock()
-        .unwrap()
-        .insert(template.to_owned(), env.clone());
+    cache.insert(template.to_owned(), env.clone());
     Ok(env)
 }
 
@@ -333,6 +385,58 @@ mod template_tests {
         let b = render_template(TMPL, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
         assert_eq!(a, b);
         assert_eq!(a, "user:hi\nassistant:yo\nbos=<s>");
+    }
+
+    /// Every environment this crate hands out carries the [`CHAT_TEMPLATE_FUEL`] bound. Asserted on
+    /// `build_env` directly (and instantly) so a future edit that reorders or drops the
+    /// `set_fuel` call fails HERE, loudly, instead of only in the slow runaway test below.
+    #[test]
+    fn build_env_sets_the_fuel_bound() {
+        let env = build_env(TMPL).expect("fixture template parses");
+        assert_eq!(env.fuel(), Some(CHAT_TEMPLATE_FUEL));
+    }
+
+    /// A malicious template — one nested loop, 10^10 iterations — must FAIL rather than hang the
+    /// process. This is the whole point of the fuel bound: the template ships inside a downloaded
+    /// GGUF, and `serve` renders it inside a `spawn_blocking` that holds a `--parallel` slot.
+    ///
+    /// The loop is nested deliberately: minijinja caps a single `range()` at 100_000 elements, so
+    /// the flat `{% for i in range(100000000) %}` form is rejected by minijinja itself and would
+    /// prove nothing about fuel. Two nested 100_000 ranges are individually legal and multiply.
+    ///
+    /// Cost note: this test burns the REAL production budget (there is no smaller-fuel back door,
+    /// on purpose — the test must exercise the environment `render_template` actually builds), so
+    /// it runs for ~1s in release and ~5s in a debug `cargo test`. That is the price of proving the
+    /// bound terminates; without it the same test never returns at all.
+    #[test]
+    fn runaway_template_runs_out_of_fuel_instead_of_hanging() {
+        const RUNAWAY: &str =
+            "{% for i in range(100000) %}{% for j in range(100000) %}x{% endfor %}{% endfor %}";
+        let err = render_template(RUNAWAY, msgs(), Value::Null, "<s>", "</s>", true, true)
+            .expect_err("a 10^10-iteration template must be cut off, not rendered");
+        assert_eq!(
+            err.kind(),
+            minijinja::ErrorKind::OutOfFuel,
+            "must fail on the fuel bound, not incidentally: {err:#}"
+        );
+    }
+
+    /// …and the bound does not clip legitimate work: an ordinary template renders byte-identically
+    /// to what it produced before the limit existed. Pairs with the runaway test — a fuel limit
+    /// that rejected real templates would "pass" that one for the wrong reason.
+    #[test]
+    fn fuel_bound_does_not_clip_a_normal_render() {
+        let out = render_template(TMPL, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
+        assert_eq!(out, "user:hi\nassistant:yo\nbos=<s>");
+
+        // A loop with real (but sane) trip count — 1000 iterations of string building — is far
+        // under the budget too, so per-message work in a long conversation is never the thing that
+        // trips the limit.
+        const LOOPY: &str = "{% for i in range(1000) %}{{ i }},{% endfor %}";
+        let out = render_template(LOOPY, msgs(), Value::Null, "", "", true, true)
+            .expect("1000 iterations is legitimate work, not a runaway");
+        assert!(out.starts_with("0,1,2,"), "{out}");
+        assert!(out.ends_with(",999,"), "{out}");
     }
 
     #[test]

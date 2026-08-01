@@ -36,6 +36,7 @@ use axum::{
 use infr_core::config::Config;
 use infr_engine::{ChatMessage, Delta, ToolCall};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
@@ -1194,6 +1195,24 @@ fn clamp_max_tokens(requested: Option<u32>, cap: u32) -> Option<u32> {
 /// when auth is DISABLED — in which case every request is allowed (default; preserves existing
 /// localhost usage). When a key IS configured, the request must carry
 /// `Authorization: Bearer <key>` with a matching token (audit finding 5).
+///
+/// The token comparison is CONSTANT TIME ([`subtle::ConstantTimeEq`]), not `==`. `str`/`[u8]`
+/// equality bails out at the first differing byte, so the time to answer a request grows with how
+/// many leading bytes of the key the attacker guessed right. Against a server reachable over a
+/// network that is a byte-at-a-time oracle: guess byte 0 (256 tries), keep the value that answers
+/// measurably slower, move to byte 1 — the key falls in time linear in its length instead of
+/// exponential. `ct_eq` folds `|=` over the XOR of every byte pair and only then collapses the
+/// accumulator to a `Choice`, so the answer costs the same whether the token differs in the first
+/// byte or the last. It is used rather than a hand-rolled loop because "no early exit" also has to
+/// survive the optimizer, which is exactly what `subtle` is written (and volatile-fenced) to do.
+///
+/// LENGTH IS STILL LEAKED — `ct_eq` short-circuits when the slices differ in length, so a wrong
+/// token of the wrong length is rejected faster than a wrong token of the right one. That is an
+/// ACCEPTED trade, not an oversight: an attacker learns only how many bytes to send, which does
+/// not narrow the search of the CONTENT in any useful way (a 32-byte random key still has 32 bytes
+/// of entropy to guess), and the alternatives — hashing both sides first, or padding to a fixed
+/// buffer — buy nothing an operator can spend. What must not leak is a per-byte signal, and that
+/// is what the fold removes.
 fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
     match expected {
         None => true,
@@ -1203,7 +1222,7 @@ fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
                     .or_else(|| h.strip_prefix("bearer "))
             })
             .map(str::trim)
-            .is_some_and(|tok| tok == key),
+            .is_some_and(|tok| bool::from(tok.as_bytes().ct_eq(key.as_bytes()))),
     }
 }
 
@@ -2148,6 +2167,37 @@ mod tests {
         assert!(!authorize(key, None));
         assert!(!authorize(key, Some("s3cret")));
         assert!(!authorize(key, Some("Basic s3cret")));
+    }
+
+    /// The constant-time swap is a comparison, not a hash or a prefix check — so pin the two
+    /// mistakes a hand-rolled "no early exit" loop typically makes.
+    ///
+    /// 1. SAME-LENGTH tokens must still be decided on CONTENT. A fold that ORs XORs together is
+    ///    easy to get wrong in the direction of always-equal (e.g. accumulating `&=`, or seeding
+    ///    the accumulator with the wrong identity), and same-length pairs are the only case where
+    ///    that bug is invisible to the length check.
+    /// 2. A correct PREFIX must be rejected. `ct_eq` answers `false` on a length mismatch, but a
+    ///    zip-based loop silently compares only `min(len)` bytes and would accept `"s3c"` for
+    ///    `"s3cret"` — the exact shape an attacker walks a key out with.
+    #[test]
+    fn auth_compares_full_token_not_a_prefix() {
+        let key = Some("s3cret");
+        // Same length as the wrong token below, and correct => allowed.
+        assert!(authorize(key, Some("Bearer s3cret")));
+        // Same length, differs only in the LAST byte => denied.
+        assert!(!authorize(key, Some("Bearer s3creT")));
+        // Same length, differs only in the FIRST byte => denied.
+        assert!(!authorize(key, Some("Bearer S3cret")));
+        // Correct prefix, short => denied (never "equal so far, therefore equal").
+        assert!(!authorize(key, Some("Bearer s3c")));
+        assert!(!authorize(key, Some("Bearer s")));
+        assert!(!authorize(key, Some("Bearer ")));
+        // Correct prefix, long => denied.
+        assert!(!authorize(key, Some("Bearer s3cretx")));
+        // The header's `str::trim` still runs before the compare (surrounding whitespace is not
+        // part of the token), so a padded correct token is accepted and a padded wrong one is not.
+        assert!(authorize(key, Some("Bearer   s3cret  ")));
+        assert!(!authorize(key, Some("Bearer   s3cre  ")));
     }
 
     // --- the `serve.*` knobs, driven through a `Config` (S7, R7: never the environment) ------
