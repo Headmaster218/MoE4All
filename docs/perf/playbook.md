@@ -510,7 +510,7 @@ Perf work is only real if the output is unchanged.
   `CpuBackend::new_with(cfg)`, …). Setting an `INFR_*` variable from a test is a
   process-wide write that races every other test in the binary — that was the
   original "flaky golden" — and there is no longer an `EnvGuard` to work around
-  it. See [`config.md`](config.md).
+  it. See [`config.md`](../config.md).
 
 ## Codebase habits
 

@@ -126,3 +126,32 @@ reference, and it's the bar infr's implementation must meet.
   `shared_head_head` → main tok_embd + tied lm_head fallbacks are the live path.
 - 4B trunk: ne=2560, full-attn every 4th layer (3,7,…,31), DeltaNet elsewhere
   (ssm inner 4096, ts_rank 32 — larger than the 0.8B but same shape family).
+
+---
+
+## MTP is parked (2026-07-31)
+
+**MTP self-speculative decode is DISABLED** (`infr_llama::mtp::mtp_enabled` is
+the single kill-switch, and carries the full rationale). `INFR_MTP=1` is ignored
+with a warning, and the MTP-head GGUFs (Qwen3.5-\*-MTP) run the **ordinary**
+decode path — their `nextn` tensors are simply unused, which is harmless. Those
+models are otherwise fully supported; only the speculative path is off.
+
+Why: MTP's contract was that its output is **token-identical to non-speculative
+greedy** — a pure speedup, not a quality trade. That no longer holds. The
+int8-activation decode kernels every fast dtype now uses carry small per-token
+rounding noise, and MTP's verify batch and the plain-decode chain it must match
+are computed at **different sequence positions with different KV state**. The
+same noise plain decode absorbs harmlessly is enough to flip a close-margin
+greedy argmax between the two streams, so `mtp_spec_matches_target_only_greedy`
+fails. Notably this is **not** a bit-identity bug (`mmv_row1_bit_identical`
+passes — decode and verify share one kernel) and **not** an accuracy cliff (all
+13 `gpu_seam_matches_cpu_*` pass; output stays coherent).
+
+That guarantee was holding the rest of the engine hostage: it blocked Q6_K's
+int8 decode tier (+10% decode, +34% prefill) on a speculative path that was
+already our slowest row (0.59–0.78× vs llama.cpp). So MTP is parked and the
+kernel wins ship. The identity test is `#[ignore]`d, **not weakened** — the
+assertion is correct; re-enabling MTP means making it pass again, which needs an
+accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
+tight), not faster kernels.

@@ -182,8 +182,8 @@ for hd≤512. There is no bm=64 build — unlike the coopmat flash-warp kernel,
 which has both bm=64 and bm=32 variants.
 
 This means even if Intel Arc had ≥64 KB shared memory (it has 64 KB on
-Alchemist, like RADV), the nc_fa kernel cannot use a larger tile. The coopmat
-flash-warp kernel _could_ use bm=64 on Intel — but only under `INFR_CM_8X8=1`,
+Alchemist, like RADV), the nc*fa kernel cannot use a larger tile. The coopmat
+flash-warp kernel \_could* use bm=64 on Intel — but only under `INFR_CM_8X8=1`,
 which also gates the GEMM tier.
 
 **Fix:** If Intel cm8 coopmat stays opt-in (finding #1), adding a bm=64 build of
@@ -201,7 +201,7 @@ of the nc_fa kernel. **Cost:** one new shader variant, one new `build.rs` entry,
 
 **What happens:** Every tiled GEMM (coopmat, nc*mmq, nc_fma) that writes to a
 non-Internal tensor (e.g., the lm_head `logits` Output) allocates a temporary
-`ceil(m/64)*64`-row buffer via `be*.alloc_uninit`, fills it, then copies the `m`
+`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the `m`
 real rows back. This allocation happens ONCE per forward on the lm_head path —
 intermediate layers produce Internal tensors and skip the copy.
 

@@ -11,17 +11,25 @@ the `infr` inference engine. The top-level project overview lives in the root
   TOML file format and lookup order, `--set`, and a per-section walkthrough of
   what is tunable. Start here before reaching for an `INFR_*` variable.
 
-## Performance & kernels
+## Performance
 
-- [perf.md](perf.md) — the performance optimization playbook: the measure →
-  profile → fix-one-lever loop, the bottleneck taxonomy, benchmarking/profiling
-  tooling, and the coopmat-operand-tier dead-end writeup. GPU / general.
-- [cpu-perf.md](cpu-perf.md) — CPU (`infr-cpu`) backend performance roadmap: the
-  two-regime (decode DRAM-bound / prefill cache-bound) model, the native
-  int8-quant landing history, and the remaining worklist.
-- [kernels.md](kernels.md) — cross-backend fast-kernel coverage: which weight
-  quant formats have a native kernel on CPU / Vulkan / Metal (24/24 on all
-  three) and each backend's decode strategy.
+Everything performance-related lives under **[perf/](perf/README.md)** — start
+at that index. It holds:
+
+- [perf/results.md](perf/results.md) — the numbers: every validated model ×
+  quant against llama.cpp on an RX 7900 XTX, per-row footnotes for each kernel
+  slice that moved a column, and where infr still loses. Moved out of the root
+  README, which now carries only the headline.
+- [perf/benchmarking.md](perf/benchmarking.md) — how to produce them:
+  `infr bench` / `infr compare --sweep` against `llama-bench`, per-op GPU
+  profiling, shape-itemised buckets, CPU `samply`.
+- [perf/playbook.md](perf/playbook.md) — the optimization method and the
+  recorded dead ends. Read before starting a perf slice.
+- [perf/kernels.md](perf/kernels.md) — cross-backend fast-kernel coverage (24/24
+  quant formats on CPU / Vulkan / Metal) and each backend's decode strategy.
+- [perf/cpu.md](perf/cpu.md) — the CPU backend's own roadmap.
+- [perf/vulkan-review.md](perf/vulkan-review.md) — multi-vendor review: what is
+  RDNA3-tuned versus portable, and the per-vendor gaps.
 
 ## Backends
 
