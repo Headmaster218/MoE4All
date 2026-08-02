@@ -163,6 +163,8 @@ impl OpProf {
             return;
         }
         let total = self.total_us();
+        // print-ok: a column-aligned profiling REPORT the user asked for with `INFR_PROF_OPS`, not
+        // a diagnostic — a per-line `tracing` prefix would destroy the columns it is made of.
         eprintln!(
             "[prof:{}] per-op {} time — {:.1} ms over {} dispatches",
             self.backend,
@@ -170,6 +172,7 @@ impl OpProf {
             total / 1000.0,
             self.rows.values().map(|(n, _)| n).sum::<u64>(),
         );
+        // print-ok: report table header, see above.
         eprintln!(
             "[prof:{}] {:>10} {:>7} {:>8} {:>9}  op",
             self.backend, "ms", "share", "count", "us/ea"
@@ -180,6 +183,7 @@ impl OpProf {
             }
             let share = if total > 0.0 { us / total * 100.0 } else { 0.0 };
             let each = if n > 0 { us / n as f64 } else { 0.0 };
+            // print-ok: report table row, see above.
             eprintln!(
                 "[prof:{}] {:>10.2} {share:>6.1}% {n:>8} {each:>9.1}  {label}",
                 self.backend,

@@ -40,7 +40,8 @@ use super::{Config, ConfigError, PartialConfig, SetPathError};
 /// Resolve and parse the config file. Returns the layer plus the file it came from; `None` means
 /// no file was found anywhere in the lookup, which is a no-op.
 ///
-/// Any unknown-key warnings are printed to stderr here; use [`parse_str`] for the pure half.
+/// Any unknown-key warnings are emitted through `tracing::warn!` here; use [`parse_str`] for the
+/// pure half.
 pub fn load(explicit: Option<&Path>) -> Result<(PartialConfig, Option<PathBuf>), ConfigError> {
     let Some(path) = discover(explicit)? else {
         return Ok((PartialConfig::default(), None));
@@ -51,7 +52,7 @@ pub fn load(explicit: Option<&Path>) -> Result<(PartialConfig, Option<PathBuf>),
     })?;
     let (partial, warnings) = parse_str(&text, &path)?;
     for w in warnings {
-        eprintln!("{w}");
+        tracing::warn!("{w}");
     }
     Ok((partial, Some(path)))
 }

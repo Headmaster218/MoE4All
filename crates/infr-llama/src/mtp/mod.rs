@@ -109,7 +109,7 @@ pub fn should_use_mtp(cfg: &crate::Config, ec: &crate::EngineConfig) -> bool {
         return false;
     }
     if !mtp_enabled() {
-        eprintln!(
+        tracing::warn!(
             "[infr] INFR_MTP=1 ignored: MTP speculative decode is disabled (known-broken — it \
              no longer matches greedy output under the int8 decode kernels; see README). \
              Running the ordinary decode path."
@@ -2691,7 +2691,7 @@ fn generate_mtp_spec_core(
 
         let (build_secs, exec_secs) = head_sess.take_timing();
         if time_mtp {
-            eprintln!(
+            tracing::info!(
                 "[mtp cycle {cycle}] drafted={} accepted={accepted} \
                  draft={:.1}ms verify={:.1}ms catchup={:.1}ms build={:.1}ms exec={:.1}ms",
                 cand.len(),
@@ -2801,7 +2801,7 @@ fn generate_mtp_spec_core(
     };
     if time_mtp {
         let (dp, vp, cp) = timing.phase_shares();
-        eprintln!(
+        tracing::info!(
             "[mtp summary] {cycle} cycles, {total_accepted}/{total_drafted} accepted (alpha={:.3}), {} tokens generated, phase share: draft {dp:.0}% verify {vp:.0}% catchup {cp:.0}%",
             timing.alpha(),
             out.len()

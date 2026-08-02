@@ -244,7 +244,7 @@ impl ParallelSeam {
             },
         );
         self.pool.get_mut().expect("fresh pool").slots = slots;
-        eprintln!(
+        tracing::info!(
             "slots: {n_slots} x {} ctx ready in {:.1}s",
             self.max_ctx,
             t0.elapsed().as_secs_f32()
@@ -368,7 +368,9 @@ impl ParallelSeam {
                         // A failed seed costs only the prefix reuse — the slot re-prefills from
                         // scratch and the answer is identical. Never fail the request for it.
                         if let Err(e) = r {
-                            eprintln!("kv slots: prefix seed failed ({e}); re-prefilling instead");
+                            tracing::warn!(
+                                "kv slots: prefix seed failed ({e}); re-prefilling instead"
+                            );
                         }
                         // `best` just went free again — wake a waiter that may want it.
                         self.freed.notify_one();

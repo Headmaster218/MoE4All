@@ -1021,7 +1021,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // loads ships that). Nothing to page — stay fully resident and let the alloc-time
             // VRAM budget guard produce its clear error if that overflows. `n_paged = 0` also
             // turns the binder's paged divert below into a no-op (it re-checks `n_paged`).
-            eprintln!(
+            tracing::warn!(
                 "MoE pager: no pageable `_exps` weight banks found — keeping every expert \
                  resident (the VRAM budget guard is the backstop)"
             );
@@ -1082,7 +1082,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     format!("{role:?}[{:.1}MB] {}/{}", sb as f64 / 1e6, p.n_slots, nb)
                 })
                 .collect();
-            eprintln!(
+            tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
              {:.2} GB budget; ctx={want_ctx})",
                 cfg.n_layer,
@@ -1230,7 +1230,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     pin_ubatch(cand);
                     // Re-read through the pin (a racing earlier set wins — use whatever stuck).
                     if fits(ubatch_rows(ec), kv_auto_q8()) {
-                        eprintln!(
+                        tracing::warn!(
                             "dense placement: resident with a {}-row prefill chunk (the default \
                              1024-row chunk's activation reserve wouldn't fit); set INFR_UBATCH \
                              to override",
@@ -1412,7 +1412,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
             let cached: usize = specs.iter().map(|s| s.n_slots).sum();
             let n_blocks: usize = specs.iter().map(|s| s.n_blocks).sum();
-            eprintln!(
+            tracing::info!(
                 "dense streaming: {n_blocks} weight blocks across {} pools, {cached} slots \
                  cached ({:.2} GB arena + {:.2} GB ring; budget {:.2} GB; ctx={want_ctx}; \
                  chunk={})",
@@ -1711,7 +1711,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     let use_p2p = ec.multi.pipeline_p2p;
     let pb = infr_vulkan::PipelineBackend::new(backends, layer_map.clone(), use_p2p)
         .map_err(|e| anyhow!("{e}"))?;
-    eprintln!(
+    tracing::info!(
         "pipeline: {}-way layer split of {} layers:",
         devices.len(),
         cfg.n_layer
@@ -1721,7 +1721,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
         let hi = layer_map.iter().rposition(|&d| d == di);
         let count = layer_map.iter().filter(|&&d| d == di).count();
         match (lo, hi) {
-            (Some(lo), Some(hi)) => eprintln!(
+            (Some(lo), Some(hi)) => tracing::info!(
                 "  Vulkan{idx} ({}): layers [{lo}..={hi}] ({count} layers){}",
                 names[di],
                 if di + 1 < devices.len() {
@@ -1730,7 +1730,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
                     " + final norm + lm_head"
                 }
             ),
-            _ => eprintln!("  Vulkan{idx} ({}): (no layers)", names[di]),
+            _ => tracing::info!("  Vulkan{idx} ({}): (no layers)", names[di]),
         }
     }
     let bind = pipeline_binder(&pb);
@@ -1925,7 +1925,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     let tp =
         infr_vulkan::TensorParallelBackend::new(backends, cfg.n_head, cfg.n_kv, cfg.n_ff, use_p2p)
             .map_err(|e| anyhow!("{e}"))?;
-    eprintln!(
+    tracing::info!(
         "tensor-parallel: {}-way weight split (n_head={}, n_kv={}, n_ff={}):",
         devices.len(),
         cfg.n_head,
@@ -1933,7 +1933,7 @@ pub(crate) fn generate_dense_vulkan_tp(
         cfg.n_ff
     );
     for (di, &idx) in devices.iter().enumerate() {
-        eprintln!(
+        tracing::info!(
             "  Vulkan{idx} ({}): rank {di} — {}/{} heads, {}/{} kv-heads, {}/{} ffn per matrix",
             names[di],
             cfg.n_head / devices.len(),
@@ -2104,14 +2104,14 @@ pub(crate) fn generate_moe_vulkan_ep(
     let ep = infr_vulkan::ExpertParallelBackend::new(backends, moe.n_expert, use_p2p)
         .map_err(|e| anyhow!("{e}"))?;
     let nl = ep.experts_per_device();
-    eprintln!(
+    tracing::info!(
         "expert-parallel: {}-way expert split ({} experts, {} used/token → {nl} experts/device):",
         devices.len(),
         moe.n_expert,
         moe.n_used,
     );
     for (di, &idx) in devices.iter().enumerate() {
-        eprintln!(
+        tracing::info!(
             "  Vulkan{idx} ({}): rank {di} — experts [{}..{}) ({nl} of {})",
             names[di],
             di * nl,

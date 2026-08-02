@@ -135,7 +135,7 @@ impl PcachePersist {
     /// a freshly-compiled pipeline is just as unsafe to persist.
     pub(crate) fn finish(&self, device: &ash::Device, cache: vk::PipelineCache, device_lost: bool) {
         if device_lost {
-            eprintln!(
+            tracing::warn!(
                 "[infr] the GPU device was lost during this run — discarding the pipeline cache \
                  rather than persisting a shader binary that may be what hung it."
             );

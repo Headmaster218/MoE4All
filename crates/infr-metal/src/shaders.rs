@@ -147,7 +147,7 @@ impl Pipelines {
         let prof = cfg.prof.stages;
         if prof {
             match archive.as_ref() {
-                Some(a) => eprintln!(
+                Some(a) => tracing::info!(
                     "[infr-metal] MSL library compiled in {:.1} ms ({} KiB source); pipeline \
                      archive {} ({})",
                     lib_wall.as_secs_f64() * 1e3,
@@ -159,7 +159,7 @@ impl Pipelines {
                     },
                     a.path().display(),
                 ),
-                None => eprintln!(
+                None => tracing::info!(
                     "[infr-metal] MSL library compiled in {:.1} ms ({} KiB source); pipeline \
                      archive DISABLED (config off, no binary-archive support, or no cache dir)",
                     lib_wall.as_secs_f64() * 1e3,
@@ -245,6 +245,8 @@ impl Drop for Pipelines {
             Some(a) => a.stats(),
             None => (0, 0, false),
         };
+        // print-ok: the `prof.stages` pipeline-cache REPORT summary line, printed from `Drop` after
+        // the final archive save — same category as `infr_metal::profile`'s table.
         eprintln!(
             "── infr-metal pipelines: library {:.1} ms (front end, NOT cached) │ {} PSOs in \
              {:.1} ms ({} from archive, {} compiled) │ archive +{added}, blob {:.1} KiB{}",

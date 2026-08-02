@@ -569,6 +569,8 @@ fn exit_if_signalled() {
     };
     // Partial output the user already saw is theirs to keep — flush it.
     std::io::stdout().flush().ok();
+    // print-ok: the CLI's own exit notice, deliberately ordered against the explicit stdout/stderr
+    // flushes on either side of it.
     eprintln!("\ninfr: interrupted — GPU work drained, device released.");
     std::io::stderr().flush().ok();
     std::process::exit(128 + signo);
@@ -869,9 +871,11 @@ fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
 fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
     let devs = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
     if devs.is_empty() {
+        // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
         println!("no Vulkan physical devices found");
         return Ok(());
     }
+    // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
     println!(
         "{} Vulkan device(s) (select with `--dev VulkanN` / `INFR_DEV=VulkanN`):\n",
         devs.len()
@@ -884,6 +888,7 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
         };
         // Bytes → GiB with one decimal (matches the backend's fmt_bytes feel; local to avoid a dep).
         let vram = format!("{:.1} GiB", d.vram_bytes as f64 / (1u64 << 30) as f64);
+        // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
         println!(
             "  Vulkan{}: {} [{}, {} device-local]{}",
             d.index, d.name, d.device_type, vram, mark
@@ -898,6 +903,7 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
         if d.external_memory_dma_buf {
             ext.push("external_memory_dma_buf");
         }
+        // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
         println!(
             "           external-memory: {}",
             if ext.is_empty() {
@@ -915,6 +921,7 @@ fn cmd_pull(model: &str) -> anyhow::Result<()> {
     // `pull` checks HF for the repo's latest commit and updates a stale cache (run/serve stay
     // cache-first via `ensure`). Offline → falls back to the cached copy.
     let path = infr_hub::ensure_latest(&r).map_err(|e| anyhow!("{e}"))?;
+    // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
     println!("{}", path.display());
     Ok(())
 }
@@ -941,6 +948,8 @@ impl ThinkRender {
     fn feed(&mut self, delta: &str) {
         use std::io::Write;
         if !self.tty {
+            // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+            // lock (see `on_signal`'s doc); `tracing` allocates and locks.
             print!("{delta}");
             let _ = std::io::stdout().flush();
             return;
@@ -955,10 +964,14 @@ impl ThinkRender {
             let in_think = &mut self.in_think;
             self.split.finish(&mut |d| Self::render(d, in_think));
             if *in_think {
+                // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                 print!("[0m");
                 self.in_think = false;
             }
         }
+        // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
         println!();
         let _ = std::io::stdout().flush();
     }
@@ -968,9 +981,13 @@ impl ThinkRender {
         match d {
             infr_engine::Delta::Reasoning(t) => {
                 if !*in_think {
+                    // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                    // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                     print!("[2;3m");
                     *in_think = true;
                 }
+                // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                 print!("{t}");
             }
             infr_engine::Delta::Content(t) => {
@@ -979,13 +996,19 @@ impl ThinkRender {
                     // whitespace around `</think>`, but channel-format models (diffusion-gemma,
                     // E2B) end reasoning at a bare `<channel|>` — without this the answer renders
                     // GLUED to the last thinking line ("…clearly.The capital of France is Paris.").
+                    // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                    // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                     print!("[0m\n\n");
                     *in_think = false;
                     // The splitter strips markers, not whitespace: a think-model's own newline
                     // after `</think>` shouldn't stack a third blank line on top of ours.
+                    // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                    // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                     print!("{}", t.trim_start_matches('\n'));
                     return;
                 }
+                // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                 print!("{t}");
             }
             infr_engine::Delta::ToolCall { .. } => {}
@@ -1010,7 +1033,7 @@ fn build_chat_model(
         // loop over a persistent session — Vulkan by default, CPU under INFR_DEV=cpu, Metal under
         // INFR_DEV=metal (the non-macOS build still compiles the Metal arm; `DiffusionGemmaChat::generate`
         // errors clearly at runtime there).
-        eprintln!(
+        tracing::info!(
             "[{} — diffusion-gemma entropy-bound block decode]",
             match backend {
                 Backend::Cpu => "cpu backend",
@@ -1027,7 +1050,7 @@ fn build_chat_model(
     }
     match &backend {
         Backend::Metal => {
-            eprintln!(
+            tracing::info!(
                 "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
             );
             #[cfg(target_os = "macos")]
@@ -1042,7 +1065,7 @@ fn build_chat_model(
             }
         }
         Backend::Cpu => {
-            eprintln!(
+            tracing::info!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
             Ok(Box::new(infr_llama::chat::CpuDenseChat::new(
@@ -1054,7 +1077,7 @@ fn build_chat_model(
         // (Qwen3.5) lands here too (same seam, `Config::from_gguf` + `MixerW::DeltaNet`), as does
         // llama4 Scout (its Q2_K bank runs on the paged expert cache).
         Backend::Vulkan(_) => {
-            eprintln!(
+            tracing::info!(
                 "[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]"
             );
             Ok(Box::new(infr_llama::chat::DenseSeamChat::new(
@@ -1114,6 +1137,7 @@ fn cmd_run(
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_dense_vulkan_pipeline(&devices, &rendered, max_new)?;
+        // print-ok: program OUTPUT — the one-shot generated text, the point of the command.
         println!("{out}");
         return Ok(());
     }
@@ -1137,6 +1161,7 @@ fn cmd_run(
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_dense_vulkan_tp(&devices, &rendered, max_new)?;
+        // print-ok: program OUTPUT — the one-shot generated text, the point of the command.
         println!("{out}");
         return Ok(());
     }
@@ -1161,6 +1186,7 @@ fn cmd_run(
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
         let out = loaded.generate_moe_vulkan_ep(&devices, &rendered, max_new)?;
+        // print-ok: program OUTPUT — the one-shot generated text, the point of the command.
         println!("{out}");
         return Ok(());
     }
@@ -1193,7 +1219,11 @@ fn cmd_run(
     }
     loop {
         match chat.repl_status() {
+            // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+            // lock (see `on_signal`'s doc); `tracing` allocates and locks.
             Some(s) => print!("\n[{s}] > "),
+            // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+            // lock (see `on_signal`'s doc); `tracing` allocates and locks.
             None => print!("\n> "),
         }
         std::io::stdout().flush().ok();
@@ -1212,6 +1242,8 @@ fn cmd_run(
             // A shutdown-aborted turn reports the abort as an error; don't print it as a failure,
             // just leave the REPL (main then exits 130/143).
             if !infr_core::shutdown::shutdown_requested() {
+                // print-ok: the REPL's reply to a failed turn, not a diagnostic about the process — kept
+                // unprefixed so it reads like a shell reporting a failed command.
                 eprintln!("error: {e}");
             }
         }
@@ -1324,6 +1356,8 @@ fn run_chat_turn(
     };
     render.finish();
     let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    // print-ok: program OUTPUT — `infr run`'s always-on per-turn result line, the same category
+    // as `infr bench`'s numbers.
     eprintln!(
         "[prefill {} tok @ {:.0} tok/s ({:.0} ms) | decode {} tok @ {:.1} tok/s]",
         stats.n_prompt,
@@ -1420,7 +1454,11 @@ impl DiffusionVisual {
     /// park the cursor back at the region's top.
     fn begin(&mut self) {
         self.prev_rows = 0;
+        // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
         print!("\x1b[?25l{}", "\n".repeat(DG_VISUAL_ROWS));
+        // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
         print!("\x1b[{DG_VISUAL_ROWS}A");
         std::io::stdout().flush().ok();
         self.active = true;
@@ -1508,6 +1546,8 @@ impl DiffusionVisual {
         }
         frame.push_str("\x1b[?7h\x1b[?2026l"); // auto-wrap back on, end synchronized update
         self.prev_rows = DG_VISUAL_ROWS - 1;
+        // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
         print!("{frame}");
         std::io::stdout().flush().ok();
     }
@@ -1523,6 +1563,8 @@ impl DiffusionVisual {
             frame.push_str(&format!("\x1b[{}A", self.prev_rows));
         }
         frame.push_str("\r\x1b[J\x1b[?25h"); // erase from cursor to end of screen, show cursor
+                                             // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
+                                             // lock (see `on_signal`'s doc); `tracing` allocates and locks.
         print!("{frame}");
         std::io::stdout().flush().ok();
         self.prev_rows = 0;
@@ -1593,12 +1635,12 @@ fn metal_chat_model(
             std::fs::metadata(&draft_path).map(|m| m.len()).unwrap_or(0),
         );
         if db * 4 > tb {
-            eprintln!(
+            tracing::warn!(
                 "[spec] warning: draft is more than 1/4 the target's size — \
                  speculation only pays when the target is much larger (see #16)"
             );
         }
-        eprintln!("[metal spec — target + {k}-token draft verify, greedy (sampling.temp=0)]");
+        tracing::info!("[metal spec — target + {k}-token draft verify, greedy (sampling.temp=0)]");
         Ok(Box::new(infr_llama::chat::SpecMetalChat::new(
             target, draft, k,
         )))
@@ -1875,7 +1917,7 @@ fn run_chat(
                     .is_some()
                 }
                 Err(e) => {
-                    eprintln!("[tools] seam grammar-constrained generation failed ({e})");
+                    tracing::warn!("[tools] seam grammar-constrained generation failed ({e})");
                     false
                 }
             };
@@ -1892,7 +1934,7 @@ fn run_chat(
             // relying on the seam's common-prefix rewind to unwind it. No-op on the multi-slot
             // engine (each request already gets a fresh best-prefix slot).
             be.reset();
-            eprintln!(
+            tracing::warn!(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
             );
         }
@@ -2171,6 +2213,7 @@ fn print_bench_avg_mtp(
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     let ratio = m.ts / avg.max(1e-9);
     if json {
+        // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!(
             "[{{\"avg_ts\": {avg:.2}, \"mtp_ts\": {:.2}, \"mtp_ratio\": {ratio:.4}, \"alpha\": {:.4}, \"draft_pct\": {:.1}, \"verify_pct\": {:.1}, \"catchup_pct\": {:.1}}}]",
             m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct
@@ -2182,6 +2225,7 @@ fn print_bench_avg_mtp(
     } else {
         String::new()
     };
+    // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
     println!(
         "{label}{d}: {avg:.1} t/s | mtp{}: {:.1} t/s ({ratio:.2}x, alpha={:.2}, draft {:.0}% verify {:.0}% catchup {:.0}%)  ({reps} reps)",
         m.n_gen, m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct
@@ -2194,6 +2238,7 @@ fn print_bench_avg_mtp(
 fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: usize, json: bool) {
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     if json {
+        // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!("[{{\"avg_ts\": {avg:.2}}}]");
     } else {
         let d = if depth > 0 {
@@ -2201,6 +2246,7 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
         } else {
             String::new()
         };
+        // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
     }
 }
@@ -2647,13 +2693,16 @@ fn cmd_bench_diffusion_gemma(
     };
     if json {
         let a = if n_gen > 0 { r.gen_ts } else { r.pp_ts };
+        // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!("[{{\"avg_ts\": {a:.2}}}]");
     } else if n_gen > 0 {
+        // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!(
             "pp{}: {:.1} t/s | gen{}: {:.1} t/s (end-to-end) | {:.1} steps | in-step parallel {:.1} t/s{tag}  ({reps} reps)",
             r.last_np, r.pp_ts, r.last_ng, r.gen_ts, r.steps, r.parallel_ts,
         );
     } else {
+        // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!("pp{}: {:.1} t/s{tag}  ({reps} reps)", r.last_np, r.pp_ts);
     }
     Ok(())
@@ -2676,10 +2725,12 @@ fn cmd_compare_sweep(
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     const METRICS: [&str; 4] = ["pp512", "tg128", "tg64@d", "pp4@d"];
+    // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
     println!(
         "\n{:<22} {:<10} | {:>9} | {:>9} | {:>10}",
         "model", "metric", "infr", "llama.cpp", "infr/llama"
     );
+    // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
     println!("{:-<23}{:-<11}+{:-<11}+{:-<11}+{:-<12}", "", "", "", "", "");
     // (model, metric, infr, llama, ratio) for the ranked summary.
     let mut rows: Vec<(String, String, f64, f64)> = Vec::new();
@@ -2699,6 +2750,7 @@ fn cmd_compare_sweep(
         ) {
             Ok(mb) => mb,
             Err(e) => {
+                // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
                 println!("{short:<22} {:<10} | resolve failed: {e}", "-");
                 continue;
             }
@@ -2732,13 +2784,13 @@ fn cmd_compare_sweep(
             // whole sweep for one bad cell.
             let mut iv = mb.infr(&args);
             if let Err(e) = &iv {
-                eprintln!("infr bench failed ({short} {metric_label}), retrying once: {e:#}");
+                tracing::warn!("infr bench failed ({short} {metric_label}), retrying once: {e:#}");
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 iv = mb.infr(&args);
             }
             let mut lv = mb.llama(np, ng, &args);
             if lv.is_none() {
-                eprintln!("llama-bench failed ({short} {metric_label}), retrying once");
+                tracing::warn!("llama-bench failed ({short} {metric_label}), retrying once");
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 lv = mb.llama(np, ng, &args);
             }
@@ -2771,6 +2823,7 @@ fn cmd_compare_sweep(
                 &mut rows,
             );
         } else {
+            // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
             println!(
                 "{short:<22} {metric_label:<10} | {:>9} | {:>9} | {:>10}",
                 "-", "-", "-"
@@ -2781,8 +2834,10 @@ fn cmd_compare_sweep(
     // malformed subprocess-JSON value (→ a NaN ratio) sorts to the end instead of panicking the
     // `partial_cmp().unwrap()` and discarding the whole sweep's results.
     rows.sort_by(|a, b| nan_safe_ratio_cmp(a.2 / a.3, b.2 / b.3));
+    // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
     println!("\nBIGGEST GAPS (infr/llama, worst first):");
     for (m, metric, i, l) in rows.iter().take(10) {
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         println!("  {:>5.2}x  {m:<22} {metric:<10} ({i:.0} vs {l:.0})", i / l);
     }
     Ok(())
@@ -2990,7 +3045,7 @@ impl ModelBench {
         let rows: serde_json::Value = match serde_json::from_slice(&out.stdout) {
             Ok(v) => v,
             Err(_) => {
-                eprintln!(
+                tracing::warn!(
                     "llama-bench failed (np={np} ng={ng}): {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
@@ -3053,7 +3108,7 @@ impl ModelBench {
             match parse_llama_cli_gen_rate(&combined) {
                 Some(v) => samples.push(v),
                 None => {
-                    eprintln!(
+                    tracing::warn!(
                         "llama-cli MTP run produced no parseable `Generation: X t/s` line: {}",
                         combined.trim()
                     );
@@ -3152,7 +3207,7 @@ impl ModelBench {
         let cpu = self.ngl == 0;
         let mut cli = Self::llama_diffusion_cli_path(cpu);
         if !cli.is_file() {
-            eprintln!(
+            tracing::warn!(
                 "llama-diffusion-cli not found ({}): set INFR_LLAMA_DIFFUSION_CLI, put it on PATH, \
                  or build the fork at ~/Projects/mxaddict/llama.cpp-dg (cmake -DGGML_VULKAN=ON \
                  -B build-vulkan && cmake --build build-vulkan --target llama-diffusion-cli)",
@@ -3185,7 +3240,7 @@ impl ModelBench {
             let mut combined = run(&cli)?;
             if !fell_back && combined.contains("unknown model architecture") {
                 let fork = Self::fork_diffusion_cli_path(cpu);
-                eprintln!(
+                tracing::warn!(
                     "{} doesn't support arch=diffusion-gemma (mainline install?) — falling back \
                      to the fork build at {}",
                     cli.display(),
@@ -3202,7 +3257,7 @@ impl ModelBench {
                     steps_v.push(r.steps);
                 }
                 None => {
-                    eprintln!(
+                    tracing::warn!(
                         "llama-diffusion-cli produced no parseable throughput line: {}",
                         combined.trim()
                     );
@@ -3323,7 +3378,7 @@ fn print_sweep_cell(
     rows: &mut Vec<(String, String, f64, f64)>,
 ) {
     let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
-        eprintln!("{err_ctx}: {e:#}");
+        tracing::warn!("{err_ctx}: {e:#}");
         "ERR".into()
     });
     let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
@@ -3334,6 +3389,7 @@ fn print_sweep_cell(
         }
         _ => "-".into(),
     };
+    // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
     println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
 }
 
@@ -3347,7 +3403,7 @@ fn print_dg_sweep_rows(mb: &ModelBench, short: &str, rows: &mut Vec<(String, Str
         .as_ref()
         .map(|r| format!("{:.0}", r.parallel_ts))
         .unwrap_or_else(|e| {
-            eprintln!("infr DG bench failed ({short}): {e:#}");
+            tracing::warn!("infr DG bench failed ({short}): {e:#}");
             "ERR".into()
         });
     let ls = llama
@@ -3366,14 +3422,17 @@ fn print_dg_sweep_rows(mb: &ModelBench, short: &str, rows: &mut Vec<(String, Str
         }
         _ => "-".into(),
     };
+    // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
     println!("{short:<22} {step_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
 
     let e2e_label = "dg-e2e".to_string();
     match (&infr, &llama) {
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         (Ok(i), Some(l)) => println!(
             "{short:<22} {e2e_label:<10} | {:>6.1}t/s@{:.0}st | {:>6.1}t/s@{:.0}st | informational (steps differ)",
             i.gen_ts, i.steps, l.e2e_ts, l.steps
         ),
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         _ => println!(
             "{short:<22} {e2e_label:<10} | {:>9} | {:>9} | {:>10}",
             "-", "-", "-"
@@ -3423,6 +3482,7 @@ fn cmd_compare(
     } else {
         "tool-default".into()
     };
+    // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
     println!("\nmodel: {model_name}   reps: {reps}   ubatch: {ub_s}");
 
     let row = |label: String, i: anyhow::Result<f64>, l: Option<f64>| {
@@ -3435,13 +3495,16 @@ fn cmd_compare(
             (Some(&iv), Some(lv)) if lv > 0.0 => format!("{:.2}x", iv / lv),
             _ => "-".into(),
         };
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         println!("{label:<17} | {is:>10} | {ls:>10} | {ratio:>8}");
     };
     let hdr = |title: &str| {
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         println!(
             "\n{title:<17} | {:>10} | {:>10} | {:>8}",
             "infr", "llama.cpp", "infr/llama"
         );
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         println!("{:-<18}+{:-<12}+{:-<12}+{:-<10}", "", "", "", "");
     };
 
@@ -3463,6 +3526,7 @@ fn cmd_compare(
             (Some(t), Some(s)) => format!("{t:.1} t/s @ {s:.0} steps"),
             _ => "-".into(),
         };
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         println!(
             "  dg-e2e (informational — step counts differ, not apples-to-apples): infr {}   llama {}",
             fmt_st(infr_e2e, infr_steps),
@@ -3518,6 +3582,7 @@ fn cmd_compare(
         row(format!("tg{N}"), infr_base, llama_base); // infr-vs-llama @ baseline
         row(format!("mtp{N}"), infr_mtp, llama_mtp); // infr-vs-llama @ MTP
         let fmt_x = |v: Option<f64>| v.map(|v| format!("{v:.2}x")).unwrap_or_else(|| "-".into());
+        // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
         println!(
             "  own-tool speedup (mtp/base): infr {}   llama {}",
             fmt_x(infr_speedup),
@@ -3668,9 +3733,11 @@ fn apply_model_sampling_defaults(
     if !specified.is_path_set("sampling.top_p") {
         out.sampling.top_p = p;
     }
-    eprintln!(
+    tracing::info!(
         "[sampling: temp={} top_k={} top_p={} ({src}); --temp/--top-k/--top-p to override]",
-        out.sampling.temp, out.sampling.top_k, out.sampling.top_p,
+        out.sampling.temp,
+        out.sampling.top_k,
+        out.sampling.top_p,
     );
     Arc::new(out)
 }
@@ -3713,7 +3780,7 @@ fn cmd_serve(
         let want_ctx = cfg.device.ctx;
         let t0 = std::time::Instant::now();
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
-        eprintln!(
+        tracing::info!(
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
@@ -3722,6 +3789,7 @@ fn cmd_serve(
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
             std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
+        // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!(
             "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx)",
             if n_slots == 1 { "" } else { "s" },
@@ -3741,7 +3809,7 @@ fn cmd_serve(
     // parallelism (`--parallel N>1`) — the default (unset) must stay silent, since every
     // CPU/Metal/diffusion serve would otherwise print a spurious "ignored" note.
     if matches!(parallel_explicit, Some(n) if n > 1) {
-        eprintln!(
+        tracing::warn!(
             "note: --parallel {} ignored on the CPU/Metal/diffusion backends (no multi-slot \
              engine); serving 1 request at a time. The Vulkan seam is the concurrent engine.",
             parallel_explicit.unwrap()
@@ -3760,13 +3828,14 @@ fn cmd_serve(
         // request doesn't pay seconds of pipeline builds on top of its own prefill.
         let t0 = std::time::Instant::now();
         m.warmup()?;
-        eprintln!(
+        tracing::info!(
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
             std::sync::Arc::new(SeamGenerator::new(&gguf, m, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
+        // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
         rt.block_on(infr_server::serve(
             generator,
@@ -3901,7 +3970,7 @@ fn cmd_multi(
             }
         }
 
-        eprintln!(
+        tracing::info!(
             "[multi] loading {model_id} on Vulkan{dev} ({})",
             devices[dev].name
         );
@@ -3917,14 +3986,18 @@ fn cmd_multi(
     }
 
     // Print the model → device routing so the demo shows exactly which model landed on which GPU.
+    // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
     println!(
         "\ninfr multi: {} model(s) on http://{sockaddr}  (OpenAI /v1)",
         entries.len()
     );
+    // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
     println!("  routing (model -> device):");
     for (id, dev, name) in &routing {
+        // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("    {id}  ->  Vulkan{dev} ({name})");
     }
+    // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
     println!();
 
     let rt = tokio::runtime::Runtime::new()?;

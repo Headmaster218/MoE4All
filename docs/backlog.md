@@ -533,67 +533,32 @@ constant, its multiply in `dense_act_reserve_at`, and the
 `act_reserve_carries_the_interim_margin` test, then re-run the table above and
 show the true reserve fills the window without it.
 
-### B9 — audit bare `println!`/`eprintln!` onto `tracing`
+### B9a — the `tracing` sweep's infr-metal half is unverified off macOS
 
-**Tag:** raised 2026-08-02 · **Blocked on:** nothing; needs the policy below
-agreed before a mechanical sweep
+**Tag:** raised 2026-08-02 · **Blocked on:** a CI run, or an Apple machine
 
-Diagnostics are emitted with bare `eprintln!` across the tree, so they carry no
-level, no structured fields, and no filtering — `infr serve` in particular is
-near-silent while running. A `tracing` subscriber already exists and covers
-every subcommand (`infr-cli`'s `main()`: `tracing_subscriber::fmt()` with
-`EnvFilter::try_from_default_env()` defaulting to `info`), so converting is safe
-— messages will not vanish. `infr-llama` and `infr-server` already declare
-`tracing`; `infr-llama` now uses it for the two KV auto-quant warnings
-(`seam::model::clamp_default_ctx` and `vulkan_moe_binder`'s dense rung) and
-nothing else, so its remaining 33 production sites are the sweep.
+B9's sweep landed (bare `println!`/`eprintln!` diagnostics routed onto
+`tracing`, guarded by `infr-core/tests/no_bare_print.rs`). Nine of its
+conversions are in `infr-metal`, which is `#![cfg(target_os = "macos")]` and so
+compiles to an empty lib on Linux: `cargo clippy --all-targets` and `cargo test`
+here say **nothing** about them. The sites are `MetalBackend::new`'s two
+counter-sampling fallbacks, `ArchiveCache`'s five pipeline-cache warnings, and
+`Pipelines::new`'s two `prof.stages` lines. Each is a one-line macro swap
+(`eprintln!` → `tracing::warn!`/`tracing::info!`) with the message text
+untouched, so the risk is a compile error, not a behaviour change — but only CI
+or an Apple build can say so.
 
-Scope, counted by splitting each `src/` file at its first `#[cfg(test)]`:
+`tracing` was added to `crates/infr-metal/Cargo.toml` under plain
+`[dependencies]`, not the `cfg(target_os = "macos")` block, deliberately: the
+crate body is cfg'd out off-macOS, so a target-gated dep would make the import
+resolve only on Apple and hide any mistake even longer.
 
-| crate        | production | in-test (leave alone) |
-| ------------ | ---------- | --------------------- |
-| infr-cli     | 64         | 0                     |
-| infr-llama   | 33         | 10                    |
-| infr-metal   | 13         | 1                     |
-| infr-vulkan  | 11         | 55                    |
-| infr-prof-rt | 11         | 0                     |
-| infr-core    | 8          | 3                     |
-| infr-cpu     | 3          | 6                     |
-| infr-chat    | 2          | 0                     |
-| infr-testkit | 1          | 0                     |
-| **total**    | **146**    | **75**                |
-
-Note infr-vulkan looks like the worst offender on a naive grep (66) and is
-actually 11 — 55 of them are in-crate test output.
-
-**Policy — this is not a blanket conversion. Four categories:**
-
-- **Diagnostics → `tracing`.** Everything in the library crates (infr-core,
-  infr-vulkan, infr-llama, infr-cpu, infr-metal, infr-gguf, infr-hub): a library
-  should never write to the process's streams directly. Levels: `warn!` for
-  degradations the user should know about (auto-quant, clamps, fallbacks),
-  `info!` for lifecycle, `debug!`/`trace!` for the rest.
-- **Program OUTPUT stays `println!`.** Generated tokens, `infr bench` result
-  tables, `--json` output, `infr devices` listings. This is the CLI's contract
-  and is piped by users; routing it through a filterable logger would break it.
-- **In-crate test modules stay as they are** (75 sites) — that is test output.
-- **`build.rs` stays** (17 sites) — `cargo:rerun-if-changed` etc. are a build
-  protocol, not logging.
-
-**Two hard carve-outs, both load-bearing:**
-
-- **The SIGINT/SIGTERM handler must keep raw `write(2)`**
-  (`infr-cli/src/main.rs`'s `on_signal`). It is async-signal-safe by
-  construction; `tracing` allocates and takes locks, so converting it
-  reintroduces exactly the deadlock-against-an-interrupted-`print!` that the
-  comment there warns about.
-- **The token-streaming path** deliberately avoids taking the stdout lock for
-  the same reason — check before touching anything near it.
-
-**To do:** agree the policy, then sweep crate by crate (library crates first,
-they are the clear-cut cases), and add a lint or a test that fails on a new bare
-`println!`/`eprintln!` outside the sanctioned categories — otherwise this decays
-straight back.
+Also unverified: `infr_metal::profile`'s three-line report table and
+`shaders.rs`'s pipeline-cache summary line were KEPT as `eprintln!` and marked
+`// print-ok:`, on the same reasoning as `infr_core::prof::OpProf::flush` — a
+per-line `tracing` prefix would destroy a column-aligned table. Nobody has seen
+that table render since the change; it should not have moved, but it has not
+been looked at.
 
 ### B10a — the serve arrival line reports prompt CHARS, not prompt tokens
 

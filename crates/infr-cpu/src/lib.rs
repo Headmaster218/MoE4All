@@ -2179,7 +2179,7 @@ impl Backend for CpuBackend {
                                     .unwrap()
                             })
                             .sum();
-                        eprintln!(
+                        tracing::info!(
                             "MOE_COUNTS rows={rows} n_expert={n_expert} n_used={n_used} \
                              n_pairs={n_pairs} nonzero={nz} min={min} max={max} mean={mean:.2} \
                              p50={p50} p90={p90} hist(0-3,4-7,8-15,16-23,24-31,32-47,48-63,64+)={hist:?} \
@@ -2193,7 +2193,7 @@ impl Backend for CpuBackend {
                             real_tiles(64),
                         );
                         if moe_counts_dump {
-                            eprintln!("MOE_COUNTS_RAW {counts:?}");
+                            tracing::info!("MOE_COUNTS_RAW {counts:?}");
                         }
                     }
                     let out_gu = if fused_gate_up { 2 * nffx } else { nffx };
@@ -2473,7 +2473,7 @@ impl Backend for CpuBackend {
                             bmax = bmax.max(c);
                             single += (c == 1) as usize;
                         }
-                        eprintln!(
+                        tracing::info!(
                             "[prof-moe] gather {:.2}ms gate_up {:.2}ms act {:.2}ms down {:.2}ms  bucket[min={},max={}] active={} single={}",
                             t_gather.as_secs_f64() * 1e3,
                             t_gate_up.as_secs_f64() * 1e3,

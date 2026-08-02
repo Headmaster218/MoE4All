@@ -429,12 +429,12 @@ impl PipelineBackend {
             match self.backends[producer].p2p_export(bytes, P2pHandleType::DmaBuf) {
                 Ok(export) => match self.backends[consumer].p2p_import(&export) {
                     Ok(imported) => return Ok(Handoff::P2p { export, imported }),
-                    Err(e) => eprintln!(
+                    Err(e) => tracing::warn!(
                         "pipeline: P2P import Vulkan{producer}→Vulkan{consumer} rejected \
                          ({e}); using host-bounce handoff"
                     ),
                 },
-                Err(e) => eprintln!(
+                Err(e) => tracing::warn!(
                     "pipeline: P2P export on Vulkan{producer} failed ({e}); host-bounce handoff"
                 ),
             }

@@ -232,7 +232,7 @@ impl MetalBackend {
                 if !device
                     .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "[infr-metal] prof.metal_device_time=counters: no stage-boundary counter \
                          sampling on this device — falling back to encode-only profiling"
                     );
@@ -243,7 +243,9 @@ impl MetalBackend {
                     .into_iter()
                     .find(|cs| cs.name() == "timestamp");
                 if set.is_none() {
-                    eprintln!("[infr-metal] PROFILE=3: no timestamp counter set — falling back");
+                    tracing::warn!(
+                        "[infr-metal] PROFILE=3: no timestamp counter set — falling back"
+                    );
                 }
                 set
             })

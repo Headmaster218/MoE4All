@@ -172,7 +172,7 @@ impl AllReduce {
                 match ranks[p].p2p_export(bytes, P2pHandleType::DmaBuf) {
                     Ok(e) => *ex = Some(e),
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "tp all-reduce: p2p_export on rank {p} failed ({e}); host bounce"
                         );
                         p2p_ok = false;
@@ -191,7 +191,7 @@ impl AllReduce {
                         match ranks[r].p2p_import(export) {
                             Ok(buf) => imported[r][p] = Some(buf),
                             Err(e) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "tp all-reduce: p2p import rank{p}->rank{r} rejected ({e}); \
                                      host bounce"
                                 );
@@ -221,7 +221,7 @@ impl AllReduce {
                 match ranks[p].tp_export_timeline() {
                     Ok(e) => *es = Some(e),
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "tp all-reduce: semaphore export on rank {p} failed ({e}); host-fence"
                         );
                         sem_ok = false;
@@ -240,7 +240,7 @@ impl AllReduce {
                     match ranks[r].tp_import_timeline(exp) {
                         Ok(imp) => import_sems[r][p] = Some(imp),
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "tp all-reduce: cross-device semaphore import rank{p}->rank{r} \
                                  rejected ({e}); host-fence"
                             );
@@ -269,7 +269,7 @@ impl AllReduce {
                 AllReduceMode::Host => "host-bounce (no cross-device dma-buf)",
             };
             let data = if p2p_ok { "P2P dma-buf" } else { "host RAM" };
-            eprintln!(
+            tracing::info!(
                 "tp all-reduce: {w}-way, {} bytes/boundary — data path: {data}, cross-device sync: {sync}",
                 bytes
             );

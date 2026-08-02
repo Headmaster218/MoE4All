@@ -11,6 +11,7 @@ indicatif.workspace = true
 infr-gguf.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+tracing.workspace = true
 
 # Apple-only: `metal`/`objc` link the Objective-C runtime and don't build off macOS. The crate is
 # `#![cfg(target_os = "macos")]`, so on other targets it compiles to an empty lib with no deps.

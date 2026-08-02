@@ -417,7 +417,13 @@ pub fn report() {
     }
     if !rows.is_empty() {
         let accounted: u64 = rows.iter().map(|r| r.self_ns).sum();
+        // print-ok: this is the `INFR_PROFILE` / `INFR_PROF_OPS` REPORT the user asked for by
+        // setting the env var, and it runs from a C `atexit` hook (see `report_at_exit`). Two
+        // reasons it must not go through `tracing`: a per-line level/target prefix would destroy
+        // the column alignment the table IS, and at `atexit` the CLI's subscriber guard may
+        // already be gone.
         eprintln!();
+        // print-ok: report line, see above.
         eprintln!(
             "== INFR_PROFILE report: {} sites, {} threads, wall {} (since first instrumented call), accounted self {} ==",
             rows.len(),
@@ -425,12 +431,14 @@ pub fn report() {
             fmt_ns(wall_ns),
             fmt_ns(accounted),
         );
+        // print-ok: report line, see above.
         eprintln!(
             "{:>12} {:>7} {:>12} {:>12} {:>10}  function",
             "self", "self%", "total", "calls", "avg(self)"
         );
         const TOP: usize = 50;
         for r in rows.iter().take(TOP) {
+            // print-ok: report line, see above.
             eprintln!(
                 "{:>12} {:>6.2}% {:>12} {:>12} {:>10}  {}",
                 fmt_ns(r.self_ns),
@@ -442,6 +450,7 @@ pub fn report() {
             );
         }
         if rows.len() > TOP {
+            // print-ok: report line, see above.
             eprintln!(
                 "  ... {} more sites (set INFR_PROF_OUT=path for the full table as JSON)",
                 rows.len() - TOP
@@ -451,17 +460,21 @@ pub fn report() {
     if !gpu.is_empty() {
         let total_us: f64 = gpu.iter().map(|(_, us, _)| us).sum();
         let total_n: u64 = gpu.iter().map(|(_, _, n)| n).sum();
+        // print-ok: report line, see above.
         eprintln!();
+        // print-ok: report line, see above.
         eprintln!(
             "== per-op device report: {} ops, {total_n} dispatches, device total {} (every backend, all submits; warmup excluded where the bench resets) ==",
             gpu.len(),
             fmt_ns((total_us * 1e3) as u64),
         );
+        // print-ok: report line, see above.
         eprintln!(
             "{:>12} {:>7} {:>12} {:>10}  gpu op",
             "total", "gpu%", "dispatches", "avg"
         );
         for (label, us, count) in &gpu {
+            // print-ok: report line, see above.
             eprintln!(
                 "{:>12} {:>6.2}% {:>12} {:>10}  {label}",
                 fmt_ns((us * 1e3) as u64),
@@ -474,7 +487,9 @@ pub fn report() {
     if let Some(path) = profile_out() {
         if !path.is_empty() {
             match write_json(&path, &rows, &gpu, n_threads, wall_ns) {
+                // print-ok: report line, see above.
                 Ok(()) => eprintln!("profile JSON written to {path}"),
+                // print-ok: report line, see above.
                 Err(e) => eprintln!("failed to write INFR_PROF_OUT={path}: {e}"),
             }
         }

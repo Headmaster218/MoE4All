@@ -40,17 +40,17 @@ pub struct ConfigOverrides {
 
 /// Fold [`ConfigOverrides`] into the CLI layer.
 ///
-/// Warnings (a `--set` shadowed by a bespoke flag) are printed to stderr; [`parse_reporting`] is
-/// the pure half the tests use.
+/// Warnings (a `--set` shadowed by a bespoke flag) are emitted through `tracing::warn!`;
+/// [`parse_reporting`] is the pure half the tests use.
 pub fn parse(overrides: &ConfigOverrides) -> Result<PartialConfig, ConfigError> {
     let (partial, warnings) = parse_reporting(overrides)?;
     for w in warnings {
-        eprintln!("{w}");
+        tracing::warn!("{w}");
     }
     Ok(partial)
 }
 
-/// [`parse`] without the stderr side effect: returns the layer plus its warning lines.
+/// [`parse`] without the logging side effect: returns the layer plus its warning lines.
 pub fn parse_reporting(
     overrides: &ConfigOverrides,
 ) -> Result<(PartialConfig, Vec<String>), ConfigError> {

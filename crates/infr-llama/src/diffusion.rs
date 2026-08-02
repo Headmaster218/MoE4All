@@ -473,7 +473,11 @@ fn denoise_block(
         prev_temp_inv = temp_inv;
         if eb_trace {
             let n_accepted = accepted.iter().filter(|&&a| a).count();
-            eprintln!(
+            // `debug!`, not `info!`, unlike the other flag-gated diagnostics in this sweep: this one
+            // fires once per DENOISE STEP, so at `info` it would bury the request log it shares a
+            // stream with. `eb_trace` is already opt-in, so reaching it needs the flag AND
+            // `RUST_LOG=debug` — deliberate for a per-step trace.
+            tracing::debug!(
                 "[eb_trace] block={block} step={} temp_inv={temp_inv:.6} mean_entropy={mean_entropy:.6} accepted={n_accepted}/{c} held={held} stable={stable} confident={confident}",
                 steps_run - 1,
             );

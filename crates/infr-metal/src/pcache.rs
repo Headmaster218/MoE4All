@@ -181,7 +181,7 @@ impl ArchiveCache {
                 if decoded.is_none() {
                     // Checksum-valid but structurally wrong: a bug on OUR side, not bit-rot. Same
                     // remedy either way.
-                    eprintln!(
+                    tracing::warn!(
                         "[infr-metal] the cached pipeline archive's manifest did not parse — \
                          discarding {} and rebuilding.",
                         blob.display()
@@ -199,7 +199,7 @@ impl ArchiveCache {
                         // wrong. Recompiling is the correct answer, not a failure — but say so,
                         // because a cache that silently misses every launch is a perf bug nobody
                         // would ever notice.
-                        eprintln!(
+                        tracing::warn!(
                             "[infr-metal] the cached pipeline archive was rejected by Metal ({e}) \
                              — discarding it and rebuilding."
                         );
@@ -257,7 +257,7 @@ impl ArchiveCache {
                 Ok(p) => Some(p),
                 Err(e) => {
                     if !st.broken {
-                        eprintln!(
+                        tracing::warn!(
                             "[infr-metal] creating a pipeline through the binary archive failed \
                              ({e}) — falling back to uncached pipeline creation for this run."
                         );
@@ -287,7 +287,7 @@ impl ArchiveCache {
                             Err(e) => e,
                             _ => "refused without an error".to_string(),
                         };
-                        eprintln!(
+                        tracing::warn!(
                             "[infr-metal] this Metal device would not add {name} to a binary \
                              archive ({why}) — running without a persisted pipeline cache."
                         );
@@ -341,7 +341,7 @@ impl ArchiveCache {
             Ok(true) => true,
             Ok(false) => false,
             Err(ref e) => {
-                eprintln!(
+                tracing::warn!(
                     "[infr-metal] could not serialize the pipeline archive ({e}) — this run keeps \
                      its pipelines, but the next launch will compile them again."
                 );

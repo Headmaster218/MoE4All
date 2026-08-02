@@ -301,13 +301,13 @@ fn render_core(
     ) {
         Ok(s) => {
             if cfg.debug.chat {
-                eprintln!("[chat-template] rendered:\n{s}\n[/chat-template]");
+                tracing::info!("[chat-template] rendered:\n{s}\n[/chat-template]");
             }
             Ok(s)
         }
         Err(e) => {
             if cfg.debug.chat {
-                eprintln!("[chat-template] render error: {e:#}");
+                tracing::info!("[chat-template] render error: {e:#}");
             }
             Err(TemplateError::Render(e))
         }

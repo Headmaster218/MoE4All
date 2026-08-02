@@ -327,7 +327,7 @@ impl KernelCache {
             dirty = true;
         }
         if dirty {
-            eprintln!(
+            tracing::warn!(
                 "[infr] a previous run seeded the GPU kernel cache and then died without a clean \
                  exit (a hung GPU does exactly that, and a cached kernel binary is the prime \
                  suspect) — discarding {} and recompiling. This costs one slow start.",
@@ -367,7 +367,7 @@ impl KernelCache {
             // Damaged file: never hand it to the driver (invalid cache data is explicitly
             // undefined behavior, and on a GPU that reads as a hung ring rather than an error).
             // Drop it and let this launch rebuild.
-            eprintln!(
+            tracing::warn!(
                 "[infr] kernel cache {} failed its checksum — discarding and rebuilding",
                 path.display()
             );

@@ -282,7 +282,7 @@ impl SlotPool {
                     self.slots.len() - 1
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "kv slots: fork of a {}th slot failed ({e}); recycling the LRU slot \
                          instead (fewer concurrent conversations keep their KV)",
                         self.slots.len() + 1,
@@ -538,7 +538,7 @@ impl SeamModel {
         // `Config` the backend was built with) — one value, so the clamp ladder and the
         // allocator cannot disagree about whether the spill is armed.
         if vk.cfg().kv.overflow {
-            eprintln!(
+            tracing::warn!(
                 "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
                  INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
             );
@@ -601,7 +601,7 @@ impl SeamModel {
                 gib(fp.total()),
             ));
         }
-        eprintln!(
+        tracing::warn!(
             "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
              {:.2} GiB available{}); set INFR_CTX to override",
             fp.total() as f64 / (1u64 << 30) as f64,
@@ -834,7 +834,7 @@ impl SeamModel {
         let per_slot = (budget / n_slots).max(crate::seam::MIN_SESSION_CTX);
         let ctx = trained.min(per_slot);
         if ctx < trained {
-            eprintln!(
+            tracing::warn!(
                 "ctx clamp: --parallel {n_slots} -> per-slot context {trained} -> {ctx} \
                  (each of the {n_slots} slots owns a full KV cache; their total stays within the \
                  same VRAM budget a single slot is held to). Set --ctx to override."
@@ -1554,7 +1554,7 @@ impl SeamModel {
                 session.max_ctx,
             )?;
             if self.ecfg.spec.debug {
-                eprintln!(
+                tracing::info!(
                     "[spec] draft {:.1}ms verify {:.1}ms (exec {:.1}ms) cand={}",
                     td.as_secs_f64() * 1e3,
                     tv.elapsed().as_secs_f64() * 1e3,

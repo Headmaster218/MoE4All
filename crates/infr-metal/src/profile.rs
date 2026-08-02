@@ -58,6 +58,9 @@ impl Profile {
         let total: Duration = self.per_op.values().map(|(_, d)| *d).sum();
         let total_s = total.as_secs_f64().max(1e-9);
 
+        // print-ok: the `prof.stages` profiling REPORT — same category as `infr_core::prof::OpProf`'s
+        // table (which the next lines feed): column-aligned output the user asked for, not a
+        // diagnostic, and a per-line `tracing` prefix would destroy the columns.
         eprintln!("\n── infr-metal profile ({} forwards) ──", self.forwards);
         if !self.per_op_gpu.is_empty() {
             let mut p = infr_core::prof::OpProf::new("metal", infr_core::prof::Unit::Device);
@@ -78,11 +81,13 @@ impl Profile {
         // separately rather than as fractions of each other.
         let dwall = self.dispatch_wall.as_secs_f64();
         let f = self.forwards as f64;
+        // print-ok: report line, see above.
         eprintln!(
             "── CPU encode: {:.1} ms total ({:.2} ms/forward)",
             total_s * 1e3,
             total_s * 1e3 / f
         );
+        // print-ok: report line, see above.
         eprintln!(
             "── GPU (commit+wait): {:.1} ms total ({:.2} ms/forward) over {} command buffers ({:.2}/forward)",
             dwall * 1e3,

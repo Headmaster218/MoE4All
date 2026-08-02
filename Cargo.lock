@@ -1134,6 +1134,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers 0.20.4",
+ "tracing",
 ]
 
 [[package]]
@@ -1171,6 +1172,7 @@ dependencies = [
  "libc",
  "thiserror 2.0.18",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1186,6 +1188,7 @@ dependencies = [
  "infr-prof-rt",
  "infr-testkit",
  "rayon",
+ "tracing",
 ]
 
 [[package]]
@@ -1271,6 +1274,7 @@ dependencies = [
  "infr-testkit",
  "metal",
  "objc",
+ "tracing",
 ]
 
 [[package]]

@@ -1054,7 +1054,7 @@ impl Drop for WeightProgress {
         // its device memory; what remains is weights + already-allocated session buffers.
         if self.vram_log {
             let v = vram_info(&self.shared);
-            eprintln!(
+            tracing::info!(
                 "post-load vram in use: {:.2} GiB of {:.2} GiB ({})",
                 v.total.saturating_sub(v.available) as f64 / (1u64 << 30) as f64,
                 v.total as f64 / (1u64 << 30) as f64,
@@ -1408,7 +1408,7 @@ impl VulkanBackend {
                 })
                 .map(|h| mp.memory_heaps[h].size)
                 .sum();
-            eprintln!(
+            tracing::info!(
                 "[infr] vulkan device Vulkan{i}: {name} ({}, {})",
                 device_type_str(p.device_type),
                 fmt_bytes(dev_local),
@@ -1432,7 +1432,7 @@ impl VulkanBackend {
             let p = unsafe { instance.get_physical_device_properties(physical_device) };
             let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
             let idx = pdevices.iter().position(|&pd| pd == physical_device);
-            eprintln!(
+            tracing::info!(
                 "[infr] vulkan: selected {}{name} ({})",
                 idx.map(|i| format!("Vulkan{i}=")).unwrap_or_default(),
                 device_type_str(p.device_type),
@@ -1657,7 +1657,7 @@ impl VulkanBackend {
                     (m, n, k, a.as_raw(), b.as_raw(), c.as_raw(), r.as_raw())
                 })
                 .collect();
-            eprintln!(
+            tracing::info!(
                 "[infr] coopmat configs (M,N,K,aType_raw,bType_raw,cType_raw,resultType_raw): \
                  {raws:?}"
             );
@@ -1780,16 +1780,16 @@ impl VulkanBackend {
         // an 8x8x16 f16 config it changes NOTHING, and the kernel set stays identical.
         if cm8_env {
             match coopmat_f16 {
-                Some(infr_core::COOPMAT_TILE_8) => eprintln!(
+                Some(infr_core::COOPMAT_TILE_8) => tracing::info!(
                     "[infr] INFR_CM_8X8=1: 8x8x16 f16 coopmat selected — native_gemm_warp _cm8 \
                      prefill tier live (other coopmat families stay on their non-coopmat \
                      fallbacks)"
                 ),
-                Some(_) => eprintln!(
+                Some(_) => tracing::warn!(
                     "[infr] INFR_CM_8X8=1 has no effect: device provides the default 16x16x16 \
                      f16 coopmat tile — kernel set unchanged"
                 ),
-                None => eprintln!(
+                None => tracing::warn!(
                     "[infr] INFR_CM_8X8=1 has no effect: device enumerates no usable 8x8x16 f16 \
                      coopmat config (or coopmat is disabled) — kernel set unchanged"
                 ),
@@ -1798,7 +1798,7 @@ impl VulkanBackend {
         // Extend the `debug.coopmat` dump with the CHOSEN shape per component type (the raw
         // enumeration is printed above, before selection).
         if cfg.debug.coopmat {
-            eprintln!(
+            tracing::info!(
                 "[infr] coopmat chosen shapes (M,N,K): f16={coopmat_f16:?} bf16={coopmat_bf16:?} \
                  f8={coopmat_f8:?} i8={coopmat_i8:?}"
             );
@@ -2028,7 +2028,7 @@ impl VulkanBackend {
         // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
         // unchanged). 32 is always pinnable here (hard-required above).
         let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
-            eprintln!(
+            tracing::warn!(
                 "[infr] INFR_SG=16 requested but this device's subgroup range \
                  [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
             );
@@ -2119,7 +2119,7 @@ impl VulkanBackend {
         // across `warmup()` + every turn (see `chat/vulkan.rs`'s `mtp_vk`), so an ordinary
         // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
         let yn = |b: bool| if b { "y" } else { "n" };
-        eprintln!(
+        tracing::info!(
             "[infr] GPU: {} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} i8cm:{} \
              subgroup:{}-{} sgp:{} shared:{}KB",
             caps.name,
@@ -2151,7 +2151,7 @@ impl VulkanBackend {
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
         // prefills slowly. Silent on every discrete device (nothing changed there).
         if caps.integrated {
-            eprintln!(
+            tracing::info!(
                 "[infr] GPU: INTEGRATED (cu:{}) — prefill chunk {} rows, forward split every {} \
                  dispatches to stay under the GPU hang watchdog; INFR_UBATCH / \
                  INFR_SUBMIT_DISPATCHES override",
@@ -2180,7 +2180,7 @@ impl VulkanBackend {
                     dev_local += mp.memory_heaps[i].size;
                 }
             }
-            eprintln!(
+            tracing::info!(
                 "[infr] GPU: UNIFIED MEMORY — budgeting against all {} heaps ({}), not the \
                  device-local slice alone ({}); this GPU's memory IS system RAM",
                 mp.memory_heap_count,
@@ -3510,7 +3510,7 @@ impl Backend for VulkanBackend {
             return;
         }
         if let Some(line) = spill_report_line(self.shared.kv_spill.counts(), &KV_SPILL, fmt_bytes) {
-            eprintln!("{line}");
+            tracing::info!("{line}");
         }
     }
 

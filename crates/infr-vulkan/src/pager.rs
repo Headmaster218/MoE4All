@@ -927,7 +927,7 @@ impl MoePagerSession {
         }
         for p in &self.pools {
             let s = p.pager.stats();
-            eprintln!(
+            tracing::info!(
                 "[moe pager] {}/{:.1}MB: {} slots={}",
                 p.role.name(),
                 p.slot_bytes as f64 / 1e6,
@@ -1157,7 +1157,7 @@ impl DensePagerSession {
         }
         for (i, p) in self.pools.iter().enumerate() {
             let s = p.pager.stats();
-            eprintln!(
+            tracing::info!(
                 "[dense pager] pool{i}/{:.1}MB: {} slots={}/{}",
                 p.spec.slot_bytes as f64 / 1e6,
                 stats_suffix(&s),

@@ -414,6 +414,9 @@ impl SweepReport {
     /// Print every case, then panic listing the failures (if any).
     pub fn assert_ok(&self) {
         for c in &self.cases {
+            // print-ok: infr-testkit is the shared TEST harness — every caller is a `#[test]`, and
+            // this is the per-case line the failing assertion below is read against. Category 3
+            // (test output) applies to the crate's whole public surface.
             println!("[{}] {}", self.label, c.line());
         }
         let bad: Vec<String> = self

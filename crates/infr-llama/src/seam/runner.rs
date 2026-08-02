@@ -3265,7 +3265,7 @@ pub(crate) fn generate_dense_backend(
         if plan_sc && sc_embt.is_none() {
             let t_embt0 = std::time::Instant::now();
             *sc_embt = Some(build_sc_embt(be, token_embd, ne, c.vocab)?);
-            eprintln!(
+            tracing::info!(
                 "[diffusion denoise] built the SC soft-embedding weight ({:.0} MB) in {:.2}s",
                 (ne * c.vocab * 2) as f64 / 1e6,
                 t_embt0.elapsed().as_secs_f64()
@@ -3429,7 +3429,7 @@ pub(crate) fn generate_dense_backend(
             *sc_ping_write = 1 - *sc_ping_write;
         }
         if time_diffusion {
-            eprintln!(
+            tracing::info!(
                 "[diffusion denoise] sc={sc_secs:.3}s build={build_secs:.3}s exec={exec_secs:.3}s dl={dl_secs:.3}s total={:.3}s",
                 sc_secs + build_secs + exec_secs + dl_secs,
             );
@@ -3583,7 +3583,7 @@ pub(crate) fn generate_dense_backend(
         }
         let vdl_secs = t_vdl0.elapsed().as_secs_f64();
         if time_verify {
-            eprintln!(
+            tracing::info!(
                 "[mtp verify] m={m} start={start} full_reprefill={full_reprefill} \
                  build={:.1}ms compile={:.1}ms exec={:.1}ms dl={:.1}ms total={:.1}ms",
                 vbuild_secs * 1e3,
@@ -3837,7 +3837,7 @@ pub(crate) fn generate_dense_backend(
             // compile, and execute (record + submit + GPU) — where a small-batch chunk's fixed
             // cost lives decides whether to attack recording or kernels.
             if ec.prof.stages {
-                eprintln!(
+                tracing::info!(
                     "[pf prof] m={pf_m} build={:.1}ms compile={:.1}ms execute={:.1}ms",
                     t_build.as_secs_f64() * 1e3,
                     (t_compile - t_build).as_secs_f64() * 1e3,
@@ -4333,7 +4333,7 @@ pub(crate) fn generate_dense_backend(
                 0.0
             }
         };
-        eprintln!(
+        tracing::info!(
             "[cpu prof] prompt {} tok in {:.2}s ({:.1} tok/s) | decode {} tok in {:.2}s ({:.2} tok/s)",
             prompt.len(),
             prompt_t.as_secs_f64(),
@@ -4344,7 +4344,7 @@ pub(crate) fn generate_dense_backend(
         );
     }
     if prof_dec && decode_n > 0 {
-        eprintln!(
+        tracing::info!(
             "[dec prof] {} decode tok | setup(build+compile+bind) {:.3}ms/tok | exec(record+submit+gpu) {:.3}ms/tok",
             decode_n,
             dec_setup.as_secs_f64() * 1e3 / decode_n as f64,
