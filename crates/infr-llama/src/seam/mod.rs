@@ -309,11 +309,10 @@ pub(crate) fn generate_dense_vulkan_session(
 /// under-reserving makes the alloc-time VRAM guard error a live request mid-prefill (exactly
 /// what the old formula did on this 31B at pp2048 — the second chunk's 512 MiB `nonfa_pv`
 /// tripped the guard mid-run), over-reserving only streams/clamps a borderline model.
-pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize, ec: &EngineConfig) -> u64 {
-    dense_act_reserve_at(cfg, want_ctx, ubatch_rows(ec))
-}
-
-/// [`dense_act_reserve`] at an EXPLICIT chunk height (the try-resident sweep).
+/// Always taken at an EXPLICIT chunk height: every caller (the try-resident sweep, the streaming
+/// budget, the context-fit math) walks [`ubatch_candidates`] rather than assuming the default
+/// 1024-row chunk — assuming it is what let the KV-format decision and the placement decision
+/// disagree.
 pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
     // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
     let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
@@ -340,8 +339,51 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     };
     let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s) as u64;
     const FIXED: u64 = 256 * 1024 * 1024;
-    FIXED + rows * per_row * 5 / 4
+    let est = FIXED + rows * per_row * 5 / 4;
+    est * ACT_RESERVE_MARGIN.0 / ACT_RESERVE_MARGIN.1
 }
+
+/// INTERIM safety margin on [`dense_act_reserve_at`], as `(numerator, denominator)`.
+///
+/// **Why this term and not the KV term.** KV bytes are computed EXACTLY — per-layer geometry and
+/// each side's dtype, run through `kv_fmt_bytes`, the same sizer the runner hands `Backend::alloc`
+/// — so they need no margin and get none. The activation reserve is a MODEL, and a
+/// measured-wrong one: it prices the non-flash score tile as two live pools at the final context,
+/// while the real pools are keyed by byte size and ACCUMULATE as `kv_len` grows across the ~150+
+/// chunks of a deep prefill. `FIT_FRACTION = 0.95` used to blur the two together; the slack
+/// belongs on the estimate alone.
+///
+/// **Why it is needed at all.** Once [`kv_fit_ctx_for`] returns the exact boundary rather than a
+/// 5%-shy one, any error in this model lands directly as a mid-prefill allocation failure —
+/// i.e. as a default context whose top cannot be filled. Measured on gemma-4-31B UD-Q5_K_XL
+/// (24 GiB 7900 XTX): with no margin the fit advertised 19 973 tokens and a `-d 19000` prefill
+/// died with `VRAM budget exceeded` on a 4 MiB activation alloc.
+///
+/// **Sized by measurement, at the ADVERTISED context, not by choosing a number.** Each candidate
+/// was built, the default context it produces read off the `ctx clamp` line, and a prefill run at
+/// ~100% of THAT context (gemma-4-31B UD-Q5_K_XL, `infr bench -p 0 -n 4 -d <ctx-8>`):
+///
+/// | margin | advertised ctx | prefill at ~100% of it            | peak MiB |
+/// | ------ | -------------- | --------------------------------- | -------- |
+/// | 1.00   | 19 973         | `VRAM budget exceeded` @ d19000   | 24 298   |
+/// | 1.25   | 17 848         | `VRAM budget exceeded` @ d17840   | 24 299   |
+/// | 1.50   | 15 872         | **ok**, 30.2 t/s @ d15864         | 24 142   |
+///
+/// 1.50 is the FIRST rung that fills the window it advertises, so that is what shipped — nothing
+/// was added on top of the measurement. It also holds at d15000 / d12000 / d8000 (30.3 / 30.6 /
+/// 31.2 t/s) and the d15864 peak reproduces byte-for-byte across runs. Remaining spare at the
+/// advertised context is 157 MiB of the 24 299 MiB guard budget (~0.6%) — thin, which is the
+/// argument for B8 rather than for a bigger constant.
+///
+/// Cost: gemma-4-31B's default context goes 19 973 -> 15 872 (against 1024 before this slice, so
+/// the win is 15.5x rather than 19.5x) and it stays FULLY RESIDENT, which is the property worth
+/// 10x on decode. gemma-3-12b is unaffected — still f16 @131072 with no auto-quant, because the
+/// shared chunk ladder absorbs the wider reserve one rung down.
+///
+/// **DELETE THIS when the reserve becomes path-aware (backlog B8).** It stands in for that work;
+/// it is not an input to it, and a path-aware estimate must replace it rather than be stacked on
+/// top of it.
+const ACT_RESERVE_MARGIN: (u64, u64) = (3, 2);
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
@@ -370,6 +412,40 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
 /// True even for a value this reader cannot use (`0`, garbage): see [`ubatch_rows`].
 pub(crate) fn user_pinned_ubatch(ec: &EngineConfig) -> bool {
     ec.device.ubatch_specified
+}
+
+/// The SHRINK ladder the dense placement sweeps walk when the default prefill chunk's activation
+/// reserve is what tips a model out of residency: 512 → 256 → 128 rows. A shorter chunk shrinks
+/// both the activation reserve (whole-chunk scratch scales with rows) and the SWA ring rows
+/// (`window + chunk`), and resident-at-512 decodes ~10x faster than streaming at the PCIe ceiling
+/// — so trading prefill chunk height for residency is strictly the right call.
+///
+/// 128 is the floor: below it the per-dispatch launch overhead dominates prefill entirely.
+pub(crate) const DENSE_UBATCH_LADDER: [usize; 3] = [512, 256, 128];
+
+/// Every prefill chunk height a dense placement decision is allowed to settle on, TALLEST FIRST:
+/// the current/default height ([`ubatch_rows`]) followed by the [`DENSE_UBATCH_LADDER`] rungs
+/// BELOW it. A user-pinned `INFR_UBATCH` is authoritative — the sweeps skip themselves — so the
+/// list is then just that one height.
+///
+/// **One ladder, two readers.** `vulkan_moe_binder`'s residency / auto-q8 / streaming sweeps walk
+/// this to pick a height, and `SeamModel::kv_fit_ctx_fmt` walks the SAME list to decide how much
+/// context fits: a context is accepted when it fits at ANY height placement could settle on.
+/// Before this was shared, the fit math priced the DEFAULT 1024-row chunk's reserve while
+/// placement went on to pick 512 — the KV format was chosen against an assumption the very next
+/// step abandoned (gemma-3-12b: an unnecessary auto-q8 at ctx 131072, while f16 at a 512-row
+/// chunk fits with room to spare). `dense_ubatch_ladder_is_the_only_one` guards the drift.
+///
+/// Filtering to heights `< ubatch_rows(ec)` matters on an INTEGRATED GPU, whose default chunk is
+/// already below 512 ([`default_ubatch_rows`]): an unfiltered ladder would let a "shrink" sweep
+/// RAISE the chunk past the watchdog-safe default and trip `VK_ERROR_DEVICE_LOST`.
+pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
+    let now = ubatch_rows(ec);
+    let mut cands = vec![now];
+    if !user_pinned_ubatch(ec) {
+        cands.extend(DENSE_UBATCH_LADDER.into_iter().filter(|&c| c < now));
+    }
+    cands
 }
 
 /// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
@@ -563,24 +639,45 @@ pub(crate) fn kv_bytes_estimate(
     ubatch: usize,
     q8: bool,
 ) -> u64 {
+    let side = if q8 { DType::Q8_0 } else { DType::F16 };
+    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, side, side)
+}
+
+/// Rows of headroom every KV footprint estimate adds PER LAYER on top of the context's own rows.
+///
+/// The runner allocates exactly `kv_rows(..) * n_kv * head_dim` elements per side (see
+/// `generate_dense_backend`'s KV loop and `SeamKv::fork`) — this is deliberate slop, not a
+/// pad the allocation actually contains, so every estimate that uses it is conservative by a
+/// bounded, layer-proportional amount rather than by an unexplained percentage.
+pub(crate) const KV_SLOP_ROWS: usize = 64;
+
+/// [`kv_bytes_estimate`] with the two sides priced INDEPENDENTLY. `INFR_KV_TYPE_K` and
+/// `INFR_KV_TYPE_V` are separate knobs and the runner allocates each side in its own dtype, so
+/// the context-fit math — which must compare against the REAL allocation size — cannot go through
+/// the single-`q8` flavor above.
+pub(crate) fn kv_bytes_estimate_fmt(
+    cfg: &Config,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
-            let elems = (cfg.layer_n_kv(l) * cfg.layer_head_dim(l)) as u64
-                * (kv_rows_at(cfg, l, want_ctx, ring, ubatch) as u64 + 64);
-            kv_pair_bytes(elems, q8)
+            let elems = (cfg.layer_n_kv(l) * cfg.layer_head_dim(l))
+                * (kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS);
+            kv_pair_bytes(elems, k_fmt, v_fmt)
         })
         .sum()
 }
 
-/// K+V byte footprint for ONE layer at `elems` per-side elements (rows × n_kv × head_dim): both
-/// sides Q8_0 (34 B / 32-elem block, rounded to a u32 multiple — mirrors [`kv_fmt_bytes`]) when
-/// `q8`, else both f16 (2 B/elem). The pure per-layer core of [`kv_bytes_estimate`], honoring the
-/// q8 flag so the dense sweep and the MoE budget price a pinned auto-q8 cache at ~half the bytes.
-fn kv_pair_bytes(elems: u64, q8: bool) -> u64 {
-    let side = if q8 { DType::Q8_0 } else { DType::F16 };
+/// K+V byte footprint for ONE layer at `elems` per-side elements (rows × n_kv × head_dim), each
+/// side in its own dtype. The pure per-layer core of [`kv_bytes_estimate_fmt`].
+fn kv_pair_bytes(elems: usize, k_fmt: DType, v_fmt: DType) -> u64 {
     // Priced through the SAME sizer the runner allocates with, so "mirrors `kv_fmt_bytes`" is
     // now a call rather than a comment.
-    2 * kv_fmt_bytes(side, elems as usize) as u64
+    (kv_fmt_bytes(k_fmt, elems) + kv_fmt_bytes(v_fmt, elems)) as u64
 }
 
 /// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
@@ -611,6 +708,98 @@ pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
         && ec.kv.ring
         && fmt_ok(ec.kv.type_k_specified, ec.kv.type_k)
         && fmt_ok(ec.kv.type_v_specified, ec.kv.type_v)
+}
+
+/// The smallest context a session is worth opening with. A window below this is useless for any
+/// real prompt, so it is the line between "clamp the default context" and "this model cannot be
+/// served on this device at all" (`SeamModel::clamp_default_ctx`'s refuse rung), and the floor
+/// every derived per-slot / fractional window is held to.
+pub(crate) const MIN_SESSION_CTX: usize = 1024;
+
+/// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
+/// activation reserve both PLATEAU with context — every attention layer sliding-window (so the
+/// ring caps its rows) and head_dim 128 with no score tile. There the fit is bounded by nothing
+/// physical, and a number is still needed; 4 Mi tokens is past any trained window in existence.
+const CTX_FIT_SEARCH_CAP: usize = 1 << 22;
+
+/// The EXACT largest context whose KV cache + activation reserve fit `available` bytes alongside
+/// `weights` — the arithmetic half of [`SeamModel::kv_fit_ctx_fmt`], split out so it is testable
+/// without a GPU (`kv_fit_*` in `seam_helper_tests`).
+///
+/// Two things make it exact where the old estimator was not:
+///
+///  - **KV bytes are the real allocation**, not a bytes-per-token rate divided into a budget:
+///    [`kv_bytes_estimate_fmt`] prices each layer's K and V buffers through the same
+///    `kv_fmt_bytes` sizer the runner hands `Backend::alloc`, including the SWA ring's row cap
+///    and each side's own dtype. A `0.95` fudge factor used to stand in for the block-quant
+///    rounding and the ring split that this now computes directly.
+///  - **The reserve is priced at the chunk height placement will ACTUALLY settle on.** A context
+///    is accepted when it fits at ANY height in [`ubatch_candidates`], because the dense
+///    placement sweep walks that same ladder and will shrink the prefill chunk to keep the
+///    session resident. Pricing only the default 1024-row chunk here made the KV-format decision
+///    against an assumption placement then abandoned — which is exactly how gemma-3-12b talked
+///    itself into an unnecessary q8 cache at ctx 131072.
+///
+/// Returns the RAW fit, which may be below [`MIN_SESSION_CTX`] (or `0`) — that is the signal the
+/// refuse rung reads. `None` for a pure recurrent-state arch: no per-token KV to size.
+///
+/// MoE models keep the plain `total/12` heuristic: their placement budgets pager arenas
+/// separately from this and never walks the dense chunk ladder.
+pub(crate) fn kv_fit_ctx_for(
+    cfg: &Config,
+    ec: &EngineConfig,
+    weights: u64,
+    available: u64,
+    vram_total: u64,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
+    if (0..cfg.n_layer).all(|l| cfg.layer_n_kv(l) * cfg.layer_head_dim(l) == 0) {
+        return None;
+    }
+    // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`): the config/env gate
+    // AND f16/q8 on both sides. A low-bit side keeps full-context caches, so pricing it as a ring
+    // would hand out a context the allocation cannot honor.
+    let ring = kv_ring_wanted(cfg, ec)
+        && matches!(k_fmt, DType::F16 | DType::Q8_0)
+        && matches!(v_fmt, DType::F16 | DType::Q8_0);
+    let cands = ubatch_candidates(ec);
+    let reserve = |ctx: usize, ubatch: usize| -> u64 {
+        if cfg.moe.is_some() {
+            (vram_total / 12).max(1024 * 1024 * 1024)
+        } else {
+            dense_act_reserve_at(cfg, ctx, ubatch)
+        }
+    };
+    let fits = |ctx: usize| -> bool {
+        cands.iter().any(|&ubatch| {
+            weights
+                .saturating_add(kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt))
+                .saturating_add(reserve(ctx, ubatch))
+                <= available
+        })
+    };
+    // Monotone in ctx (both terms grow with it), so double-then-bisect finds the exact boundary.
+    if !fits(0) {
+        return Some(0);
+    }
+    let (mut lo, mut hi) = (0usize, 1usize);
+    while hi < CTX_FIT_SEARCH_CAP && fits(hi) {
+        lo = hi;
+        hi = (hi * 2).min(CTX_FIT_SEARCH_CAP);
+    }
+    if fits(hi) {
+        return Some(hi); // plateaued: the cap IS the answer.
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
 }
 
 /// One resident-BDA / streamed-arena addressing unit's ELEMENT-count cap (the invariant's element
@@ -923,7 +1112,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //   1. `INFR_CACHE=<size>` on a DENSE model — force EVERY streamable block through the
     //      streamer with that byte budget (deterministic test hook, same grammar as the MoE tier).
     //   2. Auto (unset): TRY RESIDENT FIRST — fully resident (the fast path, zero change) when
-    //      weights + KV + the honest dense activation reserve (`dense_act_reserve`) fit live
+    //      weights + KV + the honest dense activation reserve (`dense_act_reserve_at`) fit live
     //      VRAM; otherwise stream with budget = remaining VRAM after resident-weights+KV+reserve.
     //      An explicit oversized INFR_CTX whose KV can't sit beside resident weights falls back
     //      to streaming the same way (never clamped here — the ctx the caller asked for is kept).
@@ -1034,7 +1223,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // throughput, while q8 KV costs ~10-16% GQA decode — prefer the cheaper concession.
         let mut resident = fits(ubatch_rows(ec), kv_auto_q8());
         if !resident && !user_pinned_ubatch(ec) && cache_override.is_none() {
-            for cand in [512usize, 256, 128] {
+            // Shared ladder (`ubatch_candidates`) minus its first rung, which is the height
+            // `resident` above already priced.
+            for cand in ubatch_candidates(ec).into_iter().skip(1) {
                 if fits(cand, kv_auto_q8()) {
                     pin_ubatch(cand);
                     // Re-read through the pin (a racing earlier set wins — use whatever stuck).
@@ -1069,12 +1260,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             && kv_unset(ec)
             && kv_q8_layout_ok(cfg)
         {
-            let ub_now = ubatch_rows(ec);
-            let mut cands = vec![ub_now];
-            if !user_pinned_ubatch(ec) {
-                cands.extend([512usize, 256, 128].into_iter().filter(|&c| c < ub_now));
-            }
-            for cand in cands {
+            for cand in ubatch_candidates(ec) {
                 if fits(cand, true) {
                     pin_kv_auto_q8();
                     if cand != ubatch_rows(ec) {
@@ -1082,9 +1268,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     }
                     // Re-read through the pins (racing earlier sets win — use whatever stuck).
                     if kv_auto_q8() && fits(ubatch_rows(ec), true) {
-                        eprintln!(
-                            "kv auto-quant: q8_0 (f16 KV wouldn't fit resident at ctx={want_ctx}; \
-                             INFR_KV_TYPE_K/V=f16 to force f16)"
+                        tracing::warn!(
+                            requested_ctx = want_ctx,
+                            prefill_chunk = ubatch_rows(ec),
+                            kv_dtype = "q8_0",
+                            "kv auto-quant: q8_0 KV cache — an f16 cache would not fit resident \
+                             at ctx={want_ctx} at any prefill chunk height; set \
+                             INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% slower on q8)"
                         );
                         resident = true;
                     }
@@ -1145,8 +1335,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         ) >= need
                     };
                     let ub_now = ubatch_rows(ec);
-                    let mut cands = vec![ub_now];
-                    cands.extend([512usize, 256, 128].into_iter().filter(|&c| c < ub_now));
+                    let cands = ubatch_candidates(ec);
                     let pick = cands
                         .iter()
                         .copied()
@@ -2431,7 +2620,7 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
-    use super::{kv_pair_bytes, EngineConfig, PlacementPins, PlacementScope};
+    use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
 
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
     // (S4 deleted this crate's duplicate of that grammar — §6.11).
@@ -2520,17 +2709,359 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn kv_pair_bytes_honors_q8_flag() {
+    fn kv_pair_bytes_prices_each_side_in_its_own_dtype() {
         // q8 prices K+V at ~half the f16 bytes (34 B / 32-elem block vs 2 B/elem, ×2 sides).
-        let elems = 32_000u64;
-        let f16 = kv_pair_bytes(elems, false);
-        let q8 = kv_pair_bytes(elems, true);
-        assert_eq!(f16, 2 * 2 * elems); // 128_000
-        assert_eq!(q8, 2 * (elems / 32 * 34)); // 68_000, already u32-aligned
+        let elems = 32_000usize;
+        let f16 = kv_pair_bytes(elems, DType::F16, DType::F16);
+        let q8 = kv_pair_bytes(elems, DType::Q8_0, DType::Q8_0);
+        assert_eq!(f16, 2 * 2 * elems as u64); // 128_000
+        assert_eq!(q8, 2 * (elems as u64 / 32 * 34)); // 68_000, already u32-aligned
         assert!(
             q8 < f16 && q8 * 2 > f16,
             "q8 must be ~half of f16, not equal"
         );
+        // The MIXED case the single-flag helper could not express: `INFR_KV_TYPE_K=q8_0` with V
+        // left at f16 is exactly one of each, not two of either.
+        let mixed = kv_pair_bytes(elems, DType::Q8_0, DType::F16);
+        assert_eq!(mixed, q8 / 2 + f16 / 2);
+        assert!(mixed > q8 && mixed < f16);
+    }
+
+    // ── context-fit math (`kv_fit_ctx_for`) ──────────────────────────────────────────────────
+    //
+    // GPU-free: the function takes the weight footprint and the device's byte figures as plain
+    // arguments, so every case below is exact arithmetic. Model geometry and weight footprints are
+    // read off the real GGUFs (`Config::from_gguf` + `weights::weight_footprint`); the byte figures
+    // are this box's 7900 XTX (`/sys/class/drm/card1/device/mem_info_vram_total` = 25 753 026 560,
+    // live free ~23.94 GiB on an idle desktop).
+
+    /// RX 7900 XTX, 24 GB.
+    const XTX_TOTAL: u64 = 25_753_026_560;
+    /// What `VulkanBackend::alloc_room()` reports on an idle XTX: live free (~23.94 GiB) minus the
+    /// allocator guard's own 256 MiB headroom. Anything the fit math plans past this the VRAM
+    /// guard will refuse, so this — not the raw free figure — is the budget.
+    const XTX_ROOM: u64 = 25_701_257_216 - 256 * 1024 * 1024;
+
+    /// gemma-3-12b-it-Q4_K_M — the reported case. Geometry from the GGUF metadata.
+    fn gemma3_12b() -> Config {
+        Config {
+            n_layer: 48,
+            n_head: 16,
+            n_kv: 8,
+            n_kv_swa: 8,
+            head_dim: 256,
+            head_dim_swa: 256,
+            n_embd: 3840,
+            n_ff: 15360,
+            swa_window: 1024,
+            swa_pattern: 6,
+            n_ctx_train: 131072,
+            ..Default::default()
+        }
+    }
+    /// `weights::weight_footprint` of that GGUF.
+    const GEMMA3_12B_WEIGHTS: u64 = 7_292_694_912;
+
+    /// A plain dense model with NO sliding window and head_dim 128 — the flash tier, so
+    /// `dense_act_reserve_at`'s score-tile term is zero and the KV grows strictly linearly.
+    /// Qwen3-14B's geometry.
+    fn qwen3_14b() -> Config {
+        Config {
+            n_layer: 40,
+            n_head: 40,
+            n_kv: 8,
+            head_dim: 128,
+            n_embd: 5120,
+            n_ff: 17408,
+            n_ctx_train: 40960,
+            ..Default::default()
+        }
+    }
+
+    /// Re-derive the accept predicate from the shared primitives and assert `fit` is EXACTLY its
+    /// boundary: it fits, and one more token does not. Returns nothing — it panics with detail.
+    fn assert_exact_boundary(
+        cfg: &Config,
+        ec: &EngineConfig,
+        weights: u64,
+        room: u64,
+        k: DType,
+        v: DType,
+        fit: usize,
+    ) {
+        let ring = super::kv_ring_wanted(cfg, ec)
+            && matches!(k, DType::F16 | DType::Q8_0)
+            && matches!(v, DType::F16 | DType::Q8_0);
+        let need = |ctx: usize, ub: usize| {
+            weights
+                + super::kv_bytes_estimate_fmt(cfg, ctx, ring, ub, k, v)
+                + super::dense_act_reserve_at(cfg, ctx, ub)
+        };
+        let cands = super::ubatch_candidates(ec);
+        let best = |ctx: usize| cands.iter().map(|&ub| need(ctx, ub)).min().expect("ladder");
+        assert!(
+            best(fit) <= room,
+            "fit {fit} must FIT: cheapest need {} > room {room}",
+            best(fit)
+        );
+        assert!(
+            best(fit + 1) > room,
+            "fit {fit} must be the LARGEST: {} tokens also fits (need {} <= room {room})",
+            fit + 1,
+            best(fit + 1)
+        );
+    }
+
+    /// The linear (no-ring) branch, both element sizes: the returned context is the exact largest
+    /// that fits, not an approximation of it. A `0.95` haircut or a `saturating_sub(64)` on the
+    /// RESULT — what this replaced — fails the second half of the boundary check.
+    #[test]
+    fn kv_fit_linear_is_the_exact_largest_context() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = qwen3_14b();
+        let ec = EngineConfig::default();
+        let weights = 9 * (1u64 << 30);
+        for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
+            let fit = super::kv_fit_ctx_for(&cfg, &ec, weights, XTX_ROOM, XTX_TOTAL, k, v)
+                .expect("has KV");
+            assert_exact_boundary(&cfg, &ec, weights, XTX_ROOM, k, v, fit);
+        }
+        // q8 is ~half the bytes per token, so it must buy materially more context than f16.
+        let f16 = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            weights,
+            XTX_ROOM,
+            XTX_TOTAL,
+            DType::F16,
+            DType::F16,
+        )
+        .expect("has KV");
+        let q8 = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            weights,
+            XTX_ROOM,
+            XTX_TOTAL,
+            DType::Q8_0,
+            DType::Q8_0,
+        )
+        .expect("has KV");
+        assert!(q8 > f16, "q8 {q8} must beat f16 {f16}");
+        assert!(q8 < 2 * f16, "q8 {q8} is ~2x f16 {f16}, not more");
+    }
+
+    /// The SWA-ring branch, both element sizes. A window layer's KV stops growing with context
+    /// once the ring caps its rows, so the fit is enormously larger than the same model priced
+    /// without the ring — and it is still the EXACT boundary.
+    #[test]
+    fn kv_fit_swa_ring_is_exact_and_much_larger_than_linear() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let no_ring = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                ring: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ring = EngineConfig::default();
+        assert!(super::kv_ring_wanted(&cfg, &ring) && !super::kv_ring_wanted(&cfg, &no_ring));
+        for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
+            let a =
+                super::kv_fit_ctx_for(&cfg, &ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, XTX_TOTAL, k, v)
+                    .expect("has KV");
+            let b = super::kv_fit_ctx_for(
+                &cfg,
+                &no_ring,
+                GEMMA3_12B_WEIGHTS,
+                XTX_ROOM,
+                XTX_TOTAL,
+                k,
+                v,
+            )
+            .expect("has KV");
+            assert_exact_boundary(&cfg, &ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, a);
+            assert_exact_boundary(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, b);
+            assert!(
+                a > b * 4,
+                "40 of 48 layers ring: {a} should dwarf the full-cache fit {b}"
+            );
+        }
+    }
+
+    /// **Regression, the reported case.** gemma-3-12b at its trained 131072 window on a 24 GiB
+    /// XTX fits at f16 — it never needed the q8 cache the clamp used to pin. What used to make it
+    /// miss is priced here explicitly: the DEFAULT 1024-row prefill chunk's activation reserve
+    /// does not fit, a SHORTER rung of the same ladder the dense placement sweep walks does, and
+    /// the sweep would have shrunk to it anyway. Pricing only the default chunk decided the KV
+    /// format against an assumption the very next step abandoned.
+    ///
+    /// Deliberately does not name the winning rung. Which one it is moves with
+    /// `ACT_RESERVE_MARGIN` (512 unmargined, 256 at the 1.5 shipped today) and that is not what
+    /// this is guarding — the invariant is "the default chunk misses, a lower rung on the SHARED
+    /// ladder saves it, and f16 therefore reaches the trained window".
+    ///
+    /// (Whole-run confirmation is `infr bench -d 120000` on the real model, which peaks at
+    /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
+    #[test]
+    fn kv_fit_walks_the_placement_chunk_ladder_gemma3_12b() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        let want = cfg.n_ctx_train;
+        let need = |ub: usize| {
+            GEMMA3_12B_WEIGHTS
+                + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, DType::F16, DType::F16)
+                + super::dense_act_reserve_at(&cfg, want, ub)
+        };
+        let cands = super::ubatch_candidates(&ec);
+        assert_eq!(cands[0], 1024, "the default chunk leads the ladder");
+        assert!(
+            need(1024) > XTX_ROOM,
+            "the default chunk really does not fit — otherwise this test proves nothing"
+        );
+        let rescued_by = cands.iter().copied().find(|&ub| need(ub) <= XTX_ROOM);
+        assert!(
+            rescued_by.is_some_and(|ub| ub < 1024),
+            "…but a SHORTER rung of the shared ladder must: {:?}",
+            cands.iter().map(|&ub| (ub, need(ub))).collect::<Vec<_>>()
+        );
+
+        let fit = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            GEMMA3_12B_WEIGHTS,
+            XTX_ROOM,
+            XTX_TOTAL,
+            DType::F16,
+            DType::F16,
+        )
+        .expect("has KV");
+        assert!(
+            fit >= want,
+            "f16 must reach the trained window ({want}); got {fit} — the auto-q8 rung would fire"
+        );
+    }
+
+    /// The interim activation-reserve margin (`ACT_RESERVE_MARGIN`) is REALLY in the number, and
+    /// the formula around it is the one documented on `dense_act_reserve_at`. Spelled out term by
+    /// term for gemma-4-31B's shape at a 128-row chunk and ctx 16384, so deleting the margin — or
+    /// quietly changing a coefficient — fails here rather than showing up as a `VRAM budget
+    /// exceeded` on someone's deep prefill.
+    ///
+    /// When backlog B8 lands (a path-aware reserve), this test goes with the margin. It is not a
+    /// floor to build on.
+    #[test]
+    fn act_reserve_carries_the_interim_margin() {
+        let cfg = Config {
+            n_head: 32,
+            head_dim: 512,
+            head_dim_swa: 256,
+            swa_window: 1024,
+            swa_pattern: 6,
+            n_embd: 5376,
+            n_ff: 21504,
+            ..Default::default()
+        };
+        let (ctx, ubatch) = (16384usize, 128usize);
+        let rows: u64 = 128; // already a multiple of 64
+        let attn_pv: u64 = 32 * 32 * 768; // n_head x (head_dim + head_dim_swa), both shapes live
+        let attn_s: u64 = 4 * 32 * 16384; // non-flash score tiles: hd 512 misses the flash tier
+        let per_row = 12 * 21504 + 96 * 5376 + attn_pv + attn_s;
+        let unmargined = 256 * 1024 * 1024 + rows * per_row * 5 / 4;
+        assert_eq!(unmargined, 853_671_936);
+
+        let got = super::dense_act_reserve_at(&cfg, ctx, ubatch);
+        assert_eq!(
+            got,
+            unmargined * super::ACT_RESERVE_MARGIN.0 / super::ACT_RESERVE_MARGIN.1,
+            "reserve must be the model TIMES the interim margin"
+        );
+        assert!(
+            got > unmargined,
+            "the margin must actually widen the reserve — {got} vs {unmargined}"
+        );
+        assert_eq!(
+            got, 1_280_507_904,
+            "1.5x, the measured value that lets \
+             gemma-4-31B fill the context it advertises"
+        );
+    }
+
+    /// The ladder is ONE list. Both readers — `vulkan_moe_binder`'s residency / auto-q8 /
+    /// streaming sweeps and `kv_fit_ctx_for` — call [`super::ubatch_candidates`], so a rung added
+    /// or removed cannot reach one and miss the other. This pins its shape, including the two
+    /// rules that are easy to lose in a refactor: the current height leads, and a user-pinned
+    /// `INFR_UBATCH` collapses the list to that one height.
+    #[test]
+    fn dense_ubatch_ladder_is_the_only_one() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        assert_eq!(super::DENSE_UBATCH_LADDER, [512, 256, 128]);
+        let unset = EngineConfig::default();
+        assert_eq!(super::ubatch_rows(&unset), 1024);
+        assert_eq!(super::ubatch_candidates(&unset), vec![1024, 512, 256, 128]);
+
+        // Rungs at or above the current height are filtered out — a SHRINK ladder must never
+        // raise an integrated GPU past its watchdog-safe default.
+        let pinned = |rows: usize| EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(rows),
+                ubatch_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(super::ubatch_candidates(&pinned(256)), vec![256]);
+        assert_eq!(super::ubatch_candidates(&pinned(2048)), vec![2048]);
+    }
+
+    /// The refuse rung's input: when the weights leave no usable room, the fit reports the honest
+    /// small number (possibly `0`) rather than a floored 1024 that reads as "a session fits".
+    /// `clamp_default_ctx` turns that into an error naming the numbers; that half needs a live
+    /// backend, so it is only exercised by the GPU tests.
+    #[test]
+    fn kv_fit_reports_below_the_floor_instead_of_pretending() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        // Weights fill the card: room left is under the 256 MiB fixed activation reserve alone.
+        let fit = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            XTX_ROOM - 64 * 1024 * 1024,
+            XTX_ROOM,
+            XTX_TOTAL,
+            DType::F16,
+            DType::F16,
+        )
+        .expect("has KV");
+        assert!(
+            fit < super::MIN_SESSION_CTX,
+            "must report the real (unusable) fit, got {fit}"
+        );
+    }
+
+    /// A pure recurrent-state arch has no per-token KV to size — `None`, not `0`, so callers keep
+    /// the trained window instead of clamping to nothing.
+    #[test]
+    fn kv_fit_is_none_without_a_per_token_cache() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = Config {
+            n_layer: 24,
+            n_ctx_train: 32768,
+            ..Default::default() // n_kv == head_dim == 0
+        };
+        assert!(super::kv_fit_ctx_for(
+            &cfg,
+            &EngineConfig::default(),
+            1 << 30,
+            XTX_ROOM,
+            XTX_TOTAL,
+            DType::F16,
+            DType::F16,
+        )
+        .is_none());
     }
 
     #[test]

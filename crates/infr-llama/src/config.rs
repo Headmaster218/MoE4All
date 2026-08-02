@@ -5,7 +5,11 @@ use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
 
-#[derive(Clone, Debug)]
+/// `Default` is an ALL-ZERO placeholder, not a runnable model: [`Config::from_gguf`] is the only
+/// source of a real one. It exists so a test can name the two or three fields the arithmetic it is
+/// checking actually reads (`Config { n_layer: 48, n_kv: 8, ..Default::default() }`) instead of
+/// spelling out sixty irrelevant ones — see `seam_helper_tests`' KV-fit cases.
+#[derive(Clone, Debug, Default)]
 pub struct Config {
     pub n_layer: usize,
     pub n_head: usize,

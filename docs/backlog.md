@@ -485,6 +485,54 @@ path.
    plumbing, and potentially circular — the plan depends on the ctx being sized
    — so it likely needs a fixed-point or a two-pass build.
 
+**Second measurement, and the reason this is now urgent.** With the chunk-ladder
+fix landed, `kv_fit_ctx_for` returns the EXACT boundary of
+`weights + KV + dense_act_reserve_at <= alloc_room`, so any error in the reserve
+is no longer absorbed by slack — it becomes a mid-prefill allocation failure.
+gemma-4-31B UD-Q5_K_XL (weights 21 871 930 488 B, 24 GiB XTX) now resolves its
+default context to 19 968 tokens at a 128-row chunk, and:
+
+| prefill depth | result                                          | peak MiB |
+| ------------- | ----------------------------------------------- | -------- |
+| 8 000         | ok, 31.4 t/s                                    | 23 807   |
+| 12 000        | ok, 30.8 t/s                                    | 24 038   |
+| 16 000        | ok, 30.4 t/s                                    | 24 221   |
+| 19 000        | **`VRAM budget exceeded`** on a 4 MiB act alloc | 24 298   |
+
+So the top ~15-20% of the window it hands out could not actually be filled. The
+term that runs away is the non-flash score tile, which the estimator prices as
+`4 * n_head * ctx_pad` per row ("2 live pools at the final ctx") while the real
+pools are keyed by byte size and ACCUMULATE as `kv_len` grows across the ~150+
+chunks of a deep prefill. Note the failure tracks the prefill DEPTH reached, not
+the context allocated: at margin 1.25 the model advertised a SMALLER context
+(17 848) and still died, at d17840, because the depth tested rose with it.
+Fixing that term is the specific thing that would make an advertised window
+honest.
+
+**An interim margin is in the tree, and it is yours to DELETE.**
+`seam::ACT_RESERVE_MARGIN = (3, 2)` multiplies `dense_act_reserve_at`'s result.
+It is applied to the ESTIMATED term only — KV bytes stay exact, computed from
+geometry and dtype through the runner's own `kv_fmt_bytes` — and it was sized by
+running each candidate and prefilling at ~100% of the context that candidate
+advertises:
+
+| margin | advertised ctx | prefill at ~100% of it          | peak MiB |
+| ------ | -------------- | ------------------------------- | -------- |
+| 1.00   | 19 973         | `VRAM budget exceeded` @ d19000 | 24 298   |
+| 1.25   | 17 848         | `VRAM budget exceeded` @ d17840 | 24 299   |
+| 1.50   | 15 872         | **ok**, 30.2 t/s @ d15864       | 24 142   |
+
+1.50 is the first rung that fills its own window; also verified at d15000 /
+d12000 / d8000 (30.3 / 30.6 / 31.2 t/s), and the d15864 peak reproduces
+byte-for-byte. Remaining spare at the advertised context is **157 MiB of the 24
+299 MiB guard budget (~0.6%)** — thin enough that this entry is the fix, not a
+bigger constant.
+
+A path-aware reserve must REPLACE the margin, not stack on it: delete the
+constant, its multiply in `dense_act_reserve_at`, and the
+`act_reserve_carries_the_interim_margin` test, then re-run the table above and
+show the true reserve fills the window without it.
+
 ### B9 — audit bare `println!`/`eprintln!` onto `tracing`
 
 **Tag:** raised 2026-08-02 · **Blocked on:** nothing; needs the policy below
@@ -496,7 +544,9 @@ near-silent while running. A `tracing` subscriber already exists and covers
 every subcommand (`infr-cli`'s `main()`: `tracing_subscriber::fmt()` with
 `EnvFilter::try_from_default_env()` defaulting to `info`), so converting is safe
 — messages will not vanish. `infr-llama` and `infr-server` already declare
-`tracing`; `infr-llama`'s is currently unused.
+`tracing`; `infr-llama` now uses it for the two KV auto-quant warnings
+(`seam::model::clamp_default_ctx` and `vulkan_moe_binder`'s dense rung) and
+nothing else, so its remaining 33 production sites are the sweep.
 
 Scope, counted by splitting each `src/` file at its first `#[cfg(test)]`:
 
@@ -575,6 +625,81 @@ is doing or how fast.
 2. Should request logging include a prompt preview? Useful for debugging, but it
    puts user prompt text into logs — a privacy decision, not a technical one.
    Default assumption if unanswered: no preview, token counts only.
+
+### B11 — dense placement still budgets against raw free VRAM, not the guard's ceiling
+
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; deliberately scoped out
+of the KV-fit slice to keep the residency decision from moving
+
+`VulkanBackend::check_vram_budget` enforces
+`used + want <= total - GUARD_HEADROOM` (256 MiB), so the largest allocation
+that can ever succeed is `vram().available - GUARD_HEADROOM`.
+`VulkanBackend::alloc_room()` now returns exactly that, and
+`SeamModel::kv_fit_ctx_fmt` budgets against it.
+
+`vulkan_moe_binder`'s dense placement sweeps do NOT — their `fits` closure still
+compares `fp.total() + kv_total_at(..) + dense_act_reserve_at(..)` against
+`vram.available`, i.e. it may declare a model resident while planning 256 MiB
+into memory the allocator will refuse. Same for the streaming `budget_at` and
+the MoE expert-placement budget.
+
+Not changed in the KV-fit slice on purpose: tightening the binder's budget can
+flip a borderline model from resident to streamed, which is a ~10x decode
+regression (gemma-4-31B: 33 t/s resident vs ~3 t/s streamed), so it needs its
+own before/after measurement on the tight models rather than riding along.
+
+Live consequence worth knowing before touching it: the two budgets now disagree
+by more than the 256 MiB, because `ACT_RESERVE_MARGIN` (B8) widens the reserve
+both of them consume while only the fit math also subtracts `GUARD_HEADROOM`. On
+gemma-3-12b @131072 that is visible — the fit math validates the context at a
+256-row chunk while the binder still goes resident at 512. Safe today (the
+binder is the looser of the two, and the run peaks 6.5 GiB under budget), but it
+means the two are no longer picking the same rung, which is the property the
+shared `ubatch_candidates` ladder exists to give. Fix them together.
+
+### B12 — an explicit `--ctx N` never reaches the refuse rung
+
+**Tag:** raised 2026-08-02 · **Blocked on:** a product decision
+
+`SeamModel::clamp_default_ctx` gained a refuse rung: when neither f16 nor q8_0
+can serve even `MIN_SESSION_CTX` tokens it returns an `Err` naming the requested
+context, both fits, the KV bytes needed and the free bytes after weights,
+instead of handing back an unusable window.
+
+It only ever sees the MODEL-DEFAULT context. A user-supplied `--ctx N` /
+`INFR_CTX=N` is taken verbatim — `vulkan_session_on` and `vulkan_slot_ctx`'s
+`SizeSpec::Bytes` arm both return it without consulting the fit math — and fails
+later at allocation time with the generic VRAM-guard message. That is the case
+where "refuse rather than silently degrade" has the most force, and it is the
+one not covered.
+
+The narrowness of the default-path rung is also deliberate and should not be
+widened by accident: refusing whenever the TRAINED window does not fit would
+break every ordinary long-context model on a 24 GiB card (Qwen3-30B-A3B clamps
+262144 → ~50k and runs at 148 t/s; gemma-4-31B clamps 262144 → 19 968). Only "no
+usable context at all" may refuse.
+
+**To do:** decide whether an explicit oversized `--ctx` should fail early with
+the detailed message (a behaviour change on a path documented as "never clamped
+— the user asked") or keep failing at the alloc guard. If early: the check must
+be provable, i.e. exact KV bytes alone + weights > `alloc_room()`, with no
+activation reserve in it, so an over-estimating reserve can never refuse a run
+that would have worked.
+
+### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
+
+**Tag:** verified 2026-08-02 · **Blocked on:** nothing; left alone deliberately
+
+`seam::kv_bytes_estimate_fmt` adds `KV_SLOP_ROWS = 64` rows per layer before
+sizing each side's buffer, and the comment it inherited described this as
+mirroring a pad `SeamKv` allegedly applies. It does not: both allocation sites
+(`generate_dense_backend`'s KV loop and `SeamKv::fork`) allocate exactly
+`kv_rows(..) * n_kv * head_dim` elements. The 64 rows are a deliberate
+conservative margin and nothing more — the doc now says so.
+
+Left in because every placement estimate shares this helper and removing it
+would loosen all of them at once, on a model where (see B8) the remaining margin
+is already ~1%. Worth revisiting only together with a path-aware reserve.
 
 ---
 

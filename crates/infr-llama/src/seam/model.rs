@@ -324,28 +324,6 @@ impl SlotPool {
 #[cfg(target_os = "macos")]
 pub type DenseMetalSession = DenseSession<infr_metal::MetalBackend>;
 
-/// Estimated KV-cache bytes per element for one side (K or V), from the same config the runner
-/// honors (`kv.type_k`/`kv.type_v`, legacy `kv.force_q8`). ESTIMATE ONLY — the runner additionally
-/// gates each format on backend/alignment and falls back to f16, so a gated-out low-bit request
-/// can under-estimate here; the alloc-time VRAM budget guard backstops that.
-/// Unknown/unset → `auto_q8` picks between f16 (2 bytes, the GPU default) and Q8_0 — pass the
-/// current [`crate::seam::kv_auto_q8`] pin (or `true` to PRICE a candidate auto-q8 placement
-/// before pinning it, as `clamp_default_ctx` does).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-fn kv_bytes_per_elem(side: Option<DType>, ec: &crate::EngineConfig, auto_q8: bool) -> f64 {
-    // Format spellings and their per-element rates both come from the shared seam — the same
-    // table the runner turns into an actual allocation — so this estimate can no longer price a
-    // format the runner would allocate differently. Only the DEFAULT ladder (the legacy
-    // `kv.force_q8` alias, then the placement-pinned auto-q8, then f16) is local; it is policy,
-    // not format arithmetic. An unrecognized format name reaches here as `None` (§11 decision 8) —
-    // priced as the ladder's fallback, exactly as the runner will allocate it.
-    match side {
-        Some(dt) => infr_core::budget::kv_bytes_per_elem(dt),
-        None if ec.kv.force_q8 || auto_q8 => infr_core::budget::kv_bytes_per_elem(DType::Q8_0),
-        None => infr_core::budget::kv_bytes_per_elem(DType::F16),
-    }
-}
-
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamModel {
     /// The engine configuration this model was loaded with (see the `ecfg` field). Handed to every
@@ -455,6 +433,7 @@ impl SeamModel {
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
         drop(scope);
+        let max_ctx = max_ctx?;
         Ok(DenseVulkanSession {
             be: vk,
             pool: SlotPool::new(),
@@ -498,75 +477,152 @@ impl SeamModel {
         })
     }
 
-    /// Clamp a DEFAULT context length so the full weight footprint + one KV cache fit the VRAM
-    /// budget (live free bytes when VK_EXT_memory_budget is present — the backend is created
-    /// before the weights upload, so `available` still includes their space). KV bytes/token
-    /// follows the per-layer KV geometry and the runner's KV-dtype env overrides
-    /// (INFR_KV_TYPE_K/V, INFR_KV_Q8). Only ever shrinks, and logs when it does. Extra KV slots
-    /// (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the alloc-time budget
-    /// guard remains the backstop for those.
-    fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> usize {
+    /// Resolve a DEFAULT context length against the VRAM budget: the full weight footprint + one
+    /// KV cache (priced as the exact allocation, [`kv_fit_ctx`](Self::kv_fit_ctx)) + the dense
+    /// activation reserve must fit the live free bytes. The rung ladder, in order:
+    ///
+    ///  1. **f16 fits `want`** → use it, say nothing. (The overwhelmingly common case, and — since
+    ///     the fit now walks the same prefill-chunk ladder placement walks — the case gemma-3-12b
+    ///     at ctx 131072 belongs in and used to miss.)
+    ///  2. **f16 misses, q8_0 reaches `want`** → pin auto-q8 and `tracing::warn!`. Only a FULL
+    ///     rescue pins q8; a partial one keeps the predictable f16 cache, because auto-q8 exists
+    ///     to avoid losing capability, not to trade decode speed for a still-clamped window.
+    ///  3. **`INFR_KV_OVERFLOW`** → keep `want` with the cache in system RAM.
+    ///  4. **Nothing serves even [`MIN_SESSION_CTX`](crate::seam::MIN_SESSION_CTX)** → `Err`. The
+    ///     weights leave no room for a usable cache on this device, so refusing with the numbers
+    ///     beats a session that errors at its first activation alloc.
+    ///  5. Otherwise **clamp and log**, exactly as before.
+    ///
+    /// Rung 4 is deliberately narrow. It fires on "no usable context at all", NOT on "the trained
+    /// window is bigger than this card" — a 262144-token trained window on a 24 GiB card is
+    /// completely ordinary (Qwen3-30B-A3B) and must keep clamping to a working ~50k, not refuse.
+    /// A context the USER asked for explicitly (`--ctx N` / `INFR_CTX=N`) never reaches this
+    /// function at all: those are taken verbatim and backstopped by the alloc-time VRAM guard.
+    ///
+    /// Extra KV slots (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the
+    /// alloc-time budget guard remains the backstop for those.
+    fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> Result<usize> {
         let Some(fit) = self.kv_fit_ctx(vk) else {
-            return want; // pure recurrent-state arch: no per-token KV to size.
+            return Ok(want); // pure recurrent-state arch: no per-token KV to size.
         };
-        if fit < want {
-            // Auto-q8 KV rung, clamp flavor (see `crate::seam::PlacementPins` for the policy):
-            // before shrinking the DEFAULT context below the trained window, try a Q8_0 KV
-            // cache — roughly half the bytes per token. Only a FULL rescue pins q8 (fit at q8
-            // reaches `want`); a partial rescue keeps the predictable f16 cache and clamps as
-            // before — auto-q8 exists to avoid losing capability (ctx / residency), not to
-            // trade decode speed for a somewhat-larger-but-still-clamped default window.
-            // Dense non-MoE models only, matching the placement rung this was validated on
-            // (MoE placement budgets pager arenas separately from this fit math).
-            if self.cfg.moe.is_none()
-                && !crate::seam::kv_auto_q8()
-                && crate::seam::kv_unset(&self.ecfg)
-                && crate::seam::kv_q8_layout_ok(&self.cfg)
-                && self.kv_fit_ctx_fmt(vk, true).is_some_and(|f| f >= want)
-            {
-                crate::seam::pin_kv_auto_q8();
-                eprintln!(
-                    "kv auto-quant: q8_0 (f16 KV would clamp the default ctx {want} -> {fit}; \
-                     INFR_KV_TYPE_K/V=f16 to force f16)"
-                );
-                return want;
-            }
-            // Placement ladder's LAST rung (SWA ring → auto-q8 → THIS): if the context still does
-            // not fit VRAM and the user opted into KV overflow, keep the requested window and let
-            // the KV cache live in system RAM (`INFR_KV_OVERFLOW`, honored by the Vulkan backend's
-            // `BufferUsage::KvCache` alloc). Read over PCIe by attention — slower, but the big
-            // context actually runs instead of clamping. Flag off ⇒ today's clamp/error unchanged.
-            // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the
-            // `Config` the backend was built with) — one value, so the clamp ladder and the
-            // allocator cannot disagree about whether the spill is armed.
-            if vk.cfg().kv.overflow {
-                eprintln!(
-                    "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
-                     INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
-                );
-                return want;
-            }
-            let vram = vk.vram();
-            let fp = self.footprint();
-            eprintln!(
-                "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
-                 {:.2} GiB available{}); set INFR_CTX to override",
-                (fp.dense + fp.expert) as f64 / (1u64 << 30) as f64,
-                vram.available as f64 / (1u64 << 30) as f64,
-                if vram.live { ", live" } else { ", total heap" },
-            );
-            return fit;
+        if fit >= want {
+            return Ok(want);
         }
-        want
+        // Auto-q8 KV rung, clamp flavor (see `crate::seam::PlacementPins` for the policy): before
+        // shrinking the DEFAULT context below the trained window, try a Q8_0 KV cache — roughly
+        // half the bytes per token. Dense non-MoE models only, matching the placement rung this
+        // was validated on (MoE placement budgets pager arenas separately from this fit math).
+        let may_auto_q8 = self.cfg.moe.is_none()
+            && !crate::seam::kv_auto_q8()
+            && crate::seam::kv_unset(&self.ecfg)
+            && crate::seam::kv_q8_layout_ok(&self.cfg);
+        let fit_q8 = may_auto_q8.then(|| self.kv_fit_ctx_fmt(vk, true)).flatten();
+        if fit_q8.is_some_and(|f| f >= want) {
+            crate::seam::pin_kv_auto_q8();
+            tracing::warn!(
+                requested_ctx = want,
+                f16_fit_ctx = fit,
+                kv_dtype = "q8_0",
+                "kv auto-quant: q8_0 KV cache — an f16 cache would clamp the default context \
+                 {want} -> {fit}; set INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% \
+                 slower on q8), or --ctx to pick the window yourself"
+            );
+            return Ok(want);
+        }
+        // Placement ladder's LAST rung (SWA ring → auto-q8 → THIS): if the context still does
+        // not fit VRAM and the user opted into KV overflow, keep the requested window and let
+        // the KV cache live in system RAM (`INFR_KV_OVERFLOW`, honored by the Vulkan backend's
+        // `BufferUsage::KvCache` alloc). Read over PCIe by attention — slower, but the big
+        // context actually runs instead of clamping. Flag off ⇒ today's clamp/error unchanged.
+        // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the
+        // `Config` the backend was built with) — one value, so the clamp ladder and the
+        // allocator cannot disagree about whether the spill is armed.
+        if vk.cfg().kv.overflow {
+            eprintln!(
+                "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
+                 INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
+            );
+            return Ok(want);
+        }
+        // f16 cannot reach even the floor but q8 can: pin q8 and clamp to THAT. A partial rescue
+        // normally keeps f16 (see the ladder doc), but the choice here is not "slower cache vs
+        // smaller window" — it is "slower cache vs no session at all".
+        let q8_rescues_the_floor = fit < crate::seam::MIN_SESSION_CTX
+            && fit_q8.is_some_and(|f| f >= crate::seam::MIN_SESSION_CTX);
+        if q8_rescues_the_floor {
+            let f8 = fit_q8.expect("guarded by q8_rescues_the_floor");
+            crate::seam::pin_kv_auto_q8();
+            tracing::warn!(
+                requested_ctx = want,
+                f16_fit_ctx = fit,
+                q8_fit_ctx = f8,
+                kv_dtype = "q8_0",
+                "kv auto-quant: q8_0 KV cache — an f16 cache leaves only {fit} tokens of context, \
+                 below the {} usable minimum; clamping the default context {want} -> {f8}",
+                crate::seam::MIN_SESSION_CTX
+            );
+            return Ok(f8);
+        }
+        let vram = vk.vram();
+        let fp = self.footprint();
+        // Refuse rung: the BEST cache this model may pick on its own (q8_0 when the user set no
+        // format, else the format they did set) cannot serve even a minimally-useful window.
+        let best = fit.max(fit_q8.unwrap_or(0));
+        if best < crate::seam::MIN_SESSION_CTX {
+            let free = vram.available.saturating_sub(fp.total());
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
+            let need = crate::seam::kv_bytes_estimate_fmt(
+                &self.cfg,
+                want,
+                crate::seam::kv_ring_wanted(&self.cfg, &self.ecfg),
+                crate::seam::ubatch_rows(&self.ecfg),
+                k_fmt,
+                v_fmt,
+            );
+            return Err(anyhow!(
+                "this model cannot be served on this device: no usable KV cache fits.\n  \
+                 requested context   : {want} tokens\n  \
+                 fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
+                 fits at q8_0 KV     : {}\n  \
+                 KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
+                 free after weights  : {:.2} GiB ({:.2} GiB {} - {:.2} GiB weights)\n\
+                 Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
+                 (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
+                 in system RAM, or a smaller quant of the model.",
+                match fit_q8 {
+                    Some(f) => format!("{f} tokens"),
+                    None => "not available (an explicit INFR_KV_TYPE_K/V wins)".to_string(),
+                },
+                gib(need),
+                gib(free),
+                gib(vram.available),
+                if vram.live { "free, live" } else { "heap" },
+                gib(fp.total()),
+            ));
+        }
+        eprintln!(
+            "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
+             {:.2} GiB available{}); set INFR_CTX to override",
+            fp.total() as f64 / (1u64 << 30) as f64,
+            vram.available as f64 / (1u64 << 30) as f64,
+            if vram.live { ", live" } else { ", total heap" },
+        );
+        Ok(fit)
     }
 
-    /// The VRAM-fit KV capacity in tokens: how much context fits in the device's AVAILABLE
-    /// memory after the full weight footprint + activation headroom (live free bytes when
-    /// VK_EXT_memory_budget is present — call before the weights upload so `available` still
-    /// includes their space). KV bytes/token follows the per-layer KV geometry and the runner's
-    /// KV-dtype env overrides (INFR_KV_TYPE_K/V, INFR_KV_Q8). `None` for a pure recurrent-state
-    /// arch (no per-token KV). Extra KV slots (INFR_KV_SLOTS forks) aren't modeled — the
-    /// alloc-time budget guard remains the backstop.
+    /// The VRAM-fit KV capacity in tokens: the LARGEST context whose KV cache — priced as the
+    /// exact allocation the runner will make — plus the dense activation reserve still fits the
+    /// device's AVAILABLE memory after the full weight footprint (live free bytes when
+    /// VK_EXT_memory_budget is present, so call this BEFORE the weights upload while `available`
+    /// still includes their space). Honors the per-layer KV geometry, the SWA ring, and the
+    /// runner's KV-dtype env overrides (INFR_KV_TYPE_K/V, INFR_KV_Q8).
+    ///
+    /// RAW: may return a value below [`crate::seam::MIN_SESSION_CTX`] (down to `0`) when the
+    /// weights leave no usable room — [`clamp_default_ctx`](Self::clamp_default_ctx)'s refuse
+    /// rung is the reader of that. `None` for a pure recurrent-state arch (no per-token KV).
+    /// Extra KV slots (INFR_KV_SLOTS forks) aren't modeled — the alloc-time budget guard remains
+    /// the backstop.
     fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
         // Price whatever the runner will actually allocate: the auto-q8 pin (if the placement
         // ladder set it earlier in this process) or the plain env-driven formats.
@@ -577,92 +633,42 @@ impl SeamModel {
     /// `auto_q8 = true` prices both sides Q8_0 wherever the user set nothing — how the ctx
     /// clamp's auto-q8 rung asks "would the trained window fit if we quantized the cache?"
     /// BEFORE pinning that choice process-wide.
+    ///
+    /// All the arithmetic lives in [`crate::seam::kv_fit_ctx_for`] (GPU-free, unit-tested); this
+    /// only collects the device's VRAM figures and this model's weight footprint and dtypes.
     fn kv_fit_ctx_fmt(&self, vk: &infr_vulkan::VulkanBackend, auto_q8: bool) -> Option<usize> {
-        /// Take only this fraction of the KV bytes that nominally fit — absorbs allocation slop
-        /// (alignment, dedicated-buffer rounding) and estimate error, same spirit as the alloc
-        /// guard's fixed headroom.
-        const FIT_FRACTION: f64 = 0.95;
-        /// Below this a session is useless anyway — let the alloc guard produce its clear error.
-        const MIN_CTX: usize = 1024;
-        // Reserve beyond weights+KV: activations/scratch PLUS the measured non-modeled residents.
-        // Empirics (gemma-3-12b Q4_K_M, 7900 XTX): live usage ran ~1.5 GiB past weights+KV —
-        // upload-staging pools land in the device-local host-visible heap under ReBAR and
-        // gpu-allocator retains freed blocks, dedicated buffers round up, and the warmup graph's
-        // activations stay resident. A flush clamp just moves the failure to the first real
-        // request's activation alloc (observed as a 500), so reserve generously: max(1 GiB,
-        // total/12) — ~2 GiB on a 24 GiB card, 1 GiB floor on small ones. Over-clamping is safe;
-        // under-clamping errors requests.
-        // 2026-07 re-audit (after dedicated weight-upload staging landed in infr-vulkan): /sys
-        // VRAM watermarks on the 14B (Q4_K_M) and gemma-4-31B (UD-Q5_K_XL) loads were unchanged
-        // to within ~0.2 MiB — the residual this reserve absorbs is warmup activation pools,
-        // gpu-allocator block granularity, and driver internals, NOT reclaimable staging, so
-        // the total/12 headroom stays.
         let vram = vk.vram();
-        let mut act_headroom: u64 = (vram.total / 12).max(1024 * 1024 * 1024);
-        // Keep the clamp CONSISTENT with the dense placement decision (`vulkan_moe_binder`'s
-        // try-resident tier): reserve at least what placement will demand as its activation
-        // estimate at this ctx, so a DEFAULT ctx this fit math hands out always lands RESIDENT
-        // instead of clamping to a window the placement then streams anyway. MoE models keep the
-        // plain heuristic (their placement reserves pager arenas separately from this).
-        if self.cfg.moe.is_none() {
-            act_headroom = act_headroom.max(crate::seam::dense_act_reserve(
-                &self.cfg,
-                self.cfg.n_ctx_train,
-                &self.ecfg,
-            ));
-        }
-        // Bytes per token across all layers, K side + V side (bytes-per-element from the same
-        // env the runner honors; formats it would gate back to f16 are an estimate only — the
-        // alloc guard catches a resulting overflow).
-        let (kb, vb) = (
-            kv_bytes_per_elem(self.ecfg.kv.type_k, &self.ecfg, auto_q8),
-            kv_bytes_per_elem(self.ecfg.kv.type_v, &self.ecfg, auto_q8),
-        );
-        let kv_per_tok: u64 = (0..self.cfg.n_layer)
-            .map(|l| {
-                let elems = (self.cfg.layer_n_kv(l) * self.cfg.layer_head_dim(l)) as f64;
-                (elems * (kb + vb)).ceil() as u64
-            })
-            .sum();
-        if kv_per_tok == 0 {
-            return None;
-        }
         let fp = self.footprint();
-        let free = vram
-            .available
-            .saturating_sub(fp.dense + fp.expert + act_headroom);
-        // SeamKv pads its buffers past max_ctx by ~64 rows; mirror that.
-        let fit_linear = ((free as f64 * FIT_FRACTION / kv_per_tok as f64) as usize)
-            .saturating_sub(64)
-            .max(MIN_CTX);
-        // SWA ring sizing (see `crate::seam::kv_rows`): past `ring_rows` a window layer's KV
-        // stops growing with ctx, so bytes(ctx) = full_per_tok*ctx + swa_fixed and the fit is
-        // (free - swa_fixed) / full_per_tok — a mostly-SWA model's default ctx clamp relaxes
-        // enormously. The linear fit stays authoritative while it lands BELOW ring_rows (no
-        // layer would actually ring there).
-        if crate::seam::kv_ring_wanted(&self.cfg, &self.ecfg) && fit_linear >= 1024 {
-            let ring_rows =
-                (self.cfg.swa_window + crate::seam::ubatch_rows(&self.ecfg)).next_multiple_of(64);
-            if fit_linear >= ring_rows {
-                let (mut full_per_tok, mut swa_fixed) = (0f64, 0f64);
-                for l in 0..self.cfg.n_layer {
-                    let bytes =
-                        (self.cfg.layer_n_kv(l) * self.cfg.layer_head_dim(l)) as f64 * (kb + vb);
-                    if self.cfg.is_swa_layer(l) {
-                        swa_fixed += bytes * ring_rows as f64;
-                    } else {
-                        full_per_tok += bytes;
-                    }
-                }
-                if full_per_tok > 0.0 {
-                    let fit = (((free as f64 * FIT_FRACTION - swa_fixed) / full_per_tok) as usize)
-                        .saturating_sub(64)
-                        .max(MIN_CTX);
-                    return Some(fit.max(fit_linear));
-                }
-            }
-        }
-        Some(fit_linear)
+        let (k_fmt, v_fmt) = self.kv_fit_fmts(auto_q8);
+        crate::seam::kv_fit_ctx_for(
+            &self.cfg,
+            &self.ecfg,
+            fp.total(),
+            // The allocator's OWN ceiling, not the raw free figure: the VRAM guard reserves a
+            // fixed headroom below it and will refuse anything that reaches into it (see
+            // `VulkanBackend::alloc_room`). Budgeting against `vram.available` planned a context
+            // 256 MiB past what could ever be allocated, and — now that the rest of this math is
+            // exact rather than 5%-shy — that overhang landed as a mid-prefill alloc failure.
+            vk.alloc_room(),
+            vram.total,
+            k_fmt,
+            v_fmt,
+        )
+    }
+
+    /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit
+    /// `INFR_KV_TYPE_K`/`_V` when set, else the default ladder (legacy `INFR_KV_Q8`, then a
+    /// placement-pinned or candidate auto-q8, then f16) — the same ladder `parse_kv_fmt` walks in
+    /// the runner. ESTIMATE ONLY in one direction: the runner additionally gates each format on
+    /// backend/alignment and falls back to f16, so a gated-out low-bit request under-estimates
+    /// here and the alloc-time VRAM guard backstops it.
+    fn kv_fit_fmts(&self, auto_q8: bool) -> (DType, DType) {
+        let side = |want: Option<DType>| match want {
+            Some(dt) => dt,
+            None if self.ecfg.kv.force_q8 || auto_q8 => DType::Q8_0,
+            None => DType::F16,
+        };
+        (side(self.ecfg.kv.type_k), side(self.ecfg.kv.type_v))
     }
 
     /// Greedy generation on the Vulkan seam through a persistent session (see
@@ -806,26 +812,26 @@ impl SeamModel {
         vk: &infr_vulkan::VulkanBackend,
         n_slots: usize,
         want: Option<infr_core::SizeSpec>,
-    ) -> usize {
+    ) -> Result<usize> {
         let n_slots = n_slots.max(1);
         // An explicit token count is the user's demand — honour it verbatim, at any N.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
-            return (c as usize).max(1);
+            return Ok((c as usize).max(1));
         }
         if n_slots == 1 && want.is_none() {
             return self.clamp_default_ctx(vk, self.cfg.n_ctx_train);
         }
         let trained = self.cfg.n_ctx_train;
         let Some(fit) = self.kv_fit_ctx(vk) else {
-            return trained; // pure recurrent-state arch: no per-token KV to divide.
+            return Ok(trained); // pure recurrent-state arch: no per-token KV to divide.
         };
         let budget = match want {
             Some(infr_core::SizeSpec::Percent(f)) => (fit as f64 * f) as usize,
             _ => fit,
         };
-        // 1024 is the runner's own floor (`kv_fit_ctx`'s MIN_CTX) — below it a slot is useless and
-        // the alloc guard's clear error is the better outcome than a silently-crippled window.
-        let per_slot = (budget / n_slots).max(1024);
+        // `MIN_SESSION_CTX` is the runner's own floor — below it a slot is useless and the alloc
+        // guard's clear error is the better outcome than a silently-crippled window.
+        let per_slot = (budget / n_slots).max(crate::seam::MIN_SESSION_CTX);
         let ctx = trained.min(per_slot);
         if ctx < trained {
             eprintln!(
@@ -834,7 +840,7 @@ impl SeamModel {
                  same VRAM budget a single slot is held to). Set --ctx to override."
             );
         }
-        ctx
+        Ok(ctx)
     }
 
     /// Detokenize ids back to text (`encode`'s twin, `skip_special_tokens=true` — matches

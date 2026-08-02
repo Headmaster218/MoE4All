@@ -2438,6 +2438,23 @@ impl VulkanBackend {
         vram_info(&self.shared)
     }
 
+    /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it:
+    /// [`vram`](Self::vram)'s free figure minus the guard's own [`GUARD_HEADROOM`].
+    ///
+    /// Sizing math must budget against this, not against `vram().available` — the guard enforces
+    /// `used + want <= total - GUARD_HEADROOM`, so the last 256 MiB of "free" VRAM is reserved and
+    /// can never be handed out. A context/placement decision that plans into it produces a session
+    /// the allocator then refuses mid-prefill, which is the worst possible place to find out
+    /// (observed on gemma-4-31B UD-Q5_K_XL: a clamped-but-exact 22610-token window died on a 2 MiB
+    /// activation alloc at 23.86 GiB in use against a 23.73 GiB budget).
+    ///
+    /// Exact when the driver reports a live budget (VK_EXT_memory_budget, so `available` already
+    /// nets out everything held); on the fallback path `available` is the whole heap, so this is
+    /// the room only before this backend has allocated — which is when placement runs.
+    pub fn alloc_room(&self) -> u64 {
+        self.vram().available.saturating_sub(GUARD_HEADROOM)
+    }
+
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
     /// that would exceed the budget. Over-committing does not fail cleanly on GPUs — the driver
     /// accepts the allocation and then evicts, which on a discrete card means reading weights back

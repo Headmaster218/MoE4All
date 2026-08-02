@@ -164,7 +164,7 @@ impl ParallelSeam {
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
         let pins = Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx);
+        let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
         let mut engine = Self {
             model,
             vk,
