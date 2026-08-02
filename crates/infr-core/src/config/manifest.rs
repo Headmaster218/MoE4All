@@ -318,6 +318,9 @@ knobs! {
     // `0`/unset = no deadline, so the env layer does NOT filter non-positive values the way
     // `INFR_MAX_TOKENS_CAP` does — see `ServeCfg::request_timeout_secs`.
     "INFR_REQUEST_TIMEOUT_SECS" => "serve.request_timeout_secs", Int, Ignored, "300", migrated;
+    // Same "`0` is a VALUE, not a bad one" grammar as the deadline above: `0` disables the periodic
+    // throughput line, so the env layer must not filter it out.
+    "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
 }
 
 /// `INFR_*` keys that exist in `crates/*/src` (or a `build.rs`) and deliberately do NOT become

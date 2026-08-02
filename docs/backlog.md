@@ -595,36 +595,23 @@ they are the clear-cut cases), and add a lint or a test that fails on a new bare
 `println!`/`eprintln!` outside the sanctioned categories — otherwise this decays
 straight back.
 
-### B10 — `infr serve` has no request or throughput logging
+### B10a — the serve arrival line reports prompt CHARS, not prompt tokens
 
-**Tag:** raised 2026-08-02 · **Blocked on:** two product questions below
+**Tag:** raised 2026-08-02 · **Blocked on:** a `ChatGenerator` trait change
 
-`infr serve` is near-silent while running: it logs `infr-server listening` at
-startup, a drain message at shutdown, and two `warn!`s. There is no per-request
-record and no throughput signal, so a running server gives no way to see what it
-is doing or how fast.
+B10's request/throughput logging landed, with one part of its spec unmet: the
+`request start` line carries `prompt_chars`, not prompt tokens. The tokenizer
+lives behind `ChatGenerator`, so at arrival the server genuinely cannot know the
+token count — it only learns it from `ChatOutcome` when the generation ends,
+which is where the real `prompt_tokens` is logged (`request done`).
 
-**To do:**
-
-- **Per-request**, at INFO: one line on arrival (route, model, prompt tokens,
-  `max_tokens`, streaming or not, slot/session id) and one on completion (prompt
-  and generated token counts, prefill tok/s, decode tok/s, total ms, finish
-  reason). Errors and the existing deadline-abort at WARN.
-- **Periodic throughput**, every ~5 s: prefill tok/s, decode tok/s, tokens
-  generated, active and queued requests, KV slot occupancy — covering the
-  interval, not cumulative.
-- Interval and verbosity through the existing `serve.*` / `INFR_*` config
-  conventions, not a new mechanism.
-
-**Open questions (need the owner's call):**
-
-1. Should the periodic line emit when the server is IDLE? A heartbeat proves the
-   process is alive; the alternative (emit only when there was activity in the
-   interval) keeps an idle server's log clean. Default assumption if unanswered:
-   activity-only.
-2. Should request logging include a prompt preview? Useful for debugging, but it
-   puts user prompt text into logs — a privacy decision, not a technical one.
-   Default assumption if unanswered: no preview, token counts only.
+Fixing it means a new `ChatGenerator` method
+(`count_prompt_tokens(&[ChatMessage])` or similar) implemented by `infr-cli`'s
+`SeamGenerator` / `ParallelGenerator`, which then have to render the chat
+template a second time — the template render, not just the tokenization, is what
+determines the count. Out of scope for the logging slice: it is a trait change
+plus duplicated render work on every request, for a number the completion line
+already reports accurately a moment later.
 
 ### B11 — dense placement still budgets against raw free VRAM, not the guard's ceiling
 

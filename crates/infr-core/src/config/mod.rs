@@ -626,6 +626,15 @@ cfg_struct! {
         /// decision, made once they know their model's token rate and what a `--parallel` slot is
         /// worth to them.
         request_timeout_secs: u64 = 0,
+        /// `INFR_SERVE_STATS_SECS`: how often `infr serve` logs its throughput line, in seconds.
+        /// `0` switches the line off entirely.
+        ///
+        /// ON by default, unlike `request_timeout_secs`, because it changes nothing a client can
+        /// observe — it is a log line, not a policy — and a server with no throughput signal is the
+        /// state this knob exists to end. It is ACTIVITY-ONLY: an interval in which nothing
+        /// happened emits nothing, so an idle server's log stays clean and the knob is only worth
+        /// reaching for when the log itself is expensive.
+        stats_interval_secs: u64 = 5,
     }
 }
 

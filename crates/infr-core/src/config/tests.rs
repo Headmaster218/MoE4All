@@ -111,6 +111,9 @@ fn default_config_matches_documented_defaults() {
     // A per-request wall-clock deadline is OFF unless the operator asks for one: it truncates a
     // legitimate slow reply, so it cannot be a shipped default (§6.9).
     assert_eq!(d.serve.request_timeout_secs, 0);
+    // The periodic throughput line is ON by default (it is a log line, not a policy) and reports
+    // every 5 s — but only for intervals in which something happened.
+    assert_eq!(d.serve.stats_interval_secs, 5);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
@@ -509,6 +512,25 @@ fn non_presence_grammars_are_preserved() {
             .serve
             .max_tokens_cap,
         131_072
+    );
+    // `INFR_SERVE_STATS_SECS=0` is the same shape: `0` DISABLES the periodic throughput line, so it
+    // has to survive the layer and beat a file that turned it on.
+    for (value, want) in [("0", 0u64), ("30", 30)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_SERVE_STATS_SECS", value)])]);
+        assert_eq!(
+            cfg.serve.stats_interval_secs, want,
+            "INFR_SERVE_STATS_SECS={value:?}"
+        );
+    }
+    assert_eq!(
+        Config::load_from_layers(&[
+            file_layer("[serve]\nstats_interval_secs = 20\n"),
+            env_layer(&[("INFR_SERVE_STATS_SECS", "0")]),
+        ])
+        .serve
+        .stats_interval_secs,
+        0,
+        "an explicit 0 in the environment must switch off a stats line the file turned on"
     );
 }
 
@@ -1252,12 +1274,12 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// NOT here: `INFR_DIFFUSION_VISUAL`, which §6.10 sends to a plain clap flag rather than to
     /// `Config` — it stays in `manifest::NOT_MIGRATED`.
     ///
-    /// `INFR_REQUEST_TIMEOUT_SECS` was never migrated — it was BORN on `Config`, after the
-    /// campaign, and its only read site is `infr-server`'s `AppState`. A knob with no legacy
-    /// `std::env::var` site is still `migrated` (the flag means "the read site takes the value
-    /// from a `Config`", which is trivially true), so it has to be listed in some slice or this
-    /// test fails. It joins the slice that owns its section — `serve.*` is S7's — rather than
-    /// growing a ninth, empty-by-construction one for post-campaign additions.
+    /// `INFR_REQUEST_TIMEOUT_SECS` and `INFR_SERVE_STATS_SECS` were never migrated — both were BORN
+    /// on `Config`, after the campaign, and their only read site is `infr-server`. A knob with no
+    /// legacy `std::env::var` site is still `migrated` (the flag means "the read site takes the
+    /// value from a `Config`", which is trivially true), so it has to be listed in some slice or
+    /// this test fails. They join the slice that owns their section — `serve.*` is S7's — rather
+    /// than growing a ninth, empty-by-construction one for post-campaign additions.
     const S7: &[&str] = &[
         "INFR_API_KEY",
         "INFR_CTX",
@@ -1266,6 +1288,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_THINK",
         "INFR_PROF_OUT",
         "INFR_REQUEST_TIMEOUT_SECS",
+        "INFR_SERVE_STATS_SECS",
     ];
 
     /// S8 — the CLI's own transitional bridge, and with it the LAST unmigrated knob. The six

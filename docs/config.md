@@ -70,6 +70,7 @@ pipeline = [0, 1]    # or ["Vulkan0", "Vulkan1"]
 
 [serve]
 max_tokens_cap = 8192
+stats_interval_secs = 10  # throughput line every 10 s; 0 turns it off
 ```
 
 Value grammars: booleans accept `true`/`false` (and `1`/`0`, `yes`/`no`,
@@ -256,10 +257,20 @@ all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth — it
 gates `/v1/chat/completions` and `/v1/models`, never `/health`),
-`max_tokens_cap`, and `request_timeout_secs` (per-request wall-clock deadline in
+`max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
-slow reply, so it is opt-in). Per-request sampling is not here — it stays on the
-request.
+slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`
+— how often the server logs its throughput line, default `5`; `0` switches the
+line off). Per-request sampling is not here — it stays on the request.
+
+The throughput line is **activity-only**: an interval in which nothing happened
+emits nothing, so an idle server leaves a clean log and there is no heartbeat to
+mistake for load. Its `prefill_tps`/`decode_tps` are the whole server's tokens
+divided by the WALL time of that one interval — not cumulative, and not the same
+number as the per-request `prefill_tps`/`decode_tps` on the `request done` line,
+which are that one request's own speeds (`prompt_tokens / TTFT` and
+`gen_tokens / (total - TTFT)`). Request logging carries **counts only, never
+prompt text**.
 
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,

@@ -21,10 +21,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -533,6 +533,378 @@ pub struct DeltaPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Observability
+// ---------------------------------------------------------------------------
+
+/// Per-request id: a process-monotonic counter, NOT a timestamp.
+///
+/// It is deliberately not derived from the wall clock. Two requests admitted in the same
+/// millisecond (routine under `--parallel N`) would collide on a `now()`-based id, and the whole
+/// value of the id is that the arrival line and the completion line for ONE request can be joined
+/// in a log that has N of them interleaved. It is also NOT the wire `id` ([`make_id`]): that one is
+/// a client-facing `chatcmpl-…` string, and pinning a log key to a wire format is how the log
+/// breaks when the wire format moves.
+static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_req_id() -> u64 {
+    REQ_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The server-wide counters behind the periodic throughput line, and the two gauges behind
+/// `active`/`queued`.
+///
+/// **Everything here is an atomic and nothing here is a lock.** The only counter touched from
+/// inside a generation is [`Self::bump_gen`], one relaxed `fetch_add` per emitted delta — the
+/// decode loop must not acquire anything, because it is holding the GPU baton for every other
+/// sequence behind it (the same reason the SSE channel is unbounded).
+///
+/// The four `interval_*` counters are DRAINED (swapped to zero) by each report, which is what makes
+/// the reported numbers cover the interval rather than the process lifetime. There is deliberately
+/// no cumulative total kept alongside them: a total nobody drains is the thing that silently turns
+/// a rate into an average-since-boot.
+#[derive(Debug, Default)]
+struct ServeStats {
+    /// Prompt tokens PREFILLED in this interval. Folded once per request, at completion — the real
+    /// count from [`ChatOutcome`], which is not knowable before the generator has tokenized.
+    interval_prompt_tokens: AtomicU64,
+    /// Tokens GENERATED in this interval, live. Incremented per delta while a generation runs (so a
+    /// long request shows up in the intervals it spans, not only in the one it ends in) and
+    /// RECONCILED at completion against `ChatOutcome::completion_tokens`, which is authoritative:
+    /// a delta is a text piece and is only approximately a token (a think-tag boundary can split
+    /// or merge one). The correction is signed, hence `i64`.
+    interval_gen_tokens: AtomicI64,
+    /// Requests that COMPLETED in this interval (success or failure).
+    interval_completed: AtomicU64,
+    /// Requests that FAILED in this interval — a subset of `interval_completed`.
+    interval_failed: AtomicU64,
+    /// Gauge: requests generating right now (holding a slot permit).
+    active: AtomicU64,
+    /// Gauge: requests admitted by the handler but still waiting for a slot permit.
+    queued: AtomicU64,
+}
+
+impl ServeStats {
+    /// One decoded piece. The ONE call on the hot path — a single relaxed add.
+    fn bump_gen(&self, n: i64) {
+        self.interval_gen_tokens.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Fold one finished request's exact tallies in, once.
+    fn fold_completion(&self, rec: &ReqRecord) {
+        self.interval_prompt_tokens
+            .fetch_add(u64::from(rec.prompt_tokens), Ordering::Relaxed);
+        // Reconcile the live per-delta estimate against the generator's authoritative count. The
+        // difference is normally 0; it is non-zero when deltas and tokens did not line up 1:1.
+        let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
+        if correction != 0 {
+            self.bump_gen(correction);
+        }
+        self.interval_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Fold one request that ended in an error. Its partial deltas are already counted; there is no
+    /// [`ChatOutcome`] to reconcile against, so nothing is corrected.
+    fn fold_failure(&self) {
+        self.interval_completed.fetch_add(1, Ordering::Relaxed);
+        self.interval_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take the interval counters (resetting them to zero) and sample the gauges. `elapsed` is the
+    /// REAL time since the last drain, not the nominal period — a tick that ran late must not
+    /// inflate the rate it reports.
+    fn drain(&self, elapsed: Duration) -> StatsWindow {
+        StatsWindow {
+            elapsed,
+            prompt_tokens: self.interval_prompt_tokens.swap(0, Ordering::Relaxed),
+            gen_tokens: self.interval_gen_tokens.swap(0, Ordering::Relaxed).max(0) as u64,
+            completed: self.interval_completed.swap(0, Ordering::Relaxed),
+            failed: self.interval_failed.swap(0, Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            queued: self.queued.load(Ordering::Relaxed),
+            busy_slots: 0,
+            total_slots: 0,
+        }
+    }
+}
+
+/// One interval's drained counters — the whole input to one periodic log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StatsWindow {
+    elapsed: Duration,
+    prompt_tokens: u64,
+    gen_tokens: u64,
+    completed: u64,
+    failed: u64,
+    active: u64,
+    queued: u64,
+    /// Slot permits held across every hosted model — KV slot occupancy.
+    busy_slots: u64,
+    /// Slot permits in existence across every hosted model (the sum of `--parallel N`).
+    total_slots: u64,
+}
+
+impl StatsWindow {
+    /// Was there anything to report? An interval in which the server did nothing at all emits NO
+    /// line — the periodic report is activity-only, deliberately not a heartbeat, so an idle server
+    /// leaves a clean log. A request that is mid-generation counts as activity (`active > 0`) even
+    /// when it has produced no token yet, so a long single request still reports every interval it
+    /// spans.
+    fn has_activity(&self) -> bool {
+        self.prompt_tokens > 0
+            || self.gen_tokens > 0
+            || self.completed > 0
+            || self.active > 0
+            || self.queued > 0
+    }
+
+    /// Prompt tokens ingested per WALL second of the interval.
+    ///
+    /// This is the server's aggregate ingest throughput, NOT one model's prefill speed: the
+    /// denominator is the interval, including the time the server spent decoding or idle. The
+    /// per-request completion line carries the other number (that request's `prompt_tokens / TTFT`),
+    /// and the two are supposed to differ — one answers "how much is this box doing", the other
+    /// "how fast is this model".
+    fn prefill_tps(&self) -> f64 {
+        per_second(self.prompt_tokens, self.elapsed)
+    }
+
+    /// Tokens generated per WALL second of the interval — aggregate across every in-flight request.
+    /// Same scope note as [`Self::prefill_tps`].
+    fn decode_tps(&self) -> f64 {
+        per_second(self.gen_tokens, self.elapsed)
+    }
+}
+
+/// `n` per second over `d`. A zero (or absurdly small) window yields 0.0 rather than an infinity —
+/// a log line reading `inf` is worse than one reading 0.
+fn per_second(n: u64, d: Duration) -> f64 {
+    let secs = d.as_secs_f64();
+    if secs > 0.0 {
+        n as f64 / secs
+    } else {
+        0.0
+    }
+}
+
+/// RAII gauge for [`ServeStats::queued`]: a request waiting for a slot permit. Dropped the moment
+/// the permit is acquired (or the acquire fails during shutdown).
+///
+/// A guard rather than a matching `fetch_sub` because there are three ways out of the wait — got
+/// the permit, the semaphore closed, the task was dropped — and a gauge that leaks on one of them
+/// reads as a permanently-queued request forever after.
+struct QueuedGuard(Arc<ServeStats>);
+
+impl QueuedGuard {
+    fn new(stats: Arc<ServeStats>) -> Self {
+        stats.queued.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+
+impl Drop for QueuedGuard {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII gauge for [`ServeStats::active`]: a request holding a slot permit and generating. Moved
+/// INTO the blocking task alongside the permit, so it is released on exactly the same events the
+/// permit is — including an unwinding panic inside the decode closure.
+struct ActiveGuard(Arc<ServeStats>);
+
+impl ActiveGuard {
+    fn new(stats: Arc<ServeStats>) -> Self {
+        stats.active.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The per-request tally kept INSIDE the generation, as plain locals in the blocking task. It is
+/// folded into [`ServeStats`] once, at completion — the request's own timing needs no sharing, and
+/// making it shared would put a second atomic (or worse) on the decode path for nothing.
+#[derive(Debug)]
+struct ReqTally {
+    started: Instant,
+    /// When the FIRST delta arrived: the boundary between prefill and decode. `None` means the
+    /// generation produced nothing.
+    first_delta: Option<Instant>,
+    /// Text deltas seen (content + reasoning). Reconciled against the real token count at the end.
+    deltas: u64,
+}
+
+impl ReqTally {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            first_delta: None,
+            deltas: 0,
+        }
+    }
+
+    /// Called from the generator's `on_delta` callback for a TEXT delta. Two increments and one
+    /// relaxed atomic add — no lock, no allocation, nothing that can block the decode loop.
+    fn on_text_delta(&mut self, stats: &ServeStats) {
+        if self.first_delta.is_none() {
+            self.first_delta = Some(Instant::now());
+        }
+        self.deltas += 1;
+        stats.bump_gen(1);
+    }
+
+    /// Close the tally out against the generator's authoritative counts.
+    fn finish(&self, outcome: ChatOutcome, finish: Finish) -> ReqRecord {
+        let total = self.started.elapsed();
+        // TTFT is the prefill boundary. With no delta at all (an empty completion) there is no
+        // boundary to draw, so the whole request counts as prefill and decode time is zero.
+        let prefill = self
+            .first_delta
+            .map_or(total, |t| t.saturating_duration_since(self.started));
+        ReqRecord {
+            prompt_tokens: outcome.prompt_tokens,
+            gen_tokens: outcome.completion_tokens,
+            deltas: self.deltas,
+            prefill,
+            decode: total.saturating_sub(prefill),
+            total,
+            finish,
+        }
+    }
+}
+
+/// One finished request, as the completion log line and [`ServeStats::fold_completion`] see it.
+#[derive(Debug, Clone, Copy)]
+struct ReqRecord {
+    prompt_tokens: u32,
+    gen_tokens: u32,
+    deltas: u64,
+    /// Time to the first delta — the prefill.
+    prefill: Duration,
+    /// From the first delta to the end — the decode.
+    decode: Duration,
+    total: Duration,
+    finish: Finish,
+}
+
+impl ReqRecord {
+    /// THIS request's prefill speed: prompt tokens over its time-to-first-delta. A per-request
+    /// number, unlike [`StatsWindow::prefill_tps`].
+    fn prefill_tps(&self) -> f64 {
+        per_second(u64::from(self.prompt_tokens), self.prefill)
+    }
+
+    /// THIS request's decode speed: generated tokens over the time after the first delta.
+    fn decode_tps(&self) -> f64 {
+        per_second(u64::from(self.gen_tokens), self.decode)
+    }
+}
+
+/// Emit one request's completion line at INFO. The counterpart to the arrival line
+/// ([`log_request_start`]), joined to it by `req`.
+fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
+    tracing::info!(
+        req = req_id,
+        model,
+        stream,
+        prompt_tokens = rec.prompt_tokens,
+        gen_tokens = rec.gen_tokens,
+        prefill_tps = format_args!("{:.1}", rec.prefill_tps()),
+        decode_tps = format_args!("{:.1}", rec.decode_tps()),
+        total_ms = format_args!("{:.0}", rec.total.as_secs_f64() * 1000.0),
+        finish = rec.finish.as_str(),
+        "request done"
+    );
+}
+
+/// Emit one request's arrival line at INFO.
+///
+/// `prompt_chars` and not prompt TOKENS, and that is a real limitation rather than an oversight:
+/// the tokenizer lives behind [`ChatGenerator`], so at arrival the server genuinely does not know
+/// how many tokens the messages are. The true count is on the completion line, from
+/// [`ChatOutcome`]; the char count is the arrival-time proxy for "how big is this".
+///
+/// **No prompt text, ever.** Counts only. Putting user prompt text into an operator's logs is a
+/// privacy decision that has been made in the negative — do not add a preview here, not even
+/// truncated, not even behind a flag.
+fn log_request_start(
+    req_id: u64,
+    route: &'static str,
+    model: &str,
+    messages: usize,
+    prompt_chars: usize,
+    max_tokens: Option<u32>,
+    stream: bool,
+) {
+    tracing::info!(
+        req = req_id,
+        route,
+        model,
+        messages,
+        prompt_chars,
+        max_tokens = ?max_tokens,
+        stream,
+        "request start"
+    );
+}
+
+/// The configured period for the periodic throughput line, or `None` when it is switched OFF.
+///
+/// `serve.stats_interval_secs` (`INFR_SERVE_STATS_SECS`), where `0` means "no periodic line" —
+/// the same "0 disables" grammar as [`request_timeout`], and for the same reason: an operator
+/// piping this server's logs somewhere expensive needs a way to say no from the environment, over
+/// a config file that said yes.
+fn stats_interval(cfg: &Config) -> Option<Duration> {
+    let secs = cfg.serve.stats_interval_secs;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The periodic throughput reporter: drain the interval counters every `period` and, IF anything
+/// happened, log one line.
+///
+/// **Shutdown.** It polls the same process-wide latch [`shutdown_latched`] does, at the same 50 ms
+/// granularity, so a Ctrl-C ends it at the next poll rather than up to a full period later — and it
+/// is a plain tokio task, which cannot hold the process open by itself: when `serve_state` returns
+/// the runtime drops and the task goes with it. It emits one FINAL drain on the way out so the
+/// tokens generated in the last partial interval are not silently dropped.
+async fn stats_reporter(state: AppState, period: Duration) {
+    const POLL: Duration = Duration::from_millis(50);
+    let mut last = Instant::now();
+    loop {
+        tokio::time::sleep(POLL).await;
+        let shutting_down = infr_core::shutdown::shutdown_requested();
+        if !shutting_down && last.elapsed() < period {
+            continue;
+        }
+        let mut window = state.stats.drain(last.elapsed());
+        (window.busy_slots, window.total_slots) = state.slot_occupancy();
+        last = Instant::now();
+        if window.has_activity() {
+            tracing::info!(
+                interval_s = format_args!("{:.1}", window.elapsed.as_secs_f64()),
+                prefill_tps = format_args!("{:.1}", window.prefill_tps()),
+                decode_tps = format_args!("{:.1}", window.decode_tps()),
+                gen_tokens = window.gen_tokens,
+                prompt_tokens = window.prompt_tokens,
+                completed = window.completed,
+                failed = window.failed,
+                active = window.active,
+                queued = window.queued,
+                kv_slots = format_args!("{}/{}", window.busy_slots, window.total_slots),
+                "serve stats"
+            );
+        }
+        if shutting_down {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -553,6 +925,22 @@ struct ModelEntry {
     id: Arc<str>,
     engine: Option<Arc<dyn ChatGenerator>>,
     slots: Arc<Semaphore>,
+    /// How many permits `slots` was created with (`--parallel N`, floored at 1). `Semaphore` reports
+    /// how many are AVAILABLE but not how many exist, and occupancy is the difference — so the
+    /// capacity has to be remembered here or the periodic line cannot say `2/4`.
+    capacity: usize,
+}
+
+impl ModelEntry {
+    fn new(id: &str, engine: Option<Arc<dyn ChatGenerator>>, n_parallel: usize) -> Self {
+        let capacity = n_parallel.max(1);
+        Self {
+            id: Arc::from(id),
+            engine,
+            slots: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        }
+    }
 }
 
 /// Shared server state — a non-empty, ordered set of hosted [`ModelEntry`]s. A request is routed to
@@ -568,6 +956,10 @@ pub struct AppState {
     /// parameter on every entry point that can host a real model, so an embedder cannot silently
     /// end up with auth disabled by forgetting to pass one.
     cfg: Arc<Config>,
+    /// Server-wide request/throughput counters (B10). Shared with the periodic reporter task
+    /// [`stats_reporter`] that `serve_state` spawns; a state built for tests simply has no reporter
+    /// draining it.
+    stats: Arc<ServeStats>,
 }
 
 impl AppState {
@@ -581,12 +973,13 @@ impl AppState {
         cfg: Arc<Config>,
     ) -> Self {
         Self {
-            models: Arc::new(vec![ModelEntry {
-                id: Arc::from(model_id.into().as_str()),
-                engine: Some(generator),
-                slots: Arc::new(Semaphore::new(n_parallel.max(1))),
-            }]),
+            models: Arc::new(vec![ModelEntry::new(
+                &model_id.into(),
+                Some(generator),
+                n_parallel,
+            )]),
             cfg,
+            stats: Arc::default(),
         }
     }
 
@@ -604,15 +997,12 @@ impl AppState {
         );
         let models = entries
             .into_iter()
-            .map(|(id, gen, n)| ModelEntry {
-                id: Arc::from(id.as_str()),
-                engine: Some(gen),
-                slots: Arc::new(Semaphore::new(n.max(1))),
-            })
+            .map(|(id, gen, n)| ModelEntry::new(&id, Some(gen), n))
             .collect();
         Self {
             models: Arc::new(models),
             cfg,
+            stats: Arc::default(),
         }
     }
 
@@ -621,13 +1011,19 @@ impl AppState {
     /// (R7).
     pub fn headless(model_id: impl Into<String>, cfg: Arc<Config>) -> Self {
         Self {
-            models: Arc::new(vec![ModelEntry {
-                id: Arc::from(model_id.into().as_str()),
-                engine: None,
-                slots: Arc::new(Semaphore::new(1)),
-            }]),
+            models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
             cfg,
+            stats: Arc::default(),
         }
+    }
+
+    /// KV slot occupancy across every hosted model: `(busy, total)` permits. `busy` is what the
+    /// semaphores are NOT handing out right now, which is exactly the set of generations in flight.
+    fn slot_occupancy(&self) -> (u64, u64) {
+        self.models.iter().fold((0, 0), |(busy, total), m| {
+            let free = m.slots.available_permits().min(m.capacity);
+            (busy + (m.capacity - free) as u64, total + m.capacity as u64)
+        })
     }
 
     /// Route a request's `model` field to a hosted entry: an exact id match, else the default
@@ -690,12 +1086,21 @@ pub async fn serve_multi(
 /// place the listener, the graceful-shutdown latch, and `axum::serve` live.
 async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
     let n_models = state.models.len();
+    // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
+    // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
+    // server ends, no task is left ticking.
+    let reporter = stats_interval(&state.cfg)
+        .map(|period| tokio::spawn(stats_reporter(state.clone(), period)));
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %n_models, "infr-server listening");
-    axum::serve(listener, router)
+    let served = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_latched())
-        .await?;
+        .await;
+    if let Some(h) = reporter {
+        h.abort();
+    }
+    served?;
     Ok(())
 }
 
@@ -799,68 +1204,92 @@ async fn chat_completions_handler(
     // client that omitted/mis-named the model sees which one answered.
     let entry = state.route(&req.model);
     let model_id = entry.id.to_string();
-    let cid = make_id();
-    let created = unix_ts();
-    // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
-    // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
-    let deadline = request_timeout(&state.cfg);
+    let ctx = ReqCtx {
+        id: next_req_id(),
+        cid: make_id(),
+        model_id,
+        created: unix_ts(),
+        // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
+        // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
+        deadline: request_timeout(&state.cfg),
+        stream: req.stream,
+        stats: state.stats.clone(),
+    };
+    log_request_start(
+        ctx.id,
+        "/v1/chat/completions",
+        &ctx.model_id,
+        messages.len(),
+        messages.iter().map(|m| m.content.len()).sum(),
+        params.max_tokens,
+        ctx.stream,
+    );
 
-    if req.stream {
-        streaming(
-            entry,
-            messages,
-            tools,
-            tool_choice,
-            params,
-            cid,
-            model_id,
-            created,
-            deadline,
-        )
-        .await
+    if ctx.stream {
+        streaming(entry, messages, tools, tool_choice, params, ctx).await
     } else {
-        non_streaming(
-            entry,
-            messages,
-            tools,
-            tool_choice,
-            params,
-            cid,
-            model_id,
-            created,
-            deadline,
-        )
-        .await
+        non_streaming(entry, messages, tools, tool_choice, params, ctx).await
     }
+}
+
+/// Everything about one in-flight request that is not its messages: identity (the log's `req` and
+/// the wire's `chatcmpl-…`), the reply framing, the deadline policy, and the shared counters.
+///
+/// It exists because [`streaming`] and [`non_streaming`] took nine positional arguments and the
+/// instrumentation wanted three more — at which point the next `String` inserted in the wrong slot
+/// is a bug the compiler cannot see.
+struct ReqCtx {
+    /// Log-only, monotonic. See [`next_req_id`].
+    id: u64,
+    /// The client-facing completion id (`chatcmpl-…`).
+    cid: String,
+    /// The model that ACTUALLY answered, echoed on the wire.
+    model_id: String,
+    created: i64,
+    deadline: Option<Duration>,
+    stream: bool,
+    stats: Arc<ServeStats>,
 }
 
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 async fn non_streaming(
     entry: ModelEntry,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
     tool_choice: Option<String>,
     params: GenParams,
-    cid: String,
-    model_id: String,
-    created: i64,
-    deadline: Option<Duration>,
+    ctx: ReqCtx,
 ) -> Response {
+    let ReqCtx {
+        id: req_id,
+        cid,
+        model_id,
+        created,
+        deadline,
+        stream,
+        stats,
+    } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
     // soon as one of that model's generations finishes. A different model's slots are independent.
+    // The guard is what the periodic line's `queued` counts; it drops however the wait ends.
+    let queued = QueuedGuard::new(stats.clone());
     let Ok(permit) = entry.slots.clone().acquire_owned().await else {
+        stats.fold_failure();
+        tracing::warn!(req = req_id, "rejected — server shutting down");
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server shutting down".into(),
         );
     };
+    drop(queued);
+    let active = ActiveGuard::new(stats.clone());
     let engine_arc = entry.engine.clone();
     let cid_blk = cid.clone();
+    let stats_blk = stats.clone();
 
     // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
     // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
@@ -872,8 +1301,10 @@ async fn non_streaming(
 
     let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         // The permit is MOVED into the blocking task and dropped when it ends: a slot is held for
-        // exactly the generation, and the next queued request is admitted the moment it frees.
+        // exactly the generation, and the next queued request is admitted the moment it frees. The
+        // `active` gauge rides along with it, so the two can never disagree.
         let _permit = permit;
+        let _active = active;
         let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
@@ -881,6 +1312,8 @@ async fn non_streaming(
         let mut reasoning = String::new();
         let mut content = String::new();
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
+        // Per-request tally: plain locals, folded into the shared counters once at the end.
+        let mut tally = ReqTally::new();
 
         let outcome = engine
             .chat(
@@ -890,8 +1323,14 @@ async fn non_streaming(
                 &params,
                 &cancel_blk,
                 &mut |delta| match delta {
-                    Delta::Reasoning(t) => reasoning.push_str(&t),
-                    Delta::Content(t) => content.push_str(&t),
+                    Delta::Reasoning(t) => {
+                        tally.on_text_delta(&stats_blk);
+                        reasoning.push_str(&t);
+                    }
+                    Delta::Content(t) => {
+                        tally.on_text_delta(&stats_blk);
+                        content.push_str(&t);
+                    }
                     Delta::ToolCall { name, arguments } => {
                         let idx = tool_calls.len();
                         tool_calls.push(OAIToolCall {
@@ -905,7 +1344,7 @@ async fn non_streaming(
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        Ok((reasoning, content, tool_calls, outcome))
+        Ok((reasoning, content, tool_calls, outcome, tally))
     });
 
     // The deadline, and the ONE thing about it that is easy to get wrong.
@@ -931,6 +1370,7 @@ async fn non_streaming(
                 deadline_hit = true;
                 cancel.store(true, Ordering::Relaxed);
                 tracing::warn!(
+                    req = req_id,
                     timeout_s = d.as_secs(),
                     "request deadline hit — returning the partial completion"
                 );
@@ -941,8 +1381,12 @@ async fn non_streaming(
     let result = joined.map_err(anyhow::Error::from).and_then(|r| r);
 
     match result {
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Ok((reasoning, content, tool_calls, outcome)) => {
+        Err(e) => {
+            stats.fold_failure();
+            tracing::warn!(req = req_id, error = %e, "request failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+        Ok((reasoning, content, tool_calls, outcome, tally)) => {
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
             // (a 500 would throw away work it can use) and `finish_reason` says "length", which is
             // OpenAI's reason for a completion that ran out of budget.
@@ -960,8 +1404,11 @@ async fn non_streaming(
                 Finish::Length
             } else {
                 outcome.finish
-            }
-            .as_str();
+            };
+            // Fold the request's tallies in ONCE, here, and log its completion line.
+            let rec = tally.finish(outcome, finish);
+            stats.fold_completion(&rec);
+            log_request_done(req_id, &model_id, stream, &rec);
             Json(ChatCompletionResponse {
                 id: cid,
                 object: "chat.completion",
@@ -987,7 +1434,7 @@ async fn non_streaming(
                             Some(tool_calls)
                         },
                     },
-                    finish_reason: finish.into(),
+                    finish_reason: finish.as_str().into(),
                 }],
                 usage: UsageInfo {
                     prompt_tokens: outcome.prompt_tokens,
@@ -1006,18 +1453,23 @@ async fn non_streaming(
 // Streaming path (SSE)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 async fn streaming(
     entry: ModelEntry,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
     tool_choice: Option<String>,
     params: GenParams,
-    cid: String,
-    model_id: String,
-    created: i64,
-    deadline: Option<Duration>,
+    ctx: ReqCtx,
 ) -> Response {
+    let ReqCtx {
+        id: req_id,
+        cid,
+        model_id,
+        created,
+        deadline,
+        stream,
+        stats,
+    } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
     // slow (or stalled) SSE client apply backpressure straight into that callback, so ONE
@@ -1030,17 +1482,23 @@ async fn streaming(
     // Same per-model admission gate as the non-streaming path — the (N+1)'th concurrent stream to
     // this model queues here. Taken BEFORE the SSE response is returned, so a queued client simply
     // waits for its first byte rather than being handed an open-but-silent stream.
+    let queued = QueuedGuard::new(stats.clone());
     let Ok(permit) = entry.slots.clone().acquire_owned().await else {
+        stats.fold_failure();
+        tracing::warn!(req = req_id, "rejected — server shutting down");
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server shutting down".into(),
         );
     };
+    drop(queued);
+    let active = ActiveGuard::new(stats.clone());
     let engine_arc = entry.engine.clone();
     // Clone sender + strings for use inside the on_delta callback closure.
     let tx_cb = tx.clone();
     let cid_cb = cid.clone();
     let model_cb = model_id.clone();
+    let stats_cb = stats.clone();
 
     // Per-request abort latch: set when the client disconnects (an SSE `send` starts failing) and
     // polled by the generator's decode loop so it stops promptly and frees the GPU slot instead of
@@ -1061,8 +1519,10 @@ async fn streaming(
     let done_tx = deadline.map(|d| arm_deadline(d, cancel.clone(), deadline_hit.clone()));
 
     tokio::task::spawn_blocking(move || {
-        // Held for exactly this generation; freed for the next queued request on return.
+        // Held for exactly this generation; freed for the next queued request on return. The
+        // `active` gauge is released by the same return (or unwind).
         let _permit = permit;
+        let _active = active;
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
@@ -1085,11 +1545,15 @@ async fn streaming(
 
         let Some(engine) = engine_arc else {
             // No engine — `DoneGuard` closes the stream with `[DONE]`.
+            stats.fold_failure();
+            tracing::warn!(req = req_id, "request failed: no engine loaded");
             return;
         };
 
         let mut tc_index = 0usize;
         let mut saw_tool_call = false;
+        // Per-request tally: plain locals inside the generation, folded in once below.
+        let mut tally = ReqTally::new();
 
         let res = engine.chat(
             &messages,
@@ -1099,14 +1563,20 @@ async fn streaming(
             &cancel_cb,
             &mut |delta| {
                 let payload = match delta {
-                    Delta::Reasoning(t) => DeltaPayload {
-                        reasoning_content: Some(t),
-                        ..Default::default()
-                    },
-                    Delta::Content(t) => DeltaPayload {
-                        content: Some(t),
-                        ..Default::default()
-                    },
+                    Delta::Reasoning(t) => {
+                        tally.on_text_delta(&stats_cb);
+                        DeltaPayload {
+                            reasoning_content: Some(t),
+                            ..Default::default()
+                        }
+                    }
+                    Delta::Content(t) => {
+                        tally.on_text_delta(&stats_cb);
+                        DeltaPayload {
+                            content: Some(t),
+                            ..Default::default()
+                        }
+                    }
                     Delta::ToolCall { name, arguments } => {
                         let tc = OAIToolCall {
                             index: tc_index,
@@ -1153,12 +1623,18 @@ async fn streaming(
                     DeltaPayload::default(),
                     Some(finish.as_str().into()),
                 )));
+                // Fold the request's tallies in ONCE, here, and log its completion line.
+                let rec = tally.finish(outcome, finish);
+                stats.fold_completion(&rec);
+                log_request_done(req_id, &model_id, stream, &rec);
             }
             Err(e) => {
                 // A mid-stream failure is NOT a clean `stop` — emit a terminal error frame so the
                 // client can tell this apart from success (matching the non-streaming 500). `[DONE]`
                 // still follows, via `DoneGuard` (audit finding 1).
                 let _ = tx.send(Ok(sse_error_event(&e.to_string())));
+                stats.fold_failure();
+                tracing::warn!(req = req_id, error = %e, "request failed");
             }
         }
         // `DoneGuard` drops here (or on an unwinding panic), sending the final `[DONE]`.
@@ -2608,6 +3084,21 @@ mod tests {
         AppState::new(generator, "m", 1, Arc::new(Config::default())).route("m")
     }
 
+    /// The per-request context the two generation paths take, with a fresh (undrained) stats sink —
+    /// the handler builds this from the request; a test that calls `streaming`/`non_streaming`
+    /// directly has to build its own.
+    fn test_ctx(deadline: Option<Duration>, stream: bool) -> ReqCtx {
+        ReqCtx {
+            id: next_req_id(),
+            cid: "cid".into(),
+            model_id: "m".into(),
+            created: 0,
+            deadline,
+            stream,
+            stats: Arc::default(),
+        }
+    }
+
     fn user_msg() -> Vec<ChatMessage> {
         vec![ChatMessage {
             role: "user".into(),
@@ -2634,10 +3125,7 @@ mod tests {
             None,
             None,
             GenParams::default(),
-            "cid".into(),
-            "m".into(),
-            0,
-            Some(Duration::from_millis(150)),
+            test_ctx(Some(Duration::from_millis(150)), false),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "a deadline is not a failure");
@@ -2668,10 +3156,7 @@ mod tests {
                 None,
                 None,
                 GenParams::default(),
-                "cid".into(),
-                "m".into(),
-                0,
-                Some(Duration::from_millis(100)),
+                test_ctx(Some(Duration::from_millis(100)), false),
             )
             .await;
             assert_eq!(
@@ -2696,10 +3181,7 @@ mod tests {
             None,
             None,
             GenParams::default(),
-            "cid".into(),
-            "m".into(),
-            0,
-            Some(Duration::from_secs(30)),
+            test_ctx(Some(Duration::from_secs(30)), false),
         )
         .await;
         let v = body_json(resp).await;
@@ -2717,10 +3199,7 @@ mod tests {
             None,
             None,
             GenParams::default(),
-            "cid".into(),
-            "m".into(),
-            0,
-            Some(Duration::from_millis(150)),
+            test_ctx(Some(Duration::from_millis(150)), true),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2831,6 +3310,245 @@ mod tests {
         assert!(
             cancel.load(Ordering::Relaxed),
             "a failed send must latch the abort flag so the decode loop stops"
+        );
+    }
+
+    // --- request / throughput logging (B10) ---------------------------------
+
+    /// A finished request, spelled out so a test can fold one in without running a generator.
+    fn rec(prompt: u32, gen: u32, deltas: u64) -> ReqRecord {
+        ReqRecord {
+            prompt_tokens: prompt,
+            gen_tokens: gen,
+            deltas,
+            prefill: Duration::from_millis(100),
+            decode: Duration::from_millis(400),
+            total: Duration::from_millis(500),
+            finish: Finish::Stop,
+        }
+    }
+
+    /// **The whole point of the periodic line.** Its numbers must describe the INTERVAL, so a drain
+    /// has to leave the counters at zero — a cumulative counter would turn every rate into an
+    /// average-since-boot, which looks plausible and is useless.
+    ///
+    /// Asserted by three consecutive intervals of the SAME wall length with DIFFERENT work in them:
+    /// busy, half as busy, idle. Per-interval, the rates must go 10 → 5 → 0. Cumulative, they would
+    /// go 10 → 15 → 15 (or 10 → 7.5 → 5 as an average), i.e. they could never fall — which is the
+    /// exact failure this pins.
+    #[test]
+    fn stats_windows_cover_the_interval_and_never_accumulate() {
+        let stats = ServeStats::default();
+        let window = Duration::from_secs(2);
+
+        for _ in 0..20 {
+            stats.bump_gen(1);
+        }
+        stats.fold_completion(&rec(100, 20, 20));
+        let busy = stats.drain(window);
+        assert_eq!(
+            (busy.prompt_tokens, busy.gen_tokens, busy.completed),
+            (100, 20, 1)
+        );
+        assert!((busy.decode_tps() - 10.0).abs() < 1e-9, "{busy:?}");
+        assert!((busy.prefill_tps() - 50.0).abs() < 1e-9, "{busy:?}");
+
+        for _ in 0..10 {
+            stats.bump_gen(1);
+        }
+        stats.fold_completion(&rec(20, 10, 10));
+        let quieter = stats.drain(window);
+        assert_eq!((quieter.prompt_tokens, quieter.gen_tokens), (20, 10));
+        assert!(
+            (quieter.decode_tps() - 5.0).abs() < 1e-9,
+            "the second interval must report only ITS OWN 10 tokens: {quieter:?}"
+        );
+        assert!(
+            quieter.decode_tps() < busy.decode_tps() && quieter.prefill_tps() < busy.prefill_tps(),
+            "half the work in the same wall time must report a LOWER rate: {busy:?} then {quieter:?}"
+        );
+
+        let idle = stats.drain(window);
+        assert_eq!(
+            (idle.gen_tokens, idle.prompt_tokens, idle.completed),
+            (0, 0, 0)
+        );
+        assert_eq!(idle.decode_tps(), 0.0);
+        assert!(
+            !idle.has_activity(),
+            "an interval with nothing in it must emit no line: {idle:?}"
+        );
+    }
+
+    /// The live per-delta count is an ESTIMATE (a delta is a text piece, not necessarily a token);
+    /// `ChatOutcome` is authoritative. Whichever way they disagree, the interval total must end up
+    /// on the authoritative number.
+    #[test]
+    fn the_live_delta_count_is_reconciled_against_the_real_token_count() {
+        // Generator emitted 3 pieces but really decoded 5 tokens.
+        let under = ServeStats::default();
+        for _ in 0..3 {
+            under.bump_gen(1);
+        }
+        under.fold_completion(&rec(1, 5, 3));
+        assert_eq!(under.drain(Duration::from_secs(1)).gen_tokens, 5);
+
+        // …and the other way: 6 pieces for 4 tokens.
+        let over = ServeStats::default();
+        for _ in 0..6 {
+            over.bump_gen(1);
+        }
+        over.fold_completion(&rec(1, 4, 6));
+        assert_eq!(over.drain(Duration::from_secs(1)).gen_tokens, 4);
+    }
+
+    /// Activity-only, and what counts as activity. A request that is mid-generation has produced no
+    /// completed tokens yet, but the server is plainly busy — so `active`/`queued` alone must be
+    /// enough to emit a line, or a single long generation would log nothing until it ended. An
+    /// interval with none of it emits nothing: there is no idle heartbeat, by decision.
+    #[test]
+    fn in_flight_requests_are_activity_and_an_empty_interval_is_not() {
+        let stats = Arc::new(ServeStats::default());
+        let w = Duration::from_secs(1);
+        assert!(!stats.drain(w).has_activity(), "idle must be silent");
+
+        let generating = ActiveGuard::new(stats.clone());
+        assert!(
+            stats.drain(w).has_activity(),
+            "a generation in flight is activity even before it yields a token"
+        );
+        drop(generating);
+        assert!(!stats.drain(w).has_activity());
+
+        let waiting = QueuedGuard::new(stats.clone());
+        assert!(
+            stats.drain(w).has_activity(),
+            "a request queued for a slot is activity"
+        );
+        drop(waiting);
+        assert!(!stats.drain(w).has_activity());
+    }
+
+    /// The gauges are RAII, so the interesting case is the abnormal exit: a guard dropped while
+    /// unwinding must still put the gauge back, or one panicking request leaves the server looking
+    /// permanently busy.
+    #[test]
+    fn the_active_gauge_is_released_by_an_unwinding_panic() {
+        let stats = Arc::new(ServeStats::default());
+        let inner = stats.clone();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _active = ActiveGuard::new(inner);
+            panic!("decode closure blew up");
+        }));
+        assert!(caught.is_err(), "the panic must have happened");
+        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+    }
+
+    /// `serve.stats_interval_secs`: 5 s by default, `0` switches the periodic line OFF.
+    #[test]
+    fn stats_interval_defaults_to_five_seconds_and_zero_disables_it() {
+        let mut cfg = Config::default();
+        assert_eq!(stats_interval(&cfg), Some(Duration::from_secs(5)));
+        cfg.serve.stats_interval_secs = 0;
+        assert_eq!(stats_interval(&cfg), None, "0 => no periodic line at all");
+        cfg.serve.stats_interval_secs = 30;
+        assert_eq!(stats_interval(&cfg), Some(Duration::from_secs(30)));
+    }
+
+    /// KV slot occupancy is `busy/total` across every hosted model — the number the periodic line
+    /// reports. It has to count HELD permits, not available ones.
+    #[tokio::test]
+    async fn slot_occupancy_counts_held_permits_across_models() {
+        let a: Arc<dyn ChatGenerator> = Arc::new(EchoGen("alpha"));
+        let b: Arc<dyn ChatGenerator> = Arc::new(EchoGen("beta"));
+        let state = AppState::multi(
+            vec![("alpha".into(), a, 3), ("beta".into(), b, 1)],
+            Arc::new(Config::default()),
+        );
+        assert_eq!(state.slot_occupancy(), (0, 4));
+        let held = state.models[0].slots.clone().acquire_owned().await.unwrap();
+        assert_eq!(state.slot_occupancy(), (1, 4));
+        let held2 = state.models[1].slots.clone().acquire_owned().await.unwrap();
+        assert_eq!(state.slot_occupancy(), (2, 4));
+        drop(held);
+        drop(held2);
+        assert_eq!(state.slot_occupancy(), (0, 4));
+    }
+
+    /// Request ids are a monotonic counter, NOT a clock reading: two requests admitted in the same
+    /// millisecond must still be tellable apart in the log.
+    #[test]
+    fn request_ids_are_monotonic_and_distinct() {
+        // STRICTLY increasing rather than dense: the counter is process-wide and the rest of the
+        // suite is minting ids from other threads at the same time, so the gaps are the mechanism
+        // working, not a failure. What must hold is that no id is ever reissued or reused.
+        let ids: Vec<u64> = (0..1000).map(|_| next_req_id()).collect();
+        assert!(
+            ids.windows(2).all(|w| w[1] > w[0]),
+            "ids must increase monotonically"
+        );
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "ids must never repeat");
+    }
+
+    /// End to end through the real non-streaming path: the request's tallies reach the shared
+    /// counters exactly once, with the generator's OWN token counts — `EchoGen` sends one delta but
+    /// reports two completion tokens, so this also proves the reconciliation runs on the live path
+    /// and not only in its unit test.
+    #[tokio::test]
+    async fn a_served_request_folds_its_counts_into_the_window() {
+        let stats: Arc<ServeStats> = Arc::default();
+        let ctx = ReqCtx {
+            stats: stats.clone(),
+            ..test_ctx(None, false)
+        };
+        let resp = non_streaming(
+            deadline_entry(Arc::new(EchoGen("alpha"))),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            ctx,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let w = stats.drain(Duration::from_secs(1));
+        assert_eq!(
+            (w.prompt_tokens, w.gen_tokens, w.completed, w.failed),
+            (3, 2, 1, 0),
+            "EchoGen reports prompt_tokens=3, completion_tokens=2 for one request: {w:?}"
+        );
+        assert_eq!(
+            (w.active, w.queued),
+            (0, 0),
+            "both gauges must be back at zero once the request is answered"
+        );
+    }
+
+    /// A failed generation is still a completed request, and it is counted as a FAILURE — a server
+    /// erroring on everything must not look idle.
+    #[tokio::test]
+    async fn a_failed_request_is_counted_as_a_failure() {
+        let stats: Arc<ServeStats> = Arc::default();
+        let ctx = ReqCtx {
+            stats: stats.clone(),
+            ..test_ctx(None, false)
+        };
+        let resp = non_streaming(
+            deadline_entry(Arc::new(FailGen)),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            ctx,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let w = stats.drain(Duration::from_secs(1));
+        assert_eq!((w.completed, w.failed), (1, 1), "{w:?}");
+        assert!(
+            w.has_activity(),
+            "an interval of failures is not an idle one"
         );
     }
 }

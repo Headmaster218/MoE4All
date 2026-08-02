@@ -237,6 +237,15 @@ metal_debug = false
 
 max_tokens_cap = 131072
 
+# Per-request wall-clock deadline, in seconds. 0 (the default) means NO deadline
+# — a deadline truncates a legitimate slow reply, so it is opt-in.
+request_timeout_secs = 0
+
+# How often the server logs its throughput line, in seconds. 0 switches the line
+# off. The line is ACTIVITY-ONLY: an interval in which nothing happened emits
+# nothing, so an idle server leaves a clean log.
+stats_interval_secs = 5
+
 # ── debug ────────────────────────────────────────────────────────────────────
 
 [debug]
