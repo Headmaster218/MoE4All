@@ -577,7 +577,17 @@ fn exit_if_signalled() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // DIAGNOSTICS GO TO STDERR, never stdout. `tracing_subscriber::fmt()` defaults to stdout, and
+    // once `refactor: route library diagnostics through tracing` (a6e9131) moved the device-probe
+    // and placement lines off `eprintln!` onto `tracing`, that default interleaved them with
+    // PROGRAM OUTPUT — which broke every machine-readable stdout this CLI has. Concretely
+    // `infr bench --json` emitted five INFO lines ahead of its `[{"avg_ts": ..}]`, so
+    // `ModelBench::infr_json`'s `serde_json::from_slice` failed on every cell and a whole
+    // `infr compare --sweep` printed `ERR` for all 35 rows. Same hazard for `--man`/`--completions`
+    // and for anything piping `infr run`. The split is the contract: stdout = results, stderr =
+    // logs.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -2087,7 +2097,7 @@ fn cmd_bench(
     // `VulkanBackend::new_with` when it picks the physical device; the prefill chunk
     // (`-u`/`device.ubatch`) rides the same config. Nothing to set here — straight to the seam.
     let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let samples = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
+    let (samples, placement) = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
     } else if n_gen > 0 {
@@ -2111,7 +2121,16 @@ fn cmd_bench(
     } else {
         None
     };
-    print_bench_avg_mtp(&samples, &label, depth, "", reps, json, mtp.as_ref());
+    print_bench_avg_mtp(
+        &samples,
+        &label,
+        depth,
+        "",
+        reps,
+        json,
+        mtp.as_ref(),
+        Some(&placement),
+    );
     Ok(())
 }
 
@@ -2195,6 +2214,7 @@ fn bench_mtp_tg(
 /// head (or `-pg`/`-n 0` bench calls), in which case this is BYTE-IDENTICAL to the pre-MTP output
 /// (falls straight through to `print_bench_avg`) — the "no new flags, unchanged output" guarantee
 /// for non-MTP models.
+#[allow(clippy::too_many_arguments)]
 fn print_bench_avg_mtp(
     samples: &[f64],
     label: &str,
@@ -2205,19 +2225,17 @@ fn print_bench_avg_mtp(
     reps: usize,
     json: bool,
     mtp: Option<&MtpBenchStats>,
+    placement: Option<&infr_llama::BenchPlacement>,
 ) {
     let Some(m) = mtp else {
-        print_bench_avg(samples, label, depth, suffix, reps, json);
+        print_bench_avg(samples, label, depth, suffix, reps, json, placement);
         return;
     };
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     let ratio = m.ts / avg.max(1e-9);
     if json {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
-        println!(
-            "[{{\"avg_ts\": {avg:.2}, \"mtp_ts\": {:.2}, \"mtp_ratio\": {ratio:.4}, \"alpha\": {:.4}, \"draft_pct\": {:.1}, \"verify_pct\": {:.1}, \"catchup_pct\": {:.1}}}]",
-            m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct
-        );
+        println!("{}", bench_json_line(samples, Some(m), placement));
         return;
     }
     let d = if depth > 0 {
@@ -2227,19 +2245,114 @@ fn print_bench_avg_mtp(
     };
     // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
     println!(
-        "{label}{d}: {avg:.1} t/s | mtp{}: {:.1} t/s ({ratio:.2}x, alpha={:.2}, draft {:.0}% verify {:.0}% catchup {:.0}%)  ({reps} reps)",
-        m.n_gen, m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct
+        "{label}{d}: {avg:.1} t/s | mtp{}: {:.1} t/s ({ratio:.2}x, alpha={:.2}, draft {:.0}% verify {:.0}% catchup {:.0}%)  ({reps} reps{}){}",
+        m.n_gen, m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct,
+        spread_note(samples, avg),
+        placement_note(placement),
     );
+}
+
+/// `infr bench --json`'s one output line, as a string — the SINGLE place the machine-readable
+/// shape is built, so both the plain and the MTP printer emit the same contract and it can be
+/// parsed in a test.
+///
+/// **The contract this holds:** a one-element array whose object starts with `avg_ts`, matching
+/// `llama-bench -o json` closely enough that `ModelBench::infr_json` (and any user script) reads
+/// it with `[0]["avg_ts"]`. Everything else is ADDITIVE — `reps_ts` and the placement fields — so
+/// adding a field can never break a reader. It must also be the ONLY thing on stdout: `main`
+/// pins the tracing subscriber to stderr for exactly this reason.
+fn bench_json_line(
+    samples: &[f64],
+    mtp: Option<&MtpBenchStats>,
+    placement: Option<&infr_llama::BenchPlacement>,
+) -> String {
+    let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+    let reps_ts: Vec<String> = samples.iter().map(|s| format!("{s:.2}")).collect();
+    let mtp_fields = match mtp {
+        Some(m) => format!(
+            ", \"mtp_ts\": {:.2}, \"mtp_ratio\": {:.4}, \"alpha\": {:.4}, \"draft_pct\": {:.1}, \"verify_pct\": {:.1}, \"catchup_pct\": {:.1}",
+            m.ts,
+            m.ts / avg.max(1e-9),
+            m.alpha,
+            m.draft_pct,
+            m.verify_pct,
+            m.catchup_pct
+        ),
+        None => String::new(),
+    };
+    let place = match placement {
+        Some(p) => format!(
+            ", \"ubatch\": {}, \"ubatch_pinned\": {}, \"kv_q8\": {}, \"submit_cap\": {}",
+            p.ubatch, p.ubatch_pinned, p.kv_q8, p.submit_cap
+        ),
+        None => String::new(),
+    };
+    format!(
+        "[{{\"avg_ts\": {avg:.2}{mtp_fields}, \"reps_ts\": [{}]{place}}}]",
+        reps_ts.join(", ")
+    )
+}
+
+/// How the reps SPREAD, as `min-max` t/s plus the peak-to-peak percentage of the mean — the half
+/// of a benchmark result an average deletes.
+///
+/// Backlog B6/B16: on this hardware a prefill average is reproducible to a few percent and a
+/// single leg can be 9% off, so an average alone cannot tell a real 3% win from noise. The spread
+/// can, and it costs nothing to print — the samples are already in hand. Empty/one-sample input
+/// gives an empty string (nothing to say).
+fn spread_note(samples: &[f64], avg: f64) -> String {
+    if samples.len() < 2 {
+        return String::new();
+    }
+    let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    format!(
+        ", {lo:.1}-{hi:.1}, spread {:.1}%",
+        (hi - lo) / avg.max(1e-9) * 100.0
+    )
+}
+
+/// The `ubatch=N kv=f16 submit=unlimited` fragment `infr bench` appends so a throughput number can
+/// be attributed later — see [`infr_llama::BenchPlacement`] for why these three and not others.
+/// Empty for the CPU/Metal arms, which have no Vulkan placement to report.
+fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
+    let Some(p) = p else {
+        return String::new();
+    };
+    format!(
+        " [ubatch {}{}, kv {}, submit {}]",
+        p.ubatch,
+        if p.ubatch_pinned { " pinned" } else { "" },
+        if p.kv_q8 { "q8_0" } else { "f16" },
+        if p.submit_cap == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("split/{}", p.submit_cap)
+        },
+    )
 }
 
 /// Shared bench-result reporter: average the per-rep t/s samples and print either the JSON shape
 /// (`[{"avg_ts": ..}]`, llama-bench-comparable) or `label[ @ dN][tag]: X t/s (N reps)`. One
 /// implementation for the dense-CPU / qwen35 bench tails (they previously each had a copy).
-fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: usize, json: bool) {
+///
+/// Both shapes carry the per-rep spread and — on Vulkan — the [`infr_llama::BenchPlacement`] the
+/// run settled on. The JSON keeps `avg_ts` as its first key and only ADDS fields, so
+/// `llama-bench -o json` consumers (including this CLI's own `ModelBench::infr_json`) are
+/// unaffected.
+fn print_bench_avg(
+    samples: &[f64],
+    label: &str,
+    depth: usize,
+    tag: &str,
+    reps: usize,
+    json: bool,
+    placement: Option<&infr_llama::BenchPlacement>,
+) {
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     if json {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
-        println!("[{{\"avg_ts\": {avg:.2}}}]");
+        println!("{}", bench_json_line(samples, None, placement));
     } else {
         let d = if depth > 0 {
             format!(" @ d{depth}")
@@ -2247,7 +2360,11 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
             String::new()
         };
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
-        println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
+        println!(
+            "{label}{d}{tag}: {avg:.1} t/s  ({reps} reps{}){}",
+            spread_note(samples, avg),
+            placement_note(placement),
+        );
     }
 }
 
@@ -2380,6 +2497,7 @@ fn cmd_bench_metal(
             reps,
             json,
             mtp.as_ref(),
+            None, // Metal has no Vulkan placement ladder / submit splitter to report.
         );
         Ok(())
     }
@@ -2424,7 +2542,7 @@ fn cmd_bench_cpu(
     } else {
         format!("pp{n_prompt}")
     };
-    print_bench_avg(&samples, &label, depth, " [cpu]", reps, json);
+    print_bench_avg(&samples, &label, depth, " [cpu]", reps, json, None);
     Ok(())
 }
 
@@ -4476,5 +4594,106 @@ mod tests {
         assert_eq!(arch_sampling(GEMMA4), (1.0, 64, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
+    }
+
+    /// `infr bench --json` must emit PARSEABLE JSON whose first key is `avg_ts`, in every
+    /// combination of the optional MTP and placement blocks.
+    ///
+    /// This guards the exact failure that made `infr compare --sweep` print `ERR` for all 35 rows
+    /// at 68a74b2 (backlog B6): `ModelBench::infr_json` runs `serde_json::from_slice` over the
+    /// child's WHOLE stdout and reads `[0]["avg_ts"]`, so anything that malforms this line — or
+    /// any diagnostic printed beside it — takes down every cell of a sweep at once, silently, as
+    /// a measurement failure rather than a crash. The stdout-purity half is enforced in `main`
+    /// (the subscriber is pinned to stderr); this is the shape half.
+    #[test]
+    fn bench_json_line_parses_and_leads_with_avg_ts() {
+        let samples = [100.0_f64, 110.0, 120.0];
+        let mtp = MtpBenchStats {
+            n_gen: 128,
+            ts: 150.0,
+            alpha: 0.51,
+            draft_pct: 30.0,
+            verify_pct: 60.0,
+            catchup_pct: 10.0,
+        };
+        let place = infr_llama::BenchPlacement {
+            ubatch: 256,
+            ubatch_pinned: true,
+            kv_q8: true,
+            submit_cap: 112,
+        };
+        for (name, line) in [
+            ("bare", bench_json_line(&samples, None, None)),
+            ("placement", bench_json_line(&samples, None, Some(&place))),
+            ("mtp", bench_json_line(&samples, Some(&mtp), None)),
+            ("both", bench_json_line(&samples, Some(&mtp), Some(&place))),
+        ] {
+            assert!(
+                line.starts_with("[{\"avg_ts\": "),
+                "{name}: avg_ts must lead the object: {line}"
+            );
+            let v: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("{name}: {e}: {line}"));
+            // Exactly what `ModelBench::infr_json` and `llama-bench -o json` readers do.
+            assert_eq!(v[0]["avg_ts"].as_f64(), Some(110.0), "{name}");
+            // The per-rep samples are carried, not just their mean (backlog B16: a single value
+            // hides the one leg in thirteen that was 8.9% low).
+            assert_eq!(
+                v[0]["reps_ts"].as_array().map(|a| a.len()),
+                Some(3),
+                "{name}: every rep is reported"
+            );
+        }
+        // The placement block is what makes an archived number attributable after the fact.
+        let v: serde_json::Value =
+            serde_json::from_str(&bench_json_line(&samples, Some(&mtp), Some(&place))).unwrap();
+        assert_eq!(v[0]["ubatch"].as_u64(), Some(256));
+        assert_eq!(v[0]["ubatch_pinned"].as_bool(), Some(true));
+        assert_eq!(v[0]["kv_q8"].as_bool(), Some(true));
+        assert_eq!(v[0]["submit_cap"].as_u64(), Some(112));
+        assert_eq!(v[0]["mtp_ts"].as_f64(), Some(150.0));
+        // The CPU/Metal arms have no Vulkan placement: those keys must be ABSENT, not zeroed —
+        // a `submit_cap: 0` there would read as "measured, unlimited" instead of "not applicable".
+        let bare: serde_json::Value =
+            serde_json::from_str(&bench_json_line(&samples, None, None)).unwrap();
+        assert!(bare[0]["ubatch"].is_null());
+        assert!(bare[0]["submit_cap"].is_null());
+    }
+
+    /// The spread note is the anti-average: it must show the peak-to-peak range, and say nothing
+    /// at all when there is only one sample to report (`-r 1`).
+    #[test]
+    fn spread_note_reports_peak_to_peak_and_is_silent_on_one_sample() {
+        // 90..110 around a mean of 100 is a 20% peak-to-peak spread.
+        let s = spread_note(&[90.0, 100.0, 110.0], 100.0);
+        assert!(s.contains("90.0-110.0"), "{s}");
+        assert!(s.contains("spread 20.0%"), "{s}");
+        assert_eq!(spread_note(&[100.0], 100.0), "");
+        assert_eq!(spread_note(&[], 0.0), "");
+    }
+
+    /// The placement note must distinguish "the splitter never armed" from "it armed at N" —
+    /// they are different runs and an A/B across them is not a comparison.
+    #[test]
+    fn placement_note_distinguishes_unlimited_from_split() {
+        let base = infr_llama::BenchPlacement {
+            ubatch: 1024,
+            ubatch_pinned: false,
+            kv_q8: false,
+            submit_cap: 0,
+        };
+        let s = placement_note(Some(&base));
+        assert_eq!(s, " [ubatch 1024, kv f16, submit unlimited]");
+        let split = infr_llama::BenchPlacement {
+            ubatch: 256,
+            ubatch_pinned: true,
+            kv_q8: true,
+            submit_cap: 112,
+        };
+        assert_eq!(
+            placement_note(Some(&split)),
+            " [ubatch 256 pinned, kv q8_0, submit split/112]"
+        );
+        assert_eq!(placement_note(None), "");
     }
 }

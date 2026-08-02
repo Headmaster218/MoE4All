@@ -10,6 +10,31 @@ use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+/// The placement/dispatch choices a Vulkan bench run actually settled on — reported next to the
+/// throughput figure by [`SeamModel::bench_vulkan`]'s caller.
+///
+/// **Why a throughput number is not interpretable without this.** Two of the inputs are decided at
+/// RUN time rather than by the shape being measured: the prefill chunk comes off the placement
+/// ladder ([`crate::seam::ubatch_rows`], which the VRAM residency sweep may pin below the default),
+/// and the submit cap is latched from a wall-clock sample of the first slow forward
+/// (`VulkanBackend::observe_forward`). Both change how the same graph is executed while leaving the
+/// dispatched KERNELS byte-identical, so neither is visible in `INFR_PROF_OPS` and a run that
+/// differs in either looks like unexplained variance. Printing them makes an old number
+/// attributable and an A/B checkable — if the two legs disagree here, they did not measure the
+/// same thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BenchPlacement {
+    /// Prefill chunk height in rows, as the prefill loop and the activation reserve saw it.
+    pub ubatch: usize,
+    /// The height came from the user (`-u` / `INFR_UBATCH`), not from the placement ladder.
+    pub ubatch_pinned: bool,
+    /// The placement ladder chose a q8_0 KV cache to keep the session resident.
+    pub kv_q8: bool,
+    /// Dispatches per submit; `0` = unlimited, one command buffer per forward (every healthy
+    /// discrete GPU). Anything else means the submit splitter armed during this run.
+    pub submit_cap: usize,
+}
+
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
 /// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
 /// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
@@ -1191,7 +1216,8 @@ impl SeamModel {
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
     /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,
     /// `n_gen > 0` = decode at depth, else prefill of `n_prompt` at depth. Returns the per-rep
-    /// tokens/sec samples.
+    /// tokens/sec samples AND the [`BenchPlacement`] the run actually used, so the number can be
+    /// attributed after the fact instead of being an unlabelled throughput figure.
     pub fn bench_vulkan(
         &self,
         n_prompt: usize,
@@ -1199,7 +1225,7 @@ impl SeamModel {
         depth: usize,
         pg: Option<(usize, usize)>,
         reps: usize,
-    ) -> Result<Vec<f64>> {
+    ) -> Result<(Vec<f64>, BenchPlacement)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
@@ -1245,11 +1271,11 @@ impl SeamModel {
          -> Result<crate::GenStats> {
             crate::with_profiling_suppressed(|| run(prompt_len, gen, state))
         };
-        // Untimed warmup: uploads the weights and compiles every pipeline the timed reps hit.
-        unprofiled(8, 2, &mut state)?;
-        infr_prof_rt::gpu_reset();
-        let mut samples = Vec::with_capacity(reps);
-        for _ in 0..reps.max(1) {
+        // ONE rep, exactly as measured: reset the KV, warm it to `depth` (untimed), time the
+        // metric, return it as tokens/sec. A closure so the discarded warm rep below and the
+        // measured reps run BYTE-IDENTICAL code — a warm rep that differs from a timed one in any
+        // way is not a warmup, it is a second measurement of something else.
+        let one_rep = |state: &mut Option<crate::seam::SeamKv>| -> Result<f64> {
             if let Some(st) = state.as_mut() {
                 st.reset();
             }
@@ -1268,27 +1294,63 @@ impl SeamModel {
                 // per-row throughput had IMPROVED. Feeding one extra token here leaves exactly
                 // `depth` rows resident, so the timed window holds precisely the work it reports —
                 // llama-bench's `-d` semantics.
-                unprofiled(depth + 1, 0, &mut state)?; // warm the cache to `depth` (untimed)
+                unprofiled(depth + 1, 0, state)?; // warm the cache to `depth` (untimed)
             }
             if let Some((p, g)) = pg {
                 // coding-agent turn: prompt ingest + reply generation timed together.
-                let s = run(depth + p, g, &mut state)?;
-                samples.push((p + g) as f64 / (s.prompt_secs + s.decode_secs).max(1e-9));
+                let s = run(depth + p, g, state)?;
+                Ok((p + g) as f64 / (s.prompt_secs + s.decode_secs).max(1e-9))
             } else if n_gen > 0 {
                 // decode at depth: 1-token suffix feeds the loop, the timed part is the decode.
-                let s = run(depth + 1, n_gen, &mut state)?;
-                samples.push(n_gen as f64 / s.decode_secs.max(1e-9));
+                let s = run(depth + 1, n_gen, state)?;
+                Ok(n_gen as f64 / s.decode_secs.max(1e-9))
             } else {
                 // +1: the suffix's LAST token is the decode feed and is never processed at
                 // gen=0, and a suffix of <= 2 skips batched prefill entirely — so `depth + N`
                 // measured N-1 batched rows (and pp2 measured nothing, reporting the 1e-9
                 // floor). With +1, exactly N rows batch-prefill (positions depth..depth+N) and
                 // prompt_secs covers precisely them — llama-bench's -p N semantics.
-                let s = run(depth + n_prompt + 1, 0, &mut state)?;
-                samples.push(n_prompt as f64 / s.prompt_secs.max(1e-9));
+                let s = run(depth + n_prompt + 1, 0, state)?;
+                Ok(n_prompt as f64 / s.prompt_secs.max(1e-9))
             }
+        };
+        // Untimed warmup: uploads the weights and compiles the pipelines a generic turn hits.
+        unprofiled(8, 2, &mut state)?;
+        // Untimed warm rep AT THE MEASURED SHAPE, discarded (backlog B6/B16). The (8, 2) turn
+        // above does NOT cover the shape being timed — it prefills 7 rows and decodes 2 — so the
+        // first TIMED rep was paying that shape's one-time costs (its pipeline variants, its
+        // first-touch scratch pools) inside the measured window, and `avg_ts` averaged them in.
+        //
+        // Measured, Qwen3.6-35B-A3B UD-IQ3_S `pp4 @ d4096`, per-rep wall for the timed m=4 chunk
+        // (`INFR_PROF_STAGES=1`) across six processes: rep 1 came in at 24.6 / 40.1 / 45.6 / 42.3
+        // / 24.1 / 46.9 ms while reps 2-3 sat at 13.3-14.1 ms every single time. So rep 1 cost
+        // 1.8-3.5x steady state, and the SPREAD of that one rep was the whole cell's variance:
+        // avg_ts moved 220.1-251.2 t/s (14%) while the steady reps moved under 6%. The same
+        // effect is 3% on `pp512` (155.5 vs 150.4 ms) because there the fixed cost is small next
+        // to the work — which is exactly why the two prefill columns disagree about
+        // reproducibility, and why the shortest metric is the worst offender.
+        //
+        // This is what `bench_vulkan`'s doc always claimed to do, and llama-bench does the same
+        // (a discarded warmup iteration per shape). It removes a cold-start cost from the
+        // average; it does not make any kernel faster.
+        crate::with_profiling_suppressed(|| one_rep(&mut state))?;
+        infr_prof_rt::gpu_reset();
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps.max(1) {
+            samples.push(one_rep(&mut state)?);
         }
-        Ok(samples)
+        // Read the placement AFTER the reps: the pins are set by the binder on the first load, and
+        // the submit cap can only have moved during the runs. `bench_vulkan` holds no
+        // `PlacementScope`, so these read the process-wide fallback pins this session wrote.
+        Ok((
+            samples,
+            BenchPlacement {
+                ubatch: crate::seam::ubatch_rows(&self.ecfg),
+                ubatch_pinned: self.ecfg.device.ubatch_specified,
+                kv_q8: crate::seam::kv_auto_q8(),
+                submit_cap: vk.submit_cap_now(),
+            },
+        ))
     }
 
     /// Open a persistent Metal seam session (the Apple-GPU twin of

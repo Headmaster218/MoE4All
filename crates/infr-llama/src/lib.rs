@@ -12,7 +12,7 @@ pub mod arch;
 pub mod chat;
 mod config;
 pub mod seam;
-pub use seam::model::SeamModel;
+pub use seam::model::{BenchPlacement, SeamModel};
 pub mod diffusion;
 mod util;
 pub(crate) use util::*;

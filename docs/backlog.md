@@ -99,36 +99,121 @@ worse version of solved infrastructure.
 traffic with no proxy in front. That is a different product decision, not a
 missing feature.
 
-### B6 — prefill throughput is not reproducible run-to-run
+### B6 — prefill reproducibility: the stated cause was WRONG; the real one is fixed
 
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; needs a decision on
-where to pin the tier
+**Tag:** diagnosed + fixed 2026-08-02 · **Blocked on:** nothing; what is left is
+the residual on the two smallest models, and it is not tier choice
 
-Running the full 35-row sweep twice against the SAME infr binary (`691c0dc`),
-with llama.cpp absolutes moving under 1%, the two prefill columns disagree with
-themselves:
+**The original claim, kept because it is what was disproved.** Running the
+35-row sweep twice against the same binary (`691c0dc`) gave `pp512` 6.8% mean /
+34.5% worst and `pp4@d4096` 7.7% / 31.7%, against under 1% on both decode
+columns, and the entry attributed it to "tier/chunk nondeterminism — a short
+prefill can land on a different kernel tier between runs".
 
-| column       | mean abs Δ between runs | worst row | rows moving >5% |
-| ------------ | ----------------------- | --------- | --------------- |
-| `tg128`      | 0.8%                    | 3.0%      | 0 / 35          |
-| `tg64@d4096` | 0.7%                    | 2.2%      | 0 / 35          |
-| `pp512`      | 6.8%                    | **34.5%** | 10 / 35         |
-| `pp4@d4096`  | 7.7%                    | **31.7%** | **19 / 35**     |
+**That attribution does not survive measurement.** Three separate checks:
 
-Decode is solid; prefill is not. The cause is the documented tier/chunk
-nondeterminism — a short prefill can land on a different kernel tier between
-runs — and it bites hardest where the prefill is shortest (the sub-2B models)
-and on the IQ3_S MoE (+34.5%).
+- **The kernels are identical.** `INFR_PROF_OPS=1` over six back-to-back `pp512`
+  runs and eight `pp4@d4096` runs of Qwen3-0.6B Q4_K_M produced a byte-identical
+  (op name, dispatch count) signature every time — 14 ops / 729 dispatches for
+  `pp512`, 449 for `pp4` — while `pp4`'s reported throughput moved 1029.5 →
+  1120.4 t/s. Different throughput, same kernels: no tier changed.
+- **Nothing feeds a tier decision live VRAM at bench scale.** `adaptive_chunk`
+  is a pure function of the KV span. `vulkan_moe_binder` takes ONE `vk.vram()`
+  snapshot per load and every budget derives from it, and both rungs that could
+  move a chunk (`dense_resident_rung`, the auto-q8 rung) log at WARN when they
+  fire. A bench sizes its KV to `depth + p + g + 16` — 528 rows for `pp512` — so
+  no model in the sweep is anywhere near a rung boundary. None of these fired.
+- **`pp512` is now reproducible, so the 34.5% is not a live property of the
+  tree.** Four full sweeps of the five named-worst models at `68a74b2`: `pp512`
+  peak-to-peak 0.9% mean / 1.4% worst, `tg128` 0.6/1.1, `tg64@d4096` 1.0/1.7.
+  Only `pp4@d4096` moved — 8.4% mean, 20.2% worst, on the IQ3_S MoE.
 
-This is not cosmetic. It moved `pp512` from 26/35 wins to 34/35 between two runs
-of one binary, and it means a prefill A/B under ~10% cannot be trusted without
-repeats. The previous snapshot's "small-model `pp512` cluster" finding turned
-out to be this variance, not a real deficit.
+**What actually moved `pp4@d4096`: the first timed rep was a COLD rep.**
+`bench_vulkan`'s untimed warmup was a hardcoded `(8, 2)` turn — 7 prefill rows
+and 2 decode steps — which does not cover the shape about to be timed, so the
+first TIMED rep paid that shape's one-time costs (its pipeline variants, its
+first-touch scratch pools) inside the measured window and `avg_ts` averaged them
+in. `INFR_PROF_STAGES=1` on Qwen3.6-35B-A3B UD-IQ3_S `pp4 @ d4096`, per-rep wall
+for the timed m=4 chunk across six processes:
 
-**To do:** make the tier/chunk choice deterministic for a given shape, or pin it
-when `-r > 1` so a benchmark at least measures one tier consistently. Until then
-`infr bench -u/--ubatch <N>` is the workaround, and prefill numbers should be
-reported as a median of several runs rather than a single value.
+| rep | run 1 | run 2 | run 3 | run 4 | run 5 | run 6 |
+| --- | ----- | ----- | ----- | ----- | ----- | ----- |
+| 1   | 24.6  | 40.1  | 45.6  | 42.3  | 24.1  | 46.9  |
+| 2   | 13.6  | 13.6  | 13.6  | 14.1  | 13.8  | 13.5  |
+| 3   | 13.5  | 13.5  | 13.9  | 14.1  | 13.3  | 14.0  |
+
+Reps 2-3 never leave 13.3-14.1 ms. Rep 1 costs 1.8-3.5x that and its scatter IS
+the cell's variance (`avg_ts` 220.1-251.2, 13.4%). The same effect is only 3% on
+`pp512` (155.5 / 153.1 / 150.4 ms) because there the fixed cost is small next to
+the work — which is exactly why the two prefill columns disagreed about
+reproducibility, and why the SHORTEST metric was the worst offender rather than
+the one with the shortest prefill.
+
+**Fixed** by running one untimed warm rep at the measured shape before the timed
+ones — the same discarded warmup iteration llama-bench does, and what
+`bench_vulkan`'s own doc already claimed. Four sweeps before, four after:
+
+| column       | p2p before (mean / worst) | p2p after (mean / worst) |
+| ------------ | ------------------------- | ------------------------ |
+| `pp4@d4096`  | 8.4% / **20.2%**          | 4.3% / 7.9%              |
+| `pp512`      | 0.9% / 1.4%               | 1.4% / 2.8%              |
+| `tg128`      | 0.6% / 1.1%               | 1.4% / 1.9%              |
+| `tg64@d4096` | 1.0% / 1.7%               | 1.2% / 1.7%              |
+
+The named worst row collapses: Qwen3.6-35B-A3B UD-IQ3_S `pp4@d4096` went
+223/200/246/244 (20.2%) to 293/294/294/290 (**1.4%**). The other three columns
+are unchanged within their own noise — the small rises there are between-block
+ambient drift, not an effect of the change, which cannot touch a steady-state
+rep.
+
+**`pp4@d4096` absolutes MOVED and are not comparable across this change.** The
+MoE reads +26% (232 → 290 t/s) because a cold rep is no longer averaged into a
+steady-state figure. The re-sweep (B14) must regenerate that column, not diff it
+against the old table.
+
+**What is still open, and it is not tier choice.** Qwen3-0.6B and gemma-3-1b
+keep ~8% peak-to-peak on `pp4@d4096`. That metric times four tokens: ~3.7 ms
+wall per rep of which ~2.8 ms is device time (`INFR_PROF_OPS`), so roughly a
+quarter is host-side record/submit/fence and its jitter is what is left. Options
+if it ever matters: raise `-r` for that column only, report the median instead
+of the mean, or accept that a four-token measurement resolves nothing under
+~10%. `infr bench` now prints the per-rep min-max and spread on every line, so
+this is visible in the output instead of inferred.
+
+**Two other things this slice found and changed:**
+
+- **`infr compare --sweep` was completely broken at `68a74b2`** and printed
+  `ERR` for every cell. `refactor: route library diagnostics through tracing`
+  (`a6e9131`) moved the device-probe lines onto `tracing`, and
+  `tracing_subscriber::fmt()` defaults to STDOUT — so `infr bench --json`
+  emitted five INFO lines ahead of its `[{"avg_ts": ..}]` and
+  `ModelBench::infr_json`'s `serde_json::from_slice` failed on all of them. The
+  subscriber is now pinned to stderr, and
+  `bench_json_line_parses_and_leads_with_avg_ts` guards the shape half (shown
+  red by prefixing the line with a log line).
+- **The submit splitter can latch on a wall-clock sample.**
+  `VulkanBackend::observe_forward` arms `submit_dispatch_cap` on a discrete GPU
+  when ONE forward exceeds `SUBMIT_DANGER_NS` (1 s), and the cap only ratchets
+  down — so a slow first forward (a cold pipeline build, a loaded host)
+  permanently changes the submit structure of every later forward in that
+  process while leaving the dispatched kernels byte-identical, i.e. invisible in
+  `INFR_PROF_OPS`. It never fired in any run measured here (every line reports
+  `submit unlimited`), so this is a latent hazard, not the cause of anything
+  observed. It now logs at WARN when it arms and `infr bench` reports the final
+  cap.
+
+**Coverage gaps in this diagnosis, stated plainly.** `llama-bench` on this box
+is currently broken
+(`/usr/lib/libllama.so.0: undefined symbol: ggml_dsv4_hc_post`), so all eight
+sweeps ran infr-only with `NA` in the oracle column. The original two sweeps
+interleaved ~30 s of full-GPU llama-bench work between every infr cell; that
+thermal coupling is absent here and cannot be ruled out as a contributor to the
+original `pp512` numbers. The subset was five models (the four sub-2B rows and
+the IQ3_S MoE that B6 named), not all 35.
+
+**Withdrawn from the original entry:** "pin the tier when `-r > 1`". There is no
+tier to pin — the choice was already a pure function of the shape at bench
+scale, and pinning it would have fixed nothing.
 
 ### B7 — decode attention at depth: three designs measured; a mid-depth win found
 
@@ -809,8 +894,17 @@ is +0.6% at d8192 and −1.5% at d32768. A re-sweep must not extrapolate it.
 
 ### B16 — one decode leg in thirteen was 8.9% low
 
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; recorded so it is not
-mistaken for a real effect
+**Tag:** measured 2026-08-02, cause identified 2026-08-02 · **Blocked on:**
+nothing; recorded so it is not mistaken for a real effect
+
+**Very likely the same cold-first-rep effect B6 diagnosed and fixed** — the
+suspicion below ("a cold shader/pipeline cache or a first-touch VRAM effect")
+was right, and B6 measured it directly: before the fix, rep 1 of a bench cost
+1.8-3.5x the steady-state rep and only rep 1. The tell here is the same one: "it
+was the FIRST leg run against that model". NOT re-measured on this shape
+(gemma-3-12b `tg128 @ d8192` with `INFR_NO_ATTN_DECODE=1`), so this is a strong
+inference, not a verified claim — the original 13 legs would have to be re-run
+to confirm the 8.9% outlier is gone. Everything below is the original record.
 
 B6 establishes that decode is reproducible to ~1% on this box while prefill is
 not. That is right on average and it is not a guarantee. Benching gemma-3-12b

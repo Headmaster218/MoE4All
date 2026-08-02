@@ -2337,7 +2337,31 @@ impl VulkanBackend {
             self.shared
                 .submit_dispatch_cap
                 .store(next, Ordering::Relaxed);
+            // SAY IT OUT LOUD when a never-split device starts splitting. This transition is
+            // latched (the cap only ratchets down) and it is decided by ONE wall-clock sample, so
+            // a slow first forward — a cold pipeline build, a loaded host — permanently changes
+            // the submit structure of every later forward in the process. Two runs of the same
+            // command can therefore differ in submit count while dispatching byte-identical
+            // kernels, which is invisible in `INFR_PROF_OPS` and looks exactly like unexplained
+            // benchmark variance. `infr bench` reports the final cap for the same reason.
+            if cur == 0 {
+                tracing::warn!(
+                    "[infr] submit splitter ARMED: a forward took {:.0} ms over {dispatches} \
+                     dispatches (past the {} ms danger threshold), so forwards now split every \
+                     {next} dispatches for the rest of this process. Set \
+                     INFR_SUBMIT_DISPATCHES=0 to disable.",
+                    ns as f64 / 1e6,
+                    infr_core::SUBMIT_DANGER_NS / 1_000_000,
+                );
+            }
         }
+    }
+
+    /// The submit splitter's cap as it stands NOW, for reporting (`infr bench`'s result line).
+    /// `0` = unlimited, i.e. one command buffer per forward — see [`Self::observe_forward`] for
+    /// why this is worth printing next to a throughput number.
+    pub fn submit_cap_now(&self) -> usize {
+        self.submit_dispatch_cap()
     }
 
     /// Begin a "loading weights" progress bar covering `total_bytes` (pass `None` for an
