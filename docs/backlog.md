@@ -701,6 +701,45 @@ Left in because every placement estimate shares this helper and removing it
 would loosen all of them at once, on a model where (see B8) the remaining margin
 is already ~1%. Worth revisiting only together with a path-aware reserve.
 
+### B14 — verification gaps from the 2026-08-02 decode-attention and KV-fit slices
+
+**Tag:** raised 2026-08-02 · **Blocked on:** nothing; each is a measurement
+someone has to run
+
+Recorded as gaps rather than left implicit. Everything below shipped without the
+check named, and in each case the check is cheap — the reason it is missing is
+time or hardware, not difficulty.
+
+- **qwen35 (hd 256/512) was never benched against `attn_decode`.** Slice 3b's
+  hd-256/512 family is proven CORRECT on it (the bitwise parity suite plus
+  `unified_qwen35_gpu_seam_matches_cpu` / `gpu_seam_matches_cpu_qwen35moe`), but
+  only gemma-3-12b and gemma-4-12b got a throughput A/B. qwen35 could be faster,
+  slower or a wash and nobody has looked.
+- **`INFR_NO_ATTN_HD=1` is wired and compiles but has never been executed.** It
+  is the A/B escape back to `attn_partial_*_nohd_bda` for hd 256/512. An unrun
+  escape hatch is not an escape hatch.
+- **`docs/perf/results.md` is stale.** Its decode-at-depth cells are 4–8% better
+  than published after slices 3a/3b, and the whole 35-row table predates both.
+  It needs a re-sweep — and per B6 the prefill columns need medians of several
+  runs, not single values, or the regenerated table will just re-import that
+  variance.
+- **Metal and CPU are unexercised for the KV-fit change.** Only the Vulkan path
+  was measured. The Apple `#[cfg]`-gated code is not even compiled locally, so
+  only CI can judge it.
+- **`infr serve --parallel N` for N > 1 was not exercised.** `vulkan_slot_ctx`'s
+  divide-by-N branch is unchanged by the slice but was only ever run at N=1.
+- **The refuse rung's `Err` has never been printed by a real run.** No model on
+  this box drives `max(fit_f16, fit_q8)` under `MIN_SESSION_CTX`, so the message
+  text — the thing a stuck user actually reads — is untested against a human.
+- **The iGPU chunk-ladder filtering is reasoned, not measured.** Filtering
+  `ubatch_candidates` to heights below the current one also stops a placement
+  sweep raising an integrated GPU's chunk above its watchdog-safe default. That
+  argument was never run on an iGPU, and the watchdog is exactly the thing that
+  punishes being wrong (see `docs/igpu.md`).
+- **gemma at d32768 with `attn_decode` was not measured.** The window-capped
+  profile (40 of 48 layers flat at ~17.8 µs from d4096 to d8192) predicts no
+  further gain there. That is a prediction, not a measurement.
+
 ---
 
 ## Withdrawn
