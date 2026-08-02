@@ -9,7 +9,9 @@ use infr_gguf::dequant::{
     e8m0_to_fp32_half, k4, rdf16, ue4m3_to_fp32, KVALUES_IQ4NL, KVALUES_MXFP4,
 };
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{__m256i, __m512i, _mm256_loadu_si256, _mm512_loadu_si512};
+use std::arch::x86_64::{
+    __m128i, __m256i, __m512i, _mm256_loadu_si256, _mm512_loadu_si512, _mm_loadu_si128,
+};
 
 /// Load the 32 bytes starting at ELEMENT offset `off` of `s` into a ymm register.
 ///
@@ -93,6 +95,35 @@ unsafe fn load512<T>(s: &[T], off: usize) -> __m512i {
         size_of_val(s)
     );
     _mm512_loadu_si512(s[off..].as_ptr() as *const __m512i)
+}
+
+/// Load the 16 bytes starting at ELEMENT offset `off` of `s` into an xmm register.
+///
+/// The 128-bit twin of [`load256`] — see that function for the full rationale. The failure mode is
+/// identical: a `RangeFrom` slice index bounds only the first byte while the intrinsic reads
+/// SIXTEEN, so the load is correct by block geometry alone and a layout change breaks it silently.
+///
+/// Several call sites read a fixed-size codebook (`KVALUES_IQ4NL` / `KVALUES_MXFP4`, both
+/// `[i8; 16]`) where the bound is trivially exact; they go through the helper anyway so the
+/// invariant is uniform across every wide load in this file and a future codebook resize cannot
+/// quietly widen the read.
+///
+/// # Safety
+/// `sse2` must be available. It is part of the x86_64 baseline, and every caller is additionally
+/// inside an `avx2`/`avx512*` `#[target_feature]` function, all of which imply it.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn load128<T>(s: &[T], off: usize) -> __m128i {
+    debug_assert!(
+        off * size_of::<T>() + 16 <= size_of_val(s),
+        "load128 reads out of bounds: offset {off} elems ({} bytes) + 16 bytes > slice of {} elems \
+         ({} bytes) — block geometry changed and the load width no longer fits",
+        off * size_of::<T>(),
+        s.len(),
+        size_of_val(s)
+    );
+    _mm_loadu_si128(s[off..].as_ptr() as *const __m128i)
 }
 
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
@@ -1018,8 +1049,7 @@ unsafe fn vec_dot_iq4xs_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
     let ones_i16 = _mm256_set1_epi16(1i16);
     // Codebook table broadcast into both 128-bit lanes for lane-local pshufb.
-    let table =
-        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+    let table = _mm256_broadcastsi128_si256(load128(&KVALUES_IQ4NL, 0));
     for b in 0..nb {
         let blk = &row[b * 136..b * 136 + 136];
         let d = rdf16(&blk[0..2]);
@@ -1030,7 +1060,7 @@ unsafe fn vec_dot_iq4xs_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let mut isum = 0i32;
         for ib in 0..8usize {
             // 16 code bytes → xmm; nibbles → 32 codes ([lo16 | hi16]).
-            let codes16 = _mm_loadu_si128(qs[ib * 16..].as_ptr() as *const __m128i);
+            let codes16 = load128(qs, ib * 16);
             let lo =
                 _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
             let hi = _mm256_castsi128_si256(_mm_and_si128(
@@ -1069,7 +1099,7 @@ unsafe fn vec_dot_iq4xs_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let mut sumf = 0f32;
     let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
     let ones_i16_z = _mm512_set1_epi16(1i16);
-    let table_z = _mm512_broadcast_i32x4(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+    let table_z = _mm512_broadcast_i32x4(load128(&KVALUES_IQ4NL, 0));
     for b in 0..nb {
         let blk = &row[b * 136..b * 136 + 136];
         let d = rdf16(&blk[0..2]);
@@ -2627,9 +2657,7 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let w1 = load512(flat, 64);
             let w2 = load512(flat, 128);
             let w3 = load512(flat, 192);
-            let sc_z = _mm512_cvtepi8_epi32(_mm_loadu_si128(
-                scales_arr[b * 16..].as_ptr() as *const __m128i
-            ));
+            let sc_z = _mm512_cvtepi8_epi32(load128(&scales_arr, b * 16));
             let sumi_a = q6k_sumi16!(q8a, b, w0, w1, w2, w3);
             let sumi_b = q6k_sumi16!(q8b, b, w0, w1, w2, w3);
             q6k_epilogue!(q8a, b, sumi_a, sc_z, sumf_a);
@@ -2648,9 +2676,7 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let w1 = load512(flat, 64);
             let w2 = load512(flat, 128);
             let w3 = load512(flat, 192);
-            let sc_z = _mm512_cvtepi8_epi32(_mm_loadu_si128(
-                scales_arr[b * 16..].as_ptr() as *const __m128i
-            ));
+            let sc_z = _mm512_cvtepi8_epi32(load128(&scales_arr, b * 16));
             let sumi = q6k_sumi16!(q8, b, w0, w1, w2, w3);
             q6k_epilogue!(q8, b, sumi, sc_z, sumf);
         }
@@ -2754,8 +2780,7 @@ unsafe fn vec_dot_iq4xs_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mu
     let nb = in_f / 256;
     let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
     let ones_i16 = _mm256_set1_epi16(1i16);
-    let table =
-        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+    let table = _mm256_broadcastsi128_si256(load128(&KVALUES_IQ4NL, 0));
 
     let mut d_arr = vec![0f32; nb];
     let mut ls_arr = vec![0i32; nb * 8];
@@ -2768,7 +2793,7 @@ unsafe fn vec_dot_iq4xs_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mu
         let qs = &blk[8..136];
         for ib in 0..8usize {
             ls_arr[b * 8 + ib] = iq4xs_ls_minus_32(scales_h, scales_l, ib);
-            let codes16 = _mm_loadu_si128(qs[ib * 16..].as_ptr() as *const __m128i);
+            let codes16 = load128(qs, ib * 16);
             let lo =
                 _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
             let hi = _mm256_castsi128_si256(_mm_and_si128(
@@ -5128,8 +5153,8 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
                 } else {
                     // Q8_0: bias the signed bytes to unsigned (two 16-byte xors).
                     let q = &blk[2..34];
-                    let v0 = _mm_loadu_si128(q.as_ptr() as *const __m128i);
-                    let v1 = _mm_loadu_si128(q[16..].as_ptr() as *const __m128i);
+                    let v0 = load128(q, 0);
+                    let v1 = load128(q, 16);
                     _mm_storeu_si128(tmp[i].as_mut_ptr() as *mut __m128i, _mm_xor_si128(v0, bias));
                     _mm_storeu_si128(
                         tmp[i][16..].as_mut_ptr() as *mut __m128i,
@@ -5993,14 +6018,13 @@ unsafe fn iq4nl_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<i8>, Vec
     let mut flat = vec![0i8; nb * 32];
     let mut d_arr = vec![0f32; nb];
     let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
-    let table =
-        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+    let table = _mm256_broadcastsi128_si256(load128(&KVALUES_IQ4NL, 0));
     for b in 0..nb {
         let blk = &row[b * bpr..b * bpr + bpr];
         d_arr[b] = rdf16(&blk[0..2]);
         let qs = &blk[2..18];
         // 16 code bytes → xmm; nibbles → 32 codes ([lo16 | hi16]); pshufb → 32 signed weights.
-        let codes16 = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let codes16 = load128(qs, 0);
         let lo = _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
         let hi = _mm256_castsi128_si256(_mm_and_si128(
             _mm_srli_epi16(codes16, 4),
@@ -6171,14 +6195,13 @@ unsafe fn mxfp4_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<i8>, Vec
     let mut flat = vec![0i8; nb * 32];
     let mut d_arr = vec![0f32; nb];
     let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
-    let table =
-        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_MXFP4.as_ptr() as *const __m128i));
+    let table = _mm256_broadcastsi128_si256(load128(&KVALUES_MXFP4, 0));
     for b in 0..nb {
         let blk = &row[b * bpr..b * bpr + bpr];
         d_arr[b] = e8m0_to_fp32_half(blk[0]);
         let qs = &blk[1..17];
         // 16 code bytes → xmm; nibbles → 32 codes ([lo16 | hi16]); pshufb → 32 signed weights.
-        let codes16 = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let codes16 = load128(qs, 0);
         let lo = _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
         let hi = _mm256_castsi128_si256(_mm_and_si128(
             _mm_srli_epi16(codes16, 4),
@@ -6355,7 +6378,7 @@ unsafe fn nvfp4_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<i8>, Vec
     let mut flat = vec![0i8; nb * 64];
     let mut d_arr = vec![0f32; nb * 4];
     let mask_0f = _mm_set1_epi8(0x0F_u8 as i8);
-    let table = _mm_loadu_si128(KVALUES_MXFP4.as_ptr() as *const __m128i);
+    let table = load128(&KVALUES_MXFP4, 0);
     for b in 0..nb {
         let blk = &row[b * bpr..b * bpr + bpr];
         for s in 0..4usize {
@@ -6429,8 +6452,8 @@ unsafe fn vec_dot_nvfp4_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: 
         for b in 0..nb {
             for s in 0..4usize {
                 let t = 2 * b + s / 2;
-                let w = _mm_loadu_si128(w_flat[b * 64 + s * 16..].as_ptr() as *const __m128i);
-                let a = _mm_loadu_si128(q8.qs[t * 32 + (s % 2) * 16..].as_ptr() as *const __m128i);
+                let w = load128(&w_flat, b * 64 + s * 16);
+                let a = load128(&q8.qs, t * 32 + (s % 2) * 16);
                 let w_abs = _mm_abs_epi8(w);
                 let a_signed = _mm_sign_epi8(a, w);
                 let sum32 = _mm_dpbusd_epi32(_mm_setzero_si128(), w_abs, a_signed);

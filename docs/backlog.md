@@ -37,30 +37,11 @@ which makes it match the `presence_inv` grammar every other `INFR_NO_*` key
 uses. No alias — the project's env policy is to drop old spellings cleanly
 rather than carry them.
 
-### B2 — 16 unconverted 128-bit SIMD loads
-
-**Tag:** CR-U3 residual · **Blocked on:** nothing; scoped out of its slice
-
-`crates/infr-cpu/src/kernels.rs` still has 16 `_mm_loadu_si128` sites taking the
-raw intrinsic. The 171 256/512-bit sites were converted to the bounds-checking
-`load256` / `load512` helpers; the 128-bit ones were explicitly out of that
-slice's scope.
-
-Same failure mode: a `RangeFrom` slice index bounds only the first byte while
-the intrinsic reads sixteen, so the loads are correct by block geometry alone
-and a layout change breaks them silently.
-
-**To do:** add a `load128` alongside the existing two (same shape — generic over
-the element type, offset in elements, width checked in bytes, `#[inline]` +
-`#[target_feature(enable = "sse2")]`) and convert all 16. Note several read a
-fixed-size const table (`KVALUES_IQ4NL.as_ptr()`) where the bound is trivially
-exact; those are still worth converting so the invariant is uniform.
-
 ### B3 — the VNNI kernel family's bounds assertions are unexercised
 
 **Tag:** CR-U3 coverage gap · **Blocked on:** CI hardware
 
-63 of the 171 converted SIMD load sites are in the `*_vnni` kernels. They
+69 of the 187 converted SIMD load sites are in the `*_vnni` kernels. They
 dispatch behind `is_x86_feature_detected!("avx512vnni")`, and no development or
 CI machine currently has it, so their `debug_assert!`s are compiled but never
 executed. The tests _call_ those kernels; the runtime gate skips them.
@@ -68,6 +49,16 @@ executed. The tests _call_ those kernels; the runtime gate skips them.
 The other tiers are covered: avx512bw runs natively, and the avx2 tier was
 verified by temporarily stubbing the 37 `avx512bw` gates to `false` and
 re-running the suite.
+
+The count grew from 63/171 when the 16 remaining `_mm_loadu_si128` sites were
+routed through a new `load128` helper: 6 of those 16 landed in this untested set
+— two in `vec_dot_q6k_batch_vnni` (the `scales_arr` per-block scale load), two
+in `vec_dot_q32_batch8_ilv_vnni` (the Q8_0 bias path's two halves of `blk`), and
+two in `vec_dot_nvfp4_batch_vnni` (`w_flat` and `q8.qs`). The other 10 run on
+this hardware through the avx2 and avx512bw tiers and are covered by the
+per-format parity tests; `load128`'s assertion was shown to fire by widening the
+offset at `iq4nl_expand_codes`' code load and watching the iq4nl parity tests
+panic.
 
 **To do:** either add a VNNI-capable CI runner, or install an emulator (Intel
 SDE) and add a job that runs `cargo test -p infr-cpu` under it. Until then,

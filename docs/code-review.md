@@ -62,11 +62,12 @@ only its duplicate-tensor-name half was real, and that is fixed.
   actually drops. Rate limiting was deliberately declined — see backlog **B5**.
 - **N10** — **DEFERRED** to the next breaking sweep; see backlog **B1**.
 
-**Nothing from this review is left unresolved.** The residual work it surfaced —
-the 16 unconverted 128-bit SIMD loads, the unexercised VNNI bounds assertions,
-and tensor-parallel's lack of automated coverage — is tracked in
-[backlog.md](backlog.md) as **B2**, **B3** and **B4**, since each is blocked on
-hardware or scoped out of the slice that found it rather than merely unfinished.
+**Nothing from this review is left unresolved.** The 16 unconverted 128-bit SIMD
+loads have since been converted to a bounds-checking `load128`, closing that
+item. What remains — the unexercised VNNI bounds assertions and
+tensor-parallel's lack of automated coverage — is tracked in
+[backlog.md](backlog.md) as **B3** and **B4**; both are blocked on hardware
+rather than merely unfinished.
 
 ### C10 (H) — tensor-parallel KV checkpoints are double-sharded — FIXED
 
