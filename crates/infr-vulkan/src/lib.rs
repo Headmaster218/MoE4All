@@ -208,6 +208,25 @@ pub struct VramInfo {
     pub uma: bool,
 }
 
+impl VramInfo {
+    /// Bytes a new device-local allocation may still take before [`VulkanBackend::check_vram_budget`]
+    /// REFUSES it: this snapshot's free figure minus the guard's own [`GUARD_HEADROOM`].
+    ///
+    /// **The ONE ceiling every sizing decision budgets against** — the context-fit math
+    /// (`SeamModel::kv_fit_ctx_fmt`) and the placement sweeps (`vulkan_moe_binder`'s residency /
+    /// streaming / MoE-expert budgets) all derive their budget from THIS function, so a planner
+    /// cannot place bytes the allocator will refuse. Budgeting against the raw `available` plans
+    /// 256 MiB past what can ever be handed out, which surfaces as an allocation failure
+    /// mid-prefill — the worst possible place to find out.
+    ///
+    /// It is a method on the SNAPSHOT rather than on the backend so the seam's placement helpers
+    /// are unit-testable without a GPU (they take a `VramInfo` and derive the ceiling themselves);
+    /// [`VulkanBackend::alloc_room`] is the live-device spelling of the same thing.
+    pub fn alloc_room(&self) -> u64 {
+        self.available.saturating_sub(GUARD_HEADROOM)
+    }
+}
+
 struct VulkanShared {
     // NOTE: field declaration order matters for drop.
     // Rust drops struct fields in *declaration order*.  We keep `allocator`
@@ -2439,7 +2458,8 @@ impl VulkanBackend {
     }
 
     /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it:
-    /// [`vram`](Self::vram)'s free figure minus the guard's own [`GUARD_HEADROOM`].
+    /// [`vram`](Self::vram)'s free figure minus the guard's own [`GUARD_HEADROOM`]. The live-device
+    /// spelling of [`VramInfo::alloc_room`], which carries the full rationale.
     ///
     /// Sizing math must budget against this, not against `vram().available` — the guard enforces
     /// `used + want <= total - GUARD_HEADROOM`, so the last 256 MiB of "free" VRAM is reserved and
@@ -2452,7 +2472,7 @@ impl VulkanBackend {
     /// nets out everything held); on the fallback path `available` is the whole heap, so this is
     /// the room only before this backend has allocated — which is when placement runs.
     pub fn alloc_room(&self) -> u64 {
-        self.vram().available.saturating_sub(GUARD_HEADROOM)
+        self.vram().alloc_room()
     }
 
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes

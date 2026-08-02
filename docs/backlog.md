@@ -643,36 +643,27 @@ determines the count. Out of scope for the logging slice: it is a trait change
 plus duplicated render work on every request, for a number the completion line
 already reports accurately a moment later.
 
-### B11 — dense placement still budgets against raw free VRAM, not the guard's ceiling
+### B11 — an explicit `INFR_CACHE=<pct>` still resolves against raw free VRAM
 
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; deliberately scoped out
-of the KV-fit slice to keep the residency decision from moving
+**Tag:** narrowed 2026-08-02 · **Blocked on:** a decision about what the
+percentage should MEAN
 
-`VulkanBackend::check_vram_budget` enforces
-`used + want <= total - GUARD_HEADROOM` (256 MiB), so the largest allocation
-that can ever succeed is `vram().available - GUARD_HEADROOM`.
-`VulkanBackend::alloc_room()` now returns exactly that, and
-`SeamModel::kv_fit_ctx_fmt` budgets against it.
+The placement budgets that infr derives for itself — `vulkan_moe_binder`'s dense
+residency predicate, its streaming budget and its MoE expert budget — now take
+the allocator's ceiling (`VramInfo::alloc_room`, free minus the VRAM guard's 256
+MiB headroom), the same function the context-fit math uses, guarded by
+`budgets_agree_with_the_allocator_ceiling` and
+`fit_math_and_placement_pick_the_same_rung`.
 
-`vulkan_moe_binder`'s dense placement sweeps do NOT — their `fits` closure still
-compares `fp.total() + kv_total_at(..) + dense_act_reserve_at(..)` against
-`vram.available`, i.e. it may declare a model resident while planning 256 MiB
-into memory the allocator will refuse. Same for the streaming `budget_at` and
-the MoE expert-placement budget.
-
-Not changed in the KV-fit slice on purpose: tightening the binder's budget can
-flip a borderline model from resident to streamed, which is a ~10x decode
-regression (gemma-4-31B: 33 t/s resident vs ~3 t/s streamed), so it needs its
-own before/after measurement on the tight models rather than riding along.
-
-Live consequence worth knowing before touching it: the two budgets now disagree
-by more than the 256 MiB, because `ACT_RESERVE_MARGIN` (B8) widens the reserve
-both of them consume while only the fit math also subtracts `GUARD_HEADROOM`. On
-gemma-3-12b @131072 that is visible — the fit math validates the context at a
-256-row chunk while the binder still goes resident at 512. Safe today (the
-binder is the looser of the two, and the run peaks 6.5 GiB under budget), but it
-means the two are no longer picking the same rung, which is the property the
-shared `ubatch_candidates` ladder exists to give. Fix them together.
+Both `INFR_CACHE` tiers still resolve a percentage spec against `vram.available`
+(`spec.resolve(..)` in the MoE and dense override arms). Left alone
+deliberately: that value is the CALLER's budget, the grammar is documented as "a
+percentage of the device's AVAILABLE VRAM", and the override exists to force a
+placement the auto tiers would not choose — so failing loudly at the alloc guard
+is defensible where silently handing back less than asked is not.
+`INFR_CACHE=100%` is the case that would trip it. Decide whether the percentage
+means "of free VRAM" (today) or "of what can actually be allocated" before
+changing it; either way it is one `spec.resolve` argument per arm.
 
 ### B12 — an explicit `--ctx N` never reaches the refuse rung
 
@@ -746,6 +737,14 @@ time or hardware, not difficulty.
   sweep raising an integrated GPU's chunk above its watchdog-safe default. That
   argument was never run on an iGPU, and the watchdog is exactly the thing that
   punishes being wrong (see `docs/igpu.md`).
+- **The tightened placement budgets were only exercised on their RESIDENT
+  branch** (the 2026-08-02 B11 slice). gemma-4-31B, gemma-3-12b and
+  Qwen3-30B-A3B all stay resident on this box, so `dense_stream_budget_at` and
+  `moe_expert_budget`'s `None` arm (dense weights + KV past the ceiling — the
+  hard error) were verified only by unit test, never by a run that actually
+  streams or pages. A model that does not fit this card would cover both;
+  `INFR_CACHE=<size>` forces the streaming path but with the caller's budget,
+  not the derived one.
 
 ### B15 — `attn_decode` crosses over and LOSES on gemma above d16384
 

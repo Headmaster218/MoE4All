@@ -640,20 +640,14 @@ impl SeamModel {
         let vram = vk.vram();
         let fp = self.footprint();
         let (k_fmt, v_fmt) = self.kv_fit_fmts(auto_q8);
-        crate::seam::kv_fit_ctx_for(
-            &self.cfg,
-            &self.ecfg,
-            fp.total(),
-            // The allocator's OWN ceiling, not the raw free figure: the VRAM guard reserves a
-            // fixed headroom below it and will refuse anything that reaches into it (see
-            // `VulkanBackend::alloc_room`). Budgeting against `vram.available` planned a context
-            // 256 MiB past what could ever be allocated, and — now that the rest of this math is
-            // exact rather than 5%-shy — that overhang landed as a mid-prefill alloc failure.
-            vk.alloc_room(),
-            vram.total,
-            k_fmt,
-            v_fmt,
-        )
+        // The snapshot goes in whole: `kv_fit_ctx_for` derives its budget from the allocator's OWN
+        // ceiling (`VramInfo::alloc_room`), not from the raw free figure — the VRAM guard reserves
+        // a fixed headroom below it and refuses anything reaching into it. Budgeting against
+        // `vram.available` planned a context 256 MiB past what could ever be allocated, and — now
+        // that the rest of this math is exact rather than 5%-shy — that overhang landed as a
+        // mid-prefill alloc failure. The placement sweeps derive from the same function, so the
+        // context this validates is one placement will actually take (`seam`'s drift tests).
+        crate::seam::kv_fit_ctx_for(&self.cfg, &self.ecfg, fp.total(), &vram, k_fmt, v_fmt)
     }
 
     /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit

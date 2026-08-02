@@ -377,8 +377,10 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
 ///
 /// Cost: gemma-4-31B's default context goes 19 973 -> 15 872 (against 1024 before this slice, so
 /// the win is 15.5x rather than 19.5x) and it stays FULLY RESIDENT, which is the property worth
-/// 10x on decode. gemma-3-12b is unaffected — still f16 @131072 with no auto-quant, because the
-/// shared chunk ladder absorbs the wider reserve one rung down.
+/// 10x on decode. gemma-3-12b keeps its window — still f16 @131072 with no auto-quant, because
+/// the shared chunk ladder absorbs the wider reserve: at that context both the fit math and
+/// placement settle on the 256-row rung (measured, `infr bench -p 131056`: 760 t/s prefill,
+/// peaking 17 255 MiB).
 ///
 /// **DELETE THIS when the reserve becomes path-aware (backlog B8).** It stands in for that work;
 /// it is not an input to it, and a path-aware estimate must replace it rather than be stacked on
@@ -716,6 +718,127 @@ pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
 /// every derived per-slot / fractional window is held to.
 pub(crate) const MIN_SESSION_CTX: usize = 1024;
 
+// ── one budget, two families of callers ───────────────────────────────────────────────────────
+//
+// The context-fit math ([`kv_fit_ctx_for`], via `SeamModel::kv_fit_ctx_fmt`) and the placement
+// sweeps (`vulkan_moe_binder`'s residency / auto-q8 / streaming / MoE-expert budgets) are two
+// readers of ONE question: what still fits this device? Every helper below takes the raw
+// [`infr_vulkan::VramInfo`] snapshot and derives its ceiling from [`VramInfo::alloc_room`] —
+// the allocator's own limit — so neither family can plan bytes `check_vram_budget` will refuse.
+// `budgets_agree_with_the_allocator_ceiling` and `fit_math_and_placement_pick_the_same_rung`
+// guard the drift.
+
+/// Will the KV cache a placement/fit decision is pricing actually RING (SWA rows capped at
+/// `window + chunk`)? The config/env gate AND f16/q8 on BOTH sides — the same pair of conditions
+/// the runner applies. A low-bit side keeps full-context caches, so pricing it as a ring would
+/// hand out a context the allocation cannot honor.
+pub(crate) fn placement_ring(cfg: &Config, ec: &EngineConfig, k_fmt: DType, v_fmt: DType) -> bool {
+    kv_ring_wanted(cfg, ec)
+        && matches!(k_fmt, DType::F16 | DType::Q8_0)
+        && matches!(v_fmt, DType::F16 | DType::Q8_0)
+}
+
+/// Bytes a FULLY-RESIDENT dense session needs at one EXPLICIT prefill chunk height and KV format
+/// pair: weights + the exact KV allocation ([`kv_bytes_estimate_fmt`]) + the activation reserve
+/// ([`dense_act_reserve_at`]). The arithmetic both the fit math and the placement sweep compare
+/// against the ceiling, in one place so the two cannot price a session differently.
+pub(crate) fn dense_resident_need(
+    cfg: &Config,
+    weights: u64,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    weights
+        .saturating_add(kv_bytes_estimate_fmt(
+            cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
+        ))
+        .saturating_add(dense_act_reserve_at(cfg, want_ctx, ubatch))
+}
+
+/// Does a fully-resident dense session at this chunk height fit the ALLOCATOR's ceiling?
+///
+/// `vram.alloc_room()`, NOT `vram.available`: the VRAM guard reserves a fixed headroom below the
+/// free figure and refuses anything that reaches into it, so a residency decision taken against
+/// the raw figure can declare a model resident while planning 256 MiB the allocator will never
+/// hand out — and then fail on an activation alloc mid-prefill.
+pub(crate) fn dense_placement_fits(
+    cfg: &Config,
+    ec: &EngineConfig,
+    weights: u64,
+    vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> bool {
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    dense_resident_need(cfg, weights, want_ctx, ring, ubatch, k_fmt, v_fmt) <= vram.alloc_room()
+}
+
+/// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
+/// none of them does (the caller streams). The rung the placement sweep settles on — and the same
+/// walk [`kv_fit_ctx_for`] makes when it decides a context fits.
+pub(crate) fn dense_resident_rung(
+    cfg: &Config,
+    ec: &EngineConfig,
+    weights: u64,
+    vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
+    ubatch_candidates(ec)
+        .into_iter()
+        .find(|&ub| dense_placement_fits(cfg, ec, weights, vram, want_ctx, ub, k_fmt, v_fmt))
+}
+
+/// Streaming budget: what is left of the allocator's ceiling for the dense weight-streaming arenas
+/// once the always-resident weights, the KV cache and the activation reserve are paid for. Same
+/// ceiling as [`dense_placement_fits`] — every byte this over-states is a slot the arena allocates
+/// and the guard then refuses.
+pub(crate) fn dense_stream_budget_at(
+    cfg: &Config,
+    ec: &EngineConfig,
+    resident_weights: u64,
+    vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    vram.alloc_room().saturating_sub(dense_resident_need(
+        cfg,
+        resident_weights,
+        want_ctx,
+        ring,
+        ubatch,
+        k_fmt,
+        v_fmt,
+    ))
+}
+
+/// Headroom the MoE expert budget holds back on top of the dense weights and the KV cache: covers
+/// activation scratch (pooled, but per-tag sizes scale with n_embd/n_ff and the `fp`/`kv_bytes`
+/// terms are estimates, not the exact bytes gpu-allocator's block granularity commits) plus the
+/// pager's own arena+staging+LUT allocations, which aren't counted in `fp` at all. Sized
+/// empirically on Scout's 48-layer, 37 GB Q2_K pager placement — 512 MiB undershot by a few
+/// hundred MiB and the guard rightly refused to over-commit.
+const MOE_ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Bytes left for the MoE expert banks after this model's dense weights, its KV cache and
+/// [`MOE_ACT_HEADROOM`] — against the allocator's ceiling, like every other budget here. `None`
+/// when the dense half alone does not fit, which is not a paging decision but a hard error (dense
+/// layer streaming does not cover an MoE model's dense part).
+pub(crate) fn moe_expert_budget(vram: &infr_vulkan::VramInfo, dense: u64, kv: u64) -> Option<u64> {
+    let room = vram.alloc_room();
+    let base = dense.saturating_add(kv);
+    (base <= room).then(|| room.saturating_sub(base.saturating_add(MOE_ACT_HEADROOM)))
+}
+
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
 /// activation reserve both PLATEAU with context — every attention layer sliding-window (so the
 /// ring caps its rows) and head_dim 128 with no score tile. There the fit is bounded by nothing
@@ -749,34 +872,32 @@ pub(crate) fn kv_fit_ctx_for(
     cfg: &Config,
     ec: &EngineConfig,
     weights: u64,
-    available: u64,
-    vram_total: u64,
+    vram: &infr_vulkan::VramInfo,
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
     if (0..cfg.n_layer).all(|l| cfg.layer_n_kv(l) * cfg.layer_head_dim(l) == 0) {
         return None;
     }
-    // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`): the config/env gate
-    // AND f16/q8 on both sides. A low-bit side keeps full-context caches, so pricing it as a ring
-    // would hand out a context the allocation cannot honor.
-    let ring = kv_ring_wanted(cfg, ec)
-        && matches!(k_fmt, DType::F16 | DType::Q8_0)
-        && matches!(v_fmt, DType::F16 | DType::Q8_0);
+    // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`) — see `placement_ring`.
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
     let cands = ubatch_candidates(ec);
-    let reserve = |ctx: usize, ubatch: usize| -> u64 {
-        if cfg.moe.is_some() {
-            (vram_total / 12).max(1024 * 1024 * 1024)
-        } else {
-            dense_act_reserve_at(cfg, ctx, ubatch)
-        }
-    };
+    // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
+    // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
+    let room = vram.alloc_room();
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
-            weights
-                .saturating_add(kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt))
-                .saturating_add(reserve(ctx, ubatch))
-                <= available
+            if cfg.moe.is_some() {
+                // MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are
+                // budgeted by `moe_expert_budget`, not by the dense activation reserve.
+                let reserve = (vram.total / 12).max(1024 * 1024 * 1024);
+                weights
+                    .saturating_add(kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt))
+                    .saturating_add(reserve)
+                    <= room
+            } else {
+                dense_resident_need(cfg, weights, ctx, ring, ubatch, k_fmt, v_fmt) <= room
+            }
         })
     };
     // Monotone in ctx (both terms grow with it), so double-then-bisect finds the exact boundary.
@@ -917,30 +1038,28 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
                 let kv_bytes: u64 =
                     kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), kv_auto_q8());
-                // 2 GiB: covers activation scratch (pooled, but per-tag sizes scale with n_embd/
-                // n_ff and this budget calc's `fp`/`kv_bytes` are estimates, not the exact bytes
-                // `alloc`/gpu-allocator's 256 MiB block granularity ends up committing) plus the
-                // pager's own arena+staging+LUT allocations, which aren't counted in `fp` at all
-                // (found empirically sizing Scout's 48-layer, 37 GB Q2_K pager placement — 512 MiB
-                // undershot by a few hundred MiB and the guard rightly refused to over-commit).
-                const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+                // Budgeted against the ALLOCATOR's ceiling (`VramInfo::alloc_room`), like the
+                // dense sweeps below and the context-fit math: the last 256 MiB of "free" VRAM is
+                // the guard's headroom and can never be handed out, so an expert budget sized
+                // against the raw figure hands the pager 256 MiB of arena the allocator refuses.
+                // `moe_expert_budget` also holds back `MOE_ACT_HEADROOM` for the pager's own
+                // arenas/staging and the activation scratch neither `fp` nor `kv_bytes` counts.
+                //
                 // Mixed oversize (an MoE model whose DENSE part alone doesn't fit) is out of
-                // scope for dense layer streaming — fail with a clear message instead of letting
-                // a degenerate expert budget stumble into the alloc-time VRAM guard's generic
-                // over-commit error.
-                if vram.available < fp.dense + kv_bytes {
+                // scope for dense layer streaming — `None`, and we fail with a clear message
+                // instead of letting a degenerate expert budget stumble into the alloc-time VRAM
+                // guard's generic over-commit error.
+                let Some(budget) = moe_expert_budget(&vram, fp.dense, kv_bytes) else {
                     return Err(anyhow!(
                         "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed \
-                         available VRAM ({:.2} GB) — dense layer streaming does not cover MoE \
-                         models' dense parts; reduce ctx or run on the CPU backend (INFR_DEV=cpu)",
+                         the allocatable VRAM ({:.2} GB, free minus the guard headroom) — dense \
+                         layer streaming does not cover MoE models' dense parts; reduce ctx or \
+                         run on the CPU backend (INFR_DEV=cpu)",
                         fp.dense as f64 / 1e9,
                         kv_bytes as f64 / 1e9,
-                        vram.available as f64 / 1e9,
+                        vram.alloc_room() as f64 / 1e9,
                     ));
-                }
-                let budget = vram
-                    .available
-                    .saturating_sub(fp.dense + kv_bytes + ACT_HEADROOM);
+                };
                 if budget < fp.expert {
                     // Page EVERY expert layer with the WHOLE budget (tier-2 semantics), NOT
                     // "keep the first gpu_layers banks resident and page the overflow with
@@ -1184,24 +1303,27 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .sum();
         let fp = crate::weights::weight_footprint(g);
         let vram = vk.vram();
-        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`) — this is what
-        // lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its KV small enough to
-        // take the try-resident tier at real contexts instead of streaming. +64 rows/layer slop.
-        let ring = kv_ring_wanted(cfg, ec);
-        // KV bytes at an EXPLICIT chunk height and side format — the ONE pricing helper every
-        // decision below shares (try-resident, the chunk sweeps, the auto-q8 rung, the streaming
-        // budget), so they all price exactly the allocation the runner will make. `q8` prices
-        // BOTH sides Q8_0 (34 bytes / 32 elems, mirroring `kv_fmt_bytes`); false = f16 (2 B/elem).
-        let kv_total_at =
-            |ubatch: usize, q8: bool| -> u64 { kv_bytes_estimate(cfg, want_ctx, ring, ubatch, q8) };
-        // Does weights + KV + the honest activation reserve fit live VRAM at this (chunk, fmt)?
+        // The per-side KV formats a chunk/format candidate prices: `q8` = BOTH sides Q8_0 (34
+        // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
+        // (see `kv_rows`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
+        // KV small enough to take the try-resident tier at real contexts instead of streaming.
+        let kv_fmts = |q8: bool| {
+            let side = if q8 { DType::Q8_0 } else { DType::F16 };
+            (side, side)
+        };
+        // Does weights + KV + the honest activation reserve fit at this (chunk, fmt)? Through the
+        // SHARED predicate, so this decision and `kv_fit_ctx_for`'s price the same session against
+        // the same ceiling — the ALLOCATOR's (`VramInfo::alloc_room`), not the raw free figure.
+        // Against `vram.available` this could declare a model resident while planning 256 MiB the
+        // VRAM guard will refuse, and the two ladders picked different rungs (gemma-3-12b @131072:
+        // the fit math validated the context at 256 rows while this went resident at 512).
         let fits = |ubatch: usize, q8: bool| {
-            fp.total() + kv_total_at(ubatch, q8) + dense_act_reserve_at(cfg, want_ctx, ubatch)
-                <= vram.available
+            let (k, v) = kv_fmts(q8);
+            dense_placement_fits(cfg, ec, fp.total(), &vram, want_ctx, ubatch, k, v)
         };
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
-        // the live free VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
+        // the allocatable VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
         // sized for pager arenas/staging that a dense-resident session doesn't have — reusing it
         // here streamed gemma-4-31B (21.9 GB weights on a 24 GB card, decode 33 t/s resident vs
         // ~3 t/s streamed at the PCIe ceiling). If residency is chosen but a later activation
@@ -1223,22 +1345,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // throughput, while q8 KV costs ~10-16% GQA decode — prefer the cheaper concession.
         let mut resident = fits(ubatch_rows(ec), kv_auto_q8());
         if !resident && !user_pinned_ubatch(ec) && cache_override.is_none() {
-            // Shared ladder (`ubatch_candidates`) minus its first rung, which is the height
-            // `resident` above already priced.
-            for cand in ubatch_candidates(ec).into_iter().skip(1) {
-                if fits(cand, kv_auto_q8()) {
-                    pin_ubatch(cand);
-                    // Re-read through the pin (a racing earlier set wins — use whatever stuck).
-                    if fits(ubatch_rows(ec), kv_auto_q8()) {
-                        tracing::warn!(
-                            "dense placement: resident with a {}-row prefill chunk (the default \
-                             1024-row chunk's activation reserve wouldn't fit); set INFR_UBATCH \
-                             to override",
-                            ubatch_rows(ec).min(want_ctx),
-                        );
-                        resident = true;
-                    }
-                    break;
+            // `dense_resident_rung` walks the shared ladder — the SAME walk `kv_fit_ctx_for` makes
+            // to decide a context fits, so the rung it lands on here is the rung that math priced.
+            // Its first entry is the height `resident` above already priced and rejected.
+            let (k, v) = kv_fmts(kv_auto_q8());
+            if let Some(cand) = dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, k, v) {
+                pin_ubatch(cand);
+                // Re-read through the pin (a racing earlier set wins — use whatever stuck).
+                if fits(ubatch_rows(ec), kv_auto_q8()) {
+                    tracing::warn!(
+                        "dense placement: resident with a {}-row prefill chunk (the default \
+                         1024-row chunk's activation reserve wouldn't fit); set INFR_UBATCH \
+                         to override",
+                        ubatch_rows(ec).min(want_ctx),
+                    );
+                    resident = true;
                 }
             }
         }
@@ -1260,25 +1381,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
             && kv_unset(ec)
             && kv_q8_layout_ok(cfg)
         {
-            for cand in ubatch_candidates(ec) {
-                if fits(cand, true) {
-                    pin_kv_auto_q8();
-                    if cand != ubatch_rows(ec) {
-                        pin_ubatch(cand);
-                    }
-                    // Re-read through the pins (racing earlier sets win — use whatever stuck).
-                    if kv_auto_q8() && fits(ubatch_rows(ec), true) {
-                        tracing::warn!(
-                            requested_ctx = want_ctx,
-                            prefill_chunk = ubatch_rows(ec),
-                            kv_dtype = "q8_0",
-                            "kv auto-quant: q8_0 KV cache — an f16 cache would not fit resident \
-                             at ctx={want_ctx} at any prefill chunk height; set \
-                             INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% slower on q8)"
-                        );
-                        resident = true;
-                    }
-                    break;
+            let (k, v) = kv_fmts(true);
+            if let Some(cand) = dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, k, v) {
+                pin_kv_auto_q8();
+                if cand != ubatch_rows(ec) {
+                    pin_ubatch(cand);
+                }
+                // Re-read through the pins (racing earlier sets win — use whatever stuck).
+                if kv_auto_q8() && fits(ubatch_rows(ec), true) {
+                    tracing::warn!(
+                        requested_ctx = want_ctx,
+                        prefill_chunk = ubatch_rows(ec),
+                        kv_dtype = "q8_0",
+                        "kv auto-quant: q8_0 KV cache — an f16 cache would not fit resident \
+                         at ctx={want_ctx} at any prefill chunk height; set \
+                         INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% slower on q8)"
+                    );
+                    resident = true;
                 }
             }
         }
@@ -1318,10 +1437,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // prefill loop, the runner's ring sizing, and this budget all agree.
                 let q8 = kv_auto_q8();
                 let base = fp.total() - streamable_resident;
+                // Same ceiling as `fits` above (`VramInfo::alloc_room`): every byte this
+                // over-states is an arena slot the allocator then refuses.
                 let budget_at = |ub: usize| {
-                    vram.available.saturating_sub(
-                        base + kv_total_at(ub, q8) + dense_act_reserve_at(cfg, want_ctx, ub),
-                    )
+                    let (k, v) = kv_fmts(q8);
+                    dense_stream_budget_at(cfg, ec, base, &vram, want_ctx, ub, k, v)
                 };
                 if !user_pinned_ubatch(ec) && !eligible.is_empty() {
                     let need: u64 = eligible
@@ -2737,10 +2857,23 @@ mod seam_helper_tests {
 
     /// RX 7900 XTX, 24 GB.
     const XTX_TOTAL: u64 = 25_753_026_560;
-    /// What `VulkanBackend::alloc_room()` reports on an idle XTX: live free (~23.94 GiB) minus the
-    /// allocator guard's own 256 MiB headroom. Anything the fit math plans past this the VRAM
+    /// Live FREE bytes on an idle XTX (~23.94 GiB) — the raw `VramInfo::available` figure, which is
+    /// NOT the budget: see [`XTX_ROOM`].
+    const XTX_FREE: u64 = 25_701_257_216;
+    /// What `VramInfo::alloc_room()` yields for that snapshot: live free minus the allocator
+    /// guard's own 256 MiB headroom. Anything a fit or placement decision plans past this the VRAM
     /// guard will refuse, so this — not the raw free figure — is the budget.
-    const XTX_ROOM: u64 = 25_701_257_216 - 256 * 1024 * 1024;
+    const XTX_ROOM: u64 = XTX_FREE - 256 * 1024 * 1024;
+
+    /// That box's VRAM snapshot at an arbitrary free figure, as the backend would report it.
+    fn xtx(available: u64) -> infr_vulkan::VramInfo {
+        infr_vulkan::VramInfo {
+            total: XTX_TOTAL,
+            available,
+            live: true,
+            uma: false,
+        }
+    }
 
     /// gemma-3-12b-it-Q4_K_M — the reported case. Geometry from the GGUF metadata.
     fn gemma3_12b() -> Config {
@@ -2822,31 +2955,16 @@ mod seam_helper_tests {
         let ec = EngineConfig::default();
         let weights = 9 * (1u64 << 30);
         for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
-            let fit = super::kv_fit_ctx_for(&cfg, &ec, weights, XTX_ROOM, XTX_TOTAL, k, v)
-                .expect("has KV");
+            let fit =
+                super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), k, v).expect("has KV");
             assert_exact_boundary(&cfg, &ec, weights, XTX_ROOM, k, v, fit);
         }
         // q8 is ~half the bytes per token, so it must buy materially more context than f16.
-        let f16 = super::kv_fit_ctx_for(
-            &cfg,
-            &ec,
-            weights,
-            XTX_ROOM,
-            XTX_TOTAL,
-            DType::F16,
-            DType::F16,
-        )
-        .expect("has KV");
-        let q8 = super::kv_fit_ctx_for(
-            &cfg,
-            &ec,
-            weights,
-            XTX_ROOM,
-            XTX_TOTAL,
-            DType::Q8_0,
-            DType::Q8_0,
-        )
-        .expect("has KV");
+        let f16 = super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), DType::F16, DType::F16)
+            .expect("has KV");
+        let q8 =
+            super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), DType::Q8_0, DType::Q8_0)
+                .expect("has KV");
         assert!(q8 > f16, "q8 {q8} must beat f16 {f16}");
         assert!(q8 < 2 * f16, "q8 {q8} is ~2x f16 {f16}, not more");
     }
@@ -2868,19 +2986,10 @@ mod seam_helper_tests {
         let ring = EngineConfig::default();
         assert!(super::kv_ring_wanted(&cfg, &ring) && !super::kv_ring_wanted(&cfg, &no_ring));
         for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
-            let a =
-                super::kv_fit_ctx_for(&cfg, &ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, XTX_TOTAL, k, v)
-                    .expect("has KV");
-            let b = super::kv_fit_ctx_for(
-                &cfg,
-                &no_ring,
-                GEMMA3_12B_WEIGHTS,
-                XTX_ROOM,
-                XTX_TOTAL,
-                k,
-                v,
-            )
-            .expect("has KV");
+            let a = super::kv_fit_ctx_for(&cfg, &ring, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), k, v)
+                .expect("has KV");
+            let b = super::kv_fit_ctx_for(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), k, v)
+                .expect("has KV");
             assert_exact_boundary(&cfg, &ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, a);
             assert_exact_boundary(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, b);
             assert!(
@@ -2932,8 +3041,7 @@ mod seam_helper_tests {
             &cfg,
             &ec,
             GEMMA3_12B_WEIGHTS,
-            XTX_ROOM,
-            XTX_TOTAL,
+            &xtx(XTX_FREE),
             DType::F16,
             DType::F16,
         )
@@ -3016,6 +3124,133 @@ mod seam_helper_tests {
         assert_eq!(super::ubatch_candidates(&pinned(2048)), vec![2048]);
     }
 
+    /// **Drift guard (backlog B11).** Every VRAM budget in this file — the residency predicate, the
+    /// streaming budget, the MoE expert budget — must be taken against the ALLOCATOR's ceiling
+    /// (`VramInfo::alloc_room` = free minus the guard's 256 MiB headroom), never the raw free
+    /// figure. The placement sweeps used to compare against `vram.available`, so they could declare
+    /// a model resident, or hand a pager an arena, 256 MiB past anything `check_vram_budget` will
+    /// ever allocate — which surfaces as a failed activation alloc mid-prefill.
+    ///
+    /// Each assertion below is placed ONE BYTE either side of the ceiling, so restoring any
+    /// `vram.available` comparison flips it: the raw figure accepts every "must not" case here.
+    #[test]
+    fn budgets_agree_with_the_allocator_ceiling() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let vram = xtx(XTX_FREE);
+        const GUARD: u64 = 256 * 1024 * 1024;
+        assert_eq!(vram.alloc_room(), XTX_ROOM);
+        assert_eq!(
+            vram.available - vram.alloc_room(),
+            GUARD,
+            "the ceiling is the free figure minus the guard headroom"
+        );
+
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        let (ctx, ub) = (32768usize, 256usize);
+        let f16 = (DType::F16, DType::F16);
+        // Weights that make a resident session land EXACTLY on the ceiling (KV + reserve priced
+        // from the shared primitives, weights = whatever is left of the ceiling).
+        let kv_and_act = super::dense_resident_need(&cfg, 0, ctx, true, ub, f16.0, f16.1);
+        let exact = XTX_ROOM - kv_and_act;
+        let fits = |w: u64| super::dense_placement_fits(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
+        assert!(
+            fits(exact),
+            "a session that exactly fills the ceiling is resident"
+        );
+        assert!(
+            !fits(exact + 1),
+            "one byte PAST the guard's ceiling must not be placed resident"
+        );
+        assert!(
+            exact + 1 + kv_and_act <= vram.available,
+            "…and that byte is one the raw free figure would have accepted, which is the bug"
+        );
+
+        // Streaming budget: exhausted at the ceiling, and it never offers the guard's headroom.
+        let budget =
+            |w: u64| super::dense_stream_budget_at(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
+        assert_eq!(
+            budget(exact),
+            0,
+            "nothing left to stream into at the ceiling"
+        );
+        assert_eq!(
+            budget(exact - (1 << 30)),
+            1 << 30,
+            "and it is exactly the room below the ceiling, not the free figure"
+        );
+
+        // MoE expert placement: same ceiling, minus the pager's own headroom.
+        assert_eq!(
+            super::moe_expert_budget(&vram, 0, 0),
+            Some(XTX_ROOM - super::MOE_ACT_HEADROOM)
+        );
+        assert_eq!(super::moe_expert_budget(&vram, XTX_ROOM, 0), Some(0));
+        assert_eq!(
+            super::moe_expert_budget(&vram, XTX_ROOM + 1, 0),
+            None,
+            "a dense half past the ceiling is a hard error, not a 256 MiB overdraft"
+        );
+        assert!(
+            XTX_ROOM < vram.available,
+            "…again a case the raw free figure would have waved through"
+        );
+    }
+
+    /// **Drift guard (backlog B11), the rung half.** The shared `ubatch_candidates` ladder exists so
+    /// the context-fit math and the placement sweep settle on the SAME prefill chunk. They only do
+    /// while both budget against the same ceiling: with the sweep on `vram.available` and the fit
+    /// math on `alloc_room()`, gemma-3-12b @131072 was validated at one rung and placed at a taller
+    /// one (the reported case). Re-derives the expected rung from the primitives — weights + KV +
+    /// reserve against `XTX_ROOM` — rather than from the function under test.
+    #[test]
+    fn fit_math_and_placement_pick_the_same_rung() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        let vram = xtx(XTX_FREE);
+        let (k, v) = (DType::F16, DType::F16);
+        let cands = super::ubatch_candidates(&ec);
+        let need = |ctx: usize, ub: usize| {
+            GEMMA3_12B_WEIGHTS
+                + super::kv_bytes_estimate_fmt(&cfg, ctx, true, ub, k, v)
+                + super::dense_act_reserve_at(&cfg, ctx, ub)
+        };
+        let expect_rung = |ctx: usize| cands.iter().copied().find(|&ub| need(ctx, ub) <= XTX_ROOM);
+
+        // The reported shape: the trained window, where the two disagreed.
+        let want = cfg.n_ctx_train;
+        assert!(
+            expect_rung(want).is_some_and(|ub| ub < cands[0]),
+            "the default chunk must miss and a shorter rung save it — otherwise this proves nothing"
+        );
+        assert_eq!(
+            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, want, k, v),
+            expect_rung(want),
+            "placement must settle on the rung the fit math priced"
+        );
+
+        // And at the exact boundary the fit math hands out: placement takes it resident, and one
+        // token past it neither of them accepts.
+        let fit =
+            super::kv_fit_ctx_for(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, k, v).expect("has KV");
+        assert_eq!(
+            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit, k, v),
+            expect_rung(fit),
+        );
+        assert!(
+            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit, k, v).is_some(),
+            "the advertised context must be one placement can hold resident"
+        );
+        assert_eq!(
+            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit + 1, k, v),
+            None,
+            "one token past the advertised context must miss at EVERY rung — a placement that \
+             still says yes here is budgeting against a wider ceiling than the fit math"
+        );
+    }
+
     /// The refuse rung's input: when the weights leave no usable room, the fit reports the honest
     /// small number (possibly `0`) rather than a floored 1024 that reads as "a session fits".
     /// `clamp_default_ctx` turns that into an error naming the numbers; that half needs a live
@@ -3030,8 +3265,7 @@ mod seam_helper_tests {
             &cfg,
             &ec,
             XTX_ROOM - 64 * 1024 * 1024,
-            XTX_ROOM,
-            XTX_TOTAL,
+            &xtx(XTX_FREE),
             DType::F16,
             DType::F16,
         )
@@ -3056,8 +3290,7 @@ mod seam_helper_tests {
             &cfg,
             &EngineConfig::default(),
             1 << 30,
-            XTX_ROOM,
-            XTX_TOTAL,
+            &xtx(XTX_FREE),
             DType::F16,
             DType::F16,
         )
