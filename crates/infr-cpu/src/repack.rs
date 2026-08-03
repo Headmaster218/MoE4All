@@ -13,10 +13,19 @@ use std::sync::Arc;
 /// the GEMM can `loadu` them straight into vectors. Cacheable: building this is the per-call
 /// repack cost the (layer, expert) cache eliminates (ggml pays it once at load via its
 /// `block_q4_Kx8` buffers; we pay it once per cached expert).
-/// `(entries keyed by weight-slice (addr, len), total cached bytes)` — see `repack_cache`'s doc.
-pub(crate) type RepackCacheState = (HashMap<(usize, usize), Arc<Q4kPack>>, usize);
+/// Identity of one cached pack: `(buffer uid, byte offset within that buffer, byte length)`.
+///
+/// The uid — not the slice's ADDRESS — is what makes this key sound. A pack cache outlives the
+/// weights it was built from (the same `CpuBackend` survives a serve model reload), and both an
+/// allocator and an mmap hand the same address out again afterwards, so an address key returns a
+/// pack built from a different weight of equal length: plausible numbers, no error. See
+/// `CpuBuffer::uid`.
+pub(crate) type PackKey = (u64, usize, usize);
 
-pub(crate) type Repack6CacheState = (HashMap<(usize, usize), Arc<Q6kPack>>, usize);
+/// `(entries keyed by [`PackKey`], total cached bytes)` — see `repack_cache`'s doc.
+pub(crate) type RepackCacheState = (HashMap<PackKey, Arc<Q4kPack>>, usize);
+
+pub(crate) type Repack6CacheState = (HashMap<PackKey, Arc<Q6kPack>>, usize);
 
 /// Insert `pack` under `key` if still absent, then return the *resident* `Arc` — the caller holds
 /// the cache lock. This closes the check-then-insert race in `q4k_pack_for`/`q6k_pack_for`: the lock
@@ -26,8 +35,8 @@ pub(crate) type Repack6CacheState = (HashMap<(usize, usize), Arc<Q6kPack>>, usiz
 /// its own build. Byte accounting happens ONLY on a genuine insert.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn cache_insert_if_absent<P>(
-    state: &mut (HashMap<(usize, usize), Arc<P>>, usize),
-    key: (usize, usize),
+    state: &mut (HashMap<PackKey, Arc<P>>, usize),
+    key: PackKey,
     pack: Arc<P>,
     bytes: usize,
     budget: usize,
@@ -396,19 +405,19 @@ mod tests {
     // the key is already resident (the race loser gets the winner's Arc), and (c) respect the budget.
     #[test]
     fn cache_insert_if_absent_is_idempotent_and_budgeted() {
-        let mut state: (HashMap<(usize, usize), Arc<u32>>, usize) = (HashMap::new(), 0);
+        let mut state: (HashMap<PackKey, Arc<u32>>, usize) = (HashMap::new(), 0);
         let budget = 100usize;
 
         // First insert of a fresh key: lands, counts its bytes.
-        let win = cache_insert_if_absent(&mut state, (1, 2), Arc::new(42), 10, budget);
+        let win = cache_insert_if_absent(&mut state, (1, 2, 3), Arc::new(42), 10, budget);
         assert_eq!(*win, 42);
         assert_eq!(state.1, 10, "bytes counted once");
         assert_eq!(state.0.len(), 1);
 
         // Simulated race: a second builder reaches the lock with the SAME key but its own Arc. It
         // must get the RESIDENT Arc back (Arc::ptr_eq the winner) and must NOT double-count bytes.
-        let resident = state.0.get(&(1, 2)).unwrap().clone();
-        let loser = cache_insert_if_absent(&mut state, (1, 2), Arc::new(999), 10, budget);
+        let resident = state.0.get(&(1, 2, 3)).unwrap().clone();
+        let loser = cache_insert_if_absent(&mut state, (1, 2, 3), Arc::new(999), 10, budget);
         assert!(
             Arc::ptr_eq(&loser, &resident),
             "loser gets the resident pack"
@@ -417,7 +426,7 @@ mod tests {
         assert_eq!(state.0.len(), 1);
 
         // A pack that would blow the budget is built-and-returned but NOT inserted/counted.
-        let big = cache_insert_if_absent(&mut state, (3, 4), Arc::new(7), 1_000, budget);
+        let big = cache_insert_if_absent(&mut state, (4, 5, 6), Arc::new(7), 1_000, budget);
         assert_eq!(*big, 7, "over-budget pack still usable, just transient");
         assert_eq!(state.1, 10, "over-budget insert must not count bytes");
         assert_eq!(state.0.len(), 1, "over-budget key not inserted");

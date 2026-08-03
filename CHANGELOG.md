@@ -56,3 +56,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Publish graceful-shutdown state and its signal number atomically so
   interrupted CLI commands retain the correct exit status.
 - Drop completed CPU spin-pool results when a sibling task panics.
+- The CPU backend's dequantized-weight and Q4_K/Q6_K repack caches now key on a
+  never-reused buffer id instead of a memory address. A `CpuBackend` that
+  outlives a model — `infr serve` reloading one — could otherwise return a
+  cached weight built from the PREVIOUS model, because both the allocator and a
+  fresh mmap hand out addresses that were just freed.

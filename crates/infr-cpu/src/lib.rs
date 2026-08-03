@@ -49,7 +49,7 @@ use repack::{q4k_pack, q6k_gemm_group, q6k_pack, Q6kPack};
 use repack::{Q4kPack, Repack6CacheState, RepackCacheState};
 
 /// Dequantized-weight cache: `(buffer address, byte-len, dtype) -> Arc<f32>`. See `weight_cache`.
-type WeightCache = HashMap<(usize, usize, DType), Arc<Vec<f32>>>;
+type WeightCache = HashMap<(u64, DType), Arc<Vec<f32>>>;
 
 // ─── Q8_0 integer dot kernels ─────────────────────────────────────────────────
 //
@@ -111,11 +111,29 @@ type WeightCache = HashMap<(usize, usize, DType), Arc<Vec<f32>>>;
 // scalar only (no SIMD; this path is memory/allocation-bound, not compute-bound, so a plain scalar
 // loop over int8 bytes already beats dequantizing the whole row to f32 first).
 
+/// Hands out a process-unique [`CpuBuffer::uid`]. Monotonic and never reused, which is the whole
+/// point: an address IS reused (a freed buffer's allocation, or a fresh mmap landing where the
+/// previous model's was), so a cache keyed on one can hand back another weight's data.
+fn next_buffer_uid() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A host buffer. Weights are **mapped** — a zero-copy [`TensorBytes`] view straight into the GGUF
 /// mmap (read-only, no `memcpy`, no owned RAM). Everything the model writes (KV / conv / recurrent
 /// state, per-step IO) is **owned** — a plain byte vec behind a `Mutex` (so `&dyn Buffer` stays
 /// `Send + Sync` and writes are safe). `&dyn Buffer` reads go through [`CpuBuffer::read`].
-pub enum CpuBuffer {
+pub struct CpuBuffer {
+    /// This buffer's identity for the backend's derived-data caches (`weight_cache`, the repack
+    /// caches). It is a `uid` and not an address because those caches outlive a model: a reused
+    /// `CpuBackend` (serve model reload) frees every buffer and maps a new file, and a stale entry
+    /// keyed by an address the allocator or the kernel handed out again would be returned for a
+    /// DIFFERENT weight — plausible numbers, no error. A uid is never handed out twice.
+    uid: u64,
+    store: CpuStore,
+}
+
+enum CpuStore {
     Owned(Mutex<Vec<u8>>),
     Mapped(TensorBytes),
 }
@@ -140,18 +158,32 @@ impl std::ops::Deref for CpuRead<'_> {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBuffer {
+    /// A writable buffer over `bytes` (KV, recurrent state, per-step IO).
+    fn owned_buf(bytes: Vec<u8>) -> Self {
+        Self {
+            uid: next_buffer_uid(),
+            store: CpuStore::Owned(Mutex::new(bytes)),
+        }
+    }
+    /// A read-only zero-copy view of a GGUF mmap region (weights).
+    fn mapped_buf(bytes: TensorBytes) -> Self {
+        Self {
+            uid: next_buffer_uid(),
+            store: CpuStore::Mapped(bytes),
+        }
+    }
     /// Read view of the bytes (zero-copy for mapped weights; mutex guard for owned buffers).
     fn read(&self) -> CpuRead<'_> {
-        match self {
-            CpuBuffer::Owned(m) => CpuRead::Owned(m.lock().unwrap()),
-            CpuBuffer::Mapped(t) => CpuRead::Mapped(t),
+        match &self.store {
+            CpuStore::Owned(m) => CpuRead::Owned(m.lock().unwrap()),
+            CpuStore::Mapped(t) => CpuRead::Mapped(t),
         }
     }
     /// Mutable owned storage; panics for mapped (read-only) weights.
     fn owned(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
-        match self {
-            CpuBuffer::Owned(m) => m.lock().unwrap(),
-            CpuBuffer::Mapped(_) => {
+        match &self.store {
+            CpuStore::Owned(m) => m.lock().unwrap(),
+            CpuStore::Mapped(_) => {
                 panic!("cpu backend: write to a mapped (read-only) weight buffer")
             }
         }
@@ -161,9 +193,9 @@ impl CpuBuffer {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Buffer for CpuBuffer {
     fn len_bytes(&self) -> usize {
-        match self {
-            CpuBuffer::Owned(m) => m.lock().unwrap().len(),
-            CpuBuffer::Mapped(t) => t.len(),
+        match &self.store {
+            CpuStore::Owned(m) => m.lock().unwrap().len(),
+            CpuStore::Mapped(t) => t.len(),
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -172,17 +204,17 @@ impl Buffer for CpuBuffer {
 }
 
 pub struct CpuBackend {
-    /// Dequantized-weight cache keyed by the bound buffer's `(address, byte-len, dtype)` (weights
-    /// are bound the same every step, so dequant once and reuse). Only the small norm weights
-    /// (`RmsNorm` / `QkNorm`) land here — the large `Op::Linear` weights are streamed row-by-row
-    /// instead (see that arm), so this never holds the whole model in f32. Keying on len+dtype (not
-    /// the raw address alone) guards a reused `CpuBackend` (serve model reload): a freed weight's
-    /// address can be reallocated to a *different* weight, and a bare-address key would then hand
-    /// back the previous model's f32 — the len/dtype discriminates the two.
+    /// Dequantized-weight cache keyed by the bound buffer's `(uid, dtype)` (weights are bound the
+    /// same every step, so dequant once and reuse). Only the small norm weights (`RmsNorm` /
+    /// `QkNorm`) land here — the large `Op::Linear` weights are streamed row-by-row instead (see
+    /// that arm), so this never holds the whole model in f32. The uid is what makes a reused
+    /// `CpuBackend` (serve model reload) safe: a freed weight's ADDRESS can be handed out again for
+    /// a different weight, and an address key would then return the previous model's f32 (see
+    /// [`CpuBuffer::uid`]).
     weight_cache: Mutex<WeightCache>,
     /// (layer, expert)-granular repack cache for the interleaved-x8 Q4_K GEMM ([`Q4kPack`]):
-    /// keyed by the expert weight slice's (address, length) — stable for the mmap'd/upload-once
-    /// weight buffers this backend binds (same lifetime argument as `weight_cache`). ggml pays
+    /// keyed by the expert weight slice's [`repack::PackKey`] (same identity argument as
+    /// `weight_cache`, extended to a slice WITHIN a buffer). ggml pays
     /// its `block_q4_Kx8` repack once at LOAD; this pays it once per (expert, session) instead
     /// of once per CALL. Byte-budgeted (`kernels.cpu.repack_mb`, default 4096 MiB): over budget,
     /// packs are built transient and not inserted. The `usize` is the current cached-bytes total.
@@ -285,11 +317,17 @@ impl CpuBackend {
     }
 
     /// Fetch-or-build the [`Q4kPack`] for one weight bank slice (see `repack_cache`'s doc).
+    /// `key` identifies the slice by its buffer's uid + byte range — see [`repack::PackKey`].
     /// SAFETY-adjacent note: callers only reach this from the VNNI ilv path, which implies AVX2
     /// for the pack expansion.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn q4k_pack_for(&self, w: &[u8], in_f: usize, out_f: usize) -> Arc<Q4kPack> {
-        let key = (w.as_ptr() as usize, w.len());
+    pub(crate) fn q4k_pack_for(
+        &self,
+        key: repack::PackKey,
+        w: &[u8],
+        in_f: usize,
+        out_f: usize,
+    ) -> Arc<Q4kPack> {
         if let Some(p) = self.repack_cache.lock().unwrap().0.get(&key) {
             return p.clone();
         }
@@ -302,8 +340,13 @@ impl CpuBackend {
 
     /// Fetch-or-build the [`Q6kPack`] for one weight bank slice — `q4k_pack_for`'s Q6_K sibling.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn q6k_pack_for(&self, w: &[u8], in_f: usize, out_f: usize) -> Arc<Q6kPack> {
-        let key = (w.as_ptr() as usize, w.len());
+    pub(crate) fn q6k_pack_for(
+        &self,
+        key: repack::PackKey,
+        w: &[u8],
+        in_f: usize,
+        out_f: usize,
+    ) -> Arc<Q6kPack> {
         if let Some(p) = self.repack6_cache.lock().unwrap().0.get(&key) {
             return p.clone();
         }
@@ -316,17 +359,16 @@ impl CpuBackend {
 
     /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
     pub fn map_weight(&self, bytes: TensorBytes) -> Box<dyn Buffer> {
-        Box::new(CpuBuffer::Mapped(bytes))
+        Box::new(CpuBuffer::mapped_buf(bytes))
     }
 
-    /// Fetch-or-build a dequantized weight from `weight_cache` under its `(addr, len, dtype)` key.
-    /// The key's len+dtype ensure a reload that re-uses a freed weight's address can't collide
-    /// with the stale entry (see `weight_cache`'s doc). `bytes` is dequantized per `key.2` on a miss.
-    pub(crate) fn cached_weight(&self, key: (usize, usize, DType), bytes: &[u8]) -> Arc<Vec<f32>> {
+    /// Fetch-or-build a dequantized weight from `weight_cache` under its `(buffer uid, dtype)` key
+    /// (see `weight_cache`'s doc). `bytes` is dequantized per `key.1` on a miss.
+    pub(crate) fn cached_weight(&self, key: (u64, DType), bytes: &[u8]) -> Arc<Vec<f32>> {
         if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
             return w.clone();
         }
-        let w = Arc::new(bytes_to_f32(bytes, key.2));
+        let w = Arc::new(bytes_to_f32(bytes, key.1));
         self.weight_cache.lock().unwrap().insert(key, w.clone());
         w
     }
@@ -497,10 +539,7 @@ impl Backend for CpuBackend {
     }
 
     fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
-        Ok(Box::new(CpuBuffer::Owned(Mutex::new(vec![
-            0u8;
-            bytes.max(4)
-        ]))))
+        Ok(Box::new(CpuBuffer::owned_buf(vec![0u8; bytes.max(4)])))
     }
 
     fn alloc_uninit(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
@@ -508,10 +547,7 @@ impl Backend for CpuBackend {
         // tests/oracle instead of silently working. Release: the Vec is zeroed anyway (no CPU perf
         // win to skip it), so stay safe.
         let fill = if cfg!(debug_assertions) { 0xFFu8 } else { 0u8 };
-        Ok(Box::new(CpuBuffer::Owned(Mutex::new(vec![
-            fill;
-            bytes.max(4)
-        ]))))
+        Ok(Box::new(CpuBuffer::owned_buf(vec![fill; bytes.max(4)])))
     }
 
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
@@ -565,8 +601,7 @@ impl Backend for CpuBackend {
         // Fetch a (cached) dequantized weight.
         let weight = |id: TensorId| -> Arc<Vec<f32>> {
             let buf = bindings.get(id).expect("cpu backend: unbound Weight");
-            let addr = cpu_buf(buf) as *const CpuBuffer as usize;
-            let key = (addr, buf.len_bytes(), g.desc(id).dtype);
+            let key = (cpu_buf(buf).uid, g.desc(id).dtype);
             if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
                 return w.clone();
             }
@@ -1052,7 +1087,15 @@ impl Backend for CpuBackend {
                             // pass instead of 1 — same activation-reuse trick Q4_K got.
                             #[cfg(target_arch = "x86_64")]
                             {
-                                let pack = self.q6k_pack_for(wbytes, in_f, out_f);
+                                // Key the pack by the weight buffer's uid + this projection's byte
+                                // range inside it (`w_off` selects a slice of a fused weight), not
+                                // by `wbytes`' address — see `repack::PackKey`.
+                                let pack = self.q6k_pack_for(
+                                    (cpu_buf(buf).uid, row0 * bpr, wbytes.len()),
+                                    wbytes,
+                                    in_f,
+                                    out_f,
+                                );
                                 let groups8 = out_f / 8;
                                 let rem = out_f % 8;
                                 let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
@@ -2281,7 +2324,14 @@ impl Backend for CpuBackend {
                         if packable {
                             pool.collect(buckets.len(), &|b| {
                                 let e = buckets[b].0;
-                                Some(self.q4k_pack_for(&gb[e * gst..(e + 1) * gst], ne, 2 * nffx))
+                                // Keyed by the bank buffer's uid + this expert's byte band inside
+                                // it, never the slice address — see `repack::PackKey`.
+                                Some(self.q4k_pack_for(
+                                    (cpu_buf(gbuf).uid, e * gst, gst),
+                                    &gb[e * gst..(e + 1) * gst],
+                                    ne,
+                                    2 * nffx,
+                                ))
                             })
                         } else {
                             vec![None; buckets.len()]
@@ -3120,17 +3170,17 @@ mod tests {
         assert_eq!(tok, 1);
     }
 
-    // #2: `cached_weight` keys on (addr, len, dtype). Same key returns the CACHED value (even if the
-    // bytes changed — proves it dedups); a key differing in len or dtype MISSES and dequants fresh
-    // (proves a reused address can't collide with a stale, differently-shaped weight).
+    // #2: `cached_weight` keys on (buffer uid, dtype). Same key returns the CACHED value (even if
+    // the bytes changed — proves it dedups); a key differing in uid or dtype MISSES and dequants
+    // fresh.
     #[test]
-    fn cached_weight_keys_on_addr_len_dtype() {
+    fn cached_weight_keys_on_uid_and_dtype() {
         let be = CpuBackend::new();
         let a = [1.0f32, 2.0]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<u8>>();
-        let key = (0xDEAD_BEEF, a.len(), DType::F32);
+        let key = (7u64, DType::F32);
         let w1 = be.cached_weight(key, &a);
         assert_eq!(&**w1, &[1.0, 2.0]);
 
@@ -3142,29 +3192,50 @@ mod tests {
         let w2 = be.cached_weight(key, &b);
         assert_eq!(&**w2, &[1.0, 2.0], "same key must hit the cache");
 
-        // Same address+len but a DIFFERENT dtype => distinct key => fresh dequant (no collision).
+        // Same uid but a DIFFERENT dtype => distinct key => fresh dequant (no collision).
         let c: Vec<u8> = [3i32, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let key_i32 = (0xDEAD_BEEF, c.len(), DType::I32);
-        let w3 = be.cached_weight(key_i32, &c);
+        let w3 = be.cached_weight((7, DType::I32), &c);
         assert_eq!(
             &**w3,
             &[3.0, 4.0],
             "different dtype must miss and dequant fresh"
         );
 
-        // Same address+dtype but a DIFFERENT byte-len => distinct key => fresh (simulates a reload
-        // that reused a freed weight's address for a longer weight).
+        // A different buffer (uid) with the same dtype is a distinct weight => fresh dequant.
         let d = [7.0f32, 8.0, 9.0]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<u8>>();
-        let key_len = (0xDEAD_BEEF, d.len(), DType::F32);
-        let w4 = be.cached_weight(key_len, &d);
+        let w4 = be.cached_weight((8, DType::F32), &d);
         assert_eq!(
             &**w4,
             &[7.0, 8.0, 9.0],
-            "different len must miss and dequant fresh"
+            "different uid must miss and dequant fresh"
         );
+    }
+
+    /// The property every derived-data cache in this backend now keys on: a buffer's `uid` is never
+    /// handed out twice, INCLUDING to a buffer that reuses a freed one's address. Freeing an
+    /// allocation and immediately re-allocating the same size is the shape a serve model reload
+    /// takes, and an allocator frequently returns the very same address for it — which is exactly
+    /// how an address-keyed `weight_cache`/`repack_cache` entry could be returned for a different
+    /// weight. The address may repeat here (that is not asserted, it is allocator-dependent); the
+    /// uid may not.
+    #[test]
+    fn buffer_uids_are_never_reused() {
+        let be = CpuBackend::new();
+        let first = be.alloc(4096, BufferUsage::Weights).expect("alloc");
+        let first_uid = cpu_buf(first.as_ref()).uid;
+        drop(first);
+        let second = be.alloc(4096, BufferUsage::Weights).expect("alloc");
+        assert_ne!(
+            cpu_buf(second.as_ref()).uid,
+            first_uid,
+            "a uid was reused after the first buffer was freed"
+        );
+        // Two live buffers never collide either.
+        let third = be.alloc(4096, BufferUsage::Weights).expect("alloc");
+        assert_ne!(cpu_buf(third.as_ref()).uid, cpu_buf(second.as_ref()).uid);
     }
 
     /// `kernels.cpu.repack_mb` is the Q4_K/Q6_K repack caches' byte budget, in MiB, and BOTH
