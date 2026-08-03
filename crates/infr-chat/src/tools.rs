@@ -96,6 +96,15 @@ fn remove_spans(text: &str, mut spans: Vec<(usize, usize)>) -> String {
 /// levels of object/array; legitimate calls never reach it.
 const MAX_VALUE_DEPTH: usize = 64;
 
+/// Index of the next non-whitespace byte at or after `i` (or `s.len()`). Used both to enter a value
+/// and to look ahead at one without committing to parsing it.
+fn skip_ws(s: &[u8], mut i: usize) -> usize {
+    while i < s.len() && matches!(s[i], b' ' | b'\n' | b'\t' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
 /// Recursive-descent value parser — mirrors `_parse_value` in the Python shim.
 ///
 /// `s` has already had `<|"|>` replaced with `"`.
@@ -114,16 +123,13 @@ const MAX_VALUE_DEPTH: usize = 64;
 /// (`{a:[}]}` is enough), so it is a hang and an unbounded allocation, not a parse quirk.
 /// Propagating `None` is the only exit that terminates every loop.
 ///
-/// The cost is that a VALUELESS object entry now drops its call too: `{a:}` and `{a:,b:1}` used to
-/// yield `a` bound to an empty string, and no longer parse at all. That is deliberate — binding an
-/// argument the model never wrote is its own bug, and a dropped call is the visible failure — but
-/// it does mean "partial object" is no longer uniformly lenient. Only a valueless entry is
-/// affected; a truncated one (`{a:` with nothing after it) still parses best-effort.
+/// A VALUELESS OBJECT ENTRY never reaches here: the object arm looks ahead past the colon and, on
+/// finding a `,` or `}`, drops that one entry and carries on. `{a:,b:1}` is `{"b": 1}`, not a
+/// dropped call — one malformed pair must not cost the pairs that parsed. So the `,`/`}` half of
+/// the rejection above is reachable only from an ARRAY (`[}]`) or the top level, where there is no
+/// entry to drop and no way to make progress.
 fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
-    // skip whitespace
-    while i < s.len() && matches!(s[i], b' ' | b'\n' | b'\t' | b'\r') {
-        i += 1;
-    }
+    i = skip_ws(s, i);
     if i >= s.len() {
         return Some((Value::Null, i));
     }
@@ -214,6 +220,16 @@ fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
                     .trim_matches('\'')
                     .to_owned();
                 i = colon + 1;
+                // A valueless entry (`{a:,b:1}`, `{a:}`) loses THE ENTRY, not the call: binding a
+                // value the model never wrote would hand the tool an argument it never asked for,
+                // and dropping the whole call over one bad pair throws away the pairs that ARE
+                // well-formed. Resume on the delimiter itself so the loop above consumes it —
+                // advancing past it here would skip whatever follows.
+                let vi = skip_ws(s, i);
+                if vi < s.len() && matches!(s[vi], b',' | b'}') {
+                    i = vi;
+                    continue;
+                }
                 let (val, ni) = parse_value(s, i, depth + 1)?;
                 i = ni;
                 obj.insert(raw_key, val);
@@ -731,34 +747,84 @@ mod tests {
         assert!(calls.is_empty());
     }
 
-    /// Where the delimiter rejection draws its line, asserted rather than described: a VALUELESS
-    /// entry drops the whole call, a TRUNCATED one still parses best-effort, and well-formed input
-    /// is untouched. The middle case is the one that keeps the rejection from swallowing every
-    /// partial object — a stream cut mid-value is the common malformation, and it still yields a
-    /// call.
+    /// Where the delimiter rejection draws its line, asserted rather than described. A valueless
+    /// entry costs THAT ENTRY and nothing else — the surrounding call survives with the pairs that
+    /// did parse, which is the whole point: a model that fumbles one argument should not lose the
+    /// other four. Only a malformation with no entry to drop (a stray delimiter inside an ARRAY)
+    /// takes the call down, because there the loop cannot otherwise advance.
     #[test]
-    fn valueless_entries_drop_the_call_but_truncated_ones_still_parse() {
+    fn a_valueless_entry_costs_only_itself() {
         let args = |t: &str| {
             let (_, calls) = parse_tool_calls(t);
             calls.first().map(|c| c.arguments.clone())
         };
 
-        // Valueless: nothing was written for `a`, so binding it would invent an argument.
-        assert_eq!(args("<|tool_call>call:x{a:}<tool_call|>"), None);
-        assert_eq!(args("<|tool_call>call:x{a:,b:1}<tool_call|>"), None);
+        // The entry goes; its siblings, on both sides of it, stay.
+        assert_eq!(
+            args(r#"<|tool_call>call:x{a:,b:<|"|>We have something<|"|>}<tool_call|>"#),
+            Some(serde_json::json!({ "b": "We have something" }))
+        );
+        assert_eq!(
+            args("<|tool_call>call:x{a:1,b:,c:3}<tool_call|>"),
+            Some(serde_json::json!({ "a": 1, "c": 3 }))
+        );
+        // Sole entry valueless → the call still fires, with no arguments.
+        assert_eq!(
+            args("<|tool_call>call:x{a:}<tool_call|>"),
+            Some(serde_json::json!({}))
+        );
 
-        // Truncated: the value position runs off the end rather than hitting a delimiter.
+        // Truncated rather than valueless: the value position runs off the end.
         assert_eq!(
             args("<|tool_call>call:x{a:<tool_call|>"),
             Some(serde_json::json!({ "a": null })),
             "a stream cut mid-value must still yield a best-effort call"
         );
 
-        // Well-formed input is unaffected by the rejection, including empty containers.
+        // Well-formed input is untouched, including empty containers.
         assert_eq!(
             args("<|tool_call>call:x{a:1,b:[1,2],c:{}}<tool_call|>"),
             Some(serde_json::json!({ "a": 1, "b": [1, 2], "c": {} }))
         );
+
+        // No entry to drop and no way forward: the array arm still takes the whole call down,
+        // which is what stops the unbounded-allocation loop.
+        assert!(parse_tool_calls("<|tool_call>call:x{a:[}]}<tool_call|>")
+            .1
+            .is_empty());
+    }
+
+    /// Every container loop must advance its cursor on every path.
+    ///
+    /// This parser runs on model output, which in `infr serve` is steerable by whoever sent the
+    /// request, so a body that leaves the cursor parked is not a parse quirk — it is a hang and an
+    /// unbounded allocation reachable from a single HTTP request. That shipped once already
+    /// (`{a:[}]}`, where the bareword arm returned at `}` without consuming it), and the object
+    /// arm's valueless-entry skip is a second place that has to get this right.
+    ///
+    /// Cheap enough to be exhaustive rather than sampled, which is what makes it a regression test
+    /// and not a fuzz run: every 6-byte body over the punctuation that drives those loops. There is
+    /// nothing to assert about the RESULTS — the property is only that each call returns at all, so
+    /// a regression shows up as this test hanging or exhausting memory rather than failing.
+    #[test]
+    fn delimiter_soup_always_terminates() {
+        let alphabet = *b"{}[],:a\"";
+        let mut n = 0u64;
+        for w in 0..alphabet.len().pow(6) {
+            let mut body = Vec::new();
+            let mut x = w;
+            for _ in 0..6 {
+                body.push(alphabet[x % alphabet.len()]);
+                x /= alphabet.len();
+            }
+            let text = format!(
+                "<|tool_call>call:x{}<tool_call|>",
+                String::from_utf8_lossy(&body)
+            );
+            let _ = parse_tool_calls(&text);
+            n += 1;
+        }
+        assert_eq!(n, 262_144, "every case must have returned");
     }
 
     #[test]
