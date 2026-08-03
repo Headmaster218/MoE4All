@@ -1526,10 +1526,15 @@ async fn streaming(
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
-        // Guarantees `[DONE]` is ALWAYS the final frame — including when the decode closure panics
-        // (Drop runs while unwinding), so a strict SSE client never hangs waiting for a sentinel
-        // that a panic swallowed (audit finding 1).
-        let _done = DoneGuard { tx: tx.clone() };
+        // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
+        // — unless `settled()` says a terminal frame already went out — reports the generation as a
+        // failure. Both matter on an unwinding panic, which skips every arm below (B23).
+        let mut done = DoneGuard {
+            tx: tx.clone(),
+            req_id,
+            stats: stats.clone(),
+            settled: false,
+        };
 
         // First chunk: role delta (mirrors the Python shim's opening chunk).
         let _ = tx.send(Ok(sse_chunk(
@@ -1544,9 +1549,9 @@ async fn streaming(
         )));
 
         let Some(engine) = engine_arc else {
-            // No engine — `DoneGuard` closes the stream with `[DONE]`.
-            stats.fold_failure();
-            tracing::warn!(req = req_id, "request failed: no engine loaded");
+            // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then closes
+            // the stream with `[DONE]`.
+            done.fail("no engine loaded");
             return;
         };
 
@@ -1623,21 +1628,23 @@ async fn streaming(
                     DeltaPayload::default(),
                     Some(finish.as_str().into()),
                 )));
-                // Fold the request's tallies in ONCE, here, and log its completion line.
+                // Fold the request's tallies in ONCE, here, and log its completion line. The finish
+                // chunk above IS this stream's terminal frame, so the guard must not also report a
+                // failure when it drops.
                 let rec = tally.finish(outcome, finish);
                 stats.fold_completion(&rec);
                 log_request_done(req_id, &model_id, stream, &rec);
+                done.settled();
             }
             Err(e) => {
-                // A mid-stream failure is NOT a clean `stop` — emit a terminal error frame so the
-                // client can tell this apart from success (matching the non-streaming 500). `[DONE]`
-                // still follows, via `DoneGuard` (audit finding 1).
-                let _ = tx.send(Ok(sse_error_event(&e.to_string())));
-                stats.fold_failure();
-                tracing::warn!(req = req_id, error = %e, "request failed");
+                // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
+                // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
+                // via `DoneGuard` (audit finding 1).
+                done.fail(&e.to_string());
             }
         }
-        // `DoneGuard` drops here (or on an unwinding panic), sending the final `[DONE]`.
+        // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
+        // above settled the stream it first reports the request as failed (B23).
     });
 
     // Bridge the mpsc receiver to an async Stream for axum's Sse.
@@ -1652,16 +1659,64 @@ async fn streaming(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Sends the OpenAI `[DONE]` sentinel exactly once when it drops — from the normal end of the
-/// stream OR from an unwinding panic inside the decode closure. That is the whole point: a strict
-/// SSE client blocks until it sees `[DONE]`, so a swallowed panic must never leave the sentinel
-/// unsent (audit finding 1). A failed send (client already gone) is fine — nothing to deliver to.
+/// Closes the SSE stream exactly once when it drops, from the normal end of the generation OR from
+/// an unwinding panic inside the decode closure.
+///
+/// Two jobs, and the second one exists because the first was not enough:
+///
+/// 1. `[DONE]` is ALWAYS the final frame. A strict SSE client blocks until it sees the sentinel, so
+///    a swallowed panic must never leave it unsent (audit finding 1).
+/// 2. A generation that never reached its terminal frame is reported AS A FAILURE — error frame,
+///    `fold_failure`, and a `warn!` carrying the `req` id.
+///
+/// The streaming path discards its `spawn_blocking` join handle, so a panic in
+/// `ChatGenerator::chat` unwinds past the `match res` and the `Err` arm never runs. Before this
+/// guard owned the failure path, the wire showed the role chunk and then `[DONE]` with no error
+/// frame and no terminal `finish_reason` — indistinguishable from a short success — while
+/// `interval_failed` AND `interval_completed` both stayed zero, so the throughput line under-
+/// reported the failure and the completion at once (backlog B23, proved).
+///
+/// [`Self::settled`] is what separates the two cases. Every path that produces its own terminal
+/// frame calls it; anything that unwinds or returns early does not, and the guard speaks for it.
+/// A flag rather than `std::thread::panicking()` because an early `return` is not a panic and still
+/// leaves the stream unterminated.
 struct DoneGuard {
     tx: tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    /// The request id, so the failure this guard reports joins its `request start` line.
+    req_id: u64,
+    stats: Arc<ServeStats>,
+    /// Set by [`Self::settled`] once a terminal frame is out and the tallies are folded.
+    settled: bool,
+}
+
+impl DoneGuard {
+    /// The generation reached a terminal frame and folded its own tallies — the guard should send
+    /// nothing but `[DONE]`.
+    fn settled(&mut self) {
+        self.settled = true;
+    }
+
+    /// Report this request as failed, exactly once: terminal error frame, `fold_failure`, `warn!`.
+    ///
+    /// The ONE place a streaming failure is recorded, so the wire frame, the statistic and the log
+    /// line cannot drift apart or be emitted twice. Called explicitly by the paths that know why
+    /// they failed, and by [`Drop`] for the paths that never got the chance.
+    fn fail(&mut self, msg: &str) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        // A failed send just means the client is already gone; the accounting still has to be
+        // right, so the fold and the log are NOT conditional on it.
+        let _ = self.tx.send(Ok(sse_error_event(msg)));
+        self.stats.fold_failure();
+        tracing::warn!(req = self.req_id, error = msg, "request failed");
+    }
 }
 
 impl Drop for DoneGuard {
     fn drop(&mut self) {
+        self.fail("internal error: generation ended without a terminal frame");
         let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
     }
 }
@@ -3294,6 +3349,75 @@ mod tests {
             !text.contains("\"finish_reason\":\"stop\""),
             "an Err must not report a clean stop: {text}"
         );
+    }
+
+    /// A generator whose `chat` PANICS mid-stream, which is not the same as returning `Err`: the
+    /// unwind skips every arm of the `match res` below it, so before B23 the only thing that ran
+    /// was `DoneGuard`'s `[DONE]`.
+    struct PanicGen;
+    impl ChatGenerator for PanicGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &AtomicBool,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("partial".into()));
+            panic!("boom: generator panicked mid-stream")
+        }
+    }
+
+    /// B23: a panicking generator must terminate the stream like a FAILURE, not like a success.
+    ///
+    /// The bug this pins is one of omission, so assert on what was missing: an error frame, and a
+    /// `failed` count. Both were absent while `[DONE]` was present, which is precisely what made a
+    /// panic indistinguishable from a short completion on the wire.
+    #[tokio::test]
+    async fn streaming_panic_is_reported_as_a_failure() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(PanicGen);
+        let state = AppState::new(g, "m", 1, Arc::new(Config::default()));
+        let stats = state.stats.clone();
+        let router = build_router(state);
+        // The panic itself is expected; keep the default hook from spraying the test log with it.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        std::panic::set_hook(prev);
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            text.contains("\"error\""),
+            "a panicking generator must still put a terminal error frame on the wire: {text}"
+        );
+        assert!(text.contains("[DONE]"), "sentinel missing: {text}");
+        assert!(
+            !text.contains("\"finish_reason\":\"stop\""),
+            "a panic must never look like a clean stop: {text}"
+        );
+
+        let w = stats.drain(Duration::from_secs(1));
+        assert_eq!(w.failed, 1, "the panic must be counted as a failure");
+        assert_eq!(
+            w.completed, 1,
+            "a failure is still a completed request for the interval line"
+        );
+        assert_eq!(w.active, 0, "the slot gauge must be released by the unwind");
     }
 
     /// The abort-on-disconnect decision, unit-tested without a socket: when the SSE `send` returns

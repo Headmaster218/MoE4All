@@ -1132,45 +1132,6 @@ been executed, and it stems from the same missing validation.
 `tool_choice_str` 400s, which already establish that a malformed forced choice
 is an error rather than a silent downgrade to `auto`.
 
-### B23 — a panicking streaming generator terminates the SSE stream like a success
-
-**Tag:** CR-2026-08-03 M5 (**PROVED**) · **Blocked on:** nothing
-
-`crates/infr-server/src/lib.rs`'s `streaming` discards the `spawn_blocking` join
-handle. A panic inside `ChatGenerator::chat` unwinds past the `match res`, so
-the `Err` arm — the one that sends `sse_error_event`, calls
-`ServeStats::fold_failure` and logs `request failed` — never runs.
-`DoneGuard::drop` still emits `[DONE]`.
-
-**Proved with a temporary test, not argued.** A `ChatGenerator` emitting one
-content delta and then panicking, driven through the real `streaming` function,
-put exactly this on the wire:
-
-```text
-data: {..,"delta":{"role":"assistant"},"finish_reason":null}
-data: {..,"delta":{"content":"partial"},"finish_reason":null}
-data: [DONE]
-```
-
-No error frame and no terminal chunk carrying a real `finish_reason` — a client
-that does not specifically check for the finish chunk cannot tell this from a
-completed generation. `ServeStats::drain` afterwards reported `failed == 0` and
-`completed == 0`, so the periodic throughput line under-reports both. The test
-also confirmed the half that IS fine: `active` was back to 0 and the slot permit
-was released, both by RAII on the unwind.
-
-**One correction to the finding as filed:** it is not silent. There is no custom
-`std::panic::set_hook` anywhere in the tree, so the default hook still prints
-`thread '..' panicked at ..` to stderr. What is missing is a `tracing` event —
-the request has a `request start` line carrying its `req` id and then NO
-terminal line of any kind, so the structured log shows an arrival that never
-ended and nothing joins the stderr panic to it.
-
-**The fix shape:** keep the `JoinHandle` and await it (the non-streaming path
-already does), or wrap the closure body in `catch_unwind` and run the `Err`
-arm's three actions on the caught payload. Either way the terminal frame has to
-go out before `DoneGuard` drops.
-
 ### B24 — `ServeStats` loses a completion correction across a drain
 
 **Tag:** CR-2026-08-03 L1 (**PROVED**) · **Blocked on:** nothing
