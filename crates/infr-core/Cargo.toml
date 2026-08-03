@@ -17,3 +17,6 @@ toml.workspace = true
 # seeded a cached kernel binary is still alive (see `kernel_cache.rs`).
 libc.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

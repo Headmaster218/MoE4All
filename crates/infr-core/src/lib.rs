@@ -5,6 +5,7 @@
 //! Nothing here is GPU- or model-specific. See docs/plan.md.
 
 pub mod backend;
+pub mod blockio;
 pub mod budget;
 /// The layered `INFR_*` replacement: a typed, explicitly-passed [`config::Config`].
 pub mod config;
