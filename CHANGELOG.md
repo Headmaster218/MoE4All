@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `infr run`, `infr bench` and `infr serve` now notice the model file being
+  overwritten underneath the live weight mapping and fail with a named error
+  instead of serving output from weights that no longer match the file. `run`
+  checks at both ends of every turn, `bench` before reporting any numbers, and
+  `serve` at the start of each request. New `infr_gguf::watch::WeightWatch`,
+  re-exported as `infr_llama::WeightWatch`.
+
 ### Fixed
 
 - Reject GGUF tensors whose encoded byte count overflows `usize` and model

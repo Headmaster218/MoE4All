@@ -1107,6 +1107,8 @@ fn cmd_run(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let (gguf, tok) = resolve(model)?;
+    // Stamped next to the mapping it guards, then checked before every turn below.
+    let watch = infr_llama::WeightWatch::open(&gguf)?;
     // diffusion-gemma (block text-diffusion, Phase 3 — docs/diffusion-gemma.md): a cheap arch peek
     // (no full SeamModel load) so the default token budget below and the ChatModel selection further
     // down can both branch on it. -n/max_new drives `blocks = ceil(n_predict / canvas_length)`
@@ -1225,7 +1227,7 @@ fn cmd_run(
 
     // One-shot (a message) or an interactive multi-turn REPL (every backend now supports it).
     if let Some(m) = message {
-        run_chat_turn(&mut chat, m, max_new, visual.as_mut())?;
+        run_chat_turn(&mut chat, m, max_new, visual.as_mut(), &watch)?;
         return Ok(());
     }
     loop {
@@ -1249,7 +1251,7 @@ fn cmd_run(
         if matches!(line, "exit" | "quit" | ":q" | ":quit") {
             break;
         }
-        if let Err(e) = run_chat_turn(&mut chat, line, max_new, visual.as_mut()) {
+        if let Err(e) = run_chat_turn(&mut chat, line, max_new, visual.as_mut(), &watch) {
             // A shutdown-aborted turn reports the abort as an error; don't print it as a failure,
             // just leave the REPL (main then exits 130/143).
             if !infr_core::shutdown::shutdown_requested() {
@@ -1336,7 +1338,14 @@ fn run_chat_turn(
     message: &str,
     max_new: usize,
     visual: Option<&mut DiffusionVisual>,
+    watch: &infr_llama::WeightWatch,
 ) -> anyhow::Result<()> {
+    // Checked at BOTH ends of the turn, and the two catch different things. Before: a REPL session
+    // outlives any number of things happening to the model file, so turn five must not be answered
+    // out of a mapping that stopped matching after turn two. After: one turn can generate for
+    // minutes, and a change landing inside that window would otherwise go unmentioned until the
+    // next turn — or, for a one-shot `infr run`, never.
+    watch.check()?;
     let mut render = ThinkRender::new();
     let stats = match visual {
         Some(v) => {
@@ -1366,6 +1375,10 @@ fn run_chat_turn(
         None => chat.turn(message, max_new, &mut |p| render.feed(p))?,
     };
     render.finish();
+    // The reply is already on screen, so this cannot un-print it — it makes the reply's last line
+    // an error instead of a rate, which is the difference between a user knowing the answer came
+    // out of a mapping that moved and not knowing.
+    watch.check()?;
     let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
     // print-ok: program OUTPUT — `infr run`'s always-on per-turn result line, the same category
     // as `infr bench`'s numbers.
@@ -1677,6 +1690,7 @@ fn metal_chat_model(
 struct SeamGenerator {
     model: std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>>,
     renderer: infr_llama::chat::OaiRenderer,
+    watch: infr_llama::WeightWatch,
 }
 
 impl SeamGenerator {
@@ -1688,6 +1702,7 @@ impl SeamGenerator {
         Ok(Self {
             model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
+            watch: infr_llama::WeightWatch::open(gguf_path)?,
         })
     }
 }
@@ -1697,6 +1712,7 @@ impl SeamGenerator {
 struct ParallelGenerator {
     engine: infr_llama::parallel::ParallelSeam,
     renderer: infr_llama::chat::OaiRenderer,
+    watch: infr_llama::WeightWatch,
 }
 
 impl ParallelGenerator {
@@ -1708,6 +1724,7 @@ impl ParallelGenerator {
         Ok(Self {
             engine,
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
+            watch: infr_llama::WeightWatch::open(gguf_path)?,
         })
     }
 }
@@ -1717,6 +1734,11 @@ impl ParallelGenerator {
 /// duplicated per backend.
 trait GenBackend: Send + Sync {
     fn renderer(&self) -> &infr_llama::chat::OaiRenderer;
+
+    /// This backend's weight-file watch, checked once per request in [`run_chat`]. Serving from a
+    /// mapping whose file has been overwritten is how a process starts returning confident
+    /// nonsense, so a served reply is worth one `fstat`.
+    fn weights(&self) -> &infr_llama::WeightWatch;
 
     /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`,
     /// default 2048) off the config this backend's renderer was opened with. A trait method
@@ -1755,6 +1777,10 @@ impl GenBackend for SeamGenerator {
         &self.renderer
     }
 
+    fn weights(&self) -> &infr_llama::WeightWatch {
+        &self.watch
+    }
+
     fn request_ctx(
         &self,
         sampling: infr_llama::sampling::RequestSampling,
@@ -1790,6 +1816,10 @@ impl GenBackend for SeamGenerator {
 impl GenBackend for ParallelGenerator {
     fn renderer(&self) -> &infr_llama::chat::OaiRenderer {
         &self.renderer
+    }
+
+    fn weights(&self) -> &infr_llama::WeightWatch {
+        &self.watch
     }
 
     fn request_ctx(
@@ -1884,6 +1914,11 @@ fn run_chat(
     on_delta: &mut dyn FnMut(infr_engine::Delta),
 ) -> anyhow::Result<infr_server::ChatOutcome> {
     {
+        // Refuse before generating, not after: once the weight file has been overwritten under the
+        // mapping this process cannot produce a trustworthy reply, and a served answer carries no
+        // sign that anything was wrong. One `fstat` per request, on the request thread. See
+        // `infr_gguf::watch` for what this can and cannot see.
+        be.weights().check()?;
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
         let prompt = be.renderer().render(messages, tools)?;
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
@@ -2039,6 +2074,9 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
+    // Stamped before the model loads and checked before any arm reports, so the timed window is
+    // covered end to end. Each sub-bench arm below stamps its own for the same reason.
+    let watch = infr_llama::WeightWatch::open(&gguf)?;
     // ONE backend reader shared with `cmd_run`/`cmd_serve` ([`selected_backend`], METAL > CPU >
     // Vulkan) — bench used to read CPU before METAL, disagreeing with run/serve. `-ngl 0` is bench's
     // own extra "force the CPU reference backend" gate (llama-bench semantics), so it wins first.
@@ -2131,6 +2169,9 @@ fn cmd_bench(
     } else {
         None
     };
+    // Numbers measured against a mapping whose file moved under it are not numbers. Checked
+    // before REPORTING rather than before running, so the whole timed window is covered.
+    watch.check()?;
     print_bench_avg_mtp(
         &samples,
         &label,
@@ -2447,6 +2488,7 @@ fn cmd_bench_metal(
     }
     #[cfg(target_os = "macos")]
     {
+        let watch = infr_llama::WeightWatch::open(gguf)?;
         let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
         let shape = metal_bench_shape(n_prompt, n_gen, depth, pg);
         // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
@@ -2499,6 +2541,9 @@ fn cmd_bench_metal(
         } else {
             None
         };
+        // Numbers measured against a mapping whose file moved under it are not numbers. Checked
+        // before REPORTING rather than before running, so the whole timed window is covered.
+        watch.check()?;
         print_bench_avg_mtp(
             &samples,
             &label,
@@ -2527,6 +2572,7 @@ fn cmd_bench_cpu(
     json: bool,
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
+    let watch = infr_llama::WeightWatch::open(gguf)?;
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
     // One untimed warmup to build runtime caches before the timed reps.
@@ -2552,6 +2598,9 @@ fn cmd_bench_cpu(
     } else {
         format!("pp{n_prompt}")
     };
+    // Numbers measured against a mapping whose file moved under it are not numbers. Checked
+    // before REPORTING rather than before running, so the whole timed window is covered.
+    watch.check()?;
     print_bench_avg(&samples, &label, depth, " [cpu]", reps, json, None);
     Ok(())
 }
@@ -2810,9 +2859,13 @@ fn cmd_bench_diffusion_gemma(
              AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
         );
     }
+    let watch = infr_llama::WeightWatch::open(gguf)?;
     let r = dg_bench_run(
         gguf, tok, n_prompt, n_gen, depth, reps, None, cpu, metal, cfg,
     )?;
+    // Numbers measured against a mapping whose file moved under it are not numbers. Checked
+    // before REPORTING rather than before running, so the whole timed window is covered.
+    watch.check()?;
     let tag = if cpu {
         " [cpu]"
     } else if metal {

@@ -1022,64 +1022,61 @@ turn stops at a block boundary, not immediately.
 
 ### B30 — the GGUF weight mmap trusts the file, and cannot enforce it
 
-**Tag:** PR#90 · **Blocked on:** a decision — and the case for acting is weaker
-than it first looked
+**Tag:** PR#90 · **Blocked on:** nothing outstanding; detection SHIPPED, the
+preventing half is deliberately not attempted
 
 `Gguf::open` maps the model file and hands out `&[u8]` slices into it for the
 mapping's whole life. Nothing stops another process writing or truncating that
 file: a write mutates memory Rust believes is frozen, and a truncation turns a
-resident page into `SIGBUS` on next touch. The `SAFETY` note there is a claim
-about the environment, not something the code enforces — it is written down as
-an UNENFORCED INVARIANT on `open`.
+resident page into `SIGBUS` on next touch. That invariant is stated on `open`
+and remains UNENFORCED — what shipped notices the breach, it does not prevent
+it.
+
+**Shipped: detection.** `infr_gguf::watch::WeightWatch` stamps `(len, mtime)`
+off a HELD DESCRIPTOR at load and re-`fstat`s it on demand. `infr run` checks at
+both ends of every turn, `infr bench` before reporting any numbers (all four
+arms), `infr serve` at the start of each request via `GenBackend::weights`.
+Verified live on all three, not just by unit test: a `touch` mid-bench refuses
+to print numbers, a `touch` mid-generation makes `infr run` exit 1, and a
+`touch` between two served requests turns the second into an error response.
+
+Statting the descriptor rather than the path is the load-bearing choice, and
+`a_rename_into_place_is_not_a_change` pins it: `infr pull` renames into place,
+which leaves a live mapping reading the old inode perfectly intact, so a
+path-stat would cry wolf on the one file-replacing operation infr itself
+performs. It goes red if `check` is switched to stat the path.
+
+**Known boundaries, none of them worth closing on current evidence:**
+
+- A same-length in-place write whose mtime is then restored is invisible. The
+  only alternative is hashing gigabytes per check.
+- `serve` checks per REQUEST, so a change landing mid-request is caught by the
+  next one, after that response has already streamed. Post-checking would not
+  un-send it.
+- `WeightWatch::open` is a second `open` beside `Gguf::open`, so a rename
+  landing exactly between them leaves the watch on the new inode and the mapping
+  on the old — a missed detection, never a false one, two syscalls wide.
 
 **Considered and rejected: copying the file into an anonymous mapping.** PR #90
-did exactly that and it works, but it is not affordable. Measured here on a 16
-GiB Qwen3.6-27B, warm page cache, two reps each: warm load 1.87 s → 10.5 s
-(5.6x, re-opening almost exactly the gap `model-load-time` closed), and 14 GiB
-of evictable page cache became 20.2 GiB of anonymous RSS. Anonymous pages are
+did exactly that and it works, but it is not affordable. Measured on a 16 GiB
+Qwen3.6-27B, warm page cache, two reps each: warm load 1.87 s → 10.5 s (5.6x,
+re-opening almost exactly the gap `model-load-time` closed), and 14 GiB of
+evictable page cache became 20.2 GiB of anonymous RSS. Anonymous pages are
 swap-only, so a model larger than RAM goes from slow to unrunnable — the Llama-4
 Scout blob on this host is 47.5 GiB against 60 GiB of RAM. Reverted in
 `5ba6b3f`; the same PR's tensor byte-count overflow check was kept.
 
-**`infr` cannot currently corrupt its own mapping.** Checked while scoping this,
-and it narrows the threat a long way. `pull.rs` downloads to a `.dl-` temp and
-`fs::rename`s it into place; nothing anywhere opens a blob for writing, and the
-only `remove_file` calls target links, `.meta` validators and temps. A rename
-swaps the directory entry, so a running process keeps reading the OLD inode
-through its mapping until it drops. `infr pull` concurrent with `infr serve` is
-therefore safe today, and a lock would not be what makes it safe.
-
-**What is left is external and mostly unlockable.** The realistic corruption is
-a person overwriting a model file with another tool. `cp new.gguf live.gguf`
-opens the destination `O_TRUNC` and rewrites in place — that is both the
-mutation and the `SIGBUS` window, in one ordinary command. An advisory `flock`
-does not stop it: `cp` takes no lock, nor does any editor, nor llama.cpp. So the
-lock would bind only writers that opt in, and `infr` has no in-place writer to
-opt in.
-
-**Therefore, three honest options, in the order they look worth doing:**
-
-1. **Accept and document — where the tree is now.** Every mmap-based loader in
-   the ecosystem has this same hole. The invariant is stated at `Gguf::open`
-   instead of being implied by a bare `SAFETY` line, which is most of the value.
-2. **Detect instead of prevent.** Re-`stat` the fd at open and record
-   `(len, mtime, inode)`; a cheap re-check at a natural boundary (session start,
-   or the pager's first expert fetch) turns silent corruption into a loud error.
-   Does not stop UB, converts a mystery into a message. Cheap, portable, and
-   does not depend on anyone cooperating.
-3. **`flock` the fd for the mapping's lifetime.** Keep the `File` in `Gguf`
-   (`open` currently drops it — the mapping alone keeps the inode alive), take
-   the lock there, drop it with the mapping. `FileLock` in `pull.rs` is already
-   this shape and can be reused. Take it SHARED, not exclusive: exclusive would
-   stop two `infr` processes sharing one model, which is normal. But be clear
-   this buys nothing until an in-place writer exists to conflict with it.
-
-**Windows is not a constraint here**, contrary to the first version of this
-entry: `pull.rs`'s `FileLock` already calls `libc::flock` and `as_raw_fd`
-unconditionally, `libc` is an ungated dependency of `infr-hub`, there is no
-`cfg(windows)` anywhere in `crates/`, and CI builds only ubuntu-26.04 and
-macos-15. `infr-hub` does not compile for Windows today, so a `flock` in
-`infr-gguf` would not be what breaks it.
+**Considered and rejected: an advisory `flock`.** `infr` cannot corrupt its own
+mapping in the first place — `pull.rs` downloads to a temp and renames, nothing
+anywhere opens a blob for writing — so a lock has no in-house writer to conflict
+with. And it does not bind the writer that actually matters:
+`cp new.gguf live.gguf` opens the destination `O_TRUNC` and takes no lock, nor
+does any editor, nor llama.cpp. Reusable machinery exists (`FileLock` in
+`pull.rs`) if this is ever revisited, and it should be taken SHARED — exclusive
+would stop two `infr` processes sharing one model. Windows is not the obstacle
+it first appeared: `FileLock` already calls `libc::flock` unconditionally, so
+`infr-hub` does not build there today and CI covers only ubuntu-26.04 and
+macos-15.
 
 ### B31a — the CPU spin pool's unsafe has never been run under Miri
 

@@ -10,6 +10,7 @@
 //!   `~/Projects/llama.cpp/conversion/diffusion_gemma.py` (tensor names / keys)
 
 pub mod dequant;
+pub mod watch;
 
 use infr_core::{
     error::{Error, Result},

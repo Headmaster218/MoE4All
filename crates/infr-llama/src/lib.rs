@@ -35,6 +35,12 @@ pub use config::Config;
 pub use infr_core::config::Config as EngineConfig;
 mod weights;
 pub use weights::{weight_footprint, WeightFootprint};
+
+/// Notices a weight file being overwritten under a live mapping — see [`infr_gguf::watch`].
+///
+/// Re-exported here because the CLI reaches every GGUF concern through this crate rather than
+/// depending on `infr-gguf` directly, and a watch is opened beside each model load.
+pub use infr_gguf::watch::WeightWatch;
 pub mod mtp;
 mod quant;
 pub mod qwen35;
