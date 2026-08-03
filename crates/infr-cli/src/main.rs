@@ -503,10 +503,11 @@ enum Cmd {
 // ---------------------------------------------------------------------------
 
 /// `SIGINT`/`SIGTERM` handler. **Async-signal-safe by construction**: the first signal does nothing
-/// but a lock-free atomic store ([`infr_core::shutdown::request_shutdown`]) — no allocation, no
-/// locking, no Rust `println!` (which takes the stdout lock and would deadlock against an
-/// interrupted `print!`). The engine's poll sites see the latch at their next submit boundary,
-/// drain the GPU work already in flight, unwind, and let the backend's `Drop` destroy the device.
+/// but a lock-free atomic compare-exchange ([`infr_core::shutdown::request_shutdown`]) — no
+/// allocation, no locking, no Rust `println!` (which takes the stdout lock and would deadlock
+/// against an interrupted `print!`). The engine's poll sites see the latch at their next submit
+/// boundary, drain the GPU work already in flight, unwind, and let the backend's `Drop` destroy the
+/// device.
 ///
 /// The SECOND signal is the user saying they have given up waiting, and is honoured immediately:
 /// `write(2)` and `_exit(2)` are both on POSIX's async-signal-safe list (unlike `exit`, which runs
@@ -1855,6 +1856,15 @@ impl infr_server::ChatGenerator for ParallelGenerator {
     }
 }
 
+/// Tool-call parsing is enabled only when the request offers at least one tool and has not
+/// explicitly disabled calls with `tool_choice: "none"`.
+fn tool_parsing_allowed(tools: Option<&serde_json::Value>, tool_choice: Option<&str>) -> bool {
+    tools
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        && tool_choice != Some("none")
+}
+
 /// The OpenAI chat body, shared by every serve backend: render the conversation through the model's
 /// own template, honour a FORCED tool_choice with an llguidance constraint, then stream the reply
 /// through the reasoning/content/tool-call splitter with stop sequences applied to the raw text.
@@ -1948,7 +1958,7 @@ fn run_chat(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
             );
         }
-        let mut stream = infr_engine::ChatStream::new(tool_choice != Some("none"));
+        let mut stream = infr_engine::ChatStream::new(tool_parsing_allowed(tools, tool_choice));
         // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
         // stop string that spans two tokens still fires, and a partial stop prefix is held back
         // instead of being streamed out (see `StopMatcher`). A hit latches an abort on THIS
@@ -2444,7 +2454,7 @@ fn cmd_bench_metal(
         // the depth warm resets the materialized tokens). A fresh backend per rep re-paid those
         // one-time costs inside the measurement.
         let mut sess = model.metal_session(shape.max_ctx)?;
-        // One untimed warmup: page-cache the mmap + build the weight caches + compile pipelines.
+        // One untimed warmup: build the weight caches and compile pipelines.
         let _ = model.bench_metal(&mut sess, 8, 2, true, false);
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
@@ -2519,7 +2529,7 @@ fn cmd_bench_cpu(
 ) -> anyhow::Result<()> {
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
-    // One untimed warmup (page-cache the mmap'd weights) before the timed reps.
+    // One untimed warmup to build runtime caches before the timed reps.
     let _ = model.bench(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
     let mut samples = Vec::with_capacity(reps);
     for _ in 0..reps {
@@ -4162,6 +4172,17 @@ mod tests {
             ubatch: None,
             threads: None,
         }
+    }
+
+    #[test]
+    fn tool_parsing_requires_nonempty_tools() {
+        let empty = serde_json::json!([]);
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "bash"}}]);
+
+        assert!(!tool_parsing_allowed(None, None));
+        assert!(!tool_parsing_allowed(Some(&empty), None));
+        assert!(tool_parsing_allowed(Some(&tools), None));
+        assert!(!tool_parsing_allowed(Some(&tools), Some("none")));
     }
 
     #[test]

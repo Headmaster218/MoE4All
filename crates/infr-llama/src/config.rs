@@ -176,6 +176,28 @@ pub struct Config {
     pub sub_norm: bool,
 }
 
+fn positive_model_dimension(key: &str, value: u64) -> Result<usize> {
+    let value = value as usize;
+    if value == 0 {
+        bail!("{key} must be positive");
+    }
+    Ok(value)
+}
+
+fn positive_array_model_dimension(
+    values: Option<&[MetaValue]>,
+    key: &str,
+    index: usize,
+) -> Result<Option<usize>> {
+    let Some(value) = values
+        .and_then(|values| values.get(index))
+        .and_then(MetaValue::as_u64)
+    else {
+        return Ok(None);
+    };
+    positive_model_dimension(&format!("{key}[{index}]"), value).map(Some)
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Config {
     /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
@@ -411,8 +433,14 @@ impl Config {
         }
         let n_layer = n_layer_all - n_layer_nextn;
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
-        let n_head = meta_u64(g, &mk("attention.head_count")).context("head_count")? as usize;
-        let n_kv = meta_u64(g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
+        let n_head = positive_model_dimension(
+            &mk("attention.head_count"),
+            meta_u64(g, &mk("attention.head_count")).context("head_count")?,
+        )?;
+        let n_kv = match meta_u64(g, &mk("attention.head_count_kv")) {
+            Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
+            None => n_head,
+        };
         let n_ff_layers: Vec<usize> = if let Some(arr) = g
             .metadata()
             .get(&mk("feed_forward_length"))
@@ -541,15 +569,8 @@ impl Config {
             rope_theta
         };
         let (head_dim, n_kv, rope_dim, head_dim_swa, n_kv_swa, rope_dim_swa) = if gemma4 {
-            let hk = g
-                .metadata()
-                .get(&mk("attention.head_count_kv"))
-                .and_then(MetaValue::as_arr);
-            let kv_at = |i: usize| {
-                hk.and_then(|a| a.get(i))
-                    .and_then(MetaValue::as_u64)
-                    .map(|v| v as usize)
-            };
+            let kv_key = mk("attention.head_count_kv");
+            let hk = g.metadata().get(&kv_key).and_then(MetaValue::as_arr);
             let full_idx = swa_pattern.saturating_sub(1);
             let hd_full =
                 meta_u64(g, &mk("attention.key_length")).unwrap_or(head_dim as u64) as usize;
@@ -561,10 +582,10 @@ impl Config {
                 meta_u64(g, &mk("rope.dimension_count_swa")).unwrap_or(hd_swa as u64) as usize;
             (
                 hd_full,
-                kv_at(full_idx).unwrap_or(n_kv),
+                positive_array_model_dimension(hk, &kv_key, full_idx)?.unwrap_or(n_kv),
                 rd_full,
                 hd_swa,
-                kv_at(0).unwrap_or(n_kv),
+                positive_array_model_dimension(hk, &kv_key, 0)?.unwrap_or(n_kv),
                 rd_swa,
             )
         } else {
@@ -762,5 +783,88 @@ impl Config {
             shexp_gated,
             sub_norm,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_str(bytes: &mut Vec<u8>, value: &str) {
+        push_u64(bytes, value.len() as u64);
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_u32_metadata(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        push_str(bytes, key);
+        push_u32(bytes, 4); // GGUF_TYPE_UINT32
+        push_u32(bytes, value);
+    }
+
+    fn gemma4_zero_kv_heads_fixture() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, 1); // tensor count
+        push_u64(&mut bytes, 6); // metadata count
+
+        push_str(&mut bytes, "general.architecture");
+        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
+        push_str(&mut bytes, "gemma4");
+        push_u32_metadata(&mut bytes, "gemma4.block_count", 1);
+        push_u32_metadata(&mut bytes, "gemma4.embedding_length", 8);
+        push_u32_metadata(&mut bytes, "gemma4.attention.head_count", 8);
+        push_u32_metadata(&mut bytes, "gemma4.feed_forward_length", 16);
+
+        push_str(&mut bytes, "gemma4.attention.head_count_kv");
+        push_u32(&mut bytes, 9); // GGUF_TYPE_ARRAY
+        push_u32(&mut bytes, 4); // GGUF_TYPE_UINT32
+        push_u64(&mut bytes, 1);
+        push_u32(&mut bytes, 0);
+
+        push_str(&mut bytes, "token_embd.weight");
+        push_u32(&mut bytes, 2);
+        push_u64(&mut bytes, 8);
+        push_u64(&mut bytes, 1);
+        push_u32(&mut bytes, 0); // F32
+        push_u64(&mut bytes, 0);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&[0; 32]);
+        bytes
+    }
+
+    #[test]
+    fn model_dimensions_must_be_positive() {
+        assert!(positive_model_dimension("test.head_count", 0).is_err());
+        assert_eq!(positive_model_dimension("test.head_count", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn gemma4_array_kv_heads_must_be_positive() {
+        let path = std::env::temp_dir().join(format!(
+            "infr-llama-gemma4-zero-kv-heads-{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, gemma4_zero_kv_heads_fixture()).expect("write GGUF fixture");
+        let gguf = Gguf::open(&path).expect("open GGUF fixture");
+        std::fs::remove_file(path).expect("remove GGUF fixture");
+
+        let Err(err) = Config::from_gguf(&gguf) else {
+            panic!("zero KV heads must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "gemma4.attention.head_count_kv[0] must be positive"
+        );
     }
 }

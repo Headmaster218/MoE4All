@@ -497,8 +497,8 @@ pub trait Backend: Send + Sync {
     /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
     /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so
     /// no loader can forget a tensor — a loader only opens the scope around its upload loop.
-    /// Backends without a display (the CPU interpreter's zero-copy mmap load is instant) keep
-    /// this default no-op scope.
+    /// Backends without a display (the CPU interpreter has no backend upload phase) keep this
+    /// default no-op scope.
     fn weight_progress(&self, _total_bytes: Option<u64>) -> Box<dyn ProgressScope> {
         struct NoProgress;
         impl ProgressScope for NoProgress {}

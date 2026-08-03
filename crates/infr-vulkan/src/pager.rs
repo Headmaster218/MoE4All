@@ -356,10 +356,10 @@ impl GpuPager {
 
 /// Parallel memcpy of one expert's bytes into the mapped staging ring. The single-thread copy is
 /// the staging bottleneck (the bandwidth probe's 22 GB/s is a hot-source best case; streaming
-/// distinct experts out of a 37 GB page-cache-backed mmap into write-combined ReBAR runs well
-/// below that) — chunked `copy_nonoverlapping` across the rayon pool recovers most of the
-/// PCIe/DRAM headroom. 4 MiB chunks: big enough for streaming stores, small enough to spread a
-/// 14-18 MB expert across several workers.
+/// distinct experts out of a 37 GB immutable snapshot into write-combined ReBAR runs well below
+/// that) — chunked `copy_nonoverlapping` across the rayon pool recovers most of the PCIe/DRAM
+/// headroom. 4 MiB chunks: big enough for streaming stores, small enough to spread a 14-18 MB
+/// expert across several workers.
 fn par_copy_to_mapped(src: &[u8], dst: *mut u8) {
     use rayon::prelude::*;
     const CHUNK: usize = 4 << 20;

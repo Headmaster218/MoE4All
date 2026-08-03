@@ -100,13 +100,13 @@ const MAX_VALUE_DEPTH: usize = 64;
 ///
 /// `s` has already had `<|"|>` replaced with `"`.
 ///
-/// Returns `None` — and only ever `None` — when nesting would exceed [`MAX_VALUE_DEPTH`];
-/// every other malformation stays lenient-by-design (partial objects, missing quotes and
-/// unterminated strings all yield a best-effort `Value`, as callers rely on). `None`
-/// propagates all the way out so the caller drops the whole call instead of acting on a
-/// truncated one. Note the degradation could NOT be "return `Value::Null` in place and stop
-/// consuming": the array arm loops `while` the cursor hasn't reached `]`, so a value that
-/// returns without advancing `i` spins forever pushing `Null`s — a hang and an OOM in place
+/// Returns `None` when nesting would exceed [`MAX_VALUE_DEPTH`] or when the current byte is
+/// a container delimiter that cannot begin a value. Other malformations stay lenient-by-design
+/// (partial objects, missing quotes and unterminated strings all yield a best-effort `Value`, as
+/// callers rely on). `None` propagates all the way out so the caller drops the whole call instead
+/// of acting on a truncated one. Note the degradation could NOT be "return `Value::Null` in place
+/// and stop consuming": the array arm loops `while` the cursor hasn't reached `]`, so a value
+/// that returns without advancing `i` spins forever pushing `Null`s — a hang and an OOM in place
 /// of the stack overflow. Propagating `None` is the only exit that terminates every loop.
 fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
     // skip whitespace
@@ -115,6 +115,11 @@ fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
     }
     if i >= s.len() {
         return Some((Value::Null, i));
+    }
+    // A closing delimiter is not a value. Returning a successful empty bareword without consuming
+    // it leaves the surrounding container loop on the same byte forever.
+    if matches!(s[i], b',' | b'}' | b']') {
+        return None;
     }
     // Refuse before descending into a container, so the frame budget is checked once per level.
     if matches!(s[i], b'{' | b'[') && depth >= MAX_VALUE_DEPTH {
@@ -699,6 +704,20 @@ mod tests {
         let (clean, calls) = parse_tool_calls(text);
         assert!(calls.is_empty());
         assert_eq!(clean, text);
+    }
+
+    #[test]
+    fn unexpected_container_delimiter_is_not_a_value() {
+        assert!(
+            parse_value(b"}", 0, 0).is_none(),
+            "a value parser must reject a delimiter without consuming it"
+        );
+    }
+
+    #[test]
+    fn malformed_array_delimiter_does_not_loop() {
+        let (_, calls) = parse_tool_calls("<|tool_call>call:x{a:[}]}<tool_call|>");
+        assert!(calls.is_empty());
     }
 
     #[test]

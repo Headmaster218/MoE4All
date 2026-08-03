@@ -38,8 +38,8 @@ pub struct BenchPlacement {
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
 /// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
 /// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
-/// no weight upload: the projection weights are streamed straight from the kept-open GGUF mmap at
-/// forward time. Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), qwen3moe, and qwen35
+/// no weight upload: projection weights stream from the immutable GGUF snapshot at forward time.
+/// Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), qwen3moe, and qwen35
 /// (`MixerW::DeltaNet`) all drive this same struct.
 pub struct SeamModel {
     gguf: Gguf,

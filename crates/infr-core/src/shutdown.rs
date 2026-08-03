@@ -15,7 +15,7 @@
 //! this latch:
 //!
 //! * The CLI's signal handler does exactly ONE thing — [`request_shutdown`], a lock-free atomic
-//!   store. Nothing else in the handler is async-signal-safe, so nothing else is in it.
+//!   compare-exchange. Nothing else in the handler is async-signal-safe, so nothing else is in it.
 //! * Everything that can issue GPU work polls [`shutdown_requested`] at the boundary where it is
 //!   about to submit MORE work, and stops there. Work already submitted is always drained
 //!   (`vkQueueWaitIdle` / fence wait) — never abandoned.
@@ -32,33 +32,29 @@
 //! a poll loop that observes it one iteration late is fine — the guarantee is "stops promptly", not
 //! "stops instantly".
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// The signal number that latched it (0 = none), so the CLI can exit 128+signo.
+/// The signal number that latched shutdown (`0` means no request). Publishing the request and its
+/// signal as one atomic transition prevents observers from seeing shutdown without an exit status.
 static SIGNO: AtomicI32 = AtomicI32::new(0);
 
 /// Latch the shutdown request. Returns `true` if THIS call was the one that latched it, `false` if
 /// it was already set (i.e. this is a second signal — the caller may then decide the user has given
 /// up waiting and force-exit).
 ///
-/// **Async-signal-safe**: a `compare_exchange` and a `store` on lock-free atomics, nothing else. No
-/// allocation, no locking, no I/O. It is called directly from the CLI's `SIGINT`/`SIGTERM` handler.
+/// **Async-signal-safe**: one `compare_exchange` on a lock-free atomic, nothing else. No allocation,
+/// no locking, no I/O. It is called directly from the CLI's `SIGINT`/`SIGTERM` handler.
 pub fn request_shutdown(signo: i32) -> bool {
-    let first = SHUTDOWN
-        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok();
-    if first {
-        SIGNO.store(signo, Ordering::Relaxed);
-    }
-    first
+    SIGNO
+        .compare_exchange(0, signo, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Has a shutdown been requested? One relaxed atomic load — cheap enough for a per-op poll inside
 /// the Vulkan recording loop (it is dwarfed by the descriptor writes of a single dispatch).
 #[inline]
 pub fn shutdown_requested() -> bool {
-    SHUTDOWN.load(Ordering::Relaxed)
+    SIGNO.load(Ordering::Relaxed) != 0
 }
 
 /// The signal that latched the shutdown, or `None` if none has. The CLI turns this into the

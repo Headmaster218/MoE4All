@@ -1,10 +1,10 @@
 //! CPU reference backend — a correctness-first interpreter of the backend-agnostic
 //! [`infr_core`] compute [`Graph`]. Projection matmuls and attention use rayon for multi-core
 //! parallelism; QK/PV inner loops use an 8-accumulator dot for AVX autovectorization.
-//! Weights are read **zero-copy from the GGUF mmap** (no `memcpy`, no owned RAM): the bulk
-//! projection weights (`Op::Linear`) are dequantized one row at a time straight from the mapping
-//! inside the dot, so 12B / MoE models cost only their on-disk size in page cache. Only the tiny
-//! norm weights are dequant-cached; the model writes (KV / conv / recurrent state, per-step IO) use
+//! Weights are read without additional copies from the immutable GGUF snapshot: the bulk
+//! projection weights (`Op::Linear`) are dequantized one row at a time straight from that native
+//! byte layout inside the dot, so there is no full-model f32 materialization. Only the tiny norm
+//! weights are dequant-cached; the model writes (KV / conv / recurrent state, per-step IO) use
 //! small owned buffers. It exists to (a) run every model without a GPU and (b) serve as the oracle
 //! the GPU backends are validated against.
 #![allow(clippy::needless_range_loop)]
@@ -111,10 +111,11 @@ type WeightCache = HashMap<(usize, usize, DType), Arc<Vec<f32>>>;
 // scalar only (no SIMD; this path is memory/allocation-bound, not compute-bound, so a plain scalar
 // loop over int8 bytes already beats dequantizing the whole row to f32 first).
 
-/// A host buffer. Weights are **mapped** — a zero-copy [`TensorBytes`] view straight into the GGUF
-/// mmap (read-only, no `memcpy`, no owned RAM). Everything the model writes (KV / conv / recurrent
-/// state, per-step IO) is **owned** — a plain byte vec behind a `Mutex` (so `&dyn Buffer` stays
-/// `Send + Sync` and writes are safe). `&dyn Buffer` reads go through [`CpuBuffer::read`].
+/// A host buffer. Weights are **snapshot-backed** — a read-only [`TensorBytes`] view into the
+/// immutable GGUF bytes, with no additional allocation or copy per weight. Everything the model
+/// writes (KV / conv / recurrent state, per-step IO) is **owned** — a plain byte vec behind a
+/// `Mutex` (so `&dyn Buffer` stays `Send + Sync` and writes are safe). `&dyn Buffer` reads go
+/// through [`CpuBuffer::read`].
 pub enum CpuBuffer {
     Owned(Mutex<Vec<u8>>),
     Mapped(TensorBytes),
@@ -181,11 +182,12 @@ pub struct CpuBackend {
     /// back the previous model's f32 — the len/dtype discriminates the two.
     weight_cache: Mutex<WeightCache>,
     /// (layer, expert)-granular repack cache for the interleaved-x8 Q4_K GEMM ([`Q4kPack`]):
-    /// keyed by the expert weight slice's (address, length) — stable for the mmap'd/upload-once
-    /// weight buffers this backend binds (same lifetime argument as `weight_cache`). ggml pays
-    /// its `block_q4_Kx8` repack once at LOAD; this pays it once per (expert, session) instead
-    /// of once per CALL. Byte-budgeted (`kernels.cpu.repack_mb`, default 4096 MiB): over budget,
-    /// packs are built transient and not inserted. The `usize` is the current cached-bytes total.
+    /// keyed by the expert weight slice's (address, length) — stable for the snapshot-backed,
+    /// upload-once weight buffers this backend binds (same lifetime argument as `weight_cache`).
+    /// ggml pays its `block_q4_Kx8` repack once at LOAD; this pays it once per (expert, session)
+    /// instead of once per CALL. Byte-budgeted (`kernels.cpu.repack_mb`, default 4096 MiB): over
+    /// budget, packs are built transient and not inserted. The `usize` is the current cached-bytes
+    /// total.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
     /// Q6_K sibling of `repack_cache` (same keying and budget knob; separate accounting) — holds
@@ -314,7 +316,7 @@ impl CpuBackend {
         repack::cache_insert_if_absent(&mut guard, key, pack, bytes, self.repack_budget_bytes())
     }
 
-    /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
+    /// Wrap a GGUF snapshot view as a read-only weight buffer without another allocation or copy.
     pub fn map_weight(&self, bytes: TensorBytes) -> Box<dyn Buffer> {
         Box::new(CpuBuffer::Mapped(bytes))
     }

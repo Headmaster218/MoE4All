@@ -153,6 +153,23 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
     }
 }
 
+struct CollectGuard<'a, T> {
+    slots: *mut std::mem::MaybeUninit<T>,
+    initialized: &'a [AtomicBool],
+}
+
+impl<T> Drop for CollectGuard<'_, T> {
+    fn drop(&mut self) {
+        for (i, initialized) in self.initialized.iter().enumerate() {
+            if initialized.load(Ordering::Acquire) {
+                // SAFETY: each true flag is published only after its corresponding slot has been
+                // initialized, and `run` waits for all tasks before propagating a panic.
+                unsafe { std::ptr::drop_in_place(self.slots.add(i).cast::<T>()) };
+            }
+        }
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SpinPool {
     /// Thread count follows rayon's (`RAYON_NUM_THREADS` / available parallelism) so `-t` pins
@@ -317,26 +334,20 @@ impl SpinPool {
         let mut out: Vec<std::mem::MaybeUninit<T>> = Vec::with_capacity(n);
         // SAFETY: every index 0..n is written exactly once below before assume-init.
         unsafe { out.set_len(n) };
+        let initialized: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+        let guard = CollectGuard {
+            slots: out.as_mut_ptr(),
+            initialized: &initialized,
+        };
         let base = SendPtr(out.as_mut_ptr());
-        self.run(n, &move |i| {
+        self.run(n, &|i| {
             // SAFETY: each task writes only its own slot.
             unsafe { base.get().add(i).write(std::mem::MaybeUninit::new(f(i))) };
+            initialized[i].store(true, Ordering::Release);
         });
-        // SAFETY: all n slots are initialized. `run` returns only after every task completed, and
-        // if any task panicked `run` re-panics before we get here, so the rebuild below is only
-        // reached on the all-written path.
-        //
-        // LEAK ON PANIC (not UB, but not free either): `run` catches each task's panic
-        // individually and only re-panics once ALL tasks have finished — so by the time that panic
-        // unwinds through here, the non-panicking tasks have already written their slots. `out` is
-        // still typed `Vec<MaybeUninit<T>>`, and dropping a `MaybeUninit<T>` is a no-op, so every
-        // `T` that WAS constructed leaks its destructor. That is not free at the call sites this
-        // has: `T` is `Q8`/`Q8x32`, each holding several heap `Vec`s, so an aborted quantize of an
-        // m-row activation leaks up to m of them. It is a real leak, not merely a lost value —
-        // fixing it would mean tracking which indices were written and dropping those in place.
-        // The old comment claimed only that a panic "propagates out of `run` before we get here",
-        // which is true but says nothing about what the already-written slots cost on that path.
-        //
+        // Every slot is initialized after a successful `run`; disable the unwind-only destructor.
+        std::mem::forget(guard);
+
         // The rebuild is done via `from_raw_parts` rather than
         // `transmute::<Vec<MaybeUninit<T>>, Vec<T>>`: `Vec` is not `repr(C)`, so transmuting
         // between two instantiations of it is not a language guarantee even though
@@ -450,6 +461,37 @@ mod tests {
             hits[t].fetch_add(1, Ordering::Relaxed);
         });
         assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn collect_drops_completed_values_when_another_task_panics() {
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let pool = SpinPool::new(&CpuCfg::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.collect(2, &|i| {
+                if i == 1 {
+                    panic!("task boom");
+                }
+                DropCounter(Arc::clone(&drops))
+            });
+        }));
+        std::panic::set_hook(prev);
+
+        assert!(caught.is_err(), "the task panic must propagate");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "the value completed before the panic must be dropped"
+        );
     }
 
     #[test]

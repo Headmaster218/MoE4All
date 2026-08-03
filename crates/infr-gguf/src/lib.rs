@@ -1,7 +1,7 @@
 //! GGUF loader — `WeightSource` impl.
 //!
-//! Parses the GGUF binary format (little-endian) by mmap-ping the file and
-//! walking a byte cursor through header → metadata KV pairs → tensor directory.
+//! Parses the GGUF binary format (little-endian) into an immutable memory snapshot and
+//! walks a byte cursor through header → metadata KV pairs → tensor directory.
 //! Quantised weight blocks are returned as-is; the backend owns dequantisation.
 //!
 //! References:
@@ -17,8 +17,8 @@ use infr_core::{
     tensor::DType,
     WeightSource,
 };
-use memmap2::Mmap;
-use std::{collections::HashMap, fs::File, path::Path, sync::Arc};
+use memmap2::{Mmap, MmapMut};
+use std::{collections::HashMap, fs::File, io::Read, path::Path, sync::Arc};
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -61,21 +61,21 @@ const MAX_META_DEPTH: usize = 64;
 
 // ─── public struct ────────────────────────────────────────────────────────────
 
-/// A parsed, mmap-backed GGUF file.
+/// A parsed GGUF snapshot.
 ///
-/// The `Mmap` handle keeps the backing memory alive for the lifetime of this
+/// The anonymous read-only `Mmap` owns a stable copy of the file bytes for the lifetime of this
 /// struct; `tensor_bytes` returns slices directly into that region.
 pub struct Gguf {
     mmap: Arc<Mmap>,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
-    /// Absolute byte offset into `mmap` where tensor data begins.
+    /// Absolute byte offset into the snapshot where tensor data begins.
     data_region_start: usize,
 }
 
-/// An owning, ref-counted view of a tensor's bytes in the mmap'd file — a zero-copy `[u8]` slice that
-/// keeps the whole `Mmap` alive via `Arc`, so it can outlive the borrow of `&Gguf` (e.g. a CPU
-/// backend buffer that reads weights straight from the mapping with no `memcpy`).
+/// An owning, ref-counted view of a tensor's bytes in the immutable snapshot. It keeps the whole
+/// snapshot alive via `Arc`, so it can outlive the borrow of `&Gguf` (e.g. a CPU backend buffer that
+/// reads weights directly with no additional `memcpy`).
 #[derive(Clone)]
 pub struct TensorBytes {
     mmap: Arc<Mmap>,
@@ -331,7 +331,7 @@ pub fn block_layout(dtype: DType) -> (usize, usize) {
 /// same bounds checks catch loudly instead. `debug_assert` states the contract so a new caller that
 /// breaks it trips in tests rather than inheriting the rounding.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
+fn checked_tensor_nbytes(dtype: DType, numel: usize) -> Option<usize> {
     // i2_s stores `numel/4` bytes of 2-bit ternary codes followed by ONE per-tensor f32 scale (see
     // `DType::I2S`). The scale is part of the tensor's data region (ggml rounds the next tensor's
     // offset up to `general.alignment`, so the on-disk stride is `numel/4 + 4` padded to 32B, but
@@ -342,14 +342,19 @@ fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
             numel.is_multiple_of(4),
             "i2_s packs 4 ternary codes per byte; numel {numel} is not a multiple of 4"
         );
-        return numel.div_ceil(4) + 4;
+        return numel.div_ceil(4).checked_add(4);
     }
     let (be, bb) = block_layout(dtype);
     debug_assert!(
         numel.is_multiple_of(be),
         "{dtype:?} blocks hold {be} elements; numel {numel} is not a whole number of blocks"
     );
-    numel.div_ceil(be) * bb
+    numel.div_ceil(be).checked_mul(bb)
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
+    checked_tensor_nbytes(dtype, numel).expect("tensor byte count overflows usize")
 }
 
 /// Bytes occupied by `numel` elements of `dtype` in its GGUF block layout (`numel` must be a whole
@@ -375,32 +380,26 @@ pub fn nbytes(dtype: DType, numel: usize) -> usize {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Gguf {
-    /// Open and parse a GGUF file.
+    /// Open and parse a stable snapshot of a GGUF file.
     ///
-    /// The file is memory-mapped; no tensor bytes are copied into RAM.
+    /// File-backed mappings cannot safely expose shared references because another handle or
+    /// process can modify or truncate the file while those references are live. Read into an
+    /// anonymous mapping first, then make it read-only, so every safe caller observes immutable
+    /// bytes after this function returns.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
-        // SAFETY: the file is not modified while this Mmap is live.
-        let mmap = unsafe { Mmap::map(&file) }?;
-
-        // Best-effort madvise hints. All are advisory: `advise()` returns an
-        // `io::Result`, but a rejected/unsupported hint must never fail the load —
-        // weight correctness does not depend on any hint landing, so we swallow errors.
-        // NOTE: we deliberately do NOT use `Advice::Sequential`. Decode re-reads the
-        // ENTIRE model every token, so `MADV_SEQUENTIAL`'s drop-behind eviction would
-        // throw away pages we need on the very next token — wrong for this access
-        // pattern. Only `WillNeed`/`HugePage` fit.
-        #[cfg(unix)]
-        {
-            // Populate/readahead the whole mapping into the page cache now, front-loading
-            // the weight read at load instead of faulting it in lazily on the first token.
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
-            // Linux only: request 2 MB transparent huge pages to cut dTLB page-walks over
-            // the multi-GB sequential weight stream. On file-backed mmaps this is frequently
-            // a no-op (THP-for-filesystem is not always enabled) — hence best-effort.
-            #[cfg(target_os = "linux")]
-            let _ = mmap.advise(memmap2::Advice::HugePage);
-        }
+        let mut file = File::open(path)?;
+        let file_len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+            Error::Loader(format!(
+                "GGUF: file size for {path:?} does not fit in usize"
+            ))
+        })?;
+        let mut snapshot = MmapMut::map_anon(file_len)?;
+        file.read_exact(&mut snapshot)?;
+        let mmap = snapshot.make_read_only()?;
+        // Best-effort transparent huge pages reduce dTLB pressure when CPU inference scans the
+        // anonymous multi-gigabyte snapshot. The hint is advisory and does not affect correctness.
+        #[cfg(target_os = "linux")]
+        let _ = mmap.advise(memmap2::Advice::HugePage);
 
         // All parsing happens in this block so the borrow of `mmap` ends
         // before we move `mmap` into the returned struct.
@@ -531,7 +530,11 @@ impl Gguf {
                         )));
                     }
                 }
-                let nbytes = tensor_nbytes(dtype, numel);
+                let nbytes = checked_tensor_nbytes(dtype, numel).ok_or_else(|| {
+                    Error::Loader(format!(
+                        "GGUF: tensor '{name}' shape {shape:?} byte size overflows usize"
+                    ))
+                })?;
                 tensors.push(TensorInfo {
                     name,
                     shape,
@@ -573,9 +576,9 @@ impl Gguf {
         })
     }
 
-    /// Zero-copy, ref-counted view of a tensor's raw bytes (keeps the `Mmap` alive via `Arc`). Unlike
-    /// [`WeightSource::tensor_bytes`] the result is not borrow-bound to `&self`, so a backend can hold
-    /// it as a weight buffer and read straight from the mapping — no `memcpy` into owned RAM.
+    /// Ref-counted view of a tensor's raw bytes that keeps the immutable snapshot alive. Unlike
+    /// [`WeightSource::tensor_bytes`], the result is not borrow-bound to `&self`, so a backend can
+    /// retain it as a weight buffer without another copy.
     pub fn tensor_bytes_arc(&self, name: &str) -> Result<TensorBytes> {
         let (off, len) = self.resolve(name)?;
         Ok(TensorBytes {
@@ -585,7 +588,7 @@ impl Gguf {
         })
     }
 
-    /// Look up a tensor by name and return its `(absolute_offset, len)` in the mmap,
+    /// Look up a tensor by name and return its `(absolute_offset, len)` in the snapshot,
     /// bounds-checked against the file size with `checked_add` so a crafted
     /// offset/length can't overflow. Shared by [`Self::tensor_bytes_arc`] and
     /// [`WeightSource::tensor_bytes`] so the lookup + overflow-safe bounds check lives
@@ -625,10 +628,9 @@ impl WeightSource for Gguf {
         &self.tensors
     }
 
-    /// Returns a slice into the mmap'd data region for the named tensor.
+    /// Returns a slice into the immutable tensor-data snapshot.
     ///
-    /// The slice lifetime is tied to `&self` (i.e. the `Gguf` struct keeps
-    /// the `Mmap` alive).
+    /// The slice lifetime is tied to `&self` (i.e. the `Gguf` struct keeps the snapshot alive).
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         let (start, len) = self.resolve(name)?;
         Ok(&self.mmap[start..start + len])
@@ -752,26 +754,20 @@ mod tests {
         assert!(gguf.chat_template().is_none());
     }
 
-    // ── madvise hints are transparent ─────────────────────────────────────────
+    // ── immutable snapshot ────────────────────────────────────────────────────
 
-    /// The best-effort `madvise` hints applied to the weight mmap in `Gguf::open`
-    /// (`WillNeed`, and `HugePage` on Linux) must not change what the mapping reads
-    /// back. Open the fixture and assert the tensor bytes are byte-for-byte identical
-    /// to the raw tensor-data region of the source buffer — i.e. the hint is a no-op
-    /// on observable content. This is the only path that exercises the advise() calls.
     #[test]
-    fn madvise_hints_are_transparent() {
+    fn snapshot_stays_stable_after_source_changes() {
         let bytes = build_fixture();
         let tmp = write_temp_gguf(&bytes);
         let gguf = Gguf::open(tmp.path()).expect("open fixture");
 
-        // tensor0 is F32 [4] at data offset 0 → the last 16 bytes of the buffer.
+        // A second safe file handle can replace the source after `open`. Tensor references must
+        // continue to read the owned snapshot, never changed file-backed memory.
+        std::fs::write(tmp.path(), vec![0xFF; bytes.len()]).expect("replace source file");
         let expected = &bytes[bytes.len() - 16..];
         let data = gguf.tensor_bytes("tensor0").expect("tensor_bytes");
-        assert_eq!(
-            data, expected,
-            "mmap read must be byte-for-byte with the source"
-        );
+        assert_eq!(data, expected);
     }
 
     // ── malformed / truncated header hardening ────────────────────────────────
@@ -1036,6 +1032,17 @@ mod tests {
     }
 
     // ── block-alignment hardening ─────────────────────────────────────────────
+
+    #[test]
+    fn tensor_byte_count_overflow_errors() {
+        let b = build_typed_fixture(0, 1u64 << 62, 0);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        assert!(
+            matches!(err, Err(Error::Loader(_))),
+            "overflowing F32 byte count should be Error::Loader, got {err:?}"
+        );
+    }
 
     /// A GGUF holding exactly one tensor of `ggml_type` with the given 1-D length, and `data_len`
     /// bytes of zeros in the data region. The round-trip fixture uses F32 (`block_elems == 1`), so
