@@ -490,6 +490,18 @@ fn denoise_block(
     Ok((argmax_canvas, steps_run))
 }
 
+/// How many of a trimmed block's `cut` tokens may be RETURNED, given `so_far` already emitted and
+/// a budget of `n_predict`.
+///
+/// Block diffusion denoises a whole canvas and cannot produce a partial one, so `n_predict` can
+/// only ever be honoured on the way out. It used to be read once — to size `blocks_wanted` — and
+/// never again, so a `max_tokens: 1` turn returned (and billed) a whole `canvas_length` block
+/// (backlog B20). Splitting the arithmetic out because the loop it lives in cannot be unit-tested:
+/// `denoise_block` needs a real `SeamModel`, hence a real DiffusionGemma GGUF.
+fn budget_take(cut: usize, so_far: usize, n_predict: usize) -> usize {
+    cut.min(n_predict.saturating_sub(so_far))
+}
+
 /// Cut a denoised canvas at the first end-of-generation token, or (many checkpoints emit no stop
 /// token) at the onset of a repetition loop — a token recurring at stride 1-2 for >= 6 reps
 /// (`diffusion-cli.cpp:388-411`'s `trim_canvas`). A cut shorter than the canvas ends the turn.
@@ -605,10 +617,21 @@ pub fn diffusion_generate(
         blocks_run += 1;
 
         let cut = trim_canvas(&canvas, |t| eos_ids.contains(&t));
+        // `n_predict` is an UPPER BOUND on tokens returned, not a block count.
+        //
+        // A block denoises a whole `canvas_len` canvas and cannot produce a partial one, so the
+        // budget could only ever be enforced on what is HANDED BACK. It was not enforced at all:
+        // `n_predict` was read once to size `blocks_wanted` and never again, so `max_tokens: 1`
+        // against a DiffusionGemma model returned — and billed, via `GenStats.n_gen` — a full
+        // canvas (backlog B20). The compute is spent either way; the contract is about the reply.
+        let take = budget_take(cut, response.len(), n_predict);
         if let Some(cb) = on_block.as_deref_mut() {
-            cb(&canvas[..cut]);
+            cb(&canvas[..take]);
         }
-        response.extend_from_slice(&canvas[..cut]);
+        response.extend_from_slice(&canvas[..take]);
+        if take < cut || response.len() >= n_predict {
+            break; // budget spent — the caller asked for no more than this
+        }
         if cut < canvas_len {
             break; // end token or repetition loop: answer complete (line 478-480)
         }
@@ -643,7 +666,7 @@ pub fn is_diffusion_gemma(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_by_entropy_bound, entropy_order, trim_canvas};
+    use super::{accept_by_entropy_bound, budget_take, entropy_order, trim_canvas};
 
     #[test]
     fn entropy_order_is_ascending_and_nan_safe() {
@@ -701,6 +724,24 @@ mod tests {
         // NaN sorted last → its exclusive-prefix check is false → not accepted, no panic.
         let accepted = accept_by_entropy_bound(&entropy, &order, 10.0);
         assert!(!accepted[1]);
+    }
+
+    /// B20: `n_predict` bounds the tokens RETURNED, so a one-token request cannot come back with a
+    /// whole canvas. The loop that uses this cannot be tested without a real DiffusionGemma GGUF
+    /// (`denoise_block` takes a `&SeamModel`), which is why the arithmetic is its own function.
+    #[test]
+    fn budget_take_caps_a_block_at_the_remaining_budget() {
+        // The reported case: a 128-token canvas against `max_tokens: 1`.
+        assert_eq!(budget_take(128, 0, 1), 1);
+        // Zero budget yields nothing rather than one forced block's worth.
+        assert_eq!(budget_take(128, 0, 0), 0);
+        // Already at or over budget: nothing more, and no underflow on the subtraction.
+        assert_eq!(budget_take(128, 64, 64), 0);
+        assert_eq!(budget_take(128, 100, 64), 0);
+        // Under budget: the block is taken whole, budget or trim — whichever binds first.
+        assert_eq!(budget_take(128, 0, 512), 128);
+        assert_eq!(budget_take(128, 400, 512), 112);
+        assert_eq!(budget_take(30, 0, 512), 30, "an EOG trim still wins");
     }
 
     #[test]

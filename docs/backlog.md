@@ -999,38 +999,6 @@ binary runs on this box** (`undefined symbol: ggml_dsv4_hc_post`). The packaging
 fix is not ours; the shim lived in session scratch and will not survive, so the
 next sweep needs its own working oracle before it starts.
 
-### B20 — `diffusion_generate` enforces `n_predict` per BLOCK, never per token
-
-**Tag:** CR-2026-08-03 M2 (verified) · **Blocked on:** a decision on what
-over-budget should do — truncate, or keep the block and report honestly
-
-`crates/infr-llama/src/diffusion.rs`: `diffusion_generate` uses `n_predict`
-exactly once — `blocks_wanted = n_predict.div_ceil(canvas_len.max(1)).max(1)` —
-and never again. Each block appends its whole trimmed canvas
-(`response.extend_from_slice(&canvas[..cut])`) with no comparison against a
-remaining budget, and `.max(1)` forces one block even for an `n_predict` of 0 or
-
-1. `DiffusionGemmaChat::generate_impl`
-   (`crates/infr-llama/src/chat/diffusion.rs`) passes `max_new` straight in as
-   `n_predict`.
-
-So a `max_tokens: 1` request against a DiffusionGemma model gets up to
-`diffusion.canvas_length` tokens (read from GGUF metadata; `config.rs` requires
-it to be positive). It is also BILLED that way:
-`GenStats.n_gen = response.len()`, and `run_chat`'s `stats.n_gen >= max_new`
-branch then reports `finish_reason: "length"` with
-`completion_tokens = canvas_length` for a one-token request.
-
-Argued from the control flow, not executed — a proving test needs a real
-DiffusionGemma GGUF, because `denoise_block` takes a `&SeamModel` and reads
-`model.engine_cfg()`, so no mock `DiffusionSession` can stand in for it.
-
-**The decision:** truncating `response` to `n_predict` is one line but changes
-what a DG turn returns; the alternative is to keep block granularity and make
-the budget honest at the API edge (round `max_tokens` up to a whole block and
-say so). Block diffusion genuinely cannot produce a partial canvas, which is
-what makes this a product call rather than only a bug.
-
 ### B21 — `DiffusionGemmaChat` discards `RequestCtx`: no cancellation, no per-request seed
 
 **Tag:** CR-2026-08-03 M3 (verified) · **Blocked on:** threading an abort poll
