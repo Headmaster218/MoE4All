@@ -1067,38 +1067,6 @@ Combined with B20 (a `max_tokens: 1` request generating a whole canvas), the
 worst case is a disconnected client leaving the single DG slot busy for
 `ceil(max_new / canvas_length)` blocks with nothing able to interrupt it.
 
-### B22 — a forced `tool_choice` with no `tools` generates unconstrained instead of 400
-
-**Tag:** CR-2026-08-03 M4 (verified) · **Blocked on:** nothing; it is a
-validation rule to add, plus a decision on how strict to be
-
-Two halves, both confirmed by reading:
-
-- `crates/infr-llama/src/grammar.rs`: `tool_constraint_for` opens with
-  `let Some(tools) = tools else { return Ok(None) };` — `tool_choice` is never
-  inspected when `tools` is absent.
-- `crates/infr-server/src/lib.rs`: `tool_choice_str` passes EVERY JSON string
-  through unchanged, so `"bogus"` is accepted as a function name (its own test
-  `tool_choice_string_passes_through` asserts exactly that), and the
-  `chat_completions` handler never cross-checks `tool_choice` against `tools`.
-
-So `POST /v1/chat/completions` with `"tool_choice":"required"` and no `tools`
-returns ordinary assistant text: `run_chat` sees `tool_constraint(..) == None`
-and falls into the unconstrained branch. Same for any misspelled choice.
-
-Note the near-miss the review did not mention: with `tools` PRESENT and a
-`tool_choice` naming no tool in it, `tool_constraint_for`'s filter yields an
-empty array and `forced_tool_call_grammar` builds `{"anyOf": []}` — a grammar
-matching nothing. That is a different failure (a grammar error, or an empty
-constrained decode followed by `run_chat`'s unconstrained fallback), it has not
-been executed, and it stems from the same missing validation.
-
-**The rule to add:** reject `tool_choice` values outside `auto` / `none` /
-`required` / a name present in `tools`, and reject a forced choice with no
-`tools`, as a `ParamError` in the handler — alongside the existing
-`tool_choice_str` 400s, which already establish that a malformed forced choice
-is an error rather than a silent downgrade to `auto`.
-
 ### B25 — `SpinPool::run` releases `in_run` before consuming `panicked`
 
 **Tag:** CR-2026-08-03 L2 (verified) · **Blocked on:** nothing

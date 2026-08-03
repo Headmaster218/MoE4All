@@ -412,6 +412,66 @@ fn tool_choice_str(v: &serde_json::Value) -> Result<Option<String>, ParamError> 
     }
 }
 
+/// The three `tool_choice` values that are POLICIES rather than tool names.
+const TOOL_CHOICE_POLICIES: [&str; 3] = ["auto", "none", "required"];
+
+/// Cross-check a normalised `tool_choice` against the request's `tools`, which
+/// [`tool_choice_str`] cannot do on its own — it never sees `tools`.
+///
+/// Two holes this closes, both of which used to produce ordinary unconstrained assistant text
+/// (backlog B22). `tool_constraint_for` returns `Ok(None)` the moment `tools` is absent, without
+/// ever looking at `tool_choice`, and `run_chat` reads that `None` as "no constraint wanted":
+///
+/// - **A forced choice with no `tools`.** `"tool_choice":"required"` and no tools is a request the
+///   server cannot honour — there is nothing to call — so it is a 400 rather than a silent
+///   downgrade to free text. `"none"` is exempt: it asks for no tool call, which is satisfiable
+///   with no tools, and `"auto"` means "your discretion".
+/// - **A name that is not in `tools`.** A misspelled function name reached the generator as a
+///   forced choice and then vanished. With `tools` present it is worse than nothing: the filter in
+///   `tool_constraint_for` yields an empty array and `forced_tool_call_grammar` builds
+///   `{"anyOf": []}`, a grammar that matches no output at all.
+///
+/// Same policy as the existing malformed-object 400s: a forced tool call the server cannot deliver
+/// is an error, never a quiet fallback to "auto" (audit finding 6).
+fn validate_tool_choice(
+    tool_choice: Option<&str>,
+    tools: Option<&serde_json::Value>,
+) -> Result<(), ParamError> {
+    let Some(choice) = tool_choice else {
+        return Ok(());
+    };
+    if TOOL_CHOICE_POLICIES.contains(&choice) && choice != "required" {
+        return Ok(());
+    }
+    // `tools` may be absent, `null`, or an empty array — all "no tools offered".
+    let names: Vec<&str> = tools
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.get("function")?.get("name")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        return Err(ParamError {
+            param: "tool_choice",
+            message: format!(
+                "tool_choice {choice:?} requires a non-empty `tools` array; none was supplied"
+            ),
+        });
+    }
+    if choice == "required" || names.contains(&choice) {
+        return Ok(());
+    }
+    Err(ParamError {
+        param: "tool_choice",
+        message: format!(
+            "tool_choice {choice:?} names no tool in `tools` (have: {})",
+            names.join(", ")
+        ),
+    })
+}
+
 /// A single chat message.  `content` may be a JSON string or a content-part array.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessageDto {
@@ -1256,6 +1316,13 @@ async fn chat_completions_handler(
             Err(e) => return param_error(Some(e.param), e.message),
         },
     };
+    // …and a WELL-FORMED forced choice the server cannot honour is a 400 too: the constraint
+    // builder ignores `tool_choice` entirely when `tools` is absent, so without this the request
+    // would quietly generate ordinary text instead (B22).
+    if let Err(e) = validate_tool_choice(tool_choice.as_deref(), tools.as_ref()) {
+        return param_error(Some(e.param), e.message);
+    }
+
     // Route to the hosted model named in the request (exact id), else the default (first) entry.
     // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
     // client that omitted/mis-named the model sees which one answered.
@@ -2914,6 +2981,63 @@ mod tests {
             tool_choice_str(&serde_json::json!("auto")).unwrap(),
             Some("auto".to_string())
         );
+    }
+
+    /// B22: a forced `tool_choice` the server cannot honour is a 400, not free text.
+    ///
+    /// `tool_constraint_for` returns `None` as soon as `tools` is absent — without reading
+    /// `tool_choice` at all — and `run_chat` treats that as "generate normally". So every case
+    /// below used to produce ordinary assistant text while the client believed it had forced a
+    /// call.
+    #[test]
+    fn a_forced_tool_choice_needs_tools_that_can_satisfy_it() {
+        let tools = serde_json::json!([{"function": {"name": "bash"}}]);
+
+        // Rejected: nothing to call.
+        for choice in ["required", "bash"] {
+            assert!(
+                validate_tool_choice(Some(choice), None).is_err(),
+                "{choice:?} with no tools must 400"
+            );
+            assert!(
+                validate_tool_choice(Some(choice), Some(&serde_json::json!([]))).is_err(),
+                "{choice:?} with an empty tools array must 400"
+            );
+        }
+        // Rejected: names no tool that was offered. This is the case that built `{"anyOf": []}`.
+        assert!(validate_tool_choice(Some("bogus"), Some(&tools)).is_err());
+
+        // Accepted: policies that are satisfiable without tools, and a name that is present.
+        assert!(validate_tool_choice(Some("auto"), None).is_ok());
+        assert!(
+            validate_tool_choice(Some("none"), None).is_ok(),
+            "`none` asks for no tool call, which needs no tools"
+        );
+        assert!(validate_tool_choice(None, None).is_ok());
+        assert!(validate_tool_choice(Some("required"), Some(&tools)).is_ok());
+        assert!(validate_tool_choice(Some("bash"), Some(&tools)).is_ok());
+    }
+
+    /// The same rule over HTTP, so the wire really returns 400 and names the offending parameter.
+    #[tokio::test]
+    async fn forced_tool_choice_without_tools_is_a_400() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"a","messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["param"], "tool_choice");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     #[test]
