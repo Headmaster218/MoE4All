@@ -2347,7 +2347,7 @@ fn bench_json_line(
 /// How the reps SPREAD, as `min-max` t/s plus the peak-to-peak percentage of the mean — the half
 /// of a benchmark result an average deletes.
 ///
-/// Backlog B6/B16: on this hardware a prefill average is reproducible to a few percent and a
+/// Backlog B6: on this hardware a prefill average is reproducible to a few percent and a
 /// single leg can be 9% off, so an average alone cannot tell a real 3% win from noise. The spread
 /// can, and it costs nothing to print — the samples are already in hand. Empty/one-sample input
 /// gives an empty string (nothing to say).
@@ -4711,7 +4711,7 @@ mod tests {
                 serde_json::from_str(&line).unwrap_or_else(|e| panic!("{name}: {e}: {line}"));
             // Exactly what `ModelBench::infr_json` and `llama-bench -o json` readers do.
             assert_eq!(v[0]["avg_ts"].as_f64(), Some(110.0), "{name}");
-            // The per-rep samples are carried, not just their mean (backlog B16: a single value
+            // The per-rep samples are carried, not just their mean (backlog B6: a single value
             // hides the one leg in thirteen that was 8.9% low).
             assert_eq!(
                 v[0]["reps_ts"].as_array().map(|a| a.len()),

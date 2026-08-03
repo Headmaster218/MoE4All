@@ -14,11 +14,13 @@ Provenance tags point at the finding that opened the item:
 - `CR-*` — the whole-tree correctness reviews. Their report lived at
   `docs/code-review.md` and was **deleted on 2026-08-03, folded into this
   file**: the eight findings of the 2026-08-03 pass were re-verified against the
-  code and are B19–B26, and that pass's cleared / hardening / coverage lists are
-  B27–B29. The tags on B1–B5 come from the earlier 2026-08-01 pass, whose text
-  the file had already stopped carrying (`6ab8b1c` overwrote it with the later
-  review). A `CR-*` tag is therefore a historical marker for where an item came
-  from, not a link to anything.
+  code and became B19–B26, all eight of which have since been fixed and deleted
+  from here (`git log -S'### B19' -- docs/backlog.md` finds them). That pass's
+  cleared / hardening / coverage lists survive as B27–B29. The tags on B1–B5
+  come from the earlier 2026-08-01 pass, whose text the file had already stopped
+  carrying (`6ab8b1c` overwrote it with the later review). A `CR-*` tag is
+  therefore a historical marker for where an item came from, not a link to
+  anything.
 
 ---
 
@@ -106,472 +108,147 @@ worse version of solved infrastructure.
 traffic with no proxy in front. That is a different product decision, not a
 missing feature.
 
-### B6 — prefill reproducibility: the stated cause was WRONG; the real one is fixed
+### B6 — a four-token bench column resolves nothing under ~10%
 
 **Tag:** diagnosed + fixed 2026-08-02 · **Blocked on:** nothing; what is left is
-the residual on the two smallest models, and it is not tier choice
+a measurement floor nobody intends to chase
 
-**The original claim, kept because it is what was disproved.** Running the
-35-row sweep twice against the same binary (`691c0dc`) gave `pp512` 6.8% mean /
-34.5% worst and `pp4@d4096` 7.7% / 31.7%, against under 1% on both decode
-columns, and the entry attributed it to "tier/chunk nondeterminism — a short
-prefill can land on a different kernel tier between runs".
+The prefill columns' 6.8–34.5% run-to-run spread was **not** tier
+nondeterminism, which is what this entry originally claimed: `INFR_PROF_OPS=1`
+over six back-to-back runs produced a byte-identical (op name, dispatch count)
+signature while throughput moved 1029.5 → 1120.4 t/s, and nothing feeds a tier
+decision live VRAM at bench scale. The cause was that `bench_vulkan`'s untimed
+warmup was a hardcoded `(8, 2)` turn, so the first TIMED rep of any other shape
+paid that shape's one-time costs — pipeline variants, first-touch scratch pools
+— inside the measured window. Fixed by warming at the measured shape.
+`pp4@d4096` peak-to-peak went 8.4% / 20.2% to 4.3% / 7.9% over four sweeps each
+way, and the worst named row (Qwen3.6-35B-A3B UD-IQ3_S) 20.2% → **1.4%**.
 
-**That attribution does not survive measurement.** Three separate checks:
+**The residual, accepted.** Qwen3-0.6B and gemma-3-1b keep ~8% peak-to-peak on
+`pp4@d4096`. That column times four tokens — ~3.7 ms wall per rep of which ~2.8
+ms is device time — so roughly a quarter is host-side record/submit/fence and
+its jitter is what is left. Options if it ever matters: raise `-r` for that
+column only, report the median instead of the mean, or accept that a four-token
+measurement resolves nothing under ~10%. `infr bench` prints the per-rep min-max
+and spread on every line, so this is visible in the output rather than inferred.
 
-- **The kernels are identical.** `INFR_PROF_OPS=1` over six back-to-back `pp512`
-  runs and eight `pp4@d4096` runs of Qwen3-0.6B Q4_K_M produced a byte-identical
-  (op name, dispatch count) signature every time — 14 ops / 729 dispatches for
-  `pp512`, 449 for `pp4` — while `pp4`'s reported throughput moved 1029.5 →
-  1120.4 t/s. Different throughput, same kernels: no tier changed.
-- **Nothing feeds a tier decision live VRAM at bench scale.** `adaptive_chunk`
-  is a pure function of the KV span. `vulkan_moe_binder` takes ONE `vk.vram()`
-  snapshot per load and every budget derives from it, and both rungs that could
-  move a chunk (`dense_resident_rung`, the auto-q8 rung) log at WARN when they
-  fire. A bench sizes its KV to `depth + p + g + 16` — 528 rows for `pp512` — so
-  no model in the sweep is anywhere near a rung boundary. None of these fired.
-- **`pp512` is now reproducible, so the 34.5% is not a live property of the
-  tree.** Four full sweeps of the five named-worst models at `68a74b2`: `pp512`
-  peak-to-peak 0.9% mean / 1.4% worst, `tg128` 0.6/1.1, `tg64@d4096` 1.0/1.7.
-  Only `pp4@d4096` moved — 8.4% mean, 20.2% worst, on the IQ3_S MoE.
+**Methodology that outlived the diagnosis:** alternate A/B legs at least twice
+and report every repeat, never a single value or an average that hides the
+spread. A single-leg A/B on this box has been wrong by 9% — that outlier (one
+leg in thirteen, gemma-3-12b `tg128 @ d8192`, 75.9 against a 83.0–83.3 cluster,
+and it was the FIRST leg run against that model) was measured on the pre-fix
+binary and never re-run, so it is a reason for the rule and not evidence about
+the current tree.
 
-**What actually moved `pp4@d4096`: the first timed rep was a COLD rep.**
-`bench_vulkan`'s untimed warmup was a hardcoded `(8, 2)` turn — 7 prefill rows
-and 2 decode steps — which does not cover the shape about to be timed, so the
-first TIMED rep paid that shape's one-time costs (its pipeline variants, its
-first-touch scratch pools) inside the measured window and `avg_ts` averaged them
-in. `INFR_PROF_STAGES=1` on Qwen3.6-35B-A3B UD-IQ3_S `pp4 @ d4096`, per-rep wall
-for the timed m=4 chunk across six processes:
+### B7 — decode at depth: two designs declined, one landed, one still open
 
-| rep | run 1 | run 2 | run 3 | run 4 | run 5 | run 6 |
-| --- | ----- | ----- | ----- | ----- | ----- | ----- |
-| 1   | 24.6  | 40.1  | 45.6  | 42.3  | 24.1  | 46.9  |
-| 2   | 13.6  | 13.6  | 13.6  | 14.1  | 13.8  | 13.5  |
-| 3   | 13.5  | 13.5  | 13.9  | 14.1  | 13.3  | 14.0  |
-
-Reps 2-3 never leave 13.3-14.1 ms. Rep 1 costs 1.8-3.5x that and its scatter IS
-the cell's variance (`avg_ts` 220.1-251.2, 13.4%). The same effect is only 3% on
-`pp512` (155.5 / 153.1 / 150.4 ms) because there the fixed cost is small next to
-the work — which is exactly why the two prefill columns disagreed about
-reproducibility, and why the SHORTEST metric was the worst offender rather than
-the one with the shortest prefill.
-
-**Fixed** by running one untimed warm rep at the measured shape before the timed
-ones — the same discarded warmup iteration llama-bench does, and what
-`bench_vulkan`'s own doc already claimed. Four sweeps before, four after:
-
-| column       | p2p before (mean / worst) | p2p after (mean / worst) |
-| ------------ | ------------------------- | ------------------------ |
-| `pp4@d4096`  | 8.4% / **20.2%**          | 4.3% / 7.9%              |
-| `pp512`      | 0.9% / 1.4%               | 1.4% / 2.8%              |
-| `tg128`      | 0.6% / 1.1%               | 1.4% / 1.9%              |
-| `tg64@d4096` | 1.0% / 1.7%               | 1.2% / 1.7%              |
-
-The named worst row collapses: Qwen3.6-35B-A3B UD-IQ3_S `pp4@d4096` went
-223/200/246/244 (20.2%) to 293/294/294/290 (**1.4%**). The other three columns
-are unchanged within their own noise — the small rises there are between-block
-ambient drift, not an effect of the change, which cannot touch a steady-state
-rep.
-
-**`pp4@d4096` absolutes MOVED and are not comparable across this change.** The
-MoE reads +26% (232 → 290 t/s) because a cold rep is no longer averaged into a
-steady-state figure. The re-sweep (B14) must regenerate that column, not diff it
-against the old table.
-
-**What is still open, and it is not tier choice.** Qwen3-0.6B and gemma-3-1b
-keep ~8% peak-to-peak on `pp4@d4096`. That metric times four tokens: ~3.7 ms
-wall per rep of which ~2.8 ms is device time (`INFR_PROF_OPS`), so roughly a
-quarter is host-side record/submit/fence and its jitter is what is left. Options
-if it ever matters: raise `-r` for that column only, report the median instead
-of the mean, or accept that a four-token measurement resolves nothing under
-~10%. `infr bench` now prints the per-rep min-max and spread on every line, so
-this is visible in the output instead of inferred.
-
-**Two other things this slice found and changed:**
-
-- **`infr compare --sweep` was completely broken at `68a74b2`** and printed
-  `ERR` for every cell. `refactor: route library diagnostics through tracing`
-  (`a6e9131`) moved the device-probe lines onto `tracing`, and
-  `tracing_subscriber::fmt()` defaults to STDOUT — so `infr bench --json`
-  emitted five INFO lines ahead of its `[{"avg_ts": ..}]` and
-  `ModelBench::infr_json`'s `serde_json::from_slice` failed on all of them. The
-  subscriber is now pinned to stderr, and
-  `bench_json_line_parses_and_leads_with_avg_ts` guards the shape half (shown
-  red by prefixing the line with a log line).
-- **The submit splitter can latch on a wall-clock sample.**
-  `VulkanBackend::observe_forward` arms `submit_dispatch_cap` on a discrete GPU
-  when ONE forward exceeds `SUBMIT_DANGER_NS` (1 s), and the cap only ratchets
-  down — so a slow first forward (a cold pipeline build, a loaded host)
-  permanently changes the submit structure of every later forward in that
-  process while leaving the dispatched kernels byte-identical, i.e. invisible in
-  `INFR_PROF_OPS`. It never fired in any run measured here (every line reports
-  `submit unlimited`). It now logs at WARN when it arms and `infr bench` reports
-  the final cap. **UPDATE 2026-08-03: it is no longer only latent.** The
-  `results.md` re-sweep caught it arming reproducibly — see B17.
-
-**Coverage gaps in this diagnosis, stated plainly.** `llama-bench` on this box
-is currently broken
-(`/usr/lib/libllama.so.0: undefined symbol: ggml_dsv4_hc_post`), so all eight
-sweeps ran infr-only with `NA` in the oracle column. The original two sweeps
-interleaved ~30 s of full-GPU llama-bench work between every infr cell; that
-thermal coupling is absent here and cannot be ruled out as a contributor to the
-original `pp512` numbers. The subset was five models (the four sub-2B rows and
-the IQ3_S MoE that B6 named), not all 35.
-
-**Withdrawn from the original entry:** "pin the tier when `-r > 1`". There is no
-tier to pin — the choice was already a pure function of the shape at bench
-scale, and pinning it would have fixed nothing.
-
-### B7 — decode attention at depth: three designs measured; a mid-depth win found
-
-**Tag:** measured 2026-08-02 · **Blocked on:** nothing; slice 3a (the
-specialization) has LANDED — what remains open is width by workgroup count
-
-Note the `tg128` numbers in the table below are the PRE-slice-3a baselines
-(`INFR_NO_ATTN_DECODE=1` reproduces them exactly); see "What slice 3a bought" at
-the end of this entry for the shipped figures.
+**Tag:** measured 2026-08-02 · **Blocked on:** nothing; slices 3a and 3b have
+LANDED and are deleted from here — what remains open is (b), width by workgroup
+count
 
 The largest remaining gap to llama.cpp is decode at depth, not prefill.
-Qwen3-30B-A3B Q4_K_M on a 7900 XTX against `llama-bench c629da5`:
+Qwen3-30B-A3B Q4_K_M on a 7900 XTX against `llama-bench c629da5`, `tg128`
+infr/llama: **138.7 / 165.1** @d8192, **106.5 / 140.3** @d16384, **66.9 /
+112.1** @d32768 — 0.60× at depth while `pp512` holds parity. (Those are the
+PRE-slice-3a baselines; `INFR_NO_ATTN_DECODE=1` reproduces them.)
+`attn_partial_bda` is **59% of decode GPU time** at d32768 and scales exactly
+linearly with KV.
 
-| depth | `pp512` infr/llama  | `tg128` infr/llama |
-| ----- | ------------------- | ------------------ |
-| 8192  | 1771.7 / 1692.9 t/s | 138.7 / 165.1 t/s  |
-| 16384 | 1145.4 / 1174.8     | 106.5 / 140.3      |
-| 32768 | 670.3 / 738.3       | **66.9 / 112.1**   |
+**Two designs are DECLINED — do not re-try either as written.** Both reached
+agreement with the reference (GQA bit-identically, the k-tile to 9.6e-7), so
+they were correct, just slower:
 
-Prefill holds near parity; decode falls to **0.60×** and is what drags the
-`pg8192,512` turn to 0.73× @32k. Per-token cost over 8k→32k (a 2.25 GiB KV
-delta) rises **+7.74 ms** for infr against **+2.86 ms** for llama.cpp — an
-effective KV rate of ~291 GB/s vs ~787 GB/s.
+- **GQA head-grouping**, one workgroup per (KV-head, chunk) covering all
+  `g = nh/nkv` query heads: cuts K/V traffic 8× (537 → 67 MB per layer-token)
+  and measures **329 µs against 177 µs — 1.87× SLOWER**. Grouping serializes 8
+  cross-lane reductions into one wave that previously ran on 8 CUs; the re-read
+  it eliminates was nearly free out of Infinity Cache. Not starvation either:
+  re-run at matched parallelism it measured 359 µs, with `attn_combine` going
+  24.5 → 146 µs on the 8× larger `pacc`. Fewer keys per workgroup also loses
+  (chunk 256 on the ungrouped kernel: 314 µs). So neither traffic nor occupancy
+  is the lever. Reverted; the tree is unchanged.
+- **The LDS-staged K-tile** — the design `recorder.rs`'s
+  `attention_kv_split_impl` comment names ("per-thread full dots, no cross-lane
+  reductions, which is how llama.cpp wins that cell"). Best of four configs is
+  **2.7× slower** at d32768 (382 µs against the shipped 184). Not an
+  implementation miss: the ISA shows **0 cross-lane ops** against
+  `attn_partial_bda`'s 54, so the reduction really is gone — the LDS transpose
+  that buys its removal costs more than the reduction saved, because the K tile
+  has ZERO data reuse (every byte written once, read once) and time is monotone
+  in LDS budget (34 KB → 687 µs, 17 KB → 494, 9 KB → 382). Survives unwired as
+  `tests/attn_ktile_probe.rs` + `shaders/attn_ktile.comp` because it is the
+  measurement rig for the next attempt.
 
-`attn_partial_bda` is **59% of decode GPU time** at d32768 (177 µs per
-layer-token, 3072 dispatches) and `attn_combine` another 8%. It scales exactly
-linearly — 44.2 µs @ d8192 → 177 µs @ d32768, 4.0× for 4× the KV, no fixed
-overhead.
+**What the oracle actually does**, read rather than guessed (`ggml-vulkan.cpp`,
+`get_fa_tuning_params_scalar`, our shape on RDNA3): `path = FA_SCALAR` — coopmat
+is **deliberately avoided at decode** ("scalar is faster than coopmat when
+N==1"), which kills the matrix-core / `gqa_ratio` idea this entry once proposed;
+`shmem_staging = 0` on AMD, independently corroborating the k-tile negative;
+`block_rows = 1`, `block_cols = 64`, `workgroup_size = 128`; and
+**`d_split = 8`** — the width of the group that cooperates on one key's dot, the
+one parameter none of the experiments varied.
 
-**The bottleneck is the per-key subgroup reduction, not bandwidth.** The kernel
-gives each 32-lane wave one key and reduces its 128-dim dot with a
-`subgroupAdd`, so the cross-lane reduction ALU scales with keys×heads. Three
-measurements pin it:
+**The `d_split` sweep** (`shaders/attn_partial_dsplit.comp`,
+`tests/attn_dsplit_probe.rs`) produced two SEPARABLE findings, and the `w=32`
+control is what separates them:
 
-- **GQA head-grouping LOSES.** One workgroup per (KV-head, chunk) covering all
-  `g = nh/nkv` query heads cuts K/V traffic 8× (537 MB → 67 MB per layer-token,
-  the re-read the per-query-head grid pays). Measured **329 µs vs 177 µs**, i.e.
-  1.87× SLOWER while moving an eighth of the bytes. Grouping serializes 8
-  cross-lane reductions into one wave that previously ran on 8 CUs in parallel;
-  the re-read was nearly free, served out of Infinity Cache.
-- **It is not workgroup starvation either.** Re-running the grouped kernel at
-  matched parallelism (chunk 64 → 2048 workgroups, same as the per-head grid)
-  measured **359 µs** — worse still, and `attn_combine` went 24.5 → 146 µs on
-  the 8× larger `pacc`.
-- **Fewer keys per workgroup also loses.** Halving `ATTN_SPLIT.max_chunk` to 256
-  on the UNGROUPED kernel (4096 workgroups) measured **314 µs** vs 177 µs. The
-  shipped 512/2048 point is a real optimum between per-workgroup fixed cost and
-  latency hiding.
-
-So neither traffic nor occupancy is the lever, and the whole GQA-grouping
-approach is **declined** on this kernel structure — do not re-try it as written.
-(The experiment was reverted; the tree is unchanged. It did reach bit-identical
-parity with `attn_partial`, so the approach was correct, just slower.)
-
-- **The LDS-staged K-tile kernel LOSES too, badly.** This is the design
-  `recorder.rs`'s `attention_kv_split_impl` names in its rows-batched comment
-  ("per-thread full dots, no cross-lane reductions, which is how llama.cpp wins
-  that cell"). Built and measured as an unwired probe
-  (`tests/attn_ktile_probe.rs`, `shaders/attn_ktile.comp`), per-dispatch µs at
-  `nh=32 nkv=4 hd=128 chunk=512`, reference measured in the same harness:
-
-  | leg                             | d8192 | d32768    |
-  | ------------------------------- | ----- | --------- |
-  | shipped `attention_kv_split_at` | 69.8  | **183.9** |
-  | k-tile, 64-key tile, 17 KB LDS  | 127.7 | 493.9     |
-  | k-tile, same but unpadded rows  | 147.3 | 535.4     |
-  | k-tile, 128-key tile, 34 KB LDS | 190.1 | 687.2     |
-  | k-tile, 64-key half-depth, 9 KB | 127.9 | **381.9** |
-
-  Best config is **2.7× slower** at d32768. It is not an implementation miss:
-  the ISA confirms the design did what it set out to do — `attn_partial_bda` has
-  54 cross-lane ops, all four k-tile builds have **0**, with ACO fusing the
-  f16→f32 conversion into 140 `v_fma_mix_f32` per shader. The reduction is gone
-  and it is still 2.7× down, because **the LDS transpose that buys its removal
-  costs more than the reduction saved**. The K tile has ZERO data reuse (each
-  staged key row is read by exactly one thread), so LDS is pure coalescing
-  overhead — every K byte written once and read once — plus an occupancy loss.
-  Time is monotone in LDS budget: 34 KB → 687 µs, 17 KB → 494, 9 KB → 382.
-
-So the reduction ALU is real but is not the lever either, and **both the
-GQA-grouping and the LDS-K-tile approaches are declined** — do not re-try either
-as written. (GQA grouping was reverted; the k-tile survives as an unwired probe
-because it is the measurement rig for the next attempt. Both reached agreement
-with the reference — GQA bit-identically, k-tile to 9.6e-7 relative.)
-
-**What the oracle actually does.** Rather than guess a third time, read
-llama.cpp's own decode path (`ggml/src/ggml-vulkan/ggml-vulkan.cpp`,
-`get_fa_tuning_params_scalar`). For our shape on RDNA3 — hsk=hsv=128, n_rows=1,
-f16 KV — it resolves to:
-
-- `path = FA_SCALAR`. Coopmat is **deliberately avoided at decode**: "scalar is
-  faster than coopmat when N==1" forces `FA_COOPMAT1/2` → `FA_SCALAR` at
-  `n_rows == 1`. This kills the matrix-core / `gqa_ratio` idea previously
-  proposed here — the oracle does not use matrix cores for decode.
-- `shmem_staging = 0` on AMD (it is set only for NVIDIA). The oracle does
-  **not** stage K/V in shared memory on this hardware, independently
-  corroborating the k-tile negative above.
-- `block_rows = 1`, `block_cols = 64`, `workgroup_size = 128` (4 subgroups of
-  32).
-- **`d_split = min(min(subgroup_size, 8), D_lsb/4) = 8`.**
-
-`d_split` is the parameter that matters and it is the one thing none of the
-three experiments varied. It is the width of the group that cooperates on ONE
-key's dot:
-
-| design        | d_split | reduction steps | keys in flight per wave | needs LDS?    |
-| ------------- | ------- | --------------- | ----------------------- | ------------- |
-| shipped       | 32      | 5               | 1                       | no            |
-| k-tile probe  | 1       | 0               | 32                      | yes (sank it) |
-| **llama.cpp** | **8**   | **3**           | **4**                   | **no**        |
-
-**The `d_split` sweep was run** (`shaders/attn_partial_dsplit.comp`,
-`tests/attn_dsplit_probe.rs` — a parameterized decode-only copy; the grid, chunk
-policy, `pm`/`pl`/`pacc` layout and `attn_combine` are all unchanged, so it A/Bs
-directly). Width × workgroup size, per-dispatch µs, reference measured in the
-same harness. Read the rows at PRODUCTION's chunk: `adaptive_chunk` picks 256 at
-d8192 and 512 at d32768, so ch=512-at-d8192 is a configuration production never
-dispatches.
-
-| leg                | d8192 ch=256 (1024 wg) | d32768 ch=512 (2048 wg) |
-| ------------------ | ---------------------- | ----------------------- |
-| shipped reference  | 53.3                   | **179.9**               |
-| w=1 wg=64          | 47.3 (1.13×)           | 306.9 (0.59×)           |
-| w=2 wg=64          | 41.9 (1.27×)           | 273.4 (0.66×)           |
-| **w=4 wg=64**      | **36.6 (1.46×)**       | 212.6 (0.85×)           |
-| w=8 wg=64 (llama)  | 37.2 (1.43×)           | 209.8 (0.86×)           |
-| w=16 wg=64         | 39.5 (1.35×)           | 201.6 (0.89×)           |
-| w=32 wg=64 (ctrl)  | 49.0 (1.09×)           | **170.3 (1.06×)**       |
-| w=8 wg=128 (llama) | 50.2 (1.06×)           | 243.1 (0.74×)           |
-
-Two SEPARABLE findings, and the `w=32` control is what separates them:
-
-1. **Specialization is free ~6–9% at every depth, with no algorithmic change.**
-   `w=32` reproduces the shipped mapping exactly yet beats it (1.09× / 1.06×),
-   because the probe is a decode-only copy — no window/canvas/ring/Q8/hd-256/512
-   arms — and allocates **96 VGPRs against `attn_partial_bda`'s 120**
-   (`RADV_DEBUG=shaderstats`), so more waves fit per SIMD. Zero spills in all 12
-   builds, so this is occupancy, not spill relief.
-2. **Narrow width wins only where workgroup parallelism is short**, and the
-   effect is monotone in workgroup count: 512 wg → best 2.01×, 1024 wg → 1.46×,
-   2048 wg → every width loses. Width substitutes keys-in-flight-per-wave for
-   workgroups. At depth the kernel is already at ~3.0 TB/s (537 MB / 180 µs =
-   Infinity-Cache rate), and splitting a wave's contiguous 512-byte K read into
-   `32/w` separate segments costs more than the shallower reduction saves.
-
-So llama.cpp's `d_split = 8` is right for ITS configuration, not universally —
-and **the original B7 target (d32768) remains a negative**: nothing beats the
-shipped kernel there except the free specialization.
-
-**What slice 3a bought (LANDED).** `shaders/attn_decode.comp` — the hd=128 f16
-BDA decode arm of `attn_partial`, copied statement for statement, with the
-window / canvas / SWA-ring / Q8 / mainline-inline / hd-256 / hd-512 / small-m
-arms deleted and `sc[1024]` cut to `sc[512]`. Two builds (static and
-`-DUSE_PARAMS -DSELF_CHUNK` replay), selected in
-`Recorder::attention_kv_split_impl` / `attention_kv_split_dynac_impl`;
-`INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode`) forces `attn_partial`
-back. `RADV_DEBUG=shaderstats`: **96 VGPRs / 3072 B LDS** against
-`attn_partial_bda`'s **120 / 5120**, zero spills either way.
-
-Qwen3-30B-A3B Q4_K_M, `infr bench -p 0 -n 128 -r 3`, legs alternated twice:
-
-| depth | ON            | OFF (= the table above) | gain      |
-| ----- | ------------- | ----------------------- | --------- |
-| 4096  | 169.9 / 169.5 | 163.2 / 162.8           | **1.04×** |
-| 8192  | 147.4 / 147.2 | 138.4 / 138.3           | **1.06×** |
-| 32768 | 71.9 / 71.7   | 66.5 / 66.4             | **1.08×** |
-
-Independently re-measured on the same box (separate alternated run): 170.4 /
-163.1 = 1.045×, 148.1 / 138.5 = 1.069×, 72.3 / 67.1 = 1.078×. The OFF legs land
-on the pre-slice baselines recorded at the top of this entry (138.9 and 66.9),
-which is what makes the A/B trustworthy — the knob really is reverting to the
-old kernel and not just perturbing it.
-
-The output is **BIT-identical** —
-`crates/infr-vulkan/tests/attn_decode_parity.rs` asserts raw `f32` bits over
-every shape × both call paths, and no `gpu_seam_matches_cpu*` golden moved. B7's
-earlier claim that the drift came from `ClusteredReduce` is WRONG, or at least
-incomplete: making all five of `attn_decode`'s reductions
-`subgroupClusteredAdd(., 32u)` still produced bit-identical output on RADV/RDNA3
-(a full-width cluster lowers to the same tree), and so did swapping the runtime
-`sqrt(float(pc.hd))` for a constant-folded `sqrt(128.0)`. **The
-`attn_partial_dsplit` probe's 9.6e-7 at w=32 is therefore unexplained** — worth
-ten minutes before slice (b) leans on that probe's numbers again.
-
-Also: `dsplit_bench`'s "SHIPPED reference" leg now measures `attn_decode`, not
-`attn_partial_bda`, because it calls `attention_kv_split_at`. Re-run it under
-`INFR_NO_ATTN_DECODE=1` to compare against the old baseline.
+1. **Specialization is free 6–9% at every depth with no algorithmic change** —
+   `w=32` reproduces the shipped mapping exactly yet beats it, because a
+   decode-only copy allocates **96 VGPRs against 120** with zero spills either
+   way, so more waves fit per SIMD. This is what slices 3a/3b shipped.
+2. **Narrow width wins only where workgroup parallelism is short**, monotone in
+   workgroup COUNT rather than depth: 512 wg → best 2.01×, 1024 wg → 1.46×, 2048
+   wg → every width loses. At depth the kernel is already at ~3.0 TB/s
+   (Infinity-Cache rate) and splitting a wave's contiguous 512-byte K read into
+   `32/w` segments costs more than the shallower reduction saves. So llama.cpp's
+   `d_split = 8` is right for ITS configuration, not universally, and **the
+   original B7 target (d32768) remains a negative**.
 
 **Still open — (b) width by workgroup count.** Choose `w` from `nh * n_chunks`
-against the device CU count rather than from depth directly (the monotone
-relationship is in workgroups, not kv_len). Needs validating on shapes the probe
-never covered — it only tested `nh=32 nkv=4 hd=128`. Note the width sweep's
-per-width numbers were measured against the OLD reference, so its ratios now
-overstate the remaining headroom by the 4–8% slice 3a already took.
+against the device CU count rather than from depth. Needs shapes the probe never
+covered — it only tested `nh=32 nkv=4 hd=128` — and its per-width numbers were
+measured against the OLD reference, so the ratios overstate the remaining
+headroom by the 4–8% slice 3a already took. Treat it as a mid-depth lever: it
+does NOT close the headline gap, where the model is still ~0.64× at d32768.
+Before leaning on that probe again, spend ten minutes on **the unexplained
+9.6e-7 drift at w=32** — `attn_decode` itself is bit-identical, and neither
+making every reduction `subgroupClusteredAdd(., 32u)` nor constant-folding
+`sqrt(float(pc.hd))` reproduces it. Also note `dsplit_bench`'s "SHIPPED
+reference" leg now measures `attn_decode`, so re-run it under
+`INFR_NO_ATTN_DECODE=1` to compare against the old baseline.
 
-This does NOT close the headline deep-context gap: at d32768 the model is still
-~0.64× llama.cpp's tg128. Treat (b) as a mid-depth lever, not a fix for B7's
-opening table.
+**Still falling back to `attn_partial`** — each would need its own member of the
+`attn_decode` family: planar-Q8 and mainline-inline quant KV (**this is what
+gemma runs by DEFAULT at full context, so it is the biggest remaining coverage
+hole**), the DiffusionGemma canvas mask, `rows > 1` (small-m spec-verify and
+prefill), the bound-SSBO (non-BDA) dispatch, `chunk > 512` (only reachable above
+~524k keys under `INFR_KV_OVERFLOW`), head dims other than 128/256/512, and a
+RING cache on a `window == 0` layer (unreachable today — only SWA layers are
+allocated as rings — and the static gate's row bound rejects it rather than
+assuming).
 
-**What slice 3b bought (LANDED) — coverage, not speed.** The two exclusions that
-cost real models throughput are gone: **sliding-window** (`-DSWA -DRING`) and
-**hd 256 / 512** (`-DDHD4=64/128`). Widened as a FAMILY of build-time
-specializations, never one runtime-branching kernel — `attn_decode.comp` now
-compiles into 12 builds (3 head dims × causal/SWA × static/replay). `-DSWA`
-always ships with `-DRING`: an SWA layer's cache is a ring of
-`round64(window + ubatch)` rows, so the build carries `j % rcap`, which is the
-identity on a full-context cache and lets the host gate skip any cap reasoning.
-The static gate keeps its `pos < cap/(nkv*hd)` row bound for the CAUSAL builds
-only (they still assume the identity); the replay gate cannot check it at all
-(kv_len is not known at record time), which is exactly why covering the ring was
-a precondition for covering SWA there.
+**Two traps the shipped kernels carry, worth reading before touching them.**
 
-`RADV_DEBUG=shaderstats` (fresh `XDG_CACHE_HOME`,
-`MESA_SHADER_CACHE_DISABLE=1`), all 12 builds: **96 VGPRs / 3072 B LDS, zero
-spills** — identical to slice 3a's and against `attn_partial_bda`'s /
-`attn_partial_dynac_bda`'s **120 / 5120** and `attn_partial_nohd_bda`'s **120 /
-5120**. So every variant is meaningfully leaner than the arm it replaces; none
-was withheld. (Dropping `vsh[32]` for hd 256/512 does not show up — LDS
-granularity rounds 2304 B back to 3072.)
+- The hd 256/512 QK tail loop must keep `attn_partial`'s redundant
+  `if (r < hd4)` guard AND read `hd4` from the push constant at runtime. Folded
+  to a build-time literal the guard vanishes, ACO fuses the terms into one FMA
+  chain, and the chunk score moves 1 ULP — which `attn_combine`'s `exp(m_c - M)`
+  weight turns into 136/2048 non-identical outputs. The shader says so; do not
+  "clean it up".
+- `INFR_NO_ATTN_HD=1` is a **DIAGNOSTIC, not a bitwise A/B**. It deletes the
+  specialized arm for the general runtime-`hd4` loop — a different summation
+  order — and on Qwen3.5-9B the output stays coherent and correct while
+  splitting from the shipped text at generated byte 302 of 396, where shipped
+  and `INFR_NO_ATTN_DECODE` are byte-equal. Verified BY KERNEL NAME that both
+  the static and replay gates honour it. Cost: −4.2% at d4096, −11.7% at d32768.
 
-`infr bench -p 0 -n 128 -r 3`, legs alternated twice, f16 KV (the bench default
-at these depths; note `infr run` at gemma's full 131072 ctx auto-quants KV to
-q8_0, and a q8 cache does not take this path at all):
-
-| model                 | depth | ON            | OFF           | gain       |
-| --------------------- | ----- | ------------- | ------------- | ---------- |
-| gemma-3-12b (hd256)   | 4096  | 86.3 / 86.1   | 85.9 / 85.7   | 1.005×     |
-| gemma-3-12b           | 8192  | 83.8 / 83.9   | 83.4 / 83.5   | 1.005×     |
-| gemma-4-12b (256/512) | 4096  | 84.9 / 84.8   | 84.2 / 84.3   | 1.008×     |
-| gemma-4-12b           | 8192  | 82.3 / 82.3   | 81.4 / 81.5   | **1.010×** |
-| Qwen3-30B-A3B (ctrl)  | 4096  | 170.0 / 170.1 | 163.6 / 163.0 | 1.041×     |
-| Qwen3-30B-A3B (ctrl)  | 8192  | 147.5 / 147.6 | 138.3 / 138.3 | 1.067×     |
-
-The Qwen control reproduces slice 3a's 1.04× / 1.06× to within noise, so the
-shipped hd=128 causal gate was not perturbed.
-
-Independently re-measured on the same box: gemma-3-12b 86.3 / 85.9 @d4096 and
-83.8 / 83.5 @d8192; Qwen control 148.4 / 139.0 @d8192 (1.068×). The gemma
-profile above was re-run too and confirms both halves of the explanation —
-attention pass 1 is 8.8% of decode GPU time, and `attn_decode_hd256_swa` is flat
-at 18.1 → 17.8 µs from d4096 to d8192 while `attn_decode_hd256` grows 40.1 →
-77.9 µs.
-
-**Judgement: this slice is coverage insurance, not throughput.** Roughly 0.5% on
-gemma is barely above measurement noise, and it cost 12 shader builds and ~240
-lines of `#ifdef`. It ships because it is bit-identical, uniformly leaner, and
-removes a "some layers fast, some not" inconsistency that would confuse the next
-profile — not because it moved a number worth quoting.
-
-**The gemma gain is ~0.5–1%, an order of magnitude below Qwen's, and the reason
-is share, not kernel quality.** `INFR_PROF_OPS=1 INFR_SEAM_NO_REPLAY=1` on
-gemma-3-12b @d4096: `native_mmv_mrow_q4k_m4` is 55% of decode GPU time and the
-whole attention pass 1 is 8.7% (`attn_decode_hd256_swa` 5.9% over 40 layers,
-`attn_decode_hd256` 2.6–5.7% over 8). Gemma's SWA layers are **window-capped** —
-17.8 µs/layer at d4096 AND at d8192 — so 40 of 48 layers do not grow with depth
-and the lever cannot grow with it either. Do not expect this to improve at
-d32768; the global layers are the only part that scales. gemma-4-12b @d4096 is
-the same picture with `attn_decode_hd512` (47.5 µs × 8 global layers) in place
-of hd256.
-
-**One measured trap, worth remembering.** The hd 256/512 QK tail loop must keep
-`attn_partial`'s redundant `if (r < hd4)` guard AND read `hd4` from the push
-constant at runtime. With `hd4` folded to the build-time literal the guard
-vanishes, ACO fuses `part + dot(..)` across the terms into one FMA chain, and
-the chunk score moves 1 ULP — which `attn_combine`'s `exp(m_c - M)` weight then
-turns into 136/2048 non-identical outputs on
-`hd256 swa513 kv1500 ring1024 single-key chunk`. The comment in the shader says
-so; do not "clean it up".
-
-**Still falling back after 3b** — each would need its own family member:
-planar-Q8 and mainline-inline quant KV (this is what gemma runs by DEFAULT at
-full context, so widening it is the biggest remaining coverage hole), the
-DiffusionGemma canvas mask, `rows > 1` (small-m spec-verify and prefill), the
-bound-SSBO (non-BDA) dispatch, `chunk > 512` (only reachable above ~524k keys
-under `INFR_KV_OVERFLOW`), head dims other than 128/256/512, and a RING cache on
-a `window == 0` layer (unreachable today — only SWA layers are allocated as
-rings — and the static gate's row bound rejects it rather than assuming).
-
-**Addendum, 2026-08-02 — three B14 measurement gaps closed.** All throughput
-figures are `infr bench -p 0 -n 128 -r 3` on the 7900 XTX, legs alternated at
-least twice, f16 KV; ON = shipped, OFF = `INFR_NO_ATTN_DECODE=1`. Per-op figures
-are `INFR_PROF_OPS=1 INFR_SEAM_NO_REPLAY=1`.
-
-_(1) qwen35, the model slice 3b was never benched on._ **Qwen3.5-9B Q4_K_M** —
-all three cached Qwen3.5 GGUFs carry `qwen35.attention.key_length = 256`, so any
-of them exercises the `-DDHD4=64` family; the 9B is the largest dense one and is
-not the MTP variant, so it has the biggest attention share and no spec-decode
-interaction. `attn_decode_hd256` confirmed dispatching, 8× per token — qwen35 is
-a DeltaNet hybrid, so only 8 of its 32 layers are full attention.
-
-| depth | ON            | OFF           | gain   |
-| ----- | ------------- | ------------- | ------ |
-| 4096  | 116.9 / 116.7 | 116.4 / 116.4 | 1.004× |
-| 8192  | 113.7 / 113.6 | 112.7 / 112.7 | 1.008× |
-| 32768 | 102.9 / 102.5 | 101.5 / 101.4 | 1.011× |
-
-**A wash end-to-end, and for the same reason gemma is: SHARE, not kernel
-quality.** Attention pass 1 is 2.93% of decode GPU time at d4096 and 12.42% at
-d32768. The KERNEL is in fact the best result the specialization has recorded
-anywhere: at d32768 `attn_decode_hd256` is **152.9 µs** against
-`attn_partial_bda`'s **167.0 µs**, **1.09×** — and this one needs no modelling,
-because every qwen35 attention layer is causal hd 256, so both legs put all 128
-dispatches in a single profiler bucket.
-
-_(2) `INFR_NO_ATTN_HD=1` — executed, and it does what it says._ Verified by
-KERNEL NAME, not by inference from a throughput number:
-
-- Qwen3.5-9B d4096: `attn_decode_hd256` 33.5 µs × 64 → `attn_partial_nohd_bda`
-  **83.1 µs** × 64.
-- gemma-3-12b d4096: `attn_decode_hd256` 40.1 µs × 128 + `attn_decode_hd256_swa`
-  18.4 µs × 640 (16.9 ms) → one `attn_partial_nohd_bda` **45.3 µs** × 768 (34.8
-  ms). BOTH arms fall back, causal and SWA.
-
-Output is correct. Greedy `--temp 0 --max-new 120`, same prompt: on gemma-3-12b
-all three legs (shipped / `NO_ATTN_HD` / `NO_ATTN_DECODE`) produce
-**byte-identical** text. **But `NO_ATTN_HD` is NOT bit-identical** — on
-Qwen3.5-9B it stays coherent and correct while splitting from the shipped output
-at generated byte 302 of 396 ("Additionally, if 1 were prime, the Fundamental
-Theorem…" vs "Additionally, excluding 1 from the set of primes ensures that the
-Fundamental Theorem…"), where the shipped and `NO_ATTN_DECODE` legs are
-byte-for- byte equal. Expected — `-DNO_HD_SPEC` deletes the specialized arm and
-runs the general runtime-`hd4` loop, a different summation order — but it means
-this knob is a DIAGNOSTIC, not a bitwise A/B, and it must not be used as one.
-
-Cost of the hatch (tg128, alternated): Qwen3.5-9B d4096 116.9 / 116.8 → 112.0 /
-111.9 (**−4.2%**), d32768 103.0 / 102.9 → 90.9 / 90.9 (**−11.7%**). Those legs
-ran WITHOUT `INFR_SEAM_NO_REPLAY`, so the replay gate in
-`attention_kv_split_dynac_impl` honors the knob too, not just the static one.
-
-_(3) gemma at d32768 — the prediction's premise held and its conclusion did
-not._ f16 KV confirmed two ways: no `kv auto-quant: q8_0` warning fired, and the
-profile shows `attn_decode_hd256` / `attn_decode_hd256_swa` rather than any
-`attn_partial_*q8*`, so the leg really is on the path.
-
-| depth | ON (gemma-3-12b)          | OFF                       | ratio      |
-| ----- | ------------------------- | ------------------------- | ---------- |
-| 8192  | 83.9 / 83.8 / 83.6 / 83.6 | 83.3 / 83.3 / 83.1 / 83.0 | 1.006×     |
-| 16384 | 79.6 / 79.6               | 78.9 / 79.0               | 1.008×     |
-| 32768 | 70.8 / 70.8 / 70.6 / 70.6 | 71.9 / 71.9 / 71.7 / 71.7 | **0.985×** |
-
-**At d32768 the specialization is a 1.5% REGRESSION**, reproducible to 0.1 t/s
-across three alternated pairs. See **B15**.
-
-What held: the SWA layers really are window-capped. `attn_decode_hd256_swa` is
-**18.4 / 18.4 / 18.5 / 18.1 µs** at d4096 / d8192 / d16384 / d32768 — flat over
-an 8× depth range.
-
-What did not: the inference drawn from it. Attention pass 1 goes from **8.9%**
-of decode GPU time at d4096 (16.9 ms of 190.4) to **23.8%** at d32768 (54.6 ms
-of 229.8), because the 8 global layers scale 40.1 → 335.7 µs. The lever DOES
-grow with depth; it just points the other way at the far end.
+**Why the gains are model-shaped:** 4–7% on Qwen3-30B-A3B but ~0.5–1% on gemma
+and a wash on Qwen3.5-9B, because attention SHARE differs (2.9% of decode GPU
+time on qwen35 at d4096, 8.7% on gemma-3-12b), not because the kernel is worse —
+at d32768 `attn_decode_hd256` beats `attn_partial_bda` 152.9 vs 167.0 µs on
+qwen35. Gemma's 40 SWA layers are window-capped (18.4 µs flat from d4096 to
+d32768), so most of its layers cannot grow with depth. The one place the
+specialization LOSES is gemma above d16384 — see B15.
 
 ### B8 — the activation/scratch reserve is not path-aware
 
@@ -690,33 +367,6 @@ constant, its multiply in `dense_act_reserve_at`, and the
 `act_reserve_carries_the_interim_margin` test, then re-run the table above and
 show the true reserve fills the window without it.
 
-### B9a — the `tracing` sweep's infr-metal half is unverified off macOS
-
-**Tag:** raised 2026-08-02 · **Blocked on:** a CI run, or an Apple machine
-
-B9's sweep landed (bare `println!`/`eprintln!` diagnostics routed onto
-`tracing`, guarded by `infr-core/tests/no_bare_print.rs`). Nine of its
-conversions are in `infr-metal`, which is `#![cfg(target_os = "macos")]` and so
-compiles to an empty lib on Linux: `cargo clippy --all-targets` and `cargo test`
-here say **nothing** about them. The sites are `MetalBackend::new`'s two
-counter-sampling fallbacks, `ArchiveCache`'s five pipeline-cache warnings, and
-`Pipelines::new`'s two `prof.stages` lines. Each is a one-line macro swap
-(`eprintln!` → `tracing::warn!`/`tracing::info!`) with the message text
-untouched, so the risk is a compile error, not a behaviour change — but only CI
-or an Apple build can say so.
-
-`tracing` was added to `crates/infr-metal/Cargo.toml` under plain
-`[dependencies]`, not the `cfg(target_os = "macos")` block, deliberately: the
-crate body is cfg'd out off-macOS, so a target-gated dep would make the import
-resolve only on Apple and hide any mistake even longer.
-
-Also unverified: `infr_metal::profile`'s three-line report table and
-`shaders.rs`'s pipeline-cache summary line were KEPT as `eprintln!` and marked
-`// print-ok:`, on the same reasoning as `infr_core::prof::OpProf::flush` — a
-per-line `tracing` prefix would destroy a column-aligned table. Nobody has seen
-that table render since the change; it should not have moved, but it has not
-been looked at.
-
 ### B10a — the serve arrival line reports prompt CHARS, not prompt tokens
 
 **Tag:** raised 2026-08-02 · **Blocked on:** a `ChatGenerator` trait change
@@ -811,8 +461,11 @@ check named, and in each case the check is cheap — the reason it is missing is
 time or hardware, not difficulty.
 
 - **Metal and CPU are unexercised for the KV-fit change.** Only the Vulkan path
-  was measured. The Apple `#[cfg]`-gated code is not even compiled locally, so
-  only CI can judge it.
+  was measured. The Apple `#[cfg]`-gated code does not compile locally at all,
+  so CI is the only thing that judges it — and CI does: the
+  `cargo test (macOS / Metal)` and `cargo check (infr-metal, Apple target)` jobs
+  are green. That settles compilation, not behaviour; nobody has run the fit
+  math on an Apple device or on the CPU backend.
 - **`infr serve --parallel N` for N > 1 was not exercised.** `vulkan_slot_ctx`'s
   divide-by-N branch is unchanged by the slice but was only ever run at N=1.
 - **The refuse rung's `Err` has never been printed by a real run.** No model on
@@ -895,34 +548,6 @@ the gain concentrated on Qwen and MoE rows (Qwen3-30B-A3B 0.91× → 0.96×,
 Qwen3-14B Q4_K_M 0.94× → 1.00×) and nothing measurable on gemma (Gemma-3-12B
 1.13× → 1.14×). The doc now says that instead of extrapolating. The d32768
 regression this entry is about is beyond the table's depth and unaffected.
-
-### B16 — one decode leg in thirteen was 8.9% low
-
-**Tag:** measured 2026-08-02, cause identified 2026-08-02 · **Blocked on:**
-nothing; recorded so it is not mistaken for a real effect
-
-**Very likely the same cold-first-rep effect B6 diagnosed and fixed** — the
-suspicion below ("a cold shader/pipeline cache or a first-touch VRAM effect")
-was right, and B6 measured it directly: before the fix, rep 1 of a bench cost
-1.8-3.5x the steady-state rep and only rep 1. The tell here is the same one: "it
-was the FIRST leg run against that model". NOT re-measured on this shape
-(gemma-3-12b `tg128 @ d8192` with `INFR_NO_ATTN_DECODE=1`), so this is a strong
-inference, not a verified claim — the original 13 legs would have to be re-run
-to confirm the 8.9% outlier is gone. Everything below is the original record.
-
-B6 establishes that decode is reproducible to ~1% on this box while prefill is
-not. That is right on average and it is not a guarantee. Benching gemma-3-12b
-`tg128 @ d8192` with `INFR_NO_ATTN_DECODE=1`, the first leg of the first
-sequence measured **75.9 t/s**; three later repeats of the identical command
-measured **83.3 / 83.1 / 83.0**, and the ON legs of the same sequences were 83.9
-/ 83.8 / 83.6 / 83.6. So one leg in thirteen came in **8.9% low** — enough to
-invert a 1% A/B — and it was the FIRST leg run against that model.
-
-Not diagnosed. The obvious suspects are a cold shader/pipeline cache or a
-first-touch VRAM effect; nothing else was on the GPU. The practical consequence
-is the one B7 already applies: alternate legs at least twice and report every
-repeat, never a single value or an average that hides the spread. A single-leg
-A/B on this box can be wrong by 9%.
 
 ### B17 — the submit splitter arms for real on Qwen3.6-27B at d4096
 
@@ -1029,24 +654,14 @@ preventing half is deliberately not attempted
 mapping's whole life. Nothing stops another process writing or truncating that
 file: a write mutates memory Rust believes is frozen, and a truncation turns a
 resident page into `SIGBUS` on next touch. That invariant is stated on `open`
-and remains UNENFORCED — what shipped notices the breach, it does not prevent
-it.
+and remains **UNENFORCED** — `infr_gguf::watch::WeightWatch` notices the breach,
+it does not prevent it. Statting the HELD DESCRIPTOR rather than the path is the
+load-bearing choice and `a_rename_into_place_is_not_a_change` pins it:
+`infr pull` renames into place, which leaves a live mapping on the old inode
+perfectly intact, so a path-stat would cry wolf on the one file-replacing
+operation infr itself performs.
 
-**Shipped: detection.** `infr_gguf::watch::WeightWatch` stamps `(len, mtime)`
-off a HELD DESCRIPTOR at load and re-`fstat`s it on demand. `infr run` checks at
-both ends of every turn, `infr bench` before reporting any numbers (all four
-arms), `infr serve` at the start of each request via `GenBackend::weights`.
-Verified live on all three, not just by unit test: a `touch` mid-bench refuses
-to print numbers, a `touch` mid-generation makes `infr run` exit 1, and a
-`touch` between two served requests turns the second into an error response.
-
-Statting the descriptor rather than the path is the load-bearing choice, and
-`a_rename_into_place_is_not_a_change` pins it: `infr pull` renames into place,
-which leaves a live mapping reading the old inode perfectly intact, so a
-path-stat would cry wolf on the one file-replacing operation infr itself
-performs. It goes red if `check` is switched to stat the path.
-
-**Known boundaries, none of them worth closing on current evidence:**
+**Known boundaries of the detection, none worth closing on current evidence:**
 
 - A same-length in-place write whose mtime is then restored is invisible. The
   only alternative is hashing gigabytes per check.
@@ -1078,16 +693,16 @@ it first appeared: `FileLock` already calls `libc::flock` unconditionally, so
 `infr-hub` does not build there today and CI covers only ubuntu-26.04 and
 macos-15.
 
-### B31a — miri now runs, over a deliberately narrow slice
+### B31a — what the weekly miri job does NOT cover
 
 **Tag:** PR#90 review residual · **Blocked on:** nothing; recorded so the
 coverage claim stays accurate
 
-Miri runs weekly against `SpinPool` via `.github/workflows/cron.yml`, and all
-seven `pool::` tests pass — so `collect`'s raw base pointer, its `set_len` over
-uninitialized slots, `CollectGuard`'s `drop_in_place` during unwinding and the
-`Vec::from_raw_parts` rebuild are now checked by a tool rather than argued in a
-comment. What that does NOT cover, and will not:
+Miri runs weekly against `SpinPool` via `.github/workflows/cron.yml` (which
+carries the reasoning for its flags — two upstream workarounds are load-bearing
+and must not be "simplified" away). That covers `collect`'s raw base pointer,
+its `set_len` over uninitialized slots, `CollectGuard`'s `drop_in_place` during
+unwinding and the `Vec::from_raw_parts` rebuild. What it does not, and will not:
 
 - **`kernels.rs`** — 168 of `infr-cpu`'s 191 `unsafe` uses are x86 SIMD, which
   miri cannot execute. That unsafe stays unchecked by anything but review.
@@ -1099,15 +714,7 @@ comment. What that does NOT cover, and will not:
   16 of 58 tests when stopped). Those bounds are "did not finish by", not
   measured durations. Little is lost either way: `infr-chat` contains no
   `unsafe`, and `infr-core` has three uses, one being a `libc::kill` miri cannot
-  execute. A timed run is in `docs/backlog.md` terms cheap to redo if the
-  question ever matters.
-
-Two upstream workarounds are load-bearing and worth knowing before anyone
-"simplifies" the flags. Under default **Stacked Borrows** the job fails inside
-`rayon_core` on a retag reached from `SpinPool::new`'s
-`rayon::current_num_threads()` — upstream code, not ours — so it runs under
-`-Zmiri-tree-borrows`. And `-Zmiri-ignore-leaks` is there because rayon never
-joins its global pool threads, which miri otherwise reports as an error.
+  execute.
 
 ### B33 — the `wildcards` gate in `deny.toml` is off, for a fixable reason
 
@@ -1239,7 +846,7 @@ It did NOT go line by line through:
 - Most Vulkan recorder, adapter, GEMM, pager, tensor-parallel, expert-routing
   and shader host/ABI combinations (see also B4).
 - Most of `crates/infr-metal/src/exec.rs`, and full Metal shader/host ABI
-  validation (see also B9a, B14).
+  validation (see also B14).
 - Every quantisation arm in `crates/infr-gguf/src/dequant.rs`.
 - Large CLI benchmark and diffusion-specific command paths.
 - Every test assertion and example.
@@ -1256,6 +863,19 @@ Recorded so they are not rediscovered and re-investigated.
 were re-verified against the code and all eight survived — seven outright
 (B19–B25) and one narrowed by a scope the review had missed (B26: the leaking
 function is a `#[doc(hidden)]` test/bench helper with no production caller).
+
+### W3 — pin the kernel tier when `-r > 1` (B6's original remedy)
+
+**Claim:** the prefill columns' run-to-run spread came from a short prefill
+landing on a different kernel tier between runs, so the tier should be pinned
+for a multi-rep bench.
+
+**Why it is wrong:** there is no tier to pin. `INFR_PROF_OPS=1` over six
+back-to-back runs gives a byte-identical (op name, dispatch count) signature
+while throughput moves 9%, `adaptive_chunk` is a pure function of the KV span,
+and every rung that could move a chunk logs at WARN and never fired. The real
+cause was a warmup at the wrong shape (B6), and pinning would have fixed
+nothing.
 
 ### W1 — VRAM guard check-then-act race (CR-N7)
 
