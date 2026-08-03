@@ -304,7 +304,11 @@ window between the weight upload and the KV allocation, against
    estimate.** The re-clamp can LOWER it (`repin_ubatch_lower`) when that buys
    context, but placement's resident-vs-stream decision itself is unchanged and
    ~2% optimistic on weights. It self-corrects into a smaller window rather than
-   a failure, so this is a context cost, not a correctness one.
+   a failure, so this is a context cost, not a correctness one. Whenever the
+   reserve moves, re-check `docs/perf/results.md`'s placement box, which names
+   the rung a model settles on: gemma-3-12b went 256 → 1024 rows at ctx 131072
+   in this slice (780 t/s, was 760), while gemma-4-31B's documented 256 rows at
+   d4096 and 1024 rows at `pp512` were re-measured and still hold.
 3. **The context is ~1.5k tokens more conservative than the device strictly
    requires.** gemma-4-31B advertises 14 592 (the interim-margin build said 15
    872, and 19 021 was measured to miss by 2 MiB). The gap is
@@ -384,8 +388,8 @@ one not covered.
 The narrowness of the default-path rung is also deliberate and should not be
 widened by accident: refusing whenever the TRAINED window does not fit would
 break every ordinary long-context model on a 24 GiB card (Qwen3-30B-A3B clamps
-262144 → ~50k and runs at 148 t/s; gemma-4-31B clamps 262144 → 19 968). Only "no
-usable context at all" may refuse.
+262144 → ~50k and runs at 148 t/s; gemma-4-31B clamps 262144 → 14 592 and fills
+it at 30.3 t/s). Only "no usable context at all" may refuse.
 
 **To do:** decide whether an explicit oversized `--ctx` should fail early with
 the detailed message (a behaviour change on a path documented as "never clamped
@@ -433,9 +437,16 @@ time or hardware, not difficulty.
   so CI is the only thing that judges it — and CI does: the
   `cargo test (macOS / Metal)` and `cargo check (infr-metal, Apple target)` jobs
   are green. That settles compilation, not behaviour; nobody has run the fit
-  math on an Apple device or on the CPU backend.
-- **`infr serve --parallel N` for N > 1 was not exercised.** `vulkan_slot_ctx`'s
-  divide-by-N branch is unchanged by the slice but was only ever run at N=1.
+  math on an Apple device or on the CPU backend. The 2026-08-04 measured
+  re-clamp does not change that either way: both backends return `None` from
+  `Backend::device_alloc_room`, so they keep the estimate-only path unchanged
+  (B8).
+- **`infr serve --parallel N` is exercised at N=2 only, and not at a size where
+  the window moves.** Two 40960-token slots on Qwen3-1.7B served a request
+  (2026-08-04), which covers the fork path but not `vulkan_slot_ctx`'s
+  divide-by-N against a window the post-load re-clamp shrank — the engine now
+  reads its advertised window back from slot 0 after the warmup, and no run has
+  put those two together.
 - **The refuse rung's `Err` has never been printed by a real run.** No model on
   this box drives `max(fit_f16, fit_q8)` under `MIN_SESSION_CTX`, so the message
   text — the thing a stuck user actually reads — is untested against a human.
@@ -443,7 +454,9 @@ time or hardware, not difficulty.
   `ubatch_candidates` to heights below the current one also stops a placement
   sweep raising an integrated GPU's chunk above its watchdog-safe default. That
   argument was never run on an iGPU, and the watchdog is exactly the thing that
-  punishes being wrong (see `docs/igpu.md`).
+  punishes being wrong (see `docs/igpu.md`). `repin_ubatch_lower` (B8's measured
+  re-clamp) refuses to RAISE a height for the same reason, and is equally
+  unmeasured there.
 - **The tightened placement budgets were only exercised on their RESIDENT
   branch** (the 2026-08-02 B11 slice). gemma-4-31B, gemma-3-12b and
   Qwen3-30B-A3B all stay resident on this box, so `dense_stream_budget_at` and
@@ -534,7 +547,9 @@ matching WARN line). It also arms on **Qwen3-30B-A3B** on four of the nine
 deep-context legs: cap 269 on `pp512`/`tg128` at `-d 32768`, and 342 / 222 on
 `pg8192,512` at d16384 / d32768. It does not arm on the d16384 `pp512`/`tg128`
 legs or anywhere at d8192, so the trigger tracks the single longest forward in
-the process, not the depth.
+the process, not the depth. Also observed 2026-08-04 on **gemma-3-12b Q4_K_M at
+`-p 131056`** (cap 133) — a whole-window prefill is long enough to latch it, so
+any deep-prefill measurement on that model is split too.
 
 **Why it matters.** The dispatched kernels stay byte-identical, so this is
 invisible to `INFR_PROF_OPS` and to any golden; only the submit structure
@@ -737,9 +752,6 @@ first exhibiting that case.
 
 - `with_profiling_suppressed` restores a process-global boolean only on normal
   return; an RAII nesting counter would survive panics and overlapping scopes.
-- `SpinPool::collect` leaks already-initialised values when another task panics;
-  unwind cleanup could track and drop initialised slots. (Adjacent to B25, but a
-  different mechanism — that one is attribution, this is cleanup.)
 - Existing HuggingFace `blobs/<expected_sha>` files are trusted by pathname and
   existence without rehashing; optional verification would catch local cache
   corruption.
