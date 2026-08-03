@@ -743,35 +743,49 @@ escape and `\u` paths that the punctuation alphabet cannot.
 Adding it means a `fuzz/` crate, a nightly job, and a decision about how long
 per target per week.
 
-### B35 — tiered weight paging (VRAM → DRAM → disk) is planned, not built
+### B35 — tiered weight paging: phases 3-5 are not built
 
-**Tag:** design slice 2026-08-04 · **Blocked on:** the phase-0 measurement, and
-the two decisions in §7 of the plan
+**Tag:** design slice 2026-08-04 · **Blocked on:** phase 4 needs Apple hardware
+this host does not have
 
-`docs/disk-streaming-plan.md` designs a third paging tier below DRAM, so a model
-that fits neither VRAM nor DRAM runs from the model file under our own policy
-instead of the OS page cache. Nothing is implemented. The plan carries the
-phasing, the verification per phase, and the per-backend integration for CPU,
-Vulkan and Metal.
+`docs/disk-streaming-plan.md` carries the design and the per-phase verification.
+**Phases 0-2 have LANDED** (baseline measured, core `blockio`/`hostpager`/pins,
+CPU backend on the DRAM tier — numbers in `docs/perf/results.md`). What is left:
 
-Findings the design review turned up that the tier work must handle. The CPU
-cache-identity one is **fixed** — those caches now key on a never-reused
-`CpuBuffer::uid`, guarded by `buffer_uids_are_never_reused`. The rest are
-constraints rather than defects, recorded so the slice that hits them does not
-rediscover them:
+- **Phase 3, Vulkan's third tier.** `DenseSource`/`ExpertSource` still take mmap
+  views; the three-case stage path (VRAM hit / DRAM hit / read straight into the
+  pinned ring) is unbuilt. Verifiable on this host — the parity tests only cover
+  `ensure_resident`/`flush_lut` today, so `schedule_staged`, the ring and
+  `DensePagerSession::stage` need new ones that force each case and assert each
+  is actually taken.
+- **Phase 4, Metal / UMA collapse.** Unbuilt and **unverifiable here**: no Apple
+  hardware, and `infr-metal` does not compile on this box. Writing it blind
+  would produce code whose only evidence is that it type-checks in CI. Its own
+  precondition is the `qui_cache` gate below.
+- **Phase 5 levers**, each gated on a measurement that has not been taken:
+  `fadvise(DONTNEED)`/`F_NOCACHE` for the double-caching a buffered `pread`
+  leaves, prefetch (deferred from phase 2 — the synchronous read already beat
+  the baseline, and depth/thread knobs have no measured values), io_uring,
+  exclusive VRAM/DRAM placement for MoE, and multi-GPU/MTP coverage
+  (TP/EP/pipeline binders and MTP's second weight set bypass the tier entirely).
+
+Constraints the remaining phases must handle, recorded so they are not
+rediscovered:
 
 - `infr-metal`'s `qui_cache` factored arm copies the transformed weight out and
   retains it unboundedly, keyed by `MTLBuffer::id()`. Correct, but it is a
   second full copy of every touched weight in host RAM, so a paged Metal model
-  must gate or budget it (plan §3.4, phase 4).
-- The seam's `wload` materializes every multi-name group into `WBytes::Owned`,
-  and the Vulkan streamed binder then ignores those bytes and re-fetches
-  per-component mmap views — a concat built and dropped on every fused streamed
-  group. Paged groups must not build it at all (plan §3.2).
-- `WBytes`'s `Deref<Target = [u8]>` is infallible, so a variant that has no
-  bytes in hand cannot be added without a panic arm; `pipeline_binder` and
-  `tensor_parallel_binder` deref it directly. The `Paged` variant lands together
-  with that `Deref`'s removal (plan §3.7), never before.
+  must gate or budget it (plan §3.4).
+- **CPU paging is single-process-shaped.** `HostPager`'s exhaustion error names
+  `paging.dram`, but nothing sizes the arena against `infr serve --parallel N`:
+  the floor is N concurrent working sets and only 1 is priced. A tight budget
+  under `--parallel` will surface as that error rather than a deadlock, which is
+  the safe failure, but the sizing is still not done.
+- **The per-pass file-change check is not wired.**
+  `FileBlockIo::verify_unchanged` exists and is tested; no caller runs it yet,
+  so a model rewritten mid-generation is read as whatever the new bytes are (the
+  same exposure as B30, now reachable through explicit reads rather than the
+  mapping).
 
 ### B27 — hardening candidates from the 2026-08-03 review
 
