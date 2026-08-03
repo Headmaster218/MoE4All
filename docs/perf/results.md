@@ -590,6 +590,48 @@ quant formats **Q4_K_M / Q5_K_M / Q6_K / Q4_0 / Q2_K / IQ4_XS / Q8_0 / BF16**
 (each decoded on-device via hand-written SPIR-V, byte-identical to the CPU
 dequant).
 
+## Weights that do not fit memory — the mmap/page-cache baseline
+
+The phase-0 measurement for the tiered weight pager
+(`docs/disk-streaming-plan.md`): what the GGUF mmap plus the OS page cache
+deliver today when the weights do not fit the memory the process may use. It is
+the bar that design has to beat, and every later phase re-runs this harness.
+
+`scripts/paging-baseline.py`, CPU backend, Llama-3.2-1B-Instruct **F16 (2.48
+GB)**, r=2, each run started cold (`posix_fadvise(DONTNEED)` on the model). The
+squeeze is a cgroup-v2 `MemoryMax` rather than a bigger model — page cache
+charged to the cgroup is reclaimed under the limit, so the access pattern is the
+one a 60 GB model shows on a 48 GB host while the sweep still runs in minutes.
+`majflt` is major faults (`ru_majflt`), `read` is what the process pulled off
+the device (`ru_inblock`).
+
+| MemoryMax | pp512 t/s | pp majflt | pp read | tg32 t/s | tg majflt | tg read |
+| --------- | --------: | --------: | ------: | -------: | --------: | ------: |
+| unlimited |      48.0 |     2 407 | 1.87 GB |    21.72 |     5 584 | 2.37 GB |
+| 3 GB      |      46.9 |     2 406 | 1.87 GB |    22.48 |     5 870 | 2.37 GB |
+| 2 GB      |      45.9 |     4 649 | 3.62 GB | **0.96** |   460 780 |  100 GB |
+| 1.5 GB    |      46.6 |     5 061 | 3.73 GB | **0.67** |   419 517 |  153 GB |
+| 1.2 GB    |      47.5 |     5 046 | 3.73 GB | **0.66** |   426 478 |  154 GB |
+
+**Decode falls 23–33×** the moment the limit bites (22.5 → 0.96 → 0.67 t/s)
+while **prefill is flat** (46.9 → 46.6, −0.6%). That split is the whole physics
+of streaming weights: prefill amortizes one weight sweep over 512 tokens and
+read only 3.7 GB for the entire run, decode pays a sweep per token.
+
+**The page cache is doing worse than no cache at all.** At 1.5 GB it moved 153
+GB for 32 tokens — 4.8 GB per token against a 2.48 GB model, i.e. **1.9× the
+whole model per token**, where never caching anything would have read 1.0×. The
+extra comes from evicting by recency against a cyclic sweep (every page dropped
+just before its next use) plus 4 KiB fault granularity and readahead pulling in
+neighbours that are evicted before they are read. It is not a small constant to
+shave: it is the policy being wrong for the access pattern, which is the case
+`Pager::schedule` already handles for VRAM.
+
+**Not measured here:** the Vulkan and Metal paths (their staging copies read the
+same mapping, but a GPU-side baseline needs a model that overflows VRAM, not a
+cgroup cap), and any model whose blob genuinely exceeds host RAM — nothing that
+large is on this host. Both are gaps in the baseline, not results.
+
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs
 > (NVIDIA, Intel Arc) and Apple Metal are wanted — please open an issue with

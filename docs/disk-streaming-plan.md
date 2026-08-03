@@ -70,13 +70,25 @@ invent that stall, it lengthens it — and, unlike the fault, it can be moved of
 the critical path by prefetch. The fence wait that follows is outside the guard,
 so the guard is not held across submission.
 
-**Phase 0 must prove the premise.** Before building anything, measure the mmap
-baseline on a model larger than RAM (the Llama-4 Scout blob is 47.5 GiB against
-60 GiB of RAM on the dev host — backlog B30 — plus a dense model over RAM):
-tokens/s prefill and decode, major fault count (`/usr/bin/time -v`), and bytes
-actually read from the device (`/proc/self/io` `read_bytes` on Linux, `fs_usage`
-on macOS), plus device sequential and 4-thread random bandwidth at block size.
-Those are the bar. If the bespoke tier does not beat them, it does not land.
+**Phase 0 measured the premise — DONE.** `scripts/paging-baseline.py` runs the
+CPU backend under a cgroup-v2 `MemoryMax` with the model's page cache dropped
+first, so the weights genuinely do not fit the memory the process may use. Full
+table in `docs/perf/results.md`; on Llama-3.2-1B F16 (2.48 GB):
+
+- **Decode collapses 23–33×** once the cap bites (22.5 t/s unlimited → 0.96 at 2
+  GB → 0.67 at 1.5 GB), with 420–460 k major faults per 32-token run.
+- **Prefill is flat** (46.9 → 46.6 t/s, −0.6%), reading 3.7 GB for the whole run
+  — one weight sweep amortized over 512 tokens.
+- At 1.5 GB decode moved **153 GB for 32 tokens = 1.9× the whole model per
+  token**, where never caching anything at all would have read 1.0×. Recency
+  eviction against a cyclic sweep, plus 4 KiB granularity and readahead, costs
+  nearly double what a policy that simply gave up would.
+
+That last line is the bar: a tier whose per-pass traffic is
+`model − VRAM_home − DRAM_home` and whose I/O is issued in whole blocks starts
+from under half the bytes, before any hit-rate benefit. The gaps in the baseline
+— no GPU-side figure, no genuinely-over-RAM blob on this host — are recorded
+with the table.
 
 ### 1.2 The constraint prior art already established
 
@@ -114,6 +126,10 @@ streams 12 GB/token from disk; at a few GB/s that is well under one token/s.
 **That is the honest ceiling and it is the point** — it turns "cannot run" into
 "runs", and the same bytes amortize across a whole prefill chunk, so prefill
 stays usable while interactive decode does not. §7 turns this into a decision.
+
+The phase-0 baseline is that same split measured from the other side: under a
+hard memory cap, prefill lost 0.6% and decode lost 23–33×, because only decode
+pays a whole weight sweep per token (§1.1).
 
 MoE is the opposite case and the real prize: routing is skewed, so a small hot
 set carries most tokens and the in-tree MoE pager already runs at a high
@@ -405,8 +421,9 @@ shipped to the user. `INFR_CACHE` (`paging.cache`) keeps its current meaning
 
 ## 5. Phasing
 
-**Phase 0 — measure the baseline (no code).** §1.1's numbers, recorded in
-`docs/perf/results.md`. The bar every later phase is judged against.
+**Phase 0 — measure the baseline (no code). DONE.** `scripts/paging-baseline.py`
+and its table in `docs/perf/results.md`; headline in §1.1. The bar every later
+phase is judged against, re-run with the same harness.
 
 **Phase 1 — core, no backend wired.** `blockio.rs`, `hostpager.rs`, pins in
 `Pager`, `TierPlan`, the `infr-gguf` path/offset accessor, and the address-keyed
