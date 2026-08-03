@@ -60,13 +60,21 @@ jobs:
   # Miri: the undefined-behaviour interpreter, over the one part of this tree it
   # can actually reach.
   #
-  # ## Why only `pool::`
+  # ## Why only `pool::` and `hostpager::`
   #
   # `infr-cpu` holds most of the workspace's unsafe, but the bulk of it is x86
   # SIMD in `kernels.rs`, which miri cannot execute. The FFI crates are outside
   # its reach entirely and always will be: `infr-vulkan` dlopens `libvulkan`,
   # `infr-metal` talks to the Apple GPU, `infr-gguf` maps a file, `infr-hub`
   # takes an `flock`.
+  #
+  # `infr_core::hostpager` is the second target: its arena hands out `&[u8]` and
+  # `&mut [u8]` into one allocation from raw pointers, on several threads at
+  # once, and its soundness rests on a locking argument no test can observe
+  # directly — a reader of an evicted slot returns plausible bytes. The whole
+  # module's tests run under miri in seconds (the crate-wide probe recorded in
+  # backlog B31a, which did not finish in 10 minutes, was every test in
+  # `infr-core`, not this filter).
   #
   # What is left is the part miri is uniquely good at and nothing else in the
   # tree checks: `SpinPool`'s raw base pointer crossed between threads, its
@@ -126,3 +134,4 @@ jobs:
       - run: cargo miri setup
       # Quoted: a plain YAML scalar ending in `:` parses as a mapping key.
       - run: 'cargo miri test -p infr-cpu pool::'
+      - run: 'cargo miri test -p infr-core hostpager::'

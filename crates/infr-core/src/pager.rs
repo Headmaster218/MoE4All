@@ -289,6 +289,29 @@ impl Pager {
         self.pinned.len()
     }
 
+    /// Forget `id` and return its slot to the free list, if it was resident.
+    ///
+    /// For the caller whose fill FAILED: the slot holds partial bytes, so the block must not stay
+    /// resident (the next request would be served that garbage as a hit). This is not a capacity
+    /// eviction and is not counted as one — nothing was displaced to make room.
+    ///
+    /// # Panics
+    /// If `id` is pinned. Removing a block someone is reading is the exact failure pins exist to
+    /// prevent, so it is a caller bug, not a recoverable state.
+    pub fn evict(&mut self, id: BlockId) -> Option<u32> {
+        assert!(
+            !self.pinned.contains_key(&id),
+            "pager: evict of pinned block {id}"
+        );
+        let slot = self.resident.remove(&id)?;
+        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
+            self.lru.remove(pos);
+        }
+        self.epoch.remove(&id);
+        self.free.push(slot);
+        Some(slot)
+    }
+
     /// Schedule-driven residency for a DETERMINISTIC cyclic sweep — the dense layer-streaming
     /// policy the module doc names (`BlockId = layer`, every forward pass visits blocks in the
     /// same fixed order). This is NOT demand/LRU: under a cyclic sweep the block whose next use

@@ -681,23 +681,26 @@ macos-15.
 **Tag:** PR#90 review residual · **Blocked on:** nothing; recorded so the
 coverage claim stays accurate
 
-Miri runs weekly against `SpinPool` via `.github/workflows/cron.yml` (which
-carries the reasoning for its flags — two upstream workarounds are load-bearing
-and must not be "simplified" away). That covers `collect`'s raw base pointer,
-its `set_len` over uninitialized slots, `CollectGuard`'s `drop_in_place` during
-unwinding and the `Vec::from_raw_parts` rebuild. What it does not, and will not:
+Miri runs weekly against `SpinPool` and `infr_core::hostpager` via
+`.github/workflows/cron.yml` (which carries the reasoning for its flags — two
+upstream workarounds are load-bearing and must not be "simplified" away). That
+covers `collect`'s raw base pointer, its `set_len` over uninitialized slots,
+`CollectGuard`'s `drop_in_place` during unwinding, the `Vec::from_raw_parts`
+rebuild, and the host pager arena's per-slot raw-pointer slices across threads.
+What it does not, and will not:
 
 - **`kernels.rs`** — 168 of `infr-cpu`'s 191 `unsafe` uses are x86 SIMD, which
   miri cannot execute. That unsafe stays unchecked by anything but review.
 - **Every FFI crate**, by construction: `infr-vulkan` dlopens `libvulkan`,
   `infr-metal` talks to a real GPU, `infr-gguf` maps a file, `infr-hub` takes an
   `flock`.
-- **`infr-core` and `infr-chat`** — probed, neither included. Neither finished
-  inside the window it was given (10 and 50 minutes; `infr-chat` had completed
-  16 of 58 tests when stopped). Those bounds are "did not finish by", not
-  measured durations. Little is lost either way: `infr-chat` contains no
-  `unsafe`, and `infr-core` has three uses, one being a `libc::kill` miri cannot
-  execute.
+- **`infr-core` and `infr-chat` in FULL** — both probed crate-wide, neither
+  finished inside the window it was given (10 and 50 minutes; `infr-chat` had
+  completed 16 of 58 tests when stopped). Those bounds are "did not finish by",
+  not measured durations. Little is lost: `infr-chat` contains no `unsafe`, and
+  `infr-core`'s uses outside `hostpager` are three, one being a `libc::kill`
+  miri cannot execute. The `hostpager::` filter added later runs in seconds, so
+  the crate-wide cost was never the obstacle for the part that matters.
 
 ### B33 — the `wildcards` gate in `deny.toml` is off, for a fixable reason
 
