@@ -131,7 +131,8 @@ pub fn generate_mtp_spec_vulkan_timed_on(
     let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
     let bind: &BindWeightFn = &|_name, tb, dt, _n| {
-        let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+        let bytes = tb.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
         let buf = vk
             .alloc(padded.len(), BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
@@ -219,7 +220,8 @@ pub fn generate_mtp_spec_cpu_timed(
     let cpu = infr_cpu::CpuBackend::new_with(model.engine_cfg().clone());
     let bind: &BindWeightFn = &|_name, tb, dt, _n| match tb {
         crate::seam::WBytes::Mmap(tb) => Ok((cpu.map_weight(tb), dt)),
-        crate::seam::WBytes::Owned(v) => {
+        other => {
+            let v = other.materialize();
             let buf = cpu
                 .alloc(v.len().max(1), BufferUsage::Weights)
                 .map_err(|e| anyhow!("{e}"))?;

@@ -629,8 +629,10 @@ shave: it is the policy being wrong for the access pattern, which is the case
 
 **Not measured here:** the Vulkan and Metal paths (their staging copies read the
 same mapping, but a GPU-side baseline needs a model that overflows VRAM, not a
-cgroup cap), and any model whose blob genuinely exceeds host RAM — nothing that
-large is on this host. Both are gaps in the baseline, not results.
+cgroup cap), and any model whose blob genuinely exceeds host RAM — the largest
+local blob is Llama-4-Scout Q2_K at 36.8 GiB against 60 GB of RAM, so the cgroup
+squeeze is what stands in for that case. Both are gaps in the baseline, not
+results.
 
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs

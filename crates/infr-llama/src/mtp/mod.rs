@@ -1387,7 +1387,8 @@ impl<'a> MtpHeadSession<'a> {
             cpu_be,
             &|_name, tb, dt, _n| match tb {
                 crate::seam::WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
-                crate::seam::WBytes::Owned(v) => {
+                other => {
+                    let v = other.materialize();
                     let buf = cpu_be
                         .alloc(v.len().max(1), BufferUsage::Weights)
                         .map_err(|e| anyhow!("{e}"))?;
@@ -1420,7 +1421,8 @@ impl<'a> MtpHeadSession<'a> {
         Self::build(
             vk,
             &|_name, tb, dt, _n| {
-                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+                let bytes = tb.materialize();
+                let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
                 let buf = vk
                     .alloc(padded.len(), BufferUsage::Weights)
                     .map_err(|e| anyhow!("{e}"))?;

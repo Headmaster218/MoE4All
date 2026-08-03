@@ -81,7 +81,11 @@ impl<'a> TokenEmbd<'a> {
 fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
     Box::new(move |_name, tb, dt, _n| match tb {
         WBytes::Mmap(tb) => Ok((be.map_weight(tb), dt)),
-        WBytes::Owned(v) => {
+        // Owned bytes (a load-time rewrite) and a fused group both become one host buffer here.
+        // The concat is materialized only on this arm — a binder that pages the group never
+        // reaches it.
+        other => {
+            let v = other.materialize();
             let buf = be
                 .alloc(v.len().max(1), BufferUsage::Weights)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -1854,7 +1858,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         } else {
             check_bda_element_cap(name, "tensor", numel)?;
         }
-        let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+        let bytes = tb.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
         // alloc_uninit: the `upload` right below writes the buffer's FULL extent (it is sized to
         // exactly `padded.len()`), so the calloc contract's zero-fill is dead work — and an
         // expensive kind: on the device-local path it costs a `vkCmdFillBuffer` over the whole
@@ -1978,7 +1983,8 @@ fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'
             check_bda_element_cap(name, "tensor", numel)?;
         }
         let d = pb.device_for_weight(name);
-        let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+        let bytes = tb.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
         let buf = pb
             .backend(d)
             .alloc_uninit(padded.len(), BufferUsage::Weights)
@@ -2171,6 +2177,9 @@ fn tensor_parallel_binder<'a>(
         }
         match tp_weight_role(name, cfg) {
             Some((role, in_f)) => {
+                // Every rank's slice is cut from the whole tensor, so this binder needs the bytes
+                // themselves — materialize once for all `world` cuts, not per rank.
+                let tb = tb.materialize();
                 let mut bufs = Vec::with_capacity(world);
                 for r in 0..world {
                     let slice = match role {
@@ -2192,7 +2201,8 @@ fn tensor_parallel_binder<'a>(
             }
             None => {
                 // Replicated: the full padded tensor on every rank.
-                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+                let bytes = tb.materialize();
+                let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
                 let mut bufs = Vec::with_capacity(world);
                 for r in 0..world {
                     let buf = tp
@@ -2318,6 +2328,8 @@ fn expert_parallel_binder<'a>(
             }
             let nl = n_expert / world;
             check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+            // Each rank uploads its own band of the bank, so the bytes are needed here.
+            let tb = tb.materialize();
             let mut bufs = Vec::with_capacity(world);
             for r in 0..world {
                 let start = r * nl * stride_bytes;
@@ -2342,7 +2354,8 @@ fn expert_parallel_binder<'a>(
             } else {
                 check_bda_element_cap(name, "tensor", numel)?;
             }
-            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            let bytes = tb.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
             let mut bufs = Vec::with_capacity(world);
             for r in 0..world {
                 let buf = ep
@@ -2704,7 +2717,8 @@ pub(crate) fn verify_dense_vulkan(
     generate_dense_backend(
         vk,
         &|_name, tb, dt, _n| {
-            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            let bytes = tb.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
             let buf = vk
                 .alloc(padded.len(), BufferUsage::Weights)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -2743,14 +2757,41 @@ pub(crate) fn verify_dense_vulkan(
 pub(crate) enum WBytes {
     Mmap(TensorBytes),
     Owned(Vec<u8>),
+    /// Several mapped tensors to be laid down back to back — the fused qkv / gate+up groups.
+    ///
+    /// Kept as its COMPONENTS rather than a concatenated buffer, because a binder that pages or
+    /// streams the group never wants the bytes at all: it registers the components' file ranges and
+    /// has them read straight into a slot later. Materializing first meant building a multi-MB
+    /// concat per fused group at load and immediately dropping it (and touching every one of those
+    /// pages, which for a model that does not fit memory is the cost this whole tier exists to
+    /// avoid).
+    Concat(Vec<TensorBytes>),
 }
 
-impl std::ops::Deref for WBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
+impl WBytes {
+    /// Byte length, without materializing anything.
+    pub(crate) fn len(&self) -> usize {
         match self {
-            WBytes::Mmap(tb) => tb,
-            WBytes::Owned(v) => v,
+            WBytes::Mmap(tb) => tb.len(),
+            WBytes::Owned(v) => v.len(),
+            WBytes::Concat(parts) => parts.iter().map(|p| p.len()).sum(),
+        }
+    }
+
+    /// The bytes themselves. Borrowed for a single mapped tensor or an owned buffer; a `Concat` is
+    /// joined HERE, so the cost lands on the binders that genuinely need the bytes and on no one
+    /// else.
+    pub(crate) fn materialize(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            WBytes::Mmap(tb) => std::borrow::Cow::Borrowed(tb),
+            WBytes::Owned(v) => std::borrow::Cow::Borrowed(v),
+            WBytes::Concat(parts) => {
+                let mut out = Vec::with_capacity(self.len());
+                for p in parts {
+                    out.extend_from_slice(p);
+                }
+                std::borrow::Cow::Owned(out)
+            }
         }
     }
 }

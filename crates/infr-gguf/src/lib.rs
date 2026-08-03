@@ -102,6 +102,18 @@ impl AsRef<[u8]> for TensorBytes {
     }
 }
 
+impl TensorBytes {
+    /// This view's `(offset, len)` in the FILE, for a reader that opens it instead of using the
+    /// mapping (the pager's disk tier — see [`Gguf::tensor_file_range`], which reports the same
+    /// numbers by tensor name).
+    ///
+    /// The offset is a file offset and not merely a mapping offset because `Gguf::open` maps the
+    /// whole file from byte 0, so the two coincide; `mapping_covers_the_whole_file` pins that.
+    pub fn file_range(&self) -> (u64, usize) {
+        (self.off as u64, self.len)
+    }
+}
+
 // ─── byte-cursor ──────────────────────────────────────────────────────────────
 
 struct Reader<'a> {
@@ -832,6 +844,26 @@ mod tests {
             data, expected,
             "mmap read must be byte-for-byte with the source"
         );
+    }
+
+    /// The mapping starts at file byte 0, which is what lets a mapped view's offset double as a
+    /// FILE offset ([`TensorBytes::file_range`]). `Mmap::map` maps the whole file, so this holds by
+    /// construction — but it is the assumption every descriptor the disk tier builds rests on, and
+    /// a future partial mapping would break it silently, shifting every streamed weight.
+    #[test]
+    fn mapping_covers_the_whole_file() {
+        let bytes = build_fixture();
+        let tmp = write_temp_gguf(&bytes);
+        let gguf = Gguf::open(tmp.path()).expect("open fixture");
+        let view = gguf.tensor_bytes_arc("tensor0").expect("view");
+        let (off, len) = view.file_range();
+        assert_eq!(
+            (off, len),
+            gguf.tensor_file_range("tensor0").expect("range"),
+            "a view's file range must agree with the by-name range"
+        );
+        // And it really is a file offset: the same bytes are there when read through the file.
+        assert_eq!(&bytes[off as usize..off as usize + len], &view[..]);
     }
 
     /// The pager's disk tier reads a tensor by `(offset, len)` taken from

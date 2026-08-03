@@ -641,8 +641,17 @@ pub(crate) fn generate_dense_backend(
                     None => (WBytes::Mmap(tb), i.dtype, numel),
                 }
             } else {
-                let mut cat = Vec::new();
+                // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
+                // concatenated buffer: a binder that pages or streams the group registers their
+                // file ranges and never wants the bytes, and materializing here would build — and
+                // fault in — a multi-MB copy per group only to drop it. `WBytes::materialize` joins
+                // them for the binders that do read bytes.
+                //
+                // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
+                // any group containing one falls back to the owned concat.
+                let mut parts = Vec::with_capacity(names.len());
                 let mut numel = 0usize;
+                let mut permuted = false;
                 let dt = info(names[0])?.dtype;
                 for name in names {
                     let i = info(name)?;
@@ -650,15 +659,23 @@ pub(crate) fn generate_dense_backend(
                         return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                     }
                     numel += i.shape.iter().product::<usize>();
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    match qk_perm_heads(name) {
-                        Some(heads) => {
-                            cat.extend_from_slice(&permute_rows(&tb, heads, row_bytes(name, dt)))
-                        }
-                        None => cat.extend_from_slice(&tb),
-                    }
+                    parts.push(g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                    permuted |= qk_perm_heads(name).is_some();
                 }
-                (WBytes::Owned(cat), dt, numel)
+                if !permuted {
+                    (WBytes::Concat(parts), dt, numel)
+                } else {
+                    let mut cat = Vec::new();
+                    for (name, tb) in names.iter().zip(&parts) {
+                        match qk_perm_heads(name) {
+                            Some(heads) => {
+                                cat.extend_from_slice(&permute_rows(tb, heads, row_bytes(name, dt)))
+                            }
+                            None => cat.extend_from_slice(tb),
+                        }
+                    }
+                    (WBytes::Owned(cat), dt, numel)
+                }
             };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
             // weights to f16), so the graph declares the handle to match what the backend will read.
