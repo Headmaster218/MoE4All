@@ -250,122 +250,80 @@ qwen35. Gemma's 40 SWA layers are window-capped (18.4 µs flat from d4096 to
 d32768), so most of its layers cannot grow with depth. The one place the
 specialization LOSES is gemma above d16384 — see B15.
 
-### B8 — the activation/scratch reserve is not path-aware
+### B8 — what is still ESTIMATED after the measured-fit slice
 
-**Tag:** measured 2026-08-02 · **Blocked on:** a design choice between the two
-options below
+**Tag:** re-measured 2026-08-04 · **Blocked on:** nothing; each item below is a
+bounded piece of work, and none of them is currently causing a failure
 
-`seam::dense_act_reserve` estimates how much VRAM to hold back for activations.
-It is the term that made `kv_fit_ctx_fmt` claim gemma-3-12b's trained window
-would not fit at f16 (~11 GiB reserved at the default 1024-row chunk), which
-triggered a KV auto-quant that measurement showed was unnecessary. The immediate
-inconsistency — reserving for a 1024-row chunk that placement then abandons for
-512 — is being fixed separately. **This entry is about the reserve's ACCURACY,
-which is a different problem and is not fixed by that.**
+The original entry claimed the reserve's runaway term was the non-flash score
+tile, priced as "2 live pools at the final ctx" while the real pools "ACCUMULATE
+across the ~150+ chunks of a deep prefill". **Both halves were wrong**, and the
+measurement that settled it is now permanent machinery:
+`Backend::activation_peak` (a high-water mark of live `Activations` bytes) and
+the runner's `activation reserve too low` warning. Each chunk's `execute` drops
+its pool before the next builds, and every layer of a chunk shares one `kv_len`,
+so ONE tile is live — the model was over-reserving, by 3.5x at a 128-row chunk.
 
-Measured ground truth, gemma-3-12b Q4_K_M f16 KV @ctx 131072 with a real 120k
-prefill (peak sampled from `/sys/class/drm/card1/device/mem_info_vram_used`):
+What actually broke the fit, on the reported gemma-4-31B UD-Q5_K_XL case
+(reproduced at margin 1.0, `bench -p 0 -n 4 -d 19000`, which died on a 4 MiB
+alloc **2 MiB** past the guard budget):
 
-| term        | MiB        | source                                              |
-| ----------- | ---------- | --------------------------------------------------- |
-| peak VRAM   | 17 506     | measured                                            |
-| weights     | 6 962      | GGUF size on disk                                   |
-| KV cache    | ~8 672     | 8 global × 8192 B/tok × 131072 + 40 SWA × 1536 rows |
-| **scratch** | **~1 872** | residual                                            |
+| term            | planner        | actual                         | delta   |
+| --------------- | -------------- | ------------------------------ | ------- |
+| weights         | 21 871 930 488 | 22 353 012 736 (217 arena blk) | +481 MB |
+| KV              | 2 559 590 400  | ~2 504 MB                      | −56 MB  |
+| activation peak | 911 343 616    | 262 MB                         | −649 MB |
+| driver-side     | 0              | 187 MB after load → 368 at pk  | +368 MB |
 
-(The 40/8 SWA/global split is confirmed from a decode profile: 1280
-`attn_decode_hd256_swa` dispatches over 32 tokens = 40 layers, 256 = 8.)
+So the fix was not a better activation model: it was to stop estimating the
+things the device can be ASKED about. `reclamp_ctx_to_live_room` re-decides the
+window between the weight upload and the KV allocation, against
+`Backend::device_alloc_room`. What is still predicted at that point:
 
-The reserve has exactly ONE path branch today:
+- **The activation reserve**, now re-fit to measured peaks with named MoE and
+  DeltaNet terms and a 1.5x pad (`ACT_RESERVE_PAD`, sized by the worst arch
+  measured — Qwen3.5-4B-MTP at 1.42x).
+- **`POST_KV_DEVICE_RESERVE`** (256 MiB) — the pipelines/descriptors the driver
+  builds while recording the first forwards, measured at 181 MiB on the largest
+  model here.
 
-```rust
-let attn_s = if cfg.swa_window == 0 && cfg.max_head_dim() == 128 { 0 } else { /* full want_ctx */ };
-```
+**What is left, in the order it matters.**
 
-Two things are wrong with it. It is far too coarse — real dispatch picks between
-flash / non-flash-coopmat / `nc_fa` / split-K **per layer**, on hd, mask, row
-count, kv length, KV dtype and coopmat capability — and the comment above it
-asserts "gemma3-12b: full layers are Causal+hd128 = flash", which a profile
-disproves: gemma-3-12b is hd **256** on every layer and takes the pessimistic
-branch. Terms a correct accounting has to price, none expressible as a constant:
-
-- **non-flash score tile** — `rows × n_head × kv × 4`; 3.9 GiB at 512×16×120064,
-  and **zero** on the flash path.
-- **split-K partials** `pm`/`pl`/`pacc` — `[rows, nh, n_chunks, hd]`; the
-  adapter's own comment notes ~1 GB at 1024 rows × 32 chunks × hd 256.
-- **KV dequant f16 scratch** — only for the prepass formats (q4_0/q4_1/q5_0/
-  q5_1/iq4_nl); zero for f16 and for native planar-Q8.
-- flash `po`/`pm`/`pl` pools, MoE expert scratch / pager arenas, GEMM output row
-  padding, rmsnorm and quantize temporaries.
-
-**Do NOT replace it with a flat pad.** A constant was proposed (KV + 128 MiB)
-and withdrawn on the numbers above: 128 MiB under-reserves the measured 1 872
-MiB by ~15×, at a 512-row chunk, and scratch scales with both chunk height and
-path.
-
-**Two designs, pick one:**
-
-1. **Shared tier predicate + drift test.** Extract the attention-tier selection
-   the adapter already performs into one predicate that BOTH the dispatch gate
-   and the estimator consume, then price each tier's buffers. Precedent in this
-   repo: `infr_core::tensor::MOE_MMQ_DTYPES` as the single source both the
-   graph-build and adapter gates derive from, guarded by `moe_mmq_drift_test`.
-   Cheaper, but it is still two consumers of one fact and only the drift test
-   stops them separating.
-2. **Derive from the plan.** The adapter already allocates every scratch buffer
-   through a named pool while recording the graph, so a dry-run graph build for
-   the intended shape yields the exact total with no duplicated logic and
-   nothing to drift. Exact by construction rather than by maintenance. More
-   plumbing, and potentially circular — the plan depends on the ctx being sized
-   — so it likely needs a fixed-point or a two-pass build.
-
-**Second measurement, and the reason this is now urgent.** With the chunk-ladder
-fix landed, `kv_fit_ctx_for` returns the EXACT boundary of
-`weights + KV + dense_act_reserve_at <= alloc_room`, so any error in the reserve
-is no longer absorbed by slack — it becomes a mid-prefill allocation failure.
-gemma-4-31B UD-Q5_K_XL (weights 21 871 930 488 B, 24 GiB XTX) now resolves its
-default context to 19 968 tokens at a 128-row chunk, and:
-
-| prefill depth | result                                          | peak MiB |
-| ------------- | ----------------------------------------------- | -------- |
-| 8 000         | ok, 31.4 t/s                                    | 23 807   |
-| 12 000        | ok, 30.8 t/s                                    | 24 038   |
-| 16 000        | ok, 30.4 t/s                                    | 24 221   |
-| 19 000        | **`VRAM budget exceeded`** on a 4 MiB act alloc | 24 298   |
-
-So the top ~15-20% of the window it hands out could not actually be filled. The
-term that runs away is the non-flash score tile, which the estimator prices as
-`4 * n_head * ctx_pad` per row ("2 live pools at the final ctx") while the real
-pools are keyed by byte size and ACCUMULATE as `kv_len` grows across the ~150+
-chunks of a deep prefill. Note the failure tracks the prefill DEPTH reached, not
-the context allocated: at margin 1.25 the model advertised a SMALLER context
-(17 848) and still died, at d17840, because the depth tested rose with it.
-Fixing that term is the specific thing that would make an advertised window
-honest.
-
-**An interim margin is in the tree, and it is yours to DELETE.**
-`seam::ACT_RESERVE_MARGIN = (3, 2)` multiplies `dense_act_reserve_at`'s result.
-It is applied to the ESTIMATED term only — KV bytes stay exact, computed from
-geometry and dtype through the runner's own `kv_fmt_bytes` — and it was sized by
-running each candidate and prefilling at ~100% of the context that candidate
-advertises:
-
-| margin | advertised ctx | prefill at ~100% of it          | peak MiB |
-| ------ | -------------- | ------------------------------- | -------- |
-| 1.00   | 19 973         | `VRAM budget exceeded` @ d19000 | 24 298   |
-| 1.25   | 17 848         | `VRAM budget exceeded` @ d17840 | 24 299   |
-| 1.50   | 15 872         | **ok**, 30.2 t/s @ d15864       | 24 142   |
-
-1.50 is the first rung that fills its own window; also verified at d15000 /
-d12000 / d8000 (30.3 / 30.6 / 31.2 t/s), and the d15864 peak reproduces
-byte-for-byte. Remaining spare at the advertised context is **157 MiB of the 24
-299 MiB guard budget (~0.6%)** — thin enough that this entry is the fix, not a
-bigger constant.
-
-A path-aware reserve must REPLACE the margin, not stack on it: delete the
-constant, its multiply in `dense_act_reserve_at`, and the
-`act_reserve_carries_the_interim_margin` test, then re-run the table above and
-show the true reserve fills the window without it.
+1. **The per-arch activation algebra is whack-a-mole, and the structural fix is
+   known.** Every term in `dense_act_reserve_at` re-derives, in the seam, what
+   `runner.rs`'s `build` closure already declares exactly (`g.internal(...)`,
+   each `batch * <width>`), plus what the Vulkan adapter's `pooled(...)` sites
+   allocate. Fitting it per arch found three misses in one afternoon (MoE expert
+   scratch, qwen35's DeltaNet mixer, qwen35's double-width `qg`/`gate_a` pair) —
+   each caught by the new warning, none by a test. The fix is to SUM the graph's
+   `Internal` tensors instead of modelling them, which needs the graph buildable
+   for a shape before the KV cache exists; today `build` is defined after the
+   cold-init block and closes over the KV handles. The pooled attention/MoE
+   terms would still need the adapter's tier predicate (the old option 1).
+2. **The chunk rung is still chosen pre-load, against the light weight
+   estimate.** The re-clamp can LOWER it (`repin_ubatch_lower`) when that buys
+   context, but placement's resident-vs-stream decision itself is unchanged and
+   ~2% optimistic on weights. It self-corrects into a smaller window rather than
+   a failure, so this is a context cost, not a correctness one.
+3. **The context is ~1.5k tokens more conservative than the device strictly
+   requires.** gemma-4-31B advertises 14 592 (the interim-margin build said 15
+   872, and 19 021 was measured to miss by 2 MiB). The gap is
+   `POST_KV_DEVICE_RESERVE` + the allocator's own 256 MiB `GUARD_HEADROOM` + the
+   reserve's pad + `KV_SLOP_ROWS` (B13). Reclaiming it means measuring the
+   driver-side growth on more than one GPU first — 181 MiB is one sample, on one
+   RADV version.
+4. **Every measurement here is from one 7900 XTX on RADV.** The arena-tail
+   percentage, the driver-side growth and the activation peaks are all
+   Mesa/RADV/discrete numbers. An Intel or NVIDIA driver could report its budget
+   with different granularity, and an iGPU shares the heap with the host.
+5. **Metal and CPU are untouched by design**: `device_alloc_room` and
+   `activation_peak` default to `None`, so both keep exactly their previous
+   behaviour and neither gets the measured clamp. Metal has a working-set query
+   that could implement the first.
+6. **`infr serve --parallel N` was exercised at N=2** (two 40960-token slots on
+   Qwen3-1.7B, a request served) but not at a size where the re-clamp fires, so
+   the interaction between a shrunk window and `vulkan_slot_ctx`'s divide-by-N
+   is reasoned, not measured.
 
 ### B10a — the serve arrival line reports prompt CHARS, not prompt tokens
 
@@ -436,6 +394,13 @@ be provable, i.e. exact KV bytes alone + weights > `alloc_room()`, with no
 activation reserve in it, so an over-estimating reserve can never refuse a run
 that would have worked.
 
+**Since 2026-08-04 the explicit path at least says so first.**
+`reclamp_ctx_to_live_room` runs on it too and WARNs, naming the window that does
+fit the device's measured free memory, before honoring the one that was asked
+for. The decision above is now only about whether to escalate that warning to an
+error — and the "provable check" it asks for is exactly what that path already
+computes.
+
 ### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
 
 **Tag:** verified 2026-08-02 · **Blocked on:** nothing; left alone deliberately
@@ -448,8 +413,11 @@ mirroring a pad `SeamKv` allegedly applies. It does not: both allocation sites
 conservative margin and nothing more — the doc now says so.
 
 Left in because every placement estimate shares this helper and removing it
-would loosen all of them at once, on a model where (see B8) the remaining margin
-is already ~1%. Worth revisiting only together with a path-aware reserve.
+would loosen all of them at once. That argument has weakened since: the window a
+session actually gets is now re-decided against the device's measured free
+memory (B8), so these rows are no longer a cushion against an over-optimistic
+plan — they are context the fit hands back for nothing. Removing them is worth a
+measurement now, not just a revisit.
 
 ### B14 — verification gaps from the 2026-08-02 decode-attention and KV-fit slices
 

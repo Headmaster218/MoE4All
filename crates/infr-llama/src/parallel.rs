@@ -211,6 +211,11 @@ impl ParallelSeam {
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
+        // The warmup is what loads the weights, so it is also where the cold init re-clamps the
+        // context against the memory the device reports free once they are resident. Take the
+        // window that was actually allocated: every slot forked below is sized from it, and it is
+        // what the server advertises and admits requests against.
+        self.max_ctx = slot0.max_ctx();
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
         slot0.reset();

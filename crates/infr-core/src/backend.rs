@@ -493,6 +493,28 @@ pub trait Backend: Send + Sync {
     /// loop, so the user sees the resident/spilled split. Default no-op (backends without host spill,
     /// or with the flag off, print nothing).
     fn kv_overflow_report(&self) {}
+    /// Bytes a new device-local allocation may still take RIGHT NOW, as this backend's own
+    /// allocation guard sees it — the live answer to "what is left?", including everything a
+    /// pre-load estimate cannot know: allocator block tails, retained upload staging, the driver's
+    /// own pipeline/descriptor/command-buffer memory, and other processes on the same device.
+    ///
+    /// `None` (the default) means this backend has no such budget to report, and every caller must
+    /// keep whatever estimate it already had. A `Some` is a MEASUREMENT and outranks any estimate
+    /// of the same bytes: the runner re-sizes the KV cache against it once the weights are resident
+    /// (`generate_dense_backend`'s cold init), which is the one moment the device can be asked
+    /// instead of predicted.
+    fn device_alloc_room(&self) -> Option<u64> {
+        None
+    }
+    /// High-water mark of concurrently-live [`BufferUsage::Activations`] bytes since this backend
+    /// was created, and `None` from a backend that does not track it. The oracle for the seam's
+    /// activation reserve: the reserve is a PREDICTION of this number, so a session that ends with
+    /// a peak above what it reserved has a reserve that is wrong, and says so
+    /// (`generate_dense_backend`'s post-generation check) instead of waiting to fail an allocation
+    /// on some other model.
+    fn activation_peak(&self) -> Option<u64> {
+        None
+    }
     /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
     /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
     /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so

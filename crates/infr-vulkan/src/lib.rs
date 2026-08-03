@@ -288,6 +288,17 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
+    /// Concurrently-live [`BufferUsage::Activations`] bytes, and the high-water mark that figure
+    /// has reached since this backend was built ([`VulkanBackend::activation_peak`]).
+    ///
+    /// The seam's activation reserve is a PREDICTION of `act_peak`, and nothing else in the tree
+    /// observes the predicted quantity — so a reserve could be wrong by a factor and only show up
+    /// as a mid-prefill allocation failure on some unrelated model. These two counters are what
+    /// make the prediction checkable: the runner compares them against what it reserved when a
+    /// generation ends. Charged in `make_alloc` (the single funnel every `Activations` allocation
+    /// takes) and released in `VkBuffer::drop` via its `act_bytes`.
+    act_live: AtomicU64,
+    act_peak: AtomicU64,
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
     /// before submitting it and opening the next (`0` = unlimited, never split).
     ///
@@ -484,6 +495,11 @@ struct VkBuffer {
     /// `BufferUsage::KvCache` allocations (see [`Buffer::device_addr`]). `None` for every buffer
     /// that never requested one.
     own_addr: Option<u64>,
+    /// This buffer's charge against [`VulkanShared::act_live`] — its logical size when it was
+    /// allocated as [`BufferUsage::Activations`], and `0` for every other usage (weights, KV,
+    /// staging, readback), which the activation high-water mark deliberately does not count.
+    /// Set by `make_alloc`, released by this buffer's `Drop`.
+    act_bytes: u64,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -514,6 +530,13 @@ impl VkBuffer {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VkBuffer {
     fn drop(&mut self) {
+        // Release this buffer's share of the live-activation tally (see `VulkanShared::act_live`).
+        // `act_peak` is a high-water mark and deliberately never comes back down.
+        if self.act_bytes > 0 {
+            self.shared
+                .act_live
+                .fetch_sub(self.act_bytes, Ordering::Relaxed);
+        }
         unsafe {
             match &mut self.backing {
                 Backing::Pooled(alloc) => {
@@ -2293,6 +2316,8 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
+                act_live: AtomicU64::new(0),
+                act_peak: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 uma_overflow_type,
                 host_overflow_type,
@@ -2689,6 +2714,7 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr,
+            act_bytes: 0,
         })
     }
 
@@ -2807,6 +2833,7 @@ impl VulkanBackend {
                     // `device_addr()` derives a `BdaSub`'s address from the block's `base_addr` +
                     // `sub_offset` — no own address needed here.
                     own_addr: None,
+                    act_bytes: 0,
                 });
             }
         }
@@ -2855,6 +2882,7 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr: None,
+            act_bytes: 0,
         })
     }
 
@@ -3035,6 +3063,7 @@ impl VulkanBackend {
             location,
             sub_offset: 0,
             own_addr,
+            act_bytes: 0,
         })
     }
 
@@ -3173,13 +3202,26 @@ impl VulkanBackend {
             // living in VRAM.
             BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
         };
-        let buf = self.make_buf(bytes, location, label)?;
+        let mut buf = self.make_buf(bytes, location, label)?;
         // Advance the weight-load progress bar for host-weights too (the single funnel every
         // weight upload passes through, so no loader can forget to account for a tensor).
         if matches!(usage, BufferUsage::HostWeights) {
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }
+        }
+        // Charge the live-activation tally and raise the high-water mark (see
+        // `VulkanShared::act_live`). The logical `bytes`, not the allocation's aligned size: this
+        // measures what the seam's reserve is trying to predict, which is asked for in logical
+        // bytes. Released by `VkBuffer::drop` through the `act_bytes` set here.
+        if usage == BufferUsage::Activations {
+            buf.act_bytes = bytes as u64;
+            let live = self
+                .shared
+                .act_live
+                .fetch_add(bytes as u64, Ordering::Relaxed)
+                + bytes as u64;
+            self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
         }
         Ok(buf)
     }
@@ -3558,6 +3600,21 @@ impl Backend for VulkanBackend {
         if let Some(line) = spill_report_line(self.shared.kv_spill.counts(), &KV_SPILL, fmt_bytes) {
             tracing::info!("{line}");
         }
+    }
+
+    /// The dyn-`Backend` spelling of [`alloc_room`](Self::alloc_room) — always `Some` here, because
+    /// this backend has a real allocation guard to report. What makes it worth reaching for through
+    /// the trait: read AFTER the weights are resident it prices the arena's block tails, the
+    /// retained upload staging and the driver's own memory as FACT, where every pre-load estimate
+    /// of the same bytes is a model (measured on gemma-4-31B UD-Q5_K_XL: the weight footprint alone
+    /// is 2.2% under what the arena commits, and 187 MiB of driver-side memory exists that no
+    /// footprint has a term for).
+    fn device_alloc_room(&self) -> Option<u64> {
+        Some(self.alloc_room())
+    }
+
+    fn activation_peak(&self) -> Option<u64> {
+        Some(self.shared.act_peak.load(Ordering::Relaxed))
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {

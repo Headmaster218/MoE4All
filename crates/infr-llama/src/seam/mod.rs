@@ -278,37 +278,31 @@ pub(crate) fn generate_dense_vulkan_session(
 /// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at
 /// INFR_UBATCH, default 1024; decode's single row is dwarfed by this).
 ///
-/// Derivation — measured on gemma-4-31B UD-Q5_K_XL (n_embd 5376, n_ff 32768, n_head 32,
-/// head_dim 512/256 full/SWA) on a 24 GiB 7900 XTX with a tagged allocation trace
-/// (INFR_ALLOC_TRACE-style eprintln on every ≥16 MiB activation alloc) at a 1024-row prefill
-/// chunk, ctx 2064:
-/// - Internal graph tensors (`alloc_scratch`, ~850 MiB): fused gate_up out `[rows, 2*n_ff]` f32
-///   (256 MiB) + activated intermediate `[rows, n_ff]` f32 (128 MiB) + fused qkv staging
-///   (168 MiB = rows*8*n_embd*4 here) + ~a dozen `[rows, n_embd]`-class f32/f16 temps.
-///   Modeled as `12*n_ff + 96*n_embd` per row (the n_embd umbrella also absorbs the
+/// Every term is per ROW of the prefill chunk, and the whole estimate is now checked against the
+/// backend's own high-water mark of live activation bytes at the end of every generation (see
+/// `Backend::activation_peak` and the runner's `activation reserve too low` warning), so the
+/// numbers below are a fit to measurements rather than an argument:
+/// - Internal graph tensors (`alloc_scratch`): fused gate_up out `[rows, 2*n_ff]` f32 + activated
+///   intermediate `[rows, n_ff]` f32 + fused qkv staging + ~a dozen `[rows, n_embd]`-class f32/f16
+///   temps. Modeled as `12*n_ff + 96*n_embd` per row (the n_embd umbrella also absorbs the
 ///   lin_a16/mmq activation-quant pools, which are n_embd/n_ff-wide f16/i8).
-/// - Attention pools — the term a previous calibration MISATTRIBUTED as "rows*vocab*2
-///   whole-chunk f16 logits" (batched prefill has run a last-row-only m=1 LM head since long
-///   before that trace, and is fully headless now — no logits allocation scales with rows;
-///   2*vocab merely coincided with the real per-row attention bytes on this model, where
-///   2*262144 == 8*n_head*head_dim*4 at head_dim 512):
-/// - `nonfa_pv`/`flash_po`: `8*rows*n_head*head_dim*4` per DISTINCT head shape — gemma4
-///   alternates SWA(256)/full(512) head dims, so BOTH pools live at once (512 + 256 MiB
-///   measured) → `32*n_head*(head_dim + head_dim_swa-if-distinct)` per row.
-/// - `nonfa_s` (score tiles, non-flash tier only — any model with SWA layers or
-///   head_dim != 128): `n_head*rows*kv_pad*2`, kv_pad = kv_len rounded up to 256. The pool
-///   key includes the byte size, so as kv grows across chunks stale sizes are retained —
-///   modeled as 2 live pools at the final ctx: `4*n_head*ctx_pad` per row. Uniform-hd-128
-///   no-SWA models (llama/qwen3) ride the single-pass flash tier: no score tiles, only the
-///   (negligible) flash_pm/pl partials — term skipped.
+/// - `nonfa_pv`/`flash_po`: `8*rows*n_head*head_dim*4` per DISTINCT head shape — gemma4 alternates
+///   SWA(256)/full(512) head dims, so BOTH pools live at once →
+///   `32*n_head*(head_dim + head_dim_swa-if-distinct)` per row.
+/// - `nonfa_s` (score tiles, non-flash tier only — any model with SWA layers or head_dim != 128):
+///   `n_head*rows*kv_pad*2`, kv_pad = kv_len rounded up to 256, i.e. `2*n_head*ctx_pad` per row at
+///   the final context. ONE live tile, not two: the pool key includes the byte size, so a deep
+///   prefill does allocate a fresh (larger) tile per chunk, but each chunk's `execute` drops its
+///   pool before the next one builds — and every layer of a chunk shares one kv_len, so one size
+///   is live at a time. Uniform-hd-128 no-SWA models (llama/qwen3) ride the single-pass flash
+///   tier: no score tiles, only the (negligible) flash_pm/pl partials — term skipped.
 ///
-/// All times a 1.25 margin for unmeasured tails (split-path partials, per-shape pool
-/// duplicates), plus a fixed 256 MiB for what shapes don't scale: gpu-allocator's block
-/// granularity, retained upload staging (device-local under ReBAR), and the weight-buffer
-/// u32/dedicated-alloc padding not in `weight_footprint`. Deliberately a slight over-reserve:
-/// under-reserving makes the alloc-time VRAM guard error a live request mid-prefill (exactly
-/// what the old formula did on this 31B at pp2048 — the second chunk's 512 MiB `nonfa_pv`
-/// tripped the guard mid-run), over-reserving only streams/clamps a borderline model.
+/// Times [`ACT_RESERVE_PAD`]. What is deliberately NOT here any more: a fixed 256 MiB that stood
+/// in for gpu-allocator block granularity, retained upload staging and weight-buffer padding.
+/// Those are not activations at all — they are exactly what the runner's post-load re-clamp
+/// ([`reclamp_ctx_to_live_room`]) prices by ASKING the device, so carrying an estimate of them
+/// here as well is double-counting, and the estimate was 3.5x wrong at a 128-row chunk.
+///
 /// Always taken at an EXPLICIT chunk height: every caller (the try-resident sweep, the streaming
 /// budget, the context-fit math) walks [`ubatch_candidates`] rather than assuming the default
 /// 1024-row chunk — assuming it is what let the KV-format decision and the placement decision
@@ -335,57 +329,67 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
         } else {
             want_ctx
         };
-        4 * cfg.n_head * kv_span.next_multiple_of(256)
+        2 * cfg.n_head * kv_span.next_multiple_of(256)
     };
-    let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s) as u64;
-    const FIXED: u64 = 256 * 1024 * 1024;
-    let est = FIXED + rows * per_row * 5 / 4;
-    est * ACT_RESERVE_MARGIN.0 / ACT_RESERVE_MARGIN.1
+    // MoE expert scratch (`moe_*` / `moe_pgb_*` in the Vulkan adapter). Its pools are sized by
+    // (row, expert) PAIRS, not rows — the batched path buckets every row's `n_used` picks and runs
+    // them through the expert FFN together — so the per-row cost carries an `n_used` multiplier.
+    // Per pair: the gate+up output `2*n_ff_exp` f32, the activated intermediate `n_ff_exp` f32,
+    // the down-projection's f32 result `n_embd`, and the int8 activation-quant pools (one byte per
+    // element plus two f16 scales per 32-element block, on both the `n_embd` and `n_ff_exp` sides).
+    let moe = cfg.moe.as_ref().map_or(0, |m| {
+        let per_pair = 3 * m.n_ff_exp * 4 + cfg.n_embd * 4 + m.n_ff_exp + cfg.n_embd;
+        m.n_used * per_pair
+    });
+    // qwen35's gated-DeltaNet mixer scratch, which the `n_embd` umbrella above does not cover: its
+    // buffers are keyed on the SSM dims, not on n_embd, and a hybrid model held 1.53x the umbrella
+    // (Qwen3.5-9B, `activation reserve too low` at a 1024-row chunk). Named one for one after the
+    // `dn_*` internals the runner's graph declares, all f32 and all `batch`-wide, so the two lists
+    // can be read side by side: qkv + conv out (conv channels each), z (d_inner), q + k (key dim
+    // each), v + out (value dim each), beta + alpha (one per v-head).
+    // Plus its attention out-gate pair (`qg` + `gate_a`), which every arch declares but only this
+    // one makes big: qwen35 interleaves q and gate in one projection, so `qg` is DOUBLE the q
+    // width and the umbrella's n_embd term no longer covers the three of them.
+    let deltanet = if cfg.qwen35 {
+        4 * (2 * cfg.q35_conv_channels()
+            + cfg.ssm_d_inner
+            + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
+            + 2 * cfg.q35_num_v_heads() * cfg.q35_head_v_dim()
+            + 2 * cfg.q35_num_v_heads())
+            + 12 * cfg.n_head * cfg.max_head_dim()
+    } else {
+        0
+    };
+    let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet) as u64;
+    rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
 }
 
-/// INTERIM safety margin on [`dense_act_reserve_at`], as `(numerator, denominator)`.
+/// Safety pad on [`dense_act_reserve_at`]'s per-row terms, as `(numerator, denominator)`.
 ///
-/// **Why this term and not the KV term.** KV bytes are computed EXACTLY — per-layer geometry and
-/// each side's dtype, run through `kv_fmt_bytes`, the same sizer the runner hands `Backend::alloc`
-/// — so they need no margin and get none. The activation reserve is a MODEL, and a
-/// measured-wrong one: it prices the non-flash score tile as two live pools at the final context,
-/// while the real pools are keyed by byte size and ACCUMULATE as `kv_len` grows across the ~150+
-/// chunks of a deep prefill. `FIT_FRACTION = 0.95` used to blur the two together; the slack
-/// belongs on the estimate alone.
+/// **What it covers.** The terms above name the pools a forward allocates, but WHICH pools it
+/// allocates is a tier decision the Vulkan adapter takes per layer, per op, on row count / head
+/// dim / mask / KV dtype / coopmat capability — and the per-arch algebra is fit to the graphs that
+/// have been measured, not to the ones that have not. This pad is that distance.
 ///
-/// **Why it is needed at all.** Once [`kv_fit_ctx_for`] returns the exact boundary rather than a
-/// 5%-shy one, any error in this model lands directly as a mid-prefill allocation failure —
-/// i.e. as a default context whose top cannot be filled. Measured on gemma-4-31B UD-Q5_K_XL
-/// (24 GiB 7900 XTX): with no margin the fit advertised 19 973 tokens and a `-d 19000` prefill
-/// died with `VRAM budget exceeded` on a 4 MiB activation alloc.
+/// **Sized by measurement, against the backend's own high-water mark** (`Backend::activation_peak`
+/// — every row below is reproducible with `RUST_LOG=infr_llama=debug` on the run named, and the
+/// runner warns when a peak lands above the reserve). Unpadded model against measured peak, all on
+/// a 24 GiB 7900 XTX:
 ///
-/// **Sized by measurement, at the ADVERTISED context, not by choosing a number.** Each candidate
-/// was built, the default context it produces read off the `ctx clamp` line, and a prefill run at
-/// ~100% of THAT context (gemma-4-31B UD-Q5_K_XL, `infr bench -p 0 -n 4 -d <ctx-8>`):
+/// | model                | chunk | ctx     | modeled MiB | measured MiB | measured / modeled |
+/// | -------------------- | ----- | ------- | ----------- | ------------ | ------------------ |
+/// | Qwen3.5-4B-MTP Q4_K_M| 1024  |   2 064 |         724 |        1 027 |              1.42x |
+/// | Qwen3.5-9B Q4_K_M    | 1024  |   2 064 |         904 |        1 112 |              1.23x |
+/// | Llama-3.2-1B Q4_K_M  | 1024  |   2 064 |         406 |          429 |              1.06x |
+/// | Qwen3-30B-A3B Q4_K_M | 1024  |     528 |         309 |          291 |              0.94x |
+/// | gemma-3-12b Q4_K_M   | 1024  | 131 072 |       3 811 |        4 735 |              1.24x |
+/// | gemma-4-31B UD-Q5_K_XL| 128  |  15 440 |         261 |          334 |              1.28x |
 ///
-/// | margin | advertised ctx | prefill at ~100% of it            | peak MiB |
-/// | ------ | -------------- | --------------------------------- | -------- |
-/// | 1.00   | 19 973         | `VRAM budget exceeded` @ d19000   | 24 298   |
-/// | 1.25   | 17 848         | `VRAM budget exceeded` @ d17840   | 24 299   |
-/// | 1.50   | 15 872         | **ok**, 30.2 t/s @ d15864         | 24 142   |
-///
-/// 1.50 is the FIRST rung that fills the window it advertises, so that is what shipped — nothing
-/// was added on top of the measurement. It also holds at d15000 / d12000 / d8000 (30.3 / 30.6 /
-/// 31.2 t/s) and the d15864 peak reproduces byte-for-byte across runs. Remaining spare at the
-/// advertised context is 157 MiB of the 24 299 MiB guard budget (~0.6%) — thin, which is the
-/// argument for B8 rather than for a bigger constant.
-///
-/// Cost: gemma-4-31B's default context goes 19 973 -> 15 872 (against 1024 before this slice, so
-/// the win is 15.5x rather than 19.5x) and it stays FULLY RESIDENT, which is the property worth
-/// 10x on decode. gemma-3-12b keeps its window — still f16 @131072 with no auto-quant, because
-/// the shared chunk ladder absorbs the wider reserve: at that context both the fit math and
-/// placement settle on the 256-row rung (measured, `infr bench -p 131056`: 760 t/s prefill,
-/// peaking 17 255 MiB).
-///
-/// **DELETE THIS when the reserve becomes path-aware (backlog B8).** It stands in for that work;
-/// it is not an input to it, and a path-aware estimate must replace it rather than be stacked on
-/// top of it.
-const ACT_RESERVE_MARGIN: (u64, u64) = (3, 2);
+/// 1.5 is the first rung above the worst of them (the MTP 4B at 1.42x). The hybrid archs are what
+/// set it: their DeltaNet mixer and double-width q projection are named terms now, and the residue
+/// is still the largest — which is the argument for deriving these bytes from the graph the runner
+/// already builds rather than re-deriving them here (backlog B8).
+const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
@@ -405,7 +409,13 @@ const ACT_RESERVE_MARGIN: (u64, u64) = (3, 2);
 /// today's behaviour bit-for-bit (R1).
 pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     ec.device.ubatch.filter(|&v| v > 0).unwrap_or_else(|| {
-        with_placement_pins(|p| p.ubatch.get().copied()).unwrap_or_else(default_ubatch_rows)
+        with_placement_pins(
+            |p| match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None, // nothing pinned
+                rows => Some(rows),
+            },
+        )
+        .unwrap_or_else(default_ubatch_rows)
     })
 }
 
@@ -501,10 +511,21 @@ pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
 /// A's pinned chunk height / q8 decision — which may not fit B's VRAM. They now live PER SESSION
 /// (owned by `DenseVulkanSession`, entered via [`PlacementScope`] around each placement + generate),
 /// so each model's ladder decision is isolated.
+/// The chunk height has ONE exception to "set once, then stable": the runner's post-load
+/// re-clamp ([`reclamp_ctx_to_live_room`]) may LOWER it, because the sweep that pinned it decided
+/// against an estimate of the weight bytes and the re-clamp knows the real ones. It still runs
+/// before the first KV allocation, so everything that reads the height — the prefill loop, the
+/// activation reserve, the SWA ring sizing — still sees one value for the session's whole life.
+/// `0` = unpinned (see [`repin_ubatch`]).
 #[derive(Default)]
 pub(crate) struct PlacementPins {
-    ubatch: std::sync::OnceLock<usize>,
+    ubatch: std::sync::atomic::AtomicUsize,
     kv_q8: std::sync::OnceLock<()>,
+    /// Has this session already reported an activation peak above what it reserved (the runner's
+    /// `activation reserve too low` warning)? The condition persists for the session's whole life —
+    /// the peak is a high-water mark and the reserve is fixed — so without a latch a server would
+    /// repeat the same line on every request for as long as it runs.
+    act_over_reserve_reported: std::sync::atomic::AtomicBool,
 }
 
 thread_local! {
@@ -553,11 +574,41 @@ impl Drop for PlacementScope {
     }
 }
 
-/// Pin the placement prefill chunk (rows) for the current session scope. Idempotent (OnceLock).
+/// Pin the placement prefill chunk (rows) for the current session scope, if nothing pinned one
+/// yet — the placement sweeps' spelling, which keeps the first decision (a racing second sweep
+/// must not move a height an earlier one already priced buffers against).
 fn pin_ubatch(rows: usize) {
     with_placement_pins(|p| {
-        let _ = p.ubatch.set(rows);
+        let _ = p.ubatch.compare_exchange(
+            0,
+            rows,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     });
+}
+
+/// LOWER the pinned prefill chunk, overriding whatever the placement sweeps pinned — the runner's
+/// post-load re-clamp only. A shorter chunk shrinks both the activation reserve and the SWA ring,
+/// so it buys context; the sweeps chose their height against an ESTIMATE of the weight bytes,
+/// and by here the real ones are known. Refuses to RAISE a height (that could outgrow buffers a
+/// pre-load decision already sized, and on an integrated GPU it is the watchdog bound).
+fn repin_ubatch_lower(rows: usize) {
+    with_placement_pins(|p| {
+        let cur = p.ubatch.load(std::sync::atomic::Ordering::Relaxed);
+        if cur == 0 || rows < cur {
+            p.ubatch.store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Claim the one-shot "activation reserve too low" report for the current session scope: `true`
+/// exactly once, for the first caller that finds the peak above the reserve.
+pub(crate) fn claim_act_over_reserve_report() -> bool {
+    with_placement_pins(|p| {
+        !p.act_over_reserve_reported
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// Whether the placement ladder pinned auto-q8 KV for the current session scope (see
@@ -876,28 +927,56 @@ pub(crate) fn kv_fit_ctx_for(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
+    // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
+    // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
+    // MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are budgeted by
+    // `moe_expert_budget`, not by the dense activation reserve.
+    let moe_reserve = cfg
+        .moe
+        .is_some()
+        .then(|| (vram.total / 12).max(1024 * 1024 * 1024));
+    kv_fit_ctx_in_budget(
+        cfg,
+        ec,
+        vram.alloc_room().saturating_sub(weights),
+        moe_reserve,
+        &ubatch_candidates(ec),
+        k_fmt,
+        v_fmt,
+    )
+}
+
+/// The search half of [`kv_fit_ctx_for`], against a budget that is ALREADY net of the weights:
+/// the largest context whose KV cache plus its activation reserve fit `budget` bytes.
+///
+/// Split out because the two callers know the weight bytes with very different confidence. Before
+/// the load, [`kv_fit_ctx_for`] can only subtract an ESTIMATE of them (`weight_footprint`, which
+/// prices tensor bytes and not the arena block tails they land in). After the load, the runner
+/// asks the device what is left (`Backend::device_alloc_room`) and passes that here — a budget with
+/// the tails, the retained staging and the driver's own memory already netted out, because they
+/// have been allocated. Same arithmetic either way; only the confidence in the input differs.
+///
+/// `moe_reserve` is the MoE arm's flat headroom in place of the dense activation reserve (`None`
+/// for a dense model).
+pub(crate) fn kv_fit_ctx_in_budget(
+    cfg: &Config,
+    ec: &EngineConfig,
+    budget: u64,
+    moe_reserve: Option<u64>,
+    cands: &[usize],
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
     if (0..cfg.n_layer).all(|l| cfg.layer_n_kv(l) * cfg.layer_head_dim(l) == 0) {
         return None;
     }
     // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`) — see `placement_ring`.
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    let cands = ubatch_candidates(ec);
-    // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
-    // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
-    let room = vram.alloc_room();
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
-            if cfg.moe.is_some() {
-                // MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are
-                // budgeted by `moe_expert_budget`, not by the dense activation reserve.
-                let reserve = (vram.total / 12).max(1024 * 1024 * 1024);
-                weights
-                    .saturating_add(kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt))
-                    .saturating_add(reserve)
-                    <= room
-            } else {
-                dense_resident_need(cfg, weights, ctx, ring, ubatch, k_fmt, v_fmt) <= room
-            }
+            let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
+            let reserve = moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, ctx, ubatch));
+            kv.saturating_add(reserve) <= budget
         })
     };
     // Monotone in ctx (both terms grow with it), so double-then-bisect finds the exact boundary.
@@ -921,6 +1000,122 @@ pub(crate) fn kv_fit_ctx_for(
         }
     }
     Some(lo)
+}
+
+/// Device memory a live session commits AFTER its KV cache is allocated, which therefore has to be
+/// held back from [`reclamp_ctx_to_live_room`]'s budget: the compute pipelines, descriptor pools
+/// and command buffers the driver builds while recording the first forwards. It is the driver's
+/// own memory, so no `Backend` allocation accounts for it and only the live budget query sees it —
+/// which is why it is a term here rather than a footprint somewhere.
+///
+/// Sized by measurement (7900 XTX, RADV): the gap between the driver's reported used bytes and
+/// this backend's own tally grows from 187 MiB right after the weight load to 368 MiB at the peak
+/// of a deep gemma-4-31B prefill — 181 MiB of pipeline/descriptor memory built during the run,
+/// with the idle desktop's 43 MiB present in both figures and cancelling out. Rounded up to 256
+/// MiB: the term protects the LAST thing to allocate, and under-reserving it lands as the
+/// mid-prefill failure this whole path exists to prevent.
+///
+/// Deliberately NOT the same money as `infr_vulkan`'s `GUARD_HEADROOM`. That headroom is the
+/// allocator's own cushion below the free figure (alignment, block rounding); spending it on
+/// pipelines is what left the guard nothing to cushion with and turned a 2 MiB overshoot into a
+/// failed request.
+pub(crate) const POST_KV_DEVICE_RESERVE: u64 = 256 * 1024 * 1024;
+
+/// Re-decide the session's context against what the device says is LEFT, now that the weights are
+/// resident — the runner's cold init calls this between the weight upload and the KV allocation.
+///
+/// **Why this exists at all.** Every pre-load estimate of "will this fit?" has to model the weight
+/// bytes, and the model is wrong in a direction that hurts: `weight_footprint` sums tensor bytes,
+/// while the resident-BDA arena commits those tensors into ≥64 MiB blocks whose tails nobody
+/// counts (measured: **+2.20%** on gemma-4-31B UD-Q5_K_XL = 481 MiB, +2.43% on gemma-3-12b,
+/// +1.16% on Qwen3-14B Q4_K_M), and neither the retained upload staging nor the driver's own
+/// memory appears in any footprint. At THIS point none of that has to be modelled: the weights,
+/// the tails, the staging and the driver's memory so far are all allocated, so the live budget
+/// query prices them exactly. What remains predicted is the activation reserve
+/// ([`dense_act_reserve_at`]) and [`POST_KV_DEVICE_RESERVE`].
+///
+/// **Only ever shrinks**, and only a context the SESSION chose. A user-pinned `--ctx`/`INFR_CTX`
+/// is documented as taken verbatim (never clamped), so it is warned about and honored — the
+/// alloc-time VRAM guard stays its backstop. Returns `want_ctx` unchanged on a backend with no
+/// budget to report (`Backend::device_alloc_room` → `None`: CPU, Metal today).
+///
+/// May also LOWER the pinned prefill chunk ([`repin_ubatch_lower`]) when a shorter one serves more
+/// context — the same trade the pre-load sweep makes, retaken with the weight bytes known.
+pub(crate) fn reclamp_ctx_to_live_room(
+    be: &dyn Backend,
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> usize {
+    let Some(room) = be.device_alloc_room() else {
+        return want_ctx;
+    };
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
+    // Walk the chunk ladder HERE too, and price each rung on its own: a shorter chunk shrinks both
+    // the activation reserve and the SWA ring, so it buys context, and the rung the pre-load sweep
+    // pinned was chosen against weight bytes that turned out to be ~2% light. Pricing only the
+    // pinned rung leaves that context on the floor (measured on gemma-4-31B: 10 440 tokens at the
+    // pinned 256-row chunk against 15 440 at 128). Tallest-first, so a rung is only lowered when
+    // the taller one genuinely cannot serve the window.
+    let cands = ubatch_candidates(ec);
+    // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
+    // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
+    // is what an MoE forward's activations actually need beside them.
+    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt);
+    let Some(_) = at(cands[0]) else {
+        return want_ctx; // pure recurrent-state arch: no per-token KV to size.
+    };
+    // The tallest rung that serves the whole window, else the rung that serves the most of it.
+    let (chunk, fit) = cands
+        .iter()
+        .map(|&ub| (ub, at(ub).unwrap_or(0)))
+        .find(|&(_, fit)| fit >= want_ctx)
+        .unwrap_or_else(|| {
+            cands
+                .iter()
+                .map(|&ub| (ub, at(ub).unwrap_or(0)))
+                .max_by_key(|&(ub, fit)| (fit, ub))
+                .expect("ubatch_candidates is never empty")
+        });
+    // Lower the pinned height BEFORE the KV buffers below are sized: the ring is `window + chunk`
+    // rows, and the reserve this fit was priced with is that height's.
+    if chunk < ubatch_rows(ec) {
+        repin_ubatch_lower(chunk);
+    }
+    if fit >= want_ctx {
+        return want_ctx;
+    }
+    if ec.device.ctx.is_some() {
+        tracing::warn!(
+            requested_ctx = want_ctx,
+            fits_ctx = fit,
+            "ctx: only {fit} tokens fit the {:.2} GiB the device reports free after the weights, \
+             but the context was set explicitly — honoring it. The allocation guard will fail \
+             this session if it really does not fit; lower INFR_CTX/--ctx to pick a window that \
+             does.",
+            gib(room),
+        );
+        return want_ctx;
+    }
+    let ubatch = ubatch_rows(ec);
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    tracing::warn!(
+        requested_ctx = want_ctx,
+        fits_ctx = fit,
+        "ctx clamp (measured): {want_ctx} -> {fit} tokens against the {:.2} GiB the device reports \
+         free after the weights are resident (KV {:.2} GiB + activation reserve {:.2} GiB at a \
+         {ubatch}-row chunk, minus {:.2} GiB held for the driver's own later allocations) — the \
+         pre-load estimate does not price the weight arena's block tails or the driver's own \
+         memory; set INFR_CTX to override",
+        gib(room),
+        gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)),
+        gib(dense_act_reserve_at(cfg, fit, ubatch)),
+        gib(POST_KV_DEVICE_RESERVE),
+    );
+    fit
 }
 
 /// One resident-BDA / streamed-arena addressing unit's ELEMENT-count cap (the invariant's element
@@ -3006,10 +3201,10 @@ mod seam_helper_tests {
     /// the sweep would have shrunk to it anyway. Pricing only the default chunk decided the KV
     /// format against an assumption the very next step abandoned.
     ///
-    /// Deliberately does not name the winning rung. Which one it is moves with
-    /// `ACT_RESERVE_MARGIN` (512 unmargined, 256 at the 1.5 shipped today) and that is not what
-    /// this is guarding — the invariant is "the default chunk misses, a lower rung on the SHARED
-    /// ladder saves it, and f16 therefore reaches the trained window".
+    /// Deliberately does not name the winning rung. Which one it is moves with the reserve's own
+    /// coefficients and that is not what this is guarding — the invariant is "the default chunk
+    /// misses, a lower rung on the SHARED ladder saves it, and f16 therefore reaches the trained
+    /// window".
     ///
     /// (Whole-run confirmation is `infr bench -d 120000` on the real model, which peaks at
     /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
@@ -3026,14 +3221,14 @@ mod seam_helper_tests {
         };
         let cands = super::ubatch_candidates(&ec);
         assert_eq!(cands[0], 1024, "the default chunk leads the ladder");
+        // With the measured reserve this model now fits at the DEFAULT chunk — it no longer needs
+        // a shorter rung to reach its trained window, which is a strictly better outcome than the
+        // one this test was written for (and matches the device: `infr bench -p 131056` runs at
+        // ubatch 1024, 780 t/s, peaking 4735 MiB of activations against a 7146 MiB reserve).
+        // What still has to hold is that SOME rung of the shared ladder serves it.
         assert!(
-            need(1024) > XTX_ROOM,
-            "the default chunk really does not fit — otherwise this test proves nothing"
-        );
-        let rescued_by = cands.iter().copied().find(|&ub| need(ub) <= XTX_ROOM);
-        assert!(
-            rescued_by.is_some_and(|ub| ub < 1024),
-            "…but a SHORTER rung of the shared ladder must: {:?}",
+            cands.iter().any(|&ub| need(ub) <= XTX_ROOM),
+            "a rung of the shared ladder must serve the trained window: {:?}",
             cands.iter().map(|&ub| (ub, need(ub))).collect::<Vec<_>>()
         );
 
@@ -3052,16 +3247,16 @@ mod seam_helper_tests {
         );
     }
 
-    /// The interim activation-reserve margin (`ACT_RESERVE_MARGIN`) is REALLY in the number, and
-    /// the formula around it is the one documented on `dense_act_reserve_at`. Spelled out term by
-    /// term for gemma-4-31B's shape at a 128-row chunk and ctx 16384, so deleting the margin — or
-    /// quietly changing a coefficient — fails here rather than showing up as a `VRAM budget
-    /// exceeded` on someone's deep prefill.
+    /// The reserve is the model documented on `dense_act_reserve_at`, term by term, at
+    /// gemma-4-31B's shape and a 128-row chunk — so changing a coefficient, or dropping the pad,
+    /// fails HERE rather than as a `VRAM budget exceeded` on someone's deep prefill.
     ///
-    /// When backlog B8 lands (a path-aware reserve), this test goes with the margin. It is not a
-    /// floor to build on.
+    /// The two numbers this pins that a reader is most likely to "simplify": the score tile is ONE
+    /// live pool (`2 * n_head * ctx_pad`), not two, and there is no fixed byte term — the
+    /// non-activation slop a 256 MiB constant used to stand in for is measured by
+    /// `reclamp_ctx_to_live_room` instead of estimated twice.
     #[test]
-    fn act_reserve_carries_the_interim_margin() {
+    fn act_reserve_is_the_measured_model() {
         let cfg = Config {
             n_head: 32,
             head_dim: 512,
@@ -3075,26 +3270,19 @@ mod seam_helper_tests {
         let (ctx, ubatch) = (16384usize, 128usize);
         let rows: u64 = 128; // already a multiple of 64
         let attn_pv: u64 = 32 * 32 * 768; // n_head x (head_dim + head_dim_swa), both shapes live
-        let attn_s: u64 = 4 * 32 * 16384; // non-flash score tiles: hd 512 misses the flash tier
+        let attn_s: u64 = 2 * 32 * 16384; // ONE non-flash score tile: hd 512 misses the flash tier
         let per_row = 12 * 21504 + 96 * 5376 + attn_pv + attn_s;
-        let unmargined = 256 * 1024 * 1024 + rows * per_row * 5 / 4;
-        assert_eq!(unmargined, 853_671_936);
-
+        let unpadded = rows * per_row;
         let got = super::dense_act_reserve_at(&cfg, ctx, ubatch);
         assert_eq!(
             got,
-            unmargined * super::ACT_RESERVE_MARGIN.0 / super::ACT_RESERVE_MARGIN.1,
-            "reserve must be the model TIMES the interim margin"
+            unpadded * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1,
+            "reserve must be the per-row model times the pad"
         );
-        assert!(
-            got > unmargined,
-            "the margin must actually widen the reserve — {got} vs {unmargined}"
-        );
-        assert_eq!(
-            got, 1_280_507_904,
-            "1.5x, the measured value that lets \
-             gemma-4-31B fill the context it advertises"
-        );
+        assert_eq!(got, 500_957_184);
+        // No fixed term: halving the rows must halve the reserve, which a constant would floor.
+        let half = super::dense_act_reserve_at(&cfg, ctx, 64);
+        assert_eq!(half * 2, got, "the reserve is purely per-row");
     }
 
     /// The ladder is ONE list. Both readers — `vulkan_moe_binder`'s residency / auto-q8 /
@@ -3219,15 +3407,30 @@ mod seam_helper_tests {
         };
         let expect_rung = |ctx: usize| cands.iter().copied().find(|&ub| need(ctx, ub) <= XTX_ROOM);
 
-        // The reported shape: the trained window, where the two disagreed.
+        // A shape where the ladder is genuinely WALKED — otherwise "they agree" would be satisfied
+        // by both picking the default rung and the guard would prove nothing. Derived, not
+        // hardcoded: the heaviest weights that still fit at the 512-row rung, which by construction
+        // cannot fit at 1024. (The reported gemma-3-12b @131072 case no longer needs a shorter rung
+        // at all — the measured reserve is small enough that the default chunk holds it — so the
+        // agreement is checked here and the trained-window outcome in
+        // `kv_fit_walks_the_placement_chunk_ladder_gemma3_12b`.)
         let want = cfg.n_ctx_train;
+        let heavy = XTX_ROOM
+            - super::kv_bytes_estimate_fmt(&cfg, want, true, 512, k, v)
+            - super::dense_act_reserve_at(&cfg, want, 512);
+        let need_heavy = |ub: usize| {
+            heavy
+                + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, k, v)
+                + super::dense_act_reserve_at(&cfg, want, ub)
+        };
+        assert!(need_heavy(1024) > XTX_ROOM, "the default chunk must miss");
         assert!(
-            expect_rung(want).is_some_and(|ub| ub < cands[0]),
-            "the default chunk must miss and a shorter rung save it — otherwise this proves nothing"
+            need_heavy(512) <= XTX_ROOM,
+            "…and the 512-row rung must save it"
         );
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, want, k, v),
-            expect_rung(want),
+            super::dense_resident_rung(&cfg, &ec, heavy, &vram, want, k, v),
+            Some(512),
             "placement must settle on the rung the fit math priced"
         );
 
@@ -3297,6 +3500,109 @@ mod seam_helper_tests {
         .is_none());
     }
 
+    /// A `Backend` that reports nothing but a live allocation budget — enough to drive
+    /// [`super::reclamp_ctx_to_live_room`], which touches no other method. `room: None` stands in
+    /// for the CPU/Metal backends, which have no budget to report.
+    struct RoomOnly(Option<u64>);
+
+    impl infr_core::backend::Backend for RoomOnly {
+        fn name(&self) -> &str {
+            "room-only"
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            infr_core::backend::Capabilities::default()
+        }
+        fn alloc(
+            &self,
+            _bytes: usize,
+            _usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::Result<Box<dyn infr_core::backend::Buffer>> {
+            unreachable!("the re-clamp allocates nothing")
+        }
+        fn upload(
+            &self,
+            _dst: &dyn infr_core::backend::Buffer,
+            _src: &[u8],
+        ) -> infr_core::Result<()> {
+            unreachable!("the re-clamp uploads nothing")
+        }
+        fn download(
+            &self,
+            _src: &dyn infr_core::backend::Buffer,
+            _dst: &mut [u8],
+        ) -> infr_core::Result<()> {
+            unreachable!("the re-clamp downloads nothing")
+        }
+        fn compile(
+            &self,
+            _graph: &infr_core::graph::Graph,
+        ) -> infr_core::Result<Box<dyn infr_core::backend::Plan>> {
+            unreachable!("the re-clamp compiles nothing")
+        }
+        fn execute(
+            &self,
+            _plan: &dyn infr_core::backend::Plan,
+            _bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::Result<()> {
+            unreachable!("the re-clamp executes nothing")
+        }
+        fn sync(&self) -> infr_core::Result<()> {
+            Ok(())
+        }
+        fn device_alloc_room(&self) -> Option<u64> {
+            self.0
+        }
+    }
+
+    /// The post-load re-clamp only ever SHRINKS, and only a context the session chose. Each arm is
+    /// a decision someone could quietly invert: a backend that cannot report a budget must leave
+    /// the window alone (CPU/Metal), a roomy device must not touch it, a tight one must cut it to
+    /// something that fits its OWN measured budget, and a user-pinned `--ctx` is documented as
+    /// verbatim — the alloc-time guard is its backstop, not this.
+    #[test]
+    fn reclamp_only_shrinks_and_never_a_pinned_ctx() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        let (k, v) = (DType::F16, DType::F16);
+        let want = 32768;
+        let call = |be: &dyn infr_core::backend::Backend, ec: &EngineConfig| {
+            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v)
+        };
+
+        // No budget to report: the caller's window survives untouched.
+        assert_eq!(call(&RoomOnly(None), &ec), want);
+
+        // Roomy: the fit is past `want`, so the window is kept rather than raised.
+        let roomy = super::kv_bytes_estimate_fmt(&cfg, want, true, 1024, k, v)
+            + super::dense_act_reserve_at(&cfg, want, 1024)
+            + super::POST_KV_DEVICE_RESERVE
+            + (1 << 30);
+        assert_eq!(call(&RoomOnly(Some(roomy)), &ec), want);
+
+        // Tight: cut, and cut to a window that really fits the budget it was given.
+        let tight = roomy / 3;
+        let got = call(&RoomOnly(Some(tight)), &ec);
+        assert!(got < want, "a tight device must shrink the window: {got}");
+        let ub = super::ubatch_rows(&ec);
+        let need = super::kv_bytes_estimate_fmt(&cfg, got, true, ub, k, v)
+            + super::dense_act_reserve_at(&cfg, got, ub);
+        assert!(
+            need <= tight - super::POST_KV_DEVICE_RESERVE,
+            "the clamped window must fit the measured budget: {need} > {tight}"
+        );
+
+        // Pinned by the user: honored verbatim, however tight the device is.
+        let pinned = EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ctx: Some(infr_core::SizeSpec::Bytes(want as u64)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(call(&RoomOnly(Some(tight)), &pinned), want);
+    }
+
     #[test]
     fn placement_pins_are_per_scope_not_process_global() {
         // The multi-model fix: two independent sessions' pins are isolated. Session A pins a chunk
@@ -3310,14 +3616,14 @@ mod seam_helper_tests {
             super::pin_ubatch(512);
             super::pin_kv_auto_q8();
             assert!(super::kv_auto_q8(), "A's scope sees its own q8 pin");
-            assert_eq!(a.ubatch.get().copied(), Some(512));
+            assert_eq!(a.ubatch.load(std::sync::atomic::Ordering::Relaxed), 512);
         }
         {
             let _sb = PlacementScope::enter(b.clone());
             assert!(!super::kv_auto_q8(), "B must NOT inherit A's q8 pin");
             assert_eq!(
-                b.ubatch.get().copied(),
-                None,
+                b.ubatch.load(std::sync::atomic::Ordering::Relaxed),
+                0,
                 "B must NOT inherit A's chunk"
             );
         }

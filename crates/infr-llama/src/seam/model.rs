@@ -747,6 +747,13 @@ impl SeamModel {
             constraint,
             req,
         )?;
+        // The cold init may have re-clamped the window against the memory the device reported free
+        // once the weights were resident (`crate::seam::reclamp_ctx_to_live_room`), so the slot's
+        // KV cache — not this field's opening value — is the authority. Refresh it, or every later
+        // turn would cap `max_new` against a window that was never allocated.
+        if let Some(kv) = session.pool.slots[slot].as_ref() {
+            session.max_ctx = kv.max_ctx();
+        }
         Ok(stats)
     }
 

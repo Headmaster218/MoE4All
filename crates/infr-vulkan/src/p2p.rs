@@ -252,6 +252,7 @@ impl VulkanBackend {
                 location: MemoryLocation::GpuOnly,
                 sub_offset: 0,
                 own_addr: None,
+                act_bytes: 0,
             },
             fd,
             mem_size: req.size,
@@ -396,6 +397,7 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr: None,
+            act_bytes: 0,
         }))
     }
 }

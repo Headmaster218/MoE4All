@@ -180,6 +180,10 @@ pub(crate) struct SeamKv {
     pub(super) pos_buf: Box<dyn Buffer>,
     pub(super) ipl_buf: Option<Box<dyn Buffer>>,
     pub(super) logits_buf: Box<dyn Buffer>,
+    /// The context this slot's KV cache was ACTUALLY allocated for. Usually the `want_ctx` the
+    /// caller asked for; smaller when the cold init's live-room re-clamp shrank it (see
+    /// `crate::seam::reclamp_ctx_to_live_room`), which is why callers holding a `want_ctx` of
+    /// their own read it back from here ([`SeamKv::max_ctx`]) once the first generation returns.
     pub(super) max_ctx: usize,
     /// Whether this session's SWA layers were allocated as window-sized RINGS (see
     /// `crate::seam::kv_rows`): fork must size its buffers identically, and seed must respect
@@ -249,6 +253,15 @@ pub(crate) struct SeamWeights {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
+    /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
+    /// because the cold init may have re-clamped the caller's `want_ctx` against the device's live
+    /// free memory (`crate::seam::reclamp_ctx_to_live_room`). A caller that keeps its own copy
+    /// (`DenseVulkanSession::max_ctx`, `ParallelSeam::max_ctx`) refreshes it from here after the
+    /// first generation, so what it advertises is what was allocated.
+    pub(crate) fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
     /// Longest common prefix of this slot's materialized tokens and `prompt` — the slot-selection
     /// score for multi-conversation serve.
     pub(crate) fn prefix_score(&self, prompt: &[u32]) -> usize {

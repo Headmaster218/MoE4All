@@ -877,6 +877,13 @@ pub(crate) fn generate_dense_backend(
             wspecs.push((DType::F32, c.head_dim));
         }
 
+        // ── re-decide the context against what the device says is LEFT ───────────────────────
+        // Every weight this session will hold is resident by now — including the arena block tails
+        // and the driver's own memory that no pre-load footprint prices — so the budget query here
+        // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
+        // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
+        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt);
+
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
         // qwen35 DeltaNet layers have NO KV cache: `kbufs[l]`/`vbufs[l]` instead hold that layer's
@@ -4359,6 +4366,40 @@ pub(crate) fn generate_dense_backend(
     // grammar-forced tokens queued past the frontier that a break left un-fed. On every run where
     // the old `prompt ++ out[..out.len()-1]` was already correct this is byte-identical to it.
     *cached = resident_after_gen(&cur, last_written);
+    // The activation reserve is a PREDICTION, and this is the one place the predicted quantity can
+    // be compared with what happened: the backend's high-water mark of concurrently-live
+    // activation bytes. Nothing else in the tree observes it, so without this a reserve wrong by a
+    // factor stays invisible until it fails an allocation on some other model. Reported at WARN
+    // because an over-run means every context this model advertises was sized against a number
+    // that does not hold.
+    if let Some(peak) = be.activation_peak() {
+        let rows = crate::seam::ubatch_rows(ec);
+        let reserved = crate::seam::dense_act_reserve_at(c, max_ctx, rows);
+        // RUST_LOG=debug turns this into the measurement the reserve is re-fit against; the WARN
+        // below is what a user sees when the prediction was wrong in the direction that hurts.
+        tracing::debug!(
+            activation_peak = peak,
+            reserved,
+            prefill_chunk = rows,
+            ctx = max_ctx,
+            "activations peaked at {:.0} MiB against a {:.0} MiB reserve",
+            peak as f64 / (1u64 << 20) as f64,
+            reserved as f64 / (1u64 << 20) as f64,
+        );
+        if peak > reserved && crate::seam::claim_act_over_reserve_report() {
+            tracing::warn!(
+                activation_peak = peak,
+                reserved,
+                prefill_chunk = rows,
+                ctx = max_ctx,
+                "activation reserve too low: {:.0} MiB of activations were live at once against a \
+                 {:.0} MiB reserve — every context sized with this reserve is optimistic by the \
+                 difference (see `dense_act_reserve_at`)",
+                peak as f64 / (1u64 << 20) as f64,
+                reserved as f64 / (1u64 << 20) as f64,
+            );
+        }
+    }
     let stats = GenStats {
         // The tokens actually PREFILLED this call (the un-cached suffix) — the TTFT-honest count.
         n_prompt: prompt.len() - start,

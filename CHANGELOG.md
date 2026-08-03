@@ -15,6 +15,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `serve` at the start of each request. New `infr_gguf::watch::WeightWatch`,
   re-exported as `infr_llama::WeightWatch`.
 
+### Changed
+
+- The Vulkan context window is now re-decided against the memory the device
+  reports free once the weights are resident, instead of only against a pre-load
+  estimate of them. That estimate is systematically light — the weight footprint
+  prices tensor bytes while the resident-BDA arena commits them into ≥64 MiB
+  blocks (measured +2.20% on gemma-4-31B, +2.43% on gemma-3-12b, +1.16% on
+  Qwen3-14B), and no footprint has a term for the driver's own pipeline and
+  descriptor memory. Sessions whose window used to be advertised and then fail
+  mid-prefill on a `VRAM budget exceeded` now get a window they can fill. The
+  clamp logs what it measured, only ever shrinks, and leaves a context set
+  explicitly via `--ctx`/`INFR_CTX` alone.
+- The activation reserve is re-fit to measured peaks and its interim 1.5x safety
+  margin is gone, so gemma-3-12b now serves its full 131072-token f16 window at
+  the default 1024-row prefill chunk (780 t/s, was 760 at the 256-row rung it
+  used to be pushed onto). The reserve gained explicit terms for MoE expert
+  scratch and for qwen35's DeltaNet mixer, both of which it previously
+  under-counted.
+- New `Backend::device_alloc_room` and `Backend::activation_peak`, both
+  defaulting to `None` for backends that cannot report them (CPU, Metal — those
+  keep their existing behaviour unchanged). The second is a high-water mark of
+  live activation bytes that the runner compares against what it reserved,
+  warning when a generation's real peak exceeds the prediction.
+
 ### Security
 
 - Update `crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204 (invalid
