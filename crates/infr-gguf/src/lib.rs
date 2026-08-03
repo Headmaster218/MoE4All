@@ -72,6 +72,9 @@ pub struct Gguf {
     tensors: Vec<TensorInfo>,
     /// Absolute byte offset into `mmap` where tensor data begins.
     data_region_start: usize,
+    /// The path this was opened from, for a reader that wants the FILE rather than this mapping —
+    /// see [`Gguf::path`].
+    path: std::path::PathBuf,
 }
 
 /// An owning, ref-counted view of a tensor's bytes in the mmap'd file — a zero-copy `[u8]` slice that
@@ -601,6 +604,7 @@ impl Gguf {
             metadata,
             tensors,
             data_region_start,
+            path: path.to_path_buf(),
         })
     }
 
@@ -614,6 +618,27 @@ impl Gguf {
             off,
             len,
         })
+    }
+
+    /// One tensor's byte range in the FILE — the same `(absolute_offset, len)` the mapping uses,
+    /// for a reader that opens the file itself instead of going through this mapping.
+    ///
+    /// That is the weight pager's disk tier (`infr_core::blockio`): it reads at explicit offsets so
+    /// residency is its own decision rather than the page cache's. Bounds-checked identically to
+    /// every mapped read, so a descriptor built from this can never name bytes outside the file.
+    pub fn tensor_file_range(&self, name: &str) -> Result<(u64, usize)> {
+        let (off, len) = self.resolve(name)?;
+        Ok((off as u64, len))
+    }
+
+    /// The file this was opened from — what a second reader (the pager's disk tier) opens.
+    ///
+    /// A path, not a descriptor, and that is a real difference: re-opening it can land on a
+    /// DIFFERENT inode if the model was replaced meanwhile. `infr_core::blockio::FileBlockIo`
+    /// stamps whatever it opens and re-checks that, so a mid-run replacement is caught rather than
+    /// silently read (the same guarantee, and the same blind spot, as `watch::WeightWatch`).
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// Look up a tensor by name and return its `(absolute_offset, len)` in the mmap,
@@ -807,6 +832,36 @@ mod tests {
             data, expected,
             "mmap read must be byte-for-byte with the source"
         );
+    }
+
+    /// The pager's disk tier reads a tensor by `(offset, len)` taken from
+    /// [`Gguf::tensor_file_range`] and opens [`Gguf::path`] itself. Both halves must land on
+    /// exactly the bytes the MAPPING serves — an off-by-one against `data_region_start` here is
+    /// weights shifted by a few bytes, which decodes to plausible garbage rather than failing.
+    #[test]
+    fn the_file_range_reads_what_the_mapping_reads() {
+        use std::io::{Read, Seek};
+        let bytes = build_fixture();
+        let tmp = write_temp_gguf(&bytes);
+        let gguf = Gguf::open(tmp.path()).expect("open fixture");
+
+        let mapped = gguf.tensor_bytes("tensor0").expect("tensor_bytes").to_vec();
+        let (off, len) = gguf
+            .tensor_file_range("tensor0")
+            .expect("tensor_file_range");
+        assert_eq!(len, mapped.len());
+
+        let mut f = std::fs::File::open(gguf.path()).expect("re-open by path");
+        let mut from_file = vec![0u8; len];
+        f.seek(std::io::SeekFrom::Start(off)).expect("seek");
+        f.read_exact(&mut from_file).expect("read");
+        assert_eq!(
+            from_file, mapped,
+            "a file read at the reported range must match the mapping"
+        );
+
+        // A name the file does not carry is an error, not a range into nothing.
+        assert!(gguf.tensor_file_range("nope").is_err());
     }
 
     // ── malformed / truncated header hardening ────────────────────────────────
