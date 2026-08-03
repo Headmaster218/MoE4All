@@ -425,23 +425,30 @@ shipped to the user. `INFR_CACHE` (`paging.cache`) keeps its current meaning
 and its table in `docs/perf/results.md`; headline in §1.1. The bar every later
 phase is judged against, re-run with the same harness.
 
-**Phase 1 — core, no backend wired.** `blockio.rs`, `hostpager.rs`, pins in
-`Pager`, `TierPlan`, the `infr-gguf` path/offset accessor, and the address-keyed
-cache audit from §3.4. Verification: unit tests over the fake `BlockIo` —
-content correctness after churn (known per-block patterns read back through the
-same path kernels use, which a wrong slot or torn multi-extent read fails), a
-pinned block never evicted, arena bounded by `n_slots`, exhaustion surfacing
-rather than corrupting, short reads and I/O errors propagating, and the per-pass
-file-change check firing. Each assertion checked by breaking what it guards
-first. Miri over the arena's unsafe.
+**Phase 1 — core, no backend wired. DONE.** `blockio.rs` (`BlockDesc`,
+`FileBlockIo`, the file-replaced stamp), `hostpager.rs` (arena, `Pin`, the
+`Loading`/`Ready` handshake), pins in `Pager`, `Gguf::tensor_file_range` /
+`Gguf::path`, and the address-keyed cache fix from §3.4 (`CpuBuffer::uid`).
+Verified by unit tests over a fake `BlockIo` — content correct after churn, a
+pinned block never evicted, exhaustion surfacing rather than corrupting, failed
+reads leaving nothing resident, extent order deciding the layout, the
+file-change check firing — each shown to fail by breaking what it guards. The
+arena's unsafe is clean under Miri (tree-borrows), now a weekly cron step.
+
+Deferred out of this phase, deliberately: **`TierPlan`** (its only consumer is
+the phase-2 placement decision; a plan type with no caller is machinery shaped
+by a guess) and the **prefetch worker pool** (same reason — the pool's depth and
+thread count are meaningless until something measures them, and `HostPager::pin`
+reads synchronously in the meantime).
 
 **Phase 2 — CPU backend on the DRAM tier.** `CpuBuffer::Paged`, the pin
-pre-step, the re-keyed repack caches, the `WBytes` change with its `Deref`
-removal, dense and MoE prefetch. Verification: greedy token identity against the
-CPU reference path with the budget forced small enough to churn; hit rates
-matching the policy's predicted `(n_slots − 1) / n_blocks` per sweep; a model
-larger than the budget completing at all; and beating phase 0 on throughput
-**and** major-fault count.
+pre-step, the `WBytes` change with its `Deref` removal, `TierPlan` and the
+placement decision that calls it, then prefetch once there is something to
+measure it against. Verification: greedy token identity against the CPU
+reference path with the budget forced small enough to churn; hit rates matching
+the policy's predicted `(n_slots − 1) / n_blocks` per sweep; a model larger than
+the budget completing at all; and beating phase 0 on throughput **and**
+major-fault count.
 
 **Phase 3 — Vulkan third tier.** The source enum and the three-case stage path.
 Verification: the pager parity tests currently cover
