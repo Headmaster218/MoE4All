@@ -1,0 +1,125 @@
+name: Cron
+
+# The checks that are worth running against a repo NOBODY PUSHED TO.
+#
+# `ci.yml` answers "did this change break something" and only runs when there is
+# a change. Both jobs here answer a different question — "did the world move
+# under code that did not" — which per-PR CI structurally cannot ask:
+#
+# * `deny` re-checks a quiet tree against a freshly fetched advisory DB, so a new
+#   RustSec advisory does not wait for the next commit to be noticed. It found
+#   one the day it was written (`crossbeam-epoch` RUSTSEC-2026-0204, fixed in the
+#   same commit), which is the argument for the job.
+# * `miri` interprets the spin pool's aliasing. Too slow to gate a PR, and the
+#   defects it finds — a pointer used after its tag was invalidated — are ones
+#   that never show up as a failing test, so nothing else in the tree looks for
+#   them.
+#
+# Mirrors the sibling repos' `cron.yml` (hjkl, crcbl, hrdr, langr, tikr) in
+# schedule and shape. Jobs those have and this does not: `fuzz` (no fuzz targets
+# in this tree yet), `bench` (infr's benchmarks need a GPU and multi-GB models,
+# so they run on the workstation, not a runner), and `wasm_size` (not a target).
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Monday 06:00 UTC — same slot as the sibling repos
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cron-${{ github.workflow }}-${{ github.ref }}
+  # NOT cancel-in-progress: a manual dispatch must not kill a scheduled run
+  # partway through 45 minutes of interpretation.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Opt JS-based actions into Node 24 ahead of the GH default flip (June 2026)
+  # to surface upstream incompatibility early. Mirrors ci.yml.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  deny:
+    name: cargo-deny (fresh advisory DB)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned: `deny.toml`'s gates were written and verified against this
+      # version, and cargo-deny changes what its checks mean between minors.
+      # A prebuilt binary rather than `cargo install` — nothing here needs to
+      # compile it, and it is the difference between seconds and minutes.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.7
+      - run: cargo deny --all-features check
+
+  # Miri: the undefined-behaviour interpreter, over the one part of this tree it
+  # can actually reach.
+  #
+  # ## Why only `pool::`
+  #
+  # `infr-cpu` holds most of the workspace's unsafe, but the bulk of it is x86
+  # SIMD in `kernels.rs`, which miri cannot execute. The FFI crates are outside
+  # its reach entirely and always will be: `infr-vulkan` dlopens `libvulkan`,
+  # `infr-metal` talks to the Apple GPU, `infr-gguf` maps a file, `infr-hub`
+  # takes an `flock`.
+  #
+  # What is left is the part miri is uniquely good at and nothing else in the
+  # tree checks: `SpinPool`'s raw base pointer crossed between threads, its
+  # `set_len` over uninitialized slots, `CollectGuard`'s `drop_in_place` during
+  # unwinding, and the `Vec::from_raw_parts` rebuild. A provenance bug there was
+  # found by READING during the PR #90 review; this is what would have found it.
+  #
+  # `infr-core` was measured and left out — its suite does not finish inside ten
+  # minutes under interpretation, which would make this a timeout rather than a
+  # gate. Re-measure and add it if either gets faster.
+  #
+  # ## Why the flags
+  #
+  # `-Zmiri-tree-borrows`: under the default Stacked Borrows model this job fails
+  # inside `rayon_core`, on a retag in rayon's own thread registry reached from
+  # `SpinPool::new`'s `rayon::current_num_threads()`. That is upstream code and
+  # not something this repo can fix; Tree Borrows accepts it and still checks
+  # everything this pool does.
+  #
+  # `-Zmiri-ignore-leaks`: rayon's global pool threads are never joined, and miri
+  # treats main exiting with live threads as an error. Nothing to do with the
+  # code under test.
+  #
+  # `-Zmiri-disable-isolation`: the pool reads the clock and the environment.
+  miri:
+    name: miri (infr-cpu spin pool)
+    runs-on: ubuntu-26.04
+    # Interpretation is ~160s locally on top of a cold compile. The cap is not a
+    # target — it is so a regression in test cost fails visibly instead of
+    # quietly burning a six-hour runner.
+    timeout-minutes: 45
+    env:
+      MIRIFLAGS:
+        -Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks
+    steps:
+      - uses: actions/checkout@v7
+      # No glslc step, unlike every job in ci.yml: `infr-cpu`'s graph does not
+      # include `infr-vulkan`, so nothing here compiles a shader.
+      #
+      # No `RUSTUP_TOOLCHAIN: nightly` either, which hjkl and crcbl both set on
+      # their miri jobs — they carry a `rust-toolchain.toml` that claims authority
+      # over rustup and would otherwise refuse the channel. This repo has no such
+      # file. Add the override here if one ever lands.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: miri
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Its own cache: a miri sysroot build shares nothing with the stable
+          # artifacts ci.yml caches.
+          shared-key: miri
+      - run: cargo miri setup
+      # Quoted: a plain YAML scalar ending in `:` parses as a mapping key.
+      - run: 'cargo miri test -p infr-cpu pool::'

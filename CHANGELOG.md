@@ -15,6 +15,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `serve` at the start of each request. New `infr_gguf::watch::WeightWatch`,
   re-exported as `infr_llama::WeightWatch`.
 
+### Security
+
+- Update `crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204 (invalid
+  pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). Reached
+  through `rayon`, so it applies to every CPU-backend build.
+
 ### Fixed
 
 - Reject GGUF tensors whose encoded byte count overflows `usize` and model

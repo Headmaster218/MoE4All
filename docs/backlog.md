@@ -1078,28 +1078,73 @@ it first appeared: `FileLock` already calls `libc::flock` unconditionally, so
 `infr-hub` does not build there today and CI covers only ubuntu-26.04 and
 macos-15.
 
-### B31a — the CPU spin pool's unsafe has never been run under Miri
+### B31a — miri now runs, over a deliberately narrow slice
 
-**Tag:** PR#90 review residual · **Blocked on:** nothing; needs a nightly
-toolchain and some patience with the spin loops
+**Tag:** PR#90 review residual · **Blocked on:** nothing; recorded so the
+coverage claim stays accurate
 
-`SpinPool::collect` and `CollectGuard` in `crates/infr-cpu/src/pool.rs` carry
-the crate's densest unsafe: `set_len` on uninitialized memory, a raw base
-pointer crossed between threads via `SendPtr`, `drop_in_place` on a subset of
-slots during unwinding, and a `Vec::from_raw_parts` rebuild. The provenance bug
-found reviewing PR #90 (two `as_mut_ptr` calls, the second invalidating the
-first) was found by READING, and fixed in `7784ab3` by construction — one
-pointer now feeds both uses. Nothing checked it mechanically.
+Miri runs weekly against `SpinPool` via `.github/workflows/cron.yml`, and all
+seven `pool::` tests pass — so `collect`'s raw base pointer, its `set_len` over
+uninitialized slots, `CollectGuard`'s `drop_in_place` during unwinding and the
+`Vec::from_raw_parts` rebuild are now checked by a tool rather than argued in a
+comment. What that does NOT cover, and will not:
 
-Miri is the tool for exactly this class and the repo has never run it: not in
-CI, not in the history, not installed. Two things to expect when someone tries.
-The pool spawns real threads and spins on atomics, which Miri runs but slowly —
-the tests may need a small `n` or a preemption-rate flag. And `infr-cpu` is full
-of x86 SIMD intrinsics; Miri covers many but not all, so the crate may need a
-feature-gated or scalar-only build to get there at all.
+- **`kernels.rs`** — 168 of `infr-cpu`'s 191 `unsafe` uses are x86 SIMD, which
+  miri cannot execute. That unsafe stays unchecked by anything but review.
+- **Every FFI crate**, by construction: `infr-vulkan` dlopens `libvulkan`,
+  `infr-metal` talks to a real GPU, `infr-gguf` maps a file, `infr-hub` takes an
+  `flock`.
+- **`infr-core`** — measured and left out: its suite does not finish inside ten
+  minutes under interpretation, which would make the job a timeout rather than a
+  gate. Re-measure if either gets faster.
 
-Worth doing once, then wiring into CI only if it turns out to be cheap. Until
-then the honest statement is that this file's unsafe is argued, not verified.
+Two upstream workarounds are load-bearing and worth knowing before anyone
+"simplifies" the flags. Under default **Stacked Borrows** the job fails inside
+`rayon_core` on a retag reached from `SpinPool::new`'s
+`rayon::current_num_threads()` — upstream code, not ours — so it runs under
+`-Zmiri-tree-borrows`. And `-Zmiri-ignore-leaks` is there because rayon never
+joins its global pool threads, which miri otherwise reports as an error.
+
+### B33 — the `wildcards` gate in `deny.toml` is off, for a fixable reason
+
+**Tag:** cron slice 2026-08-04 · **Blocked on:** a decision about whether the
+workspace crates are ever published
+
+`cargo-deny`'s `wildcards = "deny"` catches a `*` version requirement on a
+registry crate — non-reproducible builds, and a semver-major landing with no
+diff. It is set to `allow` because this workspace's own members are declared
+`{ path = ... }` with no version, which cargo-deny also reads as a wildcard.
+`allow-wildcard-paths = true` is the intended escape and does not help: it
+applies only to crates marked `publish = false`, and only `infr-testkit` is.
+
+Marking the remaining members `publish = false` turns the gate back on and is
+accurate today — everything is at `0.0.0` and nothing is on crates.io. It is
+also a statement that these crates will not be published, which is a call to
+make on purpose rather than in passing, and `infr-cli` is the one where the
+answer might reasonably be "eventually". No registry wildcard exists in the tree
+right now (`grep '= "\*"' crates/*/Cargo.toml`), so what is currently missing is
+a guard against a future mistake, not cover for a present one.
+
+### B34 — no fuzz targets, and there is an obvious first one
+
+**Tag:** cron slice 2026-08-04 · **Blocked on:** nothing; scoped out of the cron
+slice that surfaced it
+
+The sibling repos' `cron.yml` runs `cargo-fuzz`; this one does not, because the
+tree has no fuzz targets. hjkl's job guards its absence with
+`if [ -d .../fuzz ]`, which is a job that reports "skipping" forever — a check
+that cannot fail — so it was left out rather than copied.
+
+`infr_chat::tools::parse_tool_calls` is the target that has already earned it.
+It parses model output, which on `infr serve` is steerable by whoever sent the
+request, and it has produced one unbounded-allocation hang in that position
+(`{a:[}]}`, fixed in `0aa0661`). `delimiter_soup_always_terminates` now covers
+every 6-byte body of container punctuation exhaustively, which is a floor rather
+than a ceiling — libFuzzer over the same entry point would reach the string,
+escape and `\u` paths that the punctuation alphabet cannot.
+
+Adding it means a `fuzz/` crate, a nightly job, and a decision about how long
+per target per week.
 
 ### B27 — hardening candidates from the 2026-08-03 review
 
