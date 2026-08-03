@@ -1,7 +1,7 @@
 //! GGUF loader — `WeightSource` impl.
 //!
-//! Parses the GGUF binary format (little-endian) into an immutable memory snapshot and
-//! walks a byte cursor through header → metadata KV pairs → tensor directory.
+//! Parses the GGUF binary format (little-endian) by mmap-ping the file and
+//! walking a byte cursor through header → metadata KV pairs → tensor directory.
 //! Quantised weight blocks are returned as-is; the backend owns dequantisation.
 //!
 //! References:
@@ -17,8 +17,8 @@ use infr_core::{
     tensor::DType,
     WeightSource,
 };
-use memmap2::{Mmap, MmapMut};
-use std::{collections::HashMap, fs::File, io::Read, path::Path, sync::Arc};
+use memmap2::Mmap;
+use std::{collections::HashMap, fs::File, path::Path, sync::Arc};
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -61,21 +61,21 @@ const MAX_META_DEPTH: usize = 64;
 
 // ─── public struct ────────────────────────────────────────────────────────────
 
-/// A parsed GGUF snapshot.
+/// A parsed, mmap-backed GGUF file.
 ///
-/// The anonymous read-only `Mmap` owns a stable copy of the file bytes for the lifetime of this
+/// The `Mmap` handle keeps the backing memory alive for the lifetime of this
 /// struct; `tensor_bytes` returns slices directly into that region.
 pub struct Gguf {
     mmap: Arc<Mmap>,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
-    /// Absolute byte offset into the snapshot where tensor data begins.
+    /// Absolute byte offset into `mmap` where tensor data begins.
     data_region_start: usize,
 }
 
-/// An owning, ref-counted view of a tensor's bytes in the immutable snapshot. It keeps the whole
-/// snapshot alive via `Arc`, so it can outlive the borrow of `&Gguf` (e.g. a CPU backend buffer that
-/// reads weights directly with no additional `memcpy`).
+/// An owning, ref-counted view of a tensor's bytes in the mmap'd file — a zero-copy `[u8]` slice that
+/// keeps the whole `Mmap` alive via `Arc`, so it can outlive the borrow of `&Gguf` (e.g. a CPU
+/// backend buffer that reads weights straight from the mapping with no `memcpy`).
 #[derive(Clone)]
 pub struct TensorBytes {
     mmap: Arc<Mmap>,
@@ -380,26 +380,53 @@ pub fn nbytes(dtype: DType, numel: usize) -> usize {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Gguf {
-    /// Open and parse a stable snapshot of a GGUF file.
+    /// Open and parse a GGUF file.
     ///
-    /// File-backed mappings cannot safely expose shared references because another handle or
-    /// process can modify or truncate the file while those references are live. Read into an
-    /// anonymous mapping first, then make it read-only, so every safe caller observes immutable
-    /// bytes after this function returns.
+    /// The file is memory-mapped; no tensor bytes are copied into RAM.
+    ///
+    /// UNENFORCED INVARIANT: nothing else may write to or truncate the file while this `Mmap` is
+    /// live. A file-backed mapping is not immutable memory — another process editing the file
+    /// mutates the bytes under the `&[u8]` slices `tensor_bytes` hands out, which is a data race
+    /// on memory Rust believes is frozen, and truncating it turns a resident page into `SIGBUS`.
+    /// The `SAFETY` note below is a claim about the environment, not a guarantee this code makes.
+    ///
+    /// TODO: hold an exclusive advisory lock on the fd for the mapping's whole lifetime — i.e.
+    /// keep the `File` in the struct, `flock(LOCK_EX | LOCK_NB)` (Windows: `LockFileEx` with
+    /// `LOCKFILE_EXCLUSIVE_LOCK`) at open, and drop it with the mapping — so a concurrent writer
+    /// is refused rather than trusted. Two things to settle before doing it: advisory locks bind
+    /// only cooperating processes (`flock` does not stop a writer that never asks for the lock,
+    /// so this narrows the window rather than closing it), and taking a lock EXCLUSIVE would stop
+    /// two `infr` processes from sharing one model, which is a normal thing to want and the
+    /// reason a shared lock is probably the right call for readers.
+    ///
+    /// Copying the file into an anonymous mapping DOES close the hole, and was tried — it is not
+    /// affordable. Measured on a 16 GiB Qwen3.6-27B with a warm page cache: warm load 1.87 s →
+    /// 10.5 s, and 14 GiB of evictable page cache became 20.2 GiB of anonymous RSS. Weights that
+    /// the kernel could previously reclaim under pressure become swap-only, so a model larger
+    /// than RAM stops being merely slow and starts being unrunnable.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let file_len = usize::try_from(file.metadata()?.len()).map_err(|_| {
-            Error::Loader(format!(
-                "GGUF: file size for {path:?} does not fit in usize"
-            ))
-        })?;
-        let mut snapshot = MmapMut::map_anon(file_len)?;
-        file.read_exact(&mut snapshot)?;
-        let mmap = snapshot.make_read_only()?;
-        // Best-effort transparent huge pages reduce dTLB pressure when CPU inference scans the
-        // anonymous multi-gigabyte snapshot. The hint is advisory and does not affect correctness.
-        #[cfg(target_os = "linux")]
-        let _ = mmap.advise(memmap2::Advice::HugePage);
+        let file = File::open(path)?;
+        // SAFETY: the file is not modified while this Mmap is live — see the invariant above.
+        let mmap = unsafe { Mmap::map(&file) }?;
+
+        // Best-effort madvise hints. All are advisory: `advise()` returns an
+        // `io::Result`, but a rejected/unsupported hint must never fail the load —
+        // weight correctness does not depend on any hint landing, so we swallow errors.
+        // NOTE: we deliberately do NOT use `Advice::Sequential`. Decode re-reads the
+        // ENTIRE model every token, so `MADV_SEQUENTIAL`'s drop-behind eviction would
+        // throw away pages we need on the very next token — wrong for this access
+        // pattern. Only `WillNeed`/`HugePage` fit.
+        #[cfg(unix)]
+        {
+            // Populate/readahead the whole mapping into the page cache now, front-loading
+            // the weight read at load instead of faulting it in lazily on the first token.
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+            // Linux only: request 2 MB transparent huge pages to cut dTLB page-walks over
+            // the multi-GB sequential weight stream. On file-backed mmaps this is frequently
+            // a no-op (THP-for-filesystem is not always enabled) — hence best-effort.
+            #[cfg(target_os = "linux")]
+            let _ = mmap.advise(memmap2::Advice::HugePage);
+        }
 
         // All parsing happens in this block so the borrow of `mmap` ends
         // before we move `mmap` into the returned struct.
@@ -576,9 +603,9 @@ impl Gguf {
         })
     }
 
-    /// Ref-counted view of a tensor's raw bytes that keeps the immutable snapshot alive. Unlike
-    /// [`WeightSource::tensor_bytes`], the result is not borrow-bound to `&self`, so a backend can
-    /// retain it as a weight buffer without another copy.
+    /// Zero-copy, ref-counted view of a tensor's raw bytes (keeps the `Mmap` alive via `Arc`). Unlike
+    /// [`WeightSource::tensor_bytes`] the result is not borrow-bound to `&self`, so a backend can hold
+    /// it as a weight buffer and read straight from the mapping — no `memcpy` into owned RAM.
     pub fn tensor_bytes_arc(&self, name: &str) -> Result<TensorBytes> {
         let (off, len) = self.resolve(name)?;
         Ok(TensorBytes {
@@ -588,7 +615,7 @@ impl Gguf {
         })
     }
 
-    /// Look up a tensor by name and return its `(absolute_offset, len)` in the snapshot,
+    /// Look up a tensor by name and return its `(absolute_offset, len)` in the mmap,
     /// bounds-checked against the file size with `checked_add` so a crafted
     /// offset/length can't overflow. Shared by [`Self::tensor_bytes_arc`] and
     /// [`WeightSource::tensor_bytes`] so the lookup + overflow-safe bounds check lives
@@ -628,9 +655,10 @@ impl WeightSource for Gguf {
         &self.tensors
     }
 
-    /// Returns a slice into the immutable tensor-data snapshot.
+    /// Returns a slice into the mmap'd data region for the named tensor.
     ///
-    /// The slice lifetime is tied to `&self` (i.e. the `Gguf` struct keeps the snapshot alive).
+    /// The slice lifetime is tied to `&self` (i.e. the `Gguf` struct keeps
+    /// the `Mmap` alive).
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         let (start, len) = self.resolve(name)?;
         Ok(&self.mmap[start..start + len])
@@ -754,20 +782,30 @@ mod tests {
         assert!(gguf.chat_template().is_none());
     }
 
-    // ── immutable snapshot ────────────────────────────────────────────────────
+    // ── madvise hints are transparent ─────────────────────────────────────────
 
+    /// The best-effort `madvise` hints applied to the weight mmap in `Gguf::open`
+    /// (`WillNeed`, and `HugePage` on Linux) must not change what the mapping reads
+    /// back. Open the fixture and assert the tensor bytes are byte-for-byte identical
+    /// to the raw tensor-data region of the source buffer — i.e. the hint is a no-op
+    /// on observable content. This is the only path that exercises the advise() calls.
+    ///
+    /// Deliberately NOT asserted here: that the mapping keeps reading the ORIGINAL bytes
+    /// after the file is rewritten. It does not, and cannot — see the unenforced invariant
+    /// on [`Gguf::open`].
     #[test]
-    fn snapshot_stays_stable_after_source_changes() {
+    fn madvise_hints_are_transparent() {
         let bytes = build_fixture();
         let tmp = write_temp_gguf(&bytes);
         let gguf = Gguf::open(tmp.path()).expect("open fixture");
 
-        // A second safe file handle can replace the source after `open`. Tensor references must
-        // continue to read the owned snapshot, never changed file-backed memory.
-        std::fs::write(tmp.path(), vec![0xFF; bytes.len()]).expect("replace source file");
+        // tensor0 is F32 [4] at data offset 0 → the last 16 bytes of the buffer.
         let expected = &bytes[bytes.len() - 16..];
         let data = gguf.tensor_bytes("tensor0").expect("tensor_bytes");
-        assert_eq!(data, expected);
+        assert_eq!(
+            data, expected,
+            "mmap read must be byte-for-byte with the source"
+        );
     }
 
     // ── malformed / truncated header hardening ────────────────────────────────

@@ -6,11 +6,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed
-
-- `Gguf::open` now snapshots files into immutable memory before exposing tensor
-  bytes, preventing later file changes from invalidating live references.
-
 ### Fixed
 
 - Reject GGUF tensors whose encoded byte count overflows `usize` and model
