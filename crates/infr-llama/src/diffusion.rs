@@ -568,6 +568,7 @@ pub fn diffusion_generate(
     max_ctx: usize,
     mut on_step: Option<&mut dyn FnMut(StepView)>,
     mut on_block: Option<&mut dyn FnMut(&[u32])>,
+    should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<DiffusionGenResult> {
     let blocks_wanted = n_predict.div_ceil(canvas_len.max(1)).max(1);
     let mut prefix: Vec<u32> = prompt_tokens.to_vec();
@@ -578,6 +579,15 @@ pub fn diffusion_generate(
     let mut decode_secs = 0f64; // every block's prefill + denoise AFTER the first prompt ingest
 
     for b in 0..blocks_wanted {
+        // Abort poll. A block is the finest granularity available here — `denoise_block` runs a
+        // whole canvas to completion — so a cancelled DG turn stops at the next block boundary
+        // rather than immediately. That is still the difference between stopping and running every
+        // remaining block: before this, a client disconnect and the request deadline both latched a
+        // flag nothing on this path ever read, and because `cmd_serve` serialises DG the next
+        // request queued behind the whole thing (backlog B21).
+        if should_stop.is_some_and(|stop| stop()) {
+            break;
+        }
         let max_length = prefix.len() + canvas_len;
         if max_length > max_ctx {
             if b == 0 {

@@ -999,41 +999,26 @@ binary runs on this box** (`undefined symbol: ggml_dsv4_hc_post`). The packaging
 fix is not ours; the shim lived in session scratch and will not survive, so the
 next sweep needs its own working oracle before it starts.
 
-### B21 — `DiffusionGemmaChat` discards `RequestCtx`: no cancellation, no per-request seed
+### B21a — the DG abort poll is wired but has never fired in a real run
 
-**Tag:** CR-2026-08-03 M3 (verified) · **Blocked on:** threading an abort poll
-and a seed through `diffusion_generate`'s block loop
+**Tag:** CR-2026-08-03 M3 residual · **Blocked on:** nothing; it is a test that
+needs a live DG serve request
 
-Both `ChatModel` entry points on `DiffusionGemmaChat`
-(`crates/infr-llama/src/chat/diffusion.rs`) take `_req` and drop it. The impl's
-own doc comment already discloses the gap; what it does not say is how far the
-gap reaches now that `infr serve` hosts DG.
+`DiffusionGemmaChat` now threads `RequestCtx` into `diffusion_generate`, which
+polls the abort latch at each BLOCK boundary, and the per-request seed is
+resolved by `resolve_seed` (unit-tested). What is not tested is the poll
+actually stopping anything: `diffusion_generate`'s loop needs a loaded
+DiffusionGemma model, so no unit test can drive it, and the wiring was verified
+by reading rather than by cancelling a real request.
 
-`cmd_serve` in `crates/infr-cli/src/main.rs` routes diffusion-gemma to the
-SERIALISED path (`is_vulkan = !is_dg && ..`) — one request at a time behind a
-Mutex. `run_chat` creates the `RequestCtx` and its `on_piece` calls
-`req.abort()` on a stop-sequence hit or a latched `cancel`. On DG none of it
-lands:
+Two things to check by hand against `infr serve` hosting a DG model: a client
+disconnect mid-generation stops at the next block instead of running every
+remaining block, and `serve.request_timeout_secs` does the same. Both latch the
+same flag, so one test covers the mechanism.
 
-- **A client disconnect does not stop the generation.** `streaming`'s failing
-  `tx.send` latches `cancel`, `run_chat` calls `req.abort()`, and
-  `diffusion_generate`'s block loop polls nothing — all `blocks_wanted` blocks
-  still run.
-- **Neither does the deadline.** `serve.request_timeout_secs` works by latching
-  that same `cancel` via `arm_deadline`. B5 says the deadline "bounds how long
-  one request can hold a `--parallel` slot"; on DG it bounds nothing, and
-  because the DG path is serialised the next request waits behind the whole
-  thing.
-- **`on_piece` fires once per finished BLOCK**, not per token, so even the poll
-  points would be coarse.
-- **The per-request seed is ignored.** `GenParams.seed` is a real accepted field
-  and `request_sampling` copies it into `RequestSampling.seed`; `generate_impl`
-  resolves `self.model.engine_cfg().sampling.seed.unwrap_or(42)` instead, so two
-  requests with different seeds produce identical output.
-
-Combined with B20 (a `max_tokens: 1` request generating a whole canvas), the
-worst case is a disconnected client leaving the single DG slot busy for
-`ceil(max_new / canvas_length)` blocks with nothing able to interrupt it.
+Also still true, and by construction: a block is the finest granularity
+available. `denoise_block` runs a whole canvas to completion, so a cancelled DG
+turn stops at a block boundary, not immediately.
 
 ### B27 — hardening candidates from the 2026-08-03 review
 

@@ -2957,6 +2957,7 @@ fn diffusion_gemma_decode_matches_oracle() {
         max_ctx,
         None,
         None,
+        None,
     )
     .expect("diffusion_generate");
     let secs = t0.elapsed().as_secs_f64();

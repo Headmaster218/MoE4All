@@ -2733,6 +2733,7 @@ fn dg_bench_run(
                         max_ctx,
                         None,
                         None,
+                        None, // benchmark: no request to abort
                     )?;
                     pps.push(p_eff as f64 / result.stats.prompt_secs.max(1e-9));
                     gens.push(result.stats.n_gen as f64 / result.stats.decode_secs.max(1e-9));

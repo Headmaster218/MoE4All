@@ -208,21 +208,21 @@ impl ChatModel for DiffusionGemmaChat {
         &mut self,
         prompt: &str,
         max_new: usize,
-        _req: Option<&crate::sampling::RequestCtx>,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        self.generate_impl(prompt, max_new, on_piece, None)
+        self.generate_impl(prompt, max_new, req, on_piece, None)
     }
 
     fn generate_with_step_hook(
         &mut self,
         prompt: &str,
         max_new: usize,
-        _req: Option<&crate::sampling::RequestCtx>,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
         on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
-        self.generate_impl(prompt, max_new, on_piece, on_step)
+        self.generate_impl(prompt, max_new, req, on_piece, on_step)
     }
 }
 
@@ -244,6 +244,7 @@ impl DiffusionGemmaChat {
         &mut self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
         on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
@@ -263,7 +264,15 @@ impl DiffusionGemmaChat {
         // reseeds its RNG from a fixed value every block, so a fixed `sampling.seed` (INFR_SEED;
         // default 42 HERE — §6.12's two-defaults knob, both kept at their own site — matching the
         // oracle's `-s 42`) makes every turn reproducible.
-        let seed: u64 = self.model.engine_cfg().sampling.seed.unwrap_or(42);
+        // The REQUEST's seed wins when it carries one. `GenParams.seed` is an accepted field that
+        // `request_sampling` copies into `RequestSampling`, but this path used to read only the
+        // process config, so two serve requests with different seeds produced identical output
+        // (backlog B21). Falling back to `INFR_SEED`, then to 42 — §6.12's two-defaults knob, kept
+        // at its own site, matching the oracle's `-s 42`.
+        let seed: u64 = resolve_seed(
+            req.and_then(|r| r.sampling().seed),
+            self.model.engine_cfg().sampling.seed,
+        );
 
         // Size the session to THIS turn's [prompt | every block's canvas] plus REPL headroom —
         // NOT n_ctx_train: DG's per-token KV is heavy (hd 256/512 across 30 layers ≈ 225 KB/tok)
@@ -300,6 +309,10 @@ impl DiffusionGemmaChat {
             );
         };
 
+        // The abort latch `run_chat` sets on a stop-sequence hit, a client disconnect, or the
+        // request deadline firing. Polled at each block boundary — see `diffusion_generate`.
+        let stop = req.map(|r| move || r.aborted());
+
         let result = crate::diffusion::diffusion_generate(
             self.sess.as_mut().unwrap(),
             &self.model,
@@ -313,8 +326,46 @@ impl DiffusionGemmaChat {
             self.max_ctx,
             on_step,
             Some(&mut on_block),
+            stop.as_ref().map(|f| f as &dyn Fn() -> bool),
         )?;
 
         Ok(result.stats)
+    }
+}
+
+/// Which RNG seed a DiffusionGemma turn runs with: the REQUEST's if it carries one, else the
+/// process config's (`INFR_SEED`), else 42.
+///
+/// Split out because the precedence is the whole of backlog B21's sampling half and the function
+/// around it cannot be tested — `generate_impl` needs a loaded DiffusionGemma model. The bug was
+/// that only the middle term was ever read, so two serve requests with different `seed` values
+/// produced identical output.
+///
+/// The 42 is §6.12's two-defaults knob kept at its own site, and matches the reference CLI's
+/// `-s 42`; DiffusionGemma reseeds per block, so a fixed seed makes a turn reproducible.
+fn resolve_seed(req_seed: Option<u64>, cfg_seed: Option<u64>) -> u64 {
+    req_seed.or(cfg_seed).unwrap_or(42)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_seed;
+
+    /// B21: a per-request seed must beat the process config, which used to be the only thing read.
+    #[test]
+    fn the_request_seed_wins_over_the_process_seed() {
+        assert_eq!(resolve_seed(Some(7), Some(99)), 7, "request wins");
+        assert_eq!(resolve_seed(Some(7), None), 7);
+        // Two requests differing only in seed must not resolve to the same value — the reported
+        // symptom was that they did.
+        assert_ne!(
+            resolve_seed(Some(7), Some(99)),
+            resolve_seed(Some(8), Some(99))
+        );
+        // No request seed: fall back to the config, then to the oracle-matching default.
+        assert_eq!(resolve_seed(None, Some(99)), 99);
+        assert_eq!(resolve_seed(None, None), 42);
+        // A request seed of 0 is a VALUE, not "unset".
+        assert_eq!(resolve_seed(Some(0), Some(99)), 0);
     }
 }
