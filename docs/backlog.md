@@ -999,39 +999,6 @@ binary runs on this box** (`undefined symbol: ggml_dsv4_hc_post`). The packaging
 fix is not ours; the shim lived in session scratch and will not survive, so the
 next sweep needs its own working oracle before it starts.
 
-### B19 — `shard_set` expands an unbounded remote shard count before any download
-
-**Tag:** CR-2026-08-03 M1 (verified) · **Blocked on:** nothing; the fix is one
-guard, and it is unfixed only because the fold-in slice was docs-only
-
-`crates/infr-hub/src/store.rs`: `parse_shard` accepts any `u32` as the
-`-of-MMMMM` total, and `shard_set` immediately materialises `(1..=total)`
-formatted filenames into a `Vec<String>`. `pull_repo_latest`
-(`crates/infr-hub/src/pull.rs`) calls `shard_set` on the filename `repo_info`
-picked out of the HuggingFace API's sibling list — BEFORE `fetch_and_link`'s
-`check_relative` and before any download — so the count is remote input and
-nothing bounds it.
-
-**Verified, not argued.** A temporary test asserted
-`parse_shard("m-Q4_K_M-0000000001-of-4294967295.gguf").unwrap().total == u32::MAX`
-(the `total_s.len() != idx_s.len()` guard is satisfied — both fields are 10
-digits), and that `shard_set("m-Q4_K_M-0001-of-1000.gguf")` returns 1000 names,
-i.e. the enumeration really is `1..=total` with no cap anywhere. The `u32::MAX`
-expansion itself was deliberately NOT run: 4.29e9 `String`s is ~100 GB and would
-take the runner with it, which is the finding.
-
-`Store::resolve_repo` calls `shard_set` too, on locally-listed snapshot
-filenames — same expansion, but there the input is a file the user already has.
-
-**The fix shape:** llama.cpp's split naming is 5 digits, so a `total` above
-99999 (equivalently `width > 5`) cannot name a real split. Reject in
-`parse_shard` rather than in `shard_set`, so both call sites are covered by one
-check.
-
-**Honest reachability:** it needs a repo the user asked for that ships a hostile
-filename — a typo-squat or a compromised repo, not a normal one. That is why it
-is filed rather than hot-fixed.
-
 ### B20 — `diffusion_generate` enforces `n_predict` per BLOCK, never per token
 
 **Tag:** CR-2026-08-03 M2 (verified) · **Blocked on:** a decision on what
