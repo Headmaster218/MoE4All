@@ -225,6 +225,52 @@ fn cpu_golden_qwen3() {
     check_golden(&model, QWEN3_GOLDEN);
 }
 
+/// Host weight paging (`paging.dram`, `infr_cpu::paged`) must not change a single token: the
+/// weights are the same bytes, read from the file instead of through the mapping.
+///
+/// The budget is deliberately far below the model — 24 MiB against ~380 MiB of Q4_K_M — so every
+/// pool churns: each generation evicts and re-reads most blocks many times, which is precisely
+/// where a wrong slot, a torn multi-extent read, or an eviction under a live pin would show up. A
+/// budget large enough to hold everything would pass no matter what the pager did.
+#[test]
+fn cpu_paged_weights_match_the_mapped_path() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let mut _tlk = test_serial_lock();
+    let prompt = "Name three primary colors.";
+
+    let mapped = cpu_gen(&model_default(&path), prompt, 24);
+    let paged = cpu_gen(
+        &model_cfg(&path, |c| {
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(24 << 20));
+        }),
+        prompt,
+        24,
+    );
+    assert_eq!(
+        paged, mapped,
+        "paged weights changed the generated text — the pager served bytes the mapping does not"
+    );
+    assert!(!mapped.trim().is_empty(), "the oracle generated nothing");
+}
+
+/// The same, with the budget below every weight class: nothing is pageable, so the binder must
+/// fall back to mapping rather than fail the load. A `paging.dram` too small to be useful has to
+/// degrade, not break.
+#[test]
+fn cpu_paging_falls_back_when_the_budget_seats_nothing() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let mut _tlk = test_serial_lock();
+    let prompt = "Name three primary colors.";
+    let tiny = cpu_gen(
+        &model_cfg(&path, |c| {
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(64 << 10));
+        }),
+        prompt,
+        16,
+    );
+    assert_eq!(tiny, cpu_gen(&model_default(&path), prompt, 16));
+}
+
 /// A BIG prompt (~1000+ tokens): large enough that the dense prefill's padded-KV attention reads the
 /// padding rows beyond the real tokens. Short prompts don't reproduce the KV-cache bug.
 fn repeat_prompt() -> String {

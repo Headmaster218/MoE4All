@@ -193,6 +193,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // ── paging ───────────────────────────────────────────────────────────────
     p.paging.cache = opt_size(get, "INFR_CACHE");
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
+    p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
 
     // ── kernels.vulkan ───────────────────────────────────────────────────────

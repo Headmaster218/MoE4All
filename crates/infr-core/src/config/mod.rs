@@ -149,6 +149,14 @@ cfg_struct! {
         ring: Option<SizeSpec> = None,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
+        /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
+        /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
+        /// leaving residency to the OS page cache.
+        ///
+        /// `None` (the default) keeps the zero-copy mmap path, which costs nothing and is right
+        /// whenever the weights fit. This budget is anonymous, non-evictable memory, so it is only
+        /// ever what the user asked for — never a fraction picked on their behalf.
+        dram: Option<SizeSpec> = None,
     }
 }
 

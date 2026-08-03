@@ -155,6 +155,7 @@ knobs! {
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
+    "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8g",  migrated;
 
     // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
     "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", migrated;

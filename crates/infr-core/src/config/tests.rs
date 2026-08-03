@@ -1309,6 +1309,11 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_TOP_P",
     ];
 
+    /// Keys added AFTER the migration campaign finished. There is no transitional half for these:
+    /// they were born reading `Config` (`docs/config-plan.md` R3), so they are `migrated` from
+    /// their first commit and this list exists only to keep the count honest.
+    const POST_MIGRATION: &[&str] = &["INFR_DRAM_CACHE"];
+
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
     got.sort_unstable();
     let mut want: Vec<&str> = S2
@@ -1320,6 +1325,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         .chain(S6)
         .chain(S7)
         .chain(S8)
+        .chain(POST_MIGRATION)
         .copied()
         .collect();
     want.sort_unstable();

@@ -441,14 +441,23 @@ by a guess) and the **prefetch worker pool** (same reason — the pool's depth a
 thread count are meaningless until something measures them, and `HostPager::pin`
 reads synchronously in the meantime).
 
-**Phase 2 — CPU backend on the DRAM tier.** `CpuBuffer::Paged`, the pin
-pre-step, the `WBytes` change with its `Deref` removal, `TierPlan` and the
-placement decision that calls it, then prefetch once there is something to
-measure it against. Verification: greedy token identity against the CPU
-reference path with the budget forced small enough to churn; hit rates matching
-the policy's predicted `(n_slots − 1) / n_blocks` per sweep; a model larger than
-the budget completing at all; and beating phase 0 on throughput **and**
-major-fault count.
+**Phase 2 — CPU backend on the DRAM tier. DONE (prefetch deferred).**
+`CpuBuffer::Paged` + `CpuRead::Pinned`, the per-op pin pre-step driven by
+`Op::io()`, `infr_cpu::paged` (one pool per weight-size class, planned up front
+from the GGUF's tensor directory), the `paging.dram` key, and the
+`INFR_PAGER_STATS` per-pool report. Measured against phase 0 in
+`docs/perf/results.md`: decode 1.28x at a 2 GB cap and **2.06x at 1.5 GB**,
+major faults 210-335x lower, and read volume flat as the cap tightens where
+mmap's grows. Prefill costs 3-7.5%.
+
+Prefetch is still not built: the synchronous read is what the numbers above
+already beat, and the pool/depth knobs have no measured values yet.
+
+The ORIGINAL phase-2 verification, for the record: greedy token identity against
+the CPU reference path with the budget forced small enough to churn; hit rates
+matching the policy's predicted `(n_slots − 1) / n_blocks` per sweep; a model
+larger than the budget completing at all; and beating phase 0 on throughput
+**and** major-fault count.
 
 **Phase 3 — Vulkan third tier.** The source enum and the three-case stage path.
 Verification: the pager parity tests currently cover

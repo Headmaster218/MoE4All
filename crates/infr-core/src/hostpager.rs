@@ -194,6 +194,15 @@ impl HostPager {
         self.arena.total
     }
 
+    /// One slot's byte stride — every block in this pager is at most this large.
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.inner.lock().unwrap().pager.n_slots()
+    }
+
     /// Pin `id`'s bytes, reading them from the tier below if they are not resident.
     ///
     /// Blocks on I/O when it misses, and blocks while another thread fills the same block — but
@@ -284,14 +293,16 @@ impl HostPager {
 
     /// Pin `id` only if it is already resident and readable — never reads from the tier below.
     ///
-    /// The probe a tier above uses to choose between "copy from here" and "go one tier down", and
-    /// the only entry point that cannot block on I/O.
+    /// Two callers, one shape: a reader re-borrowing a block it already pinned (the CPU op body,
+    /// after its pre-step), and a tier above probing before going one tier down. Neither is a
+    /// residency DECISION, so this moves no counter — see [`Pager::repin`]. A caller that wants the
+    /// probe counted keeps its own tally.
     pub fn try_pin(&self, id: BlockId) -> Option<Pin<'_>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.state.get(&id) != Some(&SlotState::Ready) {
             return None;
         }
-        let slot = inner.pager.pin_if_resident(id)?;
+        let slot = inner.pager.repin(id)?;
         Some(self.pinned(id, slot, &inner))
     }
 
@@ -555,6 +566,28 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// `try_pin` must not move the counters. The CPU read path calls it once per op on top of the
+    /// pin the op's pre-step already took, so counting it would add exactly one hit per access:
+    /// a cache thrashing at 0% would report ~50%, and a perfect one 100% — the number stops
+    /// distinguishing the two cases it exists to distinguish.
+    #[test]
+    fn try_pin_does_not_move_the_counters() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(2, 32, io, &[1]);
+        drop(p.pin(1, Insert::Mru).expect("pin")); // 1 miss
+        let before = p.stats().pager;
+        for _ in 0..10 {
+            drop(p.try_pin(1).expect("resident"));
+        }
+        assert!(p.try_pin(999).is_none());
+        let after = p.stats().pager;
+        assert_eq!(
+            (after.hits, after.misses),
+            (before.hits, before.misses),
+            "re-borrowing a pinned block is not a residency decision"
+        );
     }
 
     #[test]

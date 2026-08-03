@@ -71,8 +71,12 @@ def run(cmd, limit_bytes):
     }
 
 
-def bench(model, dev, limit, flags):
+def bench(model, dev, limit, flags, dram=None):
     cmd = [INFR, "bench", model, "--dev", dev, "--json"] + flags
+    if dram:
+        # The host weight cache (`paging.dram`): weights read from the file into our own arena
+        # under our own eviction policy, instead of mapped and left to the page cache.
+        cmd += ["--set", f"paging.dram={dram}"]
     drop_cache(model)
     out, ru = run(cmd, limit)
     # `--json` mirrors llama-bench: [{"avg_ts": X, ...}]
@@ -88,6 +92,8 @@ def main():
     ap.add_argument("--prompt", type=int, default=512, help="prefill tokens (-p)")
     ap.add_argument("--gen", type=int, default=32, help="decode tokens (-n)")
     ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument("--dram", default=None,
+                    help="also run each limit with this paging.dram budget (e.g. `1g`)")
     args = ap.parse_args()
 
     if not os.path.exists(INFR):
@@ -99,17 +105,20 @@ def main():
     print(f"model: {args.model}")
     print(f"bytes: {size / 1e9:.2f} GB   dev: {args.dev}   reps: {args.reps}")
     print()
-    print(f"{'limit':>8} {'pp t/s':>9} {'pp majflt':>10} {'pp read MB':>11} "
+    print(f"{'limit':>8} {'mode':>6} {'pp t/s':>9} {'pp majflt':>10} {'pp read MB':>11} "
           f"{'tg t/s':>8} {'tg majflt':>10} {'tg read MB':>11}")
 
+    arms = [("mmap", None)] + ([("dram", args.dram)] if args.dram else [])
     for spec in args.limits.split(","):
         limit = None if spec.strip() == "none" else parse_size(spec)
-        pp, pru = bench(args.model, args.dev, limit,
-                        ["-p", str(args.prompt), "-n", "0", "-r", str(args.reps)])
-        tg, tru = bench(args.model, args.dev, limit,
-                        ["-p", "0", "-n", str(args.gen), "-r", str(args.reps)])
-        print(f"{spec.strip():>8} {pp:>9.1f} {pru['majflt']:>10} {pru['inblock'] / 2048:>11.0f} "
-              f"{tg:>8.2f} {tru['majflt']:>10} {tru['inblock'] / 2048:>11.0f}")
+        for name, dram in arms:
+            pp, pru = bench(args.model, args.dev, limit,
+                            ["-p", str(args.prompt), "-n", "0", "-r", str(args.reps)], dram)
+            tg, tru = bench(args.model, args.dev, limit,
+                            ["-p", "0", "-n", str(args.gen), "-r", str(args.reps)], dram)
+            print(f"{spec.strip():>8} {name:>6} {pp:>9.1f} {pru['majflt']:>10} "
+                  f"{pru['inblock'] / 2048:>11.0f} {tg:>8.2f} {tru['majflt']:>10} "
+                  f"{tru['inblock'] / 2048:>11.0f}")
 
 
 if __name__ == "__main__":

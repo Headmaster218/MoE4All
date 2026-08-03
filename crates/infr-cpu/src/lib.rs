@@ -10,6 +10,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod kvquant;
+pub mod paged;
 mod pool;
 pub mod turbo;
 
@@ -136,13 +137,23 @@ pub struct CpuBuffer {
 enum CpuStore {
     Owned(Mutex<Vec<u8>>),
     Mapped(TensorBytes),
+    /// Read from the model file into the host arena on demand (`paging.dram`). The bytes are only
+    /// valid while pinned, which is why every op pins what it reads before running — see
+    /// [`CpuBackend::pin_op_weights`].
+    Paged {
+        store: Arc<paged::PagedWeights>,
+        id: paged::PagedId,
+        nbytes: usize,
+    },
 }
 
-/// A uniform read view over either storage (a `MutexGuard` for owned, the slice for mapped); both
-/// deref to `[u8]`.
+/// A uniform read view over any storage (a `MutexGuard` for owned, the slice for mapped, a pin for
+/// paged); all deref to `[u8]`.
 enum CpuRead<'a> {
     Owned(std::sync::MutexGuard<'a, Vec<u8>>),
     Mapped(&'a TensorBytes),
+    /// Holds the block resident for as long as the view lives.
+    Pinned(infr_core::hostpager::Pin<'a>),
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -152,6 +163,7 @@ impl std::ops::Deref for CpuRead<'_> {
         match self {
             CpuRead::Owned(g) => g,
             CpuRead::Mapped(t) => t,
+            CpuRead::Pinned(p) => p,
         }
     }
 }
@@ -172,19 +184,30 @@ impl CpuBuffer {
             store: CpuStore::Mapped(bytes),
         }
     }
-    /// Read view of the bytes (zero-copy for mapped weights; mutex guard for owned buffers).
+    /// Read view of the bytes (zero-copy for mapped weights; mutex guard for owned buffers; a pin
+    /// for paged ones).
+    ///
+    /// # Panics
+    /// If a PAGED weight is not resident. This path cannot read from disk — it has no way to
+    /// report an I/O failure — so residency is established first, by the op's pin pre-step
+    /// ([`CpuBackend::pin_op_weights`]), which runs before any op body and does return errors. A
+    /// panic here means an op read a weight its `Op::io()` did not list.
     fn read(&self) -> CpuRead<'_> {
         match &self.store {
             CpuStore::Owned(m) => CpuRead::Owned(m.lock().unwrap()),
             CpuStore::Mapped(t) => CpuRead::Mapped(t),
+            CpuStore::Paged { store, id, .. } => CpuRead::Pinned(store.try_pin(*id).expect(
+                "cpu backend: a paged weight was read without being pinned first — the op's \
+                 Op::io() reads must name every weight its body reads",
+            )),
         }
     }
     /// Mutable owned storage; panics for mapped (read-only) weights.
     fn owned(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
         match &self.store {
             CpuStore::Owned(m) => m.lock().unwrap(),
-            CpuStore::Mapped(_) => {
-                panic!("cpu backend: write to a mapped (read-only) weight buffer")
+            CpuStore::Mapped(_) | CpuStore::Paged { .. } => {
+                panic!("cpu backend: write to a read-only weight buffer")
             }
         }
     }
@@ -196,6 +219,7 @@ impl Buffer for CpuBuffer {
         match &self.store {
             CpuStore::Owned(m) => m.lock().unwrap().len(),
             CpuStore::Mapped(t) => t.len(),
+            CpuStore::Paged { nbytes, .. } => *nbytes,
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -360,6 +384,48 @@ impl CpuBackend {
     /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
     pub fn map_weight(&self, bytes: TensorBytes) -> Box<dyn Buffer> {
         Box::new(CpuBuffer::mapped_buf(bytes))
+    }
+
+    /// Wrap a registered paged weight (see [`paged::PagedWeights`]) as a read-only weight buffer.
+    /// Nothing is read here: the bytes arrive on the first pin.
+    pub fn paged_weight(
+        &self,
+        store: Arc<paged::PagedWeights>,
+        id: paged::PagedId,
+        nbytes: usize,
+    ) -> Box<dyn Buffer> {
+        Box::new(CpuBuffer {
+            uid: next_buffer_uid(),
+            store: CpuStore::Paged { store, id, nbytes },
+        })
+    }
+
+    /// Pin every paged weight `op` READS, returning guards that keep them resident until dropped.
+    ///
+    /// Driven by [`Op::io`], the same exhaustive enumeration the multi-device pipeline executor
+    /// uses — so a new `Op` variant cannot forget to declare its reads here without also failing
+    /// that. A weight an op reads without listing panics at `CpuBuffer::read` rather than silently
+    /// reading an evicted slot.
+    fn pin_op_weights<'b>(
+        &self,
+        op: &Op,
+        bindings: &'b Bindings<'b>,
+    ) -> Result<Vec<infr_core::hostpager::Pin<'b>>> {
+        let mut pins = Vec::new();
+        for id in op.io().0 {
+            let Some(buf) = bindings.get(id) else {
+                continue;
+            };
+            // Not every bound operand is a `CpuBuffer` in every test harness; a non-CPU buffer
+            // cannot be paged, so it is simply not ours to pin.
+            let Some(cb) = buf.as_any().downcast_ref::<CpuBuffer>() else {
+                continue;
+            };
+            if let CpuStore::Paged { store, id, .. } = &cb.store {
+                pins.push(store.pin(*id)?);
+            }
+        }
+        Ok(pins)
     }
 
     /// Fetch-or-build a dequantized weight from `weight_cache` under its `(buffer uid, dtype)` key
@@ -624,6 +690,13 @@ impl Backend for CpuBackend {
         // `Linear m=512 1536x1536 Q4K`.
         let mut op_times: HashMap<String, (u64, f64)> = HashMap::new();
         for op in &g.ops {
+            // Make every PAGED weight this op reads resident, and hold it resident for the op's
+            // whole body. This is the one fallible point in the interpreter, which is exactly why
+            // it is here and not inside `CpuBuffer::read`: that returns a view, not a `Result`, so
+            // an I/O failure there could only panic. The guards drop at the end of the iteration.
+            // Empty (and free) for a model with no paged weights, which is every model until
+            // `paging.dram` is set.
+            let _pins = self.pin_op_weights(op, bindings)?;
             let __t0 = if prof_ops {
                 Some(std::time::Instant::now())
             } else {

@@ -254,6 +254,19 @@ impl Pager {
         Some(Resolution::Miss { slot, evicted })
     }
 
+    /// Take ANOTHER pin on a block that is already resident, without counting anything.
+    ///
+    /// This is not a residency decision — it is a second borrow of a block the caller has already
+    /// resolved (the CPU read path re-borrows what its op's pin pre-step resolved a moment ago).
+    /// Counting it would inflate the hit rate by exactly one hit per access, which makes a
+    /// thrashing cache report ~50% and a perfect one report 100%: the two become indistinguishable
+    /// where it matters. Returns `None` if `id` is not resident.
+    pub fn repin(&mut self, id: BlockId) -> Option<u32> {
+        let slot = *self.resident.get(&id)?;
+        *self.pinned.entry(id).or_insert(0) += 1;
+        Some(slot)
+    }
+
     /// Pin `id` only if it is ALREADY resident — never reads, never evicts, never inserts.
     ///
     /// The hit-only probe a tier above this one uses to decide between "copy from here" and "go to

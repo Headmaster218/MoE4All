@@ -634,6 +634,36 @@ local blob is Llama-4-Scout Q2_K at 36.8 GiB against 60 GB of RAM, so the cgroup
 squeeze is what stands in for that case. Both are gaps in the baseline, not
 results.
 
+### The host tier against that baseline (CPU backend)
+
+Same harness, same model, `--dram 1g` adding a second arm that runs with
+`paging.dram=1g` — a 0.81 GB arena of 1 MiB+ weight blocks read from the file by
+`pread`, evicted by the cyclic-sweep policy instead of by recency:
+
+| MemoryMax | mode | pp512 t/s | tg32 t/s | tg majflt | tg read |
+| --------- | ---- | --------: | -------: | --------: | ------: |
+| 2 GB      | mmap |      45.2 |     1.01 |   489 002 |   94 GB |
+| 2 GB      | dram |      43.8 | **1.29** | **1 459** |   75 GB |
+| 1.5 GB    | mmap |      47.8 |     0.63 |   448 882 |  153 GB |
+| 1.5 GB    | dram |      44.2 | **1.30** | **2 136** |   75 GB |
+
+**Decode is 1.28× faster at a 2 GB cap and 2.06× at 1.5 GB**, with **210–335×
+fewer major faults** — the stalls moved from 4 KiB page faults inside kernel
+loops to whole-block reads at the op boundary.
+
+**The tier's read volume does not move with the cap** (75 GB at both, against
+mmap's 94 → 153 GB as the cap tightens). That is the design claim, measured:
+per-pass traffic is `model − resident`, and `resident` is what the budget says,
+not what the kernel decided to keep. mmap gets _worse_ as memory gets tighter
+because recency eviction against a cyclic sweep re-reads what it just dropped.
+
+**Prefill costs 3–7.5%** (45.2 → 43.8, 47.8 → 44.2). Prefill was never the
+problem — it amortizes one weight sweep over 512 tokens — so this is the tier's
+extra copy showing up where there was nothing to fix. Nothing here is free; this
+is what it costs.
+
+Reproduce: `scripts/paging-baseline.py MODEL --limits 2G,1.5G --dram 1g`.
+
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs
 > (NVIDIA, Intel Arc) and Apple Metal are wanted — please open an issue with

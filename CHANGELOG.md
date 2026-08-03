@@ -15,6 +15,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `serve` at the start of each request. New `infr_gguf::watch::WeightWatch`,
   re-exported as `infr_llama::WeightWatch`.
 
+### Added
+
+- `INFR_DRAM_CACHE` / `paging.dram`: a host weight cache for the CPU backend.
+  Weights above 1 MiB are read from the model file into a bounded arena under
+  the engine's own cyclic-sweep eviction policy, instead of being mapped and
+  left to the OS page cache. Off by default (the zero-copy mmap path is
+  unchanged and is right whenever the weights fit); a budget too small to seat
+  any weight class falls back to mapping and says so. Measured on a
+  memory-capped Llama-3.2-1B F16: decode 2.06x faster at a 1.5 GB cap with 210x
+  fewer major faults, prefill 3-7.5% slower (`docs/perf/results.md`).
+  `INFR_PAGER_STATS=1` reports per-class hit rate, reads and bytes.
+
 ### Changed
 
 - The Vulkan context window is now re-decided against the memory the device

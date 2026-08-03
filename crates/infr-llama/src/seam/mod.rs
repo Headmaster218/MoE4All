@@ -78,8 +78,77 @@ impl<'a> TokenEmbd<'a> {
 /// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
 /// copy: map an mmap slice zero-copy; alloc+upload owned bytes (the combined gate+up concat — never
 /// produced for CPU since `combined_gu` is false there, but stays correct if it ever is).
+/// Build the CPU backend's host weight cache when `paging.dram` asks for one, or `None` to keep
+/// the zero-copy mmap path.
+///
+/// The budget is only ever what the user set: this arena is anonymous, non-evictable memory (the
+/// cost backlog B30 measured), so nothing here picks a fraction of the machine's RAM on their
+/// behalf. Returns `None` — not an error — when the budget buys no pool at all, so a too-small
+/// value degrades to today's behaviour.
+fn cpu_paged_store(
+    ec: &EngineConfig,
+    g: &Gguf,
+) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
+    let Some(budget) = ec
+        .paging
+        .dram
+        .map(|s| s.resolve(0) as usize)
+        .filter(|&b| b > 0)
+    else {
+        return Ok(None);
+    };
+    let plans = infr_cpu::paged::plan_pools(budget, g.tensors());
+    if plans.is_empty() {
+        tracing::warn!(
+            "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
+             mmap path (raise INFR_DRAM_CACHE past one tensor's size to page)",
+            budget as f64 / 1e9,
+        );
+        return Ok(None);
+    }
+    let io = std::sync::Arc::new(
+        infr_core::blockio::FileBlockIo::open(g.path()).map_err(|e| anyhow!("{e}"))?,
+    );
+    let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
+    tracing::info!(
+        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget",
+        plans.len(),
+        store.arena_bytes() as f64 / 1e9,
+        budget as f64 / 1e9,
+    );
+    Ok(Some(std::sync::Arc::new(store)))
+}
+
 fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
-    Box::new(move |_name, tb, dt, _n| match tb {
+    cpu_bind_with(be, None)
+}
+
+/// The CPU binder. With a `store`, a weight whose bytes come straight off disk (no load-time
+/// rewrite) and whose size class has a pool is registered and read on demand; everything else takes
+/// the same paths as before.
+fn cpu_bind_with<'a>(
+    be: &'a CpuBackend,
+    store: Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>,
+) -> Box<BindWeight<'a>> {
+    Box::new(move |_name, tb, dt, _n| {
+        if let Some(store) = &store {
+            // `file_ranges` is `None` exactly for bytes the loader REWROTE (the qwen2 q/k permute,
+            // the BitNet dequant), which correspond to nothing on disk and so cannot be re-read.
+            if let Some(ranges) = tb.file_ranges() {
+                if let Some(id) = store.register(&ranges).map_err(|e| anyhow!("{e}"))? {
+                    let nbytes = ranges.iter().map(|(_, l)| l).sum();
+                    return Ok((be.paged_weight(store.clone(), id, nbytes), dt));
+                }
+            }
+        }
+        cpu_bind_resident(be, tb, dt)
+    })
+}
+
+/// The non-paged half of the CPU binder: map an mmap slice zero-copy, or materialize owned/fused
+/// bytes into one host buffer.
+fn cpu_bind_resident(be: &CpuBackend, tb: WBytes, dt: DType) -> AResult<(Box<dyn Buffer>, DType)> {
+    match tb {
         WBytes::Mmap(tb) => Ok((be.map_weight(tb), dt)),
         // Owned bytes (a load-time rewrite) and a fused group both become one host buffer here.
         // The concat is materialized only on this arm — a binder that pages the group never
@@ -92,7 +161,7 @@ fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
             be.upload(buf.as_ref(), &v).map_err(|e| anyhow!("{e}"))?;
             Ok((buf, dt))
         }
-    })
+    }
 }
 
 /// The Metal seam weight binder (raw native-dtype upload; the backend dequantizes lazily), hoisted
@@ -166,10 +235,12 @@ pub(crate) fn generate_dense_cpu_mode(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a zero-copy weight binder
-    // (maps each tensor straight from the GGUF mmap — no alloc, no memcpy).
-    let bind = cpu_upload_bind(&cpu_be);
-    generate_dense_backend(
+    // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a weight binder that maps
+    // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when `paging.dram` asks
+    // for a host weight cache, registers the big ones to be read from the file on demand.
+    let store = cpu_paged_store(ec, g)?;
+    let bind = cpu_bind_with(&cpu_be, store.clone());
+    let out = generate_dense_backend(
         &cpu_be,
         &bind,
         g,
@@ -189,7 +260,32 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // h_out
         None, // denoise_req
         req,
-    )
+    );
+    if let Some(store) = store.filter(|_| ec.paging.stats) {
+        report_host_paging(&store);
+    }
+    out
+}
+
+/// `paging.stats` (`INFR_PAGER_STATS=1`): what the host tier actually did, per size class.
+///
+/// The hit rate alone cannot distinguish a tier that is working from one that was never asked, so
+/// the read count and the bytes moved are reported beside it: those are what a run's throughput is
+/// bounded by, and what the mmap baseline in `docs/perf/results.md` is compared against.
+fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
+    for (slot_bytes, n_slots, s) in store.pool_stats() {
+        tracing::info!(
+            "[host pager] {:.1}MB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
+             {} reads, {:.2} GB from disk",
+            slot_bytes as f64 / 1e6,
+            s.pager.hits,
+            s.pager.misses,
+            s.pager.hit_rate() * 100.0,
+            s.pager.evictions,
+            s.reads,
+            s.bytes_read as f64 / 1e9,
+        );
+    }
 }
 
 /// GPU seam runner: the SAME dense forward as [`generate_dense_cpu`], but on the Vulkan backend
@@ -2775,6 +2871,20 @@ impl WBytes {
             WBytes::Mmap(tb) => tb.len(),
             WBytes::Owned(v) => v.len(),
             WBytes::Concat(parts) => parts.iter().map(|p| p.len()).sum(),
+        }
+    }
+
+    /// The components' `(offset, len)` ranges in the model file, in layout order — what a binder
+    /// that reads weights itself registers instead of taking the bytes.
+    ///
+    /// `None` for `Owned` bytes: those exist only because the loader REWROTE them (the qwen2 q/k
+    /// row permute, the BitNet dequant), so they correspond to nothing on disk and re-reading the
+    /// file would produce the pre-rewrite bytes.
+    pub(crate) fn file_ranges(&self) -> Option<Vec<(u64, usize)>> {
+        match self {
+            WBytes::Mmap(tb) => Some(vec![tb.file_range()]),
+            WBytes::Concat(parts) => Some(parts.iter().map(|p| p.file_range()).collect()),
+            WBytes::Owned(_) => None,
         }
     }
 
