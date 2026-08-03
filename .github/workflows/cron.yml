@@ -74,9 +74,12 @@ jobs:
   # unwinding, and the `Vec::from_raw_parts` rebuild. A provenance bug there was
   # found by READING during the PR #90 review; this is what would have found it.
   #
-  # `infr-core` was measured and left out — its suite does not finish inside ten
-  # minutes under interpretation, which would make this a timeout rather than a
-  # gate. Re-measure and add it if either gets faster.
+  # `infr-core` and `infr-chat` were both probed and neither is here: neither
+  # finished inside the window it was given (10 minutes and 50 minutes
+  # respectively; `infr-chat` had done 16 of its 58 tests when it was stopped).
+  # Those are "did not finish by", not durations — nobody has one. Neither crate
+  # is a big loss: `infr-chat` has no `unsafe` at all, and `infr-core` has three
+  # uses, one of which is a `libc::kill` miri cannot execute anyway.
   #
   # ## Why the flags
   #

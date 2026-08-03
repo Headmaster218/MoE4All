@@ -1094,9 +1094,13 @@ comment. What that does NOT cover, and will not:
 - **Every FFI crate**, by construction: `infr-vulkan` dlopens `libvulkan`,
   `infr-metal` talks to a real GPU, `infr-gguf` maps a file, `infr-hub` takes an
   `flock`.
-- **`infr-core`** — measured and left out: its suite does not finish inside ten
-  minutes under interpretation, which would make the job a timeout rather than a
-  gate. Re-measure if either gets faster.
+- **`infr-core` and `infr-chat`** — probed, neither included. Neither finished
+  inside the window it was given (10 and 50 minutes; `infr-chat` had completed
+  16 of 58 tests when stopped). Those bounds are "did not finish by", not
+  measured durations. Little is lost either way: `infr-chat` contains no
+  `unsafe`, and `infr-core` has three uses, one being a `libc::kill` miri cannot
+  execute. A timed run is in `docs/backlog.md` terms cheap to redo if the
+  question ever matters.
 
 Two upstream workarounds are load-bearing and worth knowing before anyone
 "simplifies" the flags. Under default **Stacked Borrows** the job fails inside
