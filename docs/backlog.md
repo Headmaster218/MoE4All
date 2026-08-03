@@ -1022,14 +1022,15 @@ turn stops at a block boundary, not immediately.
 
 ### B30 — the GGUF weight mmap trusts the file, and cannot enforce it
 
-**Tag:** PR#90 · **Blocked on:** a decision on shared-vs-exclusive locking
+**Tag:** PR#90 · **Blocked on:** a decision — and the case for acting is weaker
+than it first looked
 
 `Gguf::open` maps the model file and hands out `&[u8]` slices into it for the
 mapping's whole life. Nothing stops another process writing or truncating that
 file: a write mutates memory Rust believes is frozen, and a truncation turns a
-resident page into `SIGBUS`. The `SAFETY` note there is a claim about the
-environment, not something the code enforces — this is the "comment is not a
-safeguard" shape, and it is written down as an UNENFORCED INVARIANT on `open`.
+resident page into `SIGBUS` on next touch. The `SAFETY` note there is a claim
+about the environment, not something the code enforces — it is written down as
+an UNENFORCED INVARIANT on `open`.
 
 **Considered and rejected: copying the file into an anonymous mapping.** PR #90
 did exactly that and it works, but it is not affordable. Measured here on a 16
@@ -1040,21 +1041,45 @@ swap-only, so a model larger than RAM goes from slow to unrunnable — the Llama
 Scout blob on this host is 47.5 GiB against 60 GiB of RAM. Reverted in
 `5ba6b3f`; the same PR's tensor byte-count overflow check was kept.
 
-**The direction that is affordable:** hold an advisory lock on the fd for the
-mapping's lifetime — keep the `File` in `Gguf`, take the lock in `open`, drop it
-with the mapping. Two things to settle first, and they are why this is not
-already done:
+**`infr` cannot currently corrupt its own mapping.** Checked while scoping this,
+and it narrows the threat a long way. `pull.rs` downloads to a `.dl-` temp and
+`fs::rename`s it into place; nothing anywhere opens a blob for writing, and the
+only `remove_file` calls target links, `.meta` validators and temps. A rename
+swaps the directory entry, so a running process keeps reading the OLD inode
+through its mapping until it drops. `infr pull` concurrent with `infr serve` is
+therefore safe today, and a lock would not be what makes it safe.
 
-- `flock` binds only cooperating processes. A writer that never asks for the
-  lock is unaffected, so this narrows the window rather than closing it. Worth
-  deciding whether that is enough to be worth the code.
-- An EXCLUSIVE lock would stop two `infr` processes from sharing one model,
-  which is a normal thing to want. A SHARED lock among readers, refusing only
-  writers, is probably the right shape — but nothing in the tree currently takes
-  a lock, so the writer half has no counterpart to conflict with.
+**What is left is external and mostly unlockable.** The realistic corruption is
+a person overwriting a model file with another tool. `cp new.gguf live.gguf`
+opens the destination `O_TRUNC` and rewrites in place — that is both the
+mutation and the `SIGBUS` window, in one ordinary command. An advisory `flock`
+does not stop it: `cp` takes no lock, nor does any editor, nor llama.cpp. So the
+lock would bind only writers that opt in, and `infr` has no in-place writer to
+opt in.
 
-Windows needs `LockFileEx` rather than `flock`; both sides must be implemented
-or the missing one must fail loudly.
+**Therefore, three honest options, in the order they look worth doing:**
+
+1. **Accept and document — where the tree is now.** Every mmap-based loader in
+   the ecosystem has this same hole. The invariant is stated at `Gguf::open`
+   instead of being implied by a bare `SAFETY` line, which is most of the value.
+2. **Detect instead of prevent.** Re-`stat` the fd at open and record
+   `(len, mtime, inode)`; a cheap re-check at a natural boundary (session start,
+   or the pager's first expert fetch) turns silent corruption into a loud error.
+   Does not stop UB, converts a mystery into a message. Cheap, portable, and
+   does not depend on anyone cooperating.
+3. **`flock` the fd for the mapping's lifetime.** Keep the `File` in `Gguf`
+   (`open` currently drops it — the mapping alone keeps the inode alive), take
+   the lock there, drop it with the mapping. `FileLock` in `pull.rs` is already
+   this shape and can be reused. Take it SHARED, not exclusive: exclusive would
+   stop two `infr` processes sharing one model, which is normal. But be clear
+   this buys nothing until an in-place writer exists to conflict with it.
+
+**Windows is not a constraint here**, contrary to the first version of this
+entry: `pull.rs`'s `FileLock` already calls `libc::flock` and `as_raw_fd`
+unconditionally, `libc` is an ungated dependency of `infr-hub`, there is no
+`cfg(windows)` anywhere in `crates/`, and CI builds only ubuntu-26.04 and
+macos-15. `infr-hub` does not compile for Windows today, so a `flock` in
+`infr-gguf` would not be what breaks it.
 
 ### B31a — the CPU spin pool's unsafe has never been run under Miri
 
