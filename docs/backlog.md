@@ -1056,54 +1056,28 @@ already done:
 Windows needs `LockFileEx` rather than `flock`; both sides must be implemented
 or the missing one must fail loudly.
 
-### B31 — two nits left unfixed when PR #90 landed
+### B31a — the CPU spin pool's unsafe has never been run under Miri
 
-**Tag:** PR#90 review · **Blocked on:** nothing; both are small and neither is a
-live defect
+**Tag:** PR#90 review residual · **Blocked on:** nothing; needs a nightly
+toolchain and some patience with the spin loops
 
-Found while reviewing PR #90, out of scope for the merge, neither fixed:
+`SpinPool::collect` and `CollectGuard` in `crates/infr-cpu/src/pool.rs` carry
+the crate's densest unsafe: `set_len` on uninitialized memory, a raw base
+pointer crossed between threads via `SendPtr`, `drop_in_place` on a subset of
+slots during unwinding, and a `Vec::from_raw_parts` rebuild. The provenance bug
+found reviewing PR #90 (two `as_mut_ptr` calls, the second invalidating the
+first) was found by READING, and fixed in `7784ab3` by construction — one
+pointer now feeds both uses. Nothing checked it mechanically.
 
-- **`CollectGuard.slots` may be invalidated before it is used.**
-  `SpinPool::collect` in `crates/infr-cpu/src/pool.rs` calls `out.as_mut_ptr()`
-  twice — once for the guard, once for `SendPtr`. The second reborrow pops the
-  first pointer's tag under Stacked Borrows, and the guard then uses `slots`
-  during unwinding. It will not miscompile (same allocation, and LLVM has no
-  reason to reorder across the panic), but it is UB by the model. Fix is one
-  line: take the pointer once and derive both from it. Not checked under Miri —
-  the repo has never run it, and the spin pool's real threads and spin loops
-  would need work to run there at all.
-- **`request_shutdown(0)` returns `true` while latching nothing.** Now that
-  `SIGNO` IS the latch (`crates/infr-core/src/shutdown.rs`),
-  `compare_exchange(0, 0)` succeeds and reports itself as the first caller,
-  while `shutdown_requested()` stays false. Unreachable today — the CLI signal
-  handler is the only caller and always passes a real signo — but it is a public
-  API in `infr-core`. A `debug_assert!(signo != 0)` or a documented precondition
-  closes it.
+Miri is the tool for exactly this class and the repo has never run it: not in
+CI, not in the history, not installed. Two things to expect when someone tries.
+The pool spawns real threads and spins on atomics, which Miri runs but slowly —
+the tests may need a small `n` or a preemption-rate flag. And `infr-cpu` is full
+of x86 SIMD intrinsics; Miri covers many but not all, so the crate may need a
+feature-gated or scalar-only build to get there at all.
 
-### B32 — PR #90 narrowed tool-parser leniency beyond malformed arrays
-
-**Tag:** PR#90 review · **Blocked on:** a product call on which behaviour is
-wanted
-
-`parse_value` in `crates/infr-chat/src/tools.rs` now returns `None` when the
-current byte is `,`, `}` or `]`. That is what fixes the array hang (verified: on
-the pre-merge tree, the model output `<|tool_call>call:x{a:[}]}<tool_call|>`
-allocates without bound — it reached 4.8 GB under a `ulimit -v` cap and aborted
-only because of it, since the bareword arm returns at `}` without advancing the
-cursor). But it also changes valueless OBJECT entries, which the array fix did
-not require. Measured on both trees:
-
-| input       | before              | after        |
-| ----------- | ------------------- | ------------ |
-| `{a:}`      | `{"a": ""}`         | call dropped |
-| `{a:,b:1}`  | `{"a": "", "b": 1}` | call dropped |
-| `{a:1,b:2}` | unchanged           | unchanged    |
-| `{a:[1,2]}` | unchanged           | unchanged    |
-
-Well-formed input is unaffected. Dropping the call is arguably better than
-inventing an empty-string argument the model never wrote — but the doc comment
-on `parse_value` still advertises leniency for partial objects, so either the
-behaviour or the doc is now wrong. Decide which, then make them agree.
+Worth doing once, then wiring into CI only if it turns out to be cheap. Until
+then the honest statement is that this file's unsafe is argued, not verified.
 
 ### B27 — hardening candidates from the 2026-08-03 review
 
