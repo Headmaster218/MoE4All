@@ -1067,38 +1067,6 @@ Combined with B20 (a `max_tokens: 1` request generating a whole canvas), the
 worst case is a disconnected client leaving the single DG slot busy for
 `ceil(max_new / canvas_length)` blocks with nothing able to interrupt it.
 
-### B25 — `SpinPool::run` releases `in_run` before consuming `panicked`
-
-**Tag:** CR-2026-08-03 L2 (verified) · **Blocked on:** nothing
-
-`crates/infr-cpu/src/pool.rs`, the tail of `SpinPool::run`:
-
-```rust
-self.in_run.store(false, Ordering::Release);
-if sh.panicked.swap(false, Ordering::AcqRel) {
-    panic!("spin-pool: a task panicked (caught per-task; state may be incomplete)");
-}
-```
-
-`panicked` is pool-global (on `Shared`), written by both the participating
-caller and `worker_loop`. Releasing `in_run` first is exactly what lets a second
-caller's `compare_exchange` succeed in the gap: job B starts, one of its tasks
-panics and sets the flag, then job A's `swap` consumes it — A panics for B's
-failure and B returns normally with incomplete task state.
-
-The rest of the handshake is sound, which is what makes this the only hole: A
-waits for `done >= workers` before releasing, and every worker stores `panicked`
-with `Release` before its `done` `fetch_add`, so none of A's OWN flags can be
-missed. Concurrent callers are real rather than hypothetical — the rayon
-fallback branch above exists for "a second graph executing concurrently on this
-backend, e.g. parallel serve sessions".
-
-Not proved: a deterministic repro needs the caller paused between the store and
-the swap, i.e. instrumenting the pool. The ordering argument is self-contained.
-
-**The fix shape:** swap `panicked` BEFORE releasing `in_run`, and panic after.
-It only matters once a task has already panicked, which is why it is Low.
-
 ### B26 — `matmul_f32` leaks its transient Vulkan handles on every error path
 
 **Tag:** CR-2026-08-03 L3 (verified, and narrower than filed) · **Blocked on:**

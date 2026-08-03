@@ -260,8 +260,21 @@ impl SpinPool {
         unsafe {
             *sh.job.get() = None;
         }
+        // Consume `panicked` BEFORE releasing the job slot, and release it either way.
+        //
+        // The flag is pool-GLOBAL (it lives on `Shared`, written by this caller and by every
+        // `worker_loop`), while `in_run` is what makes the pool single-job. Releasing first opens a
+        // window in which another caller's `compare_exchange` succeeds, its task panics and sets
+        // the flag, and THIS caller's swap then consumes it: we would panic for their failure and
+        // they would return normally with incomplete task state (backlog B25).
+        //
+        // Reading it while still holding `in_run` closes that window — no second job can have
+        // started, so the flag can only be ours. The store must still happen before the `panic!`,
+        // or an unwinding caller would leave `in_run` latched `true` and every later `run` would
+        // silently take the rayon fallback for the life of the process.
+        let panicked = sh.panicked.swap(false, Ordering::AcqRel);
         self.in_run.store(false, Ordering::Release);
-        if sh.panicked.swap(false, Ordering::AcqRel) {
+        if panicked {
             panic!("spin-pool: a task panicked (caught per-task; state may be incomplete)");
         }
     }
@@ -397,6 +410,46 @@ mod tests {
                 "n={n}: some task ran zero or multiple times"
             );
         }
+    }
+
+    /// B25's observable consequence: after a panicking job the pool must still be a POOL.
+    ///
+    /// The race itself — a second caller slipping into the window between `in_run.store(false)` and
+    /// the `panicked` swap — is not deterministically reproducible without pausing a thread
+    /// mid-teardown, so this pins the property the reorder must not break instead: the panic
+    /// propagates, `in_run` is released, and the next job neither inherits the flag nor gets
+    /// silently demoted to the rayon fallback.
+    #[test]
+    fn a_panicking_job_leaves_the_pool_reusable_and_does_not_leak_its_flag() {
+        let pool = SpinPool::new(&CpuCfg::default());
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(64, &|t| {
+                if t == 17 {
+                    panic!("task boom");
+                }
+            });
+        }));
+        std::panic::set_hook(prev);
+        assert!(caught.is_err(), "a task panic must propagate to the caller");
+        assert!(
+            !pool.in_run.load(Ordering::Acquire),
+            "the job slot must be released even when run() unwinds, or every later run() \
+             silently falls back to rayon for the life of the process"
+        );
+        assert!(
+            !pool.shared.panicked.load(Ordering::Acquire),
+            "the panic flag must have been consumed, not left for the next job to inherit"
+        );
+
+        // The next job runs normally: it must not re-panic on a stale flag, and it must still be
+        // the spin pool doing the work (every task exactly once).
+        let hits: Vec<AtomicU64> = (0..256).map(|_| AtomicU64::new(0)).collect();
+        pool.run(256, &|t| {
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
     }
 
     #[test]
