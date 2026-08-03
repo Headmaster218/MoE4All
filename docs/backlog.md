@@ -1035,34 +1035,6 @@ Combined with B20 (a `max_tokens: 1` request generating a whole canvas), the
 worst case is a disconnected client leaving the single DG slot busy for
 `ceil(max_new / canvas_length)` blocks with nothing able to interrupt it.
 
-### B26 — `matmul_f32` leaks its transient Vulkan handles on every error path
-
-**Tag:** CR-2026-08-03 L3 (verified, and narrower than filed) · **Blocked on:**
-nothing; the open question is whether it is worth touching at all
-
-`crates/infr-vulkan/src/matmul.rs`: `VulkanBackend::matmul_f32` creates a shader
-module, descriptor-set layout, pipeline layout, pipeline and descriptor pool as
-raw handles and destroys them only in the success tail. Every `?` between them
-leaks whatever was already created, and so does the explicit "driver returned
-VK_SUCCESS with a null pipeline handle" early return, which abandons the shader
-module and both layouts. The buffers are fine — `buf_a`/`buf_b`/`buf_c` are
-RAII.
-
-**What the review missed, and it is the whole severity story:** the function is
-`#[doc(hidden)]` and its own doc says "ONE-SHOT bench/test helper (only callers
-are `examples/smoke.rs` and `test_matmul_f32`) … NOT on any production path". A
-grep confirms those are the only two callers. So the leak is real code and
-unreachable from `infr run` / `serve` / `bench`, and it leaks per failed call in
-a process that is about to exit anyway.
-
-Worth recording anyway because the same doc comment's step 5 — "Destroys all
-transient Vulkan objects (pool, pipeline, layouts, shader module)" — is a
-factual claim that holds only on success, and that is the kind of comment the
-next reader trusts without checking.
-
-**If it is fixed:** one `(|| { .. })()` inner closure whose `Err` falls through
-to the existing destroy block, rather than five separate `map_err` cleanups.
-
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an

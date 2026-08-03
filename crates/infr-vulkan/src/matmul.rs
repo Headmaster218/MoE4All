@@ -60,6 +60,71 @@ fn checked_matmul_shape(
     Ok((mk, kn, mn4, m32, n32, k32))
 }
 
+/// RAII for [`VulkanBackend::matmul_f32`]'s transient Vulkan objects.
+///
+/// The function creates a shader module, two layouts, a pipeline and a descriptor pool as raw
+/// handles, and used to destroy them only in its success tail. Every `?` between them leaked
+/// whatever had already been created, as did the "driver returned VK_SUCCESS with a null pipeline"
+/// bail-out, which abandoned the shader module and both layouts (backlog B26).
+///
+/// The leak was narrow — this helper is `#[doc(hidden)]`, its only callers are `examples/smoke.rs`
+/// and `test_matmul_f32`, and nothing on a production path reaches it. It is fixed with a guard
+/// rather than by adding cleanup to each early return because the step-5 line in the function's own
+/// doc ("Destroys all transient Vulkan objects") is a factual claim, and a claim that holds only on
+/// the happy path is the kind the next reader trusts without checking.
+///
+/// Fields are filled in as each object is created; a handle still null was never created and is not
+/// destroyed. Destruction order is the reverse of creation, and the pool frees its descriptor sets
+/// implicitly.
+struct Transients<'a> {
+    device: &'a ash::Device,
+    shader_module: vk::ShaderModule,
+    ds_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    desc_pool: vk::DescriptorPool,
+}
+
+impl<'a> Transients<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        Self {
+            device,
+            shader_module: vk::ShaderModule::null(),
+            ds_layout: vk::DescriptorSetLayout::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            desc_pool: vk::DescriptorPool::null(),
+        }
+    }
+}
+
+impl Drop for Transients<'_> {
+    fn drop(&mut self) {
+        // SAFETY: every handle was created on `self.device` and, by the time this runs, the queue
+        // has been idled by the caller's fence wait (success) or nothing was ever submitted with
+        // them (early return). A null handle is one that was never created.
+        unsafe {
+            if self.desc_pool != vk::DescriptorPool::null() {
+                self.device.destroy_descriptor_pool(self.desc_pool, None);
+            }
+            if self.pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.pipeline, None);
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+            }
+            if self.ds_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.ds_layout, None);
+            }
+            if self.shader_module != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.shader_module, None);
+            }
+        }
+    }
+}
+
 // ── VulkanBackend::matmul_f32 ─────────────────────────────────────────────────
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -74,7 +139,8 @@ impl VulkanBackend {
     /// 2. Uploads A and B to device-local storage buffers (via staging).
     /// 3. Dispatches with `ceil(m/16) × ceil(n/16) × 1` workgroups.
     /// 4. Downloads C to host.
-    /// 5. Destroys all transient Vulkan objects (pool, pipeline, layouts, shader module).
+    /// 5. Destroys all transient Vulkan objects (pool, pipeline, layouts, shader module) — on
+    ///    EVERY path, success or error, via [`Transients`]. It did so only on success until B26.
     #[doc(hidden)]
     pub fn matmul_f32(
         &self,
@@ -93,11 +159,17 @@ impl VulkanBackend {
         let device = &self.shared.device;
         let spv = matmul_spv();
 
+        // Every transient handle below is registered here as it is created, so all of them are
+        // destroyed however this function leaves — including the dozen `?` early returns and the
+        // null-pipeline bail-out, which used to abandon whatever had been built so far.
+        let mut tr = Transients::new(device);
+
         // ── shader module ──────────────────────────────────────────────────────
         let shader_module = unsafe {
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
         }
         .map_err(|e| be(format!("create_shader_module: {e}")))?;
+        tr.shader_module = shader_module;
 
         // ── descriptor set layout (3 storage buffers: A, B, C) ────────────────
         let ds_bindings = [
@@ -124,6 +196,7 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("create_descriptor_set_layout: {e}")))?;
+        tr.ds_layout = ds_layout;
 
         // ── pipeline layout (push constants: M, N, K as u32 = 12 bytes) ───────
         let push_range = vk::PushConstantRange::default()
@@ -139,6 +212,7 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("create_pipeline_layout: {e}")))?;
+        tr.pipeline_layout = pipeline_layout;
 
         // ── compute pipeline ───────────────────────────────────────────────────
         let entry_name = c"main";
@@ -157,6 +231,7 @@ impl VulkanBackend {
                 )
                 .map_err(|(_, e)| be(format!("create_compute_pipelines: {e}")))?[0]
         };
+        tr.pipeline = pipeline;
         // A driver can return VK_SUCCESS with a VK_NULL_HANDLE pipeline (some ICDs use this to
         // signal a per-pipeline compile failure inside an otherwise-successful batch call). Using
         // that handle in a later vkCmdBindPipeline/vkCmdDispatch is how the segfault manifested —
@@ -182,6 +257,7 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("create_descriptor_pool: {e}")))?;
+        tr.desc_pool = desc_pool;
         let desc_set = unsafe {
             device
                 .allocate_descriptor_sets(
@@ -320,15 +396,10 @@ impl VulkanBackend {
         let c: Vec<f32> = bytemuck::cast_slice(&c_bytes).to_vec();
 
         // ── free transient Vulkan objects ──────────────────────────────────────
-        // buf_a / buf_b / buf_c drop here (VkBuffer + gpu-allocator sub-alloc freed).
+        // buf_a / buf_b / buf_c drop here (VkBuffer + gpu-allocator sub-alloc freed); `tr` drops on
+        // the way out and destroys the pool, pipeline, layouts and shader module — on this path and
+        // on every early return above it.
         drop((buf_a, buf_b, buf_c));
-        unsafe {
-            device.destroy_descriptor_pool(desc_pool, None); // frees desc_set implicitly
-            device.destroy_pipeline(pipeline, None);
-            device.destroy_pipeline_layout(pipeline_layout, None);
-            device.destroy_descriptor_set_layout(ds_layout, None);
-            device.destroy_shader_module(shader_module, None);
-        }
 
         Ok(c)
     }
