@@ -1132,42 +1132,6 @@ been executed, and it stems from the same missing validation.
 `tool_choice_str` 400s, which already establish that a malformed forced choice
 is an error rather than a silent downgrade to `auto`.
 
-### B24 — `ServeStats` loses a completion correction across a drain
-
-**Tag:** CR-2026-08-03 L1 (**PROVED**) · **Blocked on:** nothing
-
-`crates/infr-server/src/lib.rs`: the live per-delta estimate (`bump_gen`) and
-the authoritative correction (`fold_completion`'s
-`i64::from(rec.gen_tokens) - rec.deltas as i64`) share ONE process-global
-`interval_gen_tokens: AtomicI64`, and `drain` takes it as `.swap(0).max(0)`. A
-correction arriving after the deltas it corrects were already drained cannot
-reach them.
-
-**Proved with a temporary test.** Two deltas, drain (window reports 2), then
-`fold_completion` with `gen_tokens = 1, deltas = 2` (correction −1), drain
-again: the second window clamps to 0 and the two windows total **2** where the
-truth is
-
-1. Worse with another request's tokens in the second window: 3 real tokens from
-   request B reported as **2**, because A's −1 came out of B's interval.
-
-The existing `the_live_delta_count_is_reconciled_against_the_real_token_count`
-test passes only because it never drains between the deltas and the correction.
-
-**Why it is Low:** it needs a drain (default `serve.stats_interval_secs = 5`) to
-land between a request's last delta and its completion, and the error is bounded
-by how far deltas and tokens diverge on that one request. It skews the periodic
-`decode_tps` line and nothing else — no per-request number is affected, since
-`log_request_done` reads `ReqRecord` directly.
-
-**The fix shape:** apply the correction only when the current interval is still
-the one the deltas landed in (tag `ReqTally` with the drain generation it
-started in and drop the correction when it no longer matches), or stop
-double-counting altogether — count deltas per request and fold the authoritative
-number once at completion. The second loses the "a long request shows up in
-every interval it spans" property that `bump_gen` exists for; that trade is the
-decision.
-
 ### B25 — `SpinPool::run` releases `in_run` before consuming `panicked`
 
 **Tag:** CR-2026-08-03 L2 (verified) · **Blocked on:** nothing

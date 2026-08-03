@@ -581,6 +581,13 @@ struct ServeStats {
     active: AtomicU64,
     /// Gauge: requests admitted by the handler but still waiting for a slot permit.
     queued: AtomicU64,
+    /// Which interval is currently open. Incremented by every [`Self::drain`].
+    ///
+    /// A completion's correction is only meaningful against the deltas it corrects, and those
+    /// deltas may already have been drained and REPORTED. Stamping each request's live count with
+    /// the window it landed in is what lets [`Self::fold_completion`] tell "still correctable" from
+    /// "already published" (backlog B24).
+    window: AtomicU64,
 }
 
 impl ServeStats {
@@ -589,15 +596,36 @@ impl ServeStats {
         self.interval_gen_tokens.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// The interval currently accepting tokens.
+    fn window(&self) -> u64 {
+        self.window.load(Ordering::Relaxed)
+    }
+
     /// Fold one finished request's exact tallies in, once.
+    ///
+    /// **The correction is clamped to what this request still has in the OPEN window.** Deltas are
+    /// only an estimate of tokens (a think-tag boundary can split or merge one), so completion
+    /// reconciles against `ChatOutcome`'s authoritative count. But a retraction cannot reach a
+    /// window that has already been drained and logged, and subtracting it from the current one
+    /// takes the tokens out of whatever OTHER request is generating now — which is how a −1 from
+    /// request A turned request B's three real tokens into two (B24, proved).
+    ///
+    /// So a negative correction is applied only against `rec.deltas_in_window`, and only while
+    /// `rec.window` is still open. Anything older stays as it was reported: an interval line is a
+    /// statement about a window that has closed, and the honest move is to leave it alone rather
+    /// than to bill the difference to somebody else. A POSITIVE correction is always applied — it
+    /// is new information about tokens nobody has counted yet, the same shape as `prompt_tokens`
+    /// arriving at completion.
     fn fold_completion(&self, rec: &ReqRecord) {
         self.interval_prompt_tokens
             .fetch_add(u64::from(rec.prompt_tokens), Ordering::Relaxed);
-        // Reconcile the live per-delta estimate against the generator's authoritative count. The
-        // difference is normally 0; it is non-zero when deltas and tokens did not line up 1:1.
         let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
-        if correction != 0 {
+        if correction > 0 {
             self.bump_gen(correction);
+        } else if correction < 0 && rec.window == self.window() {
+            // Retract at most what this request itself put into the window that is still open.
+            let retractable = rec.deltas_in_window.min(i64::MAX as u64) as i64;
+            self.bump_gen(-correction.abs().min(retractable));
         }
         self.interval_completed.fetch_add(1, Ordering::Relaxed);
     }
@@ -613,6 +641,9 @@ impl ServeStats {
     /// REAL time since the last drain, not the nominal period — a tick that ran late must not
     /// inflate the rate it reports.
     fn drain(&self, elapsed: Duration) -> StatsWindow {
+        // Close the current window BEFORE taking the counters: from here on, a completion whose
+        // deltas landed in the old window can no longer retract them (see `fold_completion`).
+        self.window.fetch_add(1, Ordering::Relaxed);
         StatsWindow {
             elapsed,
             prompt_tokens: self.interval_prompt_tokens.swap(0, Ordering::Relaxed),
@@ -736,6 +767,11 @@ struct ReqTally {
     first_delta: Option<Instant>,
     /// Text deltas seen (content + reasoning). Reconciled against the real token count at the end.
     deltas: u64,
+    /// The [`ServeStats`] window `deltas_in_window` is counted against.
+    window: u64,
+    /// Deltas this request has contributed to `window` — i.e. how much of the still-open interval
+    /// is this request's, and therefore the most a completion correction may retract from it (B24).
+    deltas_in_window: u64,
 }
 
 impl ReqTally {
@@ -744,16 +780,31 @@ impl ReqTally {
             started: Instant::now(),
             first_delta: None,
             deltas: 0,
+            window: 0,
+            deltas_in_window: 0,
         }
     }
 
-    /// Called from the generator's `on_delta` callback for a TEXT delta. Two increments and one
-    /// relaxed atomic add — no lock, no allocation, nothing that can block the decode loop.
+    /// Called from the generator's `on_delta` callback for a TEXT delta. A few increments, one
+    /// relaxed atomic load and one relaxed atomic add — no lock, no allocation, nothing that can
+    /// block the decode loop.
+    ///
+    /// The load is what keeps `deltas_in_window` honest across a drain: a reporter tick between two
+    /// deltas moves the window, and this request's share of the new one restarts at zero. The load
+    /// and the add are not atomic together, so a drain landing exactly between them can misplace a
+    /// single token; that is one token on an interval line, and closing it would mean a lock on the
+    /// decode path, which is the one thing this whole structure exists to avoid.
     fn on_text_delta(&mut self, stats: &ServeStats) {
         if self.first_delta.is_none() {
             self.first_delta = Some(Instant::now());
         }
+        let w = stats.window();
+        if w != self.window {
+            self.window = w;
+            self.deltas_in_window = 0;
+        }
         self.deltas += 1;
+        self.deltas_in_window += 1;
         stats.bump_gen(1);
     }
 
@@ -769,6 +820,8 @@ impl ReqTally {
             prompt_tokens: outcome.prompt_tokens,
             gen_tokens: outcome.completion_tokens,
             deltas: self.deltas,
+            window: self.window,
+            deltas_in_window: self.deltas_in_window,
             prefill,
             decode: total.saturating_sub(prefill),
             total,
@@ -783,6 +836,10 @@ struct ReqRecord {
     prompt_tokens: u32,
     gen_tokens: u32,
     deltas: u64,
+    /// The stats window this request's last deltas landed in — see [`ServeStats::fold_completion`].
+    window: u64,
+    /// How many of `deltas` were counted into `window`.
+    deltas_in_window: u64,
     /// Time to the first delta — the prefill.
     prefill: Duration,
     /// From the first delta to the end — the decode.
@@ -3440,11 +3497,27 @@ mod tests {
     // --- request / throughput logging (B10) ---------------------------------
 
     /// A finished request, spelled out so a test can fold one in without running a generator.
+    ///
+    /// Defaults to "all of its deltas are in window 0, which is still open" — the ordinary case
+    /// where no drain intervened. [`rec_in_window`] is for the case that does.
     fn rec(prompt: u32, gen: u32, deltas: u64) -> ReqRecord {
+        rec_in_window(prompt, gen, deltas, 0, deltas)
+    }
+
+    /// A finished request whose deltas landed in a specific stats window — the B24 shape.
+    fn rec_in_window(
+        prompt: u32,
+        gen: u32,
+        deltas: u64,
+        window: u64,
+        deltas_in_window: u64,
+    ) -> ReqRecord {
         ReqRecord {
             prompt_tokens: prompt,
             gen_tokens: gen,
             deltas,
+            window,
+            deltas_in_window,
             prefill: Duration::from_millis(100),
             decode: Duration::from_millis(400),
             total: Duration::from_millis(500),
@@ -3524,6 +3597,91 @@ mod tests {
         }
         over.fold_completion(&rec(1, 4, 6));
         assert_eq!(over.drain(Duration::from_secs(1)).gen_tokens, 4);
+    }
+
+    /// B24: a correction must never be paid for out of a DIFFERENT request's interval.
+    ///
+    /// The reconciliation above only works because nothing drains between the deltas and the
+    /// completion. When a reporter tick lands in that gap the deltas have already been published,
+    /// and the retraction used to come out of whatever was generating next.
+    #[test]
+    fn a_correction_never_retracts_another_requests_tokens() {
+        let s = ServeStats::default();
+
+        // Request A emits two deltas, and the reporter ticks before A finishes.
+        let mut a = ReqTally::new();
+        a.on_text_delta(&s);
+        a.on_text_delta(&s);
+        let w1 = s.drain(Duration::from_secs(1));
+        assert_eq!(w1.gen_tokens, 2, "the open window had A's two deltas");
+
+        // Request B is now generating and puts three real tokens into the new window.
+        let mut b = ReqTally::new();
+        for _ in 0..3 {
+            b.on_text_delta(&s);
+        }
+
+        // A completes: it really produced ONE token, so its live estimate was 1 too high. That
+        // overcount is in a window that has already been reported and cannot be taken back.
+        s.fold_completion(&a.finish(
+            ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            Finish::Stop,
+        ));
+
+        let w2 = s.drain(Duration::from_secs(1));
+        assert_eq!(
+            w2.gen_tokens, 3,
+            "B's three tokens must survive A's correction — the −1 belongs to a closed window"
+        );
+    }
+
+    /// The other half of B24: while the window is still open, a correction DOES apply — clamped to
+    /// this request's own contribution, so it can never dig into tokens it did not put there.
+    #[test]
+    fn a_correction_applies_within_the_open_window_and_is_clamped_to_its_own_deltas() {
+        let s = ServeStats::default();
+        let mut a = ReqTally::new();
+        for _ in 0..4 {
+            a.on_text_delta(&s);
+        }
+        // No drain: A's deltas are still in the open window, so its −2 lands.
+        s.fold_completion(&a.finish(
+            ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 2,
+            },
+            Finish::Stop,
+        ));
+        assert_eq!(s.drain(Duration::from_secs(1)).gen_tokens, 2);
+
+        // A request claiming FEWER tokens than it has deltas in this window can still only retract
+        // what it contributed: 1 delta here, so a −3 becomes −1 and the other request keeps its 5.
+        let s = ServeStats::default();
+        let mut c = ReqTally::new();
+        c.on_text_delta(&s);
+        for _ in 0..5 {
+            s.bump_gen(1); // another request's tokens, same window
+        }
+        let mut r = c.finish(
+            ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            },
+            Finish::Stop,
+        );
+        r.deltas = 4; // pretend 4 deltas were seen, only 1 of them in this window
+        s.fold_completion(&r);
+        assert_eq!(
+            s.drain(Duration::from_secs(1)).gen_tokens,
+            5,
+            "the retraction is capped at this request's own contribution to the window"
+        );
     }
 
     /// Activity-only, and what counts as activity. A request that is mid-generation has produced no
