@@ -1020,6 +1020,91 @@ Also still true, and by construction: a block is the finest granularity
 available. `denoise_block` runs a whole canvas to completion, so a cancelled DG
 turn stops at a block boundary, not immediately.
 
+### B30 — the GGUF weight mmap trusts the file, and cannot enforce it
+
+**Tag:** PR#90 · **Blocked on:** a decision on shared-vs-exclusive locking
+
+`Gguf::open` maps the model file and hands out `&[u8]` slices into it for the
+mapping's whole life. Nothing stops another process writing or truncating that
+file: a write mutates memory Rust believes is frozen, and a truncation turns a
+resident page into `SIGBUS`. The `SAFETY` note there is a claim about the
+environment, not something the code enforces — this is the "comment is not a
+safeguard" shape, and it is written down as an UNENFORCED INVARIANT on `open`.
+
+**Considered and rejected: copying the file into an anonymous mapping.** PR #90
+did exactly that and it works, but it is not affordable. Measured here on a 16
+GiB Qwen3.6-27B, warm page cache, two reps each: warm load 1.87 s → 10.5 s
+(5.6x, re-opening almost exactly the gap `model-load-time` closed), and 14 GiB
+of evictable page cache became 20.2 GiB of anonymous RSS. Anonymous pages are
+swap-only, so a model larger than RAM goes from slow to unrunnable — the Llama-4
+Scout blob on this host is 47.5 GiB against 60 GiB of RAM. Reverted in
+`5ba6b3f`; the same PR's tensor byte-count overflow check was kept.
+
+**The direction that is affordable:** hold an advisory lock on the fd for the
+mapping's lifetime — keep the `File` in `Gguf`, take the lock in `open`, drop it
+with the mapping. Two things to settle first, and they are why this is not
+already done:
+
+- `flock` binds only cooperating processes. A writer that never asks for the
+  lock is unaffected, so this narrows the window rather than closing it. Worth
+  deciding whether that is enough to be worth the code.
+- An EXCLUSIVE lock would stop two `infr` processes from sharing one model,
+  which is a normal thing to want. A SHARED lock among readers, refusing only
+  writers, is probably the right shape — but nothing in the tree currently takes
+  a lock, so the writer half has no counterpart to conflict with.
+
+Windows needs `LockFileEx` rather than `flock`; both sides must be implemented
+or the missing one must fail loudly.
+
+### B31 — two nits left unfixed when PR #90 landed
+
+**Tag:** PR#90 review · **Blocked on:** nothing; both are small and neither is a
+live defect
+
+Found while reviewing PR #90, out of scope for the merge, neither fixed:
+
+- **`CollectGuard.slots` may be invalidated before it is used.**
+  `SpinPool::collect` in `crates/infr-cpu/src/pool.rs` calls `out.as_mut_ptr()`
+  twice — once for the guard, once for `SendPtr`. The second reborrow pops the
+  first pointer's tag under Stacked Borrows, and the guard then uses `slots`
+  during unwinding. It will not miscompile (same allocation, and LLVM has no
+  reason to reorder across the panic), but it is UB by the model. Fix is one
+  line: take the pointer once and derive both from it. Not checked under Miri —
+  the repo has never run it, and the spin pool's real threads and spin loops
+  would need work to run there at all.
+- **`request_shutdown(0)` returns `true` while latching nothing.** Now that
+  `SIGNO` IS the latch (`crates/infr-core/src/shutdown.rs`),
+  `compare_exchange(0, 0)` succeeds and reports itself as the first caller,
+  while `shutdown_requested()` stays false. Unreachable today — the CLI signal
+  handler is the only caller and always passes a real signo — but it is a public
+  API in `infr-core`. A `debug_assert!(signo != 0)` or a documented precondition
+  closes it.
+
+### B32 — PR #90 narrowed tool-parser leniency beyond malformed arrays
+
+**Tag:** PR#90 review · **Blocked on:** a product call on which behaviour is
+wanted
+
+`parse_value` in `crates/infr-chat/src/tools.rs` now returns `None` when the
+current byte is `,`, `}` or `]`. That is what fixes the array hang (verified: on
+the pre-merge tree, the model output `<|tool_call>call:x{a:[}]}<tool_call|>`
+allocates without bound — it reached 4.8 GB under a `ulimit -v` cap and aborted
+only because of it, since the bareword arm returns at `}` without advancing the
+cursor). But it also changes valueless OBJECT entries, which the array fix did
+not require. Measured on both trees:
+
+| input       | before              | after        |
+| ----------- | ------------------- | ------------ |
+| `{a:}`      | `{"a": ""}`         | call dropped |
+| `{a:,b:1}`  | `{"a": "", "b": 1}` | call dropped |
+| `{a:1,b:2}` | unchanged           | unchanged    |
+| `{a:[1,2]}` | unchanged           | unchanged    |
+
+Well-formed input is unaffected. Dropping the call is arguably better than
+inventing an empty-string argument the model never wrote — but the doc comment
+on `parse_value` still advertises leniency for partial objects, so either the
+behaviour or the doc is now wrong. Decide which, then make them agree.
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
