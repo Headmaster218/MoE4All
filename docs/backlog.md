@@ -740,6 +740,36 @@ escape and `\u` paths that the punctuation alphabet cannot.
 Adding it means a `fuzz/` crate, a nightly job, and a decision about how long
 per target per week.
 
+### B35 — tiered weight paging (VRAM → DRAM → disk) is planned, not built
+
+**Tag:** design slice 2026-08-04 · **Blocked on:** the phase-0 measurement, and
+the two decisions in §7 of the plan
+
+`docs/disk-streaming-plan.md` designs a third paging tier below DRAM, so a model
+that fits neither VRAM nor DRAM runs from the model file under our own policy
+instead of the OS page cache. Nothing is implemented. The plan carries the
+phasing, the verification per phase, and the per-backend integration for CPU,
+Vulkan and Metal.
+
+Findings the design review turned up that the tier work must handle. The CPU
+cache-identity one is **fixed** — those caches now key on a never-reused
+`CpuBuffer::uid`, guarded by `buffer_uids_are_never_reused`. The rest are
+constraints rather than defects, recorded so the slice that hits them does not
+rediscover them:
+
+- `infr-metal`'s `qui_cache` factored arm copies the transformed weight out and
+  retains it unboundedly, keyed by `MTLBuffer::id()`. Correct, but it is a
+  second full copy of every touched weight in host RAM, so a paged Metal model
+  must gate or budget it (plan §3.4, phase 4).
+- The seam's `wload` materializes every multi-name group into `WBytes::Owned`,
+  and the Vulkan streamed binder then ignores those bytes and re-fetches
+  per-component mmap views — a concat built and dropped on every fused streamed
+  group. Paged groups must not build it at all (plan §3.2).
+- `WBytes`'s `Deref<Target = [u8]>` is infallible, so a variant that has no
+  bytes in hand cannot be added without a panic arm; `pipeline_binder` and
+  `tensor_parallel_binder` deref it directly. The `Paged` variant lands together
+  with that `Deref`'s removal (plan §3.7), never before.
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
