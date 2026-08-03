@@ -97,7 +97,24 @@ pub struct Pager {
     /// inserts at the COLD end, so it needs the epoch guard instead).
     epoch: HashMap<BlockId, u64>,
     cur_epoch: u64,
+    /// block_id -> outstanding pin count, for blocks a caller is READING right now
+    /// ([`Self::resolve_and_pin`]). Only present while non-zero. A pinned block is never an
+    /// eviction victim: the epoch guard above cannot express this, because it is scoped to one
+    /// dispatch batch while a pin lasts as long as the borrow — a CPU kernel reads a weight for a
+    /// whole op, spanning batches.
+    pinned: HashMap<BlockId, u32>,
     stats: PagerStats,
+}
+
+/// Where a miss inserts into the LRU order — the two policies this pager already had, named so a
+/// caller can pick one at the call site instead of through three near-identical entry points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Insert {
+    /// Most-recently-used end: recency (`touch`). Right when reuse follows use.
+    Mru,
+    /// Cold end: scan-resistant / cyclic-sweep (`touch_cold`, `schedule`). Right when the block
+    /// just used is the one whose next use is furthest away.
+    Cold,
 }
 
 impl Pager {
@@ -136,6 +153,7 @@ impl Pager {
             free: (0..n_slots as u32).rev().collect(), // pop() hands out slot 0 first
             epoch: HashMap::with_capacity(n_slots),
             cur_epoch: 0,
+            pinned: HashMap::new(),
             stats: PagerStats::default(),
         }
     }
@@ -199,6 +217,78 @@ impl Pager {
         Resolution::Miss { slot, evicted }
     }
 
+    /// Ensure `id` is resident AND pin it, so it cannot be evicted until [`Self::unpin`].
+    ///
+    /// This is the entry point for a tier whose slots are read DIRECTLY (the host DRAM arena: a
+    /// CPU kernel dereferences the slot for a whole op, and a staging copy reads it until the copy
+    /// is recorded), as opposed to the VRAM pagers, whose callers upload a slot's bytes and then
+    /// let residency ride the batch epoch alone.
+    ///
+    /// `None` means every resident block is protected right now — all pinned, or all touched by
+    /// the current batch — so there is no slot to give. Nothing is evicted, nothing is inserted and
+    /// no counter moves in that case: the caller has to release pins (or was sized below its own
+    /// working set, which is a configuration error it should report). This is a `None` and not a
+    /// panic precisely because it IS reachable at runtime, unlike the unpinned callers' floor.
+    ///
+    /// On a `Miss` the caller must fill the slot before reading it; on a `Hit` it is already valid.
+    /// Either way the block comes back pinned exactly once.
+    pub fn resolve_and_pin(&mut self, id: BlockId, insert: Insert) -> Option<Resolution> {
+        if let Some(&slot) = self.resident.get(&id) {
+            self.epoch.insert(id, self.cur_epoch);
+            self.stats.hits += 1;
+            if insert == Insert::Mru {
+                self.mark_mru(id);
+            }
+            *self.pinned.entry(id).or_insert(0) += 1;
+            return Some(Resolution::Hit { slot });
+        }
+        let (slot, evicted) = self.take_slot_opt()?;
+        self.epoch.insert(id, self.cur_epoch);
+        self.stats.misses += 1;
+        self.resident.insert(id, slot);
+        match insert {
+            Insert::Mru => self.lru.push_back(id),
+            Insert::Cold => self.lru.push_front(id),
+        }
+        *self.pinned.entry(id).or_insert(0) += 1;
+        Some(Resolution::Miss { slot, evicted })
+    }
+
+    /// Pin `id` only if it is ALREADY resident — never reads, never evicts, never inserts.
+    ///
+    /// The hit-only probe a tier above this one uses to decide between "copy from here" and "go to
+    /// the tier below". A hit counts as a hit; a miss counts as nothing, because no residency
+    /// decision was made.
+    pub fn pin_if_resident(&mut self, id: BlockId) -> Option<u32> {
+        let slot = *self.resident.get(&id)?;
+        self.epoch.insert(id, self.cur_epoch);
+        self.stats.hits += 1;
+        *self.pinned.entry(id).or_insert(0) += 1;
+        Some(slot)
+    }
+
+    /// Release one pin taken by [`Self::resolve_and_pin`] / [`Self::pin_if_resident`].
+    ///
+    /// # Panics
+    /// If `id` holds no pin. An unbalanced release is not a state to recover from: it would let a
+    /// slot be evicted while a reader still holds bytes from it, which is silent wrong output
+    /// rather than a failure. The RAII guard in the host tier is what makes this balanced.
+    pub fn unpin(&mut self, id: BlockId) {
+        match self.pinned.get_mut(&id) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                self.pinned.remove(&id);
+            }
+            None => panic!("pager: unpin of block {id}, which holds no pin"),
+        }
+    }
+
+    /// How many distinct blocks are pinned right now — the number a caller sizes `n_slots`
+    /// against (see [`Self::resolve_and_pin`]'s `None`).
+    pub fn pinned_blocks(&self) -> usize {
+        self.pinned.len()
+    }
+
     /// Schedule-driven residency for a DETERMINISTIC cyclic sweep — the dense layer-streaming
     /// policy the module doc names (`BlockId = layer`, every forward pass visits blocks in the
     /// same fixed order). This is NOT demand/LRU: under a cyclic sweep the block whose next use
@@ -242,10 +332,46 @@ impl Pager {
         Resolution::Miss { slot, evicted }
     }
 
+    /// A free slot, evicting if none remain, or `None` when every resident block is protected
+    /// (pinned, or touched by the current batch). [`Self::take_slot`] is the infallible form the
+    /// unpinned callers use.
+    fn take_slot_opt(&mut self) -> Option<(u32, Option<BlockId>)> {
+        if let Some(s) = self.free.pop() {
+            return Some((s, None));
+        }
+        // A block is protected by its PIN always, and by the batch epoch only once batches are in
+        // use: a caller that never opens one leaves `cur_epoch` at 0, which every block's default
+        // epoch also is, so an unconditional epoch test would mark the whole cache as in-batch and
+        // find no victim at all. (The infallible `take_slot` expresses the same exemption as its
+        // `cur_epoch == 0` assert.)
+        let batches = self.cur_epoch != 0;
+        let idx = self.lru.iter().position(|b| {
+            !(batches && self.epoch.get(b) == Some(&self.cur_epoch)) && !self.pinned.contains_key(b)
+        })?;
+        let victim = self.lru.remove(idx).expect("index from position()");
+        let vslot = self
+            .resident
+            .remove(&victim)
+            .expect("every lru entry has a resident mapping");
+        // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
+        // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
+        // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
+        self.epoch.remove(&victim);
+        self.stats.evictions += 1;
+        Some((vslot, Some(victim)))
+    }
+
     /// A free slot, evicting if none remain. The victim is the coldest block NOT touched in the
     /// current batch (epoch guard — see [`Self::begin_batch`]); legacy callers that never open a
     /// batch share epoch 0 everywhere, for which the guard degrades to plain LRU `pop_front`.
     fn take_slot(&mut self) -> (u32, Option<BlockId>) {
+        if self.free.is_empty() {
+            // Only reachable through the infallible entry points, whose callers hold no pins.
+            debug_assert!(
+                self.pinned.is_empty(),
+                "pins are for the fallible resolve_and_pin path; touch/schedule cannot see them"
+            );
+        }
         if let Some(s) = self.free.pop() {
             return (s, None);
         }
@@ -740,6 +866,118 @@ mod tests {
             p.epoch_len(),
             p.n_slots()
         );
+    }
+
+    /// The pin's whole purpose: a pinned block is not a victim even when it is the COLDEST thing
+    /// in the cache. Without the guard, LRU order alone would hand slot 0 straight back.
+    #[test]
+    fn a_pinned_block_is_never_the_victim() {
+        let mut p = Pager::new(2);
+        let Some(Resolution::Miss { slot: s1, .. }) = p.resolve_and_pin(1, Insert::Mru) else {
+            panic!("expected miss")
+        };
+        p.touch(2); // unpinned, and now the MRU end — but 1 is pinned, so 2 is the only victim
+        let Some(Resolution::Miss { evicted, .. }) = p.resolve_and_pin(3, Insert::Mru) else {
+            panic!("expected miss")
+        };
+        assert_eq!(evicted, Some(2), "the unpinned block must be the victim");
+        assert_eq!(p.slot_of(1), Some(s1), "pinned block moved or was evicted");
+    }
+
+    /// Exhaustion is a `None`, not a panic and not a silent eviction — and it must leave the cache
+    /// exactly as it was, so a caller that releases a pin and retries gets a working pager.
+    #[test]
+    fn every_slot_pinned_yields_none_and_changes_nothing() {
+        let mut p = Pager::new(2);
+        p.resolve_and_pin(1, Insert::Mru).expect("slot 1");
+        p.resolve_and_pin(2, Insert::Mru).expect("slot 2");
+        let before = p.stats();
+        assert!(
+            p.resolve_and_pin(3, Insert::Mru).is_none(),
+            "a fully pinned cache cannot admit a third block"
+        );
+        assert_eq!(p.resident_count(), 2);
+        assert!(p.slot_of(1).is_some() && p.slot_of(2).is_some());
+        assert_eq!(
+            p.slot_of(3),
+            None,
+            "the rejected block must not be resident"
+        );
+        let after = p.stats();
+        assert_eq!(
+            (after.hits, after.misses, after.evictions),
+            (before.hits, before.misses, before.evictions),
+            "a refused resolve must not move any counter"
+        );
+
+        // Releasing one pin makes exactly one slot available again.
+        p.unpin(1);
+        let Some(Resolution::Miss { evicted, .. }) = p.resolve_and_pin(3, Insert::Mru) else {
+            panic!("expected the freed slot")
+        };
+        assert_eq!(evicted, Some(1));
+    }
+
+    /// A pin outlives the batch epoch — the reason it exists at all. The epoch guard expires the
+    /// moment the next batch opens; the pin does not.
+    #[test]
+    fn a_pin_outlives_its_batch() {
+        let mut p = Pager::new(2);
+        p.begin_batch();
+        p.resolve_and_pin(1, Insert::Cold).expect("resident");
+        p.begin_batch(); // block 1's epoch protection is now stale; only its pin remains
+        p.touch_cold(2);
+        p.begin_batch(); // ...and now block 2's is stale too, so it is the only legal victim
+        let Some(Resolution::Miss { evicted, .. }) = p.resolve_and_pin(3, Insert::Cold) else {
+            panic!("expected miss")
+        };
+        assert_eq!(evicted, Some(2), "the pin must still protect block 1");
+        assert!(p.slot_of(1).is_some());
+    }
+
+    /// Nesting: two pins on one block need two releases. A single `unpin` must NOT make it
+    /// evictable while the second reader still holds it.
+    #[test]
+    fn pins_are_counted_not_boolean() {
+        let mut p = Pager::new(1);
+        p.resolve_and_pin(1, Insert::Mru).expect("resident");
+        p.resolve_and_pin(1, Insert::Mru).expect("hit, second pin");
+        assert_eq!(p.pinned_blocks(), 1);
+        p.unpin(1);
+        assert!(
+            p.resolve_and_pin(2, Insert::Mru).is_none(),
+            "one release of two must leave the block pinned"
+        );
+        p.unpin(1);
+        assert!(p.resolve_and_pin(2, Insert::Mru).is_some());
+    }
+
+    /// `pin_if_resident` is a probe: a miss must not read, insert, evict or count a miss.
+    #[test]
+    fn pin_if_resident_never_admits_a_block() {
+        let mut p = Pager::new(2);
+        assert_eq!(p.pin_if_resident(9), None);
+        assert_eq!(p.resident_count(), 0);
+        assert_eq!(p.stats().misses, 0, "a probe miss is not a residency miss");
+
+        let Some(Resolution::Miss { slot, .. }) = p.resolve_and_pin(9, Insert::Mru) else {
+            panic!("expected miss")
+        };
+        assert_eq!(p.pin_if_resident(9), Some(slot));
+        // Two pins now (resolve + probe): both must be released before 9 can be evicted.
+        p.unpin(9);
+        p.unpin(9);
+        assert_eq!(p.pinned_blocks(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "holds no pin")]
+    fn unpinning_an_unpinned_block_panics() {
+        // An unbalanced release would let a slot be evicted under a live reader — wrong bytes with
+        // no error, which is worse than the panic.
+        let mut p = Pager::new(1);
+        p.touch(1);
+        p.unpin(1);
     }
 
     #[test]
