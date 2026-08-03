@@ -3,108 +3,183 @@
 Everything below is **validated on an AMD Radeon RX 7900 XTX** (RDNA3, 24 GB,
 Vulkan / RADV): correctness is checked against the CPU reference implementation
 (the `gpu_seam_matches_cpu_*` tests generate token-for-token on both and
-compare) and throughput is measured against the system `llama.cpp` build with
+compare) and throughput is measured against a `llama.cpp` build with
 `infr compare`.
 
 **Throughput vs llama.cpp** — ratios are `infr / llama.cpp` (**>1.0 = infr is
-faster**); r=3, 2026-08-02 snapshot (infr `691c0dc`, every model×quant in the
-local cache, oracle `llama-bench` **`c629da5`** Vulkan build on every row).
-Hardware: **AMD Radeon RX 7900 XTX** (RDNA3, 24 GB, Vulkan / RADV, Mesa).
+faster**); r=3, **2026-08-03** snapshot. Provenance:
+
+- **infr `2241e60`**, release build, every model×quant resolved from the local
+  HF cache.
+- **Oracle `llama-bench` b9833** (`build: c818263f2a (9833)`), Vulkan, release,
+  on every row. **Not the `c629da5` the previous table cited** — see the oracle
+  box below for why, and for what that does to comparability.
+- **Hardware:** AMD Radeon RX 7900 XTX (RDNA3, 24 GB), Vulkan / RADV, **Mesa
+  26.1.6**, host Ryzen 9 9950X3D. Exclusive use of the GPU; every measurement
+  serial.
+
 `pp512` = 512-token prefill throughput, `tg128` = 128-token decode throughput,
 `tg64@d4096` = decode at 4096 KV depth, `pp4@d4096` = short-turn prefill at 4096
 KV depth (the multi-turn serve shape).
 
-> ### Read the prefill columns as one significant figure
+> ### Caveat on the oracle: the SYSTEM `llama-bench` is broken on this box
 >
-> The two **decode** columns are reproducible; the two **prefill** columns are
-> not, and by much more than this table used to admit. Running the whole sweep
-> TWICE against the same infr binary (`691c0dc`) and near-identical llama.cpp
-> absolutes gives, per column:
+> The distro `llama-cpp` package (b10182) links against ggml 0.17 while the
+> installed `ggml-vulkan` is still 0.15.3, so `/usr/lib/libllama.so.0` dies with
+> `undefined symbol: ggml_dsv4_hc_post` and **no system llama.cpp binary runs at
+> all**. Rather than change the machine's packages, this sweep ran a cached
+> **`llama-cpp-vulkan-b9833-1` release build against its own bundled libs**
+> (`LD_LIBRARY_PATH` shim, passed to `infr compare --llama-bench`). It is a
+> release build; the other cached builds print `warning: asserts enabled` and
+> would flatter infr, so they were not used.
 >
-> | column       | mean abs Δ between runs | worst row | rows moving >5% |
-> | ------------ | ----------------------- | --------- | --------------- |
-> | `tg128`      | 0.8%                    | 3.0%      | 0 / 35          |
-> | `tg64@d4096` | 0.7%                    | 2.2%      | 0 / 35          |
-> | `pp512`      | 6.8%                    | **34.5%** | 10 / 35         |
-> | `pp4@d4096`  | 7.7%                    | **31.7%** | **19 / 35**     |
->
-> That is the SAME binary measured twice, so it is pure run-to-run variance, not
-> a code change. The cause is known and documented as an open issue: infr's
-> default prefill is nondeterministic in its tier/chunk choice, so a short
-> prefill can land on a different kernel tier between runs. It bites hardest on
-> the small models (whole prefill is short) and on the IQ3_S MoE.
->
-> Practical consequences: **a prefill cell's second decimal is meaningless**, a
-> prefill difference under ~10% between two rows or two snapshots is not a
-> result, and the per-column win counts below move by several rows run to run
-> (`pp512` was 26/35 on the immediately preceding run and is 34/35 here, same
-> binary). Decode cells can be read as written. To get a stable prefill number,
-> pin the chunk with `-u/--ubatch` and repeat the run.
+> Spot-check that b9833 is comparable to the `c629da5` the previous snapshot
+> used, on the one shape both have a recorded value for (Qwen3-30B-A3B Q4_K_M,
+> d8192): **`pp512` 1686.8 against 1692.9 recorded (−0.4%)**, **`tg128` 161.2
+> against 165.1 (−2.4%)**. Close, but not zero — so treat cross-snapshot ratio
+> diffs under ~3% as oracle drift, not as an infr change. To answer "did infr
+> get faster", run an infr-vs-infr A/B, never a diff of two tables.
 
-> **The oracle moved, so these ratios are NOT comparable to the 2026-07-13 table
-> they replace.** That snapshot was taken against `llama-bench` **b9957**; this
-> one against **`00f5442`**, three weeks of upstream Vulkan work later. Most
-> ratios fell, and almost none of that is infr slowing down — an infr-vs-infr
-> A/B across the same commit range (`2b3a943` → HEAD, same GPU, alternated
-> order, 30 s cooldowns) has infr FASTER on every metric it moved: `pp512`
-> +9–19%, `tg128` +0.3–4.7%, `tg64@d4096` +0.6–3.7%, `pp4@d4096` +5%. Where a
-> row lost ground, llama.cpp gained more than we did. Read a drop here as "they
-> closed the gap", not "we regressed" — and if you need the latter question
-> answered, run the infr-vs-infr comparison, not this table.
+> ### How reproducible is each column?
+>
+> **The old warning in this box no longer holds.** The previous version warned
+> that both prefill columns were untrustworthy: `pp512` 6.8% mean / **34.5%**
+> worst between two runs of the same binary, `pp4@d4096` 7.7% / 31.7%. **That is
+> fixed and the diagnosis in it was wrong.** Backlog **B6** established that the
+> cause was not tier nondeterminism (the dispatched kernels were byte-identical
+> across runs) but a **cold first timed rep** — `bench_vulkan`'s untimed warmup
+> ran a different shape from the one about to be measured, so rep 1 paid that
+> shape's one-time costs inside the measured window. `2241e60` warms the
+> measured shape, and three independent measurements of variance on THIS tree
+> now say:
+>
+> | column       | in-run rep spread¹ | ratio p2p, 4 full runs² | infr abs, 2 passes³ |
+> | ------------ | ------------------ | ----------------------- | ------------------- |
+> | `tg128`      | 0.5% / 3.4%        | 1.5% / **2.7%**         | 0.5% / 1.3%         |
+> | `tg64@d4096` | 0.6% / 2.4%        | 1.4% / **2.2%**         | 0.6% / 1.7%         |
+> | `pp512`      | 2.6% / 7.1%        | 1.6% / **3.4%**         | 0.6% / 3.5%         |
+> | `pp4@d4096`  | 5.8% / 22.6%       | 7.4% / **16.0%**        | 2.0% / 10.0%        |
+>
+> ¹ mean / worst of `(max−min)/min` over the 3 reps `infr bench` reports on
+> every line, across all 35 rows. ² mean / worst peak-to-peak of the
+> **infr/llama ratio** over four complete `infr compare` runs of the six rows
+> the old box named worst (Qwen3-0.6B Q4_K_M, Qwen3.5-0.8B, Gemma-3-1B Q4_K_M,
+> Llama-3.2-1B Q4_K_M, Qwen3-1.7B, Qwen3.6-35B-A3B UD-IQ3_S). ³ mean / worst
+> disagreement of infr's absolute t/s between the sweep pass and a separate
+> infr-only pass ~90 minutes later, all 35 rows.
+>
+> **Three of the four columns are now reproducible and can be read as written.**
+> `pp512` in particular: it is stable to ~1.5% run to run, so a `pp512` figure
+> is a result, and the small-model `pp512` softness noted below is a real,
+> repeatable deficit rather than the noise the old box blamed it on.
+>
+> **`pp4@d4096` is still soft, and only on the smallest models.** Every row with
+> an in-run spread over 5% is ≤4B parameters (all eight Qwen3-0.6B quants,
+> Qwen3.5-0.8B, all three Gemma-3-1B, Qwen3.5-4B UD-Q4_K_XL, Gemma-4-E2B); every
+> row at 8B and above is under 5%, and the IQ3_S MoE that used to be the worst
+> row in the table is now **2.6%** peak-to-peak. This is B6's residual and it is
+> not tier choice: the metric times four tokens, ~3.7 ms of wall of which only
+> ~2.8 ms is device time, so host record/submit/fence jitter is a quarter of the
+> measurement. It is not an infr artefact either — **llama.cpp's own
+> `pp4@d4096`** wobbles 3.5% mean / 8.9% worst over the same four runs, and the
+> ratio compounds both. Read the small models' `pp4@d4096` as ±10%; read the ≥8B
+> rows as written.
+
+> ### Two rows do not run the same way the rest do
+>
+> `infr bench` now reports the chunk, the KV dtype and the final submit cap it
+> used. No row in this sweep auto-quantized its KV cache, but two rows differ
+> from the default and it changes what their at-depth cells mean:
+>
+> - **Qwen3.6-27B Q4_K_M — the submit splitter ARMS on both at-depth cells.**
+>   The 4096-token depth prime is one 1633-dispatch forward that takes ~1.01 s,
+>   just past the 1 s `SUBMIT_DANGER_NS` threshold, so
+>   `VulkanBackend::observe_forward` latches a cap and every later forward in
+>   that process — including the timed ones — splits every ~400 dispatches.
+>   Reproduced in 3 of 3 processes (caps 392 / 401 / 403), so this row is
+>   self-consistent, but its `tg64@d4096` and `pp4@d4096` are the only cells in
+>   the table measured with a split submit structure. B6 recorded this splitter
+>   as a latent hazard that had never fired; it fires here. (It also fires on
+>   Qwen3-30B-A3B on some legs past d8192 — see the deep-context section — but
+>   never at the d4096 this table uses.)
+> - **Gemma-4-31B UD-Q5_K_XL runs a 256-row prefill chunk at depth**, not the
+>   default 1024: at 21.9 GiB of weights on a 24 GB card the 1024-row chunk's
+>   activation reserve does not fit, so dense placement drops to 256 and logs it
+>   (footnote ⁴). Its `pp512`/`tg128` cells use the default 1024.
 
 | Model                 | Quant       | pp512     | tg128     | tg64@d4096 | pp4@d4096 |
 | --------------------- | ----------- | --------- | --------- | ---------- | --------- |
-| Qwen3-0.6B            | Q2_K        | **1.16×** | **1.41×** | **1.23×**  | **2.01×** |
-| Qwen3-0.6B            | IQ4_XS      | **1.12×** | **1.16×** | **1.13×**  | **1.91×** |
-| Qwen3-0.6B            | Q4_0        | **1.12×** | **1.30×** | **1.17×**  | **1.89×** |
-| Qwen3-0.6B            | Q4_K_M      | **1.15×** | **1.20×** | **1.14×**  | **2.04×** |
-| Qwen3-0.6B            | Q5_K_M      | **1.17×** | **1.25×** | **1.16×**  | **1.85×** |
-| Qwen3-0.6B            | Q6_K¹       | **1.18×** | **1.06×** | **1.03×**  | **1.83×** |
-| Qwen3-0.6B            | Q8_0        | **1.19×** | **1.12×** | **1.08×**  | **1.86×** |
-| Qwen3-0.6B            | BF16⁸       | **1.06×** | 0.98×     | 0.98×      | **1.79×** |
-| Qwen3.5-0.8B          | Q4_K_M      | **1.37×** | **1.11×** | **1.07×**  | **1.64×** |
-| Gemma-3-1B            | Q2_K        | **1.05×** | **1.04×** | 0.97×      | **1.01×** |
-| Gemma-3-1B            | Q4_K_M      | 0.96×     | **1.17×** | **1.08×**  | **1.10×** |
-| Gemma-3-1B            | Q8_0        | **1.32×** | **1.13×** | **1.06×**  | **1.04×** |
-| Llama-3.2-1B          | Q4_K_M      | **1.04×** | **1.08×** | 0.95×      | **1.15×** |
-| Llama-3.2-1B          | Q8_0        | **1.04×** | 0.97×     | 0.88×      | **1.05×** |
-| Qwen3-1.7B            | Q4_K_M      | **1.15×** | **1.12×** | **1.10×**  | **1.65×** |
-| Qwen3.5-4B (MTP)²     | Q4_K_M      | **1.29×** | **1.01×** | **1.01×**  | **1.58×** |
-| Qwen3.5-4B (MTP)²     | UD-Q4_K_XL  | **1.27×** | **1.02×** | **1.02×**  | **1.60×** |
-| Gemma-4-E2B           | Q4_K_M      | **1.15×** | **1.06×** | 0.98×      | **1.10×** |
-| Qwen3-8B              | Q4_K_M      | **1.39×** | **1.02×** | **1.00×**  | **1.07×** |
-| Ornith-1.0-9B         | Q4_K_M      | **1.39×** | **1.04×** | **1.04×**  | **1.27×** |
-| Qwen3.5-9B            | Q4_K_M      | **1.39×** | **1.05×** | **1.05×**  | **1.23×** |
-| Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.41×** | **1.00×** | **1.01×**  | **1.23×** |
-| Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.39×** | **1.00×** | **1.00×**  | **1.20×** |
-| Gemma-3-12B           | Q4_K_M      | **1.32×** | **1.13×** | **1.13×**  | **1.54×** |
-| Gemma-4-12B           | Q4_K_M      | **1.35×** | **1.12×** | **1.10×**  | **1.46×** |
-| Qwen3-14B             | Q2_K³       | **1.24×** | 0.90×     | 0.84×      | **1.02×** |
-| Qwen3-14B             | Q4_K_M      | **1.23×** | **1.01×** | 0.94×      | 0.97×     |
-| Qwen3-14B             | Q8_0        | **1.18×** | 0.99×     | 0.94×      | 0.88×     |
-| Gemma-4-26B-A4B (MoE) | UD-Q4_K_M⁹  | **1.15×** | **1.05×** | **1.06×**  | **1.35×** |
-| Qwen3.6-27B           | Q4_K_M      | **1.27×** | **1.02×** | 0.99×      | **1.07×** |
-| Qwen3-30B-A3B (MoE)   | Q4_K_M⁹     | **1.10×** | 0.96×     | 0.91×      | 0.85×     |
-| Gemma-4-31B           | UD-Q5_K_XL⁴ | **1.08×** | **1.03×** | **1.04×**  | **1.06×** |
-| Ornith-1.0-35B        | Q4_K_M⁵     | **1.04×** | **1.03×** | **1.02×**  | **1.18×** |
-| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁶   | **1.17×** | 0.91×     | 0.91×      | **1.02×** |
-| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.19×** | **1.00×** | **1.00×**  | **1.30×** |
+| Qwen3-0.6B            | Q2_K        | **1.20×** | **1.51×** | **1.27×**  | **2.19×** |
+| Qwen3-0.6B            | IQ4_XS      | **1.14×** | **1.21×** | **1.17×**  | **1.86×** |
+| Qwen3-0.6B            | Q4_0        | **1.20×** | **1.33×** | **1.20×**  | **1.91×** |
+| Qwen3-0.6B            | Q4_K_M      | **1.20×** | **1.22×** | **1.16×**  | **1.95×** |
+| Qwen3-0.6B            | Q5_K_M      | **1.17×** | **1.28×** | **1.20×**  | **1.90×** |
+| Qwen3-0.6B            | Q6_K¹       | **1.20×** | **1.09×** | **1.08×**  | **1.72×** |
+| Qwen3-0.6B            | Q8_0        | **1.23×** | **1.15×** | **1.12×**  | **1.91×** |
+| Qwen3-0.6B            | BF16⁸       | **1.08×** | **1.00×** | 0.99×      | **1.83×** |
+| Qwen3.5-0.8B          | Q4_K_M      | **1.36×** | **1.14×** | **1.09×**  | **1.75×** |
+| Gemma-3-1B            | Q2_K        | **1.05×** | **1.07×** | **1.01×**  | **1.10×** |
+| Gemma-3-1B            | Q4_K_M      | 0.95×     | **1.20×** | **1.11×**  | **1.05×** |
+| Gemma-3-1B            | Q8_0        | **1.30×** | **1.14×** | **1.06×**  | **1.00×** |
+| Llama-3.2-1B          | Q4_K_M      | **1.05×** | **1.07×** | 0.94×      | **1.18×** |
+| Llama-3.2-1B          | Q8_0        | **1.04×** | 0.98×     | 0.88×      | **1.08×** |
+| Qwen3-1.7B            | Q4_K_M      | **1.14×** | **1.15×** | **1.13×**  | **1.66×** |
+| Qwen3.5-4B (MTP)²     | Q4_K_M      | **1.31×** | **1.02×** | **1.03×**  | **1.61×** |
+| Qwen3.5-4B (MTP)²     | UD-Q4_K_XL  | **1.30×** | **1.02×** | **1.02×**  | **1.61×** |
+| Gemma-4-E2B           | Q4_K_M      | **1.16×** | **1.06×** | 0.99×      | **1.05×** |
+| Qwen3-8B              | Q4_K_M      | **1.42×** | **1.03×** | **1.02×**  | **1.22×** |
+| Ornith-1.0-9B         | Q4_K_M      | **1.41×** | **1.04×** | **1.04×**  | **1.47×** |
+| Qwen3.5-9B            | Q4_K_M      | **1.41×** | **1.06×** | **1.06×**  | **1.47×** |
+| Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.43×** | **1.01×** | **1.01×**  | **1.48×** |
+| Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.41×** | **1.01×** | **1.01×**  | **1.40×** |
+| Gemma-3-12B           | Q4_K_M      | **1.34×** | **1.13×** | **1.14×**  | **1.55×** |
+| Gemma-4-12B           | Q4_K_M      | **1.36×** | **1.13×** | **1.11×**  | **1.52×** |
+| Qwen3-14B             | Q2_K³       | **1.26×** | 0.90×     | 0.90×      | **1.14×** |
+| Qwen3-14B             | Q4_K_M      | **1.23×** | **1.02×** | **1.00×**  | **1.07×** |
+| Qwen3-14B             | Q8_0⁷       | **1.16×** | 0.99×     | 0.98×      | 0.95×     |
+| Gemma-4-26B-A4B (MoE) | UD-Q4_K_M⁹  | **1.18×** | **1.06×** | **1.07×**  | **1.37×** |
+| Qwen3.6-27B           | Q4_K_M†     | **1.26×** | **1.03×** | 0.99×      | **1.16×** |
+| Qwen3-30B-A3B (MoE)   | Q4_K_M⁹     | **1.11×** | **1.00×** | 0.96×      | **1.05×** |
+| Gemma-4-31B           | UD-Q5_K_XL⁴ | **1.07×** | **1.03×** | **1.04×**  | **1.15×** |
+| Ornith-1.0-35B        | Q4_K_M⁵     | **1.04×** | **1.04×** | **1.04×**  | **1.37×** |
+| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁶   | **1.18×** | 0.92×     | 0.92×      | **1.19×** |
+| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.20×** | **1.02×** | **1.00×**  | **1.40×** |
+
+† at-depth cells run with the submit splitter armed — see the box above.
+
+**`pp4@d4096` is not comparable to the pre-`2241e60` table.** That commit gave
+`bench_vulkan` an untimed warm rep at the measured shape; before it, rep 1 was a
+cold rep costing 1.8–3.5× steady state and was averaged in. The column's
+absolutes moved by up to +26% from that alone (the IQ3_S MoE, 232 → 290 t/s), so
+diffing this column against any earlier snapshot measures the bench fix, not the
+engine. The other three columns are comparable modulo the oracle change.
 
 **Column by column.** `pp4@d4096` — multi-turn ingest, the shape a coding agent
-actually runs — is the strongest column at **32 of 35** rows and up to
-**2.04×**, and the small-model rows (1.8×–2.0× on Qwen3-0.6B) are the clearest
-wins here. `pp512` reads 34 of 35 this run. Both are prefill, so both carry the
-variance in the box above: treat the counts as "most rows" and the values as one
-significant figure.
+actually runs — is the strongest column at **34 of 35** rows and up to
+**2.19×**, with the sub-1B rows (1.7×–2.2× on Qwen3-0.6B) the clearest wins.
+`pp512` also reads **34 of 35**, peaking at **1.43×**, and unlike in previous
+snapshots that count is stable: repeated runs move it by ~1.5%, not by eight
+rows.
 
-Decode is the half to quote precisely. `tg128` wins **29 of 35** and
-`tg64@d4096` **24 of 35**, both reproducible to under 3% run to run.
-`tg64@d4096` is the softer of the two — 11 rows below 1.0, worst Qwen3-14B Q2_K
-at **0.84×** — and the at-depth softness is the clearest remaining signal in the
-table, because it is the one that survives re-measurement.
+Decode: `tg128` wins **31 of 35** and `tg64@d4096` **26 of 35**. `tg64@d4096` is
+still the softest column — 9 rows below 1.0 — and it is where the remaining work
+is.
 
-The losses concentrate on **Qwen3-14B and the larger MoEs**, not spread evenly,
-which makes them a tractable target rather than a broad deficit.
+**What the decode-at-depth slices actually did.** The previous table warned its
+decode-at-depth cells were "stale by 4–8%" because `attn_decode.comp` landed
+after it. This table includes that kernel, and the correction is **not
+family-wide**, exactly as backlog **B15** predicted. Per-row `tg64@d4096` change
+against the previous snapshot: Qwen3-30B-A3B **0.91× → 0.96×** (its infr
+absolute lands on 170.4 t/s, the figure B7 measured for the specialized kernel),
+Qwen3-14B Q2_K 0.84× → 0.90×, Qwen3-14B Q4_K_M 0.94× → 1.00×; but Gemma-3-12B
+1.13× → 1.14× and Gemma-4-12B 1.10× → 1.11×, i.e. inside noise. Averaged over
+all 35 rows the column moved **+0.021×** — a couple of percent, concentrated on
+Qwen and MoE rows. B15's measured 1.5% LOSS on gemma-3-12b at d32768 is beyond
+this table's depth and is unaffected by these numbers.
+
+The losses concentrate on **Qwen3-14B's Q2_K and Q8_0 files, the IQ3_S MoE, and
+Llama-3.2-1B at depth** — Qwen3-14B Q4_K_M, which used to be in that cluster, is
+now a win in all four columns.
 
 ¹ **Q6_K now decodes on the int8 tier too** (`f82d74e` + `de987d7`). It was the
 last format still unpacking its `ql`/`qh` bit-planes **byte-at-a-time** (8
@@ -116,21 +191,13 @@ two facts were the same fact. A word-parallel `wdec` rewrite (funnel-shifted
 plus a SWAR `q−32` rebias) is **bit-identical** to the old byte loop and
 inverted the result: decode 44.3 → **64.3 t/s**, now BEATING f32's 58.4; prefill
 `pp4@d4096` 137.9 → **183.6** (+34%). Unpack ALU, not memory bandwidth, was the
-wall.
+wall. (Those are the slice's own A/B figures on Qwen3-14B, not this table's
+Qwen3-0.6B row.)
 
-² **MTP speculative decode is currently DISABLED — see "MTP is parked" below.**
-These rows are the models' ORDINARY (non-speculative) numbers, which is how the
-MTP-head GGUFs now run. `INFR_MTP=1` is ignored with a warning; the `mtp128`
-column is no longer measured.
-
-These four rows' `tg64@d4096` cells were a GPU device-lost in the raw sweep and
-are re-measured post-`8513358`: 35821b6's capacity gate on the `nonfa` coopmat
-prefill tier (which reads K in whole 256-row tiles, so it touches
-`ceil(kv_len/256)*256` rows) had no catcher for a **non-SWA** model — `split_ok`
-only covered the SWA `ring_past` case — so the op fell through to the scalar
-`attention_kv` at 3591 rows × 3591 kv and hung the GPU. MTP's un-chunked
-whole-prompt verify is the only shape that reliably lands `kv_len` within one
-tile-pad of the cache's row capacity.
+² **MTP speculative decode is currently DISABLED** — see "MTP is parked" in
+[mtp.md](../mtp.md). These rows are the models' ORDINARY (non-speculative)
+numbers, which is how the MTP-head GGUFs now run. `INFR_MTP=1` is ignored with a
+warning; the `mtp128` column is no longer measured.
 
 ³ **The int8-activation decode tier.** Quantizing the _activations_ to int8 and
 integer-dotting them against the raw weight codes (`dotPacked4x8AccSatEXT`, the
@@ -138,8 +205,10 @@ integer-dotting them against the raw weight codes (`dotPacked4x8AccSatEXT`, the
 default-on for **Q2_K, Q4_K, Q6_K, Q4_0, Q5_0, Q5_1, IQ4_NL**; **ordinary
 prefill takes it for every integer dtype** (all 12). This row (Qwen3-14B Q2_K)
 is what it bought at 2 bits: tg128 0.74× → 0.81×, tg64@d4096 0.72× → 0.78×, and
-`pp4@d4096` 0.98× → a win. (The table's current values for this row,
-0.85×/0.81×/1.49×, also include the later wide-rmsnorm lift — footnote ⁸.)
+`pp4@d4096` 0.98× → a win. Successive levers since (the wide rmsnorm, footnote
+⁸, and the decode-attention specialization) have carried it to the **0.90× /
+0.90× / 1.14×** this table measures — better than the 0.84× floor the previous
+snapshot recorded, and still the densest loss cluster in the table.
 
 The single most useful thing learned here: **int8's value is row-count
 dependent, and the two directions are independent policies.** The cost of the
@@ -180,19 +249,20 @@ placement (`e2c0694` — honest activation reserve + a phantom +1.6 GiB accounti
 fix) and **window-sized ring KV for sliding-window layers** (`35821b6`,
 llama.cpp-parity: 50 of its 60 layers are SWA with a 1024 window, so their
 caches are 2048-row rings instead of full-context — @8k that's 0.44 GiB instead
-of 5.5). The d4096 row went 0.08× → 0.90× (28 vs 31 t/s). The same slice also
-reuses empty KV slots instead of forking a duplicate (`f74556c` — was silently
-wasting a full KV per session, 6.25 GiB on a 14B), and lifted the gemma-family
-multi-turn rows (12B `pp4@d4096` 1.40× → 1.66×: less dead KV to re-scan).
+of 5.5). The d4096 row went 0.08× → 0.90× (28 vs 31 t/s) at that slice, and
+reads **1.04×** here. The same slice also reuses empty KV slots instead of
+forking a duplicate (`f74556c` — was silently wasting a full KV per session,
+6.25 GiB on a 14B), and lifted the gemma-family multi-turn rows.
 
-This row's `pp4@d4096` was the table's worst loss at 0.84×; it is now **1.32×**,
-a win. That came from Q5*K's ordinary-prefill int8 tier (footnote ³) — this is a
-Q5_K_XL file, and Q5_K's prefill win (+45%) was previously unreachable because
-it was gated behind an off-by-default \_decode* tier. Splitting the two policies
-banked it. Its **decode** was then closed too (0.91×/0.92× → **0.98×/1.00×**) by
-the wide rmsnorm (footnote ⁸) — this model, at 21.9 GiB on a 24 GB card and 57%
-of its GPU time in one Q5_K GEMV, is where that kernel was found. The fix added
-zero allocations, so it still loads fully resident (peak 23.14 / 23.98 GiB).
+This row's `pp4@d4096` was once the table's worst loss at 0.84×; it is now
+**1.15×**. That came from Q5*K's ordinary-prefill int8 tier (footnote ³) — this
+is a Q5_K_XL file, and Q5_K's prefill win (+45%) was previously unreachable
+because it was gated behind an off-by-default \_decode* tier. Splitting the two
+policies banked it. Its **decode** was then closed too (0.91×/0.92× at the time
+→ **1.03×/1.04×** here) by the wide rmsnorm (footnote ⁸) — this model, at 21.9
+GiB on a 24 GB card and 57% of its GPU time in one Q5_K GEMV, is where that
+kernel was found. Note this is also the row that drops to a **256-row prefill
+chunk** at depth (see the box above): the fit is that tight.
 
 ⁵ **The DeltaNet scan: chunking was the bug, not the fix** (`0a5d366`).
 Ornith-35B `pp512` was 0.89× — its scan ran **31.7 ms per 512 tokens against
@@ -211,8 +281,8 @@ flight to hide latency). It sustained **0.76 TFLOP/s against llama.cpp's 3.5**.
 The fix was to go _simpler_, not more fused: single-subgroup workgroups (zero
 barriers; the kd-contractions become one `subgroupAdd`), state in registers, and
 all transcendentals hoisted out of the serial loop into a flat gates pass.
-**31.7 → 8.4 ms.** `pp512` 0.89× → **1.03×**, and every one of Ornith-35B's four
-metrics is now a win. It also lifted the other DeltaNet models (Ornith-9B, the
+**31.7 → 8.4 ms.** `pp512` 0.89× → **1.04×** here, and every one of Ornith-35B's
+four metrics is a win. It also lifted the other DeltaNet models (Ornith-9B, the
 Qwen3.5/3.6 family). Decode is untouched (`rows == 1` still routes to the old
 sequential kernel). Gated on `kd == 128`; `INFR_DN_CHUNK_SCAN=1` restores the
 old path. The path no longer needs coopmat at all, so non-coopmat GPUs get the
@@ -232,7 +302,7 @@ and IQ2_S/IQ3_S — this file's expert pair — got batched dp4a mmq expert GEMM
 shipped MoE GGUF uses them for expert banks — see `MOE_MMQ_DTYPES`'s exclusions
 doc).
 
-**Prefill is now a WIN** (`c7c3f50`): `pp512` 0.90× → **1.16×**. The gap was
+**Prefill is a WIN** (`c7c3f50`): `pp512` 0.90× → **1.18×** here. The gap was
 codebook _staging_, not bandwidth — the discriminator is that this file's Q4*K_M
 sibling (same architecture, arithmetic experts) runs `expert_gateup` in 46 ms
 while moving **1.76× more weight bytes**. Two causes, in places nobody had
@@ -246,40 +316,50 @@ summation order — proved against a host dequant reference by `grid_mmq_parity`
 and took `expert_gateup` 82.4 → **65.8 ms**. IQ3_S's down-projection also joined
 the subgroup id-GEMV band (42 → 34.8 ms).
 
-**Decode is still a loss** (0.93× / 0.94×, up from 0.89× / 0.90×) and the
-remaining lever is _quantified but deliberately not taken_: ablating the
-codebook staging entirely measures `native_idm_iq2s` 49.8 → **23.3 ms** and
-`native_idm_iq3s` 42.0 → **18.9 ms** — i.e. **~50 ms of a 505 ms decode is pure
-per-workgroup re-staging of the codebook into LDS**, which is essentially the
-whole residual gap. The fix is to make the codebook **L2-resident in a buffer**
-instead of re-staged by every workgroup (this also frees 8 KB of LDS per
-workgroup, so it should beat the ablation). That needs a new SSBO binding across
-every grid GEMV variant and re-validation of all 7 grid dtypes — a campaign of
-its own, not a slice. Null: an SG tier for IQ2_S gate/up **regressed** hard
-(`native_idm_iq2s` 49.8 → 117.2 ms — 8 KB of LDS on a single-wave workgroup
-collapses occupancy).
+**Decode is still a loss** (**0.92× / 0.92×**) and the remaining lever is
+_quantified but deliberately not taken_: ablating the codebook staging entirely
+measures `native_idm_iq2s` 49.8 → **23.3 ms** and `native_idm_iq3s` 42.0 →
+**18.9 ms** — i.e. **~50 ms of a 505 ms decode is pure per-workgroup re-staging
+of the codebook into LDS**, which is essentially the whole residual gap. The fix
+is to make the codebook **L2-resident in a buffer** instead of re-staged by
+every workgroup (this also frees 8 KB of LDS per workgroup, so it should beat
+the ablation). That needs a new SSBO binding across every grid GEMV variant and
+re-validation of all 7 grid dtypes — a campaign of its own, not a slice. Null:
+an SG tier for IQ2_S gate/up **regressed** hard (`native_idm_iq2s` 49.8 → 117.2
+ms — 8 KB of LDS on a single-wave workgroup collapses occupancy).
+
+This row is also the one B6 named as the table's worst variance offender, at
+20.2% peak-to-peak on `pp4@d4096`. After the warm-rep fix it is **2.6%** over
+four runs — the most reproducible large-model row in the sweep.
 
 ⁷ **The legacy 32-block quants now have an int8 dp4a GEMV**, not just a dp4a
 GEMM. The dp4a _GEMM_ (`native_gemm_mmq_*`) has covered ~17 dtypes for a while,
 but the dp4a _GEMV_ (`native_mmv_mrow.comp`) covered only the six k-quants +
-IQ4*XS — so every non-k-quant integer file fell to the f32 dequant path at
+IQ4\*XS — so every non-k-quant integer file fell to the f32 dequant path at
 decode AND at small-m prefill, which is exactly why this Q8_0 row was one of the
-table's three `pp4@d4096` LOSSES. Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL now have
-`wdec` arms (the mmq unpack, word-parallelized: aligned/funnel-shifted u32 loads
-— every `_0`-family stride is 2 mod 4 — nibble masks, SWAR zero-point rebias, a
+table's `pp4@d4096` LOSSES. Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL now have `wdec` arms
+(the mmq unpack, word-parallelized: aligned/funnel-shifted u32 loads — every
+`_0`-family stride is 2 mod 4 — nibble masks, SWAR zero-point rebias, a
 4-bit→4-byte-lane `qh` spread, and Q4_1/Q5_1's additive min folded through the
 ones-dot against `sact`). Measured on Qwen3-14B (7900 XTX), int8 vs the f32 GEMV
 that shipped before, **ordinary prefill** (`pp4@d4096`): Q4_0 **+66.9%**, Q5_0
-**+64.0%**, Q5_1 **+42.2%**, Q4_1 **+32.9%**, Q8_0 **+28.8%** (128 → 158 t/s —
-this row: 0.92× → **1.18×**), IQ4_NL **+20.7%**. **Decode** (`tg64`) is a
-separate policy and splits: Q5_0 **+16.8%**, Q4_0 **+10.5%**, IQ4_NL **+6.3%**,
-Q5_1 **+6.1%** are default-ON; **Q8_0 −4.2%, and Q4_1 a wash, are default-OFF**
-(prefill-only). Q8_0's decode loss is structural, not a wart to fix — at 8 bits
-the stored byte already IS the dp4a operand, so there is no unpack ALU to save,
-and decode is weight-bandwidth bound while the int8 route still pays the
-`quant_q8` bubble (llama.cpp excludes Q8_0 from mmvq off old GCN for the same
-reason). Hence this row's `tg64@d4096` stays 0.97×: the fix is a prefill fix.
-Guards: `mmv_mrow_legacy_formats` (each `wdec` vs a from-scratch host reference,
+**+64.0%**, Q5_1 **+42.2%**, Q4_1 **+32.9%**, Q8_0 **+28.8%** (128 → 158 t/s),
+IQ4_NL **+20.7%**. **Decode** (`tg64`) is a separate policy and splits: Q5_0
+**+16.8%**, Q4_0 **+10.5%**, IQ4_NL **+6.3%**, Q5_1 **+6.1%** are default-ON;
+**Q8_0 −4.2%, and Q4_1 a wash, are default-OFF** (prefill-only). Q8_0's decode
+loss is structural, not a wart to fix — at 8 bits the stored byte already IS the
+dp4a operand, so there is no unpack ALU to save, and decode is
+weight-bandwidth-bound while the int8 route still pays the `quant_q8` bubble
+(llama.cpp excludes Q8_0 from mmvq off old GCN for the same reason). Hence this
+row's `tg64@d4096` sits at 0.98×: the fix was a prefill fix.
+
+**Correction to what this footnote used to claim.** It read "this row: 0.92× →
+1.18×" for `pp4@d4096`, which was the SLICE's own A/B (infr before vs infr
+after), never a table cell — the table it sat next to said 0.88×, and B14 raised
+exactly that disagreement. Measured here against b9833 the cell is **0.95×**:
+still the table's only `pp4@d4096` loss, and still the only Qwen3-14B file
+losing three of four columns. Guards for the kernels themselves are unchanged:
+`mmv_mrow_legacy_formats` (each `wdec` vs a from-scratch host reference,
 f64-accumulated), `mmv_row1_bit_identical` (m=1 decode ≡ row 0 of the m≥3
 dispatch, exact `to_bits()`), and all 13 `gpu_seam_matches_cpu*\*` (two of which
 load an IQ4_NL and a Q8_0 model, so the decode flips face the CPU oracle).
@@ -299,9 +379,10 @@ Gated to `rows == 1 && dim >= 2048`; the 256-thread build's SPIR-V is
 byte-identical, so the change is purely additive.
 
 This is **not model-specific** — it lifts every model with hidden ≥ 2048, and it
-is what turned the entire 8B–27B decode band from losses into wins (Qwen3-8B
-`tg128` 0.96× → 1.02×, Qwen3-14B Q4_K_M 0.97× → 1.02×, Gemma-3-12B 1.02× →
-1.12×, Gemma-4-26B MoE 1.01× → 1.13×).
+is what turned the entire 8B–27B decode band from losses into wins (`tg128` at
+the slice: Qwen3-8B 0.96× → 1.02×, Qwen3-14B Q4_K_M 0.97× → 1.02×, Gemma-3-12B
+1.02× → 1.12×, Gemma-4-26B MoE 1.01× → 1.13×; this table's current values for
+those four are 1.03× / 1.02× / 1.13× / 1.06×).
 
 It also corrects a story this README told for a long time. "Decode is
 weight-bandwidth bound" was **measured but incomplete**: `native_q8_0` runs the
@@ -315,8 +396,11 @@ hypothesis was **falsified** — a SWAR rewrite of its 5-bit rebuild predicted
 genuine residual is **VMEM instruction count** (a Q5_K sub-block issues 16 word
 loads to Q8_0's 8, and a superblock's `qh` bytes get re-read ~3× by its
 sub-blocks), which needs superblock-granular decode — left open. **BF16 decode**
-(0.87×) is the one row none of this can help: it is the only non-integer weight
-dtype, so there is no unpack ALU to save and no weight codes to integer-dot.
+is the one row none of this can help: it is the only non-integer weight dtype,
+so there is no unpack ALU to save and no weight codes to integer-dot. It is no
+longer a loss — this sweep reads `tg128` **1.00×** and `tg64@d4096` 0.99×,
+against 0.98×/0.98× last time — but it is parity, not a win, and it will stay
+there.
 
 ⁹ **MoE expert GEMMs: the waste was inside the tile, not in the routing**
 (`6a33065`). The expert GEMMs are **72% of MoE prefill GPU time**. The suspicion
@@ -343,8 +427,9 @@ weight-staging bound, not math bound**; masking drops the dead math _without_
 paying the re-stage. A BN=128 wide-N tile also ships, gated on `k <= 1024`: it
 helps the shallow-k `down` proj (`expert_down` 56.7 → 50.0 ms) but **hurts** the
 deep-k `gate`/`up` proj (`expert_gateup` 65.0 → 69.2 ms), so applying it
-unconditionally would have been a wash that slowed the dominant op. `pp512`:
-Qwen3-30B-A3B 0.95× → **1.09×**, Gemma-4-26B-A4B 1.07× → **1.15×**.
+unconditionally would have been a wash that slowed the dominant op. `pp512` at
+that slice: Qwen3-30B-A3B 0.95× → 1.09×, Gemma-4-26B-A4B 1.07× → 1.15×; this
+sweep reads **1.11×** and **1.18×**.
 
 The MoE expert kernel floor (the id-indexed GEMV family every MoE model needs
 for decode) now covers **every weight dtype the dense Vulkan path supports** —
@@ -358,70 +443,90 @@ kernel tables against drift, and its doc records the deliberate exclusions: grid
 i-quants (IQ1–IQ3), ternary (TQ\*), and float banks prefill via the per-token
 id-GEMV path).
 
-**Where infr wins.** Decode is the trustworthy story, because it is the
-reproducible one: `tg128` wins **29 of 35** rows and `tg64@d4096` **24 of 35**,
-both with run-to-run variance under 3%. Prefill reads as a near-sweep this run
-(`pp512` 34/35, `pp4@d4096` 32/35, peaking at **2.04×**) but see the
-reproducibility box above before quoting those counts — the immediately
-preceding run of the same binary gave 26/35 on `pp512`. The durable prefill
-claim is the SHAPE, not the count: `pp4@d4096` (multi-turn ingest, what a coding
-agent actually runs) is consistently the strongest column, roughly 1.5–2× on the
-small and mid models across both runs.
+**Where infr wins.** Prefill is now the strongest AND the reproducible half:
+`pp512` **34 of 35** and `pp4@d4096` **34 of 35**, peaking at **2.19×**, and
+both counts hold across repeated runs of the same binary (~1.5% ratio movement,
+never a row-count swing). `pp4@d4096` — multi-turn ingest, what a coding agent
+actually runs — is the strongest column in the table, roughly 1.5–2× on the
+small and mid models. Decode is the narrower win: `tg128` **31 of 35**,
+`tg64@d4096` **26 of 35**, both reproducible to under 3%.
 
-**Where infr loses.** 21 losing cells of 140, and after the prefill columns
-stabilised into wins this run they are almost entirely DECODE — which is the
-half of the table you can trust. Two clusters:
+**Where infr loses.** 15 losing cells of 140 (was 21), and 13 of the 15 are
+DECODE. Three clusters:
 
-- **Qwen3-14B, every quant** — the densest cluster and the one to fix next. Q2_K
-  is worst (`tg64@d4096` **0.84×**, `tg128` 0.90×), and Q4_K_M/Q8_0 lose the
-  same column (0.94× both). Successive levers have lifted Q2_K (0.74×/0.72× →
-  the int8 tier → the wide rmsnorm) without closing it. It remains the only row
-  whose gap has never been root-caused to a named kernel; it deserves its own
-  profile rather than another inherited hypothesis.
-- **The larger MoEs at depth** — Qwen3-30B-A3B (`tg64@d4096` 0.91×, `tg128`
-  0.96×, `pp4@d4096` 0.85×) and Qwen3.6-35B-A3B UD-IQ3_S (0.91× on both decode
-  columns). The IQ3_S gap is **fully diagnosed and deliberately not fixed**: ~50
-  ms of its decode is per-workgroup re-staging of the codebook into LDS
-  (footnote ⁶). Making the codebook L2-resident should close essentially all of
-  it, but it touches every grid GEMV variant and all 7 grid dtypes — a campaign,
-  not a slice.
+- **Qwen3-14B Q2_K and Q8_0** — the densest cluster. Q2_K is worst (`tg128`
+  0.90×, `tg64@d4096` **0.90×**), and Q8_0 loses three columns (0.99× / 0.98× /
+  0.95×). Q2_K has been lifted by three successive levers (0.74×/0.72× → the
+  int8 tier → the wide rmsnorm → the decode-attention specialization) without
+  being closed, and it remains the only row whose gap has never been root-caused
+  to a named kernel; it deserves its own profile rather than another inherited
+  hypothesis. Q8_0's decode side is structural (footnote ⁷); its `pp4@d4096`
+  0.95× is not, and is unexplained.
+- **Qwen3.6-35B-A3B UD-IQ3_S** (0.92× on both decode columns). **Fully diagnosed
+  and deliberately not fixed**: ~50 ms of its decode is per-workgroup re-staging
+  of the codebook into LDS (footnote ⁶). Making the codebook L2-resident should
+  close essentially all of it, but it touches every grid GEMV variant and all 7
+  grid dtypes — a campaign, not a slice.
+- **Small-model decode at depth.** Llama-3.2-1B is the worst cell in the whole
+  table at `tg64@d4096` **0.88×** (Q8_0) / 0.94× (Q4_K_M), while both its other
+  columns win. Reproducible: 0.92–0.94× on Q4_K_M across four runs. Gemma-4-E2B
+  (0.99×) and Qwen3-0.6B BF16 (0.99×) sit just under parity in the same column.
 
-Note the small-model `pp512` cluster reported in the previous snapshot is GONE
-this run (only Gemma-3-1B Q4_K_M at 0.96× remains, inside the noise band). That
-cluster was prefill variance, not a real deficit — a caution against acting on a
-single prefill run.
+**A prose claim the numbers overturn.** The previous snapshot said the
+small-model `pp512` cluster "was prefill variance, not a real deficit". With
+`pp512` now reproducible to ~1.5%, that is no longer defensible for the one row
+left: **Gemma-3-1B Q4_K_M `pp512` measures 0.95× / 0.95× / 0.95× / 0.94× across
+four independent runs.** It is a real, repeatable deficit — small, but a result,
+not noise. Its Q2_K (1.05×) and Q8_0 (1.30×) siblings win the same column, so it
+is dtype-specific, not architectural.
 
-Two structural rows sit outside those clusters: **BF16** (`pp512` 0.94×, decode
-~0.98–0.99×) is the only non-integer weight dtype in the table, so there is no
-unpack ALU to save and no weight codes to integer-dot — out of reach of
-everything that fixed the other rows. And **Llama-3.2-1B `tg64@d4096`**
-(0.90×–0.94×) remains an isolated small-model decode-at-depth row whose other
-columns are wins.
+The other structural row is **BF16**, the only non-integer weight dtype in the
+table, so there is no unpack ALU to save and no weight codes to integer-dot —
+out of reach of everything that fixed the other rows. It has drifted up to
+parity (`pp512` 1.08×, decode 1.00× / 0.99×) rather than being fixed.
 
 **A loss the table does not show.** `infr compare`'s deep-context turn shapes
-(16k–32k KV, beyond this table's 4096) still lose on the MoE rows and get
-**monotonically worse with depth** — Qwen3-30B-A3B `pg8192,512`: 0.88× @8k,
-0.80× @16k, **0.74× @32k** (re-measured 2026-08-02: 0.878 / 0.787 / 0.727). The
-published table tops out at d4096 and so flatters us at exactly the shape a
-long-lived agent session actually reaches.
+(8k–32k KV, beyond this table's 4096) still lose on the MoE rows and get
+**monotonically worse with depth**. Re-measured 2026-08-03 on Qwen3-30B-A3B
+Q4_K_M against the same b9833 oracle, r=3:
 
-Now triaged — it is **decode**, not prefill. Splitting that turn: `pp512` holds
-1.05× / 0.98× / 0.91× across the three depths while `tg128` falls 0.84× / 0.76×
-/ **0.60×**. `attn_partial` is 59% of decode GPU time at d32768. Three designs
-were measured against it and two are declined outright (GQA head-grouping 1.87×
-slower, an LDS-staged K-tile 2.7× slower); backlog **B7** carries the numbers.
+| depth | `pp512` infr/llama  | `tg128` infr/llama | `pg8192,512` (whole turn) |
+| ----- | ------------------- | ------------------ | ------------------------- |
+| 8192  | 1773.1 / 1686.8 t/s | 147.1 / 161.2 t/s  | 871.4 / 945.8 t/s         |
+|       | **1.05×**           | 0.91×              | 0.92×                     |
+| 16384 | 1138.8 / 1179.0     | 116.3 / 137.9      | 622.0 / 736.0             |
+|       | 0.97×               | 0.84×              | 0.85×                     |
+| 32768 | 669.9 / 735.3       | 71.3 / 110.4       | 401.6 / 517.6             |
+|       | 0.91×               | **0.65×**          | **0.78×**                 |
 
-**The decode-at-depth cells are now stale by 4–8%.** A decode-only
-specialization of the split-K kernel (`attn_decode.comp`) landed after this
-snapshot. It is bit-identical to what the table measured — same summation order,
-no golden moved — so it changed speed only: Qwen3-30B-A3B `tg128` 163.1 → 170.4
-t/s @d4096, 138.5 → 148.1 @d8192, 67.1 → 72.3 @d32768 (`INFR_NO_ATTN_DECODE=1`
-restores the old kernel). The `tg128` column in the table above is depth-0 and
-is NOT affected — shallow decode runs a different kernel (`attention_kv`)
-entirely. Regenerate the table to pick the rest up.
+The published table tops out at d4096 and so flatters us at exactly the shape a
+long-lived agent session actually reaches. **It is decode, not prefill** —
+`pp512` holds within 9% of parity all the way to 32k while `tg128` falls to
+0.65×. `attn_partial` is 59% of decode GPU time at d32768.
 
-**DiffusionGemma** (`dg-step`) beats the reference fork at 1.23× (this sweep;
-previously 1.18×).
+These are better than the previous snapshot's 0.84× / 0.76× / 0.60× `tg128` and
+0.878 / 0.787 / 0.727 whole-turn figures, and the decode-attention
+specialization (`attn_decode.comp`) is why: it is bit-identical to the old
+kernel, so it changed speed only. The shape of the problem is unchanged. Three
+designs were measured against it and two are declined outright (GQA
+head-grouping 1.87× slower, an LDS-staged K-tile 2.7× slower); backlog **B7**
+carries the numbers, and **B15** records that the same specialization LOSES 1.5%
+on gemma-3-12b at d32768, so it is not a free win everywhere.
+
+Note that the submit splitter arms on four of these nine legs: **cap 269 on the
+`pp512`/`tg128` legs at d32768**, and **342 / 222 on `pg8192,512` at d16384 /
+d32768**. The other five legs report `submit unlimited`, as does every cell of
+the main table except Qwen3.6-27B's. Those four rows are therefore measured with
+a split submit structure — see the box at the top and backlog **B17**.
+
+**DiffusionGemma** (`dg-step`, the in-step-parallel throughput) beats the
+reference fork at **1.15×** (three runs: 1.16× / 1.14× / 1.16×; 1228 vs
+1059–1074 tok/s). That is down from the 1.23× the previous snapshot recorded,
+and the movement is entirely on the oracle's side — infr measured 1227–1228 in
+all three runs. The DG oracle is the reference fork's own `llama-diffusion-cli`
+(`~/Projects/mxaddict/llama.cpp-dg/build-vulkan`), reached via
+`INFR_LLAMA_DIFFUSION_CLI` because the system copy is broken by the same package
+mismatch as `llama-bench`.
 
 **Ternary-Bonsai (Q2_0) — infr is the only engine that runs these on a GPU.**
 llama.cpp merged the **Q2_0** weight dtype (GGML type 42) but shipped **no GPU
@@ -429,8 +534,10 @@ kernels for it**: there is not a single `q2_0` reference in its `ggml-vulkan/`
 or `ggml-cuda/` trees, so every backend but CPU refuses to load these files.
 infr runs Q2_0 natively on Vulkan (in-shader dequant + dp4a mmq — `ad89fb4`), so
 the comparison below is **absolute throughput on different devices, not a
-like-for- like ratio**: infr on the RX 7900 XTX vs llama.cpp on a Ryzen 9
-9950X3D (16 threads, Release + `GGML_NATIVE`). r=3, 2026-07-12.
+like-for-like ratio**: infr on the RX 7900 XTX vs llama.cpp on a Ryzen 9 9950X3D
+(16 threads, Release + `GGML_NATIVE`). r=3, **2026-07-12 — NOT re-measured in
+the 2026-08-03 sweep**, because its oracle is a CPU llama.cpp run rather than
+the `llama-bench` shim.
 
 | Model (Prism ML) | Size    | infr pp512 | infr tg128 | llama.cpp pp512 | llama.cpp tg128 |
 | ---------------- | ------- | ---------- | ---------- | --------------- | --------------- |
@@ -475,7 +582,7 @@ pager's budget (see the MoE placement paragraph above); `INFR_PAGER_RING`
 overrides the staging-ring size (default: budget/8 clamped to [256 MiB, 2 GiB]);
 pure CPU stays available under `--dev cpu` / `-ngl 0`. Remaining follow-up:
 splitting a role across several arena buffers to lift the 4 GiB per-role cache
-cap.
+cap. (These figures predate the 2026-08-03 sweep and were not re-measured.)
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across

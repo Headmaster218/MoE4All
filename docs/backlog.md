@@ -198,9 +198,9 @@ this is visible in the output instead of inferred.
   permanently changes the submit structure of every later forward in that
   process while leaving the dispatched kernels byte-identical, i.e. invisible in
   `INFR_PROF_OPS`. It never fired in any run measured here (every line reports
-  `submit unlimited`), so this is a latent hazard, not the cause of anything
-  observed. It now logs at WARN when it arms and `infr bench` reports the final
-  cap.
+  `submit unlimited`). It now logs at WARN when it arms and `infr bench` reports
+  the final cap. **UPDATE 2026-08-03: it is no longer only latent.** The
+  `results.md` re-sweep caught it arming reproducibly — see B17.
 
 **Coverage gaps in this diagnosis, stated plainly.** `llama-bench` on this box
 is currently broken
@@ -803,12 +803,6 @@ Recorded as gaps rather than left implicit. Everything below shipped without the
 check named, and in each case the check is cheap — the reason it is missing is
 time or hardware, not difficulty.
 
-- **`docs/perf/results.md` is stale.** Its decode-at-depth cells moved after
-  slices 3a/3b, and the whole 35-row table predates both. It needs a re-sweep —
-  and per B6 the prefill columns need medians of several runs, not single
-  values, or the regenerated table will just re-import that variance. Do NOT
-  apply the "+4–8%" figure as a family-wide correction: that is Qwen3-30B-A3B,
-  and B15 measures gemma-3-12b at +0.6% (d8192) and **−1.5%** (d32768).
 - **Metal and CPU are unexercised for the KV-fit change.** Only the Vulkan path
   was measured. The Apple `#[cfg]`-gated code is not even compiled locally, so
   only CI can judge it.
@@ -887,10 +881,13 @@ qwen35, which is still gaining at d32768. (c) Chase the occupancy hypothesis and
 fix the kernel rather than gate it. Nothing here is urgent; it is recorded so
 the next profile does not rediscover it as a mystery.
 
-**Related, not the same thing:** `docs/perf/results.md` says "the
-decode-at-depth cells are now stale by 4–8%". That paragraph names Qwen3-30B-A3B
-and is still true of it, but the 4–8% is NOT a family-wide number — gemma-3-12b
-is +0.6% at d8192 and −1.5% at d32768. A re-sweep must not extrapolate it.
+**Related, not the same thing:** `docs/perf/results.md` used to say "the
+decode-at-depth cells are now stale by 4–8%". The 2026-08-03 re-sweep settled
+that: the `tg64@d4096` column moved **+0.021× averaged over all 35 rows**, with
+the gain concentrated on Qwen and MoE rows (Qwen3-30B-A3B 0.91× → 0.96×,
+Qwen3-14B Q4_K_M 0.94× → 1.00×) and nothing measurable on gemma (Gemma-3-12B
+1.13× → 1.14×). The doc now says that instead of extrapolating. The d32768
+regression this entry is about is beyond the table's depth and unaffected.
 
 ### B16 — one decode leg in thirteen was 8.9% low
 
@@ -919,6 +916,81 @@ first-touch VRAM effect; nothing else was on the GPU. The practical consequence
 is the one B7 already applies: alternate legs at least twice and report every
 repeat, never a single value or an average that hides the spread. A single-leg
 A/B on this box can be wrong by 9%.
+
+### B17 — the submit splitter arms for real on Qwen3.6-27B at d4096
+
+**Tag:** measured 2026-08-03 (the `results.md` re-sweep) · **Blocked on:** a
+decision — soften the trigger, or accept that one table row is measured with a
+different submit structure
+
+B6 recorded `VulkanBackend::observe_forward`'s submit splitter as a latent
+hazard that had never fired. It fires. Benching **Qwen3.6-27B Q4_K_M** at
+`-d 4096`, the untimed depth prime is a single 1633-dispatch forward that takes
+**~1.01 s** — just past the 1 s `SUBMIT_DANGER_NS` threshold — so the cap
+latches and every later forward in the process, **including the timed ones**,
+splits every ~400 dispatches. Reproduced in **3 of 3** processes (caps 392 / 401
+/ 403, read from the `submit_cap` field `infr bench --json` emits and the
+matching WARN line). It also arms on **Qwen3-30B-A3B** on four of the nine
+deep-context legs: cap 269 on `pp512`/`tg128` at `-d 32768`, and 342 / 222 on
+`pg8192,512` at d16384 / d32768. It does not arm on the d16384 `pp512`/`tg128`
+legs or anywhere at d8192, so the trigger tracks the single longest forward in
+the process, not the depth.
+
+**Why it matters.** The dispatched kernels stay byte-identical, so this is
+invisible to `INFR_PROF_OPS` and to any golden; only the submit structure
+changes. Two consequences:
+
+- `results.md`'s Qwen3.6-27B `tg64@d4096` and `pp4@d4096` cells, and every
+  deep-context row past d8192, are measured under a split submit while every
+  other cell in the table is not. The doc flags this; the cells are not wrong,
+  they are just not the same experiment.
+- The trigger is a **wall-clock sample of one forward, at a threshold this model
+  sits within 2% of**, so a slightly warmer or busier box would flip the row.
+  Reproducing 3/3 here is the luck of that margin, not stability.
+
+**What was NOT done:** no A/B of the split against `INFR_SUBMIT_DISPATCHES=0` on
+this model, so the size of the effect on those two cells is **unknown** — it may
+be nothing. That measurement is the obvious next step and is cheap.
+
+**Options.** (a) Leave it. (b) Exclude the untimed depth-prime forward from
+`observe_forward`'s sampling, which is arguably what the guard always meant —
+the watchdog risk is about user-visible forwards, and the prime is one
+deliberate bulk operation. (c) Raise the threshold. (b) looks right but changes
+iGPU watchdog behaviour, so it is not a one-liner — see `docs/igpu.md`.
+
+### B18 — three rows the 2026-08-03 re-sweep left unexplained
+
+**Tag:** measured 2026-08-03 · **Blocked on:** nothing; each needs a profile
+
+Recorded so the next `results.md` reader does not have to re-derive them. All
+three are reproducible, not variance: `pp512` and both decode columns now repeat
+to under 3.4% peak-to-peak over four full runs (see the doc's variance box).
+
+- **Gemma-3-1B Q4_K_M `pp512` = 0.95×, and it is real.** Four independent runs
+  gave 0.95 / 0.95 / 0.95 / 0.94. The doc used to dismiss the small-model
+  `pp512` cluster as "prefill variance, not a real deficit"; that explanation
+  died with the warm-rep fix. It is **dtype-specific, not architectural** — the
+  same model's Q2_K reads 1.05× and its Q8_0 1.30× on the same column. Nobody
+  has profiled the Q4_K prefill path on a 1B gemma.
+- **Qwen3-14B Q8_0 `pp4@d4096` = 0.95×** — the table's only `pp4@d4096` loss.
+  `results.md` footnote ⁷ used to imply this cell was 1.18×; that figure was the
+  legacy-int8-GEMV slice's own before/after A/B, never a table cell, and the doc
+  now says so. Why the small-m prefill path loses on Q8_0 specifically, when the
+  same slice's +28.8% held on every other legacy format, is unexplained.
+- **Llama-3.2-1B `tg64@d4096` = 0.88× (Q8_0) / 0.94× (Q4_K_M)** — the worst cell
+  in the table, on the smallest model in it, while both of that model's other
+  columns win. Reproducible (0.92–0.94× on Q4_K_M across four runs). An isolated
+  small-model decode-at-depth deficit with no named cause.
+
+**Coverage gaps in that sweep, stated plainly.** The Ternary-Bonsai Q2_0 table
+(CPU oracle), the Llama-4-Scout pager figures and DiffusionGemma's `dg-e2e` were
+**not** re-measured — of the DG pair only `dg-step` was. Metal was not measured
+at all. The oracle was a cached `llama-cpp-vulkan-b9833` release build run
+through an `LD_LIBRARY_PATH` shim, because the distro `llama-cpp` (b10182) links
+ggml 0.17 against an installed `ggml-vulkan` 0.15.3 and **no system llama.cpp
+binary runs on this box** (`undefined symbol: ggml_dsv4_hc_post`). The packaging
+fix is not ours; the shim lived in session scratch and will not survive, so the
+next sweep needs its own working oracle before it starts.
 
 ---
 
