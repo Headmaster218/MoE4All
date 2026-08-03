@@ -11,7 +11,14 @@ rediscovered).
 
 Provenance tags point at the finding that opened the item:
 
-- `CR-*` — [code-review.md](code-review.md), the 2026-08-01 whole-tree review.
+- `CR-*` — the whole-tree correctness reviews. Their report lived at
+  `docs/code-review.md` and was **deleted on 2026-08-03, folded into this
+  file**: the eight findings of the 2026-08-03 pass were re-verified against the
+  code and are B19–B26, and that pass's cleared / hardening / coverage lists are
+  B27–B29. The tags on B1–B5 come from the earlier 2026-08-01 pass, whose text
+  the file had already stopped carrying (`6ab8b1c` overwrote it with the later
+  review). A `CR-*` tag is therefore a historical marker for where an item came
+  from, not a link to anything.
 
 ---
 
@@ -992,11 +999,380 @@ binary runs on this box** (`undefined symbol: ggml_dsv4_hc_post`). The packaging
 fix is not ours; the shim lived in session scratch and will not survive, so the
 next sweep needs its own working oracle before it starts.
 
+### B19 — `shard_set` expands an unbounded remote shard count before any download
+
+**Tag:** CR-2026-08-03 M1 (verified) · **Blocked on:** nothing; the fix is one
+guard, and it is unfixed only because the fold-in slice was docs-only
+
+`crates/infr-hub/src/store.rs`: `parse_shard` accepts any `u32` as the
+`-of-MMMMM` total, and `shard_set` immediately materialises `(1..=total)`
+formatted filenames into a `Vec<String>`. `pull_repo_latest`
+(`crates/infr-hub/src/pull.rs`) calls `shard_set` on the filename `repo_info`
+picked out of the HuggingFace API's sibling list — BEFORE `fetch_and_link`'s
+`check_relative` and before any download — so the count is remote input and
+nothing bounds it.
+
+**Verified, not argued.** A temporary test asserted
+`parse_shard("m-Q4_K_M-0000000001-of-4294967295.gguf").unwrap().total == u32::MAX`
+(the `total_s.len() != idx_s.len()` guard is satisfied — both fields are 10
+digits), and that `shard_set("m-Q4_K_M-0001-of-1000.gguf")` returns 1000 names,
+i.e. the enumeration really is `1..=total` with no cap anywhere. The `u32::MAX`
+expansion itself was deliberately NOT run: 4.29e9 `String`s is ~100 GB and would
+take the runner with it, which is the finding.
+
+`Store::resolve_repo` calls `shard_set` too, on locally-listed snapshot
+filenames — same expansion, but there the input is a file the user already has.
+
+**The fix shape:** llama.cpp's split naming is 5 digits, so a `total` above
+99999 (equivalently `width > 5`) cannot name a real split. Reject in
+`parse_shard` rather than in `shard_set`, so both call sites are covered by one
+check.
+
+**Honest reachability:** it needs a repo the user asked for that ships a hostile
+filename — a typo-squat or a compromised repo, not a normal one. That is why it
+is filed rather than hot-fixed.
+
+### B20 — `diffusion_generate` enforces `n_predict` per BLOCK, never per token
+
+**Tag:** CR-2026-08-03 M2 (verified) · **Blocked on:** a decision on what
+over-budget should do — truncate, or keep the block and report honestly
+
+`crates/infr-llama/src/diffusion.rs`: `diffusion_generate` uses `n_predict`
+exactly once — `blocks_wanted = n_predict.div_ceil(canvas_len.max(1)).max(1)` —
+and never again. Each block appends its whole trimmed canvas
+(`response.extend_from_slice(&canvas[..cut])`) with no comparison against a
+remaining budget, and `.max(1)` forces one block even for an `n_predict` of 0 or
+
+1. `DiffusionGemmaChat::generate_impl`
+   (`crates/infr-llama/src/chat/diffusion.rs`) passes `max_new` straight in as
+   `n_predict`.
+
+So a `max_tokens: 1` request against a DiffusionGemma model gets up to
+`diffusion.canvas_length` tokens (read from GGUF metadata; `config.rs` requires
+it to be positive). It is also BILLED that way:
+`GenStats.n_gen = response.len()`, and `run_chat`'s `stats.n_gen >= max_new`
+branch then reports `finish_reason: "length"` with
+`completion_tokens = canvas_length` for a one-token request.
+
+Argued from the control flow, not executed — a proving test needs a real
+DiffusionGemma GGUF, because `denoise_block` takes a `&SeamModel` and reads
+`model.engine_cfg()`, so no mock `DiffusionSession` can stand in for it.
+
+**The decision:** truncating `response` to `n_predict` is one line but changes
+what a DG turn returns; the alternative is to keep block granularity and make
+the budget honest at the API edge (round `max_tokens` up to a whole block and
+say so). Block diffusion genuinely cannot produce a partial canvas, which is
+what makes this a product call rather than only a bug.
+
+### B21 — `DiffusionGemmaChat` discards `RequestCtx`: no cancellation, no per-request seed
+
+**Tag:** CR-2026-08-03 M3 (verified) · **Blocked on:** threading an abort poll
+and a seed through `diffusion_generate`'s block loop
+
+Both `ChatModel` entry points on `DiffusionGemmaChat`
+(`crates/infr-llama/src/chat/diffusion.rs`) take `_req` and drop it. The impl's
+own doc comment already discloses the gap; what it does not say is how far the
+gap reaches now that `infr serve` hosts DG.
+
+`cmd_serve` in `crates/infr-cli/src/main.rs` routes diffusion-gemma to the
+SERIALISED path (`is_vulkan = !is_dg && ..`) — one request at a time behind a
+Mutex. `run_chat` creates the `RequestCtx` and its `on_piece` calls
+`req.abort()` on a stop-sequence hit or a latched `cancel`. On DG none of it
+lands:
+
+- **A client disconnect does not stop the generation.** `streaming`'s failing
+  `tx.send` latches `cancel`, `run_chat` calls `req.abort()`, and
+  `diffusion_generate`'s block loop polls nothing — all `blocks_wanted` blocks
+  still run.
+- **Neither does the deadline.** `serve.request_timeout_secs` works by latching
+  that same `cancel` via `arm_deadline`. B5 says the deadline "bounds how long
+  one request can hold a `--parallel` slot"; on DG it bounds nothing, and
+  because the DG path is serialised the next request waits behind the whole
+  thing.
+- **`on_piece` fires once per finished BLOCK**, not per token, so even the poll
+  points would be coarse.
+- **The per-request seed is ignored.** `GenParams.seed` is a real accepted field
+  and `request_sampling` copies it into `RequestSampling.seed`; `generate_impl`
+  resolves `self.model.engine_cfg().sampling.seed.unwrap_or(42)` instead, so two
+  requests with different seeds produce identical output.
+
+Combined with B20 (a `max_tokens: 1` request generating a whole canvas), the
+worst case is a disconnected client leaving the single DG slot busy for
+`ceil(max_new / canvas_length)` blocks with nothing able to interrupt it.
+
+### B22 — a forced `tool_choice` with no `tools` generates unconstrained instead of 400
+
+**Tag:** CR-2026-08-03 M4 (verified) · **Blocked on:** nothing; it is a
+validation rule to add, plus a decision on how strict to be
+
+Two halves, both confirmed by reading:
+
+- `crates/infr-llama/src/grammar.rs`: `tool_constraint_for` opens with
+  `let Some(tools) = tools else { return Ok(None) };` — `tool_choice` is never
+  inspected when `tools` is absent.
+- `crates/infr-server/src/lib.rs`: `tool_choice_str` passes EVERY JSON string
+  through unchanged, so `"bogus"` is accepted as a function name (its own test
+  `tool_choice_string_passes_through` asserts exactly that), and the
+  `chat_completions` handler never cross-checks `tool_choice` against `tools`.
+
+So `POST /v1/chat/completions` with `"tool_choice":"required"` and no `tools`
+returns ordinary assistant text: `run_chat` sees `tool_constraint(..) == None`
+and falls into the unconstrained branch. Same for any misspelled choice.
+
+Note the near-miss the review did not mention: with `tools` PRESENT and a
+`tool_choice` naming no tool in it, `tool_constraint_for`'s filter yields an
+empty array and `forced_tool_call_grammar` builds `{"anyOf": []}` — a grammar
+matching nothing. That is a different failure (a grammar error, or an empty
+constrained decode followed by `run_chat`'s unconstrained fallback), it has not
+been executed, and it stems from the same missing validation.
+
+**The rule to add:** reject `tool_choice` values outside `auto` / `none` /
+`required` / a name present in `tools`, and reject a forced choice with no
+`tools`, as a `ParamError` in the handler — alongside the existing
+`tool_choice_str` 400s, which already establish that a malformed forced choice
+is an error rather than a silent downgrade to `auto`.
+
+### B23 — a panicking streaming generator terminates the SSE stream like a success
+
+**Tag:** CR-2026-08-03 M5 (**PROVED**) · **Blocked on:** nothing
+
+`crates/infr-server/src/lib.rs`'s `streaming` discards the `spawn_blocking` join
+handle. A panic inside `ChatGenerator::chat` unwinds past the `match res`, so
+the `Err` arm — the one that sends `sse_error_event`, calls
+`ServeStats::fold_failure` and logs `request failed` — never runs.
+`DoneGuard::drop` still emits `[DONE]`.
+
+**Proved with a temporary test, not argued.** A `ChatGenerator` emitting one
+content delta and then panicking, driven through the real `streaming` function,
+put exactly this on the wire:
+
+```text
+data: {..,"delta":{"role":"assistant"},"finish_reason":null}
+data: {..,"delta":{"content":"partial"},"finish_reason":null}
+data: [DONE]
+```
+
+No error frame and no terminal chunk carrying a real `finish_reason` — a client
+that does not specifically check for the finish chunk cannot tell this from a
+completed generation. `ServeStats::drain` afterwards reported `failed == 0` and
+`completed == 0`, so the periodic throughput line under-reports both. The test
+also confirmed the half that IS fine: `active` was back to 0 and the slot permit
+was released, both by RAII on the unwind.
+
+**One correction to the finding as filed:** it is not silent. There is no custom
+`std::panic::set_hook` anywhere in the tree, so the default hook still prints
+`thread '..' panicked at ..` to stderr. What is missing is a `tracing` event —
+the request has a `request start` line carrying its `req` id and then NO
+terminal line of any kind, so the structured log shows an arrival that never
+ended and nothing joins the stderr panic to it.
+
+**The fix shape:** keep the `JoinHandle` and await it (the non-streaming path
+already does), or wrap the closure body in `catch_unwind` and run the `Err`
+arm's three actions on the caught payload. Either way the terminal frame has to
+go out before `DoneGuard` drops.
+
+### B24 — `ServeStats` loses a completion correction across a drain
+
+**Tag:** CR-2026-08-03 L1 (**PROVED**) · **Blocked on:** nothing
+
+`crates/infr-server/src/lib.rs`: the live per-delta estimate (`bump_gen`) and
+the authoritative correction (`fold_completion`'s
+`i64::from(rec.gen_tokens) - rec.deltas as i64`) share ONE process-global
+`interval_gen_tokens: AtomicI64`, and `drain` takes it as `.swap(0).max(0)`. A
+correction arriving after the deltas it corrects were already drained cannot
+reach them.
+
+**Proved with a temporary test.** Two deltas, drain (window reports 2), then
+`fold_completion` with `gen_tokens = 1, deltas = 2` (correction −1), drain
+again: the second window clamps to 0 and the two windows total **2** where the
+truth is
+
+1. Worse with another request's tokens in the second window: 3 real tokens from
+   request B reported as **2**, because A's −1 came out of B's interval.
+
+The existing `the_live_delta_count_is_reconciled_against_the_real_token_count`
+test passes only because it never drains between the deltas and the correction.
+
+**Why it is Low:** it needs a drain (default `serve.stats_interval_secs = 5`) to
+land between a request's last delta and its completion, and the error is bounded
+by how far deltas and tokens diverge on that one request. It skews the periodic
+`decode_tps` line and nothing else — no per-request number is affected, since
+`log_request_done` reads `ReqRecord` directly.
+
+**The fix shape:** apply the correction only when the current interval is still
+the one the deltas landed in (tag `ReqTally` with the drain generation it
+started in and drop the correction when it no longer matches), or stop
+double-counting altogether — count deltas per request and fold the authoritative
+number once at completion. The second loses the "a long request shows up in
+every interval it spans" property that `bump_gen` exists for; that trade is the
+decision.
+
+### B25 — `SpinPool::run` releases `in_run` before consuming `panicked`
+
+**Tag:** CR-2026-08-03 L2 (verified) · **Blocked on:** nothing
+
+`crates/infr-cpu/src/pool.rs`, the tail of `SpinPool::run`:
+
+```rust
+self.in_run.store(false, Ordering::Release);
+if sh.panicked.swap(false, Ordering::AcqRel) {
+    panic!("spin-pool: a task panicked (caught per-task; state may be incomplete)");
+}
+```
+
+`panicked` is pool-global (on `Shared`), written by both the participating
+caller and `worker_loop`. Releasing `in_run` first is exactly what lets a second
+caller's `compare_exchange` succeed in the gap: job B starts, one of its tasks
+panics and sets the flag, then job A's `swap` consumes it — A panics for B's
+failure and B returns normally with incomplete task state.
+
+The rest of the handshake is sound, which is what makes this the only hole: A
+waits for `done >= workers` before releasing, and every worker stores `panicked`
+with `Release` before its `done` `fetch_add`, so none of A's OWN flags can be
+missed. Concurrent callers are real rather than hypothetical — the rayon
+fallback branch above exists for "a second graph executing concurrently on this
+backend, e.g. parallel serve sessions".
+
+Not proved: a deterministic repro needs the caller paused between the store and
+the swap, i.e. instrumenting the pool. The ordering argument is self-contained.
+
+**The fix shape:** swap `panicked` BEFORE releasing `in_run`, and panic after.
+It only matters once a task has already panicked, which is why it is Low.
+
+### B26 — `matmul_f32` leaks its transient Vulkan handles on every error path
+
+**Tag:** CR-2026-08-03 L3 (verified, and narrower than filed) · **Blocked on:**
+nothing; the open question is whether it is worth touching at all
+
+`crates/infr-vulkan/src/matmul.rs`: `VulkanBackend::matmul_f32` creates a shader
+module, descriptor-set layout, pipeline layout, pipeline and descriptor pool as
+raw handles and destroys them only in the success tail. Every `?` between them
+leaks whatever was already created, and so does the explicit "driver returned
+VK_SUCCESS with a null pipeline handle" early return, which abandons the shader
+module and both layouts. The buffers are fine — `buf_a`/`buf_b`/`buf_c` are
+RAII.
+
+**What the review missed, and it is the whole severity story:** the function is
+`#[doc(hidden)]` and its own doc says "ONE-SHOT bench/test helper (only callers
+are `examples/smoke.rs` and `test_matmul_f32`) … NOT on any production path". A
+grep confirms those are the only two callers. So the leak is real code and
+unreachable from `infr run` / `serve` / `bench`, and it leaks per failed call in
+a process that is about to exit anyway.
+
+Worth recording anyway because the same doc comment's step 5 — "Destroys all
+transient Vulkan objects (pool, pipeline, layouts, shader module)" — is a
+factual claim that holds only on success, and that is the kind of comment the
+next reader trusts without checking.
+
+**If it is fixed:** one `(|| { .. })()` inner closure whose `Err` falls through
+to the existing destroy block, rather than five separate `map_err` cleanups.
+
+### B27 — hardening candidates from the 2026-08-03 review
+
+**Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
+established defect and none was verified in the fold-in pass
+
+Kept with the deleted report's framing intact: the review listed these as **"not
+established current defects"** — places where a stronger construction would
+survive a case nobody has shown to occur. Do not promote one to a bug without
+first exhibiting that case.
+
+- `with_profiling_suppressed` restores a process-global boolean only on normal
+  return; an RAII nesting counter would survive panics and overlapping scopes.
+- `SpinPool::collect` leaks already-initialised values when another task panics;
+  unwind cleanup could track and drop initialised slots. (Adjacent to B25, but a
+  different mechanism — that one is attribution, this is cleanup.)
+- Existing HuggingFace `blobs/<expected_sha>` files are trusted by pathname and
+  existence without rehashing; optional verification would catch local cache
+  corruption.
+- Public `dequant_block` assumes block-sized input. The reviewed GGUF callers
+  supply validated slices; an explicit length check would protect direct
+  callers.
+- The streaming SSE channel is unbounded, so a non-reading client can retain a
+  whole completion in memory.
+
+**That last one is NOT B5, and it is already a recorded decision.** B5 declined
+RATE limiting — how many requests one client may make — because a reverse proxy
+owns that. This is per-stream memory retention on an already-admitted request,
+and `streaming`'s own comment in `crates/infr-server/src/lib.rs` argues the
+choice explicitly: a bounded channel would push backpressure into `on_delta`,
+which runs inside the decode loop while it holds the GPU baton, so one slow
+client would stall every other sequence. Retention is bounded by `max_tokens`,
+itself capped by `clamp_max_tokens` / `max_tokens_cap`. Treat it as decided
+unless someone measures the retention and finds the bound too loose.
+
+### B28 — what the 2026-08-03 review CLEARED
+
+**Tag:** CR-2026-08-03 cleared · **Blocked on:** nothing; recorded so it is not
+re-investigated
+
+Investigated at low depth and found sound. These were NOT re-verified in the
+fold-in pass — that pass verified the review's FINDINGS, not its clearances — so
+treat each as "one reviewer looked and was satisfied", never as tested.
+
+- CLI backend strings such as `vulkanfoo` do not silently select Vulkan device
+  0; the downstream numeric parse rejects the suffix.
+- GGUF loading validates metadata depth, tensor dimension arithmetic, alignment,
+  duplicate names, quantisation block divisibility and mapped-file bounds before
+  exposing tensor bytes.
+- `StopMatcher` preserves split stop prefixes and UTF-8 boundaries.
+- Vulkan upload, download and copy paths validate buffer extents.
+- Vulkan external-memory file descriptors transfer ownership on a successful
+  import and close the duplicate on failure.
+- The Metal derived-buffer cache keys include monotonic allocation identity, so
+  a recycled address cannot produce a false cache hit.
+- Autoregressive generation handles `max_new == 0` explicitly; the budget defect
+  is confined to block diffusion (B20).
+- `SpinPool` waits for every worker check-in before releasing an ordinary
+  borrowed job; the surviving defect is panic attribution between jobs (B25).
+- Pager production callers reject zero slots before construction.
+- Dense-runner token ids are validated before embedding lookup on the reviewed
+  generation paths.
+- Malformed Hermes tool markup is gated out of production streaming and removed
+  rather than surfacing as assistant content.
+
+### B29 — what the 2026-08-03 review did NOT cover
+
+**Tag:** CR-2026-08-03 coverage · **Blocked on:** nothing; each line is a gap,
+stated as one
+
+The review was explicitly **low depth** and **ran no build and no tests**. It
+traced core graph / pager / sampling / pool / backend boundaries; llama's
+autoregressive, diffusion, grammar, chat and request-context flow; server
+validation, admission, deadlines, streaming and non-streaming responses,
+statistics and cancellation; hub selection, shard expansion, cache resolution,
+downloads, integrity, symlinks and path validation; GGUF metadata/tensor
+validation and host dequant entry points; CLI backend/model parsing and the
+serve generation adapters; chat-template, reasoning, stop and tool-call parsing;
+profiling aggregation and JSON output; selected Vulkan and Metal allocation,
+transfer, cache, synchronisation, dispatch and lifecycle paths; and the testkit.
+It did NOT go line by line through:
+
+- SIMD/scalar numerical bodies and architecture-specific branches in
+  `crates/infr-cpu/src/kernels.rs` (see also B3).
+- Every graph-rewrite combination in `crates/infr-core/src/fusion.rs`.
+- The static quantisation tables in `crates/infr-core/src/iquant_grids.rs`.
+- Every MTP and per-architecture seam graph formula.
+- Most Vulkan recorder, adapter, GEMM, pager, tensor-parallel, expert-routing
+  and shader host/ABI combinations (see also B4).
+- Most of `crates/infr-metal/src/exec.rs`, and full Metal shader/host ABI
+  validation (see also B9a, B14).
+- Every quantisation arm in `crates/infr-gguf/src/dequant.rs`.
+- Large CLI benchmark and diffusion-specific command paths.
+- Every test assertion and example.
+- Live Vulkan or Metal execution — nothing ran on a device.
+- Platform-gated macOS code, which was read but never compiled.
+
 ---
 
 ## Withdrawn
 
 Recorded so they are not rediscovered and re-investigated.
+
+**Nothing from the 2026-08-03 review landed here.** All eight of its findings
+were re-verified against the code and all eight survived — seven outright
+(B19–B25) and one narrowed by a scope the review had missed (B26: the leaking
+function is a `#[doc(hidden)]` test/bench helper with no production caller).
 
 ### W1 — VRAM guard check-then-act race (CR-N7)
 

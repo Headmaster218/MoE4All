@@ -678,7 +678,8 @@ const KV_SPILL: SpillNouns<'static> = SpillNouns {
 ///
 /// Carried on the `Config` in MiB (`kv.overflow_vram_mb`); the byte conversion is this accessor's.
 ///
-/// KEEP (reviewed 2026-08-01, docs/code-review.md Y4). One read site, and a YAGNI sweep flagged it
+/// KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so the
+/// reasoning lives here rather than behind a citation). One read site, and a YAGNI sweep flagged it
 /// as measurement scaffolding. It stays for the same reason as `debug.poison_uninit`: it costs
 /// nothing when unset, and it is what makes a partial-spill placement reproducible on hardware
 /// where the model would otherwise fit — i.e. what lets a placement bug be re-created on a machine
@@ -3380,7 +3381,8 @@ impl Backend for VulkanBackend {
         // hunting layout-sensitive read-before-write bugs whose output shifts with unrelated code
         // changes.
         //
-        // KEEP (reviewed 2026-08-01, docs/code-review.md Y3). This knob has exactly one read site —
+        // KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so
+        // the reasoning lives here rather than behind a citation). One read site —
         // the line below — and a YAGNI sweep flagged it as scaffolding. It stays: it costs one
         // branch on an allocation path that runs at load, nothing at all when unset, and it is the
         // only way to reproduce a read-before-write bug in a RELEASE build, where the debug poison

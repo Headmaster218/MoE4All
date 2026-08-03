@@ -60,10 +60,9 @@ at that index. It holds:
 
 - [audit.md](audit.md) — module-by-module codebase audit for bugs, correctness,
   perf, DRY, and YAGNI.
-- [code-review.md](code-review.md) — risk-prioritised whole-tree review
-  (2026-08-01): correctness bugs, security/robustness gaps, `unsafe` soundness,
-  DRY, and YAGNI, each with a file:line and a suggested fix. All findings are
-  resolved; residual work is in the backlog.
 - [backlog.md](backlog.md) — triaged work that is deliberately not done, with
   why (blocked on hardware, scoped out, or declined), plus withdrawn findings
-  recorded so they are not rediscovered.
+  recorded so they are not rediscovered. The whole-tree correctness reviews that
+  used to live in `code-review.md` were folded into it on 2026-08-03 and that
+  file deleted: the re-verified findings are B19–B26, and the reviews' cleared /
+  hardening / coverage lists are B27–B29.
