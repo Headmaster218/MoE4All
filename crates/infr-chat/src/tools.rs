@@ -100,14 +100,25 @@ const MAX_VALUE_DEPTH: usize = 64;
 ///
 /// `s` has already had `<|"|>` replaced with `"`.
 ///
-/// Returns `None` when nesting would exceed [`MAX_VALUE_DEPTH`] or when the current byte is
-/// a container delimiter that cannot begin a value. Other malformations stay lenient-by-design
-/// (partial objects, missing quotes and unterminated strings all yield a best-effort `Value`, as
-/// callers rely on). `None` propagates all the way out so the caller drops the whole call instead
-/// of acting on a truncated one. Note the degradation could NOT be "return `Value::Null` in place
-/// and stop consuming": the array arm loops `while` the cursor hasn't reached `]`, so a value
-/// that returns without advancing `i` spins forever pushing `Null`s — a hang and an OOM in place
-/// of the stack overflow. Propagating `None` is the only exit that terminates every loop.
+/// Returns `None` in exactly two cases: nesting would exceed [`MAX_VALUE_DEPTH`], or the value
+/// position holds a byte that cannot begin one (`,`, `}`, `]`). `None` propagates all the way out,
+/// so the caller drops the WHOLE call rather than acting on a partial one.
+///
+/// Everything else stays lenient-by-design — missing quotes, unterminated strings and an input
+/// that simply runs out all yield a best-effort `Value`, which callers rely on.
+///
+/// The delimiter rejection is not merely strictness, and it is why the degradation could NOT be
+/// "return `Value::Null` in place and stop consuming": both container arms loop until they reach
+/// their closing bracket, so a value that returns WITHOUT advancing `i` leaves the loop on the
+/// same byte forever, pushing values until the process dies. That is reachable from model output
+/// (`{a:[}]}` is enough), so it is a hang and an unbounded allocation, not a parse quirk.
+/// Propagating `None` is the only exit that terminates every loop.
+///
+/// The cost is that a VALUELESS object entry now drops its call too: `{a:}` and `{a:,b:1}` used to
+/// yield `a` bound to an empty string, and no longer parse at all. That is deliberate — binding an
+/// argument the model never wrote is its own bug, and a dropped call is the visible failure — but
+/// it does mean "partial object" is no longer uniformly lenient. Only a valueless entry is
+/// affected; a truncated one (`{a:` with nothing after it) still parses best-effort.
 fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
     // skip whitespace
     while i < s.len() && matches!(s[i], b' ' | b'\n' | b'\t' | b'\r') {
@@ -718,6 +729,36 @@ mod tests {
     fn malformed_array_delimiter_does_not_loop() {
         let (_, calls) = parse_tool_calls("<|tool_call>call:x{a:[}]}<tool_call|>");
         assert!(calls.is_empty());
+    }
+
+    /// Where the delimiter rejection draws its line, asserted rather than described: a VALUELESS
+    /// entry drops the whole call, a TRUNCATED one still parses best-effort, and well-formed input
+    /// is untouched. The middle case is the one that keeps the rejection from swallowing every
+    /// partial object — a stream cut mid-value is the common malformation, and it still yields a
+    /// call.
+    #[test]
+    fn valueless_entries_drop_the_call_but_truncated_ones_still_parse() {
+        let args = |t: &str| {
+            let (_, calls) = parse_tool_calls(t);
+            calls.first().map(|c| c.arguments.clone())
+        };
+
+        // Valueless: nothing was written for `a`, so binding it would invent an argument.
+        assert_eq!(args("<|tool_call>call:x{a:}<tool_call|>"), None);
+        assert_eq!(args("<|tool_call>call:x{a:,b:1}<tool_call|>"), None);
+
+        // Truncated: the value position runs off the end rather than hitting a delimiter.
+        assert_eq!(
+            args("<|tool_call>call:x{a:<tool_call|>"),
+            Some(serde_json::json!({ "a": null })),
+            "a stream cut mid-value must still yield a best-effort call"
+        );
+
+        // Well-formed input is unaffected by the rejection, including empty containers.
+        assert_eq!(
+            args("<|tool_call>call:x{a:1,b:[1,2],c:{}}<tool_call|>"),
+            Some(serde_json::json!({ "a": 1, "b": [1, 2], "c": {} }))
+        );
     }
 
     #[test]

@@ -42,9 +42,18 @@ static SIGNO: AtomicI32 = AtomicI32::new(0);
 /// it was already set (i.e. this is a second signal — the caller may then decide the user has given
 /// up waiting and force-exit).
 ///
+/// **`signo` must not be 0**, which is this latch's "no request" state rather than a signal —
+/// POSIX reserves 0 as the null signal for `kill(pid, 0)` existence probes, so no handler is ever
+/// invoked with it. Passing it would compare-exchange 0 for 0: the call reports itself as the one
+/// that latched, while [`shutdown_requested`] keeps saying no. Debug-asserted; the CLI's handler
+/// is the only caller and always passes the signal it was invoked with.
+///
 /// **Async-signal-safe**: one `compare_exchange` on a lock-free atomic, nothing else. No allocation,
-/// no locking, no I/O. It is called directly from the CLI's `SIGINT`/`SIGTERM` handler.
+/// no locking, no I/O. It is called directly from the CLI's `SIGINT`/`SIGTERM` handler. (The
+/// `debug_assert` is compiled out of release builds, so the handler's release path stays exactly
+/// one atomic instruction.)
 pub fn request_shutdown(signo: i32) -> bool {
+    debug_assert_ne!(signo, 0, "signal 0 is the unset state, not a signal");
     SIGNO
         .compare_exchange(0, signo, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
@@ -83,5 +92,15 @@ mod tests {
         assert!(!request_shutdown(2), "second signal does NOT latch again");
         assert_eq!(shutdown_signal(), Some(15), "exit status stays the first's");
         assert!(shutdown_requested(), "the latch never un-sets");
+    }
+
+    /// Signal 0 is the unset state, so latching it would report success while leaving
+    /// [`shutdown_requested`] false. The assert fires BEFORE the compare-exchange, so this test
+    /// cannot disturb the global latch the test above drives.
+    #[test]
+    #[should_panic(expected = "signal 0 is the unset state")]
+    #[cfg(debug_assertions)]
+    fn signal_zero_is_rejected() {
+        let _ = request_shutdown(0);
     }
 }

@@ -335,11 +335,17 @@ impl SpinPool {
         // SAFETY: every index 0..n is written exactly once below before assume-init.
         unsafe { out.set_len(n) };
         let initialized: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+        // ONE `as_mut_ptr` feeds both the tasks' writes and the unwind guard's drops. Calling it
+        // twice would reborrow `out` mutably a second time, popping the first pointer's tag off
+        // the borrow stack — so the guard, which runs only while unwinding and therefore only
+        // AFTER the second pointer exists, would be dropping through a pointer the aliasing model
+        // already considers dead. Same address either way, so nothing observable changes today;
+        // it is UB by the model, not by the codegen.
+        let base = SendPtr(out.as_mut_ptr());
         let guard = CollectGuard {
-            slots: out.as_mut_ptr(),
+            slots: base.get(),
             initialized: &initialized,
         };
-        let base = SendPtr(out.as_mut_ptr());
         self.run(n, &|i| {
             // SAFETY: each task writes only its own slot.
             unsafe { base.get().add(i).write(std::mem::MaybeUninit::new(f(i))) };
