@@ -2128,6 +2128,51 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
     );
 }
 
+/// The same dense streaming path with its THIRD tier engaged (`paging.dram`): every streamed weight
+/// group's bytes come from the host arena — read off the model file by `FileBlockIo` — instead of
+/// the GGUF mmap. Token identity against the all-resident run is what says the tier below hands the
+/// staging ring the same bytes the mapping did.
+///
+/// Both budgets are forced far under what the model needs, so neither tier can hold its working
+/// set: VRAM re-uploads nearly every group every pass, and the host arena evicts and re-reads
+/// underneath it. That is what makes the run exercise a recycled host slot rather than a warm cache
+/// that never moves — the case where a wrong slot index produces plausible garbage instead of an
+/// error. `crates/infr-vulkan/tests/dense_tier_parity.rs` pins down which of the three stage cases
+/// each of those is; this test is the end-to-end statement that the whole model still decodes.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_dense_stream_host_tier_matches_resident() {
+    let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
+    let mut _tlk = test_serial_lock();
+    let n = 8usize;
+
+    let model = model_default(&path);
+    let rendered = model
+        .render_chat("What is 2+2? Answer briefly.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    let tiered = model_cfg(&path, |c| {
+        c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+        c.paging.dram = Some(infr_core::SizeSpec::Bytes(256 * 1024 * 1024));
+        c.paging.stats = true;
+    });
+    let mut tiered_ids = Vec::new();
+    tiered
+        .generate_vulkan_ids(&prompt_ids, n, |id| tiered_ids.push(id))
+        .expect("tiered gpu gen");
+
+    assert_eq!(
+        tiered_ids, resident_ids,
+        "the host tier diverged from the all-resident GPU run"
+    );
+}
+
 fn qwen3_17b() -> Option<PathBuf> {
     find_gguf("unsloth--Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
 }

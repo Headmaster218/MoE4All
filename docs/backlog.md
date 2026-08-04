@@ -743,25 +743,29 @@ escape and `\u` paths that the punctuation alphabet cannot.
 Adding it means a `fuzz/` crate, a nightly job, and a decision about how long
 per target per week.
 
-### B35 — tiered weight paging: phases 3-5 are not built
+### B35 — tiered weight paging: phases 4-5 are not built
 
 **Tag:** design slice 2026-08-04 · **Blocked on:** phase 4 needs Apple hardware
 this host does not have
 
 `docs/disk-streaming-plan.md` carries the design and the per-phase verification.
-**Phases 0-2 have LANDED** (baseline measured, core `blockio`/`hostpager`/pins,
-CPU backend on the DRAM tier — numbers in `docs/perf/results.md`). What is left:
+**Phases 0-3 have LANDED** (baseline measured, core `blockio`/`hostpager`/pins,
+CPU backend on the DRAM tier, Vulkan dense streaming's third tier — numbers in
+`docs/perf/results.md`). What is left:
 
-- **Phase 3, Vulkan's third tier.** `DenseSource`/`ExpertSource` still take mmap
-  views; the three-case stage path (VRAM hit / DRAM hit / read straight into the
-  pinned ring) is unbuilt. Verifiable on this host — the parity tests only cover
-  `ensure_resident`/`flush_lut` today, so `schedule_staged`, the ring and
-  `DensePagerSession::stage` need new ones that force each case and assert each
-  is actually taken.
 - **Phase 4, Metal / UMA collapse.** Unbuilt and **unverifiable here**: no Apple
   hardware, and `infr-metal` does not compile on this box. Writing it blind
   would produce code whose only evidence is that it type-checks in CI. Its own
-  precondition is the `qui_cache` gate below.
+  precondition is the `qui_cache` gate below. The options and their trade-off
+  are written out in the plan's §7 as an open question for the user — do not
+  re-derive them.
+- **MoE on the host tier is not wired, on any GPU backend.** Phase 3 covered the
+  DENSE session only: `MoePagerSession` still resolves every miss against
+  `ExpertSource`'s mmap view, so an over-RAM MoE model on a GPU is still the
+  page cache's problem. The block model transfers directly — one expert's one
+  role is already a uniform-size block — so this is a small slice, and §2 argues
+  MoE's routing skew makes it the tier's best case. Not in any phase's scope as
+  written; plan §7 records it as a question.
 - **Phase 5 levers**, each gated on a measurement that has not been taken:
   `fadvise(DONTNEED)`/`F_NOCACHE` for the double-caching a buffered `pread`
   leaves, prefetch (deferred from phase 2 — the synchronous read already beat
@@ -776,11 +780,14 @@ rediscovered:
   retains it unboundedly, keyed by `MTLBuffer::id()`. Correct, but it is a
   second full copy of every touched weight in host RAM, so a paged Metal model
   must gate or budget it (plan §3.4).
-- **CPU paging is single-process-shaped.** `HostPager`'s exhaustion error names
+- **Host paging is single-process-shaped.** `HostPager`'s exhaustion error names
   `paging.dram`, but nothing sizes the arena against `infr serve --parallel N`:
   the floor is N concurrent working sets and only 1 is priced. A tight budget
   under `--parallel` will surface as that error rather than a deadlock, which is
-  the safe failure, but the sizing is still not done.
+  the safe failure, but the sizing is still not done. The Vulkan tier is less
+  exposed than the CPU one — `DensePagerSession::stage` drops its pin before
+  returning, so its floor is one slot per pool regardless of N — while the CPU
+  interpreter holds a whole op's pins across the op.
 - **The per-pass file-change check is not wired.**
   `FileBlockIo::verify_unchanged` exists and is tested; no caller runs it yet,
   so a model rewritten mid-generation is read as whatever the new bytes are (the

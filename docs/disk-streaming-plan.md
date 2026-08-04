@@ -4,9 +4,11 @@ Plan for running models that fit neither VRAM nor DRAM, by extending the
 existing block pager into a **tiered** one whose bottom tier is the model file
 itself, read by explicit positioned I/O rather than left to the OS page cache.
 
-Status: **design, nothing implemented.** Claims about the tree name the file and
-symbol they came from. Numbers this plan does not have are marked as phase-0
-measurements rather than estimated here; the one worked example in §2 is
+Status: **phases 0–3 landed; 4 and 5 are not built** (§5 says what each phase
+delivered and what it deferred; §7 holds the questions still open, including
+whether phase 4 should be attempted at all on a machine that cannot run it).
+Claims about the tree name the file and symbol they came from. Numbers come from
+a command that was run, not an estimate; the one worked example in §2 is
 labelled as illustrative arithmetic, not a prediction.
 
 ## 1. What exists today
@@ -23,10 +25,12 @@ The residency machinery is already block-agnostic and already has two policies:
   `MoePagerSession` drives it with `(layer, role, expert)` blocks;
   `DensePagerSession` drives it with per-layer weight-group blocks
   (`DenseSource`, `DensePoolSpec`).
-- The **source of bytes** for both is zero-copy GGUF mmap views:
-  `DenseSource::segments` is `Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>`, built in
-  the Vulkan binder (`infr-llama/src/seam/mod.rs`) by calling
-  `Gguf::tensor_bytes_arc` once per component tensor.
+- The **source of bytes** was zero-copy GGUF mmap views for both:
+  `DenseSource::segments` was `Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>`, built
+  in the Vulkan binder (`infr-llama/src/seam/mod.rs`) by calling
+  `Gguf::tensor_bytes_arc` once per component tensor. Phase 3 replaced that
+  field with `DenseBytes`, whose second arm reads the host tier instead (§3.7);
+  `ExpertSource` — the MoE side — still takes the mmap view only.
 - Placement is decided once per load in the seam: the MoE tier ladder, then the
   dense try-resident → smaller-ubatch → auto-q8 → stream ladder, priced against
   `Backend::device_alloc_room`.
@@ -359,13 +363,30 @@ infallible over already-pinned slots. That pre-step is also where prefetch for
 the next op is issued. This is where tiering matters most — today the CPU
 backend's only answer to "bigger than RAM" is the page cache.
 
-**Vulkan (`infr-vulkan`).** `DenseSource`'s segments become a source enum: mmap
-view (fast path, unchanged) or paged block. `stage` then has three cases: VRAM
-hit (unchanged); VRAM miss with DRAM hit (memcpy DRAM → pinned ring); VRAM miss
-with DRAM miss (read disk **straight into the pinned ring** — it is already host
-memory — and admit to DRAM separately per policy). Never two copies of the same
-bytes on the critical path. The `-DSTREAMED` shader twins are **not** a new
-cost: `build.rs` already makes the streamed form the sole weight build.
+**Vulkan (`infr-vulkan`) — LANDED.** `DenseSource`'s segments became
+`DenseBytes`: `Mmap(segments)` (fast path, unchanged) or `Host`, which reads the
+block from the pool's own `HostPager` (`DensePoolSpec::host`). One host pager
+per VRAM pool, because a pool is already exactly a block-size class — the
+uniform-slot shape the host tier needs — so both tiers name the same blocks by
+the same `block_id`, with no mapping table between them. `stage` has the three
+cases: VRAM hit (nothing copied); VRAM miss with DRAM hit (memcpy arena → pinned
+ring); VRAM miss with DRAM miss (`HostPager::pin` reads the model file, then the
+same memcpy). The pin is released before `stage` returns, so one host slot per
+pool is enough for a sweep to make progress. The `-DSTREAMED` shader twins are
+**not** a new cost: `build.rs` already makes the streamed form the sole weight
+build.
+
+**What that gives up, and why.** The plan originally had the double-miss read go
+**straight into the pinned ring**, to avoid a second host touch. It is not
+built, because the saving only exists for a block that will never be re-read:
+reading into the arena and memcpying costs one read plus one memcpy, and reading
+into the ring and admitting afterwards costs exactly the same — the copy
+disappears only if you **skip** admission, and which blocks may be skipped is
+the `TierPlan` disk/DRAM partition (§3.6), which is deferred. Against that, the
+pinned ring is write-combined device-local memory on a ReBAR host, so a `pread`
+into it has an unmeasured cost a memcpy out of cached DRAM does not. Phase-5
+lever, gated on a measurement, once there is a partition that makes it
+meaningful.
 
 **Metal (`infr-metal`).** Unified memory collapses the VRAM and DRAM tiers into
 **one**: an arena slot is host memory the GPU reads directly, so a disk read
@@ -459,13 +480,33 @@ matching the policy's predicted `(n_slots − 1) / n_blocks` per sweep; a model
 larger than the budget completing at all; and beating phase 0 on throughput
 **and** major-fault count.
 
-**Phase 3 — Vulkan third tier.** The source enum and the three-case stage path.
-Verification: the pager parity tests currently cover
-`ensure_resident`/`flush_lut` only, so this phase writes new ones for
-`schedule_staged`, the ring, and `DensePagerSession::stage`, with budgets tuned
-to force each of the three cases — asserting each case is actually taken, since
-a case that never runs looks identical to one that works. Validation layer
-clean; streamed vs resident logits identical.
+**Phase 3 — Vulkan third tier. DONE (prefetch and the direct-to-ring read
+deferred).** `DenseBytes`, `DensePoolSpec::host`, the three-case
+`schedule_staged`, `DensePagerSession::pool_stats`, and the seam's
+`dense_host_tier` (one host pager per dense pool, budget split by
+`hostpager::plan_slots` — the same function `infr_cpu::paged::plan_pools` now
+calls, so the two tiers cannot drift apart on the rule).
+
+Verified by `infr-vulkan/tests/dense_tier_parity.rs`, which forces all three
+cases in one sweep (VRAM 3 slots, DRAM 5 slots, 8 blocks, 3 passes) and asserts
+each was taken from the counters rather than assuming: 4 VRAM hits, 20 VRAM
+misses, 4 DRAM hits, 16 file reads, across 9 ring-half rotations — the ring
+cursor persists across blocks, so `stage` really does refuse a full half and the
+caller really does swap. Correctness is content-checked through the streamed
+GEMV against the same weight in a plain arena, so a wrong slot decodes to
+visibly different finite floats. It also pins the accounting — the tier below is
+consulted exactly once per VRAM miss, one DRAM miss is one file read, and a read
+moves a whole block — because a probe that fired on hits too would report the
+sweep as warmer than it is. End-to-end, `gpu_seam_dense_stream_host_tier_`
+`matches_resident` (Qwen3-1.7B, 200 MB VRAM and 256 MB DRAM budgets, both far
+under the working set) is token-identical to the all-resident run. Clean under
+the Khronos validation layer, with the loader confirmed to have loaded it.
+
+Each new assertion was shown to go red by breaking what it guards: serving a
+neighbouring block from the host tier (both the unit and the end-to-end test
+fail — which is also what proves the end-to-end test engages the tier at all
+rather than passing vacuously), consulting the tier twice per miss, and dropping
+the registration check that a `Host` block exists below.
 
 **Phase 4 — Metal / UMA collapse.** Arena, pager, offset binding, the
 `qui_cache` gate. Verification: Metal decode parity against CPU reference under
@@ -511,6 +552,39 @@ Needing the user's call:
    `GlobalMemoryStatusEx`, i.e. a new dependency (`sysinfo` or `windows-sys`).
    Recommendation: neither — Windows requires an explicit `paging.dram` and says
    so. CI builds only ubuntu and macos today.
+
+   Note this is not yet load-bearing: nothing probes host memory on ANY
+   platform. `paging.dram` is explicit-only everywhere today (both
+   `cpu_paged_store` and `dense_host_tier` return "no tier" when it is unset),
+   which is the safe default B30 argues for — an anonymous arena sized from a
+   guess is the expensive kind of wrong. The question only becomes live if the
+   tier should ever engage automatically.
+
+4. **Phase 4 (Metal) cannot be verified on this machine.** There is no Apple
+   hardware here and `infr-metal` does not compile on this box, so the only
+   evidence a Metal tier could carry is that CI type-checks it. That is exactly
+   the shape the repo rules call a stub documented as working. Options:
+   - **Skip it** and leave §3.7's Metal paragraph as the design (recommended if
+     no Mac is coming): the tier stays a CPU + Vulkan feature, and Apple silicon
+     keeps today's behaviour, which is that an over-RAM model cannot load at
+     all.
+   - **Write it unverified**, clearly marked in code and docs as never having
+     run, for a later Mac session to finish. Cheap to write, and the risk is a
+     reader mistaking "compiles" for "works".
+   - **Defer until a Mac is available**, which is the honest version of option 1
+     if one is.
+
+   Nothing else in the plan is blocked on this — phase 5's levers are all
+   CPU/Vulkan and each is gated on its own measurement.
+
+5. **Is the host tier worth engaging for MoE on Vulkan?** Phase 3 wired the
+   DENSE session only. `MoePagerSession` still takes `ExpertSource`'s mmap view
+   on every miss, so an over-RAM MoE model on a GPU is still the page cache's
+   problem. The block model transfers directly (one expert's one role is already
+   a uniform-size block, which is what `HostPager` wants), so this is a small
+   slice — but §3.6 says MoE-on-GPU has no exact prefetch to be had, and §2 says
+   MoE's skew is what makes it the real prize. Worth doing; not started, and not
+   in any phase's scope as written.
 
 ## 8. Non-goals
 

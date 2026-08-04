@@ -42,7 +42,8 @@ use ash::vk;
 
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::error::Result;
-use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
+use infr_core::hostpager::HostPager;
+use infr_core::pager::{BlockId, Insert, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
@@ -263,32 +264,59 @@ impl GpuPager {
     /// The host LUT mirror is kept coherent (eviction/insert) so a pager can't be silently
     /// half-adopted by a LUT-reading path later, but dense dispatch never reads it — the slot
     /// index returned here is baked into the dispatch's weight element offset instead.
+    ///
+    /// `host` is the pool's tier below, required exactly when `bytes` is [`DenseBytes::Host`]. That
+    /// is the case that makes this three-tiered: a VRAM miss resolves against DRAM, which either
+    /// hits (a memcpy out of its arena) or reads the model file into it first.
     pub fn schedule_staged(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
         ring: &dyn Buffer,
         ring_off: usize,
         id: BlockId,
-        segments: &[Arc<dyn AsRef<[u8]> + Send + Sync>],
+        bytes: &DenseBytes,
+        host: Option<&HostPager>,
     ) -> Result<(u32, usize)> {
         match self.pager.schedule(id) {
             Resolution::Hit { slot } => Ok((slot, 0)),
             Resolution::Miss { slot, evicted } => {
-                let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
-                debug_assert!(
-                    total <= self.slot_bytes,
-                    "dense block bytes ({total}) exceed the pool's slot stride ({})",
-                    self.slot_bytes
-                );
+                let slot_bytes = self.slot_bytes;
+                let fits = |total: usize| {
+                    debug_assert!(
+                        total <= slot_bytes,
+                        "dense block bytes ({total}) exceed the pool's slot stride ({slot_bytes})"
+                    );
+                };
                 let base = as_vk_buf(ring)?
                     .mapped_ptr()
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                let mut off = ring_off;
-                for s in segments {
-                    let seg = expert_bytes(s);
-                    par_copy_to_mapped(seg, unsafe { base.add(off) });
-                    off += seg.len();
-                }
+                let total = match bytes {
+                    DenseBytes::Mmap(segments) => {
+                        let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
+                        fits(total);
+                        let mut off = ring_off;
+                        for s in segments {
+                            let seg = expert_bytes(s);
+                            par_copy_to_mapped(seg, unsafe { base.add(off) });
+                            off += seg.len();
+                        }
+                        total
+                    }
+                    DenseBytes::Host => {
+                        let host = host.ok_or_else(|| {
+                            be(format!(
+                                "dense pager: block {id} has no host tier to read from"
+                            ))
+                        })?;
+                        // Hit or disk read, decided inside the tier — and either way the pin is
+                        // released before this returns, so one host slot per pool is enough for
+                        // the sweep to make progress.
+                        let pin = host.pin(id, Insert::Cold)?;
+                        fits(pin.len());
+                        par_copy_to_mapped(&pin, unsafe { base.add(ring_off) });
+                        pin.len()
+                    }
+                };
                 // Word-align the copy length (the ring pad bytes it may carry are never read —
                 // see the fn doc); `total <= slot_bytes` and `slot_bytes % 4 == 0` keep it in
                 // the slot.
@@ -971,12 +999,24 @@ pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
 //     every token edge — streaming lm_head would add its full bytes to every token's PCIe bill
 //     with zero locality to exploit, a strict loss.
 
-/// Where one streamed dense block's bytes live: one or more consecutive zero-copy views into the
-/// GGUF mmap (SEGMENTS, in upload order — a fused qkv/gate_up block lists its component tensors
-/// so the concat never materializes in host RAM), plus the block's schedule id within its pool
-/// (ascending layer order — the cyclic-sweep key `infr_core::pager::Pager::schedule` expects).
+/// The tier a streamed dense block's bytes come from when VRAM misses.
+pub enum DenseBytes {
+    /// One or more consecutive zero-copy views into the GGUF mmap, in upload order — a fused
+    /// qkv/gate_up block lists its component tensors so the concat never materializes in host RAM.
+    /// The fits-in-host-RAM fast path, and what every model took before the host tier existed.
+    Mmap(Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>),
+    /// The pool's host DRAM tier ([`DensePoolSpec::host`]), under this block's own `block_id` —
+    /// the model does not fit host RAM either, so its bytes are read from the model file into a
+    /// bounded arena instead of being left to the OS page cache.
+    Host,
+}
+
+/// Where one streamed dense block's bytes live ([`DenseBytes`]), plus the block's schedule id
+/// within its pool (ascending layer order — the cyclic-sweep key
+/// `infr_core::pager::Pager::schedule` expects). The id keys BOTH tiers: a pool's host pager holds
+/// exactly the same block set under the same ids, so one number locates a block in either.
 pub struct DenseSource {
-    pub segments: Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    pub bytes: DenseBytes,
     pub block_id: u32,
 }
 
@@ -991,6 +1031,12 @@ pub struct DensePoolSpec {
     pub slot_bytes: usize,
     pub n_slots: usize,
     pub n_blocks: usize,
+    /// This pool's tier BELOW VRAM, or `None` to read every miss from the mmap (the fast path).
+    ///
+    /// One host pager per pool rather than one per model: a pool is already exactly a block-size
+    /// class, which is the uniform-slot shape [`HostPager`] needs, so the two tiers agree on both
+    /// the block set and its ids with no mapping table between them.
+    pub host: Option<Arc<HostPager>>,
 }
 
 struct DensePool {
@@ -1072,7 +1118,26 @@ impl DensePagerSession {
             .pools
             .get(pool)
             .ok_or_else(|| be(format!("dense pager: pool index {pool} out of range")))?;
-        let total: usize = source.segments.iter().map(|s| expert_bytes(s).len()).sum();
+        let total: usize = match &source.bytes {
+            DenseBytes::Mmap(segments) => segments.iter().map(|s| expert_bytes(s).len()).sum(),
+            // Asking the host tier for the size doubles as the check that the seam registered the
+            // block there first — a `Host` source whose block is unknown below would otherwise
+            // fail only later, mid-generation, on the first miss.
+            DenseBytes::Host => {
+                let host = p.spec.host.as_ref().ok_or_else(|| {
+                    be(format!(
+                        "dense pager: pool {pool} has no host tier for host-backed block {}",
+                        source.block_id
+                    ))
+                })?;
+                host.block_bytes(source.block_id).ok_or_else(|| {
+                    be(format!(
+                        "dense pager: block {} is not registered with pool {pool}'s host tier",
+                        source.block_id
+                    ))
+                })?
+            }
+        };
         if total > p.spec.slot_bytes {
             return Err(be(format!(
                 "dense pager: block bytes ({total}) exceed pool {pool}'s slot stride ({})",
@@ -1127,14 +1192,15 @@ impl DensePagerSession {
             return Ok(None); // half full — caller rotates and re-calls
         }
         pool.pager.begin_batch();
-        // Pass the mmap-backed segment `Arc`s straight through — `schedule_staged` derefs each via
-        // `expert_bytes`, so no per-call `Vec<&[u8]>` is materialized.
+        // Pass the source through by reference — `schedule_staged` derefs mmap segments via
+        // `expert_bytes` and pins a host block in place, so neither tier materializes a copy here.
         let (slot, consumed) = pool.pager.schedule_staged(
             rec,
             ring.as_ref(),
             half_base + *cursor,
             id,
-            &src.segments,
+            &src.bytes,
+            pool.spec.host.as_deref(),
         )?;
         *cursor += consumed;
         // Slot base BYTE address = arena base + slot * slot_bytes, in 64-bit (the BDA arena's
@@ -1146,6 +1212,18 @@ impl DensePagerSession {
 
     pub fn ring_half_bytes(&self) -> usize {
         self.ring_half_bytes
+    }
+
+    /// Per-pool `(VRAM residency, host tier)` counters, in pool order.
+    ///
+    /// The host half is what separates a VRAM miss the DRAM tier absorbed from one that reached the
+    /// disk — the two are indistinguishable in every other number this session reports, and a
+    /// three-tier path where one of those cases never runs looks exactly like one where it works.
+    pub fn pool_stats(&self) -> Vec<(PagerStats, Option<infr_core::hostpager::HostPagerStats>)> {
+        self.pools
+            .iter()
+            .map(|p| (p.pager.stats(), p.spec.host.as_ref().map(|h| h.stats())))
+            .collect()
     }
 
     /// `paging.stats` (`INFR_PAGER_STATS=1`): per-pool hit/miss/eviction counters (cyclic-sweep
@@ -1164,6 +1242,19 @@ impl DensePagerSession {
                 p.spec.n_slots,
                 p.spec.n_blocks,
             );
+            // The tier below, when there is one. Its READS are the line that matters: a VRAM miss
+            // that the host tier also missed is what actually touched the disk, and nothing else
+            // reported here distinguishes those two from each other.
+            if let Some(h) = &p.spec.host {
+                let hs = h.stats();
+                tracing::info!(
+                    "[dense pager]   host{i}: {} slots={} reads={} {:.2}GB from disk",
+                    stats_suffix(&hs.pager),
+                    h.n_slots(),
+                    hs.reads,
+                    hs.bytes_read as f64 / 1e9,
+                );
+            }
         }
     }
 }

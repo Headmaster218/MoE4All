@@ -53,45 +53,28 @@ pub struct PoolPlan {
 
 /// Decide the pools for a model's tensors within `budget_bytes`.
 ///
-/// Each class gets a share of the budget proportional to its share of the pageable bytes, floored
-/// at one slot and capped at its block count (slots beyond that are unusable). Classes are seated
-/// largest-total-bytes first, so when the budget runs out it is the classes that matter least that
-/// go unpaged. Pure arithmetic — no I/O, no allocation — so the policy is testable on its own.
+/// One class per distinct weight size above [`MIN_PAGED_BYTES`]; the budget splits across them by
+/// [`infr_core::hostpager::plan_slots`], which is the same rule the Vulkan dense session's host
+/// tier uses. A class the budget cannot seat once is dropped — it stays mapped.
 pub fn plan_pools(budget_bytes: usize, tensors: &[TensorInfo]) -> Vec<PoolPlan> {
     let mut counts: HashMap<usize, usize> = HashMap::new();
     for t in tensors.iter().filter(|t| t.nbytes >= MIN_PAGED_BYTES) {
         *counts.entry(t.nbytes).or_insert(0) += 1;
     }
-    let total: usize = counts.iter().map(|(size, n)| size * n).sum();
-    if total == 0 || budget_bytes == 0 {
-        return Vec::new();
-    }
     let mut classes: Vec<(usize, usize)> = counts.into_iter().collect();
-    // Largest total bytes first; size breaks ties so the plan is deterministic (a HashMap's order
-    // is not, and a plan that varies run to run would make residency unreproducible).
-    classes
-        .sort_unstable_by_key(|&(size, n)| (std::cmp::Reverse(size * n), std::cmp::Reverse(size)));
-
-    let mut left = budget_bytes;
-    let mut plans = Vec::new();
-    for (slot_bytes, n_blocks) in classes {
-        // This class's proportional share, in slots, floored at 1 and capped at its block count.
-        let share =
-            (budget_bytes as u128 * (slot_bytes * n_blocks) as u128 / total as u128) as usize;
-        let want = (share / slot_bytes).clamp(1, n_blocks);
-        let afford = left / slot_bytes;
-        let n_slots = want.min(afford);
-        if n_slots == 0 {
-            continue; // cannot seat even one block of this class — it stays mapped
-        }
-        left -= n_slots * slot_bytes;
-        plans.push(PoolPlan {
+    // A `HashMap`'s iteration order is not stable, and `plan_slots` only promises to preserve the
+    // order it is GIVEN — sort here so the same model and budget produce the same plan every run.
+    classes.sort_unstable();
+    infr_core::hostpager::plan_slots(budget_bytes, &classes)
+        .into_iter()
+        .zip(classes)
+        .filter(|&(n_slots, _)| n_slots > 0)
+        .map(|(n_slots, (slot_bytes, n_blocks))| PoolPlan {
             slot_bytes,
             n_slots,
             n_blocks,
-        });
-    }
-    plans
+        })
+        .collect()
 }
 
 /// The CPU backend's host weight cache: one [`HostPager`] per planned size class.

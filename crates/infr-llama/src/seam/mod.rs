@@ -119,6 +119,63 @@ fn cpu_paged_store(
     Ok(Some(std::sync::Arc::new(store)))
 }
 
+/// Build the host DRAM tier under the Vulkan dense-streaming pools — one
+/// [`infr_core::hostpager::HostPager`] per VRAM pool, since a pool is already exactly a block-size
+/// class.
+///
+/// `classes` is `(slot stride, block count)` per pool, in pool order; the result matches that
+/// order, `None` where the budget seated nothing. Same policy as [`cpu_paged_store`], for the same
+/// reasons: the budget is only ever what the user set (this arena is anonymous, non-evictable
+/// memory), and a budget too small to seat a pool leaves that pool on the mmap path rather than
+/// failing the load.
+fn dense_host_tier(
+    ec: &EngineConfig,
+    g: &Gguf,
+    classes: &[(usize, usize)],
+) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
+    let unpaged = || vec![None; classes.len()];
+    let Some(budget) = ec
+        .paging
+        .dram
+        .map(|s| s.resolve(0) as usize)
+        .filter(|&b| b > 0)
+    else {
+        return Ok(unpaged());
+    };
+    let slots = infr_core::hostpager::plan_slots(budget, classes);
+    if slots.iter().all(|&n| n == 0) {
+        tracing::warn!(
+            "dense host tier: a {:.2} GB budget seats no weight class of this model — keeping the \
+             mmap path (raise INFR_DRAM_CACHE past one weight group's size to page)",
+            budget as f64 / 1e9,
+        );
+        return Ok(unpaged());
+    }
+    let io = std::sync::Arc::new(
+        infr_core::blockio::FileBlockIo::open(g.path()).map_err(|e| anyhow!("{e}"))?,
+    );
+    let mut arena = 0usize;
+    let mut out = Vec::with_capacity(classes.len());
+    for (&n_slots, &(slot_bytes, _)) in slots.iter().zip(classes) {
+        if n_slots == 0 {
+            out.push(None);
+            continue;
+        }
+        let p = infr_core::hostpager::HostPager::new(n_slots, slot_bytes, io.clone())
+            .map_err(|e| anyhow!("{e}"))?;
+        arena += p.arena_bytes();
+        out.push(Some(std::sync::Arc::new(p)));
+    }
+    tracing::info!(
+        "dense host tier: {} of {} pool(s) paged, {:.2} GB arena of a {:.2} GB budget",
+        slots.iter().filter(|&&n| n > 0).count(),
+        classes.len(),
+        arena as f64 / 1e9,
+        budget as f64 / 1e9,
+    );
+    Ok(out)
+}
+
 fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
     cpu_bind_with(be, None)
 }
@@ -1536,6 +1593,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // permute rewrites bytes at load, so those tensors stay resident).
     let mut dense_plan: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
         std::collections::HashMap::new();
+    // The tier BELOW VRAM, one entry per dense pool (empty = none: every miss reads the mmap).
+    let mut dense_host: Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>> = Vec::new();
     if first_load && cfg.moe.is_none() {
         let fuse_gu = runner::fuse_gu_decision(vk.capabilities().combined_gu, g, cfg);
         let fuse_qkv = runner::fuse_qkv_decision(vk.capabilities().combined_gu, g, cfg, ec);
@@ -1788,9 +1847,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .map(|&(_, s, nb)| (s * nb) as u64)
                 .sum::<u64>()
                 .max(1);
+            // The tier below VRAM, sized before the pools so a `Host` source can name it. Pool
+            // order is preserved, so pool `i`'s host tier is `dense_host[i]`.
+            let classes: Vec<(usize, usize)> = pools.iter().map(|&(_, s, nb)| (s, nb)).collect();
+            dense_host = dense_host_tier(ec, g, &classes)?;
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
-                .map(|&(_, stride, nb)| {
+                .enumerate()
+                .map(|(i, &(_, stride, nb))| {
                     // Proportional budget split (byte share == access share: every block is read
                     // exactly once per sweep). Floor 2 slots so the next block's upload can
                     // overlap the previous block's dispatch instead of serializing on one slot.
@@ -1808,6 +1872,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         slot_bytes: stride,
                         n_slots: budget_slots,
                         n_blocks: nb,
+                        host: dense_host[i].clone(),
                     }
                 })
                 .collect();
@@ -1867,20 +1932,43 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // guard between this plan's group enumeration and the runner's actual upload grouping
         // (`fuse_*_decision` keeps them aligned; a mismatch here is a bug, caught loudly).
         if let Some((pool, block_id, comps)) = dense_plan.get(name) {
-            let segments: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = comps
-                .iter()
-                .map(|c| {
-                    Ok(
-                        std::sync::Arc::new(g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?)
-                            as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
-                    )
-                })
-                .collect::<AResult<_>>()?;
-            let seg_total: usize = segments.iter().map(|s| s.as_ref().as_ref().len()).sum();
-            if seg_total != tb.len() {
+            // With a host tier under this pool, the group's bytes are read from the model file on
+            // demand instead of faulted in through the mmap. `file_ranges` is `None` exactly for
+            // bytes the loader REWROTE, which correspond to nothing on disk — those keep the mmap
+            // source even when a tier exists (the eligibility filter already excludes them, so
+            // this is a fallback, not a normal path).
+            let host = dense_host.get(*pool).and_then(|h| h.as_ref());
+            let (bytes, plan_bytes) = match (host, tb.file_ranges()) {
+                (Some(h), Some(ranges)) => {
+                    let total: usize = ranges.iter().map(|(_, l)| l).sum();
+                    h.register(infr_core::blockio::BlockDesc {
+                        id: *block_id,
+                        extents: ranges
+                            .iter()
+                            .map(|&(offset, len)| infr_core::blockio::BlockExtent { offset, len })
+                            .collect(),
+                    })
+                    .map_err(|e| anyhow!("{e}"))?;
+                    (infr_vulkan::pager::DenseBytes::Host, total)
+                }
+                _ => {
+                    let segments: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = comps
+                        .iter()
+                        .map(|c| {
+                            Ok(std::sync::Arc::new(
+                                g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
+                            )
+                                as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                        })
+                        .collect::<AResult<_>>()?;
+                    let total = segments.iter().map(|s| s.as_ref().as_ref().len()).sum();
+                    (infr_vulkan::pager::DenseBytes::Mmap(segments), total)
+                }
+            };
+            if plan_bytes != tb.len() {
                 return Err(anyhow!(
                     "dense streaming plan out of sync with the upload order for {name}: plan \
-                     bytes {seg_total} != uploaded bytes {}",
+                     bytes {plan_bytes} != uploaded bytes {}",
                     tb.len()
                 ));
             }
@@ -1892,7 +1980,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 *pool,
                 buf_id,
                 infr_vulkan::pager::DenseSource {
-                    segments,
+                    bytes,
                     block_id: *block_id,
                 },
             )

@@ -29,6 +29,50 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// Split an arena budget across uniform size classes, in slots per class.
+///
+/// `classes` is `(slot_bytes, n_blocks)` per class. Each gets a share of the budget proportional to
+/// its share of the pageable bytes — byte share is access share, because a forward pass reads every
+/// block exactly once — floored at one slot and capped at its block count, since slots past that
+/// are unusable. Classes are seated largest-total-bytes first, so when the budget runs out it is
+/// the classes that matter least that go unseated (`0` slots; the caller keeps those on whatever
+/// path it had before). Returns one entry per input class, in the input's order.
+///
+/// Pure arithmetic, and shared by both consumers of the tier: the CPU backend sizes its pools per
+/// weight-size class, and the Vulkan dense session sizes one host pool under each VRAM pool. Two
+/// copies of this rule would be two budgets that drift.
+pub fn plan_slots(budget_bytes: usize, classes: &[(usize, usize)]) -> Vec<usize> {
+    let mut out = vec![0usize; classes.len()];
+    let total: usize = classes.iter().map(|&(size, n)| size * n).sum();
+    if total == 0 || budget_bytes == 0 {
+        return out;
+    }
+    let mut order: Vec<usize> = (0..classes.len()).collect();
+    // Largest total bytes first; size then index break ties, so the split is reproducible for a
+    // given model and budget rather than depending on how the caller happened to enumerate.
+    order.sort_unstable_by_key(|&i| {
+        let (size, n) = classes[i];
+        (std::cmp::Reverse(size * n), std::cmp::Reverse(size), i)
+    });
+    let mut left = budget_bytes;
+    for i in order {
+        let (slot_bytes, n_blocks) = classes[i];
+        if slot_bytes == 0 || n_blocks == 0 {
+            continue;
+        }
+        let share =
+            (budget_bytes as u128 * (slot_bytes * n_blocks) as u128 / total as u128) as usize;
+        let want = (share / slot_bytes).clamp(1, n_blocks);
+        let n_slots = want.min(left / slot_bytes);
+        if n_slots == 0 {
+            continue; // cannot seat even one block of this class
+        }
+        left -= n_slots * slot_bytes;
+        out[i] = n_slots;
+    }
+    out
+}
+
 /// Owned, never-resized slot storage, addressed through a raw pointer so that per-slot references
 /// never alias (see the module doc's soundness rules). Zero-initialized, matching the calloc
 /// contract every backend allocation in this workspace follows.
@@ -174,6 +218,17 @@ impl HostPager {
         }
         self.inner.lock().unwrap().descs.insert(desc.id, desc);
         Ok(())
+    }
+
+    /// How many bytes `id` occupies, or `None` if it was never registered. A tier above sizes its
+    /// own slot against this rather than re-deriving the group's byte total from the model.
+    pub fn block_bytes(&self, id: BlockId) -> Option<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .descs
+            .get(&id)
+            .map(|d| d.nbytes())
     }
 
     /// Open a new touch batch — same meaning as [`Pager::begin_batch`].
@@ -362,6 +417,54 @@ mod tests {
     use super::*;
     use crate::blockio::BlockExtent;
     use std::sync::atomic::AtomicUsize;
+
+    /// `plan_slots` returns one entry per input class, POSITIONALLY. Both callers index the result
+    /// against their own class list — the Vulkan session pairs entry `i` with VRAM pool `i` — so a
+    /// result that were sorted, filtered or compacted would attach each pool to another pool's host
+    /// arena: the wrong slot stride, the wrong block set, and no error anywhere.
+    #[test]
+    fn plan_slots_answers_in_the_order_it_was_asked() {
+        // Deliberately not in seating order: the middle class dominates the bytes.
+        let classes = [(1 << 20, 2), (8 << 20, 16), (4 << 20, 1)];
+        let slots = plan_slots(256 << 20, &classes);
+        assert_eq!(slots.len(), classes.len());
+        for (i, (&n, &(slot_bytes, n_blocks))) in slots.iter().zip(&classes).enumerate() {
+            assert!(
+                n <= n_blocks,
+                "class {i} got {n} slots for {n_blocks} blocks of {slot_bytes}B"
+            );
+        }
+        // The dominant class is the one that got the slots, and it is still at index 1.
+        assert!(
+            slots[1] > slots[0] && slots[1] > slots[2],
+            "the dominant class did not get the largest share: {slots:?}"
+        );
+    }
+
+    /// Seating is decided by each class's total bytes, not by where the caller happened to list it:
+    /// permuting the input permutes the answer and changes nothing else. Without this, the split a
+    /// model gets would depend on tensor enumeration order.
+    #[test]
+    fn plan_slots_is_independent_of_the_input_order() {
+        let classes = [(1 << 20, 3), (8 << 20, 9), (2 << 20, 5)];
+        let base = plan_slots(48 << 20, &classes);
+        let permuted: Vec<(usize, usize)> = vec![classes[2], classes[0], classes[1]];
+        let got = plan_slots(48 << 20, &permuted);
+        assert_eq!(
+            got,
+            vec![base[2], base[0], base[1]],
+            "a reordered input changed the split: {base:?} vs {got:?}"
+        );
+    }
+
+    /// A budget that cannot seat one block of any class buys nothing — the caller keeps the path it
+    /// had, rather than being handed a pool it cannot use.
+    #[test]
+    fn plan_slots_seats_nothing_it_cannot_afford() {
+        assert_eq!(plan_slots(1 << 10, &[(1 << 20, 4)]), vec![0]);
+        assert_eq!(plan_slots(0, &[(1 << 20, 4)]), vec![0]);
+        assert!(plan_slots(1 << 30, &[]).is_empty());
+    }
 
     /// A `BlockIo` with no file behind it: block `id` is `nbytes` copies of `id as u8`, so a slot
     /// filled from the wrong descriptor, or read at the wrong offset, is a value mismatch.
