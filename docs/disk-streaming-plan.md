@@ -4,9 +4,12 @@ Plan for running models that fit neither VRAM nor DRAM, by extending the
 existing block pager into a **tiered** one whose bottom tier is the model file
 itself, read by explicit positioned I/O rather than left to the OS page cache.
 
-Status: **phases 0–3 landed; 4 and 5 are not built** (§5 says what each phase
+Status: **phases 0–3 landed and the tier now beats mmap on both backends** (CPU
+2.06x at a 1.5 GB cap, Vulkan 1.29x on decode at an 8 GB cap — `docs/perf/`
+`results.md`). Phase 4 is not built and phase 5 is one lever in, the concurrent
+reader that took the GPU path from 0.79x to 1.29x. §5 says what each phase
 delivered and what it deferred; §7 holds the questions still open, including
-whether phase 4 should be attempted at all on a machine that cannot run it).
+whether phase 4 should be attempted at all on a machine that cannot run it.
 Claims about the tree name the file and symbol they came from. Numbers come from
 a command that was run, not an estimate; the one worked example in §2 is
 labelled as illustrative arithmetic, not a prediction.
@@ -545,50 +548,89 @@ blocks in both `touch_role` and `stage_role`, and
 break-probe, which diverged the output token-for-token and so proves the tier is
 on the path.
 
-**It does not beat the mmap it replaces yet, and that is measured.**
+**It now beats the mmap it replaces, and that is measured.**
 `docs/perf/results.md` carries the table: Qwen3-14B Q8_0 streamed under a forced
-2 GB VRAM budget, the tier runs at **0.79x of mmap on decode** and 0.83x under
-an 8 GB cap, while doing what it targets — 46x fewer major faults under the cap,
-232 to 195 GB read.
+2 GB VRAM budget, the tier runs at **1.29x of mmap on decode** under an 8 GB cap
+(0.22 vs 0.17 t/s, reproduced in two runs) and at parity unlimited, while doing
+what it targets — 42x fewer major faults under the cap, 232 to 195 GB read.
 
-That is after a 1.6x fix the first measurement is what found. The tier
-originally pinned each block in its arena and memcpy'd it into the ring, and
-measured 0.48x of mmap: on CPU the arena REPLACES the mapping so it adds no
-copy, but on Vulkan the bytes reach the ring either way, making
-`disk -> arena -> ring` one copy more than `page-cache -> ring`.
+Two fixes got it there, and BOTH were found by measuring rather than by
+reasoning about the design.
+
+The first was worth 1.6x. The tier originally pinned each block in its arena and
+memcpy'd it into the ring, and measured 0.48x of mmap: on CPU the arena REPLACES
+the mapping so it adds no copy, but on Vulkan the bytes reach the ring either
+way, making `disk -> arena -> ring` one copy more than `page-cache -> ring`.
 `HostPager::fill` now admits only while a slot is free and, once the arena is
 full, reads straight into the ring — which is also the correct residency call
 and is exactly §3.6's "dense: partition, do not cache", arrived at from the
 other direction. Decode 0.83 -> 1.36 t/s, prefill 54.7 -> 85.8.
 
-What remains is the read on the critical path (prefetch, unbuilt) and the
-double-caching a buffered `pread` causes. So `paging.dram` stays off by default
-and is not a recommendation for the GPU path: correctness proven, performance
-case not yet made.
+That left the tier at 0.79x, and the second fix was the READER, not the policy
+this plan spent its time on. `FileBlockIo::read_block` issued one `pread` per
+extent on one thread. A drive delivers bandwidth on queue depth: measured on
+this NVMe over 16-128 MB blocks, a single positioned read sustains 1.2-1.5 GB/s
+against a 2.2 GB/s device ceiling reached at depth 2-4. So the tier was losing
+to the mapping for a structural reason — the kernel issues readahead faults in
+parallel for free — and a block is now split across `IO_FANOUT` concurrent
+positioned reads. Read volume, fault counts and residency are unchanged across
+that fix; only bandwidth moved. Decode 0.15 -> 0.22 under the cap.
+
+**The lesson worth keeping: this plan's §5 named prefetch as the lever the
+phase-3 result "points at hardest", and that was wrong.** The regime is
+I/O-bound by orders of magnitude, so hiding a read behind compute had nearly
+nothing to hide it behind; the read was not too LATE, it was too SLOW. What is
+left is reading fewer bytes — the double-caching item below — not overlapping
+the reads.
+
+`paging.dram` remains off by default on the GPU path, but for a different reason
+than before: the performance case is made, and what is missing is coverage (one
+GPU, one drive, Linux only).
 
 **Phase 4 — Metal / UMA collapse.** Arena, pager, offset binding, the
 `qui_cache` gate. Verification: Metal decode parity against CPU reference under
 a forced-tiny budget, and the first over-RAM model to load on Apple silicon at
 all.
 
-**Phase 5 — levers, each gated on a measurement.** Two of them are no longer
-speculative: the phase-3 table is the measurement, and it says the GPU tier
-loses without them.
+**Phase 5 — levers, each gated on a measurement.** The concurrent reader (see
+phase 3) already landed the one that mattered; what follows is ordered by what
+the measurement now says, which is NOT what this section said before it.
 
-- **Prefetch** — the synchronous read sits on the critical path under the
-  session mutex. This is the one the phase-3 result points at hardest.
-- **Stop double-caching.** A buffered `pread` leaves a page-cache copy of what
-  the arena already holds, which under a memory cap halves the memory the tier
-  was given. `posix_fadvise(DONTNEED)` is the obvious lever and **will not work
-  as written**: it drops only clean, unmapped pages, and `Gguf::open` maps the
-  whole file, so those pages stay mapped. Either the resident tensors' mapping
-  has to stop covering paged blocks, or the reads have to bypass the cache
-  (`O_DIRECT`/`F_NOCACHE`, with the alignment constraints §3.5 records). Neither
-  is a small change; both are why this is a phase of its own.
+- **Stop double-caching — the top lever.** A buffered `pread` leaves a
+  page-cache copy of what the arena already holds, so under a memory cap the
+  arena effectively costs twice its size and `paging.dram` has to be set well
+  below the memory available. Fixing it buys a much larger arena, and a larger
+  arena cuts bytes read per pass directly — which is the only thing that helps
+  in a regime this I/O-bound. `posix_fadvise(DONTNEED)` is the obvious lever and
+  this plan previously asserted it **cannot** work, on the grounds that it drops
+  only clean UNMAPPED pages while `Gguf::open` maps the whole file. **That
+  reasoning has a hole worth testing before accepting it:** a page is exempt
+  only when it is actually faulted into a page table, and the tier never touches
+  paged tensor ranges THROUGH the mapping — it reads them with `pread`. If
+  untouched-but-mapped pages turn out to be reclaimable, the fix is one syscall
+  instead of the `O_DIRECT`/`F_NOCACHE` rewrite (with the alignment constraints
+  §3.5 records) that the fallback needs. Probe it with `mincore`, which reports
+  actual residency, before writing either.
+- **Prefetch — deprioritized, and the reason is worth recording.** The
+  synchronous read does sit on the critical path under the session mutex, and
+  this plan called it "the one the phase-3 result points at hardest". That was
+  wrong. Roughly 12.5 GB is read per token against tens of milliseconds of GPU
+  compute, so overlapping the two hides a read behind almost nothing. Prefetch
+  becomes interesting only once the tier is no longer I/O-bound — e.g. after the
+  arena grows enough that most of a pass hits it.
 
 Still speculative, still gated: frequency-warmed DRAM for MoE-on-GPU; io_uring
-if the reader proves queue-depth bound; exclusive VRAM/DRAM placement for MoE;
+if the reader proves queue-depth bound BEYOND what `IO_FANOUT` concurrent
+`pread`s already reach (measured: they hit the device ceiling on this drive, so
+there may be nothing left here); exclusive VRAM/DRAM placement for MoE;
 multi-GPU and MTP coverage.
+
+Coverage the reader change does NOT have: the concurrent-read speedup is
+measured on Linux/NVMe only. On Windows `seek_read` issues `ReadFile` with an
+`OVERLAPPED` offset and a handle not opened `FILE_FLAG_OVERLAPPED` has its
+concurrent operations serialized, so the fanout may buy nothing there; reads
+stay correct either way. A rotational disk is also untested and is the one case
+where concurrency could plausibly HURT.
 
 ## 6. Verification rules specific to this feature
 

@@ -743,7 +743,7 @@ escape and `\u` paths that the punctuation alphabet cannot.
 Adding it means a `fuzz/` crate, a nightly job, and a decision about how long
 per target per week.
 
-### B35 — tiered weight paging: phases 4-5 are not built
+### B35 — tiered weight paging: phase 4 unbuilt, phase 5 one lever in
 
 **Tag:** design slice 2026-08-04 · **Blocked on:** phase 4 needs Apple hardware
 this host does not have
@@ -751,8 +751,9 @@ this host does not have
 `docs/disk-streaming-plan.md` carries the design and the per-phase verification.
 **Phases 0-3 have LANDED** (baseline measured, core `blockio`/`hostpager`/pins,
 CPU backend on the DRAM tier, and the Vulkan third tier under BOTH dense
-streaming and the paged MoE cache — numbers in `docs/perf/results.md`). What is
-left:
+streaming and the paged MoE cache — numbers in `docs/perf/results.md`), and the
+tier now **beats mmap on both backends**: CPU 2.06x at a 1.5 GB cap, Vulkan
+1.29x on decode at an 8 GB cap. What is left:
 
 - **Phase 4, Metal / UMA collapse.** Unbuilt and **unverifiable here**: no Apple
   hardware, and `infr-metal` does not compile on this box. Writing it blind
@@ -760,32 +761,47 @@ left:
   precondition is the `qui_cache` gate below. The options and their trade-off
   are written out in the plan's §7 as an open question for the user — do not
   re-derive them.
-- **The GPU host tier is correct but still behind the mmap it replaces** — 0.79x
-  on decode, 0.83x under an 8 GB cap (`docs/perf/results.md`: Qwen3-14B Q8_0
-  under a forced 2 GB VRAM budget), while doing what it targets (46x fewer major
-  faults, 232 → 195 GB read). That is already after the direct-to-ring fix, worth
-  1.6x, that the first measurement is what found. It is off by default so nothing
-  regresses, but the feature does not earn its place on Vulkan yet. The two
-  levers below are what would change that, and that table is the measurement
-  gating them. Do not re-measure before building one — what is left of the gap is
-  the read sitting on the critical path, not noise.
-- **Prefetch is not built, on any backend.** `HostPager::pin` reads
-  synchronously, and on Vulkan that read is on the critical path under the
-  dense/MoE session mutex. Deferred from phase 2 (the CPU tier beat its baseline
-  without it) and now the leading suspect for the result above. Its depth and
-  thread count still have no measured values, so build the mechanism before the
-  knobs.
-- **Double-caching has no fix, and the obvious one does not work.** A buffered
-  `pread` populates the page cache with the bytes the arena already holds, so
-  under a memory cap the tier halves its own budget. `posix_fadvise(DONTNEED)`
-  drops only clean UNMAPPED pages, and `Gguf::open` maps the whole file — so it
-  cannot reclaim them. Two options, neither small: stop mapping the ranges that
-  are paged, or read with `O_DIRECT`/`F_NOCACHE` and take on the alignment
-  constraints (plan §3.5).
-- **The rest of phase 5**, still gated on measurements not taken: io_uring if
-  the reader proves queue-depth bound, frequency-warmed DRAM for MoE-on-GPU,
-  exclusive VRAM/DRAM placement for MoE, and multi-GPU/MTP coverage
-  (TP/EP/pipeline binders and MTP's second weight set bypass the tier entirely).
+- **Double-caching is now the top lever, and the reason it was ruled out needs
+  re-testing.** A buffered `pread` populates the page cache with the bytes the
+  arena already holds, so under a memory cap the arena effectively costs twice
+  its size and `paging.dram` must be set well below the memory available. A
+  bigger arena cuts bytes read per pass, which is the only thing that helps in a
+  regime this I/O-bound. This entry previously stated flatly that
+  `posix_fadvise(DONTNEED)` **cannot** work because it drops only clean UNMAPPED
+  pages while `Gguf::open` maps the whole file. **That argument has a hole:** a
+  page is exempt only when it is actually faulted into a page table, and the
+  tier never touches paged tensor ranges THROUGH the mapping — it reads them
+  with `pread`. Untouched-but-mapped pages may well be reclaimable, which would
+  make the fix one syscall. Probe with `mincore` (which reports true residency)
+  before writing the `O_DIRECT`/`F_NOCACHE` fallback and its alignment
+  constraints (plan §3.5). NOT yet tested either way — the claim in both
+  directions is currently reasoning, not evidence.
+- **Prefetch is deprioritized, and that reversal is the useful part.** It is
+  still unbuilt on every backend (`HostPager::pin` reads synchronously, and on
+  Vulkan under the dense/MoE session mutex). It was recorded here as "the
+  leading suspect" for the GPU tier being slow. It was not: the run is I/O-bound
+  by orders of magnitude — roughly 12.5 GB read per token against tens of
+  milliseconds of GPU compute — so hiding a read behind compute has nearly
+  nothing to hide it behind. The read was too SLOW, not too LATE, and the
+  concurrent reader is what fixed it. Prefetch only becomes interesting once the
+  arena is big enough that the tier stops being I/O-bound. Do not build it
+  before then.
+- **The reader's speedup is Linux/NVMe only.** `FileBlockIo` splits a block
+  across `IO_FANOUT` concurrent positioned reads, measured 1.2-1.5 → 2.2 GB/s on
+  this box's Samsung 980. Correctness is platform-independent (each read carries
+  its own offset), but the SPEEDUP is not: on Windows `seek_read` issues
+  `ReadFile` with an `OVERLAPPED` offset and a handle not opened
+  `FILE_FLAG_OVERLAPPED` has concurrent operations serialized by the kernel, so
+  the fanout may buy nothing until the file is opened for overlapped I/O.
+  Untested on Windows and macOS. A rotational disk is also untested and is the
+  one case where the concurrency could plausibly HURT (seek interleaving);
+  nothing in the code adapts to device type.
+- **The rest of phase 5**, still gated on measurements not taken: io_uring only
+  if the reader proves queue-depth bound beyond what `IO_FANOUT` concurrent
+  `pread`s reach (on this drive they already hit the device ceiling, so there
+  may be nothing left), frequency-warmed DRAM for MoE-on-GPU, exclusive
+  VRAM/DRAM placement for MoE, and multi-GPU/MTP coverage (TP/EP/pipeline
+  binders and MTP's second weight set bypass the tier entirely).
 
 Constraints the remaining phases must handle, recorded so they are not
 rediscovered:

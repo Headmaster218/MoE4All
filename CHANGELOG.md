@@ -28,11 +28,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     reaches the file only when that misses too. MoE pages ONE EXPERT at a time
     rather than a whole bank. A block the arena has no room for is read straight
     into the staging ring instead of evicting one, so the streaming majority
-    costs one copy rather than two. **Still measured slower than the mmap path
-    it replaces** (0.79x decode), so enable it because you are out of RAM, not
-    for speed — `docs/perf/results.md` has the table and what is left of the
-    gap.
+    costs one copy rather than two. Measured on a memory-capped Qwen3-14B Q8_0
+    under a forced 2 GB VRAM budget: **decode 1.29x faster than the mmap path it
+    replaces** at an 8 GB cap, with 42x fewer major faults and 232 → 195 GB
+    read, and at parity when memory is plentiful (`docs/perf/results.md`). Still
+    off by default: the measurement covers one GPU, one drive and Linux only.
   - `INFR_PAGER_STATS=1` reports hit rate, reads and bytes for each tier.
+  - One paged block is read with several concurrent positioned reads rather than
+    one, which is what puts the tier ahead of the mapping it replaces: a drive
+    delivers its bandwidth on queue depth (measured 1.2-1.5 GB/s for a single
+    read against a 2.2 GB/s device ceiling), while the page cache gets its
+    readahead issued in parallel by the kernel for free. Reads stay correct on
+    every platform, but the speedup is measured on Linux/NVMe only — a Windows
+    handle not opened for overlapped I/O serializes them.
 
 ### Changed
 

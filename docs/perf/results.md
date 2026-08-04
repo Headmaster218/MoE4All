@@ -663,48 +663,68 @@ is what it costs.
 
 Reproduce: `scripts/paging-baseline.py MODEL --limits 2G,1.5G --dram 1g`.
 
-### The same tier under Vulkan dense streaming — closer, still behind
+### The same tier under Vulkan dense streaming — now ahead of mmap
 
 Same harness with `--dev Vulkan0 --cache 2g` (a forced 2 GB VRAM paging budget,
 identical in both arms, which is what puts the run on the dense streaming path
-at all). Qwen3-14B **Q8_0 (15.70 GB)**, `-p 64 -n 8 -r 1`, `--dram 3g` (a 3.16
-GB arena over four pools):
+at all). Qwen3-14B **Q8_0 (15.70 GB)**, `--prompt 64 --gen 8 --reps 1`,
+`--dram 3g` (a 3.16 GB arena over four pools). Two independent runs, both
+columns shown, because at `--reps 1` a single row is not evidence:
 
-| MemoryMax | mode | pp64 t/s | pp majflt | tg8 t/s | tg majflt | tg read |
-| --------- | ---- | -------: | --------: | ------: | --------: | ------: |
-| unlimited | mmap |    110.0 |     7 540 |    1.73 |     7 277 |   15 GB |
-| unlimited | dram |     85.8 |     1 626 |    1.36 |     1 530 |   15 GB |
-| 8 GB      | mmap |     11.2 |    19 885 |    0.18 |    65 675 |  232 GB |
-| 8 GB      | dram |      9.9 |     1 380 |    0.15 |     1 438 |  195 GB |
+| MemoryMax | mode |      pp64 t/s |     tg8 t/s | tg majflt | tg read |
+| --------- | ---- | ------------: | ----------: | --------: | ------: |
+| unlimited | mmap | 108.9 / 110.2 | 1.71 / 1.73 |     6 253 |   15 GB |
+| unlimited | dram | 110.5 / 110.4 | 1.75 / 1.73 |     1 589 |   15 GB |
+| 8 GB      | mmap |    11.2 / 9.3 | 0.17 / 0.17 |    65 115 |  232 GB |
+| 8 GB      | dram |   13.2 / 12.8 | 0.22 / 0.22 |     1 544 |  195 GB |
 
-**The tier is still slower than the mmap it replaces** — 0.79x on decode with
-memory to spare, 0.83x under the cap — while doing what it was built to do:
-major faults fall **46x** under the cap (65 675 → 1 438) and read volume falls
-232 → 195 GB.
+**The tier now beats the mmap it replaces where it matters** — **1.29x** on
+decode under the 8 GB cap (0.22 vs 0.17, both runs), and parity when memory is
+plentiful (1.73-1.75 vs 1.71-1.73). Prefill under the cap is 12.8-13.2 vs
+9.3-11.2; the mmap arm is the noisy one there, so read that as "ahead", not as a
+precise ratio. It keeps doing what it was built for: major faults **42x** lower
+under the cap (65 115 → 1 544) and read volume 232 → 195 GB.
 
-**That is after a fix worth 1.6x, which the first measurement is what found.**
-The tier originally pinned each block in its arena and memcpy'd it to the pinned
-ring, and measured 0.83 t/s decode / 54.7 t/s prefill unlimited — 0.48x and
-0.50x of mmap. The cost was structural: on CPU the arena _replaces_ the mapping
-(the kernels read the slot directly, no copy added), but on Vulkan the bytes
-must reach the ring either way, so `disk → arena → ring` is one copy more than
-`page-cache → ring`. `HostPager::fill` now admits a block only while a slot is
-free and, once the arena is full, reads it **straight into the ring** — which is
-also the right residency call, because under a cyclic sweep the block that just
-missed is the one whose next use is furthest away. Decode went 0.83 → 1.36 and
-prefill 54.7 → 85.8.
+**What closed the gap was the reader, not the policy.** The tier measured 0.79x
+of mmap on decode until `FileBlockIo::read_block` stopped being a single
+`pread`. A drive delivers its bandwidth on queue depth: measured on this NVMe
+over 16-128 MB blocks, one positioned read sustains 1.2-1.5 GB/s while the
+device does 2.2 GB/s at depth 2-4 (8 and 16 buy nothing). A serial reader was
+therefore losing to the mapping it replaces for a structural reason — the kernel
+issues readahead faults in parallel for free. One block is now split across
+`IO_FANOUT` concurrent positioned reads. **Read volume, fault counts and
+residency policy are all unchanged** across that fix (still 195 GB, still ~1 500
+faults); only the bandwidth moved, which is the signature a reader-only change
+should leave and the reason to believe the gain is the one claimed.
 
-**What is left of the gap** is the read itself: a `pread` on the critical path
-under the session mutex, where mmap gets kernel readahead and, when the file
-fits RAM, no I/O at all. Prefetch is the lever and it is not built. There is
-also a second copy nobody asked for — a buffered `pread` populates the page
-cache with what we already have — and `posix_fadvise(DONTNEED)` cannot reclaim
-it while the GGUF mapping still covers those pages. Both are in the backlog
-under B35.
+**Before that came a fix worth 1.6x, which the first measurement is what
+found.** The tier originally pinned each block in its arena and memcpy'd it to
+the pinned ring, and measured 0.83 t/s decode / 54.7 t/s prefill unlimited —
+0.48x and 0.50x of mmap. The cost was structural: on CPU the arena _replaces_
+the mapping (the kernels read the slot directly, no copy added), but on Vulkan
+the bytes must reach the ring either way, so `disk → arena → ring` is one copy
+more than `page-cache → ring`. `HostPager::fill` now admits a block only while a
+slot is free and, once the arena is full, reads it **straight into the ring** —
+which is also the right residency call, because under a cyclic sweep the block
+that just missed is the one whose next use is furthest away. Decode went 0.83 →
+1.36 and prefill 54.7 → 85.8, and the concurrent reader took it from there to
+0.22 under the cap.
 
-**So `paging.dram` is not a recommendation for the Vulkan path today.** It is
-off by default and stays that way; correctness is verified (the parity tests and
-the token-identity runs), the performance case is not yet made.
+**What is left is reading fewer bytes, not overlapping the reads.** This regime
+is I/O-bound by orders of magnitude — roughly 12.5 GB read per token against
+tens of milliseconds of GPU compute — so prefetch, which hides a read behind
+compute, has almost nothing to hide it behind. The lever that remains is the
+double-caching: a buffered `pread` leaves a page-cache copy of what the arena
+already holds, so under a memory cap the arena effectively costs twice its size
+and `paging.dram` must be set well under the memory available. Fixing that
+allows a much larger arena, which cuts bytes read per pass directly. Backlog
+B35.
+
+**`paging.dram` is still off by default on the Vulkan path**, but the reason has
+changed: the performance case is now made, and what is missing is coverage
+(measured on one GPU, one drive, Linux only — the concurrent reader's speedup is
+explicitly unverified on Windows, where a non-overlapped handle serializes
+concurrent reads).
 
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs
