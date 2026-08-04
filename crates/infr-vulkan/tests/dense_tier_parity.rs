@@ -6,7 +6,8 @@
 //!
 //!   1. **VRAM hit** — the slot already holds the block; nothing is copied.
 //!   2. **VRAM miss, DRAM hit** — the block is pinned in the host arena and memcpy'd to the ring.
-//!   3. **VRAM miss, DRAM miss** — the host tier reads the block off the model file first.
+//!   3. **VRAM miss, DRAM full** — the host tier reads the block off the model file STRAIGHT into
+//!      the ring, admitting nothing (see `HostPager::fill`).
 //!
 //! A case that never runs looks identical to one that works, so the budgets here are picked to
 //! force all three (VRAM: 3 slots for 8 blocks; DRAM: 5 slots for the same 8) and the test ASSERTS
@@ -39,8 +40,8 @@ const IN_F: usize = 256;
 const OUT_F: usize = 32;
 /// VRAM slots for `N_BLOCKS` blocks — fewer, so the sweep both hits and misses.
 const VRAM_SLOTS: usize = 3;
-/// Host slots for the same blocks — fewer again, so the DRAM tier keeps missing after the first
-/// pass instead of warming up once and never touching the file again.
+/// Host slots for the same blocks — fewer again, so some blocks are admitted and the rest stream
+/// past a full arena on every pass, which is what exercises case 3 beyond the first sweep.
 const DRAM_SLOTS: usize = 5;
 const PASSES: usize = 3;
 
@@ -293,27 +294,34 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
         host_s.pager.hits
     );
     assert!(
-        host_s.reads > 0,
-        "case 3 (VRAM miss, DRAM miss) never ran — nothing was read from the file"
+        host_s.streamed > 0,
+        "case 3 (VRAM miss, DRAM full) never ran — nothing streamed past the arena"
     );
-    assert!(
-        host_s.pager.evictions > 0,
-        "the host tier never evicted, so no block was re-read into a recycled slot — the case a \
-         wrong slot index shows up in"
+    // The PARTITION property, and the reason `fill` exists: once the arena is full the tier streams
+    // rather than evicting. An eviction here would mean the arena is churning — paying a copy to
+    // admit a block whose next use is a whole sweep away, which is the shape that measured slower
+    // than the mmap it replaces.
+    assert_eq!(
+        host_s.pager.evictions, 0,
+        "the host tier evicted; a full arena must stream past itself instead"
+    );
+    assert_eq!(
+        host_s.pager.misses, DRAM_SLOTS as u64,
+        "admissions must stop at the arena's slot count"
     );
     // The tier below is asked exactly on the VRAM misses, and no more: a probe that also fired on
     // hits would make the hit rate meaningless (the counters would report the sweep as warmer than
     // it is), which is the failure `HostPager::repin` exists to prevent.
+    let consulted = host_s.pager.hits + host_s.pager.misses + host_s.streamed;
     assert_eq!(
-        host_s.pager.hits + host_s.pager.misses,
-        vram.misses,
-        "the host tier was consulted {} times for {} VRAM misses",
-        host_s.pager.hits + host_s.pager.misses,
+        consulted, vram.misses,
+        "the host tier was consulted {consulted} times for {} VRAM misses",
         vram.misses
     );
     assert_eq!(
-        host_s.reads, host_s.pager.misses,
-        "a DRAM miss must be exactly one file read"
+        host_s.reads,
+        host_s.pager.misses + host_s.streamed,
+        "every admission and every streamed block is exactly one file read"
     );
     assert_eq!(
         host_s.bytes_read,

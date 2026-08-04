@@ -26,9 +26,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **Vulkan backend**: a third tier under both dense weight streaming and the
     paged MoE expert cache, so a VRAM miss resolves against the arena and
     reaches the file only when that misses too. MoE pages ONE EXPERT at a time
-    rather than a whole bank. **Measured slower than the mmap path it replaces**
-    on every row tried, so it is worth enabling only if you are out of RAM, not
-    for speed — `docs/perf/results.md` has the table and the reasons.
+    rather than a whole bank. A block the arena has no room for is read straight
+    into the staging ring instead of evicting one, so the streaming majority
+    costs one copy rather than two. **Still measured slower than the mmap path
+    it replaces** (0.79x decode), so enable it because you are out of RAM, not
+    for speed — `docs/perf/results.md` has the table and what is left of the
+    gap.
   - `INFR_PAGER_STATS=1` reports hit rate, reads and bytes for each tier.
 
 ### Changed

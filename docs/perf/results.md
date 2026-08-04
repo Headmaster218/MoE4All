@@ -663,7 +663,7 @@ is what it costs.
 
 Reproduce: `scripts/paging-baseline.py MODEL --limits 2G,1.5G --dram 1g`.
 
-### The same tier under Vulkan dense streaming — it does NOT pay off
+### The same tier under Vulkan dense streaming — closer, still behind
 
 Same harness with `--dev Vulkan0 --cache 2g` (a forced 2 GB VRAM paging budget,
 identical in both arms, which is what puts the run on the dense streaming path
@@ -672,41 +672,39 @@ GB arena over four pools):
 
 | MemoryMax | mode | pp64 t/s | pp majflt | tg8 t/s | tg majflt | tg read |
 | --------- | ---- | -------: | --------: | ------: | --------: | ------: |
-| unlimited | mmap |    109.7 |     7 218 |    1.74 |     6 684 |   15 GB |
-| unlimited | dram |     54.7 |     6 256 |    0.83 |     5 817 |   15 GB |
-| 8 GB      | mmap |     11.3 |    20 250 |    0.18 |    65 384 |  232 GB |
-| 8 GB      | dram |      8.9 |     5 903 |    0.14 |     5 876 |  201 GB |
+| unlimited | mmap |    110.0 |     7 540 |    1.73 |     7 277 |   15 GB |
+| unlimited | dram |     85.8 |     1 626 |    1.36 |     1 530 |   15 GB |
+| 8 GB      | mmap |     11.2 |    19 885 |    0.18 |    65 675 |  232 GB |
+| 8 GB      | dram |      9.9 |     1 380 |    0.15 |     1 438 |  195 GB |
 
-**The host tier is slower on every row** — 2.1× on decode with memory to spare,
-1.3× under the cap — even though it does what it was built to do on the counters
-it targets: major faults fall 11× under the cap (65 384 → 5 876) and read volume
-falls 232 → 201 GB. It buys the right things and still loses.
+**The tier is still slower than the mmap it replaces** — 0.79x on decode with
+memory to spare, 0.83x under the cap — while doing what it was built to do:
+major faults fall **46x** under the cap (65 675 → 1 438) and read volume falls
+232 → 195 GB.
 
-Two reasons, and they are specific to the GPU path rather than to the tier:
+**That is after a fix worth 1.6x, which the first measurement is what found.**
+The tier originally pinned each block in its arena and memcpy'd it to the pinned
+ring, and measured 0.83 t/s decode / 54.7 t/s prefill unlimited — 0.48x and
+0.50x of mmap. The cost was structural: on CPU the arena _replaces_ the mapping
+(the kernels read the slot directly, no copy added), but on Vulkan the bytes
+must reach the ring either way, so `disk → arena → ring` is one copy more than
+`page-cache → ring`. `HostPager::fill` now admits a block only while a slot is
+free and, once the arena is full, reads it **straight into the ring** — which is
+also the right residency call, because under a cyclic sweep the block that just
+missed is the one whose next use is furthest away. Decode went 0.83 → 1.36 and
+prefill 54.7 → 85.8.
 
-1. **The extra copy has nowhere to hide.** On CPU the arena _replaces_ the
-   mapping — kernels read the slot directly, so the tier adds no copy. On Vulkan
-   the bytes must reach the pinned ring either way, so the tier turns
-   `page-cache → ring` into `disk → arena → ring`. The read is synchronous, on
-   the critical path, under the session mutex (`docs/disk-streaming-plan.md`
-   §1.1 predicted exactly this and named prefetch as the fix; prefetch is not
-   built).
-2. **The arena competes with the page cache for the same capped memory.** Under
-   the 8 GB cap, 3.16 GB of anonymous non-evictable arena leaves ~4.8 GB of page
-   cache where mmap had ~8 GB — B30's finding, now measured from the other side.
-   Worse, a buffered `pread` populates the page cache with what the arena
-   already holds, and `posix_fadvise(DONTNEED)` cannot reclaim those pages while
-   the GGUF mapping still covers them.
+**What is left of the gap** is the read itself: a `pread` on the critical path
+under the session mutex, where mmap gets kernel readahead and, when the file
+fits RAM, no I/O at all. Prefetch is the lever and it is not built. There is
+also a second copy nobody asked for — a buffered `pread` populates the page
+cache with what we already have — and `posix_fadvise(DONTNEED)` cannot reclaim
+it while the GGUF mapping still covers those pages. Both are in the backlog
+under B35.
 
 **So `paging.dram` is not a recommendation for the Vulkan path today.** It is
-off by default and stays that way; correctness is verified (see the parity tests
-and the token-identity runs), the performance case is not made. What would have
-to change is in the backlog under B35: prefetch to get the read off the critical
-path, and a way to stop double-caching that survives the mapping.
-
-The CPU rows above and these are not comparable to each other — different model,
-different token counts, different backend. Each arm is only compared with the
-mmap arm measured beside it.
+off by default and stays that way; correctness is verified (the parity tests and
+the token-identity runs), the performance case is not yet made.
 
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs

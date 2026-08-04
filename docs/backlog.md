@@ -760,15 +760,15 @@ left:
   precondition is the `qui_cache` gate below. The options and their trade-off
   are written out in the plan's §7 as an open question for the user — do not
   re-derive them.
-- **The GPU host tier is correct but SLOWER than the mmap it replaces**, on
-  every row measured (`docs/perf/results.md`: Qwen3-14B Q8_0 streamed under a
-  forced 2 GB VRAM budget — 2.1x slower on decode with memory to spare, 1.3x
-  under an 8 GB cap), even while doing what it targets (11x fewer major faults,
-  232 → 201 GB read). It is off by default so nothing regresses, but the feature
-  does not earn its place on Vulkan yet. The two levers below are what would
-  change that, and that table is the measurement gating them. Do not re-measure
-  before building one: the result is not noise, it is the design paying for an
-  extra copy.
+- **The GPU host tier is correct but still behind the mmap it replaces** — 0.79x
+  on decode, 0.83x under an 8 GB cap (`docs/perf/results.md`: Qwen3-14B Q8_0
+  under a forced 2 GB VRAM budget), while doing what it targets (46x fewer major
+  faults, 232 → 195 GB read). That is already after the direct-to-ring fix, worth
+  1.6x, that the first measurement is what found. It is off by default so nothing
+  regresses, but the feature does not earn its place on Vulkan yet. The two
+  levers below are what would change that, and that table is the measurement
+  gating them. Do not re-measure before building one — what is left of the gap is
+  the read sitting on the critical path, not noise.
 - **Prefetch is not built, on any backend.** `HostPager::pin` reads
   synchronously, and on Vulkan that read is on the critical path under the
   dense/MoE session mutex. Deferred from phase 2 (the CPU tier beat its baseline

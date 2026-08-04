@@ -155,6 +155,19 @@ struct Inner {
     descs: HashMap<BlockId, BlockDesc>,
 }
 
+/// What [`HostPager::fill`] did with one block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    /// Resident: copied out of the arena, nothing read.
+    Hit,
+    /// Read into a free arena slot, then copied out. The block is now resident.
+    Admitted,
+    /// The arena was full, so the block was read straight into the caller's buffer and left
+    /// unresident. One copy instead of two — see [`HostPager::fill`] for why that is the right
+    /// trade on a sweep.
+    Streamed,
+}
+
 /// Cumulative tier activity. The residency half comes from the [`Pager`]; the I/O half is what
 /// says whether a good hit rate was earned or was never tested.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +176,9 @@ pub struct HostPagerStats {
     /// Blocks actually read from the tier below.
     pub reads: u64,
     pub bytes_read: u64,
+    /// Of those reads, how many went STRAIGHT to the caller because the arena was full
+    /// ([`Fill::Streamed`]). `reads - streamed` is what the arena absorbed.
+    pub streamed: u64,
 }
 
 /// A fixed-budget host cache of uniform `slot_bytes` blocks, read in place.
@@ -176,6 +192,7 @@ pub struct HostPager {
     slot_bytes: usize,
     reads: AtomicU64,
     bytes_read: AtomicU64,
+    streamed: AtomicU64,
 }
 
 impl HostPager {
@@ -203,6 +220,7 @@ impl HostPager {
             slot_bytes,
             reads: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
+            streamed: AtomicU64::new(0),
         })
     }
 
@@ -241,6 +259,7 @@ impl HostPager {
             pager: self.inner.lock().unwrap().pager.stats(),
             reads: self.reads.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            streamed: self.streamed.load(Ordering::Relaxed),
         }
     }
 
@@ -336,6 +355,109 @@ impl HostPager {
                 // Drop the failed block entirely: leaving it resident would serve a partly-written
                 // slot to the next caller, and leaving it `Loading` would park every waiter for
                 // good. The pin taken by `resolve_and_pin` goes with it.
+                inner.state.remove(&id);
+                inner.pager.unpin(id);
+                inner.pager.evict(id);
+                drop(inner);
+                self.ready.notify_all();
+                Err(e)
+            }
+        }
+    }
+
+    /// Deliver `id`'s bytes into `dst`, admitting the block only while the arena has room.
+    ///
+    /// The PARTITION shape of the tier (`docs/disk-streaming-plan.md` §3.6), for a caller that
+    /// copies the bytes straight out — a GPU staging ring — rather than reading the slot in place:
+    ///
+    /// - resident: copied out of the arena, nothing read;
+    /// - not resident, a slot free: read into the arena, then copied out. The arena fills once;
+    /// - not resident, arena full: read STRAIGHT into `dst`, residency untouched.
+    ///
+    /// That last case is why this exists. Admitting by eviction would spend the copy AND evict a
+    /// block whose next use is sooner: under a cyclic sweep the block that just missed is the one
+    /// whose next use is furthest away, so a full arena is already holding the right set and the
+    /// rest should stream through with ONE copy instead of two. A cache that keeps churning is the
+    /// [`Self::pin`] shape, and that is the right one for MoE, where routing is skewed and
+    /// unpredictable — not for a sweep.
+    ///
+    /// `dst` must be at least the block's length; only that prefix is written.
+    ///
+    /// There is no insertion-policy argument because nothing would read it: the LRU order exists to
+    /// choose a victim, and this never has one. A caller that mixed this with [`Self::pin`] on one
+    /// pager would make the order matter again — nothing does, and the cold-end insert below is the
+    /// conservative choice if one ever did.
+    pub fn fill(&self, id: BlockId, dst: &mut [u8]) -> Result<Fill> {
+        // `(admitted slot, descriptor)` — the slot is `None` when this call will stream.
+        let (slot, desc) = loop {
+            let mut inner = self.inner.lock().unwrap();
+            let Some(desc) = inner.descs.get(&id).cloned() else {
+                return Err(Error::backend(format!(
+                    "host pager: block {id} was never registered"
+                )));
+            };
+            if inner.state.get(&id) == Some(&SlotState::Ready) {
+                if let Some(slot) = inner.pager.pin_if_resident(id) {
+                    let pin = self.pinned(id, slot, &inner);
+                    drop(inner); // copy out of the arena without holding every other block's lock
+                    dst[..pin.len()].copy_from_slice(&pin);
+                    return Ok(Fill::Hit);
+                }
+            }
+            if inner.state.get(&id) == Some(&SlotState::Loading) {
+                let _unused = self.ready.wait(inner).unwrap();
+                continue;
+            }
+            // Room to admit? Only a FREE slot counts — `Pager::take_slot_opt` drains the free list
+            // before it evicts, so this is exactly the "admits without evicting" test.
+            if inner.pager.resident_count() < inner.pager.n_slots() {
+                match inner.pager.resolve_and_pin(id, Insert::Cold) {
+                    Some(Resolution::Miss { slot, evicted }) => {
+                        debug_assert!(evicted.is_none(), "a free slot cannot have evicted");
+                        inner.state.insert(id, SlotState::Loading);
+                        break (Some(slot), desc);
+                    }
+                    // Resident without a state entry, or every slot pinned. Neither is reachable
+                    // here (the `Ready` arm above covers the first, and this path pins only across
+                    // its own fill), and both are correctly served by streaming the block.
+                    _ => break (None, desc),
+                }
+            }
+            break (None, desc);
+        };
+
+        let Some(slot) = slot else {
+            // Streamed: no arena involvement at all, so no lock and no residency change.
+            let n = desc.nbytes();
+            self.io.read_block(&desc, &mut dst[..n])?;
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+            self.streamed.fetch_add(1, Ordering::Relaxed);
+            return Ok(Fill::Streamed);
+        };
+
+        // Admitting: fill the slot outside the lock, exactly as `pin` does and under the same
+        // exclusivity argument (this thread set `Loading` and holds the pin).
+        let n = desc.nbytes();
+        // SAFETY: see `pin`'s fill — identical claim, identical proof.
+        let arena = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, n), n) };
+        let read = self.io.read_block(&desc, arena);
+        let mut inner = self.inner.lock().unwrap();
+        match read {
+            Ok(()) => {
+                inner.state.insert(id, SlotState::Ready);
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                // The guard adopts the pin `resolve_and_pin` took and releases it on drop, so the
+                // copy below runs with the slot un-evictable and nothing is released twice.
+                let pin = self.pinned(id, slot, &inner);
+                drop(inner);
+                dst[..n].copy_from_slice(&pin);
+                drop(pin);
+                self.ready.notify_all();
+                Ok(Fill::Admitted)
+            }
+            Err(e) => {
                 inner.state.remove(&id);
                 inner.pager.unpin(id);
                 inner.pager.evict(id);
@@ -691,6 +813,76 @@ mod tests {
             (before.hits, before.misses),
             "re-borrowing a pinned block is not a residency decision"
         );
+    }
+
+    /// `fill`'s three outcomes, each forced and each identified — and the bytes are the block's own
+    /// in all three, which is what a caller staging them into a GPU ring depends on.
+    #[test]
+    fn fill_admits_until_the_arena_is_full_then_streams() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(2, 16, io.clone(), &[1, 2, 3]);
+        let mut dst = [0u8; 16];
+
+        assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Admitted);
+        assert_eq!(dst, [1u8; 16]);
+        assert_eq!(p.fill(2, &mut dst).unwrap(), Fill::Admitted);
+        assert_eq!(dst, [2u8; 16]);
+        // Arena full: block 3 must NOT evict either resident block, and must still deliver.
+        assert_eq!(p.fill(3, &mut dst).unwrap(), Fill::Streamed);
+        assert_eq!(dst, [3u8; 16]);
+        // Re-asking for a resident block is a hit that reads nothing.
+        let before = io.reads.load(Ordering::SeqCst);
+        assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Hit);
+        assert_eq!(dst, [1u8; 16]);
+        assert_eq!(
+            io.reads.load(Ordering::SeqCst),
+            before,
+            "a hit read the file"
+        );
+
+        let s = p.stats();
+        assert_eq!(s.pager.evictions, 0, "a full arena must stream, not evict");
+        assert_eq!((s.reads, s.streamed), (3, 1));
+        assert_eq!(s.bytes_read, 48);
+    }
+
+    /// Streaming past a full arena must not disturb what the arena holds — that is the whole point
+    /// of not evicting, and a slot quietly overwritten by a streamed block would be silent garbage.
+    #[test]
+    fn a_streamed_block_leaves_the_resident_set_alone() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(2, 16, io, &[1, 2, 3, 4, 5]);
+        let mut dst = [0u8; 16];
+        for id in [1u32, 2] {
+            assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Admitted);
+        }
+        for id in [3u32, 4, 5, 3, 4, 5] {
+            assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Streamed);
+            assert_eq!(
+                &dst, &[id as u8; 16],
+                "streamed block {id} read wrong bytes"
+            );
+        }
+        for id in [1u32, 2] {
+            assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Hit);
+            assert_eq!(&dst, &[id as u8; 16], "resident block {id} was disturbed");
+        }
+    }
+
+    /// A failed read leaves nothing resident on the admit path, exactly as `pin` does.
+    #[test]
+    fn a_failed_fill_leaves_no_resident_block() {
+        let io = Arc::new(FakeIo {
+            reads: AtomicUsize::new(0),
+            fail_on: Some(2),
+            delay: None,
+        });
+        let p = pager_with(2, 16, io, &[1, 2]);
+        let mut dst = [0u8; 16];
+        assert!(p.fill(2, &mut dst).is_err());
+        assert_eq!(p.stats().pager.hits, 0);
+        // The slot is free again, so block 1 admits rather than streaming.
+        assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Admitted);
     }
 
     #[test]

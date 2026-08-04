@@ -308,13 +308,25 @@ impl GpuPager {
                                 "dense pager: block {id} has no host tier to read from"
                             ))
                         })?;
-                        // Hit or disk read, decided inside the tier — and either way the pin is
-                        // released before this returns, so one host slot per pool is enough for
-                        // the sweep to make progress.
-                        let pin = host.pin(id, Insert::Cold)?;
-                        fits(pin.len());
-                        par_copy_to_mapped(&pin, unsafe { base.add(ring_off) });
-                        pin.len()
+                        let n = host.block_bytes(id).ok_or_else(|| {
+                            be(format!(
+                                "dense pager: block {id} is unknown to the host tier"
+                            ))
+                        })?;
+                        fits(n);
+                        // Delivered STRAIGHT into the ring. `HostPager::fill` copies out of its
+                        // arena on a hit and reads into a free slot while one remains, but once the
+                        // arena is full it reads the block into this buffer directly — one copy on
+                        // the streaming majority instead of two, which is the cost
+                        // `docs/perf/results.md` measured the pin-then-memcpy shape paying.
+                        //
+                        // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of the
+                        // persistently-mapped ring — reserved by the cursor before this call, and
+                        // not reused until the recording that reads it completes (the fn's ring
+                        // contract). No other thread can hold a reference to it.
+                        let dst = unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
+                        host.fill(id, dst)?;
+                        n
                     }
                 };
                 // Word-align the copy length (the ring pad bytes it may carry are never read —
@@ -1361,10 +1373,12 @@ impl DensePagerSession {
             if let Some(h) = &p.spec.host {
                 let hs = h.stats();
                 tracing::info!(
-                    "[dense pager]   host{i}: {} slots={} reads={} {:.2}GB from disk",
+                    "[dense pager]   host{i}: {} slots={} reads={} ({} streamed past the arena) \
+                     {:.2}GB from disk",
                     stats_suffix(&hs.pager),
                     h.n_slots(),
                     hs.reads,
+                    hs.streamed,
                     hs.bytes_read as f64 / 1e9,
                 );
             }

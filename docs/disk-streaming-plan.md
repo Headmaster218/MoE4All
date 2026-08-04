@@ -325,11 +325,25 @@ Belady-parity) policy. Per-pass disk traffic is then
 `model − VRAM_home − DRAM_home`, which is the minimum any policy achieves on a
 sweep.
 
+**The DRAM half of that partition is LANDED, without `TierPlan`.**
+`HostPager::fill` reaches the same place by first-touch rather than by planning:
+it admits a block only while a slot is free, and once the arena is full it reads
+straight past it into the caller's buffer, never evicting. On a cyclic sweep
+that IS the partition — the first pass fills the arena, and every later pass
+finds the same set resident — and it needs no plan because the sweep order
+supplies one. What a real `TierPlan` would add is choosing WHICH blocks get the
+DRAM home rather than taking whichever came first, which only matters once
+blocks differ in size or in access frequency. Measured as worth 1.6x on the
+Vulkan path over the evict-and-cache shape (§5, phase 3).
+
 **MoE: cache, and fill from the read path only.** Routing is skewed and
 unpredictable, so both tiers cache with the existing policies (`touch` for
 decode, `touch_cold` for prefill sweeps). The DRAM tier is filled **only** from
 disk reads — never by copying a block back from VRAM, which spends a device→host
-transfer on bytes that can be re-read from disk instead.
+transfer on bytes that can be re-read from disk instead. **LANDED** on the
+Vulkan MoE session: both entry points take `HostPager::pin` (the evicting
+shape), and each hands the tier below the same insertion policy it is using
+itself, so the two tiers cannot disagree about which experts are hot.
 
 **Prefetch:**
 
@@ -531,20 +545,26 @@ blocks in both `touch_role` and `stage_role`, and
 break-probe, which diverged the output token-for-token and so proves the tier is
 on the path.
 
-**It does not pay off yet, and that is measured.** `docs/perf/results.md`
-carries the table: Qwen3-14B Q8_0 streamed under a forced 2 GB VRAM budget, the
-host tier is **slower on every row** — 2.1× on decode with memory to spare, 1.3×
-under an 8 GB cap — while doing exactly what it targets (11× fewer major faults,
-232 → 201 GB read). Two GPU-specific reasons: on Vulkan the bytes reach the
-pinned ring either way, so the tier adds a copy on the critical path under the
-session mutex rather than replacing one (the CPU tier replaces the mapping
-outright, which is why it wins); and the arena competes with the page cache for
-the same capped memory, made worse by a buffered `pread` populating the cache
-with what the arena already holds. So `paging.dram` remains off by default and
-is not a recommendation for the GPU path — the correctness is proven, the
-performance case is not. Prefetch and the double-caching fix are what would
-change it; both are phase 5, and this table is the measurement that now gates
-them.
+**It does not beat the mmap it replaces yet, and that is measured.**
+`docs/perf/results.md` carries the table: Qwen3-14B Q8_0 streamed under a forced
+2 GB VRAM budget, the tier runs at **0.79x of mmap on decode** and 0.83x under
+an 8 GB cap, while doing what it targets — 46x fewer major faults under the cap,
+232 to 195 GB read.
+
+That is after a 1.6x fix the first measurement is what found. The tier
+originally pinned each block in its arena and memcpy'd it into the ring, and
+measured 0.48x of mmap: on CPU the arena REPLACES the mapping so it adds no
+copy, but on Vulkan the bytes reach the ring either way, making
+`disk -> arena -> ring` one copy more than `page-cache -> ring`.
+`HostPager::fill` now admits only while a slot is free and, once the arena is
+full, reads straight into the ring — which is also the correct residency call
+and is exactly §3.6's "dense: partition, do not cache", arrived at from the
+other direction. Decode 0.83 -> 1.36 t/s, prefill 54.7 -> 85.8.
+
+What remains is the read on the critical path (prefetch, unbuilt) and the
+double-caching a buffered `pread` causes. So `paging.dram` stays off by default
+and is not a recommendation for the GPU path: correctness proven, performance
+case not yet made.
 
 **Phase 4 — Metal / UMA collapse.** Arena, pager, offset binding, the
 `qui_cache` gate. Verification: Metal decode parity against CPU reference under
