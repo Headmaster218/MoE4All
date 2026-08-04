@@ -824,6 +824,66 @@ rediscovered:
   same exposure as B30, now reachable through explicit reads rather than the
   mapping).
 
+### B36 — paging optimizations found by review, measured but not built
+
+**Tag:** paging review 2026-08-04 · **Blocked on:** nothing; each is scoped out
+of the slice that found it
+
+A read of the whole paging path (DISK `blockio`, DRAM `hostpager`, VRAM
+`infr-vulkan::pager`, the CPU `paged` pools and the seam placement) against the
+counters `INFR_PAGER_STATS` reports. The two items that LANDED from it — the
+concurrent reader and the admission doorkeeper — are gone from this list; what
+follows is what was found and deliberately left.
+
+- **`paging.dram` has no auto-sizing, and sizing it is the single biggest lever
+  measured anywhere in this feature.** On Qwen3-14B Q8_0 under an 8 GB
+  `MemoryMax` with a 2 GB VRAM budget, decode goes **0.22 t/s at `--dram 3g`,
+  0.29 at 6g, 0.35 at 7g** against mmap's 0.17 — i.e. a config value the user
+  has to guess is worth **1.6x**, and the feature is off entirely unless they
+  name one. `vulkan_host_tier` (`infr-llama/src/seam/mod.rs`) reads
+  `ec.paging.dram` and returns an all-`None` tier when it is unset. Nothing
+  probes host memory on any platform, which is exactly the plan's §7 question 3
+  (recommendation there: no new dependency, require an explicit budget on
+  Windows). Sizing it automatically from available RAM is the highest-value
+  remaining work on this feature, and it needs that question answered first.
+  Note the arena must stay ANONYMOUS memory for this to be safe: the kernel then
+  reclaims page cache in its favour, which is why the 7 GB arena under an 8 GB
+  cap did not thrash (major faults flat at ~1 560).
+- **A chunked prefill re-reads the whole model once per chunk.** The prefill
+  loop (`infr-llama/src/seam/runner.rs`, the `cstart`/`cend` walk) runs the full
+  graph per `ubatch` chunk, so a P-token prompt costs `ceil(P / ubatch)`
+  complete weight sweeps. That is invisible when the weights are resident and
+  brutal when they stream: at the 1024-row default a 32k prompt is 32 sweeps.
+  **Layer-major prefill** — layers outer, chunks inner — reads the model ONCE
+  per prefill instead. The cost is holding every chunk's activations at once
+  rather than one chunk's: 32k x 4096 x 2 B is ~268 MB, affordable. This is the
+  largest unbuilt win for streamed models and it matters most for the
+  DeepSeek-class targets this feature exists for. It is a real restructuring of
+  the prefill path, not a tweak, and it should be gated on the model actually
+  streaming (resident models must keep today's chunk-major order, which is right
+  for them).
+- **`Pager`'s LRU is O(n_slots) per touch.** `mark_mru`, `evict` and
+  `take_slot`/`take_slot_opt` all do `lru.iter().position(...)` followed by
+  `VecDeque::remove`. The module doc scopes this to "tens to low hundreds" of
+  slots and names the intrusive doubly-linked list as the upgrade path, and at
+  today's model sizes it is genuinely not worth doing. It stops being true at
+  DeepSeek-V4-Flash scale: 256 experts x 43 layers is ~11k blocks per role, and
+  an MoE decode step touches ~6 experts x 43 layers x 3 roles per token. Fix it
+  before that model, not because of a measurement today.
+- **The dense session mutex spans the disk read.** `stage_dense_linear`
+  (`infr-vulkan/src/adapter.rs`) holds `be_.dense_pager().lock()` across
+  `DensePagerSession::stage`, which reaches `HostPager::fill` and blocks on I/O.
+  Irrelevant to `bench` (one sequence), but under `infr serve --parallel N`
+  every sequence serializes on every other sequence's disk reads. Related to the
+  `--parallel` sizing gap recorded in B35 but a distinct problem: that one is
+  about arena capacity, this one is about lock hold time.
+- **Checked and CLEARED, so it is not re-investigated:** `plan_slots`'
+  proportional split cannot affect bytes read. Total cached bytes equal the
+  arena size no matter how slots divide across size classes, because a dense
+  pass touches every block exactly once — the split only decides WHICH blocks
+  are cached, not how many bytes. Any fully-spending split is equivalent on I/O
+  volume.
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an

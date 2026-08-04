@@ -34,6 +34,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     read, and at parity when memory is plentiful (`docs/perf/results.md`). Still
     off by default: the measurement covers one GPU, one drive and Linux only.
   - `INFR_PAGER_STATS=1` reports hit rate, reads and bytes for each tier.
+  - The host arena admits a block on its SECOND miss, not its first. A tier
+    above only calls down on its own misses, so first-miss admission filled the
+    arena with the prefix the VRAM pager was about to keep resident forever —
+    blocks that then never call down again. Measured on Qwen3-14B: 4 of 9 slots
+    per pool were dead, and the rule turns useful hits per pass from 5 into 9
+    while cutting bytes read ~9% at the same budget.
   - One paged block is read with several concurrent positioned reads rather than
     one, which is what puts the tier ahead of the mapping it replaces: a drive
     delivers its bandwidth on queue depth (measured 1.2-1.5 GB/s for a single

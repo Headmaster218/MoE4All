@@ -25,7 +25,7 @@
 use crate::blockio::{BlockDesc, BlockIo};
 use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -153,6 +153,19 @@ struct Inner {
     pager: Pager,
     state: HashMap<BlockId, SlotState>,
     descs: HashMap<BlockId, BlockDesc>,
+    /// Blocks [`HostPager::fill`] has missed on at least once — the admission doorkeeper.
+    ///
+    /// A tier ABOVE this one keeps its own resident set, and it only calls down on ITS misses. On
+    /// the first pass nothing is resident up there, so every block calls down and a
+    /// first-miss-admits arena fills with the prefix the tier above is about to keep forever —
+    /// blocks that then never call down again, holding slots that can never be hit. Measured on
+    /// Qwen3-14B: 4 of 9 slots per pool dead, 44% of the arena.
+    ///
+    /// Requiring a SECOND miss fixes it with no knowledge of the tier above: a block that tier
+    /// keeps resident never misses twice, so it is never admitted, and the arena fills with exactly
+    /// the blocks that do keep coming back. Bounded by the pool's block count (one bit of interest
+    /// per registered block), not by traffic.
+    missed_once: HashSet<BlockId>,
 }
 
 /// What [`HostPager::fill`] did with one block.
@@ -213,6 +226,7 @@ impl HostPager {
                 pager: Pager::new(n_slots),
                 state: HashMap::new(),
                 descs: HashMap::new(),
+                missed_once: HashSet::new(),
             }),
             ready: Condvar::new(),
             arena: Arena::new(n_slots, slot_bytes),
@@ -371,8 +385,12 @@ impl HostPager {
     /// copies the bytes straight out — a GPU staging ring — rather than reading the slot in place:
     ///
     /// - resident: copied out of the arena, nothing read;
-    /// - not resident, a slot free: read into the arena, then copied out. The arena fills once;
-    /// - not resident, arena full: read STRAIGHT into `dst`, residency untouched.
+    /// - not resident, a slot free AND this block has missed before: read into the arena, then
+    ///   copied out. The arena fills once;
+    /// - otherwise: read STRAIGHT into `dst`, residency untouched.
+    ///
+    /// The "has missed before" condition is the admission doorkeeper ([`Inner::missed_once`]) and it
+    /// is what keeps the arena from filling with the tier above's permanently-resident prefix.
     ///
     /// That last case is why this exists. Admitting by eviction would spend the copy AND evict a
     /// block whose next use is sooner: under a cyclic sweep the block that just missed is the one
@@ -408,9 +426,13 @@ impl HostPager {
                 let _unused = self.ready.wait(inner).unwrap();
                 continue;
             }
-            // Room to admit? Only a FREE slot counts — `Pager::take_slot_opt` drains the free list
-            // before it evicts, so this is exactly the "admits without evicting" test.
-            if inner.pager.resident_count() < inner.pager.n_slots() {
+            // Room to admit, and has this block earned admission? Only a FREE slot counts —
+            // `Pager::take_slot_opt` drains the free list before it evicts, so this is exactly the
+            // "admits without evicting" test — and only a block that has missed BEFORE is admitted,
+            // so the tier above's permanently-resident prefix never takes a slot (see
+            // `Inner::missed_once`).
+            if inner.pager.resident_count() < inner.pager.n_slots() && !inner.missed_once.insert(id)
+            {
                 match inner.pager.resolve_and_pin(id, Insert::Cold) {
                     Some(Resolution::Miss { slot, evicted }) => {
                         debug_assert!(evicted.is_none(), "a free slot cannot have evicted");
@@ -817,12 +839,23 @@ mod tests {
 
     /// `fill`'s three outcomes, each forced and each identified — and the bytes are the block's own
     /// in all three, which is what a caller staging them into a GPU ring depends on.
+    ///
+    /// Admission needs a SECOND miss, so the first pass over a block set streams entirely and the
+    /// arena fills on the second.
     #[test]
-    fn fill_admits_until_the_arena_is_full_then_streams() {
+    fn fill_admits_on_the_second_miss_then_streams_when_full() {
         let io = Arc::new(FakeIo::new());
         let p = pager_with(2, 16, io.clone(), &[1, 2, 3]);
         let mut dst = [0u8; 16];
 
+        // First sight of each block: streamed, arena untouched.
+        for id in [1u32, 2, 3] {
+            assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Streamed);
+            assert_eq!(&dst, &[id as u8; 16]);
+        }
+        assert_eq!(p.stats().pager.misses, 0, "nothing may be admitted yet");
+
+        // Second sight: admitted until the two slots are gone, then streamed again.
         assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Admitted);
         assert_eq!(dst, [1u8; 16]);
         assert_eq!(p.fill(2, &mut dst).unwrap(), Fill::Admitted);
@@ -842,8 +875,36 @@ mod tests {
 
         let s = p.stats();
         assert_eq!(s.pager.evictions, 0, "a full arena must stream, not evict");
-        assert_eq!((s.reads, s.streamed), (3, 1));
-        assert_eq!(s.bytes_read, 48);
+        assert_eq!((s.reads, s.streamed), (6, 4));
+        assert_eq!(s.bytes_read, 96);
+    }
+
+    /// The doorkeeper's whole purpose: a block the tier ABOVE keeps resident calls down exactly
+    /// once, and must never take an arena slot — otherwise the arena fills with blocks that can
+    /// never be hit again. Measured on Qwen3-14B before this rule: 4 of 9 slots per pool dead.
+    ///
+    /// Modelled here as a tier above that keeps block 1 after its first miss (so 1 is never filled
+    /// again) while blocks 2 and 3 keep coming back.
+    #[test]
+    fn a_block_the_tier_above_keeps_never_takes_a_slot() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(2, 16, io, &[1, 2, 3]);
+        let mut dst = [0u8; 16];
+
+        // Pass 1: everything misses down to here.
+        for id in [1u32, 2, 3] {
+            assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Streamed);
+        }
+        // Passes 2 and 3: block 1 is resident above and never calls down again.
+        for _ in 0..2 {
+            for id in [2u32, 3] {
+                p.fill(id, &mut dst).unwrap();
+                assert_eq!(&dst, &[id as u8; 16]);
+            }
+        }
+        // Both slots went to the blocks that kept coming back, not to block 1.
+        assert_eq!(p.fill(2, &mut dst).unwrap(), Fill::Hit);
+        assert_eq!(p.fill(3, &mut dst).unwrap(), Fill::Hit);
     }
 
     /// Streaming past a full arena must not disturb what the arena holds — that is the whole point
@@ -853,8 +914,9 @@ mod tests {
         let io = Arc::new(FakeIo::new());
         let p = pager_with(2, 16, io, &[1, 2, 3, 4, 5]);
         let mut dst = [0u8; 16];
-        for id in [1u32, 2] {
-            assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Admitted);
+        // Two passes: the first only arms the doorkeeper, the second seats 1 and 2.
+        for id in [1u32, 2, 1, 2] {
+            p.fill(id, &mut dst).unwrap();
         }
         for id in [3u32, 4, 5, 3, 4, 5] {
             assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Streamed);
@@ -879,9 +941,14 @@ mod tests {
         });
         let p = pager_with(2, 16, io, &[1, 2]);
         let mut dst = [0u8; 16];
+        // The doorkeeper is armed BEFORE the read is attempted, so the first call streams and
+        // fails while still marking block 2 seen; the second is the one that admits — and it is
+        // that admitted-then-failed fill whose cleanup this test is about.
+        assert!(p.fill(2, &mut dst).is_err());
         assert!(p.fill(2, &mut dst).is_err());
         assert_eq!(p.stats().pager.hits, 0);
-        // The slot is free again, so block 1 admits rather than streaming.
+        // The slot is free again, so block 1 admits — once its own doorkeeper miss is spent.
+        assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Streamed);
         assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Admitted);
     }
 
