@@ -2432,13 +2432,14 @@ impl VulkanBackend {
         role: crate::pager::Role,
         buf_id: usize,
         source: crate::pager::ExpertSource,
+        n_expert: usize,
     ) -> Result<()> {
         self.moe_pager
             .lock()
             .unwrap()
             .as_mut()
             .expect("register_paged_expert called before init_moe_pager")
-            .register(role, buf_id, source)
+            .register(role, buf_id, source, n_expert)
     }
 
     /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
@@ -4262,6 +4263,7 @@ mod tests {
                 role: crate::pager::Role::Gate,
                 slot_bytes: 4096,
                 n_slots: 2,
+                host: None,
             }],
             ring_bytes: 1 << 20,
         })

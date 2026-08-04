@@ -627,12 +627,11 @@ neighbours that are evicted before they are read. It is not a small constant to
 shave: it is the policy being wrong for the access pattern, which is the case
 `Pager::schedule` already handles for VRAM.
 
-**Not measured here:** the Vulkan and Metal paths (their staging copies read the
-same mapping, but a GPU-side baseline needs a model that overflows VRAM, not a
-cgroup cap), and any model whose blob genuinely exceeds host RAM — the largest
-local blob is Llama-4-Scout Q2_K at 36.8 GiB against 60 GB of RAM, so the cgroup
-squeeze is what stands in for that case. Both are gaps in the baseline, not
-results.
+**Not measured here:** the Metal path, and any model whose blob genuinely
+exceeds host RAM — the largest local blob is Llama-4-Scout Q2_K at 36.8 GiB
+against 60 GB of RAM, so the cgroup squeeze is what stands in for that case.
+Both are gaps in the baseline, not results. The Vulkan path is measured below,
+with a forced VRAM budget standing in for a card the model overflows.
 
 ### The host tier against that baseline (CPU backend)
 
@@ -663,6 +662,51 @@ extra copy showing up where there was nothing to fix. Nothing here is free; this
 is what it costs.
 
 Reproduce: `scripts/paging-baseline.py MODEL --limits 2G,1.5G --dram 1g`.
+
+### The same tier under Vulkan dense streaming — it does NOT pay off
+
+Same harness with `--dev Vulkan0 --cache 2g` (a forced 2 GB VRAM paging budget,
+identical in both arms, which is what puts the run on the dense streaming path
+at all). Qwen3-14B **Q8_0 (15.70 GB)**, `-p 64 -n 8 -r 1`, `--dram 3g` (a 3.16
+GB arena over four pools):
+
+| MemoryMax | mode | pp64 t/s | pp majflt | tg8 t/s | tg majflt | tg read |
+| --------- | ---- | -------: | --------: | ------: | --------: | ------: |
+| unlimited | mmap |    109.7 |     7 218 |    1.74 |     6 684 |   15 GB |
+| unlimited | dram |     54.7 |     6 256 |    0.83 |     5 817 |   15 GB |
+| 8 GB      | mmap |     11.3 |    20 250 |    0.18 |    65 384 |  232 GB |
+| 8 GB      | dram |      8.9 |     5 903 |    0.14 |     5 876 |  201 GB |
+
+**The host tier is slower on every row** — 2.1× on decode with memory to spare,
+1.3× under the cap — even though it does what it was built to do on the counters
+it targets: major faults fall 11× under the cap (65 384 → 5 876) and read volume
+falls 232 → 201 GB. It buys the right things and still loses.
+
+Two reasons, and they are specific to the GPU path rather than to the tier:
+
+1. **The extra copy has nowhere to hide.** On CPU the arena _replaces_ the
+   mapping — kernels read the slot directly, so the tier adds no copy. On Vulkan
+   the bytes must reach the pinned ring either way, so the tier turns
+   `page-cache → ring` into `disk → arena → ring`. The read is synchronous, on
+   the critical path, under the session mutex (`docs/disk-streaming-plan.md`
+   §1.1 predicted exactly this and named prefetch as the fix; prefetch is not
+   built).
+2. **The arena competes with the page cache for the same capped memory.** Under
+   the 8 GB cap, 3.16 GB of anonymous non-evictable arena leaves ~4.8 GB of page
+   cache where mmap had ~8 GB — B30's finding, now measured from the other side.
+   Worse, a buffered `pread` populates the page cache with what the arena
+   already holds, and `posix_fadvise(DONTNEED)` cannot reclaim those pages while
+   the GGUF mapping still covers them.
+
+**So `paging.dram` is not a recommendation for the Vulkan path today.** It is
+off by default and stays that way; correctness is verified (see the parity tests
+and the token-identity runs), the performance case is not made. What would have
+to change is in the backlog under B35: prefetch to get the read off the critical
+path, and a way to stop double-caching that survives the mapping.
+
+The CPU rows above and these are not comparable to each other — different model,
+different token counts, different backend. Each arm is only compared with the
+mmap arm measured beside it.
 
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs

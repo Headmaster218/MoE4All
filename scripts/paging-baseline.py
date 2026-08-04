@@ -71,8 +71,14 @@ def run(cmd, limit_bytes):
     }
 
 
-def bench(model, dev, limit, flags, dram=None):
+def bench(model, dev, limit, flags, dram=None, cache=None):
     cmd = [INFR, "bench", model, "--dev", dev, "--json"] + flags
+    if cache:
+        # `paging.cache`: the VRAM paging budget. Forcing it small is what puts a GPU run on the
+        # streaming path at all, and it must be IDENTICAL in both arms — otherwise the two legs
+        # differ in where the weights live as well as in what backs the misses, and the comparison
+        # says nothing about the host tier.
+        cmd += ["--set", f"paging.cache={cache}"]
     if dram:
         # The host weight cache (`paging.dram`): weights read from the file into our own arena
         # under our own eviction policy, instead of mapped and left to the page cache.
@@ -94,6 +100,9 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--dram", default=None,
                     help="also run each limit with this paging.dram budget (e.g. `1g`)")
+    ap.add_argument("--cache", default=None,
+                    help="paging.cache (VRAM paging budget), applied to BOTH arms — how a GPU run "
+                         "is forced onto the streaming path")
     args = ap.parse_args()
 
     if not os.path.exists(INFR):
@@ -113,9 +122,11 @@ def main():
         limit = None if spec.strip() == "none" else parse_size(spec)
         for name, dram in arms:
             pp, pru = bench(args.model, args.dev, limit,
-                            ["-p", str(args.prompt), "-n", "0", "-r", str(args.reps)], dram)
+                            ["-p", str(args.prompt), "-n", "0", "-r", str(args.reps)],
+                            dram, args.cache)
             tg, tru = bench(args.model, args.dev, limit,
-                            ["-p", "0", "-n", str(args.gen), "-r", str(args.reps)], dram)
+                            ["-p", "0", "-n", str(args.gen), "-r", str(args.reps)],
+                            dram, args.cache)
             print(f"{spec.strip():>8} {name:>6} {pp:>9.1f} {pru['majflt']:>10} "
                   f"{pru['inblock'] / 2048:>11.0f} {tg:>8.2f} {tru['majflt']:>10} "
                   f"{tru['inblock'] / 2048:>11.0f}")

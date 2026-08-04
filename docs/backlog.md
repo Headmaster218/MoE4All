@@ -750,8 +750,9 @@ this host does not have
 
 `docs/disk-streaming-plan.md` carries the design and the per-phase verification.
 **Phases 0-3 have LANDED** (baseline measured, core `blockio`/`hostpager`/pins,
-CPU backend on the DRAM tier, Vulkan dense streaming's third tier — numbers in
-`docs/perf/results.md`). What is left:
+CPU backend on the DRAM tier, and the Vulkan third tier under BOTH dense
+streaming and the paged MoE cache — numbers in `docs/perf/results.md`). What is
+left:
 
 - **Phase 4, Metal / UMA collapse.** Unbuilt and **unverifiable here**: no Apple
   hardware, and `infr-metal` does not compile on this box. Writing it blind
@@ -759,17 +760,30 @@ CPU backend on the DRAM tier, Vulkan dense streaming's third tier — numbers in
   precondition is the `qui_cache` gate below. The options and their trade-off
   are written out in the plan's §7 as an open question for the user — do not
   re-derive them.
-- **MoE on the host tier is not wired, on any GPU backend.** Phase 3 covered the
-  DENSE session only: `MoePagerSession` still resolves every miss against
-  `ExpertSource`'s mmap view, so an over-RAM MoE model on a GPU is still the
-  page cache's problem. The block model transfers directly — one expert's one
-  role is already a uniform-size block — so this is a small slice, and §2 argues
-  MoE's routing skew makes it the tier's best case. Not in any phase's scope as
-  written; plan §7 records it as a question.
-- **Phase 5 levers**, each gated on a measurement that has not been taken:
-  `fadvise(DONTNEED)`/`F_NOCACHE` for the double-caching a buffered `pread`
-  leaves, prefetch (deferred from phase 2 — the synchronous read already beat
-  the baseline, and depth/thread knobs have no measured values), io_uring,
+- **The GPU host tier is correct but SLOWER than the mmap it replaces**, on
+  every row measured (`docs/perf/results.md`: Qwen3-14B Q8_0 streamed under a
+  forced 2 GB VRAM budget — 2.1x slower on decode with memory to spare, 1.3x
+  under an 8 GB cap), even while doing what it targets (11x fewer major faults,
+  232 → 201 GB read). It is off by default so nothing regresses, but the feature
+  does not earn its place on Vulkan yet. The two levers below are what would
+  change that, and that table is the measurement gating them. Do not re-measure
+  before building one: the result is not noise, it is the design paying for an
+  extra copy.
+- **Prefetch is not built, on any backend.** `HostPager::pin` reads
+  synchronously, and on Vulkan that read is on the critical path under the
+  dense/MoE session mutex. Deferred from phase 2 (the CPU tier beat its baseline
+  without it) and now the leading suspect for the result above. Its depth and
+  thread count still have no measured values, so build the mechanism before the
+  knobs.
+- **Double-caching has no fix, and the obvious one does not work.** A buffered
+  `pread` populates the page cache with the bytes the arena already holds, so
+  under a memory cap the tier halves its own budget. `posix_fadvise(DONTNEED)`
+  drops only clean UNMAPPED pages, and `Gguf::open` maps the whole file — so it
+  cannot reclaim them. Two options, neither small: stop mapping the ranges that
+  are paged, or read with `O_DIRECT`/`F_NOCACHE` and take on the alignment
+  constraints (plan §3.5).
+- **The rest of phase 5**, still gated on measurements not taken: io_uring if
+  the reader proves queue-depth bound, frequency-warmed DRAM for MoE-on-GPU,
   exclusive VRAM/DRAM placement for MoE, and multi-GPU/MTP coverage
   (TP/EP/pipeline binders and MTP's second weight set bypass the tier entirely).
 

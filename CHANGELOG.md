@@ -23,9 +23,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **CPU backend**: every weight above 1 MiB. Measured on a memory-capped
     Llama-3.2-1B F16: decode 2.06x faster at a 1.5 GB cap with 210x fewer major
     faults, prefill 3-7.5% slower (`docs/perf/results.md`).
-  - **Vulkan backend**: a third tier under dense weight streaming, so a streamed
-    model's VRAM misses resolve against the arena and reach the file only when
-    that misses too. One host pool per streaming pool, same key.
+  - **Vulkan backend**: a third tier under both dense weight streaming and the
+    paged MoE expert cache, so a VRAM miss resolves against the arena and
+    reaches the file only when that misses too. MoE pages ONE EXPERT at a time
+    rather than a whole bank. **Measured slower than the mmap path it replaces**
+    on every row tried, so it is worth enabling only if you are out of RAM, not
+    for speed — `docs/perf/results.md` has the table and the reasons.
   - `INFR_PAGER_STATS=1` reports hit rate, reads and bytes for each tier.
 
 ### Changed

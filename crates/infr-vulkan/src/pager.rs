@@ -518,14 +518,27 @@ fn stats_suffix(s: &PagerStats) -> String {
     )
 }
 
-/// Where one paged layer's whole per-role expert bank lives: a zero-copy view into the GGUF mmap
-/// (kept alive via `Arc` — see `infr_gguf::TensorBytes`, which this trait object mirrors without
-/// infr-vulkan taking a dependency on infr-gguf), plus the byte stride of ONE expert within it.
-/// "expert e is the e-th equal-size contiguous slice" holds for every GGUF MoE bank in this
-/// codebase (`Op::MoeFfn`'s doc), so `stride_bytes = bytes.len() / n_expert` locates any expert
-/// with no quant-format-specific math.
+/// Which tier one paged layer's per-role expert bank is read from.
+///
+/// Either way, "expert `e` is the `e`-th equal-size contiguous slice" holds for every GGUF MoE bank
+/// in this codebase (`Op::MoeFfn`'s doc), so `stride_bytes` locates any expert with no
+/// quant-format-specific math — the two arms differ only in whether that slice is reached through
+/// the mapping or read from the file.
+pub enum ExpertBytes {
+    /// One zero-copy view of the whole per-layer bank; expert `e` is the `e`-th equal-size slice.
+    Mmap(Arc<dyn AsRef<[u8]> + Send + Sync>),
+    /// The pool's host DRAM tier ([`MoePoolSpec::host`]), which holds ONE BLOCK PER EXPERT under
+    /// the same global id the arena uses (`layer_base + local_id`). The bank is never viewed whole
+    /// on this path — an expert is read from the model file on its own, which is what lets a model
+    /// far larger than host RAM route through a bounded arena.
+    Host,
+}
+
+/// Where one paged layer's per-role expert bank lives ([`ExpertBytes`]), plus the byte stride of
+/// ONE expert within it. The mmap arm keeps the bank alive via `Arc` — see `infr_gguf::TensorBytes`,
+/// which that trait object mirrors without infr-vulkan taking a dependency on infr-gguf.
 pub struct ExpertSource {
-    pub bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    pub bytes: ExpertBytes,
     pub stride_bytes: usize,
     /// This layer's offset into the role's shared LUT/arena block-id space
     /// (`layer_index * n_expert`) — turns a per-layer LOCAL expert id (what the router/top-k
@@ -540,6 +553,9 @@ struct Pool {
     role: Role,
     slot_bytes: usize,
     pager: GpuPager,
+    /// This pool's tier BELOW VRAM, holding one block per expert (see [`ExpertBytes::Host`]), or
+    /// `None` to read every miss from the mmap.
+    host: Option<Arc<HostPager>>,
 }
 
 /// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools + the shared
@@ -593,6 +609,10 @@ pub struct MoePoolSpec {
     pub role: Role,
     pub slot_bytes: usize,
     pub n_slots: usize,
+    /// This pool's host DRAM tier, or `None` to keep every miss on the mmap (the fast path).
+    /// Registered with one block per (layer, expert) under the same global id the arena uses, so
+    /// the two tiers need no mapping between them — see [`ExpertBytes::Host`].
+    pub host: Option<Arc<HostPager>>,
 }
 
 /// Fixed layout for [`MoePagerSession::new`] — sizes every arena/LUT UP FRONT, before any tensor
@@ -631,6 +651,7 @@ impl MoePagerSession {
                 slot_bytes: spec.slot_bytes,
                 // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
                 pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
+                host: spec.host.clone(),
             });
             staging_bytes = staging_bytes.max(spec.slot_bytes);
         }
@@ -670,7 +691,17 @@ impl MoePagerSession {
     /// The pool is picked by `(role, source.stride_bytes)` — errors if the layout has no matching
     /// pool (a seam sizing bug: the layout enumeration and this registration must derive the slot
     /// size from the same tensor bytes).
-    pub fn register(&mut self, role: Role, buf_id: usize, source: ExpertSource) -> Result<()> {
+    ///
+    /// `n_expert` is how many experts this layer's bank holds, checked against the tier below when
+    /// there is one: every one of the layer's blocks must already be registered there, or a routed
+    /// id would fail only later, mid-generation, on the first miss that names it.
+    pub fn register(
+        &mut self,
+        role: Role,
+        buf_id: usize,
+        source: ExpertSource,
+        n_expert: usize,
+    ) -> Result<()> {
         let pool = self
             .pools
             .iter()
@@ -681,6 +712,27 @@ impl MoePagerSession {
                     role, source.stride_bytes,
                 ))
             })?;
+        if matches!(source.bytes, ExpertBytes::Host) {
+            let host = self.pools[pool].host.as_ref().ok_or_else(|| {
+                be(format!(
+                    "moe pager: pool ({role:?}, {} B) has no host tier for a host-backed bank",
+                    source.stride_bytes,
+                ))
+            })?;
+            for e in 0..n_expert as u32 {
+                let id = source.layer_base + e;
+                match host.block_bytes(id) {
+                    Some(n) if n == source.stride_bytes => {}
+                    other => {
+                        return Err(be(format!(
+                            "moe pager: expert block {id} is {other:?} bytes in the host tier, \
+                             expected {}",
+                            source.stride_bytes
+                        )))
+                    }
+                }
+            }
+        }
         self.sources.insert(buf_id, (role, pool, source));
         Ok(())
     }
@@ -709,8 +761,13 @@ impl MoePagerSession {
         debug_assert_eq!(*r, role, "touch_role: role/buffer mismatch");
         let stride = src.stride_bytes;
         let layer_base = src.layer_base;
-        let bytes = expert_bytes(&src.bytes);
-        let pager = &mut self.pools[*pool].pager;
+        let bank = match &src.bytes {
+            ExpertBytes::Mmap(a) => Some(expert_bytes(a)),
+            ExpertBytes::Host => None,
+        };
+        // Destructure the pool: the pager is taken mutably while the tier below is read, and
+        // indexing twice would borrow the whole `pools` vector each time.
+        let Pool { pager, host, .. } = &mut self.pools[*pool];
         // Reuse a scratch Vec across calls instead of allocating one per touch — this is the
         // steady-state demand path (per layer per token). NOTE: each miss still does one
         // synchronous `one_shot` submit (inside `ensure_resident`); batching those into a single
@@ -721,12 +778,26 @@ impl MoePagerSession {
         global.clear();
         global.reserve(local_ids.len());
         for &lid in local_ids {
-            let off = lid as usize * stride;
-            let slice = bytes
-                .get(off..off + stride)
-                .ok_or_else(|| be("moe pager: expert id out of range for this layer's bank"))?;
-            pager.ensure_resident(vk, self.staging.as_ref(), layer_base + lid, slice)?;
-            global.push(layer_base + lid);
+            let id = layer_base + lid;
+            match bank {
+                Some(bytes) => {
+                    let off = lid as usize * stride;
+                    let slice = bytes.get(off..off + stride).ok_or_else(|| {
+                        be("moe pager: expert id out of range for this layer's bank")
+                    })?;
+                    pager.ensure_resident(vk, self.staging.as_ref(), id, slice)?;
+                }
+                // Tier below: routing is unpredictable, so this caches under recency like the
+                // arena above it does on the demand path (`docs/disk-streaming-plan.md` §3.6).
+                None => {
+                    let host = host
+                        .as_ref()
+                        .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
+                    let pin = host.pin(id, Insert::Mru)?;
+                    pager.ensure_resident(vk, self.staging.as_ref(), id, &pin)?;
+                }
+            }
+            global.push(id);
         }
         pager.flush_lut(vk)?;
         Ok(&self.global_scratch)
@@ -822,14 +893,13 @@ impl MoePagerSession {
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: stage on an unregistered buffer"))?;
-            (
-                *pool,
-                src.stride_bytes,
-                src.layer_base,
-                Arc::clone(&src.bytes),
-            )
+            let arc = match &src.bytes {
+                ExpertBytes::Mmap(a) => Some(Arc::clone(a)),
+                ExpertBytes::Host => None,
+            };
+            (*pool, src.stride_bytes, src.layer_base, arc)
         };
-        let bytes = expert_bytes(&bytes_arc);
+        let bank = bytes_arc.as_ref().map(expert_bytes);
         // Disjoint field borrows (the pool mutably, the ring by ref) — destructure once.
         let Self {
             pools,
@@ -837,7 +907,7 @@ impl MoePagerSession {
             ring_half_bytes,
             ..
         } = self;
-        let pager = &mut pools[pool_idx].pager;
+        let Pool { pager, host, .. } = &mut pools[pool_idx];
         let half_bytes = *ring_half_bytes;
         debug_assert!(
             half_bytes >= pager.slot_bytes(),
@@ -848,12 +918,26 @@ impl MoePagerSession {
             if !pager.is_resident(id) && *cursor + pager.slot_bytes() > half_bytes {
                 return Ok(i); // half full — caller rotates and continues from here
             }
-            let off = lid as usize * stride;
-            let slice = bytes
-                .get(off..off + stride)
-                .ok_or_else(|| be("moe pager: expert id out of range for this layer's bank"))?;
-            *cursor +=
-                pager.touch_staged(rec, ring.as_ref(), half_base + *cursor, id, slice, scan)?;
+            let ring_off = half_base + *cursor;
+            *cursor += match bank {
+                Some(bytes) => {
+                    let off = lid as usize * stride;
+                    let slice = bytes.get(off..off + stride).ok_or_else(|| {
+                        be("moe pager: expert id out of range for this layer's bank")
+                    })?;
+                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, slice, scan)?
+                }
+                // Tier below, under the SAME policy the arena above uses for this batch: a
+                // full-set prefill sweep inserts cold, a routed decode touch inserts MRU.
+                None => {
+                    let host = host
+                        .as_ref()
+                        .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
+                    let insert = if scan { Insert::Cold } else { Insert::Mru };
+                    let pin = host.pin(id, insert)?;
+                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, &pin, scan)?
+                }
+            };
         }
         Ok(local_ids.len())
     }
@@ -962,7 +1046,36 @@ impl MoePagerSession {
                 stats_suffix(&s),
                 p.pager.n_slots(),
             );
+            // The tier below, when there is one. Its READS are the line that matters: an arena miss
+            // this absorbed never touched the disk, and nothing else here tells those two apart.
+            if let Some(h) = &p.host {
+                let hs = h.stats();
+                tracing::info!(
+                    "[moe pager]   host/{}: {} slots={} reads={} {:.2}GB from disk",
+                    p.role.name(),
+                    stats_suffix(&hs.pager),
+                    h.n_slots(),
+                    hs.reads,
+                    hs.bytes_read as f64 / 1e9,
+                );
+            }
         }
+    }
+
+    /// Per-pool `(role, VRAM residency, host tier)` counters, in pool order — the MoE twin of
+    /// [`DensePagerSession::pool_stats`], and for the same reason: a tier transition that never
+    /// runs is indistinguishable from one that works without these.
+    pub fn pool_stats(
+        &self,
+    ) -> Vec<(
+        Role,
+        PagerStats,
+        Option<infr_core::hostpager::HostPagerStats>,
+    )> {
+        self.pools
+            .iter()
+            .map(|p| (p.role, p.pager.stats(), p.host.as_ref().map(|h| h.stats())))
+            .collect()
     }
 }
 

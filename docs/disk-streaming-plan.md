@@ -29,8 +29,8 @@ The residency machinery is already block-agnostic and already has two policies:
   `DenseSource::segments` was `Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>`, built
   in the Vulkan binder (`infr-llama/src/seam/mod.rs`) by calling
   `Gguf::tensor_bytes_arc` once per component tensor. Phase 3 replaced that
-  field with `DenseBytes`, whose second arm reads the host tier instead (§3.7);
-  `ExpertSource` — the MoE side — still takes the mmap view only.
+  field with `DenseBytes`, and `ExpertSource::bytes` with `ExpertBytes`, whose
+  second arm reads the host tier instead (§3.7).
 - Placement is decided once per load in the seam: the MoE tier ladder, then the
   dense try-resident → smaller-ubatch → auto-q8 → stream ladder, priced against
   `Backend::device_alloc_room`.
@@ -388,6 +388,22 @@ into it has an unmeasured cost a memcpy out of cached DRAM does not. Phase-5
 lever, gated on a measurement, once there is a partition that makes it
 meaningful.
 
+**Vulkan MoE (`MoePagerSession`) — LANDED.** The same shape, one tier lower down
+the same file: `ExpertSource::bytes` became `ExpertBytes::{Mmap, Host}`, and a
+`Host` bank registers **one block per expert** in the pool's `HostPager`, at
+that expert's own file offset inside the bank, under the same global
+`layer_base + local_id` the arena already keys on. That per-expert granularity
+is the whole point — a routed miss reads ONE expert off the file instead of
+faulting in a whole bank through the mapping, which is what §2 means by MoE
+being the tier's best case. Both entry points carry it: the demand path
+(`touch_role`, decode's routed readback) and the recorded path (`stage_role`),
+each passing the tier below the SAME insertion policy it uses itself — cold for
+a full-set prefill sweep, MRU for a routed decode touch — because §3.6 says MoE
+caches rather than partitions, so the two tiers should agree on what "hot"
+means. `register` checks every one of a layer's experts is present below, so a
+bank that was mis-registered fails at load rather than on the first routed miss
+that names the missing id.
+
 **Metal (`infr-metal`).** Unified memory collapses the VRAM and DRAM tiers into
 **one**: an arena slot is host memory the GPU reads directly, so a disk read
 lands in the final destination with no staging ring and no second copy. Slot
@@ -508,14 +524,51 @@ fail — which is also what proves the end-to-end test engages the tier at all
 rather than passing vacuously), consulting the tier twice per miss, and dropping
 the registration check that a `Host` block exists below.
 
+The MoE half landed with it: `ExpertBytes`, `MoePoolSpec::host`, per-expert
+blocks in both `touch_role` and `stage_role`, and
+`gpu_seam_paged_moe_host_tier_matches_resident` (Qwen3-30B-A3B, 50 MB VRAM and
+256 MB DRAM budgets) token-identical to the all-resident run — with the same
+break-probe, which diverged the output token-for-token and so proves the tier is
+on the path.
+
+**It does not pay off yet, and that is measured.** `docs/perf/results.md`
+carries the table: Qwen3-14B Q8_0 streamed under a forced 2 GB VRAM budget, the
+host tier is **slower on every row** — 2.1× on decode with memory to spare, 1.3×
+under an 8 GB cap — while doing exactly what it targets (11× fewer major faults,
+232 → 201 GB read). Two GPU-specific reasons: on Vulkan the bytes reach the
+pinned ring either way, so the tier adds a copy on the critical path under the
+session mutex rather than replacing one (the CPU tier replaces the mapping
+outright, which is why it wins); and the arena competes with the page cache for
+the same capped memory, made worse by a buffered `pread` populating the cache
+with what the arena already holds. So `paging.dram` remains off by default and
+is not a recommendation for the GPU path — the correctness is proven, the
+performance case is not. Prefetch and the double-caching fix are what would
+change it; both are phase 5, and this table is the measurement that now gates
+them.
+
 **Phase 4 — Metal / UMA collapse.** Arena, pager, offset binding, the
 `qui_cache` gate. Verification: Metal decode parity against CPU reference under
 a forced-tiny budget, and the first over-RAM model to load on Apple silicon at
 all.
 
-**Phase 5 — levers, each gated on a measurement.** `fadvise`/`F_NOCACHE`;
-frequency-warmed DRAM for MoE-on-GPU; io_uring if the pool proves queue-depth
-bound; exclusive VRAM/DRAM placement for MoE; multi-GPU and MTP coverage.
+**Phase 5 — levers, each gated on a measurement.** Two of them are no longer
+speculative: the phase-3 table is the measurement, and it says the GPU tier
+loses without them.
+
+- **Prefetch** — the synchronous read sits on the critical path under the
+  session mutex. This is the one the phase-3 result points at hardest.
+- **Stop double-caching.** A buffered `pread` leaves a page-cache copy of what
+  the arena already holds, which under a memory cap halves the memory the tier
+  was given. `posix_fadvise(DONTNEED)` is the obvious lever and **will not work
+  as written**: it drops only clean, unmapped pages, and `Gguf::open` maps the
+  whole file, so those pages stay mapped. Either the resident tensors' mapping
+  has to stop covering paged blocks, or the reads have to bypass the cache
+  (`O_DIRECT`/`F_NOCACHE`, with the alignment constraints §3.5 records). Neither
+  is a small change; both are why this is a phase of its own.
+
+Still speculative, still gated: frequency-warmed DRAM for MoE-on-GPU; io_uring
+if the reader proves queue-depth bound; exclusive VRAM/DRAM placement for MoE;
+multi-GPU and MTP coverage.
 
 ## 6. Verification rules specific to this feature
 
@@ -576,15 +629,6 @@ Needing the user's call:
 
    Nothing else in the plan is blocked on this — phase 5's levers are all
    CPU/Vulkan and each is gated on its own measurement.
-
-5. **Is the host tier worth engaging for MoE on Vulkan?** Phase 3 wired the
-   DENSE session only. `MoePagerSession` still takes `ExpertSource`'s mmap view
-   on every miss, so an over-RAM MoE model on a GPU is still the page cache's
-   problem. The block model transfers directly (one expert's one role is already
-   a uniform-size block, which is what `HostPager` wants), so this is a small
-   slice — but §3.6 says MoE-on-GPU has no exact prefetch to be had, and §2 says
-   MoE's skew is what makes it the real prize. Worth doing; not started, and not
-   in any phase's scope as written.
 
 ## 8. Non-goals
 

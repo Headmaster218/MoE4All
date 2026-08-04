@@ -2074,6 +2074,55 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     );
 }
 
+/// The paged MoE cache with its THIRD tier engaged (`paging.dram`): a routed expert that misses the
+/// VRAM arena is read from the host arena, and from the model file when that misses too — one block
+/// per expert, at its own file offset inside the bank, instead of the whole bank being faulted in
+/// through the mapping.
+///
+/// Token identity against the all-resident run is the bar, as in
+/// `gpu_seam_paged_moe_matches_resident_and_cpu`. Both budgets are forced far below one layer's
+/// banks, so neither tier holds its working set and experts are genuinely re-read into recycled
+/// slots — the case where a wrong slot or a wrong file offset yields plausible garbage rather than
+/// an error.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_paged_moe_host_tier_matches_resident() {
+    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    let mut _tlk = test_serial_lock();
+    let n = 8usize;
+
+    let pin_ubatch = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(1);
+        c.device.ubatch_specified = true;
+    };
+    let model = model_cfg(&path, pin_ubatch);
+    let rendered = model
+        .render_chat("What is 2+2? Answer briefly.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    let tiered = model_cfg(&path, |c| {
+        pin_ubatch(c);
+        c.paging.cache = Some(infr_core::SizeSpec::Bytes(50 * 1024 * 1024));
+        c.paging.dram = Some(infr_core::SizeSpec::Bytes(256 * 1024 * 1024));
+        c.paging.stats = true;
+    });
+    let mut tiered_ids = Vec::new();
+    tiered
+        .generate_vulkan_ids(&prompt_ids, n, |id| tiered_ids.push(id))
+        .expect("tiered gpu gen");
+
+    assert_eq!(
+        tiered_ids, resident_ids,
+        "the MoE host tier diverged from the all-resident GPU run"
+    );
+}
+
 /// Dense layer streaming (`infr_vulkan::pager::DensePagerSession`, wired via `INFR_CACHE` on a
 /// DENSE model): a tiny forced budget streams (nearly) every per-layer Linear weight group
 /// through the cyclic-sweep pager, and the greedy output must be IDENTICAL, token-for-token, to

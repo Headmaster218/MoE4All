@@ -119,18 +119,20 @@ fn cpu_paged_store(
     Ok(Some(std::sync::Arc::new(store)))
 }
 
-/// Build the host DRAM tier under the Vulkan dense-streaming pools — one
-/// [`infr_core::hostpager::HostPager`] per VRAM pool, since a pool is already exactly a block-size
-/// class.
+/// Build the host DRAM tier under a set of Vulkan arena pools — one
+/// [`infr_core::hostpager::HostPager`] per pool, since a pool is already exactly a block-size class,
+/// which is the uniform-slot shape the host tier needs.
 ///
 /// `classes` is `(slot stride, block count)` per pool, in pool order; the result matches that
-/// order, `None` where the budget seated nothing. Same policy as [`cpu_paged_store`], for the same
-/// reasons: the budget is only ever what the user set (this arena is anonymous, non-evictable
-/// memory), and a budget too small to seat a pool leaves that pool on the mmap path rather than
-/// failing the load.
-fn dense_host_tier(
+/// order, `None` where the budget seated nothing. `what` names the caller in the log line — the
+/// dense streaming pools and the MoE expert pools both come through here, and a run reporting one
+/// arena should say which. Same policy as [`cpu_paged_store`], for the same reasons: the budget is
+/// only ever what the user set (this arena is anonymous, non-evictable memory), and a budget too
+/// small to seat a pool leaves that pool on the mmap path rather than failing the load.
+fn vulkan_host_tier(
     ec: &EngineConfig,
     g: &Gguf,
+    what: &str,
     classes: &[(usize, usize)],
 ) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
     let unpaged = || vec![None; classes.len()];
@@ -145,8 +147,8 @@ fn dense_host_tier(
     let slots = infr_core::hostpager::plan_slots(budget, classes);
     if slots.iter().all(|&n| n == 0) {
         tracing::warn!(
-            "dense host tier: a {:.2} GB budget seats no weight class of this model — keeping the \
-             mmap path (raise INFR_DRAM_CACHE past one weight group's size to page)",
+            "{what} host tier: a {:.2} GB budget seats no block class of this model — keeping \
+             the mmap path (raise INFR_DRAM_CACHE past one block's size to page)",
             budget as f64 / 1e9,
         );
         return Ok(unpaged());
@@ -167,7 +169,7 @@ fn dense_host_tier(
         out.push(Some(std::sync::Arc::new(p)));
     }
     tracing::info!(
-        "dense host tier: {} of {} pool(s) paged, {:.2} GB arena of a {:.2} GB budget",
+        "{what} host tier: {} of {} pool(s) paged, {:.2} GB arena of a {:.2} GB budget",
         slots.iter().filter(|&&n| n > 0).count(),
         classes.len(),
         arena as f64 / 1e9,
@@ -1460,6 +1462,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // uploaded weights, so a second `init_moe_pager` would wipe an already-warm cache for nothing;
     // `n_paged > 0` already implies `first_load` — the placement calc above is first_load-gated —
     // but keep the guard explicit).
+    // The MoE twin, keyed by the `(role, per-expert bytes)` pair that identifies an expert pool —
+    // the binder receives a tensor, not a pool index, and re-derives that key the same way
+    // `MoePagerSession::register` does.
+    let mut moe_host: Vec<(
+        infr_vulkan::pager::Role,
+        usize,
+        Option<std::sync::Arc<infr_core::hostpager::HostPager>>,
+    )> = Vec::new();
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
@@ -1518,9 +1528,20 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // backstop is the alloc-time VRAM budget guard (`GpuPager::new` -> `alloc_arena_bda`);
             // the proportional split below never over-subscribes VRAM because it partitions
             // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
+            // The tier below VRAM, one host pager per expert pool, sized before the pools so a
+            // `Host` bank can name it. Pool order is preserved, so pool `i`'s tier is `moe_host[i]`.
+            let classes: Vec<(usize, usize)> =
+                pool_blocks.iter().map(|&(_, sb, nb)| (sb, nb)).collect();
+            let host_tier = vulkan_host_tier(ec, g, "MoE", &classes)?;
+            moe_host = pool_blocks
+                .iter()
+                .zip(&host_tier)
+                .map(|(&(role, sb, _), h)| (role, sb, h.clone()))
+                .collect();
             let pools: Vec<infr_vulkan::pager::MoePoolSpec> = pool_blocks
                 .iter()
-                .map(|&(role, sb, nb)| {
+                .zip(&host_tier)
+                .map(|(&(role, sb, nb), host)| {
                     // Budget split PROPORTIONALLY to each pool's total bank bytes — the byte share is
                     // also the access share under uniform routing (every (layer, expert) read touches
                     // gate+up+down alike), so proportional slots equalize expected hit rates across
@@ -1542,6 +1563,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         role,
                         slot_bytes: sb,
                         n_slots: budget_slots,
+                        host: host.clone(),
                     }
                 })
                 .collect();
@@ -1850,7 +1872,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // The tier below VRAM, sized before the pools so a `Host` source can name it. Pool
             // order is preserved, so pool `i`'s host tier is `dense_host[i]`.
             let classes: Vec<(usize, usize)> = pools.iter().map(|&(_, s, nb)| (s, nb)).collect();
-            dense_host = dense_host_tier(ec, g, &classes)?;
+            dense_host = vulkan_host_tier(ec, g, "dense", &classes)?;
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
                 .enumerate()
@@ -2004,13 +2026,47 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .alloc_uninit(4, BufferUsage::Weights)
                     .map_err(|e| anyhow!("{e}"))?;
                 let buf_id = infr_vulkan::pager::buffer_identity(placeholder.as_ref());
-                let source = infr_vulkan::pager::ExpertSource {
-                    bytes: std::sync::Arc::new(bytes.clone())
-                        as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
-                    stride_bytes,
-                    layer_base: (l * n_expert) as u32,
+                let layer_base = (l * n_expert) as u32;
+                // With a host tier under this pool, register the bank's experts INDIVIDUALLY — one
+                // block per expert, at its own file offset within the bank, under the same global
+                // id the arena uses. That is what lets a routed miss read one expert instead of
+                // faulting in the whole bank through the mapping.
+                let host = moe_host
+                    .iter()
+                    .find(|&&(r, sb, _)| r == role && sb == stride_bytes)
+                    .and_then(|(_, _, h)| h.as_ref());
+                let source_bytes = match host {
+                    Some(h) => {
+                        let (base, len) = bytes.file_range();
+                        if len != stride_bytes * n_expert {
+                            return Err(anyhow!(
+                                "MoE host tier: {name}'s file range is {len} bytes, but the pool \
+                                 expects {n_expert} x {stride_bytes}"
+                            ));
+                        }
+                        for e in 0..n_expert {
+                            h.register(infr_core::blockio::BlockDesc {
+                                id: layer_base + e as u32,
+                                extents: vec![infr_core::blockio::BlockExtent {
+                                    offset: base + (e * stride_bytes) as u64,
+                                    len: stride_bytes,
+                                }],
+                            })
+                            .map_err(|e| anyhow!("{e}"))?;
+                        }
+                        infr_vulkan::pager::ExpertBytes::Host
+                    }
+                    None => {
+                        infr_vulkan::pager::ExpertBytes::Mmap(std::sync::Arc::new(bytes.clone())
+                            as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                    }
                 };
-                vk.register_paged_expert(role, buf_id, source)
+                let source = infr_vulkan::pager::ExpertSource {
+                    bytes: source_bytes,
+                    stride_bytes,
+                    layer_base,
+                };
+                vk.register_paged_expert(role, buf_id, source, n_expert)
                     .map_err(|e| anyhow!("{e}"))?;
                 return Ok((placeholder, dt));
             }
