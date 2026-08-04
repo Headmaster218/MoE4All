@@ -667,35 +667,57 @@ Reproduce: `scripts/paging-baseline.py MODEL --limits 2G,1.5G --dram 1g`.
 
 Same harness with `--dev Vulkan0 --cache 2g` (a forced 2 GB VRAM paging budget,
 identical in both arms, which is what puts the run on the dense streaming path
-at all). Qwen3-14B **Q8_0 (15.70 GB)**, `--prompt 64 --gen 8 --reps 1`,
-`--dram 3g` (a 3.16 GB arena over four pools). Two independent runs, both
-columns shown, because at `--reps 1` a single row is not evidence:
+at all). Qwen3-14B **Q8_0 (15.70 GB)**, `--prompt 64 --gen 8 --reps 1`. Every
+row below is from the SAME binary; each `dram` row is paired with the `mmap` arm
+of its own run, because the two alternate within one invocation:
 
-| MemoryMax | mode |      pp64 t/s |     tg8 t/s | tg majflt | tg read |
-| --------- | ---- | ------------: | ----------: | --------: | ------: |
-| unlimited | mmap | 108.9 / 110.2 | 1.71 / 1.73 |     6 253 |   15 GB |
-| unlimited | dram | 110.5 / 110.4 | 1.75 / 1.73 |     1 589 |   15 GB |
-| 8 GB      | mmap |    11.2 / 9.3 | 0.17 / 0.17 |    65 115 |  232 GB |
-| 8 GB      | dram |   13.2 / 12.8 | 0.22 / 0.22 |     1 544 |  195 GB |
+| MemoryMax | mode      | pp64 t/s |  tg8 t/s | tg majflt | tg read |
+| --------- | --------- | -------: | -------: | --------: | ------: |
+| unlimited | mmap      |    110.7 |     1.74 |     6 091 |   15 GB |
+| unlimited | dram `3g` |    110.7 |     1.75 |     1 568 |   15 GB |
+| 8 GB      | mmap      |     11.3 |     0.18 |    66 108 |  232 GB |
+| 8 GB      | dram `3g` |     15.6 |     0.24 |     1 653 |  174 GB |
+| 8 GB      | dram `7g` | **25.0** | **0.39** |     1 728 |  110 GB |
 
-**The tier now beats the mmap it replaces where it matters** — **1.29x** on
-decode under the 8 GB cap (0.22 vs 0.17, both runs), and parity when memory is
-plentiful (1.73-1.75 vs 1.71-1.73). Prefill under the cap is 12.8-13.2 vs
-9.3-11.2; the mmap arm is the noisy one there, so read that as "ahead", not as a
-precise ratio. It keeps doing what it was built for: major faults **42x** lower
-under the cap (65 115 → 1 544) and read volume 232 → 195 GB.
+**The tier beats the mmap it replaces by 2.17x on decode** and 2.21x on prefill
+at a 7 GB arena under the cap, **1.41x** at a 3 GB one, and is at parity when
+memory is plentiful (1.75 vs 1.74 — it does not regress the case it is not for).
+Major faults are **38x** lower under the cap and read volume falls 232 → 110 GB.
 
-**What closed the gap was the reader, not the policy.** The tier measured 0.79x
-of mmap on decode until `FileBlockIo::read_block` stopped being a single
-`pread`. A drive delivers its bandwidth on queue depth: measured on this NVMe
-over 16-128 MB blocks, one positioned read sustains 1.2-1.5 GB/s while the
-device does 2.2 GB/s at depth 2-4 (8 and 16 buy nothing). A serial reader was
-therefore losing to the mapping it replaces for a structural reason — the kernel
-issues readahead faults in parallel for free. One block is now split across
-`IO_FANOUT` concurrent positioned reads. **Read volume, fault counts and
-residency policy are all unchanged** across that fix (still 195 GB, still ~1 500
-faults); only the bandwidth moved, which is the signature a reader-only change
+**The budget is the biggest lever in the whole feature, and nothing sets it.**
+The only difference between the last two rows is `paging.dram`: 3 GB → 7 GB is
+worth **1.6x on its own** (0.24 → 0.39), because a bigger arena means fewer
+bytes read per pass and this regime is bound by nothing else. `paging.dram` has
+no auto-sizing — an unset budget disables the tier entirely — so a user who
+guesses low gets a fraction of what is here. Backlog **B36**. Note the arena
+must stay ANONYMOUS memory for a large budget to be safe: the kernel then
+reclaims page cache in its favour, which is why a 7 GB arena under an 8 GB cap
+does not thrash (major faults flat at ~1 700). The "double-caching halves the
+budget" claim this document and the plan both used to carry was **wrong**, and a
+`mincore` probe is what settled it.
+
+**Two fixes got the tier from 0.79x to here, and measurement found both.**
+
+_The reader, worth 1.29x/0.79x._ The tier sat at 0.79x of mmap on decode until
+`FileBlockIo::read_block` stopped being a single `pread`. A drive delivers its
+bandwidth on queue depth: measured on this NVMe over 16-128 MB blocks, one
+positioned read sustains 1.2-1.5 GB/s while the device does 2.2 GB/s at depth
+2-4 (8 and 16 buy nothing). A serial reader was therefore losing to the mapping
+for a structural reason — the kernel issues readahead faults in parallel for
+free. One block is now split across `IO_FANOUT` concurrent positioned reads.
+**Read volume, fault counts and residency policy were all unchanged** across
+that fix; only bandwidth moved, which is the signature a reader-only change
 should leave and the reason to believe the gain is the one claimed.
+
+_The admission doorkeeper, worth a further 10% of bytes read._ The arena sits
+under a tier that only calls down on ITS misses, and on the first pass nothing
+is resident above — so admitting on the FIRST miss filled the arena with exactly
+the prefix the VRAM pager then keeps resident forever, blocks that never call
+down again. `INFR_PAGER_STATS` showed it plainly:
+`host0: hits=50 misses=9 slots=9`, 9 slots holding 9 blocks of which only 5
+could ever be hit. Admission now needs a SECOND miss, which no block the tier
+above keeps ever reaches. Useful hits per pass went 5 → 9, bytes read −10.5%,
+decode 0.22 → 0.24 and prefill 13.2 → 15.6.
 
 **Before that came a fix worth 1.6x, which the first measurement is what
 found.** The tier originally pinned each block in its arena and memcpy'd it to
@@ -707,18 +729,28 @@ more than `page-cache → ring`. `HostPager::fill` now admits a block only while
 slot is free and, once the arena is full, reads it **straight into the ring** —
 which is also the right residency call, because under a cyclic sweep the block
 that just missed is the one whose next use is furthest away. Decode went 0.83 →
-1.36 and prefill 54.7 → 85.8, and the concurrent reader took it from there to
-0.22 under the cap.
+1.36 and prefill 54.7 → 85.8; the concurrent reader and the doorkeeper took it
+from there.
 
 **What is left is reading fewer bytes, not overlapping the reads.** This regime
-is I/O-bound by orders of magnitude — roughly 12.5 GB read per token against
-tens of milliseconds of GPU compute — so prefetch, which hides a read behind
-compute, has almost nothing to hide it behind. The lever that remains is the
-double-caching: a buffered `pread` leaves a page-cache copy of what the arena
-already holds, so under a memory cap the arena effectively costs twice its size
-and `paging.dram` must be set well under the memory available. Fixing that
-allows a much larger arena, which cuts bytes read per pass directly. Backlog
-B35.
+is I/O-bound by orders of magnitude — roughly 12 GB read per token against tens
+of milliseconds of GPU compute — so prefetch, which hides a read behind compute,
+has almost nothing to hide it behind. That is why the two fixes that worked were
+a faster reader and a smarter admission rule, and why the remaining items are
+about volume: auto-sizing the budget (above), and a chunked prefill that
+re-reads the whole model once per chunk — `ceil(prompt / ubatch)` full sweeps,
+which at the 1024-row default makes a 32k prompt 32 of them. Layer-major prefill
+would read it once. Both are backlog **B36**.
+
+_Corrected, because this document asserted otherwise._ The tier was said to be
+held back by double-caching — a buffered `pread` leaving a page-cache copy of
+what the arena already holds — with `posix_fadvise(DONTNEED)` ruled out because
+`Gguf::open` maps the whole file. A `mincore` probe says both halves were wrong.
+`DONTNEED` **does** reclaim mapped-but-untouched pages (65 536 → 0 in the
+probe); only pages actually faulted THROUGH the mapping are pinned, and the tier
+never touches paged ranges that way. And the fix is not needed anyway: an
+anonymous arena already wins page-cache reclaim under a cap, which is what the 7
+GB row above demonstrates.
 
 **`paging.dram` is still off by default on the Vulkan path**, but the reason has
 changed: the performance case is now made, and what is missing is coverage

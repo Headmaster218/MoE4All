@@ -753,7 +753,8 @@ this host does not have
 CPU backend on the DRAM tier, and the Vulkan third tier under BOTH dense
 streaming and the paged MoE cache — numbers in `docs/perf/results.md`), and the
 tier now **beats mmap on both backends**: CPU 2.06x at a 1.5 GB cap, Vulkan
-1.29x on decode at an 8 GB cap. What is left:
+2.17x on decode at an 8 GB cap with a 7 GB arena (1.41x with a 3 GB one). What
+is left:
 
 - **Phase 4, Metal / UMA collapse.** Unbuilt and **unverifiable here**: no Apple
   hardware, and `infr-metal` does not compile on this box. Writing it blind
@@ -761,21 +762,21 @@ tier now **beats mmap on both backends**: CPU 2.06x at a 1.5 GB cap, Vulkan
   precondition is the `qui_cache` gate below. The options and their trade-off
   are written out in the plan's §7 as an open question for the user — do not
   re-derive them.
-- **Double-caching is now the top lever, and the reason it was ruled out needs
-  re-testing.** A buffered `pread` populates the page cache with the bytes the
-  arena already holds, so under a memory cap the arena effectively costs twice
-  its size and `paging.dram` must be set well below the memory available. A
-  bigger arena cuts bytes read per pass, which is the only thing that helps in a
-  regime this I/O-bound. This entry previously stated flatly that
-  `posix_fadvise(DONTNEED)` **cannot** work because it drops only clean UNMAPPED
-  pages while `Gguf::open` maps the whole file. **That argument has a hole:** a
-  page is exempt only when it is actually faulted into a page table, and the
-  tier never touches paged tensor ranges THROUGH the mapping — it reads them
-  with `pread`. Untouched-but-mapped pages may well be reclaimable, which would
-  make the fix one syscall. Probe with `mincore` (which reports true residency)
-  before writing the `O_DIRECT`/`F_NOCACHE` fallback and its alignment
-  constraints (plan §3.5). NOT yet tested either way — the claim in both
-  directions is currently reasoning, not evidence.
+- **Double-caching: CLOSED as a non-problem, and the premise was wrong in both
+  directions.** This entry used to say a buffered `pread` halves the tier's
+  effective budget, and that `posix_fadvise(DONTNEED)` **cannot** reclaim the
+  duplicate because it drops only clean UNMAPPED pages while `Gguf::open` maps
+  the whole file. A `mincore` probe refutes both halves. `DONTNEED` DOES reclaim
+  mapped-but-untouched pages (65 536 → 0 in the probe); a page is exempt only
+  once it is actually faulted into a page table, and this tier never touches
+  paged ranges through the mapping — it reads them with `pread`. Only the
+  touched case stayed pinned, which is the control. And the reclaim is not
+  needed anyway: an anonymous arena already wins page-cache reclaim under a
+  cgroup cap, demonstrated by a 7 GB arena under an 8 GB cap running with major
+  faults flat at ~1 700 and reading 110 GB against mmap's 232. No
+  `O_DIRECT`/`F_NOCACHE` rewrite and no alignment work (plan §3.5) is required.
+  **Do not reopen without new evidence** — what looked like a double-caching
+  cost was the budget being too small, which is the auto-sizing item in B36.
 - **Prefetch is deprioritized, and that reversal is the useful part.** It is
   still unbuilt on every backend (`HostPager::pin` reads synchronously, and on
   Vulkan under the dense/MoE session mutex). It was recorded here as "the
@@ -837,10 +838,11 @@ follows is what was found and deliberately left.
 
 - **`paging.dram` has no auto-sizing, and sizing it is the single biggest lever
   measured anywhere in this feature.** On Qwen3-14B Q8_0 under an 8 GB
-  `MemoryMax` with a 2 GB VRAM budget, decode goes **0.22 t/s at `--dram 3g`,
-  0.29 at 6g, 0.35 at 7g** against mmap's 0.17 — i.e. a config value the user
-  has to guess is worth **1.6x**, and the feature is off entirely unless they
-  name one. `vulkan_host_tier` (`infr-llama/src/seam/mod.rs`) reads
+  `MemoryMax` with a 2 GB VRAM budget, decode goes **0.24 t/s at `--dram 3g` and
+  0.39 at 7g** against mmap's 0.18 — i.e. a config value the user has to guess
+  is worth **1.6x**, and the feature is off entirely unless they name one. (The
+  6g rung measured 0.29 on the pre-doorkeeper binary; the 3g and 7g figures are
+  current.) `vulkan_host_tier` (`infr-llama/src/seam/mod.rs`) reads
   `ec.paging.dram` and returns an all-`None` tier when it is unset. Nothing
   probes host memory on any platform, which is exactly the plan's §7 question 3
   (recommendation there: no new dependency, require an explicit budget on

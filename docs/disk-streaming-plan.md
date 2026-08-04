@@ -5,14 +5,16 @@ existing block pager into a **tiered** one whose bottom tier is the model file
 itself, read by explicit positioned I/O rather than left to the OS page cache.
 
 Status: **phases 0–3 landed and the tier now beats mmap on both backends** (CPU
-2.06x at a 1.5 GB cap, Vulkan 1.29x on decode at an 8 GB cap — `docs/perf/`
-`results.md`). Phase 4 is not built and phase 5 is one lever in, the concurrent
-reader that took the GPU path from 0.79x to 1.29x. §5 says what each phase
-delivered and what it deferred; §7 holds the questions still open, including
-whether phase 4 should be attempted at all on a machine that cannot run it.
-Claims about the tree name the file and symbol they came from. Numbers come from
-a command that was run, not an estimate; the one worked example in §2 is
-labelled as illustrative arithmetic, not a prediction.
+2.06x at a 1.5 GB cap, Vulkan 2.17x on decode at an 8 GB cap with a 7 GB arena —
+`docs/perf/results.md`). Phase 4 is not built; phase 5 is two levers in (the
+concurrent reader and the admission doorkeeper, together 0.79x → 1.41x at a
+fixed 3 GB budget) and its top remaining item is auto-sizing that budget, worth
+a further 1.6x. §5 says what each phase delivered and what it deferred; §7 holds
+the questions still open, including whether phase 4 should be attempted at all
+on a machine that cannot run it. Claims about the tree name the file and symbol
+they came from. Numbers come from a command that was run, not an estimate; the
+one worked example in §2 is labelled as illustrative arithmetic, not a
+prediction.
 
 ## 1. What exists today
 
@@ -550,12 +552,15 @@ on the path.
 
 **It now beats the mmap it replaces, and that is measured.**
 `docs/perf/results.md` carries the table: Qwen3-14B Q8_0 streamed under a forced
-2 GB VRAM budget, the tier runs at **1.29x of mmap on decode** under an 8 GB cap
-(0.22 vs 0.17 t/s, reproduced in two runs) and at parity unlimited, while doing
-what it targets — 42x fewer major faults under the cap, 232 to 195 GB read.
+2 GB VRAM budget, the tier runs at **2.17x of mmap on decode** under an 8 GB cap
+with a 7 GB arena (0.39 vs 0.18 t/s), 1.41x with a 3 GB one, and at parity
+unlimited — while doing what it targets: 38x fewer major faults under the cap,
+232 to 110 GB read.
 
-Two fixes got it there, and BOTH were found by measuring rather than by
-reasoning about the design.
+Three fixes got it there, and ALL THREE were found by measuring rather than by
+reasoning about the design. The third is not code at all: the arena BUDGET is
+the single biggest lever in the feature (3 GB → 7 GB is worth 1.6x on its own),
+and nothing auto-sizes it — see §5's phase-5 list.
 
 The first was worth 1.6x. The tier originally pinned each block in its arena and
 memcpy'd it into the ring, and measured 0.48x of mmap: on CPU the arena REPLACES
@@ -565,6 +570,14 @@ way, making `disk -> arena -> ring` one copy more than `page-cache -> ring`.
 full, reads straight into the ring — which is also the correct residency call
 and is exactly §3.6's "dense: partition, do not cache", arrived at from the
 other direction. Decode 0.83 -> 1.36 t/s, prefill 54.7 -> 85.8.
+
+The third fix was the ADMISSION RULE. This tier sits under one that only calls
+down on its own misses, and on the first pass nothing is resident above — so
+admitting on the first miss filled the arena with exactly the prefix the VRAM
+pager then keeps forever, blocks that never call down again. `INFR_PAGER_STATS`
+showed 9 slots holding 9 blocks of which 5 could ever be hit. Admission now
+requires a SECOND miss, which no block the tier above keeps ever reaches: useful
+hits per pass 5 → 9, bytes read −10.5%, decode 0.22 → 0.24.
 
 That left the tier at 0.79x, and the second fix was the READER, not the policy
 this plan spent its time on. `FileBlockIo::read_block` issued one `pread` per
@@ -596,21 +609,25 @@ all.
 phase 3) already landed the one that mattered; what follows is ordered by what
 the measurement now says, which is NOT what this section said before it.
 
-- **Stop double-caching — the top lever.** A buffered `pread` leaves a
-  page-cache copy of what the arena already holds, so under a memory cap the
-  arena effectively costs twice its size and `paging.dram` has to be set well
-  below the memory available. Fixing it buys a much larger arena, and a larger
-  arena cuts bytes read per pass directly — which is the only thing that helps
-  in a regime this I/O-bound. `posix_fadvise(DONTNEED)` is the obvious lever and
-  this plan previously asserted it **cannot** work, on the grounds that it drops
-  only clean UNMAPPED pages while `Gguf::open` maps the whole file. **That
-  reasoning has a hole worth testing before accepting it:** a page is exempt
-  only when it is actually faulted into a page table, and the tier never touches
-  paged tensor ranges THROUGH the mapping — it reads them with `pread`. If
-  untouched-but-mapped pages turn out to be reclaimable, the fix is one syscall
-  instead of the `O_DIRECT`/`F_NOCACHE` rewrite (with the alignment constraints
-  §3.5 records) that the fallback needs. Probe it with `mincore`, which reports
-  actual residency, before writing either.
+- **Auto-size `paging.dram` — the top lever, and it is not code in this tier at
+  all.** The budget alone moves decode 0.24 → 0.29 → 0.39 t/s at 3, 6 and 7 GB
+  under an 8 GB cap (mmap: 0.18), so the value a user has to guess is worth
+  **1.6x**, and an unset budget disables the tier entirely. `vulkan_host_tier`
+  reads `ec.paging.dram` and returns an all-`None` tier when it is missing;
+  nothing probes host memory on any platform, which is §7's question 3. Answer
+  that question, then size from it. The arena must stay ANONYMOUS memory for a
+  large budget to be safe — the kernel reclaims page cache in its favour, which
+  is why 7 GB under an 8 GB cap does not thrash (major faults flat at ~1 700).
+- **Double-caching: CLOSED, the premise was wrong both ways.** This plan
+  asserted that a buffered `pread` halves the tier's effective budget and that
+  `posix_fadvise(DONTNEED)` **cannot** reclaim the duplicate because
+  `Gguf::open` maps the whole file. A `mincore` probe refutes both. `DONTNEED`
+  DOES reclaim mapped-but-untouched pages (65 536 → 0); a page is exempt only
+  once it is actually faulted into a page table, and this tier never touches
+  paged ranges through the mapping. And the reclaim is not needed anyway: an
+  anonymous arena already wins page-cache reclaim under a cap, which is exactly
+  what the 7 GB row demonstrates. No `O_DIRECT`/`F_NOCACHE` rewrite, no
+  alignment constraints, no work here. Do not reopen without new evidence.
 - **Prefetch — deprioritized, and the reason is worth recording.** The
   synchronous read does sit on the critical path under the session mutex, and
   this plan called it "the one the phase-3 result points at hardest". That was

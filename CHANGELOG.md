@@ -29,10 +29,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     rather than a whole bank. A block the arena has no room for is read straight
     into the staging ring instead of evicting one, so the streaming majority
     costs one copy rather than two. Measured on a memory-capped Qwen3-14B Q8_0
-    under a forced 2 GB VRAM budget: **decode 1.29x faster than the mmap path it
-    replaces** at an 8 GB cap, with 42x fewer major faults and 232 → 195 GB
-    read, and at parity when memory is plentiful (`docs/perf/results.md`). Still
-    off by default: the measurement covers one GPU, one drive and Linux only.
+    under a forced 2 GB VRAM budget: **decode 2.17x faster than the mmap path it
+    replaces** at an 8 GB cap with a 7 GB arena (1.41x with a 3 GB one), 38x
+    fewer major faults, 232 → 110 GB read, and parity when memory is plentiful
+    (`docs/perf/results.md`). The arena budget is the dominant factor — 3 GB → 7
+    GB is worth 1.6x on its own — and it has no auto-sizing yet, so set
+    `paging.dram` as large as the host can spare. Still off by default: the
+    measurement covers one GPU, one drive and Linux only.
   - `INFR_PAGER_STATS=1` reports hit rate, reads and bytes for each tier.
   - The host arena admits a block on its SECOND miss, not its first. A tier
     above only calls down on its own misses, so first-miss admission filled the
