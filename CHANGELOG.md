@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DeepSeek V1 support** (`deepseek` architecture): plain MHA attention +
+  softmax-gated MoE with ungated shared expert, following llama.cpp's
+  `src/models/deepseek.cpp`. First `n_layer_dense_lead` layers are dense FFN,
+  the rest are MoE. Tokenizer pre-processing added for `deepseek-llm`,
+  `deepseek-coder`, and `deepseek-v3` pre-types (see `docs/deepseek.md` § Stage
+  1). Works on CPU + Vulkan backend via the existing `FfnW::Moe` with `shexp`
+  path (same as llama4's plain-summed shared expert).
+
 - `infr run`, `infr bench` and `infr serve` now notice the model file being
   overwritten underneath the live weight mapping and fail with a named error
   instead of serving output from weights that no longer match the file. `run`

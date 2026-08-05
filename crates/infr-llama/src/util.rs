@@ -11,6 +11,35 @@ use tokenizers::Tokenizer;
 /// which is what made a naive ByteLevel produce different token ids.
 pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// DeepSeek-LLM (V1) pre-tokenizer patterns — 6 successive splits applied in order
+/// (llama.cpp's `DEEPSEEK_LLM` pre-type, `src/llama-vocab.cpp`). See docs/deepseek.md §0.2.
+pub(crate) const DEEPSEEK_LLM_PRE_RES: [&str; 6] = [
+    r"[\r\n]",
+    r"\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-ώᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐲲𑢠-𑣟𞤀-𞥃]+",
+    r"\s?[!-/:-~！-／：-～'-‟　-。]+",
+    r"\s+$",
+    r"[一-龥ࠀ-一가-퟿]+",
+    r"\p{N}+",
+];
+
+/// DeepSeek-Coder pre-tokenizer patterns — 5 successive splits
+/// (llama.cpp's `DEEPSEEK_CODER` pre-type).
+pub(crate) const DEEPSEEK_CODER_PRE_RES: [&str; 5] = [
+    r"[\r\n]",
+    r"\s?\p{L}+",
+    r"\s?\p{P}+",
+    r"[一-龥ࠀ-一가-퟿]+",
+    r"\p{N}",
+];
+
+/// DeepSeek-V3 pre-tokenizer patterns — 3 successive splits
+/// (llama.cpp's `DEEPSEEK3_LLM` pre-type, also used by V4).
+pub(crate) const DEEPSEEK_V3_PRE_RES: [&str; 3] = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##,
+];
+
 /// Llama 4 pre-tokenizer regex (`tokenizer.ggml.pre == "llama4"` → llama.cpp's `GPT4O` pre-type,
 /// the original split from the model's `tokenizer.json`). Applied via a Split before ByteLevel,
 /// exactly like `QWEN2_PRE_RE`. Numbers group in runs of up to 3 digits (`\p{N}{1,3}`), and the

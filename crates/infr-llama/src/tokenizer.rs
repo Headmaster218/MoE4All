@@ -1,6 +1,8 @@
 //! GGUF-embedded tokenizer construction (byte-level BPE + SentencePiece).
 //! Mechanically split out of `lib.rs` (no logic change).
-use crate::{LLAMA4_PRE_RE, QWEN2_PRE_RE};
+use crate::{
+    DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA4_PRE_RE, QWEN2_PRE_RE,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
 use infr_core::WeightSource;
@@ -122,27 +124,45 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         Some(MetaValue::Bool(true))
     );
     let pre = md.str("tokenizer.ggml.pre").unwrap_or("default");
-    // qwen2/llama4 both split on a regex before ByteLevel (matching HF); only the pattern differs.
-    let split_re = match pre {
-        "qwen2" => Some(QWEN2_PRE_RE),
-        "llama4" => Some(LLAMA4_PRE_RE),
-        _ => None,
-    };
-    if let Some(re) = split_re {
-        // Sequence[ Split(pre regex, Isolated), ByteLevel(use_regex=false) ] — matches HF.
-        let split = Split::new(
-            SplitPattern::Regex(re.to_string()),
-            SplitDelimiterBehavior::Isolated,
-            false,
-        )
-        .map_err(|e| anyhow!("split pretokenizer: {e}"))?;
-        let seq = PreSequence::new(vec![
-            PreTokenizerWrapper::Split(split),
-            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
-        ]);
-        tok.with_pre_tokenizer(Some(seq));
-    } else {
-        tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
+    // qwen2/llama4 both split on a SINGLE regex before ByteLevel (matching HF); only the pattern
+    // differs. DeepSeek pre-types apply a LIST of successive Split pre-tokenizers (see §0.2 of
+    // docs/deepseek.md — N successive Isolated splits reproduce llama.cpp's sequential application).
+    // The sequences below follow llama.cpp's `src/llama-vocab.cpp` verbatim.
+    match pre {
+        "deepseek-llm" => {
+            let seq = build_multi_split_seq(DEEPSEEK_LLM_PRE_RES.as_slice())?;
+            tok.with_pre_tokenizer(Some(seq));
+        }
+        "deepseek-coder" => {
+            let seq = build_multi_split_seq(DEEPSEEK_CODER_PRE_RES.as_slice())?;
+            tok.with_pre_tokenizer(Some(seq));
+        }
+        "deepseek-v3" => {
+            let seq = build_multi_split_seq(DEEPSEEK_V3_PRE_RES.as_slice())?;
+            tok.with_pre_tokenizer(Some(seq));
+        }
+        "qwen2" | "llama4" => {
+            let re = if pre == "qwen2" {
+                QWEN2_PRE_RE
+            } else {
+                LLAMA4_PRE_RE
+            };
+            // Sequence[ Split(pre regex, Isolated), ByteLevel(use_regex=false) ] — matches HF.
+            let split = Split::new(
+                SplitPattern::Regex(re.to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .map_err(|e| anyhow!("split pretokenizer: {e}"))?;
+            let seq = PreSequence::new(vec![
+                PreTokenizerWrapper::Split(split),
+                PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+            ]);
+            tok.with_pre_tokenizer(Some(seq));
+        }
+        _ => {
+            tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
+        }
     }
     tok.with_decoder(Some(ByteLevelDecoder::default()));
     // Control (type 3, e.g. <|im_end|>) as SPECIAL, user-defined (type 4, e.g. <think>) as normal
@@ -168,6 +188,28 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 /// consistently (NaN sorts to one end) rather than taking the process down.
 fn spm_merge_order(a: (f64, u32, u32), b: (f64, u32, u32)) -> std::cmp::Ordering {
     b.0.total_cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2)))
+}
+
+/// Build a `PreSequence` for a list of successive `Split` pre-tokenizers (DeepSeek's multi-regex
+/// approach — see docs/deepseek.md §0.2). Each regex splits the output of the previous one in
+/// order, followed by `ByteLevel`; mirrors llama.cpp's `unicode_regex_split` pipeline.
+fn build_multi_split_seq(patterns: &[&str]) -> Result<PreSequence> {
+    let mut parts: Vec<PreTokenizerWrapper> = patterns
+        .iter()
+        .map(|re| {
+            Split::new(
+                SplitPattern::Regex(re.to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .map(PreTokenizerWrapper::Split)
+            .map_err(|e| anyhow!("split pretokenizer: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    parts.push(PreTokenizerWrapper::ByteLevel(ByteLevel::new(
+        false, false, false,
+    )));
+    Ok(PreSequence::new(parts))
 }
 
 /// Build a SentencePiece (Unigram) tokenizer from a GGUF's embedded vocab (`tokenizer.ggml.model

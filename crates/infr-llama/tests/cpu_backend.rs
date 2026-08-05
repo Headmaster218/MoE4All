@@ -3760,3 +3760,67 @@ fn gpu_seam_matches_cpu_bitnet() {
         "CPU/Vulkan last-row logits diverged: cosine={cos}"
     );
 }
+
+// ─── DeepSeek V1 ────────────────────────────────────────────────────────────────
+
+/// Locate a DeepSeek-LLM-7B-Chat GGUF in the HF cache. The smallest V1 model (7B,
+/// ~4 GB Q4_K_M). `None` ⇒ tests self-skip.
+fn deepseek_v1_7b() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_DEEPSEEK") {
+        return Some(PathBuf::from(p));
+    }
+    find_gguf(
+        "unsloth--DeepSeek-LLM-7B-Chat-GGUF",
+        "DeepSeek-LLM-7B-Chat-Q4_K_M.gguf",
+    )
+}
+
+/// Config-only: open the GGUF and assert every deepseek gate boolean, plus that
+/// other arches' gates are false. No model load needed.
+#[test]
+fn cpu_deepseek_config() {
+    let path = need_model!(deepseek_v1_7b(), "DeepSeek-LLM-7B-Chat");
+    let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("parse config");
+    assert_eq!(
+        g.metadata().str("general.architecture"),
+        Some(infr_llama::arch::DEEPSEEK),
+        "arch string"
+    );
+    assert!(cfg.deepseek, "deepseek gate");
+    assert!(!cfg.qk_norm, "qk_norm must be false");
+    assert!(!cfg.qkv_bias, "qkv_bias must be false");
+    assert!(!cfg.permute_qk_neox, "permute_qk_neox must be false");
+    assert!(!cfg.sub_norm, "sub_norm must be false");
+    assert!(!cfg.llama4, "llama4 must be false");
+    assert!(!cfg.qwen35, "qwen35 must be false");
+    assert!(!cfg.gemma, "gemma must be false");
+    assert!(!cfg.gemma4, "gemma4 must be false");
+    assert!(!cfg.shexp_gated, "shared expert must be ungated");
+    assert!(cfg.moe.is_some(), "must have MoE config");
+    let moe = cfg.moe.unwrap();
+    assert_eq!(moe.gating, infr_core::graph::MoeGating::Softmax);
+    assert!(!moe.norm_w, "no top-k renormalization for V1");
+    assert!(!moe.weight_before, "weight-before-FFN must be false");
+    // n_layer_dense_lead is non-zero for MoE-16B, 0 for dense 7B.
+    // Shared expert: deepseek-llm-7b-chat has no shared expert (shexp_ff=0);
+    // deepseek-moe-16b-chat has n_expert_shared=2 → shexp_ff > 0.
+    eprintln!(
+        "deepseek V1: n_layer={} n_head={} n_embd={} moe.n_expert={} moe.n_used={} n_layer_dense_lead={} shexp_ff={}",
+        cfg.n_layer, cfg.n_head, cfg.n_embd,
+        moe.n_expert, moe.n_used,
+        cfg.n_layer_dense_lead, cfg.shexp_ff,
+    );
+}
+
+/// Greedy top-1 token after "The capital of France is" — validates the full
+/// forward pass (attention + MoE + output) produces a non-empty response.
+#[test]
+fn cpu_deepseek_prefill_paris() {
+    let path = need_model!(deepseek_v1_7b(), "DeepSeek-LLM-7B-Chat");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let output = cpu_gen(&model, "The capital of France is", 8);
+    assert!(!output.trim().is_empty(), "model produced no output");
+    eprintln!("deepseek V1 'Paris': {output:?}");
+}

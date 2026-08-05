@@ -174,6 +174,15 @@ pub struct Config {
     /// against llama.cpp's `build_bitnet` (`src/models/bitnet.cpp`). `false` for every other arch
     /// (their block graphs stay byte-identical).
     pub sub_norm: bool,
+    /// DeepSeek V1 (and later): `true` only for `arch == "deepseek"`. Gates the MoE with
+    /// no-renormalization softmax gating, threshold-mode `is_moe_layer`, and an ungated
+    /// shared expert (summed in plain, like llama4). See docs/deepseek.md § Stage 1.
+    pub deepseek: bool,
+    /// DeepSeek: the first `n_layer_dense_lead` layers use a DENSE FFN; the rest are MoE
+    /// (unless the model has no MoE — `Config::moe` is `None` — in which case every layer
+    /// is dense regardless). `0` = every layer MoE (not used today). Non-DeepSeek models
+    /// ignore this field.
+    pub n_layer_dense_lead: usize,
 }
 
 fn positive_model_dimension(key: &str, value: u64) -> Result<usize> {
@@ -283,12 +292,20 @@ impl Config {
         self.diffusion_gemma || self.gemma4_moe
     }
 
-    /// Whether layer `il` uses the routed-expert (MoE) FFN. For every MoE arch except llama4 that's
-    /// EVERY layer (`moe_interleave_step == 0`); llama4 interleaves MoE with dense layers on a fixed
-    /// step (`(il+1) % step == 0`). `false` for dense models (`self.moe` is `None`).
+    /// Whether layer `il` uses the routed-expert (MoE) FFN. For every MoE arch except llama4 and
+    /// deepseek that's EVERY layer (`moe_interleave_step == 0`). llama4 interleaves MoE with dense
+    /// layers on a fixed step (`(il+1) % step == 0`). DeepSeek uses a threshold: the first
+    /// `n_layer_dense_lead` layers are dense, the rest are MoE. `false` for dense models
+    /// (`self.moe` is `None`).
     pub fn is_moe_layer(&self, il: usize) -> bool {
         self.moe.is_some()
-            && (self.moe_interleave_step == 0 || (il + 1).is_multiple_of(self.moe_interleave_step))
+            && if self.deepseek {
+                il >= self.n_layer_dense_lead
+            } else if self.moe_interleave_step > 0 {
+                (il + 1).is_multiple_of(self.moe_interleave_step)
+            } else {
+                true
+            }
     }
 
     /// llama4 iRoPE: whether layer `il` SKIPS rope (a NoPE / global-attention layer). `false` for
@@ -340,6 +357,7 @@ impl Config {
             crate::arch::LLAMA
             | crate::arch::LLAMA4
             | crate::arch::QWEN2
+            | crate::arch::DEEPSEEK
             | crate::arch::BITNET
             | crate::arch::BITNET_B158 => false,
             crate::arch::QWEN3
@@ -373,6 +391,11 @@ impl Config {
         // concatenated-heads attention output BEFORE the o-projection, and `ffn_sub_norm` on the
         // FFN intermediate BEFORE `ffn_down`. Gates both the extra weight loads and the graph ops.
         let sub_norm = crate::arch::is_bitnet(&arch);
+        // DeepSeek V1: the llama skeleton (NORM/interleaved rope, no bias, no qk-norm) plus a
+        // softmax-gated MoE (no top-k renormalization, shared expert summed in plain). See
+        // docs/deepseek.md § Stage 1. All the divergent semantics are HARDCODED in the reference
+        // loader (`src/models/deepseek.cpp`), not metadata-driven.
+        let deepseek = arch == crate::arch::DEEPSEEK;
         // llama4 (Scout etc.): shares the llama attention skeleton (NORM/interleaved rope, no bias,
         // converter-permuted q/k) but adds a 16-expert sigmoid top-1 MoE + iRoPE (per-layer NoPE) +
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
@@ -479,6 +502,7 @@ impl Config {
             || qwen35_moe
             || gemma4_moe
             || llama4
+            || deepseek
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
@@ -489,14 +513,24 @@ impl Config {
             // llama4 hardcodes SIGMOID gating, NO top-k renormalization, and weight-before-FFN
             // (`models/llama4.cpp::build_arch_graph` → `build_moe_ffn(.., norm_w=false, ..,
             // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)` with `weight_before_ffn = arch == LLAMA4`).
-            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → 1.0). Every other
-            // MoE arch here is softmax + renormalized top-k, output-weighted, scale 1.0.
+            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → 1.0).
+            // DeepSeek V1 hardcodes SOFTMAX gating, NO top-k renormalization, weight-after-FFN,
+            // and scale from `expert_weights_scale` (default 0) — matching the reference's
+            // `build_deepseek` (`src/models/deepseek.cpp`). Every other MoE arch here is softmax
+            // + renormalized top-k, output-weighted, scale 1.0.
             let (gating, norm_w, weight_before, scale) = if llama4 {
                 (
                     infr_core::graph::MoeGating::Sigmoid,
                     false,
                     true,
                     meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
+                )
+            } else if deepseek {
+                (
+                    infr_core::graph::MoeGating::Softmax,
+                    false,
+                    false,
+                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
                 )
             } else {
                 (infr_core::graph::MoeGating::Softmax, true, false, 1.0)
@@ -654,17 +688,29 @@ impl Config {
             [0u32; 4]
         };
         let attn_out_gate = qwen35;
+        // DeepSeek: first N layers are dense FFN, the rest are MoE.
+        let n_layer_dense_lead = if deepseek {
+            meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
+        } else {
+            0
+        };
         // Shared-expert FFN width. qwen35moe reads `expert_shared_feed_forward_length`; llama4 has
         // NO such key — its shared expert is the SAME width as a routed expert
-        // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). `0` = no shared expert.
+        // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). DeepSeek's shared expert is
+        // `n_ff_exp * n_expert_shared` wide (llama.cpp fuses `n_expert_shared` experts into one
+        // wider branch — see docs/deepseek.md § Stage 1). `0` = no shared expert.
         let shexp_ff = if qwen35_moe {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
+        } else if deepseek {
+            let n_shared = meta_u64(g, &mk("expert_shared_count")).unwrap_or(0) as usize;
+            moe.map(|m| m.n_ff_exp * n_shared).unwrap_or(0)
         } else {
             0
         };
         // llama4 shared expert is summed in PLAIN (no per-token gate); qwen35moe gates by sigmoid.
+        // DeepSeek's shared expert is also plain-summed (no gate).
         let shexp_gated = qwen35_moe;
         // llama4 iRoPE + MoE interleave. `interleave_moe_layer_step` defaults to 1 (every layer MoE,
         // as on Scout). The NoPE step: the reference forces the chunked-attention branch whenever
@@ -782,6 +828,8 @@ impl Config {
             kq_l2norm,
             shexp_gated,
             sub_norm,
+            deepseek,
+            n_layer_dense_lead,
         })
     }
 }
