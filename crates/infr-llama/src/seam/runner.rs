@@ -440,9 +440,11 @@ pub(crate) fn generate_dense_backend(
     // carries the dtype and the env is stable for the process, so a warm session and its rebuilt
     // graphs always agree. Gates: Q8_0 needs each layer's KV row (n_kv*head_dim) 32-block-aligned and
     // a backend with the Q8 read/write (cpu/vulkan/metal). TurboQuant (turbo2/3/4) is WHT-rotated,
-    // 128-elem blocks = head_dim slices — CPU-only, needs head_dim%128. The mainline low-bit quants
-    // (q4_0/q4_1/q5_0/q5_1/iq4_nl) + f32/bf16 are CPU-only too (no GPU KV kernel yet); the block
-    // quants need 32-alignment. All of these are footprint knobs (quantized KV is slower on CPU).
+    // 128-elem blocks = head_dim slices, so it needs head_dim%128; it runs on cpu/vulkan/metal —
+    // natively on CPU, through a dequant→f16 prepass on both GPUs. The mainline low-bit quants
+    // (q4_0/q4_1/q5_0/q5_1/iq4_nl) + f32/bf16 run on those same three backends; the block quants
+    // need 32-alignment. All of these are footprint knobs, not speed knobs — a prepass format
+    // re-expands the whole prefix every token.
     // The SAME 32-block gate the placement estimator applies before pinning an auto-q8 cache
     // (`crate::seam::kv_q8_layout_ok`) — one function, so a pinned q8 can never be gated back to
     // f16 here against an estimate that priced it at q8.
