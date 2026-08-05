@@ -101,7 +101,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a single-chunk prefill's. The cost is holding every chunk's residual stream at
   once (`ctx * n_embd` f32), which the streaming budget reserves for. Resident
   models keep the chunk-major order, where the reorder would buy nothing and
-  only add activation residency.
+  only add activation residency, and so does gemma4-E2B on any backend — its
+  per-layer token embeddings are built by the graph prologue, which a span
+  starting past layer 0 cannot see.
 
 - The Vulkan context window is now re-decided against the memory the device
   reports free once the weights are resident, instead of only against a pre-load

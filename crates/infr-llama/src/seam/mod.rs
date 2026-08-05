@@ -700,13 +700,26 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 ///
 /// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
 /// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
-/// next, which is what threads the residual stream between two layers' dispatches.
+/// next, which is what threads the residual stream between two layers' dispatches, and an
+/// architecture whose layer stack can be entered past layer 0 at all (`spannable`).
 pub(crate) fn layer_major_prefill(
     ec: &EngineConfig,
     caps: &infr_core::backend::Capabilities,
     streaming: bool,
+    spannable: bool,
 ) -> bool {
     let want = ec.paging.layer_major.unwrap_or(streaming);
+    if want && !spannable {
+        // gemma4-E2B: its layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a
+        // span starting past layer 0 would read an unbound tensor. This is the gate for it — the
+        // matching `assert!` in `build` is an internal invariant, and a streamed E2B model reached
+        // it as a PANIC on an ordinary `bench`/`run` until this arm existed.
+        tracing::warn!(
+            "layer-major prefill cannot split this architecture's layer stack (per-layer inputs \
+             are built by the graph prologue) — prefilling chunk-major"
+        );
+        return false;
+    }
     if want && !caps.graph_input_inplace {
         // Only reachable through the explicit override on a wrapper backend (TP/EP/pipeline) —
         // the auto rule needs a dense pager, which those do not host. Say so rather than silently

@@ -868,7 +868,6 @@ residue worth tracking; what follows is that plus what was deliberately left.
   the arm order permuted and a cold page cache before every run — at the
   1024-row default chunk: 25.27 → 6.31 GB read and 341.9 → 779.9 pp t/s, the
   read volume now exactly a single-chunk prefill's. The residue:
-
   - **The remaining gap to the single-chunk arm is HOST cost, not I/O.** Same
     6.31 GB, but 779.9 t/s against 1049.6: layer-major builds and compiles a
     graph per (layer, chunk) — 40 x 4 here — where the one-chunk arm builds one.
@@ -887,11 +886,15 @@ residue worth tracking; what follows is that plus what was deliberately left.
     load, which it is not today.
   - **Only the dense Vulkan path.** MoE expert paging, MTP, the qwen35/DeltaNet
     bespoke path, Metal and the CPU backend all keep chunk-major: the gate is
-    `Backend::dense_paged`, and the E2B arch is rejected outright by an assert
-    in `build` (its `per_layer_inp` is prologue-built and a later span cannot
-    see it). A paged MoE prefill has the same `ceil(P/ubatch)` structure and was
-    never swept; whether the expert cache's locality makes it the same win is
-    unknown.
+    `Backend::dense_paged`, and the E2B arch is refused by
+    `layer_major_prefill`'s `spannable` arm (its `per_layer_inp` is
+    prologue-built and a later span cannot see it). That gate is load-bearing,
+    not belt-and-braces: E2B DOES take the batched-prefill path, so while the
+    only refusal was the `assert!` in `build`, a streamed E2B panicked on an
+    ordinary `infr bench <e2b> --set paging.cache=200m`. Covered by
+    `gpu_seam_streamed_e2b_stays_chunk_major`. A paged MoE prefill has the same
+    `ceil(P/ubatch)` structure and was never swept; whether the expert cache's
+    locality makes it the same win is unknown.
   - **Not measured: more than one prompt length, and any model but this one.**
     The sweep is P=4096 on one dense model, one drive, one GPU. The claim that
     the ratio grows with prompt length is arithmetic (`ceil(P/ubatch)` sweeps

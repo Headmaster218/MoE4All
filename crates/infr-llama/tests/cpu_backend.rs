@@ -1098,13 +1098,61 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
     ),
 ];
 
-/// E2B is excluded from the batched-prefill fast path).
+/// gemma4-E2B (per-layer token embeddings) through the Vulkan seam.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     let mut _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
+}
+
+/// A STREAMED gemma4-E2B keeps the chunk-major order, and a GATE is what makes it — not a panic.
+///
+/// E2B's layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a layer span
+/// starting past layer 0 would read an unbound tensor; `build` asserts exactly that. E2B does take
+/// the batched-prefill path, so once a streamed model defaulted to layer-major that assert became
+/// reachable: `infr bench <e2b> --set paging.cache=200m` panicked with "gemma4-E2B cannot start a
+/// layer span past layer 0". `seam::layer_major_prefill` now refuses the architecture and warns.
+///
+/// The assertion is token identity against the resident run, so this fails both if the gate is
+/// removed (panic) and if some later span-capable E2B path returns different tokens.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_streamed_e2b_stays_chunk_major() {
+    let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
+    let mut _tlk = test_serial_lock();
+    let n = 8usize;
+
+    let model = model_default(&path);
+    // Several chunks: only a multi-chunk prefill builds more than one span at all.
+    let long = "Explain in detail how a transformer processes a sequence of tokens. ".repeat(8);
+    let rendered = model.render_chat(&long).expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+    let pin_chunk = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(64);
+        c.device.ubatch_specified = true;
+    };
+
+    let mut resident_ids = Vec::new();
+    model_cfg(&path, pin_chunk)
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    // Small enough to force the streaming path, where `layer_major` defaults ON for every other
+    // architecture — which is the case that used to panic here.
+    let mut streamed_ids = Vec::new();
+    model_cfg(&path, |c| {
+        pin_chunk(c);
+        c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+    })
+    .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+    .expect("streamed e2b gpu gen must not panic on a layer span");
+
+    assert_eq!(
+        streamed_ids, resident_ids,
+        "streamed E2B diverged from the all-resident GPU run"
+    );
 }
 
 /// qwen3moe (routed-expert Op::MoeFfn) through the Vulkan seam, batched GPU-routed prefill. The
