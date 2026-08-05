@@ -49,6 +49,9 @@ at that index. It holds:
   self-conditioning.
 - [mtp.md](mtp.md) — multi-token prediction (MTP) speculative decoding for
   qwen35's single NextN head (issue #33).
+- [deepseek.md](deepseek.md) — the DeepSeek family port plan (V1 → V2/V3 → V3.2
+  → V4), staged around the fact that only the first two stages have a model
+  small enough to develop against. Nothing implemented yet.
 
 ## Roadmaps & history
 
