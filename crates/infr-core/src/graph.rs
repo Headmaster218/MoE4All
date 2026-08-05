@@ -255,6 +255,34 @@ pub enum Op {
         mask: AttnMask,
         pos: u32,
     },
+    /// Multi-head Latent Attention (DeepSeek V2/V3). Absorbed form: one compressed K row per token
+    /// (V is an aliased prefix view), `wk_b` absorbs Q nope into the latent space before the dot
+    /// product, and `wv_b` maps the attention output back to per-head space. See `docs/deepseek.md`.
+    Mla {
+        /// Query: `rows × n_head × q_head_dim` (`[nope|rope]` per head, q_pe already rope'd).
+        q: TensorId,
+        /// KV cache: `kv_len × key_length` (key_length = kv_lora_rank + qk_rope_dim, 576 for V3).
+        /// One row per token. V is the first `kv_lora_rank` columns — aliased, no separate cache.
+        k_cache: TensorId,
+        /// Absorption weight: `[n_head, kv_lora_rank, qk_nope_dim]`. Per head `wk_b[h]ᵀ` maps
+        /// each head's q_nope (128) into the latent space (512) before dotting with K.
+        wk_b: TensorId,
+        /// Output weight: `[n_head, kv_lora_rank, v_head_dim]`. Applied AFTER the KQV product per
+        /// head to map the attention output (512-wide) back to per-head output dim (128).
+        wv_b: TensorId,
+        dst: TensorId,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        q_head_dim: u32,
+        kv_lora_rank: u32,
+        qk_nope_dim: u32,
+        qk_rope_dim: u32,
+        v_head_dim: u32,
+        scale: f32,
+        mask: AttnMask,
+        pos: u32,
+    },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
     /// shifts the `up` read by a whole-element offset so a layer-major slice of a bigger buffer can
@@ -566,6 +594,7 @@ impl Op {
             Op::QkNormRope { .. } => "QkNormRope",
             Op::WriteKv { .. } => "WriteKv",
             Op::Attention { .. } => "Attention",
+            Op::Mla { .. } => "Mla",
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
@@ -645,6 +674,14 @@ impl Op {
                 dst,
                 ..
             } => (vec![q, k_cache, v_cache], vec![dst]),
+            Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                ..
+            } => (vec![q, k_cache, wk_b, wv_b], vec![dst]),
             Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
             Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),
@@ -789,6 +826,9 @@ impl Graph {
                     } => {
                         set.insert(*k_cache);
                         set.insert(*v_cache);
+                    }
+                    Op::Mla { k_cache, .. } => {
+                        set.insert(*k_cache);
                     }
                     _ => {}
                 }

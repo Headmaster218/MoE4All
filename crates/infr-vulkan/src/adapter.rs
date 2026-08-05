@@ -4276,6 +4276,7 @@ fn lower_op(
                 b.into_transient(transient);
             }
         }
+        Op::Mla { .. } => todo!("Vulkan MLA attention kernel"),
     }
     Ok(())
 }

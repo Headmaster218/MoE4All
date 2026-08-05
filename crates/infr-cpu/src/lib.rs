@@ -2776,6 +2776,7 @@ impl Backend for CpuBackend {
                     );
                     vals[dst.0 as usize] = out;
                 }
+                Op::Mla { .. } => todo!("CPU MLA attention kernel"),
             }
             if let Some(t0) = __t0 {
                 let e = op_times
