@@ -601,6 +601,9 @@ impl Backend for CpuBackend {
             // The interpreter's WriteKv/Attention honor ring KV caches (row = pos % cap_rows), so
             // the runner may window-size SWA layers' caches here.
             kv_swa_ring: true,
+            // `execute`'s write-back loop copies every mutated f32 `Input` back into its bound
+            // buffer (`infr_core::exec::writes_back`), so a value the ops advanced survives.
+            graph_input_inplace: true,
         }
     }
 

@@ -2143,6 +2143,10 @@ impl VulkanBackend {
             // Every KV write/read kernel maps position -> row modulo the cache's row capacity
             // (identity on full-context caches), so SWA layers may get window-sized ring caches.
             kv_swa_ring: true,
+            // `execute_static`/the replay tape dispatch straight against the bound buffers (only
+            // `Internal` handles get backend scratch — see `alloc_scratch`), so an op writing a
+            // bound `Input` writes the caller's memory and the next execute sees it.
+            graph_input_inplace: true,
         };
 
         // Publish the device class BEFORE any caller can size a prefill chunk against it (the seam

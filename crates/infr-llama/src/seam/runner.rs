@@ -1210,8 +1210,35 @@ pub(crate) fn generate_dense_backend(
                  // Sets `Graph::mtp_verify` — see that field's doc. `true` from ONLY the
                  // speculative-VERIFY call site below (this fn's `verify` param is `Some`);
                  // `false` from every other caller (decode loop, batched prefill, DG denoise).
-                 mtp_verify: bool|
+                 mtp_verify: bool,
+                 // LAYER SPAN: emit the ops for `span` only, and carry the residual stream in a
+                 // caller-owned buffer instead of graph scratch — `hidden` becomes an `Input` the
+                 // caller binds and the ops mutate in place, so a span that is not the whole model
+                 // can be chained with the spans around it (`Capabilities::graph_input_inplace` is
+                 // what makes that chaining real; the seam's layer-major prefill is the caller).
+                 // `None` = the whole model with `hidden` as scratch — every other call site, and
+                 // byte-identical to what they built before the parameter existed.
+                 span: Option<std::ops::Range<usize>>|
      -> (Graph, DecodeHandles) {
+        let (l_first, l_end) = match &span {
+            Some(r) => (r.start, r.end),
+            None => (0, c.n_layer),
+        };
+        // A partial span's last layer is not `output_norm`'s input, so an LM head over it would be
+        // reading a half-computed residual stream. Every span caller is headless by construction
+        // (batched prefill); this is the guard that keeps it that way.
+        assert!(
+            l_end == c.n_layer || logits_rows == 0,
+            "a partial layer span cannot carry the LM head (logits_rows={logits_rows})"
+        );
+        // gemma4-E2B's layer loop reads `per_layer_inp`, which the PROLOGUE computes — a span that
+        // skips the prologue has no way to hand it over (it is a whole `[batch, n_layer*npl]`
+        // tensor, not part of the residual stream). E2B prefills token-by-token today and never
+        // asks for a span; reject it here rather than emit a graph with an unbound read.
+        assert!(
+            l_first == 0 || !e2b,
+            "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
+        );
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
@@ -1234,10 +1261,16 @@ pub(crate) fn generate_dense_backend(
         let vd = |n: usize| TensorDesc::new(vec![n], v_fmt);
         let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
         // GPU embed gather: `hidden` becomes an Internal computed by the Op::EmbedGather pushed
-        // just before the first layer op (after the table weight handle is declared).
+        // just before the first layer op (after the table weight handle is declared) — unless a
+        // layer span asked for it in a caller-owned buffer, where the gather writes the Input.
         let (hidden, tok_ids) = if use_ids {
             let ids = g.input(TensorDesc::new(vec![batch], DType::I32));
-            (g.internal(f32d(batch * ne)), Some(ids))
+            let h = if span.is_some() {
+                g.input(f32d(batch * ne))
+            } else {
+                g.internal(f32d(batch * ne))
+            };
+            (h, Some(ids))
         } else {
             (g.input(f32d(batch * ne)), None)
         };
@@ -1656,9 +1689,13 @@ pub(crate) fn generate_dense_backend(
 
         let eps = c.rms_eps;
 
+        // Everything from here to the layer loop is the PROLOGUE: it produces the layer stack's
+        // input from the token ids, so it belongs to the span that starts at layer 0. A later span
+        // reads the residual stream the earlier one left in the bound `hidden` buffer instead.
+        let prologue = l_first == 0;
         // GPU embed gather: materialize `hidden` from the token ids ON the device — the first op
         // of the graph, so every consumer below is unchanged. Bakes Gemma's sqrt(n_embd) scale.
-        if let (Some(ids), Some(tbl)) = (tok_ids, w_embd) {
+        if let (Some(ids), Some(tbl), true) = (tok_ids, w_embd, prologue) {
             g.push(Op::EmbedGather {
                 ids,
                 table: tbl,
@@ -1670,7 +1707,7 @@ pub(crate) fn generate_dense_backend(
         }
         // gemma4-E2B: the per-layer token rows from the resident table — same gather, same ids,
         // scale = sqrt(npl) (mirrors the host `e2b_ipl_rows`).
-        if pl_gathered {
+        if pl_gathered && prologue {
             if let (Some(ids), Some(tbl), Some(dst)) = (tok_ids, w_ple, pl_tok_in) {
                 g.push(Op::EmbedGather {
                     ids,
@@ -1742,7 +1779,7 @@ pub(crate) fn generate_dense_backend(
         // instead of the Phase-A fully-baked residual). Runs BEFORE the layer loop below, which
         // reads/mutates `hidden` in place exactly as every other caller's — no change needed
         // there.
-        if let Some(sc_on) = gpu_sc {
+        if let (Some(sc_on), true) = (gpu_sc, prologue) {
             if sc_on {
                 let sc_logits_in =
                     sc_logits_in.expect("gpu_sc(true) plan always declares sc_logits_in");
@@ -1863,7 +1900,7 @@ pub(crate) fn generate_dense_backend(
             });
         }
 
-        for (l, lw) in lw.iter().enumerate() {
+        for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
             let nkv = c.layer_n_kv(l);
@@ -3245,6 +3282,7 @@ pub(crate) fn generate_dense_backend(
                 false, // gpu_sample: same
                 false, // use_ids: the canvas rows are soft-embeds, not token ids
                 false, // mtp_verify: DG denoise is never an MTP-verify batch
+                None,  // span: the whole model in one graph
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
@@ -3542,6 +3580,7 @@ pub(crate) fn generate_dense_backend(
             false,
             false,
             true, // mtp_verify: this IS the speculative-VERIFY batched forward
+            None, // span: the whole model in one graph
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
@@ -3791,6 +3830,21 @@ pub(crate) fn generate_dense_backend(
                     .map_err(|e| anyhow!("{e}"))?;
                 b
             };
+            // The residual stream. A layer-span build (below) carries `hidden` in a CALLER-owned
+            // buffer rather than graph scratch, so the chunk owns one: on the host-embed path the
+            // uploaded rows already ARE the layer stack's input and `pf_hidden_buf` serves, while
+            // the gpu_embed path uploads ids there and the in-graph gather needs somewhere to
+            // write. Sized EXACTLY like the `[batch, n_embd]` handle it binds — the interpreters'
+            // write-back is a length-checked `copy_from_slice` against the declared numel, and the
+            // host-embed path has always bound this shape, so nothing writes past it.
+            let pf_resid_buf = if gpu_embed {
+                Some(
+                    be.alloc(pf_m * ne * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            };
             // Absolute positions [cstart, ..., cend-1].
             let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
             let pf_pos_buf = be
@@ -3823,8 +3877,20 @@ pub(crate) fn generate_dense_backend(
             // requires this path to carry `logits_rows == pf_m` on demand, which Phase 2 will
             // add alongside the actual head forward.
             let (pf_g, pf_h) = build(
-                pf_m, cstart, 0, false, None, false, false, false, false, gpu_embed,
+                pf_m,
+                cstart,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                gpu_embed,
                 false, // mtp_verify: ordinary chunked prefill, not MTP verify
+                // The whole model in ONE graph, with the residual stream in the chunk's own
+                // buffer — the ops, and so the output, are exactly the spanless build's.
+                Some(0..c.n_layer),
             );
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
@@ -3833,6 +3899,13 @@ pub(crate) fn generate_dense_backend(
             match pf_h.tok_ids {
                 Some(ids) => {
                     pf_b.bind(ids, pf_hidden_buf.as_ref());
+                    pf_b.bind(
+                        pf_h.hidden,
+                        pf_resid_buf
+                            .as_ref()
+                            .expect("a gpu_embed chunk always allocates the residual buffer")
+                            .as_ref(),
+                    );
                 }
                 None => {
                     pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
@@ -3939,6 +4012,7 @@ pub(crate) fn generate_dense_backend(
         let (g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
             false, // mtp_verify: ordinary per-token decode, not MTP verify
+            None,  // span: the whole model in one graph
         );
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
@@ -4198,6 +4272,7 @@ pub(crate) fn generate_dense_backend(
             let (g, h) = build(
                 1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
                 false, // mtp_verify: ordinary per-token decode, not MTP verify
+                None,  // span: the whole model in one graph
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();

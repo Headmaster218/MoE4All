@@ -498,6 +498,9 @@ impl Backend for PipelineBackend {
         c.gpu_sample = false;
         c.argmax_rows = false;
         c.argmax_prob = false;
+        // The residual stream crosses devices between stages, so the caller's buffer is not what
+        // the later layers wrote.
+        c.graph_input_inplace = false;
         c
     }
 

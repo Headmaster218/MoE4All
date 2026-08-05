@@ -192,6 +192,20 @@ pub struct Capabilities {
     /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
     /// by position (Metal) leave this false and get full-context allocations for every layer.
     pub kv_swa_ring: bool,
+    /// What the ops write into a bound f32 [`TensorKind::Input`] is visible to the NEXT `execute`
+    /// that binds the same buffer — either because the backend dispatches straight against the
+    /// caller's buffer (Vulkan: only `Internal` handles get backend scratch) or because the
+    /// executor copies every mutated f32 Input back at the end of the call
+    /// ([`crate::exec::writes_back`] — the CPU reference and Metal). FALSE is for a backend that
+    /// rewrites or redistributes the graph and hands the results between its own buffers (the
+    /// multi-GPU TP/EP/pipeline wrappers), where the caller's copy is only ever an entry value.
+    ///
+    /// Only a caller that threads state ACROSS executes needs this — within one call every backend
+    /// behaves the same, which is why `hidden` has always been a bound Input on the host-embed
+    /// path. The seam's layer-major prefill is the consumer: it carries the residual stream from
+    /// one layer's dispatch to the next through exactly such a buffer, and keeps the chunk-major
+    /// order on a backend that answers false.
+    pub graph_input_inplace: bool,
 }
 
 /// The DEFAULT prefill chunk (rows) for an INTEGRATED GPU with `cu` compute units (0 = unknown).

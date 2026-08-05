@@ -392,6 +392,9 @@ impl Backend for MetalBackend {
             // Metal's KV kernels index rows directly by position — no ring mapping; the runner
             // keeps full-context KV allocations for SWA layers here.
             kv_swa_ring: false,
+            // Same write-back set as the CPU reference (`infr_core::exec::writes_back`): a mutated
+            // f32 `Input` is copied back into its bound buffer at the end of the call.
+            graph_input_inplace: true,
         }
     }
 

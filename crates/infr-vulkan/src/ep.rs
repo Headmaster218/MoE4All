@@ -397,6 +397,9 @@ impl Backend for ExpertParallelBackend {
         c.gpu_sample = false;
         c.argmax_rows = false;
         c.argmax_prob = false;
+        // The segment executor hands `hidden` between ranks through its own buffers; the caller's
+        // is only read at the start of a step.
+        c.graph_input_inplace = false;
         c
     }
 
