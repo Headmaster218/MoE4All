@@ -55,8 +55,10 @@ at that index. It holds:
 
 ## Roadmaps & history
 
-- [plan.md](plan.md) — the original master project plan (historical). Most of it
-  shipped against autoregressive decoders; kept for context.
+- [plan.md](plan.md) — the whole-system shape in one place: what shipped against
+  the original MVP, the crate layout and backend seam, the step-by-step recipe
+  for **adding a model architecture**, the ranked candidate families, and the
+  original milestones as history.
 - [train.md](train.md) — LLM training support plan (not yet built).
 
 ## Audit

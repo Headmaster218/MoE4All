@@ -957,6 +957,31 @@ Worth knowing either way: `rustup target list --installed` claimed
 cross-check has to be run against a target confirmed in the sysroot.
 `x86_64-apple-darwin` gates identically and was actually installed.
 
+### B38 — doc drift found while rewriting `docs/plan.md` (2026-08-05)
+
+**Tag:** docs · **Blocked on:** nothing; scoped out of the plan.md rewrite,
+which deliberately touched only that file
+
+Two things the rewrite surfaced and did not fix, both verified against the tree
+on 2026-08-05:
+
+- **The root `README.md` supported-models table has no BitNet rows.**
+  `infr_llama::arch::ALL` carries `bitnet` and `bitnet-b1.58` (landed in
+  `5b44ef9` and `dbc8431` — llama skeleton + SubLN, TQ2_0 / i2_s ternary
+  weights), so the engine accepts two families the README does not advertise. A
+  reader picking models off that table concludes they are unsupported. Fix is
+  two table rows plus a line in the `Scope` list; the arch consts' own doc
+  comments already say what to write.
+- **`docs/config-plan.md` was deleted (`3010e45`, campaign complete) and 74
+  references to it survive** across `docs/config.md` and code comments in
+  `infr-cpu`, `infr-cli`, `infr-vulkan` and `crates/infr-cpu/tests`. Most cite a
+  section number (`§10.6`, `R6`, `R4/R6`) as the rationale for a design
+  decision, so they are not simply deletable: the reasoning they point at is now
+  only in `git log`. Either restore the sections that are still load-bearing
+  into `docs/config.md` and repoint, or replace each citation with the reason it
+  was standing in for. Count is from
+  `grep -rn "config-plan.md" --include=*.md --include=*.rs .`
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
