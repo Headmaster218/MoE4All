@@ -79,9 +79,16 @@ def bench(model, dev, limit, flags, dram=None, cache=None):
         # differ in where the weights live as well as in what backs the misses, and the comparison
         # says nothing about the host tier.
         cmd += ["--set", f"paging.cache={cache}"]
-    if dram:
-        # The host weight cache (`paging.dram`): weights read from the file into our own arena
-        # under our own eviction policy, instead of mapped and left to the page cache.
+    # The host weight cache (`paging.dram`): weights read from the file into our own arena under
+    # our own eviction policy, instead of mapped and left to the page cache.
+    #
+    # `dram=None` is the MMAP arm and must say `0` — the OFF switch — not simply omit the flag.
+    # An omitted flag now means "size it yourself", so the baseline would quietly become a second
+    # paged run and the comparison would report ~1.0x for a tier that is doing plenty.
+    # `dram="auto"` omits it on purpose, which is what measures the automatic sizing.
+    if dram is None:
+        cmd += ["--set", "paging.dram=0"]
+    elif dram != "auto":
         cmd += ["--set", f"paging.dram={dram}"]
     drop_cache(model)
     out, ru = run(cmd, limit)
@@ -99,7 +106,8 @@ def main():
     ap.add_argument("--gen", type=int, default=32, help="decode tokens (-n)")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--dram", default=None,
-                    help="also run each limit with this paging.dram budget (e.g. `1g`)")
+                    help="also run each limit with this paging.dram budget (e.g. `1g`), or "
+                         "`auto` to leave the budget unset and measure the engine's own sizing")
     ap.add_argument("--cache", default=None,
                     help="paging.cache (VRAM paging budget), applied to BOTH arms — how a GPU run "
                          "is forced onto the streaming path")

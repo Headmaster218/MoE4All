@@ -15,11 +15,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `serve` at the start of each request. New `infr_gguf::watch::WeightWatch`,
   re-exported as `infr_llama::WeightWatch`.
 
-- `INFR_DRAM_CACHE` / `paging.dram`: a host weight cache, read from the model
-  file into a bounded arena under the engine's own cyclic-sweep eviction policy
-  instead of being mapped and left to the OS page cache. Off by default (the
-  zero-copy mmap path is unchanged and is right whenever the weights fit); a
-  budget too small to seat a weight class leaves that class mapped and says so.
+- **A model that does not fit now streams from disk on its own.** Weights that
+  fit stay exactly as they were — resident on the GPU, or zero-copy mmap on the
+  CPU backend, with no arena and no copies. Only when they do not fit does the
+  engine page them `DISK → DRAM → VRAM` (`DISK → DRAM` on the CPU backend),
+  sizing the DRAM arena from the host memory actually available rather than
+  requiring a budget nobody could guess. Measured on Qwen3-14B Q8_0 under an 8
+  GB cap, the automatic budget lands on the same 7.4 GB that measured **2.17x
+  faster decode than the mmap path** it replaces.
+  - The probe honours **cgroup memory limits** (v2 and v1, tightest ancestor),
+    not just `/proc/meminfo` — inside an 8 GiB container the host file still
+    reports the whole machine, and sizing an anonymous arena from that is an OOM
+    kill. Linux only; other platforms report "unknown" and keep the mmap path
+    unless a budget is set by hand.
+  - **Unified-memory devices (iGPU, APU) deliberately do not get a second
+    tier.** Their streaming arena is already host RAM, so a tier beneath it
+    would hold blocks the GPU cannot read in place — strictly worse than raising
+    `INFR_CACHE`. The run says so rather than silently spending the memory.
+- `INFR_DRAM_CACHE` / `paging.dram`: the host weight cache's budget. **Unset now
+  means "size it automatically"**; a value pins the arena and wins over every
+  automatic decision (including on a machine where the model would have fit,
+  which is how the streaming path gets exercised at all); and **`0` turns it off
+  entirely**, which is what an A/B against the mmap path needs. A budget too
+  small to seat a weight class leaves that class mapped and says so.
   - **CPU backend**: every weight above 1 MiB. Measured on a memory-capped
     Llama-3.2-1B F16: decode 2.06x faster at a 1.5 GB cap with 210x fewer major
     faults, prefill 3-7.5% slower (`docs/perf/results.md`).
@@ -33,9 +51,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     replaces** at an 8 GB cap with a 7 GB arena (1.41x with a 3 GB one), 38x
     fewer major faults, 232 → 110 GB read, and parity when memory is plentiful
     (`docs/perf/results.md`). The arena budget is the dominant factor — 3 GB → 7
-    GB is worth 1.6x on its own — and it has no auto-sizing yet, so set
-    `paging.dram` as large as the host can spare. Still off by default: the
-    measurement covers one GPU, one drive and Linux only.
+    GB is worth 1.6x on its own — which is why it is now sized automatically
+    rather than left to a guess. The measurement covers one GPU, one drive and
+    Linux only.
   - `INFR_PAGER_STATS=1` reports hit rate, reads and bytes for each tier.
   - The host arena admits a block on its SECOND miss, not its first. A tier
     above only calls down on its own misses, so first-miss admission filled the

@@ -6,15 +6,15 @@ itself, read by explicit positioned I/O rather than left to the OS page cache.
 
 Status: **phases 0–3 landed and the tier now beats mmap on both backends** (CPU
 2.06x at a 1.5 GB cap, Vulkan 2.17x on decode at an 8 GB cap with a 7 GB arena —
-`docs/perf/results.md`). Phase 4 is not built; phase 5 is two levers in (the
-concurrent reader and the admission doorkeeper, together 0.79x → 1.41x at a
-fixed 3 GB budget) and its top remaining item is auto-sizing that budget, worth
-a further 1.6x. §5 says what each phase delivered and what it deferred; §7 holds
-the questions still open, including whether phase 4 should be attempted at all
-on a machine that cannot run it. Claims about the tree name the file and symbol
-they came from. Numbers come from a command that was run, not an estimate; the
-one worked example in §2 is labelled as illustrative arithmetic, not a
-prediction.
+`docs/perf/results.md`), **and turns itself on when a model does not fit**
+(§4.1) rather than waiting for a budget nobody could guess. Phase 4 is not
+built; phase 5 is three levers in — the concurrent reader, the admission
+doorkeeper, and auto-sizing. §5 says what each phase delivered and what it
+deferred; §7 holds the questions still open, including whether phase 4 should be
+attempted at all on a machine that cannot run it. Claims about the tree name the
+file and symbol they came from. Numbers come from a command that was run, not an
+estimate; the one worked example in §2 is labelled as illustrative arithmetic,
+not a prediction.
 
 ## 1. What exists today
 
@@ -465,15 +465,57 @@ Two new keys in the `paging` section of `infr-core/src/config/manifest.rs`,
 following the spellings already there (`paging.cache`, `paging.ring`,
 `paging.stats`):
 
-| env                | key           | type | meaning                                                         |
-| ------------------ | ------------- | ---- | --------------------------------------------------------------- |
-| `INFR_DRAM_CACHE`  | `paging.dram` | Size | DRAM tier budget; `0` disables the tier (mmap path unchanged)   |
-| `INFR_DISK_STREAM` | `paging.disk` | Flag | Enable the disk tier; unset = auto, only when the plan needs it |
+| env               | key           | type | meaning                                                       |
+| ----------------- | ------------- | ---- | ------------------------------------------------------------- |
+| `INFR_DRAM_CACHE` | `paging.dram` | Size | DRAM tier budget — unset = automatic, `0` = off, `N` = pinned |
+
+**LANDED with three states, not two.** Unset means SIZE IT AUTOMATICALLY (see
+below); a value pins the arena and wins over every automatic rung; and `0` turns
+the tier off entirely. The third state is not decoration — once unset stopped
+meaning "off", there was no way left to A/B the tier against the mmap path it
+replaces, and `scripts/paging-baseline.py`'s baseline arm had silently become a
+second paged run until it was fixed to pass `paging.dram=0`.
+
+**`INFR_DISK_STREAM` / `paging.disk` was never built and is withdrawn.** It
+would have been a flag asking the user to say something the placement ladder
+already knows: both Vulkan tiers are only reached once residency was REJECTED,
+and the CPU backend can compare the pageable bytes against available RAM itself.
+Turning the tier on is therefore a consequence of the model not fitting, not a
+switch.
+
+**`INFR_CACHE` (`paging.cache`) keeps its meaning** — the VRAM paging budget —
+and is the other half of the testing story: capping it is what forces residency
+to be rejected on hardware that would otherwise hold the model, and
+`INFR_DRAM_CACHE` then pins what sits underneath. Every figure in
+`docs/perf/results.md` was taken that way on a card with room to spare.
 
 Reader threads, prefetch depth and page-cache dropping are **hardcoded** until a
 measurement says otherwise — a knob with no known good value is a question
-shipped to the user. `INFR_CACHE` (`paging.cache`) keeps its current meaning
-(the VRAM paging budget); `INFR_PAGER_STATS` grows per-tier lines.
+shipped to the user. `INFR_PAGER_STATS` grows per-tier lines.
+
+### 4.1 How the automatic budget is decided
+
+`infr_core::hostmem`. The probe and the arithmetic are separate so the policy is
+testable without a machine that happens to have the right amount of RAM free.
+
+- **`available_bytes`** — Linux reads `MemAvailable` (the kernel's own estimate
+  of what a new allocation can have without swapping, so reclaimable page cache
+  is already accounted for) and then takes the MINIMUM with the tightest cgroup
+  ancestor's `memory.max - memory.current` (v2) or
+  `limit_in_bytes - usage_in_bytes` (v1). The cgroup half is not optional:
+  `/proc/meminfo` is host-wide, and measured on this box an 8 GiB `systemd-run`
+  scope still reports 54.6 GB available — sizing an anonymous arena from that is
+  an OOM kill in every container. Verified at 53.57 GB unconstrained, 8.59 GB
+  under an 8 GiB cap, 2.15 GB under 2 GiB. Other platforms answer `None`, which
+  callers treat as "do not auto-size" and never as "assume plenty".
+- **`auto_arena_bytes`** — leaves the larger of 1 GiB and an eighth of what is
+  available, never budgets past the pageable bytes (more would buy nothing), and
+  returns 0 below a floor worth having.
+- **`cpu_arena_plan` / `streaming_arena_plan`** — the two decisions, differing
+  in one rung: the Vulkan tiers are already past the fit decision, while the CPU
+  backend has to make it. Both answer with a reason when they decline, because
+  "we cannot tell" and "it fits" lead to opposite advice and must never be
+  collapsed into one silent `None`.
 
 ## 5. Phasing
 
@@ -596,9 +638,11 @@ nothing to hide it behind; the read was not too LATE, it was too SLOW. What is
 left is reading fewer bytes — the double-caching item below — not overlapping
 the reads.
 
-`paging.dram` remains off by default on the GPU path, but for a different reason
-than before: the performance case is made, and what is missing is coverage (one
-GPU, one drive, Linux only).
+`paging.dram` is **no longer off by default**: the performance case is made, so
+a run that has to stream now builds the tier and sizes it itself (§4.1). What is
+still missing is coverage — one GPU, one drive, Linux only — which is why the
+probe declines rather than guesses on platforms it cannot measure, and why `0`
+exists to turn the whole thing off.
 
 **Phase 4 — Metal / UMA collapse.** Arena, pager, offset binding, the
 `qui_cache` gate. Verification: Metal decode parity against CPU reference under
@@ -609,15 +653,15 @@ all.
 phase 3) already landed the one that mattered; what follows is ordered by what
 the measurement now says, which is NOT what this section said before it.
 
-- **Auto-size `paging.dram` — the top lever, and it is not code in this tier at
-  all.** The budget alone moves decode 0.24 → 0.29 → 0.39 t/s at 3, 6 and 7 GB
-  under an 8 GB cap (mmap: 0.18), so the value a user has to guess is worth
-  **1.6x**, and an unset budget disables the tier entirely. `vulkan_host_tier`
-  reads `ec.paging.dram` and returns an all-`None` tier when it is missing;
-  nothing probes host memory on any platform, which is §7's question 3. Answer
-  that question, then size from it. The arena must stay ANONYMOUS memory for a
-  large budget to be safe — the kernel reclaims page cache in its favour, which
-  is why 7 GB under an 8 GB cap does not thrash (major faults flat at ~1 700).
+- **Auto-size `paging.dram` — LANDED, and it was the top lever.** The budget
+  alone moves decode 0.24 → 0.29 → 0.39 t/s at 3, 6 and 7 GB under an 8 GB cap
+  (mmap: 0.18), so the value a user used to have to guess was worth **1.6x** —
+  and an unset budget used to disable the tier entirely, on exactly the runs
+  that needed it. §4.1 has the sizing rule and §7's question 3 is answered
+  (Linux probes `MemAvailable` and the cgroup limit; other platforms decline
+  rather than guess). The arena must stay ANONYMOUS memory for a large budget to
+  be safe — the kernel reclaims page cache in its favour, which is why 7 GB
+  under an 8 GB cap does not thrash (major faults flat at ~1 700).
 - **Double-caching: CLOSED, the premise was wrong both ways.** This plan
   asserted that a buffered `pread` halves the tier's effective budget and that
   `posix_fadvise(DONTNEED)` **cannot** reclaim the duplicate because

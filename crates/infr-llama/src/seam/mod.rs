@@ -78,24 +78,72 @@ impl<'a> TokenEmbd<'a> {
 /// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
 /// copy: map an mmap slice zero-copy; alloc+upload owned bytes (the combined gate+up concat — never
 /// produced for CPU since `combined_gu` is false there, but stays correct if it ever is).
-/// Build the CPU backend's host weight cache when `paging.dram` asks for one, or `None` to keep
-/// the zero-copy mmap path.
+/// Build the CPU backend's host weight cache, or `None` to keep the zero-copy mmap path.
 ///
-/// The budget is only ever what the user set: this arena is anonymous, non-evictable memory (the
-/// cost backlog B30 measured), so nothing here picks a fraction of the machine's RAM on their
-/// behalf. Returns `None` — not an error — when the budget buys no pool at all, so a too-small
-/// value degrades to today's behaviour.
+/// # When this turns itself on
+/// **Only when the weights do not fit.** The CPU backend has no VRAM ladder to tell it that, the
+/// way the Vulkan paths do (see [`vulkan_host_tier`], whose callers are already past that
+/// decision), so it asks directly: do the pageable weights fit the host memory this machine can
+/// actually spare? If they do, the mmap path is right and stays — it is zero-copy, the page cache
+/// holds the model, and an arena would only add copies. If they do not, the page cache is about to
+/// thrash on the cyclic sweep a forward pass performs (`docs/perf/results.md` measured the
+/// collapse: decode 23-33x slower once the weights stop fitting), and the arena's own policy is
+/// what fixes it.
+///
+/// An explicit `paging.dram` always wins in BOTH directions — it forces the arena on a model that
+/// would have fit, and pins the size on one that would not. That is deliberate and must stay: a
+/// machine with enough RAM to hold the model is exactly the machine you want to exercise the
+/// streaming path on, so `INFR_DRAM_CACHE=<size>` is how a CPU run is put on it regardless of what
+/// the fit test would have decided.
+///
+/// Returns `None` — not an error — when nothing seats, so every degraded case falls back to
+/// today's behaviour rather than failing the load.
 fn cpu_paged_store(
     ec: &EngineConfig,
     g: &Gguf,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
-    let Some(budget) = ec
-        .paging
-        .dram
-        .map(|s| s.resolve(0) as usize)
-        .filter(|&b| b > 0)
-    else {
-        return Ok(None);
+    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
+    let explicit = infr_core::hostmem::Requested::from_config(ec.paging.dram.map(|s| s.resolve(0)));
+    // Only the weights this backend would actually page count toward "does it fit": the sub-floor
+    // tensors stay mapped either way, so counting them could page a model that fits.
+    let pageable: u64 = g
+        .tensors()
+        .iter()
+        .filter(|t| t.nbytes >= infr_cpu::paged::MIN_PAGED_BYTES)
+        .map(|t| t.nbytes as u64)
+        .sum();
+    let available = infr_core::hostmem::available_bytes();
+    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, pageable) {
+        infr_core::hostmem::ArenaPlan::Take(n) => {
+            if explicit == infr_core::hostmem::Requested::Auto {
+                tracing::info!(
+                    "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
+                     available, so they stream from disk through a {:.2} GB arena instead of the \
+                     OS page cache (set INFR_DRAM_CACHE to override)",
+                    pageable as f64 / 1e9,
+                    available.unwrap_or(0) as f64 / 1e9,
+                    n as f64 / 1e9,
+                );
+            }
+            n as usize
+        }
+        infr_core::hostmem::ArenaPlan::Skip(why) => {
+            use infr_core::hostmem::Skip;
+            // `Fits` and `NoProbe` are the ordinary paths — the weights are mapped, exactly as
+            // before this tier existed — so neither says anything. `TooLittle` is the one case
+            // where the run is about to be slow for a reason the user can act on.
+            if why == Skip::TooLittle {
+                tracing::warn!(
+                    "host paging: {:.2} GB of weights do not fit the {:.2} GB of host memory \
+                     available, but too little is free to seat a useful arena — falling back to \
+                     the OS page cache, which thrashes on a forward pass's cyclic sweep. Free \
+                     memory, or set INFR_DRAM_CACHE explicitly",
+                    pageable as f64 / 1e9,
+                    available.unwrap_or(0) as f64 / 1e9,
+                );
+            }
+            return Ok(None);
+        }
     };
     let plans = infr_cpu::paged::plan_pools(budget, g.tensors());
     if plans.is_empty() {
@@ -126,24 +174,93 @@ fn cpu_paged_store(
 /// `classes` is `(slot stride, block count)` per pool, in pool order; the result matches that
 /// order, `None` where the budget seated nothing. `what` names the caller in the log line — the
 /// dense streaming pools and the MoE expert pools both come through here, and a run reporting one
-/// arena should say which. Same policy as [`cpu_paged_store`], for the same reasons: the budget is
-/// only ever what the user set (this arena is anonymous, non-evictable memory), and a budget too
-/// small to seat a pool leaves that pool on the mmap path rather than failing the load.
+/// arena should say which. A budget too small to seat a pool leaves that pool on the mmap path
+/// rather than failing the load.
+///
+/// # Where the budget comes from
+/// **Both call sites are already past the point where the model did not fit VRAM** — dense
+/// streaming and the paged MoE cache are each only reached when residency was rejected — so
+/// reaching here IS the signal that this run has to stream. An explicit `paging.dram` still wins;
+/// otherwise the budget is sized from what the host can actually spare
+/// ([`infr_core::hostmem`]), because a tier that is off by default helps nobody on the one run
+/// that needs it, and the alternative is a user guessing a number that is worth 1.6x
+/// (`docs/perf/results.md`).
+///
+/// # Forcing this path on hardware that would not take it
+/// Auto-sizing never REPLACES the two knobs, because a machine big enough to hold the model
+/// resident is exactly the machine you want to test streaming on. `INFR_CACHE` (`paging.cache`)
+/// caps the VRAM paging budget, which is what forces residency to be rejected and this function to
+/// be reached at all; `INFR_DRAM_CACHE` (`paging.dram`) then pins this arena's size instead of
+/// letting it be measured. Both together are how every figure in `docs/perf/results.md` was taken
+/// on a card that would otherwise have kept the model resident — e.g. `--cache 2g --dram 3g`.
+///
+/// # Unified memory has only ONE host tier, and it is the arena above this one
+/// `unified` is `DeviceCaps::unified_memory` — an iGPU or APU whose "VRAM" IS system RAM. There the
+/// arena above already sits in host memory, so a host tier beneath it would hold extra blocks in
+/// the same RAM that the GPU CANNOT read directly: every hit would still be copied through the
+/// staging ring, while the identical bytes spent on the arena above are read in place. It is not
+/// merely double-counted, it is strictly worse than making that arena bigger. So auto-sizing
+/// declines on unified memory and says why; an explicit `paging.dram` is still honoured, because a
+/// user asking for it by name may be working around something this does not model.
 fn vulkan_host_tier(
     ec: &EngineConfig,
     g: &Gguf,
     what: &str,
     classes: &[(usize, usize)],
+    unified: bool,
 ) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
     let unpaged = || vec![None; classes.len()];
-    let Some(budget) = ec
-        .paging
-        .dram
-        .map(|s| s.resolve(0) as usize)
-        .filter(|&b| b > 0)
-    else {
-        return Ok(unpaged());
-    };
+    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
+    let explicit = infr_core::hostmem::Requested::from_config(ec.paging.dram.map(|s| s.resolve(0)));
+    let available = infr_core::hostmem::available_bytes();
+    let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
+    let budget =
+        match infr_core::hostmem::streaming_arena_plan(explicit, available, unified, pageable) {
+            infr_core::hostmem::ArenaPlan::Take(n) => {
+                if explicit == infr_core::hostmem::Requested::Auto {
+                    tracing::info!(
+                    "{what} host tier: sized automatically to {:.2} GB of {:.2} GB available host \
+                     memory (set INFR_DRAM_CACHE to override)",
+                    n as f64 / 1e9,
+                    available.unwrap_or(0) as f64 / 1e9,
+                );
+                }
+                n as usize
+            }
+            infr_core::hostmem::ArenaPlan::Skip(why) => {
+                use infr_core::hostmem::Skip;
+                match why {
+                    Skip::Unified => tracing::info!(
+                    "{what} host tier: not built — this device's memory IS host memory, so the \
+                     streaming arena above already lives in RAM and a tier beneath it would spend \
+                     the same bytes on blocks the GPU cannot read in place. Raise the paging \
+                     budget (INFR_CACHE) instead; INFR_DRAM_CACHE still forces one"
+                ),
+                    Skip::NoProbe => tracing::warn!(
+                    "{what} host tier: this model must stream, but there is no host-memory probe \
+                     on this platform, so the arena cannot be sized automatically — set \
+                     INFR_DRAM_CACHE to page weights through DRAM instead of leaving them to the \
+                     OS page cache"
+                ),
+                    Skip::TooLittle => tracing::warn!(
+                    "{what} host tier: this model must stream, but only {:.2} GB of host memory \
+                     is available — too little to seat a useful arena, so the weights stay on the \
+                     OS page cache. Free memory, or set INFR_DRAM_CACHE explicitly",
+                    available.unwrap_or(0) as f64 / 1e9,
+                ),
+                    // Off by name: say so once, because a user who set it and then wonders why
+                    // streaming is slow should find the reason in the log.
+                    Skip::Disabled => tracing::info!(
+                        "{what} host tier: disabled by paging.dram=0 — weights stream from the OS \
+                     page cache instead of an arena"
+                    ),
+                    // Unreachable here by construction: `streaming_arena_plan` is for callers already
+                    // past the fit decision, so it never answers `Fits`.
+                    Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
+                }
+                return Ok(unpaged());
+            }
+        };
     let slots = infr_core::hostpager::plan_slots(budget, classes);
     if slots.iter().all(|&n| n == 0) {
         tracing::warn!(
@@ -1532,7 +1649,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // `Host` bank can name it. Pool order is preserved, so pool `i`'s tier is `moe_host[i]`.
             let classes: Vec<(usize, usize)> =
                 pool_blocks.iter().map(|&(_, sb, nb)| (sb, nb)).collect();
-            let host_tier = vulkan_host_tier(ec, g, "MoE", &classes)?;
+            let host_tier =
+                vulkan_host_tier(ec, g, "MoE", &classes, vk.capabilities().unified_memory)?;
             moe_host = pool_blocks
                 .iter()
                 .zip(&host_tier)
@@ -1872,7 +1990,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // The tier below VRAM, sized before the pools so a `Host` source can name it. Pool
             // order is preserved, so pool `i`'s host tier is `dense_host[i]`.
             let classes: Vec<(usize, usize)> = pools.iter().map(|&(_, s, nb)| (s, nb)).collect();
-            dense_host = vulkan_host_tier(ec, g, "dense", &classes)?;
+            dense_host =
+                vulkan_host_tier(ec, g, "dense", &classes, vk.capabilities().unified_memory)?;
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
                 .enumerate()

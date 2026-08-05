@@ -677,26 +677,38 @@ of its own run, because the two alternate within one invocation:
 | unlimited | dram `3g` |    110.7 |     1.75 |     1 568 |   15 GB |
 | 8 GB      | mmap      |     11.3 |     0.18 |    66 108 |  232 GB |
 | 8 GB      | dram `3g` |     15.6 |     0.24 |     1 653 |  174 GB |
-| 8 GB      | dram `7g` | **25.0** | **0.39** |     1 728 |  110 GB |
+| 8 GB      | dram `7g` |     25.0 |     0.39 |     1 728 |  110 GB |
+| 8 GB      | dram auto | **24.3** | **0.38** |     1 913 |  110 GB |
 
-**The tier beats the mmap it replaces by 2.17x on decode** and 2.21x on prefill
-at a 7 GB arena under the cap, **1.41x** at a 3 GB one, and is at parity when
-memory is plentiful (1.75 vs 1.74 — it does not regress the case it is not for).
-Major faults are **38x** lower under the cap and read volume falls 232 → 110 GB.
+The `mmap` arms pass `paging.dram=0` explicitly. That matters now that an unset
+budget means "size it yourself": omitting the flag would quietly make the
+baseline a second paged run and report a ratio near 1.0 for a tier doing plenty.
 
-**The budget is the biggest lever in the whole feature, and nothing sets it.**
-The only difference between the last two rows is `paging.dram`: 3 GB → 7 GB is
-worth **1.6x on its own** (0.24 → 0.39), because a bigger arena means fewer
-bytes read per pass and this regime is bound by nothing else. `paging.dram` has
-no auto-sizing — an unset budget disables the tier entirely — so a user who
-guesses low gets a fraction of what is here. Backlog **B36**. Note the arena
-must stay ANONYMOUS memory for a large budget to be safe: the kernel then
-reclaims page cache in its favour, which is why a 7 GB arena under an 8 GB cap
-does not thrash (major faults flat at ~1 700). The "double-caching halves the
-budget" claim this document and the plan both used to carry was **wrong**, and a
-`mincore` probe is what settled it.
+**The tier beats the mmap it replaces by 2.11x on decode** and 2.17x on prefill
+with the budget it picks ITSELF — no flags — and is at parity when memory is
+plentiful (1.75 vs 1.74; it does not regress the case it is not for). Major
+faults are 35x lower under the cap and read volume falls 232 → 110 GB.
 
-**Two fixes got the tier from 0.79x to here, and measurement found both.**
+**The automatic budget is worth as much as the hand-tuned one.** `auto` measured
+0.38/24.3 against the best budget found by sweeping, `7g`, at 0.39/25.0 — inside
+the run-to-run spread. It gets there by asking the host what it can spare
+(`MemAvailable`, floored by the tightest cgroup limit — see the plan's §4.1),
+leaving an eighth in reserve, and never budgeting past the pageable bytes. Under
+this 8 GB cap that lands on 7.44 GB, which is why it matches the swept answer.
+
+**The budget was the biggest lever in the whole feature, which is why it is no
+longer a question the user is asked.** `3g` against `7g` is worth **1.6x on its
+own** (0.24 → 0.39), because a bigger arena means fewer bytes read per pass and
+this regime is bound by nothing else. That used to be a number the user had to
+guess, with an unset budget disabling the tier outright on exactly the runs that
+needed it. Note the arena must stay ANONYMOUS memory for a large budget to be
+safe: the kernel then reclaims page cache in its favour, which is why a 7 GB
+arena under an 8 GB cap does not thrash (major faults flat at ~1 700). The
+"double-caching halves the budget" claim this document and the plan both used to
+carry was **wrong**, and a `mincore` probe is what settled it.
+
+**Three fixes got the tier from 0.79x to here, and measurement found all
+three.**
 
 _The reader, worth 1.29x/0.79x._ The tier sat at 0.79x of mmap on decode until
 `FileBlockIo::read_block` stopped being a single `pread`. A drive delivers its
@@ -718,6 +730,15 @@ down again. `INFR_PAGER_STATS` showed it plainly:
 could ever be hit. Admission now needs a SECOND miss, which no block the tier
 above keeps ever reaches. Useful hits per pass went 5 → 9, bytes read −10.5%,
 decode 0.22 → 0.24 and prefill 13.2 → 15.6.
+
+_Auto-sizing, worth 1.6x — and the one nobody could have got by reading code._
+Every figure above was taken with a budget picked by sweeping, which no user
+would do. The tier now measures what the host can spare and sizes itself,
+landing on 7.44 GB under this cap and within run-to-run noise of the swept
+answer. Two things had to be true for that to be safe: the budget is capped at
+the pageable bytes (past that it buys nothing), and the probe honours **cgroup
+limits** — `/proc/meminfo` reported 54.6 GB inside an 8 GiB scope, and sizing an
+anonymous arena from that figure is an OOM kill in any container.
 
 **Before that came a fix worth 1.6x, which the first measurement is what
 found.** The tier originally pinned each block in its arena and memcpy'd it to

@@ -832,25 +832,20 @@ of the slice that found it
 
 A read of the whole paging path (DISK `blockio`, DRAM `hostpager`, VRAM
 `infr-vulkan::pager`, the CPU `paged` pools and the seam placement) against the
-counters `INFR_PAGER_STATS` reports. The two items that LANDED from it — the
-concurrent reader and the admission doorkeeper — are gone from this list; what
-follows is what was found and deliberately left.
+counters `INFR_PAGER_STATS` reports. Three items LANDED from it — the concurrent
+reader, the admission doorkeeper, and auto-sizing — and only the last leaves a
+residue worth tracking; what follows is that plus what was deliberately left.
 
-- **`paging.dram` has no auto-sizing, and sizing it is the single biggest lever
-  measured anywhere in this feature.** On Qwen3-14B Q8_0 under an 8 GB
-  `MemoryMax` with a 2 GB VRAM budget, decode goes **0.24 t/s at `--dram 3g` and
-  0.39 at 7g** against mmap's 0.18 — i.e. a config value the user has to guess
-  is worth **1.6x**, and the feature is off entirely unless they name one. (The
-  6g rung measured 0.29 on the pre-doorkeeper binary; the 3g and 7g figures are
-  current.) `vulkan_host_tier` (`infr-llama/src/seam/mod.rs`) reads
-  `ec.paging.dram` and returns an all-`None` tier when it is unset. Nothing
-  probes host memory on any platform, which is exactly the plan's §7 question 3
-  (recommendation there: no new dependency, require an explicit budget on
-  Windows). Sizing it automatically from available RAM is the highest-value
-  remaining work on this feature, and it needs that question answered first.
-  Note the arena must stay ANONYMOUS memory for this to be safe: the kernel then
-  reclaims page cache in its favour, which is why the 7 GB arena under an 8 GB
-  cap did not thrash (major faults flat at ~1 560).
+- **Auto-sizing LANDED; what is left is the platforms it cannot measure.**
+  `infr_core::hostmem` sizes the arena from `MemAvailable` floored by the
+  tightest cgroup limit, and the tier turns itself on whenever a model does not
+  fit. Measured: it picks 7.44 GB under an 8 GB cap and reaches 0.38 t/s against
+  the swept best of 0.39. **Linux only.** macOS needs `host_statistics64`'s
+  free/inactive/purgeable split and Windows `GlobalMemoryStatusEx`; neither is
+  reachable through this workspace's existing dependencies and neither could be
+  verified on the machine this was written on, so both answer "unknown" and keep
+  the mmap path unless `INFR_DRAM_CACHE` is set by hand. Adding either means
+  adding a dependency, which is the user's call.
 - **A chunked prefill re-reads the whole model once per chunk.** The prefill
   loop (`infr-llama/src/seam/runner.rs`, the `cstart`/`cend` walk) runs the full
   graph per `ubatch` chunk, so a P-token prompt costs `ceil(P / ubatch)`

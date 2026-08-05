@@ -14,6 +14,7 @@ pub mod error;
 pub mod exec;
 pub mod fusion;
 pub mod graph;
+pub mod hostmem;
 pub mod hostpager;
 pub mod iquant_grids;
 /// The shared on-disk cache for compiled kernel artifacts (Vulkan pipeline blobs) —
