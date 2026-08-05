@@ -805,6 +805,9 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_gate_exps.weight")])?;
                 wload(&[&p("ffn_up_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.weight")])?;
+                if c.deepseek2 {
+                    wload(&[&p("ffn_exp_probs_b.weight")])?;
+                }
                 if c.shexp_ff > 0 {
                     // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
                     // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
@@ -1544,6 +1547,11 @@ pub(crate) fn generate_dense_backend(
                     gate_exps: wpush(&mut g, &mut weights),
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
+                    exp_probs_b: if c.deepseek2 {
+                        Some(wpush(&mut g, &mut weights))
+                    } else {
+                        None
+                    },
                     shexp: if c.shexp_ff > 0 {
                         // Order MUST mirror the `wload` above: `gate_inp` (qwen35moe only) precedes
                         // the gate/up/down. llama4 has no gate tensor (`gate_inp = None`).
@@ -2881,6 +2889,7 @@ pub(crate) fn generate_dense_backend(
                     gate_exps,
                     up_exps,
                     down_exps,
+                    exp_probs_b,
                     shexp,
                 } => {
                     let mc = c.moe.expect("moe layer without MoeConfig");
@@ -2908,6 +2917,9 @@ pub(crate) fn generate_dense_backend(
                         norm_w: mc.norm_w,
                         weight_before: mc.weight_before,
                         ep_band: None, // set per-rank by ExpertParallelBackend's lowering
+                        exp_probs_b,
+                        n_expert_groups: mc.n_expert_groups,
+                        n_expert_groups_used: mc.n_expert_groups_used,
                     });
                     if let Some(MoeSharedW {
                         gate_inp,
@@ -3139,6 +3151,9 @@ pub(crate) fn generate_dense_backend(
                         norm_w: mc.norm_w,
                         weight_before: mc.weight_before,
                         ep_band: None, // diffusion-gemma is not an EP arch (Vulkan single-device)
+                        exp_probs_b: None,
+                        n_expert_groups: 0,
+                        n_expert_groups_used: 0,
                     });
                     g.push(Op::RmsNorm {
                         x: moe_out,

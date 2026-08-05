@@ -661,6 +661,8 @@ impl Config {
                 gating,
                 norm_w,
                 weight_before,
+                n_expert_groups: n_expert_groups as u32,
+                n_expert_groups_used: n_expert_groups_used as u32,
             })
         } else {
             None

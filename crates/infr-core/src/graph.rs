@@ -513,6 +513,13 @@ pub enum Op {
         /// `infr_vulkan::ExpertParallelBackend`'s per-rank graph lowering; every model builder and
         /// the CPU/Metal reference interpreters leave it `None` (EP is a Vulkan-only path).
         ep_band: Option<(u32, u32)>,
+        /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for SELECTION only;
+        /// the unbias'd probs are still used for the per-expert routing weights. `None` = no bias.
+        exp_probs_b: Option<TensorId>,
+        /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping).
+        n_expert_groups: u32,
+        /// DeepSeek V3+: number of groups selected per routing decision.
+        n_expert_groups_used: u32,
     },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and

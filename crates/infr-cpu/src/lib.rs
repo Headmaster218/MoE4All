@@ -2070,6 +2070,9 @@ impl Backend for CpuBackend {
                     norm_w,
                     weight_before,
                     ep_band: _, // EP is a Vulkan-only path; the CPU reference always runs full-expert
+                    exp_probs_b,
+                    n_expert_groups: _ng,
+                    n_expert_groups_used: _ngu,
                 } => {
                     let (ne, n_expert, n_used, nffx) = (
                         ne as usize,
@@ -2200,8 +2203,20 @@ impl Backend for CpuBackend {
                                     .collect()
                             }
                         };
+                        // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
+                        // top-k selection; original probs still used for per-expert weights.
+                        let sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
+                            let epb_w = weight(epb);
+                            probs
+                                .iter()
+                                .enumerate()
+                                .map(|(e, &p)| p + epb_w[e])
+                                .collect()
+                        } else {
+                            probs.clone()
+                        };
                         let mut idx: Vec<usize> = (0..n_expert).collect();
-                        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                        idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
                         idx.truncate(n_used);
                         // `norm_w`: renormalize the selected weights to sum to 1 before scaling
                         // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).

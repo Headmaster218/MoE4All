@@ -28,6 +28,9 @@ pub(super) enum FfnW {
         /// sums it in PLAIN (`Op::Add`, `gate_inp = None` — `Config::shexp_gated == false`). `None`
         /// for qwen3moe (no shared expert).
         shexp: Option<MoeSharedW>,
+        /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for selection only
+        /// (the unbias'd probs are still used for routing weights). `None` = no bias.
+        exp_probs_b: Option<TensorId>,
     },
     /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
     /// 128-expert MoE branch (fused `gate_up_exps` + per-expert `down_exps` scale), summed and

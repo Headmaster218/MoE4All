@@ -3641,6 +3641,7 @@ fn lower_op(
             norm_w,
             weight_before,
             ep_band,
+            .. // exp_probs_b, n_expert_groups, n_expert_groups_used omitted: Vulkan shaders not yet updated
         } => {
             // Router gating (softmax vs sigmoid) and renormalization are `moe_topk` push-constant
             // flags — see its shader doc. `weight_before` (llama4: the routing weight scales the
@@ -5153,9 +5154,7 @@ fn execute_paged_moe<'a>(
         gating,
         norm_w,
         weight_before,
-        // The paged executor is never reached under Expert Parallelism: the EP binder shards expert
-        // banks RESIDENT across devices (no pager), so a paged MoE layer is always full-expert.
-        ep_band: _,
+        ..
     } = op
     else {
         unreachable!("execute_paged_moe only ever called for an Op::MoeFfn");
@@ -7340,6 +7339,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7480,6 +7482,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None, // set per-rank by the EP lowering
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             g.push(Op::Copy {
                 src: sub,
@@ -7676,6 +7681,9 @@ mod tests {
             norm_w: true,
             weight_before: false,
             ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
         });
         let mk = |bytes: &[u8], usage| {
             let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7796,6 +7804,9 @@ mod tests {
                 norm_w: false,
                 weight_before: true,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7925,6 +7936,9 @@ mod tests {
                 norm_w: false,
                 weight_before: true,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8640,6 +8654,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8789,6 +8806,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8925,6 +8945,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9055,6 +9078,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9189,6 +9215,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9362,6 +9391,9 @@ mod tests {
                 norm_w: true,
                 weight_before: false,
                 ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();

@@ -19,4 +19,8 @@ pub struct MoeConfig {
     /// Apply the routing weight to the expert INPUT (llama4 `weight_before_ffn`) vs the output.
     /// Threaded into `Op::MoeFfn.weight_before`.
     pub weight_before: bool,
+    /// DeepSeek V3+: number of expert groups for group-limited routing (0 = no grouping).
+    pub n_expert_groups: u32,
+    /// DeepSeek V3+: number of groups selected per routing decision.
+    pub n_expert_groups_used: u32,
 }

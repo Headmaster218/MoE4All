@@ -524,6 +524,9 @@ mod tests {
             weight_before: false,
             fused_gate_up: false,
             ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
         });
         g.push(Op::Add {
             a: hidden,
@@ -663,6 +666,9 @@ mod tests {
             weight_before: false,
             fused_gate_up: true,
             ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
         });
         g.push(Op::Add {
             a: hidden,
