@@ -65,6 +65,13 @@ pub const BITNET: &str = "bitnet";
 /// renormalization, no group-limited routing) with an ungated shared expert summed in plain.
 /// First `n_layer_dense_lead` layers are dense FFN; the rest are MoE. See docs/deepseek.md § Stage 1.
 pub const DEEPSEEK: &str = "deepseek";
+/// DeepSeek V2/V2-Lite/V3/V3.1: adds MLA attention (absorbed form, K 576 wide, V 512 wide aliased
+/// from K, n_kv=1), YaRN rope scaling, group-limited MoE routing, router bias correction
+/// (`exp_probs_b`), and multi-function gating (softmax/sigmoid/sqrt-softplus/softmax-on-weights).
+/// The `deepseek2` GGUF arch string covers ALL of V2, V2-Lite, V3 (non-0324), and V3.1 —
+/// llama.cpp keeps them in one model class (`src/models/deepseek2.cpp`). See docs/deepseek.md
+/// § Stage 2.
+pub const DEEPSEEK2: &str = "deepseek2";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
 /// (`bitnet-b1.58.block_count`, …). Behaviorally identical to [`BITNET`] (same llama+SubLN
@@ -123,6 +130,7 @@ pub const ALL: &[&str] = &[
     BITNET,
     BITNET_B158,
     DEEPSEEK,
+    DEEPSEEK2,
     QWEN35,
     QWEN35_MOE,
 ];

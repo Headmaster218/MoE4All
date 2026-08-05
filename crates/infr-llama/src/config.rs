@@ -183,6 +183,40 @@ pub struct Config {
     /// is dense regardless). `0` = every layer MoE (not used today). Non-DeepSeek models
     /// ignore this field.
     pub n_layer_dense_lead: usize,
+    /// DeepSeek V2+: `true` only for `arch == "deepseek2"`. Gates MLA attention (absorbed form with
+    /// asymmetric K/V dims + single K row), YaRN rope scaling, and group-limited MoE routing with
+    /// router bias correction. See docs/deepseek.md § Stage 2.
+    pub deepseek2: bool,
+    /// DeepSeek V2+ MLA: Q LoRA rank (wq_a output dim, q_a_norm dim, wq_b input dim). `0` when the
+    /// "lite" variant carries a direct `wq` instead.
+    pub q_lora_rank: usize,
+    /// DeepSeek V2+ MLA: KV LoRA rank (wkv_a_mqa latent dim, attn_kv_a_norm dim, wk_b/wv_b dim-0).
+    pub kv_lora_rank: usize,
+    /// DeepSeek V2+ MLA: RoPE dimension on Q and K (q_pe/k_pe width = rope.dimension_count).
+    pub qk_rope_dim: usize,
+    /// DeepSeek V2+ MLA: MLA key length = kv_lora_rank + qk_rope_dim (576 for V3). The width of
+    /// the single cached KV row per token.
+    pub key_length: usize,
+    /// DeepSeek V2+ MLA: per-head Q nope dim (128 for V3). Derived from wq_b output shape /
+    /// n_head — NOT a GGUF key. `0` for non-DeepSeek2 models.
+    pub head_k_mla: usize,
+    /// DeepSeek V2+ MLA: per-head V output dim (128 for V3). Derived from wv_b shape — NOT a GGUF
+    /// key. `0` for non-DeepSeek2 models.
+    pub v_head_dim: usize,
+    /// DeepSeek V2+ MoE: gating function enum (1=softmax, 2=sigmoid, 3=softmax-on-weights,
+    /// 4=sqrt-softplus). Parsed from `expert_gating_func`, mapped to `MoeConfig::gating`.
+    /// `0` for non-DeepSeek2 models (and V1, which hardcodes softmax).
+    pub expert_gating_func: u8,
+    /// DeepSeek V2+ MoE: group-limited routing — number of expert groups. `0` = no grouping.
+    pub n_expert_groups: usize,
+    /// DeepSeek V2+ MoE: number of groups selected per routing decision.
+    pub n_expert_groups_used: usize,
+    /// DeepSeek V2+ YaRN: the `rope.scaling.yarn_log_multiplier` divided by 0.1 on load (the
+    /// converter writes `0.1 * mscale_all_dim`; the loader divides it back). `0.0` = no YaRN.
+    pub rope_yarn_log_mul: f32,
+    /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
+    /// tensor presence, not GGUF key.
+    pub is_lite: bool,
 }
 
 fn positive_model_dimension(key: &str, value: u64) -> Result<usize> {
@@ -358,6 +392,7 @@ impl Config {
             | crate::arch::LLAMA4
             | crate::arch::QWEN2
             | crate::arch::DEEPSEEK
+            | crate::arch::DEEPSEEK2
             | crate::arch::BITNET
             | crate::arch::BITNET_B158 => false,
             crate::arch::QWEN3
@@ -396,6 +431,7 @@ impl Config {
         // docs/deepseek.md § Stage 1. All the divergent semantics are HARDCODED in the reference
         // loader (`src/models/deepseek.cpp`), not metadata-driven.
         let deepseek = arch == crate::arch::DEEPSEEK;
+        let deepseek2 = arch == crate::arch::DEEPSEEK2;
         // llama4 (Scout etc.): shares the llama attention skeleton (NORM/interleaved rope, no bias,
         // converter-permuted q/k) but adds a 16-expert sigmoid top-1 MoE + iRoPE (per-layer NoPE) +
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
@@ -422,6 +458,62 @@ impl Config {
         let qwen35_moe = arch == crate::arch::QWEN35_MOE;
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
         let mk = |k: &str| format!("{arch}.{k}");
+        // DeepSeek2-specific metadata: MLA dims, MoE gating function, YaRN (everything EXCEPT
+        // "lite" detection, which needs n_layer — added after `n_layer` below).
+        let (q_lora_rank, kv_lora_rank, key_length_mla, value_length_mla, qk_rope_dim) =
+            if deepseek2 {
+                let qlr = meta_u64(g, &mk("attention.q_lora_rank")).unwrap_or(0) as usize;
+                let kvlr = meta_u64(g, &mk("attention.kv_lora_rank"))
+                    .context("deepseek2.attention.kv_lora_rank")?
+                    as usize;
+                let klen = meta_u64(g, &mk("attention.key_length_mla"))
+                    .unwrap_or((kvlr + 64) as u64) as usize;
+                let vlen =
+                    meta_u64(g, &mk("attention.value_length_mla")).unwrap_or(kvlr as u64) as usize;
+                let qkr = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(64) as usize;
+                (qlr, kvlr, klen, vlen, qkr)
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+        let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) = if deepseek2 {
+            let gf = meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8;
+            let norm = g
+                .metadata()
+                .get(&mk("expert_weights_norm"))
+                .and_then(|v| match v {
+                    MetaValue::Bool(b) => Some(*b),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            let mut ylm =
+                meta_f64(g, &mk("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0) as f32;
+            if ylm != 0.0 {
+                ylm /= 0.1_f32; // convert-script fix
+            }
+            (gf, norm, ylm)
+        } else {
+            (0, false, 0.0)
+        };
+        // Derived MLA dims from tensor shapes (NOT GGUF keys).
+        let (head_k_mla, v_head_dim) = if deepseek2 {
+            let hk_mla = key_length_mla
+                .checked_sub(kv_lora_rank + qk_rope_dim)
+                .unwrap_or(128);
+            let vhd = value_length_mla.checked_sub(kv_lora_rank).unwrap_or(128);
+            (hk_mla.max(1), vhd.max(1))
+        } else {
+            (0, 0)
+        };
+        let n_expert_groups = if deepseek2 {
+            meta_u64(g, &mk("expert_group_count")).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let n_expert_groups_used = if deepseek2 {
+            meta_u64(g, &mk("expert_group_used_count")).unwrap_or(0) as usize
+        } else {
+            0
+        };
         let n_layer_all = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
         // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/mtp.md): `{arch}.nextn_predict_layers`
         // extra decoder block(s) appended AFTER the trunk — `block_count` INCLUDES them. Ported
@@ -455,14 +547,26 @@ impl Config {
             );
         }
         let n_layer = n_layer_all - n_layer_nextn;
+        // DeepSeek2 "lite" detection (tensor-presence test + heuristic fallback). Must run after
+        // n_layer is known.
+        let is_lite = deepseek2 && {
+            g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight")
+                || n_layer == 27
+                || n_layer == 26
+        };
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = positive_model_dimension(
             &mk("attention.head_count"),
             meta_u64(g, &mk("attention.head_count")).context("head_count")?,
         )?;
-        let n_kv = match meta_u64(g, &mk("attention.head_count_kv")) {
-            Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
-            None => n_head,
+        // DeepSeek2 MLA: n_kv is always 1 (single key head shared by all query heads).
+        let n_kv = if deepseek2 {
+            1
+        } else {
+            match meta_u64(g, &mk("attention.head_count_kv")) {
+                Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
+                None => n_head,
+            }
         };
         let n_ff_layers: Vec<usize> = if let Some(arr) = g
             .metadata()
@@ -503,6 +607,7 @@ impl Config {
             || gemma4_moe
             || llama4
             || deepseek
+            || deepseek2
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
@@ -524,6 +629,19 @@ impl Config {
                     false,
                     true,
                     meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
+                )
+            } else if deepseek2 {
+                let gating = match expert_gating_func {
+                    1 => infr_core::graph::MoeGating::Softmax,
+                    2 => infr_core::graph::MoeGating::Sigmoid,
+                    4 => infr_core::graph::MoeGating::SqrtSoftplus,
+                    _ => infr_core::graph::MoeGating::Softmax, // type 0/3 default to softmax
+                };
+                (
+                    gating,
+                    expert_weights_norm,
+                    false, // weight-before-FFN: always false for deepseek2
+                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
                 )
             } else if deepseek {
                 (
@@ -549,9 +667,16 @@ impl Config {
         };
         // The model's trained context length (its default max context). Default 8192 if absent.
         let n_ctx_train = meta_u64(g, &mk("context_length")).unwrap_or(8192) as usize;
-        let head_dim =
-            meta_u64(g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize;
-        let rope_dim = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize;
+        let head_dim = if deepseek2 {
+            key_length_mla
+        } else {
+            meta_u64(g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize
+        };
+        let rope_dim = if deepseek2 {
+            qk_rope_dim
+        } else {
+            meta_u64(g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize
+        };
         let rope_theta = g
             .metadata()
             .get(&mk("rope.freq_base"))
@@ -689,7 +814,7 @@ impl Config {
         };
         let attn_out_gate = qwen35;
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
-        let n_layer_dense_lead = if deepseek {
+        let n_layer_dense_lead = if deepseek || deepseek2 {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
         } else {
             0
@@ -703,7 +828,7 @@ impl Config {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
-        } else if deepseek {
+        } else if deepseek || deepseek2 {
             let n_shared = meta_u64(g, &mk("expert_shared_count")).unwrap_or(0) as usize;
             moe.map(|m| m.n_ff_exp * n_shared).unwrap_or(0)
         } else {
@@ -830,6 +955,18 @@ impl Config {
             sub_norm,
             deepseek,
             n_layer_dense_lead,
+            deepseek2,
+            q_lora_rank,
+            kv_lora_rank,
+            qk_rope_dim,
+            key_length: key_length_mla,
+            head_k_mla,
+            v_head_dim,
+            expert_gating_func,
+            n_expert_groups,
+            n_expert_groups_used,
+            rope_yarn_log_mul,
+            is_lite,
         })
     }
 }

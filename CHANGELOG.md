@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DeepSeek V2 architecture support** (stage 2): registered `deepseek2` arch
+  string, parsed MLA hyperparameters (`q_lora_rank`, `kv_lora_rank`,
+  `qk_rope_dim`, `head_k_mla`, `v_head_dim`, lite detection via tensor
+  presence), configurable MoE gating (`expert_gating_func` → softmax / sigmoid /
+  sqrt-softplus), `expert_weights_norm`, group-limited routing fields, and
+  `rope_yarn_log_mul` (with the convert-script ÷0.1 fix). Added
+  `MoeGating::SqrtSoftplus` variant and wired it in CPU + Vulkan backends. See
+  `docs/deepseek.md` § Stage 2.
+
 - **DeepSeek V1 support** (`deepseek` architecture): plain MHA attention +
   softmax-gated MoE with ungated shared expert, following llama.cpp's
   `src/models/deepseek.cpp`. First `n_layer_dense_lead` layers are dense FFN,

@@ -3651,6 +3651,7 @@ fn lower_op(
             let gating_u32 = match gating {
                 infr_core::graph::MoeGating::Softmax => 0u32,
                 infr_core::graph::MoeGating::Sigmoid => 1u32,
+                infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
             };
             let (ne, n_expert, n_used, nff) = (
                 *ne as usize,
@@ -5161,6 +5162,7 @@ fn execute_paged_moe<'a>(
     let gating_u32 = match gating {
         infr_core::graph::MoeGating::Softmax => 0u32,
         infr_core::graph::MoeGating::Sigmoid => 1u32,
+        infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
     };
     let (ne, n_expert, n_used, nff) = (
         *ne as usize,

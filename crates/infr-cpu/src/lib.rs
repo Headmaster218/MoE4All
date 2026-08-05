@@ -2184,6 +2184,21 @@ impl Backend for CpuBackend {
                             MoeGating::Sigmoid => {
                                 logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect()
                             }
+                            MoeGating::SqrtSoftplus => {
+                                // sqrt(softplus(x)) = sqrt(ln(1 + exp(x))). Monotone like sigmoid;
+                                // top-k-by-logit picks the same set.
+                                logits
+                                    .iter()
+                                    .map(|&v| {
+                                        let sp = if v > 20.0 {
+                                            v
+                                        } else {
+                                            (1.0_f32 + v.exp()).ln()
+                                        };
+                                        sp.sqrt()
+                                    })
+                                    .collect()
+                            }
                         };
                         let mut idx: Vec<usize> = (0..n_expert).collect();
                         idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());

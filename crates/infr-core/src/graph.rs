@@ -62,6 +62,9 @@ pub enum MoeGating {
     /// `probs = sigmoid(logits)` per expert (llama4). Selection order is unchanged by the monotone
     /// sigmoid, so top-k picks the same experts as by raw logits.
     Sigmoid,
+    /// `probs = sqrt(softplus(logits))` per expert (deepseek2/3/4 with `expert_gating_func=4`).
+    /// Monotone in the logit like sigmoid; top-k picks the same experts as by raw logits.
+    SqrtSoftplus,
 }
 
 /// How a tensor handle is provisioned.
