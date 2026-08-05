@@ -859,19 +859,57 @@ residue worth tracking; what follows is that plus what was deliberately left.
   currently sizes it against HOST memory the way `paging.dram` now is. Needs an
   APU to answer. Metal is a separate question: it has no pager at all until
   phase 4, so it inherits none of this yet.
-- **A chunked prefill re-reads the whole model once per chunk.** The prefill
-  loop (`infr-llama/src/seam/runner.rs`, the `cstart`/`cend` walk) runs the full
-  graph per `ubatch` chunk, so a P-token prompt costs `ceil(P / ubatch)`
-  complete weight sweeps. That is invisible when the weights are resident and
-  brutal when they stream: at the 1024-row default a 32k prompt is 32 sweeps.
-  **Layer-major prefill** — layers outer, chunks inner — reads the model ONCE
-  per prefill instead. The cost is holding every chunk's activations at once
-  rather than one chunk's: 32k x 4096 x 2 B is ~268 MB, affordable. This is the
-  largest unbuilt win for streamed models and it matters most for the
-  DeepSeek-class targets this feature exists for. It is a real restructuring of
-  the prefill path, not a tweak, and it should be gated on the model actually
-  streaming (resident models must keep today's chunk-major order, which is right
-  for them).
+- **A chunked prefill re-reads the whole model once per chunk — MEASURED, not
+  inferred.** The prefill loop (`infr-llama/src/seam/runner.rs`, the
+  `cstart`/`cend` walk) runs the full graph per `ubatch` chunk, so a P-token
+  prompt costs `ceil(P / ubatch)` complete weight sweeps. That is invisible when
+  the weights are resident and brutal when they stream.
+
+  Swept 2026-08-05 on Qwen3-14B Q8_0 (14.97 GB) / RX 7900 XTX, `MemoryMax=8G`,
+  `paging.cache=2g`, `paging.dram=6g` pinned, P=4096, `-n 0 -r 2`, three rounds
+  with alternating arm order and a cold page cache before every run. Setting
+  `device.ubatch >= P` makes prefill one chunk, which is the I/O layer-major
+  would reach, so this brackets the win without implementing it:
+
+  | ubatch | chunks | prefill GB | pp t/s |
+  | -----: | -----: | ---------: | -----: |
+  |    512 |      8 |      50.52 |  172.7 |
+  |   1024 |      4 |      25.26 |  341.5 |
+  |   2048 |      2 |      12.65 |  623.5 |
+  |   4096 |      1 |       6.32 | 1052.5 |
+
+  Bytes are EXACTLY linear in chunk count — host reads came out at `72 x chunks`
+  with no residual, and the arena line was byte-identical in all twelve runs. So
+  prefill disk I/O is `6.32 GB x ceil(P / ubatch)` and otherwise independent of
+  P. At the 1024-row default that is **4.00x the bytes and 3.08x the wall time**
+  of a single sweep at P=4096, and the ratio grows linearly with prompt length.
+
+  A resident control says the win is I/O and not tile efficiency: with weights
+  resident, ubatch 1024 vs 2048 measured 1801.7 vs 1797.1 t/s, identical inside
+  0.25%. That ~1800 t/s is also the ceiling layer-major chases; the one-chunk
+  streamed arm already reaches 1052.
+
+  **`ubatch = P` is a safe proxy for the I/O, NOT a safe implementation.** The
+  resident ubatch=4096 arm died with
+  `The CS has been cancelled because the context is lost` after the submit
+  splitter armed at 103 dispatches. The streamed arms survived only
+  incidentally: paging made their first forward ~5.9 s over 3 dispatches, which
+  armed a far tighter 16-dispatch splitter. This is the hazard the `runner.rs`
+  chunk-loop comment already describes. Layer-major avoids it by construction —
+  it keeps chunk-sized dispatches and only inverts the loop nesting.
+
+  The cost is holding every chunk's activations at once rather than one chunk's:
+  32k x 4096 x 2 B is ~268 MB, affordable. This is the largest unbuilt win for
+  streamed models and it matters most for the DeepSeek-class targets this
+  feature exists for. It is a real restructuring of the prefill path, not a
+  tweak, and it should be gated on the model actually streaming (resident models
+  must keep today's chunk-major order, which is right for them).
+
+  Not covered by the sweep: only P=4096 was measured, only the dense pager (the
+  MoE paged-expert path was not swept), and `ru_majflt` is not an instrument
+  here at all — the pager uses `pread`, so it stayed flat at 1455-1888 across
+  every arm.
+
 - **`Pager`'s LRU is O(n_slots) per touch.** `mark_mru`, `evict` and
   `take_slot`/`take_slot_opt` all do `lru.iter().position(...)` followed by
   `VecDeque::remove`. The module doc scopes this to "tens to low hundreds" of
