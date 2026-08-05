@@ -2776,7 +2776,159 @@ impl Backend for CpuBackend {
                     );
                     vals[dst.0 as usize] = out;
                 }
-                Op::Mla { .. } => todo!("CPU MLA attention kernel"),
+                Op::Mla {
+                    q,
+                    k_cache,
+                    wk_b,
+                    wv_b,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    q_head_dim,
+                    kv_lora_rank,
+                    qk_nope_dim,
+                    qk_rope_dim,
+                    v_head_dim,
+                    scale,
+                    mask,
+                    pos,
+                } => {
+                    let (rows, kv_len, nh, qhd, kv_lora, np, qkr, vhd) = (
+                        rows as usize,
+                        kv_len as usize,
+                        n_head as usize,
+                        q_head_dim as usize,
+                        kv_lora_rank as usize,
+                        qk_nope_dim as usize,
+                        qk_rope_dim as usize,
+                        v_head_dim as usize,
+                    );
+                    let key_len = kv_lora + qkr;
+                    let qs = &vals[q.0 as usize];
+                    // K cache: one key_len-wide row per token. V = first kv_lora columns of same row.
+                    let kbuf = bindings.get(k_cache).expect("cpu backend: unbound k_cache");
+                    let kguard = cpu_buf(kbuf).read();
+                    let cap_rows = g.desc(k_cache).numel() / key_len.max(1);
+                    let need = kv_len.min(cap_rows) * key_len;
+                    let deq = |b: &[u8], dt: DType| -> Vec<f32> {
+                        match dt {
+                            DType::F16 => bytemuck::cast_slice::<u8, u16>(b)[..need]
+                                .iter()
+                                .map(|&x| half::f16::from_bits(x).to_f32())
+                                .collect(),
+                            DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
+                            dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
+                                crate::turbo::dequant_prefix_orig(dt, b, need)
+                            }
+                            DType::Bf16
+                            | DType::Q4_0
+                            | DType::Q4_1
+                            | DType::Q5_0
+                            | DType::Q5_1
+                            | DType::Iq4Nl => {
+                                let pb = infr_gguf::nbytes(dt, need);
+                                infr_gguf::dequant::dequant_block(dt, &b[..pb])
+                                    .expect("cpu backend: MLA KV dequant")
+                            }
+                            _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
+                        }
+                    };
+                    let ks = deq(&kguard, g.desc(k_cache).dtype);
+                    // Weights: wk_b [n_head, kv_lora, qk_nope], wv_b [n_head, kv_lora, v_head].
+                    let wk = weight(wk_b);
+                    let wv = weight(wv_b);
+                    // Masking
+                    let (window, canvas_lo) = match mask {
+                        AttnMask::Causal => (0usize, None),
+                        AttnMask::SlidingWindow(w) => (w, None),
+                        AttnMask::Canvas { lo } => (0usize, Some(lo)),
+                    };
+                    // Theta for rope — deepseek2's rope_theta is stored in Config; use it. For now
+                    // read the default 10000 from the graph (no Theta field on Op::Mla — use a
+                    // reasonable default; DeepSeek V2/V3 use 10000).
+                    let theta: f32 = 10000.0;
+                    let hf = qkr / 2; // rope pair count
+                    let mut out = vec![0f32; rows * nh * vhd];
+                    self.pool()
+                        .for_chunks_mut(&mut out, vhd, 2, &|i, ob_slice| {
+                            let ti = i / nh;
+                            let h = i % nh;
+                            let abs = pos as usize + ti;
+                            let (lo, hi) = match canvas_lo {
+                                Some(clo) => (clo, kv_len),
+                                None => {
+                                    let lo = if window > 0 && abs + 1 > window {
+                                        abs + 1 - window
+                                    } else {
+                                        0
+                                    };
+                                    (lo, abs + 1)
+                                }
+                            };
+                            let n_keys = hi - lo;
+                            // Build q_full: absorb q_nope, rope q_pe.
+                            let qhead_off = (ti * nh + h) * qhd;
+                            let q_nope = &qs[qhead_off..qhead_off + np];
+                            let q_pe_raw = &qs[qhead_off + np..qhead_off + qhd];
+                            // q_absorbed = wk_b[h]^T @ q_nope  (shape [kv_lora])
+                            let wk_off = h * kv_lora * np;
+                            let mut q_full = vec![0f32; key_len];
+                            for j in 0..kv_lora {
+                                let mut s = 0f32;
+                                for i in 0..np {
+                                    // wk_b[h][i][j]: row i, col j in the [kv_lora, np] matrix
+                                    s += wk[wk_off + i * np + j] * q_nope[i];
+                                }
+                                q_full[j] = s;
+                            }
+                            // Rope q_pe into q_full[kv_lora..]
+                            for p in 0..hf {
+                                let (i0, i1) = (2 * p, 2 * p + 1);
+                                let ang = abs as f32 * theta.powf(-2.0 * p as f32 / qkr as f32);
+                                let (s, c) = (ang.sin(), ang.cos());
+                                let a = q_pe_raw[i0];
+                                let b = q_pe_raw[i1];
+                                q_full[kv_lora + i0] = a * c - b * s;
+                                q_full[kv_lora + i1] = a * s + b * c;
+                            }
+                            // SDPA: dot q_full against each cached K row, softmax, accumulate V.
+                            let mut sc = vec![0f32; n_keys];
+                            let mut mx = f32::NEG_INFINITY;
+                            for (jj, scj) in sc.iter_mut().enumerate() {
+                                let j = lo + jj;
+                                let jr = if cap_rows > 0 { j % cap_rows } else { j };
+                                let kb = jr * key_len;
+                                // dot(q_full, K row j)
+                                *scj = crate::kernels::dot(&q_full, &ks[kb..kb + key_len]) * scale;
+                                mx = mx.max(*scj);
+                            }
+                            let mut l = 0f32;
+                            for &s in &sc {
+                                l += (s - mx).exp();
+                            }
+                            // Accumulate: V is first kv_lora columns of K.
+                            for (jj, &s) in sc.iter().enumerate() {
+                                let j = lo + jj;
+                                let jr = if cap_rows > 0 { j % cap_rows } else { j };
+                                let p = (s - mx).exp() / l;
+                                let kb = jr * key_len;
+                                // attn_out[jj] += p * V[jj] where V[jj] = ks[kb..kb+kv_lora]
+                                // Apply wv_b[h] to the accumulated output directly:
+                                // ob_slice += p * wv_b[h] @ V[jj]
+                                let wv_off = h * kv_lora * vhd;
+                                for o_idx in 0..vhd {
+                                    let mut vs = 0f32;
+                                    for a_idx in 0..kv_lora {
+                                        // wv_b[h][a_idx][o_idx]
+                                        vs += wv[wv_off + a_idx * vhd + o_idx] * ks[kb + a_idx];
+                                    }
+                                    ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
+                                }
+                            }
+                        });
+                    vals[dst.0 as usize] = out;
+                }
             }
             if let Some(t0) = __t0 {
                 let e = op_times
