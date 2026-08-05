@@ -2071,8 +2071,8 @@ impl Backend for CpuBackend {
                     weight_before,
                     ep_band: _, // EP is a Vulkan-only path; the CPU reference always runs full-expert
                     exp_probs_b,
-                    n_expert_groups: _ng,
-                    n_expert_groups_used: _ngu,
+                    n_expert_groups,
+                    n_expert_groups_used,
                 } => {
                     let (ne, n_expert, n_used, nffx) = (
                         ne as usize,
@@ -2205,7 +2205,7 @@ impl Backend for CpuBackend {
                         };
                         // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
                         // top-k selection; original probs still used for per-expert weights.
-                        let sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
+                        let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
                             let epb_w = weight(epb);
                             probs
                                 .iter()
@@ -2215,6 +2215,47 @@ impl Backend for CpuBackend {
                         } else {
                             probs.clone()
                         };
+                        // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
+                        // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
+                        if n_expert_groups > 1 && n_expert_groups_used > 0 {
+                            let n_exp_per_group = n_expert / n_expert_groups as usize;
+                            let ng = n_expert_groups as usize;
+                            let ng_used = n_expert_groups_used as usize;
+                            // Compute per-group score: sum of top-2 within each group.
+                            let mut gscores = vec![f32::NEG_INFINITY; ng];
+                            for g in 0..ng {
+                                let base = g * n_exp_per_group;
+                                let mut best = [f32::NEG_INFINITY; 2];
+                                for &s in &sel_probs[base..base + n_exp_per_group] {
+                                    if s > best[0] {
+                                        best[1] = best[0];
+                                        best[0] = s;
+                                    } else if s > best[1] {
+                                        best[1] = s;
+                                    }
+                                }
+                                gscores[g] = best[0] + best[1];
+                            }
+                            // Top ng_used groups by score.
+                            let mut gidx: Vec<usize> = (0..ng).collect();
+                            gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
+                            gidx.truncate(ng_used);
+                            // Mask non-chosen groups to -inf.
+                            let mut chosen = vec![false; ng];
+                            for &g in &gidx {
+                                chosen[g] = true;
+                            }
+                            for g in 0..ng {
+                                if !chosen[g] {
+                                    for s in sel_probs
+                                        [g * n_exp_per_group..(g + 1) * n_exp_per_group]
+                                        .iter_mut()
+                                    {
+                                        *s = f32::NEG_INFINITY;
+                                    }
+                                }
+                            }
+                        }
                         let mut idx: Vec<usize> = (0..n_expert).collect();
                         idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
                         idx.truncate(n_used);

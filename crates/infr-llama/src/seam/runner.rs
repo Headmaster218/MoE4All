@@ -2361,7 +2361,21 @@ pub(crate) fn generate_dense_backend(
                 });
 
                 // MLA attention (the kernel handles q_pe rope internally).
-                let mla_scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt();
+                // YaRN mscale² adjustment: when rope_yarn_log_mul is set and context exceeds
+                // training length, the softmax temperature is scaled down (makes attention
+                // sharper where interpolated frequencies softened it). Default is 1.0.
+                let mla_scale = if c.rope_yarn_log_mul != 0.0 {
+                    let freq_scale = (want_ctx as f64 / c.n_ctx_train as f64).max(1.0);
+                    if freq_scale > 1.0 {
+                        let ln_fs_inv = (1.0 / freq_scale).ln();
+                        let mscale = 1.0 + 0.1 * c.rope_yarn_log_mul as f64 * ln_fs_inv;
+                        (mscale * mscale) as f32 / ((qk_nope + qk_rope) as f32).sqrt()
+                    } else {
+                        1.0 / ((qk_nope + qk_rope) as f32).sqrt()
+                    }
+                } else {
+                    1.0 / ((qk_nope + qk_rope) as f32).sqrt()
+                };
                 g.push(Op::Mla {
                     q: mla_q,
                     k_cache: k_cache[l],
