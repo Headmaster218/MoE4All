@@ -8,7 +8,20 @@ in this document was read out of that tree, and every claim about what `infr`
 already has was read out of this one. Where something was **not** verified it
 says so — those lines are the ones to check first, not to trust.
 
-Read [backlog.md](backlog.md) B36 for the streaming work this depends on.
+Re-verified against both trees on 2026-08-05. That pass corrected the stage-1
+rope-type mapping (it prescribed a permute that would have corrupted output),
+renamed the router fields to where they actually live, and closed the Metal
+shared-expert and LayerNorm questions. Everything else below survived the check
+unchanged, including the llama.cpp line counts and every GGUF key name.
+
+The generic procedure for adding any architecture — dump, diff, register, load,
+graph, verify — is
+[plan.md § Adding a model architecture](plan.md#adding-a-model-architecture-the-recipe).
+This document is only what is DeepSeek-specific on top of it.
+
+Disk paging is what stages 3–4 run on at all; it landed (`69b6de0`, `588653b`).
+[backlog.md](backlog.md) B36 holds the paging optimizations that were measured
+but **not** built, including the one §0.3 below depends on.
 
 ## Why this order
 
@@ -50,11 +63,17 @@ weight-load loop.
 
 Already present and directly reusable:
 
+Note on naming: there is no `MoeConfig` type. Everything the router is
+configured by lives as **fields on the `Op::MoeFfn` variant** in
+`infr-core/src/graph.rs` (`gating`, `norm_w`, `scale`, `n_expert`, `n_used`,
+`n_ff_exp`, `down_scale`, `fused_gate_up`, `weight_before`, `ep_band`) — grep
+for the variant, not for a struct.
+
 - **Sigmoid MoE gating** — `MoeGating::Sigmoid` (`infr-core/src/graph.rs`),
   CPU + Vulkan. This is V3's `scoring_func`.
-- **Gate-weight normalisation on/off** (`MoeConfig::norm_w`) — DeepSeek's
+- **Gate-weight normalisation on/off** (`Op::MoeFfn`'s `norm_w`) — DeepSeek's
   `norm_topk_prob`.
-- **Routed scaling factor** (`MoeConfig::scale`), read from
+- **Routed scaling factor** (`Op::MoeFfn`'s `scale`), read from
   `{arch}.expert_weights_scale` — the same GGUF key DeepSeek uses.
 - **Shared experts, plain-summed** — `FfnW::Moe { shexp }` with tensor names
   `ffn_{gate,up,down}_shexp`. DeepSeek's shared expert is plain-summed, so the
@@ -96,11 +115,19 @@ Missing, and these are the real cost:
   "first N dense, rest MoE" — a threshold. New branch.
 - **Metal has no `MoeSharedExpertAdd` kernel** (`infr-metal/src/exec.rs` returns
   `Unsupported`), so any path using the _gated_ shared expert is Vulkan+CPU
-  only. DeepSeek's shared expert is ungated, so this may not bite — verify.
+  only. **Checked: this does not bite DeepSeek.** That op is only emitted for a
+  per-token-sigmoid-gated shared expert (qwen35moe); an ungated one is summed in
+  plain with `Op::Add`, which is the llama4 path and exists on all three
+  backends — see `FfnW::Moe`'s `shexp` doc in `seam/weights.rs` and
+  `Config::shexp_gated`.
 
 ### Places a new arch string must be registered
 
-1. `infr-llama/src/arch.rs` — the `pub const` and `arch::TRANSFORMER`.
+1. `infr-llama/src/arch.rs` — the `pub const`, plus `arch::TRANSFORMER` and
+   `arch::ALL`. Neither list gates anything: `TRANSFORMER` is read once to
+   render the rejection message (`config.rs`), and `ALL` currently has **no
+   consumer at all**. They are documentation that happens to compile — adding to
+   them does not make the arch load.
 2. `infr-llama/src/config.rs`, the `match arch.as_str()` inside
    `Config::from_gguf` — **this is the load gate**; an unknown arch fails here
    and nowhere else.
@@ -180,9 +207,19 @@ hardcodes softmax scoring and no normalisation.
 ### Attention
 
 Vanilla MHA. `n_embd_head_v == n_embd_head_k == n_rot` (llama.cpp asserts it).
-Full-dim rope on Q and K, rope type NORM (interleaved consecutive pairs — which
-in `infr` means the load-time row permute, `Config::permute_qk_neox`, the same
-mechanism qwen2 uses). `kq_scale = 1/sqrt(n_embd_head)`.
+Full-dim rope on Q and K, rope type **NORM** (interleaved consecutive pairs).
+`kq_scale = 1/sqrt(n_embd_head)`.
+
+**Do NOT set `Config::permute_qk_neox`.** All five DeepSeek arches return
+`LLAMA_ROPE_TYPE_NORM` from `llama_model_rope_type` (`src/llama-model.cpp`) —
+the same arm as `LLM_ARCH_LLAMA`, not the NEOX arm that `LLM_ARCH_QWEN2` sits
+in. The permute exists to make infr's interleaved (NORM) `Op::Rope` reproduce
+**NEOX** for an arch whose GGUF stayed in HF rotate-half order (qwen2, bitnet —
+see the field's own doc in `config.rs`). DeepSeek is already NORM with
+converter-permuted rows, exactly like llama, so permuting would rotate the wrong
+pairs and produce fluent nonsense. This applies to stage 2's `q_pe`/`k_pe` as
+well; the one NEOX rope in the family is the V3.2 indexer (stage 3), which is
+hardcoded NEOX against a NORM main rope.
 
 Nothing new is required in the IR.
 
@@ -417,7 +454,9 @@ Traps, each of which produces silent wrongness:
   rather than `row_size(rope)`; these coincide only because both are 64 for
   V3.2. Port it as "offset = rope width" and assert it.
 - `indexer_k_norm` is a real **LayerNorm with bias** (mean-centred), the only
-  non-RMS norm anywhere in the family. `infr` has no LayerNorm op — check.
+  non-RMS norm anywhere in the family. **Confirmed: `infr` has no LayerNorm op**
+  — `graph.rs` carries `RmsNorm` and `RmsNormAdd` and nothing mean-centred, so
+  this is a new op on CPU, Vulkan and Metal, not a config flag.
 - The indexer keeps a **second, independent KV cache**: one
   `index_head_dim`-wide row per token per layer, on top of the 576-wide MLA
   cache.
