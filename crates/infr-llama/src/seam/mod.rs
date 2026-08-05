@@ -377,7 +377,8 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
         let buf = be
             .alloc(tb.len().max(1), BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
-        be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+        be.upload(buf.as_ref(), &tb.materialize())
+            .map_err(|e| anyhow!("{e}"))?;
         Ok((buf, dt))
     })
 }

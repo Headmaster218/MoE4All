@@ -1457,7 +1457,8 @@ impl<'a> MtpHeadSession<'a> {
                 let buf = mtl
                     .alloc(tb.len().max(1), BufferUsage::Weights)
                     .map_err(|e| anyhow!("{e}"))?;
-                mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+                mtl.upload(buf.as_ref(), &tb.materialize())
+                    .map_err(|e| anyhow!("{e}"))?;
                 Ok((buf, dt))
             },
             g,
