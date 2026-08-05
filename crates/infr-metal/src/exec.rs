@@ -1240,6 +1240,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
                     return false;
                 }
             }
+            Op::Mla { .. } => return false,
             Op::Attention {
                 rows,
                 head_dim,
@@ -1326,6 +1327,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::QkNormRope { .. } => "QkNormRope",
         Op::WriteKv { .. } => "WriteKv",
         Op::Attention { .. } => "Attention",
+        Op::Mla { .. } => "Mla",
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
@@ -5144,6 +5146,11 @@ impl MetalBackend {
                     rows as usize * n as usize,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::Mla { .. } => {
+                return Err(Error::Unsupported(
+                    "Metal Op::Mla (DeepSeek V2 MLA attention) not yet implemented".into(),
+                ));
             }
             Op::MoeSharedExpertAdd { .. } => {
                 // qwen35moe (Qwen3.6 MoE) shared expert — landed on CPU + Vulkan only so far (see
