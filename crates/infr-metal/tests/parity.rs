@@ -3249,6 +3249,9 @@ fn moe_ffn_parity() {
         norm_w: true,
         weight_before: false,
         ep_band: None,
+        exp_probs_b: None,
+        n_expert_groups: 0,
+        n_expert_groups_used: 0,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(ne, 60))),
@@ -3292,6 +3295,9 @@ fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
         norm_w: true,
         weight_before: false,
         ep_band: None,
+        exp_probs_b: None,
+        n_expert_groups: 0,
+        n_expert_groups_used: 0,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(ne, seed as u64))),
@@ -3348,6 +3354,9 @@ fn moe_ffn_batched_rows_parity() {
         norm_w: true,
         weight_before: false,
         ep_band: None,
+        exp_probs_b: None,
+        n_expert_groups: 0,
+        n_expert_groups_used: 0,
     });
     // x scaled down: the ~50x-real synthetic weights would push gate/up activations past f16
     // range (the kernels' operand precision) with unit-scale inputs — real hidden states don't.

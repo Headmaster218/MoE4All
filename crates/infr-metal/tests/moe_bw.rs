@@ -79,6 +79,9 @@ fn moe_layer_wall() {
             norm_w: true,
             weight_before: false,
             ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
         });
         cur = dst;
     }
