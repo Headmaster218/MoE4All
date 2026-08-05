@@ -2121,6 +2121,26 @@ fn gpu_seam_paged_moe_host_tier_matches_resident() {
         tiered_ids, resident_ids,
         "the MoE host tier diverged from the all-resident GPU run"
     );
+
+    // The UNIFIED-memory shape: no host cache at all, every expert read from disk straight into
+    // the staging ring (`GpuPager::touch_staged_read`). A unified device takes this automatically
+    // because its streaming arena is already GPU-accessible RAM; `paging.dram_bypass` is what lets
+    // it be exercised HERE, on a discrete GPU, which is the only hardware available to test it on.
+    // Without this leg that path would ship with no coverage whatsoever.
+    let bypass = model_cfg(&path, |c| {
+        pin_ubatch(c);
+        c.paging.cache = Some(infr_core::SizeSpec::Bytes(50 * 1024 * 1024));
+        c.paging.dram_bypass = true;
+        c.paging.stats = true;
+    });
+    let mut bypass_ids = Vec::new();
+    bypass
+        .generate_vulkan_ids(&prompt_ids, n, |id| bypass_ids.push(id))
+        .expect("dram-bypass gpu gen");
+    assert_eq!(
+        bypass_ids, resident_ids,
+        "the arena-less (unified-memory) MoE path diverged from the all-resident GPU run"
+    );
 }
 
 /// Dense layer streaming (`infr_vulkan::pager::DensePagerSession`, wired via `INFR_CACHE` on a

@@ -846,6 +846,19 @@ residue worth tracking; what follows is that plus what was deliberately left.
   verified on the machine this was written on, so both answer "unknown" and keep
   the mmap path unless `INFR_DRAM_CACHE` is set by hand. Adding either means
   adding a dependency, which is the user's call.
+- **The unified-memory path is unverified on unified hardware.** An iGPU/APU now
+  streams `DISK → GPU-accessible RAM` with no host cache
+  (`HostPager::stream_only`, selected by `DeviceCaps::unified_memory`). The
+  MECHANISM is covered on a discrete GPU by `INFR_DRAM_BYPASS` — the dense leg
+  in `dense_tier_parity` content-checks it and the MoE leg in
+  `gpu_seam_paged_moe_host_tier_matches_resident` is token-identical, both shown
+  to fail when the tier serves a neighbouring block. What is NOT covered is the
+  SELECTION and the sizing: that `unified_memory` is actually set on real iGPU
+  and APU parts, and that `paging.cache` (the arena above, which on those parts
+  comes out of shared RAM) ends up large enough to be worth having — nothing
+  currently sizes it against HOST memory the way `paging.dram` now is. Needs an
+  APU to answer. Metal is a separate question: it has no pager at all until
+  phase 4, so it inherits none of this yet.
 - **A chunked prefill re-reads the whole model once per chunk.** The prefill
   loop (`infr-llama/src/seam/runner.rs`, the `cstart`/`cend` walk) runs the full
   graph per `ubatch` chunk, so a P-token prompt costs `ceil(P / ubatch)`

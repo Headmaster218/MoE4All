@@ -157,6 +157,15 @@ cfg_struct! {
         /// whenever the weights fit. This budget is anonymous, non-evictable memory, so it is only
         /// ever what the user asked for — never a fraction picked on their behalf.
         dram: Option<SizeSpec> = None,
+        /// `INFR_DRAM_BYPASS`: read paged blocks straight from disk into GPU memory, with NO host
+        /// cache in between — the shape a unified-memory device takes automatically, because there
+        /// its streaming arena is already GPU-accessible RAM and a cache beneath it would be a
+        /// second copy the device cannot read in place.
+        ///
+        /// Exists as a flag so that behaviour can be exercised on a DISCRETE GPU, which is the
+        /// only hardware most of this is developed and tested on. Also the honest choice on a
+        /// machine whose RAM is better spent elsewhere.
+        dram_bypass: bool = false,
     }
 }
 

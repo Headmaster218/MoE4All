@@ -232,6 +232,62 @@ impl GpuPager {
         }
     }
 
+    /// [`Self::touch_staged`]'s twin for a block whose bytes are READ rather than copied — the
+    /// arena-less host tier a unified-memory device gets (`HostPager::stream_only`).
+    ///
+    /// Same residency decision and the same ring→arena copy; only the source differs, so the two
+    /// cannot drift on policy. Kept separate rather than folded behind a closure because the copy
+    /// they perform is genuinely different work: the mmap path memcpys a slice with
+    /// [`par_copy_to_mapped`] (many threads over one already-resident buffer), while this issues a
+    /// positioned read straight into the ring — one copy instead of the read-then-copy that going
+    /// through a host arena would cost.
+    pub fn touch_staged_read(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        ring: &dyn Buffer,
+        ring_off: usize,
+        id: BlockId,
+        host: &HostPager,
+        scan: bool,
+    ) -> Result<usize> {
+        let resolution = if scan {
+            self.pager.touch_cold(id)
+        } else {
+            self.pager.touch(id)
+        };
+        match resolution {
+            Resolution::Hit { .. } => Ok(0),
+            Resolution::Miss { slot, evicted } => {
+                let n = host.block_bytes(id).ok_or_else(|| {
+                    be(format!("moe pager: block {id} is unknown to the host tier"))
+                })?;
+                debug_assert!(
+                    n <= self.slot_bytes,
+                    "block bytes ({n}) exceed the arena's slot stride ({})",
+                    self.slot_bytes
+                );
+                let base = as_vk_buf(ring)?
+                    .mapped_ptr()
+                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of the
+                // persistently-mapped ring — reserved by the cursor before this call and not
+                // reused until the recording that reads it completes (the caller's ring
+                // contract). No other thread holds a reference to it.
+                let dst = unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
+                host.fill(id, dst)?;
+                rec.copy(
+                    ring,
+                    ring_off,
+                    self.arena.as_ref(),
+                    slot as usize * self.slot_bytes,
+                    self.slot_bytes,
+                );
+                self.record_placement(id, slot, evicted);
+                Ok(self.slot_bytes)
+            }
+        }
+    }
+
     /// `n` host-mirror LUT words starting at block id `base` — the source a frozen tape window
     /// copies from (see [`MoePagerSession::lut_window`]).
     fn lut_words(&self, base: usize, n: usize) -> &[u32] {
@@ -945,9 +1001,15 @@ impl MoePagerSession {
                     let host = host
                         .as_ref()
                         .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
-                    let insert = if scan { Insert::Cold } else { Insert::Mru };
-                    let pin = host.pin(id, insert)?;
-                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, &pin, scan)?
+                    if host.caches() {
+                        let insert = if scan { Insert::Cold } else { Insert::Mru };
+                        let pin = host.pin(id, insert)?;
+                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, &pin, scan)?
+                    } else {
+                        // Unified memory: nothing is cached below, so read the expert straight
+                        // into the ring rather than through an arena that does not exist.
+                        pager.touch_staged_read(rec, ring.as_ref(), ring_off, id, host, scan)?
+                    }
                 }
             };
         }

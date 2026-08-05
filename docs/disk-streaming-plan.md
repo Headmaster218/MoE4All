@@ -465,9 +465,10 @@ Two new keys in the `paging` section of `infr-core/src/config/manifest.rs`,
 following the spellings already there (`paging.cache`, `paging.ring`,
 `paging.stats`):
 
-| env               | key           | type | meaning                                                       |
-| ----------------- | ------------- | ---- | ------------------------------------------------------------- |
-| `INFR_DRAM_CACHE` | `paging.dram` | Size | DRAM tier budget — unset = automatic, `0` = off, `N` = pinned |
+| env                | key                  | type | meaning                                                          |
+| ------------------ | -------------------- | ---- | ---------------------------------------------------------------- |
+| `INFR_DRAM_CACHE`  | `paging.dram`        | Size | DRAM tier budget — unset = automatic, `0` = off, `N` = pinned    |
+| `INFR_DRAM_BYPASS` | `paging.dram_bypass` | Flag | No host cache: blocks read disk → GPU memory (the unified shape) |
 
 **LANDED with three states, not two.** Unset means SIZE IT AUTOMATICALLY (see
 below); a value pins the arena and wins over every automatic rung; and `0` turns
@@ -483,6 +484,13 @@ and the CPU backend can compare the pageable bytes against available RAM itself.
 Turning the tier on is therefore a consequence of the model not fitting, not a
 switch.
 
+**`INFR_DRAM_BYPASS` is how the unified shape is tested on hardware that is not
+unified.** A unified device takes that path automatically (below); this flag
+forces it anywhere, which is the only reason it has any coverage at all — the
+machine this was built on has a discrete GPU. It is also a legitimate setting in
+its own right: a host whose RAM is better spent elsewhere still wants
+block-granular reads rather than the page cache.
+
 **`INFR_CACHE` (`paging.cache`) keeps its meaning** — the VRAM paging budget —
 and is the other half of the testing story: capping it is what forces residency
 to be rejected on hardware that would otherwise hold the model, and
@@ -492,6 +500,30 @@ to be rejected on hardware that would otherwise hold the model, and
 Reader threads, prefetch depth and page-cache dropping are **hardcoded** until a
 measurement says otherwise — a knob with no known good value is a question
 shipped to the user. `INFR_PAGER_STATS` grows per-tier lines.
+
+### 4.0 Unified memory has TWO tiers, not three
+
+On an iGPU or APU the streaming arena is already GPU-accessible host RAM. A host
+cache beneath it would hold a second copy of the same bytes in the same RAM,
+readable only by the CPU — every hit still copied through the staging ring,
+while the identical bytes spent on the arena above are read in place. So the
+ladder there is `DISK → GPU-accessible RAM`, and what sits at the bottom is a
+READER, not a cache: `HostPager::stream_only`, whose every `fill` is a
+positioned read straight into the ring. That is what the arena above needs in
+order to hold a model far larger than the machine, and it is strictly better
+than the mmap path it replaces for the same reason the discrete tier is — the
+page cache evicts by recency, which is the pathological policy for a cyclic
+sweep.
+
+**Unverified on unified hardware**: none was available. What IS verified, on a
+discrete GPU via `INFR_DRAM_BYPASS`, is the mechanism — `dense_tier_parity`'s
+third leg content-checks the arena-less dense path, and
+`gpu_seam_paged_moe_host_tier_matches_resident`'s bypass leg is token-identical
+on the MoE path (both shown to fail when the tier serves a neighbouring block).
+What is NOT verified is the SELECTION: that `DeviceCaps::unified_memory` is set
+where it should be, and that the arena above is sized sensibly out of shared RAM
+on such a part. Metal has no pager at all (phase 4) and is unaffected until it
+does.
 
 ### 4.1 How the automatic budget is decided
 

@@ -160,6 +160,12 @@ pub fn auto_arena_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
 pub enum ArenaPlan {
     /// Build an arena of this many bytes.
     Take(u64),
+    /// Build a tier that CACHES NOTHING — see [`crate::hostpager::HostPager::stream_only`]. The
+    /// blocks still come from explicit positioned reads rather than the GGUF mapping, which is the
+    /// whole point on a unified-memory device: the arena above is already GPU-accessible RAM, so
+    /// the only thing missing beneath it is a reader that does not go through a page cache
+    /// evicting by recency.
+    StreamOnly,
     /// Keep the zero-copy mmap path, for this reason. Every reason is something the caller should
     /// SAY — a run that quietly did not page when it needed to is the confusing case.
     Skip(Skip),
@@ -175,9 +181,6 @@ pub enum Skip {
     NoProbe,
     /// Streaming is needed but too little memory is free to seat a useful arena.
     TooLittle,
-    /// Unified memory: the arena ABOVE this one is already in host RAM, so a tier beneath it would
-    /// spend the same bytes on blocks the device cannot read in place.
-    Unified,
     /// The user turned it off by name (`paging.dram = 0`).
     Disabled,
 }
@@ -194,11 +197,18 @@ pub enum Requested {
     Off,
     /// A budget named by the user, which wins over every automatic rung.
     Fixed(u64),
+    /// `paging.dram_bypass` — no host cache at all: blocks are read from disk straight into the
+    /// arena above. A size cannot express this, which is why it is its own state.
+    Bypass,
 }
 
 impl Requested {
-    /// Read a resolved `paging.dram` value: `None` unset, `Some(0)` off, `Some(n)` fixed.
-    pub fn from_config(v: Option<u64>) -> Self {
+    /// Read a resolved `paging.dram` / `paging.dram_bypass` pair: bypass wins (it says something a
+    /// size cannot), then `None` unset, `Some(0)` off, `Some(n)` fixed.
+    pub fn from_config(v: Option<u64>, bypass: bool) -> Self {
+        if bypass {
+            return Self::Bypass;
+        }
         match v {
             None => Self::Auto,
             Some(0) => Self::Off,
@@ -219,12 +229,16 @@ pub fn streaming_arena_plan(
     pageable: u64,
 ) -> ArenaPlan {
     match explicit {
+        // `Bypass` outranks a size: it is the one that says "no host cache at all", which a
+        // number cannot express. It exists so the unified-memory shape can be exercised on a
+        // discrete GPU, which is the only hardware this is developed on.
+        Requested::Bypass => return ArenaPlan::StreamOnly,
         Requested::Fixed(b) => return ArenaPlan::Take(b),
         Requested::Off => return ArenaPlan::Skip(Skip::Disabled),
         Requested::Auto => {}
     }
     if unified {
-        return ArenaPlan::Skip(Skip::Unified);
+        return ArenaPlan::StreamOnly;
     }
     let Some(available) = available else {
         return ArenaPlan::Skip(Skip::NoProbe);
@@ -245,6 +259,10 @@ pub fn cpu_arena_plan(explicit: Requested, available: Option<u64>, pageable: u64
     match explicit {
         Requested::Fixed(b) => return ArenaPlan::Take(b),
         Requested::Off => return ArenaPlan::Skip(Skip::Disabled),
+        // Bypassing the host cache means "read straight into the tier above", and for the CPU
+        // backend there IS no tier above — this arena is the only one. Reading through to nothing
+        // would be a pure regression on the mapping, so the flag simply keeps the mmap path.
+        Requested::Bypass => return ArenaPlan::Skip(Skip::Disabled),
         Requested::Auto => {}
     }
     let Some(available) = available else {
@@ -373,7 +391,7 @@ mod tests {
     /// replaces once auto-sizing turns it on by itself, and `0` would otherwise read as "unset".
     #[test]
     fn a_zero_budget_is_the_off_switch() {
-        assert_eq!(Requested::from_config(Some(0)), Requested::Off);
+        assert_eq!(Requested::from_config(Some(0), false), Requested::Off);
         assert_eq!(
             cpu_arena_plan(Requested::Off, Some(GIB), 200 * GIB),
             ArenaPlan::Skip(Skip::Disabled)
@@ -391,8 +409,11 @@ mod tests {
 
     #[test]
     fn from_config_maps_unset_and_sizes() {
-        assert_eq!(Requested::from_config(None), Requested::Auto);
-        assert_eq!(Requested::from_config(Some(42)), Requested::Fixed(42));
+        assert_eq!(Requested::from_config(None, false), Requested::Auto);
+        assert_eq!(
+            Requested::from_config(Some(42), false),
+            Requested::Fixed(42)
+        );
     }
 
     /// Requirement one: if it fits, everything stays resident. Paging a model that fits would add
@@ -419,15 +440,28 @@ mod tests {
         }
     }
 
-    /// Unified memory declines the tier BENEATH the streaming arena, rather than double-spending
-    /// the one pool of RAM on blocks the device could not read in place.
+    /// Unified memory reads DISK → GPU-accessible RAM with no host cache: the arena above is
+    /// already in the one pool of RAM, so caching beneath it would hold a second copy the device
+    /// cannot read in place — but the reads themselves must still be block-granular rather than
+    /// left to the mapping, which is what `StreamOnly` expresses.
     #[test]
-    fn unified_memory_builds_no_second_tier() {
+    fn unified_memory_streams_without_caching() {
         assert_eq!(
             streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 40 * GIB),
-            ArenaPlan::Skip(Skip::Unified)
+            ArenaPlan::StreamOnly
         );
-        // The same host WITHOUT unified memory does build one — otherwise this test would pass
+        // It must NOT collapse to "keep the mmap path" — that is the thing it replaces.
+        assert_ne!(
+            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 40 * GIB),
+            ArenaPlan::Skip(Skip::Fits)
+        );
+        // A host with no memory to spare still streams on unified memory, because the decision
+        // does not depend on having any to give.
+        assert_eq!(
+            streaming_arena_plan(Requested::Auto, Some(GIB), true, 40 * GIB),
+            ArenaPlan::StreamOnly
+        );
+        // The same host WITHOUT unified memory caches instead — otherwise this test would pass
         // for a version that simply never auto-sizes.
         assert!(matches!(
             streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 40 * GIB),

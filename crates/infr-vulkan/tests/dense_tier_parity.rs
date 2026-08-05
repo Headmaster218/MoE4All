@@ -269,6 +269,37 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
         x_buf.as_ref(),
     );
 
+    // ── Leg 3: the ARENA-LESS tier — what a unified-memory device gets ────────────────────────
+    // There the arena above is already GPU-accessible RAM, so nothing is cached beneath it and
+    // every miss is read straight into the ring. This machine is a discrete GPU, so the SELECTION
+    // of this mode cannot be exercised here — but the mode itself can, and must stage the same
+    // bytes as the other two.
+    let io2 = Arc::new(FileBlockIo::open(&path).unwrap());
+    let host_ro = Arc::new(HostPager::stream_only(stride, io2).unwrap());
+    for b in 0..N_BLOCKS {
+        host_ro
+            .register(BlockDesc {
+                id: b as u32,
+                extents: vec![BlockExtent {
+                    offset: (b * raw) as u64,
+                    len: raw,
+                }],
+            })
+            .unwrap();
+    }
+    let stream_leg = sweep(
+        &be,
+        DensePoolSpec {
+            slot_bytes: stride,
+            n_slots: VRAM_SLOTS,
+            n_blocks: N_BLOCKS,
+            host: Some(host_ro.clone()),
+        },
+        4 * stride,
+        |_| DenseBytes::Host,
+        x_buf.as_ref(),
+    );
+
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(&dir).unwrap();
 
@@ -278,7 +309,29 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
             &host_leg.outputs[b], want,
             "host tier staged block {b} wrong"
         );
+        assert_eq!(
+            &stream_leg.outputs[b], want,
+            "arena-less tier staged block {b} wrong"
+        );
     }
+
+    // The arena-less tier caches NOTHING and reads through on every VRAM miss. If it ever admitted,
+    // a unified device would be holding a second copy of a block in the one pool of RAM it has.
+    let (vram_ro, ro) = &stream_leg.stats[0];
+    let ro = ro.expect("leg 3 has a host tier");
+    assert_eq!(ro.pager.hits, 0, "an arena-less tier cannot hit");
+    assert_eq!(ro.pager.misses, 0, "an arena-less tier must admit nothing");
+    assert_eq!(ro.pager.evictions, 0);
+    assert_eq!(
+        ro.streamed, vram_ro.misses,
+        "every VRAM miss must be one streamed read"
+    );
+    assert_eq!(ro.reads, ro.streamed, "every read must be a streamed one");
+    assert_eq!(
+        (vram_ro.hits, vram_ro.misses),
+        (mmap.stats[0].0.hits, mmap.stats[0].0.misses),
+        "the arena-less tier changed the VRAM schedule"
+    );
 
     // ── Every case was actually taken ─────────────────────────────────────────────────────────
     let (vram, host_s) = &host_leg.stats[0];

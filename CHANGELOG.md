@@ -28,10 +28,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     reports the whole machine, and sizing an anonymous arena from that is an OOM
     kill. Linux only; other platforms report "unknown" and keep the mmap path
     unless a budget is set by hand.
-  - **Unified-memory devices (iGPU, APU) deliberately do not get a second
-    tier.** Their streaming arena is already host RAM, so a tier beneath it
-    would hold blocks the GPU cannot read in place — strictly worse than raising
-    `INFR_CACHE`. The run says so rather than silently spending the memory.
+  - **Unified-memory devices (iGPU, APU) stream `DISK → GPU-accessible RAM` with
+    no host cache between.** Their streaming arena is already host RAM, so a
+    cache beneath it would hold a second copy the GPU cannot read in place;
+    instead its misses are served by block-granular positioned reads rather than
+    through the GGUF mapping, whose page cache thrashes on a forward pass's
+    cyclic sweep. That is what lets a model far larger than the machine run on
+    those parts at all. **Untested on unified hardware** — none was available —
+    but the mechanism is covered on a discrete GPU by `INFR_DRAM_BYPASS`
+    (below). Metal has no pager at all yet and is unaffected.
 - `INFR_DRAM_CACHE` / `paging.dram`: the host weight cache's budget. **Unset now
   means "size it automatically"**; a value pins the arena and wins over every
   automatic decision (including on a machine where the model would have fit,
@@ -68,6 +73,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     readahead issued in parallel by the kernel for free. Reads stay correct on
     every platform, but the speedup is measured on Linux/NVMe only — a Windows
     handle not opened for overlapped I/O serializes them.
+- `INFR_DRAM_BYPASS` / `paging.dram_bypass`: read paged blocks straight from
+  disk into GPU memory with no host cache — the shape a unified-memory device
+  takes automatically. It exists as a flag so that behaviour can be exercised on
+  a discrete GPU, which is the only hardware it can be tested on here, and is
+  also the honest choice on a machine whose RAM is better spent elsewhere. No
+  effect on the CPU backend, where that arena is the only tier there is.
 
 ### Changed
 

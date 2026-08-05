@@ -203,6 +203,9 @@ pub struct HostPager {
     arena: Arena,
     io: Arc<dyn BlockIo>,
     slot_bytes: usize,
+    /// How many blocks may be resident. Equal to the arena's slot count, EXCEPT in the arena-less
+    /// mode built by [`HostPager::stream_only`], where it is zero and every fill streams.
+    max_resident: usize,
     reads: AtomicU64,
     bytes_read: AtomicU64,
     streamed: AtomicU64,
@@ -232,10 +235,61 @@ impl HostPager {
             arena: Arena::new(n_slots, slot_bytes),
             io,
             slot_bytes,
+            max_resident: n_slots,
             reads: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
         })
+    }
+
+    /// A tier with NO arena: every [`Self::fill`] reads its block straight into the caller's
+    /// buffer, and nothing is ever cached here.
+    ///
+    /// # Why an arena-less tier exists
+    /// On a UNIFIED-memory device the arena ABOVE this one already lives in host RAM and is
+    /// GPU-accessible. A host cache beneath it would be a second copy of the same bytes in the same
+    /// RAM, readable only by the CPU — strictly worse than making the arena above bigger. But the
+    /// tier below still has a job: serving that arena's misses by BLOCK-GRANULAR positioned reads
+    /// (with [`crate::blockio`]'s concurrent reader) instead of through the GGUF mapping, whose
+    /// page cache evicts by recency and so thrashes on the cyclic sweep a forward pass performs —
+    /// the pathology this whole feature exists to fix (`docs/perf/results.md`).
+    ///
+    /// So on unified memory the ladder is `DISK → GPU-accessible RAM` with no host cache in
+    /// between, and this is the bottom of it.
+    ///
+    /// `slot_bytes` still bounds what one block may be, because the caller's destination (a staging
+    /// ring region) is sized from it. [`Self::pin`] and [`Self::try_pin`] are refused: they hand out
+    /// a borrow of arena bytes, and there are none.
+    pub fn stream_only(slot_bytes: usize, io: Arc<dyn BlockIo>) -> Result<Self> {
+        if slot_bytes == 0 {
+            return Err(Error::backend(
+                "host pager: a stream-only tier still needs a non-zero block stride".to_string(),
+            ));
+        }
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                // One nominal slot so the bookkeeping type stays uniform; `max_resident == 0`
+                // is what actually prevents admission, and nothing ever reaches this pager's
+                // slot-handing paths (`fill` short-circuits, `pin` is refused).
+                pager: Pager::new(1),
+                state: HashMap::new(),
+                descs: HashMap::new(),
+                missed_once: HashSet::new(),
+            }),
+            ready: Condvar::new(),
+            arena: Arena::new(0, slot_bytes),
+            io,
+            slot_bytes,
+            max_resident: 0,
+            reads: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            streamed: AtomicU64::new(0),
+        })
+    }
+
+    /// Whether this tier caches anything, or only reads through ([`Self::stream_only`]).
+    pub fn caches(&self) -> bool {
+        self.max_resident > 0
     }
 
     /// Declare where one block's bytes live. Called once per block at load; a block must be
@@ -287,8 +341,10 @@ impl HostPager {
         self.slot_bytes
     }
 
+    /// Blocks this tier may hold resident — `0` for an arena-less [`Self::stream_only`] tier, whose
+    /// bookkeeping still carries one nominal slot it never uses.
     pub fn n_slots(&self) -> usize {
-        self.inner.lock().unwrap().pager.n_slots()
+        self.max_resident
     }
 
     /// Pin `id`'s bytes, reading them from the tier below if they are not resident.
@@ -298,6 +354,14 @@ impl HostPager {
     /// exhaustion error instead, because waiting on an unordered set of pins acquired one at a time
     /// is a deadlock, not a slow path.
     pub fn pin(&self, id: BlockId, insert: Insert) -> Result<Pin<'_>> {
+        if !self.caches() {
+            // A `Pin` borrows arena bytes and there are none. Refuse rather than hand back a
+            // zero-length view of an empty arena, which would decode as silent garbage.
+            return Err(Error::backend(format!(
+                "host pager: block {id} was pinned on an arena-less (stream-only) tier — this \
+                 tier serves `fill` into a caller's buffer and has nothing to borrow"
+            )));
+        }
         let (slot, desc) = loop {
             let mut inner = self.inner.lock().unwrap();
             if !inner.descs.contains_key(&id) {
@@ -431,8 +495,7 @@ impl HostPager {
             // "admits without evicting" test — and only a block that has missed BEFORE is admitted,
             // so the tier above's permanently-resident prefix never takes a slot (see
             // `Inner::missed_once`).
-            if inner.pager.resident_count() < inner.pager.n_slots() && !inner.missed_once.insert(id)
-            {
+            if inner.pager.resident_count() < self.max_resident && !inner.missed_once.insert(id) {
                 match inner.pager.resolve_and_pin(id, Insert::Cold) {
                     Some(Resolution::Miss { slot, evicted }) => {
                         debug_assert!(evicted.is_none(), "a free slot cannot have evicted");
@@ -497,6 +560,9 @@ impl HostPager {
     /// residency DECISION, so this moves no counter — see [`Pager::repin`]. A caller that wants the
     /// probe counted keeps its own tally.
     pub fn try_pin(&self, id: BlockId) -> Option<Pin<'_>> {
+        if !self.caches() {
+            return None; // nothing is ever resident on an arena-less tier
+        }
         let mut inner = self.inner.lock().unwrap();
         if inner.state.get(&id) != Some(&SlotState::Ready) {
             return None;
@@ -929,6 +995,61 @@ mod tests {
             assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Hit);
             assert_eq!(&dst, &[id as u8; 16], "resident block {id} was disturbed");
         }
+    }
+
+    /// The unified-memory shape: an arena-less tier delivers every block's own bytes, caches
+    /// nothing, and commits no host memory. Repeated asks must re-read rather than start hitting,
+    /// because there is nowhere for a hit to come from.
+    #[test]
+    fn a_stream_only_tier_reads_through_and_caches_nothing() {
+        let io = Arc::new(FakeIo::new());
+        let p = HostPager::stream_only(16, io.clone()).expect("stream-only");
+        for id in [1u32, 2, 3] {
+            p.register(BlockDesc {
+                id,
+                extents: vec![BlockExtent {
+                    offset: id as u64 * 16,
+                    len: 16,
+                }],
+            })
+            .expect("register");
+        }
+        assert!(!p.caches(), "a stream-only tier must not claim to cache");
+        assert_eq!(p.arena_bytes(), 0, "it must commit no host memory");
+        assert_eq!(p.n_slots(), 0);
+
+        let mut dst = [0u8; 16];
+        // Two full passes: every ask is a fresh read, and every ask gets the right bytes.
+        for _ in 0..2 {
+            for id in [1u32, 2, 3] {
+                assert_eq!(p.fill(id, &mut dst).unwrap(), Fill::Streamed);
+                assert_eq!(&dst, &[id as u8; 16], "block {id} read wrong bytes");
+            }
+        }
+        let s = p.stats();
+        assert_eq!(s.reads, 6, "every ask must reach the file");
+        assert_eq!(s.streamed, 6, "and every read must be a streamed one");
+        assert_eq!(s.pager.hits, 0, "nothing can hit with no arena");
+        assert_eq!(s.pager.evictions, 0);
+    }
+
+    /// `pin` hands out a borrow of arena bytes, so it must be REFUSED rather than return an empty
+    /// view of an arena that does not exist — that would decode as silent garbage.
+    #[test]
+    fn a_stream_only_tier_refuses_to_pin() {
+        let io = Arc::new(FakeIo::new());
+        let p = HostPager::stream_only(16, io).expect("stream-only");
+        p.register(BlockDesc {
+            id: 1,
+            extents: vec![BlockExtent { offset: 0, len: 16 }],
+        })
+        .expect("register");
+        let err = p.pin(1, Insert::Cold).expect_err("pin must be refused");
+        assert!(
+            err.to_string().contains("stream-only"),
+            "unexpected error: {err}"
+        );
+        assert!(p.try_pin(1).is_none(), "try_pin must find nothing resident");
     }
 
     /// A failed read leaves nothing resident on the admit path, exactly as `pin` does.

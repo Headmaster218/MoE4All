@@ -103,7 +103,10 @@ fn cpu_paged_store(
     g: &Gguf,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
     // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(ec.paging.dram.map(|s| s.resolve(0)));
+    let explicit = infr_core::hostmem::Requested::from_config(
+        ec.paging.dram.map(|s| s.resolve(0)),
+        ec.paging.dram_bypass,
+    );
     // Only the weights this backend would actually page count toward "does it fit": the sub-floor
     // tensors stay mapped either way, so counting them could page a model that fits.
     let pageable: u64 = g
@@ -114,6 +117,13 @@ fn cpu_paged_store(
         .sum();
     let available = infr_core::hostmem::available_bytes();
     let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, pageable) {
+        // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
+        // on unified memory). For the CPU backend this arena is the only tier there is, so a
+        // read-through with nothing behind it would be a pure regression on the mapping.
+        infr_core::hostmem::ArenaPlan::StreamOnly => {
+            debug_assert!(false, "cpu_arena_plan never answers StreamOnly");
+            return Ok(None);
+        }
         infr_core::hostmem::ArenaPlan::Take(n) => {
             if explicit == infr_core::hostmem::Requested::Auto {
                 tracing::info!(
@@ -211,11 +221,36 @@ fn vulkan_host_tier(
 ) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
     let unpaged = || vec![None; classes.len()];
     // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(ec.paging.dram.map(|s| s.resolve(0)));
+    let explicit = infr_core::hostmem::Requested::from_config(
+        ec.paging.dram.map(|s| s.resolve(0)),
+        ec.paging.dram_bypass,
+    );
     let available = infr_core::hostmem::available_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
     let budget =
         match infr_core::hostmem::streaming_arena_plan(explicit, available, unified, pageable) {
+            // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
+            // to cache down here — but its misses still come from BLOCK reads instead of the
+            // mapping, which is what lets a big model run on these machines at all.
+            infr_core::hostmem::ArenaPlan::StreamOnly => {
+                let io = std::sync::Arc::new(
+                    infr_core::blockio::FileBlockIo::open(g.path()).map_err(|e| anyhow!("{e}"))?,
+                );
+                tracing::info!(
+                    "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
+                     this device's memory IS host memory, so the {} pool(s) above are already the \
+                     only useful cache and a second one would hold bytes the GPU cannot read in \
+                     place. Raise INFR_CACHE to cache more; INFR_DRAM_CACHE forces a host arena",
+                    classes.len(),
+                );
+                let mut out = Vec::with_capacity(classes.len());
+                for &(slot_bytes, _) in classes {
+                    let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
+                        .map_err(|e| anyhow!("{e}"))?;
+                    out.push(Some(std::sync::Arc::new(p)));
+                }
+                return Ok(out);
+            }
             infr_core::hostmem::ArenaPlan::Take(n) => {
                 if explicit == infr_core::hostmem::Requested::Auto {
                     tracing::info!(
@@ -230,12 +265,6 @@ fn vulkan_host_tier(
             infr_core::hostmem::ArenaPlan::Skip(why) => {
                 use infr_core::hostmem::Skip;
                 match why {
-                    Skip::Unified => tracing::info!(
-                    "{what} host tier: not built — this device's memory IS host memory, so the \
-                     streaming arena above already lives in RAM and a tier beneath it would spend \
-                     the same bytes on blocks the GPU cannot read in place. Raise the paging \
-                     budget (INFR_CACHE) instead; INFR_DRAM_CACHE still forces one"
-                ),
                     Skip::NoProbe => tracing::warn!(
                     "{what} host tier: this model must stream, but there is no host-memory probe \
                      on this platform, so the arena cannot be sized automatically — set \
