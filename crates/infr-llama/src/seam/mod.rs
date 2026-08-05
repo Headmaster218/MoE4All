@@ -670,6 +670,57 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
 }
 
+/// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]: the residual
+/// stream for the WHOLE prompt at once — one `[ubatch, n_embd]` f32 buffer per chunk, all live
+/// across the layer boundary — where chunk-major keeps only the chunk it is running.
+///
+/// Priced at the full context because that is the longest prompt the session can be handed, and
+/// these buffers are allocated mid-prefill out of whatever the arenas left: an under-reserve
+/// surfaces as a VRAM-guard refusal on a long prompt, not as a smaller cache. A short prompt
+/// really does allocate less, so on a session that never fills its window this is held back and
+/// unused — the price of sizing an arena before the prompts arrive.
+///
+/// Zero when the session prefills chunk-major ([`layer_major_prefill`]).
+pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
+    let ctx = want_ctx.max(1);
+    let ub = ubatch.clamp(1, ctx);
+    ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
+}
+
+/// Does this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
+/// L+1 — instead of running the whole model per chunk?
+///
+/// The two orders compute the same thing; they differ in what they re-read. Chunk-major sweeps the
+/// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
+/// prefill cost when they stream: measured on Qwen3-14B Q8_0 at ctx 4096, the 1024-row default read
+/// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
+/// one sweep regardless of chunk count, at the cost of holding every chunk's residual stream at once
+/// ([`layer_major_act_bytes`]) — a trade that only pays when there is I/O to save, hence the default
+/// of "on exactly when the weights stream".
+///
+/// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
+/// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
+/// next, which is what threads the residual stream between two layers' dispatches.
+pub(crate) fn layer_major_prefill(
+    ec: &EngineConfig,
+    caps: &infr_core::backend::Capabilities,
+    streaming: bool,
+) -> bool {
+    let want = ec.paging.layer_major.unwrap_or(streaming);
+    if want && !caps.graph_input_inplace {
+        // Only reachable through the explicit override on a wrapper backend (TP/EP/pipeline) —
+        // the auto rule needs a dense pager, which those do not host. Say so rather than silently
+        // running the other order.
+        tracing::warn!(
+            backend = caps.name,
+            "layer-major prefill needs a backend that carries a bound graph Input across \
+             executes; this one does not — prefilling chunk-major"
+        );
+        return false;
+    }
+    want
+}
+
 /// Safety pad on [`dense_act_reserve_at`]'s per-row terms, as `(numerator, denominator)`.
 ///
 /// **What it covers.** The terms above name the pools a forward allocates, but WHICH pools it
@@ -1132,7 +1183,17 @@ pub(crate) fn dense_placement_fits(
     v_fmt: DType,
 ) -> bool {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    dense_resident_need(cfg, weights, want_ctx, ring, ubatch, k_fmt, v_fmt) <= vram.alloc_room()
+    // A RESIDENT session prefills chunk-major unless the user forced the other order, so the
+    // whole-prompt residual stream is priced only for the forced case. `Some(true)` is the sole
+    // value that reaches here as layer-major: unset means "on iff streaming", and a session that
+    // fits does not stream.
+    let lm = if ec.paging.layer_major == Some(true) {
+        layer_major_act_bytes(cfg, want_ctx, ubatch)
+    } else {
+        0
+    };
+    dense_resident_need(cfg, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
+        <= vram.alloc_room()
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
@@ -1167,15 +1228,25 @@ pub(crate) fn dense_stream_budget_at(
     v_fmt: DType,
 ) -> u64 {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    vram.alloc_room().saturating_sub(dense_resident_need(
-        cfg,
-        resident_weights,
-        want_ctx,
-        ring,
-        ubatch,
-        k_fmt,
-        v_fmt,
-    ))
+    // A streamed session prefills LAYER-MAJOR by default, which holds every chunk's residual
+    // stream at once — those bytes come out of the same VRAM the arenas want, and they are
+    // allocated later, so the arena has to leave room for them (see `layer_major_act_bytes`).
+    let lm = if ec.paging.layer_major == Some(false) {
+        0
+    } else {
+        layer_major_act_bytes(cfg, want_ctx, ubatch)
+    };
+    vram.alloc_room()
+        .saturating_sub(dense_resident_need(
+            cfg,
+            resident_weights,
+            want_ctx,
+            ring,
+            ubatch,
+            k_fmt,
+            v_fmt,
+        ))
+        .saturating_sub(lm)
 }
 
 /// Headroom the MoE expert budget holds back on top of the dense weights and the KV cache: covers
@@ -3800,6 +3871,13 @@ mod seam_helper_tests {
         );
 
         // Streaming budget: exhausted at the ceiling, and it never offers the guard's headroom.
+        // A streamed session also prefills layer-major, whose whole-prompt residual stream is
+        // allocated AFTER the arenas out of the same VRAM — so the budget holds that back too.
+        let lm = super::layer_major_act_bytes(&cfg, ctx, ub);
+        assert!(
+            lm > 0,
+            "the layer-major term must be a real subtraction here"
+        );
         let budget =
             |w: u64| super::dense_stream_budget_at(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
         assert_eq!(
@@ -3809,8 +3887,31 @@ mod seam_helper_tests {
         );
         assert_eq!(
             budget(exact - (1 << 30)),
+            (1 << 30) - lm,
+            "and it is exactly the room below the ceiling less the residual stream, not the free \
+             figure"
+        );
+        // Forcing chunk-major back on gives those bytes to the arena, which is the knob's point.
+        let chunk_major = EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: Some(false),
+                ..ec.paging.clone()
+            },
+            ..ec.clone()
+        };
+        assert_eq!(
+            super::dense_stream_budget_at(
+                &cfg,
+                &chunk_major,
+                exact - (1 << 30),
+                &vram,
+                ctx,
+                ub,
+                f16.0,
+                f16.1
+            ),
             1 << 30,
-            "and it is exactly the room below the ceiling, not the free figure"
+            "paging.layer_major = false takes the residual-stream reserve back off the budget"
         );
 
         // MoE expert placement: same ceiling, minus the pager's own headroom.

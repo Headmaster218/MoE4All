@@ -2352,6 +2352,79 @@ fn gpu_seam_dense_stream_prefill_matches_resident() {
     );
 }
 
+/// LAYER-MAJOR streamed prefill (`paging.layer_major`): the chunk loop runs INSIDE the layer loop,
+/// so the model is swept once per prompt instead of once per chunk. Same dispatches, reordered —
+/// which is the whole claim, and token identity against the chunk-major arm is what checks it.
+///
+/// The shape matters: a 64-row chunk over this prompt is SIX-plus chunks, and only a multi-chunk
+/// prefill can tell the two orders apart at all (one chunk makes them the same sequence of
+/// dispatches). Each chunk then carries its own residual stream across every layer boundary, and
+/// chunk C's attention has to find chunks 0..C-1 already in the layer's KV — reorder the chunks
+/// within a layer and this goes red, which is what makes it a check rather than a formality.
+///
+/// Three arms, all at the same chunk height so the only difference is the loop nesting and the
+/// residency: streamed layer-major (the default for a streamed model), streamed chunk-major, and
+/// fully resident.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_dense_stream_prefill_layer_major_matches_chunk_major() {
+    let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
+    let mut _tlk = test_serial_lock();
+    let n = 8usize;
+    let chunk = 64usize;
+
+    let model = model_default(&path);
+    let long = "Explain, step by step and in thorough detail, how a transformer language model \
+        processes a sequence of tokens through its embedding, attention, and feed-forward layers. "
+        .repeat(12);
+    let rendered = model.render_chat(&long).expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+    assert!(
+        prompt_ids.len() > 4 * chunk,
+        "the prompt must span several {chunk}-row chunks; got {}",
+        prompt_ids.len()
+    );
+
+    // Every arm pins the same chunk height — the GEMM tiling is chunk-dependent, so a height
+    // difference would show up as float noise and confuse a token-identity assertion.
+    let pin_chunk = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(chunk);
+        c.device.ubatch_specified = true;
+    };
+    let mut resident_ids = Vec::new();
+    model_cfg(&path, pin_chunk)
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    // Below the model's ~1.4 GB of streamable projections → real eviction every pass.
+    let streamed = |layer_major: Option<bool>| {
+        model_cfg(&path, |c| {
+            pin_chunk(c);
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+            c.paging.layer_major = layer_major;
+        })
+    };
+    let mut chunk_major_ids = Vec::new();
+    streamed(Some(false))
+        .generate_vulkan_ids(&prompt_ids, n, |id| chunk_major_ids.push(id))
+        .expect("chunk-major streamed gpu gen");
+    // `None` is the DEFAULT, and a streamed model is exactly the case it resolves to layer-major:
+    // running the auto arm is what keeps the gate itself covered.
+    let mut layer_major_ids = Vec::new();
+    streamed(None)
+        .generate_vulkan_ids(&prompt_ids, n, |id| layer_major_ids.push(id))
+        .expect("layer-major streamed gpu gen");
+
+    assert_eq!(
+        layer_major_ids, chunk_major_ids,
+        "layer-major prefill diverged from the chunk-major order it only reorders"
+    );
+    assert_eq!(
+        layer_major_ids, resident_ids,
+        "layer-major streamed prefill diverged from the all-resident GPU run"
+    );
+}
+
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
 fn cpu_golden_gemma4_e2b() {

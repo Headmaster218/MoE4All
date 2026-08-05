@@ -79,8 +79,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a discrete GPU, which is the only hardware it can be tested on here, and is
   also the honest choice on a machine whose RAM is better spent elsewhere. No
   effect on the CPU backend, where that arena is the only tier there is.
+- `INFR_LAYER_MAJOR` / `paging.layer_major`: force the prefill loop order. `1` =
+  layer-major, `0` = chunk-major, unset = layer-major exactly when the weights
+  stream (see the Changed entry below). Both overrides are for A/B; forcing it
+  on is the only way to put a resident model on the layer-major path.
 
 ### Changed
+
+- **A streamed model now prefills LAYER-MAJOR: the prompt sweeps the weight set
+  once instead of once per prefill chunk.** Prefill runs in `device.ubatch`
+  chunks and every chunk used to run the whole model, so a P-token prompt paid
+  `ceil(P/ubatch)` complete weight sweeps — invisible when the weights are
+  resident and the entire bill when they stream. The chunk loop now runs INSIDE
+  the layer loop, which reads each weight once per prompt at the same
+  chunk-sized dispatches. (Raising `device.ubatch` to the prompt length reaches
+  the same I/O and is not a substitute: it bakes a single multi-second submit
+  that trips the GPU hang watchdog.) Measured on a memory-capped Qwen3-14B Q8_0
+  (`MemoryMax=8G`, `paging.cache=2g`, `paging.dram=6g`, P=4096, RX 7900 XTX) at
+  the 1024-row default chunk: **prefill reads 25.27 → 6.31 GB from disk (4.00x)
+  and runs 341.9 → 779.9 tok/s (2.28x)**, with the read volume now identical to
+  a single-chunk prefill's. The cost is holding every chunk's residual stream at
+  once (`ctx * n_embd` f32), which the streaming budget reserves for. Resident
+  models keep the chunk-major order, where the reorder would buy nothing and
+  only add activation residency.
 
 - The Vulkan context window is now re-decided against the memory the device
   reports free once the weights are resident, instead of only against a pre-load

@@ -166,6 +166,16 @@ cfg_struct! {
         /// only hardware most of this is developed and tested on. Also the honest choice on a
         /// machine whose RAM is better spent elsewhere.
         dram_bypass: bool = false,
+        /// `INFR_LAYER_MAJOR`, TRI-state: `None` = decide from the placement (layer-major whenever
+        /// the model's weights STREAM, chunk-major when they are resident), `Some(true)` = force it
+        /// on, `Some(false)` = force it off.
+        ///
+        /// Layer-major prefill runs the chunk loop INSIDE the layer loop, so a prompt sweeps the
+        /// weight set once instead of once per `device.ubatch` chunk. That is the whole prefill
+        /// cost of a streamed model and nothing at all when the weights are resident, where it
+        /// would only add activation residency — hence the auto rule. Both overrides exist for A/B:
+        /// forcing it ON is how a resident model can be diffed against the chunk-major order.
+        layer_major: Option<bool> = None,
     }
 }
 

@@ -859,56 +859,48 @@ residue worth tracking; what follows is that plus what was deliberately left.
   currently sizes it against HOST memory the way `paging.dram` now is. Needs an
   APU to answer. Metal is a separate question: it has no pager at all until
   phase 4, so it inherits none of this yet.
-- **A chunked prefill re-reads the whole model once per chunk — MEASURED, not
-  inferred.** The prefill loop (`infr-llama/src/seam/runner.rs`, the
-  `cstart`/`cend` walk) runs the full graph per `ubatch` chunk, so a P-token
-  prompt costs `ceil(P / ubatch)` complete weight sweeps. That is invisible when
-  the weights are resident and brutal when they stream.
+- **Layer-major prefill LANDED; what is left is where it does not reach.** The
+  chunk loop now runs inside the layer loop for a streamed model
+  (`seam::layer_major_prefill`, the `spans`/`chunks` walk in
+  `generate_dense_backend`), so a prompt sweeps the weight set once instead of
+  once per chunk. Re-measured on the B36 shape — Qwen3-14B Q8_0 / RX 7900 XTX,
+  `MemoryMax=8G`, `paging.cache=2g`, `paging.dram=6g`, P=4096, three rounds with
+  the arm order permuted and a cold page cache before every run — at the
+  1024-row default chunk: 25.27 → 6.31 GB read and 341.9 → 779.9 pp t/s, the
+  read volume now exactly a single-chunk prefill's. The residue:
 
-  Swept 2026-08-05 on Qwen3-14B Q8_0 (14.97 GB) / RX 7900 XTX, `MemoryMax=8G`,
-  `paging.cache=2g`, `paging.dram=6g` pinned, P=4096, `-n 0 -r 2`, three rounds
-  with alternating arm order and a cold page cache before every run. Setting
-  `device.ubatch >= P` makes prefill one chunk, which is the I/O layer-major
-  would reach, so this brackets the win without implementing it:
-
-  | ubatch | chunks | prefill GB | pp t/s |
-  | -----: | -----: | ---------: | -----: |
-  |    512 |      8 |      50.52 |  172.7 |
-  |   1024 |      4 |      25.26 |  341.5 |
-  |   2048 |      2 |      12.65 |  623.5 |
-  |   4096 |      1 |       6.32 | 1052.5 |
-
-  Bytes are EXACTLY linear in chunk count — host reads came out at `72 x chunks`
-  with no residual, and the arena line was byte-identical in all twelve runs. So
-  prefill disk I/O is `6.32 GB x ceil(P / ubatch)` and otherwise independent of
-  P. At the 1024-row default that is **4.00x the bytes and 3.08x the wall time**
-  of a single sweep at P=4096, and the ratio grows linearly with prompt length.
-
-  A resident control says the win is I/O and not tile efficiency: with weights
-  resident, ubatch 1024 vs 2048 measured 1801.7 vs 1797.1 t/s, identical inside
-  0.25%. That ~1800 t/s is also the ceiling layer-major chases; the one-chunk
-  streamed arm already reaches 1052.
-
-  **`ubatch = P` is a safe proxy for the I/O, NOT a safe implementation.** The
-  resident ubatch=4096 arm died with
-  `The CS has been cancelled because the context is lost` after the submit
-  splitter armed at 103 dispatches. The streamed arms survived only
-  incidentally: paging made their first forward ~5.9 s over 3 dispatches, which
-  armed a far tighter 16-dispatch splitter. This is the hazard the `runner.rs`
-  chunk-loop comment already describes. Layer-major avoids it by construction —
-  it keeps chunk-sized dispatches and only inverts the loop nesting.
-
-  The cost is holding every chunk's activations at once rather than one chunk's:
-  32k x 4096 x 2 B is ~268 MB, affordable. This is the largest unbuilt win for
-  streamed models and it matters most for the DeepSeek-class targets this
-  feature exists for. It is a real restructuring of the prefill path, not a
-  tweak, and it should be gated on the model actually streaming (resident models
-  must keep today's chunk-major order, which is right for them).
-
-  Not covered by the sweep: only P=4096 was measured, only the dense pager (the
-  MoE paged-expert path was not swept), and `ru_majflt` is not an instrument
-  here at all — the pager uses `pread`, so it stayed flat at 1455-1888 across
-  every arm.
+  - **The remaining gap to the single-chunk arm is HOST cost, not I/O.** Same
+    6.31 GB, but 779.9 t/s against 1049.6: layer-major builds and compiles a
+    graph per (layer, chunk) — 40 x 4 here — where the one-chunk arm builds one.
+    `build` re-declares every weight handle for the whole model on each call and
+    `alloc_scratch` re-allocates the whole Internal set per execute, so both
+    scale with the dispatch count. A per-(layer, batch-shape) plan cache, or a
+    span band wider than one layer, is the obvious next lever; neither was
+    tried.
+  - **The activation reserve is priced at the FULL context, not the prompt.**
+    `layer_major_act_bytes` reserves `ctx * n_embd` f32 out of the streaming
+    budget (`dense_stream_budget_at`) because those buffers are allocated
+    mid-prefill and the arenas are sized before any prompt arrives. A session
+    that never fills its window holds that back for nothing — at ctx 32k /
+    n_embd 5120 it is 671 MB of arena. Sizing it against a per-request prompt
+    length, or reserving in bands, needs the budget to be re-decidable after
+    load, which it is not today.
+  - **Only the dense Vulkan path.** MoE expert paging, MTP, the qwen35/DeltaNet
+    bespoke path, Metal and the CPU backend all keep chunk-major: the gate is
+    `Backend::dense_paged`, and the E2B arch is rejected outright by an assert
+    in `build` (its `per_layer_inp` is prologue-built and a later span cannot
+    see it). A paged MoE prefill has the same `ceil(P/ubatch)` structure and was
+    never swept; whether the expert cache's locality makes it the same win is
+    unknown.
+  - **Not measured: more than one prompt length, and any model but this one.**
+    The sweep is P=4096 on one dense model, one drive, one GPU. The claim that
+    the ratio grows with prompt length is arithmetic (`ceil(P/ubatch)` sweeps
+    become one), not an observation.
+  - **`Capabilities::graph_input_inplace` is answered, not tested, for Metal.**
+    It is set true there on the strength of `infr_core::exec::writes_back` being
+    shared with the CPU interpreter — read, not run. Nothing on Metal takes the
+    layer-major path today (its backend hosts no dense pager), so the flag is
+    inert there until something forces it on.
 
 - **`Pager`'s LRU is O(n_slots) per touch.** `mark_mru`, `evict` and
   `take_slot`/`take_slot_opt` all do `lru.iter().position(...)` followed by
