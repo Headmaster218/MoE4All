@@ -116,10 +116,33 @@ pub(super) struct DeltaW {
     pub(super) out: TensorId,
 }
 
-/// The layer's token mixer: classic attention, or (qwen35) gated-DeltaNet linear attention.
+/// DeepSeek V2+ MLA (Multi-head Latent Attention) mixer weights — absorbed form. The KV cache holds
+/// ONE compressed row per token (`key_length = kv_lora_rank + qk_rope_dim`); V is an aliased prefix —
+/// no separate V cache. See `docs/deepseek.md` § Stage 2.
+pub(super) struct MlaW {
+    /// Q low-rank input projection `[n_embd, q_lora_rank]` (absent in lite models).
+    pub(super) wq_a: Option<TensorId>,
+    /// RMSNorm on the q_lora_rank-dimensional intermediate, between wq_a and wq_b.
+    pub(super) q_a_norm: Option<TensorId>,
+    /// Q low-rank output `[q_lora_rank, n_head * head_k_mla]` (`wq` for lite: `[n_embd, ...]`).
+    pub(super) wq_b: TensorId,
+    /// Combined KV compression + rope projection `[n_embd, kv_lora_rank + qk_rope_dim]`.
+    pub(super) wkv_a_mqa: TensorId,
+    /// RMSNorm on the KV latent (`kv_lora_rank`-wide) AFTER the split from k_pe.
+    pub(super) kv_a_norm: TensorId,
+    /// Absorption weight `[n_head, kv_lora_rank, qk_nope_dim]` — wk_b[h]ᵀ maps q_nope to latent.
+    pub(super) wk_b: TensorId,
+    /// Output weight `[n_head, kv_lora_rank, v_head_dim]` — applied AFTER the KQV product.
+    pub(super) wv_b: TensorId,
+    /// Output projection `[n_head * v_head_dim, n_embd]`.
+    pub(super) wo: TensorId,
+}
+
+/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, or DeepSeek MLA.
 pub(super) enum MixerW {
     Attn(AttnW),
     DeltaNet(DeltaW),
+    Mla(MlaW),
 }
 
 /// Per-layer weight handles captured while building one decode graph (sandwich norms optional).
