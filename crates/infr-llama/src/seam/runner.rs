@@ -6,7 +6,7 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, DeltaW, FfnW, LayerW, MixerW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
+    AttnW, DeltaW, FfnW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
@@ -367,6 +367,19 @@ pub(crate) fn generate_dense_backend(
     let max_hd = c.max_head_dim();
     let max_kvrow = c.max_n_kv() * max_hd;
     let max_qrow = nh * max_hd;
+    // DeepSeek2 MLA: per-layer dims are uniform (no SWA/full variation), but the max calc is for
+    // uniform models anyway.
+    let mla_key_len = if c.deepseek2 {
+        c.kv_lora_rank + c.qk_rope_dim
+    } else {
+        0
+    };
+    let mla_qhead = if c.deepseek2 {
+        c.head_k_mla + c.qk_rope_dim
+    } else {
+        0
+    };
+    let mla_qrow = nh * mla_qhead;
     let nff = c.n_ff; // max FFN width
     let gemma = c.gemma;
     let gemma4 = c.gemma4;
@@ -691,8 +704,25 @@ pub(crate) fn generate_dense_backend(
             // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+            let is_mla = c.deepseek2;
             wload(&[&p("attn_norm.weight")])?;
-            if is_delta {
+            if is_mla {
+                // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
+                if !c.is_lite {
+                    wload(&[&p("attn_q_a.weight")])?;
+                    wload(&[&p("attn_q_a_norm.weight")])?;
+                }
+                wload(&[&p(if c.is_lite {
+                    "attn_q.weight"
+                } else {
+                    "attn_q_b.weight"
+                })])?;
+                wload(&[&p("attn_kv_a_mqa.weight")])?;
+                wload(&[&p("attn_kv_a_norm.weight")])?;
+                wload(&[&p("attn_k_b.weight")])?;
+                wload(&[&p("attn_v_b.weight")])?;
+                wload(&[&p("attn_output.weight")])?;
+            } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
                 wload(&[&p("attn_gate.weight")])?;
                 wload(&[&p("ssm_conv1d.weight")])?;
@@ -722,11 +752,11 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("attn_k.bias")])?;
                 wload(&[&p("attn_v.bias")])?;
             }
-            if qk_norm && !is_delta {
+            if qk_norm && !is_delta && !is_mla {
                 wload(&[&p("attn_q_norm.weight")])?;
                 wload(&[&p("attn_k_norm.weight")])?;
             }
-            if !is_delta {
+            if !is_delta && !is_mla {
                 wload(&[&p("attn_output.weight")])?;
             }
             // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
@@ -909,6 +939,8 @@ pub(crate) fn generate_dense_backend(
         // conv-history state (`[(d_conv-1), conv_channels]` f32) and DeltaNet recurrent state
         // (`[n_vhead, head_k, head_v]` f32) — fixed-size (NOT `want_ctx`-scaled) and always f32
         // regardless of the session's chosen KV dtype (see `MixerW::DeltaNet` / the `build` closure).
+        // DeepSeek2 MLA layers have ONE k_cache (key_length = kv_lora_rank + qk_rope_dim wide) per
+        // token; V is an aliased prefix view — no separate v_cache.
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..c.n_layer {
@@ -921,6 +953,21 @@ pub(crate) fn generate_dense_backend(
                 );
                 vbufs.push(
                     be.alloc(s_elems * 4, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                continue;
+            }
+            // DeepSeek2 MLA: ONE k_cache row (key_length = kv_lora_rank + qk_rope_dim) per token;
+            // V is an aliased prefix view — no separate v_cache. vbufs[l] is a zero-size placeholder.
+            if c.deepseek2 {
+                let key_len = c.kv_lora_rank + c.qk_rope_dim;
+                let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
+                kbufs.push(
+                    be.alloc(kv_fmt_bytes(k_fmt, rows_l * key_len), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                vbufs.push(
+                    be.alloc(4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 continue;
@@ -1323,6 +1370,14 @@ pub(crate) fn generate_dense_backend(
                 v_cache.push(g.input(f32d(s_elems)));
                 continue;
             }
+            // DeepSeek2 MLA: ONE k_cache row (key_length wide); v_cache is a zero-size placeholder.
+            if c.deepseek2 {
+                let key_len = c.kv_lora_rank + c.qk_rope_dim;
+                let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
+                k_cache.push(g.input(kd(rows_l * key_len)));
+                v_cache.push(g.input(vd(4))); // placeholder, V aliased from K
+                continue;
+            }
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
             // Declared rows MUST equal the allocation above: every backend derives the ring's
             // row capacity from this declared element count (row = pos % (numel / row_width)).
@@ -1349,7 +1404,33 @@ pub(crate) fn generate_dense_backend(
             // qwen35 gated-DeltaNet layer: 9 mixer weights, no q/k/v/qk_norm/bias/wo at all (mirrors
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
-            let mixer = if is_delta {
+            let is_mla = c.deepseek2;
+            let mixer = if is_mla {
+                let (wq_a, q_a_norm) = if c.is_lite {
+                    (None, None)
+                } else {
+                    (
+                        Some(wpush(&mut g, &mut weights)),
+                        Some(wpush(&mut g, &mut weights)),
+                    )
+                };
+                let wq_b = wpush(&mut g, &mut weights);
+                let wkv_a_mqa = wpush(&mut g, &mut weights);
+                let kv_a_norm = wpush(&mut g, &mut weights);
+                let wk_b = wpush(&mut g, &mut weights);
+                let wv_b = wpush(&mut g, &mut weights);
+                let wo = wpush(&mut g, &mut weights);
+                MixerW::Mla(MlaW {
+                    wq_a,
+                    q_a_norm,
+                    wq_b,
+                    wkv_a_mqa,
+                    kv_a_norm,
+                    wk_b,
+                    wv_b,
+                    wo,
+                })
+            } else if is_delta {
                 let qkv = wpush(&mut g, &mut weights);
                 let gate = wpush(&mut g, &mut weights);
                 let conv1d = wpush(&mut g, &mut weights);
@@ -1621,6 +1702,28 @@ pub(crate) fn generate_dense_backend(
         let q16 = g.internal(f16d(batch * max_qrow));
         let k16 = g.internal(f16d(batch * max_kvrow));
         let attn = g.internal(f32d(batch * max_qrow));
+        // DeepSeek2 MLA scratch: mla_q (f32 query with [nope|rope] per head, roped by the kernel),
+        // mla_k16 (f16 K row for WriteKv), mla_kv_cmpr (f32 latent for norm), mla_rope (f32 k_pe).
+        let mla_q = if mla_qrow > 0 {
+            Some(g.internal(f32d(batch * mla_qrow)))
+        } else {
+            None
+        };
+        let mla_k16 = if mla_key_len > 0 {
+            Some(g.internal(f16d(batch * mla_key_len)))
+        } else {
+            None
+        };
+        let mla_kv_cmpr = if c.deepseek2 {
+            Some(g.internal(f32d(batch * c.kv_lora_rank)))
+        } else {
+            None
+        };
+        let mla_rope = if c.deepseek2 {
+            Some(g.internal(f32d(batch * c.qk_rope_dim)))
+        } else {
+            None
+        };
         // Fused-QKV prefill staging: the wide GEMM writes [batch, qrow+2·kvrow] here, then three
         // CopyStrided ops split it into q/k/v. Decode (batch==1) skips it (offset GEMVs).
         let qkvbuf = if fuse_qkv && batch > 1 {
@@ -2112,6 +2215,181 @@ pub(crate) fn generate_dense_backend(
                 });
                 // DeltaNet's residual contribution is already in `sub` — skip the attention-only
                 // code below (query/key/value projections, RoPE, Attention, o-proj) entirely.
+            } else if let MixerW::Mla(mw) = &lw.mixer {
+                // DeepSeek V2+ MLA — absorbed form. Scratch tensors declared above.
+                let mla_q = mla_q.expect("deepseek2 model without mla_q scratch");
+                let mla_k16 = mla_k16.expect("deepseek2 model without mla_k16 scratch");
+                let kv_cmpr = mla_kv_cmpr.expect("deepseek2 model without mla_kv_cmpr scratch");
+                let kv_rope = mla_rope.expect("deepseek2 model without mla_rope scratch");
+                let key_len = (c.kv_lora_rank + c.qk_rope_dim) as u32;
+                let qk_nope = c.head_k_mla as u32;
+                let qk_rope = c.qk_rope_dim as u32;
+                let q_head_dim = qk_nope + qk_rope;
+                let qrow = (c.n_head as u32) * q_head_dim;
+                let kv_lora = c.kv_lora_rank as u32;
+                let v_hd = c.v_head_dim as u32;
+
+                // Q: wq_a (opt) → RMSNorm → wq_b (or wq for lite).
+                if let (Some(wq_a), Some(qan)) = (mw.wq_a, mw.q_a_norm) {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: wq_a,
+                        dst: attn,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: c.q_lora_rank as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::RmsNorm {
+                        x: attn,
+                        weight: qan,
+                        dst: attn,
+                        rows: batch as u32,
+                        dim: c.q_lora_rank as u32,
+                        eps,
+                    });
+                    g.push(Op::Linear {
+                        x: attn,
+                        weight: mw.wq_b,
+                        dst: mla_q,
+                        m: batch as u32,
+                        in_f: c.q_lora_rank as u32,
+                        out_f: qrow,
+                        w_off: 0,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: mw.wq_b,
+                        dst: mla_q,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: qrow,
+                        w_off: 0,
+                    });
+                }
+
+                // KV: wkv_a_mqa → mla_k16 (f16). Split into kv_cmpr and k_pe, norm+rope, reassemble.
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: mw.wkv_a_mqa,
+                    dst: mla_k16,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: key_len,
+                    w_off: 0,
+                });
+                // Extract kv_cmpr (first kv_lora columns), norm it.
+                g.push(Op::CopyStrided {
+                    src: mla_k16,
+                    src_off: 0,
+                    src_stride: key_len,
+                    dst: kv_cmpr,
+                    dst_off: 0,
+                    dst_stride: kv_lora,
+                    rows: batch as u32,
+                    n: kv_lora,
+                });
+                g.push(Op::RmsNorm {
+                    x: kv_cmpr,
+                    weight: mw.kv_a_norm,
+                    dst: kv_cmpr,
+                    rows: batch as u32,
+                    dim: kv_lora,
+                    eps,
+                });
+                // Copy normed kv_cmpr back.
+                g.push(Op::CopyStrided {
+                    src: kv_cmpr,
+                    src_off: 0,
+                    src_stride: kv_lora,
+                    dst: mla_k16,
+                    dst_off: 0,
+                    dst_stride: key_len,
+                    rows: batch as u32,
+                    n: kv_lora,
+                });
+                // Extract k_pe (last qk_rope columns), rope it.
+                g.push(Op::CopyStrided {
+                    src: mla_k16,
+                    src_off: kv_lora,
+                    src_stride: key_len,
+                    dst: kv_rope,
+                    dst_off: 0,
+                    dst_stride: qk_rope,
+                    rows: batch as u32,
+                    n: qk_rope,
+                });
+                g.push(Op::Rope {
+                    x: kv_rope,
+                    positions,
+                    dst: kv_rope,
+                    rows: batch as u32,
+                    n_head: 1,
+                    head_dim: qk_rope,
+                    rope_dim: qk_rope,
+                    theta,
+                    freq_factors: None,
+                    x_stride: 0,
+                });
+                // Copy roped k_pe back.
+                g.push(Op::CopyStrided {
+                    src: kv_rope,
+                    src_off: 0,
+                    src_stride: qk_rope,
+                    dst: mla_k16,
+                    dst_off: kv_lora,
+                    dst_stride: key_len,
+                    rows: batch as u32,
+                    n: qk_rope,
+                });
+                // WriteKv.
+                g.push(Op::WriteKv {
+                    src: mla_k16,
+                    cache: k_cache[l],
+                    rows: batch as u32,
+                    row_stride: key_len,
+                    pos: start_pos as u32,
+                });
+
+                // MLA attention (the kernel handles q_pe rope internally).
+                let mla_scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt();
+                g.push(Op::Mla {
+                    q: mla_q,
+                    k_cache: k_cache[l],
+                    wk_b: mw.wk_b,
+                    wv_b: mw.wv_b,
+                    dst: attn,
+                    rows: batch as u32,
+                    kv_len: (start_pos + batch) as u32,
+                    n_head: c.n_head as u32,
+                    q_head_dim,
+                    kv_lora_rank: kv_lora,
+                    qk_nope_dim: qk_nope,
+                    qk_rope_dim: qk_rope,
+                    v_head_dim: v_hd,
+                    scale: mla_scale,
+                    mask,
+                    pos: start_pos as u32,
+                });
+                // wo projection, residual add.
+                g.push(Op::Linear {
+                    x: attn,
+                    weight: mw.wo,
+                    dst: sub,
+                    m: batch as u32,
+                    in_f: (c.n_head as u32) * v_hd,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Add {
+                    a: hidden,
+                    b: sub,
+                    dst: hidden,
+                    n: (batch * ne) as u32,
+                });
+                // Skip the standard attention code below (q/k/v, RoPE, Attn, o-proj).
+                // Continue to FFN.
             } else {
                 let MixerW::Attn(aw) = &lw.mixer else {
                     unreachable!("qwen35 DeltaNet handled above")
