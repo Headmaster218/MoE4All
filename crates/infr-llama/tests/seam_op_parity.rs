@@ -752,3 +752,152 @@ fn deltanet_parity() {
     );
     assert!(maxerr(&c, &vv) < 1e-2, "DeltaNet diverges");
 }
+
+/// MLA (Multi-head Latent Attention) parity: CPU backend vs a hand-written f32 reference that
+/// replicates the absorbed-form math (rope q_pe, absorb q_nope via wk_b, SDPA, wv_b output).
+/// Small synthetic dims — no GGUF, no model load — so this runs in every CI and catches
+/// regressions in the kernel independently of the graph builder.
+#[test]
+fn mla_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // Tiny dims so the reference is trivially verifiable by hand.
+    let (rows, nh, kv_lora, qk_nope, qk_rope, vhd) =
+        (2usize, 2usize, 3usize, 2usize, 2usize, 2usize);
+    let key_len = kv_lora + qk_rope; // 5
+    let q_head_dim = qk_nope + qk_rope; // 4
+
+    let mut g = Graph::new();
+    // Q: [rows, nh, q_head_dim] — each row has nh heads of [nope(2)|rope(2)].
+    let q = g.input(f32d(rows * nh * q_head_dim));
+    // K cache: [kv_len, key_len] — kv_len rows of key_len=5 elements each (latent 3 + rope 2).
+    // V = first kv_lora=3 columns of each K row (aliased).
+    let k_cache = g.input(f32d(rows * key_len)); // kv_len = rows (simple case)
+                                                 // wk_b: [nh, kv_lora, qk_nope] = [2, 3, 2]
+    let wk_b = g.weight(f32d(nh * kv_lora * qk_nope));
+    // wv_b: [nh, kv_lora, vhd] = [2, 3, 2]
+    let wv_b = g.weight(f32d(nh * kv_lora * vhd));
+    let dst = g.output(f32d(rows * nh * vhd));
+    let scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt(); // 1/sqrt(4) = 0.5
+    g.push(Op::Mla {
+        q,
+        k_cache,
+        wk_b,
+        wv_b,
+        dst,
+        rows: rows as u32,
+        kv_len: rows as u32, // attend to all rows
+        n_head: nh as u32,
+        q_head_dim: q_head_dim as u32,
+        kv_lora_rank: kv_lora as u32,
+        qk_nope_dim: qk_nope as u32,
+        qk_rope_dim: qk_rope as u32,
+        v_head_dim: vhd as u32,
+        scale,
+        mask: AttnMask::Causal,
+        pos: 0,
+    });
+
+    // Synthetic inputs — small integers for traceability.
+    // Q: row 0 head 0 = [1,2,3,4] (nope=[1,2], pe_raw=[3,4]), head 1 = [5,6,7,8]
+    //    row 1 head 0 = [9,10,11,12], head 1 = [13,14,15,16]
+    let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
+        .map(|x| x as f32)
+        .collect();
+    // K cache: each row = [10,11,12, 1,2] (latent=[10,11,12], k_pe_raw=[1,2])
+    let ki: Vec<f32> = (0..rows * key_len)
+        .map(|i| {
+            let col = i % key_len;
+            if col < kv_lora {
+                (10 + col) as f32
+            } else {
+                (1 + (col - kv_lora)) as f32
+            }
+        })
+        .collect();
+    // wk_b[h][a_idx][nope_idx]: lay out as [nh][kv_lora][qk_nope] row-major within each head.
+    // wk_b[h=0] = [[1,0], [0,1], [0,0]]  — maps nope[0]→latent[0], nope[1]→latent[1]
+    // wk_b[h=1] = [[0,0], [1,0], [0,1]]  — maps nope[0]→latent[1], nope[1]→latent[2]
+    let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+    let s = kv_lora * qk_nope; // stride per head
+    wk[0] = 1.0; // h=0, latent 0 ← nope 0
+    wk[qk_nope + 1] = 1.0; // h=0, latent 1 ← nope 1
+    wk[s + qk_nope] = 1.0; // h=1, latent 1 ← nope 0
+    wk[s + 2 * qk_nope + 1] = 1.0; // h=1, latent 2 ← nope 1
+                                   // wv_b[h][a_idx][o_idx]: identity for h=0, shifted for h=1.
+    let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+    for h in 0..nh {
+        let off = h * kv_lora * vhd;
+        for a in 0..kv_lora.min(vhd) {
+            wv[off + a * vhd + a] = 1.0; // wv_b[h][a][a] = 1
+        }
+    }
+    let ins = [(q, &qi[..]), (k_cache, &ki[..])];
+    let ws = [(wk_b, &wk[..]), (wv_b, &wv[..])];
+    let c = run(&cpu, &g, &ins, &ws, dst, rows * nh * vhd);
+
+    // Hand-written reference: for each (row, head), absorb q_nope → dot K → softmax → wv_b.
+    let theta: f32 = 10000.0;
+    let hf = qk_rope / 2;
+    let mut ref_out = vec![0f32; rows * nh * vhd];
+    for ti in 0..rows {
+        let abs = ti; // pos=0, causal
+        for h in 0..nh {
+            // Extract q for this (row, head).
+            let q_off = (ti * nh + h) * q_head_dim;
+            let q_nope = &qi[q_off..q_off + qk_nope];
+            let q_pe_raw = &qi[q_off + qk_nope..q_off + q_head_dim];
+            // Absorb: q_full[0..kv_lora] = wk_b[h]^T @ q_nope
+            let wk_off = h * kv_lora * qk_nope;
+            let mut q_full = vec![0f32; key_len];
+            for j in 0..kv_lora {
+                let mut s = 0f32;
+                for i in 0..qk_nope {
+                    s += wk[wk_off + i * qk_nope + j] * q_nope[i];
+                }
+                q_full[j] = s;
+            }
+            // Rope q_pe
+            for p in 0..hf {
+                let (i0, i1) = (2 * p, 2 * p + 1);
+                let ang = abs as f32 * theta.powf(-2.0 * p as f32 / qk_rope as f32);
+                let (s, c) = (ang.sin(), ang.cos());
+                q_full[kv_lora + i0] = q_pe_raw[i0] * c - q_pe_raw[i1] * s;
+                q_full[kv_lora + i1] = q_pe_raw[i0] * s + q_pe_raw[i1] * c;
+            }
+            // SDPA: attend to positions [0..abs] (causal).
+            let n_keys = abs + 1;
+            let mut sc = vec![0f32; n_keys];
+            let mut mx = f32::NEG_INFINITY;
+            for (jj, scj) in sc.iter_mut().enumerate().take(n_keys) {
+                let kb = jj * key_len;
+                *scj = dot_ref(&q_full, &ki[kb..kb + key_len]) * scale;
+                mx = mx.max(*scj);
+            }
+            let mut l = 0f32;
+            for &s in &sc {
+                l += (s - mx).exp();
+            }
+            // Accumulate wv_b[h] @ V[j] into output for this head.
+            for (jj, &s) in sc.iter().enumerate().take(n_keys) {
+                let p = (s - mx).exp() / l;
+                let kb = jj * key_len;
+                let wv_off = h * kv_lora * vhd;
+                for o_idx in 0..vhd {
+                    let mut vs = 0f32;
+                    for a in 0..kv_lora {
+                        vs += wv[wv_off + a * vhd + o_idx] * ki[kb + a];
+                    }
+                    ref_out[(ti * nh + h) * vhd + o_idx] += p * vs;
+                }
+            }
+        }
+    }
+    // Compare.
+    let err = maxerr(&c, &ref_out);
+    assert!(err < 1e-4, "MLA parity diverges: max_err={err:e}");
+}
+
+/// f32 dot product (avoids pulling in the full crate::kernels::dot).
+fn dot_ref(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
