@@ -3644,7 +3644,9 @@ fn lower_op(
             norm_w,
             weight_before,
             ep_band,
-            .. // exp_probs_b, n_expert_groups, n_expert_groups_used omitted: Vulkan shaders not yet updated
+            exp_probs_b,
+            n_expert_groups,
+            n_expert_groups_used,
         } => {
             // Router gating (softmax vs sigmoid) and renormalization are `moe_topk` push-constant
             // flags — see its shader doc. `weight_before` (llama4: the routing weight scales the
@@ -3657,6 +3659,15 @@ fn lower_op(
                 infr_core::graph::MoeGating::Sigmoid => 1u32,
                 infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
             };
+            // exp_probs_b: resolve if present, else bind a dummy zero buffer (the shader ignores
+            // it when `has_bias == 0`). One float is enough — the shader reads only indices
+            // < n_expert, which push constants clamp before the bias buffer is touched.
+            let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
+                r(*epb)?
+            } else {
+                &*be_.alloc_uninit(4, BufferUsage::Weights)?
+            };
+            let has_bias = exp_probs_b.is_some();
             let (ne, n_expert, n_used, nff) = (
                 *ne as usize,
                 *n_expert as usize,
@@ -3834,12 +3845,16 @@ fn lower_op(
                     logits.as_ref(),
                     ids.as_ref(),
                     wts.as_ref(),
+                    bias_buf,
                     rows,
                     n_expert,
                     n_used,
                     *scale,
                     gating_u32,
                     *norm_w,
+                    has_bias,
+                    *n_expert_groups,
+                    *n_expert_groups_used,
                 );
                 // EP: rewrite the global top-k ids into this rank's local shard indices before the
                 // bucket sort (out-of-band → id 0, weight 0 — those assignments bucket harmlessly
@@ -4117,12 +4132,16 @@ fn lower_op(
                 logits.get(pool),
                 ids.get(pool),
                 wts.get(pool),
+                bias_buf,
                 rows,
                 n_expert,
                 n_used,
                 *scale,
                 gating_u32,
                 *norm_w,
+                has_bias,
+                *n_expert_groups,
+                *n_expert_groups_used,
             );
             // EP: rewrite the global top-k ids into this rank's local shard indices (out-of-band →
             // id 0, weight 0). The id-indexed GEMVs below then read the local bank; the weighted
@@ -5205,6 +5224,9 @@ fn execute_paged_moe<'a>(
         gating,
         norm_w,
         weight_before,
+        exp_probs_b,
+        n_expert_groups,
+        n_expert_groups_used,
         ..
     } = op
     else {
@@ -5233,6 +5255,14 @@ fn execute_paged_moe<'a>(
     let rows = graph.desc(*x).numel() / ne;
     let n_slots = rows * n_used;
     let r = |id: TensorId| resolve(scratch, bindings, id);
+
+    // Dummy bias buffer when exp_probs_b is absent (the shader ignores it when has_bias==0).
+    let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
+        r(*epb)?
+    } else {
+        &*be_.alloc_uninit(4, BufferUsage::Weights)?
+    };
+    let has_bias = exp_probs_b.is_some();
 
     // ── Router GEMV + top-k, recorded into the AMBIENT segment (no dedicated submit). `ids` is
     // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
@@ -5263,12 +5293,16 @@ fn execute_paged_moe<'a>(
             pool[&logits].as_ref(),
             pool[&ids_key].as_ref(),
             pool[&wts].as_ref(),
+            bias_buf,
             rows,
             n_expert,
             n_used,
             *scale,
             gating_u32,
             *norm_w,
+            has_bias,
+            *n_expert_groups,
+            *n_expert_groups_used,
         );
     }
 

@@ -7812,26 +7812,37 @@ impl<'a> Recorder<'a> {
         logits: &dyn Buffer,
         ids: &dyn Buffer,
         wts: &dyn Buffer,
+        bias: &dyn Buffer,
         n_tokens: usize,
         n_expert: usize,
         n_used: usize,
         scale: f32,
         gating: u32,
         norm_w: bool,
+        has_bias: bool,
+        n_expert_groups: u32,
+        n_expert_groups_used: u32,
     ) {
         let k = self
             .be
-            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 3, 20);
-        let mut push = [0u8; 20];
+            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 4, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&scale.to_ne_bytes());
         push[12..16].copy_from_slice(&gating.to_ne_bytes());
         push[16..20].copy_from_slice(&(norm_w as u32).to_ne_bytes());
-        // ids is read-modify-write (exclusion scan); bind it as an output alongside wts.
+        push[20..24].copy_from_slice(&(has_bias as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&n_expert_groups.to_ne_bytes());
+        push[28..32].copy_from_slice(&n_expert_groups_used.to_ne_bytes());
         self.dispatch(
             k,
-            &[Self::vkb(logits), Self::vkb(ids), Self::vkb(wts)],
+            &[
+                Self::vkb(logits),
+                Self::vkb(ids),
+                Self::vkb(wts),
+                Self::vkb(bias),
+            ],
             2,
             &push,
             n_tokens as u32,

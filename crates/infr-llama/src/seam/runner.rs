@@ -1544,9 +1544,7 @@ pub(crate) fn generate_dense_backend(
                     gate_exps: wpush(&mut g, &mut weights),
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
-                    exp_probs_b: None, // exp_probs_b is optional — only V3+ models carry it.
-                    // Loaded conditionally in wload above; wpush always pushes None (the
-                    // Op::MoeFfn will succeed with None — the CPU/Vulkan routers gate on it).
+                    exp_probs_b: None, // exp_probs_b optional — needs SeamWeights plumbing for V3 GGUFs
                     shexp: if c.shexp_ff > 0 {
                         // Order MUST mirror the `wload` above: `gate_inp` (qwen35moe only) precedes
                         // the gate/up/down. llama4 has no gate tensor (`gate_inp = None`).

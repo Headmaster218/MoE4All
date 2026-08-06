@@ -4,55 +4,69 @@
 // logit, weight by gating function, optional renorm over the selected set, × routing scale) so an
 // on-GPU router can drive the expert matmuls with no host round-trip.
 //
-// `gating` (0 = softmax, 1 = sigmoid) and `norm_w` (renormalize the selected weights to sum to 1)
-// are independent push-constant flags — qwen3moe/qwen35moe/diffusion-gemma ship softmax+renorm;
-// llama4 ships sigmoid+no-renorm (top-1, `w = sigmoid(logit) · scale`). Selection is unaffected by
-// either flag: both gating functions are monotone in the logit, so top-k-by-logit always picks the
-// same expert set the reference gating function would.
+// `gating` (0 = softmax, 1 = sigmoid, 2 = sqrt(softplus)) and `norm_w` (renormalize the selected
+// weights to sum to 1) are independent push-constant flags.
+//
+// DeepSeek V2+ extensions:
+//   * `has_bias` — router bias (exp_probs_b) affects SELECTION only; weights come from unbiased
+//     logits. This breaks the old monotonicity invariant (top-k-by-logit ≠ top-k-by-score).
+//   * `n_expert_groups` / `n_expert_groups_used` — group-limited routing: per-group top-2 scores
+//     are summed for a group score; the top `n_expert_groups_used` groups are kept, the rest
+//     masked to -inf (matching llama.cpp `build_moe_ffn`).
+//
+// When neither extension is active (has_bias==0 && n_expert_groups<=1), this is byte-identical to
+// the previous version — the thread-0 pre-phase sets `ssel_adj` to all zeros, and every lane adds
+// zero to its local scores, so the arithmetic is unchanged.
 //
 // General `n_expert`: each lane owns `ceil(n_expert / 128)` experts (lane `t` owns `t, t+128,
-// t+256, ...`, up to MAX_CHUNKS — headroom for n_expert up to 128*MAX_CHUNKS; out-of-range/absent
-// slots load the -1e30 sentinel so they're never picked). Was hard-capped at exactly 128 experts
-// (one lane per expert, no chunking) — silently dropped experts 128..n_expert-1 for any model with
-// n_expert > 128 (e.g. Qwen3.6-MoE's 256), routing tokens through the wrong experts. Each pick round
-// first reduces a lane's OWN chunk-owned candidates in registers (no shared memory, no barrier),
-// then tree-reduces the 128 per-lane winners exactly as before — so the barrier count per pick is
-// UNCHANGED from the n_expert<=128 case (a chunk-count-independent cost; measured: the naive
-// local_size_x=256 one-lane-per-expert alternative cost ~14% pp512 on the 256-expert model from the
-// extra tree-reduce stage + halved occupancy, so this chunked-lane form is preferred), and for
-// n_expert<=128 (one chunk) this is byte-identical to the old one-lane-per-expert code path.
+// t+256, ...`, up to MAX_CHUNKS). Out-of-range/absent slots load the -1e30 sentinel.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint n_expert;
     uint n_used;
     float scale;
-    uint gating;  // 0 = softmax, 1 = sigmoid
-    uint norm_w;  // 1 = renormalize the selected weights to sum to 1 before scaling
+    uint gating;          // 0 = softmax, 1 = sigmoid, 2 = sqrt(softplus)
+    uint norm_w;          // 1 = renormalize the selected weights to sum to 1 before scaling
+    uint has_bias;        // 1 when exp_probs_b buffer is bound (DeepSeek V3+)
+    uint n_expert_groups; // > 1 for group-limited routing (DeepSeek V3+)
+    uint n_expert_groups_used; // how many groups to keep
 } pc;
 layout(binding = 0) readonly buffer LB { float logits[]; };
 layout(binding = 1) buffer IB { uint ids[]; };
 layout(binding = 2) writeonly buffer WB { float wts[]; };
+layout(binding = 3) readonly buffer BB { float bias[]; }; // exp_probs_b, always bound
 
 shared float sval[128];
 shared uint sidx[128];
-shared float glmax; // global max logit (thread 0 broadcasts after the first pick)
+shared float glmax;
+// Per-expert score adjustment: bias (if has_bias) + group mask. Thread 0 pre-fills.
+// 256 experts → 1 KB shared — well within limits.
+shared float ssel_adj[256];
 
-// n_expert headroom: 128 lanes * 8 chunks = 1024 experts. Bump if a model ever exceeds that (loud
-// silent-truncation risk otherwise — same bug class this kernel just got fixed for).
+// n_expert headroom: 128 lanes * 8 chunks = 1024 experts.
 #define MAX_CHUNKS 8u
 
 float score_of(float logit) {
-    // Per-expert routing score: exp(logit - glmax) for softmax (max-shifted, pre-normalization —
-    // the shared `glmax` keeps every score in a safe exp() range), or sigmoid(logit) directly.
-    return (pc.gating == 0u) ? exp(logit - glmax) : (1.0 / (1.0 + exp(-logit)));
+    if (pc.gating == 0u) {
+        return exp(logit - glmax);
+    } else if (pc.gating == 1u) {
+        return 1.0 / (1.0 + exp(-logit));
+    } else {
+        // gating == 2: sqrt(softplus) — sqrt(log(1 + exp(x))). Stable: for large x,
+        // log(1+exp(x)) ≈ x, so sqrt(softplus(x)) ≈ sqrt(x). Use x when x > 20 to avoid
+        // overflow in exp().
+        float xx = (logit > 20.0) ? logit : log(1.0 + exp(logit));
+        return sqrt(max(xx, 0.0));
+    }
 }
 
 void main() {
-    uint tok = gl_WorkGroupID.x;       // one workgroup per token (decode: 1, prefill: t)
-    uint t = gl_LocalInvocationID.x;   // one lane per 128-stride chunk of experts
+    uint tok = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
     uint lbase = tok * pc.n_expert;
     uint obase = tok * pc.n_used;
 
+    // ── Load per-lane logits ──
     float llog[MAX_CHUNKS];
     bool taken[MAX_CHUNKS];
     for (uint c = 0u; c < MAX_CHUNKS; c++) {
@@ -61,19 +75,73 @@ void main() {
         taken[c] = false;
     }
 
+    // ── Thread 0: pre-fill ssel_adj = bias + group mask ──
+    if (t == 0u) {
+        bool do_adj = (pc.has_bias != 0u) || (pc.n_expert_groups > 1u && pc.n_expert_groups_used > 0u);
+        if (do_adj) {
+            // Start with bias (or zero).
+            for (uint e = 0u; e < pc.n_expert; e++) {
+                ssel_adj[e] = (pc.has_bias != 0u) ? bias[e] : 0.0;
+            }
+            // Group-limited routing.
+            uint ng = pc.n_expert_groups;
+            uint ng_used = pc.n_expert_groups_used;
+            if (ng > 1u && ng_used > 0u) {
+                uint n_per = pc.n_expert / ng;
+                // Compute per-group score: sum of top-2 within each group.
+                float gscore[64]; // 256 experts / min 4 per group = max 64 groups
+                for (uint g = 0u; g < ng; g++) {
+                    float b0 = -1e30, b1 = -1e30;
+                    uint base = g * n_per;
+                    for (uint e = base; e < base + n_per; e++) {
+                        float s = logits[lbase + e] + ssel_adj[e];
+                        if (s > b0) { b1 = b0; b0 = s; }
+                        else if (s > b1) { b1 = s; }
+                    }
+                    gscore[g] = b0 + b1;
+                }
+                // Select top ng_used groups (simple O(ng^2) selection — ng ≤ 64).
+                bool chosen[64];
+                for (uint g = 0u; g < ng; g++) { chosen[g] = false; }
+                for (uint k = 0u; k < ng_used; k++) {
+                    float best = -1e30;
+                    uint bi = 0u;
+                    for (uint g = 0u; g < ng; g++) {
+                        if (!chosen[g] && gscore[g] > best) { best = gscore[g]; bi = g; }
+                    }
+                    chosen[bi] = true;
+                }
+                // Mask non-chosen groups: add -1e30 to their ssel_adj.
+                for (uint g = 0u; g < ng; g++) {
+                    if (!chosen[g]) {
+                        uint base = g * n_per;
+                        for (uint e = base; e < base + n_per; e++) {
+                            ssel_adj[e] = -1e30;
+                        }
+                    }
+                }
+            }
+        } else {
+            // No extensions: ssel_adj stays zero — the lane-level arithmetic below is unchanged.
+            for (uint e = 0u; e < pc.n_expert; e++) { ssel_adj[e] = 0.0; }
+        }
+    }
+    barrier(); // ssel_adj published
+
+    // ── Top-k selection (uses llog + ssel_adj) ──
     for (uint k = 0u; k < pc.n_used; k++) {
-        // this lane's best still-unpicked owned expert (registers only, no shared/barrier)
         float bv = -1e30;
         uint be = 0xFFFFFFFFu;
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
-            if (!taken[c] && llog[c] > bv) { bv = llog[c]; be = t + c * 128u; }
+            if (!taken[c]) {
+                uint e = t + c * 128u;
+                float s = (e < pc.n_expert) ? (llog[c] + ssel_adj[e]) : -1e30;
+                if (s > bv) { bv = s; be = e; }
+            }
         }
         sval[t] = bv;
         sidx[t] = be;
         barrier();
-        // tree-reduce argmax over the 128 per-lane winners; ties broken toward the lower expert id
-        // (matches the host's stable sort — `sidx` carries the actual expert id, not the lane id, so
-        // the explicit id tie-break is needed here now that a lane can own more than one expert).
         for (uint s = 64u; s > 0u; s /= 2u) {
             if (t < s) {
                 bool better = sval[t + s] > sval[t]
@@ -88,14 +156,32 @@ void main() {
         uint winner = sidx[0];
         if (t == 0u) {
             ids[obase + k] = winner;
-            if (k == 0u) { glmax = sval[0]; }
+            if (k == 0u) {
+                // glmax = max of original (unbiased) logits among the selection set — used for
+                // softmax stability in the weight-computation pass (thread 0 below).
+                float mx = -1e30;
+                for (uint kk = 0u; kk <= k; kk++) {
+                    uint we = ids[obase + kk];
+                    float vl = logits[lbase + we]; // unbiased
+                    if (vl > mx) { mx = vl; }
+                }
+                glmax = mx;
+            }
         }
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
             if (t + c * 128u == winner) { taken[c] = true; }
         }
-        barrier(); // also publishes glmax (written before this barrier on k==0)
+        barrier();
     }
+
+    // ── Weight computation (uses ORIGINAL unbiased logits) ──
     if (t == 0u) {
+        // Recompute glmax over ALL selected experts (unbiased logit max for softmax stability).
+        float mx2 = -1e30;
+        for (uint k = 0u; k < pc.n_used; k++) {
+            float vl = logits[lbase + ids[obase + k]];
+            if (vl > mx2) { mx2 = vl; }
+        }
         float wsum_sel = 0.0;
         for (uint k = 0u; k < pc.n_used; k++) {
             wsum_sel += score_of(logits[lbase + ids[obase + k]]);
@@ -106,20 +192,15 @@ void main() {
                 wts[obase + k] = score_of(logits[lbase + ids[obase + k]]) / wsum_sel * pc.scale;
             }
         } else if (pc.gating == 0u) {
-            // Softmax, no renorm: need the FULL denominator over every expert (not just the
-            // selected subset) — unlike the renorm case, the full-softmax denominator does NOT
-            // cancel. No in-tree model uses this combination (llama4's no-renorm path is
-            // sigmoid), so this stays a simple serial scan rather than a parallel reduction.
             float full_sum = 0.0;
             for (uint e = 0u; e < pc.n_expert; e++) {
-                full_sum += exp(logits[lbase + e] - glmax);
+                full_sum += exp(logits[lbase + e] - mx2);
             }
             full_sum = max(full_sum, 1e-20);
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = exp(logits[lbase + ids[obase + k]] - glmax) / full_sum * pc.scale;
+                wts[obase + k] = exp(logits[lbase + ids[obase + k]] - mx2) / full_sum * pc.scale;
             }
         } else {
-            // Sigmoid, no renorm (llama4): w = sigmoid(logit) * scale, no denominator at all.
             for (uint k = 0u; k < pc.n_used; k++) {
                 wts[obase + k] = score_of(logits[lbase + ids[obase + k]]) * pc.scale;
             }
