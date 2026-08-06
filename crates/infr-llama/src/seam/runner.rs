@@ -2388,6 +2388,7 @@ pub(crate) fn generate_dense_backend(
                     scale: mla_scale,
                     mask,
                     pos: start_pos as u32,
+                    theta,
                 });
                 // wo projection, residual add.
                 g.push(Op::Linear {

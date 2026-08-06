@@ -499,6 +499,8 @@ fn main() {
         ("attn_pv", "attn_pv", &[]),
         ("attn_pv_warp", "attn_pv_warp", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
+        // MLA attention (DeepSeek V2/V3): one workgroup per token, 128 lanes covering all heads.
+        ("mla", "mla", &[]),
         ("rmsnorm", "rmsnorm", &[]),
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).

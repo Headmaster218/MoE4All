@@ -1778,6 +1778,7 @@ const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_
 const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_warp.spv"));
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
+const MLA_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mla.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
 const RMSNORM_GATE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
@@ -2134,6 +2135,12 @@ pub(crate) fn attn_pv_warp_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
     ATTN_PV_REDUCE_SPV.get_or_init(|| spv_words(ATTN_PV_REDUCE_SPV_BYTES))
+}
+/// SPIR-V for MLA attention (`mla.comp`) — DeepSeek V2/V3 absorbed-form latent attention.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn mla_spv() -> &'static [u32] {
+    static MLA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    MLA_SPV.get_or_init(|| spv_words(MLA_SPV_BYTES))
 }
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

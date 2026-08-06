@@ -196,6 +196,9 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
     let mut attn_kv_len: Option<u32> = None;
     for op in &graph.ops {
         match op {
+            // MLA attention (DeepSeek V2/V3) uses its own non-standard kernel — not eligible for
+            // the split-K record-once replay pipeline.
+            Op::Mla { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -4277,7 +4280,55 @@ fn lower_op(
                 b.into_transient(transient);
             }
         }
-        Op::Mla { .. } => todo!("Vulkan MLA attention kernel"),
+        Op::Mla {
+            q,
+            k_cache,
+            wk_b,
+            wv_b,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            q_head_dim,
+            kv_lora_rank,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_head_dim,
+            scale,
+            mask,
+            pos,
+            theta,
+        } => {
+            let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
+            let cap = graph.desc(*k_cache).numel();
+            let cache_cap_rows = (cap / key_len.max(1)) as u32;
+            let (mask_type, window) = match mask {
+                AttnMask::Causal => (0u32, 0u32),
+                AttnMask::SlidingWindow(w) => (1u32, *w as u32),
+                AttnMask::Canvas { .. } => (2u32, 0u32),
+            };
+            rec.mla(
+                r(*q)?,
+                r(*k_cache)?,
+                r(*wk_b)?,
+                r(*wv_b)?,
+                r(*dst)?,
+                *rows,
+                *kv_len,
+                *n_head,
+                *q_head_dim,
+                *kv_lora_rank,
+                *qk_nope_dim,
+                *qk_rope_dim,
+                *v_head_dim,
+                *scale,
+                *pos,
+                mask_type,
+                window,
+                *theta,
+                cache_cap_rows,
+            );
+        }
     }
     Ok(())
 }

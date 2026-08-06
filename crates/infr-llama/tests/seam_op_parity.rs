@@ -795,6 +795,7 @@ fn mla_parity() {
         scale,
         mask: AttnMask::Causal,
         pos: 0,
+        theta: 10000.0,
     });
 
     // Synthetic inputs — small integers for traceability.

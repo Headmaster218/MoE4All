@@ -282,6 +282,8 @@ pub enum Op {
         scale: f32,
         mask: AttnMask,
         pos: u32,
+        /// RoPE base frequency for the internal q_pe rope (DeepSeek V2/V3 use 10000.0).
+        theta: f32,
     },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`

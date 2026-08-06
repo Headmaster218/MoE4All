@@ -4010,6 +4010,62 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per token; 128 lanes cover all
+    /// heads. The KV cache holds ONE row per token (key_length = kv_lora_rank + qk_rope_dim wide).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla(
+        &self,
+        q: &dyn Buffer,
+        k_cache: &dyn Buffer,
+        wk_b: &dyn Buffer,
+        wv_b: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        q_head_dim: u32,
+        kv_lora_rank: u32,
+        qk_nope_dim: u32,
+        qk_rope_dim: u32,
+        v_head_dim: u32,
+        scale: f32,
+        pos: u32,
+        mask_type: u32,
+        window: u32,
+        theta: f32,
+        cache_cap_rows: u32,
+    ) {
+        let k = self.be.kernel_sg("mla", crate::gemm::mla_spv(), 5, 56, 0);
+        let mut push = [0u8; 56];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
+        push[8..12].copy_from_slice(&n_head.to_ne_bytes());
+        push[12..16].copy_from_slice(&q_head_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&kv_lora_rank.to_ne_bytes());
+        push[20..24].copy_from_slice(&qk_nope_dim.to_ne_bytes());
+        push[24..28].copy_from_slice(&qk_rope_dim.to_ne_bytes());
+        push[28..32].copy_from_slice(&v_head_dim.to_ne_bytes());
+        push[32..36].copy_from_slice(&scale.to_ne_bytes());
+        push[36..40].copy_from_slice(&pos.to_ne_bytes());
+        push[40..44].copy_from_slice(&mask_type.to_ne_bytes());
+        push[44..48].copy_from_slice(&window.to_ne_bytes());
+        push[48..52].copy_from_slice(&theta.to_ne_bytes());
+        push[52..56].copy_from_slice(&cache_cap_rows.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(q),
+                Self::vkb(k_cache),
+                Self::vkb(wk_b),
+                Self::vkb(wv_b),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            rows,
+        );
+    }
+
     pub fn rmsnorm(
         &self,
         x: &dyn Buffer,

@@ -1,0 +1,167 @@
+#version 460
+// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per token, each lane handles one
+// or more heads. The KV cache holds ONE row per token (key_length = kv_lora_rank + qk_rope_dim
+// wide); V is the first kv_lora_rank columns — aliased from K, no separate v_cache.
+//
+// The q_pe half of each query head is APPLIED ROPE internally here (matching the CPU kernel);
+// the graph passes raw q_pe. q_nope is absorbed via wk_b[h]^T per head before the QK dot.
+// After SDPA the accumulated V is projected back via wv_b[h] per head.
+//
+// Grid: rows workgroups (one per token). 128 local threads; thread t handles heads
+// t, t+128, t+256, ... up to n_head. Push constants carry all dimensions.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint q_head_dim;       // qk_nope_dim + qk_rope_dim
+    uint kv_lora_rank;
+    uint qk_nope_dim;
+    uint qk_rope_dim;
+    uint v_head_dim;
+    float scale;
+    uint pos;              // first token position
+    uint mask_type;        // 0 = causal, 1 = sliding window, 2 = canvas
+    uint window;
+    float theta;
+    uint cache_cap_rows;   // ring-buffer row capacity (0 or >= kv_len = full context)
+} pc;
+
+#define KEY_LEN (pc.kv_lora_rank + pc.qk_rope_dim)
+
+// Q: [rows, n_head, q_head_dim] — f32, un-roped q_pe
+layout(binding = 0) readonly buffer QB { float q[]; };
+// K cache: [cap_rows, key_len] — f16 (quantized), one row per token
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+// wk_b: [n_head, kv_lora_rank, qk_nope_dim] — f32
+layout(binding = 2) readonly buffer WKB { float wk_b[]; };
+// wv_b: [n_head, kv_lora_rank, v_head_dim] — f32
+layout(binding = 3) readonly buffer WVB { float wv_b[]; };
+// dst: [rows, n_head, v_head_dim] — f32 writeonly
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+
+float kread(uint j, uint d) {
+    // K cache is f16: each u32 holds two f16s at even/odd columns.
+    uint idx = j * KEY_LEN + d;
+    uint w = ku[idx >> 1u];
+    return uintBitsToFloat((idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.x;
+    if (tok >= pc.rows) return;
+
+    uint abs_pos = pc.pos + tok;
+
+    // Each lane processes heads tid, tid+128, tid+256, ...
+    for (uint h = tid; h < pc.n_head; h += 128u) {
+        // ── Load q for this head ──
+        uint q_off = (tok * pc.n_head + h) * pc.q_head_dim;
+        // Scratch: q_full after absorption + rope
+        float q_full[576]; // max key_len (512+64)
+        // q_nope → absorb via wk_b[h]^T
+        uint wk_off = h * pc.kv_lora_rank * pc.qk_nope_dim;
+        for (uint j = 0u; j < pc.kv_lora_rank; j++) {
+            float s = 0.0;
+            uint wk_row = wk_off + j * pc.qk_nope_dim;
+            uint qn_off = q_off;
+            for (uint i = 0u; i < pc.qk_nope_dim; i++) {
+                s += wk_b[wk_row + i] * q[qn_off + i];
+            }
+            q_full[j] = s;
+        }
+        // Rope q_pe into q_full[kv_lora_rank ..]
+        uint q_pe_off = q_off + pc.qk_nope_dim;
+        uint hf = pc.qk_rope_dim >> 1u;
+        for (uint p = 0u; p < hf; p++) {
+            uint i0 = 2u * p;
+            uint i1 = i0 + 1u;
+            float ang = float(abs_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.qk_rope_dim));
+            float s = sin(ang);
+            float c = cos(ang);
+            float a = q[q_pe_off + i0];
+            float b = q[q_pe_off + i1];
+            q_full[pc.kv_lora_rank + i0] = a * c - b * s;
+            q_full[pc.kv_lora_rank + i1] = a * s + b * c;
+        }
+
+        // ── Mask range ──
+        uint lo, hi;
+        if (pc.mask_type == 0u) {
+            // Causal
+            lo = 0u;
+            hi = min(abs_pos + 1u, pc.kv_len);
+            if (pc.window > 0u && abs_pos + 1u > pc.window) {
+                lo = abs_pos + 1u - pc.window;
+            }
+        } else if (pc.mask_type == 1u) {
+            // Sliding window
+            lo = (abs_pos + 1u > pc.window) ? (abs_pos + 1u - pc.window) : 0u;
+            hi = abs_pos + 1u;
+        } else {
+            // Canvas / full
+            lo = 0u;
+            hi = pc.kv_len;
+        }
+        hi = min(hi, pc.kv_len);
+        uint n_keys = hi - lo;
+        if (n_keys == 0u) {
+            // No keys to attend to: zero output.
+            uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
+            for (uint d = 0u; d < pc.v_head_dim; d++) {
+                dst[d_off + d] = 0.0;
+            }
+            continue;
+        }
+
+        // ── Pass 1: compute scores, find max ──
+        float lmax = -3.0e38;
+        for (uint jj = 0u; jj < n_keys; jj++) {
+            uint j = lo + jj;
+            uint cap = (pc.cache_cap_rows > 0u) ? pc.cache_cap_rows : pc.kv_len;
+            uint jr = j % cap;
+            // Dot product: q_full · K[jr]
+            float d = 0.0;
+            for (uint di = 0u; di < KEY_LEN; di++) {
+                d += q_full[di] * kread(jr, di);
+            }
+            d *= pc.scale;
+            lmax = max(lmax, d);
+        }
+
+        // ── Pass 2: softmax + V accumulation ──
+        float sumw = 0.0;
+        float vacc[512]; // max kv_lora_rank
+        for (uint di = 0u; di < pc.kv_lora_rank; di++) { vacc[di] = 0.0; }
+        for (uint jj = 0u; jj < n_keys; jj++) {
+            uint j = lo + jj;
+            uint cap = (pc.cache_cap_rows > 0u) ? pc.cache_cap_rows : pc.kv_len;
+            uint jr = j % cap;
+            float d = 0.0;
+            for (uint di = 0u; di < KEY_LEN; di++) {
+                d += q_full[di] * kread(jr, di);
+            }
+            float p = exp(d * pc.scale - lmax);
+            sumw += p;
+            // V = first kv_lora_rank columns of K[jr]
+            for (uint di = 0u; di < pc.kv_lora_rank; di++) {
+                vacc[di] += p * kread(jr, di);
+            }
+        }
+        float inv_sum = 1.0 / max(sumw, 1e-20);
+
+        // ── wv_b[h] applied to V_accum → output ──
+        uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
+        uint wv_off = h * pc.kv_lora_rank * pc.v_head_dim;
+        for (uint d = 0u; d < pc.v_head_dim; d++) {
+            float s = 0.0;
+            uint wv_col = wv_off + d; // wv_b[h][i][d] — column-major over v_head_dim
+            for (uint i = 0u; i < pc.kv_lora_rank; i++) {
+                s += vacc[i] * inv_sum * wv_b[wv_col + i * pc.v_head_dim];
+            }
+            dst[d_off + d] = s;
+        }
+    }
+}

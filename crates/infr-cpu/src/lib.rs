@@ -2849,6 +2849,7 @@ impl Backend for CpuBackend {
                     scale,
                     mask,
                     pos,
+                    theta,
                 } => {
                     let (rows, kv_len, nh, qhd, kv_lora, np, qkr, vhd) = (
                         rows as usize,
@@ -2900,10 +2901,6 @@ impl Backend for CpuBackend {
                         AttnMask::SlidingWindow(w) => (w, None),
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
-                    // Theta for rope — deepseek2's rope_theta is stored in Config; use it. For now
-                    // read the default 10000 from the graph (no Theta field on Op::Mla — use a
-                    // reasonable default; DeepSeek V2/V3 use 10000).
-                    let theta: f32 = 10000.0;
                     let hf = qkr / 2; // rope pair count
                     let mut out = vec![0f32; rows * nh * vhd];
                     self.pool()
