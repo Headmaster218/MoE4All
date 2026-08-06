@@ -3824,3 +3824,63 @@ fn cpu_deepseek_prefill_paris() {
     assert!(!output.trim().is_empty(), "model produced no output");
     eprintln!("deepseek V1 'Paris': {output:?}");
 }
+
+// ── DeepSeek V2-Lite ───────────────────────────────────────────────────────────
+
+/// Look up `INFR_TEST_DEEPSEEK2` env var, else the default HF repo path.
+fn deepseek_v2_lite() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_DEEPSEEK2") {
+        return Some(PathBuf::from(p));
+    }
+    find_gguf(
+        "mradermacher--DeepSeek-V2-Lite-Chat-GGUF",
+        "DeepSeek-V2-Lite-Chat.Q4_K_M.gguf",
+    )
+}
+
+/// Config-only: open the GGUF and assert every deepseek2 gate boolean, plus
+/// that other arches' gates are false. No model load needed.
+#[test]
+fn cpu_deepseek2_config() {
+    let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("parse config");
+    assert_eq!(
+        g.metadata().str("general.architecture"),
+        Some(infr_llama::arch::DEEPSEEK2),
+        "arch string"
+    );
+    assert!(cfg.deepseek2, "deepseek2 gate");
+    assert!(!cfg.deepseek, "deepseek must be false");
+    assert!(!cfg.qk_norm, "qk_norm must be false");
+    assert!(!cfg.qkv_bias, "qkv_bias must be false");
+    assert!(!cfg.permute_qk_neox, "permute_qk_neox must be false");
+    assert!(!cfg.llama4, "llama4 must be false");
+    assert!(!cfg.qwen35, "qwen35 must be false");
+    assert!(cfg.moe.is_some(), "must have MoE config");
+    let moe = cfg.moe.unwrap();
+    assert!(moe.n_expert > 1, "must have multiple experts");
+    assert!(cfg.kv_lora_rank > 0, "kv_lora_rank must be set for MLA");
+    assert_eq!(
+        cfg.n_kv, 1,
+        "n_head_kv must be 1 for MLA (one KV row per token)"
+    );
+    eprintln!(
+        "deepseek2 V2-Lite: n_layer={} n_head={} n_embd={} kv_lora_rank={} qk_rope_dim={} head_k_mla={} v_head_dim={} moe.n_expert={} moe.n_used={}",
+        cfg.n_layer, cfg.n_head, cfg.n_embd,
+        cfg.kv_lora_rank, cfg.qk_rope_dim, cfg.head_k_mla, cfg.v_head_dim,
+        moe.n_expert, moe.n_used,
+    );
+}
+
+/// Greedy top-1 token after "The capital of France is" — validates the full
+/// forward pass (MLA attention + MoE + output) on V2-Lite.
+#[test]
+fn cpu_deepseek2_prefill_paris() {
+    let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let output = cpu_gen(&model, "The capital of France is", 8);
+    assert!(!output.trim().is_empty(), "model produced no output");
+    eprintln!("deepseek2 V2-Lite 'Paris': {output:?}");
+}
