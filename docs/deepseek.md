@@ -1,6 +1,11 @@
 # DeepSeek support plan (V1 → V2/V3 → V3.2 → V4)
 
-Status: **nothing implemented.** This is the plan, not a record of work.
+Status: **Stage 2 in progress.** CPU path works end-to-end on V2-Lite; Vulkan MLA and
+MoE kernels are implemented and wired; exp_probs_b loads from V3 GGUFs.
+
+Remaining for Stage 2: YaRN frequency ramp (mscale is done, per-dimension ramp is
+not), Metal MLA kernel (returns `Unsupported`), GPU seam parity test (needs GPU).
+Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
 
 The reference implementation is llama.cpp at `b10218-1-gc629da5`, checked out
 locally at `~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths
@@ -576,14 +581,14 @@ Ordered by how much damage a wrong assumption does.
    template.
 3. **Whether N successive splits reproduce llama.cpp's tokenizer** (§0.2).
 4. **Shared-expert width when `n_shared_experts > 1`** — V2-Lite has 2.
-5. **`rope_off`** — `Op::Rope` rotates the _first_ `rope_dim` of each head with
-   no within-head offset. DeepSeek's `[nope | rope]` layout puts rope **last**.
-   Either add an offset field, or reorder rows at load time (`permute_rows` in
-   `runner.rs` is the precedent that load-time reordering is accepted here).
-   **This was not resolved and it affects stage 2 directly.**
-6. **YaRN mscale for partial rope** — folding mscale² into the attention scale
-   is what llama.cpp does, and it is correct there because the fold is uniform.
-   Verify numerically rather than by argument.
+5. **`rope_off`** — ✓ RESOLVED (2026-08-06). `Op::Rope` only rotates standalone
+   k_pe slices (extracted via `CopyStrided`, no nope prefix). The q_pe rope is
+   done inside the MLA kernel at offset `qk_nope_dim` — the offset lives in the
+   kernel, not in `Op::Rope`. No `rope_off` field needed.
+6. **YaRN** — PARTIALLY RESOLVED (2026-08-06). The mscale² is folded into the
+   MLA attention scale correctly. The per-dimension frequency ramp (the YaRN
+   interpolation/extrapolation ramp) is NOT implemented — `Op::Rope.freq_factors`
+   and the MLA kernels both need it for correct long-context quality.
 7. **DeepSeek's EOS** — `add_chat_eos` appends a fixed list that does not
    include `<｜end▁of▁sentence｜>`. It is normally the GGUF's declared
    `tokenizer.ggml.eos_token_id` and therefore already in `eos_ids`, but check
