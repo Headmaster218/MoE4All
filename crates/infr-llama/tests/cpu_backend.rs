@@ -3884,3 +3884,73 @@ fn cpu_deepseek2_prefill_paris() {
     assert!(!output.trim().is_empty(), "model produced no output");
     eprintln!("deepseek2 V2-Lite 'Paris': {output:?}");
 }
+
+/// Full CPU prefill on V2-Lite: all logits must be finite. Faster than a
+/// generation test and catches NaN/Inf in MLA attention or MoE routing.
+#[test]
+fn cpu_deepseek2_prefill_finite() {
+    let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let cfg = model.config();
+    assert!(cfg.deepseek2, "deepseek2 gate");
+    let tokens = model
+        .encode("What is the capital of France? Answer briefly.")
+        .expect("encode");
+    assert!(!tokens.is_empty(), "empty prompt");
+    let t0 = std::time::Instant::now();
+    let last_row = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    eprintln!(
+        "cpu_deepseek2_prefill_finite: {} tokens, prefill {:.1}s",
+        tokens.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    assert_eq!(last_row.len(), cfg.vocab, "logits shape");
+    assert!(
+        last_row.iter().all(|v| v.is_finite()),
+        "non-finite logit in the prefill output"
+    );
+    println!("top-5 last-row tokens: {:?}", top_k(&last_row, 5));
+}
+
+/// V2-Lite prefill through the Vulkan seam vs the CPU oracle. MLA attention
+/// and MoE both have discrete-selection steps (MLA's absorbed form with its
+/// own kernel, MoE top-k routing), so this follows the qwen35moe precedent:
+/// top-5 overlap + cosine floor, NOT bit-identical.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_deepseek2() {
+    let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let tokens = model
+        .encode("What is the capital of France? Answer briefly.")
+        .expect("encode");
+    let vocab = model.config().vocab;
+    let cpu_last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    let gpu_last = model
+        .prefill_logits_vulkan(&tokens)
+        .expect("vulkan prefill");
+    assert_eq!(cpu_last.len(), vocab, "cpu logits shape");
+    assert_eq!(gpu_last.len(), vocab, "gpu logits shape");
+    assert!(
+        gpu_last.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan prefill output"
+    );
+    let (cpu_top, gpu_top) = (top_k(&cpu_last, 20), top_k(&gpu_last, 20));
+    println!("cpu    top-5: {:?}", &cpu_top[..5]);
+    println!("vulkan top-5: {:?}", &gpu_top[..5]);
+    assert!(
+        cpu_top[..5].iter().any(|&(id, _)| id == gpu_top[0].0)
+            || gpu_top[..5].iter().any(|&(id, _)| id == cpu_top[0].0),
+        "CPU/Vulkan top tokens don't even overlap in each other's top-5: cpu={:?} vulkan={:?}",
+        cpu_top[0],
+        gpu_top[0]
+    );
+    let cos = cosine(&cpu_last, &gpu_last);
+    println!("cpu/vulkan whole-vocab cosine similarity: {cos}");
+    assert!(
+        cos > 0.5,
+        "CPU/Vulkan last-row logits diverged too far: cosine={cos}"
+    );
+}

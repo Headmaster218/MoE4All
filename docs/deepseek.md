@@ -414,12 +414,16 @@ Order matters:
 
 ### Done when
 
-- Config + CPU-finite + CPU-top-token tests on V2-Lite.
-- `gpu_seam_matches_cpu_deepseek2` — loose form (MoE).
-- **An op-level MLA parity test** in `infr-llama/tests/seam_op_parity.rs`
+- [x] Config + CPU-finite + CPU-top-token tests on V2-Lite (`cpu_deepseek2_config`,
+  `cpu_deepseek2_prefill_finite`, `cpu_deepseek2_prefill_paris` — all added
+  2026-08-06, gated behind model file).
+- [x] `gpu_seam_matches_cpu_deepseek2` — skeleton added 2026-08-06; needs GPU to run.
+- [x] **An op-level MLA parity test** in `infr-llama/tests/seam_op_parity.rs`
   against a hand-written CPU reference, following `deltanet_parity`. This is the
   one that matters: it is the only cheap check that survives into stages 3–4.
-- A numeric YaRN check against llama.cpp at a long context.
+- [ ] A numeric YaRN check against llama.cpp at a long context.
+- [ ] Metal MLA kernel (returns `Unsupported`).
+- [ ] YaRN per-dimension frequency ramp in `Op::Rope` and MLA kernels.
 
 ## Stage 3 — `deepseek32` (V3.2)
 
