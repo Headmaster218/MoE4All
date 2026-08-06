@@ -3827,15 +3827,24 @@ fn cpu_deepseek_prefill_paris() {
 
 // ── DeepSeek V2-Lite ───────────────────────────────────────────────────────────
 
-/// Look up `INFR_TEST_DEEPSEEK2` env var, else the default HF repo path.
+/// Look up `INFR_TEST_DEEPSEEK2` env var, else the modern absorbed-layout HF repo. The
+/// mradermacher V2-Lite file is the LEGACY pre-absorbed layout (`attn_kv_b`, no `attn_k_b`),
+/// which infr's MLA path does not target — so prefer a file converted after the absorbed
+/// `wk_b`/`wv_b` tensors became the default.
 fn deepseek_v2_lite() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("INFR_TEST_DEEPSEEK2") {
         return Some(PathBuf::from(p));
     }
     find_gguf(
-        "mradermacher--DeepSeek-V2-Lite-Chat-GGUF",
-        "DeepSeek-V2-Lite-Chat.Q4_K_M.gguf",
+        "JenniSD--DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF",
+        "deepseek-v2-lite-chat-q4_k_m.gguf",
     )
+    .or_else(|| {
+        find_gguf(
+            "mradermacher--DeepSeek-V2-Lite-Chat-GGUF",
+            "DeepSeek-V2-Lite-Chat.Q4_K_M.gguf",
+        )
+    })
 }
 
 /// Config-only: open the GGUF and assert every deepseek2 gate boolean, plus
