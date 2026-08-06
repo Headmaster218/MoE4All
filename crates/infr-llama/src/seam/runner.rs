@@ -551,6 +551,7 @@ pub(crate) fn generate_dense_backend(
         //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
         let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut wspecs: Vec<(DType, usize)> = Vec::new();
+        let mut layer_has_epb = vec![false; c.n_layer];
         // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
         // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
         // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
@@ -805,6 +806,13 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_gate_exps.weight")])?;
                 wload(&[&p("ffn_up_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.weight")])?;
+                if c.deepseek2 {
+                    let ep_name = p("exp_probs_b.bias");
+                    if g.tensors().iter().any(|t| t.name == ep_name) {
+                        wload(&[&ep_name])?;
+                        layer_has_epb[l] = true;
+                    }
+                }
                 if c.shexp_ff > 0 {
                     // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
                     // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
@@ -1025,6 +1033,7 @@ pub(crate) fn generate_dense_backend(
                 wbufs,
                 wspecs,
                 rf_buf,
+                layer_has_epb,
             }),
             stable: std::sync::Arc::clone(&stable),
             kbufs,
@@ -1077,6 +1086,7 @@ pub(crate) fn generate_dense_backend(
         wbufs,
         wspecs,
         rf_buf,
+        layer_has_epb,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
     if prompt.len() + max_new + 1 > max_ctx {
@@ -1544,7 +1554,11 @@ pub(crate) fn generate_dense_backend(
                     gate_exps: wpush(&mut g, &mut weights),
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
-                    exp_probs_b: None, // exp_probs_b optional — needs SeamWeights plumbing for V3 GGUFs
+                    exp_probs_b: if layer_has_epb[l] {
+                        Some(wpush(&mut g, &mut weights))
+                    } else {
+                        None
+                    },
                     shexp: if c.shexp_ff > 0 {
                         // Order MUST mirror the `wload` above: `gate_inp` (qwen35moe only) precedes
                         // the gate/up/down. llama4 has no gate tensor (`gate_inp = None`).

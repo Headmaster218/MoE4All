@@ -275,6 +275,8 @@ pub(crate) struct SeamWeights {
     pub(super) wbufs: Vec<Box<dyn Buffer>>,
     pub(super) wspecs: Vec<(DType, usize)>,
     pub(super) rf_buf: Option<(Box<dyn Buffer>, usize)>,
+    /// Per-layer: whether `ffn_exp_probs_b.weight` was loaded (DeepSeek V3+ router bias).
+    pub(super) layer_has_epb: Vec<bool>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
