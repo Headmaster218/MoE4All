@@ -333,7 +333,7 @@ impl Config {
     /// (`self.moe` is `None`).
     pub fn is_moe_layer(&self, il: usize) -> bool {
         self.moe.is_some()
-            && if self.deepseek {
+            && if self.deepseek || self.deepseek2 {
                 il >= self.n_layer_dense_lead
             } else if self.moe_interleave_step > 0 {
                 (il + 1).is_multiple_of(self.moe_interleave_step)
