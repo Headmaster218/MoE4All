@@ -4035,7 +4035,7 @@ impl<'a> Recorder<'a> {
         theta: f32,
         cache_cap_rows: u32,
     ) {
-        let k = self.be.kernel_sg("mla", crate::gemm::mla_spv(), 5, 56, 0);
+        let k = self.be.kernel("mla", crate::gemm::mla_spv(), 5, 56);
         let mut push = [0u8; 56];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
@@ -4051,7 +4051,7 @@ impl<'a> Recorder<'a> {
         push[44..48].copy_from_slice(&window.to_ne_bytes());
         push[48..52].copy_from_slice(&theta.to_ne_bytes());
         push[52..56].copy_from_slice(&cache_cap_rows.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(q),
@@ -4062,7 +4062,7 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push,
-            rows,
+            rows * n_head,
         );
     }
 
@@ -12038,5 +12038,157 @@ mod tests {
             // m>1 (per-input-row decompose), out_f 64-aligned, non-zero offset.
             assert_chunk_parity(&be, dtype, 3, 512, 256, 64, 8192);
         }
+    }
+
+    /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the
+    /// smallest possible dispatch of `recorder.mla` (no model, no seam). Mirrors `mla_parity`'s
+    /// synthetic inputs in infr-llama/tests/seam_op_parity.rs. This is the regression test for the
+    /// "logical device has been lost" hang the kernel caused on RDNA3 (see the .comp's header).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn mla_matches_cpu_reference() {
+        let be = be_with(|_| {});
+        // The EXACT real-dispatch shape from the seam (decode: rows=1, kv_len=1, ring cap=12) —
+        // exercises the ring-buffer path with cap > kv_len and the full shared-memory arrays.
+        let (rows, nh, kv_lora, qk_nope, qk_rope, vhd) =
+            (1usize, 16usize, 512usize, 128usize, 64usize, 128usize);
+        let cap_rows = 12usize; // ring capacity — bigger than kv_len
+        let key_len = kv_lora + qk_rope; // 576
+        let q_head_dim = qk_nope + qk_rope; // 192
+        let scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt();
+        let theta = 10000.0_f32;
+        // Synthetic identity-ish wk_b/wv_b: wk_b[h] maps nope dims onto distinct latent slots,
+        // wv_b[h] is a shifted identity — the CPU reference reproduces the same math.
+        let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+        let s = kv_lora * qk_nope;
+        for h in 0..nh {
+            for a in 0..qk_nope {
+                let slot = (h + a) % kv_lora;
+                wk[h * s + slot * qk_nope + a] = 1.0;
+            }
+        }
+        let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+        for h in 0..nh {
+            let off = h * kv_lora * vhd;
+            for a in 0..kv_lora.min(vhd) {
+                wv[off + a * vhd + a] = 1.0;
+            }
+        }
+        // Same synthetic inputs as the CPU mla_parity test (see seam_op_parity.rs).
+        let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
+            .map(|x| x as f32)
+            .collect();
+        let ki: Vec<f32> = (0..cap_rows * key_len)
+            .map(|i| {
+                let col = i % key_len;
+                if col < kv_lora {
+                    (10 + col) as f32
+                } else {
+                    (1 + (col - kv_lora)) as f32
+                }
+            })
+            .collect();
+        let bq = upf32(&be, &qi);
+        let bwk = upf32(&be, &wk);
+        let bwv = upf32(&be, &wv);
+        // k_cache: allocate a REAL cache buffer and write it via rec.copy (the same f16 WriteKv
+        // path the seam uses) INSIDE the same recorder as the mla — reproducing the real graph's
+        // store→read hazard sequence.
+        let s = kv_lora * qk_nope;
+        let bk = be
+            .alloc(cap_rows * key_len * 2, BufferUsage::KvCache)
+            .unwrap();
+        let ksrc = upf16(&be, &ki);
+        let bo = be
+            .alloc(rows * nh * vhd * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.copy(ksrc.as_ref(), 0, bk.as_ref(), 0, cap_rows * key_len * 2);
+        rec.mla(
+            bq.as_ref(),
+            bk.as_ref(),
+            bwk.as_ref(),
+            bwv.as_ref(),
+            bo.as_ref(),
+            rows as u32,
+            1, // kv_len — attend to just the first key (decode shape)
+            nh as u32,
+            q_head_dim as u32,
+            kv_lora as u32,
+            qk_nope as u32,
+            qk_rope as u32,
+            vhd as u32,
+            scale,
+            0, // pos
+            0, // mask_type: causal
+            0, // window
+            theta,
+            cap_rows as u32, // cache_cap_rows — ring capacity > kv_len
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; rows * nh * vhd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        // CPU reference: absorb → rope → SDPA → wv_b (see seam_op_parity.rs mla_parity).
+        let mut want = vec![0f32; rows * nh * vhd];
+        for t in 0..rows {
+            let abs_pos = 0u32; // pos = 0
+            for h in 0..nh {
+                let q_off = (t * nh + h) * q_head_dim;
+                let mut q_full = vec![0f32; key_len];
+                for j in 0..kv_lora {
+                    let mut acc = 0.0f32;
+                    for i in 0..qk_nope {
+                        acc += wk[h * s + j * qk_nope + i] * qi[q_off + i];
+                    }
+                    q_full[j] = acc;
+                }
+                for p in 0..qk_rope / 2 {
+                    let ang = abs_pos as f32 * theta.powf(-2.0 * p as f32 / qk_rope as f32);
+                    let (i0, i1) = (2 * p, 2 * p + 1);
+                    let (a, b) = (qi[q_off + qk_nope + i0], qi[q_off + qk_nope + i1]);
+                    q_full[kv_lora + i0] = a * ang.cos() - b * ang.sin();
+                    q_full[kv_lora + i1] = a * ang.sin() + b * ang.cos();
+                }
+                let mut vacc = vec![0f32; kv_lora];
+                let mut sumw = 0.0f32;
+                // Two-pass with the true lmax (max over attended keys) for exact parity.
+                let lo = 0usize;
+                let hi = (t + 1).min(rows);
+                let mut lmax = f32::NEG_INFINITY;
+                let mut scores = Vec::new();
+                for j in lo..hi {
+                    let mut d = 0.0f32;
+                    for di in 0..key_len {
+                        d += q_full[di] * ki[j * key_len + di];
+                    }
+                    d *= scale;
+                    lmax = lmax.max(d);
+                    scores.push(d);
+                }
+                for (jj, &d) in scores.iter().enumerate() {
+                    let p = (d - lmax).exp();
+                    sumw += p;
+                    for di in 0..kv_lora {
+                        vacc[di] += p * ki[(lo + jj) * key_len + di];
+                    }
+                }
+                let inv = 1.0 / sumw.max(1e-20);
+                for d in 0..vhd {
+                    let mut acc = 0.0f32;
+                    for i in 0..kv_lora {
+                        acc += vacc[i] * inv * wv[h * kv_lora * vhd + d + i * vhd];
+                    }
+                    want[t * nh * vhd + h * vhd + d] = acc;
+                }
+            }
+        }
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("mla vulkan max_err={err:e}");
+        assert!(err < 1e-3, "MLA vulkan diverges: max_err={err:e}");
     }
 }

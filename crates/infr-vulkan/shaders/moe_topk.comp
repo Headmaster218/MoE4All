@@ -154,6 +154,10 @@ void main() {
             barrier();
         }
         uint winner = sidx[0];
+        // Clamp to the valid expert range. NaN logits make every `>` comparison false, so the
+        // selection can end on the 0xFFFFFFFF sentinel (or any out-of-range slot); the downstream
+        // idm indexes weights by this id, and an OOB id reads past the weight buffer → GPU fault.
+        winner = min(winner, pc.n_expert - 1u);
         if (t == 0u) {
             ids[obase + k] = winner;
             if (k == 0u) {

@@ -647,14 +647,29 @@ pub(crate) fn generate_dense_backend(
                 (WBytes::Owned(cat), DType::F16, numel)
             } else if let [name] = names {
                 let i = info(name)?;
-                let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                let numel = i.shape.iter().product();
-                match qk_perm_heads(name) {
-                    Some(heads) => {
-                        let rb = row_bytes(name, i.dtype);
-                        (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
+                // MLA absorbed-form weights: the `mla` kernels (Vulkan/Metal) read wk_b/wv_b as
+                // PLAIN f32, but GGUFs carry them quantized (Q5_0/Q4K on V2-Lite). Host-dequant to
+                // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
+                // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
+                // quantized buffer → OOB GPU fault → device lost.
+                if c.deepseek2
+                    && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight"))
+                {
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let numel = i.shape.iter().product();
+                    let f32v = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                    (WBytes::Owned(bytes), DType::F32, numel)
+                } else {
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let numel = i.shape.iter().product();
+                    match qk_perm_heads(name) {
+                        Some(heads) => {
+                            let rb = row_bytes(name, i.dtype);
+                            (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
+                        }
+                        None => (WBytes::Mmap(tb), i.dtype, numel),
                     }
-                    None => (WBytes::Mmap(tb), i.dtype, numel),
                 }
             } else {
                 // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a

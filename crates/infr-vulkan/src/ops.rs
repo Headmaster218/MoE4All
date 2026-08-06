@@ -270,6 +270,8 @@ impl VulkanBackend {
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
+    /// A size of `0` means "no subgroup requirement" (treated like [`Self::kernel`]) — a caller
+    /// that passes 0 by mistake would otherwise build an invalid `RequiredSubgroupSizeCreateInfo`.
     pub(crate) fn kernel_sg(
         &self,
         name: &'static str,
@@ -278,7 +280,13 @@ impl VulkanBackend {
         push_size: u32,
         sg_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, Some(sg_size))
+        self.kernel_inner(
+            name,
+            spv,
+            n_buf,
+            push_size,
+            (sg_size > 0).then_some(sg_size),
+        )
     }
 
     /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the

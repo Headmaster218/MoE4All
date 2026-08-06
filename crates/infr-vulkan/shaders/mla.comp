@@ -1,14 +1,20 @@
 #version 460
-// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per token, each lane handles one
-// or more heads. The KV cache holds ONE row per token (key_length = kv_lora_rank + qk_rope_dim
-// wide); V is the first kv_lora_rank columns — aliased from K, no separate v_cache.
+// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per (token, head); 128 lanes
+// cooperate on that head's math. The KV cache holds ONE row per token (key_length =
+// kv_lora_rank + qk_rope_dim wide); V is the first kv_lora_rank columns — aliased from K,
+// no separate v_cache.
 //
 // The q_pe half of each query head is APPLIED ROPE internally here (matching the CPU kernel);
 // the graph passes raw q_pe. q_nope is absorbed via wk_b[h]^T per head before the QK dot.
 // After SDPA the accumulated V is projected back via wv_b[h] per head.
 //
-// Grid: rows workgroups (one per token). 128 local threads; thread t handles heads
-// t, t+128, t+256, ... up to n_head. Push constants carry all dimensions.
+// Cooperative design (why shared memory, not per-thread arrays): the per-head working state
+// is q_full[576] + vacc[512] = 1088 floats. As per-thread private arrays that is 1088 live
+// registers per thread — far over the ~256 VGPR budget on RDNA3, so the compiler spills to
+// scratch and the GPU hangs (observed: "logical device has been lost" on an RX 7900 XTX with
+// the earlier 128-lane-per-token layout where every lane carried the full arrays). Here the
+// arrays live in WORKGROUP shared memory (576+512 floats = 4352 bytes, trivially within the
+// 64 KB limit) and the 128 lanes fill/read them cooperatively: each lane owns a strided slice.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -41,127 +47,184 @@ layout(binding = 3) readonly buffer WVB { float wv_b[]; };
 // dst: [rows, n_head, v_head_dim] — f32 writeonly
 layout(binding = 4) writeonly buffer DB { float dst[]; };
 
+// The absorbed+roped query (key_len wide) and the V accumulator (kv_lora_rank wide) — shared
+// across the workgroup's 128 lanes, each lane owning a strided slice.
+shared float sq[576];
+shared float sv[512];
+// Scratch for the tree reduction in `reduce_sum` (one slot per lane).
+shared float red[128];
+
 float kread(uint j, uint d) {
-    // K cache is f16: each u32 holds two f16s at even/odd columns.
+    // K cache is f16: each u32 holds two f16s at even/odd columns. The half's 16 bits must be
+    // CONVERTED to f32 — `uintBitsToFloat` would reinterpret the f16 bit pattern as f32 (denormals
+    // / garbage). `unpackHalf2x16(h).x` reads the low 16 bits of `h` as an f16 and converts.
     uint idx = j * KEY_LEN + d;
     uint w = ku[idx >> 1u];
-    return uintBitsToFloat((idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u));
+    uint h = (idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u);
+    return unpackHalf2x16(h).x;
 }
+
+// Threadgroup sum-reduction of `val` (strided lanes → tree), result in lane 0. The final
+// barrier means a caller's subsequent read of the result by lane 0 is ordered.
+// NOTE: the reduction is INLINED at both call sites in `main` — a `barrier()` inside this
+// helper, called from a loop, deadlocked the workgroup on RDNA3 (RADV/ACO). Keep it that way.
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint tok = gl_WorkGroupID.x;
+    // Flat workgroup index over the rows × n_head grid — recovers the index when the dispatch
+    // split into a 2-D grid beyond 65535 groups (see `Recorder::dispatch_wide`); a no-op for
+    // 1-D dispatches (gy == 1, gl_NumWorkGroups.x == the true count).
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint tok = wg / pc.n_head;
+    uint h   = wg % pc.n_head;
     if (tok >= pc.rows) return;
 
     uint abs_pos = pc.pos + tok;
+    uint q_off = (tok * pc.n_head + h) * pc.q_head_dim;
 
-    // Each lane processes heads tid, tid+128, tid+256, ...
-    for (uint h = tid; h < pc.n_head; h += 128u) {
-        // ── Load q for this head ──
-        uint q_off = (tok * pc.n_head + h) * pc.q_head_dim;
-        // Scratch: q_full after absorption + rope
-        float q_full[576]; // max key_len (512+64)
-        // q_nope → absorb via wk_b[h]^T
-        uint wk_off = h * pc.kv_lora_rank * pc.qk_nope_dim;
-        for (uint j = 0u; j < pc.kv_lora_rank; j++) {
-            float s = 0.0;
-            uint wk_row = wk_off + j * pc.qk_nope_dim;
-            uint qn_off = q_off;
-            for (uint i = 0u; i < pc.qk_nope_dim; i++) {
-                s += wk_b[wk_row + i] * q[qn_off + i];
-            }
-            q_full[j] = s;
+    // ── Build q_full = [wk_b[h]^T · q_nope | rope(q_pe)] in shared memory ──
+    // Absorption: sq[j] = Σ_i wk_b[h][j][i] * q_nope[i], j in 0..kv_lora_rank. Each lane owns
+    // j = tid, tid+128, ... and sums the qk_nope_dim terms serially.
+    for (uint j = tid; j < pc.kv_lora_rank; j += 128u) {
+        uint wk_row = h * pc.kv_lora_rank * pc.qk_nope_dim + j * pc.qk_nope_dim;
+        float s = 0.0;
+        for (uint i = 0u; i < pc.qk_nope_dim; i++) {
+            s += wk_b[wk_row + i] * q[q_off + i];
         }
-        // Rope q_pe into q_full[kv_lora_rank ..]
-        uint q_pe_off = q_off + pc.qk_nope_dim;
-        uint hf = pc.qk_rope_dim >> 1u;
-        for (uint p = 0u; p < hf; p++) {
-            uint i0 = 2u * p;
-            uint i1 = i0 + 1u;
-            float ang = float(abs_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.qk_rope_dim));
-            float s = sin(ang);
-            float c = cos(ang);
-            float a = q[q_pe_off + i0];
-            float b = q[q_pe_off + i1];
-            q_full[pc.kv_lora_rank + i0] = a * c - b * s;
-            q_full[pc.kv_lora_rank + i1] = a * s + b * c;
-        }
+        sq[j] = s;
+    }
+    // Rope q_pe into sq[kv_lora_rank ..]: pair p owned by lane p, p+128, ... (qk_rope_dim ≤ 64,
+    // so at most ceil(64/128) = 1 pair per lane); each lane computes sin/cos for its pair.
+    uint hf = pc.qk_rope_dim >> 1u;
+    for (uint p = tid; p < hf; p += 128u) {
+        uint i0 = 2u * p;
+        uint i1 = i0 + 1u;
+        float ang = float(abs_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.qk_rope_dim));
+        float s = sin(ang);
+        float c = cos(ang);
+        float a = q[q_off + pc.qk_nope_dim + i0];
+        float b = q[q_off + pc.qk_nope_dim + i1];
+        sq[pc.kv_lora_rank + i0] = a * c - b * s;
+        sq[pc.kv_lora_rank + i1] = a * s + b * c;
+    }
+    barrier();
 
-        // ── Mask range ──
-        uint lo, hi;
-        if (pc.mask_type == 0u) {
-            // Causal
-            lo = 0u;
-            hi = min(abs_pos + 1u, pc.kv_len);
-            if (pc.window > 0u && abs_pos + 1u > pc.window) {
-                lo = abs_pos + 1u - pc.window;
-            }
-        } else if (pc.mask_type == 1u) {
-            // Sliding window
-            lo = (abs_pos + 1u > pc.window) ? (abs_pos + 1u - pc.window) : 0u;
-            hi = abs_pos + 1u;
-        } else {
-            // Canvas / full
-            lo = 0u;
-            hi = pc.kv_len;
+    // ── Mask range ──
+    uint lo, hi;
+    if (pc.mask_type == 0u) {
+        // Causal
+        lo = 0u;
+        hi = min(abs_pos + 1u, pc.kv_len);
+        if (pc.window > 0u && abs_pos + 1u > pc.window) {
+            lo = abs_pos + 1u - pc.window;
         }
-        hi = min(hi, pc.kv_len);
-        uint n_keys = hi - lo;
-        if (n_keys == 0u) {
-            // No keys to attend to: zero output.
-            uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
-            for (uint d = 0u; d < pc.v_head_dim; d++) {
-                dst[d_off + d] = 0.0;
-            }
-            continue;
+    } else if (pc.mask_type == 1u) {
+        // Sliding window
+        lo = (abs_pos + 1u > pc.window) ? (abs_pos + 1u - pc.window) : 0u;
+        hi = abs_pos + 1u;
+    } else {
+        // Canvas / full
+        lo = 0u;
+        hi = pc.kv_len;
+    }
+    hi = min(hi, pc.kv_len);
+    uint n_keys = hi - lo;
+    uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
+#ifdef NO_SDPA
+    // TEMP DEBUG: skip the SDPA entirely — zero the output. Used to bisect a GPU hang.
+    for (uint d = tid; d < pc.v_head_dim; d += 128u) {
+        dst[d_off + d] = 0.0;
+    }
+    return;
+#endif
+    if (n_keys == 0u) {
+        // No keys to attend to: zero output.
+        for (uint d = tid; d < pc.v_head_dim; d += 128u) {
+            dst[d_off + d] = 0.0;
         }
+        return;
+    }
 
-        // ── Pass 1: compute scores, find max ──
-        float lmax = -3.0e38;
-        for (uint jj = 0u; jj < n_keys; jj++) {
-            uint j = lo + jj;
-            uint cap = (pc.cache_cap_rows > 0u) ? pc.cache_cap_rows : pc.kv_len;
-            uint jr = j % cap;
-            // Dot product: q_full · K[jr]
-            float d = 0.0;
-            for (uint di = 0u; di < KEY_LEN; di++) {
-                d += q_full[di] * kread(jr, di);
+    uint cap = (pc.cache_cap_rows > 0u) ? pc.cache_cap_rows : pc.kv_len;
+
+    // ── Pass 1: scores, find max. Each lane sums its slice of the key_len dot, the workgroup
+    // reduces it, and lane 0 tracks lmax (broadcast via the loop's trailing barrier). ──
+    // The reduction is INLINED (not a helper call) — a `barrier()` inside a function called from
+    // a loop deadlocked on RDNA3 (RADV/ACO); the same tree pattern in `argmax.comp` works in main.
+    float lmax = -3.0e38;
+    for (uint jj = 0u; jj < n_keys; jj++) {
+        uint jr = (lo + jj) % cap;
+        // Lane's slice of Σ_di sq[di] * K[jr][di]: di = tid, tid+128, ... (KEY_LEN ≤ 576 < 2*128).
+        red[tid] = 0.0;
+        for (uint di = tid; di < KEY_LEN; di += 128u) {
+            red[tid] += sq[di] * kread(jr, di);
+        }
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                red[tid] += red[tid + stride];
             }
-            d *= pc.scale;
+            barrier();
+        }
+        float d = red[0] * pc.scale;
+        if (tid == 0u) {
             lmax = max(lmax, d);
         }
+        barrier();
+    }
+    // lmax is only valid in thread 0's register; broadcast it to every lane via shared memory
+    // (threads 1..127 would otherwise compute `exp(x - (-3e38)) = +inf` in pass 2).
+    if (tid == 0u) {
+        red[0] = lmax;
+    }
+    barrier();
+    lmax = red[0];
+    barrier();
 
-        // ── Pass 2: softmax + V accumulation ──
-        float sumw = 0.0;
-        float vacc[512]; // max kv_lora_rank
-        for (uint di = 0u; di < pc.kv_lora_rank; di++) { vacc[di] = 0.0; }
-        for (uint jj = 0u; jj < n_keys; jj++) {
-            uint j = lo + jj;
-            uint cap = (pc.cache_cap_rows > 0u) ? pc.cache_cap_rows : pc.kv_len;
-            uint jr = j % cap;
-            float d = 0.0;
-            for (uint di = 0u; di < KEY_LEN; di++) {
-                d += q_full[di] * kread(jr, di);
+    // ── Pass 2: softmax + V accumulation. ──
+    if (tid == 0u) {
+        for (uint di = 0u; di < pc.kv_lora_rank; di++) { sv[di] = 0.0; }
+    }
+    barrier();
+    float sumw = 0.0;
+    for (uint jj = 0u; jj < n_keys; jj++) {
+        uint jr = (lo + jj) % cap;
+        red[tid] = 0.0;
+        for (uint di = tid; di < KEY_LEN; di += 128u) {
+            red[tid] += sq[di] * kread(jr, di);
+        }
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                red[tid] += red[tid + stride];
             }
-            float p = exp(d * pc.scale - lmax);
+            barrier();
+        }
+        float p = exp(red[0] * pc.scale - lmax);
+        // Each lane accumulates its slice of the kv_lora_rank-wide V.
+        for (uint di = tid; di < pc.kv_lora_rank; di += 128u) {
+            sv[di] += p * kread(jr, di);
+        }
+        if (tid == 0u) {
             sumw += p;
-            // V = first kv_lora_rank columns of K[jr]
-            for (uint di = 0u; di < pc.kv_lora_rank; di++) {
-                vacc[di] += p * kread(jr, di);
-            }
         }
-        float inv_sum = 1.0 / max(sumw, 1e-20);
+        barrier();
+    }
+    // sumw is accumulated in thread 0's register only; broadcast it via shared memory so every
+    // lane uses the true denominator (threads 1..127 would otherwise divide by ~1e-20 → 1e20).
+    if (tid == 0u) {
+        red[0] = sumw;
+    }
+    barrier();
+    float inv_sum = 1.0 / max(red[0], 1e-20);
 
-        // ── wv_b[h] applied to V_accum → output ──
-        uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
-        uint wv_off = h * pc.kv_lora_rank * pc.v_head_dim;
-        for (uint d = 0u; d < pc.v_head_dim; d++) {
-            float s = 0.0;
-            uint wv_col = wv_off + d; // wv_b[h][i][d] — column-major over v_head_dim
-            for (uint i = 0u; i < pc.kv_lora_rank; i++) {
-                s += vacc[i] * inv_sum * wv_b[wv_col + i * pc.v_head_dim];
-            }
-            dst[d_off + d] = s;
+    // ── wv_b[h] applied to V_accum → output. Each lane writes its slice of v_head_dim. ──
+    uint wv_off = h * pc.kv_lora_rank * pc.v_head_dim;
+    for (uint d = tid; d < pc.v_head_dim; d += 128u) {
+        float s = 0.0;
+        for (uint i = 0u; i < pc.kv_lora_rank; i++) {
+            s += sv[i] * inv_sum * wv_b[wv_off + d + i * pc.v_head_dim];
         }
+        dst[d_off + d] = s;
     }
 }
