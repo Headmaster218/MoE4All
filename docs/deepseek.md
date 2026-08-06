@@ -1,11 +1,13 @@
 # DeepSeek support plan (V1 → V2/V3 → V3.2 → V4)
 
-Status: **Stage 2 in progress.** CPU path works end-to-end on V2-Lite; Vulkan MLA and
-MoE kernels are implemented and wired; exp_probs_b loads from V3 GGUFs.
+Status: **Stage 2 in progress.** CPU path works end-to-end on V2-Lite; Vulkan
+and Metal MLA kernels are implemented and wired; Vulkan MoE is implemented;
+exp_probs_b loads from V3 GGUFs.
 
-Remaining for Stage 2: YaRN frequency ramp (mscale is done, per-dimension ramp is
-not), Metal MLA kernel (returns `Unsupported`), GPU seam parity test (needs GPU).
-Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
+Remaining for Stage 2: YaRN frequency ramp (mscale is done, per-dimension ramp
+is not — and it is inert for default GGUFs, see open question #6), GPU seam
+parity test (needs GPU + model file). Stage 1 (`deepseek`) was skipped — V2-Lite
+is the development model.
 
 The reference implementation is llama.cpp at `b10218-1-gc629da5`, checked out
 locally at `~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths
@@ -414,15 +416,19 @@ Order matters:
 
 ### Done when
 
-- [x] Config + CPU-finite + CPU-top-token tests on V2-Lite (`cpu_deepseek2_config`,
-  `cpu_deepseek2_prefill_finite`, `cpu_deepseek2_prefill_paris` — all added
-  2026-08-06, gated behind model file).
-- [x] `gpu_seam_matches_cpu_deepseek2` — skeleton added 2026-08-06; needs GPU to run.
+- [x] Config + CPU-finite + CPU-top-token tests on V2-Lite
+      (`cpu_deepseek2_config`, `cpu_deepseek2_prefill_finite`,
+      `cpu_deepseek2_prefill_paris` — all added 2026-08-06, gated behind model
+      file).
+- [x] `gpu_seam_matches_cpu_deepseek2` — skeleton added 2026-08-06; needs GPU to
+      run.
 - [x] **An op-level MLA parity test** in `infr-llama/tests/seam_op_parity.rs`
-  against a hand-written CPU reference, following `deltanet_parity`. This is the
-  one that matters: it is the only cheap check that survives into stages 3–4.
+      against a hand-written CPU reference, following `deltanet_parity`. This is
+      the one that matters: it is the only cheap check that survives into stages
+      3–4.
 - [ ] A numeric YaRN check against llama.cpp at a long context.
-- [ ] Metal MLA kernel (returns `Unsupported`).
+- [x] Metal MLA kernel — `mla_f16kv` in `attention.metal` + `exec.rs` dispatch
+      (2026-08-06; ported from `mla.comp`, f16 KV cache; not yet run on a Mac).
 - [ ] YaRN per-dimension frequency ramp in `Op::Rope` and MLA kernels.
 
 ## Stage 3 — `deepseek32` (V3.2)
@@ -591,8 +597,17 @@ Ordered by how much damage a wrong assumption does.
    kernel, not in `Op::Rope`. No `rope_off` field needed.
 6. **YaRN** — PARTIALLY RESOLVED (2026-08-06). The mscale² is folded into the
    MLA attention scale correctly. The per-dimension frequency ramp (the YaRN
-   interpolation/extrapolation ramp) is NOT implemented — `Op::Rope.freq_factors`
-   and the MLA kernels both need it for correct long-context quality.
+   interpolation/extrapolation ramp) is NOT implemented —
+   `Op::Rope.freq_factors` and the MLA kernels both need it for correct
+   long-context quality. **However, the ramp is INERT for default deepseek2
+   GGUFs.** llama.cpp defaults `rope_scaling_type` to `linear` with
+   `rope_freq_scale = 1.0` and `yarn_ext_factor = 0`
+   (llama-context.cpp:185-191); with `ext_factor == 0`, `rope_yarn`'s ramp mix
+   is a no-op (ggml-cpu/ops.cpp:5835) and the mscale is the identity. The
+   convert script writes only `yarn_log_multiplier` for deepseek2, never
+   `yarn_ext_factor`/`yarn_attn_factor`/`rope_scaling.factor`. So the ramp
+   matters only when a user explicitly sets a YaRN context knob — deferred, not
+   needed for stock GGUFs.
 7. **DeepSeek's EOS** — `add_chat_eos` appends a fixed list that does not
    include `<｜end▁of▁sentence｜>`. It is normally the GGUF's declared
    `tokenizer.ggml.eos_token_id` and therefore already in `eos_ids`, but check

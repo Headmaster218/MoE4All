@@ -5148,10 +5148,90 @@ impl MetalBackend {
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
-            Op::Mla { .. } => {
-                return Err(Error::Unsupported(
-                    "Metal Op::Mla (DeepSeek V2 MLA attention) not yet implemented".into(),
-                ));
+            Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows,
+                kv_len,
+                n_head,
+                q_head_dim,
+                kv_lora_rank,
+                qk_nope_dim,
+                qk_rope_dim,
+                v_head_dim,
+                scale,
+                mask,
+                pos,
+                theta,
+            } => {
+                // MLA attention (DeepSeek V2/V3 absorbed form), ported from the Vulkan mla.comp:
+                // the kernel reads the K cache in its native f16 (`device const half*`, one half per
+                // element — the Metal layout, not Vulkan's u32-packed-pair), so an f16 cache is
+                // required here just as it is there. One thread per (token, head) does absorption,
+                // internal rope, two-pass SDPA and the wv_b output projection.
+                if g.desc(*k_cache).dtype != DType::F16 {
+                    return Err(Error::Unsupported(
+                        "metal Op::Mla: f16 KV cache required (kernel reads the cache as f16 \
+                         halves — no unpacked/dense path yet)"
+                            .into(),
+                    ));
+                }
+                let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
+                let cache_cap_rows = (g.desc(*k_cache).numel() / key_len.max(1)) as u32;
+                let (mask_type, window) = match mask {
+                    infr_core::graph::AttnMask::Causal => (0u32, 0u32),
+                    infr_core::graph::AttnMask::SlidingWindow(w) => (1u32, w as u32),
+                    infr_core::graph::AttnMask::Canvas { .. } => (2u32, 0u32),
+                };
+                let bq = self.ensure_device(r, q);
+                let bcache = metal_buf(
+                    bindings
+                        .get(k_cache)
+                        .expect("metal backend: unbound KV cache"),
+                );
+                let bwk = self.weight_buf(wk_b, g, bindings)?;
+                let bwv = self.weight_buf(wv_b, g, bindings)?;
+                let bd = self.dev_dst(
+                    r,
+                    dst,
+                    (rows as usize) * (n_head as usize) * (v_head_dim as usize),
+                );
+                // MlaParams, byte layout mirrored from recorder.mla's 56-byte push constant.
+                let mut p = rows.to_ne_bytes().to_vec();
+                p.extend_from_slice(&kv_len.to_ne_bytes());
+                p.extend_from_slice(&n_head.to_ne_bytes());
+                p.extend_from_slice(&q_head_dim.to_ne_bytes());
+                p.extend_from_slice(&kv_lora_rank.to_ne_bytes());
+                p.extend_from_slice(&qk_nope_dim.to_ne_bytes());
+                p.extend_from_slice(&qk_rope_dim.to_ne_bytes());
+                p.extend_from_slice(&v_head_dim.to_ne_bytes());
+                p.extend_from_slice(&scale.to_ne_bytes());
+                p.extend_from_slice(&pos.to_ne_bytes());
+                p.extend_from_slice(&mask_type.to_ne_bytes());
+                p.extend_from_slice(&window.to_ne_bytes());
+                p.extend_from_slice(&theta.to_ne_bytes());
+                p.extend_from_slice(&cache_cap_rows.to_ne_bytes());
+                let pso = self.pipelines.get("mla_f16kv")?;
+                let threads = (rows as usize) * (n_head as usize);
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[
+                        bq.as_ref(),
+                        &bcache.raw,
+                        bwk.as_ref(),
+                        bwv.as_ref(),
+                        bd.as_ref(),
+                    ],
+                    1 << 4,
+                    &p,
+                    threads,
+                    0,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::MoeSharedExpertAdd { .. } => {
                 // qwen35moe (Qwen3.6 MoE) shared expert — landed on CPU + Vulkan only so far (see

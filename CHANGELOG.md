@@ -17,6 +17,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `MoeGating::SqrtSoftplus` variant and wired it in CPU + Vulkan backends. See
   `docs/deepseek.md` § Stage 2.
 
+- **MLA attention kernels** (DeepSeek V2/V3 absorbed form, `Op::Mla`): Vulkan
+  `mla.comp` and Metal `mla_f16kv` compute kernels implement the full per-head
+  pipeline — `wk_b` absorption of q_nope, internal q_pe RoPE (NORM interleaved),
+  two-pass SDPA over the unified f16 KV cache (one row per token, V aliased from
+  the first `kv_lora_rank` columns of K), and the `wv_b` output projection.
+  Ring-buffer, causal / sliding-window / canvas masks supported. CPU math
+  covered by `mla_parity` in `seam_op_parity.rs`; Metal dispatch is implemented
+  but not yet run on a Mac.
+
+- **DeepSeek V3 MoE routing** (Vulkan): `moe_topk` now selects on
+  `probs + exp_probs_b` while weighting from the unbiased probs (the noaux_tc
+  router bias), supports sqrt-softplus gating (`gating=2`), and enforces
+  group-limited routing (per-group top-2, top `n_expert_groups_used` groups,
+  mask the rest). The `blk.%d.exp_probs_b.bias` tensor loads from V3 GGUFs and
+  threads into `Op::MoeFfn`.
+
+- **DeepSeek V2-Lite tests**: `cpu_deepseek2_config`,
+  `cpu_deepseek2_prefill_finite`, `cpu_deepseek2_prefill_paris` (CPU oracle +
+  finiteness over the vocab) and `gpu_seam_matches_cpu_deepseek2` (Vulkan vs
+  CPU, `#[ignore]`d behind a GPU) — gated behind a V2-Lite GGUF in the HF cache.
+
 - **DeepSeek V1 support** (`deepseek` architecture): plain MHA attention +
   softmax-gated MoE with ungated shared expert, following llama.cpp's
   `src/models/deepseek.cpp`. First `n_layer_dense_lead` layers are dense FFN,

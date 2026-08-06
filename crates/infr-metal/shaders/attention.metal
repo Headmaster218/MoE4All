@@ -776,3 +776,145 @@ template [[host_name("attnvec_dyn_f16kv_hd128")]] kernel attnvec_dyn_t attnvec_d
 // serial chain 16x vs the plain split kernel; the merge tree just starts one level lower.
 template [[host_name("attnvec_f16kv_hd256")]]     kernel attnvec_t     attnvec_f16kv_t<256, 16>;
 template [[host_name("attnvec_dyn_f16kv_hd256")]] kernel attnvec_dyn_t attnvec_dyn_f16kv_t<256, 16>;
+
+// ---- MLA attention (DeepSeek V2/V3 absorbed form). One thread per (token, head): load the head's
+// q, absorb q_nope via wk_b[h]^T, rope q_pe internally, two-pass SDPA over the f16 KV cache, then
+// project the accumulated V through wv_b[h]. The KV cache holds ONE row per token (key_len =
+// kv_lora_rank + qk_rope_dim wide, 576 for V3); V is the first kv_lora_rank columns — aliased from
+// K, no separate v_cache. The q_pe half of each query head is APPLIED ROPE internally here
+// (matching the CPU kernel); the graph passes raw q_pe. Faithful port of the Vulkan mla.comp — the
+// Metal f16 cache is `device half*` (one half per element), so unlike mla.comp there is no
+// u32-packed-pair bit unpacking: index it directly.
+struct MlaParams {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint q_head_dim;       // qk_nope_dim + qk_rope_dim
+    uint kv_lora_rank;
+    uint qk_nope_dim;
+    uint qk_rope_dim;
+    uint v_head_dim;
+    float scale;
+    uint pos;              // first token position
+    uint mask_type;        // 0 = causal, 1 = sliding window, 2 = canvas
+    uint window;
+    float theta;
+    uint cache_cap_rows;   // ring-buffer row capacity (0 or >= kv_len = full context)
+};
+
+kernel void mla_f16kv(device const float* q       [[buffer(0)]],
+                      device const half*  k_cache [[buffer(1)]],
+                      device const float* wk_b    [[buffer(2)]],
+                      device const float* wv_b    [[buffer(3)]],
+                      device float*       dst     [[buffer(4)]],
+                      constant MlaParams& p       [[buffer(5)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.n_head) return;
+    uint tok = gid / p.n_head;
+    uint h = gid % p.n_head;
+    uint abs_pos = p.pos + tok;
+    uint key_len = p.kv_lora_rank + p.qk_rope_dim;
+
+    // ── Load q for this head ──
+    uint q_off = gid * p.q_head_dim;
+    // Scratch: q_full after absorption + rope
+    float q_full[576]; // max key_len (512+64)
+    // q_nope → absorb via wk_b[h]^T
+    uint wk_off = h * p.kv_lora_rank * p.qk_nope_dim;
+    for (uint j = 0u; j < p.kv_lora_rank; j++) {
+        float s = 0.0f;
+        uint wk_row = wk_off + j * p.qk_nope_dim;
+        for (uint i = 0u; i < p.qk_nope_dim; i++) {
+            s += wk_b[wk_row + i] * q[q_off + i];
+        }
+        q_full[j] = s;
+    }
+    // Rope q_pe into q_full[kv_lora_rank ..]
+    uint q_pe_off = q_off + p.qk_nope_dim;
+    uint hf = p.qk_rope_dim >> 1u;
+    for (uint pp = 0u; pp < hf; pp++) {
+        uint i0 = 2u * pp;
+        uint i1 = i0 + 1u;
+        float ang = float(abs_pos) * pow(p.theta, -2.0 * float(pp) / float(p.qk_rope_dim));
+        float s = sin(ang);
+        float c = cos(ang);
+        float a = q[q_pe_off + i0];
+        float b = q[q_pe_off + i1];
+        q_full[p.kv_lora_rank + i0] = a * c - b * s;
+        q_full[p.kv_lora_rank + i1] = a * s + b * c;
+    }
+
+    // ── Mask range ──
+    uint lo, hi;
+    if (p.mask_type == 0u) {
+        // Causal
+        lo = 0u;
+        hi = min(abs_pos + 1u, p.kv_len);
+        if (p.window > 0u && abs_pos + 1u > p.window) {
+            lo = abs_pos + 1u - p.window;
+        }
+    } else if (p.mask_type == 1u) {
+        // Sliding window
+        lo = (abs_pos + 1u > p.window) ? (abs_pos + 1u - p.window) : 0u;
+        hi = abs_pos + 1u;
+    } else {
+        // Canvas / full
+        lo = 0u;
+        hi = p.kv_len;
+    }
+    hi = min(hi, p.kv_len);
+    uint n_keys = hi - lo;
+    if (n_keys == 0u) {
+        // No keys to attend to: zero output.
+        uint d_off = gid * p.v_head_dim;
+        for (uint d = 0u; d < p.v_head_dim; d++) {
+            dst[d_off + d] = 0.0f;
+        }
+        return;
+    }
+
+    // ── Pass 1: compute scores, find max ──
+    uint cap = (p.cache_cap_rows > 0u) ? p.cache_cap_rows : p.kv_len;
+    float lmax = -3.0e38;
+    for (uint jj = 0u; jj < n_keys; jj++) {
+        uint jr = (lo + jj) % cap;
+        // Dot product: q_full · K[jr] (unscaled — scale applied below, like mla.comp)
+        float d = 0.0f;
+        for (uint di = 0u; di < key_len; di++) {
+            d += q_full[di] * (float)k_cache[jr * key_len + di];
+        }
+        d *= p.scale;
+        lmax = max(lmax, d);
+    }
+
+    // ── Pass 2: softmax + V accumulation ──
+    float sumw = 0.0f;
+    float vacc[512]; // max kv_lora_rank
+    for (uint di = 0u; di < p.kv_lora_rank; di++) { vacc[di] = 0.0f; }
+    for (uint jj = 0u; jj < n_keys; jj++) {
+        uint jr = (lo + jj) % cap;
+        float d = 0.0f;
+        for (uint di = 0u; di < key_len; di++) {
+            d += q_full[di] * (float)k_cache[jr * key_len + di];
+        }
+        float pr = exp(d * p.scale - lmax);
+        sumw += pr;
+        // V = first kv_lora_rank columns of K[jr]
+        for (uint di = 0u; di < p.kv_lora_rank; di++) {
+            vacc[di] += pr * (float)k_cache[jr * key_len + di];
+        }
+    }
+    float inv_sum = 1.0f / max(sumw, 1e-20);
+
+    // ── wv_b[h] applied to V_accum → output ──
+    uint d_off = gid * p.v_head_dim;
+    uint wv_off = h * p.kv_lora_rank * p.v_head_dim;
+    for (uint d = 0u; d < p.v_head_dim; d++) {
+        float s = 0.0f;
+        uint wv_col = wv_off + d; // wv_b[h][i][d] — column-major over v_head_dim
+        for (uint i = 0u; i < p.kv_lora_rank; i++) {
+            s += vacc[i] * inv_sum * wv_b[wv_col + i * p.v_head_dim];
+        }
+        dst[d_off + d] = s;
+    }
+}
