@@ -5175,15 +5175,15 @@ impl MetalBackend {
                 // internal rope, two-pass SDPA and the wv_b output projection. `freq_factors`
                 // (YaRN divisors) selects the `mla_f16kv_ff` twin, which divides its q_pe angle by
                 // the bound per-pair divisor.
-                if g.desc(*k_cache).dtype != DType::F16 {
+                if g.desc(k_cache).dtype != DType::F16 {
                     return Err(Error::Unsupported(
                         "metal Op::Mla: f16 KV cache required (kernel reads the cache as f16 \
                          halves — no unpacked/dense path yet)"
                             .into(),
                     ));
                 }
-                let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
-                let cache_cap_rows = (g.desc(*k_cache).numel() / key_len.max(1)) as u32;
+                let key_len = (kv_lora_rank + qk_rope_dim) as usize;
+                let cache_cap_rows = (g.desc(k_cache).numel() / key_len.max(1)) as u32;
                 let (mask_type, window) = match mask {
                     infr_core::graph::AttnMask::Causal => (0u32, 0u32),
                     infr_core::graph::AttnMask::SlidingWindow(w) => (1u32, w as u32),
