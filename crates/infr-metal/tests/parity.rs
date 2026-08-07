@@ -4002,3 +4002,163 @@ fn embed_gather_matches_cpu() {
         "iq4xs",
     );
 }
+
+// MLA parity — exercises the `mla_f16kv` Metal kernel (no freq_factors). Tiny dims so the
+// reference is trivially verifiable by hand (same synthetic data as seam_op_parity::mla_parity):
+// rows=2, n_head=2, kv_lora=3, qk_nope=2, qk_rope=2, v_head=2.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn mla_parity() {
+    let (rows, nh, kv_lora, qk_nope, qk_rope, vhd) =
+        (2usize, 2usize, 3usize, 2usize, 2usize, 2usize);
+    let key_len = kv_lora + qk_rope; // 5
+    let q_head_dim = qk_nope + qk_rope; // 4
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows * nh * q_head_dim], DType::F32));
+    // F16 KV cache — the Metal kernel reads `device const half*`, one half per element.
+    let k_cache = g.input(TensorDesc::new(vec![rows * key_len], DType::F16));
+    let wk_b = g.weight(TensorDesc::new(vec![nh * kv_lora * qk_nope], DType::F32));
+    let wv_b = g.weight(TensorDesc::new(vec![nh * kv_lora * vhd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows * nh * vhd], DType::F32));
+    let scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt(); // 0.5
+    g.push(Op::Mla {
+        q,
+        k_cache,
+        wk_b,
+        wv_b,
+        dst,
+        rows: rows as u32,
+        kv_len: rows as u32, // attend to all rows
+        n_head: nh as u32,
+        q_head_dim: q_head_dim as u32,
+        kv_lora_rank: kv_lora as u32,
+        qk_nope_dim: qk_nope as u32,
+        qk_rope_dim: qk_rope as u32,
+        v_head_dim: vhd as u32,
+        scale,
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: 0,
+        theta: 10000.0,
+        freq_factors: None,
+    });
+    // Q: row-major [row, head, q_head_dim], values 1..=16.
+    let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
+        .map(|x| x as f32)
+        .collect();
+    // K cache rows: latent=[10,11,12], k_pe_raw=[1,2] per row.
+    let ki: Vec<f32> = (0..rows * key_len)
+        .map(|i| {
+            let col = i % key_len;
+            if col < kv_lora {
+                (10 + col) as f32
+            } else {
+                (1 + (col - kv_lora)) as f32
+            }
+        })
+        .collect();
+    // wk_b[h][latent_idx][nope_idx] i-fast: h=0 maps nope0->latent0, nope1->latent1; h=1 maps
+    // nope0->latent1, nope1->latent2.
+    let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+    let s = kv_lora * qk_nope; // per-head stride
+    wk[0] = 1.0;
+    wk[qk_nope + 1] = 1.0;
+    wk[s + qk_nope] = 1.0;
+    wk[s + 2 * qk_nope + 1] = 1.0;
+    // wv_b[h][a][o]: identity per head.
+    let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+    for h in 0..nh {
+        let off = h * kv_lora * vhd;
+        for a in 0..kv_lora.min(vhd) {
+            wv[off + a * vhd + a] = 1.0;
+        }
+    }
+    let bound = vec![
+        (q, f32_bytes(&qi)),
+        (k_cache, f16_bytes(&ki)),
+        (wk_b, f32_bytes(&wk)),
+        (wv_b, f32_bytes(&wv)),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * vhd, 1e-3);
+}
+
+// MLA ff parity — exercises the `mla_f16kv_ff` Metal kernel (freq_factors bound): the q_pe rope
+// angle is divided by the per-pair divisor ff (a real YaRN-style divisor). Identical synthetic
+// data to `mla_parity`; ff = [0.5] halves the single qk_rope/2=1 pair's angle.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn mla_ff_parity() {
+    let (rows, nh, kv_lora, qk_nope, qk_rope, vhd) =
+        (2usize, 2usize, 3usize, 2usize, 2usize, 2usize);
+    let key_len = kv_lora + qk_rope; // 5
+    let q_head_dim = qk_nope + qk_rope; // 4
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows * nh * q_head_dim], DType::F32));
+    // F16 KV cache — the Metal kernel reads `device const half*`, one half per element.
+    let k_cache = g.input(TensorDesc::new(vec![rows * key_len], DType::F16));
+    let wk_b = g.weight(TensorDesc::new(vec![nh * kv_lora * qk_nope], DType::F32));
+    let wv_b = g.weight(TensorDesc::new(vec![nh * kv_lora * vhd], DType::F32));
+    // freq_factors: one divisor per rope pair (qk_rope/2 = 1 pair here).
+    let ff = g.input(TensorDesc::new(vec![qk_rope / 2], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows * nh * vhd], DType::F32));
+    let scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt(); // 0.5
+    g.push(Op::Mla {
+        q,
+        k_cache,
+        wk_b,
+        wv_b,
+        dst,
+        rows: rows as u32,
+        kv_len: rows as u32, // attend to all rows
+        n_head: nh as u32,
+        q_head_dim: q_head_dim as u32,
+        kv_lora_rank: kv_lora as u32,
+        qk_nope_dim: qk_nope as u32,
+        qk_rope_dim: qk_rope as u32,
+        v_head_dim: vhd as u32,
+        scale,
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: 0,
+        theta: 10000.0,
+        freq_factors: Some(ff),
+    });
+    // Q: row-major [row, head, q_head_dim], values 1..=16.
+    let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
+        .map(|x| x as f32)
+        .collect();
+    // K cache rows: latent=[10,11,12], k_pe_raw=[1,2] per row.
+    let ki: Vec<f32> = (0..rows * key_len)
+        .map(|i| {
+            let col = i % key_len;
+            if col < kv_lora {
+                (10 + col) as f32
+            } else {
+                (1 + (col - kv_lora)) as f32
+            }
+        })
+        .collect();
+    // wk_b[h][latent_idx][nope_idx] i-fast: h=0 maps nope0->latent0, nope1->latent1; h=1 maps
+    // nope0->latent1, nope1->latent2.
+    let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+    let s = kv_lora * qk_nope; // per-head stride
+    wk[0] = 1.0;
+    wk[qk_nope + 1] = 1.0;
+    wk[s + qk_nope] = 1.0;
+    wk[s + 2 * qk_nope + 1] = 1.0;
+    // wv_b[h][a][o]: identity per head.
+    let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+    for h in 0..nh {
+        let off = h * kv_lora * vhd;
+        for a in 0..kv_lora.min(vhd) {
+            wv[off + a * vhd + a] = 1.0;
+        }
+    }
+    // Divisor 0.5 halves the rope angle — a real YaRN-style divisor.
+    let bound = vec![
+        (q, f32_bytes(&qi)),
+        (k_cache, f16_bytes(&ki)),
+        (wk_b, f32_bytes(&wk)),
+        (wv_b, f32_bytes(&wv)),
+        (ff, f32_bytes(&[0.5f32])),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * vhd, 1e-3);
+}

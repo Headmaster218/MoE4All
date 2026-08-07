@@ -937,15 +937,17 @@ kernel void mla_f16kv(device const float* q       [[buffer(0)]],
 }
 
 // YaRN freq_factors twin (DeepSeek V2+ `rope.scaling.type == "yarn"`): the internal q_pe rope
-// angle is DIVIDED by the per-pair divisor `ff[pair]` (`qk_rope_dim/2` floats, buffer 6) — the
+// angle is DIVIDED by the per-pair divisor `ff[pair]` (`qk_rope_dim/2` floats, buffer 5) — the
 // Vulkan `mla_ff` build's analogue; `exec.rs` picks this kernel when `Op::Mla.freq_factors` is set.
+// `exec.rs` pushes the ff buffer AFTER dst, so it lands at buffer(5) and the params bytes at
+// buffer(6) (the LAST index) — matching the convention that params bind at `bufs.len()`.
 kernel void mla_f16kv_ff(device const float* q       [[buffer(0)]],
                          device const half*  k_cache [[buffer(1)]],
                          device const float* wk_b    [[buffer(2)]],
                          device const float* wv_b    [[buffer(3)]],
                          device float*       dst     [[buffer(4)]],
-                         constant MlaParams& p       [[buffer(5)]],
-                         device const float* ff      [[buffer(6)]],
+                         device const float* ff      [[buffer(5)]],
+                         constant MlaParams& p       [[buffer(6)]],
                          uint gid [[thread_position_in_grid]]) {
     mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, true, ff);
 }
