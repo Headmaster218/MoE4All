@@ -1,13 +1,14 @@
 # DeepSeek support plan (V1 → V2/V3 → V3.2 → V4)
 
 Status: **Stage 2 done.** CPU path works end-to-end on V2-Lite; Vulkan and Metal
-MLA kernels are implemented and wired; Vulkan MoE is implemented; exp_probs_b
-loads from V3 GGUFs; the GPU seam test passes (cosine 0.9955 CPU-vs-Vulkan,
-matching greedy output vs llama.cpp c629da5).
+MLA kernels are implemented, wired, and executed on their real devices (Vulkan
+on the GPU box, Metal via the macOS CI job's parity suite); Vulkan MoE is
+implemented; exp_probs_b loads from V3 GGUFs; the GPU seam test passes (cosine
+0.9955 CPU-vs-Vulkan, matching greedy output vs llama.cpp c629da5); the YaRN
+ramp is verified numerically against llama.cpp at short AND long context (see
+the checklist).
 
-Remaining for Stage 2: a numeric YaRN check at long context (open question #6 is
-resolved for the default context — see the checklist). Stage 1 (`deepseek`) was
-skipped — V2-Lite is the development model.
+Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
 
 The reference implementation is llama.cpp at `b10218-1-gc629da5`, checked out
 locally at `~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths
@@ -429,10 +430,28 @@ Order matters:
       against a hand-written CPU reference, following `deltanet_parity`. This is
       the one that matters: it is the only cheap check that survives into stages
       3–4.
-- [ ] A numeric YaRN check against llama.cpp at a long context.
+- [x] **A numeric YaRN check against llama.cpp at a long context** — done
+      2026-08-07 on the V2-Lite Q4_K GGUF vs llama.cpp `c629da5` (CPU
+      reference):
+  - 228-token prompt, infr CPU prefill vs llama.cpp last-row logits: cosine
+    0.978, greedy token identical (185).
+  - 4560-token prompt (positions past `n_ctx_orig`=4096, in the ramp region),
+    infr Vulkan prefill vs llama.cpp: cosine 0.860, greedy token identical
+    (549). The seam's ff divisors / mscale are context-independent (llama.cpp
+    runs the full ramp at every context length), so the short-CPU and long-GPU
+    runs exercise the same numbers; both greedy tokens match.
+  - Both cosines sit in the established deepseek2 infr-vs-llama.cpp range
+    (~0.79–0.91; MLA adds f16 cache + norm + rope stages per layer).
 - [x] Metal MLA kernel — `mla_f16kv` in `attention.metal` + `exec.rs` dispatch
-      (2026-08-06; ported from `mla.comp`, f16 KV cache; not yet run on a Mac).
-- [ ] YaRN per-dimension frequency ramp in `Op::Rope` and MLA kernels.
+      (2026-08-06; ported from `mla.comp`, f16 KV cache), plus the YaRN
+      `mla_f16kv_ff` twin. Executed for the first time by `mla_parity` /
+      `mla_ff_parity` in the Metal parity suite on the macOS CI job (2026-08-07)
+      — which also caught and fixed an ff/params buffer-index swap in the kernel
+      declaration.
+- [x] YaRN per-dimension frequency ramp in `Op::Rope` and MLA kernels — the
+      `freq_factors` divisors (`ff[p] = 1/s(p)` from the corr_dims spectral
+      ramp) + the constant `mla_scale = mscale²/√(qk_nope+qk_rope)` landed in
+      `784704e` (2026-08-07); verified numerically above.
 
 ## Stage 3 — `deepseek32` (V3.2)
 
