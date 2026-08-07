@@ -1779,6 +1779,7 @@ const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const MLA_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mla.spv"));
+const MLA_FF_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mla_ff.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
 const RMSNORM_GATE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
@@ -1807,6 +1808,7 @@ const GELU_MUL_FUSED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gelu_mul_fused.spv"));
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
+const ROPE_FF_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_ff.spv"));
 const ATTENTION_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv"));
 const ATTN_COMBINE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine.spv"));
 const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention_kv.spv"));
@@ -2141,6 +2143,13 @@ pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
 pub(crate) fn mla_spv() -> &'static [u32] {
     static MLA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     MLA_SPV.get_or_init(|| spv_words(MLA_SPV_BYTES))
+}
+/// SPIR-V for MLA attention with YaRN freq_factors (`mla.comp`'s -DFREQ_FACTORS build): the
+/// internal q_pe rope DIVIDES its angle by the bound per-pair divisor `ff[p]`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn mla_ff_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(MLA_FF_SPV_BYTES))
 }
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2874,6 +2883,13 @@ pub(crate) fn store_f16_spv() -> &'static [u32] {
 pub(crate) fn rope_spv() -> &'static [u32] {
     static ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ROPE_SPV.get_or_init(|| spv_words(ROPE_SPV_BYTES))
+}
+/// SPIR-V for RoPE with YaRN freq_factors (`rope.comp`'s -DFREQ_FACTORS build): the rotation
+/// angle is DIVIDED by the bound per-pair divisor `ff[p]`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rope_ff_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(ROPE_FF_SPV_BYTES))
 }
 /// gemma4 E2B's per-layer fused inp_gate GEMV (`e2b_gate.comp`; weight read through a typed
 /// 64-bit buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the

@@ -501,6 +501,9 @@ fn main() {
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         // MLA attention (DeepSeek V2/V3): one workgroup per token, 128 lanes covering all heads.
         ("mla", "mla", &[]),
+        // YaRN freq_factors variant: the internal q_pe rope DIVIDES its angle by ff[pair]
+        // (`-DFREQ_FACTORS` adds the binding-5 ff buffer — see `Recorder::mla`).
+        ("mla", "mla_ff", &["-DFREQ_FACTORS"]),
         ("rmsnorm", "rmsnorm", &[]),
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
@@ -634,6 +637,9 @@ fn main() {
         ("dequant_turbo_f16", "dequant_turbo_t3", &["-DTURBO3"]),
         ("dequant_turbo_f16", "dequant_turbo_t4", &["-DTURBO4"]),
         ("rope", "rope", &[]),
+        // YaRN freq_factors variant: the rotation angle is DIVIDED by ff[pair] (`-DFREQ_FACTORS`
+        // adds the binding-2 ff buffer — see `Recorder::rope`).
+        ("rope", "rope_ff", &["-DFREQ_FACTORS"]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
         ("linear_f16", "linear_f16", &[]),

@@ -1,13 +1,13 @@
 # DeepSeek support plan (V1 → V2/V3 → V3.2 → V4)
 
-Status: **Stage 2 in progress.** CPU path works end-to-end on V2-Lite; Vulkan
-and Metal MLA kernels are implemented and wired; Vulkan MoE is implemented;
-exp_probs_b loads from V3 GGUFs.
+Status: **Stage 2 done.** CPU path works end-to-end on V2-Lite; Vulkan and Metal
+MLA kernels are implemented and wired; Vulkan MoE is implemented; exp_probs_b
+loads from V3 GGUFs; the GPU seam test passes (cosine 0.9955 CPU-vs-Vulkan,
+matching greedy output vs llama.cpp c629da5).
 
-Remaining for Stage 2: YaRN frequency ramp (mscale is done, per-dimension ramp
-is not — and it is inert for default GGUFs, see open question #6), GPU seam
-parity test (needs GPU + model file). Stage 1 (`deepseek`) was skipped — V2-Lite
-is the development model.
+Remaining for Stage 2: a numeric YaRN check at long context (open question #6 is
+resolved for the default context — see the checklist). Stage 1 (`deepseek`) was
+skipped — V2-Lite is the development model.
 
 The reference implementation is llama.cpp at `b10218-1-gc629da5`, checked out
 locally at `~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths
@@ -420,8 +420,11 @@ Order matters:
       (`cpu_deepseek2_config`, `cpu_deepseek2_prefill_finite`,
       `cpu_deepseek2_prefill_paris` — all added 2026-08-06, gated behind model
       file).
-- [x] `gpu_seam_matches_cpu_deepseek2` — skeleton added 2026-08-06; needs GPU to
-      run.
+- [x] `gpu_seam_matches_cpu_deepseek2` — skeleton added 2026-08-06; passing on
+      the GPU box 2026-08-07 (CPU-vs-Vulkan cosine 0.9955, matching top-5) after
+      the YaRN ramp + wk_b/wv_b orientation fixes.
+- [x] `cpu_deepseek2_golden` — hash-locked generation, blessed from the coherent
+      post-fix output (2026-08-07).
 - [x] **An op-level MLA parity test** in `infr-llama/tests/seam_op_parity.rs`
       against a hand-written CPU reference, following `deltanet_parity`. This is
       the one that matters: it is the only cheap check that survives into stages
@@ -595,19 +598,24 @@ Ordered by how much damage a wrong assumption does.
    k_pe slices (extracted via `CopyStrided`, no nope prefix). The q_pe rope is
    done inside the MLA kernel at offset `qk_nope_dim` — the offset lives in the
    kernel, not in `Op::Rope`. No `rope_off` field needed.
-6. **YaRN** — PARTIALLY RESOLVED (2026-08-06). The mscale² is folded into the
-   MLA attention scale correctly. The per-dimension frequency ramp (the YaRN
-   interpolation/extrapolation ramp) is NOT implemented —
-   `Op::Rope.freq_factors` and the MLA kernels both need it for correct
-   long-context quality. **However, the ramp is INERT for default deepseek2
-   GGUFs.** llama.cpp defaults `rope_scaling_type` to `linear` with
-   `rope_freq_scale = 1.0` and `yarn_ext_factor = 0`
-   (llama-context.cpp:185-191); with `ext_factor == 0`, `rope_yarn`'s ramp mix
-   is a no-op (ggml-cpu/ops.cpp:5835) and the mscale is the identity. The
-   convert script writes only `yarn_log_multiplier` for deepseek2, never
-   `yarn_ext_factor`/`yarn_attn_factor`/`rope_scaling.factor`. So the ramp
-   matters only when a user explicitly sets a YaRN context knob — deferred, not
-   needed for stock GGUFs.
+6. **YaRN** — RESOLVED (2026-08-07). The per-dimension frequency ramp IS
+   implemented and the mscale² is a constant (both folded per `ggml_rope_yarn` +
+   `deepseek2.cpp:162-172`). The earlier note claimed the ramp is "INERT for
+   default deepseek2 GGUFs" because it assumed the convert script never writes
+   `rope.scaling.factor`/`type` — **wrong**: the V2-Lite Q4_K GGUF declares
+   `rope.scaling.type = yarn`, `factor = 40`, `original_context_length = 4096`,
+   `yarn_log_multiplier = 0.0707`, which makes llama.cpp set
+   `yarn_ext_factor = 1.0` (llama-context.cpp:189-191) and run the FULL ramp at
+   every context length. Without it, infr's greedy output was
+   `"Reply Collabor…"` garbage while llama.cpp produced coherent text. The ramp
+   lives in `Op::Rope.freq_factors` (per-pair divisors, computed in the seam
+   from the corr_dims spectral ramp) plus the MLA kernels' internal q_pe rope;
+   the mscale² is folded into the MLA attention scale as a constant
+   (`mscale = 1 + 0.1·log_mul·ln(factor)`, applied via
+   `mla_scale = mscale²/√(qk_nope + qk_rope)` — note `qk_nope = head_k_mla` is
+   128 for V2-Lite, so the denominator is √192, not √576). The rope vector
+   mscale cancels to `rope_attn_factor` for deepseek2, so no vector scaling is
+   needed in the kernels.
 7. **DeepSeek's EOS** — `add_chat_eos` appends a fixed list that does not
    include `<｜end▁of▁sentence｜>`. It is normally the GGUF's declared
    `tokenizer.ggml.eos_token_id` and therefore already in `eos_ids`, but check

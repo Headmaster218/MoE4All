@@ -284,6 +284,10 @@ pub enum Op {
         pos: u32,
         /// RoPE base frequency for the internal q_pe rope (DeepSeek V2/V3 use 10000.0).
         theta: f32,
+        /// Optional per-pair frequency divisors for the internal q_pe rope (YaRN long-context
+        /// ramp, `qk_rope_dim/2` floats) — same semantic as `Op::Rope`'s `freq_factors`: the
+        /// rotation angle is DIVIDED by `ff[p]` for pair p. `None` = plain RoPE.
+        freq_factors: Option<TensorId>,
     },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`

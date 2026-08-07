@@ -2354,12 +2354,17 @@ fn lower_op(
             freq_factors,
             ..
         } => {
-            if freq_factors.is_some() {
+            let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
+            // YaRN freq_factors (deepseek2 k_pe) are only supported on the STATIC f32 in-place
+            // path (`rec.rope` → the `rope_ff` kernel build). The f16-out forms (`rope_f16`,
+            // fused KV write) and the record-once `_dyn` variants have no ff kernel — reject
+            // rather than silently drop the divisors.
+            if freq_factors.is_some() && (f16_out || !matches!(mode, RopeMode::Static(_))) {
                 return Err(be(
-                    "vulkan adapter: standalone Rope with freq_factors unsupported",
+                    "vulkan adapter: standalone Rope with freq_factors unsupported on this path",
                 ));
             }
-            let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
+            let ff = freq_factors.map(&r).transpose()?;
             let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
                 (r(cache)?, Some(pos))
             } else {
@@ -2407,6 +2412,7 @@ fn lower_op(
                             *rope_dim as usize,
                             *theta,
                             rope_pos[&positions.0],
+                            ff,
                         );
                     }
                 }
@@ -4317,6 +4323,7 @@ fn lower_op(
             mask,
             pos,
             theta,
+            freq_factors,
         } => {
             let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
             let cap = graph.desc(*k_cache).numel();
@@ -4326,6 +4333,7 @@ fn lower_op(
                 AttnMask::SlidingWindow(w) => (1u32, *w as u32),
                 AttnMask::Canvas { .. } => (2u32, 0u32),
             };
+            let ff = freq_factors.map(&r).transpose()?;
             rec.mla(
                 r(*q)?,
                 r(*k_cache)?,
@@ -4346,6 +4354,7 @@ fn lower_op(
                 window,
                 *theta,
                 cache_cap_rows,
+                ff,
             );
         }
     }

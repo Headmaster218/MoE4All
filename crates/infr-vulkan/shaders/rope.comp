@@ -20,6 +20,14 @@ layout(push_constant) uniform PC {
 #endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
+#ifdef FREQ_FACTORS
+// YaRN per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by
+// ff[pair] (deepseek2 k_pe — see `rope_ff` build in build.rs). Binds at 1; y shifts to 2 —
+// the hazard tracker treats the TRAILING binding as the write, and the recorder binds
+// [x, ff, y], so the output must come last for the store→read barrier. (FREQ_FACTORS is only
+// built WITHOUT OUT_F16/USE_PARAMS — the adapter rejects ff on the f16/dyn paths.)
+layout(binding = 1) readonly buffer FB { float ff[]; };
+#endif
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
 #ifndef KV_BDA
@@ -30,7 +38,11 @@ layout(binding = 2) buffer YB { float16_t y[]; };
 layout(binding = 1) buffer YB { float16_t y[]; };
 #endif
 #else
+#ifdef FREQ_FACTORS
+layout(binding = 2) buffer YB { float y[]; };
+#else
 layout(binding = 1) buffer YB { float y[]; };
+#endif
 #endif
 #if defined(OUT_F16) && defined(KV_BDA)
 #include "kv_addr.glsl"
@@ -66,6 +78,9 @@ void main() {
     for (uint i = 0u; i < hf; i++) {
         float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
         float ang = float(pos) * freq;
+#ifdef FREQ_FACTORS
+        ang /= ff[i];
+#endif
         float s = sin(ang);
         float co = cos(ang);
         float a = x[base + 2u * i];

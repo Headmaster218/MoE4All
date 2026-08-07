@@ -3882,16 +3882,40 @@ fn cpu_deepseek2_config() {
     );
 }
 
-/// Greedy top-1 token after "The capital of France is" — validates the full
-/// forward pass (MLA attention + MoE + output) on V2-Lite.
+/// Greedy generation on "The capital of France is" — the full forward pass (MLA attention +
+/// MoE + output) must produce COHERENT text. This was the test that caught the whole DeepSeek
+/// V2 bug family: it printed `"Reply CollaborReply Collabor CollaborReplyReplyReply"` before the
+/// YaRN ramp + wk_b/wv_b orientation fixes, and `" The capital of France is Paris. This"` after
+/// (verified against llama.cpp c629da5's greedy continuation " Paris.", which differs only in the
+/// top-2 dead heat between " Paris" and " The" — llama.cpp's own margin is 0.034).
 #[test]
 fn cpu_deepseek2_prefill_paris() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let output = cpu_gen(&model, "The capital of France is", 8);
-    assert!(!output.trim().is_empty(), "model produced no output");
+    assert!(
+        output.contains("Paris"),
+        "incoherent deepseek2 V2-Lite generation: {output:?}"
+    );
     eprintln!("deepseek2 V2-Lite 'Paris': {output:?}");
+}
+
+/// CPU golden-hash lock for DeepSeek V2-Lite (the MoE routed-expert + MLA path, per the
+/// qwen3moe precedent). Blessed from the coherent post-fix output — `INFR_BLESS=1` prints the
+/// text for a human coherence check before locking; the hash pins the exact generated stream.
+#[test]
+fn cpu_deepseek2_golden() {
+    let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(
+        &model,
+        &[
+            // (prompt, n_tokens, fnv1a hash of the generated text)
+            ("The capital of France is", 8, 0xc822e10860ea343b),
+        ],
+    );
 }
 
 /// Full CPU prefill on V2-Lite: all logits must be finite. Faster than a

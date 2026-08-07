@@ -2850,6 +2850,7 @@ impl Backend for CpuBackend {
                     mask,
                     pos,
                     theta,
+                    freq_factors,
                 } => {
                     let (rows, kv_len, nh, qhd, kv_lora, np, qkr, vhd) = (
                         rows as usize,
@@ -2902,6 +2903,7 @@ impl Backend for CpuBackend {
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
                     let hf = qkr / 2; // rope pair count
+                    let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
                     let mut out = vec![0f32; rows * nh * vhd];
                     self.pool()
                         .for_chunks_mut(&mut out, vhd, 2, &|i, ob_slice| {
@@ -2930,15 +2932,20 @@ impl Backend for CpuBackend {
                             for j in 0..kv_lora {
                                 let mut s = 0f32;
                                 for i in 0..np {
-                                    // wk_b[h][i][j]: row i, col j in the [kv_lora, np] matrix
-                                    s += wk[wk_off + i * np + j] * q_nope[i];
+                                    // wk_b[h][i][j]: element [i][j] of the per-head
+                                    // [qk_nope_dim, kv_lora_rank] matrix as stored in the GGUF —
+                                    // i is the FAST (row) dim: flat = i + j*qk_nope_dim.
+                                    s += wk[wk_off + i + j * np] * q_nope[i];
                                 }
                                 q_full[j] = s;
                             }
                             // Rope q_pe into q_full[kv_lora..]
                             for p in 0..hf {
                                 let (i0, i1) = (2 * p, 2 * p + 1);
-                                let ang = abs as f32 * theta.powf(-2.0 * p as f32 / qkr as f32);
+                                let mut ang = abs as f32 * theta.powf(-2.0 * p as f32 / qkr as f32);
+                                if let Some(ff) = &ff {
+                                    ang /= ff[p];
+                                }
                                 let (s, c) = (ang.sin(), ang.cos());
                                 let a = q_pe_raw[i0];
                                 let b = q_pe_raw[i1];
@@ -2973,8 +2980,9 @@ impl Backend for CpuBackend {
                                 for o_idx in 0..vhd {
                                     let mut vs = 0f32;
                                     for a_idx in 0..kv_lora {
-                                        // wv_b[h][a_idx][o_idx]
-                                        vs += wv[wv_off + a_idx * vhd + o_idx] * ks[kb + a_idx];
+                                        // wv_b[h][a_idx][o_idx]: element [a][o] with a the FAST
+                                        // (row) dim — flat = a + o*kv_lora (GGUF layout).
+                                        vs += wv[wv_off + a_idx + o_idx * kv_lora] * ks[kb + a_idx];
                                     }
                                     ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
                                 }

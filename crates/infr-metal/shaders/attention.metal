@@ -784,7 +784,8 @@ template [[host_name("attnvec_dyn_f16kv_hd256")]] kernel attnvec_dyn_t attnvec_d
 // K, no separate v_cache. The q_pe half of each query head is APPLIED ROPE internally here
 // (matching the CPU kernel); the graph passes raw q_pe. Faithful port of the Vulkan mla.comp — the
 // Metal f16 cache is `device half*` (one half per element), so unlike mla.comp there is no
-// u32-packed-pair bit unpacking: index it directly.
+// u32-packed-pair bit unpacking: index it directly. The body lives in the shared inline
+// `mla_f16kv_one`; `mla_f16kv_ff` is the YaRN freq_factors twin (see below).
 struct MlaParams {
     uint rows;
     uint kv_len;
@@ -802,13 +803,15 @@ struct MlaParams {
     uint cache_cap_rows;   // ring-buffer row capacity (0 or >= kv_len = full context)
 };
 
-kernel void mla_f16kv(device const float* q       [[buffer(0)]],
-                      device const half*  k_cache [[buffer(1)]],
-                      device const float* wk_b    [[buffer(2)]],
-                      device const float* wv_b    [[buffer(3)]],
-                      device float*       dst     [[buffer(4)]],
-                      constant MlaParams& p       [[buffer(5)]],
-                      uint gid [[thread_position_in_grid]]) {
+static inline void mla_f16kv_one(device const float* q,
+                                 device const half*  k_cache,
+                                 device const float* wk_b,
+                                 device const float* wv_b,
+                                 device float*       dst,
+                                 constant MlaParams& p,
+                                 uint gid,
+                                 bool has_ff,
+                                 device const float* ff) {
     if (gid >= p.rows * p.n_head) return;
     uint tok = gid / p.n_head;
     uint h = gid % p.n_head;
@@ -820,13 +823,13 @@ kernel void mla_f16kv(device const float* q       [[buffer(0)]],
     // Scratch: q_full after absorption + rope
     float q_full[576]; // max key_len (512+64)
     // q_nope → absorb via wk_b[h]^T (wk_b[h] is the per-head [qk_nope_dim, kv_lora_rank] file
-    // matrix; element [i][j])
+    // matrix; element [i][j] with i the FAST (row) dim: flat = i + j*qk_nope_dim)
     uint wk_off = h * p.kv_lora_rank * p.qk_nope_dim;
     for (uint j = 0u; j < p.kv_lora_rank; j++) {
         float s = 0.0f;
-        uint wk_base = wk_off + j;
+        uint wk_base = wk_off + j * p.qk_nope_dim;
         for (uint i = 0u; i < p.qk_nope_dim; i++) {
-            s += wk_b[wk_base + i * p.kv_lora_rank] * q[q_off + i];
+            s += wk_b[wk_base + i] * q[q_off + i];
         }
         q_full[j] = s;
     }
@@ -837,6 +840,7 @@ kernel void mla_f16kv(device const float* q       [[buffer(0)]],
         uint i0 = 2u * pp;
         uint i1 = i0 + 1u;
         float ang = float(abs_pos) * pow(p.theta, -2.0 * float(pp) / float(p.qk_rope_dim));
+        if (has_ff) ang /= ff[pp];
         float s = sin(ang);
         float c = cos(ang);
         float a = q[q_pe_off + i0];
@@ -912,10 +916,36 @@ kernel void mla_f16kv(device const float* q       [[buffer(0)]],
     uint wv_off = h * p.kv_lora_rank * p.v_head_dim;
     for (uint d = 0u; d < p.v_head_dim; d++) {
         float s = 0.0f;
-        uint wv_col = wv_off + d; // wv_b[h][i][d] — column-major over v_head_dim
+        // wv_b[h][i][d]: element [i][d] with i the FAST (row) dim — flat = i + d*kv_lora_rank.
+        uint wv_col = wv_off + d * p.kv_lora_rank;
         for (uint i = 0u; i < p.kv_lora_rank; i++) {
-            s += vacc[i] * inv_sum * wv_b[wv_col + i * p.v_head_dim];
+            s += vacc[i] * inv_sum * wv_b[wv_col + i];
         }
         dst[d_off + d] = s;
     }
+}
+
+// Plain entry point: no frequency divisors (non-yarn MLA / no rope scaling).
+kernel void mla_f16kv(device const float* q       [[buffer(0)]],
+                      device const half*  k_cache [[buffer(1)]],
+                      device const float* wk_b    [[buffer(2)]],
+                      device const float* wv_b    [[buffer(3)]],
+                      device float*       dst     [[buffer(4)]],
+                      constant MlaParams& p       [[buffer(5)]],
+                      uint gid [[thread_position_in_grid]]) {
+    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, false, nullptr);
+}
+
+// YaRN freq_factors twin (DeepSeek V2+ `rope.scaling.type == "yarn"`): the internal q_pe rope
+// angle is DIVIDED by the per-pair divisor `ff[pair]` (`qk_rope_dim/2` floats, buffer 6) — the
+// Vulkan `mla_ff` build's analogue; `exec.rs` picks this kernel when `Op::Mla.freq_factors` is set.
+kernel void mla_f16kv_ff(device const float* q       [[buffer(0)]],
+                         device const half*  k_cache [[buffer(1)]],
+                         device const float* wk_b    [[buffer(2)]],
+                         device const float* wv_b    [[buffer(3)]],
+                         device float*       dst     [[buffer(4)]],
+                         constant MlaParams& p       [[buffer(5)]],
+                         device const float* ff      [[buffer(6)]],
+                         uint gid [[thread_position_in_grid]]) {
+    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, true, ff);
 }

@@ -192,14 +192,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   into the routing — DeepSeek V2/V3 GPU logits changed run-to-run. Reordered the
   dispatch to `[logits, bias, ids, wts]` (and the shader bindings to match) so
   the two written buffers sit in the trailing write slots.
-- **DeepSeek MLA absorption transposition**: the Vulkan `mla.comp` and Metal
-  `mla_f16kv` kernels read the per-head `attn_k_b` weight transposed, computing
-  `W @ q_nope` where the absorbed-form math needs `Wᵀ @ q_nope` — the file
-  stores it as `[qk_nope_dim, kv_lora_rank]` per head. GPU logits for DeepSeek
-  V2/V3 models were finite but wrong. The `mla_matches_cpu_reference` parity
-  test now dispatches two attended keys with random K rows so the absorbed-query
-  scores actually shape the output (at `kv_len=1` softmax is trivial and the old
-  test could not detect a transposition).
+- **DeepSeek MLA absorption transposition**: the CPU/Vulkan/Metal MLA kernels
+  read the per-head `attn_k_b` weight transposed, computing `W @ q_nope` where
+  the absorbed-form math needs `Wᵀ @ q_nope` — the file stores it as
+  `[qk_nope_dim, kv_lora_rank]` per head with the qk_nope dim fastest. The
+  regression entered with the `6adb2de` "transpose fix" (which applied its own
+  diagnosis backwards: the diff flipped `i` from fast to slow) and was then
+  pinned by parity-test references written to the same wrong layout. The `wv_b`
+  output projection had the identical transpose (`[kv_lora, v_head_dim]` read
+  with the v_head_dim dim fastest) — invisible to every test because the parity
+  synthetic `wv_b` is an identity. Both are now read file-order (the fast dim
+  contracted) in all three backends and both parity references; the A/B check on
+  `wv_b` shows the transposed orientation collapses the pearson correlation with
+  llama.cpp from 0.79 to 0.10 and turns generation into `"ARSARSARS…"` garbage.
+  The `mla_matches_cpu_reference` parity test dispatches two attended keys with
+  random K rows so the absorbed-query scores actually shape the output (at
+  `kv_len=1` softmax is trivial and the old test could not detect a
+  transposition).
+- **DeepSeek V2/V3 YaRN frequency ramp missing**: the GGUF declares
+  `rope.scaling.type = yarn`, `factor = 40`, `original_context_length = 4096`,
+  `yarn_log_multiplier = 0.0707` — which makes llama.cpp set
+  `yarn_ext_factor = 1.0` and run the full per-dimension frequency ramp at EVERY
+  context length. infr roped with plain `θ^(−2p/d)`, so its q_pe/k_pe
+  frequencies were up to 40× off: the model output was coherent-looking but
+  wrong (`"Reply Collabor…"` garbage, top-1 unrelated to llama.cpp's). The seam
+  now computes the corr_dims spectral ramp divisors and feeds them through
+  `Op::Rope.freq_factors` (k_pe) and the MLA kernels' internal q_pe rope (Vulkan
+  `mla_ff`/`rope_ff` builds, Metal twin); the YaRN mscale² is a constant folded
+  into `mla_scale = mscale²/√(qk_nope + qk_rope)` (√192 for V2-Lite, not √576 —
+  `qk_nope = head_k_mla = 128`), replacing the previous context-length-gated
+  approximation. The rope vector mscale cancels to `rope_attn_factor` for
+  deepseek2, so the kernels need no vector scaling. Greedy output now matches
+  llama.cpp's continuation " Paris." in content.
+- **Vulkan hazard tracker mis-scoped the YaRN freq_factors dispatch**: the
+  `mla_ff`/`rope_ff` dispatches bound the read-only ff divisors AFTER the output
+  buffer with `n_out = 1`, so the tracker marked ff as the write and left the
+  real output (dst / y) untracked — no store→read barrier before the
+  wo-projection consumed the attention output, making DeepSeek V2 GPU logits
+  nondeterministic run-to-run. Reordered both dispatches to `[.., ff, dst]` /
+  `[x, ff, y]` and the shader bindings to match, so the trailing write slot is
+  the actual output.
 - Reject GGUF tensors whose encoded byte count overflows `usize` and model
   metadata with zero attention heads.
 - Stop malformed pipe-format tool arrays from entering a non-progress allocation

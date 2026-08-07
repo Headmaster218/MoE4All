@@ -214,6 +214,21 @@ pub struct Config {
     /// DeepSeek V2+ YaRN: the `rope.scaling.yarn_log_multiplier` divided by 0.1 on load (the
     /// converter writes `0.1 * mscale_all_dim`; the loader divides it back). `0.0` = no YaRN.
     pub rope_yarn_log_mul: f32,
+    /// DeepSeek V2+ YaRN: `rope.scaling.type == "yarn"` (the GGUF declares it). Gates the
+    /// per-dimension frequency ramp (`freq_scale` interpolation) applied to the q_pe/k_pe rope
+    /// divisors and the constant mscale² attention boost — see `docs/deepseek.md` § YaRN.
+    /// llama.cpp activates the full ramp whenever this flag is set (`yarn_ext_factor = 1.0` in
+    /// `llama-context.cpp`), regardless of the current context length.
+    pub rope_scaling_yarn: bool,
+    /// DeepSeek V2+ YaRN: `rope.scaling.factor` — the long-context interpolate factor (40 for
+    /// V2-Lite). `1.0` when the GGUF omits it. The per-pair divisor is `freq_scale = 1/factor`
+    /// ramped toward 1.0 below `corr_dim` (see `docs/deepseek.md`).
+    pub rope_scaling_factor: f32,
+    /// DeepSeek V2+ YaRN: `rope.scaling.original_context_length` — the context the model was
+    /// TRAINED at, the `n_ctx_orig` of the corr_dim ramp (4096 for V2-Lite). Defaults to
+    /// `context_length` when the GGUF omits it (llama.cpp's `n_ctx_orig_yarn` fallback). NOT
+    /// `n_ctx_train`: this GGUF sets `context_length = 163840` while the yarn ramp must use 4096.
+    pub rope_scaling_orig_ctx: usize,
     /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
     /// tensor presence, not GGUF key.
     pub is_lite: bool,
@@ -493,6 +508,24 @@ impl Config {
             (gf, norm, ylm)
         } else {
             (0, false, 0.0)
+        };
+        // DeepSeek V2+ YaRN: `rope.scaling.type` (string; `"yarn"` enables the full frequency
+        // ramp), `rope.scaling.factor` (the interpolate factor; llama.cpp defaults it to 1.0 when
+        // the GGUF omits it), and `rope.scaling.original_context_length` (the corr_dim ramp's
+        // `n_ctx_orig`; falls back to `context_length` like llama.cpp's `n_ctx_orig_yarn`).
+        let (rope_scaling_yarn, rope_scaling_factor, rope_scaling_orig_ctx) = if deepseek2 {
+            let yarn = g
+                .metadata()
+                .get(&mk("rope.scaling.type"))
+                .and_then(MetaValue::as_str)
+                .is_some_and(|s| s == "yarn");
+            let factor = meta_f64(g, &mk("rope.scaling.factor")).unwrap_or(1.0) as f32;
+            let orig_ctx = meta_u64(g, &mk("rope.scaling.original_context_length"))
+                .or_else(|| meta_u64(g, &mk("context_length")))
+                .unwrap_or(8192) as usize;
+            (yarn, factor, orig_ctx)
+        } else {
+            (false, 1.0, 0)
         };
         // Derived MLA dims from tensor shapes (NOT GGUF keys).
         let (head_k_mla, v_head_dim) = if deepseek2 {
@@ -968,6 +1001,9 @@ impl Config {
             n_expert_groups,
             n_expert_groups_used,
             rope_yarn_log_mul,
+            rope_scaling_yarn,
+            rope_scaling_factor,
+            rope_scaling_orig_ctx,
             is_lite,
         })
     }

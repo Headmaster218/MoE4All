@@ -4034,8 +4034,11 @@ impl<'a> Recorder<'a> {
         window: u32,
         theta: f32,
         cache_cap_rows: u32,
+        // YaRN per-pair frequency divisors for the internal q_pe rope (`qk_rope_dim/2` floats) —
+        // binds at 5 and selects the `mla_ff` kernel build (the divisor is a compile-time
+        // presence; the plain `mla` build has no ff binding).
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self.be.kernel("mla", crate::gemm::mla_spv(), 5, 56);
         let mut push = [0u8; 56];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
@@ -4051,19 +4054,45 @@ impl<'a> Recorder<'a> {
         push[44..48].copy_from_slice(&window.to_ne_bytes());
         push[48..52].copy_from_slice(&theta.to_ne_bytes());
         push[52..56].copy_from_slice(&cache_cap_rows.to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[
-                Self::vkb(q),
-                Self::vkb(k_cache),
-                Self::vkb(wk_b),
-                Self::vkb(wv_b),
-                Self::vkb(dst),
-            ],
-            1,
-            &push,
-            rows * n_head,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k = self.be.kernel("mla_ff", crate::gemm::mla_ff_spv(), 6, 56);
+                self.dispatch_wide(
+                    k,
+                    &[
+                        Self::vkb(q),
+                        Self::vkb(k_cache),
+                        Self::vkb(wk_b),
+                        Self::vkb(wv_b),
+                        // ff BEFORE dst: the hazard tracker treats the trailing `n_out` bindings
+                        // as writes, and `dst` (index 5) must be the tracked write — binding ff
+                        // last would mark the read-only divisors as written and leave `dst`
+                        // untracked (no barrier before the wo-projection read → nondeterminism).
+                        Self::vkb(ff),
+                        Self::vkb(dst),
+                    ],
+                    1,
+                    &push,
+                    rows * n_head,
+                );
+            }
+            None => {
+                let k = self.be.kernel("mla", crate::gemm::mla_spv(), 5, 56);
+                self.dispatch_wide(
+                    k,
+                    &[
+                        Self::vkb(q),
+                        Self::vkb(k_cache),
+                        Self::vkb(wk_b),
+                        Self::vkb(wv_b),
+                        Self::vkb(dst),
+                    ],
+                    1,
+                    &push,
+                    rows * n_head,
+                );
+            }
+        }
     }
 
     pub fn rmsnorm(
@@ -4228,8 +4257,10 @@ impl<'a> Recorder<'a> {
         rope_dim: usize,
         theta: f32,
         pos_offset: usize,
+        // YaRN per-pair frequency divisors (`rope_dim/2` floats) — binds at 2 and selects the
+        // `rope_ff` kernel build (compile-time presence; the plain `rope` build has no ff binding).
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -4238,13 +4269,31 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         // [24..28] out_base: 0 (in-place f32 rope has no output shift)
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            (t * n_heads) as u32,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k = self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28);
+                self.dispatch(
+                    k,
+                    // ff BEFORE y: the trailing `n_out` bindings are the hazard-tracked writes,
+                    // and `y` (index 2) must be that write — binding ff last would mark the
+                    // read-only divisors as written and leave `y` untracked (same race as mla_ff).
+                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28);
+                self.dispatch(
+                    k,
+                    &[Self::vkb(x), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// Interleaved (llama NORM) RoPE writing f16 — the llama q/k analogue of `qk_norm_rope`'s
@@ -12134,6 +12183,7 @@ mod tests {
             0, // window
             theta,
             cap_rows as u32, // cache_cap_rows — ring capacity > kv_len
+            None,            // freq_factors — no YaRN divisors in the reference test
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; rows * nh * vhd * 4];
@@ -12149,7 +12199,7 @@ mod tests {
                 for j in 0..kv_lora {
                     let mut acc = 0.0f32;
                     for i in 0..qk_nope {
-                        acc += wk[h * s + i * kv_lora + j] * qi[q_off + i];
+                        acc += wk[h * s + i + j * qk_nope] * qi[q_off + i];
                     }
                     q_full[j] = acc;
                 }
@@ -12187,7 +12237,7 @@ mod tests {
                 for d in 0..vhd {
                     let mut acc = 0.0f32;
                     for i in 0..kv_lora {
-                        acc += vacc[i] * inv * wv[h * kv_lora * vhd + d + i * vhd];
+                        acc += vacc[i] * inv * wv[h * kv_lora * vhd + i + d * kv_lora];
                     }
                     want[t * nh * vhd + h * vhd + d] = acc;
                 }

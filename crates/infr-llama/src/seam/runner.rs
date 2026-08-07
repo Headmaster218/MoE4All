@@ -118,12 +118,16 @@ fn bind_layer_io<'a>(
     h: &DecodeHandles,
     n_layer: usize,
     rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
     kbufs: &'a [Box<dyn Buffer>],
     vbufs: &'a [Box<dyn Buffer>],
     wbufs: &'a [Box<dyn Buffer>],
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
+    }
+    if let (Some(yid), Some((yb, _))) = (h.yarn_ff, yff_buf) {
+        b.bind(yid, yb.as_ref());
     }
     for l in 0..n_layer {
         b.bind(h.k_cache[l], kbufs[l].as_ref());
@@ -203,6 +207,37 @@ fn session_stable(
         } else {
             None
         };
+    // DeepSeek V2+ YaRN per-pair frequency divisors (`qk_rope_dim/2` floats): the full
+    // long-context ramp of `freq_scale = 1/factor` toward 1.0 below `corr_dim`, activated by
+    // `rope.scaling.type == "yarn"` in the GGUF. Ported from llama.cpp's `ggml_rope_yarn`
+    // (ggml/src/ggml-cpu/ops.cpp) with `yarn_ext_factor = 1.0` (llama-context.cpp) — the FULL
+    // ramp applies at EVERY context length, not just past `n_ctx_train`. The ramp's `n_ctx_orig`
+    // is `rope.scaling.original_context_length` (4096 for V2-Lite) — NOT `n_ctx_train`, which
+    // this GGUF inflates to 163840. Bound as a per-step f32 Input exactly like `rope_freqs`.
+    // `None` = plain rope (non-yarn models).
+    let yarn_ff: Option<Vec<f32>> = if c.rope_scaling_yarn && c.qk_rope_dim > 0 {
+        let n_rot = c.qk_rope_dim as f32;
+        let n_ctx_orig = c.rope_scaling_orig_ctx as f32;
+        let freq_scale = 1.0 / c.rope_scaling_factor;
+        // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
+        let corr = |nr: f32| {
+            n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * c.rope_theta.ln())
+        };
+        let start = (corr(32.0).floor() as i64).clamp(0, (n_rot as i64) - 1);
+        let end = (corr(1.0).ceil() as i64).clamp(0, (n_rot as i64) - 1);
+        let span = ((end - start) as f32).max(0.001);
+        Some(
+            (0..(n_rot as usize / 2))
+                .map(|p| {
+                    let ramp = 1.0 - (((p as f32) - start as f32) / span).clamp(0.0, 1.0);
+                    let s = freq_scale + (1.0 - freq_scale) * ramp;
+                    1.0 / s
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     // Combined gate+up FFN weights (one GEMV/GEMM + GatedActFused instead of two Linears +
     // GatedAct — the bespoke path's fused-gu shape, ~1 dispatch/layer off the decode hot loop).
     // Requires the backend to opt in (Vulkan; the CPU keeps zero-copy separate tensors) AND every
@@ -248,6 +283,7 @@ fn session_stable(
         out_scale,
         dec_out_scale,
         rope_freqs,
+        yarn_ff,
         fuse_gu,
         fuse_qkv,
         moe_batched_ok,
@@ -259,6 +295,9 @@ pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
     rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
+    // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats): the graph Input the
+    // driver binds `yff_buf` to (a per-step f32 Input like `rope_freqs`). `None` for non-yarn.
+    yarn_ff: Option<TensorId>,
     // gemma4 E2B host-gathered per-layer TOKEN embedding rows `[n_layer*npl]` — the graph Input
     // the driver binds `ipl_buf` to; the GPU prologue turns this into the layer loop's actual
     // per-layer input vector (see `per_layer_inp` inside `build`).
@@ -1030,6 +1069,17 @@ pub(crate) fn generate_dense_backend(
             }
             None => None,
         };
+        let yff_buf = match &stable.yarn_ff {
+            Some(yff) => {
+                let b = be
+                    .alloc(yff.len() * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(yff))
+                    .map_err(|e| anyhow!("{e}"))?;
+                Some((b, yff.len()))
+            }
+            None => None,
+        };
         // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
         // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
         let ipl_buf = if e2b && !gpu_ple {
@@ -1048,6 +1098,7 @@ pub(crate) fn generate_dense_backend(
                 wbufs,
                 wspecs,
                 rf_buf,
+                yff_buf,
                 layer_has_epb,
             }),
             stable: std::sync::Arc::clone(&stable),
@@ -1101,6 +1152,7 @@ pub(crate) fn generate_dense_backend(
         wbufs,
         wspecs,
         rf_buf,
+        yff_buf,
         layer_has_epb,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
@@ -1348,6 +1400,9 @@ pub(crate) fn generate_dense_backend(
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
+        // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats) — a per-step f32
+        // Input like `rope_freqs` (uploaded once into `yff_buf`, rebound every execute).
+        let yarn_ff = yff_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         // gemma4 E2B per-(token,layer) TOKEN embedding rows `[batch, n_layer*npl]` — host-gathered
         // + dequanted (the big `per_layer_token_embd` table stays off-VRAM, gathered per token).
         // The full `per_layer_inp` consumed by the layer loop is computed from this on the GPU
@@ -2359,7 +2414,7 @@ pub(crate) fn generate_dense_backend(
                     head_dim: qk_rope,
                     rope_dim: qk_rope,
                     theta,
-                    freq_factors: None,
+                    freq_factors: yarn_ff,
                     x_stride: 0,
                 });
                 // Copy roped k_pe back.
@@ -2383,18 +2438,28 @@ pub(crate) fn generate_dense_backend(
                 });
 
                 // MLA attention (the kernel handles q_pe rope internally).
-                // YaRN mscale² adjustment: when rope_yarn_log_mul is set and context exceeds
-                // training length, the softmax temperature is scaled down (makes attention
-                // sharper where interpolated frequencies softened it). Default is 1.0.
-                let mla_scale = if c.rope_yarn_log_mul != 0.0 {
-                    let freq_scale = (want_ctx as f64 / c.n_ctx_train as f64).max(1.0);
-                    if freq_scale > 1.0 {
-                        let ln_fs_inv = (1.0 / freq_scale).ln();
-                        let mscale = 1.0 + 0.1 * c.rope_yarn_log_mul as f64 * ln_fs_inv;
-                        (mscale * mscale) as f32 / ((qk_nope + qk_rope) as f32).sqrt()
+                // YaRN mscale² adjustment (llama.cpp `src/models/deepseek2.cpp`, applied as a
+                // CONSTANT whenever yarn scaling is on — not gated on context length): the
+                // interpolated frequencies soften the attention, so the score is boosted by
+                // `mscale²` where `mscale = attn_factor_org * (1 + 0.1*log_mul*ln(1/freq_scale))`
+                // and `attn_factor_org = yarn_attn_factor * (1 + 0.1*ln(1/freq_scale))` with
+                // `yarn_attn_factor = 1/(1 + 0.1*ln(1/freq_scale))` when log_mul != 0 (so
+                // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). The rope vector mscale
+                // is folded in here (both q_pe and k_pe get the same vector scale → a score-level
+                // square); the kernels only need the frequency divisors. Plain (non-yarn) MLA
+                // keeps `1/sqrt(qk_nope + qk_rope)`.
+                let mla_scale = if c.rope_scaling_yarn {
+                    // fs_inv = ln(1/freq_scale) = ln(factor) — NOT ln(1/factor) (that is the
+                    // negative; the GGUF's factor=40 gives +ln 40 = +3.6889).
+                    let fs_inv = c.rope_scaling_factor.ln();
+                    let yarn_attn_factor = if c.rope_yarn_log_mul != 0.0 {
+                        1.0 / (1.0 + 0.1 * fs_inv)
                     } else {
-                        1.0 / ((qk_nope + qk_rope) as f32).sqrt()
-                    }
+                        1.0
+                    };
+                    let attn_factor_org = yarn_attn_factor * (1.0 + 0.1 * fs_inv);
+                    let mscale = attn_factor_org * (1.0 + 0.1 * c.rope_yarn_log_mul * fs_inv);
+                    mscale * mscale / ((qk_nope + qk_rope) as f32).sqrt()
                 } else {
                     1.0 / ((qk_nope + qk_rope) as f32).sqrt()
                 };
@@ -2416,6 +2481,7 @@ pub(crate) fn generate_dense_backend(
                     mask,
                     pos: start_pos as u32,
                     theta,
+                    freq_factors: yarn_ff,
                 });
                 // wo projection, residual add.
                 g.push(Op::Linear {
@@ -3396,6 +3462,7 @@ pub(crate) fn generate_dense_backend(
                 hidden,
                 positions,
                 rope_freqs,
+                yarn_ff,
                 pl_tok_in: if pl_gathered { None } else { pl_tok_in },
                 sc_logits: sc_logits_in,
                 sc_embt: sc_embt_id,
@@ -3683,6 +3750,7 @@ pub(crate) fn generate_dense_backend(
             &dcache.dh,
             c.n_layer,
             rf_buf,
+            yff_buf,
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
@@ -3932,6 +4000,7 @@ pub(crate) fn generate_dense_backend(
             &vh,
             c.n_layer,
             rf_buf,
+            yff_buf,
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
@@ -4307,6 +4376,7 @@ pub(crate) fn generate_dense_backend(
                     &pf_h,
                     c.n_layer,
                     rf_buf,
+                    yff_buf,
                     &kbufs[..],
                     &vbufs[..],
                     &wbufs[..],
@@ -4433,6 +4503,7 @@ pub(crate) fn generate_dense_backend(
             &h,
             c.n_layer,
             rf_buf,
+            yff_buf,
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
@@ -4693,6 +4764,7 @@ pub(crate) fn generate_dense_backend(
                 &h,
                 c.n_layer,
                 rf_buf,
+                yff_buf,
                 &kbufs[..],
                 &vbufs[..],
                 &wbufs[..],

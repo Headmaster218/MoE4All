@@ -45,7 +45,16 @@ layout(binding = 2) readonly buffer WKB { float wk_b[]; };
 // wv_b: [n_head, kv_lora_rank, v_head_dim] — f32
 layout(binding = 3) readonly buffer WVB { float wv_b[]; };
 // dst: [rows, n_head, v_head_dim] — f32 writeonly
+#ifdef FREQ_FACTORS
+// YaRN per-pair frequency divisors (`qk_rope_dim/2` floats): the internal q_pe rope's rotation
+// angle is DIVIDED by ff[p] (see `mla_ff` build in build.rs). Binds at 4; dst shifts to 5 —
+// the hazard tracker treats the TRAILING binding as the write, and the recorder binds
+// [.., ff, dst], so the output must come last for the store→read barrier.
+layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) writeonly buffer DB { float dst[]; };
+#else
 layout(binding = 4) writeonly buffer DB { float dst[]; };
+#endif
 
 // The absorbed+roped query (key_len wide) and the V accumulator (kv_lora_rank wide) — shared
 // across the workgroup's 128 lanes, each lane owning a strided slice.
@@ -84,13 +93,14 @@ void main() {
 
     // ── Build q_full = [wk_b[h]^T · q_nope | rope(q_pe)] in shared memory ──
     // Absorption: sq[j] = Σ_i wk_b[h][i][j] * q_nope[i], j in 0..kv_lora_rank — wk_b[h] is the
-    // per-head [qk_nope_dim, kv_lora_rank] matrix as stored in the GGUF, so element [i][j].
+    // per-head [qk_nope_dim, kv_lora_rank] matrix as stored in the GGUF, so element [i][j] with
+    // i the FAST (row) dim: flat = i + j*qk_nope_dim within the head slice.
     // Each lane owns j = tid, tid+128, ... and sums the qk_nope_dim terms serially.
     for (uint j = tid; j < pc.kv_lora_rank; j += 128u) {
-        uint wk_base = h * pc.kv_lora_rank * pc.qk_nope_dim + j;
+        uint wk_base = h * pc.kv_lora_rank * pc.qk_nope_dim + j * pc.qk_nope_dim;
         float s = 0.0;
         for (uint i = 0u; i < pc.qk_nope_dim; i++) {
-            s += wk_b[wk_base + i * pc.kv_lora_rank] * q[q_off + i];
+            s += wk_b[wk_base + i] * q[q_off + i];
         }
         sq[j] = s;
     }
@@ -101,6 +111,9 @@ void main() {
         uint i0 = 2u * p;
         uint i1 = i0 + 1u;
         float ang = float(abs_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.qk_rope_dim));
+#ifdef FREQ_FACTORS
+        ang /= ff[p];
+#endif
         float s = sin(ang);
         float c = cos(ang);
         float a = q[q_off + pc.qk_nope_dim + i0];
@@ -220,11 +233,13 @@ void main() {
     float inv_sum = 1.0 / max(red[0], 1e-20);
 
     // ── wv_b[h] applied to V_accum → output. Each lane writes its slice of v_head_dim. ──
+    // wv_b[h] is the per-head [kv_lora_rank, v_head_dim] matrix as stored in the GGUF — element
+    // [i][d] with i the FAST (row) dim: flat = i + d*kv_lora_rank within the head slice.
     uint wv_off = h * pc.kv_lora_rank * pc.v_head_dim;
     for (uint d = tid; d < pc.v_head_dim; d += 128u) {
         float s = 0.0;
         for (uint i = 0u; i < pc.kv_lora_rank; i++) {
-            s += sv[i] * inv_sum * wv_b[wv_off + d + i * pc.v_head_dim];
+            s += sv[i] * inv_sum * wv_b[wv_off + i + d * pc.kv_lora_rank];
         }
         dst[d_off + d] = s;
     }

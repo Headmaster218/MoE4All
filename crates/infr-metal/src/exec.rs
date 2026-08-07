@@ -5166,12 +5166,15 @@ impl MetalBackend {
                 mask,
                 pos,
                 theta,
+                freq_factors,
             } => {
                 // MLA attention (DeepSeek V2/V3 absorbed form), ported from the Vulkan mla.comp:
                 // the kernel reads the K cache in its native f16 (`device const half*`, one half per
                 // element — the Metal layout, not Vulkan's u32-packed-pair), so an f16 cache is
                 // required here just as it is there. One thread per (token, head) does absorption,
-                // internal rope, two-pass SDPA and the wv_b output projection.
+                // internal rope, two-pass SDPA and the wv_b output projection. `freq_factors`
+                // (YaRN divisors) selects the `mla_f16kv_ff` twin, which divides its q_pe angle by
+                // the bound per-pair divisor.
                 if g.desc(*k_cache).dtype != DType::F16 {
                     return Err(Error::Unsupported(
                         "metal Op::Mla: f16 KV cache required (kernel reads the cache as f16 \
@@ -5194,6 +5197,10 @@ impl MetalBackend {
                 );
                 let bwk = self.weight_buf(wk_b, g, bindings)?;
                 let bwv = self.weight_buf(wv_b, g, bindings)?;
+                let bff = match freq_factors {
+                    Some(f) => Some(self.ensure_device(r, f)),
+                    None => None,
+                };
                 let bd = self.dev_dst(
                     r,
                     dst,
@@ -5214,23 +5221,23 @@ impl MetalBackend {
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&cache_cap_rows.to_ne_bytes());
-                let pso = self.pipelines.get("mla_f16kv")?;
+                let pso = if bff.is_some() {
+                    self.pipelines.get("mla_f16kv_ff")?
+                } else {
+                    self.pipelines.get("mla_f16kv")?
+                };
                 let threads = (rows as usize) * (n_head as usize);
-                self.encode_tg_w(
-                    r,
-                    &pso,
-                    &[
-                        bq.as_ref(),
-                        &bcache.raw,
-                        bwk.as_ref(),
-                        bwv.as_ref(),
-                        bd.as_ref(),
-                    ],
-                    1 << 4,
-                    &p,
-                    threads,
-                    0,
-                );
+                let mut bufs: Vec<&MtlBuffer> = vec![
+                    bq.as_ref(),
+                    &bcache.raw,
+                    bwk.as_ref(),
+                    bwv.as_ref(),
+                    bd.as_ref(),
+                ];
+                if let Some(bff) = &bff {
+                    bufs.push(bff.as_ref());
+                }
+                self.encode_tg_w(r, &pso, &bufs, 1 << 4, &p, threads, 0);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::MoeSharedExpertAdd { .. } => {

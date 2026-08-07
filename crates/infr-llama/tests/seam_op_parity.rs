@@ -796,6 +796,7 @@ fn mla_parity() {
         mask: AttnMask::Causal,
         pos: 0,
         theta: 10000.0,
+        freq_factors: None,
     });
 
     // Synthetic inputs — small integers for traceability.
@@ -853,7 +854,7 @@ fn mla_parity() {
             for j in 0..kv_lora {
                 let mut s = 0f32;
                 for i in 0..qk_nope {
-                    s += wk[wk_off + i * qk_nope + j] * q_nope[i];
+                    s += wk[wk_off + i + j * qk_nope] * q_nope[i];
                 }
                 q_full[j] = s;
             }
@@ -886,7 +887,7 @@ fn mla_parity() {
                 for o_idx in 0..vhd {
                     let mut vs = 0f32;
                     for a in 0..kv_lora {
-                        vs += wv[wv_off + a * vhd + o_idx] * ki[kb + a];
+                        vs += wv[wv_off + a + o_idx * kv_lora] * ki[kb + a];
                     }
                     ref_out[(ti * nh + h) * vhd + o_idx] += p * vs;
                 }

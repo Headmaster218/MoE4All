@@ -182,6 +182,9 @@ pub(crate) struct SessionStable {
     pub(super) dec_out_scale: Vec<Option<f32>>,
     /// gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`), dequanted.
     pub(super) rope_freqs: Option<Vec<f32>>,
+    /// DeepSeek V2+ YaRN per-pair frequency divisors (`qk_rope_dim/2` floats), computed from
+    /// `rope_scaling_factor`/`n_ctx_train`/`rope_theta` — see `runner::session_stable`.
+    pub(super) yarn_ff: Option<Vec<f32>>,
     /// Combined gate+up FFN upload decision.
     pub(super) fuse_gu: bool,
     /// Combined QKV upload decision.
@@ -275,6 +278,8 @@ pub(crate) struct SeamWeights {
     pub(super) wbufs: Vec<Box<dyn Buffer>>,
     pub(super) wspecs: Vec<(DType, usize)>,
     pub(super) rf_buf: Option<(Box<dyn Buffer>, usize)>,
+    /// DeepSeek V2+ YaRN per-pair frequency divisors (`yarn_ff`), uploaded once like `rf_buf`.
+    pub(super) yff_buf: Option<(Box<dyn Buffer>, usize)>,
     /// Per-layer: whether `ffn_exp_probs_b.weight` was loaded (DeepSeek V3+ router bias).
     pub(super) layer_has_epb: Vec<bool>,
 }
