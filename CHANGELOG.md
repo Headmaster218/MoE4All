@@ -173,6 +173,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **GPU MoE routing nondeterminism**: `Recorder::moe_topk` bound
+  `[logits, ids, wts, bias]` with `n_out = 2`, so the hazard tracker treated
+  `ids` as a read and `bias` as a write — but the shader writes `ids` and only
+  reads `bias`. The `ids` write never reached the RAW check, so the per-expert
+  GEMVs that index the weight bank by `ids[slot]` got no barrier before reading
+  it, and the pooled ids buffer (reused across layers) fed stale/torn expert ids
+  into the routing — DeepSeek V2/V3 GPU logits changed run-to-run. Reordered the
+  dispatch to `[logits, bias, ids, wts]` (and the shader bindings to match) so
+  the two written buffers sit in the trailing write slots.
 - **DeepSeek MLA absorption transposition**: the Vulkan `mla.comp` and Metal
   `mla_f16kv` kernels read the per-head `attn_k_b` weight transposed, computing
   `W @ q_nope` where the absorbed-form math needs `Wᵀ @ q_nope` — the file

@@ -32,9 +32,9 @@ layout(push_constant) uniform PC {
     uint n_expert_groups_used; // how many groups to keep
 } pc;
 layout(binding = 0) readonly buffer LB { float logits[]; };
-layout(binding = 1) buffer IB { uint ids[]; };
-layout(binding = 2) writeonly buffer WB { float wts[]; };
-layout(binding = 3) readonly buffer BB { float bias[]; }; // exp_probs_b, always bound
+layout(binding = 1) readonly buffer BB { float bias[]; }; // exp_probs_b, always bound
+layout(binding = 2) buffer IB { uint ids[]; };
+layout(binding = 3) writeonly buffer WB { float wts[]; };
 
 shared float sval[128];
 shared uint sidx[128];

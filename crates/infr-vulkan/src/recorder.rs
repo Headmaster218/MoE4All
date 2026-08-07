@@ -7806,6 +7806,9 @@ impl<'a> Recorder<'a> {
     /// VRAM (no host round-trip). `scale` = routing scale. `gating` (0 = softmax, 1 = sigmoid) and
     /// `norm_w` (renormalize the selected weights to sum to 1) select the weighting formula —
     /// qwen3moe/qwen35moe/diffusion-gemma pass (softmax, true); llama4 passes (sigmoid, false).
+    /// Bound-buffer order matters: `dispatch` treats the last `n_out` buffers as writes, so the two
+    /// WRITTEN buffers (`ids`, `wts`) must occupy the trailing slots for the hazard tracker to see
+    /// the `ids` write; `bias` is read-only.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_topk(
         &self,
@@ -7839,9 +7842,9 @@ impl<'a> Recorder<'a> {
             k,
             &[
                 Self::vkb(logits),
+                Self::vkb(bias),
                 Self::vkb(ids),
                 Self::vkb(wts),
-                Self::vkb(bias),
             ],
             2,
             &push,
