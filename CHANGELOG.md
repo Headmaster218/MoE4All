@@ -23,8 +23,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   two-pass SDPA over the unified f16 KV cache (one row per token, V aliased from
   the first `kv_lora_rank` columns of K), and the `wv_b` output projection.
   Ring-buffer, causal / sliding-window / canvas masks supported. CPU math
-  covered by `mla_parity` in `seam_op_parity.rs`; Metal dispatch is implemented
-  but not yet run on a Mac.
+  covered by `mla_parity` in `seam_op_parity.rs`; Metal dispatch covered by
+  `mla_parity`/`mla_ff_parity` in the Metal parity suite, executed on the macOS
+  CI job (a real Metal device).
 
 - **DeepSeek V3 MoE routing** (Vulkan): `moe_topk` now selects on
   `probs + exp_probs_b` while weighting from the unbiased probs (the noaux_tc
@@ -172,6 +173,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   through `rayon`, so it applies to every CPU-backend build.
 
 ### Fixed
+
+- **DeepSeek V3 router bias applied to the wrong scores (Vulkan)**: `moe_topk`
+  added `exp_probs_b` to the raw router LOGITS, but llama.cpp (and the CPU
+  interpreter) add it to the gated PROBS
+  (`selection_probs = ggml_add(probs, exp_probs_b)`). `probs + bias` is not
+  monotone in `logits + bias`, so a real V3/V3.1 model (sigmoid gated, noaux_tc
+  bias) routed to different experts than the reference. The shader now selects
+  on `gating(logit) + bias`; the no-bias paths are unchanged. Caught by the new
+  `moe_groups_bias_parity` op test, whose data makes the two semantics disagree.
+- **Metal `mla_f16kv_ff` (YaRN twin) bound its buffers at the wrong indices**:
+  the kernel declared `MlaParams` at buffer(5) and `freq_factors` at buffer(6),
+  but `exec.rs` binds `[q, k, wk_b, wv_b, dst, ff]` with params at
+  `bufs.len() = 6` — the shader would have read the 4-byte divisor buffer as its
+  params struct. Never executed until the new `mla_parity`/`mla_ff_parity` tests
+  ran it on the macOS CI job; buffer declarations swapped to match the binding
+  convention.
 
 - **DeepSeek V2/V3 decode writes every token's K to row 0**: the seam's
   `dyn_replay` gate (which must mirror the Vulkan adapter's record-once-replay

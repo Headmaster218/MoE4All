@@ -8,8 +8,10 @@
 // weights to sum to 1) are independent push-constant flags.
 //
 // DeepSeek V2+ extensions:
-//   * `has_bias` — router bias (exp_probs_b) affects SELECTION only; weights come from unbiased
-//     logits. This breaks the old monotonicity invariant (top-k-by-logit ≠ top-k-by-score).
+//   * `has_bias` — router bias (exp_probs_b) is added to the GATED selection probs (`probs +
+//     bias`, llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)`), affecting SELECTION
+//     only; weights come from the unbiased probs. This breaks the old monotonicity invariant
+//     (top-k-by-logit ≠ top-k-by-score) — see `sel_score`.
 //   * `n_expert_groups` / `n_expert_groups_used` — group-limited routing: per-group top-2 scores
 //     are summed for a group score; the top `n_expert_groups_used` groups are kept, the rest
 //     masked to -inf (matching llama.cpp `build_moe_ffn`).
@@ -60,6 +62,25 @@ float score_of(float logit) {
     }
 }
 
+// SELECTION score for the bias/groups extension — the gated PROBABILITY plus the router bias,
+// matching llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)` (llama-graph.cpp:1882-1883)
+// and the CPU interpreter (`sel_probs[e] = probs[e] + bias[e]`). The pre-extension code selected
+// by raw logits, which is only equivalent when the bias is zero: sigmoid/sqrt-softplus are
+// strictly monotone in the logit, so their prob ordering IS the logit ordering, but `probs + bias`
+// is NOT monotone in `logits + bias`, so a real exp_probs_b model (V3/V3.1, sigmoid gated) would
+// route to different experts under the old code. Softmax keeps the raw-logit ordering (monotone in
+// the normalized prob; no real exp_probs_b model uses softmax gating).
+float sel_score(float logit) {
+    if (pc.gating == 0u) {
+        return logit;
+    } else if (pc.gating == 1u) {
+        return 1.0 / (1.0 + exp(-logit));
+    } else {
+        float xx = (logit > 20.0) ? logit : log(1.0 + exp(logit));
+        return sqrt(max(xx, 0.0));
+    }
+}
+
 void main() {
     uint tok = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
@@ -94,7 +115,7 @@ void main() {
                     float b0 = -1e30, b1 = -1e30;
                     uint base = g * n_per;
                     for (uint e = base; e < base + n_per; e++) {
-                        float s = logits[lbase + e] + ssel_adj[e];
+                        float s = sel_score(logits[lbase + e]) + ssel_adj[e];
                         if (s > b0) { b1 = b0; b0 = s; }
                         else if (s > b1) { b1 = s; }
                     }
@@ -135,7 +156,7 @@ void main() {
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
             if (!taken[c]) {
                 uint e = t + c * 128u;
-                float s = (e < pc.n_expert) ? (llog[c] + ssel_adj[e]) : -1e30;
+                float s = (e < pc.n_expert) ? (sel_score(llog[c]) + ssel_adj[e]) : -1e30;
                 if (s > bv) { bv = s; be = e; }
             }
         }

@@ -982,6 +982,22 @@ on 2026-08-05:
   was standing in for. Count is from
   `grep -rn "config-plan.md" --include=*.md --include=*.rs .`
 
+### B39 — Vulkan MoE id-GEMV silently no-ops for `in_f < 32` (2026-08-07)
+
+**Tag:** vulkan · **Blocked on:** nothing; found while writing the deepseek2 MoE
+op-parity tests, which needed ne=32 to make the Vulkan cross-check meaningful
+
+`native_gemv_id_multi.comp` computes `nsub = pc.in_f/32` (integer division), so
+an expert bank with `in_f < 32` runs **zero** sub-blocks and the dispatched op
+leaves `dst` all-zero — a silent wrong output, no error. The existing adapter
+test `moe_ffn_graph_matches_host` deliberately uses ne=32 (the kernels' floor),
+and every production model has ne/n_ff ≥ 32, so no real GGUF hits it — the
+hazard is synthetic tests and any future small-`ne` arch. Fix options: assert
+`in_f >= 32` at adapter dispatch (fail loudly instead of zeros), or add a
+sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
+seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
+constraint in their comments.
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
