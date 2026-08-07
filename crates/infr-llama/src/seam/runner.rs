@@ -4380,6 +4380,13 @@ pub(crate) fn generate_dense_backend(
         // skips building the then-unused replay plan). Keeps this gate a strict subset of the
         // adapter's eligibility.
         && !c.diffusion_gemma
+        // DeepSeek2 MLA: the adapter's `decode_eligible` rejects `Op::Mla` outright (its kernel has
+        // no record-once dyn twin), but this mirror gate has no Mla check — without this exclusion
+        // the replay tape is built with pos=0 baked into every WriteKv, and the adapter's
+        // eligible=false fallback then executes THAT tape statically for every decode token,
+        // writing each token's K to row 0 (rows 1.. never populated, attention sees a one-row
+        // cache). Keeps the "strict subset" promise the gate's doc states.
+        && !c.deepseek2
         && (qk_norm || stable.rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16

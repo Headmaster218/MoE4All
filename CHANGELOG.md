@@ -173,6 +173,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **DeepSeek V2/V3 decode writes every token's K to row 0**: the seam's
+  `dyn_replay` gate (which must mirror the Vulkan adapter's record-once-replay
+  eligibility) had no `Op::Mla` exclusion, so a DeepSeek MLA model built the
+  replay tape with `pos = 0` baked into every `WriteKv`. The adapter rejects the
+  MLA graph as ineligible and falls back to the static path — executing that
+  baked `pos = 0` tape for every decode token, so each token's K row landed in
+  row 0 and rows 1.. never got populated. Attention then ran against a one-row
+  cache: logits diverged wholesale (GPU top-1 was unrelated to the CPU's, cosine
+  ~0.5). Added the `c.deepseek2` exclusion to the gate so MLA models take the
+  per-token static decode path.
 - **GPU MoE routing nondeterminism**: `Recorder::moe_topk` bound
   `[logits, ids, wts, bias]` with `n_out = 2`, so the hazard tracker treated
   `ids` as a read and `bias` as a write — but the shader writes `ids` and only
