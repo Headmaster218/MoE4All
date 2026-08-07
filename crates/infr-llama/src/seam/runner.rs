@@ -1733,14 +1733,14 @@ pub(crate) fn generate_dense_backend(
         let k16 = g.internal(f16d(batch * max_kvrow));
         let attn = g.internal(f32d(batch * max_qrow));
         // DeepSeek2 MLA scratch: mla_q (f32 query with [nope|rope] per head, roped by the kernel),
-        // mla_k16 (f16 K row for WriteKv), mla_kv_cmpr (f32 latent for norm), mla_rope (f32 k_pe).
+        // mla_k16 (f32 K row staging; cast to f16 only at WriteKv — raw wkv_a_mqa outputs exceed f16 max before RMSNorm), mla_kv_cmpr (f32 latent for norm), mla_rope (f32 k_pe).
         let mla_q = if mla_qrow > 0 {
             Some(g.internal(f32d(batch * mla_qrow)))
         } else {
             None
         };
         let mla_k16 = if mla_key_len > 0 {
-            Some(g.internal(f16d(batch * mla_key_len)))
+            Some(g.internal(f32d(batch * mla_key_len)))
         } else {
             None
         };
@@ -2299,7 +2299,7 @@ pub(crate) fn generate_dense_backend(
                     });
                 }
 
-                // KV: wkv_a_mqa → mla_k16 (f16). Split into kv_cmpr and k_pe, norm+rope, reassemble.
+                // KV: wkv_a_mqa → mla_k16 (f32). Split into kv_cmpr and k_pe, norm+rope, reassemble.
                 g.push(Op::Linear {
                     x: hn,
                     weight: mw.wkv_a_mqa,
