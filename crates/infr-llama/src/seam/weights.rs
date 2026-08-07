@@ -133,9 +133,9 @@ pub(super) struct MlaW {
     pub(super) wkv_a_mqa: TensorId,
     /// RMSNorm on the KV latent (`kv_lora_rank`-wide) AFTER the split from k_pe.
     pub(super) kv_a_norm: TensorId,
-    /// Absorption weight `[n_head, kv_lora_rank, qk_nope_dim]` — wk_b[h]ᵀ maps q_nope to latent.
+    /// Absorption weight, per-head `[qk_nope_dim, kv_lora_rank]` as stored in the GGUF (attn_k_b) — wk_b[h]ᵀ maps q_nope to latent.
     pub(super) wk_b: TensorId,
-    /// Output weight `[n_head, kv_lora_rank, v_head_dim]` — applied AFTER the KQV product.
+    /// Output weight, per-head `[kv_lora_rank, v_head_dim]` as stored in the GGUF (attn_v_b) — applied AFTER the KQV product.
     pub(super) wv_b: TensorId,
     /// Output projection `[n_head * v_head_dim, n_embd]`.
     pub(super) wo: TensorId,

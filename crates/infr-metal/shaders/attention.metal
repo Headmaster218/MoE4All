@@ -819,13 +819,14 @@ kernel void mla_f16kv(device const float* q       [[buffer(0)]],
     uint q_off = gid * p.q_head_dim;
     // Scratch: q_full after absorption + rope
     float q_full[576]; // max key_len (512+64)
-    // q_nope → absorb via wk_b[h]^T
+    // q_nope → absorb via wk_b[h]^T (wk_b[h] is the per-head [qk_nope_dim, kv_lora_rank] file
+    // matrix; element [i][j])
     uint wk_off = h * p.kv_lora_rank * p.qk_nope_dim;
     for (uint j = 0u; j < p.kv_lora_rank; j++) {
         float s = 0.0f;
-        uint wk_row = wk_off + j * p.qk_nope_dim;
+        uint wk_base = wk_off + j;
         for (uint i = 0u; i < p.qk_nope_dim; i++) {
-            s += wk_b[wk_row + i] * q[q_off + i];
+            s += wk_b[wk_base + i * p.kv_lora_rank] * q[q_off + i];
         }
         q_full[j] = s;
     }

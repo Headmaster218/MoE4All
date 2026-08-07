@@ -83,13 +83,14 @@ void main() {
     uint q_off = (tok * pc.n_head + h) * pc.q_head_dim;
 
     // ── Build q_full = [wk_b[h]^T · q_nope | rope(q_pe)] in shared memory ──
-    // Absorption: sq[j] = Σ_i wk_b[h][j][i] * q_nope[i], j in 0..kv_lora_rank. Each lane owns
-    // j = tid, tid+128, ... and sums the qk_nope_dim terms serially.
+    // Absorption: sq[j] = Σ_i wk_b[h][i][j] * q_nope[i], j in 0..kv_lora_rank — wk_b[h] is the
+    // per-head [qk_nope_dim, kv_lora_rank] matrix as stored in the GGUF, so element [i][j].
+    // Each lane owns j = tid, tid+128, ... and sums the qk_nope_dim terms serially.
     for (uint j = tid; j < pc.kv_lora_rank; j += 128u) {
-        uint wk_row = h * pc.kv_lora_rank * pc.qk_nope_dim + j * pc.qk_nope_dim;
+        uint wk_base = h * pc.kv_lora_rank * pc.qk_nope_dim + j;
         float s = 0.0;
         for (uint i = 0u; i < pc.qk_nope_dim; i++) {
-            s += wk_b[wk_row + i] * q[q_off + i];
+            s += wk_b[wk_base + i * pc.kv_lora_rank] * q[q_off + i];
         }
         sq[j] = s;
     }

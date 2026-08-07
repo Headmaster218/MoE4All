@@ -12048,11 +12048,14 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn mla_matches_cpu_reference() {
         let be = be_with(|_| {});
-        // The EXACT real-dispatch shape from the seam (decode: rows=1, kv_len=1, ring cap=12) —
-        // exercises the ring-buffer path with cap > kv_len and the full shared-memory arrays.
+        // Seam-family shape (rows=1 decode, ring cap=12) but with TWO attended keys (pos=1, causal)
+        // so the absorbed-query scores actually shape the softmax — at kv_len=1 softmax is trivial
+        // and the output is independent of q, which hid the wk_b transposition bug for months.
+        // Exercises the ring-buffer path with cap > kv_len and the full shared-memory arrays.
         let (rows, nh, kv_lora, qk_nope, qk_rope, vhd) =
             (1usize, 16usize, 512usize, 128usize, 64usize, 128usize);
         let cap_rows = 12usize; // ring capacity — bigger than kv_len
+        let kv_len = 2usize; // attended keys dispatched (pos=1 causal → keys 0..=1)
         let key_len = kv_lora + qk_rope; // 576
         let q_head_dim = qk_nope + qk_rope; // 192
         let scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt();
@@ -12063,7 +12066,7 @@ mod tests {
         let s = kv_lora * qk_nope;
         for h in 0..nh {
             for a in 0..qk_nope {
-                let slot = (h + a) % kv_lora;
+                let slot = (h + 3 * a) % kv_lora;
                 wk[h * s + slot * qk_nope + a] = 1.0;
             }
         }
@@ -12078,16 +12081,19 @@ mod tests {
         let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
             .map(|x| x as f32)
             .collect();
-        let ki: Vec<f32> = (0..cap_rows * key_len)
-            .map(|i| {
-                let col = i % key_len;
-                if col < kv_lora {
-                    (10 + col) as f32
-                } else {
-                    (1 + (col - kv_lora)) as f32
-                }
-            })
-            .collect();
+        // Random-but-deterministic K rows (xorshift, values < 2048 so the f16 cache cast is exact):
+        // a fixed column pattern (10+col) makes every key row a constant shift of the others, and
+        // with a near-one-hot softmax the output then collapses to the winner's V regardless of q —
+        // which accidentally made the output invariant to a transposed wk_b. Random rows make the
+        // scores, and hence the output, genuinely depend on the absorbed query.
+        let mut state = 0x1234_5678u32;
+        let mut ki = Vec::with_capacity(cap_rows * key_len);
+        for _ in 0..cap_rows * key_len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            ki.push((state % 1999) as f32);
+        }
         let bq = upf32(&be, &qi);
         let bwk = upf32(&be, &wk);
         let bwv = upf32(&be, &wv);
@@ -12111,7 +12117,8 @@ mod tests {
             bwv.as_ref(),
             bo.as_ref(),
             rows as u32,
-            1, // kv_len — attend to just the first key (decode shape)
+            kv_len as u32, // two DIFFERENT keys so the absorbed-query scores matter (kv_len=1 makes
+            // softmax trivial and would hide a transposed wk_b)
             nh as u32,
             q_head_dim as u32,
             kv_lora as u32,
@@ -12119,7 +12126,7 @@ mod tests {
             qk_rope as u32,
             vhd as u32,
             scale,
-            0, // pos
+            1, // pos — causal: attends keys 0..=1
             0, // mask_type: causal
             0, // window
             theta,
@@ -12132,14 +12139,14 @@ mod tests {
         // CPU reference: absorb → rope → SDPA → wv_b (see seam_op_parity.rs mla_parity).
         let mut want = vec![0f32; rows * nh * vhd];
         for t in 0..rows {
-            let abs_pos = 0u32; // pos = 0
+            let abs_pos = 1u32; // pos = 1
             for h in 0..nh {
                 let q_off = (t * nh + h) * q_head_dim;
                 let mut q_full = vec![0f32; key_len];
                 for j in 0..kv_lora {
                     let mut acc = 0.0f32;
                     for i in 0..qk_nope {
-                        acc += wk[h * s + j * qk_nope + i] * qi[q_off + i];
+                        acc += wk[h * s + i * kv_lora + j] * qi[q_off + i];
                     }
                     q_full[j] = acc;
                 }
@@ -12154,7 +12161,7 @@ mod tests {
                 let mut sumw = 0.0f32;
                 // Two-pass with the true lmax (max over attended keys) for exact parity.
                 let lo = 0usize;
-                let hi = (t + 1).min(rows);
+                let hi = (abs_pos as usize + 1).min(kv_len);
                 let mut lmax = f32::NEG_INFINITY;
                 let mut scores = Vec::new();
                 for j in lo..hi {

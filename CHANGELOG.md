@@ -173,6 +173,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **DeepSeek MLA absorption transposition**: the Vulkan `mla.comp` and Metal
+  `mla_f16kv` kernels read the per-head `attn_k_b` weight transposed, computing
+  `W @ q_nope` where the absorbed-form math needs `Wᵀ @ q_nope` — the file
+  stores it as `[qk_nope_dim, kv_lora_rank]` per head. GPU logits for DeepSeek
+  V2/V3 models were finite but wrong. The `mla_matches_cpu_reference` parity
+  test now dispatches two attended keys with random K rows so the absorbed-query
+  scores actually shape the output (at `kv_len=1` softmax is trivial and the old
+  test could not detect a transposition).
 - Reject GGUF tensors whose encoded byte count overflows `usize` and model
   metadata with zero attention heads.
 - Stop malformed pipe-format tool arrays from entering a non-progress allocation
