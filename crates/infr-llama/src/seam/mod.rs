@@ -1005,11 +1005,119 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
     !ec.kv.type_k_specified && !ec.kv.type_v_specified && !ec.kv.force_q8
 }
 
-/// Layout gate for a Q8_0 KV cache — every layer's KV row must be whole 32-elem blocks (the
-/// same alignment the runner's own `parse_kv_fmt` gate checks; keeping them identical means a
-/// pinned auto-q8 is never silently gated back to f16 with an under-sized placement estimate).
+/// Per-token (K, V) ELEMENT counts for layer `l` — the one answer to "how wide is a row of this
+/// layer's KV cache", shared by the runner's allocation, the graph declaration, the fork/seed
+/// copies and every footprint estimate. Multiply by a row count for a whole cache side.
+///
+/// DeepSeek2 MLA caches ONE compressed row per token (`kv_lora_rank + qk_rope_dim` — 576 on
+/// V2-Lite) and has **no V cache at all**: V is an aliased prefix view of that same row, so the V
+/// side is 0 elements and its buffer/tensor is a placeholder ([`kv_side_elems`]). Every other arch
+/// stores `n_kv * head_dim` per side. Reading it off `layer_n_kv * layer_head_dim` for an MLA model
+/// yields `1 * 192` — a third of what the kernels index — which is exactly what `SeamKv::fork`,
+/// `SeamKv::seed_from` and the VRAM estimate each did while the allocation carried its own copy of
+/// the branch (docs/backlog.md B41).
+///
+/// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
+/// to the fixed conv/S-state allocation BEFORE reaching here, and the estimates price them with
+/// this attention geometry as they always have.
+pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
+    if cfg.deepseek2 {
+        return (cfg.kv_lora_rank + cfg.qk_rope_dim, 0);
+    }
+    let row = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+    (row, row)
+}
+
+/// Elements a KV side that the arch does NOT cache still declares and allocates: MLA's V, whose
+/// [`kv_row_elems`] count is 0. No backend ever indexes it (the MLA kernels read V as a prefix of
+/// the K row), but every backend still binds a buffer and a graph Input for the side, and a
+/// zero-size allocation is not portable — so the placeholder is a handful of elements, sized
+/// identically at the allocation and the declaration.
+pub(crate) const KV_PLACEHOLDER_ELEMS: usize = 4;
+
+/// A KV side's element count as DECLARED in the graph: `elems`, or the placeholder when the arch
+/// does not cache that side at all (see [`KV_PLACEHOLDER_ELEMS`]).
+pub(crate) fn kv_side_elems(elems: usize) -> usize {
+    if elems == 0 {
+        KV_PLACEHOLDER_ELEMS
+    } else {
+        elems
+    }
+}
+
+/// Smallest KV-side allocation any backend will accept.
+///
+/// The floor has to be in BYTES rather than elements, because a block-quant format prices
+/// [`KV_PLACEHOLDER_ELEMS`] at zero bytes (`kv_fmt_bytes(Q8_0, 4)` is `4 / 32 * 34`) and a
+/// zero-size allocation is refused outright by the Vulkan allocator.
+const KV_MIN_SIDE_BYTES: usize = 4;
+
+/// Bytes to ALLOCATE for one KV side holding [`kv_side_elems`]`(elems)` values of `fmt`, floored at
+/// [`KV_MIN_SIDE_BYTES`]. A side the arch really caches is far past that floor at any usable
+/// context; only the placeholder ever meets it.
+pub(crate) fn kv_side_bytes(fmt: DType, elems: usize) -> usize {
+    kv_fmt_bytes(fmt, kv_side_elems(elems)).max(KV_MIN_SIDE_BYTES)
+}
+
+/// Layout half of the Q8_0 / block-quant KV gate — every layer's KV row must be whole 32-elem
+/// blocks. Pure geometry: it says the format *fits* the rows, not that this model may use it (see
+/// [`kv_q8_layout_ok`], which adds the MLA exclusion).
+pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
+    (0..cfg.n_layer).all(|l| {
+        let (k, v) = kv_row_elems(cfg, l);
+        k.is_multiple_of(32) && v.is_multiple_of(32)
+    })
+}
+
+/// Whether a Q8_0 KV cache may be CHOSEN for this model: the rows are 32-block aligned
+/// ([`kv_row_align_ok`]) **and** the model is not MLA.
+///
+/// The MLA exclusion is not about alignment (576 is 18 whole blocks) — it is that the Vulkan and
+/// Metal MLA kernels read the cache as f16 unconditionally, so `generate_dense_backend` forces f16
+/// there ([`mla_kv_fmt`]). This gate is what the Vulkan auto-q8 placement PIN consults before
+/// pricing the VRAM estimate at q8 (`model.rs`'s `clamp_default_ctx`), so excluding MLA here is
+/// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
+/// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    (0..cfg.n_layer).all(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l)).is_multiple_of(32))
+    !cfg.deepseek2 && kv_row_align_ok(cfg)
+}
+
+/// The KV formats an MLA (deepseek2) session may actually run with on `backend`, given the pair
+/// the dtype ladder resolved.
+///
+/// The GPU MLA kernels type the cache f16 UNCONDITIONALLY — `mla.comp`'s `kread` is
+/// `unpackHalf2x16`, Metal's `mla_f16kv_one` takes `device const half*` — so any other dtype is
+/// REINTERPRETED rather than converted: silent wrong output, no error. (The CPU `Op::Mla` arm
+/// dequantizes through its own closure and is dtype-correct, which is why a CPU-vs-GPU parity run
+/// would show a correct oracle beside a wrong GPU and read as a kernel bug — docs/backlog.md B42.)
+///
+/// So on every backend but `cpu`, a deepseek2 session is f16 on both sides. A format the USER named
+/// is REFUSED rather than downgraded behind their back; a format nothing asked for (the ladder's
+/// own default, or a placement pin — which [`kv_q8_layout_ok`] already prevents for MLA) is forced.
+pub(crate) fn mla_kv_fmt(
+    cfg: &Config,
+    backend: &str,
+    ec: &EngineConfig,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> AResult<(DType, DType)> {
+    if !cfg.deepseek2 || backend == "cpu" {
+        return Ok((k_fmt, v_fmt));
+    }
+    let named = |dt: Option<DType>| matches!(dt, Some(dt) if dt != DType::F16);
+    if named(ec.kv.type_k) || named(ec.kv.type_v) || ec.kv.force_q8 {
+        return Err(anyhow!(
+            "deepseek2 (MLA) KV cache is f16-only on the {backend} backend: its attention kernel \
+             reads the compressed KV row as f16 and would reinterpret any other dtype. Requested \
+             k={:?} (INFR_KV_TYPE_K), v={:?} (INFR_KV_TYPE_V), force_q8={} (INFR_KV_Q8) — unset \
+             them, ask for f16, or run this model on the CPU backend, which dequantizes every KV \
+             dtype.",
+            ec.kv.type_k,
+            ec.kv.type_v,
+            ec.kv.force_q8
+        ));
+    }
+    Ok((DType::F16, DType::F16))
 }
 
 /// [`kv_rows`] at an EXPLICIT chunk height (the try-resident sweep prices candidate heights
@@ -1068,7 +1176,7 @@ pub(crate) fn kv_bytes_estimate(
 
 /// Rows of headroom every KV footprint estimate adds PER LAYER on top of the context's own rows.
 ///
-/// The runner allocates exactly `kv_rows(..) * n_kv * head_dim` elements per side (see
+/// The runner allocates exactly `kv_rows(..) * kv_row_elems(..)` elements per side (see
 /// `generate_dense_backend`'s KV loop and `SeamKv::fork`) — this is deliberate slop, not a
 /// pad the allocation actually contains, so every estimate that uses it is conservative by a
 /// bounded, layer-proportional amount rather than by an unexplained percentage.
@@ -1088,19 +1196,25 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
-            let elems = (cfg.layer_n_kv(l) * cfg.layer_head_dim(l))
-                * (kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS);
-            kv_pair_bytes(elems, k_fmt, v_fmt)
+            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS;
+            // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
+            // and it has no V side (see `kv_row_elems`).
+            let (k_row, v_row) = kv_row_elems(cfg, l);
+            kv_pair_bytes(k_row * rows, v_row * rows, k_fmt, v_fmt)
         })
         .sum()
 }
 
-/// K+V byte footprint for ONE layer at `elems` per-side elements (rows × n_kv × head_dim), each
-/// side in its own dtype. The pure per-layer core of [`kv_bytes_estimate_fmt`].
-fn kv_pair_bytes(elems: usize, k_fmt: DType, v_fmt: DType) -> u64 {
+/// K+V byte footprint for ONE layer at `k_elems`/`v_elems` per-side elements, each side in its own
+/// dtype. The pure per-layer core of [`kv_bytes_estimate_fmt`].
+///
+/// The two sides are counted SEPARATELY because they are not always the same width: an MLA layer
+/// caches a wide K row and no V at all, so a single `elems` argument (what this took while three of
+/// the five geometry sites had drifted) cannot express it.
+fn kv_pair_bytes(k_elems: usize, v_elems: usize, k_fmt: DType, v_fmt: DType) -> u64 {
     // Priced through the SAME sizer the runner allocates with, so "mirrors `kv_fmt_bytes`" is
     // now a call rather than a comment.
-    (kv_fmt_bytes(k_fmt, elems) + kv_fmt_bytes(v_fmt, elems)) as u64
+    (kv_fmt_bytes(k_fmt, k_elems) + kv_fmt_bytes(v_fmt, v_elems)) as u64
 }
 
 /// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
@@ -1357,7 +1471,7 @@ pub(crate) fn kv_fit_ctx_in_budget(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
-    if (0..cfg.n_layer).all(|l| cfg.layer_n_kv(l) * cfg.layer_head_dim(l) == 0) {
+    if (0..cfg.n_layer).all(|l| kv_row_elems(cfg, l) == (0, 0)) {
         return None;
     }
     // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`) — see `placement_ring`.
@@ -3555,8 +3669,8 @@ mod seam_helper_tests {
     fn kv_pair_bytes_prices_each_side_in_its_own_dtype() {
         // q8 prices K+V at ~half the f16 bytes (34 B / 32-elem block vs 2 B/elem, ×2 sides).
         let elems = 32_000usize;
-        let f16 = kv_pair_bytes(elems, DType::F16, DType::F16);
-        let q8 = kv_pair_bytes(elems, DType::Q8_0, DType::Q8_0);
+        let f16 = kv_pair_bytes(elems, elems, DType::F16, DType::F16);
+        let q8 = kv_pair_bytes(elems, elems, DType::Q8_0, DType::Q8_0);
         assert_eq!(f16, 2 * 2 * elems as u64); // 128_000
         assert_eq!(q8, 2 * (elems as u64 / 32 * 34)); // 68_000, already u32-aligned
         assert!(
@@ -3565,9 +3679,173 @@ mod seam_helper_tests {
         );
         // The MIXED case the single-flag helper could not express: `INFR_KV_TYPE_K=q8_0` with V
         // left at f16 is exactly one of each, not two of either.
-        let mixed = kv_pair_bytes(elems, DType::Q8_0, DType::F16);
+        let mixed = kv_pair_bytes(elems, elems, DType::Q8_0, DType::F16);
         assert_eq!(mixed, q8 / 2 + f16 / 2);
         assert!(mixed > q8 && mixed < f16);
+        // A side the arch does not cache at all (MLA's V) is priced at nothing, not at the K
+        // side's width — the two sides are independent widths, not one width used twice.
+        assert_eq!(kv_pair_bytes(elems, 0, DType::F16, DType::F16), f16 / 2);
+    }
+
+    // ── MLA (deepseek2) KV geometry + dtype gate — docs/backlog.md B41/B42 ───────────────────
+
+    /// The KV-geometry fields of DeepSeek-V2-Lite-Chat, as `cpu_deepseek2_config` prints them off
+    /// the real GGUF (`n_layer=27 n_head=16 n_embd=2048 kv_lora_rank=512 qk_rope_dim=64
+    /// head_k_mla=128 v_head_dim=128`, and `n_kv == 1` which that test asserts). `head_dim` is
+    /// MLA's `key_length_mla` = `head_k_mla + qk_rope_dim`. Every other field stays at its default:
+    /// nothing below reads them.
+    ///
+    /// `n_kv * head_dim` is 192 here and the real cached row is 576, which is exactly why the
+    /// open-coded product looked plausible at five call sites while being a third of the truth.
+    fn deepseek_v2_lite_kv() -> Config {
+        Config {
+            deepseek2: true,
+            n_layer: 27,
+            n_head: 16,
+            n_kv: 1,
+            head_dim: 192,
+            n_embd: 2048,
+            kv_lora_rank: 512,
+            qk_rope_dim: 64,
+            head_k_mla: 128,
+            v_head_dim: 128,
+            ..Default::default()
+        }
+    }
+
+    /// The B41 defect in one assertion: an MLA layer's cached row is `kv_lora_rank + qk_rope_dim`
+    /// with NO V side, not `n_kv * head_dim` on both sides.
+    #[test]
+    fn kv_row_elems_mla_is_the_compressed_row_with_no_v_side() {
+        let cfg = deepseek_v2_lite_kv();
+        let (k, v) = super::kv_row_elems(&cfg, 0);
+        assert_eq!(k, cfg.kv_lora_rank + cfg.qk_rope_dim, "MLA K row");
+        assert_eq!(k, 576);
+        assert_eq!(v, 0, "MLA has no V cache — V is a prefix view of the K row");
+        assert_ne!(
+            k,
+            cfg.layer_n_kv(0) * cfg.layer_head_dim(0),
+            "the open-coded product (1 x 192) is what three of the five sites used"
+        );
+        // Every non-MLA arch keeps the plain per-side product on both sides.
+        let dense = qwen3_14b();
+        assert_eq!(
+            super::kv_row_elems(&dense, 0),
+            (
+                dense.layer_n_kv(0) * dense.layer_head_dim(0),
+                dense.layer_n_kv(0) * dense.layer_head_dim(0)
+            )
+        );
+        // The side an arch does not cache still gets a bindable placeholder, not a zero-size
+        // allocation — and a real side is never rewritten.
+        assert_eq!(super::kv_side_elems(v), super::KV_PLACEHOLDER_ELEMS);
+        assert_eq!(super::kv_side_elems(k), k);
+    }
+
+    /// The VRAM estimate must price the row the runner ALLOCATES. Before B41 it priced
+    /// `2 x (n_kv x head_dim)` = 384 elements/token/layer against a reality of 576 K-only —
+    /// under-reserving by exactly 1.5x, with the context clamp and the resident-fit sweep computing
+    /// off that.
+    #[test]
+    fn kv_bytes_estimate_prices_the_mla_row_it_allocates() {
+        let cfg = deepseek_v2_lite_kv();
+        let ec = EngineConfig::default();
+        let (ctx, ubatch) = (4096usize, super::ubatch_rows(&ec));
+        let rows = ctx + super::KV_SLOP_ROWS;
+        let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, DType::F16, DType::F16);
+        // 27 layers x (4096+64) rows x 576 elements x 2 bytes, K only.
+        let want = (cfg.n_layer * rows * (cfg.kv_lora_rank + cfg.qk_rope_dim) * 2) as u64;
+        assert_eq!(est, want);
+        // The pre-fix pricing, spelled out: K+V at the head-dim product.
+        let old = (cfg.n_layer * rows * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
+        assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
+    }
+
+    /// `kv_q8_layout_ok` is the "may this model use a q8 cache" gate the Vulkan auto-q8 placement
+    /// PIN consults, so it must reject MLA — the pin is priced into the VRAM estimate, and
+    /// `generate_dense_backend` will build an f16 cache for MLA no matter what was pinned. The
+    /// LAYOUT question underneath it is separate and answers yes (576 is 18 whole 32-blocks),
+    /// which is what keeps the CPU backend — whose `Op::Mla` dequantizes every KV dtype — able to
+    /// honor an explicit q8 request.
+    #[test]
+    fn q8_gate_rejects_mla_even_though_its_rows_are_block_aligned() {
+        let mla = deepseek_v2_lite_kv();
+        assert!(super::kv_row_align_ok(&mla), "576 % 32 == 0");
+        assert!(!super::kv_q8_layout_ok(&mla), "MLA may not be pinned to q8");
+        let dense = qwen3_14b();
+        assert!(super::kv_row_align_ok(&dense) && super::kv_q8_layout_ok(&dense));
+    }
+
+    /// B42: the GPU MLA kernels read the cache as f16 unconditionally, so a deepseek2 session on a
+    /// GPU backend is f16 on both sides — a NAMED non-f16 format is refused rather than silently
+    /// downgraded, and the CPU backend (dtype-correct `Op::Mla`) is untouched.
+    #[test]
+    fn mla_kv_fmt_forces_f16_on_gpu_and_refuses_a_named_format() {
+        let mla = deepseek_v2_lite_kv();
+        let unset = EngineConfig::default();
+        let q8 = |k: Option<DType>, v: Option<DType>, force: bool| EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: k,
+                type_k_specified: k.is_some(),
+                type_v: v,
+                type_v_specified: v.is_some(),
+                force_q8: force,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Nothing named: whatever the ladder resolved is forced to f16 (this is the shape an
+        // auto-q8 placement pin would arrive in, which `kv_q8_layout_ok` also prevents upstream).
+        for be in ["vulkan", "metal"] {
+            assert_eq!(
+                super::mla_kv_fmt(&mla, be, &unset, DType::Q8_0, DType::Q8_0).expect("forced"),
+                (DType::F16, DType::F16)
+            );
+        }
+        // Named non-f16 — per side, and through the legacy both-sides alias — is refused.
+        for ec in [
+            q8(Some(DType::Q8_0), None, false),
+            q8(None, Some(DType::Turbo3), false),
+            q8(None, None, true),
+        ] {
+            let err = super::mla_kv_fmt(&mla, "vulkan", &ec, DType::F16, DType::F16)
+                .expect_err("must refuse");
+            assert!(
+                err.to_string().contains("f16-only"),
+                "unhelpful refusal: {err}"
+            );
+        }
+        // f16 asked for explicitly is not a refusal.
+        assert_eq!(
+            super::mla_kv_fmt(
+                &mla,
+                "vulkan",
+                &q8(Some(DType::F16), Some(DType::F16), false),
+                DType::F16,
+                DType::F16
+            )
+            .expect("f16 is what MLA runs"),
+            (DType::F16, DType::F16)
+        );
+        // CPU keeps its dtype freedom (its MLA arm dequantizes), and a non-MLA model is untouched
+        // on every backend.
+        assert_eq!(
+            super::mla_kv_fmt(
+                &mla,
+                "cpu",
+                &q8(Some(DType::Q8_0), Some(DType::Q8_0), false),
+                DType::Q8_0,
+                DType::Q8_0
+            )
+            .expect("cpu passthrough"),
+            (DType::Q8_0, DType::Q8_0)
+        );
+        assert_eq!(
+            super::mla_kv_fmt(&qwen3_14b(), "vulkan", &unset, DType::Q8_0, DType::Q8_0)
+                .expect("non-MLA passthrough"),
+            (DType::Q8_0, DType::Q8_0)
+        );
     }
 
     // ── context-fit math (`kv_fit_ctx_for`) ──────────────────────────────────────────────────

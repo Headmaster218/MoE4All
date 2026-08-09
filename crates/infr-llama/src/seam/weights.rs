@@ -430,24 +430,44 @@ impl SeamKv {
                 );
                 continue;
             }
-            let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
-            // Same per-layer geometry as the original allocation: SWA layers ring at
-            // window+ubatch rows when this session was ring-sized (see `crate::seam::kv_rows`).
+            // Same per-layer geometry as the original allocation — same widths from the same
+            // helper (`crate::seam::kv_row_elems`, MLA's compressed K row and placeholder V side
+            // included), and SWA layers ring at window+ubatch rows when this session was
+            // ring-sized (see `crate::seam::kv_rows`).
+            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
             let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
             kbufs.push(
                 be.alloc(
-                    kv_fmt_bytes(self.k_fmt, rows_l * kvrow_l),
+                    crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
                 be.alloc(
-                    kv_fmt_bytes(self.v_fmt, rows_l * kvrow_l),
+                    crate::seam::kv_side_bytes(self.v_fmt, rows_l * v_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
             );
+        }
+        // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
+        // and the source's own sizes are right here — so check them instead of trusting two call
+        // sites to derive the same width. They did not: the MLA row width was missing from this
+        // one, which allocated a third of what the kernels index (docs/backlog.md B41).
+        for l in 0..cfg.n_layer {
+            for (side, forked, src) in [
+                ("k", kbufs[l].len_bytes(), self.kbufs[l].len_bytes()),
+                ("v", vbufs[l].len_bytes(), self.vbufs[l].len_bytes()),
+            ] {
+                if forked != src {
+                    return Err(anyhow!(
+                        "forked KV slot geometry differs from its source at layer {l} ({side}): \
+                         {forked} bytes vs {src} — the fork and the original allocation disagree \
+                         about this layer's cache row"
+                    ));
+                }
+            }
         }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
@@ -536,19 +556,26 @@ impl SeamKv {
             }
         }
         for l in 0..cfg.n_layer {
-            let elems = p * cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+            // One prefix position is `k_row`/`v_row` elements per side — MLA's compressed row is
+            // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
+            // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
+            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
             be.copy_buffer(
                 src.kbufs[l].as_ref(),
                 self.kbufs[l].as_ref(),
-                kv_fmt_bytes(self.k_fmt, elems),
+                kv_fmt_bytes(self.k_fmt, p * k_row),
             )
             .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
-                src.vbufs[l].as_ref(),
-                self.vbufs[l].as_ref(),
-                kv_fmt_bytes(self.v_fmt, elems),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            // `v_row == 0`: this arch caches no V (MLA) and `vbufs[l]` is the placeholder — there
+            // is nothing to seed.
+            if v_row > 0 {
+                be.copy_buffer(
+                    src.vbufs[l].as_ref(),
+                    self.vbufs[l].as_ref(),
+                    kv_fmt_bytes(self.v_fmt, p * v_row),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
         }
         self.cached = src.cached[..p].to_vec();
         Ok(())

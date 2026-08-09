@@ -998,54 +998,6 @@ sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
 seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
 constraint in their comments.
 
-### B41 — MLA's KV row width is missing from `fork`, `seed_from` and the VRAM estimate (2026-08-09)
-
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
-
-MLA caches ONE `kv_lora_rank + qk_rope_dim` row per token (576 for V2-Lite) with
-no V cache. The primary allocation in `generate_dense_backend` and the graph
-declaration in the seam builder both carry a `c.deepseek2` branch for that.
-Three other places that compute the same geometry do **not**, and all of them
-fall through to `layer_n_kv(l) * layer_head_dim(l)` = `1 × 192`:
-
-- `SeamKv::fork` — allocates a third of the bytes the MLA kernels index. This is
-  the serve prefix-cache slot path, so a forked slot reads and writes past its
-  own buffer.
-- `SeamKv::seed_from` — copies `p × 192` elements where `p × 576` is one
-  prefix's worth, so a seeded slot's cache is truncated garbage.
-- `kv_bytes_estimate_fmt` — prices `2 × 192` elements per token per layer (K+V)
-  against a reality of 576 K-only, under-reserving by 1.5×. Everything
-  downstream of it (the context clamp, the resident-fit sweep) is computing from
-  that.
-
-Fix is one shared helper for "this layer's per-token KV element count", MLA
-branch included, used by all five sites — the duplication is what let three of
-them drift.
-
-**Not verified:** whether the `fork` path is reachable for a deepseek2 model in
-practice was reasoned from the code, not exercised. There is no serve test on a
-deepseek2 model.
-
-### B42 — the Vulkan and Metal MLA kernels assume an f16 KV cache, and nothing gates it (2026-08-09)
-
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
-
-`mla.comp`'s `kread` unpacks the cache with `unpackHalf2x16`, and
-`mla_f16kv_one` types it `device const half*`. Both are unconditional. The KV
-dtype ladder in `generate_dense_backend` will hand deepseek2 a Q8_0, turbo, bf16
-or f32 cache: `kv_q8_layout_ok` reduces to `1 × 192 % 32 == 0` for MLA, which
-passes, so `INFR_KV_TYPE=q8_0`, the legacy `kv.force_q8` alias, **and the Vulkan
-auto-q8 placement pin** all reach it. The result is a reinterpreted bit pattern
-— silent wrong output, no error.
-
-The CPU kernel is not affected: `Op::Mla`'s arm dequantizes through a `deq`
-closure covering F16/Q8_0/turbo/block quants, so a CPU oracle run stays correct
-while the GPU it is being compared against is wrong.
-
-Cheapest correct fix is to force `DType::F16` for `c.deepseek2` on the GPU
-backends and say so where the ladder makes the choice. Teaching the kernels the
-other dtypes is the larger version and nothing needs it yet.
-
 ### B43 — the DeepSeek pre-tokenizer regexes diverge from the reference, and nothing tests them (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
@@ -1143,6 +1095,12 @@ places that evidence does not reach:
   tensor, so the load path (`b6812b2`) is unexercised end to end. Both are the
   V3-only pieces stage 3 inherits, which is exactly where the plan says a bug
   gets expensive.
+- **`SeamKv::fork` and `seed_from` are driven by no test on any arch.** Both
+  needed a deepseek2 branch they did not have (fixed), and the fix is guarded
+  only by a runtime forked-vs-source byte comparison inside `fork` itself.
+  Constructing a `SeamKv` needs a full session — weights uploaded,
+  `SessionStable` built — so there is no cheap unit test, and there is no serve
+  test on a deepseek2 model to reach it end to end.
 - **Every deepseek test `need_model!`-skips** without the GGUF in the HF cache,
   which is the house pattern, but it does mean none of the above runs in CI.
 

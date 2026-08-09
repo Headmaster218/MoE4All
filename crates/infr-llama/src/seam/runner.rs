@@ -8,7 +8,7 @@ use super::sc::{
 use super::weights::{
     AttnW, DeltaW, FfnW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
 };
-use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
+use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
@@ -499,10 +499,11 @@ pub(crate) fn generate_dense_backend(
     // (q4_0/q4_1/q5_0/q5_1/iq4_nl) + f32/bf16 run on those same three backends; the block quants
     // need 32-alignment. All of these are footprint knobs, not speed knobs — a prepass format
     // re-expands the whole prefix every token.
-    // The SAME 32-block gate the placement estimator applies before pinning an auto-q8 cache
-    // (`crate::seam::kv_q8_layout_ok`) — one function, so a pinned q8 can never be gated back to
-    // f16 here against an estimate that priced it at q8.
-    let kv_align_ok = crate::seam::kv_q8_layout_ok(c);
+    // The 32-block layout gate. The placement estimator's own pin gate (`kv_q8_layout_ok`) is this
+    // AND `!deepseek2`, so a pinned q8 can never be gated back to f16 here against an estimate that
+    // priced it at q8; the MLA exclusion it adds is a kernel-dtype fact, applied below per backend
+    // (`crate::seam::mla_kv_fmt`) rather than here, because the CPU's MLA arm reads every KV dtype.
+    let kv_align_ok = crate::seam::kv_row_align_ok(c);
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
     // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
@@ -559,6 +560,10 @@ pub(crate) fn generate_dense_backend(
             v_fmt = DType::F16;
         }
     }
+    // DeepSeek2 (MLA) on a GPU backend: the attention kernel reads the compressed KV row as f16
+    // unconditionally, so the pair is forced to f16 — and a NAMED non-f16 format is refused here
+    // rather than silently downgraded. `crate::seam::mla_kv_fmt` owns the rule and its argument.
+    (k_fmt, v_fmt) = crate::seam::mla_kv_fmt(c, be.name(), ec, k_fmt, v_fmt)?;
 
     // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
     // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows` for the sizing and
@@ -1021,32 +1026,27 @@ pub(crate) fn generate_dense_backend(
                 );
                 continue;
             }
-            // DeepSeek2 MLA: ONE k_cache row (key_length = kv_lora_rank + qk_rope_dim) per token;
-            // V is an aliased prefix view — no separate v_cache. vbufs[l] is a zero-size placeholder.
-            if c.deepseek2 {
-                let key_len = c.kv_lora_rank + c.qk_rope_dim;
-                let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
-                kbufs.push(
-                    be.alloc(kv_fmt_bytes(k_fmt, rows_l * key_len), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                continue;
-            }
-            let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
+            // Per-token row widths, MLA included: DeepSeek2 caches ONE compressed row
+            // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and
+            // `kv_side_bytes` allocates the placeholder buffer the backends still bind
+            // (`crate::seam::kv_row_elems` — the ONE definition every geometry site reads).
+            let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
             // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows
             // the window mask already excludes — `crate::seam::kv_rows` has the argument).
             let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
             kbufs.push(
-                be.alloc(kv_fmt_bytes(k_fmt, rows_l * kvrow_l), BufferUsage::KvCache)
-                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(
+                    crate::seam::kv_side_bytes(k_fmt, rows_l * k_row),
+                    BufferUsage::KvCache,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(kv_fmt_bytes(v_fmt, rows_l * kvrow_l), BufferUsage::KvCache)
-                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(
+                    crate::seam::kv_side_bytes(v_fmt, rows_l * v_row),
+                    BufferUsage::KvCache,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             );
         }
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
@@ -1452,20 +1452,14 @@ pub(crate) fn generate_dense_backend(
                 v_cache.push(g.input(f32d(s_elems)));
                 continue;
             }
-            // DeepSeek2 MLA: ONE k_cache row (key_length wide); v_cache is a zero-size placeholder.
-            if c.deepseek2 {
-                let key_len = c.kv_lora_rank + c.qk_rope_dim;
-                let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
-                k_cache.push(g.input(kd(rows_l * key_len)));
-                v_cache.push(g.input(vd(4))); // placeholder, V aliased from K
-                continue;
-            }
-            let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-            // Declared rows MUST equal the allocation above: every backend derives the ring's
-            // row capacity from this declared element count (row = pos % (numel / row_width)).
+            // Declared rows MUST equal the allocation above — same widths from the same helper
+            // (`crate::seam::kv_row_elems`, MLA's compressed K row and placeholder V included):
+            // every backend derives the ring's row capacity from this declared element count
+            // (row = pos % (numel / row_width)).
+            let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
             let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
-            k_cache.push(g.input(kd(rows_l * kvrow_l)));
-            v_cache.push(g.input(vd(rows_l * kvrow_l)));
+            k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
+            v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
