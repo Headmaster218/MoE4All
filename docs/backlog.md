@@ -1054,6 +1054,30 @@ Unrelated residual in the same branch: the extra serial `mx_all` scan runs on
 thread 0 once per token per MoE layer, and V2-Lite does take this branch
 (softmax gating, `norm_topk_prob = false`). The cost was not measured.
 
+### B50 — Metal cannot run a DeepSeek MoE layer (2026-08-10)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; it is a missing
+kernel feature, not a bug, and no one has asked for DeepSeek on Metal
+
+`infr-metal`'s `Op::MoeFfn` arm implements softmax gating + top-k renorm +
+output-weighting and asserts on anything else. V2-Lite ships
+`norm_topk_prob = false` and V3 is sigmoid-gated, so both already fail that
+assert — DeepSeek MoE layers are CPU + Vulkan only. MLA attention itself IS
+implemented on Metal and is unaffected.
+
+The arm also read neither `exp_probs_b` nor the group-routing fields: it
+destructured them away with `..`, so softmax + renorm + `expert_group_count > 1`
+— a legal `deepseek2` config — passed the assert and then routed with neither
+the bias nor the group mask applied, picking the wrong experts with no error.
+That combination now asserts too, so the gap is loud rather than silent, but the
+underlying feature is still missing.
+
+Closing it means teaching the Metal router the same two extensions
+`moe_topk.comp` grew: select on `probs + exp_probs_b` while weighting from the
+unbiased probs, and mask all but the top `n_expert_groups_used` groups scored by
+their top-2 sum. `moe_topk.comp` is the working reference. Note there is no
+Apple hardware on the dev box, so this can only be verified on the macOS CI job.
+
 ### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek coverage · **Blocked on:** nothing; stated as
@@ -1099,13 +1123,20 @@ places that evidence does not reach:
     `abs < kv_len`; the only `Canvas` producer computes `lo <= P <= kv_len`) —
     left untested for that reason, recorded so a future caller that breaks
     either invariant is not a mystery.
-- **Group-limited routing has never run on a real model.** V2-Lite ships
-  `expert_group_count = 1`, so the `n_expert_groups > 1` branch in both the CPU
-  arm and `moe_topk.comp` is exercised only by `moe_groups_bias_parity`'s
-  synthetic dims. `exp_probs_b` is the same story — V2-Lite carries no bias
-  tensor, so the load path (`b6812b2`) is unexercised end to end. Both are the
-  V3-only pieces stage 3 inherits, which is exactly where the plan says a bug
-  gets expensive.
+- **Group-limited routing and `exp_probs_b` now run end to end, but against no
+  external oracle.** `tests/synthetic_deepseek2.rs` writes a tiny but
+  structurally complete `deepseek2` GGUF (3 layers, 16 experts / 4 groups / 2
+  used, non-lite Q LoRA, YaRN on, deterministic name-seeded weights) and drives
+  it through the real `Config::from_gguf` and seam on CPU and Vulkan — so the
+  group mask, the bias-affects-selection rule and the
+  weights-from-unbiased-probs rule all execute from disk, which V2-Lite cannot
+  make happen. Each was seen red by perturbing the CPU arm, and the group mask
+  separately by perturbing `moe_topk.comp`. What it is NOT: an external oracle.
+  A bug both backends share identically — top-3-within-group instead of the
+  reference's hardcoded top-2, say — passes every test in the file. That `2` is
+  pinned only by `moe_groups_bias_parity`'s same-author hand reference. Also
+  uncovered there: decode (the file runs batched prefill only), quantized
+  experts (every synthetic tensor is F32), and `n_groups_used == n_groups`.
 - **`SeamKv::fork` and `seed_from` are driven by no test on any arch.** Both
   needed a deepseek2 branch they did not have (fixed), and the fix is guarded
   only by a runtime forked-vs-source byte comparison inside `fork` itself.

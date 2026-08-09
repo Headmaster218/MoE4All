@@ -4411,16 +4411,32 @@ impl MetalBackend {
                 norm_w,
                 weight_before,
                 ep_band: _, // EP is a Vulkan-only path; Metal always runs full-expert
+                exp_probs_b,
+                n_expert_groups,
+                n_expert_groups_used,
                 ..
             } => {
                 // The Metal MoE path implements only softmax gating + top-k renorm + output-
                 // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see
                 // the `llama4` arch note) and never reaches a GPU backend in-tree.
+                //
+                // DeepSeek V2+ adds two routing inputs this path does not read: the `exp_probs_b`
+                // selection bias and group-limited routing. Sigmoid-gated V3 already fails the
+                // gating check above, but softmax + renorm + `expert_group_count > 1` is a legal
+                // deepseek2 config that would otherwise pass it and then route with neither the
+                // bias nor the group mask applied — the wrong experts, silently. Refuse instead.
                 assert!(
                     matches!(gating, infr_core::graph::MoeGating::Softmax)
                         && norm_w
                         && !weight_before,
                     "Metal MoeFfn: only softmax + renorm + output-weighting supported (llama4 is CPU-only)"
+                );
+                assert!(
+                    exp_probs_b.is_none() && n_expert_groups <= 1,
+                    "Metal MoeFfn: DeepSeek V2+ router extensions are unimplemented here \
+                     (exp_probs_b bias: {}, expert groups: {n_expert_groups}, used: \
+                     {n_expert_groups_used}) — run this model on the CPU or Vulkan backend",
+                    exp_probs_b.is_some(),
                 );
                 let (ne, n_expert, n_used, nffx) = (
                     ne as usize,

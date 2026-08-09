@@ -128,6 +128,16 @@ Missing, and these are the real cost:
   plain with `Op::Add`, which is the llama4 path and exists on all three
   backends — see `FfnW::Moe`'s `shexp` doc in `seam/weights.rs` and
   `Config::shexp_gated`.
+- **Metal cannot run a DeepSeek MoE layer at all**, for a different reason than
+  the one above. Its `Op::MoeFfn` arm implements softmax gating + top-k renorm +
+  output-weighting and asserts on anything else, so V2-Lite
+  (`norm_topk_prob = false`) already fails that assert, and V3 (sigmoid) fails
+  it too. It also reads neither `exp_probs_b` nor the group-routing fields —
+  softmax + renorm + `expert_group_count > 1` is a legal `deepseek2` config that
+  used to pass the assert and then route with neither applied, silently; that
+  combination now asserts as well. DeepSeek is CPU + Vulkan for the MoE layers
+  until a Metal router gains those inputs. MLA attention itself IS implemented
+  on Metal.
 
 ### Places a new arch string must be registered
 
