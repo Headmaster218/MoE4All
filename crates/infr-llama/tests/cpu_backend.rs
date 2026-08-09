@@ -3788,6 +3788,8 @@ fn cpu_deepseek_config() {
         "arch string"
     );
     assert!(cfg.deepseek, "deepseek gate");
+    assert!(!cfg.deepseek2, "deepseek2 must be false");
+    assert!(!cfg.deepseek32, "deepseek32 must be false");
     assert!(!cfg.qk_norm, "qk_norm must be false");
     assert!(!cfg.qkv_bias, "qkv_bias must be false");
     assert!(!cfg.permute_qk_neox, "permute_qk_neox must be false");
@@ -3861,6 +3863,16 @@ fn cpu_deepseek2_config() {
     );
     assert!(cfg.deepseek2, "deepseek2 gate");
     assert!(!cfg.deepseek, "deepseek must be false");
+    // `deepseek2` is the SHARED MLA/KV/MoE gate and `deepseek32` (V3.2) sets it too — so this is
+    // the direction that matters on a real V2 file: the V3.2-only flag and its indexer
+    // hyperparameters must stay off, or the loader would demand five tensors this GGUF has not got.
+    assert!(!cfg.deepseek32, "deepseek32 must be false on a V2 GGUF");
+    assert_eq!(
+        (cfg.indexer_n_head, cfg.indexer_head_size, cfg.indexer_top_k),
+        (0, 0, 0),
+        "V2 has no lightning indexer"
+    );
+    assert_eq!(cfg.norm_eps, 0.0, "V2 emits no (non-RMS) LayerNorm");
     assert!(!cfg.qk_norm, "qk_norm must be false");
     assert!(!cfg.qkv_bias, "qkv_bias must be false");
     assert!(!cfg.permute_qk_neox, "permute_qk_neox must be false");

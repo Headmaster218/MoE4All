@@ -493,6 +493,17 @@ Order matters:
 
 ## Stage 3 — `deepseek32` (V3.2)
 
+**Progress: the LOAD path is done, the graph is not.** A `deepseek32` GGUF
+registers, parses into a `Config` and loads every weight including the five
+per-layer indexer tensors; `generate_dense_backend` then refuses by name rather
+than emitting the deepseek2 graph, which would run attention over every key
+instead of the indexer's top-k and produce silently wrong output.
+`Op::LayerNorm` (the indexer's `k_norm`) landed on all three backends. Still to
+do: the indexer itself, its second KV cache, and the emit arm. All verification
+is synthetic — `tests/synthetic_deepseek2.rs` builds a `deepseek32` GGUF from
+the same description as the `deepseek2` one plus an indexer, since V3.2 is 671B
+and no real file can be obtained.
+
 **~80% of this is stage 2 copied verbatim.** llama.cpp's `deepseek32.cpp` is
 deepseek2's absorbed MLA path plus the lightning indexer. Non-MLA is rejected
 outright. No small model exists; budget for slow iteration.

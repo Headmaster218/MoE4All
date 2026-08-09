@@ -72,6 +72,15 @@ pub const DEEPSEEK: &str = "deepseek";
 /// llama.cpp keeps them in one model class (`src/models/deepseek2.cpp`). See docs/deepseek.md
 /// § Stage 2.
 pub const DEEPSEEK2: &str = "deepseek2";
+/// DeepSeek V3.2: [`DEEPSEEK2`]'s absorbed MLA + group-limited MoE verbatim, plus the per-layer
+/// "lightning indexer" that scores every (query, key) pair and keeps the top
+/// `attention.indexer.top_k` keys for the real attention. Non-MLA is rejected outright and
+/// `attention.q_lora_rank` is mandatory (there is no lite variant), so `Config::deepseek2` — the
+/// MLA/KV-geometry/MoE-shape gate — is TRUE for this string too and `Config::deepseek32` gates only
+/// what is new. llama.cpp keeps it in its own model class (`src/models/deepseek32.cpp`). The
+/// indexer's five per-layer tensors LOAD; nothing emits them yet, so a graph build refuses this
+/// arch. See docs/deepseek.md § Stage 3.
+pub const DEEPSEEK32: &str = "deepseek32";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
 /// (`bitnet-b1.58.block_count`, …). Behaviorally identical to [`BITNET`] (same llama+SubLN
@@ -131,6 +140,7 @@ pub const ALL: &[&str] = &[
     BITNET_B158,
     DEEPSEEK,
     DEEPSEEK2,
+    DEEPSEEK32,
     QWEN35,
     QWEN35_MOE,
 ];

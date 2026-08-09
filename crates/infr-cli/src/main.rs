@@ -3825,8 +3825,11 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
         GEMMA3 | GEMMA4 | DIFFUSION_GEMMA => (1.0, 64, 0.95),
         // Meta Llama 3.x / 4 default generation_config: temp 0.6, top_p 0.9, top_k off.
         LLAMA | LLAMA4 => (0.6, 0, 0.9),
-        // DeepSeek V1: neutral chat default (no official generation_config).
-        DEEPSEEK => (0.6, 20, 0.95),
+        // DeepSeek: neutral chat default. None of the DeepSeek GGUF distributions ships a
+        // `generation_config.json` sibling for `generation_config_sampling` to override with, and
+        // the family publishes no per-arch recommendation, so all three arch strings stay on the
+        // same neutral values rather than on invented ones.
+        DEEPSEEK | DEEPSEEK2 | DEEPSEEK32 => (0.6, 20, 0.95),
         _ => (0.6, 20, 0.95),
     }
 }

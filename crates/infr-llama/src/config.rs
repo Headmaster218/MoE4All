@@ -183,10 +183,35 @@ pub struct Config {
     /// is dense regardless). `0` = every layer MoE (not used today). Non-DeepSeek models
     /// ignore this field.
     pub n_layer_dense_lead: usize,
-    /// DeepSeek V2+: `true` only for `arch == "deepseek2"`. Gates MLA attention (absorbed form with
-    /// asymmetric K/V dims + single K row), YaRN rope scaling, and group-limited MoE routing with
-    /// router bias correction. See docs/deepseek.md § Stage 2.
+    /// DeepSeek V2+: `true` for `arch == "deepseek2"` AND for `arch == "deepseek32"` (V3.2 is the
+    /// same skeleton plus an indexer — see [`Config::deepseek32`]). Gates MLA attention (absorbed
+    /// form with asymmetric K/V dims + single K row), YaRN rope scaling, and group-limited MoE
+    /// routing with router bias correction. See docs/deepseek.md § Stage 2.
     pub deepseek2: bool,
+    /// DeepSeek V3.2: `true` only for `arch == "deepseek32"`, which also sets
+    /// [`Config::deepseek2`] (every MLA/KV/MoE gate is shared verbatim). This flag alone gates what
+    /// V3.2 adds: the three `indexer_*` hyperparameters below, the five per-layer lightning-indexer
+    /// tensors the loader consumes, and the keys the reference reads UNCONDITIONALLY where
+    /// `deepseek2` tolerates their absence (`attention.q_lora_rank`, `expert_gating_func`) plus its
+    /// refusal of a non-MLA file. See docs/deepseek.md § Stage 3.
+    pub deepseek32: bool,
+    /// DeepSeek V3.2 lightning indexer: number of indexer QUERY heads
+    /// (`{arch}.attention.indexer.head_count`). One KEY head is shared by all of them (MQA). `0`
+    /// for every non-`deepseek32` model.
+    pub indexer_n_head: usize,
+    /// DeepSeek V3.2 lightning indexer: per-head key/query width
+    /// (`{arch}.attention.indexer.key_length`), the width of `indexer.k_norm` and of one indexer
+    /// KV-cache row. `0` for every non-`deepseek32` model.
+    pub indexer_head_size: usize,
+    /// DeepSeek V3.2 lightning indexer: how many keys the indexer's top-k keeps for the real
+    /// attention (`{arch}.attention.indexer.top_k`). `0` for every non-`deepseek32` model.
+    pub indexer_top_k: usize,
+    /// llama.cpp's `hparams.f_norm_eps` — the epsilon of a non-RMS LayerNorm, DISTINCT from
+    /// [`Config::rms_eps`] (`f_norm_rms_eps`, read from the GGUF). The lightning indexer's
+    /// `k_norm` is the only mean-centred norm anywhere in this family, and `deepseek32.cpp`
+    /// HARDCODES its epsilon rather than reading a key. `0.0` for every other arch — none of them
+    /// emits `Op::LayerNorm` at all.
+    pub norm_eps: f32,
     /// DeepSeek V2+ MLA: Q LoRA rank (wq_a output dim, q_a_norm dim, wq_b input dim). `0` when the
     /// "lite" variant carries a direct `wq` instead.
     pub q_lora_rank: usize,
@@ -194,8 +219,13 @@ pub struct Config {
     pub kv_lora_rank: usize,
     /// DeepSeek V2+ MLA: RoPE dimension on Q and K (q_pe/k_pe width = rope.dimension_count).
     pub qk_rope_dim: usize,
-    /// DeepSeek V2+ MLA: MLA key length = kv_lora_rank + qk_rope_dim (576 for V3). The width of
-    /// the single cached KV row per token.
+    /// DeepSeek V2+ MLA: the `attention.key_length_mla` GGUF key verbatim — llama.cpp's
+    /// `n_embd_head_k_mla`, the FULL per-head key width (192 on V2-Lite), which is also what
+    /// [`Config::head_dim`] carries for these models.
+    ///
+    /// NOT the cached-row width: that is `kv_lora_rank + qk_rope_dim` (576 on V2-Lite), which
+    /// `seam::kv_row_elems` and `seam::runner`'s MLA arm each derive from those two fields. Nothing
+    /// reads this field today.
     pub key_length: usize,
     /// DeepSeek V2+ MLA: llama.cpp's `n_embd_head_qk_nope` — the per-head NOPE (non-rotary) width
     /// of Q and of `wk_b`'s dim-0, 128 for V2-Lite and V3. Derived as
@@ -428,6 +458,7 @@ impl Config {
             | crate::arch::QWEN2
             | crate::arch::DEEPSEEK
             | crate::arch::DEEPSEEK2
+            | crate::arch::DEEPSEEK32
             | crate::arch::BITNET
             | crate::arch::BITNET_B158 => false,
             crate::arch::QWEN3
@@ -466,7 +497,14 @@ impl Config {
         // docs/deepseek.md § Stage 1. All the divergent semantics are HARDCODED in the reference
         // loader (`src/models/deepseek.cpp`), not metadata-driven.
         let deepseek = arch == crate::arch::DEEPSEEK;
-        let deepseek2 = arch == crate::arch::DEEPSEEK2;
+        // DeepSeek V3.2 IS deepseek2 plus the lightning indexer: the same absorbed MLA, the same
+        // one-compressed-row KV geometry, the same group-limited MoE with router bias, the same
+        // dense-lead threshold and the same YaRN. So `deepseek2` — which is what every one of those
+        // gates reads, here and in `seam` — widens to cover it, exactly as `gemma4` widens over
+        // `diffusion-gemma` and `qwen35` over `qwen35moe` below. `deepseek32` alone gates the parts
+        // that genuinely differ (mandatory MLA / q_lora_rank / expert_gating_func, the indexer).
+        let deepseek32 = arch == crate::arch::DEEPSEEK32;
+        let deepseek2 = arch == crate::arch::DEEPSEEK2 || deepseek32;
         // llama4 (Scout etc.): shares the llama attention skeleton (NORM/interleaved rope, no bias,
         // converter-permuted q/k) but adds a 16-expert sigmoid top-1 MoE + iRoPE (per-layer NoPE) +
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
@@ -497,7 +535,31 @@ impl Config {
         // "lite" detection, which needs n_layer — added after `n_layer` below).
         let (q_lora_rank, kv_lora_rank, key_length_mla, value_length_mla, qk_rope_dim) =
             if deepseek2 {
-                let qlr = meta_u64(g, &mk("attention.q_lora_rank")).unwrap_or(0) as usize;
+                if deepseek32 {
+                    // `deepseek32.cpp::load_arch_tensors` opens with
+                    // `if (!hparams.is_mla()) throw "DEEPSEEK32 architecture requires MLA"`, and
+                    // `llama_hparams::is_mla()` is "both MLA head-length keys are non-zero" (they
+                    // default to 0 when absent). V3.2 has NO unabsorbed fallback at all, so say
+                    // that, rather than letting the generic deepseek2 message below describe a
+                    // derivation this arch never had.
+                    for key in ["attention.key_length_mla", "attention.value_length_mla"] {
+                        if meta_u64(g, &mk(key)).unwrap_or(0) == 0 {
+                            bail!(
+                                "deepseek32 architecture requires MLA: {} is missing or zero",
+                                mk(key)
+                            );
+                        }
+                    }
+                }
+                // `deepseek32.cpp` reads `q_lora_rank` unconditionally — V3.2 has no "lite"
+                // variant carrying a direct `wq`, so a file without the key is not a lite model,
+                // it is a broken one.
+                let qlr = if deepseek32 {
+                    meta_u64(g, &mk("attention.q_lora_rank"))
+                        .context("deepseek32.attention.q_lora_rank")? as usize
+                } else {
+                    meta_u64(g, &mk("attention.q_lora_rank")).unwrap_or(0) as usize
+                };
                 let kvlr = meta_u64(g, &mk("attention.kv_lora_rank"))
                     .context("deepseek2.attention.kv_lora_rank")?
                     as usize;
@@ -520,7 +582,15 @@ impl Config {
                 (0, 0, 0, 0, 0)
             };
         let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) = if deepseek2 {
-            let gf = meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8;
+            // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
+            // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` reads it with no such
+            // fallback, and V3.2's real value is sigmoid — defaulting it would silently re-route.
+            let gf = if deepseek32 {
+                meta_u64(g, &mk("expert_gating_func")).context("deepseek32.expert_gating_func")?
+                    as u8
+            } else {
+                meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8
+            };
             let norm = g
                 .metadata()
                 .get(&mk("expert_weights_norm"))
@@ -601,6 +671,28 @@ impl Config {
         } else {
             0
         };
+        // DeepSeek V3.2 lightning indexer. All three keys are REQUIRED (`deepseek32.cpp`'s
+        // `load_arch_hparams` reads them with a plain `get_key`), and all three are dimensions the
+        // per-layer indexer tensors are shaped by — a zero would mis-shape them with nothing
+        // downstream able to notice.
+        let (indexer_n_head, indexer_head_size, indexer_top_k) = if deepseek32 {
+            let ix = |k: &str| -> Result<usize> {
+                let key = mk(k);
+                let v = meta_u64(g, &key).with_context(|| format!("{key} missing"))?;
+                positive_model_dimension(&key, v)
+            };
+            (
+                ix("attention.indexer.head_count")?,
+                ix("attention.indexer.key_length")?,
+                ix("attention.indexer.top_k")?,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        // The indexer's `k_norm` is a real (mean-centred) LayerNorm and `deepseek32.cpp` hardcodes
+        // `hparams.f_norm_eps = 1e-6` for it — a SEPARATE epsilon from `f_norm_rms_eps` (`rms_eps`
+        // below), which stays whatever the GGUF declares.
+        let norm_eps = if deepseek32 { 1e-6 } else { 0.0 };
         let n_layer_all = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
         // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/mtp.md): `{arch}.nextn_predict_layers`
         // extra decoder block(s) appended AFTER the trunk — `block_count` INCLUDES them. Ported
@@ -611,18 +703,32 @@ impl Config {
         // loop (`seam.rs`'s `wload`) would misclassify `blk.32` as a gated-DeltaNet layer
         // (`(32+1) % full_attn_interval != 0`) and fail on missing `ssm_*` tensors.
         let n_layer_nextn = meta_u64(g, &mk("nextn_predict_layers")).unwrap_or(0) as usize;
-        if n_layer_nextn > 0 && arch != crate::arch::QWEN35 && arch != crate::arch::QWEN35_MOE {
+        // The bail exists because a NextN block that is NOT split off the trunk gets fed to the
+        // per-layer loop as if it were an ordinary block, and then either fails on missing tensors
+        // or (worse) misreads the ones it finds. It is not "MTP is unimplemented": qwen35 splits
+        // and USES the block, and `deepseek32` splits and SKIPS it, which is exactly what
+        // `deepseek32.cpp::load_arch_tensors` does with its `i >= n_layer` → `TENSOR_SKIP` arm. So
+        // the arch list here is "arches that handle the split", and an arch missing from it still
+        // fails loudly rather than silently.
+        if n_layer_nextn > 0
+            && arch != crate::arch::QWEN35
+            && arch != crate::arch::QWEN35_MOE
+            && !deepseek32
+        {
             bail!(
-                "{arch}.nextn_predict_layers is only supported on arch={}|{} (MTP/NextN); got \
+                "{arch}.nextn_predict_layers is only supported on arch={}|{}|{} (MTP/NextN); got \
                  nextn_predict_layers={n_layer_nextn} on arch={arch:?}",
                 crate::arch::QWEN35,
                 crate::arch::QWEN35_MOE,
+                crate::arch::DEEPSEEK32,
             );
         }
         // The reference caps qwen35 at a single MTP block (`GGML_ASSERT(hparams.n_layer_nextn ==
         // 1)` in `graph_mtp`'s ctor) — mirrored here so an unsupported wider value fails loudly
-        // instead of silently misreading the tensor layout.
-        if n_layer_nextn > 1 {
+        // instead of silently misreading the tensor layout. deepseek32 has no such cap: it never
+        // builds an MTP graph, so any count simply means that many trailing blocks are skipped
+        // (`deepseek32.cpp` asserts only `n_layer_nextn < n_layer_all`, which is the next check).
+        if n_layer_nextn > 1 && !deepseek32 {
             bail!(
                 "qwen35 MTP: nextn_predict_layers={n_layer_nextn} > 1 not supported (the \
                  reference implementation caps at a single MTP block — see docs/mtp.md)",
@@ -630,7 +736,7 @@ impl Config {
         }
         if n_layer_nextn >= n_layer_all {
             bail!(
-                "qwen35 MTP: nextn_predict_layers={n_layer_nextn} must be < block_count={n_layer_all}",
+                "{arch} NextN: nextn_predict_layers={n_layer_nextn} must be < block_count={n_layer_all}",
             );
         }
         let n_layer = n_layer_all - n_layer_nextn;
@@ -639,7 +745,12 @@ impl Config {
         // llama.cpp reaches the same conclusion from a layer-count table
         // (`deepseek2.cpp::load_arch_hparams`), which misclassifies any other model with the same
         // depth; the tensors say it directly.
-        let is_lite = deepseek2 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
+        // V3.2 is never lite — `deepseek32.cpp` reads `q_lora_rank` unconditionally and its tensor
+        // loader has no `attn_q` arm at all — so the presence test does not run for it. Without
+        // this a V3.2 file that happened to carry a `blk.0.attn_q.weight` would drop the whole
+        // wq_a/q_a_norm/wq_b path the model actually has.
+        let is_lite =
+            deepseek2 && !deepseek32 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = positive_model_dimension(
             &mk("attention.head_count"),
@@ -1050,6 +1161,11 @@ impl Config {
             deepseek,
             n_layer_dense_lead,
             deepseek2,
+            deepseek32,
+            indexer_n_head,
+            indexer_head_size,
+            indexer_top_k,
+            norm_eps,
             q_lora_rank,
             kv_lora_rank,
             qk_rope_dim,

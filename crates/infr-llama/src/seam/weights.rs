@@ -122,6 +122,11 @@ pub(super) struct DeltaW {
 /// DeepSeek V2+ MLA (Multi-head Latent Attention) mixer weights — absorbed form. The KV cache holds
 /// ONE compressed row per token (`key_length = kv_lora_rank + qk_rope_dim`); V is an aliased prefix —
 /// no separate V cache. See `docs/deepseek.md` § Stage 2.
+///
+/// `deepseek32` (V3.2) uses this same mixer plus five per-layer lightning-indexer tensors. Those
+/// are UPLOADED and their graph slots DECLARED (`runner.rs`'s `wload`/`wpush` MLA arms) but are not
+/// captured here, because no op reads them yet and `generate_dense_backend` refuses a `deepseek32`
+/// model before the graph is built — see `docs/deepseek.md` § Stage 3.
 pub(super) struct MlaW {
     /// Q low-rank input projection `[n_embd, q_lora_rank]` (absent in lite models).
     pub(super) wq_a: Option<TensorId>,

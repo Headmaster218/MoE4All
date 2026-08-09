@@ -19,11 +19,16 @@
 //!
 //! # Adding an architecture
 //!
-//! Everything above [`deepseek2_model`] is arch-agnostic: [`Meta`] (the GGUF value types this
-//! harness writes), [`TensorSpec`] + [`Fill`] (name, ggml-order shape, deterministic values),
-//! [`SyntheticModel`] (the whole file as data) and its writer, and [`TempGguf`]. A later stage adds
-//! ONE function — its own `deepseek32_model(&Ds32Dims) -> SyntheticModel` — listing that arch's
-//! metadata keys and tensor names/shapes, and reuses the rest unchanged.
+//! Everything above [`mla_model`] is arch-agnostic: [`Meta`] (the GGUF value types this harness
+//! writes), [`TensorSpec`] + [`Fill`] (name, ggml-order shape, deterministic values),
+//! [`SyntheticModel`] (the whole file as data) and its writer, and [`TempGguf`].
+//!
+//! Stage 3 (`deepseek32`/V3.2) took that offer and found it could reuse more: V3.2 IS deepseek2's
+//! absorbed MLA plus a lightning indexer, so rather than a second model function listing the same
+//! thirty tensors, [`mla_model`] gained an `arch` parameter (every model key is `{arch}.`-prefixed)
+//! and an optional [`IndexerDims`]. `synthetic_deepseek32_is_deepseek2_plus_the_indexer` then
+//! ASSERTS the containment the sharing assumes. A future arch that is not a DeepSeek-MLA variant
+//! should write its own function instead — the harness below [`TempGguf`] is still what it reuses.
 //!
 //! The fill is seeded by the tensor NAME, not by its position in the file, which is what makes the
 //! differential tests below valid: adding or removing `exp_probs_b.bias` changes that tensor and
@@ -266,6 +271,12 @@ impl Drop for TempGguf {
 #[derive(Clone, Debug)]
 struct Ds2Dims {
     n_layer: usize,
+    /// `nextn_predict_layers` — trailing NextN/MTP blocks that `block_count` INCLUDES and that the
+    /// trunk loop must not walk. `0` for every deepseek2 case (V2 ships none).
+    n_layer_nextn: usize,
+    /// `attention.layer_norm_rms_epsilon`. Deliberately NOT `deepseek32`'s hardcoded LayerNorm
+    /// epsilon, so `Config::norm_eps` and `Config::rms_eps` can be told apart.
+    rms_eps: f32,
     /// `leading_dense_block_count` — layers `< this` run a plain dense SwiGLU at `n_ff`; the rest
     /// are MoE. DeepSeek's "first N dense, rest MoE" threshold, not a periodic step.
     n_dense_lead: usize,
@@ -314,6 +325,18 @@ impl Ds2Dims {
     }
 }
 
+/// The `deepseek32` lightning indexer's three hyperparameters — the only metadata V3.2 adds to
+/// [`Ds2Dims`]. See `docs/deepseek.md` § Stage 3.
+#[derive(Clone, Debug)]
+struct IndexerDims {
+    /// `attention.indexer.head_count` — the indexer's QUERY heads. One key head serves all of them.
+    n_head: usize,
+    /// `attention.indexer.key_length` — the per-head key/query width, and the width of `k_norm`.
+    head_size: usize,
+    /// `attention.indexer.top_k` — how many keys survive to the real attention.
+    top_k: usize,
+}
+
 /// The synthetic model's dimensions. Small, but every MLA relationship holds and every width the
 /// Vulkan kernels constrain is legal: the expert id-GEMV decodes 32-element sub-blocks, so `n_embd`
 /// and `n_ff_exp` are ≥ 32 and multiples of 32; `mla.comp` packs the f16 KV row two-per-`uint`, so
@@ -324,6 +347,8 @@ impl Ds2Dims {
 fn ds2_dims(n_groups: usize, n_groups_used: usize, exp_probs_b: Option<Vec<f32>>) -> Ds2Dims {
     Ds2Dims {
         n_layer: 3,
+        n_layer_nextn: 0,
+        rms_eps: 1e-6,
         n_dense_lead: 1,
         n_embd: 64,
         n_head: 2,
@@ -344,27 +369,33 @@ fn ds2_dims(n_groups: usize, n_groups_used: usize, exp_probs_b: Option<Vec<f32>>
     }
 }
 
-/// Build the whole GGUF description for a `deepseek2` model of `d`. Metadata keys are the ones
-/// `Config::from_gguf`'s `deepseek2` branch reads; tensor names are the ones `seam/runner.rs`'s
-/// `wload` MLA/MoE arms ask for.
-fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
+/// Build the whole GGUF description for an absorbed-MLA DeepSeek model of `d` under `arch`
+/// (`deepseek2` or `deepseek32` — every model key is `{arch}.`-prefixed, which is the whole reason
+/// the arch string is a parameter rather than a literal).
+///
+/// `indexer` is `Some` only for `deepseek32`: it adds the three `attention.indexer.*` keys and five
+/// per-layer tensors and changes NOTHING else, because V3.2 genuinely is V2's absorbed MLA plus the
+/// lightning indexer. Keeping one builder is what makes "the deepseek32 model is the deepseek2 one
+/// plus the indexer" a property the file can assert rather than a claim in a comment.
+fn mla_model(arch: &str, d: &Ds2Dims, indexer: Option<&IndexerDims>) -> SyntheticModel {
     assert!(
         d.n_expert.is_multiple_of(d.n_groups.max(1)),
         "expert_group_count must divide expert_count"
     );
-    let u = |k: &str, v: usize| (format!("deepseek2.{k}"), Meta::U32(v as u32));
-    let f = |k: &str, v: f32| (format!("deepseek2.{k}"), Meta::F32(v));
+    let u = |k: &str, v: usize| (format!("{arch}.{k}"), Meta::U32(v as u32));
+    let f = |k: &str, v: f32| (format!("{arch}.{k}"), Meta::F32(v));
     let mut meta = vec![
         (
             "general.architecture".to_string(),
-            Meta::Str("deepseek2".to_string()),
+            Meta::Str(arch.to_string()),
         ),
-        u("block_count", d.n_layer),
+        // `block_count` COUNTS the NextN blocks; the trunk is `block_count - nextn_predict_layers`.
+        u("block_count", d.n_layer + d.n_layer_nextn),
         u("embedding_length", d.n_embd),
         u("feed_forward_length", d.n_ff),
         u("attention.head_count", d.n_head),
         u("context_length", 256),
-        f("attention.layer_norm_rms_epsilon", 1e-6),
+        f("attention.layer_norm_rms_epsilon", d.rms_eps),
         // MLA geometry.
         u("attention.q_lora_rank", d.q_lora_rank),
         u("attention.kv_lora_rank", d.kv_lora_rank),
@@ -376,7 +407,7 @@ fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
         // `type = yarn` is what makes llama.cpp run the FULL ramp at every context length, and the
         // convert script writes `0.1 * mscale_all_dim`, which the loader divides back out.
         (
-            "deepseek2.rope.scaling.type".to_string(),
+            format!("{arch}.rope.scaling.type"),
             Meta::Str("yarn".to_string()),
         ),
         f("rope.scaling.factor", 40.0),
@@ -389,10 +420,7 @@ fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
         u("expert_shared_count", d.n_expert_shared),
         u("leading_dense_block_count", d.n_dense_lead),
         u("expert_gating_func", 2), // sigmoid — V3's scoring_func
-        (
-            "deepseek2.expert_weights_norm".to_string(),
-            Meta::Bool(true),
-        ),
+        (format!("{arch}.expert_weights_norm"), Meta::Bool(true)),
         f("expert_weights_scale", 2.5),
         u("expert_group_count", d.n_groups),
         u("expert_group_used_count", d.n_groups_used),
@@ -413,6 +441,14 @@ fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
         ),
         ("tokenizer.ggml.eos_token_id".to_string(), Meta::U32(2)),
     ];
+    if d.n_layer_nextn > 0 {
+        meta.push(u("nextn_predict_layers", d.n_layer_nextn));
+    }
+    if let Some(ix) = indexer {
+        meta.push(u("attention.indexer.head_count", ix.n_head));
+        meta.push(u("attention.indexer.key_length", ix.head_size));
+        meta.push(u("attention.indexer.top_k", ix.top_k));
+    }
     meta.sort_by(|a, b| a.0.cmp(&b.0));
 
     let w = Fill::Rand(0.25);
@@ -471,6 +507,36 @@ fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
             vec![d.n_head * d.value_length_mla, d.n_embd],
             w.clone(),
         ));
+        // The lightning indexer sits on EVERY layer, dense-lead included — `deepseek32.cpp` creates
+        // these five outside the dense/MoE branch. `k_norm` carries a weight AND a bias under one
+        // GGUF name because it is a mean-centred LayerNorm, not an RMSNorm.
+        if let Some(ix) = indexer {
+            tensors.push(TensorSpec::new(
+                p("indexer.k_norm.weight"),
+                vec![ix.head_size],
+                Fill::Gain,
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.k_norm.bias"),
+                vec![ix.head_size],
+                Fill::Rand(0.1),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.proj.weight"),
+                vec![d.n_embd, ix.n_head],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.attn_k.weight"),
+                vec![d.n_embd, ix.head_size],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.attn_q_b.weight"),
+                vec![d.q_lora_rank, ix.n_head * ix.head_size],
+                w.clone(),
+            ));
+        }
         tensors.push(TensorSpec::new(
             p("ffn_norm.weight"),
             vec![d.n_embd],
@@ -538,6 +604,11 @@ fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
         ));
     }
     SyntheticModel { meta, tensors }
+}
+
+/// [`mla_model`] as `deepseek2` — the arch every test above this line uses.
+fn deepseek2_model(d: &Ds2Dims) -> SyntheticModel {
+    mla_model(infr_llama::arch::DEEPSEEK2, d, None)
 }
 
 // ─── the routing cases ───────────────────────────────────────────────────────────
@@ -901,6 +972,370 @@ fn synthetic_deepseek2_uniform_router_bias_is_a_no_op() {
         d, 0.0,
         "a uniform router bias changed the output — the returned expert weights are being read \
          from the BIASED probs instead of the unbiased ones"
+    );
+}
+
+// ─── deepseek32 (V3.2) ───────────────────────────────────────────────────────────
+//
+// Stage 3's LOAD path. There is no V3.2 GGUF anywhere — the model is 671B — so this is the only
+// place the arch is exercised at all: `Config::from_gguf`'s `deepseek32` branch, and `wload`'s
+// five extra per-layer tensors, both driven off a real file through the real loader. The graph is
+// a later slice, so every run below ends at the seam's explicit refusal rather than in logits.
+
+/// V3.2's indexer at toy dimensions. `head_size` is DELIBERATELY not `qk_rope_dim` and `n_head` is
+/// not `n_head`: the indexer's four shaped tensors then have four distinct shapes, so a loader that
+/// reached for the MLA head's dims instead of the indexer's could not still fit.
+fn ds32_indexer() -> IndexerDims {
+    IndexerDims {
+        n_head: 4,
+        head_size: 24,
+        top_k: 5,
+    }
+}
+
+/// The canonical `deepseek32` dims: the grouped/biased deepseek2 model, with a DIFFERENT
+/// `rms_eps` from the 1e-6 `deepseek32.cpp` hardcodes for the indexer's LayerNorm, so
+/// `Config::rms_eps` and `Config::norm_eps` cannot be confused for one another.
+fn ds32_dims() -> Ds2Dims {
+    Ds2Dims {
+        rms_eps: 1e-5,
+        ..ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()))
+    }
+}
+
+fn deepseek32_model() -> SyntheticModel {
+    mla_model(
+        infr_llama::arch::DEEPSEEK32,
+        &ds32_dims(),
+        Some(&ds32_indexer()),
+    )
+}
+
+/// The five per-layer tensor names V3.2 adds, as they appear on disk (`llama-arch.cpp`'s
+/// `LLM_TENSOR_INDEXER_*` format strings).
+const INDEXER_TENSORS: [&str; 5] = [
+    "indexer.k_norm.weight",
+    "indexer.k_norm.bias",
+    "indexer.proj.weight",
+    "indexer.attn_k.weight",
+    "indexer.attn_q_b.weight",
+];
+
+/// `m` minus one tensor. The count check is the point: a typo in `name` would otherwise remove
+/// nothing and leave a "differential" test comparing a model with itself.
+fn without_tensor(mut m: SyntheticModel, name: &str) -> SyntheticModel {
+    let before = m.tensors.len();
+    m.tensors.retain(|t| t.name != name);
+    assert_eq!(
+        m.tensors.len() + 1,
+        before,
+        "{name} was not in the model — nothing was removed"
+    );
+    m
+}
+
+/// [`without_tensor`]'s metadata twin.
+fn without_meta(mut m: SyntheticModel, key: &str) -> SyntheticModel {
+    let before = m.meta.len();
+    m.meta.retain(|(k, _)| k != key);
+    assert_eq!(
+        m.meta.len() + 1,
+        before,
+        "{key} was not in the model — nothing was removed"
+    );
+    m
+}
+
+/// `Config::from_gguf`'s error for `m`, as a full `{:#}` chain. Panics if the file parses.
+fn config_err(tag: &str, m: &SyntheticModel) -> String {
+    let tmp = TempGguf::write(tag, m);
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let err = infr_llama::Config::from_gguf(&g).expect_err("this fixture must be refused");
+    format!("{err:#}")
+}
+
+/// The error a CPU prefill of `m` fails with, as a full `{:#}` chain. Every `deepseek32` fixture
+/// fails — a complete one at the graph build, an incomplete one inside `wload` — and WHICH of the
+/// two is the assertion.
+fn prefill_err(tag: &str, m: &SyntheticModel) -> String {
+    let tmp = TempGguf::write(tag, m);
+    let model = load(&tmp);
+    let err = model
+        .prefill_logits_cpu(PROMPT)
+        .expect_err("deepseek32 cannot generate yet — this must not return logits");
+    format!("{err:#}")
+}
+
+/// The message the seam refuses a `deepseek32` graph build with. Every load-path test below routes
+/// through a prefill, so this is also the marker for "the load got all the way through".
+const GRAPH_REFUSAL: &str = "arch=deepseek32 (DeepSeek V3.2) loads but cannot generate yet";
+
+/// Every gate boolean and every derived dim of a `deepseek32` config, including where the
+/// `deepseek2`-only gates land. `deepseek2` is TRUE here on purpose: MLA, the one-compressed-row KV
+/// geometry, the group-limited MoE and the dense-lead threshold are all shared verbatim, so they
+/// read one flag. `deepseek32` gates only what V3.2 adds.
+#[test]
+fn synthetic_deepseek32_config_gates() {
+    let d = ds32_dims();
+    let ix = ds32_indexer();
+    let tmp = TempGguf::write("ds32-config", &deepseek32_model());
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+
+    assert!(cfg.deepseek32, "deepseek32 gate");
+    assert!(
+        cfg.deepseek2,
+        "deepseek32 must ALSO set deepseek2 — that flag is what gates MLA, the compressed KV row, \
+         the MoE shape and the dense-lead threshold, all of which V3.2 shares verbatim"
+    );
+    assert!(!cfg.deepseek, "the V1 gate must stay false");
+    assert!(
+        !cfg.is_lite,
+        "V3.2 has no lite variant — the LoRA query path is the only one it has"
+    );
+    assert!(!cfg.qk_norm, "no learned q/k-norm");
+    assert!(!cfg.qkv_bias, "no attention biases");
+    assert!(!cfg.permute_qk_neox);
+    assert!(!cfg.sub_norm);
+    assert!(!cfg.llama4);
+    assert!(!cfg.qwen35);
+    assert!(!cfg.gemma && !cfg.gemma4);
+    assert!(!cfg.shexp_gated, "DeepSeek's shared expert is summed plain");
+
+    // Indexer hparams, and the LayerNorm epsilon that is NOT the RMSNorm one.
+    assert_eq!(cfg.indexer_n_head, ix.n_head);
+    assert_eq!(cfg.indexer_head_size, ix.head_size);
+    assert_eq!(cfg.indexer_top_k, ix.top_k);
+    assert_eq!(cfg.norm_eps, 1e-6, "deepseek32.cpp hardcodes f_norm_eps");
+    assert_eq!(cfg.rms_eps, d.rms_eps, "f_norm_rms_eps comes off the GGUF");
+    assert_ne!(
+        cfg.norm_eps, cfg.rms_eps,
+        "the indexer's LayerNorm epsilon and the RMSNorm epsilon are separate hparams"
+    );
+
+    // MLA geometry, derived by the same code deepseek2 uses.
+    assert_eq!(cfg.n_layer, d.n_layer);
+    assert_eq!(cfg.vocab, d.vocab);
+    assert_eq!(cfg.n_kv, 1, "MLA caches one key head for every query head");
+    assert_eq!(cfg.head_dim, d.key_length_mla);
+    assert_eq!(cfg.head_k_mla, d.qk_nope());
+    assert_eq!(cfg.v_head_dim, d.value_length_mla);
+    assert_eq!(cfg.kv_lora_rank, d.kv_lora_rank);
+    assert_eq!(cfg.qk_rope_dim, d.qk_rope_dim);
+    assert_eq!(cfg.q_lora_rank, d.q_lora_rank);
+    assert_eq!(cfg.key_length, d.key_length_mla);
+
+    // MoE, dense lead, YaRN — every one of them a `deepseek2` code path.
+    assert_eq!(cfg.n_layer_dense_lead, d.n_dense_lead);
+    assert!(!cfg.is_moe_layer(0), "layer 0 is the dense lead");
+    assert!(cfg.is_moe_layer(1) && cfg.is_moe_layer(2));
+    assert_eq!(cfg.shexp_ff, d.shexp_ff());
+    assert!(cfg.rope_scaling_yarn);
+    assert!((cfg.rope_yarn_log_mul - 0.707).abs() < 1e-4);
+    let moe = cfg.moe.expect("deepseek32 is a MoE arch");
+    assert_eq!(moe.gating, infr_core::graph::MoeGating::Sigmoid);
+    assert_eq!(moe.n_expert_groups, N_GROUPS as u32);
+    assert_eq!(moe.n_expert_groups_used, N_GROUPS_USED as u32);
+
+    // And the flag really is arch-keyed: the deepseek2 twin leaves every V3.2 field at zero.
+    let tmp2 = TempGguf::write("ds2-not-32", &grouped_model());
+    let g2 = infr_gguf::Gguf::open(tmp2.path()).expect("open synthetic GGUF");
+    let cfg2 = infr_llama::Config::from_gguf(&g2).expect("Config::from_gguf");
+    assert!(cfg2.deepseek2 && !cfg2.deepseek32);
+    assert_eq!(
+        (
+            cfg2.indexer_n_head,
+            cfg2.indexer_head_size,
+            cfg2.indexer_top_k
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(cfg2.norm_eps, 0.0, "deepseek2 emits no LayerNorm");
+}
+
+/// **The weight loader consumes all five indexer tensors, on every layer.**
+///
+/// A complete model reaches the graph-build refusal, which is only possible once `wload` has walked
+/// every layer without complaint. Remove any ONE of the five from any layer and the SAME run stops
+/// earlier, inside `wload`, naming the tensor it wanted — so a loader that quietly ignored these
+/// files' extra tensors would fail this test on all ten of its cases.
+#[test]
+fn synthetic_deepseek32_load_consumes_every_indexer_tensor() {
+    let complete = prefill_err("ds32-complete", &deepseek32_model());
+    assert!(
+        complete.contains(GRAPH_REFUSAL),
+        "a complete deepseek32 model must load fully and stop at the graph build, got: {complete}"
+    );
+
+    // Layer 0 is the DENSE-lead layer and layer 2 is a MoE layer: the indexer is unconditional, so
+    // both must demand all five.
+    for l in [0usize, 2] {
+        for suffix in INDEXER_TENSORS {
+            let name = format!("blk.{l}.{suffix}");
+            let err = prefill_err(
+                &format!("ds32-no-{}-{l}", suffix.replace('.', "-")),
+                &without_tensor(deepseek32_model(), &name),
+            );
+            println!("deepseek32 without {name}: {err}");
+            assert!(
+                err.contains(&format!("tensor not found: {name}")),
+                "removing {name} must fail the weight load naming it, got: {err}"
+            );
+        }
+    }
+}
+
+/// A misnamed tensor is the same failure as a missing one, and this is the case that would catch a
+/// loader asking for llama.cpp's ENUM name (`indexer_k_norm`) instead of the on-disk one
+/// (`indexer.k_norm`). Renaming is remove-plus-add, so the file stays otherwise complete.
+#[test]
+fn synthetic_deepseek32_misnamed_indexer_tensor_is_refused() {
+    let mut m = deepseek32_model();
+    let ix = ds32_indexer();
+    m = without_tensor(m, "blk.1.indexer.proj.weight");
+    m.tensors.push(TensorSpec::new(
+        "blk.1.indexer_proj.weight",
+        vec![ds32_dims().n_embd, ix.n_head],
+        Fill::Rand(0.25),
+    ));
+    let err = prefill_err("ds32-misnamed", &m);
+    println!("deepseek32 with a misnamed indexer.proj: {err}");
+    assert!(
+        err.contains("tensor not found: blk.1.indexer.proj.weight"),
+        "a misnamed indexer tensor must be refused, got: {err}"
+    );
+}
+
+/// **MLA is mandatory.** `deepseek32.cpp::load_arch_tensors` opens with
+/// `if (!hparams.is_mla()) throw "DEEPSEEK32 architecture requires MLA"`, and `is_mla()` is exactly
+/// "both MLA head-length keys are non-zero". There is no unabsorbed fallback for V3.2 at all.
+#[test]
+fn synthetic_deepseek32_requires_mla() {
+    for key in ["attention.key_length_mla", "attention.value_length_mla"] {
+        let full = format!("deepseek32.{key}");
+        let err = config_err(
+            &format!("ds32-no-{}", key.replace('.', "-")),
+            &without_meta(deepseek32_model(), &full),
+        );
+        println!("deepseek32 without {full}: {err}");
+        assert_eq!(
+            err,
+            format!("deepseek32 architecture requires MLA: {full} is missing or zero")
+        );
+    }
+}
+
+/// The keys `deepseek32.cpp` reads UNCONDITIONALLY where `deepseek2.cpp` tolerates their absence.
+/// Both defaults would be silently wrong here: a missing `q_lora_rank` would read as the lite
+/// variant V3.2 does not have, and a missing `expert_gating_func` would route softmax where V3.2 is
+/// sigmoid.
+#[test]
+fn synthetic_deepseek32_mandatory_keys_are_required() {
+    for key in [
+        "attention.q_lora_rank",
+        "expert_gating_func",
+        "attention.indexer.head_count",
+        "attention.indexer.key_length",
+        "attention.indexer.top_k",
+    ] {
+        let full = format!("deepseek32.{key}");
+        let err = config_err(
+            &format!("ds32-nokey-{}", key.replace('.', "-")),
+            &without_meta(deepseek32_model(), &full),
+        );
+        println!("deepseek32 without {full}: {err}");
+        assert!(
+            err.contains(&full),
+            "a deepseek32 GGUF without {full} must be refused naming it, got: {err}"
+        );
+    }
+}
+
+/// **NextN/MTP blocks are split off and skipped**, which is what `deepseek32.cpp` does with its
+/// `i >= n_layer` → `TENSOR_SKIP` arm. `block_count` counts them, so the trunk is the difference;
+/// the fixture carries no `blk.3` tensors at all and must still load, proving nothing walks them.
+#[test]
+fn synthetic_deepseek32_nextn_blocks_are_skipped() {
+    let d = Ds2Dims {
+        n_layer_nextn: 1,
+        ..ds32_dims()
+    };
+    let m = mla_model(infr_llama::arch::DEEPSEEK32, &d, Some(&ds32_indexer()));
+    assert!(
+        !m.tensors.iter().any(|t| t.name.starts_with("blk.3.")),
+        "the fixture must carry no NextN-block tensors — that is what makes the skip observable"
+    );
+    let tmp = TempGguf::write("ds32-nextn", &m);
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    assert_eq!(cfg.n_layer_nextn, 1);
+    assert_eq!(cfg.n_layer, d.n_layer, "the trunk excludes the NextN block");
+
+    let err = prefill_err("ds32-nextn-load", &m);
+    assert!(
+        err.contains(GRAPH_REFUSAL),
+        "the NextN fixture must load fully and stop at the graph build, got: {err}"
+    );
+}
+
+/// The graph build refuses `deepseek32` with a message that says WHY, rather than panicking or —
+/// far worse — emitting the deepseek2 graph and returning dense-attention logits that look fine.
+#[test]
+fn synthetic_deepseek32_graph_build_is_refused_clearly() {
+    let err = prefill_err("ds32-refusal", &deepseek32_model());
+    println!("deepseek32 graph build: {err}");
+    assert_eq!(
+        err,
+        "arch=deepseek32 (DeepSeek V3.2) loads but cannot generate yet: its lightning indexer is \
+         not implemented, and emitting the deepseek2 MLA graph without the indexer's top-k key \
+         selection would produce silently wrong output. See docs/deepseek.md § Stage 3."
+    );
+}
+
+/// The premise the load tests rest on: the deepseek32 fixture IS the deepseek2 one plus the
+/// indexer. If the two builders drifted, "removing an indexer tensor breaks the load" could pass
+/// for a reason that has nothing to do with the indexer.
+#[test]
+fn synthetic_deepseek32_is_deepseek2_plus_the_indexer() {
+    let d = ds32_dims();
+    let ds2 = mla_model(infr_llama::arch::DEEPSEEK2, &d, None);
+    let ds32 = deepseek32_model();
+
+    let extra: Vec<String> = ds32
+        .tensors
+        .iter()
+        .map(|t| t.name.clone())
+        .filter(|n| !ds2.tensors.iter().any(|t| &t.name == n))
+        .collect();
+    let mut want: Vec<String> = Vec::new();
+    for l in 0..d.n_layer {
+        for suffix in INDEXER_TENSORS {
+            want.push(format!("blk.{l}.{suffix}"));
+        }
+    }
+    assert_eq!(
+        extra, want,
+        "deepseek32 must add exactly the five indexer tensors, on every layer"
+    );
+
+    let strip = |m: &SyntheticModel| -> Vec<(String, Meta)> {
+        m.meta
+            .iter()
+            .filter(|(k, _)| !k.contains("indexer"))
+            .map(|(k, v)| (k.replacen("deepseek32.", "deepseek2.", 1), v.clone()))
+            .collect()
+    };
+    assert_eq!(
+        strip(&ds32),
+        strip(&ds2)
+            .into_iter()
+            .map(|(k, v)| if k == "general.architecture" {
+                (k, Meta::Str("deepseek32".to_string()))
+            } else {
+                (k, v)
+            })
+            .collect::<Vec<_>>(),
+        "apart from the arch string and the three indexer keys, the two models' metadata is equal"
     );
 }
 

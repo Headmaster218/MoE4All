@@ -784,6 +784,18 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("attn_k_b.weight")])?;
                 wload(&[&p("attn_v_b.weight")])?;
                 wload(&[&p("attn_output.weight")])?;
+                if c.deepseek32 {
+                    // DeepSeek V3.2 lightning indexer (docs/deepseek.md § Stage 3), on EVERY
+                    // layer — `deepseek32.cpp::load_arch_tensors` creates these five outside the
+                    // dense-lead/MoE branch, so a dense-lead layer carries them too. `k_norm` is a
+                    // mean-centred LayerNorm, hence a bias tensor alongside the weight under the
+                    // one GGUF name (open question 8's shape, and the reason both are listed).
+                    wload(&[&p("indexer.k_norm.weight")])?;
+                    wload(&[&p("indexer.k_norm.bias")])?;
+                    wload(&[&p("indexer.proj.weight")])?;
+                    wload(&[&p("indexer.attn_k.weight")])?;
+                    wload(&[&p("indexer.attn_q_b.weight")])?;
+                }
             } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
                 wload(&[&p("attn_gate.weight")])?;
@@ -1321,6 +1333,19 @@ pub(crate) fn generate_dense_backend(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
+    // DeepSeek V3.2: the LOAD path is complete (config, the absorbed-MLA weights and the five
+    // per-layer lightning-indexer tensors are all resident by now), but nothing emits the indexer
+    // yet. Building the deepseek2 graph here would run V3.2's attention over EVERY key instead of
+    // the indexer's top-k selection — plausible-looking, entirely wrong output with no error — so
+    // refuse instead of approximating. Placed after the weight upload on purpose: a `deepseek32`
+    // GGUF still gets its tensors validated end to end. See docs/deepseek.md § Stage 3.
+    if c.deepseek32 {
+        return Err(anyhow!(
+            "arch=deepseek32 (DeepSeek V3.2) loads but cannot generate yet: its lightning indexer \
+             is not implemented, and emitting the deepseek2 MLA graph without the indexer's top-k \
+             key selection would produce silently wrong output. See docs/deepseek.md § Stage 3."
+        ));
+    }
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
@@ -1496,6 +1521,21 @@ pub(crate) fn generate_dense_backend(
                 let wk_b = wpush(&mut g, &mut weights);
                 let wv_b = wpush(&mut g, &mut weights);
                 let wo = wpush(&mut g, &mut weights);
+                if c.deepseek32 {
+                    // DeepSeek V3.2's five lightning-indexer slots, name-for-name with the `wload`
+                    // arm above. Declared but NOT captured onto `MlaW`: nothing emits the indexer
+                    // yet, and `generate_dense_backend` refuses a `deepseek32` model before this
+                    // closure ever runs (see the `c.deepseek32` bail there). They are declared
+                    // anyway because `wpush` consumes `wspecs` SEQUENTIALLY — the day the emit arm
+                    // lands, a missing declaration here would bind every later weight in the layer
+                    // one buffer off, silently. The indexer slice replaces these bindings with
+                    // fields on `MlaW`.
+                    let _ix_k_norm = wpush(&mut g, &mut weights);
+                    let _ix_k_norm_b = wpush(&mut g, &mut weights);
+                    let _ix_proj = wpush(&mut g, &mut weights);
+                    let _ix_attn_k = wpush(&mut g, &mut weights);
+                    let _ix_attn_q_b = wpush(&mut g, &mut weights);
+                }
                 MixerW::Mla(MlaW {
                     wq_a,
                     q_a_norm,
