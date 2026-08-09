@@ -904,6 +904,310 @@ fn dot_ref(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Which ABSOLUTE positions a query at absolute position `abs` may attend to, given `kv_len`
+/// cached positions. Stated from what each [`AttnMask`] MEANS (see its doc), NOT from any
+/// backend's expression for it — `mla_mask_ring_parity` is only worth running because the
+/// reference and the kernel reach the same range by different routes.
+///
+/// Note `hi` is clamped to `kv_len` on the causal/window arms: a query may not attend past the end
+/// of what has been cached. The CPU `Op::Mla` arm omits that clamp (it takes `hi = abs + 1`
+/// outright); the two agree for every `abs < kv_len`, which is all the graph builder ever emits
+/// (`kv_len = start_pos + batch`, `pos = start_pos`) — see `docs/backlog.md` B46.
+fn mla_attends(mask: AttnMask, abs: usize, kv_len: usize) -> std::ops::Range<usize> {
+    match mask {
+        // Every earlier position plus its own.
+        AttnMask::Causal => 0..(abs + 1).min(kv_len),
+        // The `w` most recent positions, its own included.
+        AttnMask::SlidingWindow(w) => (abs + 1).saturating_sub(w)..(abs + 1).min(kv_len),
+        // One fixed span for EVERY row — `abs` is not consulted at all.
+        AttnMask::Canvas { lo } => lo..kv_len,
+    }
+}
+
+/// Hand-written f32 reference for one `Op::Mla` dispatch.
+///
+/// `keys[j]` is the logical `key_len`-wide key for ABSOLUTE position `j`. The reference never
+/// computes a cache ROW index — that is the whole point: the kernel reaches its key through
+/// `j % cap_rows` into the ring buffer, this reaches it through the absolute position, and they
+/// agree only if the kernel's modulus lands on the row the ring writer actually used.
+///
+/// The absorb/rope/softmax/output arithmetic still follows the same index formulas the CPU arm
+/// uses for `wk_b`/`wv_b` (B46's first bullet: this reference is not an independent oracle for
+/// weight ORIENTATION). Masking and ring addressing are the parts it derives independently.
+#[allow(clippy::too_many_arguments)]
+fn mla_ref(
+    qi: &[f32],
+    keys: &[Vec<f32>],
+    wk: &[f32],
+    wv: &[f32],
+    rows: usize,
+    nh: usize,
+    kv_lora: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    vhd: usize,
+    kv_len: usize,
+    scale: f32,
+    theta: f32,
+    mask: AttnMask,
+    pos: usize,
+) -> Vec<f32> {
+    let key_len = kv_lora + qk_rope;
+    let q_head_dim = qk_nope + qk_rope;
+    let hf = qk_rope / 2;
+    let mut out = vec![0f32; rows * nh * vhd];
+    for ti in 0..rows {
+        let abs = pos + ti;
+        for h in 0..nh {
+            let q_off = (ti * nh + h) * q_head_dim;
+            let q_nope = &qi[q_off..q_off + qk_nope];
+            let q_pe_raw = &qi[q_off + qk_nope..q_off + q_head_dim];
+            // q_full[0..kv_lora] = wk_b[h]^T @ q_nope
+            let wk_off = h * kv_lora * qk_nope;
+            let mut q_full = vec![0f32; key_len];
+            for (j, qf) in q_full.iter_mut().enumerate().take(kv_lora) {
+                let mut s = 0f32;
+                for i in 0..qk_nope {
+                    s += wk[wk_off + i + j * qk_nope] * q_nope[i];
+                }
+                *qf = s;
+            }
+            // Rope q_pe at the query's ABSOLUTE position.
+            for p in 0..hf {
+                let (i0, i1) = (2 * p, 2 * p + 1);
+                let ang = abs as f32 * theta.powf(-2.0 * p as f32 / qk_rope as f32);
+                let (s, c) = (ang.sin(), ang.cos());
+                q_full[kv_lora + i0] = q_pe_raw[i0] * c - q_pe_raw[i1] * s;
+                q_full[kv_lora + i1] = q_pe_raw[i0] * s + q_pe_raw[i1] * c;
+            }
+            let span = mla_attends(mask, abs, kv_len);
+            let sc: Vec<f32> = span
+                .clone()
+                .map(|j| dot_ref(&q_full, &keys[j]) * scale)
+                .collect();
+            let mx = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let l: f32 = sc.iter().map(|&s| (s - mx).exp()).sum();
+            for (j, &s) in span.zip(&sc) {
+                let p = (s - mx).exp() / l;
+                let wv_off = h * kv_lora * vhd;
+                for o_idx in 0..vhd {
+                    let mut vs = 0f32;
+                    for a in 0..kv_lora {
+                        vs += wv[wv_off + a + o_idx * kv_lora] * keys[j][a];
+                    }
+                    out[(ti * nh + h) * vhd + o_idx] += p * vs;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One `mla_mask_ring_parity` case: a mask, a query batch and a ring capacity.
+struct MlaCase {
+    name: &'static str,
+    rows: usize,
+    pos: usize,
+    kv_len: usize,
+    /// Ring row capacity — the K cache tensor is declared `cap * key_len` wide, which is where the
+    /// CPU arm reads `cap_rows` from. `cap < kv_len` is a genuinely wrapped cache.
+    cap: usize,
+    mask: AttnMask,
+}
+
+/// `Op::Mla` over the axes `mla_parity` never moves: a WRAPPED ring cache (`cap_rows < kv_len`),
+/// `AttnMask::SlidingWindow`, `AttnMask::Canvas`, and a non-zero `pos` — the gap recorded as
+/// `docs/backlog.md` B46's second bullet.
+///
+/// The cache is filled by an explicit ring WRITER (position `j` → row `j % cap`, ascending, so a
+/// row reached twice keeps the later position), and [`mla_ref`] then reads keys by absolute
+/// position. Kernel and reference therefore only agree if the kernel's `(lo + jj) % cap_rows`
+/// resolves to the same row the writer used, which is what makes the wrap cases informative.
+#[test]
+fn mla_mask_ring_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // Tiny dims, hand-checkable on failure. `kv_lora + qk_rope` is EVEN so the same case table
+    // transfers to `infr-vulkan`'s `mla_ring_and_mask_matches_cpu_reference`, whose f16 cache is
+    // read as u32-packed f16 PAIRS (`mla.comp`'s `kread`) — an odd key_len would put a row's last
+    // element in a half-word past the end of the buffer.
+    let (nh, kv_lora, qk_nope, qk_rope, vhd) = (2usize, 4usize, 2usize, 2usize, 2usize);
+    let key_len = kv_lora + qk_rope; // 6
+    let q_head_dim = qk_nope + qk_rope; // 4
+    let scale = 1.0 / (q_head_dim as f32).sqrt();
+    let theta = 10000.0f32;
+
+    // One-hot wk_b/wv_b in the READ convention both kernels use (`i` / `a` the FAST dim): head h
+    // absorbs q_nope dim `i` into latent slot `(h+i) % kv_lora`, and reads latent slot `(h+o) %
+    // kv_lora` back out into output dim `o`. Distinct per output dim on purpose — `mla_parity`'s
+    // `wv[off + a*vhd + a] = 1` is one-hot in the WRITE convention, which the read convention
+    // collapses onto latent slot 0 for BOTH output dims, so its every output pair came out equal.
+    let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+    let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+    for h in 0..nh {
+        for i in 0..qk_nope {
+            wk[h * kv_lora * qk_nope + i + ((h + i) % kv_lora) * qk_nope] = 1.0;
+        }
+        for o in 0..vhd {
+            wv[h * kv_lora * vhd + (h + o) % kv_lora + o * kv_lora] = 1.0;
+        }
+    }
+    // One distinct key per absolute position, all O(1): with scores this small the softmax stays
+    // SOFT, so every attended key moves the output. Under a near-one-hot softmax (what large
+    // values give) the result is just the winning key's V, and dropping or adding a LOSING key —
+    // exactly what an off-by-one in `lo`/`hi` does — would leave the output unchanged.
+    let key_at = |j: usize| -> Vec<f32> {
+        (0..key_len)
+            .map(|d| ((j * 7 + d * 3) % 13) as f32 / 16.0 + 0.125)
+            .collect()
+    };
+    let q_at = |i: usize| ((i * 5 + 3) % 11) as f32 / 8.0 - 0.5;
+
+    let cases = [
+        // The `mla_parity` shape, restated here as the baseline the wrap/mask cases move away from.
+        MlaCase {
+            name: "causal pos=0, no wrap",
+            rows: 2,
+            pos: 0,
+            kv_len: 2,
+            cap: 2,
+            mask: AttnMask::Causal,
+        },
+        MlaCase {
+            name: "causal pos=3, no wrap",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: AttnMask::Causal,
+        },
+        MlaCase {
+            name: "sliding window w=3, pos=3, no wrap",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: AttnMask::SlidingWindow(3),
+        },
+        // cap=5 over 14 positions is two full laps plus four rows, and the abs=12 row attends
+        // 9..13 → rows 4,0,1,2: `lo` and `hi-1` sit on OPPOSITE sides of the wrap boundary, which
+        // the single lap starting at row 0 would not have caught.
+        MlaCase {
+            name: "sliding window w=4, wrapped ring (lo/hi straddle)",
+            rows: 2,
+            pos: 12,
+            kv_len: 14,
+            cap: 5,
+            mask: AttnMask::SlidingWindow(4),
+        },
+        // Window exactly the ring capacity: every row is read once, starting mid-ring.
+        MlaCase {
+            name: "sliding window w=cap=5, wrapped ring",
+            rows: 1,
+            pos: 13,
+            kv_len: 14,
+            cap: 5,
+            mask: AttnMask::SlidingWindow(5),
+        },
+        MlaCase {
+            name: "canvas lo=0, pos=3",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: AttnMask::Canvas { lo: 0 },
+        },
+        // Canvas ignores `abs` entirely: both rows attend 2..5 even though their causal bounds
+        // differ, and `pos` still moves the internal q_pe rope.
+        MlaCase {
+            name: "canvas lo=2, pos=3",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: AttnMask::Canvas { lo: 2 },
+        },
+        MlaCase {
+            name: "canvas lo=9, wrapped ring (straddles)",
+            rows: 1,
+            pos: 13,
+            kv_len: 14,
+            cap: 5,
+            mask: AttnMask::Canvas { lo: 9 },
+        },
+    ];
+
+    for case in cases {
+        let MlaCase {
+            name,
+            rows,
+            pos,
+            kv_len,
+            cap,
+            mask,
+        } = case;
+        // Ring writer: absolute position j lands in row j % cap, written in ascending order.
+        let keys: Vec<Vec<f32>> = (0..kv_len).map(key_at).collect();
+        let mut cache = vec![0f32; cap * key_len];
+        for (j, k) in keys.iter().enumerate() {
+            cache[(j % cap) * key_len..][..key_len].copy_from_slice(k);
+        }
+        // A ring only holds the last `cap` positions. If an attended position's row was reused by
+        // a LATER position, the cache no longer holds the key the reference expects and the case
+        // is asking a question with no answer — catch that here rather than in a max_err.
+        for ti in 0..rows {
+            let abs = pos + ti;
+            for j in mla_attends(mask, abs, kv_len) {
+                let last = (0..kv_len)
+                    .rfind(|p| p % cap == j % cap)
+                    .expect("attended position is inside 0..kv_len");
+                assert_eq!(
+                    last, j,
+                    "{name}: attended position {j} was overwritten by {last} in the ring — \
+                     the case attends a wider span than cap={cap} holds"
+                );
+            }
+        }
+        let qi: Vec<f32> = (0..rows * nh * q_head_dim).map(q_at).collect();
+
+        let mut g = Graph::new();
+        let q = g.input(f32d(rows * nh * q_head_dim));
+        let k_cache = g.input(f32d(cap * key_len));
+        let wk_b = g.weight(f32d(nh * kv_lora * qk_nope));
+        let wv_b = g.weight(f32d(nh * kv_lora * vhd));
+        let dst = g.output(f32d(rows * nh * vhd));
+        g.push(Op::Mla {
+            q,
+            k_cache,
+            wk_b,
+            wv_b,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            q_head_dim: q_head_dim as u32,
+            kv_lora_rank: kv_lora as u32,
+            qk_nope_dim: qk_nope as u32,
+            qk_rope_dim: qk_rope as u32,
+            v_head_dim: vhd as u32,
+            scale,
+            mask,
+            pos: pos as u32,
+            theta,
+            freq_factors: None,
+        });
+        let ins = [(q, &qi[..]), (k_cache, &cache[..])];
+        let ws = [(wk_b, &wk[..]), (wv_b, &wv[..])];
+        let got = run(&cpu, &g, &ins, &ws, dst, rows * nh * vhd);
+        let want = mla_ref(
+            &qi, &keys, &wk, &wv, rows, nh, kv_lora, qk_nope, qk_rope, vhd, kv_len, scale, theta,
+            mask, pos,
+        );
+        let err = maxerr(&got, &want);
+        println!("MLA {name}: max_err={err:e}\n  got ={got:?}\n  want={want:?}");
+        assert!(err < 1e-5, "MLA {name} diverges: max_err={err:e}");
+    }
+}
+
 /// Hand-written f32 reference for `Op::MoeFfn`'s DeepSeek V2/V3 selection path (rows=1, norm_w=true,
 /// weight_before=false, SiLU, no down_scale, split gate/up), mirroring the CPU interpreter in
 /// `crates/infr-cpu/src/lib.rs` (MoeFfn arm, ~2076-2702): router matvec → `gating` probs → optional

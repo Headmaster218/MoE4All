@@ -4162,3 +4162,187 @@ fn mla_ff_parity() {
     ];
     assert_parity(&g, &bound, dst, rows * nh * vhd, 1e-3);
 }
+
+/// One `mla_mask_ring_parity` case.
+struct MlaCase {
+    name: &'static str,
+    rows: usize,
+    pos: u32,
+    kv_len: usize,
+    /// Ring row capacity — the K cache tensor is declared `cap * key_len` wide, which is where
+    /// both backends read `cache_cap_rows` from. `cap < kv_len` is a genuinely WRAPPED cache, so
+    /// `mla_f16kv_one`'s `(lo + jj) % cap` has to fold.
+    cap: usize,
+    mask: infr_core::graph::AttnMask,
+}
+
+/// `mla_f16kv` over the axes `mla_parity` never moves: a WRAPPED ring cache (`cap < kv_len`),
+/// `AttnMask::SlidingWindow`, `AttnMask::Canvas` and a non-zero `pos` — the gap recorded as
+/// `docs/backlog.md` B46's second bullet. Same case table, same dims and same synthetic data as
+/// `infr-llama`'s `mla_mask_ring_parity` and `infr-vulkan`'s
+/// `mla_ring_and_mask_matches_cpu_reference`, so a Metal-only divergence is identifiable by case.
+///
+/// This one compares against the CPU arm (the file's `assert_parity` convention) rather than
+/// against a from-semantics reference; the CPU arm's own mask and ring arithmetic is what
+/// `mla_mask_ring_parity` pins semantically, so the chain closes there.
+///
+/// **Canvas is covered at `lo = 0` only.** `MlaParams` carries no canvas `lo` — `mla_f16kv_one`
+/// hardcodes `lo = 0u` on the `mask_type == 2` arm — while the CPU arm honours `AttnMask::Canvas
+/// { lo }`. A `lo > 0` case would fail here, and it is a kernel defect, not a test gap; see B46.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn mla_mask_ring_parity() {
+    // key_len = kv_lora + qk_rope is EVEN so this table also runs on Vulkan, whose f16 cache is
+    // read as u32-packed f16 PAIRS.
+    let (nh, kv_lora, qk_nope, qk_rope, vhd) = (2usize, 4usize, 2usize, 2usize, 2usize);
+    let key_len = kv_lora + qk_rope; // 6
+    let q_head_dim = qk_nope + qk_rope; // 4
+    let scale = 1.0 / (q_head_dim as f32).sqrt();
+    let theta = 10000.0f32;
+    // One-hot wk_b/wv_b in the READ convention both kernels use (`i` / `a` the FAST dim).
+    let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+    let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+    for h in 0..nh {
+        for i in 0..qk_nope {
+            wk[h * kv_lora * qk_nope + i + ((h + i) % kv_lora) * qk_nope] = 1.0;
+        }
+        for o in 0..vhd {
+            wv[h * kv_lora * vhd + (h + o) % kv_lora + o * kv_lora] = 1.0;
+        }
+    }
+    // One distinct key per absolute position. Values are 1/16ths, so the f16 cache round-trip is
+    // EXACT; and they are O(1), which keeps the softmax SOFT — under a near-one-hot softmax the
+    // output is just the winning key's V, and adding or dropping a LOSING key (what an off-by-one
+    // in `lo`/`hi` does) would leave the output unchanged.
+    let key_at = |j: usize| -> Vec<f32> {
+        (0..key_len)
+            .map(|d| ((j * 7 + d * 3) % 13) as f32 / 16.0 + 0.125)
+            .collect()
+    };
+    let q_at = |i: usize| ((i * 5 + 3) % 11) as f32 / 8.0 - 0.5;
+    // Which ABSOLUTE positions a query at `abs` may attend to — from what each mask MEANS, used
+    // here only to check each case stays inside what the ring can still hold.
+    let attends = |mask: infr_core::graph::AttnMask, abs: usize, kv_len: usize| match mask {
+        infr_core::graph::AttnMask::Causal => 0..(abs + 1).min(kv_len),
+        infr_core::graph::AttnMask::SlidingWindow(w) => {
+            (abs + 1).saturating_sub(w)..(abs + 1).min(kv_len)
+        }
+        infr_core::graph::AttnMask::Canvas { lo } => lo..kv_len,
+    };
+
+    let cases = [
+        MlaCase {
+            name: "causal pos=0, no wrap",
+            rows: 2,
+            pos: 0,
+            kv_len: 2,
+            cap: 2,
+            mask: infr_core::graph::AttnMask::Causal,
+        },
+        MlaCase {
+            name: "causal pos=3, no wrap",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: infr_core::graph::AttnMask::Causal,
+        },
+        MlaCase {
+            name: "sliding window w=3, pos=3, no wrap",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: infr_core::graph::AttnMask::SlidingWindow(3),
+        },
+        // cap=5 over 14 positions is two full laps plus four rows, and the abs=12 row attends
+        // 9..13 → rows 4,0,1,2: `lo` and `hi-1` land on OPPOSITE sides of the wrap boundary,
+        // which a single lap starting at row 0 would not have caught.
+        MlaCase {
+            name: "sliding window w=4, wrapped ring (lo/hi straddle)",
+            rows: 2,
+            pos: 12,
+            kv_len: 14,
+            cap: 5,
+            mask: infr_core::graph::AttnMask::SlidingWindow(4),
+        },
+        MlaCase {
+            name: "sliding window w=cap=5, wrapped ring",
+            rows: 1,
+            pos: 13,
+            kv_len: 14,
+            cap: 5,
+            mask: infr_core::graph::AttnMask::SlidingWindow(5),
+        },
+        MlaCase {
+            name: "canvas lo=0, pos=3",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: infr_core::graph::AttnMask::Canvas { lo: 0 },
+        },
+    ];
+
+    for c in cases {
+        // Ring writer: absolute position j lands in row j % cap, ascending, so a row reached more
+        // than once keeps the LATER position.
+        let mut cache = vec![0f32; c.cap * key_len];
+        for j in 0..c.kv_len {
+            cache[(j % c.cap) * key_len..][..key_len].copy_from_slice(&key_at(j));
+        }
+        // A ring holds only the last `cap` positions. If an attended position's row was reused by
+        // a LATER one, the cache no longer holds that position's key at all and the case is
+        // asking a question with no answer — catch that here, not as a mystery rel_err.
+        for ti in 0..c.rows {
+            let abs = c.pos as usize + ti;
+            for j in attends(c.mask, abs, c.kv_len) {
+                let last = (0..c.kv_len)
+                    .rfind(|p| p % c.cap == j % c.cap)
+                    .expect("attended position is inside 0..kv_len");
+                assert_eq!(
+                    last, j,
+                    "{}: attended position {j} was overwritten by {last} in the ring — the case \
+                     attends a wider span than cap={} holds",
+                    c.name, c.cap
+                );
+            }
+        }
+        let qi: Vec<f32> = (0..c.rows * nh * q_head_dim).map(q_at).collect();
+
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![c.rows * nh * q_head_dim], DType::F32));
+        let k_cache = g.input(TensorDesc::new(vec![c.cap * key_len], DType::F16));
+        let wk_b = g.weight(TensorDesc::new(vec![nh * kv_lora * qk_nope], DType::F32));
+        let wv_b = g.weight(TensorDesc::new(vec![nh * kv_lora * vhd], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![c.rows * nh * vhd], DType::F32));
+        g.push(Op::Mla {
+            q,
+            k_cache,
+            wk_b,
+            wv_b,
+            dst,
+            rows: c.rows as u32,
+            kv_len: c.kv_len as u32,
+            n_head: nh as u32,
+            q_head_dim: q_head_dim as u32,
+            kv_lora_rank: kv_lora as u32,
+            qk_nope_dim: qk_nope as u32,
+            qk_rope_dim: qk_rope as u32,
+            v_head_dim: vhd as u32,
+            scale,
+            mask: c.mask,
+            pos: c.pos,
+            theta,
+            freq_factors: None,
+        });
+        let bound = vec![
+            (q, f32_bytes(&qi)),
+            (k_cache, f16_bytes(&cache)),
+            (wk_b, f32_bytes(&wk)),
+            (wv_b, f32_bytes(&wv)),
+        ];
+        println!("MLA metal case: {}", c.name);
+        assert_parity(&g, &bound, dst, c.rows * nh * vhd, 1e-3);
+    }
+}

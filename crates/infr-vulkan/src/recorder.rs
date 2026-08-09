@@ -12330,4 +12330,270 @@ mod tests {
         println!("mla vulkan max_err={err:e}");
         assert!(err < 1e-3, "MLA vulkan diverges: max_err={err:e}");
     }
+
+    /// One `mla_ring_and_mask_matches_cpu_reference` case.
+    struct MlaCase {
+        name: &'static str,
+        rows: usize,
+        pos: u32,
+        kv_len: usize,
+        /// Ring row capacity. `cap < kv_len` is a genuinely WRAPPED cache, so `mla.comp`'s
+        /// `(lo + jj) % cap` has to fold rather than being the identity it is at `cap >= kv_len`.
+        cap: usize,
+        /// 0 = causal, 1 = sliding window, 2 = canvas (see `mla.comp`'s `pc.mask_type`).
+        mask_type: u32,
+        window: u32,
+    }
+
+    /// `mla.comp` over the axes `mla_matches_cpu_reference` never moves: a WRAPPED ring cache
+    /// (`cache_cap_rows < kv_len`), `mask_type` 1 (sliding window) and 2 (canvas), and a `pos`
+    /// past the first — the gap recorded as `docs/backlog.md` B46's second bullet.
+    ///
+    /// The cache is filled by an explicit ring WRITER (absolute position `j` → row `j % cap`,
+    /// ascending), and the reference below reads keys by ABSOLUTE POSITION, never computing a row
+    /// index. Kernel and reference therefore agree only if the kernel's `(lo + jj) % cap` resolves
+    /// to the row the writer used — which is what makes the wrapped cases informative rather than
+    /// a restatement of the shader's own expression.
+    ///
+    /// Dims are tiny (and mirror `infr-llama`'s `mla_mask_ring_parity` case for case) so a failure
+    /// is hand-checkable; `mla_matches_cpu_reference` above keeps the DeepSeek-sized dispatch that
+    /// guards the shared-memory/lane layout.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn mla_ring_and_mask_matches_cpu_reference() {
+        let be = be_with(|_| {});
+        // key_len = kv_lora + qk_rope must be EVEN: `kread` addresses the f16 cache as u32-packed
+        // PAIRS, so an odd row width would put a row's last element in a half-word past the end of
+        // the allocation.
+        let (nh, kv_lora, qk_nope, qk_rope, vhd) = (2usize, 4usize, 2usize, 2usize, 2usize);
+        let key_len = kv_lora + qk_rope; // 6
+        let q_head_dim = qk_nope + qk_rope; // 4
+        let scale = 1.0 / (q_head_dim as f32).sqrt();
+        let theta = 10000.0f32;
+        // One-hot wk_b/wv_b in the READ convention the shader uses (`i` / `a` the FAST dim).
+        let mut wk: Vec<f32> = vec![0f32; nh * kv_lora * qk_nope];
+        let mut wv: Vec<f32> = vec![0f32; nh * kv_lora * vhd];
+        for h in 0..nh {
+            for i in 0..qk_nope {
+                wk[h * kv_lora * qk_nope + i + ((h + i) % kv_lora) * qk_nope] = 1.0;
+            }
+            for o in 0..vhd {
+                wv[h * kv_lora * vhd + (h + o) % kv_lora + o * kv_lora] = 1.0;
+            }
+        }
+        // One distinct key per absolute position. Values are 1/16ths, so the f16 cache round-trip
+        // is EXACT and the tolerance is measuring the kernel, not the cast. They are also all
+        // O(1), which keeps the softmax SOFT — under the near-one-hot softmax that large values
+        // give, the output is just the winning key's V and adding or dropping a LOSING key (what
+        // an off-by-one in `lo`/`hi` does) would leave the output unchanged.
+        let key_at = |j: usize| -> Vec<f32> {
+            (0..key_len)
+                .map(|d| ((j * 7 + d * 3) % 13) as f32 / 16.0 + 0.125)
+                .collect()
+        };
+        let q_at = |i: usize| ((i * 5 + 3) % 11) as f32 / 8.0 - 0.5;
+        // Which ABSOLUTE positions a query at `abs` may attend to — stated from what each mask
+        // MEANS, not from the shader's expression for it.
+        let attends = |mask_type: u32, window: u32, abs: usize, kv_len: usize| {
+            match mask_type {
+                // Every earlier position plus its own.
+                0 => 0..(abs + 1).min(kv_len),
+                // The `window` most recent positions, its own included.
+                1 => (abs + 1).saturating_sub(window as usize)..(abs + 1).min(kv_len),
+                // One fixed span for every row. The push constant carries no canvas `lo` (the
+                // shader hardcodes 0), so `lo = 0` is the only canvas this path can express —
+                // see B46 for the `lo > 0` divergence against the CPU arm.
+                _ => 0..kv_len,
+            }
+        };
+
+        let cases = [
+            MlaCase {
+                name: "causal pos=0, no wrap",
+                rows: 2,
+                pos: 0,
+                kv_len: 2,
+                cap: 2,
+                mask_type: 0,
+                window: 0,
+            },
+            MlaCase {
+                name: "causal pos=3, no wrap",
+                rows: 2,
+                pos: 3,
+                kv_len: 5,
+                cap: 8,
+                mask_type: 0,
+                window: 0,
+            },
+            MlaCase {
+                name: "sliding window w=3, pos=3, no wrap",
+                rows: 2,
+                pos: 3,
+                kv_len: 5,
+                cap: 8,
+                mask_type: 1,
+                window: 3,
+            },
+            // cap=5 over 14 positions is two full laps plus four rows, and the abs=12 row attends
+            // 9..13 → rows 4,0,1,2: `lo` and `hi-1` land on OPPOSITE sides of the wrap boundary,
+            // which a single lap starting at row 0 would not have caught.
+            MlaCase {
+                name: "sliding window w=4, wrapped ring (lo/hi straddle)",
+                rows: 2,
+                pos: 12,
+                kv_len: 14,
+                cap: 5,
+                mask_type: 1,
+                window: 4,
+            },
+            MlaCase {
+                name: "sliding window w=cap=5, wrapped ring",
+                rows: 1,
+                pos: 13,
+                kv_len: 14,
+                cap: 5,
+                mask_type: 1,
+                window: 5,
+            },
+            MlaCase {
+                name: "canvas lo=0, pos=3",
+                rows: 2,
+                pos: 3,
+                kv_len: 5,
+                cap: 8,
+                mask_type: 2,
+                window: 0,
+            },
+        ];
+
+        for c in cases {
+            // Ring writer: absolute position j lands in row j % cap, ascending.
+            let keys: Vec<Vec<f32>> = (0..c.kv_len).map(key_at).collect();
+            let mut cache = vec![0f32; c.cap * key_len];
+            for (j, k) in keys.iter().enumerate() {
+                cache[(j % c.cap) * key_len..][..key_len].copy_from_slice(k);
+            }
+            // A ring holds only the last `cap` positions. If an attended position's row was reused
+            // by a LATER one, the cache no longer holds the key the reference expects and the case
+            // is asking a question with no answer — catch that here, not as a mystery max_err.
+            for ti in 0..c.rows {
+                let abs = c.pos as usize + ti;
+                for j in attends(c.mask_type, c.window, abs, c.kv_len) {
+                    let last = (0..c.kv_len)
+                        .rfind(|p| p % c.cap == j % c.cap)
+                        .expect("attended position is inside 0..kv_len");
+                    assert_eq!(
+                        last, j,
+                        "{}: attended position {j} was overwritten by {last} in the ring — the \
+                         case attends a wider span than cap={} holds",
+                        c.name, c.cap
+                    );
+                }
+            }
+            let qi: Vec<f32> = (0..c.rows * nh * q_head_dim).map(q_at).collect();
+
+            let bq = upf32(&be, &qi);
+            let bwk = upf32(&be, &wk);
+            let bwv = upf32(&be, &wv);
+            let ksrc = upf16(&be, &cache);
+            let bk = be.alloc(c.cap * key_len * 2, BufferUsage::KvCache).unwrap();
+            let bo = be
+                .alloc(c.rows * nh * vhd * 4, BufferUsage::Readback)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            // Write the cache through `rec.copy` inside the SAME recorder as the mla, reproducing
+            // the real graph's store→read hazard sequence (as `mla_matches_cpu_reference` does).
+            rec.copy(ksrc.as_ref(), 0, bk.as_ref(), 0, c.cap * key_len * 2);
+            rec.mla(
+                bq.as_ref(),
+                bk.as_ref(),
+                bwk.as_ref(),
+                bwv.as_ref(),
+                bo.as_ref(),
+                c.rows as u32,
+                c.kv_len as u32,
+                nh as u32,
+                q_head_dim as u32,
+                kv_lora as u32,
+                qk_nope as u32,
+                qk_rope as u32,
+                vhd as u32,
+                scale,
+                c.pos,
+                c.mask_type,
+                c.window,
+                theta,
+                c.cap as u32,
+                None,
+            );
+            rec.finish().unwrap();
+            let mut bytes = vec![0u8; c.rows * nh * vhd * 4];
+            be.download(bo.as_ref(), &mut bytes).unwrap();
+            let got: &[f32] = bytemuck::cast_slice(&bytes);
+
+            // CPU reference: absorb → rope → SDPA over the attended ABSOLUTE positions → wv_b.
+            let mut want = vec![0f32; c.rows * nh * vhd];
+            for ti in 0..c.rows {
+                let abs = c.pos as usize + ti;
+                for h in 0..nh {
+                    let q_off = (ti * nh + h) * q_head_dim;
+                    let mut q_full = vec![0f32; key_len];
+                    for (j, qf) in q_full.iter_mut().enumerate().take(kv_lora) {
+                        let mut acc = 0.0f32;
+                        for i in 0..qk_nope {
+                            acc += wk[h * kv_lora * qk_nope + i + j * qk_nope] * qi[q_off + i];
+                        }
+                        *qf = acc;
+                    }
+                    for p in 0..qk_rope / 2 {
+                        let ang = abs as f32 * theta.powf(-2.0 * p as f32 / qk_rope as f32);
+                        let (i0, i1) = (2 * p, 2 * p + 1);
+                        let (a, b) = (qi[q_off + qk_nope + i0], qi[q_off + qk_nope + i1]);
+                        q_full[kv_lora + i0] = a * ang.cos() - b * ang.sin();
+                        q_full[kv_lora + i1] = a * ang.sin() + b * ang.cos();
+                    }
+                    let span = attends(c.mask_type, c.window, abs, c.kv_len);
+                    let sc: Vec<f32> = span
+                        .clone()
+                        .map(|j| {
+                            keys[j].iter().zip(&q_full).map(|(k, q)| k * q).sum::<f32>() * scale
+                        })
+                        .collect();
+                    let lmax = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut vacc = vec![0f32; kv_lora];
+                    let mut sumw = 0.0f32;
+                    for (j, &d) in span.zip(&sc) {
+                        let p = (d - lmax).exp();
+                        sumw += p;
+                        for (di, v) in vacc.iter_mut().enumerate() {
+                            *v += p * keys[j][di];
+                        }
+                    }
+                    let inv = 1.0 / sumw.max(1e-20);
+                    for d in 0..vhd {
+                        let mut acc = 0.0f32;
+                        for i in 0..kv_lora {
+                            acc += vacc[i] * inv * wv[h * kv_lora * vhd + i + d * kv_lora];
+                        }
+                        want[(ti * nh + h) * vhd + d] = acc;
+                    }
+                }
+            }
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "mla vulkan {}: max_err={err:e}\n  got ={got:?}\n  want={want:?}",
+                c.name
+            );
+            assert!(
+                err < 1e-4,
+                "MLA vulkan {} diverges: max_err={err:e}",
+                c.name
+            );
+        }
+    }
 }

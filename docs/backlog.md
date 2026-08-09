@@ -1062,11 +1062,41 @@ places that evidence does not reach:
   check that survives into stages 3–4", which overstates what it can do. A real
   oracle would build full MHA from the unabsorbed `wkv_b` and compare against
   the absorbed path.
-- **Ring wrap is untested everywhere.** Every MLA test runs
-  `cache_cap_rows >= kv_len`, so neither the CPU arm's `j % cap_rows` nor the
-  GPU kernels' `(lo + jj) % cap` has ever executed a wrap. Same for
-  `AttnMask::SlidingWindow` and `AttnMask::Canvas` on the MLA path — only
-  `Causal` at `pos = 0` is covered.
+- **Ring wrap and the non-causal masks are now covered — except
+  `Canvas { lo > 0 }`, which is BROKEN on both GPU kernels.** `Op::Mla` runs one
+  shared case table on all three backends: `mla_mask_ring_parity` (infr-llama
+  `tests/seam_op_parity.rs`, CPU vs a from-semantics reference),
+  `mla_ring_and_mask_matches_cpu_reference` (infr-vulkan `src/recorder.rs`) and
+  `mla_mask_ring_parity` (infr-metal `tests/parity.rs`, Metal vs CPU). It covers
+  a genuinely wrapped ring (`cap_rows` 5 over 14 positions — two full laps, with
+  `lo` and `hi-1` on opposite sides of the wrap boundary), `SlidingWindow`,
+  `Canvas`, and a non-zero `pos`. The references read keys by ABSOLUTE position
+  from an independent ring writer, so they agree with `j % cap_rows` /
+  `(lo + jj) % cap` only if the kernel's fold is right. Every case was seen red
+  by perturbing the arm it guards. What is left:
+  - **`AttnMask::Canvas { lo }` with `lo > 0` diverges on Vulkan AND Metal.**
+    Neither push-constant block carries a canvas `lo` at all — `mla.comp` and
+    `mla_f16kv_one` hardcode `lo = 0u` on their `mask_type == 2` arm, while the
+    CPU arm honours it. Measured on an RX 7900 XTX: max_err 6.3e-2 at `lo = 2`,
+    `kv_len = 5`, vs 1.8e-7 for the same case at `lo = 0`. Unreachable today
+    (only DiffusionGemma's denoise path emits `Canvas`, and it never builds
+    `Op::Mla`), which is why it is filed rather than fixed; a fix means adding
+    the field to `PC`/`MlaParams`, to `Recorder::mla`'s signature and to both
+    kernel arms. The GPU tests therefore cover `Canvas` at `lo = 0` only.
+  - **`Causal` over a wrapped ring is not covered and cannot be**: a causal
+    query at `abs` attends `abs + 1` positions, which is exactly when it exceeds
+    `cap_rows` that the ring wraps — so some attended row has already been
+    overwritten and there is no right answer to assert. Only a bounded span
+    (SWA, or a `Canvas` span `<= cap_rows`) is well defined on a wrapped ring.
+    Production deepseek2 never wraps (`cap_rows` is `ctx + KV_SLOP_ROWS`).
+  - **The CPU arm omits the `hi = min(hi, kv_len)` clamp** both shaders apply on
+    the causal/window arms (it takes `hi = abs + 1` outright), and its `Canvas`
+    arm takes `(lo, kv_len)` with no lower clamp, so `n_keys = hi - lo` would
+    underflow for `lo > kv_len`. Both are unreachable through the graph builder
+    (it emits `kv_len = start_pos + batch` with `pos = start_pos`, so
+    `abs < kv_len`; the only `Canvas` producer computes `lo <= P <= kv_len`) —
+    left untested for that reason, recorded so a future caller that breaks
+    either invariant is not a mystery.
 - **Group-limited routing has never run on a real model.** V2-Lite ships
   `expert_group_count = 1`, so the `n_expert_groups > 1` branch in both the CPU
   arm and `moe_topk.comp` is exercised only by `moe_groups_bias_parity`'s
