@@ -1062,6 +1062,26 @@ fn lower_op(
                 *eps,
             );
         }
+        // Mean-centred LayerNorm (deepseek32's `indexer_k_norm`) — the family's one non-RMS norm.
+        Op::LayerNorm {
+            x,
+            weight,
+            bias,
+            dst,
+            rows,
+            dim,
+            eps,
+        } => {
+            rec.layernorm(
+                r(*x)?,
+                r(*weight)?,
+                r(*bias)?,
+                r(*dst)?,
+                *rows as usize,
+                *dim as usize,
+                *eps,
+            );
+        }
         // Row-wise softmax over `dim` columns (diffusion-gemma's in-graph self-conditioning — see
         // docs/diffusion-gemma.md's Phase-B and the reference's `dg_canvas_embed`). `scale_buf`
         // (Some only on the DiffusionGemma denoise SC path — see its doc in `infr_core::graph`)

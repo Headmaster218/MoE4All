@@ -754,6 +754,34 @@ impl Backend for CpuBackend {
                         });
                     vals[dst.0 as usize] = dst_vals;
                 }
+                Op::LayerNorm {
+                    x,
+                    weight: w,
+                    bias,
+                    dst,
+                    rows,
+                    dim,
+                    eps,
+                } => {
+                    let (rows, dim) = (rows as usize, dim as usize);
+                    let xs = &vals[x.0 as usize];
+                    let ws = weight(w);
+                    let bs = weight(bias);
+                    // Mean-centred norm (ggml_norm): biased variance, eps inside the sqrt, then
+                    // `* weight + bias`. Rows are independent — spin-pool over rows like RmsNorm.
+                    let mut out = vec![0f32; rows * dim];
+                    self.pool().for_chunks_mut(&mut out, dim, 4, &|r, orow| {
+                        let xrow = &xs[r * dim..r * dim + dim];
+                        let mean = xrow.iter().sum::<f32>() / dim as f32;
+                        let var =
+                            xrow.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
+                        let s = 1.0 / (var + eps).sqrt();
+                        for i in 0..dim {
+                            orow[i] = (xrow[i] - mean) * s * ws[i] + bs[i];
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Softmax {
                     x,
                     dst,

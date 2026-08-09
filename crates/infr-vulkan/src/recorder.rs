@@ -4147,6 +4147,36 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Mean-centred LayerNorm: `y[i] = (x[i] - mean) * inversesqrt(var + eps) * w[i] + b[i]` per
+    /// row (`layernorm.comp`, `Op::LayerNorm`) — deepseek32's `indexer_k_norm`, the only non-RMS
+    /// norm in the family. One workgroup per row, like [`Self::rmsnorm`], but two cooperative
+    /// reductions instead of one (the mean has to land before the variance sum can start).
+    pub fn layernorm(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        b: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let k = self
+            .be
+            .kernel_sg("layernorm", crate::gemm::layernorm_spv(), 4, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(b), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32, // one workgroup per row (cooperative reduction)
+        );
+    }
+
     /// Like [`Self::rmsnorm`], but `x`/`y` are f16 instead of f32 (`rmsnorm.comp`'s -DF16IO build)
     /// — llama4's post-rope weightless Q/K L2-norm (`Op::QkNorm` in-place on the f16 rope scratch,
     /// `x == dst`). `w` stays f32 either way.

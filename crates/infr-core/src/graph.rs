@@ -117,6 +117,24 @@ pub enum Op {
         dim: u32,
         eps: f32,
     },
+    /// `dst = ((x - mean) / sqrt(var + eps)) * weight + bias`, normalizing over the last `dim` of
+    /// each of `rows` rows — the MEAN-CENTRED LayerNorm, llama.cpp's `LLM_NORM` (`ggml_norm` then
+    /// `ggml_mul(mw)` then `ggml_add(mb)`, see `llm_graph_context::build_norm`), as opposed to
+    /// [`Op::RmsNorm`]'s `LLM_NORM_RMS`. Two details that are silent precision bugs if got wrong,
+    /// both read off `ggml_compute_forward_norm_f32`: `var` is the BIASED estimator (`Σ(x-mean)²`
+    /// divided by `dim`, not `dim-1`), and `eps` is added to the variance INSIDE the sqrt.
+    ///
+    /// deepseek32's `indexer_k_norm` is the only mean-centred norm anywhere in the DeepSeek family
+    /// (every other one there is RMS); it always carries a bias, so `bias` is not optional.
+    LayerNorm {
+        x: TensorId,
+        weight: TensorId,
+        bias: TensorId,
+        dst: TensorId,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
     /// `dst[m, out_f] = x[m, in_f] · weightᵀ`. `weight` may be any (quantized) dtype; the backend
     /// dispatches the kernel (GEMV/GEMM/MMQ on GPU, dequant+matvec on CPU).
     Linear {
@@ -599,6 +617,7 @@ impl Op {
         match self {
             Op::RmsNorm { .. } => "RmsNorm",
             Op::RmsNormAdd { .. } => "RmsNormAdd",
+            Op::LayerNorm { .. } => "LayerNorm",
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
             Op::QkNorm { .. } => "QkNorm",
@@ -640,6 +659,13 @@ impl Op {
         match *self {
             Op::RmsNorm { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
             Op::RmsNormAdd { x, weight, dst, .. } => (vec![x, weight, dst], vec![dst]),
+            Op::LayerNorm {
+                x,
+                weight,
+                bias,
+                dst,
+                ..
+            } => (vec![x, weight, bias], vec![dst]),
             Op::Softmax {
                 x, dst, scale_buf, ..
             } => {

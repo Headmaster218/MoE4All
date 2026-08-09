@@ -1382,6 +1382,7 @@ fn op_name(op: &Op) -> &'static str {
     match op {
         Op::RmsNorm { .. } => "RmsNorm",
         Op::RmsNormAdd { .. } => "RmsNormAdd",
+        Op::LayerNorm { .. } => "LayerNorm",
         Op::Softmax { .. } => "Softmax",
         Op::Linear { .. } => "Linear",
         Op::QkNorm { .. } => "QkNorm",
@@ -2512,6 +2513,38 @@ impl MetalBackend {
                 }
                 r.vals[dst.0 as usize] = ds;
                 r.loc[dst.0 as usize] = Loc::Host;
+            }
+            // Mean-centred LayerNorm (deepseek32's `indexer_k_norm`) — the family's one non-RMS
+            // norm. One simdgroup per row, same launch shape as the 32-lane `rmsnorm_f32`; no
+            // wide/vec4 twin, since no model path emits this op on a decode-shaped row yet.
+            Op::LayerNorm {
+                x,
+                weight,
+                bias,
+                dst,
+                rows,
+                dim,
+                eps,
+            } => {
+                let (rows, dim) = (rows as usize, dim as usize);
+                let bx = self.ensure_device(r, x);
+                let bw = self.weight_buf(weight, g, bindings)?;
+                let bb = self.weight_buf(bias, g, bindings)?;
+                let bd = self.dev_dst(r, dst, rows * dim);
+                let pso = self.pipelines.get("layernorm_f32")?;
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(dim as u32).to_ne_bytes());
+                p.extend_from_slice(&eps.to_ne_bytes());
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bb.as_ref(), bd.as_ref()],
+                    1 << 3,
+                    &p,
+                    rows * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             // Row-wise softmax (diffusion-gemma's in-graph self-conditioning — see
             // docs/diffusion-gemma.md's Phase-B). UNVERIFIED on real Metal hardware — added blind,

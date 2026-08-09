@@ -1517,3 +1517,112 @@ fn moe_groups_bias_parity() {
         );
     }
 }
+
+/// Mean-centred LayerNorm reference, written from the DEFINITION rather than transcribed from any
+/// backend: per row subtract the row mean, divide by `sqrt(var + eps)`, scale by `weight`, add
+/// `bias`. `var` is the population (biased) variance — `Σ(x-mean)²` over `dim`, not `dim-1` — and
+/// `eps` is added to the variance BEFORE the square root. Those two are what llama.cpp's
+/// `ggml_compute_forward_norm_f32` pins down and where a plausible-looking variant is a silent
+/// precision bug, so the reference states them explicitly; the accumulation runs in f64 so it is
+/// an accuracy oracle for the f32 kernels too, not just a shape check.
+fn layernorm_ref(x: &[f32], w: &[f32], b: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0f32; rows * dim];
+    for r in 0..rows {
+        let row = &x[r * dim..(r + 1) * dim];
+        let mean = row.iter().map(|v| *v as f64).sum::<f64>() / dim as f64;
+        let var = row
+            .iter()
+            .map(|v| (*v as f64 - mean) * (*v as f64 - mean))
+            .sum::<f64>()
+            / dim as f64;
+        let sd = (var + eps as f64).sqrt();
+        for c in 0..dim {
+            out[r * dim + c] = (((row[c] as f64 - mean) / sd) as f32) * w[c] + b[c];
+        }
+    }
+    out
+}
+
+/// Input rows chosen so the two things that make a mean-centred norm different are OBSERVABLE:
+///
+/// * row 0 — mean ≈ 20 with a spread of ≈ ±2, so an RMS norm (which never subtracts the mean)
+///   divides by ≈ 20 where LayerNorm divides by ≈ 1.2 and the numerator differs entirely. A test
+///   whose rows were already zero-mean would pass against `Op::RmsNorm`.
+/// * row 1 — `0.5 ± 1/1024`, i.e. `var ≈ 9.54e-7` against `eps = 1e-6`: the two are the same
+///   order, so eps INSIDE the sqrt (`1/sqrt(var+eps)` ≈ 715) and eps outside it
+///   (`1/(sqrt(var)+eps)` ≈ 1023) disagree by 43% and the row decides between them.
+///
+/// The rest are ordinary mixed-sign rows. Callers pass a `dim` that is not a multiple of either
+/// GPU reduction width (256 threads on Vulkan, 32 lanes on Metal) so the strided loops' tail runs.
+fn layernorm_rows(rows: usize, dim: usize) -> Vec<f32> {
+    let mut v = vec![0f32; rows * dim];
+    for r in 0..rows {
+        for c in 0..dim {
+            v[r * dim + c] = match r {
+                0 => 20.0 + (((c * 7) % 13) as f32 - 6.0) * 0.3,
+                1 => 0.5 + (if c % 2 == 0 { 1.0 } else { -1.0 }) / 1024.0,
+                _ => (((c * 13 + r * 5) % 29) as f32 - 14.0) * 0.05,
+            };
+        }
+    }
+    v
+}
+
+/// `Op::LayerNorm` (deepseek32's `indexer_k_norm`, the DeepSeek family's only non-RMS norm):
+/// CPU backend vs the hand-written reference above, plus a CPU-vs-Vulkan cross-check when a GPU
+/// is present. `dim = 300` is a multiple of neither 256 (the Vulkan workgroup) nor 32 (the Metal
+/// simdgroup), so both reductions run a partial tail iteration.
+#[test]
+fn layernorm_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, dim) = (7usize, 300usize);
+    let eps = 1e-6f32; // deepseek32's hardcoded f_norm_eps
+
+    let mut g = Graph::new();
+    let x = g.input(f32d(rows * dim));
+    let w = g.weight(f32d(dim));
+    let b = g.weight(f32d(dim));
+    let dst = g.output(f32d(rows * dim));
+    g.push(Op::LayerNorm {
+        x,
+        weight: w,
+        bias: b,
+        dst,
+        rows: rows as u32,
+        dim: dim as u32,
+        eps,
+    });
+
+    let xi = layernorm_rows(rows, dim);
+    let wi = gen(dim, 3);
+    let bi = gen(dim, 17);
+    let ins = [(x, &xi[..])];
+    let ws = [(w, &wi[..]), (b, &bi[..])];
+
+    let c = run(&cpu, &g, &ins, &ws, dst, rows * dim);
+    let reference = layernorm_ref(&xi, &wi, &bi, rows, dim, eps);
+    println!("LayerNorm cpu-vs-ref max_err={:e}", maxerr(&c, &reference));
+
+    // Assert PER ROW, not on the whole-tensor max: a single number hides which case broke, and
+    // the mean-far-from-zero row (0) and the var≈eps row (1) are the two this test exists for.
+    // The per-row maxima cover every element, so there is no separate whole-tensor assert.
+    for r in 0..rows {
+        let (lo, hi) = (r * dim, (r + 1) * dim);
+        let e = maxerr(&c[lo..hi], &reference[lo..hi]);
+        println!("  row {r} cpu-vs-ref max_err={e:e}");
+        assert!(e < 1e-4, "LayerNorm row {r} diverges: max_err={e:e}");
+    }
+
+    if let Some(vk) = gpu() {
+        let v = run(&vk, &g, &ins, &ws, dst, rows * dim);
+        let e = maxerr(&c, &v);
+        println!("LayerNorm cpu-vs-vulkan max_err={e:e}");
+        assert!(e < 1e-4, "LayerNorm diverges on Vulkan: max_err={e:e}");
+        let e = maxerr(&v, &reference);
+        println!("LayerNorm vulkan-vs-ref max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "LayerNorm Vulkan diverges from reference: max_err={e:e}"
+        );
+    }
+}

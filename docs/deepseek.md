@@ -529,9 +529,14 @@ Traps, each of which produces silent wrongness:
   rather than `row_size(rope)`; these coincide only because both are 64 for
   V3.2. Port it as "offset = rope width" and assert it.
 - `indexer_k_norm` is a real **LayerNorm with bias** (mean-centred), the only
-  non-RMS norm anywhere in the family. **Confirmed: `infr` has no LayerNorm op**
-  — `graph.rs` carries `RmsNorm` and `RmsNormAdd` and nothing mean-centred, so
-  this is a new op on CPU, Vulkan and Metal, not a config flag.
+  non-RMS norm anywhere in the family — `graph.rs` carried `RmsNorm` and
+  `RmsNormAdd` and nothing mean-centred, so it needed a new op rather than a
+  config flag. **Done**: `Op::LayerNorm` landed on CPU, Vulkan
+  (`layernorm.comp`) and Metal (`layernorm_f32`), with `layernorm_parity` in
+  `seam_op_parity.rs` checking it against a from-definition f64 reference. The
+  arithmetic follows `ggml_compute_forward_norm_f32`: the BIASED variance
+  estimator, `eps` INSIDE the sqrt, then `* weight` then `+ bias`. Nothing emits
+  it yet — the indexer is its first caller.
 - The indexer keeps a **second, independent KV cache**: one
   `index_head_dim`-wide row per token per layer, on top of the 576-wide MLA
   cache.

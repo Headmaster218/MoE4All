@@ -515,6 +515,9 @@ fn main() {
         // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
         // f16 rope scratch — `w` stays f32).
         ("rmsnorm", "rmsnorm_f16", &["-DF16IO"]),
+        // Mean-centred LayerNorm (deepseek32's `indexer_k_norm`, Op::LayerNorm) — a separate
+        // shader, not an rmsnorm build: it needs two cooperative reductions and a bias binding.
+        ("layernorm", "layernorm", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).

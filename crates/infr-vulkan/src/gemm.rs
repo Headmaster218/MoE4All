@@ -2188,6 +2188,13 @@ pub(crate) fn rmsnorm_f16_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_f16.spv"))))
 }
+/// SPIR-V for the 256-thread subgroup mean-centred LayerNorm (`layernorm.comp`, `Op::LayerNorm`)
+/// — deepseek32's `indexer_k_norm`. Used by the recorder's `layernorm`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn layernorm_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/layernorm.spv"))))
+}
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

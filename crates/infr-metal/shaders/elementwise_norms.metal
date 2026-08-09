@@ -127,6 +127,32 @@ kernel void rmsnorm_vec4_f32(device const float4* x   [[buffer(0)]],
     for (uint i = tid; i < n4; i += 256u) dst[base + i] = x[base + i] * s * w[i];
 }
 
+// Mean-centred LayerNorm — llama.cpp's LLM_NORM (`ggml_norm`, then the weight multiply and bias
+// add of `llm_graph_context::build_norm`):
+//   mean = sum(x)/dim;  var = sum((x-mean)^2)/dim;  dst[i] = (x[i]-mean)*rsqrt(var+eps)*w[i]+b[i]
+// `var` is the BIASED estimator (divided by dim, not dim-1) and `eps` sits INSIDE the sqrt, added
+// to the variance — both read off `ggml_compute_forward_norm_f32`. One simdgroup per row like
+// `rmsnorm_f32`, but TWO `simd_sum`s: the mean must land before any variance term can be formed.
+// deepseek32's `indexer_k_norm` (`Op::LayerNorm`) is the only user — the family's one non-RMS norm.
+kernel void layernorm_f32(device const float* x   [[buffer(0)]],
+                          device const float* w   [[buffer(1)]],
+                          device const float* b   [[buffer(2)]],
+                          device float*       dst [[buffer(3)]],
+                          constant RmsParams& p   [[buffer(4)]],
+                          uint gid  [[thread_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32u;
+    if (row >= p.rows) return;
+    uint base = row * p.dim;
+    float sum = 0.0f;
+    for (uint i = lane; i < p.dim; i += 32u) sum += x[base + i];
+    float mean = simd_sum(sum) / (float)p.dim;
+    float vsum = 0.0f;
+    for (uint i = lane; i < p.dim; i += 32u) { float d = x[base + i] - mean; vsum += d * d; }
+    float s = 1.0f / sqrt(simd_sum(vsum) / (float)p.dim + p.eps);
+    for (uint i = lane; i < p.dim; i += 32u) dst[base + i] = (x[base + i] - mean) * s * w[i] + b[i];
+}
+
 // Row-wise softmax: dst[r,:] = softmax(x[r,:] * scale), one threadgroup (8 simdgroups) per row —
 // diffusion-gemma's in-graph self-conditioning (see docs/diffusion-gemma.md's Phase-B and the
 // reference's `dg_canvas_embed`). Same wide-launch shape as `rmsnorm_wide_f32` since the row width

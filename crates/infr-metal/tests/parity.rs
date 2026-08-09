@@ -2152,6 +2152,57 @@ fn rmsnorm_scalar_fallback_shape_parity() {
     check_rmsnorm_parity(1, 2049, 105);
 }
 
+/// Input rows for the LayerNorm parity check, chosen so the two things that make a mean-centred
+/// norm different are OBSERVABLE (the same battery as `infr-llama`'s `seam_op_parity`):
+///
+/// * row 0 — mean ≈ 20 with a spread of ≈ ±2, so an RMS norm (which never subtracts the mean)
+///   divides by ≈ 20 where LayerNorm divides by ≈ 1.2. Already-zero-mean rows would pass against
+///   `Op::RmsNorm` and prove nothing.
+/// * row 1 — `0.5 ± 1/1024`, i.e. `var ≈ 9.54e-7` against `eps = 1e-6`: same order, so eps inside
+///   the sqrt (scale ≈ 715) and eps outside it (≈ 1023) disagree by 43% on this row alone.
+fn layernorm_rows(rows: usize, dim: usize) -> Vec<f32> {
+    let mut v = vec![0f32; rows * dim];
+    for r in 0..rows {
+        for c in 0..dim {
+            v[r * dim + c] = match r {
+                0 => 20.0 + (((c * 7) % 13) as f32 - 6.0) * 0.3,
+                1 => 0.5 + (if c % 2 == 0 { 1.0 } else { -1.0 }) / 1024.0,
+                _ => (((c * 13 + r * 5) % 29) as f32 - 14.0) * 0.05,
+            };
+        }
+    }
+    v
+}
+
+/// `Op::LayerNorm` (deepseek32's `indexer_k_norm`) vs the CPU reference interpreter. `dim = 300`
+/// is not a multiple of the 32-lane simdgroup the kernel strides with, so the reduction's tail
+/// iteration is exercised.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn layernorm_parity() {
+    let (rows, dim) = (7usize, 300usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![dim], DType::F32));
+    let b = g.weight(TensorDesc::new(vec![dim], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
+    g.push(Op::LayerNorm {
+        x,
+        weight: w,
+        bias: b,
+        dst,
+        rows: rows as u32,
+        dim: dim as u32,
+        eps: 1e-6, // deepseek32's hardcoded f_norm_eps
+    });
+    let bound = vec![
+        (x, f32_bytes(&layernorm_rows(rows, dim))),
+        (w, f32_bytes(&rand_f32(dim, 131))),
+        (b, f32_bytes(&rand_f32(dim, 132))),
+    ];
+    assert_parity(&g, &bound, dst, rows * dim, 1e-4);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn qknorm_parity() {
