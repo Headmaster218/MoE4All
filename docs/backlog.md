@@ -998,6 +998,231 @@ sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
 seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
 constraint in their comments.
 
+### B40 — the MLA head dims are derived by formulas that underflow (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; found reviewing the
+stage-2 landing against llama.cpp `c629da5`
+
+`Config::from_gguf`'s deepseek2 branch computes
+
+```rust
+let hk_mla = key_length_mla.checked_sub(kv_lora_rank + qk_rope_dim).unwrap_or(128);
+let vhd    = value_length_mla.checked_sub(kv_lora_rank).unwrap_or(128);
+```
+
+Both subtractions **always underflow** on a real file. Verified by dumping
+`deepseek-v2-lite-chat-q4_k_m.gguf`: `key_length_mla = 192`,
+`value_length_mla = 128`, `kv_lora_rank = 512`, `rope.dimension_count = 64`. So
+`192 - 576` and `128 - 512` both yield `None`, and `head_k_mla` / `v_head_dim`
+land on the hardcoded `128` fallback. Every current DeepSeek V2/V3 wants exactly
+128 for both, so the model runs correctly — by accident, not by the formula.
+
+The reference derives them differently (`src/models/deepseek2.cpp`,
+`llama_hparams::n_embd_head_v_mla`):
+
+```
+n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope   // 192 - 64
+n_embd_head_v_mla   = n_embd_head_v_mla_impl                    // used as-is
+```
+
+Two consequences. A deepseek2-family GGUF whose `qk_nope` or `v_head_dim` is not
+128 gets silently mis-shaped attention. And a GGUF that omits
+`attention.key_length_mla` / `attention.value_length_mla` is worse: the local
+defaults are `kv_lora_rank + 64` and `kv_lora_rank`, so the subtractions yield
+`0`, the `.max(1)` clamps to **1**, and the model produces garbage with no
+error. The reference routes that case through `is_mla() == false` instead, and
+asserts `GGML_ASSERT(n_embd_head_qk_nope >= 1)` where this clamps.
+
+Fix: `head_k_mla = key_length_mla - qk_rope_dim`,
+`v_head_dim = value_length_mla`, and `bail!` rather than `.max(1)` when either
+key is absent or the result is zero.
+
+### B41 — MLA's KV row width is missing from `fork`, `seed_from` and the VRAM estimate (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
+
+MLA caches ONE `kv_lora_rank + qk_rope_dim` row per token (576 for V2-Lite) with
+no V cache. The primary allocation in `generate_dense_backend` and the graph
+declaration in the seam builder both carry a `c.deepseek2` branch for that.
+Three other places that compute the same geometry do **not**, and all of them
+fall through to `layer_n_kv(l) * layer_head_dim(l)` = `1 × 192`:
+
+- `SeamKv::fork` — allocates a third of the bytes the MLA kernels index. This is
+  the serve prefix-cache slot path, so a forked slot reads and writes past its
+  own buffer.
+- `SeamKv::seed_from` — copies `p × 192` elements where `p × 576` is one
+  prefix's worth, so a seeded slot's cache is truncated garbage.
+- `kv_bytes_estimate_fmt` — prices `2 × 192` elements per token per layer (K+V)
+  against a reality of 576 K-only, under-reserving by 1.5×. Everything
+  downstream of it (the context clamp, the resident-fit sweep) is computing from
+  that.
+
+Fix is one shared helper for "this layer's per-token KV element count", MLA
+branch included, used by all five sites — the duplication is what let three of
+them drift.
+
+**Not verified:** whether the `fork` path is reachable for a deepseek2 model in
+practice was reasoned from the code, not exercised. There is no serve test on a
+deepseek2 model.
+
+### B42 — the Vulkan and Metal MLA kernels assume an f16 KV cache, and nothing gates it (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
+
+`mla.comp`'s `kread` unpacks the cache with `unpackHalf2x16`, and
+`mla_f16kv_one` types it `device const half*`. Both are unconditional. The KV
+dtype ladder in `generate_dense_backend` will hand deepseek2 a Q8_0, turbo, bf16
+or f32 cache: `kv_q8_layout_ok` reduces to `1 × 192 % 32 == 0` for MLA, which
+passes, so `INFR_KV_TYPE=q8_0`, the legacy `kv.force_q8` alias, **and the Vulkan
+auto-q8 placement pin** all reach it. The result is a reinterpreted bit pattern
+— silent wrong output, no error.
+
+The CPU kernel is not affected: `Op::Mla`'s arm dequantizes through a `deq`
+closure covering F16/Q8_0/turbo/block quants, so a CPU oracle run stays correct
+while the GPU it is being compared against is wrong.
+
+Cheapest correct fix is to force `DType::F16` for `c.deepseek2` on the GPU
+backends and say so where the ladder makes the choice. Teaching the kernels the
+other dtypes is the larger version and nothing needs it yet.
+
+### B43 — the DeepSeek pre-tokenizer regexes diverge from the reference, and nothing tests them (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
+
+Two transcription slips in `util.rs`, found by diffing the constants against
+`llama-vocab.cpp`'s `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM` case byte for byte:
+
+- `DEEPSEEK_LLM_PRE_RES[2]` opens its quote range with `'` (U+0027 APOSTROPHE,
+  confirmed by hexdump) where the reference has `‘` (U+2018). The intended range
+  `‘-‟` is eight quote characters; `'-‟` is U+0027–U+201F, i.e. nearly the whole
+  BMP below U+2020 — digits, Hebrew, Arabic, Devanagari. Split #3 of the
+  `deepseek-llm` sequence then absorbs runs that the reference leaves for later
+  splits, changing chunk boundaries and therefore token ids on any text using a
+  script that split #2's Latin/Greek/Cyrillic class does not cover.
+- `DEEPSEEK_LLM_PRE_RES[1]` has `ℹ-ℿ` where the reference has `ℹℼ-ℿ`, adding
+  U+213A and U+213B to the letter class.
+
+`clean_spaces = false`, which the reference sets for all three DeepSeek
+pre-types, has no equivalent here at all.
+
+None of this is covered: there is no test for any DeepSeek pre-tokenizer, and
+the only DeepSeek tokenizer evidence in the tree is that V2-Lite generates
+coherent text (V2-Lite is `deepseek-v3` pre-type, so the V1 regexes above are
+exercised by nothing). `docs/deepseek.md` open question 3 — whether N successive
+`Isolated` splits reproduce llama.cpp's sequential `unicode_regex_split` — is
+still genuinely open, while `build_multi_split_seq`'s doc comment now states the
+equivalence as settled. Either verify it against `llama-tokenize` token ids on
+the same text and keep the comment, or soften the comment.
+
+### B44 — the deepseek2 loader ignores GGUF knobs the reference reads (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; none of these changes
+V2-Lite output, all were checked against the dumped GGUF
+
+Four values where infr hardcodes or drops what llama.cpp reads. Each is correct
+for every DeepSeek shipped so far and wrong for the first model that differs:
+
+- **YaRN `beta_fast` / `beta_slow`** are hardcoded 32 and 1 in the `yarn_ff`
+  ramp. The V2-Lite GGUF **carries** `rope.scaling.yarn_beta_fast = 32` and
+  `yarn_beta_slow = 1`, so the ramp is right today purely because the file
+  agrees with the defaults.
+- **`rope.scaling.attn_factor`** is never read. The reference applies it as
+  `cparams.yarn_attn_factor *= hparams.rope_attn_factor` before the deepseek2
+  builder cancels the interpolation adjustment out, so a GGUF that sets it gets
+  a different `mla_scale`.
+- **`expert_gating_func == 3`** (softmax-over-selected-weights) falls into the
+  `_ =>` arm and silently becomes plain `Softmax`. That is a different function,
+  not a default — it should refuse to load.
+- **`is_lite`** keeps the layer-count heuristic (`n_layer == 27 || 26`) ORed
+  with the `blk.0.attn_q.weight` presence test. `docs/deepseek.md` § Stage 2
+  says to port the presence test and drop the heuristic; as written a 27-layer
+  non-lite deepseek2 model misdetects and loads the wrong Q path.
+
+Also in this class, but Vulkan-only: `moe_topk.comp`'s weight pass computes
+`mx2` (the unbiased-logit max over the whole selection) and then only uses it in
+the softmax-no-renorm branch. The `norm_w` branch still calls `score_of`, which
+reads the shared `glmax` — set from the **first pick alone**. Under
+renormalization the shift cancels, so this is an overflow hazard and a dead
+local rather than a wrong answer, but the two branches should agree on one max.
+
+### B45 — the MLA kernels' array bounds are hardcoded to V2/V3 dims (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
+
+`mla.comp` declares `shared float sq[576]` and `shared float sv[512]`;
+`attention.metal`'s `mla_f16kv_one` declares `float q_full[576]` and
+`float vacc[512]`. Both are sized for `kv_lora_rank = 512`, `qk_rope_dim = 64`
+and neither the shaders nor the recorder/exec dispatch asserts that the incoming
+`Op::Mla` fits. A deepseek2-family model with a wider latent overruns shared
+memory on Vulkan and a private array on Metal. Add the bound check on the host
+side, where it can fail loudly with the actual dims.
+
+Two smaller things in the same files, both cosmetic but both misleading to the
+next reader: `mla.comp` still carries the `#ifdef NO_SDPA` bisect block from the
+RDNA3 hang hunt (no build variant defines it — see `build.rs`, which builds only
+`mla` and `mla_ff`), and its dot-loop comment claims "KEY_LEN ≤ 576 < 2\*128",
+which is not true and not what makes the strided loop correct. `Recorder::mla`'s
+doc says "one workgroup per token; 128 lanes cover all heads" — the dispatch is
+`rows * n_head`, one workgroup per (token, head), as the shader header correctly
+states.
+
+### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek coverage · **Blocked on:** nothing; stated as
+gaps, not as defects
+
+`docs/deepseek.md`'s Stage 2 checklist is closed, and the end-to-end evidence
+behind it is real (coherent V2-Lite output, the CPU golden, cosine 0.9955
+CPU-vs-Vulkan, the YaRN numeric check at 228 and 4560 tokens). These are the
+places that evidence does not reach:
+
+- **`mla_parity` is not an independent oracle.** Its "hand-written CPU
+  reference" transcribes the same index formulas the `Op::Mla` CPU arm uses
+  (`wk[off + i + j*qk_nope]`, `wv[off + a + o*kv_lora]`). It catches an
+  implementation slip and cannot catch a weight-orientation error — the
+  orientation bug that `6adb2de` fixed was found by the V2-Lite coherence test,
+  not by this. `docs/deepseek.md` calls it "the one that matters… the only cheap
+  check that survives into stages 3–4", which overstates what it can do. A real
+  oracle would build full MHA from the unabsorbed `wkv_b` and compare against
+  the absorbed path.
+- **Ring wrap is untested everywhere.** Every MLA test runs
+  `cache_cap_rows >= kv_len`, so neither the CPU arm's `j % cap_rows` nor the
+  GPU kernels' `(lo + jj) % cap` has ever executed a wrap. Same for
+  `AttnMask::SlidingWindow` and `AttnMask::Canvas` on the MLA path — only
+  `Causal` at `pos = 0` is covered.
+- **Group-limited routing has never run on a real model.** V2-Lite ships
+  `expert_group_count = 1`, so the `n_expert_groups > 1` branch in both the CPU
+  arm and `moe_topk.comp` is exercised only by `moe_groups_bias_parity`'s
+  synthetic dims. `exp_probs_b` is the same story — V2-Lite carries no bias
+  tensor, so the load path (`b6812b2`) is unexercised end to end. Both are the
+  V3-only pieces stage 3 inherits, which is exactly where the plan says a bug
+  gets expensive.
+- **Every deepseek test `need_model!`-skips** without the GGUF in the HF cache,
+  which is the house pattern, but it does mean none of the above runs in CI.
+
+### B47 — the MLA kernels are correct and slow (2026-08-09)
+
+**Tag:** CR-2026-08-09 deepseek perf · **Blocked on:** nothing measured; no
+DeepSeek throughput number exists yet, so these are read-off-the-code
+observations, not a regression
+
+`docs/deepseek.md` says the plan is about correctness only and makes no
+throughput claim. Three things a first perf pass should start from:
+
+- `mla.comp` **recomputes the entire `key_len` QK dot in pass 2** — the softmax
+  pass repeats the reduction the max pass already did, doubling QK work. An
+  online softmax, or staging the pass-1 scores, removes it.
+- `mla_f16kv_one` on Metal is **one thread per (token, head)** carrying
+  `q_full[576] + vacc[512]` = 1088 private floats, and loops `key_len` and
+  `kv_lora_rank` serially. That is precisely the per-thread working-set shape
+  `mla.comp`'s header blames for the RDNA3 device loss that forced the Vulkan
+  kernel cooperative; on Metal it will spill rather than hang, but it is the
+  slowest possible arrangement. Port the 128-lane cooperative structure over.
+- `moe_topk.comp`'s group-routing pre-phase runs **serially on thread 0** over
+  all experts, with `float gscore[64]` and `bool chosen[64]` private arrays,
+  before every top-k. Inert while `n_expert_groups <= 1`, so it costs nothing
+  today and everything on V3.
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
