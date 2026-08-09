@@ -998,42 +998,50 @@ sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
 seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
 constraint in their comments.
 
-### B44 — `moe_topk.comp`'s two weight branches disagree on their softmax max (2026-08-09)
+### B48 — a failing op leaks its in-flight Vulkan recorder on most error paths (2026-08-10)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; not a wrong answer
-today, which is why it was not fixed with the rest of the entry
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; surfaced by the B45
+guard, which was the first `lower_op` error path that could fire in a real run
 
-The kernel's weight pass computes `mx2` — the unbiased-logit max over the whole
-selection — and then uses it only in the softmax-no-renorm branch. The `norm_w`
-branch still calls `score_of`, which reads the shared `glmax`, set from the
-**first pick alone**. With a router bias or group masking in play the first pick
-need not be the largest unbiased logit, so `exp(logit - glmax)` can be shifted
-the wrong way. Under renormalization the shift cancels algebraically, so this is
-an overflow hazard and a dead local rather than an observable defect — but the
-two branches should agree on one max. The rest of this entry (the loader's
-dropped `beta_fast`/`beta_slow`/`attn_factor`, the silently-approximated
-`expert_gating_func = 3`, the `is_lite` layer-count heuristic) landed.
+`Recorder` has no `Drop` by design — a segment is finished or explicitly
+discarded — so an early `?` out of `execute_static`'s op loop drops it with its
+descriptor pools still allocated, and the validation layer reports them as
+leaked objects at `vkDestroyDevice`. The two `lower_op` call sites now route
+through `abort_segment`, which discards the partial recorder and folds any
+teardown error into the message. The other `?` exits inside the same loop —
+`resolve`, `execute_paged_moe`, `stage_dense_linear`, `finish_nowait` — still
+drop it.
 
-### B45 — the MLA kernels' array bounds are hardcoded to V2/V3 dims (2026-08-09)
+None of them fires in a healthy run, which is why this was invisible until an op
+gained a reachable refusal. Fix is mechanical (same `abort_segment` wrapper);
+the reason it was not done with B45 is that each site returns from a different
+place in the loop and the change wants its own review. Verified live: before the
+`abort_segment` fix the guard's own test printed
+`VUID-vkDestroyDevice-device-05137 … has 2 leaked objects` under
+`VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`; after it, that run is
+clean.
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
+### B49 — `moe_topk.comp`'s full-softmax denominator shifts by the selection max (2026-08-10)
 
-`mla.comp` declares `shared float sq[576]` and `shared float sv[512]`;
-`attention.metal`'s `mla_f16kv_one` declares `float q_full[576]` and
-`float vacc[512]`. Both are sized for `kv_lora_rank = 512`, `qk_rope_dim = 64`
-and neither the shaders nor the recorder/exec dispatch asserts that the incoming
-`Op::Mla` fits. A deepseek2-family model with a wider latent overruns shared
-memory on Vulkan and a private array on Metal. Add the bound check on the host
-side, where it can fail loudly with the actual dims.
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; no model in the tree
+reaches the combination
 
-Two smaller things in the same files, both cosmetic but both misleading to the
-next reader: `mla.comp` still carries the `#ifdef NO_SDPA` bisect block from the
-RDNA3 hang hunt (no build variant defines it — see `build.rs`, which builds only
-`mla` and `mla_ff`), and its dot-loop comment claims "KEY_LEN ≤ 576 < 2\*128",
-which is not true and not what makes the strided loop correct. `Recorder::mla`'s
-doc says "one workgroup per token; 128 lanes cover all heads" — the dispatch is
-`rows * n_head`, one workgroup per (token, head), as the shader header correctly
-states.
+The softmax-without-renormalization branch sums `exp(logit - mx)` over **all**
+experts, but `mx` is the max over the SELECTED experts only. Selection is by
+`sel_score + ssel_adj`, so with a router bias or a group mask the largest raw
+logit can belong to an expert that was not selected — and that term overflows to
+`+inf`, taking the whole denominator with it and zeroing every weight. The CPU
+oracle (`Op::MoeFfn` in `infr-cpu`) shifts by the max over all experts and does
+not have this.
+
+Unreachable today: it needs softmax gating AND `norm_topk_prob = false` AND a
+bias or group mask. V2-Lite has the first two but neither of the last (one
+expert group, no `exp_probs_b`), and there the selection max IS the global max,
+so the branch is exact. V3 is sigmoid-gated and never enters it. Fix is to
+compute the denominator's shift over all experts rather than reusing the
+selection max — cheap, but it wants a test that can only be written
+synthetically, and B44's sibling fix already carries the one synthetic case.
+Re-check when a softmax-gated grouped model appears.
 
 ### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
 

@@ -962,6 +962,18 @@ where
     Ok(())
 }
 
+/// Capacity of `mla.comp`'s `shared float sq[]` — the absorbed+roped query, `kv_lora_rank +
+/// qk_rope_dim` wide.
+///
+/// MIRRORS `#define MLA_MAX_KEY_LEN` in `shaders/mla.comp`. The shader cannot reject a dispatch
+/// that does not fit, so the `Op::Mla` arm of [`lower_op`] checks it here; `mla_shader_bounds_match_host`
+/// parses the shader source and fails if the two ever drift.
+pub(crate) const MLA_MAX_KEY_LEN: u32 = 576;
+
+/// Capacity of `mla.comp`'s `shared float sv[]` — the V accumulator, `kv_lora_rank` wide.
+/// MIRRORS `#define MLA_MAX_KV_LORA_RANK` in `shaders/mla.comp`; see [`MLA_MAX_KEY_LEN`].
+pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
+
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
 #[allow(clippy::too_many_arguments)]
@@ -4325,6 +4337,21 @@ fn lower_op(
             theta,
             freq_factors,
         } => {
+            // `mla.comp` holds the absorbed query and the V accumulator in FIXED-size shared
+            // arrays, so an over-wide latent would write past them (shared memory is not bounds
+            // checked — the symptom is corrupted neighbours or a lost device, not a fault). The
+            // kernel cannot refuse the work; this is the last place that can, and it still has the
+            // dims to name.
+            if *kv_lora_rank + *qk_rope_dim > MLA_MAX_KEY_LEN
+                || *kv_lora_rank > MLA_MAX_KV_LORA_RANK
+            {
+                return Err(be(format!(
+                    "vulkan Op::Mla: dims exceed mla.comp's fixed shared arrays — kv_lora_rank \
+                     {kv_lora_rank} + qk_rope_dim {qk_rope_dim} = key_len {} (max \
+                     {MLA_MAX_KEY_LEN}), kv_lora_rank max {MLA_MAX_KV_LORA_RANK}",
+                    *kv_lora_rank + *qk_rope_dim
+                )));
+            }
             let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
             let cap = graph.desc(*k_cache).numel();
             let cache_cap_rows = (cap / key_len.max(1)) as u32;
@@ -4648,6 +4675,25 @@ fn record_decode_replay(
     })
 }
 
+/// Tear down the segment being recorded when an op fails to lower, and return the error to
+/// propagate.
+///
+/// `Recorder` has no `Drop` (see `Recorder::free_transient`), so a bare `return Err(..)` out of the
+/// op loop leaves that segment's descriptor pools alive and `vkDestroyDevice` reports them —
+/// VUID-vkDestroyDevice-device-05137, which is what the validation layer prints if this is skipped.
+/// The partial recording is waste (the forward is being abandoned), so it is discarded rather than
+/// submitted, exactly as the shutdown abort in the loop does. Already-submitted segments need
+/// nothing here: `PendingSegment`'s `Drop` drains and frees them.
+///
+/// A teardown failure is folded into the message instead of replacing it — the original error is
+/// why the forward stopped, and it is the one worth reading.
+fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
+    match rec.map(|partial| partial.discard()) {
+        Some(Err(de)) => be(format!("{e} (partial segment teardown also failed: {de})")),
+        _ => e,
+    }
+}
+
 /// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Used for prefill
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
@@ -4841,7 +4887,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     .is_some_and(|s| s.is_streamed(wid));
                 if streamed {
                     let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
-                    lower_op(
+                    if let Err(e) = lower_op(
                         be_,
                         graph,
                         op_idx,
@@ -4857,12 +4903,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         &mut pool,
                         &mut mmv_memo,
                         Some(arena_addr),
-                    )?;
+                    ) {
+                        return Err(abort_segment(rec.take(), e));
+                    }
                     continue;
                 }
             }
         }
-        lower_op(
+        if let Err(e) = lower_op(
             be_,
             graph,
             op_idx,
@@ -4878,7 +4926,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut pool,
             &mut mmv_memo,
             None,
-        )?;
+        ) {
+            return Err(abort_segment(rec.take(), e));
+        }
     }
     for c in dyn_args.drain(..) {
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
@@ -5766,6 +5816,135 @@ mod tests {
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
+
+    /// Read a `#define <name> <integer>` back out of GLSL source. Panics when the define is gone —
+    /// a shader that no longer states its bound is exactly the drift this guards.
+    fn glsl_define_u32(src: &str, name: &str) -> u32 {
+        for line in src.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("#define ") else {
+                continue;
+            };
+            let mut it = rest.split_whitespace();
+            if it.next() == Some(name) {
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| panic!("`#define {name}` has no value"));
+                return v
+                    .parse()
+                    .unwrap_or_else(|e| panic!("`#define {name} {v}` is not a u32: {e}"));
+            }
+        }
+        panic!("`#define {name}` not found in the shader source");
+    }
+
+    /// `MLA_MAX_KEY_LEN` / `MLA_MAX_KV_LORA_RANK` are the host's copy of `mla.comp`'s shared-array
+    /// sizes, and nothing in the toolchain ties the two together — the shader could be re-sized
+    /// and the `Op::Mla` guard would go on enforcing the old number (rejecting work the kernel now
+    /// fits, or, the dangerous direction, admitting dims that overrun `sq`/`sv`). Read the numbers
+    /// back out of the shader text and compare, and check the arrays are still declared THROUGH the
+    /// defines rather than with bare literals that this test could not see.
+    #[test]
+    fn mla_shader_bounds_match_host() {
+        let src = include_str!("../shaders/mla.comp");
+        assert_eq!(
+            glsl_define_u32(src, "MLA_MAX_KEY_LEN"),
+            MLA_MAX_KEY_LEN,
+            "mla.comp's sq[] capacity drifted from the host guard"
+        );
+        assert_eq!(
+            glsl_define_u32(src, "MLA_MAX_KV_LORA_RANK"),
+            MLA_MAX_KV_LORA_RANK,
+            "mla.comp's sv[] capacity drifted from the host guard"
+        );
+        assert!(
+            src.contains("shared float sq[MLA_MAX_KEY_LEN];"),
+            "mla.comp's sq[] is no longer sized by MLA_MAX_KEY_LEN"
+        );
+        assert!(
+            src.contains("shared float sv[MLA_MAX_KV_LORA_RANK];"),
+            "mla.comp's sv[] is no longer sized by MLA_MAX_KV_LORA_RANK"
+        );
+    }
+
+    /// B45 guard: `mla.comp` keeps its whole working state in FIXED-size shared arrays, so an
+    /// `Op::Mla` whose latent does not fit must be refused BEFORE dispatch — a shared-memory
+    /// overrun has no diagnostic (corrupted neighbours or a lost device, not a fault). Both halves
+    /// of the condition get a case, and the boundary dims — `key_len` exactly `MLA_MAX_KEY_LEN` —
+    /// must still RUN: a guard that rejected everything would satisfy the negative cases alone.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn mla_oversized_dims_are_refused() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        // One token, one head, a 2-wide nope/value part so only the latent dims vary.
+        let (rows, n_head, qk_nope, v_head_dim) = (1usize, 1usize, 2usize, 2usize);
+        let run = |kv_lora: usize, qk_rope: usize| -> Result<()> {
+            let key_len = kv_lora + qk_rope;
+            let q_head_dim = qk_nope + qk_rope;
+            let mut g = Graph::new();
+            let q = g.input(TensorDesc::new(vec![rows, n_head, q_head_dim], DType::F32));
+            let k_cache = g.input(TensorDesc::new(vec![rows, key_len], DType::F16));
+            let wk_b = g.weight(TensorDesc::new(vec![n_head, kv_lora, qk_nope], DType::F32));
+            let wv_b = g.weight(TensorDesc::new(
+                vec![n_head, kv_lora, v_head_dim],
+                DType::F32,
+            ));
+            let dst = g.output(TensorDesc::new(vec![rows, n_head, v_head_dim], DType::F32));
+            g.push(Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows: rows as u32,
+                kv_len: rows as u32,
+                n_head: n_head as u32,
+                q_head_dim: q_head_dim as u32,
+                kv_lora_rank: kv_lora as u32,
+                qk_nope_dim: qk_nope as u32,
+                qk_rope_dim: qk_rope as u32,
+                v_head_dim: v_head_dim as u32,
+                scale: 1.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                theta: 10000.0,
+                freq_factors: None,
+            });
+            // Zeroed buffers of the exact shapes — the boundary case really dispatches over them.
+            let qb = be_.alloc(rows * n_head * q_head_dim * 4, BufferUsage::Activations)?;
+            let kb = be_.alloc(rows * key_len * 2, BufferUsage::Activations)?;
+            let wkb = be_.alloc(n_head * kv_lora * qk_nope * 4, BufferUsage::Weights)?;
+            let wvb = be_.alloc(n_head * kv_lora * v_head_dim * 4, BufferUsage::Weights)?;
+            let db = be_.alloc(rows * n_head * v_head_dim * 4, BufferUsage::Activations)?;
+            let plan = be_.compile(&g)?;
+            let mut bind = Bindings::new();
+            bind.bind(q, qb.as_ref());
+            bind.bind(k_cache, kb.as_ref());
+            bind.bind(wk_b, wkb.as_ref());
+            bind.bind(wv_b, wvb.as_ref());
+            bind.bind(dst, db.as_ref());
+            be_.execute(plan.as_ref(), &bind)
+        };
+        // Positive control at the exact boundary: kv_lora_rank fills `sv[]` and key_len fills
+        // `sq[]` to the last element.
+        let rope = (MLA_MAX_KEY_LEN - MLA_MAX_KV_LORA_RANK) as usize;
+        run(MLA_MAX_KV_LORA_RANK as usize, rope).expect("boundary dims must still dispatch");
+        // kv_lora_rank past `sv[]` (and, with it, key_len past `sq[]`).
+        let e = run(1024, 64).unwrap_err().to_string();
+        assert!(
+            e.contains("kv_lora_rank 1024") && e.contains("key_len 1088"),
+            "oversized kv_lora_rank: unexpected error text: {e}"
+        );
+        // key_len past `sq[]` while kv_lora_rank alone still fits `sv[]`.
+        let e = run(MLA_MAX_KV_LORA_RANK as usize, 128)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("key_len 640"),
+            "oversized key_len: unexpected error text: {e}"
+        );
+    }
 
     /// The OLD static split-K chunk formula, spelled out inline (the else-branch decode/prefill
     /// policy, before the count cap and before it moved to `infr_core::tier`). Kept as the

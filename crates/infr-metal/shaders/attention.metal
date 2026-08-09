@@ -786,6 +786,16 @@ template [[host_name("attnvec_dyn_f16kv_hd256")]] kernel attnvec_dyn_t attnvec_d
 // Metal f16 cache is `device half*` (one half per element), so unlike mla.comp there is no
 // u32-packed-pair bit unpacking: index it directly. The body lives in the shared inline
 // `mla_f16kv_one`; `mla_f16kv_ff` is the YaRN freq_factors twin (see below).
+//
+// `mla_f16kv_one`'s two scratch arrays are FIXED-size private arrays sized for DeepSeek V2/V3
+// (kv_lora_rank 512, qk_rope_dim 64), and they are the kernel's only hard dimension limits. A
+// kernel cannot reject a dispatch, so the HOST enforces them: `MLA_MAX_KEY_LEN` /
+// `MLA_MAX_KV_LORA_RANK` in `src/exec.rs` mirror these two numbers, are asserted equal to them by
+// the `mla_shader_bounds_match_host` test (which parses THIS file), and the `Op::Mla` arm fails
+// loudly with the offending dims before encoding.
+constant constexpr uint MLA_MAX_KEY_LEN = 576;       // kv_lora_rank + qk_rope_dim
+constant constexpr uint MLA_MAX_KV_LORA_RANK = 512;  // kv_lora_rank
+
 struct MlaParams {
     uint rows;
     uint kv_len;
@@ -821,7 +831,7 @@ static inline void mla_f16kv_one(device const float* q,
     // ── Load q for this head ──
     uint q_off = gid * p.q_head_dim;
     // Scratch: q_full after absorption + rope
-    float q_full[576]; // max key_len (512+64)
+    float q_full[MLA_MAX_KEY_LEN];
     // q_nope → absorb via wk_b[h]^T (wk_b[h] is the per-head [qk_nope_dim, kv_lora_rank] file
     // matrix; element [i][j] with i the FAST (row) dim: flat = i + j*qk_nope_dim)
     uint wk_off = h * p.kv_lora_rank * p.qk_nope_dim;
@@ -894,7 +904,7 @@ static inline void mla_f16kv_one(device const float* q,
 
     // ── Pass 2: softmax + V accumulation ──
     float sumw = 0.0f;
-    float vacc[512]; // max kv_lora_rank
+    float vacc[MLA_MAX_KV_LORA_RANK];
     for (uint di = 0u; di < p.kv_lora_rank; di++) { vacc[di] = 0.0f; }
     for (uint jj = 0u; jj < n_keys; jj++) {
         uint jr = (lo + jj) % cap;

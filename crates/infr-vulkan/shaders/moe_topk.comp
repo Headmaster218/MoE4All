@@ -40,7 +40,6 @@ layout(binding = 3) writeonly buffer WB { float wts[]; };
 
 shared float sval[128];
 shared uint sidx[128];
-shared float glmax;
 // Per-expert score adjustment: bias (if has_bias) + group mask. Thread 0 pre-fills.
 // 256 experts → 1 KB shared — well within limits.
 shared float ssel_adj[256];
@@ -48,9 +47,15 @@ shared float ssel_adj[256];
 // n_expert headroom: 128 lanes * 8 chunks = 1024 experts.
 #define MAX_CHUNKS 8u
 
-float score_of(float logit) {
+// WEIGHT score for one expert's (unbiased) logit. `mx` is the softmax shift and is used by the
+// softmax branch only: it must be >= every logit this is called with, or `exp` overflows. It is a
+// PARAMETER rather than a shared global because both weight branches below must shift by the SAME
+// max — a per-branch max is how they silently disagreed. Renormalization cancels the shift
+// algebraically, so the disagreement surfaces only as overflow: `exp` past ~88.7 is +inf and
+// inf/inf is NaN. Regression test `moe_topk_softmax_bias_shifts_by_selection_max` (recorder.rs).
+float score_of(float logit, float mx) {
     if (pc.gating == 0u) {
-        return exp(logit - glmax);
+        return exp(logit - mx);
     } else if (pc.gating == 1u) {
         return 1.0 / (1.0 + exp(-logit));
     } else {
@@ -181,17 +186,6 @@ void main() {
         winner = min(winner, pc.n_expert - 1u);
         if (t == 0u) {
             ids[obase + k] = winner;
-            if (k == 0u) {
-                // glmax = max of original (unbiased) logits among the selection set — used for
-                // softmax stability in the weight-computation pass (thread 0 below).
-                float mx = -1e30;
-                for (uint kk = 0u; kk <= k; kk++) {
-                    uint we = ids[obase + kk];
-                    float vl = logits[lbase + we]; // unbiased
-                    if (vl > mx) { mx = vl; }
-                }
-                glmax = mx;
-            }
         }
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
             if (t + c * 128u == winner) { taken[c] = true; }
@@ -201,33 +195,41 @@ void main() {
 
     // ── Weight computation (uses ORIGINAL unbiased logits) ──
     if (t == 0u) {
-        // Recompute glmax over ALL selected experts (unbiased logit max for softmax stability).
-        float mx2 = -1e30;
+        // The softmax shift: max of the ORIGINAL (unbiased) logits over the whole selection, so
+        // every `exp(logit - mx)` below has a non-positive exponent. The selection max is what the
+        // no-renorm branch needs anyway, and it is what BOTH branches now use — the selection loop
+        // does not compute one at all, because a max over the first pick alone need not dominate
+        // the rest once a router bias or group mask puts a non-maximal logit first.
+        //
+        // The CPU oracle (`Op::MoeFfn` in infr-cpu) shifts by the max over ALL experts instead;
+        // that is a different constant, but every use of the shift here divides two `exp`s that
+        // carry it, so it cancels — the two backends agree numerically either way.
+        float mx = -1e30;
         for (uint k = 0u; k < pc.n_used; k++) {
             float vl = logits[lbase + ids[obase + k]];
-            if (vl > mx2) { mx2 = vl; }
-        }
-        float wsum_sel = 0.0;
-        for (uint k = 0u; k < pc.n_used; k++) {
-            wsum_sel += score_of(logits[lbase + ids[obase + k]]);
+            if (vl > mx) { mx = vl; }
         }
         if (pc.norm_w != 0u) {
+            float wsum_sel = 0.0;
+            for (uint k = 0u; k < pc.n_used; k++) {
+                wsum_sel += score_of(logits[lbase + ids[obase + k]], mx);
+            }
             wsum_sel = max(wsum_sel, 1e-20);
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = score_of(logits[lbase + ids[obase + k]]) / wsum_sel * pc.scale;
+                wts[obase + k] = score_of(logits[lbase + ids[obase + k]], mx) / wsum_sel * pc.scale;
             }
         } else if (pc.gating == 0u) {
             float full_sum = 0.0;
             for (uint e = 0u; e < pc.n_expert; e++) {
-                full_sum += exp(logits[lbase + e] - mx2);
+                full_sum += exp(logits[lbase + e] - mx);
             }
             full_sum = max(full_sum, 1e-20);
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = exp(logits[lbase + ids[obase + k]] - mx2) / full_sum * pc.scale;
+                wts[obase + k] = exp(logits[lbase + ids[obase + k]] - mx) / full_sum * pc.scale;
             }
         } else {
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = score_of(logits[lbase + ids[obase + k]]) * pc.scale;
+                wts[obase + k] = score_of(logits[lbase + ids[obase + k]], mx) * pc.scale;
             }
         }
     }

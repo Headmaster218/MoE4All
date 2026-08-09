@@ -4010,8 +4010,13 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per token; 128 lanes cover all
-    /// heads. The KV cache holds ONE row per token (key_length = kv_lora_rank + qk_rope_dim wide).
+    /// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per (token, head) — the dispatch
+    /// below is `rows * n_head` groups — and that group's 128 lanes cooperate on the one head's
+    /// math. The KV cache holds ONE row per token (key_length = kv_lora_rank + qk_rope_dim wide).
+    ///
+    /// The kernel's `sq`/`sv` shared arrays are fixed-size; the caller must have checked the dims
+    /// against `adapter::MLA_MAX_KEY_LEN` / `adapter::MLA_MAX_KV_LORA_RANK` (the `Op::Mla` arm of
+    /// `lower_op` does) — a wider latent overruns shared memory here with no diagnostic.
     #[allow(clippy::too_many_arguments)]
     pub fn mla(
         &self,
@@ -12090,6 +12095,80 @@ mod tests {
             // m>1 (per-input-row decompose), out_f 64-aligned, non-zero offset.
             assert_chunk_parity(&be, dtype, 3, 512, 256, 64, 8192);
         }
+    }
+
+    /// B44: `moe_topk`'s softmax weight branch must shift by the max unbiased logit over the WHOLE
+    /// selection, not over the first pick.
+    ///
+    /// A router bias breaks the "first pick carries the largest logit" assumption — selection is by
+    /// `logit + bias`, weights come from the unbiased logits — so the first pick can be an expert
+    /// whose logit is far BELOW another selected one. Shifting by the first pick's logit then makes
+    /// `exp(logit - shift)` overflow to `+inf`, and under `norm_w` the renormalization divides
+    /// `inf/inf` = NaN. The gap here (0 vs 100) is synthetic: this is the hazard the shift protects
+    /// against, made large enough to actually cross f32's `exp` range (~88.7), so the test fails
+    /// with a NaN weight on a kernel that shifts by the wrong max.
+    ///
+    /// Under renormalization the shift otherwise cancels algebraically, so a moderate gap could not
+    /// tell the two maxima apart at all.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_softmax_bias_shifts_by_selection_max() {
+        let be = be_with(|_| {});
+        let (n_tokens, n_expert, n_used) = (1usize, 8usize, 2usize);
+        // Expert 0 wins selection on bias alone; expert 1 carries the far larger logit.
+        let mut logits = vec![-50.0f32; n_expert];
+        logits[0] = 0.0;
+        logits[1] = 100.0;
+        let mut bias = vec![0.0f32; n_expert];
+        bias[0] = 200.0;
+        let blog = upf32(&be, &logits);
+        let bbias = upf32(&be, &bias);
+        let bids = be
+            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+            .unwrap();
+        let bwts = be
+            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.moe_topk(
+            blog.as_ref(),
+            bids.as_ref(),
+            bwts.as_ref(),
+            bbias.as_ref(),
+            n_tokens,
+            n_expert,
+            n_used,
+            1.0,  // scale
+            0,    // gating: softmax
+            true, // norm_w — the branch that used to read the first-pick max
+            true, // has_bias
+            0,    // n_expert_groups
+            0,    // n_expert_groups_used
+        );
+        rec.finish().unwrap();
+        let mut idb = vec![0u8; n_tokens * n_used * 4];
+        be.download(bids.as_ref(), &mut idb).unwrap();
+        let ids: &[u32] = bytemuck::cast_slice(&idb);
+        let mut wb = vec![0u8; n_tokens * n_used * 4];
+        be.download(bwts.as_ref(), &mut wb).unwrap();
+        let wts: &[f32] = bytemuck::cast_slice(&wb);
+        // Selection is by `logit + bias`: 200 beats 100 beats the rest.
+        assert_eq!(ids, &[0u32, 1], "selection order changed: {ids:?}");
+        // Weights come from the UNBIASED logits, renormalized over the selection: expert 1's 100
+        // dominates expert 0's 0, so the pair is ~[0, 1].
+        assert!(
+            wts.iter().all(|w| w.is_finite()),
+            "softmax overflowed — weights {wts:?} (shift taken from the first pick, not the \
+             selection max)"
+        );
+        assert!(
+            wts[0] < 1e-30,
+            "expected ~0 for the low-logit pick: {wts:?}"
+        );
+        assert!(
+            (wts[1] - 1.0).abs() < 1e-6,
+            "expected ~1 for the high-logit pick: {wts:?}"
+        );
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the

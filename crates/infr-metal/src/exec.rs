@@ -18,6 +18,19 @@ use metal::{
 use std::ffi::c_void;
 use std::sync::Arc;
 
+/// Capacity of `mla_f16kv_one`'s `float q_full[]` — the absorbed+roped query, `kv_lora_rank +
+/// qk_rope_dim` wide.
+///
+/// MIRRORS `constant constexpr uint MLA_MAX_KEY_LEN` in `shaders/attention.metal`. The kernel
+/// cannot reject a dispatch that does not fit, so the `Op::Mla` arm checks it here;
+/// `mla_shader_bounds_match_host` parses the shader source and fails if the two ever drift.
+pub(crate) const MLA_MAX_KEY_LEN: u32 = 576;
+
+/// Capacity of `mla_f16kv_one`'s `float vacc[]` — the V accumulator, `kv_lora_rank` wide.
+/// MIRRORS `constant constexpr uint MLA_MAX_KV_LORA_RANK` in `shaders/attention.metal`; see
+/// [`MLA_MAX_KEY_LEN`].
+pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
+
 /// A quantized weight in the compact FACTORED device form (`infr_gguf::dequant::Factored`):
 /// bit-packed codes (4/6/8-bit, chosen by the format's max code), one `(sc, m)` i16 pair per
 /// 16-element block, and one `(d, dmin)` f16 pair per `dblk` elements, so
@@ -40,6 +53,56 @@ mod tests {
     use infr_core::backend::{Backend, Buffer, BufferUsage};
     use infr_core::graph::{AttnMask, Graph};
     use infr_core::tensor::TensorDesc;
+
+    /// Read a `constant constexpr uint <name> = <integer>;` back out of MSL source. Panics when the
+    /// declaration is gone — a shader that no longer states its bound is exactly the drift this
+    /// guards.
+    fn msl_constexpr_u32(src: &str, name: &str) -> u32 {
+        let prefix = format!("constant constexpr uint {name} = ");
+        for line in src.lines() {
+            let Some(rest) = line.trim_start().strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let v = rest
+                .split(';')
+                .next()
+                .unwrap_or_else(|| panic!("`{name}` declaration has no value"))
+                .trim();
+            return v
+                .parse()
+                .unwrap_or_else(|e| panic!("`{name} = {v}` is not a u32: {e}"));
+        }
+        panic!("`constant constexpr uint {name}` not found in the shader source");
+    }
+
+    /// `MLA_MAX_KEY_LEN` / `MLA_MAX_KV_LORA_RANK` are the host's copy of `mla_f16kv_one`'s scratch
+    /// array sizes, and nothing in the toolchain ties the two together — the shader could be
+    /// re-sized and the `Op::Mla` guard would go on enforcing the old number (rejecting work the
+    /// kernel now fits, or, the dangerous direction, admitting dims that overrun `q_full`/`vacc`).
+    /// Read the numbers back out of the shader text and compare, and check the arrays are still
+    /// declared THROUGH the constants rather than with bare literals this test could not see.
+    #[test]
+    fn mla_shader_bounds_match_host() {
+        let src = include_str!("../shaders/attention.metal");
+        assert_eq!(
+            msl_constexpr_u32(src, "MLA_MAX_KEY_LEN"),
+            MLA_MAX_KEY_LEN,
+            "attention.metal's q_full[] capacity drifted from the host guard"
+        );
+        assert_eq!(
+            msl_constexpr_u32(src, "MLA_MAX_KV_LORA_RANK"),
+            MLA_MAX_KV_LORA_RANK,
+            "attention.metal's vacc[] capacity drifted from the host guard"
+        );
+        assert!(
+            src.contains("float q_full[MLA_MAX_KEY_LEN];"),
+            "attention.metal's q_full[] is no longer sized by MLA_MAX_KEY_LEN"
+        );
+        assert!(
+            src.contains("float vacc[MLA_MAX_KV_LORA_RANK];"),
+            "attention.metal's vacc[] is no longer sized by MLA_MAX_KV_LORA_RANK"
+        );
+    }
 
     #[test]
     fn replay_gpu_decode_op_eligibility() {
@@ -5181,6 +5244,20 @@ impl MetalBackend {
                          halves — no unpacked/dense path yet)"
                             .into(),
                     ));
+                }
+                // `mla_f16kv_one` keeps the absorbed query and the V accumulator in FIXED-size
+                // private arrays, and an MSL array write past its end is undefined — corrupted
+                // neighbouring stack slots, not a fault. The kernel cannot refuse the work; this
+                // is the last place that can, and it still has the dims to name.
+                if kv_lora_rank + qk_rope_dim > MLA_MAX_KEY_LEN
+                    || kv_lora_rank > MLA_MAX_KV_LORA_RANK
+                {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::Mla: dims exceed mla_f16kv's fixed scratch arrays — \
+                         kv_lora_rank {kv_lora_rank} + qk_rope_dim {qk_rope_dim} = key_len {} \
+                         (max {MLA_MAX_KEY_LEN}), kv_lora_rank max {MLA_MAX_KV_LORA_RANK}",
+                        kv_lora_rank + qk_rope_dim
+                    )));
                 }
                 let key_len = (kv_lora_rank + qk_rope_dim) as usize;
                 let cache_cap_rows = (g.desc(k_cache).numel() / key_len.max(1)) as u32;

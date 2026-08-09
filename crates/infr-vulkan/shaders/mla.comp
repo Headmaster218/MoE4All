@@ -58,8 +58,16 @@ layout(binding = 4) writeonly buffer DB { float dst[]; };
 
 // The absorbed+roped query (key_len wide) and the V accumulator (kv_lora_rank wide) — shared
 // across the workgroup's 128 lanes, each lane owning a strided slice.
-shared float sq[576];
-shared float sv[512];
+//
+// These two capacities are the kernel's only hard dimension limits (sized for DeepSeek V2/V3:
+// kv_lora_rank 512, qk_rope_dim 64). A shader cannot reject a dispatch, so the HOST enforces them:
+// `MLA_MAX_KEY_LEN` / `MLA_MAX_KV_LORA_RANK` in `src/adapter.rs` mirror these two numbers, are
+// asserted equal to them by the `mla_shader_bounds_match_host` test (which parses THIS file), and
+// the `Op::Mla` arm fails loudly with the offending dims before dispatching.
+#define MLA_MAX_KEY_LEN 576
+#define MLA_MAX_KV_LORA_RANK 512
+shared float sq[MLA_MAX_KEY_LEN];
+shared float sv[MLA_MAX_KV_LORA_RANK];
 // Scratch for the tree reduction in `reduce_sum` (one slot per lane).
 shared float red[128];
 
@@ -144,13 +152,6 @@ void main() {
     hi = min(hi, pc.kv_len);
     uint n_keys = hi - lo;
     uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
-#ifdef NO_SDPA
-    // TEMP DEBUG: skip the SDPA entirely — zero the output. Used to bisect a GPU hang.
-    for (uint d = tid; d < pc.v_head_dim; d += 128u) {
-        dst[d_off + d] = 0.0;
-    }
-    return;
-#endif
     if (n_keys == 0u) {
         // No keys to attend to: zero output.
         for (uint d = tid; d < pc.v_head_dim; d += 128u) {
@@ -168,7 +169,11 @@ void main() {
     float lmax = -3.0e38;
     for (uint jj = 0u; jj < n_keys; jj++) {
         uint jr = (lo + jj) % cap;
-        // Lane's slice of Σ_di sq[di] * K[jr][di]: di = tid, tid+128, ... (KEY_LEN ≤ 576 < 2*128).
+        // Lane's slice of Σ_di sq[di] * K[jr][di]: di = tid, tid+128, ... The stride-128 slices
+        // partition [0, KEY_LEN) exactly, and each lane ACCUMULATES its whole slice into its own
+        // red[] slot, so the loop is correct for any KEY_LEN — the trip count per lane is just
+        // ceil(KEY_LEN/128) (5 at KEY_LEN=576), and a lane whose slice is empty leaves red[tid]=0,
+        // the identity for the sum tree below.
         red[tid] = 0.0;
         for (uint di = tid; di < KEY_LEN; di += 128u) {
             red[tid] += sq[di] * kread(jr, di);
