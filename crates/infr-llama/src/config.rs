@@ -197,15 +197,22 @@ pub struct Config {
     /// DeepSeek V2+ MLA: MLA key length = kv_lora_rank + qk_rope_dim (576 for V3). The width of
     /// the single cached KV row per token.
     pub key_length: usize,
-    /// DeepSeek V2+ MLA: per-head Q nope dim (128 for V3). Derived from wq_b output shape /
-    /// n_head — NOT a GGUF key. `0` for non-DeepSeek2 models.
+    /// DeepSeek V2+ MLA: llama.cpp's `n_embd_head_qk_nope` — the per-head NOPE (non-rotary) width
+    /// of Q and of `wk_b`'s dim-0, 128 for V2-Lite and V3. Derived as
+    /// `attention.key_length_mla - rope.dimension_count`, matching `src/models/deepseek2.cpp`.
+    /// Despite the name this is NOT llama.cpp's `n_embd_head_k_mla` (the FULL per-head key width,
+    /// 192 for V2-Lite, which is the `attention.key_length_mla` key itself). `0` for
+    /// non-DeepSeek2 models.
     pub head_k_mla: usize,
-    /// DeepSeek V2+ MLA: per-head V output dim (128 for V3). Derived from wv_b shape — NOT a GGUF
-    /// key. `0` for non-DeepSeek2 models.
+    /// DeepSeek V2+ MLA: per-head V output dim (128 for V2-Lite and V3) — llama.cpp's
+    /// `n_embd_head_v_mla`, which is the `attention.value_length_mla` GGUF key used as-is
+    /// (`llama_hparams::n_embd_head_v_mla`). `0` for non-DeepSeek2 models.
     pub v_head_dim: usize,
     /// DeepSeek V2+ MoE: gating function enum (1=softmax, 2=sigmoid, 3=softmax-on-weights,
-    /// 4=sqrt-softplus). Parsed from `expert_gating_func`, mapped to `MoeConfig::gating`.
-    /// `0` for non-DeepSeek2 models (and V1, which hardcodes softmax).
+    /// 4=sqrt-softplus). Parsed from `expert_gating_func`, mapped to `MoeConfig::gating` — 3 has
+    /// no `MoeGating` and is REFUSED at load rather than approximated by 1.
+    /// `0` (the key absent, softmax by llama.cpp's compatibility rule) for non-DeepSeek2 models
+    /// (and V1, which hardcodes softmax).
     pub expert_gating_func: u8,
     /// DeepSeek V2+ MoE: group-limited routing — number of expert groups. `0` = no grouping.
     pub n_expert_groups: usize,
@@ -229,6 +236,19 @@ pub struct Config {
     /// `context_length` when the GGUF omits it (llama.cpp's `n_ctx_orig_yarn` fallback). NOT
     /// `n_ctx_train`: this GGUF sets `context_length = 163840` while the yarn ramp must use 4096.
     pub rope_scaling_orig_ctx: usize,
+    /// DeepSeek V2+ YaRN: `rope.scaling.attn_factor` — llama.cpp's `hparams.rope_attn_factor`,
+    /// folded into `cparams.yarn_attn_factor` (`llama-context.cpp`) BEFORE the deepseek2 builder
+    /// recovers `attn_factor_org` from it, so it lands inside the squared mscale of the MLA score
+    /// scale. `1.0` (llama.cpp's default) when the GGUF omits it.
+    pub rope_attn_factor: f32,
+    /// DeepSeek V2+ YaRN: `rope.scaling.yarn_beta_fast` — the ramp's high-frequency corner, the
+    /// `beta_fast` of `ggml_rope_yarn_corr_dims`'s START dim. Defaults to llama.cpp's
+    /// `llama_hparams::yarn_beta_fast`.
+    pub rope_yarn_beta_fast: f32,
+    /// DeepSeek V2+ YaRN: `rope.scaling.yarn_beta_slow` — the ramp's low-frequency corner, the
+    /// `beta_slow` of `ggml_rope_yarn_corr_dims`'s END dim. Defaults to llama.cpp's
+    /// `llama_hparams::yarn_beta_slow`.
+    pub rope_yarn_beta_slow: f32,
     /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
     /// tensor presence, not GGUF key.
     pub is_lite: bool,
@@ -481,12 +501,21 @@ impl Config {
                 let kvlr = meta_u64(g, &mk("attention.kv_lora_rank"))
                     .context("deepseek2.attention.kv_lora_rank")?
                     as usize;
-                let klen = meta_u64(g, &mk("attention.key_length_mla"))
-                    .unwrap_or((kvlr + 64) as u64) as usize;
-                let vlen =
-                    meta_u64(g, &mk("attention.value_length_mla")).unwrap_or(kvlr as u64) as usize;
+                // No default for either MLA length: `head_k_mla`/`v_head_dim` below are derived
+                // from them and nothing downstream can detect a wrong guess — the attention is
+                // simply mis-shaped. llama.cpp routes a GGUF that carries neither key through
+                // `is_mla() == false` (`llama_hparams::is_mla`), the unabsorbed `wkv_b` path,
+                // which infr does not implement; refuse the file instead.
+                let key_mla = mk("attention.key_length_mla");
+                let Some(klen) = meta_u64(g, &key_mla) else {
+                    bail!("{key_mla} missing: deepseek2 MLA head dims cannot be derived");
+                };
+                let value_mla = mk("attention.value_length_mla");
+                let Some(vlen) = meta_u64(g, &value_mla) else {
+                    bail!("{value_mla} missing: deepseek2 MLA head dims cannot be derived");
+                };
                 let qkr = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(64) as usize;
-                (qlr, kvlr, klen, vlen, qkr)
+                (qlr, kvlr, klen as usize, vlen as usize, qkr)
             } else {
                 (0, 0, 0, 0, 0)
             };
@@ -513,7 +542,17 @@ impl Config {
         // ramp), `rope.scaling.factor` (the interpolate factor; llama.cpp defaults it to 1.0 when
         // the GGUF omits it), and `rope.scaling.original_context_length` (the corr_dim ramp's
         // `n_ctx_orig`; falls back to `context_length` like llama.cpp's `n_ctx_orig_yarn`).
-        let (rope_scaling_yarn, rope_scaling_factor, rope_scaling_orig_ctx) = if deepseek2 {
+        // `rope.scaling.attn_factor` and the two `yarn_beta_*` ramp corners come along here: all
+        // three feed the same YaRN arithmetic (`seam::runner`'s `yarn_ff` ramp and `mla_scale`),
+        // and their defaults are llama.cpp's `llama_hparams` initializers.
+        let (
+            rope_scaling_yarn,
+            rope_scaling_factor,
+            rope_scaling_orig_ctx,
+            rope_attn_factor,
+            rope_yarn_beta_fast,
+            rope_yarn_beta_slow,
+        ) = if deepseek2 {
             let yarn = g
                 .metadata()
                 .get(&mk("rope.scaling.type"))
@@ -523,17 +562,32 @@ impl Config {
             let orig_ctx = meta_u64(g, &mk("rope.scaling.original_context_length"))
                 .or_else(|| meta_u64(g, &mk("context_length")))
                 .unwrap_or(8192) as usize;
-            (yarn, factor, orig_ctx)
+            let attn_factor = meta_f64(g, &mk("rope.scaling.attn_factor")).unwrap_or(1.0) as f32;
+            let beta_fast = meta_f64(g, &mk("rope.scaling.yarn_beta_fast")).unwrap_or(32.0) as f32;
+            let beta_slow = meta_f64(g, &mk("rope.scaling.yarn_beta_slow")).unwrap_or(1.0) as f32;
+            (yarn, factor, orig_ctx, attn_factor, beta_fast, beta_slow)
         } else {
-            (false, 1.0, 0)
+            (false, 1.0, 0, 1.0, 32.0, 1.0)
         };
-        // Derived MLA dims from tensor shapes (NOT GGUF keys).
+        // MLA per-head dims, derived exactly as the reference does (`src/models/deepseek2.cpp`
+        // and `llama_hparams::n_embd_head_v_mla`): the NOPE width is the full per-head key width
+        // minus the rotary part, and the V width is the GGUF key verbatim.
         let (head_k_mla, v_head_dim) = if deepseek2 {
-            let hk_mla = key_length_mla
-                .checked_sub(kv_lora_rank + qk_rope_dim)
-                .unwrap_or(128);
-            let vhd = value_length_mla.checked_sub(kv_lora_rank).unwrap_or(128);
-            (hk_mla.max(1), vhd.max(1))
+            // Mirrors `GGML_ASSERT(n_embd_head_qk_nope >= 1)`. Clamping instead would hand the
+            // MLA kernels a one-wide NOPE dim and produce garbage with no error.
+            let Some(qk_nope) = key_length_mla
+                .checked_sub(qk_rope_dim)
+                .filter(|nope| *nope > 0)
+            else {
+                bail!(
+                    "deepseek2 MLA: attention.key_length_mla ({key_length_mla}) must exceed \
+                     rope.dimension_count ({qk_rope_dim})"
+                );
+            };
+            if value_length_mla == 0 {
+                bail!("deepseek2 MLA: attention.value_length_mla must be positive");
+            }
+            (qk_nope, value_length_mla)
         } else {
             (0, 0)
         };
@@ -580,13 +634,12 @@ impl Config {
             );
         }
         let n_layer = n_layer_all - n_layer_nextn;
-        // DeepSeek2 "lite" detection (tensor-presence test + heuristic fallback). Must run after
-        // n_layer is known.
-        let is_lite = deepseek2 && {
-            g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight")
-                || n_layer == 27
-                || n_layer == 26
-        };
+        // DeepSeek2 "lite" detection: the direct `wq` is present instead of the
+        // wq_a/q_a_norm/wq_b LoRA triple — a tensor-presence test, per docs/deepseek.md § Stage 2.
+        // llama.cpp reaches the same conclusion from a layer-count table
+        // (`deepseek2.cpp::load_arch_hparams`), which misclassifies any other model with the same
+        // depth; the tensors say it directly.
+        let is_lite = deepseek2 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = positive_model_dimension(
             &mk("attention.head_count"),
@@ -665,10 +718,16 @@ impl Config {
                 )
             } else if deepseek2 {
                 let gating = match expert_gating_func {
-                    1 => infr_core::graph::MoeGating::Softmax,
+                    // 0 = the key is absent, which llama.cpp documents as softmax for the old
+                    // V2/V2.5 GGUFs written before `expert_gating_func` existed
+                    // (`deepseek2.cpp::load_arch_hparams`).
+                    0 | 1 => infr_core::graph::MoeGating::Softmax,
                     2 => infr_core::graph::MoeGating::Sigmoid,
                     4 => infr_core::graph::MoeGating::SqrtSoftplus,
-                    _ => infr_core::graph::MoeGating::Softmax, // type 0/3 default to softmax
+                    // 3 is softmax-over-SELECTED-weights, a different function from 1 — there is
+                    // no `MoeGating` for it, and falling back to plain softmax would silently
+                    // change the routing rather than fail.
+                    other => bail!("deepseek2.expert_gating_func = {other} is not supported"),
                 };
                 (
                     gating,
@@ -1004,6 +1063,9 @@ impl Config {
             rope_scaling_yarn,
             rope_scaling_factor,
             rope_scaling_orig_ctx,
+            rope_attn_factor,
+            rope_yarn_beta_fast,
+            rope_yarn_beta_slow,
             is_lite,
         })
     }
@@ -1030,6 +1092,46 @@ mod tests {
         push_str(bytes, key);
         push_u32(bytes, 4); // GGUF_TYPE_UINT32
         push_u32(bytes, value);
+    }
+
+    /// Minimal `deepseek2` GGUF carrying exactly `keys` (each prefixed with `deepseek2.`) plus a
+    /// single dummy tensor — enough for `Config::from_gguf` to reach the MLA and MoE parses.
+    fn deepseek2_fixture(keys: &[(&str, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, 1); // tensor count
+        push_u64(&mut bytes, 1 + keys.len() as u64);
+
+        push_str(&mut bytes, "general.architecture");
+        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
+        push_str(&mut bytes, "deepseek2");
+        for (key, value) in keys {
+            push_u32_metadata(&mut bytes, &format!("deepseek2.{key}"), *value);
+        }
+
+        push_str(&mut bytes, "token_embd.weight");
+        push_u32(&mut bytes, 2);
+        push_u64(&mut bytes, 8);
+        push_u64(&mut bytes, 1);
+        push_u32(&mut bytes, 0); // F32
+        push_u64(&mut bytes, 0);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&[0; 32]);
+        bytes
+    }
+
+    /// Write a fixture to a uniquely-named temp file, parse it, and clean up.
+    fn config_from_fixture(name: &str, bytes: &[u8]) -> Result<Config> {
+        let path =
+            std::env::temp_dir().join(format!("infr-llama-{name}-{}.gguf", std::process::id()));
+        std::fs::write(&path, bytes).expect("write GGUF fixture");
+        let gguf = Gguf::open(&path).expect("open GGUF fixture");
+        let parsed = Config::from_gguf(&gguf);
+        std::fs::remove_file(path).expect("remove GGUF fixture");
+        parsed
     }
 
     fn gemma4_zero_kv_heads_fixture() -> Vec<u8> {
@@ -1089,5 +1191,144 @@ mod tests {
             err.to_string(),
             "gemma4.attention.head_count_kv[0] must be positive"
         );
+    }
+
+    /// A deepseek2 GGUF that parses, with V2-Lite's real MLA geometry. `block_count` is 27 — the
+    /// depth llama.cpp's heuristic reads as "lite" — while the fixture carries no
+    /// `blk.0.attn_q.weight`, so `is_lite` must stay false.
+    const DEEPSEEK2_BASE_KEYS: &[(&str, u32)] = &[
+        ("attention.kv_lora_rank", 512),
+        ("attention.key_length_mla", 192),
+        ("attention.value_length_mla", 128),
+        ("rope.dimension_count", 64),
+        ("block_count", 27),
+        ("embedding_length", 2048),
+        ("attention.head_count", 16),
+        ("feed_forward_length", 10944),
+        ("expert_count", 64),
+        ("expert_used_count", 6),
+    ];
+
+    fn deepseek2_keys_with(extra: &[(&str, u32)]) -> Vec<(&'static str, u32)> {
+        let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+        for (key, value) in extra {
+            match keys.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1 = *value,
+                None => panic!("{key} is not a base key; add it to DEEPSEEK2_BASE_KEYS"),
+            }
+        }
+        keys
+    }
+
+    /// B40: the MLA head dims come from the reference's derivation — `key_length_mla` minus the
+    /// rope width for the NOPE dim, `value_length_mla` verbatim for V.
+    #[test]
+    fn deepseek2_mla_head_dims_match_reference() {
+        let cfg = config_from_fixture("ds2-mla-dims", &deepseek2_fixture(DEEPSEEK2_BASE_KEYS))
+            .expect("base deepseek2 fixture must parse");
+        assert_eq!(cfg.head_k_mla, 192 - 64, "qk_nope = key_length_mla - n_rot");
+        assert_eq!(cfg.v_head_dim, 128, "v_head_dim = value_length_mla");
+        assert!(!cfg.is_lite, "27 layers alone must not imply lite");
+    }
+
+    #[test]
+    fn deepseek2_missing_key_length_mla_is_refused() {
+        let keys: Vec<_> = DEEPSEEK2_BASE_KEYS
+            .iter()
+            .filter(|(k, _)| *k != "attention.key_length_mla")
+            .copied()
+            .collect();
+        let Err(err) = config_from_fixture("ds2-no-klen", &deepseek2_fixture(&keys)) else {
+            panic!("a deepseek2 GGUF without key_length_mla must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek2.attention.key_length_mla missing: deepseek2 MLA head dims cannot be derived"
+        );
+    }
+
+    #[test]
+    fn deepseek2_missing_value_length_mla_is_refused() {
+        let keys: Vec<_> = DEEPSEEK2_BASE_KEYS
+            .iter()
+            .filter(|(k, _)| *k != "attention.value_length_mla")
+            .copied()
+            .collect();
+        let Err(err) = config_from_fixture("ds2-no-vlen", &deepseek2_fixture(&keys)) else {
+            panic!("a deepseek2 GGUF without value_length_mla must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek2.attention.value_length_mla missing: deepseek2 MLA head dims cannot be derived"
+        );
+    }
+
+    /// Mirrors `GGML_ASSERT(n_embd_head_qk_nope >= 1)`: an all-rotary key width leaves no NOPE
+    /// dim, which the old code clamped to 1 and ran anyway.
+    #[test]
+    fn deepseek2_zero_qk_nope_is_refused() {
+        let keys = deepseek2_keys_with(&[("attention.key_length_mla", 64)]);
+        let Err(err) = config_from_fixture("ds2-zero-nope", &deepseek2_fixture(&keys)) else {
+            panic!("key_length_mla == rope.dimension_count must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek2 MLA: attention.key_length_mla (64) must exceed rope.dimension_count (64)"
+        );
+    }
+
+    #[test]
+    fn deepseek2_zero_v_head_dim_is_refused() {
+        let keys = deepseek2_keys_with(&[("attention.value_length_mla", 0)]);
+        let Err(err) = config_from_fixture("ds2-zero-vhd", &deepseek2_fixture(&keys)) else {
+            panic!("value_length_mla == 0 must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek2 MLA: attention.value_length_mla must be positive"
+        );
+    }
+
+    /// B44: gating 3 is softmax-over-selected-weights, which infr has no `MoeGating` for — it
+    /// must refuse rather than quietly route as plain softmax. 0 (key absent) stays softmax.
+    #[test]
+    fn deepseek2_unsupported_expert_gating_func_is_refused() {
+        let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+        keys.push(("expert_gating_func", 3));
+        let Err(err) = config_from_fixture("ds2-gating3", &deepseek2_fixture(&keys)) else {
+            panic!("expert_gating_func = 3 must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek2.expert_gating_func = 3 is not supported"
+        );
+
+        let cfg = config_from_fixture("ds2-gating0", &deepseek2_fixture(DEEPSEEK2_BASE_KEYS))
+            .expect("absent expert_gating_func must still parse");
+        assert_eq!(
+            cfg.moe.expect("deepseek2 fixture has experts").gating,
+            infr_core::graph::MoeGating::Softmax,
+        );
+    }
+
+    /// B44: the YaRN knobs the loader used to drop. Absent keys must land on llama.cpp's own
+    /// `llama_hparams` defaults, present ones must be read.
+    #[test]
+    fn deepseek2_yarn_knobs_are_read() {
+        let cfg = config_from_fixture("ds2-yarn-default", &deepseek2_fixture(DEEPSEEK2_BASE_KEYS))
+            .expect("base deepseek2 fixture must parse");
+        assert_eq!(cfg.rope_attn_factor, 1.0);
+        assert_eq!(cfg.rope_yarn_beta_fast, 32.0);
+        assert_eq!(cfg.rope_yarn_beta_slow, 1.0);
+
+        let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+        keys.push(("rope.scaling.yarn_beta_fast", 16));
+        keys.push(("rope.scaling.yarn_beta_slow", 2));
+        keys.push(("rope.scaling.attn_factor", 3));
+        let cfg = config_from_fixture("ds2-yarn-set", &deepseek2_fixture(&keys))
+            .expect("deepseek2 fixture with YaRN knobs must parse");
+        assert_eq!(cfg.rope_yarn_beta_fast, 16.0);
+        assert_eq!(cfg.rope_yarn_beta_slow, 2.0);
+        assert_eq!(cfg.rope_attn_factor, 3.0);
     }
 }

@@ -223,8 +223,10 @@ fn session_stable(
         let corr = |nr: f32| {
             n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * c.rope_theta.ln())
         };
-        let start = (corr(32.0).floor() as i64).clamp(0, (n_rot as i64) - 1);
-        let end = (corr(1.0).ceil() as i64).clamp(0, (n_rot as i64) - 1);
+        // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), read
+        // from the GGUF — V2-Lite happens to carry llama.cpp's own defaults.
+        let start = (corr(c.rope_yarn_beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
+        let end = (corr(c.rope_yarn_beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
         let span = ((end - start) as f32).max(0.001);
         Some(
             (0..(n_rot as usize / 2))
@@ -2446,8 +2448,11 @@ pub(crate) fn generate_dense_backend(
                 // `yarn_attn_factor = 1/(1 + 0.1*ln(1/freq_scale))` when log_mul != 0 (so
                 // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). The rope vector mscale
                 // is folded in here (both q_pe and k_pe get the same vector scale → a score-level
-                // square); the kernels only need the frequency divisors. Plain (non-yarn) MLA
-                // keeps `1/sqrt(qk_nope + qk_rope)`.
+                // square); the kernels only need the frequency divisors. The GGUF's
+                // `rope.scaling.attn_factor` multiplies `attn_factor` BEFORE `attn_factor_org` is
+                // recovered from it, matching llama-context.cpp's
+                // `cparams.yarn_attn_factor *= hparams.rope_attn_factor`. Plain (non-yarn) MLA has
+                // `freq_scale = 1`, so the same expression collapses to `attn_factor²/sqrt(...)`.
                 let mla_scale = if c.rope_scaling_yarn {
                     // fs_inv = ln(1/freq_scale) = ln(factor) — NOT ln(1/factor) (that is the
                     // negative; the GGUF's factor=40 gives +ln 40 = +3.6889).
@@ -2457,11 +2462,13 @@ pub(crate) fn generate_dense_backend(
                     } else {
                         1.0
                     };
-                    let attn_factor_org = yarn_attn_factor * (1.0 + 0.1 * fs_inv);
+                    let attn_factor = yarn_attn_factor * c.rope_attn_factor;
+                    let attn_factor_org = attn_factor * (1.0 + 0.1 * fs_inv);
                     let mscale = attn_factor_org * (1.0 + 0.1 * c.rope_yarn_log_mul * fs_inv);
                     mscale * mscale / ((qk_nope + qk_rope) as f32).sqrt()
                 } else {
-                    1.0 / ((qk_nope + qk_rope) as f32).sqrt()
+                    let mscale = c.rope_attn_factor;
+                    mscale * mscale / ((qk_nope + qk_rope) as f32).sqrt()
                 };
                 g.push(Op::Mla {
                     q: mla_q,

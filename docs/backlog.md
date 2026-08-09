@@ -998,45 +998,6 @@ sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
 seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
 constraint in their comments.
 
-### B40 — the MLA head dims are derived by formulas that underflow (2026-08-09)
-
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; found reviewing the
-stage-2 landing against llama.cpp `c629da5`
-
-`Config::from_gguf`'s deepseek2 branch computes
-
-```rust
-let hk_mla = key_length_mla.checked_sub(kv_lora_rank + qk_rope_dim).unwrap_or(128);
-let vhd    = value_length_mla.checked_sub(kv_lora_rank).unwrap_or(128);
-```
-
-Both subtractions **always underflow** on a real file. Verified by dumping
-`deepseek-v2-lite-chat-q4_k_m.gguf`: `key_length_mla = 192`,
-`value_length_mla = 128`, `kv_lora_rank = 512`, `rope.dimension_count = 64`. So
-`192 - 576` and `128 - 512` both yield `None`, and `head_k_mla` / `v_head_dim`
-land on the hardcoded `128` fallback. Every current DeepSeek V2/V3 wants exactly
-128 for both, so the model runs correctly — by accident, not by the formula.
-
-The reference derives them differently (`src/models/deepseek2.cpp`,
-`llama_hparams::n_embd_head_v_mla`):
-
-```
-n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope   // 192 - 64
-n_embd_head_v_mla   = n_embd_head_v_mla_impl                    // used as-is
-```
-
-Two consequences. A deepseek2-family GGUF whose `qk_nope` or `v_head_dim` is not
-128 gets silently mis-shaped attention. And a GGUF that omits
-`attention.key_length_mla` / `attention.value_length_mla` is worse: the local
-defaults are `kv_lora_rank + 64` and `kv_lora_rank`, so the subtractions yield
-`0`, the `.max(1)` clamps to **1**, and the model produces garbage with no
-error. The reference routes that case through `is_mla() == false` instead, and
-asserts `GGML_ASSERT(n_embd_head_qk_nope >= 1)` where this clamps.
-
-Fix: `head_k_mla = key_length_mla - qk_rope_dim`,
-`v_head_dim = value_length_mla`, and `bail!` rather than `.max(1)` when either
-key is absent or the result is zero.
-
 ### B41 — MLA's KV row width is missing from `fork`, `seed_from` and the VRAM estimate (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
@@ -1114,36 +1075,21 @@ still genuinely open, while `build_multi_split_seq`'s doc comment now states the
 equivalence as settled. Either verify it against `llama-tokenize` token ids on
 the same text and keep the comment, or soften the comment.
 
-### B44 — the deepseek2 loader ignores GGUF knobs the reference reads (2026-08-09)
+### B44 — `moe_topk.comp`'s two weight branches disagree on their softmax max (2026-08-09)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; none of these changes
-V2-Lite output, all were checked against the dumped GGUF
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; not a wrong answer
+today, which is why it was not fixed with the rest of the entry
 
-Four values where infr hardcodes or drops what llama.cpp reads. Each is correct
-for every DeepSeek shipped so far and wrong for the first model that differs:
-
-- **YaRN `beta_fast` / `beta_slow`** are hardcoded 32 and 1 in the `yarn_ff`
-  ramp. The V2-Lite GGUF **carries** `rope.scaling.yarn_beta_fast = 32` and
-  `yarn_beta_slow = 1`, so the ramp is right today purely because the file
-  agrees with the defaults.
-- **`rope.scaling.attn_factor`** is never read. The reference applies it as
-  `cparams.yarn_attn_factor *= hparams.rope_attn_factor` before the deepseek2
-  builder cancels the interpolation adjustment out, so a GGUF that sets it gets
-  a different `mla_scale`.
-- **`expert_gating_func == 3`** (softmax-over-selected-weights) falls into the
-  `_ =>` arm and silently becomes plain `Softmax`. That is a different function,
-  not a default — it should refuse to load.
-- **`is_lite`** keeps the layer-count heuristic (`n_layer == 27 || 26`) ORed
-  with the `blk.0.attn_q.weight` presence test. `docs/deepseek.md` § Stage 2
-  says to port the presence test and drop the heuristic; as written a 27-layer
-  non-lite deepseek2 model misdetects and loads the wrong Q path.
-
-Also in this class, but Vulkan-only: `moe_topk.comp`'s weight pass computes
-`mx2` (the unbiased-logit max over the whole selection) and then only uses it in
-the softmax-no-renorm branch. The `norm_w` branch still calls `score_of`, which
-reads the shared `glmax` — set from the **first pick alone**. Under
-renormalization the shift cancels, so this is an overflow hazard and a dead
-local rather than a wrong answer, but the two branches should agree on one max.
+The kernel's weight pass computes `mx2` — the unbiased-logit max over the whole
+selection — and then uses it only in the softmax-no-renorm branch. The `norm_w`
+branch still calls `score_of`, which reads the shared `glmax`, set from the
+**first pick alone**. With a router bias or group masking in play the first pick
+need not be the largest unbiased logit, so `exp(logit - glmax)` can be shifted
+the wrong way. Under renormalization the shift cancels algebraically, so this is
+an overflow hazard and a dead local rather than an observable defect — but the
+two branches should agree on one max. The rest of this entry (the loader's
+dropped `beta_fast`/`beta_slow`/`attn_factor`, the silently-approximated
+`expert_gating_func = 3`, the `is_lite` layer-count heuristic) landed.
 
 ### B45 — the MLA kernels' array bounds are hardcoded to V2/V3 dims (2026-08-09)
 
