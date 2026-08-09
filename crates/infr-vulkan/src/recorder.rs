@@ -4039,12 +4039,15 @@ impl<'a> Recorder<'a> {
         window: u32,
         theta: f32,
         cache_cap_rows: u32,
+        // `AttnMask::Canvas { lo }`'s lower bound. Read by the shader on `mask_type == 2` only;
+        // pass 0 for the causal and sliding-window masks, which derive their own `lo`.
+        canvas_lo: u32,
         // YaRN per-pair frequency divisors for the internal q_pe rope (`qk_rope_dim/2` floats) —
         // binds at 5 and selects the `mla_ff` kernel build (the divisor is a compile-time
         // presence; the plain `mla` build has no ff binding).
         freq_factors: Option<&dyn Buffer>,
     ) {
-        let mut push = [0u8; 56];
+        let mut push = [0u8; 60];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
@@ -4059,9 +4062,10 @@ impl<'a> Recorder<'a> {
         push[44..48].copy_from_slice(&window.to_ne_bytes());
         push[48..52].copy_from_slice(&theta.to_ne_bytes());
         push[52..56].copy_from_slice(&cache_cap_rows.to_ne_bytes());
+        push[56..60].copy_from_slice(&canvas_lo.to_ne_bytes());
         match freq_factors {
             Some(ff) => {
-                let k = self.be.kernel("mla_ff", crate::gemm::mla_ff_spv(), 6, 56);
+                let k = self.be.kernel("mla_ff", crate::gemm::mla_ff_spv(), 6, 60);
                 self.dispatch_wide(
                     k,
                     &[
@@ -4082,7 +4086,7 @@ impl<'a> Recorder<'a> {
                 );
             }
             None => {
-                let k = self.be.kernel("mla", crate::gemm::mla_spv(), 5, 56);
+                let k = self.be.kernel("mla", crate::gemm::mla_spv(), 5, 60);
                 self.dispatch_wide(
                     k,
                     &[
@@ -12262,6 +12266,7 @@ mod tests {
             0, // window
             theta,
             cap_rows as u32, // cache_cap_rows — ring capacity > kv_len
+            0,               // canvas_lo — unused by the causal mask
             None,            // freq_factors — no YaRN divisors in the reference test
         );
         rec.finish().unwrap();
@@ -12343,6 +12348,8 @@ mod tests {
         /// 0 = causal, 1 = sliding window, 2 = canvas (see `mla.comp`'s `pc.mask_type`).
         mask_type: u32,
         window: u32,
+        /// `AttnMask::Canvas { lo }`'s lower bound — read on `mask_type == 2` only.
+        canvas_lo: u32,
     }
 
     /// `mla.comp` over the axes `mla_matches_cpu_reference` never moves: a WRAPPED ring cache
@@ -12394,16 +12401,14 @@ mod tests {
         let q_at = |i: usize| ((i * 5 + 3) % 11) as f32 / 8.0 - 0.5;
         // Which ABSOLUTE positions a query at `abs` may attend to — stated from what each mask
         // MEANS, not from the shader's expression for it.
-        let attends = |mask_type: u32, window: u32, abs: usize, kv_len: usize| {
-            match mask_type {
+        let attends = |c: &MlaCase, abs: usize| {
+            match c.mask_type {
                 // Every earlier position plus its own.
-                0 => 0..(abs + 1).min(kv_len),
+                0 => 0..(abs + 1).min(c.kv_len),
                 // The `window` most recent positions, its own included.
-                1 => (abs + 1).saturating_sub(window as usize)..(abs + 1).min(kv_len),
-                // One fixed span for every row. The push constant carries no canvas `lo` (the
-                // shader hardcodes 0), so `lo = 0` is the only canvas this path can express —
-                // see B46 for the `lo > 0` divergence against the CPU arm.
-                _ => 0..kv_len,
+                1 => (abs + 1).saturating_sub(c.window as usize)..(abs + 1).min(c.kv_len),
+                // One fixed span for EVERY row — `abs` is not consulted at all.
+                _ => c.canvas_lo as usize..c.kv_len,
             }
         };
 
@@ -12416,6 +12421,7 @@ mod tests {
                 cap: 2,
                 mask_type: 0,
                 window: 0,
+                canvas_lo: 0,
             },
             MlaCase {
                 name: "causal pos=3, no wrap",
@@ -12425,6 +12431,7 @@ mod tests {
                 cap: 8,
                 mask_type: 0,
                 window: 0,
+                canvas_lo: 0,
             },
             MlaCase {
                 name: "sliding window w=3, pos=3, no wrap",
@@ -12434,6 +12441,7 @@ mod tests {
                 cap: 8,
                 mask_type: 1,
                 window: 3,
+                canvas_lo: 0,
             },
             // cap=5 over 14 positions is two full laps plus four rows, and the abs=12 row attends
             // 9..13 → rows 4,0,1,2: `lo` and `hi-1` land on OPPOSITE sides of the wrap boundary,
@@ -12446,6 +12454,7 @@ mod tests {
                 cap: 5,
                 mask_type: 1,
                 window: 4,
+                canvas_lo: 0,
             },
             MlaCase {
                 name: "sliding window w=cap=5, wrapped ring",
@@ -12455,6 +12464,7 @@ mod tests {
                 cap: 5,
                 mask_type: 1,
                 window: 5,
+                canvas_lo: 0,
             },
             MlaCase {
                 name: "canvas lo=0, pos=3",
@@ -12464,6 +12474,34 @@ mod tests {
                 cap: 8,
                 mask_type: 2,
                 window: 0,
+                canvas_lo: 0,
+            },
+            // Canvas ignores `abs` entirely: both rows attend 2..5 even though their causal bounds
+            // differ, and `pos` still moves the internal q_pe rope. `lo = 0` cannot see the
+            // `pc.canvas_lo` field at all — the hardcoded `lo = 0u` this replaces passed that case.
+            MlaCase {
+                name: "canvas lo=2, pos=3",
+                rows: 2,
+                pos: 3,
+                kv_len: 5,
+                cap: 8,
+                mask_type: 2,
+                window: 0,
+                canvas_lo: 2,
+            },
+            // A bounded canvas span over a WRAPPED ring: 9..14 is five positions in a cap=5 ring,
+            // rows 4,0,1,2,3 — `lo` and `hi-1` on opposite sides of the wrap boundary. This is the
+            // only span shape well defined over a wrap (B46: a causal query would attend rows the
+            // ring has already overwritten).
+            MlaCase {
+                name: "canvas lo=9, wrapped ring (straddles)",
+                rows: 1,
+                pos: 13,
+                kv_len: 14,
+                cap: 5,
+                mask_type: 2,
+                window: 0,
+                canvas_lo: 9,
             },
         ];
 
@@ -12479,7 +12517,7 @@ mod tests {
             // is asking a question with no answer — catch that here, not as a mystery max_err.
             for ti in 0..c.rows {
                 let abs = c.pos as usize + ti;
-                for j in attends(c.mask_type, c.window, abs, c.kv_len) {
+                for j in attends(&c, abs) {
                     let last = (0..c.kv_len)
                         .rfind(|p| p % c.cap == j % c.cap)
                         .expect("attended position is inside 0..kv_len");
@@ -12525,6 +12563,7 @@ mod tests {
                 c.window,
                 theta,
                 c.cap as u32,
+                c.canvas_lo,
                 None,
             );
             rec.finish().unwrap();
@@ -12553,7 +12592,7 @@ mod tests {
                         q_full[kv_lora + i0] = a * ang.cos() - b * ang.sin();
                         q_full[kv_lora + i1] = a * ang.sin() + b * ang.cos();
                     }
-                    let span = attends(c.mask_type, c.window, abs, c.kv_len);
+                    let span = attends(&c, abs);
                     let sc: Vec<f32> = span
                         .clone()
                         .map(|j| {

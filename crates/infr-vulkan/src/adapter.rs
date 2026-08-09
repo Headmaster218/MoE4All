@@ -4355,10 +4355,13 @@ fn lower_op(
             let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
             let cap = graph.desc(*k_cache).numel();
             let cache_cap_rows = (cap / key_len.max(1)) as u32;
-            let (mask_type, window) = match mask {
-                AttnMask::Causal => (0u32, 0u32),
-                AttnMask::SlidingWindow(w) => (1u32, *w as u32),
-                AttnMask::Canvas { .. } => (2u32, 0u32),
+            // `canvas_lo` rides its own push-constant field rather than sharing `window`: the
+            // shader's causal arm reads `window` too (a causal mask with a window narrows `lo`),
+            // so one repurposed slot could not carry both meanings.
+            let (mask_type, window, canvas_lo) = match mask {
+                AttnMask::Causal => (0u32, 0u32, 0u32),
+                AttnMask::SlidingWindow(w) => (1u32, *w as u32, 0u32),
+                AttnMask::Canvas { lo } => (2u32, 0u32, *lo as u32),
             };
             let ff = freq_factors.map(&r).transpose()?;
             rec.mla(
@@ -4381,6 +4384,7 @@ fn lower_op(
                 window,
                 *theta,
                 cache_cap_rows,
+                canvas_lo,
                 ff,
             );
         }

@@ -1021,27 +1021,38 @@ place in the loop and the change wants its own review. Verified live: before the
 `VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`; after it, that run is
 clean.
 
-### B49 — `moe_topk.comp`'s full-softmax denominator shifts by the selection max (2026-08-10)
+### B49 — the full-softmax MoE weight has no regression test, and cannot have one here (2026-08-10)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; no model in the tree
-reaches the combination
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** hardware — a Vulkan
+implementation that preserves f32 subnormals
 
-The softmax-without-renormalization branch sums `exp(logit - mx)` over **all**
-experts, but `mx` is the max over the SELECTED experts only. Selection is by
-`sel_score + ssel_adj`, so with a router bias or a group mask the largest raw
-logit can belong to an expert that was not selected — and that term overflows to
-`+inf`, taking the whole denominator with it and zeroing every weight. The CPU
-oracle (`Op::MoeFfn` in `infr-cpu`) shifts by the max over all experts and does
-not have this.
+The defect this entry opened with is FIXED: `moe_topk.comp`'s
+softmax-without-renormalization branch summed `exp(logit - mx)` over every
+expert while `mx` was the max over the SELECTED ones, so a router bias or group
+mask could leave the largest raw logit unselected, overflow the denominator to
+`+inf` and zero every weight. It now computes its own max over all experts,
+matching the CPU oracle's constant.
 
-Unreachable today: it needs softmax gating AND `norm_topk_prob = false` AND a
-bias or group mask. V2-Lite has the first two but neither of the last (one
-expert group, no `exp_probs_b`), and there the selection max IS the global max,
-so the branch is exact. V3 is sigmoid-gated and never enters it. Fix is to
-compute the denominator's shift over all experts rather than reusing the
-selection max — cheap, but it wants a test that can only be written
-synthetically, and B44's sibling fix already carries the one synthetic case.
-Re-check when a softmax-gated grouped model appears.
+What stays open is that **nothing guards it**, and nothing can on this box. A
+selected expert's weight is `1 / D` where `D` is the denominator the wrong shift
+computes; the bug needs `D` past f32's max (3.4e38) to overflow, so the correct
+answer the fixed kernel must produce is always below 2.9e-39 — inside the
+subnormal range. Measured on an RX 7900 XTX (RADV, no denorm-preserve execution
+mode): a weight of 1.8e-35 comes back exactly, a weight of 5.5e-42 comes back as
+`0.0`. The fixed and the broken kernel return the same bytes there, so a test
+would be a green light wired to nothing; one was written, measured, and deleted
+rather than landed. lavapipe was tried as a denorm-preserving second
+implementation and the backend refuses it (it needs a pinnable subgroup size of
+32; lavapipe's range is [8, 8]).
+
+To close this, either run it under an implementation that preserves subnormals,
+or enable `VK_KHR_shader_float_controls`'s denorm-preserve on the pipeline and
+re-run the deleted case. The finding and these numbers are also recorded in the
+shader beside the fix.
+
+Unrelated residual in the same branch: the extra serial `mx_all` scan runs on
+thread 0 once per token per MoE layer, and V2-Lite does take this branch
+(softmax gating, `norm_topk_prob = false`). The cost was not measured.
 
 ### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
 
@@ -1062,27 +1073,18 @@ places that evidence does not reach:
   check that survives into stages 3–4", which overstates what it can do. A real
   oracle would build full MHA from the unabsorbed `wkv_b` and compare against
   the absorbed path.
-- **Ring wrap and the non-causal masks are now covered — except
-  `Canvas { lo > 0 }`, which is BROKEN on both GPU kernels.** `Op::Mla` runs one
-  shared case table on all three backends: `mla_mask_ring_parity` (infr-llama
-  `tests/seam_op_parity.rs`, CPU vs a from-semantics reference),
-  `mla_ring_and_mask_matches_cpu_reference` (infr-vulkan `src/recorder.rs`) and
-  `mla_mask_ring_parity` (infr-metal `tests/parity.rs`, Metal vs CPU). It covers
-  a genuinely wrapped ring (`cap_rows` 5 over 14 positions — two full laps, with
-  `lo` and `hi-1` on opposite sides of the wrap boundary), `SlidingWindow`,
-  `Canvas`, and a non-zero `pos`. The references read keys by ABSOLUTE position
-  from an independent ring writer, so they agree with `j % cap_rows` /
-  `(lo + jj) % cap` only if the kernel's fold is right. Every case was seen red
-  by perturbing the arm it guards. What is left:
-  - **`AttnMask::Canvas { lo }` with `lo > 0` diverges on Vulkan AND Metal.**
-    Neither push-constant block carries a canvas `lo` at all — `mla.comp` and
-    `mla_f16kv_one` hardcode `lo = 0u` on their `mask_type == 2` arm, while the
-    CPU arm honours it. Measured on an RX 7900 XTX: max_err 6.3e-2 at `lo = 2`,
-    `kv_len = 5`, vs 1.8e-7 for the same case at `lo = 0`. Unreachable today
-    (only DiffusionGemma's denoise path emits `Canvas`, and it never builds
-    `Op::Mla`), which is why it is filed rather than fixed; a fix means adding
-    the field to `PC`/`MlaParams`, to `Recorder::mla`'s signature and to both
-    kernel arms. The GPU tests therefore cover `Canvas` at `lo = 0` only.
+- **Ring wrap and the non-causal masks are now covered on all three backends.**
+  `Op::Mla` runs one shared case table on all three backends:
+  `mla_mask_ring_parity` (infr-llama `tests/seam_op_parity.rs`, CPU vs a
+  from-semantics reference), `mla_ring_and_mask_matches_cpu_reference`
+  (infr-vulkan `src/recorder.rs`) and `mla_mask_ring_parity` (infr-metal
+  `tests/parity.rs`, Metal vs CPU). It covers a genuinely wrapped ring
+  (`cap_rows` 5 over 14 positions — two full laps, with `lo` and `hi-1` on
+  opposite sides of the wrap boundary), `SlidingWindow`, `Canvas`, and a
+  non-zero `pos`. The references read keys by ABSOLUTE position from an
+  independent ring writer, so they agree with `j % cap_rows` / `(lo + jj) % cap`
+  only if the kernel's fold is right. Every case was seen red by perturbing the
+  arm it guards. What is left:
   - **`Causal` over a wrapped ring is not covered and cannot be**: a causal
     query at `abs` attends `abs + 1` positions, which is exactly when it exceeds
     `cap_rows` that the ring wraps — so some attended row has already been

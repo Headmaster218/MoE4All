@@ -4186,9 +4186,10 @@ struct MlaCase {
 /// against a from-semantics reference; the CPU arm's own mask and ring arithmetic is what
 /// `mla_mask_ring_parity` pins semantically, so the chain closes there.
 ///
-/// **Canvas is covered at `lo = 0` only.** `MlaParams` carries no canvas `lo` — `mla_f16kv_one`
-/// hardcodes `lo = 0u` on the `mask_type == 2` arm — while the CPU arm honours `AttnMask::Canvas
-/// { lo }`. A `lo > 0` case would fail here, and it is a kernel defect, not a test gap; see B46.
+/// `Canvas { lo > 0 }` is covered by the last two cases: `MlaParams.canvas_lo` carries the bound
+/// and `mla_f16kv_one`'s `mask_type == 2` arm reads it. Before that field existed the arm
+/// hardcoded `lo = 0u`, which the `lo = 0` case cannot tell apart — on the Vulkan twin of this
+/// table the same `lo = 2, kv_len = 5` case measured max_err 6.3e-2 against 1.8e-7 at `lo = 0`.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn mla_mask_ring_parity() {
@@ -4281,6 +4282,28 @@ fn mla_mask_ring_parity() {
             kv_len: 5,
             cap: 8,
             mask: infr_core::graph::AttnMask::Canvas { lo: 0 },
+        },
+        // Canvas ignores `abs` entirely: both rows attend 2..5 even though their causal bounds
+        // differ, and `pos` still moves the internal q_pe rope.
+        MlaCase {
+            name: "canvas lo=2, pos=3",
+            rows: 2,
+            pos: 3,
+            kv_len: 5,
+            cap: 8,
+            mask: infr_core::graph::AttnMask::Canvas { lo: 2 },
+        },
+        // A bounded canvas span over a WRAPPED ring: 9..14 is five positions in a cap=5 ring, rows
+        // 4,0,1,2,3 — `lo` and `hi-1` on opposite sides of the wrap boundary. This is the only
+        // span shape well defined over a wrap (B46: a causal query would attend rows the ring has
+        // already overwritten).
+        MlaCase {
+            name: "canvas lo=9, wrapped ring (straddles)",
+            rows: 1,
+            pos: 13,
+            kv_len: 14,
+            cap: 5,
+            mask: infr_core::graph::AttnMask::Canvas { lo: 9 },
         },
     ];
 

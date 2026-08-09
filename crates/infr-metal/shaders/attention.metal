@@ -811,6 +811,7 @@ struct MlaParams {
     uint window;
     float theta;
     uint cache_cap_rows;   // ring-buffer row capacity (0 or >= kv_len = full context)
+    uint canvas_lo;        // `AttnMask::Canvas { lo }` lower bound; read on mask_type == 2 only
 };
 
 static inline void mla_f16kv_one(device const float* q,
@@ -873,8 +874,11 @@ static inline void mla_f16kv_one(device const float* q,
         lo = (abs_pos + 1u > p.window) ? (abs_pos + 1u - p.window) : 0u;
         hi = abs_pos + 1u;
     } else {
-        // Canvas / full
-        lo = 0u;
+        // Canvas: one fixed span [canvas_lo, kv_len) for EVERY row — `abs_pos` is not consulted.
+        // The clamp is not cosmetic: `n_keys = hi - lo` is unsigned, so a `canvas_lo` past `kv_len`
+        // would wrap to ~4e9 and the score loop would read gigabytes past the cache. Clamping to
+        // `kv_len` makes that an empty span (the zero-output path below) instead.
+        lo = min(p.canvas_lo, p.kv_len);
         hi = p.kv_len;
     }
     hi = min(hi, p.kv_len);

@@ -5261,10 +5261,13 @@ impl MetalBackend {
                 }
                 let key_len = (kv_lora_rank + qk_rope_dim) as usize;
                 let cache_cap_rows = (g.desc(k_cache).numel() / key_len.max(1)) as u32;
-                let (mask_type, window) = match mask {
-                    infr_core::graph::AttnMask::Causal => (0u32, 0u32),
-                    infr_core::graph::AttnMask::SlidingWindow(w) => (1u32, w as u32),
-                    infr_core::graph::AttnMask::Canvas { .. } => (2u32, 0u32),
+                // `canvas_lo` rides its own params field rather than sharing `window`: the kernel's
+                // causal arm reads `window` too (a causal mask with a window narrows `lo`), so one
+                // repurposed slot could not carry both meanings.
+                let (mask_type, window, canvas_lo) = match mask {
+                    infr_core::graph::AttnMask::Causal => (0u32, 0u32, 0u32),
+                    infr_core::graph::AttnMask::SlidingWindow(w) => (1u32, w as u32, 0u32),
+                    infr_core::graph::AttnMask::Canvas { lo } => (2u32, 0u32, lo as u32),
                 };
                 let bq = self.ensure_device(r, q);
                 let bcache = metal_buf(
@@ -5283,7 +5286,7 @@ impl MetalBackend {
                     dst,
                     (rows as usize) * (n_head as usize) * (v_head_dim as usize),
                 );
-                // MlaParams, byte layout mirrored from recorder.mla's 56-byte push constant.
+                // MlaParams, byte layout mirrored from recorder.mla's 60-byte push constant.
                 let mut p = rows.to_ne_bytes().to_vec();
                 p.extend_from_slice(&kv_len.to_ne_bytes());
                 p.extend_from_slice(&n_head.to_ne_bytes());
@@ -5298,6 +5301,7 @@ impl MetalBackend {
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&cache_cap_rows.to_ne_bytes());
+                p.extend_from_slice(&canvas_lo.to_ne_bytes());
                 let pso = if bff.is_some() {
                     self.pipelines.get("mla_f16kv_ff")?
                 } else {
