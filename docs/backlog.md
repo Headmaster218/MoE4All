@@ -998,35 +998,6 @@ sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
 seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
 constraint in their comments.
 
-### B43 — the DeepSeek pre-tokenizer regexes diverge from the reference, and nothing tests them (2026-08-09)
-
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
-
-Two transcription slips in `util.rs`, found by diffing the constants against
-`llama-vocab.cpp`'s `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM` case byte for byte:
-
-- `DEEPSEEK_LLM_PRE_RES[2]` opens its quote range with `'` (U+0027 APOSTROPHE,
-  confirmed by hexdump) where the reference has `‘` (U+2018). The intended range
-  `‘-‟` is eight quote characters; `'-‟` is U+0027–U+201F, i.e. nearly the whole
-  BMP below U+2020 — digits, Hebrew, Arabic, Devanagari. Split #3 of the
-  `deepseek-llm` sequence then absorbs runs that the reference leaves for later
-  splits, changing chunk boundaries and therefore token ids on any text using a
-  script that split #2's Latin/Greek/Cyrillic class does not cover.
-- `DEEPSEEK_LLM_PRE_RES[1]` has `ℹ-ℿ` where the reference has `ℹℼ-ℿ`, adding
-  U+213A and U+213B to the letter class.
-
-`clean_spaces = false`, which the reference sets for all three DeepSeek
-pre-types, has no equivalent here at all.
-
-None of this is covered: there is no test for any DeepSeek pre-tokenizer, and
-the only DeepSeek tokenizer evidence in the tree is that V2-Lite generates
-coherent text (V2-Lite is `deepseek-v3` pre-type, so the V1 regexes above are
-exercised by nothing). `docs/deepseek.md` open question 3 — whether N successive
-`Isolated` splits reproduce llama.cpp's sequential `unicode_regex_split` — is
-still genuinely open, while `build_multi_split_seq`'s doc comment now states the
-equivalence as settled. Either verify it against `llama-tokenize` token ids on
-the same text and keep the comment, or soften the comment.
-
 ### B44 — `moe_topk.comp`'s two weight branches disagree on their softmax max (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; not a wrong answer
@@ -1101,6 +1072,15 @@ places that evidence does not reach:
   Constructing a `SeamKv` needs a full session — weights uploaded,
   `SessionStable` built — so there is no cheap unit test, and there is no serve
   test on a deepseek2 model to reach it end to end.
+- **The `deepseek-coder` and `deepseek-v3` pre-tokenizer lists have no token-id
+  coverage.** Both DeepSeek GGUFs in the local HF cache are
+  `tokenizer.ggml.pre == "deepseek-llm"`, so the `llama-tokenize` comparison
+  that closed `docs/deepseek.md` open question 3 exercised only the six-regex V1
+  list. The other two are byte-identical to `llama-vocab.cpp` and their chunk
+  boundaries are pinned by
+  `deepseek_pre_split_boundaries_match_the_reference_lists`, which is not the
+  same as having been checked against real ids. Close it if a GGUF with either
+  pre-type turns up — V3 is the one stage 3 needs.
 - **Every deepseek test `need_model!`-skips** without the GGUF in the HF cache,
   which is the house pattern, but it does mean none of the above runs in CI.
 

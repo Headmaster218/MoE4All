@@ -172,17 +172,45 @@ llama.cpp maps three DeepSeek pre-tokenizers (`src/llama-vocab.cpp`):
 
 V3 uses `deepseek-v3`; V4 reuses it (there is no `deepseek-v4` pre-type).
 
-llama.cpp applies these as an **ordered list of successive splits**.
-`infr-llama/src/tokenizer.rs:126` holds a single `split_re: Option<&str>` and
-builds `Sequence[Split, ByteLevel]`. The good news is that `PreSequence::new`
-already takes a `Vec`, so this is widening `Option<&str>` to a slice and pushing
-N `Split`s — not a redesign.
+llama.cpp applies these as an **ordered list of successive splits**. `infr`
+implements this in `build_multi_split_seq` (`infr-llama/src/tokenizer.rs`): N
+`Split` pre-tokenizers in `Isolated` mode followed by `ByteLevel`, with the
+regex lists in `infr-llama/src/util.rs` (`DEEPSEEK_LLM_PRE_RES`,
+`DEEPSEEK_CODER_PRE_RES`, `DEEPSEEK_V3_PRE_RES`).
 
-**Collapsing the list into one alternation is not equivalent.** Whether N
-successive `Isolated` splits reproduce llama.cpp's sequential application must
-be checked against real token ids from `llama-tokenize` on the same text, not
-assumed. `clean_spaces = false` is a second knob — check whether `infr` has an
-equivalent and what its default is.
+**Collapsing the list into one alternation is not equivalent** — and the
+successive form is no longer an assumption either. It was checked against
+`llama-tokenize` token ids; see open question 3, which is now resolved.
+
+All fourteen regexes were diffed codepoint by codepoint against
+`llama-vocab.cpp` (2026-08-09) and now match it exactly. Two did not, and the
+symptom of each is instructive: a wrong character inside a class compiles, runs,
+raises nothing, and merely moves a chunk boundary.
+
+- `DEEPSEEK_LLM_PRE_RES[2]` opened its quote range with `'` (U+0027) where the
+  reference has `‘` (U+2018), so the class ran U+0027–U+201F instead of the
+  eight quote characters — most of the BMP, including the ASCII digits, Hebrew,
+  Arabic and Devanagari.
+- `DEEPSEEK_LLM_PRE_RES[1]` had `ℹ-ℿ` where the reference has `ℹℼ-ℿ`, adding
+  U+213A and U+213B to the letter class.
+
+`clean_spaces = false`, which llama.cpp sets for all three DeepSeek pre-types,
+**needs no equivalent here**. It is read in exactly one place —
+`llama_vocab::impl::detokenize` in `llama-vocab.cpp` — where it drops the space
+before `?!.,`, strips a lone apostrophe between spaces, and closes up
+`'s`/`'m`/`'re`/`'ve`. It is a detokenizer post-process (HF's
+`clean_up_tokenization_spaces`) and never runs during encoding, so it cannot
+affect token ids. llama.cpp defaults the flag to `false`, turns it ON for every
+BPE vocab, and the DeepSeek arms turn it back off. `infr` detokenizes through
+`tokenizers::Tokenizer::decode`, and that crate contains no such pass at all —
+so `infr` is unconditionally in the `clean_spaces = false` state DeepSeek wants.
+(It is therefore also unconditionally in that state for BPE pre-types where
+llama.cpp leaves the flag ON. That is a display-only divergence, not an id one,
+and it is out of scope here.)
+
+The lists are guarded by
+`deepseek_pre_split_boundaries_match_the_reference_lists` in `tokenizer.rs`,
+which pins the chunk boundaries all three produce and needs no model file.
 
 Getting this wrong degrades output with **no error at all**, which is why it is
 stage 0.
@@ -611,7 +639,30 @@ Ordered by how much damage a wrong assumption does.
    `ggml_type_to_dtype`, the file fails at open and needs a new `DType`,
    `block_spec` and `dequant_block` arm. The i2_s commit `dbc8431` is the
    template.
-3. **Whether N successive splits reproduce llama.cpp's tokenizer** (§0.2).
+3. **Whether N successive splits reproduce llama.cpp's tokenizer** (§0.2) — ✓
+   RESOLVED (2026-08-09), for `deepseek-llm` only. `infr`'s ids were compared
+   against `llama-tokenize --ids --no-bos --no-escape` on
+   `deepseek-v2-lite-chat-q4_k_m.gguf`. Note that this GGUF is
+   `tokenizer.ggml.pre == "deepseek-llm"`, **not** `deepseek-v3` — so what it
+   exercises is the six-regex V1 list, the one that carried both transcription
+   slips. They agreed **exactly on all 31 texts**, covering digits, decimals and
+   grouped numbers, CJK, Hangul, Greek, Hebrew, Arabic, Devanagari, punctuation
+   runs, code, emoji, CRLF, smart quotes and non-ASCII whitespace. So N
+   successive `Isolated` splits do reproduce `unicode_regex_split` here.
+
+   The comparison was shown to be capable of failing: re-introducing the U+0027
+   slip made `infr` disagree with llama.cpp on 8 of 11 texts in the
+   NBSP-before-punctuation battery (e.g. `"a \u{00A0}. b"` → llama.cpp
+   `[64, 207, 1202, 13, 270]`, broken `infr` `[64, 30683, 13, 270]`).
+
+   **`deepseek-coder` and `deepseek-v3` have no token-id coverage.** Both GGUFs
+   in the local HF cache are `deepseek-llm`, so neither of those lists was
+   exercised against real ids. They are structurally identical (same
+   `build_multi_split_seq`) and byte-identical to the reference, and their chunk
+   boundaries are pinned by the unit test — but that is not the same as having
+   been checked against llama.cpp. Re-open this for either list if a matching
+   GGUF appears.
+
 4. **Shared-expert width when `n_shared_experts > 1`** — V2-Lite has 2.
 5. **`rope_off`** — ✓ RESOLVED (2026-08-06). `Op::Rope` only rotates standalone
    k_pe slices (extracted via `CopyStrided`, no nope prefix). The q_pe rope is

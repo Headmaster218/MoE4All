@@ -126,8 +126,17 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     let pre = md.str("tokenizer.ggml.pre").unwrap_or("default");
     // qwen2/llama4 both split on a SINGLE regex before ByteLevel (matching HF); only the pattern
     // differs. DeepSeek pre-types apply a LIST of successive Split pre-tokenizers (see §0.2 of
-    // docs/deepseek.md — N successive Isolated splits reproduce llama.cpp's sequential application).
+    // docs/deepseek.md, and [`build_multi_split_seq`] for the token-id evidence that N successive
+    // Isolated splits reproduce llama.cpp's sequential application).
     // The sequences below follow llama.cpp's `src/llama-vocab.cpp` verbatim.
+    //
+    // llama.cpp additionally sets `clean_spaces = false` for all three DeepSeek pre-types. Nothing
+    // is needed here to match that: `clean_spaces` is read in exactly one place, the DETOKENIZER
+    // (`llama_vocab::impl::detokenize`), where it drops the space before `?!.,`, strips a lone
+    // apostrophe between spaces, and closes up `'s`/`'m`/`'re`/`'ve`. It never runs during
+    // encoding. llama.cpp turns it ON for every BPE vocab and the DeepSeek arms turn it back off;
+    // infr detokenizes through `tokenizers::Tokenizer::decode`, which has no such pass at all, so
+    // infr is unconditionally in the `clean_spaces = false` state the DeepSeek arms ask for.
     match pre {
         "deepseek-llm" => {
             let seq = build_multi_split_seq(DEEPSEEK_LLM_PRE_RES.as_slice())?;
@@ -193,6 +202,15 @@ fn spm_merge_order(a: (f64, u32, u32), b: (f64, u32, u32)) -> std::cmp::Ordering
 /// Build a `PreSequence` for a list of successive `Split` pre-tokenizers (DeepSeek's multi-regex
 /// approach — see docs/deepseek.md §0.2). Each regex splits the output of the previous one in
 /// order, followed by `ByteLevel`; mirrors llama.cpp's `unicode_regex_split` pipeline.
+///
+/// That N successive `Isolated` splits reproduce llama.cpp's sequential `unicode_regex_split` is
+/// no longer an assumption: it was checked against `llama-tokenize` token ids on the V2-Lite-Chat
+/// Q4_K_M GGUF (`tokenizer.ggml.pre == "deepseek-llm"`, so the six-regex list), agreeing exactly on
+/// every text of a battery covering digits, CJK, Hangul, Greek, Hebrew, Arabic, Devanagari,
+/// punctuation runs, mixed scripts, emoji, CRLF and non-ASCII whitespace. The comparison has teeth:
+/// re-breaking `DEEPSEEK_LLM_PRE_RES[2]` made it disagree with llama.cpp. `deepseek-coder` and
+/// `deepseek-v3` are structurally identical but were NOT checked against ids — no GGUF with either
+/// pre-type was available. [`build_tokenizer`]'s tests pin all three at the boundary level.
 fn build_multi_split_seq(patterns: &[&str]) -> Result<PreSequence> {
     let mut parts: Vec<PreTokenizerWrapper> = patterns
         .iter()
@@ -308,6 +326,129 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 mod tokenizer_tests {
     use super::*;
     use crate::sampling::{sample_logits, Sampler};
+
+    /// The chunk boundaries a DeepSeek pre-tokenizer sequence yields, as slices of the ORIGINAL
+    /// text. [`build_multi_split_seq`] ends the sequence with `ByteLevel`, which rewrites each
+    /// chunk's CONTENT (a space becomes `\u{0120}`, every non-ASCII byte a printable stand-in),
+    /// so this reads the original-referential offsets instead of the chunk strings. Those offsets
+    /// are the boundaries the BPE then merges within, and they are exactly what a wrong character
+    /// class moves — which is the thing under test.
+    fn pre_chunks(patterns: &[&str], text: &str) -> Vec<String> {
+        use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+        let seq = build_multi_split_seq(patterns).expect("pattern list must compile");
+        let mut pre = PreTokenizedString::from(text);
+        seq.pre_tokenize(&mut pre).expect("pre-tokenize");
+        pre.get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(_, (start, end), _)| text[start..end].to_string())
+            .collect()
+    }
+
+    /// The three DeepSeek pre-tokenizer regex lists, pinned by the chunk boundaries they produce.
+    ///
+    /// These constants are transcribed from llama.cpp's `src/llama-vocab.cpp`, and a wrong
+    /// character inside a class does not fail to compile, does not error and does not crash — it
+    /// silently moves a chunk boundary, which silently changes token ids, which silently changes
+    /// the model's output. Two such slips shipped (`docs/backlog.md` B43), and the `deepseek-llm`
+    /// table below has rows that go red under each of them:
+    ///
+    /// * The Hebrew rows catch `DEEPSEEK_LLM_PRE_RES[2]` opening its quote range with `\u{0027}`
+    ///   instead of `\u{2018}`. That runs the class from U+0027 to U+201F — most of the BMP,
+    ///   including Hebrew, Arabic, Devanagari and the ASCII digits — so split #3 swallowed the
+    ///   Hebrew word together with the full stop after it. Nothing after split #3 matches Hebrew,
+    ///   so no later split puts that boundary back.
+    /// * The `\u{2139}\u{213A}\u{213F}` row catches `DEEPSEEK_LLM_PRE_RES[1]` having
+    ///   `\u{2139}-\u{213F}` where the reference has `\u{2139}\u{213C}-\u{213F}`.
+    ///   The two extra letters made split #2 run all three characters together as one word.
+    ///
+    /// The `"a \u{00A0}. b"` row is the one that was shown to move real TOKEN IDS, not just
+    /// boundaries: with the broken class, `\u{00A0}` (NO-BREAK SPACE, and NBSP before punctuation
+    /// is ordinary French typography and ordinary scraped HTML) is pulled into split #3 together
+    /// with the space before it and the full stop after it. On the V2-Lite vocab that turns
+    /// llama.cpp's `[64, 207, 1202, 13, 270]` into `[64, 30683, 13, 270]`. The Hebrew and
+    /// letterlike rows above move boundaries but happen NOT to move ids on that vocab, because it
+    /// has no merge spanning the boundary they lose — so they guard the pre-tokenizer, while this
+    /// row also guards the observable end of it.
+    ///
+    /// `deepseek-coder` and `deepseek-v3` were byte-identical to the reference when this was
+    /// written (verified codepoint by codepoint against `llama-vocab.cpp`); their tables are here
+    /// so the next slip lands on a red test rather than on a user. The differences between the
+    /// three tables are real behaviour, not noise: `deepseek-coder` splits digits one at a time
+    /// (`\p{N}`, no `+`) and matches Hebrew through `\p{L}`, while `deepseek-v3` keeps
+    /// `(x` together because its final pattern binds an opening delimiter to the letters after it.
+    #[test]
+    fn deepseek_pre_split_boundaries_match_the_reference_lists() {
+        fn check(name: &str, patterns: &[&str], cases: &[(&str, &[&str])]) {
+            for (text, want) in cases {
+                let got = pre_chunks(patterns, text);
+                assert_eq!(
+                    got, *want,
+                    "{name} chunk boundaries moved for {text:?}\n  got  {got:?}\n  want {want:?}"
+                );
+            }
+        }
+
+        check(
+            "deepseek-llm",
+            DEEPSEEK_LLM_PRE_RES.as_slice(),
+            &[
+                ("a \u{00A0}. b", &["a", " ", "\u{00A0}.", " b"]),
+                ("שלום.", &["שלום", "."]),
+                ("עברית 42 test.", &["עברית ", "42", " test", "."]),
+                ("ℹ℺ℿ", &["ℹ", "℺", "ℿ"]),
+                ("3.14", &["3", ".", "14"]),
+                (
+                    "50% off, 2 items?",
+                    &["50", "%", " off", ",", " ", "2", " items", "?"],
+                ),
+                ("中文 汉字。", &["中文", " ", "汉字", "。"]),
+                (
+                    "def f(x): return x*2\n",
+                    &["def", " f", "(", "x", "):", " return", " x", "*", "2", "\n"],
+                ),
+            ],
+        );
+        check(
+            "deepseek-coder",
+            DEEPSEEK_CODER_PRE_RES.as_slice(),
+            &[
+                ("a \u{00A0}. b", &["a", " ", "\u{00A0}.", " b"]),
+                ("שלום.", &["שלום", "."]),
+                ("עברית 42 test.", &["עברית", " ", "4", "2", " test", "."]),
+                ("ℹ℺ℿ", &["ℹ", "℺", "ℿ"]),
+                ("3.14", &["3", ".", "1", "4"]),
+                (
+                    "50% off, 2 items?",
+                    &["5", "0", "%", " off", ",", " ", "2", " items", "?"],
+                ),
+                ("中文 汉字。", &["中文", " ", "汉字", "。"]),
+                (
+                    "def f(x): return x*2\n",
+                    &["def", " f", "(", "x", "):", " return", " x", "*", "2", "\n"],
+                ),
+            ],
+        );
+        check(
+            "deepseek-v3",
+            DEEPSEEK_V3_PRE_RES.as_slice(),
+            &[
+                ("a \u{00A0}. b", &["a", " ", "\u{00A0}", ".", " b"]),
+                ("שלום.", &["שלום", "."]),
+                ("עברית 42 test.", &["עברית", " ", "42", " test", "."]),
+                ("ℹ℺ℿ", &["ℹ", "℺", "ℿ"]),
+                ("3.14", &["3", ".", "14"]),
+                (
+                    "50% off, 2 items?",
+                    &["50", "%", " off", ",", " ", "2", " items", "?"],
+                ),
+                ("中文 汉字。", &["中文", " ", "汉字", "。"]),
+                (
+                    "def f(x): return x*2\n",
+                    &["def", " f", "(x", "):", " return", " x", "*", "2", "\n"],
+                ),
+            ],
+        );
+    }
 
     /// The SPM merge ranking, pinned in both halves and made NaN-proof.
     ///

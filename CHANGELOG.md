@@ -174,6 +174,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **DeepSeek `deepseek-llm` pre-tokenizer split on the wrong character
+  classes**: `DEEPSEEK_LLM_PRE_RES[2]` opened its quote range with `'` (U+0027)
+  instead of `‘` (U+2018), so the class covered U+0027–U+201F — most of the BMP,
+  including the ASCII digits, Hebrew, Arabic and Devanagari — rather than the
+  eight quote characters; and `DEEPSEEK_LLM_PRE_RES[1]` had `ℹ-ℿ` where
+  llama.cpp has `ℹℼ-ℿ`, adding U+213A and U+213B to the letter class. Both moved
+  chunk boundaries silently, with no error: on DeepSeek-V2-Lite-Chat the first
+  one changed real token ids wherever a non-ASCII space (U+00A0, U+0085)
+  preceded punctuation, e.g. `"a \u{00A0}. b"` tokenized as
+  `[64, 30683, 13, 270]` where llama.cpp gives `[64, 207, 1202, 13, 270]`. All
+  fourteen DeepSeek regexes now match `llama-vocab.cpp` codepoint for codepoint,
+  `infr` agrees with `llama-tokenize` on every text tried, and
+  `deepseek_pre_split_boundaries_match_the_reference_lists` pins the chunk
+  boundaries of all three lists without needing a model file.
 - **DeepSeek V3 router bias applied to the wrong scores (Vulkan)**: `moe_topk`
   added `exp_probs_b` to the raw router LOGITS, but llama.cpp (and the CPU
   interpreter) add it to the gated PROBS
