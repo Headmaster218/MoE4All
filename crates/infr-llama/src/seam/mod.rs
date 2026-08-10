@@ -1017,12 +1017,29 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 /// `SeamKv::seed_from` and the VRAM estimate each did while the allocation carried its own copy of
 /// the branch (docs/backlog.md B41).
 ///
+/// **deepseek32 (V3.2) puts its lightning indexer's SECOND cache on that free V side**: one
+/// `indexer_head_size`-wide row per token per layer, on top of the compressed MLA row. It is a
+/// genuinely independent per-token cache written by its own `Op::WriteKv` and read by
+/// `Op::LightningIndexer`, and it is carried here — rather than as a third per-layer buffer — so
+/// that the SIX sites this helper feeds (allocation, graph declaration, `SeamKv::fork`,
+/// `SeamKv::seed_from`, and both VRAM estimates) size and copy it without any of them growing a
+/// private branch. Under-reserving it is exactly the failure B41 records. The precedent is
+/// `MixerW::DeltaNet`, which puts a qwen35 layer's recurrent `S` state in the same `v_cache[l]`
+/// slot; the difference is that DeltaNet's state is fixed-size and this one is per-token, which is
+/// what makes it fit the K side's own geometry.
+///
+/// The indexer cache **must never ring**: `Op::LightningIndexer` masks causally only, so position 0
+/// stays eligible for every query row and every backend refuses a cache holding fewer rows than
+/// `kv_len`. That is why it is sized off [`kv_rows`] like any full-context side — V3.2 has no
+/// sliding-window layer, so `kv_rows` returns the whole context — and why the allocation asserts it
+/// (see `generate_dense_backend`'s KV loop).
+///
 /// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
 /// to the fixed conv/S-state allocation BEFORE reaching here, and the estimates price them with
 /// this attention geometry as they always have.
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.deepseek2 {
-        return (cfg.kv_lora_rank + cfg.qk_rope_dim, 0);
+        return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
     }
     let row = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
     (row, row)

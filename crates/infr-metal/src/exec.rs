@@ -539,6 +539,7 @@ mod tests {
             theta: 10_000.0,
             freq_factors: None,
             x_stride: 0,
+            neox: false,
         });
 
         let norm_weight = g.weight(TensorDesc::new(vec![64], DType::F32));
@@ -761,6 +762,7 @@ mod tests {
             theta: 10_000.0,
             freq_factors: None,
             x_stride: 0,
+            neox: false,
         });
         let bad_ids = unsupported.input(TensorDesc::new(vec![1], DType::I32));
         let bad_table = unsupported.weight(TensorDesc::new(vec![8, 64], DType::F16));
@@ -1396,6 +1398,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Attention { .. } => "Attention",
         Op::Mla { .. } => "Mla",
         Op::LightningIndexer { .. } => "LightningIndexer",
+        Op::TopkMask { .. } => "TopkMask",
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
@@ -3315,6 +3318,7 @@ impl MetalBackend {
                 theta,
                 freq_factors,
                 x_stride,
+                neox,
             } => {
                 // The runner only strides the fused QkNormRope (qwen35 q+g interleave); the plain
                 // llama-family Rope always reads packed rows.
@@ -3337,6 +3341,7 @@ impl MetalBackend {
                 p.extend_from_slice(&(rope_dim).to_ne_bytes());
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
+                p.extend_from_slice(&u32::from(neox).to_ne_bytes());
                 // One thread per (row, head, pair) + pass-through dims — see `rope_f32`.
                 let per = (rope_dim as usize / 2) + (hd - rope_dim as usize);
                 self.encode_w(
@@ -5283,6 +5288,7 @@ impl MetalBackend {
                 pos,
                 theta,
                 freq_factors,
+                key_bias,
             } => {
                 // MLA attention (DeepSeek V2/V3 absorbed form), ported from the Vulkan mla.comp:
                 // the kernel reads the K cache in its native f16 (`device const half*`, one half per
@@ -5334,6 +5340,12 @@ impl MetalBackend {
                     Some(f) => Some(self.ensure_device(r, f)),
                     None => None,
                 };
+                // deepseek32's `[rows, kv_len]` additive top-k score mask (`Op::TopkMask`'s
+                // output); `None` on deepseek2, which keeps the exact kernel it always took.
+                let bkb = match key_bias {
+                    Some(b) => Some(self.ensure_device(r, b)),
+                    None => None,
+                };
                 let bd = self.dev_dst(
                     r,
                     dst,
@@ -5355,10 +5367,11 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&cache_cap_rows.to_ne_bytes());
                 p.extend_from_slice(&canvas_lo.to_ne_bytes());
-                let pso = if bff.is_some() {
-                    self.pipelines.get("mla_f16kv_ff")?
-                } else {
-                    self.pipelines.get("mla_f16kv")?
+                let pso = match (bff.is_some(), bkb.is_some()) {
+                    (false, false) => self.pipelines.get("mla_f16kv")?,
+                    (true, false) => self.pipelines.get("mla_f16kv_ff")?,
+                    (false, true) => self.pipelines.get("mla_f16kv_bias")?,
+                    (true, true) => self.pipelines.get("mla_f16kv_ff_bias")?,
                 };
                 let threads = (rows as usize) * (n_head as usize);
                 let mut bufs: Vec<&MtlBuffer> = vec![
@@ -5368,8 +5381,13 @@ impl MetalBackend {
                     bwv.as_ref(),
                     bd.as_ref(),
                 ];
+                // ff then kbias, both after dst — the buffer indices each `mla_f16kv*` entry
+                // point declares.
                 if let Some(bff) = &bff {
                     bufs.push(bff.as_ref());
+                }
+                if let Some(bkb) = &bkb {
+                    bufs.push(bkb.as_ref());
                 }
                 self.encode_tg_w(r, &pso, &bufs, 1 << 4, &p, threads, 0);
                 r.loc[dst.0 as usize] = Loc::Device;
@@ -5463,6 +5481,38 @@ impl MetalBackend {
                     &p,
                     (rows as usize) * tgw,
                     tgw,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::TopkMask {
+                idx,
+                dst,
+                rows,
+                kv_len,
+                top_k,
+            } => {
+                // Every index the scatter writes must land inside the mask row; the kernel cannot
+                // refuse the dispatch and an out-of-range device write is undefined. Same bound
+                // `Op::LightningIndexer` enforces on the indices it produces.
+                if top_k > kv_len {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::TopkMask: top_k {top_k} exceeds kv_len {kv_len} — the indices \
+                         cannot all name keys inside the mask row"
+                    )));
+                }
+                let bi = self.ensure_device(r, idx);
+                let bd = self.dev_dst(r, dst, (rows as usize) * (kv_len as usize));
+                let mut p = rows.to_ne_bytes().to_vec();
+                p.extend_from_slice(&kv_len.to_ne_bytes());
+                p.extend_from_slice(&top_k.to_ne_bytes());
+                let pso = self.pipelines.get("topk_mask_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bi.as_ref(), bd.as_ref()],
+                    1 << 1,
+                    &p,
+                    rows as usize,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

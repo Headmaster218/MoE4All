@@ -212,8 +212,9 @@ pub enum Op {
         head_dim: u32,
         eps: f32,
     },
-    /// NEOX RoPE over the first `rope_dim` of each head. `positions` is an i32 tensor of length
-    /// `rows`. `freq_factors`, if present, divides per-pair angles (Gemma proportional RoPE).
+    /// RoPE over the first `rope_dim` of each head; dims past `rope_dim` pass through unrotated.
+    /// `positions` is an i32 tensor of length `rows`. `freq_factors`, if present, divides per-pair
+    /// angles (Gemma proportional RoPE, DeepSeek's YaRN ramp).
     Rope {
         x: TensorId,
         positions: TensorId,
@@ -226,6 +227,23 @@ pub enum Op {
         freq_factors: Option<TensorId>,
         /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim).
         x_stride: u32,
+        /// Which two elements a rotation pair is made of — llama.cpp's rope TYPE, and the one thing
+        /// about RoPE that produces fluent nonsense rather than an error when it is wrong (the
+        /// angles, the widths and the pass-through tail are all identical either way).
+        ///
+        /// * `false` — **NORM** (`LLAMA_ROPE_TYPE_NORM`): interleaved consecutive pairs
+        ///   `(2p, 2p+1)` share the angle for pair `p`. The llama family, and DeepSeek's main
+        ///   q_pe/k_pe rope.
+        /// * `true` — **NEOX** (`LLAMA_ROPE_TYPE_NEOX`): split-half pairs `(p, p + rope_dim/2)`.
+        ///   The same pairing [`Op::QkNormRope`] applies unconditionally (qwen/gemma), and the
+        ///   pairing deepseek32's lightning indexer hardcodes for `indexer_q`/`indexer_k` while the
+        ///   MLA rope beside it stays NORM (see `docs/deepseek.md` § Stage 3).
+        ///
+        /// `Config::permute_qk_neox` is a DIFFERENT mechanism for a different problem: it rewrites
+        /// a whole model's `attn_q`/`attn_k` ROWS at load so that a NORM rope reproduces NEOX for a
+        /// GGUF that stayed in HF rotate-half order. It is model-wide and keyed on tensor names, so
+        /// it cannot express "this one projection ropes NEOX while the model's main rope is NORM".
+        neox: bool,
     },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
@@ -306,6 +324,49 @@ pub enum Op {
         /// ramp, `qk_rope_dim/2` floats) — same semantic as `Op::Rope`'s `freq_factors`: the
         /// rotation angle is DIVIDED by `ff[p]` for pair p. `None` = plain RoPE.
         freq_factors: Option<TensorId>,
+        /// Optional additive per-(query row, key) score bias `[rows, kv_len]`, f32, added to the
+        /// scaled score `q·K[j] * scale` BEFORE the softmax max — i.e. `Σ` in llama.cpp's
+        /// `ggml_soft_max_ext(kq, kq_mask, ...)` terms, the mask summand.
+        ///
+        /// deepseek32's only caller: the lightning indexer's top-k selection, expanded by
+        /// [`Op::TopkMask`] into `0` on the selected keys and `-inf` everywhere else. llama.cpp
+        /// does exactly this — it adds the top-k mask to the ordinary causal mask and runs DENSE
+        /// attention over the full `n_kv`, realising none of the FLOP saving (see `docs/deepseek.md`
+        /// § "How top-k feeds attention"). Indexing is by KEY POSITION `j`, not by the cache row
+        /// `j % cap_rows`, so a ring cache does not shift it.
+        ///
+        /// `None` for deepseek2 (V2/V2-Lite/V3/V3.1), which attends every causally-eligible key —
+        /// and on that path every backend takes the same code it did before this field existed, so
+        /// V2-Lite's numerics cannot move.
+        key_bias: Option<TensorId>,
+    },
+    /// Expand `Op::LightningIndexer`'s `[rows, top_k]` i32 key indices into the additive
+    /// `[rows, kv_len]` f32 score mask `Op::Mla::key_bias` consumes: `0.0` at every selected key,
+    /// `f32::NEG_INFINITY` everywhere else.
+    ///
+    /// This is the whole of "how top-k feeds attention" (`docs/deepseek.md`): llama.cpp materialises
+    /// the same `[n_kv, n_tokens]` mask and adds it to the causal one, so the numerics are faithful
+    /// and the FLOP saving is not taken. Keeping the expansion in its own op (rather than having the
+    /// indexer emit a mask directly) is what leaves a later gather open as a pure optimisation.
+    ///
+    /// Cost, stated because it is the reason a gather exists at all: `rows * kv_len` f32 of scratch
+    /// and one extra f32 load per key in the MLA inner loop. The alternative — membership-testing
+    /// the index list inside the MLA kernel — needs no scratch but scans `top_k` (≈2048 on V3.2)
+    /// per (row, head, key), which is worse by three orders of magnitude on the inner loop.
+    ///
+    /// `-inf` (not a large finite negative) is safe because at least one key is always selected:
+    /// `top_k >= 1` and the indexer's own order ranks every causally-eligible key above every
+    /// ineligible one, so each row's softmax max is finite and `exp(-inf - max) == 0` exactly.
+    /// Indices are read as u32 bit patterns out of the i32 `idx` tensor — [`Op::Argmax`]'s carrier
+    /// convention, which is what `Op::LightningIndexer` writes.
+    TopkMask {
+        /// Selected key indices `[rows, top_k]`, i32 — `Op::LightningIndexer`'s `dst`.
+        idx: TensorId,
+        /// Additive mask `[rows, kv_len]`, f32.
+        dst: TensorId,
+        rows: u32,
+        kv_len: u32,
+        top_k: u32,
     },
     /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
     /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
@@ -720,6 +781,7 @@ impl Op {
             Op::Attention { .. } => "Attention",
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
+            Op::TopkMask { .. } => "TopkMask",
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
@@ -812,8 +874,13 @@ impl Op {
                 wk_b,
                 wv_b,
                 dst,
+                key_bias,
                 ..
-            } => (vec![q, k_cache, wk_b, wv_b], vec![dst]),
+            } => {
+                let mut r = vec![q, k_cache, wk_b, wv_b];
+                r.extend(key_bias);
+                (r, vec![dst])
+            }
             Op::LightningIndexer {
                 q,
                 k_cache,
@@ -821,6 +888,7 @@ impl Op {
                 dst,
                 ..
             } => (vec![q, k_cache, weights], vec![dst]),
+            Op::TopkMask { idx, dst, .. } => (vec![idx], vec![dst]),
             Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
             Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),
@@ -1110,9 +1178,41 @@ mod tests {
             theta: 1e4,
             freq_factors: ff,
             x_stride: 0,
+            neox: false,
         };
         assert_eq!(rope(None).io(), (vec![t(0), t(1)], vec![t(0)]));
         assert_eq!(rope(Some(t(2))).io(), (vec![t(0), t(1), t(2)], vec![t(0)]));
+        // `Op::Mla`'s optional top-k score mask is the same shape of optional read operand.
+        let mla = |kb: Option<TensorId>| Op::Mla {
+            q: t(0),
+            k_cache: t(1),
+            wk_b: t(2),
+            wv_b: t(3),
+            dst: t(4),
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            q_head_dim: 8,
+            kv_lora_rank: 4,
+            qk_nope_dim: 4,
+            qk_rope_dim: 4,
+            v_head_dim: 4,
+            scale: 1.0,
+            mask: AttnMask::Causal,
+            pos: 0,
+            theta: 1e4,
+            freq_factors: None,
+            key_bias: kb,
+        };
+        assert_eq!(
+            mla(None).io(),
+            (vec![t(0), t(1), t(2), t(3)], vec![t(4)]),
+            "deepseek2 (key_bias None) reads exactly what it always did"
+        );
+        assert_eq!(
+            mla(Some(t(5))).io(),
+            (vec![t(0), t(1), t(2), t(3), t(5)], vec![t(4)])
+        );
         // A minimal graph round-trips a declared handle's kind (keeps the tensor imports live).
         let mut g = Graph::new();
         let w = g.weight(TensorDesc::new(vec![4], DType::F32));

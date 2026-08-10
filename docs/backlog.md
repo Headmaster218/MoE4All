@@ -1155,6 +1155,53 @@ places that evidence does not reach:
 - **Every deepseek test `need_model!`-skips** without the GGUF in the HF cache,
   which is the house pattern, but it does mean none of the above runs in CI.
 
+### B51 — what the deepseek32 lightning-indexer slice was NOT verified against (2026-08-10)
+
+**Tag:** deepseek stage-3 coverage · **Blocked on:** a V3.2 GGUF existing, which
+it does not at any size this box can run
+
+`docs/deepseek.md` § Stage 3 records what IS checked. These are the gaps:
+
+- **No external oracle exists, at all.** V3.2 is 671B, there is no small
+  variant, and llama.cpp cannot be run on it here. Every check is either
+  self-consistency (CPU vs Vulkan), a from-formula reference written by the same
+  author as the implementation, or a blessed regression lock. So the indexer's
+  absolute scores, the key set it picks on a real model, and the text it
+  produces are all unchecked against DeepSeek. This will not close without
+  hardware and a file.
+- **`synthetic_deepseek32_indexer_selection_is_locked` is a lock, not a proof.**
+  Its 64 logits were blessed from this implementation. It is sensitive (the NEOX
+  pairing and the `[rope | nope]` head order were each perturbed and seen to
+  break it) but it cannot say the blessed values are right.
+- **Metal has never executed the indexer.** The four `mla_f16kv*` entry points,
+  `topk_mask_f32` and `rope_f32`'s `neox` arm are typechecked only
+  (`cargo check --target x86_64-apple-darwin`); the macOS CI parity job is their
+  first real run. `infr-metal/tests/parity.rs` has MLA cases but none passing a
+  `key_bias`, and no `Op::TopkMask` or NEOX-`Op::Rope` case — add them when a
+  Metal box is available to see them go red first.
+- **The FLOP saving is not taken.** Attention still runs dense over the full
+  `n_kv` with a `-inf` mask, exactly as llama.cpp does. A gather is the
+  optimisation; it needs the selected indices to drive a compaction of both the
+  MLA cache read and the output scatter, and nothing has been measured.
+- **`Op::Mla::io()` omits `freq_factors`.** It lists `q`, `k_cache`, `wk_b`,
+  `wv_b` and (new) `key_bias`, but not the YaRN divisor tensor it also reads.
+  `io()`'s only consumer is `infr-vulkan`'s multi-device `PipelineBackend`,
+  which uses it to infer each op's device and to find cross-device cut tensors —
+  so a deepseek2/32 model split across GPUs could see the divisors unplaced.
+  Left alone in the stage-3 slice because it is a deepseek2-era omission with no
+  multi-GPU DeepSeek test to show it either way, and widening the read set could
+  change pipeline placement for a path nothing here exercises.
+- **The indexer cache is sized for the full context and cannot ring.** That is
+  correct (the indexer masks causally only, so position 0 stays eligible
+  forever) but it means a V3.2 session's KV footprint grows ~22% over the MLA
+  cache alone and no SWA-style trick can shrink it. If long-context V3.2 ever
+  matters, the question to answer is whether the indexer can tolerate a bounded
+  window at all — llama.cpp gives no signal, since it also keeps the full cache.
+- **Decode is exercised only one token deep.** `verify_dense_cpu` prefills the
+  prompt and takes one decode step, so the `batch == 1` indexer graph runs once.
+  There is no multi-token deepseek32 generation test, and there cannot be a
+  meaningful one on a synthetic model.
+
 ### B47 — the MLA kernels are correct and slow (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek perf · **Blocked on:** nothing measured; no

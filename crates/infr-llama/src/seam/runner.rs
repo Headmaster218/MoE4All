@@ -6,7 +6,8 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, DeltaW, FfnW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
+    AttnW, DeltaW, FfnW, IndexerW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights,
+    SessionStable,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
@@ -1042,10 +1043,24 @@ pub(crate) fn generate_dense_backend(
             // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and
             // `kv_side_bytes` allocates the placeholder buffer the backends still bind
             // (`crate::seam::kv_row_elems` — the ONE definition every geometry site reads).
+            // deepseek32 puts its lightning-indexer cache on that otherwise-unused V side, so
+            // `v_row` there is `indexer_head_size` and this loop reserves it like any other side.
             let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
             // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows
             // the window mask already excludes — `crate::seam::kv_rows` has the argument).
             let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
+            // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally
+            // only, so position 0 stays eligible for every query row and a ring that had wrapped
+            // would have overwritten it — every backend refuses `cap_rows < kv_len` rather than
+            // score a row holding some other position. V3.2 declares no sliding window, so
+            // `kv_rows` already returns `want_ctx` here; this is what keeps that true if the ring
+            // gate ever widens, checked where the buffer is actually sized.
+            assert!(
+                !c.deepseek32 || rows_l >= want_ctx,
+                "deepseek32 layer {l}: the lightning indexer's KV cache was sized at {rows_l} rows \
+                 for a {want_ctx}-token context — it must not ring, because the indexer's \
+                 causal-only mask keeps position 0 eligible for every query"
+            );
             kbufs.push(
                 be.alloc(
                     crate::seam::kv_side_bytes(k_fmt, rows_l * k_row),
@@ -1333,19 +1348,6 @@ pub(crate) fn generate_dense_backend(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
-    // DeepSeek V3.2: the LOAD path is complete (config, the absorbed-MLA weights and the five
-    // per-layer lightning-indexer tensors are all resident by now), but nothing emits the indexer
-    // yet. Building the deepseek2 graph here would run V3.2's attention over EVERY key instead of
-    // the indexer's top-k selection — plausible-looking, entirely wrong output with no error — so
-    // refuse instead of approximating. Placed after the weight upload on purpose: a `deepseek32`
-    // GGUF still gets its tensors validated end to end. See docs/deepseek.md § Stage 3.
-    if c.deepseek32 {
-        return Err(anyhow!(
-            "arch=deepseek32 (DeepSeek V3.2) loads but cannot generate yet: its lightning indexer \
-             is not implemented, and emitting the deepseek2 MLA graph without the indexer's top-k \
-             key selection would produce silently wrong output. See docs/deepseek.md § Stage 3."
-        ));
-    }
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
@@ -1521,21 +1523,17 @@ pub(crate) fn generate_dense_backend(
                 let wk_b = wpush(&mut g, &mut weights);
                 let wv_b = wpush(&mut g, &mut weights);
                 let wo = wpush(&mut g, &mut weights);
-                if c.deepseek32 {
-                    // DeepSeek V3.2's five lightning-indexer slots, name-for-name with the `wload`
-                    // arm above. Declared but NOT captured onto `MlaW`: nothing emits the indexer
-                    // yet, and `generate_dense_backend` refuses a `deepseek32` model before this
-                    // closure ever runs (see the `c.deepseek32` bail there). They are declared
-                    // anyway because `wpush` consumes `wspecs` SEQUENTIALLY — the day the emit arm
-                    // lands, a missing declaration here would bind every later weight in the layer
-                    // one buffer off, silently. The indexer slice replaces these bindings with
-                    // fields on `MlaW`.
-                    let _ix_k_norm = wpush(&mut g, &mut weights);
-                    let _ix_k_norm_b = wpush(&mut g, &mut weights);
-                    let _ix_proj = wpush(&mut g, &mut weights);
-                    let _ix_attn_k = wpush(&mut g, &mut weights);
-                    let _ix_attn_q_b = wpush(&mut g, &mut weights);
-                }
+                // DeepSeek V3.2's five lightning-indexer slots, in the SAME order as the `wload`
+                // arm above — `wpush` consumes `wspecs` SEQUENTIALLY, so a missing or reordered
+                // declaration here would bind every later weight in the layer one buffer off,
+                // silently.
+                let indexer = c.deepseek32.then(|| IndexerW {
+                    k_norm: wpush(&mut g, &mut weights),
+                    k_norm_b: wpush(&mut g, &mut weights),
+                    proj: wpush(&mut g, &mut weights),
+                    attn_k: wpush(&mut g, &mut weights),
+                    attn_q_b: wpush(&mut g, &mut weights),
+                });
                 MixerW::Mla(MlaW {
                     wq_a,
                     q_a_norm,
@@ -1545,6 +1543,7 @@ pub(crate) fn generate_dense_backend(
                     wk_b,
                     wv_b,
                     wo,
+                    indexer,
                 })
             } else if is_delta {
                 let qkv = wpush(&mut g, &mut weights);
@@ -1844,6 +1843,28 @@ pub(crate) fn generate_dense_backend(
             Some(g.internal(f32d(batch * c.qk_rope_dim)))
         } else {
             None
+        };
+        // deepseek32 lightning-indexer scratch. All f32: the k row is LayerNormed (so it never
+        // leaves f16 range) but staying f32 also keeps the `Rope → WriteKv` peephole off it —
+        // that fusion only fires on an f16 rope dst, and its fused kernels have no NEOX build.
+        //   ix_q    [batch, indexer_n_head * indexer_head_size]  queries, roped in place
+        //   ix_k    [batch, indexer_head_size]                   the ONE shared key row (MQA)
+        //   ix_w    [batch, indexer_n_head]                      per-head weights (indexer_proj·x)
+        //   ix_topk [batch, top_k]                               i32 selected key indices
+        //   ix_mask [batch, kv_len]                              additive score mask for Op::Mla
+        // `ix_topk`/`ix_mask` are sized by the SELECTION, so they scale with the context, not with
+        // the model: `batch * kv_len` f32 is the mask's whole cost (see `Op::TopkMask`).
+        let ix_top_k = c.indexer_top_k.min(start_pos + batch);
+        let (ix_q, ix_k, ix_w, ix_topk, ix_mask) = if c.deepseek32 {
+            (
+                Some(g.internal(f32d(batch * c.indexer_n_head * c.indexer_head_size))),
+                Some(g.internal(f32d(batch * c.indexer_head_size))),
+                Some(g.internal(f32d(batch * c.indexer_n_head))),
+                Some(g.internal(TensorDesc::new(vec![batch * ix_top_k], DType::I32))),
+                Some(g.internal(f32d(batch * (start_pos + batch)))),
+            )
+        } else {
+            (None, None, None, None, None)
         };
         // Fused-QKV prefill staging: the wide GEMM writes [batch, qrow+2·kvrow] here, then three
         // CopyStrided ops split it into q/k/v. Decode (batch==1) skips it (offset GEMVs).
@@ -2390,6 +2411,168 @@ pub(crate) fn generate_dense_backend(
                     });
                 }
 
+                // ── deepseek32's lightning indexer ────────────────────────────────────────
+                // Runs on EVERY layer, between q_a_norm and the MLA attention, and decides which
+                // keys that layer's attention may see. `deepseek32.cpp`'s `// lightning indexer`
+                // block, in its order: queries off the same normed low-rank `qr` that `wq_b`
+                // consumes (`attn`, which `Op::Mla` only overwrites later), keys and per-head
+                // weights off the attn-normed input (`hn` — llama.cpp's `cur`).
+                //
+                // `key_mask` is `None` for deepseek2, which attends every causally-eligible key.
+                // The emit reads `mw.indexer`, NOT `c.deepseek32`: a V3.2 model whose indexer
+                // weights were not captured therefore takes the `else` below and FAILS loudly,
+                // instead of quietly running the deepseek2 graph over every key.
+                let key_mask = match &mw.indexer {
+                    None => {
+                        assert!(
+                            !c.deepseek32,
+                            "deepseek32 model reached the MLA emit with no lightning-indexer \
+                             weights captured — running the deepseek2 graph here would attend \
+                             every key instead of the indexer's top-k. See docs/deepseek.md § \
+                             Stage 3."
+                        );
+                        None
+                    }
+                    Some(ix) => {
+                        let ix_q = ix_q.expect("deepseek32 model without ix_q scratch");
+                        let ix_k = ix_k.expect("deepseek32 model without ix_k scratch");
+                        let ix_w = ix_w.expect("deepseek32 model without ix_w scratch");
+                        let ix_topk = ix_topk.expect("deepseek32 model without ix_topk scratch");
+                        let ix_mask = ix_mask.expect("deepseek32 model without ix_mask scratch");
+                        let ix_nh = c.indexer_n_head as u32;
+                        let ix_hd = c.indexer_head_size as u32;
+                        let kv_len = (start_pos + batch) as u32;
+                        // The indexer head is `[rope | nope]` — rope FIRST, the OPPOSITE of the
+                        // MLA head's `[nope | rope]`. That is why both ropes below are a plain
+                        // `Op::Rope` over the head's leading `qk_rope` dims with no offset and no
+                        // split: the op rotates `[0, rope_dim)` of each `head_dim`-wide head and
+                        // passes the tail through. llama.cpp writes the nope view's offset as
+                        // `row_size(nope)` where the layout means `row_size(rope)`; the two
+                        // coincide only because V3.2 has nope == rope == 64. This port takes the
+                        // layout ("rope occupies the head's first `n_rot` dims") and so does not
+                        // depend on that coincidence — `synthetic_deepseek32_indexer_head_is_rope_
+                        // then_nope` runs it at nope != rope, where the two readings differ.
+                        assert!(
+                            c.indexer_head_size > c.qk_rope_dim,
+                            "deepseek32 indexer head_size {} must exceed the rope width {} — the \
+                             head is [rope | nope] and there has to be a nope part",
+                            c.indexer_head_size,
+                            c.qk_rope_dim
+                        );
+                        // indexer_k = LayerNorm(indexer_attn_k · x), rope'd, then cached. ONE key
+                        // row per token, shared by every indexer query head (MQA).
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: ix.attn_k,
+                            dst: ix_k,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: ix_hd,
+                            w_off: 0,
+                        });
+                        // A real mean-centred LayerNorm WITH bias (`Op::LayerNorm`), on its own
+                        // hardcoded 1e-6 epsilon — not the GGUF's RMS epsilon. The only non-RMS
+                        // norm in the DeepSeek family.
+                        g.push(Op::LayerNorm {
+                            x: ix_k,
+                            weight: ix.k_norm,
+                            bias: ix.k_norm_b,
+                            dst: ix_k,
+                            rows: batch as u32,
+                            dim: ix_hd,
+                            eps: c.norm_eps,
+                        });
+                        // NEOX, hardcoded in `deepseek32.cpp` (`LLAMA_ROPE_TYPE_NEOX`), while the
+                        // MLA q_pe/k_pe rope a few lines below stays NORM. Same width, same
+                        // frequencies, same YaRN divisors — different element pairing.
+                        g.push(Op::Rope {
+                            x: ix_k,
+                            positions,
+                            dst: ix_k,
+                            rows: batch as u32,
+                            n_head: 1,
+                            head_dim: ix_hd,
+                            rope_dim: qk_rope,
+                            theta,
+                            freq_factors: yarn_ff,
+                            x_stride: 0,
+                            neox: true,
+                        });
+                        // The indexer's own KV cache — a SECOND per-token cache alongside the
+                        // 576-wide MLA one, carried on the V side this arch leaves unused (see
+                        // `crate::seam::kv_row_elems`). Written before the scoring reads it.
+                        g.push(Op::WriteKv {
+                            src: ix_k,
+                            cache: v_cache[l],
+                            rows: batch as u32,
+                            row_stride: ix_hd,
+                            pos: start_pos as u32,
+                        });
+                        // indexer_q = indexer_attn_q_b · qr, same `[rope | nope]` head, same NEOX
+                        // rope. Not cached — queries never are.
+                        g.push(Op::Linear {
+                            x: attn,
+                            weight: ix.attn_q_b,
+                            dst: ix_q,
+                            m: batch as u32,
+                            in_f: c.q_lora_rank as u32,
+                            out_f: ix_nh * ix_hd,
+                            w_off: 0,
+                        });
+                        g.push(Op::Rope {
+                            x: ix_q,
+                            positions,
+                            dst: ix_q,
+                            rows: batch as u32,
+                            n_head: ix_nh,
+                            head_dim: ix_hd,
+                            rope_dim: qk_rope,
+                            theta,
+                            freq_factors: yarn_ff,
+                            x_stride: 0,
+                            neox: true,
+                        });
+                        // Per-head weights `w[t, h]`, UNSCALED — `Op::LightningIndexer` applies
+                        // the `1/sqrt(head_dim * n_head)` normaliser to the WEIGHT, which is where
+                        // llama.cpp folds it too ("pre-scale weights to avoid scaling operations
+                        // on huge indexer_score tensor").
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: ix.proj,
+                            dst: ix_w,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: ix_nh,
+                            w_off: 0,
+                        });
+                        g.push(Op::LightningIndexer {
+                            q: ix_q,
+                            k_cache: v_cache[l],
+                            weights: ix_w,
+                            dst: ix_topk,
+                            rows: batch as u32,
+                            kv_len,
+                            n_head: ix_nh,
+                            head_dim: ix_hd,
+                            top_k: ix_top_k as u32,
+                            scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
+                            pos: start_pos as u32,
+                        });
+                        // Expand the indices into the additive `-inf`-outside-top-k score mask the
+                        // MLA kernels add. llama.cpp materialises the same mask and runs DENSE
+                        // attention over the full n_kv — the FLOP saving is not taken, only the
+                        // numerics are faithful (docs/deepseek.md § "How top-k feeds attention").
+                        g.push(Op::TopkMask {
+                            idx: ix_topk,
+                            dst: ix_mask,
+                            rows: batch as u32,
+                            kv_len,
+                            top_k: ix_top_k as u32,
+                        });
+                        Some(ix_mask)
+                    }
+                };
+
                 // KV: wkv_a_mqa → mla_k16 (f32). Split into kv_cmpr and k_pe, norm+rope, reassemble.
                 g.push(Op::Linear {
                     x: hn,
@@ -2452,6 +2635,10 @@ pub(crate) fn generate_dense_backend(
                     theta,
                     freq_factors: yarn_ff,
                     x_stride: 0,
+                    // NORM (interleaved pairs) — DeepSeek's main rope, and NOT the NEOX one the
+                    // indexer above hardcodes. All five DeepSeek arches report
+                    // `LLAMA_ROPE_TYPE_NORM` from `llama_model_rope_type`.
+                    neox: false,
                 });
                 // Copy roped k_pe back.
                 g.push(Op::CopyStrided {
@@ -2523,6 +2710,7 @@ pub(crate) fn generate_dense_backend(
                     pos: start_pos as u32,
                     theta,
                     freq_factors: yarn_ff,
+                    key_bias: key_mask,
                 });
                 // wo projection, residual add.
                 g.push(Op::Linear {
@@ -2753,6 +2941,9 @@ pub(crate) fn generate_dense_backend(
                                 theta,
                                 freq_factors: layer_ff,
                                 x_stride: 0,
+                                // llama-family NORM (interleaved) rope. `Config::permute_qk_neox`
+                                // is what makes this reproduce NEOX for a rotate-half GGUF.
+                                neox: false,
                             });
                             // llama4 rope layer: weightless per-head L2-norm on the roped K.
                             if let Some(ones) = l2norm {
@@ -2839,6 +3030,7 @@ pub(crate) fn generate_dense_backend(
                             theta,
                             freq_factors: layer_ff,
                             x_stride: 0,
+                            neox: false,
                         });
                         // llama4 rope layer: weightless per-head L2-norm on the roped Q.
                         if let Some(ones) = l2norm {

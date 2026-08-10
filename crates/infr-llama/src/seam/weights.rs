@@ -123,10 +123,8 @@ pub(super) struct DeltaW {
 /// ONE compressed row per token (`key_length = kv_lora_rank + qk_rope_dim`); V is an aliased prefix —
 /// no separate V cache. See `docs/deepseek.md` § Stage 2.
 ///
-/// `deepseek32` (V3.2) uses this same mixer plus five per-layer lightning-indexer tensors. Those
-/// are UPLOADED and their graph slots DECLARED (`runner.rs`'s `wload`/`wpush` MLA arms) but are not
-/// captured here, because no op reads them yet and `generate_dense_backend` refuses a `deepseek32`
-/// model before the graph is built — see `docs/deepseek.md` § Stage 3.
+/// `deepseek32` (V3.2) uses this same mixer plus the five per-layer lightning-indexer tensors on
+/// [`IndexerW`] — see `docs/deepseek.md` § Stage 3.
 pub(super) struct MlaW {
     /// Q low-rank input projection `[n_embd, q_lora_rank]` (absent in lite models).
     pub(super) wq_a: Option<TensorId>,
@@ -144,6 +142,32 @@ pub(super) struct MlaW {
     pub(super) wv_b: TensorId,
     /// Output projection `[n_head * v_head_dim, n_embd]`.
     pub(super) wo: TensorId,
+    /// deepseek32's lightning indexer. `Some` exactly when `Config::deepseek32`; `None` for every
+    /// `deepseek2` model, which attends every causally-eligible key. The emit arm reads this
+    /// `Option` rather than the config flag, so a `deepseek32` model whose indexer weights were not
+    /// captured cannot fall through to the deepseek2 graph — it fails.
+    pub(super) indexer: Option<IndexerW>,
+}
+
+/// DeepSeek V3.2's per-layer lightning-indexer weights — the five tensors V3.2 adds to
+/// `deepseek2`'s absorbed MLA, on EVERY layer (dense-lead included: `deepseek32.cpp` creates them
+/// outside the dense/MoE branch). See `docs/deepseek.md` § "The lightning indexer".
+pub(super) struct IndexerW {
+    /// `indexer.k_norm.weight` `[indexer_head_size]` — the gain of a mean-centred LayerNorm
+    /// (`Op::LayerNorm`), the only non-RMS norm anywhere in the DeepSeek family.
+    pub(super) k_norm: TensorId,
+    /// `indexer.k_norm.bias` `[indexer_head_size]` — that LayerNorm's bias. Not optional: the
+    /// reference always loads it, and an RMSNorm-shaped port would silently drop it.
+    pub(super) k_norm_b: TensorId,
+    /// `indexer.proj.weight` `[n_embd, indexer_n_head]` — projects the layer input to ONE weight
+    /// per indexer head per token (`w` in the score formula), applied to the attn-normed input.
+    pub(super) proj: TensorId,
+    /// `indexer.attn_k.weight` `[n_embd, indexer_head_size]` — the single shared indexer KEY head
+    /// (MQA: one key row per token, dotted against every indexer query head).
+    pub(super) attn_k: TensorId,
+    /// `indexer.attn_q_b.weight` `[q_lora_rank, indexer_n_head * indexer_head_size]` — the indexer
+    /// queries, read off the SAME normed low-rank `qr` that `wq_b` consumes.
+    pub(super) attn_q_b: TensorId,
 }
 
 /// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, or DeepSeek MLA.

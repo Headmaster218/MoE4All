@@ -1,0 +1,50 @@
+#version 460
+// Expand `Op::LightningIndexer`'s top-k key indices into the additive score mask `Op::Mla` adds
+// (`Op::TopkMask`): `dst[t, j] = 0.0` when key `j` is one of row `t`'s selected keys, `-inf`
+// otherwise. deepseek32's "how top-k feeds attention" — llama.cpp materializes the same
+// `[n_kv, n_tokens]` mask and runs DENSE attention over it.
+//
+// One workgroup per query row, two phases with a barrier between them (the fill must land before
+// the scatter punches its holes, and the two touch overlapping slots):
+//   1. the 256 lanes fill this row's `kv_len` slots with -inf;
+//   2. lanes 0..top_k each write 0.0 at their index.
+//
+// Duplicate indices would just write 0.0 twice — the selector's order is total, so it cannot
+// produce one, but the scatter does not depend on that.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint top_k;
+} pc;
+
+// idx: [rows, top_k] — i32 key indices, read as raw words (the `Op::Argmax` carrier convention).
+layout(binding = 0) readonly buffer IB { uint idx[]; };
+// dst: [rows, kv_len] — f32 additive mask
+layout(binding = 1) writeonly buffer DB { float dst[]; };
+
+#define NTHREAD 256u
+
+void main() {
+    // Flat workgroup index over `rows` — recovers the index when `dispatch_wide` split the grid in
+    // two dimensions (identical to gl_WorkGroupID.x when it did not).
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= pc.rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint dbase = row * pc.kv_len;
+
+    for (uint j = t; j < pc.kv_len; j += NTHREAD) {
+        // -inf as a bit pattern: a literal `-1.0/0.0` is a constant-folded division by zero, which
+        // glslc rejects. `exp(-inf - finite_max)` is 0 exactly, which is the point.
+        dst[dbase + j] = uintBitsToFloat(0xFF800000u);
+    }
+    // The scatter below writes slots other lanes just filled, so the fill's stores must be
+    // VISIBLE, not merely retired: `barrier()` alone orders execution and shared memory.
+    memoryBarrierBuffer();
+    barrier();
+
+    for (uint k = t; k < pc.top_k; k += NTHREAD) {
+        dst[dbase + idx[row * pc.top_k + k]] = 0.0;
+    }
+}

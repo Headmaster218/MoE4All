@@ -1,8 +1,10 @@
-// ---- RoPE (Op::Rope = the no-qk-norm llama-family rotation): INTERLEAVED pairs (2p, 2p+1) —
-// llama.cpp's ROPE_TYPE_NORM, matching infr-cpu and the Vulkan `rope` kernel. (QkNormRope below
-// is the NEOX split-half used by qwen/gemma; the styles are NOT interchangeable.) Rotates the
+// ---- RoPE (Op::Rope). `neox` picks the rotation pair: 0 = INTERLEAVED (2p, 2p+1), llama.cpp's
+// ROPE_TYPE_NORM (the llama family, DeepSeek's q_pe/k_pe); 1 = SPLIT-HALF (p, p + rope_dim/2),
+// ROPE_TYPE_NEOX — the pairing QkNormRope below applies unconditionally (qwen/gemma) and the one
+// deepseek32's lightning indexer hardcodes while the MLA rope beside it stays NORM. Angles and the
+// pass-through tail are identical either way; the styles are NOT interchangeable. Rotates the
 // first rope_dim of each head; dims beyond pass through. One thread per (row, head).
-struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; };
+struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; uint neox; };
 // One thread per (row, head, rotation pair) — the previous one-thread-per-head form rotated
 // rope_dim/2 pairs SERIALLY (trig included) and copied the whole head, which left a decode row
 // on a single simdgroup (the counter profiler measured it at 19% of TinyLlama decode). Threads
@@ -25,7 +27,8 @@ kernel void rope_f32(device const float* x   [[buffer(0)]],
         dst[base + i] = x[base + i];
         return;
     }
-    uint i0 = 2 * k, i1 = 2 * k + 1;
+    uint i0 = p.neox != 0 ? k : 2 * k;
+    uint i1 = p.neox != 0 ? k + hf : 2 * k + 1;
     float p0 = pos[r];
     float ang = p0 * pow(p.theta, -2.0f * (float)k / (float)p.rope_dim);
     if (p.has_ff != 0) ang /= ff[k];

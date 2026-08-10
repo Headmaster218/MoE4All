@@ -1,12 +1,17 @@
 # DeepSeek support plan (V1 → V2/V3 → V3.2 → V4)
 
-Status: **Stage 2 done.** CPU path works end-to-end on V2-Lite; Vulkan and Metal
-MLA kernels are implemented, wired, and executed on their real devices (Vulkan
-on the GPU box, Metal via the macOS CI job's parity suite); Vulkan MoE is
-implemented; exp_probs_b loads from V3 GGUFs; the GPU seam test passes (cosine
-0.9955 CPU-vs-Vulkan, matching greedy output vs llama.cpp c629da5); the YaRN
-ramp is verified numerically against llama.cpp at short AND long context (see
-the checklist).
+Status: **Stage 3 done.** A `deepseek32` (V3.2) model loads, builds a graph with
+the lightning indexer wired in, and generates on CPU and Vulkan — see § Stage 3
+for what that is verified against and what cannot be verified without a real
+671B file.
+
+Stage 2: CPU path works end-to-end on V2-Lite; Vulkan and Metal MLA kernels are
+implemented, wired, and executed on their real devices (Vulkan on the GPU box,
+Metal via the macOS CI job's parity suite); Vulkan MoE is implemented;
+exp_probs_b loads from V3 GGUFs; the GPU seam test passes (cosine 0.9955
+CPU-vs-Vulkan, matching greedy output vs llama.cpp c629da5); the YaRN ramp is
+verified numerically against llama.cpp at short AND long context (see the
+checklist).
 
 Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
 
@@ -493,16 +498,107 @@ Order matters:
 
 ## Stage 3 — `deepseek32` (V3.2)
 
-**Progress: the LOAD path is done, the graph is not.** A `deepseek32` GGUF
-registers, parses into a `Config` and loads every weight including the five
-per-layer indexer tensors; `generate_dense_backend` then refuses by name rather
-than emitting the deepseek2 graph, which would run attention over every key
-instead of the indexer's top-k and produce silently wrong output.
-`Op::LayerNorm` (the indexer's `k_norm`) landed on all three backends. Still to
-do: the indexer itself, its second KV cache, and the emit arm. All verification
-is synthetic — `tests/synthetic_deepseek2.rs` builds a `deepseek32` GGUF from
-the same description as the `deepseek2` one plus an indexer, since V3.2 is 671B
-and no real file can be obtained.
+**Progress: complete — a `deepseek32` model loads, builds a graph and
+generates.** The indexer is wired end to end on CPU and Vulkan (executed on an
+RX 7900 XTX under the validation layer) and typechecks on Metal, whose first
+real execution is the macOS CI job's parity suite. What landed, on top of the
+already-tested `Op::LayerNorm` and `Op::LightningIndexer`:
+
+- **`Op::Rope` gained `neox`.** The indexer's rope is NEOX where the MLA rope
+  beside it is NORM; `Op::Rope` had only the interleaved NORM pairing (the NEOX
+  one existed solely fused inside `Op::QkNormRope`). CPU branches on the field;
+  Vulkan compiles two more `rope.comp` builds (`rope_neox`, `rope_ff_neox`) and
+  REFUSES `neox` on the f16-out / record-once paths, which have no such build;
+  Metal carries it as a `RopeParams` field.
+- **`Op::Mla` gained `key_bias`**, an optional additive `[rows, kv_len]` score
+  mask, and **`Op::TopkMask`** expands the indexer's indices into it. `None` for
+  `deepseek2`, where every backend takes exactly the code it took before.
+- **The indexer's second KV cache rides the V side**
+  `MLA leaves empty — see `seam::kv_row_elems`, which now answers `(kv_lora_rank +
+  qk_rope_dim,
+  indexer_head_size)`for`deepseek32`. All six geometry sites (allocation, graph declaration, `fork`, `seed_from`, both VRAM estimates) therefore size and copy it without any of them growing a private branch — under-reserving it is exactly backlog B41. The allocation asserts the cache does not ring, because `Op::LightningIndexer`
+  masks causally only.
+- **The refusal is gone**, replaced by an assertion on `MlaW::indexer`: a
+  `deepseek32` model whose indexer weights were not captured fails at the emit
+  instead of degrading to the deepseek2 graph.
+
+### The cache and mask decisions, with their costs
+
+**Second cache on the V side.** One `indexer_head_size`-wide f16 row per token
+per layer: on V3.2 that is 128 halves = 256 B/token/layer against MLA's 576
+halves = 1152 B, so the KV footprint grows ~22%. It cannot ring (see above), so
+it is sized at the full context like any non-SWA side.
+
+**Mask, not gather.** `Op::Mla` takes the `[rows, kv_len]` f32 mask; the inner
+loop pays one extra f32 load per key and the graph pays `rows × kv_len` floats
+of scratch (16 MiB at a 512-row ubatch and an 8192 context — the same order as
+the indexer's own score scratch, which was already there). The alternative,
+membership-testing the index list inside the MLA kernel, needs no scratch but
+scans `top_k` (≈2048 on V3.2) per (row, head, key) — three orders of magnitude
+worse on the inner loop. The mask is also what llama.cpp materialises, so the
+numerics are comparable term by term. **The FLOP saving is still not realised**;
+a gather remains a pure optimisation on top.
+
+### What is verified, and what cannot be
+
+All verification is synthetic — `tests/synthetic_deepseek2.rs` builds a
+`deepseek32` GGUF from the same description as the `deepseek2` one plus an
+indexer, since V3.2 is 671B and no real file can be obtained.
+
+- `synthetic_deepseek32_cpu_prefill_is_finite` — the whole model runs.
+- `gpu_synthetic_deepseek32_matches_cpu` — CPU vs Vulkan: cosine
+  `0.9999999999998446`, same top token, on the GPU box under the Khronos
+  validation layer with zero VUID lines. Everything the indexer adds executes
+  there: `layernorm.comp`, `rope.comp`'s `-DNEOX` build, the second `WriteKv`,
+  `lightning_indexer.comp`, `topk_mask.comp`, `mla.comp`'s `-DKEY_BIAS` build.
+- `synthetic_deepseek32_full_top_k_matches_no_indexer_at_all` — with
+  `top_k >= kv_len` the mask is all-zero and the CPU logits are
+  **bit-identical** (`max|Δ| = 0`) to the same model with no indexer at all.
+  This is the property that makes the mask faithful, and it is also what proves
+  the indexer perturbs nothing else. Its Vulkan twin can only assert ~1 ULP
+  (`9.536743e-7`): the masked build's score is `red[0]*scale + kbias[j]`, which
+  the compiler fuses into one FMA where the unmasked build rounds the product
+  separately, so the two pipelines differ by a rounding even at `kbias == 0`.
+- `synthetic_deepseek32_top_k_restricts_attention` — at `top_k = 5` of 8 keys
+  the output moves by `max|Δ| = 2.52` against a logit rms of `1.11`. A version
+  of this suite without that case would pass with the mask never reaching the
+  kernel.
+- `rope_neox_and_norm_parity`, `topk_mask_parity`,
+  `mla_key_bias_removes_the_masked_keys` in `seam_op_parity.rs` — op-level, CPU
+  vs from-definition references and CPU vs Vulkan. The `key_bias` case checks
+  the equivalence that matters: masking a key is exactly the key not being in
+  the cache.
+- `synthetic_deepseek32_indexer_selection_is_locked` — a tolerance-based lock on
+  the restricted run's logits. It is a REGRESSION lock blessed from this
+  implementation, not an independent oracle; what it buys is that the indexer's
+  NEOX pairing and its `[rope | nope]` head order cannot change silently.
+
+Each of the three traps was applied as a perturbation, seen to fail, and
+reverted (2026-08-10, CPU, `--test synthetic_deepseek2`; the lock's own scale is
+logit rms `1.0331706e0`):
+
+| perturbation                                     | what went red                    |            max\|Δ\| |
+| ------------------------------------------------ | -------------------------------- | ------------------: |
+| indexer roped NORM instead of NEOX               | the selection lock               |       `8.557266e-2` |
+| indexer head read as `[nope \| rope]`            | the selection lock               |       `1.0638273e0` |
+| `Op::Mla::key_bias` passed `None` (mask dropped) | the lock AND `top_k_restricts_…` | `2.5244246e0` / `0` |
+
+The third row is the important one: with the mask dropped, `top_k = 5` and
+`top_k >= kv_len` become **indistinguishable** (`max|Δ| = 0`), which is exactly
+the failure a suite without that case would have shipped.
+
+**Not verified, and not verifiable here:** anything against llama.cpp's own
+numbers. There is no V3.2 GGUF and no CPU oracle, so the indexer's absolute
+scores, the top-k it picks on a real model, and the resulting text are all
+unchecked. The synthetic harness proves the pieces agree with their own
+specifications and with each other across backends; it cannot prove the
+specification matches DeepSeek.
+
+**Metal has not executed any of this.**
+`cargo check -p infr-metal --target x86_64-apple-darwin` typechecks the new arms
+and the four `mla_f16kv*` entry points; the macOS CI parity job is the first
+thing that runs them. (And a `deepseek32` MoE layer cannot run on Metal at all
+yet, for the router reasons in "What `infr` already has".)
 
 **~80% of this is stage 2 copied verbatim.** llama.cpp's `deepseek32.cpp` is
 deepseek2's absorbed MLA path plus the lightning indexer. Non-MLA is rejected
@@ -534,11 +630,23 @@ New tensors: `indexer.k_norm.{weight,bias}`, `indexer.proj.weight`,
 Traps, each of which produces silent wrongness:
 
 - **The indexer's rope type is NEOX, hardcoded**, while the main MLA rope is
-  NORM. Same width, same frequencies, different pairing.
+  NORM. Same width, same frequencies, different pairing. **Done**: `Op::Rope`
+  carries a `neox` flag on all three backends (§ Stage 3 progress above).
+  `Config::permute_qk_neox` is NOT the tool — it is model-wide and keyed on
+  `attn_q`/`attn_k` tensor names, so it cannot say "this one projection ropes
+  NEOX while the model's main rope is NORM" (see § Stage 1).
 - **The indexer head layout is `[rope | nope]`** — the _opposite_ of the MLA
   head. Worse, llama.cpp writes the nope view's offset as `row_size(nope)`
   rather than `row_size(rope)`; these coincide only because both are 64 for
-  V3.2. Port it as "offset = rope width" and assert it.
+  V3.2. **Ported as the layout says**: rope occupies each head's first `n_rot`
+  dims, which is what makes both indexer ropes a plain `Op::Rope` with no offset
+  and no split (that op rotates `[0, rope_dim)` of each head and passes the tail
+  through). This port therefore does not depend on the coincidence at all, and
+  the synthetic fixture runs at `head_size = 24, n_rot = 16` — nope 8 ≠ rope 16,
+  a geometry where the two readings genuinely differ. Note the consequence: on a
+  hypothetical V3.2-shaped model with nope ≠ rope, llama.cpp's view arithmetic
+  and this port would disagree, and llama.cpp would be the one reading a
+  misaligned nope.
 - `indexer_k_norm` is a real **LayerNorm with bias** (mean-centred), the only
   non-RMS norm anywhere in the family — `graph.rs` carried `RmsNorm` and
   `RmsNormAdd` and nothing mean-centred, so it needed a new op rather than a
@@ -550,7 +658,8 @@ Traps, each of which produces silent wrongness:
   it yet — the indexer is its first caller.
 - The indexer keeps a **second, independent KV cache**: one
   `index_head_dim`-wide row per token per layer, on top of the 576-wide MLA
-  cache.
+  cache. **Done**: it rides the V side MLA leaves empty (`seam::kv_row_elems`),
+  and it must never ring.
 - A **Hadamard rotation** is applied to q and k. It is an orthogonal transform
   applied identically to both, so dot products are preserved: it exists for
   quantisation friendliness and **can be skipped entirely** in an unquantised
@@ -568,6 +677,14 @@ speedup must gather, and the selected indices are per (query token, stream), not
 per head. Doing the mask version first is the safe order: it is checkable
 against llama.cpp token-for-token, and the gather can follow as a pure
 optimisation.
+
+**Done, as the mask.** `Op::LightningIndexer` emits indices, `Op::TopkMask`
+expands them into an additive `[rows, kv_len]` f32 mask (0 on the selected keys,
+`-inf` elsewhere), and `Op::Mla::key_bias` adds it to the score. Costs are in §
+Stage 3's "cache and mask decisions". `-inf` is safe rather than a large finite
+negative because at least one key is always selected — `top_k >= 1`, and the
+indexer ranks every causally-eligible key above every ineligible one — so each
+row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 

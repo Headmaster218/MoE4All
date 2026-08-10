@@ -46,15 +46,39 @@ layout(binding = 2) readonly buffer WKB { float wk_b[]; };
 // wv_b: [n_head, kv_lora_rank, v_head_dim] — f32
 layout(binding = 3) readonly buffer WVB { float wv_b[]; };
 // dst: [rows, n_head, v_head_dim] — f32 writeonly
-#ifdef FREQ_FACTORS
-// YaRN per-pair frequency divisors (`qk_rope_dim/2` floats): the internal q_pe rope's rotation
-// angle is DIVIDED by ff[p] (see `mla_ff` build in build.rs). Binds at 4; dst shifts to 5 —
-// the hazard tracker treats the TRAILING binding as the write, and the recorder binds
-// [.., ff, dst], so the output must come last for the store→read barrier.
+//
+// The two optional read bindings come BEFORE dst, in this order, because the hazard tracker treats
+// the TRAILING binding as the write: the recorder binds [.., ff, kbias, dst], so `dst` must stay
+// last or the read-only buffers would be marked written and `dst` left untracked (no store→read
+// barrier before the wo-projection reads it — nondeterminism).
+//
+//   -DFREQ_FACTORS  YaRN per-pair frequency divisors (`qk_rope_dim/2` floats): the internal q_pe
+//                   rope's rotation angle is DIVIDED by ff[p].
+//   -DKEY_BIAS      Additive per-(row, key) score mask `[rows, kv_len]` (`Op::Mla::key_bias`) —
+//                   deepseek32's lightning-indexer top-k, 0 on the selected keys and -inf
+//                   elsewhere. Indexed by KEY POSITION, not by the ring row.
+#if defined(FREQ_FACTORS) && defined(KEY_BIAS)
 layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) readonly buffer BB { float kbias[]; };
+layout(binding = 6) writeonly buffer DB { float dst[]; };
+#elif defined(FREQ_FACTORS)
+layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) writeonly buffer DB { float dst[]; };
+#elif defined(KEY_BIAS)
+layout(binding = 4) readonly buffer BB { float kbias[]; };
 layout(binding = 5) writeonly buffer DB { float dst[]; };
 #else
 layout(binding = 4) writeonly buffer DB { float dst[]; };
+#endif
+
+// Add the score mask at key POSITION `j` (NOT the ring row) for this workgroup's query row. The
+// no-mask build adds NOTHING rather than adding a literal 0.0 — `x + 0.0` is not the identity on
+// -0.0, so a shared expression would leave deepseek2 one instruction and one IEEE corner away from
+// the arithmetic it had before this build existed.
+#ifdef KEY_BIAS
+#define ADD_KEY_BIAS(d, tok, j) ((d) + kbias[(tok) * pc.kv_len + (j)])
+#else
+#define ADD_KEY_BIAS(d, tok, j) (d)
 #endif
 
 // The absorbed+roped query (key_len wide) and the V accumulator (kv_lora_rank wide) — shared
@@ -189,7 +213,7 @@ void main() {
             }
             barrier();
         }
-        float d = red[0] * pc.scale;
+        float d = ADD_KEY_BIAS(red[0] * pc.scale, tok, lo + jj);
         if (tid == 0u) {
             lmax = max(lmax, d);
         }
@@ -223,7 +247,7 @@ void main() {
             }
             barrier();
         }
-        float p = exp(red[0] * pc.scale - lmax);
+        float p = exp(ADD_KEY_BIAS(red[0] * pc.scale, tok, lo + jj) - lmax);
         // Each lane accumulates its slice of the kv_lora_rank-wide V.
         for (uint di = tid; di < pc.kv_lora_rank; di += 128u) {
             sv[di] += p * kread(jr, di);

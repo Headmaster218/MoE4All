@@ -4043,9 +4043,13 @@ impl<'a> Recorder<'a> {
         // pass 0 for the causal and sliding-window masks, which derive their own `lo`.
         canvas_lo: u32,
         // YaRN per-pair frequency divisors for the internal q_pe rope (`qk_rope_dim/2` floats) —
-        // binds at 5 and selects the `mla_ff` kernel build (the divisor is a compile-time
-        // presence; the plain `mla` build has no ff binding).
+        // selects the `-DFREQ_FACTORS` kernel build (a compile-time presence; the plain `mla`
+        // build has no ff binding).
         freq_factors: Option<&dyn Buffer>,
+        // deepseek32's additive `[rows, kv_len]` top-k score mask — selects the `-DKEY_BIAS`
+        // build. Independent of `freq_factors`, hence the four kernels. Both optional reads bind
+        // BEFORE `dst`, which must stay the trailing (hazard-tracked write) binding.
+        key_bias: Option<&dyn Buffer>,
     ) {
         let mut push = [0u8; 60];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
@@ -4063,45 +4067,48 @@ impl<'a> Recorder<'a> {
         push[48..52].copy_from_slice(&theta.to_ne_bytes());
         push[52..56].copy_from_slice(&cache_cap_rows.to_ne_bytes());
         push[56..60].copy_from_slice(&canvas_lo.to_ne_bytes());
-        match freq_factors {
-            Some(ff) => {
-                let k = self.be.kernel("mla_ff", crate::gemm::mla_ff_spv(), 6, 60);
-                self.dispatch_wide(
-                    k,
-                    &[
-                        Self::vkb(q),
-                        Self::vkb(k_cache),
-                        Self::vkb(wk_b),
-                        Self::vkb(wv_b),
-                        // ff BEFORE dst: the hazard tracker treats the trailing `n_out` bindings
-                        // as writes, and `dst` (index 5) must be the tracked write — binding ff
-                        // last would mark the read-only divisors as written and leave `dst`
-                        // untracked (no barrier before the wo-projection read → nondeterminism).
-                        Self::vkb(ff),
-                        Self::vkb(dst),
-                    ],
-                    1,
-                    &push,
-                    rows * n_head,
-                );
-            }
-            None => {
-                let k = self.be.kernel("mla", crate::gemm::mla_spv(), 5, 60);
-                self.dispatch_wide(
-                    k,
-                    &[
-                        Self::vkb(q),
-                        Self::vkb(k_cache),
-                        Self::vkb(wk_b),
-                        Self::vkb(wv_b),
-                        Self::vkb(dst),
-                    ],
-                    1,
-                    &push,
-                    rows * n_head,
-                );
-            }
-        }
+        // The optional reads bind BEFORE dst: the hazard tracker treats the trailing `n_out`
+        // bindings as writes, and `dst` must be the tracked one — binding ff/kbias last would mark
+        // read-only buffers as written and leave `dst` untracked (no barrier before the
+        // wo-projection read → nondeterminism).
+        let mut bufs = vec![
+            Self::vkb(q),
+            Self::vkb(k_cache),
+            Self::vkb(wk_b),
+            Self::vkb(wv_b),
+        ];
+        bufs.extend(freq_factors.map(Self::vkb));
+        bufs.extend(key_bias.map(Self::vkb));
+        bufs.push(Self::vkb(dst));
+        let (name, spv) = match (freq_factors.is_some(), key_bias.is_some()) {
+            (false, false) => ("mla", crate::gemm::mla_spv()),
+            (true, false) => ("mla_ff", crate::gemm::mla_ff_spv()),
+            (false, true) => ("mla_bias", crate::gemm::mla_bias_spv()),
+            (true, true) => ("mla_ff_bias", crate::gemm::mla_ff_bias_spv()),
+        };
+        let k = self.be.kernel(name, spv, bufs.len(), 60);
+        self.dispatch_wide(k, &bufs, 1, &push, rows * n_head);
+    }
+
+    /// Expand `Op::LightningIndexer`'s `[rows, top_k]` key indices into the additive `[rows,
+    /// kv_len]` f32 score mask `Recorder::mla`'s `key_bias` adds (`topk_mask.comp`,
+    /// `Op::TopkMask`): one workgroup per query row, `-inf` fill then a scatter of `0.0`.
+    pub fn topk_mask(
+        &self,
+        idx: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        top_k: u32,
+    ) {
+        let k = self
+            .be
+            .kernel("topk_mask", crate::gemm::topk_mask_spv(), 2, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
+        push[8..12].copy_from_slice(&top_k.to_ne_bytes());
+        self.dispatch_wide(k, &[Self::vkb(idx), Self::vkb(dst)], 1, &push, rows);
     }
 
     /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
@@ -4352,6 +4359,10 @@ impl<'a> Recorder<'a> {
         // YaRN per-pair frequency divisors (`rope_dim/2` floats) — binds at 2 and selects the
         // `rope_ff` kernel build (compile-time presence; the plain `rope` build has no ff binding).
         freq_factors: Option<&dyn Buffer>,
+        // NEOX split-half pairing instead of the interleaved NORM one (`Op::Rope::neox`) — a
+        // second compile-time build rather than a push-constant branch, so the existing NORM
+        // pipelines and their push layout are untouched.
+        neox: bool,
     ) {
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
@@ -4363,7 +4374,12 @@ impl<'a> Recorder<'a> {
         // [24..28] out_base: 0 (in-place f32 rope has no output shift)
         match freq_factors {
             Some(ff) => {
-                let k = self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28);
+                let k = if neox {
+                    self.be
+                        .kernel("rope_ff_neox", crate::gemm::rope_ff_neox_spv(), 3, 28)
+                } else {
+                    self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28)
+                };
                 self.dispatch(
                     k,
                     // ff BEFORE y: the trailing `n_out` bindings are the hazard-tracked writes,
@@ -4376,7 +4392,12 @@ impl<'a> Recorder<'a> {
                 );
             }
             None => {
-                let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28);
+                let k = if neox {
+                    self.be
+                        .kernel("rope_neox", crate::gemm::rope_neox_spv(), 2, 28)
+                } else {
+                    self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28)
+                };
                 self.dispatch(
                     k,
                     &[Self::vkb(x), Self::vkb(y)],
@@ -12351,6 +12372,7 @@ mod tests {
             cap_rows as u32, // cache_cap_rows — ring capacity > kv_len
             0,               // canvas_lo — unused by the causal mask
             None,            // freq_factors — no YaRN divisors in the reference test
+            None,            // key_bias — deepseek2 attends every causally-eligible key
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; rows * nh * vhd * 4];
@@ -12647,6 +12669,7 @@ mod tests {
                 theta,
                 c.cap as u32,
                 c.canvas_lo,
+                None,
                 None,
             );
             rec.finish().unwrap();

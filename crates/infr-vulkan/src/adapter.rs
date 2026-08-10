@@ -2387,6 +2387,7 @@ fn lower_op(
             rope_dim,
             theta,
             freq_factors,
+            neox,
             ..
         } => {
             let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
@@ -2397,6 +2398,15 @@ fn lower_op(
             if freq_factors.is_some() && (f16_out || !matches!(mode, RopeMode::Static(_))) {
                 return Err(be(
                     "vulkan adapter: standalone Rope with freq_factors unsupported on this path",
+                ));
+            }
+            // Same for NEOX (deepseek32's indexer): only the static f32 builds carry `-DNEOX`.
+            // Dropping it silently would rotate the wrong element pairs — fluent nonsense, no
+            // error — so refuse instead.
+            if *neox && (f16_out || !matches!(mode, RopeMode::Static(_))) {
+                return Err(be(
+                    "vulkan adapter: standalone NEOX Rope unsupported on this path (f16-out / \
+                     record-once decode have no -DNEOX kernel build)",
                 ));
             }
             let ff = freq_factors.map(&r).transpose()?;
@@ -2448,6 +2458,7 @@ fn lower_op(
                             *theta,
                             rope_pos[&positions.0],
                             ff,
+                            *neox,
                         );
                     }
                 }
@@ -4359,6 +4370,7 @@ fn lower_op(
             pos,
             theta,
             freq_factors,
+            key_bias,
         } => {
             // `mla.comp` holds the absorbed query and the V accumulator in FIXED-size shared
             // arrays, so an over-wide latent would write past them (shared memory is not bounds
@@ -4387,6 +4399,7 @@ fn lower_op(
                 AttnMask::Canvas { lo } => (2u32, 0u32, *lo as u32),
             };
             let ff = freq_factors.map(&r).transpose()?;
+            let kbias = key_bias.map(&r).transpose()?;
             rec.mla(
                 r(*q)?,
                 r(*k_cache)?,
@@ -4409,6 +4422,7 @@ fn lower_op(
                 cache_cap_rows,
                 canvas_lo,
                 ff,
+                kbias,
             );
         }
         Op::LightningIndexer {
@@ -4475,6 +4489,24 @@ fn lower_op(
                 *scale,
                 *pos,
             );
+        }
+        Op::TopkMask {
+            idx,
+            dst,
+            rows,
+            kv_len,
+            top_k,
+        } => {
+            // Every index the scatter writes must land inside the row. The kernel cannot refuse
+            // the dispatch and an out-of-range write into an SSBO is undefined, so refuse here —
+            // this is the same bound `Op::LightningIndexer` enforces on its own output.
+            if top_k > kv_len {
+                return Err(be(format!(
+                    "vulkan Op::TopkMask: top_k {top_k} exceeds kv_len {kv_len} — the indices \
+                     cannot all name keys inside the mask row"
+                )));
+            }
+            rec.topk_mask(r(*idx)?, r(*dst)?, *rows, *kv_len, *top_k);
         }
     }
     Ok(())
@@ -6002,6 +6034,7 @@ mod tests {
                 pos: 0,
                 theta: 10000.0,
                 freq_factors: None,
+                key_bias: None,
             });
             // Zeroed buffers of the exact shapes — the boundary case really dispatches over them.
             let qb = be_.alloc(rows * n_head * q_head_dim * 4, BufferUsage::Activations)?;

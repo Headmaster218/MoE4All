@@ -1422,6 +1422,7 @@ impl Backend for CpuBackend {
                     rope_dim,
                     theta,
                     freq_factors,
+                    neox,
                     ..
                 } => {
                     let (rows, nh, hd, rd) = (
@@ -1437,17 +1438,22 @@ impl Backend for CpuBackend {
                     let pos = &vals[positions.0 as usize];
                     let ff = freq_factors.map(|f| &vals[f.0 as usize]);
                     let mut out = xs.clone(); // dims beyond rope_dim pass through unchanged
-                                              // Op::Rope is the no-qk-norm (llama-family) rotation: INTERLEAVED pairs
-                                              // (2p, 2p+1) — llama.cpp's ROPE_TYPE_NORM, matching the Vulkan `rope` kernel
-                                              // and the bespoke fused attn_in. (QkNormRope is the NEOX split-half rotation
-                                              // used by qwen/gemma; the two styles are NOT interchangeable.)
+                                              // Pair p's two elements: INTERLEAVED (2p, 2p+1) for llama.cpp's ROPE_TYPE_NORM
+                                              // (the llama family, DeepSeek's q_pe/k_pe), SPLIT-HALF (p, p + rope_dim/2) for
+                                              // NEOX (deepseek32's lightning indexer). Angles and pass-through tail are the
+                                              // same either way — see `Op::Rope::neox`, and QkNormRope for the same pairing
+                                              // applied unconditionally.
                     let hf = rd / 2;
                     for r in 0..rows {
                         let p0 = pos[r];
                         for h in 0..nh {
                             let b = (r * nh + h) * hd;
                             for p in 0..hf {
-                                let (i0, i1) = (2 * p, 2 * p + 1);
+                                let (i0, i1) = if neox {
+                                    (p, p + hf)
+                                } else {
+                                    (2 * p, 2 * p + 1)
+                                };
                                 let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
                                 if let Some(ff) = &ff {
                                     ang /= ff[p];
@@ -2905,6 +2911,7 @@ impl Backend for CpuBackend {
                     pos,
                     theta,
                     freq_factors,
+                    key_bias,
                 } => {
                     let (rows, kv_len, nh, qhd, kv_lora, np, qkr, vhd) = (
                         rows as usize,
@@ -2935,6 +2942,10 @@ impl Backend for CpuBackend {
                     };
                     let hf = qkr / 2; // rope pair count
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
+                    // deepseek32's top-k score mask `[rows, kv_len]` (0 on the selected keys,
+                    // -inf elsewhere) — indexed by KEY POSITION, not by the ring row. `None` on
+                    // deepseek2, where the arithmetic below is byte-for-byte what it was.
+                    let kb = key_bias.map(|b| vals[b.0 as usize].clone());
                     let mut out = vec![0f32; rows * nh * vhd];
                     self.pool()
                         .for_chunks_mut(&mut out, vhd, 2, &|i, ob_slice| {
@@ -2989,9 +3000,13 @@ impl Backend for CpuBackend {
                             for (jj, scj) in sc.iter_mut().enumerate() {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
-                                let kb = jr * key_len;
-                                // dot(q_full, K row j)
-                                *scj = crate::kernels::dot(&q_full, &ks[kb..kb + key_len]) * scale;
+                                let krow = jr * key_len;
+                                // dot(q_full, K row j), plus the optional top-k mask at key j
+                                *scj =
+                                    crate::kernels::dot(&q_full, &ks[krow..krow + key_len]) * scale;
+                                if let Some(kb) = &kb {
+                                    *scj += kb[ti * kv_len + j];
+                                }
                                 mx = mx.max(*scj);
                             }
                             let mut l = 0f32;
@@ -3003,8 +3018,8 @@ impl Backend for CpuBackend {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
                                 let p = (s - mx).exp() / l;
-                                let kb = jr * key_len;
-                                // attn_out[jj] += p * V[jj] where V[jj] = ks[kb..kb+kv_lora]
+                                let krow = jr * key_len;
+                                // attn_out[jj] += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
                                 // Apply wv_b[h] to the accumulated output directly:
                                 // ob_slice += p * wv_b[h] @ V[jj]
                                 let wv_off = h * kv_lora * vhd;
@@ -3013,7 +3028,8 @@ impl Backend for CpuBackend {
                                     for a_idx in 0..kv_lora {
                                         // wv_b[h][a_idx][o_idx]: element [a][o] with a the FAST
                                         // (row) dim — flat = a + o*kv_lora (GGUF layout).
-                                        vs += wv[wv_off + a_idx + o_idx * kv_lora] * ks[kb + a_idx];
+                                        vs +=
+                                            wv[wv_off + a_idx + o_idx * kv_lora] * ks[krow + a_idx];
                                     }
                                     ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
                                 }
@@ -3118,6 +3134,32 @@ impl Backend for CpuBackend {
                                 *slot = f32::from_bits(bi as u32);
                             }
                         });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::TopkMask {
+                    idx,
+                    dst,
+                    rows,
+                    kv_len,
+                    top_k,
+                } => {
+                    let (rows, kv_len, top_k) = (rows as usize, kv_len as usize, top_k as usize);
+                    let ids = &vals[idx.0 as usize];
+                    let mut out = vec![f32::NEG_INFINITY; rows * kv_len];
+                    for (t, row) in out.chunks_exact_mut(kv_len).enumerate() {
+                        for s in 0..top_k {
+                            // i32 index carried as a u32 bit pattern in the f32 slot — the
+                            // convention `Op::LightningIndexer` writes and `Op::Argmax` uses.
+                            let j = ids[t * top_k + s].to_bits() as usize;
+                            assert!(
+                                j < kv_len,
+                                "cpu Op::TopkMask: index {j} at (row {t}, slot {s}) is past \
+                                 kv_len {kv_len} — the indices did not come from a matching \
+                                 Op::LightningIndexer"
+                            );
+                            row[j] = 0.0;
+                        }
+                    }
                     vals[dst.0 as usize] = out;
                 }
             }

@@ -977,19 +977,56 @@ fn synthetic_deepseek2_uniform_router_bias_is_a_no_op() {
 
 // ─── deepseek32 (V3.2) ───────────────────────────────────────────────────────────
 //
-// Stage 3's LOAD path. There is no V3.2 GGUF anywhere — the model is 671B — so this is the only
-// place the arch is exercised at all: `Config::from_gguf`'s `deepseek32` branch, and `wload`'s
-// five extra per-layer tensors, both driven off a real file through the real loader. The graph is
-// a later slice, so every run below ends at the seam's explicit refusal rather than in logits.
+// Stage 3. There is no V3.2 GGUF anywhere — the model is 671B — so this is the only place the arch
+// is exercised at all: `Config::from_gguf`'s `deepseek32` branch, `wload`'s five extra per-layer
+// tensors, and the lightning indexer's emit arm, all driven off a real file through the real seam.
 
-/// V3.2's indexer at toy dimensions. `head_size` is DELIBERATELY not `qk_rope_dim` and `n_head` is
-/// not `n_head`: the indexer's four shaped tensors then have four distinct shapes, so a loader that
-/// reached for the MLA head's dims instead of the indexer's could not still fit.
+/// How many keys the indexer keeps, when the case wants the top-k to actually RESTRICT attention.
+/// [`PROMPT`] is 8 tokens, so at the prefill graph 5 of 8 keys survive, and the last prompt row —
+/// the one the logits come from — sees 5 of its 8 causally-eligible keys.
+const RESTRICT_TOP_K: usize = 5;
+
+/// The blessed value of [`synthetic_deepseek32_indexer_selection_is_locked`] — see that test for
+/// what it does and does not prove.
+#[rustfmt::skip]
+const GOLDEN_DS32_TOPK5: [f32; 64] = [
+    1.1634496, 0.55583966, -1.083919, -2.9751287,
+    -1.6523329, -0.0013271719, 0.23705888, 0.002301976,
+    1.4342694, 1.050138, 1.3096284, 1.5038577,
+    0.32831174, -0.52826184, 0.72379166, 0.4672855,
+    0.3796335, 1.1862715, 0.44356698, -1.1651667,
+    1.0941807, -2.219788, -0.4968652, 0.84665793,
+    -1.7739847, -0.12243594, 1.1845412, 0.7563032,
+    0.09609932, -0.60896444, -0.14078188, -0.023309775,
+    -0.2940429, 0.66930676, 0.12828845, 1.2945883,
+    0.49087483, 0.8542345, -0.9175889, 2.0058444,
+    -0.6591824, -0.07517361, -0.7924243, 1.1822766,
+    1.1122972, -0.25596488, -0.8652606, 0.77131444,
+    0.793506, 1.4103872, -1.080347, 0.035427153,
+    -1.0616684, 0.86063415, 0.9556941, -0.24923778,
+    0.37757862, 0.25142026, 2.1608865, -0.8568267,
+    -0.6813617, -1.491607, 0.504219, 1.2186759,
+];
+
+/// A `top_k` past every `kv_len` this harness can produce (prompt 8 + the one decode step). The
+/// seam clamps to `min(top_k, kv_len)` exactly as `deepseek32.cpp` does, so every key is selected
+/// and the mask is all-zero — the case that must reproduce the unrestricted answer.
+const UNRESTRICTED_TOP_K: usize = 64;
+
+/// V3.2's indexer at toy dimensions.
+///
+/// `head_size` is DELIBERATELY neither `qk_rope_dim` nor `2 * qk_rope_dim`, and `n_head` is not the
+/// model's `n_head`: the indexer's four shaped tensors then have four distinct shapes, so a loader
+/// that reached for the MLA head's dims instead of the indexer's could not still fit. `head_size =
+/// 24` against `qk_rope_dim = 16` also puts the `[rope | nope]` split at 16/8 — llama.cpp writes the
+/// nope view's offset as `row_size(nope)` where the layout means `row_size(rope)`, and the two
+/// coincide only on V3.2's own 64/64 head, so running here at 16/8 exercises a geometry where the
+/// two readings genuinely differ.
 fn ds32_indexer() -> IndexerDims {
     IndexerDims {
         n_head: 4,
         head_size: 24,
-        top_k: 5,
+        top_k: RESTRICT_TOP_K,
     }
 }
 
@@ -1003,12 +1040,35 @@ fn ds32_dims() -> Ds2Dims {
     }
 }
 
+/// The canonical `deepseek32` model — indexer top-k = [`RESTRICT_TOP_K`], so the indexer really
+/// does restrict attention.
 fn deepseek32_model() -> SyntheticModel {
+    deepseek32_model_top_k(RESTRICT_TOP_K)
+}
+
+/// [`deepseek32_model`] with a chosen `attention.indexer.top_k` and NOTHING else changed — the
+/// fill is seeded by tensor NAME, so two `top_k` variants share every weight byte for byte and
+/// differ only in one metadata u32.
+fn deepseek32_model_top_k(top_k: usize) -> SyntheticModel {
     mla_model(
         infr_llama::arch::DEEPSEEK32,
         &ds32_dims(),
-        Some(&ds32_indexer()),
+        Some(&IndexerDims {
+            top_k,
+            ..ds32_indexer()
+        }),
     )
+}
+
+/// The `deepseek2` twin of [`deepseek32_model`]: the SAME dims and the same (name-seeded) weights,
+/// minus the five indexer tensors and the three indexer keys.
+///
+/// This is the "mask disabled" reference the two top-k cases below compare against, and it is an
+/// exact one rather than an approximation: the indexer's ONLY effect on the model is the additive
+/// score mask it hands `Op::Mla`, so an all-zero mask must leave the arithmetic bit-identical to a
+/// model that has no indexer at all.
+fn deepseek32_without_indexer_model() -> SyntheticModel {
+    mla_model(infr_llama::arch::DEEPSEEK2, &ds32_dims(), None)
 }
 
 /// The five per-layer tensor names V3.2 adds, as they appear on disk (`llama-arch.cpp`'s
@@ -1054,21 +1114,16 @@ fn config_err(tag: &str, m: &SyntheticModel) -> String {
     format!("{err:#}")
 }
 
-/// The error a CPU prefill of `m` fails with, as a full `{:#}` chain. Every `deepseek32` fixture
-/// fails — a complete one at the graph build, an incomplete one inside `wload` — and WHICH of the
-/// two is the assertion.
+/// The error a CPU prefill of `m` fails with, as a full `{:#}` chain. Panics if the run succeeds —
+/// every caller is a DAMAGED fixture that must be refused.
 fn prefill_err(tag: &str, m: &SyntheticModel) -> String {
     let tmp = TempGguf::write(tag, m);
     let model = load(&tmp);
     let err = model
         .prefill_logits_cpu(PROMPT)
-        .expect_err("deepseek32 cannot generate yet — this must not return logits");
+        .expect_err("this fixture is incomplete and must be refused, not silently run");
     format!("{err:#}")
 }
-
-/// The message the seam refuses a `deepseek32` graph build with. Every load-path test below routes
-/// through a prefill, so this is also the marker for "the load got all the way through".
-const GRAPH_REFUSAL: &str = "arch=deepseek32 (DeepSeek V3.2) loads but cannot generate yet";
 
 /// Every gate boolean and every derived dim of a `deepseek32` config, including where the
 /// `deepseek2`-only gates land. `deepseek2` is TRUE here on purpose: MLA, the one-compressed-row KV
@@ -1155,16 +1210,16 @@ fn synthetic_deepseek32_config_gates() {
 
 /// **The weight loader consumes all five indexer tensors, on every layer.**
 ///
-/// A complete model reaches the graph-build refusal, which is only possible once `wload` has walked
-/// every layer without complaint. Remove any ONE of the five from any layer and the SAME run stops
+/// A complete model prefills to finite logits, which is only possible once `wload` has walked every
+/// layer without complaint. Remove any ONE of the five from any layer and the SAME run stops
 /// earlier, inside `wload`, naming the tensor it wanted — so a loader that quietly ignored these
 /// files' extra tensors would fail this test on all ten of its cases.
 #[test]
 fn synthetic_deepseek32_load_consumes_every_indexer_tensor() {
-    let complete = prefill_err("ds32-complete", &deepseek32_model());
+    let complete = cpu_logits("ds32-complete", &deepseek32_model());
     assert!(
-        complete.contains(GRAPH_REFUSAL),
-        "a complete deepseek32 model must load fully and stop at the graph build, got: {complete}"
+        complete.iter().all(|v| v.is_finite()),
+        "a complete deepseek32 model must load and run, got: {complete:?}"
     );
 
     // Layer 0 is the DENSE-lead layer and layer 2 is a MoE layer: the indexer is unconditional, so
@@ -1271,24 +1326,144 @@ fn synthetic_deepseek32_nextn_blocks_are_skipped() {
     assert_eq!(cfg.n_layer_nextn, 1);
     assert_eq!(cfg.n_layer, d.n_layer, "the trunk excludes the NextN block");
 
-    let err = prefill_err("ds32-nextn-load", &m);
+    let logits = cpu_logits("ds32-nextn-load", &m);
     assert!(
-        err.contains(GRAPH_REFUSAL),
-        "the NextN fixture must load fully and stop at the graph build, got: {err}"
+        logits.iter().all(|v| v.is_finite()),
+        "the NextN fixture must load fully and run the trunk, got: {logits:?}"
     );
 }
 
-/// The graph build refuses `deepseek32` with a message that says WHY, rather than panicking or —
-/// far worse — emitting the deepseek2 graph and returning dense-attention logits that look fine.
+/// **The whole V3.2 model runs**: MLA plus the lightning indexer on every layer (its own LayerNorm,
+/// its NEOX rope, its second KV cache, its top-k, and the score mask that feeds `Op::Mla`), a
+/// dense-lead layer and two group-routed MoE layers, end to end on the CPU reference backend.
 #[test]
-fn synthetic_deepseek32_graph_build_is_refused_clearly() {
-    let err = prefill_err("ds32-refusal", &deepseek32_model());
-    println!("deepseek32 graph build: {err}");
+fn synthetic_deepseek32_cpu_prefill_is_finite() {
+    let logits = cpu_logits("ds32-finite", &deepseek32_model());
+    assert_eq!(logits.len(), 64, "logits are [vocab]");
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "non-finite logit in the synthetic deepseek32 CPU prefill: {logits:?}"
+    );
+    assert!(rms(&logits) > 1e-3, "logits are degenerate: {logits:?}");
+}
+
+/// **`top_k >= kv_len` reproduces the unrestricted answer, EXACTLY.** This is the property that
+/// makes the mask faithful: with every key selected the mask is all-zero, `score + 0.0` is exact,
+/// and the run must therefore be bit-identical to the same model with no indexer at all.
+///
+/// Bit-identity holds on the CPU because its `Op::Mla` arm adds the mask as a SEPARATE statement,
+/// which Rust does not contract. The Vulkan twin
+/// (`gpu_synthetic_deepseek32_top_k_paths_execute`) can only assert it to ~1 ULP, for a reason
+/// spelled out there.
+///
+/// It is also the check that the indexer perturbs NOTHING else — not the KV geometry it shares a
+/// buffer with, not the residual stream, not the MoE routing. A single non-zero digit here means
+/// some part of the indexer is leaking into the attention path.
+#[test]
+fn synthetic_deepseek32_full_top_k_matches_no_indexer_at_all() {
+    let full = cpu_logits(
+        "ds32-topk-full",
+        &deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+    );
+    let none = cpu_logits("ds32-no-indexer", &deepseek32_without_indexer_model());
+    let d = max_abs_diff(&full, &none);
+    println!("cpu deepseek32 top_k>=kv_len vs no indexer: max|Δ| = {d:e}");
     assert_eq!(
-        err,
-        "arch=deepseek32 (DeepSeek V3.2) loads but cannot generate yet: its lightning indexer is \
-         not implemented, and emitting the deepseek2 MLA graph without the indexer's top-k key \
-         selection would produce silently wrong output. See docs/deepseek.md § Stage 3."
+        d, 0.0,
+        "an all-selected top-k must add an all-zero mask and leave the attention untouched"
+    );
+}
+
+/// **The indexer actually RESTRICTS attention.** Same weights, same prompt, same everything — only
+/// `attention.indexer.top_k` moves, from "keep every key" to "keep 5 of 8". The 8-token prompt's
+/// last row has 8 causally-eligible keys and may see only 5 of them, so the outputs cannot agree
+/// unless the mask never reached the MLA kernel.
+///
+/// A test that passed with the mask absent would be testing nothing, which is why this asserts
+/// against the [`UNRESTRICTED_TOP_K`] run rather than against "is finite".
+#[test]
+fn synthetic_deepseek32_top_k_restricts_attention() {
+    let restricted = cpu_logits("ds32-topk-5", &deepseek32_model());
+    let full = cpu_logits(
+        "ds32-topk-full-b",
+        &deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+    );
+    assert_routing_differs(
+        "cpu deepseek32 top_k=5 vs top_k>=kv_len",
+        &restricted,
+        &full,
+    );
+}
+
+/// The two `top_k` fixtures differ in exactly one metadata u32 — the premise the case above rests
+/// on. Without this, "restricted vs full differ" could be true for some reason that has nothing to
+/// do with the top-k.
+#[test]
+fn synthetic_deepseek32_top_k_variants_differ_only_in_top_k() {
+    let (a, b) = (
+        deepseek32_model(),
+        deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+    );
+    assert_eq!(
+        weights_of(&a),
+        weights_of(&b),
+        "the two top_k variants must share every weight"
+    );
+    let diff: Vec<_> = a
+        .meta
+        .iter()
+        .zip(&b.meta)
+        .filter(|(x, y)| x != y)
+        .map(|(x, _)| x.0.clone())
+        .collect();
+    assert_eq!(diff, vec!["deepseek32.attention.indexer.top_k".to_string()]);
+
+    // And the no-indexer reference is the deepseek32 model minus exactly the indexer.
+    let (ix, no_ix) = (deepseek32_model(), deepseek32_without_indexer_model());
+    let extra: Vec<String> = ix
+        .tensors
+        .iter()
+        .map(|t| t.name.clone())
+        .filter(|n| !no_ix.tensors.iter().any(|t| &t.name == n))
+        .collect();
+    assert_eq!(extra.len(), INDEXER_TENSORS.len() * ds32_dims().n_layer);
+    for (n, v) in weights_of(&no_ix) {
+        let (_, w) = weights_of(&ix)
+            .into_iter()
+            .find(|(m, _)| *m == n)
+            .expect("shared tensor");
+        assert_eq!(w, v, "{n} must be identical across the two");
+    }
+}
+
+/// **Regression lock on the indexer's SELECTION.** The restricted run's logits are a sharp function
+/// of *which* 5 keys the indexer picked, and that pick depends on every detail of the indexer's
+/// arithmetic: its LayerNorm (mean-centred, with bias), its NEOX rope pairing where the MLA rope
+/// beside it is NORM, and the `[rope | nope]` head order that is the opposite of the MLA head's.
+/// None of those has a cheap independent oracle — llama.cpp cannot run a 671B model here, and a
+/// from-scratch host reference for this fixture would be a second implementation of the model.
+///
+/// So this is a LOCK, not a proof: the numbers were blessed from this implementation, and what they
+/// buy is that any later change to the indexer's arithmetic is visible instead of silent. Each of
+/// those three details was individually shown to move it (`docs/deepseek.md` § Stage 3).
+///
+/// The tolerance is deliberately relative and loose: a different rope pairing or head order changes
+/// the selected key set, which moves the logits by a real fraction of their own scale, while
+/// cross-machine float noise (SIMD width, reduction order) is many orders below it.
+#[test]
+fn synthetic_deepseek32_indexer_selection_is_locked() {
+    /// `cpu_logits("ds32-topk-5", &deepseek32_model())`, blessed 2026-08-10.
+    const GOLDEN: [f32; 64] = GOLDEN_DS32_TOPK5;
+    let got = cpu_logits("ds32-lock", &deepseek32_model());
+    let d = max_abs_diff(&got, &GOLDEN);
+    let scale = rms(&GOLDEN);
+    println!("deepseek32 selection lock: max|Δ| = {d:e}  (logit rms {scale:e})\n  got = {got:?}");
+    assert!(
+        d < 1e-4 * scale,
+        "the synthetic deepseek32 logits moved (max|Δ| = {d:e}, logit rms {scale:e}) — the \
+         lightning indexer selected a different key set. If that was intended, say why in \
+         docs/deepseek.md before re-blessing; do not re-bless to make this green.\n  got  = \
+         {got:?}\n  want = {GOLDEN:?}"
     );
 }
 
@@ -1392,6 +1567,82 @@ fn gpu_synthetic_deepseek2_routing_paths_execute() {
         d, 0.0,
         "a uniform router bias changed the Vulkan output — moe_topk.comp is weighting from the \
          BIASED probs instead of the unbiased ones"
+    );
+}
+
+/// [`gpu_synthetic_deepseek2_matches_cpu`]'s V3.2 twin — the only cross-backend check the lightning
+/// indexer will ever get, since no real `deepseek32` file exists. Everything the indexer adds runs
+/// on the GPU here: `layernorm.comp`, `rope.comp`'s `-DNEOX` build, the second `WriteKv` into the
+/// indexer's own cache, `lightning_indexer.comp`, `topk_mask.comp`, and `mla.comp`'s `-DKEY_BIAS`
+/// build. `RESTRICT_TOP_K` is in force, so the two backends must also agree on WHICH keys the
+/// indexer picked — an integer decision, where a divergence is a whole key swapping in or out
+/// rather than a rounding difference.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek32_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let model = deepseek32_model();
+    let cpu = cpu_logits("ds32-gpu-parity-cpu", &model);
+    let gpu = vulkan_logits("ds32-gpu-parity-vk", &model);
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan deepseek32 prefill: {gpu:?}"
+    );
+    let cos = cosine(&cpu, &gpu);
+    println!("synthetic deepseek32 cpu-vs-vulkan cosine = {cos}");
+    let (cpu_top, gpu_top) = (argmax(&cpu), argmax(&gpu));
+    println!("cpu argmax = {cpu_top}, vulkan argmax = {gpu_top}");
+    assert_eq!(cpu_top, gpu_top, "CPU and Vulkan disagree on the top token");
+    // Same threshold and same reasoning as the deepseek2 twin: three f32 layers with a pinned
+    // routed set, so the two backends agree far tighter than this.
+    assert!(
+        cos > 0.9999,
+        "CPU/Vulkan logits diverged on the synthetic deepseek32 model: cosine = {cos}"
+    );
+}
+
+/// The two top-k properties, repeated on Vulkan: `topk_mask.comp` and `mla.comp`'s `-DKEY_BIAS`
+/// build are their own implementations of the rule the CPU arm implements, so proving it on one
+/// backend proves nothing about the other.
+///
+/// The all-selected case is NOT bit-exact here, unlike on the CPU, and the reason is worth stating
+/// because it looks like a leak: the two runs take DIFFERENT pipelines (`mla_ff_bias` vs `mla_ff`),
+/// and the masked build's score is `red[0] * scale + kbias[j]` — a fused-multiply-add candidate the
+/// compiler takes, so the product is rounded ONCE where the unmasked build rounds it twice. With
+/// `kbias[j] == 0.0` that is still a ≤1-ULP difference in the score, which the softmax and three
+/// layers carry out to ~1e-6 on the logits. The mask really is all-zero: the CPU pair of the same
+/// two files agrees to 0.0 exactly, and `topk_mask_parity` pins the Vulkan mask equal to the CPU's.
+///
+/// So the bound is relative and ~10× above what is observed, which is still four orders below the
+/// difference a mask that actually removed keys makes (the case below).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek32_top_k_paths_execute() {
+    let _lk = gpu_serial_lock();
+    let full = vulkan_logits(
+        "vk-ds32-topk-full",
+        &deepseek32_model_top_k(UNRESTRICTED_TOP_K),
+    );
+    let none = vulkan_logits("vk-ds32-no-indexer", &deepseek32_without_indexer_model());
+    let d = max_abs_diff(&full, &none);
+    let scale = rms(&none);
+    println!("vulkan deepseek32 top_k>=kv_len vs no indexer: max|Δ| = {d:e} (logit rms {scale:e})");
+    assert!(
+        d < 1e-5 * scale,
+        "an all-selected top-k must add an all-zero mask and leave mla.comp's attention untouched \
+         (max|Δ| = {d:e}, logit rms {scale:e})"
+    );
+    assert_eq!(
+        argmax(&full),
+        argmax(&none),
+        "an all-zero mask changed the top token"
+    );
+
+    let restricted = vulkan_logits("vk-ds32-topk-5", &deepseek32_model());
+    assert_routing_differs(
+        "vulkan deepseek32 top_k=5 vs top_k>=kv_len",
+        &restricted,
+        &full,
     );
 }
 

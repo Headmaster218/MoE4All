@@ -2278,6 +2278,7 @@ fn rope_parity() {
         theta: 10000.0,
         freq_factors: None,
         x_stride: 0,
+        neox: false,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i + 3).collect();
     let bound = vec![
@@ -2308,6 +2309,7 @@ fn rope_partial_with_freq_factors_parity() {
         theta: 1000000.0,
         freq_factors: Some(ff),
         x_stride: 0,
+        neox: false,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i * 2 + 1).collect();
     let ffv: Vec<f32> = (0..rd / 2).map(|i| 1.0 + i as f32 * 0.1).collect();
@@ -4091,6 +4093,7 @@ fn mla_parity() {
         pos: 0,
         theta: 10000.0,
         freq_factors: None,
+        key_bias: None,
     });
     // Q: row-major [row, head, q_head_dim], values 1..=16.
     let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
@@ -4171,6 +4174,7 @@ fn mla_ff_parity() {
         pos: 0,
         theta: 10000.0,
         freq_factors: Some(ff),
+        key_bias: None,
     });
     // Q: row-major [row, head, q_head_dim], values 1..=16.
     let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
@@ -4409,6 +4413,7 @@ fn mla_mask_ring_parity() {
             pos: c.pos,
             theta,
             freq_factors: None,
+            key_bias: None,
         });
         let bound = vec![
             (q, f32_bytes(&qi)),

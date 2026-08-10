@@ -502,8 +502,13 @@ fn main() {
         // MLA attention (DeepSeek V2/V3): one workgroup per token, 128 lanes covering all heads.
         ("mla", "mla", &[]),
         // YaRN freq_factors variant: the internal q_pe rope DIVIDES its angle by ff[pair]
-        // (`-DFREQ_FACTORS` adds the binding-5 ff buffer — see `Recorder::mla`).
+        // (`-DFREQ_FACTORS` adds the binding-4 ff buffer — see `Recorder::mla`).
         ("mla", "mla_ff", &["-DFREQ_FACTORS"]),
+        // deepseek32: `-DKEY_BIAS` adds the `[rows, kv_len]` additive score mask the lightning
+        // indexer's top-k expands into (`Op::Mla::key_bias`). Independent of FREQ_FACTORS, so all
+        // four combinations exist; the optional reads bind before `dst`, which stays last.
+        ("mla", "mla_bias", &["-DKEY_BIAS"]),
+        ("mla", "mla_ff_bias", &["-DFREQ_FACTORS", "-DKEY_BIAS"]),
         ("rmsnorm", "rmsnorm", &[]),
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
@@ -518,8 +523,10 @@ fn main() {
         // Mean-centred LayerNorm (deepseek32's `indexer_k_norm`, Op::LayerNorm) — a separate
         // shader, not an rmsnorm build: it needs two cooperative reductions and a bias binding.
         ("layernorm", "layernorm", &[]),
-        // DeepSeek V3.2 lightning indexer top-k key selection (Op::LightningIndexer).
+        // DeepSeek V3.2 lightning indexer top-k key selection (Op::LightningIndexer), and the
+        // expansion of its indices into the additive score mask `Op::Mla` adds (Op::TopkMask).
         ("lightning_indexer", "lightning_indexer", &[]),
+        ("topk_mask", "topk_mask", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
@@ -645,6 +652,11 @@ fn main() {
         // YaRN freq_factors variant: the rotation angle is DIVIDED by ff[pair] (`-DFREQ_FACTORS`
         // adds the binding-2 ff buffer — see `Recorder::rope`).
         ("rope", "rope_ff", &["-DFREQ_FACTORS"]),
+        // NEOX split-half pairing (`Op::Rope::neox`) — deepseek32's lightning indexer, whose rope
+        // is NEOX where the MLA rope beside it is NORM. Static f32 in place only, which is the one
+        // shape that caller has; the adapter refuses neox on the f16/dyn paths.
+        ("rope", "rope_neox", &["-DNEOX"]),
+        ("rope", "rope_ff_neox", &["-DFREQ_FACTORS", "-DNEOX"]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
         ("linear_f16", "linear_f16", &[]),

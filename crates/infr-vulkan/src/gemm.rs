@@ -2151,6 +2151,20 @@ pub(crate) fn mla_ff_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(MLA_FF_SPV_BYTES))
 }
+/// SPIR-V for MLA attention with deepseek32's additive top-k score mask (`mla.comp`'s -DKEY_BIAS
+/// build, `Op::Mla::key_bias`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn mla_bias_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/mla_bias.spv"))))
+}
+/// SPIR-V for MLA attention with BOTH the YaRN divisors and the top-k score mask (`mla.comp`'s
+/// -DFREQ_FACTORS -DKEY_BIAS build) — deepseek32's production shape.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn mla_ff_bias_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/mla_ff_bias.spv"))))
+}
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
@@ -2207,6 +2221,13 @@ pub(crate) fn lightning_indexer_spv() -> &'static [u32] {
             "/lightning_indexer.spv"
         )))
     })
+}
+/// SPIR-V for the top-k index → additive score mask expansion (`topk_mask.comp`, `Op::TopkMask`)
+/// — one workgroup per query row, fill then scatter. Used by the recorder's `topk_mask`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn topk_mask_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/topk_mask.spv"))))
 }
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
@@ -2910,6 +2931,25 @@ pub(crate) fn rope_spv() -> &'static [u32] {
 pub(crate) fn rope_ff_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ROPE_FF_SPV_BYTES))
+}
+/// SPIR-V for NEOX RoPE (`rope.comp`'s -DNEOX build): pairs `(i, i + rope_dim/2)` instead of the
+/// interleaved `(2i, 2i+1)` — deepseek32's lightning indexer (`Op::Rope::neox`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rope_neox_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rope_neox.spv"))))
+}
+/// SPIR-V for NEOX RoPE with YaRN freq_factors (`rope.comp`'s -DNEOX -DFREQ_FACTORS build) —
+/// deepseek32's production indexer shape (its rope carries the same YaRN ramp as the MLA one).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rope_ff_neox_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/rope_ff_neox.spv"
+        )))
+    })
 }
 /// gemma4 E2B's per-layer fused inp_gate GEMV (`e2b_gate.comp`; weight read through a typed
 /// 64-bit buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the

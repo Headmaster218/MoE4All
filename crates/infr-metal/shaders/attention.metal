@@ -814,6 +814,9 @@ struct MlaParams {
     uint canvas_lo;        // `AttnMask::Canvas { lo }` lower bound; read on mask_type == 2 only
 };
 
+// `kbias` (when `has_bias`) is the additive per-(query row, key) score mask `Op::Mla::key_bias`,
+// `[rows, kv_len]` f32 — deepseek32's lightning-indexer top-k, 0 on the selected keys and -inf
+// elsewhere. Indexed by KEY POSITION, not by the ring cache row.
 static inline void mla_f16kv_one(device const float* q,
                                  device const half*  k_cache,
                                  device const float* wk_b,
@@ -822,7 +825,9 @@ static inline void mla_f16kv_one(device const float* q,
                                  constant MlaParams& p,
                                  uint gid,
                                  bool has_ff,
-                                 device const float* ff) {
+                                 device const float* ff,
+                                 bool has_bias,
+                                 device const float* kbias) {
     if (gid >= p.rows * p.n_head) return;
     uint tok = gid / p.n_head;
     uint h = gid % p.n_head;
@@ -903,6 +908,7 @@ static inline void mla_f16kv_one(device const float* q,
             d += q_full[di] * (float)k_cache[jr * key_len + di];
         }
         d *= p.scale;
+        if (has_bias) d += kbias[tok * p.kv_len + (lo + jj)];
         lmax = max(lmax, d);
     }
 
@@ -916,7 +922,9 @@ static inline void mla_f16kv_one(device const float* q,
         for (uint di = 0u; di < key_len; di++) {
             d += q_full[di] * (float)k_cache[jr * key_len + di];
         }
-        float pr = exp(d * p.scale - lmax);
+        d *= p.scale;
+        if (has_bias) d += kbias[tok * p.kv_len + (lo + jj)];
+        float pr = exp(d - lmax);
         sumw += pr;
         // V = first kv_lora_rank columns of K[jr]
         for (uint di = 0u; di < p.kv_lora_rank; di++) {
@@ -939,7 +947,11 @@ static inline void mla_f16kv_one(device const float* q,
     }
 }
 
-// Plain entry point: no frequency divisors (non-yarn MLA / no rope scaling).
+// Four entry points for the two independent optional inputs. `exec.rs` pushes ff then kbias AFTER
+// dst and binds the params bytes at `bufs.len()` (the LAST index) — the convention every kernel
+// here follows — so each variant's buffer indices are exactly the ones written below.
+
+// Plain entry point: no frequency divisors, no top-k mask (non-yarn MLA / no rope scaling).
 kernel void mla_f16kv(device const float* q       [[buffer(0)]],
                       device const half*  k_cache [[buffer(1)]],
                       device const float* wk_b    [[buffer(2)]],
@@ -947,14 +959,12 @@ kernel void mla_f16kv(device const float* q       [[buffer(0)]],
                       device float*       dst     [[buffer(4)]],
                       constant MlaParams& p       [[buffer(5)]],
                       uint gid [[thread_position_in_grid]]) {
-    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, false, nullptr);
+    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, false, nullptr, false, nullptr);
 }
 
 // YaRN freq_factors twin (DeepSeek V2+ `rope.scaling.type == "yarn"`): the internal q_pe rope
 // angle is DIVIDED by the per-pair divisor `ff[pair]` (`qk_rope_dim/2` floats, buffer 5) — the
 // Vulkan `mla_ff` build's analogue; `exec.rs` picks this kernel when `Op::Mla.freq_factors` is set.
-// `exec.rs` pushes the ff buffer AFTER dst, so it lands at buffer(5) and the params bytes at
-// buffer(6) (the LAST index) — matching the convention that params bind at `bufs.len()`.
 kernel void mla_f16kv_ff(device const float* q       [[buffer(0)]],
                          device const half*  k_cache [[buffer(1)]],
                          device const float* wk_b    [[buffer(2)]],
@@ -963,7 +973,51 @@ kernel void mla_f16kv_ff(device const float* q       [[buffer(0)]],
                          device const float* ff      [[buffer(5)]],
                          constant MlaParams& p       [[buffer(6)]],
                          uint gid [[thread_position_in_grid]]) {
-    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, true, ff);
+    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, true, ff, false, nullptr);
+}
+
+// deepseek32 without YaRN: the additive top-k score mask at buffer(5) (Vulkan's `mla_bias`).
+kernel void mla_f16kv_bias(device const float* q       [[buffer(0)]],
+                           device const half*  k_cache [[buffer(1)]],
+                           device const float* wk_b    [[buffer(2)]],
+                           device const float* wv_b    [[buffer(3)]],
+                           device float*       dst     [[buffer(4)]],
+                           device const float* kbias   [[buffer(5)]],
+                           constant MlaParams& p       [[buffer(6)]],
+                           uint gid [[thread_position_in_grid]]) {
+    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, false, nullptr, true, kbias);
+}
+
+// deepseek32's production shape: YaRN divisors AND the top-k mask (Vulkan's `mla_ff_bias`).
+kernel void mla_f16kv_ff_bias(device const float* q       [[buffer(0)]],
+                              device const half*  k_cache [[buffer(1)]],
+                              device const float* wk_b    [[buffer(2)]],
+                              device const float* wv_b    [[buffer(3)]],
+                              device float*       dst     [[buffer(4)]],
+                              device const float* ff      [[buffer(5)]],
+                              device const float* kbias   [[buffer(6)]],
+                              constant MlaParams& p       [[buffer(7)]],
+                              uint gid [[thread_position_in_grid]]) {
+    mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, true, ff, true, kbias);
+}
+
+// ---- `Op::TopkMask`: expand `Op::LightningIndexer`'s `[rows, top_k]` key indices into the
+// additive `[rows, kv_len]` f32 score mask `mla_f16kv_bias` adds — 0.0 at every selected key,
+// -inf elsewhere. One THREAD per query row: the fill and the scatter then need no barrier at all
+// (a threadgroup-wide version would), and `rows` is a batch height, not a context length.
+struct TopkMaskParams { uint rows; uint kv_len; uint top_k; };
+kernel void topk_mask_f32(device const uint*  idx [[buffer(0)]],
+                          device float*       dst [[buffer(1)]],
+                          constant TopkMaskParams& p [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows) return;
+    uint dbase = gid * p.kv_len;
+    for (uint j = 0u; j < p.kv_len; j++) {
+        dst[dbase + j] = -INFINITY; // exp(-inf - finite_max) == 0 exactly
+    }
+    for (uint k = 0u; k < p.top_k; k++) {
+        dst[dbase + idx[gid * p.top_k + k]] = 0.0f;
+    }
 }
 
 // ---- DeepSeek V3.2 lightning indexer (`Op::LightningIndexer`) — the top-k KEY SELECTOR that

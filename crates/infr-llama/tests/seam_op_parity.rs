@@ -797,6 +797,7 @@ fn mla_parity() {
         pos: 0,
         theta: 10000.0,
         freq_factors: None,
+        key_bias: None,
     });
 
     // Synthetic inputs — small integers for traceability.
@@ -1194,6 +1195,7 @@ fn mla_mask_ring_parity() {
             pos: pos as u32,
             theta,
             freq_factors: None,
+            key_bias: None,
         });
         let ins = [(q, &qi[..]), (k_cache, &cache[..])];
         let ws = [(wk_b, &wk[..]), (wv_b, &wv[..])];
@@ -2083,4 +2085,379 @@ fn lightning_indexer_scale_cannot_change_the_selection() {
     println!("LightningIndexer scale invariance: {normalised:?}");
     assert_eq!(normalised, select(1.0), "scale 1 changed the selection");
     assert_eq!(normalised, select(64.0), "scale 64 changed the selection");
+}
+
+// ── Op::Rope's NEOX pairing (deepseek32's lightning indexer) ─────────────────────────────────
+
+/// Hand-written reference for one `Op::Rope` dispatch, from the DEFINITION of the two rope types
+/// (llama.cpp `ggml_compute_forward_rope_f32`'s `is_neox` fork), not transcribed from the CPU arm.
+///
+/// Pair `p` (of `rope_dim/2`) rotates by `position * theta^(-2p/rope_dim)`; the two elements it
+/// rotates are `(2p, 2p+1)` for NORM and `(p, p + rope_dim/2)` for NEOX. Dims at or past
+/// `rope_dim` pass through untouched in both.
+#[allow(clippy::too_many_arguments)]
+fn rope_ref(
+    x: &[f32],
+    positions: &[i32],
+    rows: usize,
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    neox: bool,
+) -> Vec<f32> {
+    let mut out = x.to_vec();
+    let hf = rope_dim / 2;
+    for (r, &p0) in positions.iter().enumerate().take(rows) {
+        for h in 0..n_head {
+            let b = (r * n_head + h) * head_dim;
+            for p in 0..hf {
+                let (i0, i1) = if neox {
+                    (p, p + hf)
+                } else {
+                    (2 * p, 2 * p + 1)
+                };
+                let ang = p0 as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
+                let (s, c) = (ang.sin(), ang.cos());
+                out[b + i0] = x[b + i0] * c - x[b + i1] * s;
+                out[b + i1] = x[b + i0] * s + x[b + i1] * c;
+            }
+        }
+    }
+    out
+}
+
+/// `Op::Rope`'s two pairings, each against the from-definition reference above, on CPU and Vulkan.
+///
+/// `rope_dim < head_dim` so the pass-through tail is exercised, and `rope_dim/2` is odd so the NEOX
+/// half-split does not coincide with any power-of-two lane boundary.
+#[test]
+fn rope_neox_and_norm_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n_head, head_dim, rope_dim) = (3usize, 4usize, 24usize, 12usize);
+    let theta = 10000.0f32;
+    let xi = gen(rows * n_head * head_dim, 11);
+    // CONSECUTIVE from a base: `rope.comp` derives each row's position as `pos_offset + row`,
+    // which is what the seam always binds (one contiguous ubatch). A non-consecutive vector would
+    // be testing something no caller can produce.
+    let positions: Vec<i32> = (0..rows as i32).map(|i| i + 5).collect();
+
+    let mut got = Vec::new();
+    for neox in [false, true] {
+        let mut g = Graph::new();
+        let x = g.input(f32d(rows * n_head * head_dim));
+        let pos = g.input(TensorDesc::new(vec![rows], DType::I32));
+        let dst = g.output(f32d(rows * n_head * head_dim));
+        g.push(Op::Rope {
+            x,
+            positions: pos,
+            dst,
+            rows: rows as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            rope_dim: rope_dim as u32,
+            theta,
+            freq_factors: None,
+            x_stride: 0,
+            neox,
+        });
+        // `run` uploads f32 for every bound input; the positions tensor is I32, so bind by hand.
+        let runner = |be: &dyn Backend| -> Vec<f32> {
+            let plan = be.compile(&g).unwrap();
+            let xb = be.alloc(xi.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(xb.as_ref(), bytemuck::cast_slice(&xi)).unwrap();
+            let pb = be.alloc(rows * 4, BufferUsage::Activations).unwrap();
+            be.upload(pb.as_ref(), bytemuck::cast_slice(&positions))
+                .unwrap();
+            let ob = be.alloc(xi.len() * 4, BufferUsage::Readback).unwrap();
+            let mut b = Bindings::new();
+            b.bind(x, xb.as_ref());
+            b.bind(pos, pb.as_ref());
+            b.bind(dst, ob.as_ref());
+            be.execute(plan.as_ref(), &b).unwrap();
+            let mut bytes = vec![0u8; xi.len() * 4];
+            be.download(ob.as_ref(), &mut bytes).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+        };
+        let want = rope_ref(
+            &xi, &positions, rows, n_head, head_dim, rope_dim, theta, neox,
+        );
+        let c = runner(&cpu);
+        let e = maxerr(&c, &want);
+        println!("Rope(neox={neox}) cpu-vs-ref max_err={e:e}");
+        assert!(e < 1e-5, "Rope(neox={neox}) diverges from reference: {e:e}");
+        if let Some(vk) = gpu() {
+            let v = runner(&vk);
+            let e = maxerr(&v, &want);
+            println!("Rope(neox={neox}) vulkan-vs-ref max_err={e:e}");
+            assert!(e < 1e-4, "Rope(neox={neox}) diverges on Vulkan: {e:e}");
+        }
+        got.push(c);
+    }
+
+    // The two pairings must not be interchangeable — the failure mode this whole field exists for
+    // is a port that picks the wrong one, which raises nothing and merely rotates other elements.
+    // The pass-through tail is identical in both, so compare only the rotated slice.
+    let mut worst = 0f32;
+    for r in 0..rows {
+        for h in 0..n_head {
+            let b = (r * n_head + h) * head_dim;
+            for i in 0..rope_dim {
+                worst = worst.max((got[0][b + i] - got[1][b + i]).abs());
+            }
+            for i in rope_dim..head_dim {
+                assert_eq!(
+                    got[0][b + i],
+                    got[1][b + i],
+                    "the un-rotated tail must not depend on the pairing"
+                );
+            }
+        }
+    }
+    println!("Rope NORM vs NEOX: max|Δ| over the rotated slice = {worst:e}");
+    assert!(
+        worst > 1e-2,
+        "NORM and NEOX produced the same rotation — one of the two pairings is not being applied"
+    );
+}
+
+// ── Op::TopkMask (the indexer's top-k → the MLA score mask) ──────────────────────────────────
+
+/// `Op::TopkMask` on CPU and Vulkan, driven by a REAL `Op::LightningIndexer` in the same graph.
+///
+/// Chained rather than fed a hand-made index tensor on purpose: the indices travel as i32 words in
+/// an Internal handle (`Op::Argmax`'s carrier convention), and a standalone fixture would have to
+/// fake that carrier — which is exactly the part a wrong reading would get wrong. Here the producer
+/// and the consumer are the two real ops, and the expected mask is derived from
+/// [`lightning_indexer_ref`], which knows nothing about either implementation.
+#[test]
+fn topk_mask_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // kv_len 300 is not a multiple of the 256-lane Vulkan workgroup, so the mask's fill loop runs a
+    // partial tail; `pos` puts the causal cut inside the row so the tail of the selection comes
+    // from the ineligible keys (whose mask slots the MLA loop never reads, but which must still be
+    // written somewhere legal).
+    let (rows, n_head, head_dim, kv_len, top_k, pos) =
+        (3usize, 3usize, 8usize, 300usize, 7usize, 294usize);
+    let scale = 1.0 / ((head_dim * n_head) as f32).sqrt();
+    let keys: Vec<Vec<f32>> = (0..kv_len).map(|j| lidx_key_at(j, head_dim)).collect();
+    let mut cache = vec![0f32; kv_len * head_dim];
+    for (j, k) in keys.iter().enumerate() {
+        cache[j * head_dim..][..head_dim].copy_from_slice(k);
+    }
+    let qi: Vec<f32> = (0..rows * n_head * head_dim)
+        .map(|i| (((i * 7 + 3) % 13) as f32 - 6.0) / 8.0)
+        .collect();
+    let wi: Vec<f32> = (0..rows * n_head)
+        .map(|i| (((i * 5 + 1) % 9) as f32 - 4.0) / 4.0)
+        .collect();
+
+    let mut g = Graph::new();
+    let q = g.input(f32d(rows * n_head * head_dim));
+    let k_cache = g.input(TensorDesc::new(vec![kv_len * head_dim], DType::F16));
+    let w = g.input(f32d(rows * n_head));
+    let idx = g.internal(TensorDesc::new(vec![rows * top_k], DType::I32));
+    let dst = g.output(f32d(rows * kv_len));
+    g.push(Op::LightningIndexer {
+        q,
+        k_cache,
+        weights: w,
+        dst: idx,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        top_k: top_k as u32,
+        scale,
+        pos: pos as u32,
+    });
+    g.push(Op::TopkMask {
+        idx,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        top_k: top_k as u32,
+    });
+
+    let kf: Vec<u8> = cache
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let runner = |be: &dyn Backend| -> Vec<f32> {
+        let plan = be.compile(&g).unwrap();
+        let qb = be.alloc(qi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(qb.as_ref(), bytemuck::cast_slice(&qi)).unwrap();
+        let wb = be.alloc(wi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(wb.as_ref(), bytemuck::cast_slice(&wi)).unwrap();
+        let kb = be.alloc(kf.len(), BufferUsage::Activations).unwrap();
+        be.upload(kb.as_ref(), &kf).unwrap();
+        let ob = be.alloc(rows * kv_len * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(w, wb.as_ref());
+        b.bind(k_cache, kb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut bytes = vec![0u8; rows * kv_len * 4];
+        be.download(ob.as_ref(), &mut bytes).unwrap();
+        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+    };
+
+    // Expected mask, from the indexer's own from-formula reference: 0.0 at each selected key,
+    // -inf everywhere else.
+    let (sel, _) = lightning_indexer_ref(
+        &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos,
+    );
+    let mut want = vec![f32::NEG_INFINITY; rows * kv_len];
+    for r in 0..rows {
+        for s in 0..top_k {
+            want[r * kv_len + sel[r * top_k + s] as usize] = 0.0;
+        }
+    }
+    // The check is only meaningful if the mask really is mostly -inf.
+    let zeros = want.iter().filter(|v| **v == 0.0).count();
+    println!("TopkMask: {zeros} selected slots of {}", rows * kv_len);
+    assert_eq!(
+        zeros,
+        rows * top_k,
+        "the reference selection has duplicate indices — the fixture, not the op, is wrong"
+    );
+
+    let c = runner(&cpu);
+    assert_eq!(c, want, "TopkMask: CPU diverges from the contract");
+    if let Some(vk) = gpu() {
+        let v = runner(&vk);
+        assert_eq!(v, c, "TopkMask: Vulkan diverges from CPU");
+    }
+}
+
+// ── Op::Mla's optional top-k score mask ──────────────────────────────────────────────────────
+
+/// `Op::Mla::key_bias` really removes the masked keys, on CPU and Vulkan.
+///
+/// Two runs of the SAME dispatch: one over `kv_len = 3` keys with a bias that `-inf`s key 1, and
+/// one over a 2-key cache holding only keys 0 and 2 (at their own positions, via a `Canvas` span
+/// that would otherwise attend everything). Masking a key must be exactly equivalent to the key
+/// not being there — `exp(-inf - max) == 0` contributes nothing to either the softmax denominator
+/// or the V accumulation.
+///
+/// It also asserts the masked run DIFFERS from the unmasked one over the same three keys: without
+/// that, a `key_bias` the kernel silently ignored would pass the first half by construction.
+#[test]
+fn mla_key_bias_removes_the_masked_keys() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, kv_lora, qk_nope, qk_rope, vhd) =
+        (2usize, 2usize, 4usize, 2usize, 2usize, 3usize);
+    let key_len = kv_lora + qk_rope;
+    let q_head_dim = qk_nope + qk_rope;
+    let (theta, scale) = (10000.0f32, 1.0 / (q_head_dim as f32).sqrt());
+    let qi = gen(rows * nh * q_head_dim, 5);
+    let wk = gen(nh * kv_lora * qk_nope, 6);
+    let wv = gen(nh * kv_lora * vhd, 7);
+    // Three logical keys; the middle one is the one the mask removes.
+    // Key 1 — the one the mask removes — is scaled up so it DOMINATES the softmax: removing a key
+    // that barely contributed would make "the output changed" a tolerance argument instead of an
+    // observation.
+    let keys: Vec<Vec<f32>> = (0..3)
+        .map(|j| {
+            let s = if j == 1 { 4.0 } else { 1.0 };
+            gen(key_len, 40 + j).iter().map(|v| v * s).collect()
+        })
+        .collect();
+
+    // `keep` selects which of `keys` the cache holds; `bias` is the per-(row, key) mask (empty =
+    // no mask). Both runs use a Canvas mask over the whole cache so every row sees every key —
+    // the ONLY thing that removes a key is the bias.
+    let run_mla = |be: &dyn Backend, cache_keys: &[Vec<f32>], bias: Option<&[f32]>| -> Vec<f32> {
+        let kv_len = cache_keys.len();
+        let mut g = Graph::new();
+        let q = g.input(f32d(rows * nh * q_head_dim));
+        let k_cache = g.input(TensorDesc::new(vec![kv_len * key_len], DType::F16));
+        let wk_b = g.weight(f32d(nh * kv_lora * qk_nope));
+        let wv_b = g.weight(f32d(nh * kv_lora * vhd));
+        let kb = bias.map(|_| g.input(f32d(rows * kv_len)));
+        let dst = g.output(f32d(rows * nh * vhd));
+        g.push(Op::Mla {
+            q,
+            k_cache,
+            wk_b,
+            wv_b,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            q_head_dim: q_head_dim as u32,
+            kv_lora_rank: kv_lora as u32,
+            qk_nope_dim: qk_nope as u32,
+            qk_rope_dim: qk_rope as u32,
+            v_head_dim: vhd as u32,
+            scale,
+            mask: AttnMask::Canvas { lo: 0 },
+            pos: 0,
+            theta,
+            freq_factors: None,
+            key_bias: kb,
+        });
+        let flat: Vec<f32> = cache_keys.iter().flatten().copied().collect();
+        let kf: Vec<u8> = flat
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let plan = be.compile(&g).unwrap();
+        let qb = be.alloc(qi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(qb.as_ref(), bytemuck::cast_slice(&qi)).unwrap();
+        let kcb = be.alloc(kf.len(), BufferUsage::Activations).unwrap();
+        be.upload(kcb.as_ref(), &kf).unwrap();
+        let wkb = be.alloc(wk.len() * 4, BufferUsage::Weights).unwrap();
+        be.upload(wkb.as_ref(), bytemuck::cast_slice(&wk)).unwrap();
+        let wvb = be.alloc(wv.len() * 4, BufferUsage::Weights).unwrap();
+        be.upload(wvb.as_ref(), bytemuck::cast_slice(&wv)).unwrap();
+        let ob = be
+            .alloc(rows * nh * vhd * 4, BufferUsage::Readback)
+            .unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(k_cache, kcb.as_ref());
+        b.bind(wk_b, wkb.as_ref());
+        b.bind(wv_b, wvb.as_ref());
+        b.bind(dst, ob.as_ref());
+        let bb = bias.map(|bv| {
+            let buf = be.alloc(bv.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(buf.as_ref(), bytemuck::cast_slice(bv)).unwrap();
+            buf
+        });
+        if let (Some(id), Some(buf)) = (kb, bb.as_ref()) {
+            b.bind(id, buf.as_ref());
+        }
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut bytes = vec![0u8; rows * nh * vhd * 4];
+        be.download(ob.as_ref(), &mut bytes).unwrap();
+        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+    };
+
+    // Mask key 1 out of the 3-key cache; the 2-key cache is the same computation with key 1 absent.
+    let ninf = f32::NEG_INFINITY;
+    let bias3: Vec<f32> = (0..rows).flat_map(|_| [0.0, ninf, 0.0]).collect();
+    let kept: Vec<Vec<f32>> = vec![keys[0].clone(), keys[2].clone()];
+    for (name, be) in [("cpu", &cpu as &dyn Backend)]
+        .into_iter()
+        .chain(gpu().iter().map(|vk| ("vulkan", vk as &dyn Backend)))
+    {
+        let masked = run_mla(be, &keys, Some(&bias3));
+        let subset = run_mla(be, &kept, None);
+        let e = maxerr(&masked, &subset);
+        println!("Mla key_bias {name}: masked-vs-subset max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "Mla {name}: a -inf-masked key still influenced the output (max_err={e:e})\n  \
+             masked={masked:?}\n  subset={subset:?}"
+        );
+        let unmasked = run_mla(be, &keys, None);
+        let d = maxerr(&masked, &unmasked);
+        println!("Mla key_bias {name}: masked-vs-unmasked max|Δ|={d:e}");
+        assert!(
+            d > 1e-3,
+            "Mla {name}: masking a key changed nothing — key_bias is not reaching the kernel"
+        );
+    }
 }

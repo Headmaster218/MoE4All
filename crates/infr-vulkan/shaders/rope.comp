@@ -1,9 +1,13 @@
 #version 460
-// RoPE (ggml NORM, interleaved pairs) over x laid out [t, n_heads, hd]. One thread per (t, head).
+// RoPE over x laid out [t, n_heads, hd]. One thread per (t, head).
 // Variants: -DOUT_F16 writes f16 (the llama q/KV-cache write: `out_base` shifts the output row —
 // 0 for the Q scratch, `pos` for the fused K cache write); -DUSE_PARAMS additionally reads the
 // per-token pos from the params SSBO so the record-once decode can replay (`pc.pos_offset` is
-// then the 0/1 out_base multiplier, like qk_norm_rope_dyn's `out_base`).
+// then the 0/1 out_base multiplier, like qk_norm_rope_dyn's `out_base`);
+// -DNEOX pairs (i, i + rope_dim/2) instead of the default interleaved (2i, 2i+1) — llama.cpp's
+// ROPE_TYPE_NEOX vs ROPE_TYPE_NORM (see `Op::Rope::neox`). Only the STATIC f32 builds carry it
+// (`rope_neox`, `rope_ff_neox`); its one caller is deepseek32's lightning indexer, which ropes an
+// f32 scratch in place, and the adapter refuses neox on the f16/dyn paths rather than drop it.
 #ifdef OUT_F16
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -83,14 +87,19 @@ void main() {
 #endif
         float s = sin(ang);
         float co = cos(ang);
-        float a = x[base + 2u * i];
-        float b = x[base + 2u * i + 1u];
-#ifdef OUT_F16
-        KVWH(obase + 2u * i, a * co - b * s);
-        KVWH(obase + 2u * i + 1u, a * s + b * co);
+#ifdef NEOX
+        uint i0 = i, i1 = i + hf;
 #else
-        y[obase + 2u * i] = a * co - b * s;
-        y[obase + 2u * i + 1u] = a * s + b * co;
+        uint i0 = 2u * i, i1 = i0 + 1u;
+#endif
+        float a = x[base + i0];
+        float b = x[base + i1];
+#ifdef OUT_F16
+        KVWH(obase + i0, a * co - b * s);
+        KVWH(obase + i1, a * s + b * co);
+#else
+        y[obase + i0] = a * co - b * s;
+        y[obase + i1] = a * s + b * co;
 #endif
     }
 }
