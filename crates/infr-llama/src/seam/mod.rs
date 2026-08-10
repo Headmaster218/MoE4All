@@ -1038,9 +1038,37 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 /// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
 /// to the fixed conv/S-state allocation BEFORE reaching here, and the estimates price them with
 /// this attention geometry as they always have.
+/// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per side per token**, and the V side is a
+/// DUPLICATE of the K side rather than the MLA-style 0-width placeholder (docs/backlog.md B53).
+///
+/// V4's raw attention is `build_attn_mha(q, k_all, k_all, …)` — K and V really are the same rows —
+/// so `(head_dim, 0)` with `Op::Attention` pointed at one buffer for both sides is the shape the
+/// arithmetic wants. It is not the shape this codebase can execute: the CPU backend's
+/// `Op::Attention` arm takes `cpu_buf(kbuf).read()` and `cpu_buf(vbuf).read()` as two
+/// SIMULTANEOUSLY-LIVE guards (`crates/infr-cpu/src/lib.rs`), and a KV buffer is
+/// `CpuStore::Owned(Mutex<Vec<u8>>)` — a non-reentrant `std::sync::Mutex`, so one id bound to both
+/// sides self-deadlocks the moment the first V4 attention op runs. (Vulkan is fine with it: both
+/// bindings are `readonly` and the hazard tracker de-dupes.) Aliasing therefore costs a one-line
+/// change in a crate the V4 wiring slice does not own, in exchange for halving a cache that, at
+/// V4's MQA width, is `head_dim` floats per token per layer. The emit writes the same normed+roped
+/// row to BOTH caches with two `Op::WriteKv`s instead — see `docs/backlog.md` § B53.
+///
+/// The compressed caches (CSA/HCA/LID) and the three compressor states a ratio-4 / ratio-128 layer
+/// owns are NOT modelled here. They cannot be: they are per-layer (a ratio-0 layer has none) and
+/// the states are fixed-size recurrent buffers, not per-token rows. `generate_dense_backend`
+/// refuses any non-zero ratio before a graph is built, so nothing reads a geometry that does not
+/// exist yet.
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.deepseek2 {
         return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
+    }
+    if cfg.deepseek4 {
+        // Read straight off `head_dim` rather than through `layer_head_dim`/`layer_n_kv`: those
+        // route via `is_swa_layer`, which is TRUE for every V4 layer, and so would answer with
+        // gemma4's `head_dim_swa`/`n_kv_swa` fields. They happen to equal `head_dim`/`n_kv` for
+        // every non-gemma4 model, which is an accident this arch should not depend on.
+        let row = cfg.head_dim;
+        return (row, row);
     }
     let row = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
     (row, row)

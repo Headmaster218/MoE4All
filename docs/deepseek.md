@@ -688,21 +688,78 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: the LOAD path and every attention/HC/MoE PRIMITIVE are done, the
-compressed-KV state machine is now SPECIFIED from the source, and nothing is
-emitted yet.** The graph-build refusal in `seam::runner::generate_dense_backend`
-and its `assert!` backstop are both still in place, for every compression ratio
-including 0.
+**Progress: a V4 model whose `compress_ratios` are ALL ZERO generates.** The
+ratio-0 tier is emitted end to end and runs on CPU and Vulkan; ratios 4 and 128,
+and hash-routed layers, are refused by name. See "Slice A — ratio 0" below for
+what that covers and `docs/backlog.md` § B-DSV4-WIRING for what slice B owes.
 
-The most recent slice (2026-08-10) was a read, not a port:
+The 2026-08-10 read slice that preceded it was a read, not a port:
 `llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
 account of the compressed caches the least trustworthy part of the document. It
 has been, and "The compressed-KV state machine" below is rewritten off it — the
 real inventory, the per-ubatch index plan, four boundary conditions, and two
 corrections to what this document previously claimed about V4's indexer (its
-rope type and its head order were both stated backwards). No graph code was
-written. What the wiring slice still owes, and the design questions it has to
-answer first, are in `docs/backlog.md` § B53 and § B-DSV4-WIRING.
+rope type and its head order were both stated backwards).
+
+### Slice A — ratio 0 end to end (2026-08-10)
+
+`seam::runner`'s `MixerW::Dsv4` arm emits, per layer:
+
+```text
+hc wrap (attn) : rmsnorm(res, ones) -> Linear(hc_attn_fn) -> HyperConnectMix
+                 -> HyperConnectPre -> RmsNorm(attn_norm)
+attention      : wq_a -> q_a_norm -> wq_b -> QkNorm{weight:None}
+                 -> rope the [nope|rope] TAIL -> Copy to f16 q
+                 wkv -> attn_kv_a_norm -> rope the tail -> WriteKv (K and V)
+                 Attention{ n_kv:1, sinks, SlidingWindow(swa) }
+                 -> rope BACKWARD (de-rope) -> per-group Linear(wo_a, w_off)
+                 -> Linear(wo_b)
+hc post (attn) : HyperConnectPost  res[0] -> res[1]
+hc wrap (ffn)  : ... on res[1] -> RmsNorm(ffn_norm)
+ffn            : MoeFfn{ SqrtSoftplus, exp_probs_b, swiglu_clamp_exp[il] }
+                 + shared expert (swiglu_clamp_shexp[il]), summed
+hc post (ffn)  : HyperConnectPost  res[1] -> res[0]
+```
+
+then, once, `HyperConnectMix { gates: None }` + `HyperConnectPre` collapse the
+streams back into `hidden` for `output_norm`. Four resolved design points:
+
+- **The residual PING-PONGS between two `[batch, hc_mult, n_embd]` buffers.**
+  `Op::HyperConnectPost` cannot run in place — every output element reads every
+  `src` stream of `residual`. A layer wraps exactly two sublayers, so the parity
+  returns to buffer 0 at every layer boundary and the pair is a fixed a→b→a.
+- **The widened stream is seeded by REPLICATING the embedding across the
+  `hc_mult` streams.** This is the one piece of the emit that is an assumption
+  rather than a transcription — see the caveat in `docs/backlog.md` § B-DSV4-HC.
+- **The `[nope | rope]` tail is sliced with ONE `Op::CopyStrided` each way**, at
+  `rows = batch * n_head`, `src_stride = head_dim`, `src_off = nope` — the
+  packed result is then a plain `n_head`-head rope row. Three sites: q, kv, and
+  the backward de-rope of the attention output.
+- **`Op::Attention` reads an f16 `q`** (the seam's producer→consumer dtype
+  flow), so the normed+roped f32 query is `Op::Copy`d into `q16` exactly as
+  llama4's NoPE layer casts its unroped one. The rope itself stays on the f32
+  buffer.
+
+Two things outside the emit had to move with it:
+
+- **Vulkan's `Op::Linear` now takes `w_off` on an F32 weight**, by shifting the
+  weight's `bufferDeviceAddress` base rather than adding a push field — every
+  float GEMV here already addresses its weight by pointer, and `w_off` is
+  row-aligned, so the slice IS a shifted pointer. F16 stays refused (four more
+  call sites, an alignment obligation, and no caller). Without this the grouped
+  output projection could not run on Vulkan at all with an f32 `wo_a`.
+- **V4 is excluded from the record-once decode replay tape**, exactly as
+  `deepseek2` already is. Its four new ops have no dyn twins, so the adapter's
+  `decode_eligible` is false and the tape would have been executed STATICALLY
+  with `pos = 0` baked into every `WriteKv` and `Attention` — every token
+  writing its KV to row 0 and attending only itself. Measured before the fix:
+  the CPU-vs-Vulkan cosine fell 1.0 → 0.95 → 0.67 over prompt lengths 1, 2, 3,
+  while a `sliding_window = 1` model (where attending only your own row IS
+  correct) stayed exact and hid it.
+
+What ratio 0 does NOT cover, and is refused rather than approximated: compressed
+layers (ratios 4/128) and hash-routed layers, whose expert ids nothing in the
+tree can gather.
 
 Slice 2 added the op-level pieces V4's attention needs, on CPU, Vulkan and
 Metal, with op-level parity tests in `crates/infr-llama/tests/seam_op_parity.rs`
@@ -729,23 +786,24 @@ and `crates/infr-metal/tests/parity.rs`:
    is exactly `Op::Linear` over `wo_a` rows `[g·o_lora_rank, (g+1)·o_lora_rank)`
    — which `Op::Linear::w_off` already selects — over output columns
    `[g·o_group_dim, (g+1)·o_group_dim)`, which `Op::CopyStrided` already slices.
-   One caveat for the wiring slice: Vulkan accepts `w_off` only on the
-   offset-capable NATIVE-block kernels (every quant format plus bf16) and
-   refuses it on the f32/f16 fallbacks, so this holds for a real quantized
-   `wo_a` and would need a pack copy for an f32 one.
+   The Vulkan caveat this listed — `w_off` refused on the f32/f16 fallbacks — is
+   half resolved: F32 now rides a shifted device address (see "Slice A"), F16 is
+   still refused.
 
 The GPU coverage is deliberately narrow, because each new capability lives in
 ONE kernel rather than across the whole tier ladder — see `docs/backlog.md` (§
 B-DSV4) for exactly which shapes are refused and what a perf pass would need.
 
-**The rest of stage 4 is untouched.** A `deepseek4` GGUF registers, parses into
-a `Config` — including the per-layer `compress_ratios` array, the per-layer
-SwiGLU clamps and the mandatory sqrt-softplus gating — and loads every tensor,
-with each layer's set chosen by its ratio and its hash/bias routing.
+**The LOAD path is complete.** A `deepseek4` GGUF registers, parses into a
+`Config` — including the per-layer `compress_ratios` array, the per-layer SwiGLU
+clamps and the mandatory sqrt-softplus gating — and loads every tensor, with
+each layer's set chosen by its ratio and its hash/bias routing.
 `Config::deepseek2` is FALSE for V4 (unlike V3.2, which genuinely is V2 plus an
-indexer); every reader of that flag was enumerated and is MLA-specific.
-`generate_dense_backend` then refuses, with an `assert!` at the top of the build
-closure as a backstop. Still to do: everything in the rest of this section.
+indexer); every reader of that flag was enumerated and is MLA-specific. A model
+with any non-zero ratio or any hash-routed layer is then refused by name, with
+an `assert!` at the top of the build closure as the backstop — `wpush`'s Dsv4
+arm declares the ratio-0 tensor set only, so a compressed layer reaching the
+builder would bind every later weight one buffer off.
 
 A genuinely different architecture, not an increment. Sharing with stage 2 is
 limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.

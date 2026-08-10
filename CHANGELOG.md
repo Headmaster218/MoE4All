@@ -43,28 +43,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   length is no longer the one the weights were loaded against (which would shift
   every offset in every later shard).
 
+- **A DeepSeek V4 model whose `compress_ratios` are all zero now GENERATES**
+  (stage 4, slice A). The `ratio == 0` tier — hyper-connections wrapping both
+  sublayers, single-head MQA attention with a weightless per-head Q norm, a
+  `[nope | rope]` tail rope, attention sinks, a de-roped grouped low-rank output
+  projection, and bias-routed sqrt-softplus MoE with the per-layer SwiGLU clamps
+  — is emitted end to end and runs on CPU and Vulkan. Compressed layers (ratio 4
+  or 128) and hash-routed layers are refused by name, each message saying which
+  layer and what is missing, rather than approximated by the ratio-0 graph. Two
+  supporting changes ship with it: Vulkan's `Op::Linear` now accepts `w_off` on
+  an **F32** weight (by shifting the weight's `bufferDeviceAddress` base — the
+  float GEMVs already address their weight by pointer, and `w_off` is
+  row-aligned), which is what lets the grouped output projection run there at
+  all; and V4 is excluded from the record-once decode replay tape, like
+  `deepseek2`, because its ops have no dynamic twins. See `docs/deepseek.md` §
+  Stage 4.
 - **DeepSeek V4 hash-routed MoE and per-layer SwiGLU clamping** (stage 4, op
-  level — nothing emits them yet). `Op::MoeFfn` gains `expert_ids`: an optional
-  pre-gathered `[rows, n_expert_used]` I32 handle (llama.cpp's
-  `selected_experts_in`, gathered from `ffn_gate_tid2eid` by token id) that
-  replaces the top-k selection on V4's first `hash_layer_count` layers. The
-  router matmul and gating still run — the routing WEIGHTS remain the router's
-  own probabilities at the hash-chosen experts, renormalised and scaled — while
-  `argsort_top_k`, `exp_probs_b` and group-limited routing are skipped; the last
-  two are refused alongside `expert_ids` rather than silently ignored.
-  `Op::GatedAct`, `Op::GatedActFused` and `Op::MoeFfn` also gain
-  `swiglu_clamp: Option<f32>`, built through the new
-  `infr_core::graph::swiglu_clamp(limit)` which carries llama.cpp's
-  `limit > 1e-6` disabled gate so no caller can pass a layer's `0.0` through as
-  a real clamp. V4 clamps `up` symmetrically and the gate one-sided and
-  **pre**-activation, where every other arch clamps post-SiLU. All of it runs on
-  CPU, Vulkan and Metal; `None` leaves every existing model's numerics
+  level). `Op::MoeFfn` gains `expert_ids`: an optional pre-gathered
+  `[rows, n_expert_used]` I32 handle (llama.cpp's `selected_experts_in`,
+  gathered from `ffn_gate_tid2eid` by token id) that replaces the top-k
+  selection on V4's first `hash_layer_count` layers. The router matmul and
+  gating still run — the routing WEIGHTS remain the router's own probabilities
+  at the hash-chosen experts, renormalised and scaled — while `argsort_top_k`,
+  `exp_probs_b` and group-limited routing are skipped; the last two are refused
+  alongside `expert_ids` rather than silently ignored. `Op::GatedAct`,
+  `Op::GatedActFused` and `Op::MoeFfn` also gain `swiglu_clamp: Option<f32>`,
+  built through the new `infr_core::graph::swiglu_clamp(limit)` which carries
+  llama.cpp's `limit > 1e-6` disabled gate so no caller can pass a layer's `0.0`
+  through as a real clamp. V4 clamps `up` symmetrically and the gate one-sided
+  and **pre**-activation, where every other arch clamps post-SiLU. All of it
+  runs on CPU, Vulkan and Metal; `None` leaves every existing model's numerics
   bit-identical. See `docs/deepseek.md` § Stage 4.
-- **DeepSeek V4 Sinkhorn hyper-connections** (stage 4, op level — nothing emits
-  them yet): three new ops that replace `x = x + f(x)` with `hc_mult` parallel
-  residual streams. `Op::HyperConnectMix` turns the mixing matmul's output into
-  the `pre` collapse weights, the `post` output gates and the `comb` mixing
-  matrix (Sinkhorn-normalised to approximately doubly stochastic);
+- **DeepSeek V4 Sinkhorn hyper-connections** (stage 4, op level): three new ops
+  that replace `x = x + f(x)` with `hc_mult` parallel residual streams.
+  `Op::HyperConnectMix` turns the mixing matmul's output into the `pre` collapse
+  weights, the `post` output gates and the `comb` mixing matrix
+  (Sinkhorn-normalised to approximately doubly stochastic);
   `Op::HyperConnectPre` collapses the streams to one vector for a sublayer; and
   `Op::HyperConnectPost` re-expands that sublayer's output back across the
   streams. `Op::HyperConnectMix`'s `gates` is `None` for the model head
@@ -72,16 +86,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `mixes`. All three run on CPU, Vulkan and Metal; `hc_mult` is accepted in
   `1..=infr_core::graph::HYPER_CONNECT_MAX_MULT` (8) and refused loudly on the
   host beyond that. See `docs/deepseek.md` § "Sinkhorn hyper-connections".
-- **DeepSeek V4 attention primitives** (stage 4, op level — nothing emits them
-  yet): `Op::QkNorm`'s `weight` became optional, so a weightless per-head
-  RMSNorm is expressible without a fake ones-vector operand; `Op::Attention`
-  gained an optional per-head `sinks` input (one extra logit per head joining
-  the softmax max and denominator, contributing no value); and `Op::Rope` gained
-  a `backward` flag for de-roping (llama.cpp's `ggml_rope_ext_back` — the
-  forward rotation with `sin` negated). All three run on CPU, Vulkan and Metal;
-  `sinks: None` / `backward: false` / `weight: Some(..)` reproduce the previous
-  code path exactly, so no existing model's numerics move. V4's grouped low-rank
-  output projection needs no new op — it composes from `Op::CopyStrided` and
+- **DeepSeek V4 attention primitives** (stage 4, op level): `Op::QkNorm`'s
+  `weight` became optional, so a weightless per-head RMSNorm is expressible
+  without a fake ones-vector operand; `Op::Attention` gained an optional
+  per-head `sinks` input (one extra logit per head joining the softmax max and
+  denominator, contributing no value); and `Op::Rope` gained a `backward` flag
+  for de-roping (llama.cpp's `ggml_rope_ext_back` — the forward rotation with
+  `sin` negated). All three run on CPU, Vulkan and Metal; `sinks: None` /
+  `backward: false` / `weight: Some(..)` reproduce the previous code path
+  exactly, so no existing model's numerics move. V4's grouped low-rank output
+  projection needs no new op — it composes from `Op::CopyStrided` and
   `Op::Linear`'s existing `w_off`.
 - **DeepSeek V2 architecture support** (stage 2): registered `deepseek2` arch
   string, parsed MLA hyperparameters (`q_lora_rank`, `kv_lora_rank`,

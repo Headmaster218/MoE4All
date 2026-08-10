@@ -1179,10 +1179,28 @@ fn lower_op(
                 }
                 return Ok(());
             }
-            // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
-            // gates fusion on `native_dense_supported`, so the f16/f32 fallbacks never see it.
-            if w_off != 0 && !native_dense_supported(dt) {
-                return Err(be("vulkan adapter: Linear w_off on a non-native weight"));
+            // `w_off` on a NON-native (float) weight. The native quant/bf16 kernels take the offset
+            // as a push field; the float fallbacks have no such field and index the weight from
+            // element 0 — so an unhandled `w_off` there reads rows 0..out_f and is silently wrong.
+            //
+            // F32 is handled: every float GEMV in this backend already addresses its weight by a
+            // 64-bit `bufferDeviceAddress` (`Recorder::linear_f32` is `linear_f32_at` at
+            // `w.device_addr()`), so a ROW-ALIGNED slice is just a shifted base pointer, which is
+            // what the `w_off != 0` arm at the F32 dispatch below passes. DeepSeek V4's grouped
+            // output projection is the caller (`w_off = g * o_lora_rank * in_f`); an f32 `wo_a` is
+            // what the synthetic V4 fixture writes, and what the CPU-vs-Vulkan parity test runs.
+            //
+            // F16 is NOT, and is refused rather than approximated: its m>1 path is the coopmat
+            // `matmul_proj` and its m=1 path is `linear`/`linear_f16_noext`, three more shifted-
+            // address call sites plus a 4-byte alignment obligation on the two that read the
+            // weight as packed u32 words — and nothing in the tree produces an f16 `w_off` today,
+            // so every line of it would be untested. A real (quantized) V4 GGUF takes the native
+            // path above and never reaches here.
+            if w_off != 0 && !native_dense_supported(dt) && dt != infr_core::DType::F32 {
+                return Err(be(format!(
+                    "vulkan adapter: Linear w_off on a {dt:?} weight — only the native (quant / \
+                     bf16) kernels and the f32 GEMV take a weight offset"
+                )));
             }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
@@ -1877,9 +1895,31 @@ fn lower_op(
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
             } else if matches!(dt, infr_core::DType::F32) {
-                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
-                // uploads native dtype, and the f16 GEMV would read the f32 bytes as f16 garbage.
-                rec.linear_f32(w, xb, y, m, in_f, out_f);
+                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj, DeepSeek
+                // V4's grouped output projection): the seam uploads native dtype, and the f16 GEMV
+                // would read the f32 bytes as f16 garbage.
+                if w_off == 0 {
+                    rec.linear_f32(w, xb, y, m, in_f, out_f);
+                } else {
+                    // Row-aligned slice of the weight (`w_off % in_f == 0`, `Op::Linear::w_off`'s
+                    // contract) expressed as a shifted base ADDRESS, because `linear_f32r.comp` has
+                    // no offset field. Alignment: the vec4 variant declares a 16-byte-aligned
+                    // buffer_reference and is only chosen when `in_f % 4 == 0`, and `w_off` is a
+                    // whole multiple of `in_f`, so `w_off * 4` bytes is a multiple of 16 exactly
+                    // when that variant can run. The scalar variants need 4, which any f32 element
+                    // offset satisfies. Asserted rather than assumed — a violation would read
+                    // misaligned and is not otherwise detectable.
+                    if w_off % in_f != 0 {
+                        return Err(be(format!(
+                            "vulkan adapter: Linear w_off {w_off} is not a whole multiple of \
+                             in_f {in_f} — the f32 GEMV addresses a row-aligned weight slice"
+                        )));
+                    }
+                    let base = w.device_addr().ok_or_else(|| {
+                        be("vulkan adapter: f32 Linear with w_off needs a BDA weight address")
+                    })?;
+                    rec.linear_f32_at(base + (w_off * 4) as u64, xb, y, m, in_f, out_f);
+                }
             } else if be_.caps().f16 {
                 rec.linear(w, xb, y, m, in_f, out_f);
             } else {

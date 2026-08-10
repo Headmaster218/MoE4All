@@ -1119,120 +1119,50 @@ Two V4-specific instances of the same gap, both found reading
 Fix is one shared "expected dims" check in `wload` rather than per-arch asserts;
 the tests that exist would then gain teeth for free.
 
-### B53 — V4's KV geometry is a placeholder (2026-08-10)
+### B53 — V4's KV geometry duplicates the V side (2026-08-10)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** the stage-4 wiring slice (§
-B-DSV4-WIRING), which is the first thing that reads it
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** a one-line change in
+`crates/infr-cpu`, which the wiring slice did not own
 
-`seam::kv_row_elems` has no `deepseek4` branch, so V4 falls through to the
-generic `layer_n_kv(l) * layer_head_dim(l)` arm. The geometry is now known
-exactly — `llama-kv-cache-dsv4.cpp` has been read in full and the inventory is
-tabulated in `docs/deepseek.md` § Stage 4, "The compressed-KV state machine" —
-so this entry records the answer rather than the question.
+`seam::kv_row_elems` now has a `deepseek4` branch and it returns
+`(head_dim, head_dim)` — one MQA row per side per token. **The V side is a
+DUPLICATE of the K side, written by a second `Op::WriteKv` from the same source
+row**, and that is not what the arithmetic wants.
 
-**What the generic arm gets right:** V4 is MQA (`attn_kv` is
-`[n_embd, head_dim]`, one KV head for every query head), so
-`layer_n_kv(l) * layer_head_dim(l)` is `1 * head_dim`, which IS the raw
-sliding-window cache's K row width. A ratio-0 layer needs nothing else, which is
-why the wiring slice can start there.
+V4's raw attention is `build_attn_mha(q, k_all, k_all, …)`: K and V really are
+the same rows, so `(head_dim, 0)` — MLA's aliasing, with `kv_side_elems`
+supplying the placeholder and `Op::Attention` pointed at one buffer for both
+sides — is the correct shape. It is not the shape this codebase can execute. The
+CPU backend's `Op::Attention` arm takes `cpu_buf(kbuf).read()` and
+`cpu_buf(vbuf).read()` as two simultaneously-live guards, and a KV buffer is
+`CpuStore::Owned(Mutex<Vec<u8>>)` — a non-reentrant `std::sync::Mutex`. One id
+bound to both sides therefore self-deadlocks on the first V4 attention op. (The
+CPU MLA arm and `Op::LightningIndexer` both already take exactly ONE guard,
+which is the shape to copy; Vulkan is fine with the aliasing — both bindings are
+`readonly` and `Recorder::sync`'s dirty-set tracking de-dupes.)
 
-**What it gets wrong, in order of how much it costs:**
+**To close it:** make the CPU arm take one guard when `k_cache == v_cache` (or
+take one guard and dequant twice from it), then flip the branch to
+`(head_dim, 0)` and drop the second `Op::WriteKv` in the `MixerW::Dsv4` emit.
+Add a CPU parity test that binds one id to both sides — there is none today.
+Worth roughly half of a V4 session's KV bytes. Also worth a `k_cache == v_cache`
+short-circuit in the Vulkan adapter's dequant prepass, which would otherwise
+dequant the same cache twice into two pooled scratch buffers (`kvdeq_k` /
+`kvdeq_v`); harmless for V4's f16 cache, live if a quantized V4 KV ever lands.
 
-- **The V side is a duplicate.** V4's attention is
-  `build_attn_mha(q, k_all, k_all, …)` — K and V are the same rows, exactly as
-  MLA aliases V into the K row. The generic arm returns `(row, row)`, allocating
-  and copying a V cache nothing distinct ever writes. Whether the answer is
-  `(head_dim, 0)` (MLA's aliasing, with `kv_side_elems` supplying the
-  placeholder) depends on whether `Op::Attention` can be pointed at one buffer
-  for both sides; decide it with the emit, not before.
-- **The compressed caches are unmodelled.** A ratio-4 layer additionally needs a
-  CSA cache (`PAD(ceil(ctx/4), 256)` rows × `head_dim`) and a LID cache (same
-  rows × `indexer_head_size`); a ratio-128 layer needs an HCA cache
-  (`PAD(ceil(ctx/128), 256)` rows × `head_dim`). These are per-layer and keyed
-  on `layer_compress_ratio(l)`, so unlike deepseek32's indexer cache they cannot
-  ride a free side uniformly — layers genuinely differ in how many caches they
-  own.
-- **The compressor states are unmodelled and are not per-token.** Three of them,
-  each TWO f32 tensors (`kv` and `score`), `[n_embd_state, state_size]` per
-  stream, always f32 regardless of `type_k`: CSA `8 × 2*head_dim`, HCA
-  `128 × head_dim`, LID `8 × 2*indexer_head_size`. Fixed-size recurrent state,
-  so the precedent is `MixerW::DeltaNet`'s conv/S-state allocation, not
-  `kv_row_elems`.
-
-Buffers are allocated on the placeholder geometry today, before the graph-build
-refusal fires — harmless because nothing reads them, and wrong the moment the
-emit slice lands. Note `kv_rows` already handles V4's sliding window correctly
-(`Config::is_swa_layer` returns `swa_window > 0` for every layer when
-`deepseek4`, matching `set_swa_pattern(0)`), so only the row WIDTHS are at
-issue.
+**The compressed caches and compressor states are still unmodelled**, and cannot
+be modelled by this helper: they are per-layer (a ratio-0 layer has none) and
+the three compressor states are fixed-size recurrent buffers rather than
+per-token rows, so the precedent is `MixerW::DeltaNet`'s conv/S-state
+allocation. Sizes are tabulated in `docs/deepseek.md` § Stage 4. Nothing reads
+them: `generate_dense_backend` refuses a non-zero ratio before a graph is built.
 
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; this is the next
-stage-4 slice
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
 
-The op layer is finished (`HyperConnectMix`/`Pre`/`Post`, `Attention::sinks`,
-`Rope::backward`, `QkNorm { weight: None }`, `GatedAct::swiglu_clamp`,
-`MoeFfn::expert_ids`, `MoeGating::SqrtSoftplus` — all three backends, all with
-parity tests), config parsing is finished, and every V4 tensor already uploads.
-What is missing is the seam graph build. Scoped as two slices, because the
-ratio-0 half needs no new ops and the compressed half needs several.
-
-**Slice A — ratio 0 end to end.** Four insertions, in dependency order:
-
-1. A `deepseek4` branch in `seam::kv_row_elems` (§ B53).
-2. A `MixerW::Dsv4` variant in `seam/weights.rs` plus a matching `wpush` arm in
-   `runner.rs`'s handle loop, in the **exact** order of the existing `is_dsv4`
-   upload arm — `wpush` consumes `wspecs` sequentially, so one missing handle
-   binds every later weight in the layer one buffer off, silently. The per-layer
-   hyper-connection triples and the model-level `output_hc_*` triple are not
-   mixer weights and need somewhere of their own on `LayerW`.
-3. V4-gated scratch declarations beside the existing `mla_*` block.
-4. An emit arm where the residual is a `[batch, hc, n_embd]` widened stream and
-   `HyperConnectMix → HyperConnectPre → sublayer → HyperConnectPost`
-   **replaces** the `Op::Add { a: hidden, b: sub, dst: hidden }` pattern at both
-   the attention and the FFN tail. The head is
-   `HyperConnectMix { gates: None }` + `HyperConnectPre` collapsing back to
-   `[batch, n_embd]` before `output_norm`.
-
-Design questions to settle before writing it, each of which was verified against
-the code rather than assumed:
-
-- **`HyperConnectPost` cannot run in place.** Every output element
-  `dst[t, dst_h, i]` reads `residual[t, src, i]` for all `src`, so aliasing
-  `dst` onto `residual` corrupts the second and later streams. The widened
-  stream needs two buffers, ping-ponged per wrap — four wraps per layer pair, so
-  pick the convention once.
-- **`w_off` on an f32 weight is refused on Vulkan.** The grouped output
-  projection wants `Op::Linear { w_off: g * o_lora_rank * o_group_dim }` to
-  select group `g`'s rows of `wo_a`, but the adapter errors with "Linear w_off
-  on a non-native weight" unless the dtype is in `native_dense_dtypes()`, which
-  excludes F32 and F16. The synthetic fixture writes f32, so the CPU-vs-Vulkan
-  parity test cannot use `w_off` as-is. Options: emit `wo_a` in a native-block
-  dtype in the fixture, pack-copy the weight slice per group, or run the whole
-  `wo_a` per group and slice the output. Setting `o_group_count == 1` in the
-  fixture is NOT an option — it would leave the grouped path untested, which is
-  a check that cannot fail.
-- **The rope slice is a TAIL, not a prefix.** V4's q, kv and indexer heads are
-  all `[nope | rope]`, with the roped dims LAST. `Op::Rope` rotates
-  `[0, rope_dim)` of each head, so V4 needs the extract → rope → copy-back dance
-  the MLA arm already does for `k_pe`, at three sites (q, kv, and the `backward`
-  de-rope of the attention output).
-- **The de-rope is per head over the attention output**, before the grouped
-  projection — `Op::Rope { backward: true }` at the same `theta` and layout as
-  the forward q rope. Ratio-0 layers rope at `rope_theta` plain (no YaRN:
-  llama.cpp passes `freq_scale = 1`, `ext_factor = 0`, both betas 0,
-  `n_ctx_orig = 0`), so `backward` is an exact inverse there.
-- **Every V4 layer is sliding-window**, including ratio-0 ones, so the mask is
-  `AttnMask::SlidingWindow(swa_window)` — never `Causal`.
-- **`kq_scale` is a plain `1/sqrt(head_dim)`** at all three attention call
-  sites. None of stage 2's mscale² games apply.
-
-The tripwire to replace when this lands is
-`synthetic_deepseek4_refuses_to_generate`, which asserts the refusal string
-verbatim; it becomes a CPU `prefill_is_finite` plus a `gpu_..._matches_cpu`
-modelled on the deepseek32 pair. The refusal and its `assert!` backstop must
-stay for ratios 4 and 128 until slice B.
+**Slice A (ratio 0) is DONE and generates** — see `docs/deepseek.md` § Stage 4,
+"Slice A". What is left:
 
 **Slice B — ratios 4 and 128.** Needs new ops, not just wiring:
 
@@ -1249,431 +1179,30 @@ stay for ratios 4 and 128 until slice B.
 - **`Op::LightningIndexer`'s contract is written for V3.2's per-token key
   cache.** V4's keys come out of the compressor, so `top_k` counts compressed
   blocks; re-read the op's `k_cache`/`kv_len` meaning before reusing it.
-- The four boundary conditions in `docs/deepseek.md` § Stage 4 each need a test
-  that fails without them — in particular the one where a prefill shorter than
-  the ratio produces `n_kv == 0` and llama.cpp silently builds a **different
-  graph** (pure raw attention), which is not a masking difference and cannot be
-  tested as one.
+- The per-layer KV geometry those tiers need (§ B53) and the `wpush` handles for
+  their tensors, which the ratio-0 arm deliberately does not declare — the
+  `assert!` at the top of the build closure is what keeps that honest.
 
-### B54 — `WeightWatch` watches one file of a shard set (2026-08-10)
+**What slice A left unverified, in its own right:**
 
-**Tag:** multi-shard GGUF slice · **Blocked on:** nothing; scoped out of the
-loading slice that surfaced it
-
-`Gguf::open` now loads a whole `gguf-split` set, but `WeightWatch::open` is
-still called from `infr-cli` with the single path the user typed, so on a split
-model it stamps shard 1 and notices nothing about shards 2..N being replaced
-mid-run. The detection it provides is per-inode (see B30), so extending it means
-holding one stamp per shard — the shape `FileBlockIo::open_shards` already has,
-where every shard's descriptor is stamped and `verify_unchanged` walks them.
-
-The pieces to connect: `Gguf::shards` reports `(path, length)` per shard, which
-is what a set-aware `WeightWatch::open` would take instead of a path, and every
-`WeightWatch::open` call site in `infr-cli/src/main.rs` passes a path it got
-from model resolution rather than from the loaded `Gguf`. Note the streaming
-tier is already covered on a split model — `FileBlockIo::open_shards` stamps
-every shard and refuses one whose length no longer matches what the weights were
-loaded against — so this gap is only about the non-streaming mmap path.
-
-### B55 — multi-shard GGUF: what the slice did NOT verify (2026-08-10)
-
-**Tag:** multi-shard GGUF slice coverage · **Blocked on:** nothing; each line is
-a gap, stated as one
-
-Shard-set loading is covered by synthetic two-shard fixtures in `infr-gguf`
-(round trip, byte values from the second shard's own file, opening a later shard
-directly, and one test per validation) plus `FileBlockIo::open_shards` tests in
-`infr-core`, and end to end by one real run of a 5-shard 229 GB
-`DeepSeek-V3.2-Q2_K` on the CPU backend. Not reached by any of that:
-
-- **Windows and macOS.** The shard reader is `read_exact_at` per shard, the same
-  positioned-read path as before, so nothing new is platform-gated — but the
-  real-model run was Linux/NVMe only, and B35 already records that the fanout's
-  benefit is unverified off Linux.
-- **A sharded model on Vulkan or Metal.** Only the CPU backend was exercised end
-  to end. The GPU paths reach the same `Gguf` API (`tensor_bytes_arc`,
-  `tensor_file_range`, and `vulkan_host_tier`'s `FileBlockIo::open_shards`), so
-  the seam is shared, but no sharded model has been run on a device.
-- **A sharded model that fits memory.** The one real run streamed. The resident
-  path differs only in which binder is chosen, and both go through `resolve`.
-- **A shard set whose members have different `general.alignment`.** Each shard's
-  data region is computed from its own header, so this should just work; no
-  fixture asserts it.
-- **More than two shards in the unit fixtures.** The real model has five, but
-  the synthetic sets are two — the assembly loop is uniform in the count.
-
-### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
-
-**Tag:** CR-2026-08-09 deepseek coverage · **Blocked on:** nothing; stated as
-gaps, not as defects
-
-`docs/deepseek.md`'s Stage 2 checklist is closed, and the end-to-end evidence
-behind it is real (coherent V2-Lite output, the CPU golden, cosine 0.9955
-CPU-vs-Vulkan, the YaRN numeric check at 228 and 4560 tokens). These are the
-places that evidence does not reach:
-
-- **`mla_parity` is not an independent oracle.** Its "hand-written CPU
-  reference" transcribes the same index formulas the `Op::Mla` CPU arm uses
-  (`wk[off + i + j*qk_nope]`, `wv[off + a + o*kv_lora]`). It catches an
-  implementation slip and cannot catch a weight-orientation error — the
-  orientation bug that `6adb2de` fixed was found by the V2-Lite coherence test,
-  not by this. `docs/deepseek.md` calls it "the one that matters… the only cheap
-  check that survives into stages 3–4", which overstates what it can do. A real
-  oracle would build full MHA from the unabsorbed `wkv_b` and compare against
-  the absorbed path.
-- **Ring wrap and the non-causal masks are now covered on all three backends.**
-  `Op::Mla` runs one shared case table on all three backends:
-  `mla_mask_ring_parity` (infr-llama `tests/seam_op_parity.rs`, CPU vs a
-  from-semantics reference), `mla_ring_and_mask_matches_cpu_reference`
-  (infr-vulkan `src/recorder.rs`) and `mla_mask_ring_parity` (infr-metal
-  `tests/parity.rs`, Metal vs CPU). It covers a genuinely wrapped ring
-  (`cap_rows` 5 over 14 positions — two full laps, with `lo` and `hi-1` on
-  opposite sides of the wrap boundary), `SlidingWindow`, `Canvas`, and a
-  non-zero `pos`. The references read keys by ABSOLUTE position from an
-  independent ring writer, so they agree with `j % cap_rows` / `(lo + jj) % cap`
-  only if the kernel's fold is right. Every case was seen red by perturbing the
-  arm it guards. What is left:
-  - **`Causal` over a wrapped ring is not covered and cannot be**: a causal
-    query at `abs` attends `abs + 1` positions, which is exactly when it exceeds
-    `cap_rows` that the ring wraps — so some attended row has already been
-    overwritten and there is no right answer to assert. Only a bounded span
-    (SWA, or a `Canvas` span `<= cap_rows`) is well defined on a wrapped ring.
-    Production deepseek2 never wraps (`cap_rows` is `ctx + KV_SLOP_ROWS`).
-  - **The CPU arm omits the `hi = min(hi, kv_len)` clamp** both shaders apply on
-    the causal/window arms (it takes `hi = abs + 1` outright), and its `Canvas`
-    arm takes `(lo, kv_len)` with no lower clamp, so `n_keys = hi - lo` would
-    underflow for `lo > kv_len`. Both are unreachable through the graph builder
-    (it emits `kv_len = start_pos + batch` with `pos = start_pos`, so
-    `abs < kv_len`; the only `Canvas` producer computes `lo <= P <= kv_len`) —
-    left untested for that reason, recorded so a future caller that breaks
-    either invariant is not a mystery.
-- **Group-limited routing and `exp_probs_b` now run end to end, but against no
-  external oracle.** `tests/synthetic_deepseek2.rs` writes a tiny but
-  structurally complete `deepseek2` GGUF (3 layers, 16 experts / 4 groups / 2
-  used, non-lite Q LoRA, YaRN on, deterministic name-seeded weights) and drives
-  it through the real `Config::from_gguf` and seam on CPU and Vulkan — so the
-  group mask, the bias-affects-selection rule and the
-  weights-from-unbiased-probs rule all execute from disk, which V2-Lite cannot
-  make happen. Each was seen red by perturbing the CPU arm, and the group mask
-  separately by perturbing `moe_topk.comp`. What it is NOT: an external oracle.
-  A bug both backends share identically — top-3-within-group instead of the
-  reference's hardcoded top-2, say — passes every test in the file. That `2` is
-  pinned only by `moe_groups_bias_parity`'s same-author hand reference. Also
-  uncovered there: decode (the file runs batched prefill only), quantized
-  experts (every synthetic tensor is F32), and `n_groups_used == n_groups`.
-- **`SeamKv::fork` and `seed_from` are driven by no test on any arch.** Both
-  needed a deepseek2 branch they did not have (fixed), and the fix is guarded
-  only by a runtime forked-vs-source byte comparison inside `fork` itself.
-  Constructing a `SeamKv` needs a full session — weights uploaded,
-  `SessionStable` built — so there is no cheap unit test, and there is no serve
-  test on a deepseek2 model to reach it end to end.
-- **The `deepseek-coder` and `deepseek-v3` pre-tokenizer lists have no token-id
-  coverage.** Both DeepSeek GGUFs in the local HF cache are
-  `tokenizer.ggml.pre == "deepseek-llm"`, so the `llama-tokenize` comparison
-  that closed `docs/deepseek.md` open question 3 exercised only the six-regex V1
-  list. The other two are byte-identical to `llama-vocab.cpp` and their chunk
-  boundaries are pinned by
-  `deepseek_pre_split_boundaries_match_the_reference_lists`, which is not the
-  same as having been checked against real ids. Close it if a GGUF with either
-  pre-type turns up — V3 is the one stage 3 needs.
-- **Every deepseek test `need_model!`-skips** without the GGUF in the HF cache,
-  which is the house pattern, but it does mean none of the above runs in CI.
-
-### B51 — what the deepseek32 lightning-indexer slice was NOT verified against (2026-08-10)
-
-**Tag:** deepseek stage-3 coverage · **Blocked on:** a V3.2 GGUF existing, which
-it does not at any size this box can run
-
-`docs/deepseek.md` § Stage 3 records what IS checked. These are the gaps:
-
-- **No external oracle exists, at all.** V3.2 is 671B, there is no small
-  variant, and llama.cpp cannot be run on it here. Every check is either
-  self-consistency (CPU vs Vulkan), a from-formula reference written by the same
-  author as the implementation, or a blessed regression lock. So the indexer's
-  absolute scores, the key set it picks on a real model, and the text it
-  produces are all unchecked against DeepSeek. This will not close without
-  hardware and a file.
-- **`synthetic_deepseek32_indexer_selection_is_locked` is a lock, not a proof.**
-  Its 64 logits were blessed from this implementation. It is sensitive (the NEOX
-  pairing and the `[rope | nope]` head order were each perturbed and seen to
-  break it) but it cannot say the blessed values are right.
-- **Metal has never executed the indexer.** The four `mla_f16kv*` entry points,
-  `topk_mask_f32` and `rope_f32`'s `neox` arm are typechecked only
-  (`cargo check --target x86_64-apple-darwin`); the macOS CI parity job is their
-  first real run. `infr-metal/tests/parity.rs` has MLA cases but none passing a
-  `key_bias`, and no `Op::TopkMask` or NEOX-`Op::Rope` case — add them when a
-  Metal box is available to see them go red first.
-- **The FLOP saving is not taken.** Attention still runs dense over the full
-  `n_kv` with a `-inf` mask, exactly as llama.cpp does. A gather is the
-  optimisation; it needs the selected indices to drive a compaction of both the
-  MLA cache read and the output scatter, and nothing has been measured.
-- **`Op::Mla::io()` omits `freq_factors`.** It lists `q`, `k_cache`, `wk_b`,
-  `wv_b` and (new) `key_bias`, but not the YaRN divisor tensor it also reads.
-  `io()`'s only consumer is `infr-vulkan`'s multi-device `PipelineBackend`,
-  which uses it to infer each op's device and to find cross-device cut tensors —
-  so a deepseek2/32 model split across GPUs could see the divisors unplaced.
-  Left alone in the stage-3 slice because it is a deepseek2-era omission with no
-  multi-GPU DeepSeek test to show it either way, and widening the read set could
-  change pipeline placement for a path nothing here exercises.
-- **The indexer cache is sized for the full context and cannot ring.** That is
-  correct (the indexer masks causally only, so position 0 stays eligible
-  forever) but it means a V3.2 session's KV footprint grows ~22% over the MLA
-  cache alone and no SWA-style trick can shrink it. If long-context V3.2 ever
-  matters, the question to answer is whether the indexer can tolerate a bounded
-  window at all — llama.cpp gives no signal, since it also keeps the full cache.
-- **Decode is exercised only one token deep.** `verify_dense_cpu` prefills the
-  prompt and takes one decode step, so the `batch == 1` indexer graph runs once.
-  There is no multi-token deepseek32 generation test, and there cannot be a
-  meaningful one on a synthetic model.
-
-### B47 — the MLA kernels are correct and slow (2026-08-09)
-
-**Tag:** CR-2026-08-09 deepseek perf · **Blocked on:** nothing measured; no
-DeepSeek throughput number exists yet, so these are read-off-the-code
-observations, not a regression
-
-`docs/deepseek.md` says the plan is about correctness only and makes no
-throughput claim. Three things a first perf pass should start from:
-
-- `mla.comp` **recomputes the entire `key_len` QK dot in pass 2** — the softmax
-  pass repeats the reduction the max pass already did, doubling QK work. An
-  online softmax, or staging the pass-1 scores, removes it.
-- `mla_f16kv_one` on Metal is **one thread per (token, head)** carrying
-  `q_full[576] + vacc[512]` = 1088 private floats, and loops `key_len` and
-  `kv_lora_rank` serially. That is precisely the per-thread working-set shape
-  `mla.comp`'s header blames for the RDNA3 device loss that forced the Vulkan
-  kernel cooperative; on Metal it will spill rather than hang, but it is the
-  slowest possible arrangement. Port the 128-lane cooperative structure over.
-- `moe_topk.comp`'s group-routing pre-phase runs **serially on thread 0** over
-  all experts, with `float gscore[64]` and `bool chosen[64]` private arrays,
-  before every top-k. Inert while `n_expert_groups <= 1`, so it costs nothing
-  today and everything on V3.
-
-### B56 — ranged parallelism WITHIN one file is not implemented (2026-08-10)
-
-**Tag:** concurrent-pull slice · **Blocked on:** nothing; scoped out, and it
-needs a persisted-state decision before it can be written safely
-
-`infr pull` now fetches several FILES at once (`hub.pull_jobs`,
-`infr_hub::pull`'s `fetch_all`), which is worth ~9x on a split model because a
-single HF CDN connection is the ceiling, not the link (measured on this host
-against the DeepSeek-V3.2 Q2_K objects: 1 connection 8.8 MB/s, 5 connections
-78.7 MB/s aggregate). It does nothing for a model that ships as ONE file —
-`unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` variant is a single 161 GB GGUF, and
-it will still take the ~9 MB/s path. The same gap shows up as the tail of every
-shard set: once fewer files remain than there are workers, the pull falls back
-to one connection.
-
-**The mechanism exists.** HF serves ranges — that is what
-`download::download_to_blob`'s resume already relies on — so N workers could
-each `GET Range: bytes=A-B` and `pwrite` their slice into the one temp file, and
-the existing end-of-body sha256 over the assembled file would still be the
-integrity gate, unchanged.
-
-**What stops it being a small change is RESUME.** Today "how much do I already
-have" is `metadata(tmp).len()`, which is only meaningful because exactly one
-writer appends. With N sparse writers the file's length stops being the amount
-downloaded, so an interrupted pull would need a persisted per-range progress
-sidecar next to the `.dl-` temp, plus a rule for what happens when the range
-plan changes between attempts (different `pull_jobs`, a resized object) and for
-an `If-Range` validator that is now per-range. Getting that wrong reproduces
-exactly the failure class the sha256 gate exists for — a plausible-sized file
-assembled from two different uploads — which cost a day of "the quant is broken"
-debugging once already (memory `verify-gguf-downloads`).
-
-**If it is picked up:** the honest cheap version is to make it opt-in and
-resume-less — a single-file download splits into ranges only when there is no
-partial on disk, and any interruption discards the temp and starts over. That
-keeps the state machine as it is and still fixes the 161 GB single-file case;
-the cost is that a failure at 150 GB is a full restart, which is the trade to
-put in front of the user rather than decide here.
-
-### B57 — `infr pull` ignores the shutdown latch (2026-08-10)
-
-**Tag:** concurrent-pull slice · **Blocked on:** nothing; PRE-EXISTING, left out
-of the concurrency slice on scope grounds
-
-The CLI installs `SIGINT`/`SIGTERM` handlers that latch
-`infr_core::shutdown::request_shutdown`, and every GPU submit path polls
-`shutdown_requested()`. Nothing on the download path does: neither
-`download::stream_into`'s read loop nor `pull::fetch_all`'s claim loop. Verified
-by observation, not by reading alone — a `SIGTERM` sent to a running
-`infr pull unsloth/DeepSeek-V3.2-GGUF:Q2_K` left the process downloading, and it
-took `SIGKILL` to stop it.
-
-Nothing is corrupted by that: the partials are append-only, the next run resumes
-from `metadata(tmp).len()`, and a real 229 GB pull was in fact killed and
-resumed exactly this way. The defect is that the first Ctrl-C appears to do
-nothing.
-
-**The fix is two polls**, both of which keep today's "partial kept for resume"
-contract: `fetch_all`'s `while !stop` becomes
-`while !stop && !shutdown_requested()` so a fan-out over 236 shards stops
-claiming files, and `stream_into` checks per 64 KiB chunk and returns
-`Error::Aborted`. The second one is why this was not just done: `Aborted` would
-have to travel out through `StreamError`, and the caller must treat it as the
-KEEP-the-partial case rather than the discard case — a distinction the current
-two-variant enum makes by accident of which error it is, not deliberately.
-
-### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
-
-**Tag:** concurrent-pull slice coverage · **Blocked on:** nothing; each line is
-a gap, stated so the coverage claim stays honest
-
-`hub.pull_jobs` and `pull::fetch_all` are covered by six tests against a local
-HTTP origin (`infr-hub/src/testhttp.rs`) — all files land, the bound is asserted
-on the peak the SERVER observed, `jobs = 1` stays sequential, a planted partial
-resumes under concurrency, a stale `If-Range` restarts rather than splices, a
-sha256 mismatch is refused and unlinked, and a failure stops the fan-out — plus
-one real 229 GB five-shard pull. Not covered:
-
-- **A concurrency bound above 5 in anger.** The real run had five shards and the
-  default is 8, so the default has never actually bounded anything on the
-  network; only the local-origin test has run it at a bound below the file
-  count. Where the per-connection rate finally bends is therefore unmeasured —
-  the 1-vs-5 curl comparison shows five is not it (per-connection throughput
-  ROSE from 8.8 to 15.7 MB/s), and nothing above five was tried.
-- **Two `infr` processes pulling the same model at once.** The per-blob `flock`
-  that serialises them is unchanged and still unit-tested
-  (`file_lock_is_exclusive`), but no test starts a second process, and the
-  cross-process case is now N locks held at once instead of one.
-- **A repo with more files than the bound.** `DeepSeek-V3.2-REAP`'s 236 shards
-  is the case the bound exists for, and it has only been exercised at 10 files /
-  3 workers against a local origin with the progress group HIDDEN. What that
-  leaves unknown is the shape of the bar block over a long queue: `indicatif`
-  reaps a finished bar's line only once every bar ahead of it has also finished
-  (`BarState::drop` marks a zombie; `MultiState::draw` reaps consecutive zombies
-  from the head), so files completing out of order could leave the redrawn block
-  growing past `pull_jobs` lines. Five shards did not show it. If it turns out
-  to matter, the lever is `MultiProgress::remove` / `finish_and_clear` on each
-  completed bar, at the cost of the per-shard `✓` line.
-- **Windows and macOS.** `download.rs` calls `libc::flock` unconditionally, so
-  `infr-hub` does not build on Windows at all (B30 records the same); the
-  fan-out itself is `std::thread::scope` and portable. macOS is CI-only.
-- **`HF_TOKEN` on a gated repo.** The token now reaches `download_to_blob` from
-  inside rather than as a parameter; unchanged in effect, but no gated repo was
-  pulled.
-- **The progress rendering was read, not eyeballed live.** The five-bar block
-  was captured from a `script`-allocated pty and inspected as escape sequences
-  (one line per shard, `MultiProgress::suspend` clearing the block around each
-  log line), not watched on a real terminal.
-
-### B27 — hardening candidates from the 2026-08-03 review
-
-**Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an
-established defect and none was verified in the fold-in pass
-
-Kept with the deleted report's framing intact: the review listed these as **"not
-established current defects"** — places where a stronger construction would
-survive a case nobody has shown to occur. Do not promote one to a bug without
-first exhibiting that case.
-
-- `with_profiling_suppressed` restores a process-global boolean only on normal
-  return; an RAII nesting counter would survive panics and overlapping scopes.
-- Existing HuggingFace `blobs/<expected_sha>` files are trusted by pathname and
-  existence without rehashing; optional verification would catch local cache
-  corruption.
-- Public `dequant_block` assumes block-sized input. The reviewed GGUF callers
-  supply validated slices; an explicit length check would protect direct
-  callers.
-- The streaming SSE channel is unbounded, so a non-reading client can retain a
-  whole completion in memory.
-
-**That last one is NOT B5, and it is already a recorded decision.** B5 declined
-RATE limiting — how many requests one client may make — because a reverse proxy
-owns that. This is per-stream memory retention on an already-admitted request,
-and `streaming`'s own comment in `crates/infr-server/src/lib.rs` argues the
-choice explicitly: a bounded channel would push backpressure into `on_delta`,
-which runs inside the decode loop while it holds the GPU baton, so one slow
-client would stall every other sequence. Retention is bounded by `max_tokens`,
-itself capped by `clamp_max_tokens` / `max_tokens_cap`. Treat it as decided
-unless someone measures the retention and finds the bound too loose.
-
-### B28 — what the 2026-08-03 review CLEARED
-
-**Tag:** CR-2026-08-03 cleared · **Blocked on:** nothing; recorded so it is not
-re-investigated
-
-Investigated at low depth and found sound. These were NOT re-verified in the
-fold-in pass — that pass verified the review's FINDINGS, not its clearances — so
-treat each as "one reviewer looked and was satisfied", never as tested.
-
-- CLI backend strings such as `vulkanfoo` do not silently select Vulkan device
-  0; the downstream numeric parse rejects the suffix.
-- GGUF loading validates metadata depth, tensor dimension arithmetic, alignment,
-  duplicate names, quantisation block divisibility and mapped-file bounds before
-  exposing tensor bytes.
-- `StopMatcher` preserves split stop prefixes and UTF-8 boundaries.
-- Vulkan upload, download and copy paths validate buffer extents.
-- Vulkan external-memory file descriptors transfer ownership on a successful
-  import and close the duplicate on failure.
-- The Metal derived-buffer cache keys include monotonic allocation identity, so
-  a recycled address cannot produce a false cache hit.
-- Autoregressive generation handles `max_new == 0` explicitly; the budget defect
-  is confined to block diffusion (B20).
-- `SpinPool` waits for every worker check-in before releasing an ordinary
-  borrowed job; the surviving defect is panic attribution between jobs (B25).
-- Pager production callers reject zero slots before construction.
-- Dense-runner token ids are validated before embedding lookup on the reviewed
-  generation paths.
-- Malformed Hermes tool markup is gated out of production streaming and removed
-  rather than surfacing as assistant content.
-
-### B29 — what the 2026-08-03 review did NOT cover
-
-**Tag:** CR-2026-08-03 coverage · **Blocked on:** nothing; each line is a gap,
-stated as one
-
-The review was explicitly **low depth** and **ran no build and no tests**. It
-traced core graph / pager / sampling / pool / backend boundaries; llama's
-autoregressive, diffusion, grammar, chat and request-context flow; server
-validation, admission, deadlines, streaming and non-streaming responses,
-statistics and cancellation; hub selection, shard expansion, cache resolution,
-downloads, integrity, symlinks and path validation; GGUF metadata/tensor
-validation and host dequant entry points; CLI backend/model parsing and the
-serve generation adapters; chat-template, reasoning, stop and tool-call parsing;
-profiling aggregation and JSON output; selected Vulkan and Metal allocation,
-transfer, cache, synchronisation, dispatch and lifecycle paths; and the testkit.
-It did NOT go line by line through:
-
-- SIMD/scalar numerical bodies and architecture-specific branches in
-  `crates/infr-cpu/src/kernels.rs` (see also B3).
-- Every graph-rewrite combination in `crates/infr-core/src/fusion.rs`.
-- The static quantisation tables in `crates/infr-core/src/iquant_grids.rs`.
-- Every MTP and per-architecture seam graph formula.
-- Most Vulkan recorder, adapter, GEMM, pager, tensor-parallel, expert-routing
-  and shader host/ABI combinations (see also B4).
-- Most of `crates/infr-metal/src/exec.rs`, and full Metal shader/host ABI
-  validation (see also B14).
-- Every quantisation arm in `crates/infr-gguf/src/dequant.rs`.
-- Large CLI benchmark and diffusion-specific command paths.
-- Every test assertion and example.
-- Live Vulkan or Metal execution — nothing ran on a device.
-- Platform-gated macOS code, which was read but never compiled.
-
----
-
-## Withdrawn
-
-Recorded so they are not rediscovered and re-investigated.
-
-**Nothing from the 2026-08-03 review landed here.** All eight of its findings
-were re-verified against the code and all eight survived — seven outright
-(B19–B25) and one narrowed by a scope the review had missed (B26: the leaking
-function is a `#[doc(hidden)]` test/bench helper with no production caller).
-
-### W3 — pin the kernel tier when `-r > 1` (B6's original remedy)
-
-**Claim:** the prefill columns' run-to-run spread came from a short prefill
-landing on a different kernel tier between runs, so the tier should be pinned
-for a multi-rep bench.
-
-**Why it is wrong:** there is no tier to pin. `INFR_PROF_OPS=1` over six
-back-to-back runs gives a byte-identical (op name, dispatch count) signature
-while throughput moves 9%, `adaptive_chunk` is a pure function of the KV span,
-and every rung that could move a chunk logs at WARN and never fired. The real
-cause was a warmup at the wrong shape (B6), and pinning would have fixed
-nothing.
+- **`batch > 1` has never been EXECUTED for V4 on any backend.** The only V4
+  fixture that exists (`crates/infr-llama/tests/synthetic_deepseek2.rs`'s
+  `dsv4_model`) writes f32 expert banks, so `moe_batched_ok` is false and the
+  chunked batched prefill is unreachable from it — and `generate_dense_backend`
+  now excludes V4 from that path outright rather than leave an untested shape
+  live. Every V4 graph the tests build is `batch == 1`. Re-enabling it means a
+  quantized-expert fixture (or a real GGUF) plus the layer-span question below.
+- **A partial layer span is refused** (the assert beside the compress-ratio
+  one): the widened residual is `hc_mult` streams wide and a span hands over one
+  `n_embd`-wide `hidden` buffer. Layer-major prefill therefore cannot serve V4
+  as written; a span-carried widened stream would need `hidden` to be the wide
+  buffer for V4 builds.
+- **Metal has never been executed** (no Apple hardware). The V4 emit is
+  backend-generic, so Metal will take it as soon as its own gaps close — but its
+  DEVICE MoE path asserts `MoeGating::Softmax` and V4's gating is mandatory
+  `SqrtSoftplus` (§ B-DSV4-HASH), so a V4 MoE layer aborts there first.
+- **No real V4 GGUF has been opened.** Every dimension in the fixture came from
+  the reference's formulas — see `docs/deepseek.md` § "Open questions" 1.
 
 ### B-DSV4 — what the V4 attention primitives do NOT cover yet (2026-08-10)
 
@@ -1711,6 +1240,18 @@ a silent fallback.
   `_dyn` path all error. V4's de-rope is NORM on an f32 scratch. Metal's rope is
   one runtime-parameterised kernel, so it carries `backward` on every path
   already.
+- **A V4 graph cannot take the record-once decode replay tape at all** — four of
+  its ops (`Attention{sinks}`, the three `HyperConnect*`, `Rope{backward}`,
+  `QkNorm{weight:None}`) have no `_dyn` twin, so `decode_eligible` is false and
+  the seam's mirror gate excludes `c.deepseek4` explicitly. Every V4 decode
+  token therefore rebuilds + recompiles its graph. That is a real per-token host
+  cost (the thing the tape exists to remove) and the first perf item for this
+  arch.
+- **`Op::Linear` with `w_off` on an F16 weight is still refused on Vulkan.** F32
+  now rides a shifted `bufferDeviceAddress` base (the grouped output
+  projection's caller); F16 would need the same at `matmul_proj` / `linear` /
+  `linear_f16_noext`, plus a `w_off % 2 == 0` obligation on the two that read
+  the weight as packed u32 words. Nothing produces an f16 `w_off` today.
 - **gemma4's V-norm and llama4's L2-norm still pass a ones-vector weight** to
   `Op::QkNorm`. They could now pass `None` and drop a per-graph `head_dim`-float
   allocation each; the numbers are bit-identical (`x * s * 1.0` is `x * s` in
@@ -1734,13 +1275,23 @@ op-level slice, which was explicitly "add the ops, emit nothing"
 `Op::HyperConnectMix` / `HyperConnectPre` / `HyperConnectPost` are implemented
 and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
 
-- **Nothing emits them.** `crates/infr-llama/src` was not touched: no `hc_fn` /
-  `hc_scale` / `hc_base` weight is read into a graph, and
-  `generate_dense_backend` still refuses V4 outright. The wiring slice also
-  needs the RMS-norm over the FLATTENED `hc*n_embd` row that produces `mixes` —
-  `Op::RmsNorm` requires a `weight`, and llama.cpp calls bare `ggml_rms_norm`
-  here, so that slice must either pass a ones vector or extend `Op::RmsNorm` the
-  way `Op::QkNorm` was extended with `weight: Option<_>`.
+- **How the widened stream is SEEDED is an assumption, not a transcription.**
+  The ratio-0 emit replicates the token embedding across all `hc_mult` streams
+  (`Op::CopyStrided` per stream, in the prologue). Neither `docs/deepseek.md` §
+  Stage 4 nor this file records what `deepseek4.cpp` actually does there — the
+  read slice covered the compressed caches, the attention block and the HC math,
+  not the stream initialisation. Replication is what the hyper-connections
+  formulation calls for and what makes the head's collapse a partition of unity
+  at depth 0, but it has not been checked against the source. **Read
+  `deepseek4.cpp`'s `build_arch_graph` prologue and confirm it before trusting a
+  real V4 checkpoint's output.** A wrong seed produces plausible logits.
+- **The weightless RMSNorm over the flattened `hc*n_embd` row went the
+  ones-vector way**, not the `Op::RmsNorm { weight: Option<_> }` way: one
+  `hc_mult*n_embd`-wide vector of 1.0 is uploaded per V4 session, matching the
+  three ones-vectors gemma4 / dual-MoE / llama4 already upload. Extending
+  `Op::RmsNorm` the way `Op::QkNorm` was extended would drop that allocation for
+  all four callers and is the tidier end state; it was out of scope here because
+  it is a change to every backend.
 - **Performance was not considered at all.** Every kernel is the naive shape:
   `hyper_mix` runs ONE THREAD per token with the `hc × hc` matrix in a private
   array (dynamic indexing into a private array is the classic scratch-memory
@@ -1789,9 +1340,14 @@ op-level slice, which was explicitly "extend the ops, emit nothing"
 Vulkan (real RX 7900 XTX, validation layer clean) and typechecked on Metal. What
 is left:
 
-- **Nothing emits them.** `crates/infr-llama/src` got only the mechanical
-  `None`/`None` defaults at existing construction sites; no V4 layer builds a
-  `MoeFfn` and `generate_dense_backend` still refuses V4 outright.
+- **The CLAMPS now emit; hash routing does not.** A ratio-0 V4 layer builds a
+  real `Op::MoeFfn` with `swiglu_clamp: swiglu_clamp(swiglu_clamp_exp[il])` and
+  a shared expert at `swiglu_clamp_shexp[il]`, on CPU and Vulkan. A HASH-ROUTED
+  layer is refused by name in `generate_dense_backend`, because of the gather
+  below — emitting it with `expert_ids: None` would silently run the router's
+  own top-k and pick different experts. That refusal is what the ratio-0
+  generating fixture avoids by setting `hash_layer_count = 0`; the canonical
+  fixture keeps `hash_layer_count = 2` and pins the refusal.
 - **The GATHER that produces `expert_ids` does not exist.** The op takes the ids
   ALREADY gathered; nothing in the tree can produce them from
   `blk.N.ffn_gate_tid2eid.weight` + the token-id input. `Op::EmbedGather` was
@@ -1806,6 +1362,16 @@ is left:
   `embed_gather.comp` or a dedicated gather op. `infr`'s own synthetic V4
   fixture (`crates/infr-llama/tests/synthetic_deepseek2.rs`) writes the table as
   a FLOAT weight, so it will not surface this.
+
+  A third option the ratio-0 wiring slice considered and did NOT take: gather on
+  the HOST. The token ids are known there, the table is
+  `[n_expert_used, n_vocab]`, and the result would be one
+  `[batch, n_expert_used]` i32 Input per hash layer per step — no new kernel at
+  all. Declined on scope (it needs a host-side dequant of every hash layer's
+  table on `SessionStable`, one extra graph Input per hash layer, and a per-step
+  upload), and because a small-`ne` I32 `embed_gather` path is the reusable
+  answer. Revisit if the kernel work looks worse than the plumbing.
+
 - **`Op::io` still omits `exp_probs_b`.** Pre-existing (it lists `x`,
   `router_x`, `router`, the three banks and `down_scale`); `expert_ids` was
   added, `exp_probs_b` deliberately left alone as out of scope. It matters only

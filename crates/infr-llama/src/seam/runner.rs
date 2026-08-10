@@ -6,15 +6,15 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, DeltaW, FfnW, IndexerW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights,
-    SessionStable,
+    AttnW, DeltaW, Dsv4W, FfnW, HcTriple, IndexerW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
+    SeamKv, SeamWeights, SessionStable,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
-use infr_core::graph::{Activation, AttnMask, Graph, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, HyperGates, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
@@ -1093,6 +1093,21 @@ pub(crate) fn generate_dense_backend(
             wbufs.push(b);
             wspecs.push((DType::F32, c.head_dim));
         }
+        // DeepSeek V4: a weightless RMSNorm over the FLATTENED `hc_mult * n_embd` widened residual
+        // row is what feeds every hyper-connection mixing matmul (llama.cpp calls bare
+        // `ggml_rms_norm` there). `Op::RmsNorm` requires a weight, so — exactly like the three
+        // ones-vectors above — one `hc_mult*n_embd`-wide vector of 1.0 serves all of them
+        // (`x * s * 1.0 == x * s` in IEEE). See the matching `hc_ones` handle in `build`.
+        if c.deepseek4 {
+            let ones = vec![1.0f32; c.hc_mult * ne];
+            let b = be
+                .alloc(ones.len() * 4, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                .map_err(|e| anyhow!("{e}"))?;
+            wbufs.push(b);
+            wspecs.push((DType::F32, c.hc_mult * ne));
+        }
 
         // ── re-decide the context against what the device says is LEFT ───────────────────────
         // Every weight this session will hold is resident by now — including the arena block tails
@@ -1434,23 +1449,87 @@ pub(crate) fn generate_dense_backend(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
-    // DeepSeek V4: the LOAD path is complete — config, every per-layer tensor at every compression
-    // ratio, the hash-routed tables and the model-level hyper-connection head are all resident by
-    // now — but nothing emits V4 yet. It is NOT MLA, so `c.deepseek2` is false and the mixer chain
-    // in `build` below would declare V4's weights as a plain q/k/v attention, binding every handle
-    // to a buffer shaped for a model this is not. Deleting this bail and the assert in `build` was
-    // tried: the synthetic fixture dies inside the CPU `Op::Linear` (`bytes.len() / total_rows`
-    // with `total_rows == 0`, a divide by zero), which is a panic from a kernel rather than an
-    // answer — and a fixture whose numbers happened to divide would have got silent garbage
-    // instead. Placed after the weight upload on purpose, exactly as the deepseek32 slice was: a
-    // `deepseek4` GGUF still gets every tensor it declares validated end to end. See
-    // docs/deepseek.md § Stage 4.
+    // DeepSeek V4: the `compress_ratio == 0` tier emits (hyper-connections, MQA attention with
+    // sinks and the grouped output projection, bias-routed MoE with the per-layer SwiGLU clamp).
+    // Everything below is what does NOT, refused by name rather than approximated — each of these
+    // would otherwise run and produce plausible wrong numbers. Placed after the weight upload on
+    // purpose, exactly as the deepseek32 slice was: a `deepseek4` GGUF still gets every tensor it
+    // declares validated end to end. See docs/deepseek.md § Stage 4.
     if c.deepseek4 {
-        return Err(anyhow!(
-            "arch=deepseek4 (DeepSeek V4) loads but cannot generate yet: its hyper-connections, \
-             three-tier compressed attention and hash-routed MoE are not implemented, and no other \
-             architecture's graph is a valid stand-in for them. See docs/deepseek.md § Stage 4."
-        ));
+        // Ratios 4 and 128. Their compressed caches, the three compressor states, the per-channel
+        // softmax pooling op and the block-counting lightning indexer are all still missing — see
+        // docs/backlog.md § B-DSV4-WIRING slice B. Naming the layer AND its ratio, because a real
+        // V4 file mixes tiers and "which layer" is the first thing to know.
+        if let Some((l, r)) = (0..c.n_layer)
+            .map(|l| (l, c.layer_compress_ratio(l)))
+            .find(|&(_, r)| r != 0)
+        {
+            return Err(anyhow!(
+                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio {r}: only the ratio-0 \
+                 tier (pure sliding window) generates. A compressed layer needs the {} compressor \
+                 over blocks of {r} tokens, its persistent compressor state, the CSA/HCA block \
+                 cache{} — none of which is implemented. See docs/deepseek.md § Stage 4.",
+                if r == 4 { "CSA" } else { "HCA" },
+                if r == 4 {
+                    " and the lightning indexer with its own compressor + LID cache"
+                } else {
+                    ""
+                },
+            ));
+        }
+        // Hash-routed layers. `Op::MoeFfn::expert_ids` exists and every backend implements it, but
+        // NOTHING can produce the ids: they are `ggml_get_rows(ffn_gate_tid2eid, inp_tokens)`, an
+        // I32 `[n_expert_used, n_vocab]` lookup by TOKEN ID, and `Op::EmbedGather` cannot serve it
+        // (its Vulkan kernel iterates whole 32-element sub-blocks, so an `n_expert_used`-wide row
+        // writes nothing and every token silently routes to expert 0). Emitting the layer with
+        // `expert_ids: None` would run the ordinary top-k instead — different experts, no error.
+        // See docs/backlog.md § B-DSV4-HASH.
+        if let Some(l) = (0..c.n_layer).find(|&l| c.is_hash_moe_layer(l)) {
+            return Err(anyhow!(
+                "arch=deepseek4 (DeepSeek V4) layer {l} is hash-routed (hash_layer_count={}): its \
+                 experts come from the `blk.{l}.ffn_gate_tid2eid` token-id table, and no op in this \
+                 tree can gather an i32 `[rows, n_expert_used]` selection from it. Running the \
+                 layer's router top-k instead would pick DIFFERENT experts silently. See \
+                 docs/backlog.md § B-DSV4-HASH.",
+                c.hash_layer_count,
+            ));
+        }
+        // The hyper-connection shape every backend's fixed-size per-token scratch is built for.
+        // `Op::HyperConnectMix` asserts both on the host; catching them here names the GGUF key.
+        if c.hc_mult == 0 || c.hc_mult > infr_core::graph::HYPER_CONNECT_MAX_MULT as usize {
+            return Err(anyhow!(
+                "arch=deepseek4: deepseek4.hyper_connection.count = {} is outside 1..={} — every \
+                 backend holds a token's whole hc x hc Sinkhorn matrix in a fixed-size array.",
+                c.hc_mult,
+                infr_core::graph::HYPER_CONNECT_MAX_MULT,
+            ));
+        }
+        if c.hc_sinkhorn_iters == 0 {
+            return Err(anyhow!(
+                "arch=deepseek4: deepseek4.hyper_connection.sinkhorn_iterations = 0 — the \
+                 reference's loop still runs one normalisation over `src` at 0, a shape no config \
+                 asks for and one no backend here reproduces."
+            ));
+        }
+        // The `[nope | rope]` head split the three rope sites slice out.
+        if c.rope_dim > c.head_dim {
+            return Err(anyhow!(
+                "arch=deepseek4: rope.dimension_count {} exceeds attention.key_length {} — V4's \
+                 head is [nope | rope] with the rotated dims LAST, so the rope width cannot exceed \
+                 the head.",
+                c.rope_dim,
+                c.head_dim,
+            ));
+        }
+        // The grouped output projection's two divisibility facts, both of which would otherwise
+        // surface as a wrong `w_off` rather than an error.
+        if c.o_group_count == 0 || !(nh * c.head_dim).is_multiple_of(c.o_group_count) {
+            return Err(anyhow!(
+                "arch=deepseek4: attention.output_group_count {} must divide n_head*key_length {}",
+                c.o_group_count,
+                nh * c.head_dim,
+            ));
+        }
     }
     let build = |batch: usize,
                  start_pos: usize,
@@ -1496,16 +1575,27 @@ pub(crate) fn generate_dense_backend(
             l_first == 0 || !e2b,
             "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
         );
-        // Backstop for the `c.deepseek4` refusal above — the only thing standing between a V4
-        // model and another architecture's graph. `wpush` below declares handles in lockstep with
-        // the upload loop by ARCH, and V4 has no arm there (it has no `MixerW` to build: hyper-
-        // connections restructure the whole block, not just the mixer), so if the refusal is ever
-        // removed without one being added, every weight in the layer binds to the wrong buffer.
-        // Fail loudly at the seam instead of somewhere inside a kernel.
+        // Backstop for the `c.deepseek4` refusals above. `wpush` below declares V4's handles in
+        // lockstep with the upload loop, and a compressed (ratio 4/128) layer uploads FOUR to TEN
+        // more tensors than the ratio-0 arm declares — so reaching the builder with one would bind
+        // every later weight in the layer, and every weight of every later layer, one buffer off.
+        // Silently. Fail at the seam instead of somewhere inside a kernel.
         assert!(
-            !c.deepseek4,
-            "deepseek4 reached the graph builder: it has no mixer arm in `wpush`, so the refusal \
-             in `generate_dense_backend` must not be removed until one exists"
+            !c.deepseek4 || (0..c.n_layer).all(|l| c.layer_compress_ratio(l) == 0),
+            "deepseek4 reached the graph builder with a non-zero compress_ratio: `wpush`'s Dsv4 arm \
+             declares the ratio-0 tensor set only, so the refusal in `generate_dense_backend` must \
+             not be removed until the compressed tiers have handles of their own"
+        );
+        // The widened `[batch, hc_mult, n_embd]` residual stream lives in graph scratch and is
+        // collapsed back to `[batch, n_embd]` only by the model head. A partial layer span carries
+        // its residual in the caller's `hidden` buffer, which is `n_embd` wide — there is nowhere
+        // to hand the other `hc_mult - 1` streams over. `decode_start`'s batched-prefill gate keeps
+        // V4 off that path entirely (see it); this is the backstop.
+        assert!(
+            !c.deepseek4 || (l_first == 0 && l_end == c.n_layer),
+            "deepseek4 cannot be built as a partial layer span ({l_first}..{l_end} of {}): the \
+             hyper-connection residual is hc_mult streams wide and a span hands over one",
+            c.n_layer
         );
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
@@ -1623,7 +1713,22 @@ pub(crate) fn generate_dense_backend(
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
             let is_mla = c.deepseek2;
-            let mixer = if is_mla {
+            let mixer = if c.deepseek4 {
+                // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
+                // so one handle out of place binds every later weight in the model one buffer off,
+                // silently. The two hyper-connection triples are pushed right after `wo_b` for the
+                // same reason (they upload there), even though they are not mixer weights.
+                MixerW::Dsv4(Dsv4W {
+                    sinks: wpush(&mut g, &mut weights),
+                    wq_a: wpush(&mut g, &mut weights),
+                    q_a_norm: wpush(&mut g, &mut weights),
+                    wq_b: wpush(&mut g, &mut weights),
+                    wkv: wpush(&mut g, &mut weights),
+                    wkv_norm: wpush(&mut g, &mut weights),
+                    wo_a: wpush(&mut g, &mut weights),
+                    wo_b: wpush(&mut g, &mut weights),
+                })
+            } else if is_mla {
                 let (wq_a, q_a_norm) = if c.is_lite {
                     (None, None)
                 } else {
@@ -1730,6 +1835,20 @@ pub(crate) fn generate_dense_backend(
                     wo,
                 })
             };
+            // DeepSeek V4's two hyper-connection triples, in `wload`'s order: attn `(fn, base,
+            // scale)` then ffn `(fn, base, scale)`.
+            let hc = c.deepseek4.then(|| LayerHcW {
+                attn: HcTriple {
+                    w_fn: wpush(&mut g, &mut weights),
+                    base: wpush(&mut g, &mut weights),
+                    scale: wpush(&mut g, &mut weights),
+                },
+                ffn: HcTriple {
+                    w_fn: wpush(&mut g, &mut weights),
+                    base: wpush(&mut g, &mut weights),
+                    scale: wpush(&mut g, &mut weights),
+                },
+            });
             // bitnet SubLN attention-output norm — mirrors the `wload` push right after
             // `attn_output.weight` (loaded under the same `c.sub_norm && !is_delta` gate; bitnet
             // has no DeltaNet layers, so `is_delta` is always false there).
@@ -1832,6 +1951,7 @@ pub(crate) fn generate_dense_backend(
             lw.push(LayerW {
                 attn_norm,
                 mixer,
+                hc,
                 attn_sub_norm,
                 post_attn,
                 ffn_norm,
@@ -1845,6 +1965,16 @@ pub(crate) fn generate_dense_backend(
         }
         let w_out_norm = wpush(&mut g, &mut weights);
         let w_lm = wpush(&mut g, &mut weights);
+        // DeepSeek V4's hyper-connection HEAD triple (`output_hc_fn/base/scale`) — model-level, and
+        // uploaded right after the lm_head, so declared right after it too. `output_hc_fn` is
+        // `{hc_dim, hc}` rather than `{hc_dim, (2+hc)*hc}`: the head has no sublayer to wrap, so
+        // its `mixes` IS the `pre` chunk and `Op::HyperConnectMix { gates: None }` reads it at the
+        // same `scale[0]`/`base[0..hc]` indices.
+        let hc_head = c.deepseek4.then(|| HcTriple {
+            w_fn: wpush(&mut g, &mut weights),
+            base: wpush(&mut g, &mut weights),
+            scale: wpush(&mut g, &mut weights),
+        });
         // GPU embed gather table: tied-lm_head models read the w_lm slot (same tensor); untied
         // models declare the extra upload here (mirrors the wload order).
         // Declarations MIRROR THE UPLOADS (generation-gated `gpu_embed`/`gpu_ple`, NOT the
@@ -1918,6 +2048,14 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
+        // DeepSeek V4's `hc_mult*n_embd`-wide ones-vector for the weightless RMSNorm that feeds
+        // every hyper-connection mixing matmul — upload order matches the `if c.deepseek4` block
+        // at the end of the weight loop above.
+        let hc_ones = if c.deepseek4 {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
+        };
         // `logits_rows == 0` (task #27): a HEADLESS graph — the chunked batched-prefill path,
         // whose per-chunk logits nothing ever consumes (the sampler reads the decode loop's own
         // fresh logits for the LAST prompt token; earlier rows' logits were always discarded).
@@ -1959,6 +2097,48 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
+        // DeepSeek V4 scratch (docs/deepseek.md § Stage 4), all f32 and all `.max(1)`-guarded so a
+        // non-V4 model (`hc_mult`/`o_lora_rank`/… all 0) still gets valid, harmlessly-tiny
+        // allocations — the same convention as the E2B/qwen35 scratch above.
+        //
+        //   hcr[0..2]  [batch, hc_mult*n_embd]  the widened residual stream, PING-PONGED: every
+        //              output element of `Op::HyperConnectPost` reads every `src` stream of its
+        //              `residual`, so it cannot run in place. Each layer wraps exactly TWO
+        //              sublayers, so the parity returns to `hcr[0]` at every layer boundary and
+        //              the pair is a fixed a→b→a per layer rather than a running index.
+        //   hc_normed  [batch, hc_mult*n_embd]  weightless RMSNorm of the stream, the mix input
+        //   hc_mixes   [batch, (2+hc)*hc]       the mixing matmul's output (wrapping form)
+        //   hc_hmixes  [batch, hc]              ditto for the model head (`gates: None`)
+        //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
+        //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
+        let hcw = c.hc_mult * ne;
+        let hcr = [
+            g.internal(f32d(batch * hcw.max(1))),
+            g.internal(f32d(batch * hcw.max(1))),
+        ];
+        let hc_normed = g.internal(f32d(batch * hcw.max(1)));
+        let hc_mixes = g.internal(f32d(batch * ((2 + c.hc_mult) * c.hc_mult).max(1)));
+        let hc_hmixes = g.internal(f32d(batch * c.hc_mult.max(1)));
+        let hc_pre = g.internal(f32d(batch * c.hc_mult.max(1)));
+        let hc_post = g.internal(f32d(batch * c.hc_mult.max(1)));
+        let hc_comb = g.internal(f32d(batch * (c.hc_mult * c.hc_mult).max(1)));
+        //   d4_qa      [batch, q_lora_rank]     the normed low-rank query intermediate
+        //   d4_kv      [batch, head_dim]        the single MQA key/value row
+        //   d4_rq      [batch, n_head*rope_dim] the rope TAIL of every q head, packed
+        //   d4_rkv     [batch, rope_dim]        the rope tail of the kv row
+        //   d4_xg      [batch, hd_g]            one output-projection group's slice of `attn`
+        //   d4_og      [batch, o_lora_rank]     that group's low-rank output
+        //   d4_oa      [batch, o_group_count*o_lora_rank]  all groups' outputs, concatenated
+        let d4_qa = g.internal(f32d(batch * c.q_lora_rank.max(1)));
+        let d4_kv = g.internal(f32d(batch * c.head_dim.max(1)));
+        let d4_rq = g.internal(f32d(batch * (nh * c.rope_dim).max(1)));
+        let d4_rkv = g.internal(f32d(batch * c.rope_dim.max(1)));
+        // `o_group_count` is 0 on every non-V4 model (and refused as 0 on a V4 one), so this is
+        // the harmless-allocation guard the rest of this block uses, not a real division.
+        let d4_hdg = (nh * c.head_dim).checked_div(c.o_group_count).unwrap_or(0);
+        let d4_xg = g.internal(f32d(batch * d4_hdg.max(1)));
+        let d4_og = g.internal(f32d(batch * c.o_lora_rank.max(1)));
+        let d4_oa = g.internal(f32d(batch * (c.o_group_count * c.o_lora_rank).max(1)));
         // deepseek32 lightning-indexer scratch. All f32: the k row is LayerNormed (so it never
         // leaves f16 range) but staying f32 also keeps the `Rope → WriteKv` peephole off it —
         // that fusion only fires on an f16 rope dst, and its fused kernels have no NEOX build.
@@ -2048,6 +2228,60 @@ pub(crate) fn generate_dense_backend(
         let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
 
         let eps = c.rms_eps;
+
+        // DeepSeek V4 hyper-connection WRAP-PRE: everything between the widened residual `res` and
+        // the single `[batch, n_embd]` vector `dst` a sublayer consumes.
+        //
+        //   normed = rmsnorm(res flattened to hc_mult*n_embd)     (weightless — `hc_ones`)
+        //   mixes  = normed · triple.fn                            [(2+hc)*hc]
+        //   (pre, post, comb) = HyperConnectMix(mixes, scale, base)
+        //   dst    = Σ_h res[·, h, ·] * pre[·, h]
+        //
+        // `post`/`comb` stay in `hc_post`/`hc_comb` for the matching `Op::HyperConnectPost` that
+        // closes this wrap. The two wraps of a layer are strictly sequential (attention's Post runs
+        // before the FFN's Mix overwrites them), which is what lets one pair of buffers serve both.
+        let hc_wrap_pre = |g: &mut Graph, t: &HcTriple, res: TensorId, dst: TensorId| {
+            let ones = hc_ones.expect("deepseek4 build always declares hc_ones");
+            g.push(Op::RmsNorm {
+                x: res,
+                weight: ones,
+                dst: hc_normed,
+                rows: batch as u32,
+                dim: hcw as u32,
+                eps,
+            });
+            g.push(Op::Linear {
+                x: hc_normed,
+                weight: t.w_fn,
+                dst: hc_mixes,
+                m: batch as u32,
+                in_f: hcw as u32,
+                out_f: ((2 + c.hc_mult) * c.hc_mult) as u32,
+                w_off: 0,
+            });
+            g.push(Op::HyperConnectMix {
+                mixes: hc_mixes,
+                scale: t.scale,
+                base: t.base,
+                pre: hc_pre,
+                gates: Some(HyperGates {
+                    post: hc_post,
+                    comb: hc_comb,
+                }),
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                eps: c.hc_eps,
+                n_iter: c.hc_sinkhorn_iters as u32,
+            });
+            g.push(Op::HyperConnectPre {
+                x: res,
+                weights: hc_pre,
+                dst,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                n_embd: ne as u32,
+            });
+        };
 
         // Everything from here to the layer loop is the PROLOGUE: it produces the layer stack's
         // input from the token ids, so it belongs to the span that starts at layer 0. A later span
@@ -2261,6 +2495,31 @@ pub(crate) fn generate_dense_backend(
             });
         }
 
+        // DeepSeek V4: WIDEN the embedding into the `hc_mult` parallel residual streams the layer
+        // stack carries. Every stream starts as a copy of `hidden`; the model head collapses them
+        // back into `hidden` after the last layer.
+        //
+        // **This replication is an ASSUMPTION, not a transcription** — `docs/deepseek.md` § Stage 4
+        // was written from `llama-kv-cache-dsv4.cpp` and `deepseek4.cpp`'s attention/HC/MoE blocks,
+        // and neither it nor `docs/backlog.md` § B-DSV4-WIRING records how the reference seeds the
+        // widened stream. Replicating the input across streams is what the hyper-connections
+        // formulation calls for and what makes the head's collapse a partition of unity at depth 0;
+        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC.
+        if c.deepseek4 {
+            for h in 0..c.hc_mult {
+                g.push(Op::CopyStrided {
+                    src: hidden,
+                    src_off: 0,
+                    src_stride: ne as u32,
+                    dst: hcr[0],
+                    dst_off: (h * ne) as u32,
+                    dst_stride: hcw as u32,
+                    rows: batch as u32,
+                    n: ne as u32,
+                });
+            }
+        }
+
         for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
@@ -2270,7 +2529,8 @@ pub(crate) fn generate_dense_backend(
             let nff_l = c.layer_n_ff(l);
             let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
             let rope_dim = c.layer_rope_dim(l);
-            let swa = gemma && c.is_swa_layer(l);
+            // EVERY deepseek4 layer is sliding-window (`set_swa_pattern(0)`) — never `Causal`.
+            let swa = (gemma || c.deepseek4) && c.is_swa_layer(l);
             // llama4 iRoPE: NoPE (global) layers skip rope entirely; rope (local) layers apply a
             // weightless per-head L2-norm to Q/K AFTER rope (`Llama4TextL2Norm`). `l2norm` is the
             // ones-vector handle on llama4 rope layers, `None` on NoPE layers and every other model.
@@ -2302,9 +2562,30 @@ pub(crate) fn generate_dense_backend(
             };
             // gemma4 proportional-RoPE applies only on full-attention layers.
             let layer_ff = if gemma4 && !swa { rope_freqs } else { None };
-            // attn input norm
+            // DeepSeek V4's per-layer SwiGLU clamps: `swiglu_clamp_exp[il]` on the ROUTED experts
+            // and `swiglu_clamp_shexp[il]` on the shared one — two different hparam arrays, so the
+            // two can differ within a layer. `infr_core::graph::swiglu_clamp` owns the
+            // `limit > 1e-6` disabled gate; passing a non-clamping layer's raw 0.0 through as
+            // `Some(0.0)` would clamp that whole FFN to zero. `None` for every other arch.
+            let (clamp_exp, clamp_shexp) = if c.deepseek4 {
+                (
+                    infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l]),
+                    infr_core::graph::swiglu_clamp(c.swiglu_clamp_shexp[l]),
+                )
+            } else {
+                (None, None)
+            };
+            // attn input norm. DeepSeek V4 reads the widened residual through its attention
+            // hyper-connection wrap instead of reading `hidden` directly: the wrap collapses the
+            // `hc_mult` streams into `hn`, and `attn_norm` then normalises that.
+            let attn_in = if let Some(hcl) = &lw.hc {
+                hc_wrap_pre(&mut g, &hcl.attn, hcr[0], hn);
+                hn
+            } else {
+                hidden
+            };
             g.push(Op::RmsNorm {
-                x: hidden,
+                x: attn_in,
                 weight: lw.attn_norm,
                 dst: hn,
                 rows: batch as u32,
@@ -2474,6 +2755,229 @@ pub(crate) fn generate_dense_backend(
                 });
                 // DeltaNet's residual contribution is already in `sub` — skip the attention-only
                 // code below (query/key/value projections, RoPE, Attention, o-proj) entirely.
+            } else if let MixerW::Dsv4(mw) = &lw.mixer {
+                // ── DeepSeek V4 attention, `compress_ratio == 0` (pure sliding window) ─────────
+                // `docs/deepseek.md` § Stage 4. Every non-zero ratio was refused before the graph
+                // was built, so this arm is the WHOLE of V4's attention today.
+                let hd4 = c.head_dim as u32; // MQA: one KV head of this width serves every q head
+                let rd = c.rope_dim as u32;
+                let nope4 = hd4 - rd; // the head is [nope | rope]; the ROPED dims are LAST
+                let qrow4 = (nh as u32) * hd4;
+                let qlr = c.q_lora_rank as u32;
+                let ogc = c.o_group_count as u32;
+                let olr = c.o_lora_rank as u32;
+                let hdg = qrow4 / ogc;
+                // Ratio-0 layers rope PLAIN: `deepseek4.cpp` passes `freq_scale = 1`,
+                // `ext_factor = 0` and both betas 0 there, so there is no YaRN ramp and no mscale
+                // — only the compressed tiers use `compress_rope_theta` with YaRN. That is also
+                // what makes the `backward` de-rope below an exact inverse of the forward rope
+                // (`Op::Rope::backward`'s doc: ggml's forward-then-back scales by mscale², and V4
+                // cancels mscale to 1 at every one of its rope call sites).
+                let theta4 = c.rope_theta;
+
+                // Q: wq_a → q_a_norm → wq_b, then a WEIGHTLESS per-head RMS norm (bare
+                // `ggml_rms_norm` after the reshape to [head_dim, n_head, n_tokens] — there is no
+                // `attn_q_norm` tensor in a V4 file, which is why `Op::QkNorm` takes `None`).
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: mw.wq_a,
+                    dst: d4_qa,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: qlr,
+                    w_off: 0,
+                });
+                g.push(Op::RmsNorm {
+                    x: d4_qa,
+                    weight: mw.q_a_norm,
+                    dst: d4_qa,
+                    rows: batch as u32,
+                    dim: qlr,
+                    eps,
+                });
+                g.push(Op::Linear {
+                    x: d4_qa,
+                    weight: mw.wq_b,
+                    dst: q,
+                    m: batch as u32,
+                    in_f: qlr,
+                    out_f: qrow4,
+                    w_off: 0,
+                });
+                g.push(Op::QkNorm {
+                    x: q,
+                    weight: None,
+                    dst: q,
+                    rows: batch as u32,
+                    n_head: nh as u32,
+                    head_dim: hd4,
+                    eps,
+                    x_stride: 0,
+                });
+                // Rope the head's TAIL. `Op::Rope` rotates `[0, rope_dim)` of each head and passes
+                // the rest through, so the roped slice is extracted, rotated and written back —
+                // the same dance the MLA arm does for `k_pe`, in ONE `CopyStrided` each way: with
+                // `rows = batch*n_head` and `src_stride = head_dim`, row `b*n_head+h` is exactly
+                // head `h` of token `b`, and `src_off = nope` lands on its rope tail. The packed
+                // `[batch, n_head, rope_dim]` result is then a plain `n_head`-head rope row.
+                let rope_tail = |g: &mut Graph, x: TensorId, pack: TensorId, heads: u32, back| {
+                    g.push(Op::CopyStrided {
+                        src: x,
+                        src_off: nope4,
+                        src_stride: hd4,
+                        dst: pack,
+                        dst_off: 0,
+                        dst_stride: rd,
+                        rows: (batch as u32) * heads,
+                        n: rd,
+                    });
+                    g.push(Op::Rope {
+                        x: pack,
+                        positions,
+                        dst: pack,
+                        rows: batch as u32,
+                        n_head: heads,
+                        head_dim: rd,
+                        rope_dim: rd,
+                        theta: theta4,
+                        freq_factors: None,
+                        x_stride: 0,
+                        // NORM (interleaved pairs) — `llama_model::rope_type` puts DEEPSEEK4 in
+                        // the NORM group, and V4's indexer does NOT inherit V3.2's NEOX override
+                        // (docs/deepseek.md § Stage 4, "Two corrections").
+                        neox: false,
+                        backward: back,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: pack,
+                        src_off: 0,
+                        src_stride: rd,
+                        dst: x,
+                        dst_off: nope4,
+                        dst_stride: hd4,
+                        rows: (batch as u32) * heads,
+                        n: rd,
+                    });
+                };
+                if rd > 0 {
+                    rope_tail(&mut g, q, d4_rq, nh as u32, false);
+                }
+
+                // KV: ONE head for the whole layer (`attn_kv` is `[n_embd, head_dim]`), RMS-normed
+                // over the full row, then roped on the same tail. Written to BOTH cache sides —
+                // V4's attention is `build_attn_mha(q, k_all, k_all, …)`, so V IS K; see
+                // `crate::seam::kv_row_elems` for why they are two buffers here rather than one.
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: mw.wkv,
+                    dst: d4_kv,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: hd4,
+                    w_off: 0,
+                });
+                g.push(Op::RmsNorm {
+                    x: d4_kv,
+                    weight: mw.wkv_norm,
+                    dst: d4_kv,
+                    rows: batch as u32,
+                    dim: hd4,
+                    eps,
+                });
+                if rd > 0 {
+                    rope_tail(&mut g, d4_kv, d4_rkv, 1, false);
+                }
+                for cache in [k_cache[l], v_cache[l]] {
+                    g.push(Op::WriteKv {
+                        src: d4_kv,
+                        cache,
+                        rows: batch as u32,
+                        row_stride: hd4,
+                        pos: start_pos as u32,
+                    });
+                }
+                // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
+                // cast into it exactly as llama4's NoPE layer casts its unroped one — `Op::Copy`,
+                // whose lowering does the f32→f16 conversion. The rope itself has to stay on the
+                // f32 buffer: Vulkan's `backward` rope build is f32-out only, and the de-rope reads
+                // the ATTENTION OUTPUT, not this.
+                g.push(Op::Copy {
+                    src: q,
+                    src_off: 0,
+                    dst: q16,
+                    dst_off: 0,
+                    n: (batch as u32) * qrow4,
+                });
+                g.push(Op::Attention {
+                    q: q16,
+                    k_cache: k_cache[l],
+                    v_cache: v_cache[l],
+                    dst: attn,
+                    rows: batch as u32,
+                    kv_len: (start_pos + batch) as u32,
+                    n_head: nh as u32,
+                    n_kv: 1,
+                    head_dim: hd4,
+                    // Plain 1/√head_dim at all three of V4's attention call sites — none of
+                    // stage 2's mscale² games.
+                    scale: 1.0 / (c.head_dim as f32).sqrt(),
+                    mask,
+                    pos: start_pos as u32,
+                    sinks: Some(mw.sinks),
+                });
+                // DE-ROPE the attention output's rope slice, per head, by the QUERY position —
+                // `ggml_rope_ext_back` at the same theta and layout as the forward q rope. Nothing
+                // else in the DeepSeek family rotates backwards.
+                if rd > 0 {
+                    rope_tail(&mut g, attn, d4_rq, nh as u32, true);
+                }
+                // Grouped low-rank output projection. `wo_a` read as `{hd_g, o_lora_rank,
+                // o_group_count}`: group `g` takes input columns `[g*hd_g, (g+1)*hd_g)` of the
+                // concatenated heads against weight rows `[g*o_lora_rank, (g+1)*o_lora_rank)`
+                // (`w_off`, which is row-aligned because it is a whole multiple of `hd_g == in_f`)
+                // and lands in output columns `[g*o_lora_rank, …)`. Then one `wo_b` back to n_embd.
+                for grp in 0..ogc {
+                    g.push(Op::CopyStrided {
+                        src: attn,
+                        src_off: grp * hdg,
+                        src_stride: qrow4,
+                        dst: d4_xg,
+                        dst_off: 0,
+                        dst_stride: hdg,
+                        rows: batch as u32,
+                        n: hdg,
+                    });
+                    g.push(Op::Linear {
+                        x: d4_xg,
+                        weight: mw.wo_a,
+                        dst: d4_og,
+                        m: batch as u32,
+                        in_f: hdg,
+                        out_f: olr,
+                        w_off: grp * olr * hdg,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: d4_og,
+                        src_off: 0,
+                        src_stride: olr,
+                        dst: d4_oa,
+                        dst_off: grp * olr,
+                        dst_stride: ogc * olr,
+                        rows: batch as u32,
+                        n: olr,
+                    });
+                }
+                g.push(Op::Linear {
+                    x: d4_oa,
+                    weight: mw.wo_b,
+                    dst: sub,
+                    m: batch as u32,
+                    in_f: ogc * olr,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                // `sub` is the attention sublayer's output; the hyper-connection POST below closes
+                // the wrap in place of the usual residual add.
             } else if let MixerW::Mla(mw) = &lw.mixer {
                 // DeepSeek V2+ MLA — absorbed form. Scratch tensors declared above.
                 let mla_q = mla_q.expect("deepseek2 model without mla_q scratch");
@@ -3236,21 +3740,49 @@ pub(crate) fn generate_dense_backend(
                     eps,
                 });
             }
-            g.push(Op::Add {
-                a: hidden,
-                b: sub,
-                dst: hidden,
-                n: (batch * ne) as u32,
-            });
-            // ffn
-            g.push(Op::RmsNorm {
-                x: hidden,
-                weight: lw.ffn_norm,
-                dst: hn,
-                rows: batch as u32,
-                dim: ne as u32,
-                eps,
-            });
+            // DeepSeek V4: `x = x + f(x)` is replaced by the hyper-connection POST, which writes
+            // the sublayer output back across ALL `hc_mult` streams while mixing them among
+            // themselves. It cannot run in place — every output element reads every `src` stream of
+            // `residual` — so the widened stream ping-pongs `hcr[0] -> hcr[1]` here and
+            // `hcr[1] -> hcr[0]` at the FFN tail below, returning to `hcr[0]` at each layer
+            // boundary. The FFN's own wrap then collapses the NEW stream into `hn`.
+            if let Some(hcl) = &lw.hc {
+                g.push(Op::HyperConnectPost {
+                    x: sub,
+                    residual: hcr[0],
+                    post: hc_post,
+                    comb: hc_comb,
+                    dst: hcr[1],
+                    rows: batch as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                });
+                hc_wrap_pre(&mut g, &hcl.ffn, hcr[1], hn);
+                g.push(Op::RmsNorm {
+                    x: hn,
+                    weight: lw.ffn_norm,
+                    dst: hn,
+                    rows: batch as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+            } else {
+                g.push(Op::Add {
+                    a: hidden,
+                    b: sub,
+                    dst: hidden,
+                    n: (batch * ne) as u32,
+                });
+                // ffn
+                g.push(Op::RmsNorm {
+                    x: hidden,
+                    weight: lw.ffn_norm,
+                    dst: hn,
+                    rows: batch as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+            }
             match lw.ffn {
                 FfnW::DenseFused { wgu, wdown } => {
                     g.push(Op::Linear {
@@ -3382,7 +3914,11 @@ pub(crate) fn generate_dense_backend(
                         exp_probs_b,
                         n_expert_groups: mc.n_expert_groups,
                         n_expert_groups_used: mc.n_expert_groups_used,
-                        swiglu_clamp: None,
+                        swiglu_clamp: clamp_exp,
+                        // DeepSeek V4's HASH-routed layers would supply the ids here; they are
+                        // refused before the graph is built because nothing can gather them
+                        // (docs/backlog.md § B-DSV4-HASH), so every layer that reaches this arm
+                        // routes by the router's own top-k.
                         expert_ids: None,
                     });
                     if let Some(MoeSharedW {
@@ -3442,7 +3978,7 @@ pub(crate) fn generate_dense_backend(
                             up_stride: 0,
                             gate_stride: 0,
                             gate_block_width: 0,
-                            swiglu_clamp: None,
+                            swiglu_clamp: clamp_shexp,
                         });
                         g.push(Op::Linear {
                             x: actbuf,
@@ -3653,12 +4189,27 @@ pub(crate) fn generate_dense_backend(
                     eps,
                 });
             }
-            g.push(Op::Add {
-                a: hidden,
-                b: sub,
-                dst: hidden,
-                n: (batch * ne) as u32,
-            });
+            if lw.hc.is_some() {
+                // Close the FFN wrap, ping-ponging back to `hcr[0]` — the stream the NEXT layer's
+                // attention wrap (and, after the last layer, the model head) reads.
+                g.push(Op::HyperConnectPost {
+                    x: sub,
+                    residual: hcr[1],
+                    post: hc_post,
+                    comb: hc_comb,
+                    dst: hcr[0],
+                    rows: batch as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                });
+            } else {
+                g.push(Op::Add {
+                    a: hidden,
+                    b: sub,
+                    dst: hidden,
+                    n: (batch * ne) as u32,
+                });
+            }
             // gemma4 E2B per-layer input embedding (gemma3n): mix this layer's input vector into
             // `hidden` after the FFN residual. `g = gelu(inp_gate·hidden) * inp_per_layer[l]`,
             // `p = post_norm(proj·g)`, `hidden += p`.
@@ -3725,6 +4276,50 @@ pub(crate) fn generate_dense_backend(
                     n: (batch * ne) as u32,
                 });
             }
+        }
+        // DeepSeek V4's hyper-connection HEAD: collapse the `hc_mult` streams back into `hidden`,
+        // which the LM-head tail below then reads exactly as every other arch does. `build_hc_head`
+        // is `Op::HyperConnectMix { gates: None }` + `Op::HyperConnectPre` — its `output_hc_fn` is
+        // `{hc_dim, hc}`, so its `mixes` IS the `pre` chunk, read at the same `scale[0]` /
+        // `base[0..hc]` indices the wrapping form uses.
+        if let Some(t) = &hc_head {
+            let ones = hc_ones.expect("deepseek4 build always declares hc_ones");
+            g.push(Op::RmsNorm {
+                x: hcr[0],
+                weight: ones,
+                dst: hc_normed,
+                rows: batch as u32,
+                dim: hcw as u32,
+                eps,
+            });
+            g.push(Op::Linear {
+                x: hc_normed,
+                weight: t.w_fn,
+                dst: hc_hmixes,
+                m: batch as u32,
+                in_f: hcw as u32,
+                out_f: c.hc_mult as u32,
+                w_off: 0,
+            });
+            g.push(Op::HyperConnectMix {
+                mixes: hc_hmixes,
+                scale: t.scale,
+                base: t.base,
+                pre: hc_pre,
+                gates: None,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                eps: c.hc_eps,
+                n_iter: c.hc_sinkhorn_iters as u32,
+            });
+            g.push(Op::HyperConnectPre {
+                x: hcr[0],
+                weights: hc_pre,
+                dst: hidden,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                n_embd: ne as u32,
+            });
         }
         // LM-head tail — skipped entirely for headless builds (`logits_rows == 0`, the batched
         // prefill chunks: see `logits`' declaration above).
@@ -4531,7 +5126,13 @@ pub(crate) fn generate_dense_backend(
     // re-reads than it saves in readbacks.)
     // `moe_batched_ok` (this `MOE_MMQ_DTYPES` eligibility scan) is a session-stable derivation —
     // computed once in `session_stable` and read here off `stable`.
-    let decode_start = if prompt.len() - start > 2 && (c.moe.is_none() || moe_batched_ok) {
+    // DeepSeek V4 is excluded from the batched path outright. Two reasons, both current: a
+    // layer-major span cannot carry its `hc_mult`-wide residual across spans (see the assert in
+    // `build`), and no `batch > 1` V4 graph has ever been EXECUTED — the only V4 fixture that
+    // exists writes f32 expert banks, so `moe_batched_ok` is false for it and nothing here could
+    // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
+    let batched_prefill_ok = (c.moe.is_none() || moe_batched_ok) && !c.deepseek4;
+    let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
         // One giant graph would scale the internal activation/attention scratch with the whole
@@ -4824,6 +5425,16 @@ pub(crate) fn generate_dense_backend(
         // writing each token's K to row 0 (rows 1.. never populated, attention sees a one-row
         // cache). Keeps the "strict subset" promise the gate's doc states.
         && !c.deepseek2
+        // DeepSeek V4: the same trap, from four ops at once. `Op::Attention { sinks }`,
+        // `Op::HyperConnectMix`/`Pre`/`Post`, `Op::Rope { backward }` and `Op::QkNorm { weight:
+        // None }` each have no record-once dyn twin, so the adapter's `decode_eligible` is false —
+        // and without this exclusion the tape is built with pos=0 baked into every `WriteKv` and
+        // every `Attention`, then run STATICALLY for every token. Measured: each token writes its
+        // KV to row 0 and attends only row 0 (itself), so a V4 prefill's CPU-vs-Vulkan cosine
+        // decayed with prompt length (1.0 at one token, 0.95 at two, 0.67 at three) while a
+        // `sliding_window = 1` model — where attending only your own row IS the right answer —
+        // stayed exact and hid it.
+        && !c.deepseek4
         && (qk_norm || stable.rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16

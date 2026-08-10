@@ -170,19 +170,64 @@ pub(super) struct IndexerW {
     pub(super) attn_q_b: TensorId,
 }
 
-/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, or DeepSeek MLA.
+/// DeepSeek V4's attention-mixer weights — the `compress_ratio == 0` (pure sliding-window) tier.
+/// See `docs/deepseek.md` § Stage 4.
 ///
-/// **`deepseek4` (V4) has no variant here.** Its weights are UPLOADED (`runner.rs`'s `wload` has a
-/// `is_dsv4` arm covering every tensor at every compression ratio) but no handles are declared,
-/// because V4 is not a mixer swap: hyper-connections wrap the attention sublayer AND the FFN
-/// sublayer and carry the residual as `hc_mult` parallel streams, so the block itself changes shape
-/// and `LayerW` does not fit it either. `generate_dense_backend` refuses a `deepseek4` model before
-/// the graph is built, and asserts the same at the top of the builder — see `docs/deepseek.md`
-/// § Stage 4. The slice that emits V4 adds the variant, its `wpush` arm and the emit together.
+/// V4 is NOT MLA: there is no `kv_lora_rank`, no `wk_b`/`wv_b`, and one MQA KV head serves every
+/// query head. What it keeps from deepseek2 is the Q-LoRA triple; everything after it is its own.
+///
+/// The compressor / lightning-indexer tensors a ratio-4 or ratio-128 layer additionally carries
+/// (`attn_compressor_*`, `indexer*`) have NO handles here: `generate_dense_backend` refuses a model
+/// with any non-zero ratio before the graph is built, so a layer that owns them never reaches the
+/// emit. Adding them means adding the compressed-KV state machine at the same time — see
+/// `docs/backlog.md` § B-DSV4-WIRING slice B.
+pub(super) struct Dsv4W {
+    /// `attn_sinks.weight` `[n_head]` — one learned logit per query head, joining the softmax MAX
+    /// and DENOMINATOR and never the numerator (`Op::Attention::sinks`).
+    pub(super) sinks: TensorId,
+    /// Q LoRA: `attn_q_a` `[n_embd, q_lora_rank]` → `attn_q_a_norm` → `attn_q_b`
+    /// `[q_lora_rank, n_head * head_dim]`. V4 has no "lite" variant — `q_lora_rank` is mandatory.
+    pub(super) wq_a: TensorId,
+    pub(super) q_a_norm: TensorId,
+    pub(super) wq_b: TensorId,
+    /// `attn_kv.weight` `[n_embd, head_dim]` — the SINGLE MQA key/value head shared by every query
+    /// head. Not a per-head bank, and not deepseek2's `wkv_a_mqa` (there is no latent to compress).
+    pub(super) wkv: TensorId,
+    /// `attn_kv_a_norm.weight` `[head_dim]` — RMSNorm over the whole KV row. Shares its on-disk
+    /// name with deepseek2's `attn_kv_a_norm` (`docs/deepseek.md` open question 8).
+    pub(super) wkv_norm: TensorId,
+    /// Grouped low-rank output projection, replacing `attn_output`:
+    /// `attn_output_a` `[n_head*head_dim / o_group_count, o_lora_rank * o_group_count]` read as
+    /// `{hd_g, o_lora_rank, o_group_count}` — group `g` is rows `[g*o_lora_rank, (g+1)*o_lora_rank)`
+    /// (selected by `Op::Linear::w_off`) over input columns `[g*hd_g, (g+1)*hd_g)` — then
+    /// `attn_output_b` `[o_group_count*o_lora_rank, n_embd]`.
+    pub(super) wo_a: TensorId,
+    pub(super) wo_b: TensorId,
+}
+
+/// One hyper-connection block's `(fn, base, scale)` triple. `w_fn` is the mixing matmul's weight
+/// (`[hc_mult*n_embd, (2+hc_mult)*hc_mult]` wrapping a sublayer, `[hc_mult*n_embd, hc_mult]` at the
+/// model head); `base`/`scale` are the per-chunk affine offsets/slopes `Op::HyperConnectMix` reads.
+#[derive(Clone, Copy)]
+pub(super) struct HcTriple {
+    pub(super) w_fn: TensorId,
+    pub(super) base: TensorId,
+    pub(super) scale: TensorId,
+}
+
+/// The two per-layer hyper-connection triples: one wrapping the attention sublayer, one the FFN.
+/// Both are unconditional on every V4 layer (`hc_attn_*` / `hc_ffn_*`).
+pub(super) struct LayerHcW {
+    pub(super) attn: HcTriple,
+    pub(super) ffn: HcTriple,
+}
+
+/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, DeepSeek MLA, or DeepSeek V4.
 pub(super) enum MixerW {
     Attn(AttnW),
     DeltaNet(DeltaW),
     Mla(MlaW),
+    Dsv4(Dsv4W),
 }
 
 /// Per-layer weight handles captured while building one decode graph (sandwich norms optional).
@@ -190,6 +235,10 @@ pub(super) enum MixerW {
 pub(super) struct LayerW {
     pub(super) attn_norm: TensorId, // the mixer INPUT norm (applies to any mixer type)
     pub(super) mixer: MixerW,
+    /// DeepSeek V4's two per-layer hyper-connection triples. `Some` exactly when the mixer is
+    /// [`MixerW::Dsv4`]; `None` for every other arch. They are NOT mixer weights — one of them
+    /// wraps the FFN sublayer — which is why they sit on `LayerW` beside the norms.
+    pub(super) hc: Option<LayerHcW>,
     /// bitnet (BitNet b1.58) SubLN: RMSNorm on the concatenated-heads attention output BEFORE the
     /// o-projection (`AttnW::wo`). `Some` only when `Config::sub_norm` (bitnet); `None` elsewhere.
     pub(super) attn_sub_norm: Option<TensorId>,
