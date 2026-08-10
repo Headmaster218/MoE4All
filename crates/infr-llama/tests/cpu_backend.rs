@@ -184,9 +184,12 @@ fn qwen2_05b() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("INFR_TEST_QWEN2") {
         return Some(PathBuf::from(p));
     }
+    // `unsloth/Qwen2.5-0.5B-Instruct-GGUF` does not exist (the HF API 401s on it). The cache
+    // held the model all along under Qwen's own org with a lower-case filename, and this
+    // helper still could not see it — so every Qwen2.5 test self-skipped forever.
     find_gguf(
-        "unsloth--Qwen2.5-0.5B-Instruct-GGUF",
-        "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+        "Qwen--Qwen2.5-0.5B-Instruct-GGUF",
+        "qwen2.5-0.5b-instruct-q4_k_m.gguf",
     )
 }
 
@@ -3769,9 +3772,18 @@ fn deepseek_v1_7b() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("INFR_TEST_DEEPSEEK") {
         return Some(PathBuf::from(p));
     }
+    // `unsloth/DeepSeek-LLM-7B-Chat-GGUF` does not exist (the HF API 401s on it), so this
+    // helper could only ever return `None` and every V1 test self-skipped forever.
+    //
+    // The replacement is the MoE-16B, not a dense 7B: `LLM_ARCH_DEEPSEEK` is really the MoE
+    // variant. Dense DeepSeek-LLM-7B IS architecturally Llama, and every GGUF of it declares
+    // `general.architecture = "llama"` — TheBloke's does, so it loads and generates fine while
+    // testing none of the `deepseek` path. This file carries the arch string, 64 experts, 2
+    // shared and 1 dense-lead layer, so it also exercises the `n_expert_shared > 1` shared-expert
+    // width that docs/deepseek.md open question 4 flags as unverified.
     find_gguf(
-        "unsloth--DeepSeek-LLM-7B-Chat-GGUF",
-        "DeepSeek-LLM-7B-Chat-Q4_K_M.gguf",
+        "mradermacher--deepseek-moe-16b-chat-GGUF",
+        "deepseek-moe-16b-chat.Q4_K_M.gguf",
     )
 }
 
