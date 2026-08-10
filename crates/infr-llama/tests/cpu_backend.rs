@@ -3790,6 +3790,7 @@ fn cpu_deepseek_config() {
     assert!(cfg.deepseek, "deepseek gate");
     assert!(!cfg.deepseek2, "deepseek2 must be false");
     assert!(!cfg.deepseek32, "deepseek32 must be false");
+    assert!(!cfg.deepseek4, "deepseek4 must be false");
     assert!(!cfg.qk_norm, "qk_norm must be false");
     assert!(!cfg.qkv_bias, "qkv_bias must be false");
     assert!(!cfg.permute_qk_neox, "permute_qk_neox must be false");
@@ -3867,6 +3868,19 @@ fn cpu_deepseek2_config() {
     // the direction that matters on a real V2 file: the V3.2-only flag and its indexer
     // hyperparameters must stay off, or the loader would demand five tensors this GGUF has not got.
     assert!(!cfg.deepseek32, "deepseek32 must be false on a V2 GGUF");
+    // V4, by contrast, does NOT widen `deepseek2` — it is not MLA. The direction that matters here
+    // is the other one: none of V4's per-layer machinery may switch on for a real V2 file, or the
+    // loader would ask this GGUF for compressor, hyper-connection and hash-routing tensors.
+    assert!(!cfg.deepseek4, "deepseek4 must be false on a V2 GGUF");
+    assert!(
+        cfg.compress_ratios.is_empty() && cfg.swiglu_clamp_exp.is_empty(),
+        "V2 has no per-layer compression tiers and no SwiGLU clamps"
+    );
+    assert_eq!(
+        (cfg.hash_layer_count, cfg.hc_mult, cfg.o_group_count),
+        (0, 0, 0),
+        "V2 has no hash routing, no hyper-connections and no grouped output projection"
+    );
     assert_eq!(
         (cfg.indexer_n_head, cfg.indexer_head_size, cfg.indexer_top_k),
         (0, 0, 0),

@@ -171,6 +171,14 @@ pub(super) struct IndexerW {
 }
 
 /// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, or DeepSeek MLA.
+///
+/// **`deepseek4` (V4) has no variant here.** Its weights are UPLOADED (`runner.rs`'s `wload` has a
+/// `is_dsv4` arm covering every tensor at every compression ratio) but no handles are declared,
+/// because V4 is not a mixer swap: hyper-connections wrap the attention sublayer AND the FFN
+/// sublayer and carry the residual as `hc_mult` parallel streams, so the block itself changes shape
+/// and `LayerW` does not fit it either. `generate_dense_backend` refuses a `deepseek4` model before
+/// the graph is built, and asserts the same at the top of the builder — see `docs/deepseek.md`
+/// § Stage 4. The slice that emits V4 adds the variant, its `wpush` arm and the emit together.
 pub(super) enum MixerW {
     Attn(AttnW),
     DeltaNet(DeltaW),

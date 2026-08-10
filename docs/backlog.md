@@ -1078,6 +1078,51 @@ unbiased probs, and mask all but the top `n_expert_groups_used` groups scored by
 their top-2 sum. `moe_topk.comp` is the working reference. Note there is no
 Apple hardware on the dev box, so this can only be verified on the macOS CI job.
 
+### B52 — the weight loader validates tensor NAMES, not shapes (2026-08-10)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; family-wide, surfaced
+by the deepseek4 load slice
+
+`wload` asks the GGUF for a tensor by name and fails if it is absent, but never
+checks its dimensions against what the graph will index it as. Every "the loader
+consumes every tensor" test in `tests/synthetic_deepseek2.rs` therefore proves
+only that each name was requested — never that it was the right shape. A GGUF
+whose `attn_q_b` is the wrong width loads clean and produces garbage.
+
+Two V4-specific instances of the same gap, both found reading
+`src/models/deepseek4.cpp`:
+
+- **`output_group_count` divisibility is unchecked.** The reference sizes `wo_a`
+  as `n_head * n_embd_head / o_groups` with plain integer division
+  (`deepseek4.cpp:97`), so a non-dividing group count silently truncates.
+  llama.cpp catches it downstream as a `create_tensor` shape mismatch; `infr`
+  would not notice at all.
+- **The reference shapes every V4 tensor with `n_embd_head_k()` at the default
+  `il = 0`**, and `load_arch_hparams` has already called `set_swa_pattern(0)`,
+  so that call returns the SWA head width rather than the full one. They are
+  equal only because `llama-model.cpp` defaults `_swa` to `_full` and no V4 GGUF
+  declares `attention.key_length_swa`. `infr` reads `attention.key_length`
+  directly and so does not inherit this, but a file that declared the SWA key
+  would make the two implementations disagree.
+
+Fix is one shared "expected dims" check in `wload` rather than per-arch asserts;
+the tests that exist would then gain teeth for free.
+
+### B53 — V4's KV geometry is a placeholder (2026-08-10)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** the stage-4 compressed-KV
+slice, which owns the real answer
+
+`seam::kv_row_elems` currently answers `n_kv * head_dim` for `deepseek4`, which
+is only the raw sliding-window cache. The real thing is the seven-structure
+state machine in llama.cpp's `llama-kv-cache-dsv4.cpp` (1978 lines): three
+compressor states holding in-flight partial blocks, an overlapping 2×ratio
+pooling window with `-inf` sentinel rows, and absolute position-in-block
+embeddings. Buffers are allocated on that placeholder geometry today, before the
+graph-build refusal fires — harmless because nothing reads them, and wrong the
+moment the emit slice lands. `docs/deepseek.md` § Stage 4 calls this the largest
+single porting risk in the family.
+
 ### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek coverage · **Blocked on:** nothing; stated as

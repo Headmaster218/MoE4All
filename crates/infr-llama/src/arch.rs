@@ -81,6 +81,21 @@ pub const DEEPSEEK2: &str = "deepseek2";
 /// indexer's five per-layer tensors LOAD; nothing emits them yet, so a graph build refuses this
 /// arch. See docs/deepseek.md § Stage 3.
 pub const DEEPSEEK32: &str = "deepseek32";
+/// DeepSeek V4 (V4-Flash / V4-Pro): a genuinely different architecture, NOT an increment on
+/// [`DEEPSEEK2`]. There is no MLA here — no `kv_lora_rank`, no `wk_b`/`wv_b` — so `Config::deepseek2`
+/// is FALSE for this string and `Config::deepseek4` gates everything. What it keeps from the family
+/// is the Q-LoRA projection (`wq_a`/`q_a_norm`/`wq_b`), the routed-expert MoE block with its shared
+/// expert, the norms and the generic rope/embedding plumbing. What it adds: single-head MQA KV, a
+/// low-rank grouped output projection, attention sinks, hyper-connections (`hc_mult` parallel
+/// residual streams with Sinkhorn-normalised mixing) replacing every `x = x + f(x)`, three-tier
+/// per-layer attention keyed on `attention.compress_ratios[il] ∈ {0, 4, 128}`, compressor blocks,
+/// hash-routed MoE on the first `hash_layer_count` layers, and mandatory `sqrt(softplus)` gating.
+/// Every layer is sliding-window (`set_swa_pattern(0)`), and there are no dense-lead layers and no
+/// NextN. llama.cpp keeps it in its own model class (`src/models/deepseek4.cpp`).
+///
+/// The LOAD path is complete — config, every tensor — and nothing emits it yet, so a graph build
+/// refuses this arch. See docs/deepseek.md § Stage 4.
+pub const DEEPSEEK4: &str = "deepseek4";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
 /// (`bitnet-b1.58.block_count`, …). Behaviorally identical to [`BITNET`] (same llama+SubLN
@@ -141,6 +156,7 @@ pub const ALL: &[&str] = &[
     DEEPSEEK,
     DEEPSEEK2,
     DEEPSEEK32,
+    DEEPSEEK4,
     QWEN35,
     QWEN35_MOE,
 ];

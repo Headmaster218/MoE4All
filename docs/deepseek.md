@@ -688,6 +688,15 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
+**Progress: the LOAD path is done, nothing else.** A `deepseek4` GGUF registers,
+parses into a `Config` — including the per-layer `compress_ratios` array, the
+per-layer SwiGLU clamps and the mandatory sqrt-softplus gating — and loads every
+tensor, with each layer's set chosen by its ratio and its hash/bias routing.
+`Config::deepseek2` is FALSE for V4 (unlike V3.2, which genuinely is V2 plus an
+indexer); every reader of that flag was enumerated and is MLA-specific.
+`generate_dense_backend` then refuses, with an `assert!` at the top of the build
+closure as a backstop. Still to do: everything in the rest of this section.
+
 A genuinely different architecture, not an increment. Sharing with stage 2 is
 limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
 

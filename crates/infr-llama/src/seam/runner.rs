@@ -768,6 +768,10 @@ pub(crate) fn generate_dense_backend(
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
             let is_mla = c.deepseek2;
+            // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
+            // output projection, attention sinks, hyper-connections and up to two compressor blocks
+            // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
+            let is_dsv4 = c.deepseek4;
             wload(&[&p("attn_norm.weight")])?;
             if is_mla {
                 // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
@@ -796,6 +800,64 @@ pub(crate) fn generate_dense_backend(
                     wload(&[&p("indexer.proj.weight")])?;
                     wload(&[&p("indexer.attn_k.weight")])?;
                     wload(&[&p("indexer.attn_q_b.weight")])?;
+                }
+            } else if is_dsv4 {
+                // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
+                // triple verbatim; everything after it is V4's own.
+                wload(&[&p("attn_sinks.weight")])?;
+                wload(&[&p("attn_q_a.weight")])?;
+                wload(&[&p("attn_q_a_norm.weight")])?;
+                wload(&[&p("attn_q_b.weight")])?;
+                // ONE KV head for every query head (MQA): `attn_kv` is `[n_embd, head_dim]`, not a
+                // per-head bank. `attn_kv_a_norm` is `LLM_TENSOR_ATTN_KV_NORM`, which shares its
+                // on-disk name with deepseek2's `LLM_TENSOR_ATTN_KV_A_NORM` (docs/deepseek.md open
+                // question 8) — two enum values, one string, and no way to tell them apart on disk.
+                wload(&[&p("attn_kv.weight")])?;
+                wload(&[&p("attn_kv_a_norm.weight")])?;
+                // Low-rank GROUPED output projection: `wo_a` over `o_group_count` groups, then
+                // `wo_b` back to n_embd. There is no single `attn_output` here.
+                wload(&[&p("attn_output_a.weight")])?;
+                wload(&[&p("attn_output_b.weight")])?;
+                // Hyper-connections: one (fn, base, scale) triple wrapping the attention sublayer
+                // and another wrapping the FFN. Both are per-layer and unconditional.
+                for name in [
+                    "hc_attn_fn.weight",
+                    "hc_attn_base.weight",
+                    "hc_attn_scale.weight",
+                    "hc_ffn_fn.weight",
+                    "hc_ffn_base.weight",
+                    "hc_ffn_scale.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+                // The per-layer compression ratio decides which tensors this layer HAS: 0 carries
+                // no compressor at all, 4 and 128 carry the attention compressor, and 4 alone adds
+                // the lightning indexer with its own compressor. `Config::from_gguf` has already
+                // refused any other value, so these two comparisons cover every layer.
+                let ratio = c.layer_compress_ratio(l);
+                if ratio != 0 {
+                    for name in [
+                        "attn_compressor_kv.weight",
+                        "attn_compressor_gate.weight",
+                        "attn_compressor_ape.weight",
+                        "attn_compressor_norm.weight",
+                    ] {
+                        wload(&[&p(name)])?;
+                    }
+                }
+                if ratio == 4 {
+                    // V4's indexer has no `attn_k` and no `k_norm`, unlike V3.2's: its keys come out
+                    // of the compressor below, so `indexer_top_k` counts compressed BLOCKS.
+                    for name in [
+                        "indexer.proj.weight",
+                        "indexer.attn_q_b.weight",
+                        "indexer_compressor_kv.weight",
+                        "indexer_compressor_gate.weight",
+                        "indexer_compressor_ape.weight",
+                        "indexer_compressor_norm.weight",
+                    ] {
+                        wload(&[&p(name)])?;
+                    }
                 }
             } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
@@ -831,7 +893,9 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("attn_q_norm.weight")])?;
                 wload(&[&p("attn_k_norm.weight")])?;
             }
-            if !is_delta && !is_mla {
+            // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
+            // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
+            if !is_delta && !is_mla && !is_dsv4 {
                 wload(&[&p("attn_output.weight")])?;
             }
             // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
@@ -887,6 +951,19 @@ pub(crate) fn generate_dense_backend(
                         layer_has_epb[l] = true;
                     }
                 }
+                if c.deepseek4 {
+                    // Hash-routed MoE: the first `hash_layer_count` layers pick their experts from
+                    // a token-id → expert-id table INSTEAD of scoring the router bias, so the two
+                    // tensors are mutually exclusive per layer — `deepseek4.cpp` creates exactly
+                    // one of them. A V4 file is not optional about either (unlike deepseek2's
+                    // `exp_probs_b`, which the pre-V3 GGUFs simply do not have).
+                    if c.is_hash_moe_layer(l) {
+                        wload(&[&p("ffn_gate_tid2eid.weight")])?;
+                    } else {
+                        wload(&[&p("exp_probs_b.bias")])?;
+                        layer_has_epb[l] = true;
+                    }
+                }
                 if c.shexp_ff > 0 {
                     // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
                     // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
@@ -930,6 +1007,15 @@ pub(crate) fn generate_dense_backend(
             wload(&["output.weight"])?;
         } else {
             wload(&["token_embd.weight"])?;
+        }
+        // DeepSeek V4's hyper-connection HEAD: the model-level triple that collapses the `hc_mult`
+        // parallel residual streams back to one vector before `output_norm`. Model-level, not
+        // per-layer (`output_hc_*`, no `blk.` prefix) — same standing as `output_norm`/`output`
+        // above, which is why they load here rather than in the layer loop.
+        if c.deepseek4 {
+            wload(&["output_hc_fn.weight"])?;
+            wload(&["output_hc_base.weight"])?;
+            wload(&["output_hc_scale.weight"])?;
         }
         // GPU embed gather: untied models upload the quantized token_embd as one extra weight
         // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
@@ -1348,6 +1434,24 @@ pub(crate) fn generate_dense_backend(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
+    // DeepSeek V4: the LOAD path is complete — config, every per-layer tensor at every compression
+    // ratio, the hash-routed tables and the model-level hyper-connection head are all resident by
+    // now — but nothing emits V4 yet. It is NOT MLA, so `c.deepseek2` is false and the mixer chain
+    // in `build` below would declare V4's weights as a plain q/k/v attention, binding every handle
+    // to a buffer shaped for a model this is not. Deleting this bail and the assert in `build` was
+    // tried: the synthetic fixture dies inside the CPU `Op::Linear` (`bytes.len() / total_rows`
+    // with `total_rows == 0`, a divide by zero), which is a panic from a kernel rather than an
+    // answer — and a fixture whose numbers happened to divide would have got silent garbage
+    // instead. Placed after the weight upload on purpose, exactly as the deepseek32 slice was: a
+    // `deepseek4` GGUF still gets every tensor it declares validated end to end. See
+    // docs/deepseek.md § Stage 4.
+    if c.deepseek4 {
+        return Err(anyhow!(
+            "arch=deepseek4 (DeepSeek V4) loads but cannot generate yet: its hyper-connections, \
+             three-tier compressed attention and hash-routed MoE are not implemented, and no other \
+             architecture's graph is a valid stand-in for them. See docs/deepseek.md § Stage 4."
+        ));
+    }
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
@@ -1391,6 +1495,17 @@ pub(crate) fn generate_dense_backend(
         assert!(
             l_first == 0 || !e2b,
             "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
+        );
+        // Backstop for the `c.deepseek4` refusal above — the only thing standing between a V4
+        // model and another architecture's graph. `wpush` below declares handles in lockstep with
+        // the upload loop by ARCH, and V4 has no arm there (it has no `MixerW` to build: hyper-
+        // connections restructure the whole block, not just the mixer), so if the refusal is ever
+        // removed without one being added, every weight in the layer binds to the wrong buffer.
+        // Fail loudly at the seam instead of somewhere inside a kernel.
+        assert!(
+            !c.deepseek4,
+            "deepseek4 reached the graph builder: it has no mixer arm in `wpush`, so the refusal \
+             in `generate_dense_backend` must not be removed until one exists"
         );
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
