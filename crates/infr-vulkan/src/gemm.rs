@@ -2236,6 +2236,40 @@ pub(crate) fn topk_mask_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/topk_mask.spv"))))
 }
+/// SPIR-V for the DeepSeek V4 hyper-connection coefficients (`hyper_mix.comp`,
+/// `Op::HyperConnectMix`) — the `build_hc_head` form: `pre` only, no `post`/`comb`. Used by the
+/// recorder's `hyper_mix`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_mix_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_mix.spv"))))
+}
+/// SPIR-V for the sublayer-wrapping `hyper_mix.comp` build (`-DGATES`) — `pre`, `post` and the
+/// Sinkhorn-normalised `comb`. Used by the recorder's `hyper_mix`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_mix_gates_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/hyper_mix_gates.spv"
+        )))
+    })
+}
+/// SPIR-V for the hyper-connection stream collapse (`hyper_pre.comp`, `Op::HyperConnectPre`).
+/// Used by the recorder's `hyper_pre`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_pre_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_pre.spv"))))
+}
+/// SPIR-V for the hyper-connection stream re-expansion (`hyper_post.comp`,
+/// `Op::HyperConnectPost`). Used by the recorder's `hyper_post`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_post_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_post.spv"))))
+}
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

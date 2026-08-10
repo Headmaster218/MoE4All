@@ -4586,6 +4586,88 @@ fn lower_op(
             }
             rec.topk_mask(r(*idx)?, r(*dst)?, *rows, *kv_len, *top_k);
         }
+        Op::HyperConnectMix {
+            mixes,
+            scale,
+            base,
+            pre,
+            gates,
+            rows,
+            hc,
+            eps,
+            n_iter,
+        } => {
+            hyper_check_hc(*hc, "vulkan Op::HyperConnectMix")?;
+            if *n_iter < 1 {
+                return Err(be(format!(
+                    "vulkan Op::HyperConnectMix: n_iter {n_iter} — Sinkhorn runs at least one \
+                     normalisation over src"
+                )));
+            }
+            let g = match gates {
+                Some(infr_core::graph::HyperGates { post, comb }) => Some((r(*post)?, r(*comb)?)),
+                None => None,
+            };
+            rec.hyper_mix(
+                r(*mixes)?,
+                r(*scale)?,
+                r(*base)?,
+                r(*pre)?,
+                g,
+                *rows,
+                *hc,
+                *eps,
+                *n_iter,
+            );
+        }
+        Op::HyperConnectPre {
+            x,
+            weights,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => {
+            hyper_check_hc(*hc, "vulkan Op::HyperConnectPre")?;
+            rec.hyper_pre(r(*x)?, r(*weights)?, r(*dst)?, *rows, *hc, *n_embd);
+        }
+        Op::HyperConnectPost {
+            x,
+            residual,
+            post,
+            comb,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => {
+            hyper_check_hc(*hc, "vulkan Op::HyperConnectPost")?;
+            rec.hyper_post(
+                r(*x)?,
+                r(*residual)?,
+                r(*post)?,
+                r(*comb)?,
+                r(*dst)?,
+                *rows,
+                *hc,
+                *n_embd,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a stream count wider than the fixed-size private array `hyper_mix.comp` holds a token's
+/// mixing matrix in. The kernel cannot bounds-check itself — an out-of-range private-array write
+/// is undefined — so the refusal has to happen here, before the dispatch.
+fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
+    let max = infr_core::graph::HYPER_CONNECT_MAX_MULT;
+    if hc < 1 || hc > max {
+        return Err(be(format!(
+            "{what}: hc_mult {hc} outside the supported 1..={max} (every shipped DeepSeek V4 \
+             config uses 4; hyper_mix.comp holds a token's whole hc*hc matrix in a private array \
+             of HC_MAX*HC_MAX floats)"
+        )));
     }
     Ok(())
 }

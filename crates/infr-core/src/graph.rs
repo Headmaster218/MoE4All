@@ -67,6 +67,28 @@ pub enum MoeGating {
     SqrtSoftplus,
 }
 
+/// Largest `hc_mult` (parallel residual-stream count) any backend accepts for DeepSeek V4's
+/// hyper-connection ops. Every shipped V4 config uses 4 and llama.cpp `GGML_ASSERT`s exactly that;
+/// this is the next power of two above it, chosen so a token's whole `hc × hc` mixing matrix
+/// (`HYPER_CONNECT_MAX_MULT²` = 64 f32) fits in a fixed-size per-thread scratch array on every
+/// backend — Sinkhorn iterates over the whole matrix, so it has to be materialised somewhere.
+/// [`Op::HyperConnectMix`], [`Op::HyperConnectPre`] and [`Op::HyperConnectPost`] refuse anything
+/// wider on the HOST, before a kernel that would read past that array is ever dispatched.
+pub const HYPER_CONNECT_MAX_MULT: u32 = 8;
+
+/// The two extra outputs [`Op::HyperConnectMix`] produces when it wraps a SUBLAYER, absent in the
+/// model-head form. One struct rather than two `Option` fields because llama.cpp's `build_hc_pre`
+/// writes both or neither: separate `Option`s would let a caller ask for a `comb` with no `post`,
+/// a state no backend could act on and every one would have to reject at run time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HyperGates {
+    /// Per-stream output gates `[rows, hc]` f32 — [`Op::HyperConnectPost`]'s `post`.
+    pub post: TensorId,
+    /// Sinkhorn-normalised mixing matrix `[rows, hc, hc]` f32, flat `dst + hc*src` within a token
+    /// — [`Op::HyperConnectPost`]'s `comb`.
+    pub comb: TensorId,
+}
+
 /// How a tensor handle is provisioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorKind {
@@ -433,6 +455,135 @@ pub enum Op {
         rows: u32,
         kv_len: u32,
         top_k: u32,
+    },
+    /// DeepSeek V4's **hyper-connection mixing coefficients** — the whole of `deepseek4.cpp`'s
+    /// `build_hc_pre` except its final collapse, i.e. llama.cpp's `ggml_dsv4_hc_comb` plus the
+    /// `pre`/`post` gate arithmetic that reference leaves as elementwise views.
+    ///
+    /// V4 widens the residual stream to `hc` parallel copies and wraps every sublayer
+    /// `pre → sublayer → post` (`docs/deepseek.md` § "Sinkhorn hyper-connections"). ONE matmul over
+    /// the RMS-normed flattened streams produces `mixes` `[rows, (2 + hc)*hc]`; this op turns that
+    /// into the three coefficient sets the wrap needs. Per token `t`:
+    ///
+    /// ```text
+    /// pre[t, h]           = sigmoid(mixes[t, h]                * scale[0] + base[h])              + eps
+    /// post[t, h]          = sigmoid(mixes[t, hc + h]           * scale[1] + base[hc + h])         * 2
+    /// logits[t, dst, src] =         mixes[t, 2hc + dst + hc*src]* scale[2] + base[2hc + dst + hc*src]
+    /// comb[t]             = sinkhorn(logits[t])
+    /// ```
+    ///
+    /// with `sinkhorn` making the `hc × hc` matrix approximately doubly stochastic, so no stream's
+    /// mass blows up or vanishes with depth:
+    ///
+    /// ```text
+    /// m = softmax over dst        (independently for each src column)
+    /// m = m + eps
+    /// norm_src(m)                                     // 1 column normalisation, THEN
+    /// for _ in 1..n_iter { norm_dst(m); norm_src(m) } // n_iter-1 (row, column) rounds
+    ///
+    /// norm_src: for each dst, m[dst, :] /= (Σ_src m[dst, src] + eps)
+    /// norm_dst: for each src, m[:, src] /= (Σ_dst m[dst, src] + eps)
+    /// ```
+    ///
+    /// Five things that still RUN when got wrong, all read off `build_hc_sinkhorn` and
+    /// `ggml_dsv4_hc_comb`'s header comment rather than off prose:
+    ///
+    /// * **The `comb` chunk starts at `2*hc` and its flat index is `dst + hc*src`.** `dst` is the
+    ///   FAST axis. `src + hc*dst` transposes the mixing matrix, and since Sinkhorn's fixed point is
+    ///   near-symmetric the output stays plausible — only a value check catches it.
+    /// * **The iteration is ASYMMETRIC**: `n_iter` normalisations over `src`, `n_iter - 1` over
+    ///   `dst`. The last one is over `src`, which is why `Σ_src` comes out closer to 1 than `Σ_dst`.
+    /// * **`eps` is added in THREE places inside Sinkhorn** — once to every element after the
+    ///   softmax, and once to each of the two sums before they divide — plus a FOURTH on `pre`.
+    ///   None of them is a guard against a zero that cannot happen: the post-softmax `+eps` shifts
+    ///   the fixed point the iteration converges to, so dropping it moves the answer.
+    /// * **`pre` is `sigmoid` then `+ eps`; `post` is `sigmoid` then `× 2`.** Different tails on
+    ///   adjacent, equal-width chunks of the same tensor.
+    /// * **llama.cpp's lambda names are inverted relative to its own `dst`/`src` vocabulary.** Its
+    ///   `norm_cols` sums over `src` (`ggml_sum_rows` of the PERMUTED matrix) and its `norm_rows`
+    ///   sums over `dst` (`ggml_sum_rows` of the matrix as laid out, whose fast axis is `dst`).
+    ///   `norm_src`/`norm_dst` above are named for the axis each one actually reduces.
+    ///
+    /// `gates` is `None` for the **model head** (`build_hc_head`), which collapses the streams one
+    /// last time before `output_norm` and has no sublayer to wrap. That is not a separate op: the
+    /// head's `output_hc_fn` is `{hc_dim, hc}` instead of `{hc_dim, (2+hc)*hc}`, so its `mixes` is
+    /// exactly the `pre` chunk, and its `output_hc_scale` `{1}` / `output_hc_base` `{hc}` are read
+    /// at the SAME indices (`scale[0]`, `base[0..hc]`) the wrapping form reads them at. Same
+    /// arithmetic, narrower inputs — a second op would have been a copy of the `pre` line.
+    ///
+    /// `hc` is 4 in every shipped V4 config (llama.cpp `GGML_ASSERT`s it); every backend here
+    /// accepts `1..=`[`HYPER_CONNECT_MAX_MULT`] and refuses anything wider rather than read past a
+    /// fixed-size per-token scratch array. `n_iter >= 1` is required — `n_iter = 0` would still run
+    /// one `norm_src` in the reference (its loop starts at 1), which is a shape no config asks for
+    /// and not worth reproducing.
+    HyperConnectMix {
+        /// `[rows, (2 + hc)*hc]` f32 — the mixing matmul's output. `[rows, hc]` when `gates` is
+        /// `None` (the head form).
+        mixes: TensorId,
+        /// `[3]` f32 — the per-chunk affine slopes. `[1]` when `gates` is `None`.
+        scale: TensorId,
+        /// `[(2 + hc)*hc]` f32 — the per-element affine offsets, sliced at `0`, `hc` and `2*hc`.
+        /// `[hc]` when `gates` is `None`.
+        base: TensorId,
+        /// Stream-collapse weights `[rows, hc]` f32 — [`Op::HyperConnectPre`]'s `weights`.
+        pre: TensorId,
+        /// The wrapping form's two extra outputs; `None` for the model head (see above).
+        gates: Option<HyperGates>,
+        /// Token count.
+        rows: u32,
+        /// Number of parallel residual streams (`hc_mult`).
+        hc: u32,
+        eps: f32,
+        /// Sinkhorn iteration count. Ignored when `gates` is `None` (nothing to normalise).
+        n_iter: u32,
+    },
+    /// DeepSeek V4 hyper-connection **stream collapse** — llama.cpp's `ggml_dsv4_hc_pre`, the
+    /// three-argument `build_hc_pre` overload. Weighted sum of the `hc` parallel residual streams
+    /// down to the single vector a sublayer (or the model head) consumes:
+    ///
+    /// ```text
+    /// dst[t, i] = Σ_h x[t, h, i] * weights[t, h]
+    /// ```
+    ///
+    /// `weights` is [`Op::HyperConnectMix`]'s `pre` — strictly positive (a sigmoid plus `eps`), so
+    /// this is a convex-ish blend rather than a signed combination, but nothing here depends on
+    /// that.
+    HyperConnectPre {
+        /// The widened residual `[rows, hc, n_embd]` f32.
+        x: TensorId,
+        /// Per-stream collapse weights `[rows, hc]` f32.
+        weights: TensorId,
+        /// `[rows, n_embd]` f32.
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    },
+    /// DeepSeek V4 hyper-connection **stream re-expansion** — llama.cpp's `ggml_dsv4_hc_post`, the
+    /// non-fused `build_hc_post`. Writes the sublayer's single output back across all `hc` streams
+    /// while mixing the streams among themselves, replacing `x = x + f(x)`:
+    ///
+    /// ```text
+    /// dst[t, dst_h, i] = x[t, i] * post[t, dst_h] + Σ_src residual[t, src, i] * comb[t, dst_h, src]
+    /// ```
+    ///
+    /// `residual` is the widened stream as it entered the wrap (NOT the collapsed vector), and
+    /// `comb`'s per-token flat index is `dst_h + hc*src` — see [`Op::HyperConnectMix`] on why that
+    /// transpose is invisible to anything but a value check.
+    HyperConnectPost {
+        /// The sublayer's output `[rows, n_embd]` f32.
+        x: TensorId,
+        /// The widened residual as it entered the wrap `[rows, hc, n_embd]` f32.
+        residual: TensorId,
+        /// Per-stream output gates `[rows, hc]` f32.
+        post: TensorId,
+        /// Sinkhorn-normalised mixing matrix `[rows, hc, hc]` f32, `dst_h + hc*src` per token.
+        comb: TensorId,
+        /// The new widened residual `[rows, hc, n_embd]` f32.
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
     },
     /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
     /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
@@ -848,6 +999,9 @@ impl Op {
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
             Op::TopkMask { .. } => "TopkMask",
+            Op::HyperConnectMix { .. } => "HyperConnectMix",
+            Op::HyperConnectPre { .. } => "HyperConnectPre",
+            Op::HyperConnectPost { .. } => "HyperConnectPost",
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
@@ -964,6 +1118,32 @@ impl Op {
                 ..
             } => (vec![q, k_cache, weights], vec![dst]),
             Op::TopkMask { idx, dst, .. } => (vec![idx], vec![dst]),
+            Op::HyperConnectMix {
+                mixes,
+                scale,
+                base,
+                pre,
+                gates,
+                ..
+            } => {
+                let mut w = vec![pre];
+                if let Some(HyperGates { post, comb }) = gates {
+                    w.push(post);
+                    w.push(comb);
+                }
+                (vec![mixes, scale, base], w)
+            }
+            Op::HyperConnectPre {
+                x, weights, dst, ..
+            } => (vec![x, weights], vec![dst]),
+            Op::HyperConnectPost {
+                x,
+                residual,
+                post,
+                comb,
+                dst,
+                ..
+            } => (vec![x, residual, post, comb], vec![dst]),
             Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
             Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),

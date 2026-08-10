@@ -624,3 +624,149 @@ kernel void sample_f32_stage2_dyn(device const float* values    [[buffer(0)]],
         t, sval, sidx, gval, gidx, gslot
     );
 }
+
+// ---- DeepSeek V4 Sinkhorn hyper-connections (`Op::HyperConnectMix` / `Pre` / `Post`).
+//
+// Ports of the Vulkan `hyper_mix.comp`, `hyper_pre.comp` and `hyper_post.comp` — same arithmetic,
+// same loop structure, same accumulation orders. See `Op::HyperConnectMix`'s doc for the contract;
+// the details that still RUN when got wrong (comb's `dst + hc*src` index, the asymmetric iteration
+// count, the four eps sites, pre's `+eps` vs post's `x2`) are pinned by `infr-llama`'s
+// `hyper_connect_*` tests against a from-definition reference.
+//
+// Must equal `infr_core::graph::HYPER_CONNECT_MAX_MULT`; the host refuses a wider `hc` before
+// encoding, which is the only thing keeping `m` in range.
+constant constexpr uint HC_MAX = 8u;
+
+struct HyperMixParams {
+    uint  rows;
+    uint  hc;
+    uint  mix_dim;   // (2 + hc)*hc for the wrapping form, hc for the head form
+    float eps;
+    uint  n_iter;
+};
+
+// The gate + Sinkhorn body, shared by both entry points. `post`/`comb` are null in the head form
+// (`build_hc_head`), whose `mixes` is the `pre` chunk alone read at the SAME indices.
+static inline void hyper_mix_one(device const float* mixes,
+                                 device const float* scl,
+                                 device const float* bse,
+                                 device float*       pre,
+                                 device float*       post,
+                                 device float*       comb,
+                                 constant HyperMixParams& p,
+                                 uint t) {
+    if (t >= p.rows) return;
+    uint hc = p.hc;
+    uint mb = t * p.mix_dim;
+
+    for (uint h = 0u; h < hc; ++h) {
+        float z = mixes[mb + h] * scl[0] + bse[h];
+        // sigmoid then + eps — the fourth eps site, distinct from Sinkhorn's three.
+        pre[t*hc + h] = 1.0f / (1.0f + exp(-z)) + p.eps;
+    }
+    if (comb == nullptr) return;
+
+    for (uint h = 0u; h < hc; ++h) {
+        float z = mixes[mb + hc + h] * scl[1] + bse[hc + h];
+        // sigmoid then x2 — NOT + eps. Adjacent chunk of the same tensor, different tail.
+        post[t*hc + h] = 2.0f / (1.0f + exp(-z));
+    }
+
+    float m[HC_MAX*HC_MAX];
+    uint n = hc*hc;
+    for (uint i = 0u; i < n; ++i) {
+        // comb's chunk starts at 2*hc and `dst` is its FAST axis (`dst + hc*src`).
+        m[i] = mixes[mb + 2u*hc + i] * scl[2] + bse[2u*hc + i];
+    }
+    // Softmax over dst (a contiguous run of hc per src column), then the post-softmax + eps.
+    for (uint src = 0u; src < hc; ++src) {
+        uint o = src*hc;
+        float mx = m[o];
+        for (uint d = 1u; d < hc; ++d) { mx = max(mx, m[o + d]); }
+        float s = 0.0f;
+        for (uint d = 0u; d < hc; ++d) { m[o + d] = exp(m[o + d] - mx); s += m[o + d]; }
+        for (uint d = 0u; d < hc; ++d) { m[o + d] = m[o + d] / s + p.eps; }
+    }
+    // The ASYMMETRIC loop: `n_iter` normalisations over src, `n_iter - 1` over dst, starting AND
+    // ending with an over-src one (`it > 0` reproduces the reference's `for (i = 1; i < n_iter)`).
+    for (uint it = 0u; it < p.n_iter; ++it) {
+        if (it > 0u) {
+            for (uint src = 0u; src < hc; ++src) {
+                uint o = src*hc;
+                float s = 0.0f;
+                for (uint d = 0u; d < hc; ++d) { s += m[o + d]; }
+                s += p.eps;
+                for (uint d = 0u; d < hc; ++d) { m[o + d] /= s; }
+            }
+        }
+        for (uint d = 0u; d < hc; ++d) {
+            float s = 0.0f;
+            for (uint src = 0u; src < hc; ++src) { s += m[d + hc*src]; }
+            s += p.eps;
+            for (uint src = 0u; src < hc; ++src) { m[d + hc*src] /= s; }
+        }
+    }
+    for (uint i = 0u; i < n; ++i) { comb[t*n + i] = m[i]; }
+}
+
+// `build_hc_head`'s form: `pre` only.
+kernel void hyper_mix_f32(device const float* mixes [[buffer(0)]],
+                          device const float* scl   [[buffer(1)]],
+                          device const float* bse   [[buffer(2)]],
+                          device float*       pre   [[buffer(3)]],
+                          constant HyperMixParams& p [[buffer(4)]],
+                          uint t [[thread_position_in_grid]]) {
+    hyper_mix_one(mixes, scl, bse, pre, nullptr, nullptr, p, t);
+}
+
+// The sublayer-wrapping form: `pre`, `post` and the Sinkhorn-normalised `comb`.
+kernel void hyper_mix_gates_f32(device const float* mixes [[buffer(0)]],
+                                device const float* scl   [[buffer(1)]],
+                                device const float* bse   [[buffer(2)]],
+                                device float*       pre   [[buffer(3)]],
+                                device float*       post  [[buffer(4)]],
+                                device float*       comb  [[buffer(5)]],
+                                constant HyperMixParams& p [[buffer(6)]],
+                                uint t [[thread_position_in_grid]]) {
+    hyper_mix_one(mixes, scl, bse, pre, post, comb, p, t);
+}
+
+struct HyperConnParams { uint hc; uint n_embd; uint total; };
+
+// `Op::HyperConnectPre`: dst[t, i] = sum_h x[t, h, i] * w[t, h], h ASCENDING. One thread per
+// output element.
+kernel void hyper_pre_f32(device const float* x   [[buffer(0)]],
+                          device const float* w   [[buffer(1)]],
+                          device float*       dst [[buffer(2)]],
+                          constant HyperConnParams& p [[buffer(3)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= p.total) return;
+    uint t = i / p.n_embd;
+    uint e = i - t*p.n_embd;
+    float acc = 0.0f;
+    for (uint h = 0u; h < p.hc; ++h) {
+        acc = fma(x[(t*p.hc + h)*p.n_embd + e], w[t*p.hc + h], acc);
+    }
+    dst[i] = acc;
+}
+
+// `Op::HyperConnectPost`: dst[t, d, i] = x[t,i]*post[t,d] + sum_src res[t,src,i]*comb[t, d+hc*src].
+// One thread per output element.
+kernel void hyper_post_f32(device const float* x    [[buffer(0)]],
+                           device const float* res  [[buffer(1)]],
+                           device const float* post [[buffer(2)]],
+                           device const float* comb [[buffer(3)]],
+                           device float*       dst  [[buffer(4)]],
+                           constant HyperConnParams& p [[buffer(5)]],
+                           uint i [[thread_position_in_grid]]) {
+    if (i >= p.total) return;
+    uint r = i / p.n_embd;          // t*hc + d
+    uint e = i - r*p.n_embd;
+    uint t = r / p.hc;
+    uint d = r - t*p.hc;
+    float acc = x[t*p.n_embd + e] * post[t*p.hc + d];
+    for (uint src = 0u; src < p.hc; ++src) {
+        acc = fma(res[(t*p.hc + src)*p.n_embd + e], comb[t*p.hc*p.hc + d + p.hc*src], acc);
+    }
+    dst[i] = acc;
+}

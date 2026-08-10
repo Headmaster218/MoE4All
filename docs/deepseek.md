@@ -802,6 +802,48 @@ added in three distinct places; and llama.cpp's own lambda names
 `norm_rows`/`norm_cols` are **inverted** relative to its header's `dst`/`src`
 vocabulary. Trust the index formula and the lambda bodies, not the names.
 
+#### ✓ LANDED at the op level (2026-08-10) — nothing emits them yet
+
+Three ops on CPU + Vulkan + Metal, mirroring llama.cpp's three fused nodes:
+`Op::HyperConnectMix` (`ggml_dsv4_hc_comb` plus the `pre`/`post` gate arithmetic
+the reference leaves as elementwise views), `Op::HyperConnectPre`
+(`ggml_dsv4_hc_pre`) and `Op::HyperConnectPost` (`ggml_dsv4_hc_post`).
+`build_hc_head` is NOT a fourth op: its `output_hc_fn` is `{hc_dim, hc}` so its
+`mixes` is exactly the `pre` chunk, read at the same `scale[0]` / `base[0..hc]`
+indices — it is `Op::HyperConnectMix { gates: None }`. `hc_mult` is accepted in
+`1..=HYPER_CONNECT_MAX_MULT` (8) and refused on the host beyond that, because
+every backend holds a token's whole `hc × hc` matrix in a fixed-size array.
+
+Resolving the warnings above, verified in `seam_op_parity.rs`'s
+`hyper_connect_*` against a from-definition f64 reference (each of the nine
+deviations below was injected into the CPU arm and shown to go red):
+
+- **`norm_cols` reduces over `src`; `norm_rows` reduces over `dst`.**
+  llama.cpp's `norm_cols` permutes so `src` is `ne[0]` before `ggml_sum_rows`;
+  its `norm_rows` sums the matrix as laid out, whose `ne[0]` is `dst`. Both
+  names are the opposite of the axis they touch. The loop therefore ends on an
+  over-`src` normalisation, which is why `Σ_src comb[dst, ·] = 1` comes out
+  exact to eps level while `Σ_dst` is only as converged as the iteration got.
+- **The doubly-stochastic property does NOT catch a transposed `comb` index.**
+  Sinkhorn of a transposed matrix is Sinkhorn of another matrix: it still ends
+  on `norm_src` and its sums are just as well behaved. What the sums DO catch is
+  giving the extra normalisation to `dst` (i.e. trusting the lambda names). The
+  transposed index is caught by value — it moves the output by ~1.
+- **Sinkhorn does not converge on peaked logits.** At `hc = 4, n_iter = 3` with
+  logits spread over ±8, `|Σ_dst − 1| ≈ 0.5`. That is the algorithm (its rate
+  collapses as the matrix approaches a permutation), not a port bug; asserting
+  convergence needs mild logits and tens of iterations.
+- **The asymmetric COUNT is nearly inert, for a reason worth knowing.** The
+  softmax already leaves every `src` column summing to `1 + hc·eps`, so the
+  symmetric variant's extra leading `norm_dst` is a UNIFORM rescale that the
+  following `norm_src` undoes. What survives is second order in eps: ~1e-11 at
+  `eps = 1e-6`, ~9e-5 at `eps = 1e-2`. The count is pinned, but only the
+  large-eps case pins it for an f32 backend.
+- **At `hc = 1` almost every Sinkhorn detail is genuinely inert** (a 1×1 matrix
+  is its own transpose, `norm_src` and `norm_dst` are the same operation, and
+  the iteration's fixed point does not depend on the initial value). It is a
+  kernel SHAPE case, not a semantics one.
+
 ### The compressed-KV state machine
 
 This is the **largest single porting risk in the family**. Seven cache

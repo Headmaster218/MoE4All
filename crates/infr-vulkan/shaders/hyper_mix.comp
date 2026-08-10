@@ -1,0 +1,102 @@
+#version 460
+// DeepSeek V4 hyper-connection mixing coefficients (`Op::HyperConnectMix`) — llama.cpp's
+// `ggml_dsv4_hc_comb` plus the `pre`/`post` gate arithmetic `build_hc_pre` leaves as elementwise
+// views. Per token `t` (see the op's doc for the full contract):
+//
+//   pre[t, h]            = sigmoid(mixes[t, h]                 * scale[0] + base[h])              + eps
+//   post[t, h]           = sigmoid(mixes[t, hc + h]            * scale[1] + base[hc + h])         * 2
+//   logits[t, dst, src]  =         mixes[t, 2hc + dst + hc*src] * scale[2] + base[2hc + dst + hc*src]
+//   comb[t]              = sinkhorn(logits[t])
+//
+// ONE THREAD per token: Sinkhorn iterates over the whole `hc x hc` matrix, so the matrix has to
+// live somewhere, and at `hc <= HC_MAX` that is a fixed-size private array — no shared memory, no
+// barriers, and no cross-lane reduction whose order would have to be matched to the CPU arm's.
+// `rows` is a batch height (a few thousand at prefill), so the token axis alone saturates the GPU.
+//
+// `-DGATES` adds the `post` + `comb` outputs (bindings 4/5). Without it this is `build_hc_head`'s
+// form: `mixes` is the `pre` chunk alone, read at the SAME indices (`scale[0]`, `base[0..hc]`).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint  rows;
+    uint  hc;
+    uint  mix_dim;   // (2 + hc)*hc with GATES, hc without
+    float eps;
+    uint  n_iter;
+} pc;
+
+layout(binding = 0) readonly buffer MB { float mixes[]; };
+layout(binding = 1) readonly buffer SB { float scl[]; };
+layout(binding = 2) readonly buffer BB { float bse[]; };
+layout(binding = 3) writeonly buffer PB { float pre[]; };
+#ifdef GATES
+layout(binding = 4) writeonly buffer OB { float post[]; };
+layout(binding = 5) writeonly buffer CB { float comb[]; };
+#endif
+
+// Must equal `infr_core::graph::HYPER_CONNECT_MAX_MULT`; the adapter refuses a wider `hc` before
+// dispatching, which is the only thing keeping the indexing below inside `m`.
+#define HC_MAX 8u
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.rows) { return; }
+    uint hc = pc.hc;
+    uint mb = t * pc.mix_dim;
+
+    for (uint h = 0u; h < hc; ++h) {
+        float z = mixes[mb + h] * scl[0] + bse[h];
+        // sigmoid then + eps — the fourth eps site, distinct from Sinkhorn's three.
+        pre[t*hc + h] = 1.0 / (1.0 + exp(-z)) + pc.eps;
+    }
+
+#ifdef GATES
+    for (uint h = 0u; h < hc; ++h) {
+        float z = mixes[mb + hc + h] * scl[1] + bse[hc + h];
+        // sigmoid then x2 — NOT + eps. Adjacent chunk of the same tensor, different tail.
+        post[t*hc + h] = 2.0 / (1.0 + exp(-z));
+    }
+
+    float m[HC_MAX*HC_MAX];
+    uint n = hc*hc;
+    for (uint i = 0u; i < n; ++i) {
+        // comb's chunk starts at 2*hc and `dst` is its FAST axis (`dst + hc*src`).
+        m[i] = mixes[mb + 2u*hc + i] * scl[2] + bse[2u*hc + i];
+    }
+
+    // ggml_soft_max over ne[0] = dst: one softmax per src column (a contiguous run of hc), then
+    // the post-softmax + eps applied to every element.
+    for (uint src = 0u; src < hc; ++src) {
+        uint o = src*hc;
+        float mx = m[o];
+        for (uint d = 1u; d < hc; ++d) { mx = max(mx, m[o + d]); }
+        float s = 0.0;
+        for (uint d = 0u; d < hc; ++d) { m[o + d] = exp(m[o + d] - mx); s += m[o + d]; }
+        for (uint d = 0u; d < hc; ++d) { m[o + d] = m[o + d] / s + pc.eps; }
+    }
+
+    // The ASYMMETRIC loop: `n_iter` normalisations over src, `n_iter - 1` over dst, starting AND
+    // ending with an over-src one. `it > 0` reproduces the reference's `for (i = 1; i < n_iter)`.
+    for (uint it = 0u; it < pc.n_iter; ++it) {
+        if (it > 0u) {
+            // Over dst: sum the contiguous run, ascending (ggml_sum_rows' order).
+            for (uint src = 0u; src < hc; ++src) {
+                uint o = src*hc;
+                float s = 0.0;
+                for (uint d = 0u; d < hc; ++d) { s += m[o + d]; }
+                s += pc.eps;
+                for (uint d = 0u; d < hc; ++d) { m[o + d] /= s; }
+            }
+        }
+        // Over src, ascending.
+        for (uint d = 0u; d < hc; ++d) {
+            float s = 0.0;
+            for (uint src = 0u; src < hc; ++src) { s += m[d + hc*src]; }
+            s += pc.eps;
+            for (uint src = 0u; src < hc; ++src) { m[d + hc*src] /= s; }
+        }
+    }
+
+    for (uint i = 0u; i < n; ++i) { comb[t*n + i] = m[i]; }
+#endif
+}

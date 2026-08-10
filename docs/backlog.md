@@ -1496,6 +1496,59 @@ a silent fallback.
   (`qknorm_weightless_parity`, `rope_backward_parity`, `attention_sinks_parity`)
   are what will report it.
 
+### B-DSV4-HC — what the Sinkhorn hyper-connection ops do NOT cover yet (2026-08-10)
+
+**Tag:** deepseek · vulkan · metal · **Blocked on:** nothing; scoped out of the
+op-level slice, which was explicitly "add the ops, emit nothing"
+
+`Op::HyperConnectMix` / `HyperConnectPre` / `HyperConnectPost` are implemented
+and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
+
+- **Nothing emits them.** `crates/infr-llama/src` was not touched: no `hc_fn` /
+  `hc_scale` / `hc_base` weight is read into a graph, and
+  `generate_dense_backend` still refuses V4 outright. The wiring slice also
+  needs the RMS-norm over the FLATTENED `hc*n_embd` row that produces `mixes` —
+  `Op::RmsNorm` requires a `weight`, and llama.cpp calls bare `ggml_rms_norm`
+  here, so that slice must either pass a ones vector or extend `Op::RmsNorm` the
+  way `Op::QkNorm` was extended with `weight: Option<_>`.
+- **Performance was not considered at all.** Every kernel is the naive shape:
+  `hyper_mix` runs ONE THREAD per token with the `hc × hc` matrix in a private
+  array (dynamic indexing into a private array is the classic scratch-memory
+  spill), and `hyper_pre` / `hyper_post` are one thread per output element with
+  a serial `hc`-term loop and no vectorisation. At `hc = 4` the mix op is
+  `rows × 24` floats of work, so it is unlikely to matter; `hyper_post` writes
+  `rows × hc × n_embd` and is the one to measure first. Nothing here is
+  measured.
+- **`hc_mult` is capped at `HYPER_CONNECT_MAX_MULT` (8)** by a host check in
+  each backend. Raising it means raising `HC_MAX` in `hyper_mix.comp` and
+  `elementwise_norms.metal` together — the constant is duplicated in three
+  places (Rust, GLSL, MSL) with no compile-time link between them, only the host
+  refusal keeping the kernels in range.
+- **`Op::HyperConnectMix` writes three outputs.** Vulkan's `dispatch` treats the
+  trailing `n_out` bindings as writes and Metal takes an explicit write mask, so
+  the hazard tracking is right — but this is the first op in the codebase with
+  more than two `dst`s, and no fusion/scheduling pass has been looked at for it.
+- **Metal has never been executed.** No Apple hardware was available; the four
+  new kernels (`hyper_mix_f32`, `hyper_mix_gates_f32`, `hyper_pre_f32`,
+  `hyper_post_f32`) typecheck via
+  `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`, and
+  MSL is compiled on-device at runtime, so the macOS CI job is their first real
+  compile AND their first execution. The three `#[ignore]`d tests in
+  `crates/infr-metal/tests/parity.rs` (`hyper_connect_mix_parity`,
+  `hyper_connect_pre_parity`, `hyper_connect_post_parity`) are what will report
+  it.
+- **`n_iter` is not exercised above 40, and `eps` only at 1e-6 / 1e-2.** The
+  real V4 values come from `{arch}.hyper_connection.sinkhorn_iterations` and
+  `.epsilon`, neither of which has been read off a real GGUF (see § "Open
+  questions" 1 in `docs/deepseek.md` — no V4 file has been dumped).
+- **The four eps sites are not all pinned at production eps.** At `eps = 1e-6`
+  the over-dst site moves the answer by ~3e-7, below the 1e-5 tolerance the
+  backend comparisons run at; only the synthetic `eps = 1e-2` case pins it for
+  an f32 kernel. Same for the asymmetric iteration COUNT (~1e-11 at 1e-6). Both
+  are pinned in exact arithmetic by `hyper_connect_details_are_load_bearing`. If
+  a real V4 GGUF turns out to use a small eps, a backend that dropped the
+  over-dst eps would pass every test here.
+
 ### W1 — VRAM guard check-then-act race (CR-N7)
 
 **Claim:** `check_vram_budget` / `vram_budget_fits` read the budget then

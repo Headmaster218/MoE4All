@@ -3223,3 +3223,1092 @@ fn grouped_output_projection_composes_from_linear_and_copystrided() {
         check(&vk, "vulkan");
     }
 }
+
+// ---- DeepSeek V4 Sinkhorn hyper-connections: `Op::HyperConnectMix` / `Pre` / `Post`.
+//
+// The references below are written from the DEFINITION — `ggml.h`'s `ggml_dsv4_hc_comb` /
+// `ggml_dsv4_hc_pre` / `ggml_dsv4_hc_post` header comments for the index formulas, and
+// `deepseek4.cpp`'s UNFUSED branches (`build_hc_pre`, `build_hc_sinkhorn`, `build_hc_post`) for the
+// arithmetic. They are NOT transcribed from `infr-cpu`'s op arms: they are plain f64 triple loops
+// written from the reference, so agreement between them and the CPU backend is evidence about the
+// port rather than a restatement of it.
+
+/// Shape + hyper-parameters of one hyper-connection case.
+#[derive(Clone, Copy)]
+struct HcDims {
+    rows: usize,
+    hc: usize,
+    n_embd: usize,
+    eps: f32,
+    n_iter: u32,
+    /// `true` = `build_hc_head`'s form — `mixes` is the `pre` chunk alone, no `post`/`comb`.
+    head: bool,
+}
+
+impl HcDims {
+    /// `(2 + hc)*hc` for the sublayer wrap, `hc` for the head (whose `output_hc_fn` is
+    /// `{hc_dim, hc}`).
+    fn mix_dim(&self) -> usize {
+        if self.head {
+            self.hc
+        } else {
+            (2 + self.hc) * self.hc
+        }
+    }
+    /// `hc_scale` is `{3}` for the wrap and `{1}` for the head.
+    fn n_scale(&self) -> usize {
+        if self.head {
+            1
+        } else {
+            3
+        }
+    }
+}
+
+/// One deliberate deviation from the definition, for the negative controls. [`FAITHFUL`] is the
+/// definition itself; each field below names exactly one thing done wrong, and the test that flips
+/// it asserts the answer MOVES — which is how each of these details is shown to be load-bearing
+/// rather than decorative. Every one of them still runs and still produces plausible numbers.
+#[derive(Clone, Copy)]
+struct HcVariant {
+    /// Read `comb`'s chunk as `src + hc*dst` instead of `dst + hc*src`.
+    transpose_comb: bool,
+    /// Run `n_iter` of BOTH normalisations instead of `n_iter` over-src and `n_iter - 1` over-dst.
+    symmetric_iters: bool,
+    /// Give the EXTRA normalisation to the `dst` axis instead of `src` — start and end on
+    /// `norm_dst`. This is what trusting llama.cpp's `norm_rows`/`norm_cols` NAMES produces: the
+    /// lambdas are named for the opposite axis to the one they reduce over.
+    swap_norm_axes: bool,
+    /// Drop the `+ eps` applied to every element right after the softmax.
+    drop_eps_softmax: bool,
+    /// Drop the `+ eps` on the over-src sum before it divides.
+    drop_eps_src: bool,
+    /// Drop the `+ eps` on the over-dst sum before it divides.
+    drop_eps_dst: bool,
+    /// Drop the `+ eps` on `pre` after its sigmoid (the fourth, non-Sinkhorn site).
+    drop_eps_pre: bool,
+    /// Swap the `pre` and `post` chunk offsets (and their scale index / base offset with them) —
+    /// adjacent, equal-width chunks of the same tensor.
+    swap_pre_post: bool,
+}
+
+const FAITHFUL: HcVariant = HcVariant {
+    transpose_comb: false,
+    symmetric_iters: false,
+    swap_norm_axes: false,
+    drop_eps_softmax: false,
+    drop_eps_src: false,
+    drop_eps_dst: false,
+    drop_eps_pre: false,
+    swap_pre_post: false,
+};
+
+/// `build_hc_sinkhorn` in f64, in place over `m` laid out `dst + hc*src`.
+fn hc_ref_sinkhorn(m: &mut [f64], hc: usize, eps: f64, n_iter: u32, v: HcVariant) {
+    // ggml_soft_max over ne[0] — for `comb` reshaped `[dst_hc, src_hc, n_tokens]` that is the
+    // `dst` axis, one softmax per src column. Then `ggml_add(comb, eps)`.
+    let e_soft = if v.drop_eps_softmax { 0.0 } else { eps };
+    for src in 0..hc {
+        let col = &mut m[src * hc..][..hc];
+        let mx = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut s = 0.0;
+        for x in col.iter_mut() {
+            *x = (*x - mx).exp();
+            s += *x;
+        }
+        for x in col.iter_mut() {
+            *x = *x / s + e_soft;
+        }
+    }
+    let e_src = if v.drop_eps_src { 0.0 } else { eps };
+    let e_dst = if v.drop_eps_dst { 0.0 } else { eps };
+    // llama.cpp's `norm_cols`: permute so `src` is ne[0], `ggml_sum_rows` (i.e. sum over SRC),
+    // add eps, divide. Reduces over src, despite the name.
+    let norm_src = |m: &mut [f64]| {
+        for dst in 0..hc {
+            let s: f64 = (0..hc).map(|src| m[dst + hc * src]).sum();
+            let q = s + e_src;
+            for src in 0..hc {
+                m[dst + hc * src] /= q;
+            }
+        }
+    };
+    // llama.cpp's `norm_rows`: `ggml_sum_rows` of the matrix as laid out, whose ne[0] is DST.
+    // Reduces over dst, despite the name.
+    let norm_dst = |m: &mut [f64]| {
+        for src in 0..hc {
+            let col = &mut m[src * hc..][..hc];
+            let q: f64 = col.iter().sum::<f64>() + e_dst;
+            for x in col.iter_mut() {
+                *x /= q;
+            }
+        }
+    };
+    if v.symmetric_iters {
+        for _ in 0..n_iter {
+            norm_dst(m);
+            norm_src(m);
+        }
+    } else if v.swap_norm_axes {
+        norm_dst(m);
+        for _ in 1..n_iter {
+            norm_src(m);
+            norm_dst(m);
+        }
+    } else {
+        norm_src(m);
+        for _ in 1..n_iter {
+            norm_dst(m);
+            norm_src(m);
+        }
+    }
+}
+
+/// `build_hc_pre`'s coefficient half in f64 — returns `(pre, post, comb)`, the latter two empty in
+/// the head form.
+fn hc_ref_mix(
+    mixes: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    d: HcDims,
+    v: HcVariant,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (hc, md, eps) = (d.hc, d.mix_dim(), d.eps as f64);
+    // The pre chunk is at offset 0 with scale[0]; post at hc with scale[1]. `swap_pre_post` reads
+    // them the other way round — the mistake nothing but a value check catches.
+    let (pre_off, post_off) = if v.swap_pre_post { (hc, 0) } else { (0, hc) };
+    let (pre_si, post_si) = if v.swap_pre_post { (1, 0) } else { (0, 1) };
+    let e_pre = if v.drop_eps_pre { 0.0 } else { eps };
+    let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+    let mut pre = vec![0f64; d.rows * hc];
+    for t in 0..d.rows {
+        for h in 0..hc {
+            let z = mixes[t * md + pre_off + h] as f64 * scale[pre_si] as f64
+                + base[pre_off + h] as f64;
+            pre[t * hc + h] = sig(z) + e_pre;
+        }
+    }
+    if d.head {
+        return (pre, Vec::new(), Vec::new());
+    }
+    let mut post = vec![0f64; d.rows * hc];
+    let mut comb = vec![0f64; d.rows * hc * hc];
+    for t in 0..d.rows {
+        for h in 0..hc {
+            let z = mixes[t * md + post_off + h] as f64 * scale[post_si] as f64
+                + base[post_off + h] as f64;
+            post[t * hc + h] = 2.0 * sig(z);
+        }
+        let m = &mut comb[t * hc * hc..][..hc * hc];
+        for dst in 0..hc {
+            for src in 0..hc {
+                // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2] + base[2*hc + ...]
+                let k = if v.transpose_comb {
+                    src + hc * dst
+                } else {
+                    dst + hc * src
+                };
+                m[dst + hc * src] =
+                    mixes[t * md + 2 * hc + k] as f64 * scale[2] as f64 + base[2 * hc + k] as f64;
+            }
+        }
+        hc_ref_sinkhorn(m, hc, eps, d.n_iter, v);
+    }
+    (pre, post, comb)
+}
+
+/// `ggml_dsv4_hc_pre`: `result[i, t] = Σ_h x[i, h, t]*weights[h, t]`.
+fn hc_ref_pre(x: &[f32], w: &[f32], d: HcDims) -> Vec<f64> {
+    let (hc, ne) = (d.hc, d.n_embd);
+    let mut out = vec![0f64; d.rows * ne];
+    for t in 0..d.rows {
+        for h in 0..hc {
+            for i in 0..ne {
+                out[t * ne + i] += x[(t * hc + h) * ne + i] as f64 * w[t * hc + h] as f64;
+            }
+        }
+    }
+    out
+}
+
+/// `ggml_dsv4_hc_post`: `result[i, dst, t] = x[i,t]*post[dst,t] + Σ_src residual[i,src,t]*comb[dst,src,t]`.
+fn hc_ref_post(x: &[f32], residual: &[f32], post: &[f32], comb: &[f32], d: HcDims) -> Vec<f64> {
+    let (hc, ne) = (d.hc, d.n_embd);
+    let mut out = vec![0f64; d.rows * hc * ne];
+    for t in 0..d.rows {
+        for dst in 0..hc {
+            for i in 0..ne {
+                let mut acc = x[t * ne + i] as f64 * post[t * hc + dst] as f64;
+                for src in 0..hc {
+                    acc += residual[(t * hc + src) * ne + i] as f64
+                        * comb[t * hc * hc + dst + hc * src] as f64;
+                }
+                out[(t * hc + dst) * ne + i] = acc;
+            }
+        }
+    }
+    out
+}
+
+fn maxerr64(a: &[f32], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len(), "reference/backend length mismatch");
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64 - y).abs())
+        .fold(0.0, f64::max)
+}
+
+fn maxdiff64(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// `mixes` values for a case: mixed-sign, no symmetry between the `dst`/`src` axes of the `comb`
+/// chunk (a symmetric one would hide a transposed index) and spread wide enough that the softmax
+/// inside Sinkhorn is not near-uniform.
+fn hc_mixes(rows: usize, mix_dim: usize) -> Vec<f32> {
+    (0..rows * mix_dim)
+        .map(|i| (((i * 37 + 11) % 23) as f32 - 11.0) * 0.31)
+        .collect()
+}
+
+/// Build + run one `Op::HyperConnectMix`, returning `(pre, post, comb)` (the latter two empty in
+/// the head form). Bespoke because the op writes THREE outputs and `run` handles one.
+fn hc_run_mix(
+    be: &dyn Backend,
+    mixes: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    d: HcDims,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (hc, md) = (d.hc, d.mix_dim());
+    let mut g = Graph::new();
+    let mx = g.input(f32d(d.rows * md));
+    let sc = g.weight(f32d(d.n_scale()));
+    let bs = g.weight(f32d(md));
+    let pre = g.output(f32d(d.rows * hc));
+    let gates = (!d.head).then(|| infr_core::graph::HyperGates {
+        post: g.output(f32d(d.rows * hc)),
+        comb: g.output(f32d(d.rows * hc * hc)),
+    });
+    g.push(Op::HyperConnectMix {
+        mixes: mx,
+        scale: sc,
+        base: bs,
+        pre,
+        gates,
+        rows: d.rows as u32,
+        hc: hc as u32,
+        eps: d.eps,
+        n_iter: d.n_iter,
+    });
+
+    let plan = be.compile(&g).expect("compile HyperConnectMix");
+    let up = |data: &[f32], usage| {
+        let b = be.alloc(data.len().max(1) * 4, usage).expect("alloc");
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        b
+    };
+    let mb = up(mixes, BufferUsage::Activations);
+    let sb = up(scale, BufferUsage::Weights);
+    let bb = up(base, BufferUsage::Weights);
+    let pb = be
+        .alloc(d.rows * hc * 4, BufferUsage::Readback)
+        .expect("alloc pre");
+    let mut b = Bindings::new();
+    b.bind(mx, mb.as_ref());
+    b.bind(sc, sb.as_ref());
+    b.bind(bs, bb.as_ref());
+    b.bind(pre, pb.as_ref());
+    let gb = gates.map(|gt| {
+        (
+            gt,
+            be.alloc(d.rows * hc * 4, BufferUsage::Readback).unwrap(),
+            be.alloc(d.rows * hc * hc * 4, BufferUsage::Readback)
+                .unwrap(),
+        )
+    });
+    if let Some((gt, ob, cb)) = &gb {
+        b.bind(gt.post, ob.as_ref());
+        b.bind(gt.comb, cb.as_ref());
+    }
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let dl = |buf: &dyn infr_core::backend::Buffer, n: usize| {
+        let mut o = vec![0f32; n];
+        be.download(buf, bytemuck::cast_slice_mut(&mut o)).unwrap();
+        o
+    };
+    let pre_o = dl(pb.as_ref(), d.rows * hc);
+    match &gb {
+        Some((_, ob, cb)) => (
+            pre_o,
+            dl(ob.as_ref(), d.rows * hc),
+            dl(cb.as_ref(), d.rows * hc * hc),
+        ),
+        None => (pre_o, Vec::new(), Vec::new()),
+    }
+}
+
+/// The case table shared by every hyper-connection test below. `hc = 4` is production (llama.cpp
+/// `GGML_ASSERT`s it); the rest move the axes a kernel can get wrong — `hc = 1` (a degenerate
+/// 1×1 Sinkhorn), `hc = 3` (not a power of two), `hc = 8` (`HYPER_CONNECT_MAX_MULT`, the widest
+/// any backend accepts) — across `n_iter` 1 (the loop body never runs, only the lone `norm_src`),
+/// 2, 3 and 5.
+fn hc_cases() -> Vec<(&'static str, HcDims)> {
+    let e = 1e-6f32;
+    vec![
+        (
+            "production hc=4 n_iter=3, 7 tokens",
+            HcDims {
+                rows: 7,
+                hc: 4,
+                n_embd: 5,
+                eps: e,
+                n_iter: 3,
+                head: false,
+            },
+        ),
+        (
+            "hc=4 n_iter=1 (only the lone norm_src runs)",
+            HcDims {
+                rows: 5,
+                hc: 4,
+                n_embd: 6,
+                eps: e,
+                n_iter: 1,
+                head: false,
+            },
+        ),
+        (
+            "hc=3 (not a power of two) n_iter=2",
+            HcDims {
+                rows: 6,
+                hc: 3,
+                n_embd: 7,
+                eps: e,
+                n_iter: 2,
+                head: false,
+            },
+        ),
+        (
+            "hc=1 (degenerate 1x1 Sinkhorn) n_iter=4",
+            HcDims {
+                rows: 3,
+                hc: 1,
+                n_embd: 9,
+                eps: e,
+                n_iter: 4,
+                head: false,
+            },
+        ),
+        (
+            "hc=8 (HYPER_CONNECT_MAX_MULT) n_iter=5",
+            HcDims {
+                rows: 4,
+                hc: 8,
+                n_embd: 3,
+                eps: e,
+                n_iter: 5,
+                head: false,
+            },
+        ),
+        (
+            "model head form (pre only), hc=4",
+            HcDims {
+                rows: 7,
+                hc: 4,
+                n_embd: 5,
+                eps: e,
+                n_iter: 3,
+                head: true,
+            },
+        ),
+        (
+            "large eps 1e-2 (every eps site visible), hc=4 n_iter=3",
+            HcDims {
+                rows: 5,
+                hc: 4,
+                n_embd: 4,
+                eps: 1e-2,
+                n_iter: 3,
+                head: false,
+            },
+        ),
+    ]
+}
+
+/// Scale/base for a case. `base` is per-element and mixed-sign, `scale` differs per chunk so
+/// reading the wrong index is visible.
+fn hc_scale_base(d: HcDims) -> (Vec<f32>, Vec<f32>) {
+    let scale: Vec<f32> = vec![0.7, -1.3, 1.9][..d.n_scale()].to_vec();
+    let base = (0..d.mix_dim())
+        .map(|i| (((i * 13 + 5) % 17) as f32 - 8.0) * 0.17)
+        .collect();
+    (scale, base)
+}
+
+/// Tolerance for every hyper-connection backend comparison (CPU vs the f64 reference, and each GPU
+/// vs CPU). All these outputs are O(1) — `pre` and `comb` are in `(0, 1]`, `post` in `(0, 2)` — so
+/// an absolute bound is the meaningful one.
+///
+/// Chosen, not measured-and-rounded: f32 carries ~1e-7 relative, a Sinkhorn round is a handful of
+/// dependent ops, and a GPU `exp` is only required to be within ~3 ULP of the host's, so ~1e-6 is
+/// the floor a correct port can reach. `1e-5` sits an order of magnitude above that and two orders
+/// BELOW the smallest structural defect `hyper_connect_details_are_load_bearing` measures (a
+/// transposed `comb`, a swapped `pre`/`post`, or a symmetric iteration count each move the answer
+/// by >1e-3). Observed with this table: CPU vs reference ≤1.8e-7, Vulkan vs CPU ≤2.4e-7.
+const HC_TOL: f32 = 1e-5;
+
+/// `Op::HyperConnectMix` — CPU vs the from-definition f64 reference, plus CPU-vs-Vulkan.
+#[test]
+fn hyper_connect_mix_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in hc_cases() {
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (wpre, wpost, wcomb) = hc_ref_mix(&mixes, &scale, &base, d, FAITHFUL);
+        let (pre, post, comb) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        let (ep, eo, ec) = (
+            maxerr64(&pre, &wpre),
+            maxerr64(&post, &wpost),
+            maxerr64(&comb, &wcomb),
+        );
+        println!("HyperConnectMix {name}: cpu vs ref pre={ep:e} post={eo:e} comb={ec:e}");
+        let tol = HC_TOL as f64;
+        assert!(ep < tol, "{name}: pre diverges from the reference ({ep:e})");
+        assert!(
+            eo < tol,
+            "{name}: post diverges from the reference ({eo:e})"
+        );
+        assert!(
+            ec < tol,
+            "{name}: comb diverges from the reference ({ec:e})"
+        );
+
+        if let Some(vk) = gpu() {
+            let (vp, vo, vc) = hc_run_mix(&vk, &mixes, &scale, &base, d);
+            let (ep, eo, ec) = (maxerr(&vp, &pre), maxerr(&vo, &post), maxerr(&vc, &comb));
+            println!("HyperConnectMix {name}: vulkan vs cpu pre={ep:e} post={eo:e} comb={ec:e}");
+            assert!(ep < HC_TOL, "{name}: Vulkan pre diverges from CPU ({ep:e})");
+            assert!(
+                eo < HC_TOL,
+                "{name}: Vulkan post diverges from CPU ({eo:e})"
+            );
+            assert!(
+                ec < HC_TOL,
+                "{name}: Vulkan comb diverges from CPU ({ec:e})"
+            );
+        }
+    }
+}
+
+/// **The doubly-stochastic property itself** — the whole point of the Sinkhorn iteration, asserted
+/// on the CPU BACKEND's output (not on the reference).
+///
+/// Two data sets, because the property and the ORIENTATION of the normalisations cannot be shown
+/// by the same one:
+///
+/// * `converged` — mild logits (`|z| < 1`) and 40 iterations. Sinkhorn converges and BOTH sums
+///   land within 1e-4: that is the property.
+/// * `production` — the `hc = 4, n_iter = 3` case from the shared table, with the table's peaked
+///   logits. Sinkhorn has NOT converged there (its rate collapses as the matrix approaches a
+///   permutation — a property of the algorithm, not a port bug: `|sum_dst - 1| ≈ 0.5`), and that
+///   is exactly what makes the orientation visible. `norm_src` is the LAST normalisation the
+///   asymmetric loop runs and it divides by `sum + eps`, so `sum_src` is exact to eps level while
+///   `sum_dst` is only as close as the iteration got.
+///
+/// The RED case here is `swap_norm_axes` — giving the extra normalisation to `dst`, which is what
+/// trusting llama.cpp's INVERTED `norm_rows`/`norm_cols` names produces. It swaps which axis comes
+/// out exact and is asserted to fail the tight bound.
+///
+/// What these sums do NOT catch, asserted so the gap is on the record rather than assumed: a
+/// transposed `comb` INDEX (`src + hc*dst`). Sinkhorn applied to a transposed matrix is just
+/// Sinkhorn applied to a different matrix — it still ends on `norm_src` and its sums are just as
+/// well behaved. That one is caught by value: `hyper_connect_details_are_load_bearing` and
+/// `hyper_connect_post_parity`'s executed transpose, which move the answer by ~1.
+#[test]
+fn hyper_connect_comb_is_doubly_stochastic() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let converged = HcDims {
+        rows: 5,
+        hc: 4,
+        n_embd: 4,
+        eps: 1e-6,
+        n_iter: 40,
+        head: false,
+    };
+    let production = hc_cases()[0].1;
+    for (name, d, want_converged) in [
+        ("converged (mild logits, n_iter=40)", converged, true),
+        ("production hc=4 n_iter=3", production, false),
+    ] {
+        let (hc, eps) = (d.hc, d.eps as f64);
+        // The converged case needs logits small enough that the softmax is not near-one-hot; the
+        // production case uses the shared generator unchanged.
+        let mixes: Vec<f32> = if want_converged {
+            (0..d.rows * d.mix_dim())
+                .map(|i| (((i * 37 + 11) % 23) as f32 - 11.0) * 0.04)
+                .collect()
+        } else {
+            hc_mixes(d.rows, d.mix_dim())
+        };
+        let (scale, base) = if want_converged {
+            (
+                vec![0.7, -1.3, 0.5],
+                (0..d.mix_dim())
+                    .map(|i| (((i * 13 + 5) % 17) as f32 - 8.0) * 0.02)
+                    .collect::<Vec<f32>>(),
+            )
+        } else {
+            hc_scale_base(d)
+        };
+        let (_, _, comb) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        // The RED variant: the extra normalisation given to `dst` instead of `src`.
+        let (_, _, swapped) = hc_ref_mix(
+            &mixes,
+            &scale,
+            &base,
+            d,
+            HcVariant {
+                swap_norm_axes: true,
+                ..FAITHFUL
+            },
+        );
+        // And the transposed INDEX, which these sums are asserted below NOT to be able to see.
+        let (_, _, tcomb) = hc_ref_mix(
+            &mixes,
+            &scale,
+            &base,
+            d,
+            HcVariant {
+                transpose_comb: true,
+                ..FAITHFUL
+            },
+        );
+
+        let sums = |m: &[f64]| -> (f64, f64) {
+            let (mut esrc, mut edst) = (0f64, 0f64);
+            for t in 0..d.rows {
+                let b = t * hc * hc;
+                for dst in 0..hc {
+                    let s: f64 = (0..hc).map(|src| m[b + dst + hc * src]).sum();
+                    esrc = esrc.max((s - 1.0).abs());
+                }
+                for src in 0..hc {
+                    let s: f64 = (0..hc).map(|dst| m[b + dst + hc * src]).sum();
+                    edst = edst.max((s - 1.0).abs());
+                }
+            }
+            (esrc, edst)
+        };
+        let got: Vec<f64> = comb.iter().map(|&v| v as f64).collect();
+        let (esrc, edst) = sums(&got);
+        println!("comb[{name}]: |sum_src - 1| = {esrc:e}, |sum_dst - 1| = {edst:e} (eps={eps:e})");
+        let tight = 4.0 * eps + hc as f64 * 1e-6;
+        let (wsrc, wdst) = sums(&swapped);
+        let (tsrc, tdst) = sums(&tcomb);
+        println!("comb[{name}] swapped norm axes: src={wsrc:e} dst={wdst:e}");
+        println!("comb[{name}] transposed index:  src={tsrc:e} dst={tdst:e}");
+        // The gap, asserted rather than assumed: a transposed INDEX leaves both sums exactly as
+        // well behaved as the faithful one, so nothing here can see it.
+        assert!(
+            (tsrc < tight) == (esrc < tight) && (tdst < tight) == (edst < tight),
+            "{name}: a transposed comb index changed which axis is exact (src {tsrc:e} vs \
+             {esrc:e}, dst {tdst:e} vs {edst:e}) — then the doc above is wrong and this test \
+             could have been asserting the index too"
+        );
+        if want_converged {
+            assert!(
+                esrc < 1e-4 && edst < 1e-4,
+                "{name}: comb is not doubly stochastic (src {esrc:e}, dst {edst:e})"
+            );
+        } else {
+            // Stated as an assertion so it goes red if it ever stops being true: at n_iter=3 on
+            // peaked logits the over-dst sums have NOT converged, which is why the case above
+            // exists at all.
+            assert!(
+                edst > 1e-2,
+                "{name}: sum_dst is already converged ({edst:e}) — the `converged` case above is \
+                 no longer testing anything the production one does not"
+            );
+            // The orientation. `norm_src` divides by `sum + eps`, so `sum_src`'s residual is
+            // bounded by eps regardless of convergence; f32 storage of comb adds ~hc ULP.
+            assert!(
+                esrc < tight,
+                "{name}: the LAST normalisation is over src, so |sum_src - 1| must be at eps \
+                 level, not {esrc:e} (> {tight:e}) — comb is transposed"
+            );
+            // The RED half: the same bound applied to a Sinkhorn whose extra normalisation went
+            // to `dst` must FAIL, and `sum_dst` must be the exact one there instead.
+            assert!(
+                wsrc > tight,
+                "{name}: swapping the normalisation axes passes the tight sum_src bound \
+                 ({wsrc:e} <= {tight:e}) — the assertion above proves nothing"
+            );
+            assert!(
+                wdst < tight,
+                "{name}: with the axes swapped, sum_dst should be the exact one ({wdst:e})"
+            );
+        }
+    }
+}
+
+/// Each detail `docs/deepseek.md` warns about, shown to CHANGE the answer. If the CPU arm had
+/// implemented any of these variants, `hyper_connect_mix_parity` would be comparing against the
+/// wrong reference and would still pass — so this test is what makes that one mean something.
+///
+/// Bounds, and what each says:
+///
+/// * a STRUCTURAL variant (swapped `pre`/`post` offsets, transposed `comb` index, the extra
+///   normalisation given to `dst`) must move the answer by >1e-3, two orders above `HC_TOL`. Those
+///   are pinned by the backend parity test on every case.
+/// * an EPS-SITE drop must move it by >1e-9 — unambiguously not inert. At `eps = 1e-6` that can
+///   fall BELOW `HC_TOL` (the over-dst site is the smallest, since the final over-src
+///   normalisation partly washes it out), which is why the table carries an `eps = 1e-2` case
+///   where every site is required to clear `HC_TOL` and the backends are pinned too.
+/// * `symmetric_iters` gets its own, much smaller bound — see the comment at its call site.
+///
+/// Three details are genuinely INERT on some cases, and each is asserted to move the answer by
+/// EXACTLY zero there rather than skipped quietly: `comb`'s index at `hc = 1` (a 1×1 transpose is
+/// the identity), the over-dst eps site at `n_iter = 1` (the reference's `for (i = 1; i < n_iter)`
+/// body never runs, so `norm_dst` is never called — a direct check that the loop is the asymmetric
+/// one), and every `comb`/`post` variant in the head form, which has neither.
+#[test]
+fn hyper_connect_details_are_load_bearing() {
+    for (name, d) in hc_cases() {
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (pre0, post0, comb0) = hc_ref_mix(&mixes, &scale, &base, d, FAITHFUL);
+        // How far this variant moves the faithful answer, over all three outputs.
+        let moved = |what: &str, v: HcVariant| -> f64 {
+            let (pre, post, comb) = hc_ref_mix(&mixes, &scale, &base, d, v);
+            let e = maxdiff64(&pre0, &pre)
+                .max(maxdiff64(&post0, &post))
+                .max(maxdiff64(&comb0, &comb));
+            println!("HyperConnect {name}: {what} moves the answer by {e:e}");
+            e
+        };
+        let must_move = |what: &str, v: HcVariant, min: f64| {
+            let e = moved(what, v);
+            assert!(
+                e > min,
+                "{name}: {what} changed the answer by only {e:e} (<= {min:e}) — that detail is \
+                 not pinned by this case"
+            );
+        };
+        let must_be_inert = |what: &str, v: HcVariant, why: &str| {
+            let e = moved(what, v);
+            assert_eq!(
+                e, 0.0,
+                "{name}: {what} was expected to be inert here ({why}) but moved \
+                 the answer by {e:e}"
+            );
+        };
+
+        let big_eps = d.eps as f64 >= 1e-3;
+        // An eps site must not be inert; on the large-eps case it must also clear the tolerance
+        // the backend comparisons run at.
+        let tiny = if big_eps { 10.0 * HC_TOL as f64 } else { 1e-9 };
+
+        must_move(
+            "dropping eps on pre",
+            HcVariant {
+                drop_eps_pre: true,
+                ..FAITHFUL
+            },
+            tiny,
+        );
+        if d.head {
+            continue; // no post, no comb, no Sinkhorn
+        }
+        must_move(
+            "reading pre/post at each other's offsets",
+            HcVariant {
+                swap_pre_post: true,
+                ..FAITHFUL
+            },
+            1e-3,
+        );
+        if d.hc == 1 {
+            // Every Sinkhorn detail below is genuinely inert on a 1x1 matrix, for three separate
+            // reasons — see `hyper_connect_hc1_sinkhorn_details_are_inert`, which asserts each one.
+            continue;
+        }
+        must_move(
+            "indexing comb as src + hc*dst",
+            HcVariant {
+                transpose_comb: true,
+                ..FAITHFUL
+            },
+            1e-3,
+        );
+        must_move(
+            "dropping eps after the softmax",
+            HcVariant {
+                drop_eps_softmax: true,
+                ..FAITHFUL
+            },
+            tiny,
+        );
+        must_move(
+            "dropping eps on the over-src sum",
+            HcVariant {
+                drop_eps_src: true,
+                ..FAITHFUL
+            },
+            tiny,
+        );
+        let drop_dst = HcVariant {
+            drop_eps_dst: true,
+            ..FAITHFUL
+        };
+        // At n_iter = 1 the reference's `for (i = 1; i < n_iter)` body never runs, so `norm_dst`
+        // is never called — a direct check that the loop really is the asymmetric one.
+        if d.n_iter > 1 {
+            must_move("dropping eps on the over-dst sum", drop_dst, tiny);
+        } else {
+            must_be_inert(
+                "dropping eps on the over-dst sum",
+                drop_dst,
+                "at n_iter = 1 the loop body never runs, so norm_dst is never called",
+            );
+        }
+        must_move(
+            "giving the extra normalisation to dst (llama.cpp's inverted lambda names)",
+            HcVariant {
+                swap_norm_axes: true,
+                ..FAITHFUL
+            },
+            1e-3,
+        );
+        // The count itself is pinned, but only just, and the mechanism is worth stating: the
+        // softmax already left every src column summing to `1 + hc*eps`, so the symmetric
+        // variant's EXTRA LEADING `norm_dst` divides the whole matrix by one and the same
+        // constant — a uniform rescale that the following `norm_src` undoes. What survives is
+        // second order in eps, ~1e-11 at eps = 1e-6 and ~1e-4 at eps = 1e-2. So the count IS
+        // observable, but below `HC_TOL` on the small-eps cases: the large-eps case is what pins
+        // it for the backends.
+        must_move(
+            "running n_iter of BOTH normalisations",
+            HcVariant {
+                symmetric_iters: true,
+                ..FAITHFUL
+            },
+            if big_eps { HC_TOL as f64 } else { 1e-13 },
+        );
+    }
+}
+
+/// `hc = 1` is degenerate three times over, and each degeneracy makes a Sinkhorn detail inert.
+/// `hyper_connect_details_are_load_bearing` therefore runs only its non-Sinkhorn checks there, and
+/// this test states exactly what is lost — as assertions, so a change that made any of them
+/// observable would show up here rather than silently widen that test's coverage claim:
+///
+/// * a 1×1 matrix is its own transpose, so `comb`'s index formula cannot be got wrong;
+/// * `norm_src` and `norm_dst` are THE SAME operation on a 1×1 matrix, so the asymmetric loop and
+///   its axis-swapped variant collapse onto each other;
+/// * `v ← v/(v + eps)` has a fixed point independent of the initial value, and `n_iter = 4`
+///   reaches it — so a perturbation applied BEFORE the iteration (the post-softmax eps) is washed
+///   out entirely.
+///
+/// What is NOT lost, asserted too: the eps sites INSIDE the normalisations change the fixed point
+/// itself, so they still move the answer — the over-src one at first order in eps (it runs last,
+/// so nothing re-normalises after it) and the over-dst one at second order (the following
+/// `norm_src` almost washes it out, the same mechanism that makes `symmetric_iters` tiny).
+/// `hc = 1` is in the shared table for kernel SHAPE coverage (a degenerate loop bound on every
+/// backend), not for semantics.
+#[test]
+fn hyper_connect_hc1_sinkhorn_details_are_inert() {
+    let d = HcDims {
+        rows: 3,
+        hc: 1,
+        n_embd: 9,
+        eps: 1e-6,
+        n_iter: 4,
+        head: false,
+    };
+    let mixes = hc_mixes(d.rows, d.mix_dim());
+    let (scale, base) = hc_scale_base(d);
+    let (_, _, c0) = hc_ref_mix(&mixes, &scale, &base, d, FAITHFUL);
+    let comb_of = |v: HcVariant| hc_ref_mix(&mixes, &scale, &base, d, v).2;
+    for (what, v) in [
+        (
+            "transposing comb's index",
+            HcVariant {
+                transpose_comb: true,
+                ..FAITHFUL
+            },
+        ),
+        (
+            "swapping the normalisation axes",
+            HcVariant {
+                swap_norm_axes: true,
+                ..FAITHFUL
+            },
+        ),
+        (
+            "dropping eps after the softmax",
+            HcVariant {
+                drop_eps_softmax: true,
+                ..FAITHFUL
+            },
+        ),
+    ] {
+        assert_eq!(
+            c0,
+            comb_of(v),
+            "hc=1: {what} was expected to be exactly inert"
+        );
+    }
+    for (what, v, min) in [
+        (
+            "dropping eps on the over-src sum",
+            HcVariant {
+                drop_eps_src: true,
+                ..FAITHFUL
+            },
+            1e-9, // first order in eps: nothing re-normalises after the last norm_src
+        ),
+        (
+            "dropping eps on the over-dst sum",
+            HcVariant {
+                drop_eps_dst: true,
+                ..FAITHFUL
+            },
+            1e-13, // second order: the following norm_src almost washes it out
+        ),
+    ] {
+        let e = maxdiff64(&c0, &comb_of(v));
+        println!("HyperConnect hc=1: {what} moves comb by {e:e}");
+        assert!(
+            e > min,
+            "hc=1: {what} changes the iteration's fixed point, so it must still move the answer \
+             (moved {e:e}, wanted > {min:e})"
+        );
+    }
+}
+
+/// `Op::HyperConnectPre` — CPU vs the from-definition reference, plus CPU-vs-Vulkan.
+///
+/// The `hc` streams are given magnitudes that differ by three orders of magnitude (stream `h` is
+/// scaled by `100^h`), so a collapse that dropped `weights`, used the wrong stream, or summed the
+/// streams unweighted is off by orders of magnitude rather than by a rounding error. The
+/// `weights` are a real `Op::HyperConnectMix` output (sigmoids in `(0, 1]`), not a synthetic
+/// vector, so this exercises the pair as it will be wired.
+#[test]
+fn hyper_connect_pre_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in hc_cases() {
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (w, _, _) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        let x: Vec<f32> = (0..d.rows * d.hc * d.n_embd)
+            .map(|i| {
+                let h = (i / d.n_embd) % d.hc;
+                (((i * 7 + 3) % 11) as f32 - 5.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let want = hc_ref_pre(&x, &w, d);
+
+        let mut g = Graph::new();
+        let xi = g.input(f32d(d.rows * d.hc * d.n_embd));
+        let wi = g.input(f32d(d.rows * d.hc));
+        let dst = g.output(f32d(d.rows * d.n_embd));
+        g.push(Op::HyperConnectPre {
+            x: xi,
+            weights: wi,
+            dst,
+            rows: d.rows as u32,
+            hc: d.hc as u32,
+            n_embd: d.n_embd as u32,
+        });
+        let go = |be: &dyn Backend| run(be, &g, &[(xi, &x), (wi, &w)], &[], dst, d.rows * d.n_embd);
+        let c = go(&cpu);
+        // Relative: stream 3's magnitude is ~1e6, so an absolute f32 bound would be meaningless.
+        let scale_of = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
+        let e = maxerr64(&c, &want) / scale_of;
+        println!("HyperConnectPre {name}: cpu vs ref rel={e:e} (|out|max={scale_of:e})");
+        assert!(
+            e < HC_TOL as f64,
+            "{name}: HyperConnectPre diverges from the reference ({e:e})"
+        );
+        if let Some(vk) = gpu() {
+            let v = go(&vk);
+            let e = maxerr(&v, &c) as f64 / scale_of;
+            println!("HyperConnectPre {name}: vulkan vs cpu rel={e:e}");
+            assert!(
+                e < HC_TOL as f64,
+                "{name}: Vulkan HyperConnectPre diverges from CPU ({e:e})"
+            );
+        }
+    }
+}
+
+/// `Op::HyperConnectPost` — CPU vs the from-definition reference, plus CPU-vs-Vulkan. `post` and
+/// `comb` are real `Op::HyperConnectMix` outputs. The residual streams again differ by orders of
+/// magnitude, which is what makes a transposed `comb` (or an ignored `post`) a large error rather
+/// than a small one.
+#[test]
+fn hyper_connect_post_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in hc_cases() {
+        if d.head {
+            continue; // the head form has no post/comb, and no sublayer to wrap
+        }
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (_, post, comb) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        let residual: Vec<f32> = (0..d.rows * d.hc * d.n_embd)
+            .map(|i| {
+                let h = (i / d.n_embd) % d.hc;
+                (((i * 5 + 2) % 13) as f32 - 6.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let x: Vec<f32> = (0..d.rows * d.n_embd)
+            .map(|i| (((i * 11 + 4) % 9) as f32 - 4.0) * 0.5)
+            .collect();
+        let want = hc_ref_post(&x, &residual, &post, &comb, d);
+
+        let mut g = Graph::new();
+        let xi = g.input(f32d(d.rows * d.n_embd));
+        let ri = g.input(f32d(d.rows * d.hc * d.n_embd));
+        let pi = g.input(f32d(d.rows * d.hc));
+        let ci = g.input(f32d(d.rows * d.hc * d.hc));
+        let dst = g.output(f32d(d.rows * d.hc * d.n_embd));
+        g.push(Op::HyperConnectPost {
+            x: xi,
+            residual: ri,
+            post: pi,
+            comb: ci,
+            dst,
+            rows: d.rows as u32,
+            hc: d.hc as u32,
+            n_embd: d.n_embd as u32,
+        });
+        let ins = [
+            (xi, &x[..]),
+            (ri, &residual[..]),
+            (pi, &post[..]),
+            (ci, &comb[..]),
+        ];
+        let n = d.rows * d.hc * d.n_embd;
+        let go = |be: &dyn Backend| run(be, &g, &ins, &[], dst, n);
+        let c = go(&cpu);
+        let scale_of = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
+        let e = maxerr64(&c, &want) / scale_of;
+        println!("HyperConnectPost {name}: cpu vs ref rel={e:e} (|out|max={scale_of:e})");
+        assert!(
+            e < HC_TOL as f64,
+            "{name}: HyperConnectPost diverges from the reference ({e:e})"
+        );
+
+        // The RED case, executed on the backend: feed the op a TRANSPOSED comb and confirm the
+        // output moves. `dst + hc*src` vs `src + hc*dst` is otherwise invisible — same buffer
+        // length, same value distribution, and (per the test above) still doubly stochastic.
+        // Skipped at `hc = 1`, where the transpose is the identity — see
+        // `hyper_connect_hc1_transpose_is_genuinely_inert`.
+        if d.hc > 1 {
+            let mut tcomb = comb.clone();
+            for t in 0..d.rows {
+                for dst_h in 0..d.hc {
+                    for src in 0..d.hc {
+                        tcomb[t * d.hc * d.hc + dst_h + d.hc * src] =
+                            comb[t * d.hc * d.hc + src + d.hc * dst_h];
+                    }
+                }
+            }
+            let ins_t = [
+                (xi, &x[..]),
+                (ri, &residual[..]),
+                (pi, &post[..]),
+                (ci, &tcomb[..]),
+            ];
+            let ct = run(&cpu, &g, &ins_t, &[], dst, n);
+            let moved = maxerr(&c, &ct) as f64 / scale_of;
+            println!("HyperConnectPost {name}: transposed comb moves the output by rel={moved:e}");
+            assert!(
+                moved > 1e-3,
+                "{name}: transposing comb changed the output by only {moved:e} — this case cannot \
+             detect the index formula being backwards"
+            );
+        }
+
+        if let Some(vk) = gpu() {
+            let v = go(&vk);
+            let e = maxerr(&v, &c) as f64 / scale_of;
+            println!("HyperConnectPost {name}: vulkan vs cpu rel={e:e}");
+            assert!(
+                e < HC_TOL as f64,
+                "{name}: Vulkan HyperConnectPost diverges from CPU ({e:e})"
+            );
+        }
+    }
+}
+
+/// The `hc_mult` bound is the ONLY thing keeping the GPU kernels' fixed-size per-token matrix in
+/// range (an out-of-range private-array write is undefined, and neither kernel can refuse its own
+/// dispatch), so it has to be shown to fire rather than assumed. `HYPER_CONNECT_MAX_MULT + 1`
+/// must be refused — loudly, before anything is dispatched — on every backend.
+///
+/// CPU refuses by panicking (the interpreter has no error channel in the op loop, like every other
+/// precondition there); Vulkan refuses with an `Err` from compile or execute.
+#[test]
+fn hyper_connect_refuses_hc_above_the_bound() {
+    let hc = infr_core::graph::HYPER_CONNECT_MAX_MULT as usize + 1;
+    let (rows, md) = (2usize, (2 + hc) * hc);
+    let build = || {
+        let mut g = Graph::new();
+        let mx = g.input(f32d(rows * md));
+        let sc = g.weight(f32d(3));
+        let bs = g.weight(f32d(md));
+        let pre = g.output(f32d(rows * hc));
+        let gates = infr_core::graph::HyperGates {
+            post: g.output(f32d(rows * hc)),
+            comb: g.output(f32d(rows * hc * hc)),
+        };
+        g.push(Op::HyperConnectMix {
+            mixes: mx,
+            scale: sc,
+            base: bs,
+            pre,
+            gates: Some(gates),
+            rows: rows as u32,
+            hc: hc as u32,
+            eps: 1e-6,
+            n_iter: 3,
+        });
+        (g, mx, sc, bs, pre, gates)
+    };
+    let go = |be: &dyn Backend| -> Result<(), infr_core::error::Error> {
+        let (g, mx, sc, bs, pre, gates) = build();
+        let plan = be.compile(&g)?;
+        let alloc = |n: usize| be.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let (mb, sb, bb) = (alloc(rows * md), alloc(3), alloc(md));
+        let (pb, ob, cb) = (alloc(rows * hc), alloc(rows * hc), alloc(rows * hc * hc));
+        let mut b = Bindings::new();
+        b.bind(mx, mb.as_ref());
+        b.bind(sc, sb.as_ref());
+        b.bind(bs, bb.as_ref());
+        b.bind(pre, pb.as_ref());
+        b.bind(gates.post, ob.as_ref());
+        b.bind(gates.comb, cb.as_ref());
+        be.execute(plan.as_ref(), &b)
+    };
+
+    let cpu = std::panic::catch_unwind(|| go(&infr_cpu::CpuBackend::new()));
+    assert!(
+        cpu.is_err(),
+        "CPU accepted hc = {hc}, past HYPER_CONNECT_MAX_MULT"
+    );
+    if let Some(vk) = gpu() {
+        let e = go(&vk).expect_err("Vulkan accepted hc past HYPER_CONNECT_MAX_MULT");
+        let msg = e.to_string();
+        println!("Vulkan refusal: {msg}");
+        assert!(
+            msg.contains("hc_mult"),
+            "Vulkan refused hc = {hc} for the wrong reason: {msg}"
+        );
+    }
+}

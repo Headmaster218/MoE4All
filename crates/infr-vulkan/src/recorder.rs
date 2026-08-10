@@ -4111,6 +4111,119 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &[Self::vkb(idx), Self::vkb(dst)], 1, &push, rows);
     }
 
+    /// DeepSeek V4 hyper-connection coefficients (`hyper_mix.comp`, `Op::HyperConnectMix`): one
+    /// thread per token computes `pre`, and — when `gates` is `Some((post, comb))` — `post` plus
+    /// the Sinkhorn-normalised `hc x hc` mixing matrix. `mix_dim` is `(2 + hc)*hc` with gates and
+    /// `hc` without (`build_hc_head`'s narrower `mixes`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hyper_mix(
+        &self,
+        mixes: &dyn Buffer,
+        scale: &dyn Buffer,
+        base: &dyn Buffer,
+        pre: &dyn Buffer,
+        gates: Option<(&dyn Buffer, &dyn Buffer)>,
+        rows: u32,
+        hc: u32,
+        eps: f32,
+        n_iter: u32,
+    ) {
+        let mut bufs = vec![
+            Self::vkb(mixes),
+            Self::vkb(scale),
+            Self::vkb(base),
+            Self::vkb(pre),
+        ];
+        let mix_dim = match gates {
+            Some((post, comb)) => {
+                bufs.push(Self::vkb(post));
+                bufs.push(Self::vkb(comb));
+                (2 + hc) * hc
+            }
+            None => hc,
+        };
+        let (name, spv) = match gates {
+            Some(_) => ("hyper_mix_gates", crate::gemm::hyper_mix_gates_spv()),
+            None => ("hyper_mix", crate::gemm::hyper_mix_spv()),
+        };
+        let k = self.be.kernel(name, spv, bufs.len(), 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&hc.to_ne_bytes());
+        push[8..12].copy_from_slice(&mix_dim.to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        push[16..20].copy_from_slice(&n_iter.to_ne_bytes());
+        // `pre` and (with gates) `post` + `comb` are the writes — the trailing bindings.
+        let n_out = if gates.is_some() { 3 } else { 1 };
+        self.dispatch(k, &bufs, n_out, &push, rows.div_ceil(64));
+    }
+
+    /// DeepSeek V4 hyper-connection stream collapse (`hyper_pre.comp`, `Op::HyperConnectPre`):
+    /// `dst[t, i] = Σ_h x[t, h, i] * w[t, h]`, one thread per output element.
+    pub fn hyper_pre(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let total = rows * n_embd;
+        let k = self
+            .be
+            .kernel("hyper_pre", crate::gemm::hyper_pre_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
+    /// DeepSeek V4 hyper-connection stream re-expansion (`hyper_post.comp`,
+    /// `Op::HyperConnectPost`): `dst[t, d, i] = x[t,i]*post[t,d] + Σ_src res[t,src,i]*comb[t,
+    /// d + hc*src]`, one thread per output element.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hyper_post(
+        &self,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        post: &dyn Buffer,
+        comb: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let total = rows * hc * n_embd;
+        let k = self
+            .be
+            .kernel("hyper_post", crate::gemm::hyper_post_spv(), 5, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(residual),
+                Self::vkb(post),
+                Self::vkb(comb),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
     /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
     /// every cached key against the row's indexer heads and writes the top-`top_k` key indices.
     /// One workgroup per query row — the dispatch below is `rows` groups, and each group's 256

@@ -1,0 +1,36 @@
+#version 460
+// DeepSeek V4 hyper-connection stream re-expansion (`Op::HyperConnectPost`, llama.cpp's
+// `ggml_dsv4_hc_post`) — what replaces `x = x + f(x)`:
+//
+//   dst[t, d, i] = x[t, i]*post[t, d] + sum_src residual[t, src, i]*comb[t, d + hc*src]
+//
+// One thread per output element (`total = rows*hc*n_embd`). `comb`'s per-token flat index is
+// `d + hc*src` — `dst` is the FAST axis; `src + hc*dst` transposes the mixing matrix and still
+// runs (see `Op::HyperConnectMix`'s doc).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint hc;
+    uint n_embd;
+    uint total;   // rows * hc * n_embd
+} pc;
+
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer RB { float res[]; };
+layout(binding = 2) readonly buffer OB { float post[]; };
+layout(binding = 3) readonly buffer CB { float comb[]; };
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) { return; }
+    uint r = i / pc.n_embd;          // t*hc + d
+    uint e = i - r*pc.n_embd;
+    uint t = r / pc.hc;
+    uint d = r - t*pc.hc;
+    float acc = x[t*pc.n_embd + e] * post[t*pc.hc + d];
+    for (uint src = 0u; src < pc.hc; ++src) {
+        acc = fma(res[(t*pc.hc + src)*pc.n_embd + e], comb[t*pc.hc*pc.hc + d + pc.hc*src], acc);
+    }
+    dst[i] = acc;
+}

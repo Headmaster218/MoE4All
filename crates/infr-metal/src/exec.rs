@@ -1402,6 +1402,9 @@ fn op_name(op: &Op) -> &'static str {
         Op::Mla { .. } => "Mla",
         Op::LightningIndexer { .. } => "LightningIndexer",
         Op::TopkMask { .. } => "TopkMask",
+        Op::HyperConnectMix { .. } => "HyperConnectMix",
+        Op::HyperConnectPre { .. } => "HyperConnectPre",
+        Op::HyperConnectPost { .. } => "HyperConnectPost",
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
@@ -1420,6 +1423,20 @@ fn op_name(op: &Op) -> &'static str {
         Op::DeltaNet { .. } => "DeltaNet",
         Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
     }
+}
+
+/// Refuse a stream count wider than the fixed-size private array `hyper_mix_f32` holds a token's
+/// mixing matrix in (`HC_MAX*HC_MAX` floats). The kernel cannot bounds-check itself, so the
+/// refusal has to happen before the encode. See `infr_core::graph::HYPER_CONNECT_MAX_MULT`.
+fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
+    let max = infr_core::graph::HYPER_CONNECT_MAX_MULT;
+    if hc < 1 || hc > max {
+        return Err(Error::Unsupported(format!(
+            "{what}: hc_mult {hc} outside the supported 1..={max} (every shipped DeepSeek V4 \
+             config uses 4)"
+        )));
+    }
+    Ok(())
 }
 
 /// Gated-FFN activation applied to the gate value (matches `infr-cpu`'s `act_fn`).
@@ -5586,6 +5603,128 @@ impl MetalBackend {
                     1 << 1,
                     &p,
                     rows as usize,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::HyperConnectMix {
+                mixes,
+                scale,
+                base,
+                pre,
+                gates,
+                rows,
+                hc,
+                eps,
+                n_iter,
+            } => {
+                hyper_check_hc(hc, "metal Op::HyperConnectMix")?;
+                if n_iter < 1 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::HyperConnectMix: n_iter {n_iter} — Sinkhorn runs at least one \
+                         normalisation over src"
+                    )));
+                }
+                let (rows_u, hc_u) = (rows as usize, hc as usize);
+                let bm = self.ensure_device(r, mixes);
+                let bs = self.weight_buf(scale, g, bindings)?;
+                let bb = self.weight_buf(base, g, bindings)?;
+                let bp = self.dev_dst(r, pre, rows_u * hc_u);
+                // (2 + hc)*hc for the wrapping form, hc for `build_hc_head`'s narrower `mixes`.
+                let mix_dim = if gates.is_some() { (2 + hc) * hc } else { hc };
+                let mut p = rows.to_ne_bytes().to_vec();
+                p.extend_from_slice(&hc.to_ne_bytes());
+                p.extend_from_slice(&mix_dim.to_ne_bytes());
+                p.extend_from_slice(&eps.to_ne_bytes());
+                p.extend_from_slice(&n_iter.to_ne_bytes());
+                let mut bufs: Vec<&MtlBuffer> =
+                    vec![bm.as_ref(), bs.as_ref(), bb.as_ref(), bp.as_ref()];
+                let gb = gates.map(|infr_core::graph::HyperGates { post, comb }| {
+                    (
+                        post,
+                        self.dev_dst(r, post, rows_u * hc_u),
+                        comb,
+                        self.dev_dst(r, comb, rows_u * hc_u * hc_u),
+                    )
+                });
+                if let Some((_, ob, _, cb)) = &gb {
+                    bufs.push(ob.as_ref());
+                    bufs.push(cb.as_ref());
+                }
+                let (pso, wmask) = match gb {
+                    Some(_) => (
+                        self.pipelines.get("hyper_mix_gates_f32")?,
+                        (1 << 3) | (1 << 4) | (1 << 5),
+                    ),
+                    None => (self.pipelines.get("hyper_mix_f32")?, 1 << 3),
+                };
+                self.encode_w(r, &pso, &bufs, wmask, &p, rows_u);
+                r.loc[pre.0 as usize] = Loc::Device;
+                if let Some((post, _, comb, _)) = gb {
+                    r.loc[post.0 as usize] = Loc::Device;
+                    r.loc[comb.0 as usize] = Loc::Device;
+                }
+            }
+            Op::HyperConnectPre {
+                x,
+                weights,
+                dst,
+                rows,
+                hc,
+                n_embd,
+            } => {
+                hyper_check_hc(hc, "metal Op::HyperConnectPre")?;
+                let total = (rows as usize) * (n_embd as usize);
+                let bx = self.ensure_device(r, x);
+                let bw = self.ensure_device(r, weights);
+                let bd = self.dev_dst(r, dst, total);
+                let mut p = hc.to_ne_bytes().to_vec();
+                p.extend_from_slice(&n_embd.to_ne_bytes());
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                let pso = self.pipelines.get("hyper_pre_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::HyperConnectPost {
+                x,
+                residual,
+                post,
+                comb,
+                dst,
+                rows,
+                hc,
+                n_embd,
+            } => {
+                hyper_check_hc(hc, "metal Op::HyperConnectPost")?;
+                let total = (rows as usize) * (hc as usize) * (n_embd as usize);
+                let bx = self.ensure_device(r, x);
+                let br = self.ensure_device(r, residual);
+                let bo = self.ensure_device(r, post);
+                let bc = self.ensure_device(r, comb);
+                let bd = self.dev_dst(r, dst, total);
+                let mut p = hc.to_ne_bytes().to_vec();
+                p.extend_from_slice(&n_embd.to_ne_bytes());
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                let pso = self.pipelines.get("hyper_post_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[
+                        bx.as_ref(),
+                        br.as_ref(),
+                        bo.as_ref(),
+                        bc.as_ref(),
+                        bd.as_ref(),
+                    ],
+                    1 << 4,
+                    &p,
+                    total,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

@@ -4798,3 +4798,234 @@ fn attention_sinks_parity() {
          denominator"
     );
 }
+
+// ---- DeepSeek V4 Sinkhorn hyper-connections: `Op::HyperConnectMix` / `Pre` / `Post`
+// (`hyper_mix_f32`, `hyper_mix_gates_f32`, `hyper_pre_f32`, `hyper_post_f32`).
+//
+// The cases mirror `infr-llama`'s `hyper_connect_*` table case for case — same generators, same
+// axes (production `hc = 4`; `hc = 3`, not a power of two; `hc = 1`, a degenerate 1x1 Sinkhorn;
+// `hc = 8`, `HYPER_CONNECT_MAX_MULT`; `n_iter = 1`, where the asymmetric loop body never runs; the
+// `build_hc_head` form with no `post`/`comb`) — so a Metal-only divergence is identifiable by
+// case. That test is where the semantics are pinned against a from-definition f64 reference; this
+// one only asks whether the Metal kernels reproduce the CPU oracle.
+
+/// One hyper-connection case: `(name, rows, hc, n_embd, eps, n_iter, head)`.
+type HcCase = (&'static str, usize, usize, usize, f32, u32, bool);
+
+const HC_CASES: [HcCase; 7] = [
+    (
+        "production hc=4 n_iter=3, 7 tokens",
+        7,
+        4,
+        5,
+        1e-6,
+        3,
+        false,
+    ),
+    ("hc=4 n_iter=1 (lone norm_src)", 5, 4, 6, 1e-6, 1, false),
+    (
+        "hc=3 (not a power of two) n_iter=2",
+        6,
+        3,
+        7,
+        1e-6,
+        2,
+        false,
+    ),
+    ("hc=1 (degenerate 1x1) n_iter=4", 3, 1, 9, 1e-6, 4, false),
+    (
+        "hc=8 (HYPER_CONNECT_MAX_MULT) n_iter=5",
+        4,
+        8,
+        3,
+        1e-6,
+        5,
+        false,
+    ),
+    ("model head form (pre only), hc=4", 7, 4, 5, 1e-6, 3, true),
+    ("large eps 1e-2, hc=4 n_iter=3", 5, 4, 4, 1e-2, 3, false),
+];
+
+fn hc_mix_dim(hc: usize, head: bool) -> usize {
+    if head {
+        hc
+    } else {
+        (2 + hc) * hc
+    }
+}
+
+/// Same generators as `infr-llama`'s `hc_mixes` / `hc_scale_base`.
+fn hc_inputs(rows: usize, hc: usize, head: bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let md = hc_mix_dim(hc, head);
+    let mixes = (0..rows * md)
+        .map(|i| (((i * 37 + 11) % 23) as f32 - 11.0) * 0.31)
+        .collect();
+    let scale = vec![0.7f32, -1.3, 1.9][..if head { 1 } else { 3 }].to_vec();
+    let base = (0..md)
+        .map(|i| (((i * 13 + 5) % 17) as f32 - 8.0) * 0.17)
+        .collect();
+    (mixes, scale, base)
+}
+
+/// Build one `Op::HyperConnectMix` graph plus its bound inputs and the (id, len) reads.
+#[allow(clippy::type_complexity)]
+fn hc_mix_graph(
+    rows: usize,
+    hc: usize,
+    eps: f32,
+    n_iter: u32,
+    head: bool,
+) -> (Graph, Vec<(TensorId, Vec<u8>)>, Vec<(TensorId, usize)>) {
+    let md = hc_mix_dim(hc, head);
+    let (mixes, scale, base) = hc_inputs(rows, hc, head);
+    let mut g = Graph::new();
+    let mx = g.input(TensorDesc::new(vec![rows * md], DType::F32));
+    let sc = g.weight(TensorDesc::new(vec![scale.len()], DType::F32));
+    let bs = g.weight(TensorDesc::new(vec![md], DType::F32));
+    let pre = g.output(TensorDesc::new(vec![rows * hc], DType::F32));
+    let gates = (!head).then(|| infr_core::graph::HyperGates {
+        post: g.output(TensorDesc::new(vec![rows * hc], DType::F32)),
+        comb: g.output(TensorDesc::new(vec![rows * hc * hc], DType::F32)),
+    });
+    g.push(Op::HyperConnectMix {
+        mixes: mx,
+        scale: sc,
+        base: bs,
+        pre,
+        gates,
+        rows: rows as u32,
+        hc: hc as u32,
+        eps,
+        n_iter,
+    });
+    let bound = vec![
+        (mx, f32_bytes(&mixes)),
+        (sc, f32_bytes(&scale)),
+        (bs, f32_bytes(&base)),
+    ];
+    let mut reads = vec![(pre, rows * hc)];
+    if let Some(gt) = gates {
+        reads.push((gt.post, rows * hc));
+        reads.push((gt.comb, rows * hc * hc));
+    }
+    (g, bound, reads)
+}
+
+/// `Op::HyperConnectMix` — Metal vs the CPU oracle, all three outputs.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn hyper_connect_mix_parity() {
+    for (name, rows, hc, _ne, eps, n_iter, head) in HC_CASES {
+        let (g, bound, reads) = hc_mix_graph(rows, hc, eps, n_iter, head);
+        let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
+        let mtl = run_multi(
+            &MetalBackend::new().expect("metal backend"),
+            &g,
+            &bound,
+            &reads,
+        );
+        for (i, label) in ["pre", "post", "comb"].iter().enumerate().take(reads.len()) {
+            // Same bound as `infr-llama`'s HC_TOL: these outputs are O(1), and a GPU `exp` is only
+            // required to be within a few ULP of the host's.
+            assert_close(
+                &cpu[i],
+                &mtl[i],
+                1e-5,
+                &format!("HyperConnectMix {name} {label}"),
+            );
+        }
+    }
+}
+
+/// `Op::HyperConnectPre` — Metal vs CPU. The `hc` streams differ in magnitude by `100^h`, so a
+/// collapse that dropped `weights` or picked the wrong stream is off by orders of magnitude.
+/// `weights` is a real `Op::HyperConnectMix` output, so the pair is exercised as it will be wired.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn hyper_connect_pre_parity() {
+    for (name, rows, hc, ne, eps, n_iter, head) in HC_CASES {
+        let (mg, mbound, mreads) = hc_mix_graph(rows, hc, eps, n_iter, head);
+        let w = run_multi(&CpuBackend::new(), &mg, &mbound, &mreads).swap_remove(0);
+        let x: Vec<f32> = (0..rows * hc * ne)
+            .map(|i| {
+                let h = (i / ne) % hc;
+                (((i * 7 + 3) % 11) as f32 - 5.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows * hc * ne], DType::F32));
+        let wi = g.input(TensorDesc::new(vec![rows * hc], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows * ne], DType::F32));
+        g.push(Op::HyperConnectPre {
+            x: xi,
+            weights: wi,
+            dst,
+            rows: rows as u32,
+            hc: hc as u32,
+            n_embd: ne as u32,
+        });
+        println!("HyperConnectPre metal case: {name}");
+        // `assert_parity`'s error is relative to `max(|cpu|, 1)`, which is what makes the 1e6-scale
+        // streams comparable at all.
+        assert_parity(
+            &g,
+            &[(xi, f32_bytes(&x)), (wi, f32_bytes(&w))],
+            dst,
+            rows * ne,
+            1e-5,
+        );
+    }
+}
+
+/// `Op::HyperConnectPost` — Metal vs CPU, with `post`/`comb` taken from a real
+/// `Op::HyperConnectMix` run and residual streams again spread over `100^h`.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn hyper_connect_post_parity() {
+    for (name, rows, hc, ne, eps, n_iter, head) in HC_CASES {
+        if head {
+            continue; // the head form has no post/comb, and no sublayer to wrap
+        }
+        let (mg, mbound, mreads) = hc_mix_graph(rows, hc, eps, n_iter, head);
+        let mixed = run_multi(&CpuBackend::new(), &mg, &mbound, &mreads);
+        let (post, comb) = (&mixed[1], &mixed[2]);
+        let residual: Vec<f32> = (0..rows * hc * ne)
+            .map(|i| {
+                let h = (i / ne) % hc;
+                (((i * 5 + 2) % 13) as f32 - 6.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let x: Vec<f32> = (0..rows * ne)
+            .map(|i| (((i * 11 + 4) % 9) as f32 - 4.0) * 0.5)
+            .collect();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows * ne], DType::F32));
+        let ri = g.input(TensorDesc::new(vec![rows * hc * ne], DType::F32));
+        let pi = g.input(TensorDesc::new(vec![rows * hc], DType::F32));
+        let ci = g.input(TensorDesc::new(vec![rows * hc * hc], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows * hc * ne], DType::F32));
+        g.push(Op::HyperConnectPost {
+            x: xi,
+            residual: ri,
+            post: pi,
+            comb: ci,
+            dst,
+            rows: rows as u32,
+            hc: hc as u32,
+            n_embd: ne as u32,
+        });
+        println!("HyperConnectPost metal case: {name}");
+        assert_parity(
+            &g,
+            &[
+                (xi, f32_bytes(&x)),
+                (ri, f32_bytes(&residual)),
+                (pi, f32_bytes(post)),
+                (ci, f32_bytes(comb)),
+            ],
+            dst,
+            rows * hc * ne,
+            1e-5,
+        );
+    }
+}

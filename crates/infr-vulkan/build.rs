@@ -531,6 +531,13 @@ fn main() {
         // expansion of its indices into the additive score mask `Op::Mla` adds (Op::TopkMask).
         ("lightning_indexer", "lightning_indexer", &[]),
         ("topk_mask", "topk_mask", &[]),
+        // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
+        // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
+        // pre-only form, whose `mixes` is the pre chunk alone.
+        ("hyper_mix", "hyper_mix", &[]),
+        ("hyper_mix", "hyper_mix_gates", &["-DGATES"]),
+        ("hyper_pre", "hyper_pre", &[]),
+        ("hyper_post", "hyper_post", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
