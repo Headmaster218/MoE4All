@@ -609,6 +609,31 @@ impl ProfCfg {
 }
 
 cfg_struct! {
+    /// Model acquisition from the HuggingFace hub (`infr pull`, and the auto-pull `infr run` and
+    /// `infr serve` do when a model is missing).
+    HubCfg / PartialHubCfg {
+        /// `INFR_PULL_JOBS`: how many files of one model may download AT THE SAME TIME.
+        ///
+        /// A split model is `-NNNNN-of-MMMMM` shards that are fetched one per connection, and a
+        /// single HTTPS connection to the HF CDN is the ceiling, not the link. Measured against
+        /// `unsloth/DeepSeek-V3.2-GGUF`'s Q2_K shards (`curl` to `/dev/null`, 25 s per run): one
+        /// connection sustained 8.8 MB/s, five sustained 78.7 MB/s — 15.7 MB/s EACH, so the
+        /// per-connection rate went UP rather than down. Five connections were nowhere near the
+        /// point where they start competing, which is why the default sits above five.
+        ///
+        /// It also has to stay a fan-OUT rather than a fan-EVERYTHING: shard counts are set by
+        /// whoever published the repo (`DeepSeek-V3.2-REAP` ships 236 shards), so "one connection
+        /// per shard" is not a bound at all. Each in-flight download holds its own socket, its own
+        /// `.dl-` temp file and its own progress LINE — and a bar block taller than the terminal
+        /// is the first of those to stop being free.
+        ///
+        /// `0` and `1` both mean strictly sequential — today's behaviour, and the value to set
+        /// when a proxy or a metered link wants exactly one connection.
+        pull_jobs: usize = 8,
+    }
+}
+
+cfg_struct! {
     /// Debug/poison/barrier switches. Setting any of these from the config FILE is announced at
     /// startup (§11 [DECIDE-7]).
     DebugCfg / PartialDebugCfg {
@@ -689,6 +714,8 @@ cfg_struct! {
             prof: ProfCfg => PartialProfCfg,
             /// Server.
             serve: ServeCfg => PartialServeCfg,
+            /// Model acquisition from the HuggingFace hub.
+            hub: HubCfg => PartialHubCfg,
             /// Debug switches.
             debug: DebugCfg => PartialDebugCfg,
         }

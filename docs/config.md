@@ -272,6 +272,18 @@ which are that one request's own speeds (`prompt_tokens / TTFT` and
 `gen_tokens / (total - TTFT)`). Request logging carries **counts only, never
 prompt text**.
 
+**`[hub]`** — model acquisition (`infr pull`, and the auto-pull `infr run` /
+`infr serve` do when a model is missing). One knob: `pull_jobs`
+(`INFR_PULL_JOBS`, default `8`) — how many files of one model download at the
+same time. A split model is `-NNNNN-of-MMMMM` shards fetched one per connection,
+and it is the CONNECTION that is slow, not the link: measured against the same
+CDN objects, one connection sustained 8.8 MB/s and five sustained 78.7 MB/s —
+15.7 MB/s each, so the per-connection rate rose rather than fell. Shard counts
+come from whoever published the repo (`DeepSeek-V3.2-REAP` ships 236), so the
+bound is what keeps the fan-out from becoming one socket per shard. `0` and `1`
+both mean strictly sequential — the setting for a metered link, or for a proxy
+that objects to several connections from one client.
+
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,
 `chat`, `moe_counts`, `moe_counts_dump`, `poison_uninit`, `no_barrier`,

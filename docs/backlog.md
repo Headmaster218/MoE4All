@@ -1328,6 +1328,115 @@ throughput claim. Three things a first perf pass should start from:
   before every top-k. Inert while `n_expert_groups <= 1`, so it costs nothing
   today and everything on V3.
 
+### B56 — ranged parallelism WITHIN one file is not implemented (2026-08-10)
+
+**Tag:** concurrent-pull slice · **Blocked on:** nothing; scoped out, and it
+needs a persisted-state decision before it can be written safely
+
+`infr pull` now fetches several FILES at once (`hub.pull_jobs`,
+`infr_hub::pull`'s `fetch_all`), which is worth ~9x on a split model because a
+single HF CDN connection is the ceiling, not the link (measured on this host
+against the DeepSeek-V3.2 Q2_K objects: 1 connection 8.8 MB/s, 5 connections
+78.7 MB/s aggregate). It does nothing for a model that ships as ONE file —
+`unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` variant is a single 161 GB GGUF, and
+it will still take the ~9 MB/s path. The same gap shows up as the tail of every
+shard set: once fewer files remain than there are workers, the pull falls back
+to one connection.
+
+**The mechanism exists.** HF serves ranges — that is what
+`download::download_to_blob`'s resume already relies on — so N workers could
+each `GET Range: bytes=A-B` and `pwrite` their slice into the one temp file, and
+the existing end-of-body sha256 over the assembled file would still be the
+integrity gate, unchanged.
+
+**What stops it being a small change is RESUME.** Today "how much do I already
+have" is `metadata(tmp).len()`, which is only meaningful because exactly one
+writer appends. With N sparse writers the file's length stops being the amount
+downloaded, so an interrupted pull would need a persisted per-range progress
+sidecar next to the `.dl-` temp, plus a rule for what happens when the range
+plan changes between attempts (different `pull_jobs`, a resized object) and for
+an `If-Range` validator that is now per-range. Getting that wrong reproduces
+exactly the failure class the sha256 gate exists for — a plausible-sized file
+assembled from two different uploads — which cost a day of "the quant is broken"
+debugging once already (memory `verify-gguf-downloads`).
+
+**If it is picked up:** the honest cheap version is to make it opt-in and
+resume-less — a single-file download splits into ranges only when there is no
+partial on disk, and any interruption discards the temp and starts over. That
+keeps the state machine as it is and still fixes the 161 GB single-file case;
+the cost is that a failure at 150 GB is a full restart, which is the trade to
+put in front of the user rather than decide here.
+
+### B57 — `infr pull` ignores the shutdown latch (2026-08-10)
+
+**Tag:** concurrent-pull slice · **Blocked on:** nothing; PRE-EXISTING, left out
+of the concurrency slice on scope grounds
+
+The CLI installs `SIGINT`/`SIGTERM` handlers that latch
+`infr_core::shutdown::request_shutdown`, and every GPU submit path polls
+`shutdown_requested()`. Nothing on the download path does: neither
+`download::stream_into`'s read loop nor `pull::fetch_all`'s claim loop. Verified
+by observation, not by reading alone — a `SIGTERM` sent to a running
+`infr pull unsloth/DeepSeek-V3.2-GGUF:Q2_K` left the process downloading, and it
+took `SIGKILL` to stop it.
+
+Nothing is corrupted by that: the partials are append-only, the next run resumes
+from `metadata(tmp).len()`, and a real 229 GB pull was in fact killed and
+resumed exactly this way. The defect is that the first Ctrl-C appears to do
+nothing.
+
+**The fix is two polls**, both of which keep today's "partial kept for resume"
+contract: `fetch_all`'s `while !stop` becomes
+`while !stop && !shutdown_requested()` so a fan-out over 236 shards stops
+claiming files, and `stream_into` checks per 64 KiB chunk and returns
+`Error::Aborted`. The second one is why this was not just done: `Aborted` would
+have to travel out through `StreamError`, and the caller must treat it as the
+KEEP-the-partial case rather than the discard case — a distinction the current
+two-variant enum makes by accident of which error it is, not deliberately.
+
+### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
+
+**Tag:** concurrent-pull slice coverage · **Blocked on:** nothing; each line is
+a gap, stated so the coverage claim stays honest
+
+`hub.pull_jobs` and `pull::fetch_all` are covered by six tests against a local
+HTTP origin (`infr-hub/src/testhttp.rs`) — all files land, the bound is asserted
+on the peak the SERVER observed, `jobs = 1` stays sequential, a planted partial
+resumes under concurrency, a stale `If-Range` restarts rather than splices, a
+sha256 mismatch is refused and unlinked, and a failure stops the fan-out — plus
+one real 229 GB five-shard pull. Not covered:
+
+- **A concurrency bound above 5 in anger.** The real run had five shards and the
+  default is 8, so the default has never actually bounded anything on the
+  network; only the local-origin test has run it at a bound below the file
+  count. Where the per-connection rate finally bends is therefore unmeasured —
+  the 1-vs-5 curl comparison shows five is not it (per-connection throughput
+  ROSE from 8.8 to 15.7 MB/s), and nothing above five was tried.
+- **Two `infr` processes pulling the same model at once.** The per-blob `flock`
+  that serialises them is unchanged and still unit-tested
+  (`file_lock_is_exclusive`), but no test starts a second process, and the
+  cross-process case is now N locks held at once instead of one.
+- **A repo with more files than the bound.** `DeepSeek-V3.2-REAP`'s 236 shards
+  is the case the bound exists for, and it has only been exercised at 10 files /
+  3 workers against a local origin with the progress group HIDDEN. What that
+  leaves unknown is the shape of the bar block over a long queue: `indicatif`
+  reaps a finished bar's line only once every bar ahead of it has also finished
+  (`BarState::drop` marks a zombie; `MultiState::draw` reaps consecutive zombies
+  from the head), so files completing out of order could leave the redrawn block
+  growing past `pull_jobs` lines. Five shards did not show it. If it turns out
+  to matter, the lever is `MultiProgress::remove` / `finish_and_clear` on each
+  completed bar, at the cost of the per-shard `✓` line.
+- **Windows and macOS.** `download.rs` calls `libc::flock` unconditionally, so
+  `infr-hub` does not build on Windows at all (B30 records the same); the
+  fan-out itself is `std::thread::scope` and portable. macOS is CI-only.
+- **`HF_TOKEN` on a gated repo.** The token now reaches `download_to_blob` from
+  inside rather than as a parameter; unchanged in effect, but no gated repo was
+  pulled.
+- **The progress rendering was read, not eyeballed live.** The five-bar block
+  was captured from a `script`-allocated pty and inspected as escape sequences
+  (one line per shard, `MultiProgress::suspend` clearing the block around each
+  log line), not watched on a real terminal.
+
 ### B27 — hardening candidates from the 2026-08-03 review
 
 **Tag:** CR-2026-08-03 hardening · **Blocked on:** nothing; none of these is an

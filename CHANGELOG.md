@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr pull` fetches a split model's shards concurrently.** A single
+  connection to the HF CDN is what caps a download, not the link — measured
+  against the same objects, one connection sustained 8.8 MB/s and five sustained
+  78.7 MB/s — so the shards of a `-NNNNN-of-MMMMM` set are now fetched several
+  at a time. A 245 GB five-shard `unsloth/DeepSeek-V3.2-GGUF:Q2_K` pull ran at
+  80 MB/s end to end. Bounded by the new `hub.pull_jobs` (`INFR_PULL_JOBS`,
+  `--set hub.pull_jobs=N`, default `8`), because shard counts come from the repo
+  rather than from the user (`DeepSeek-V3.2-REAP` ships 236); `0` and `1` both
+  keep the old strictly sequential behaviour. Resume, the LFS-sha256 gate and
+  the refusal to link a mismatched blob are unchanged and per-file. Concurrent
+  downloads each get their own progress line (`infr_core::progress::group`)
+  instead of overwriting one another, and a failed file stops the others from
+  claiming more work instead of pulling the rest of a model that cannot load.
+
 - **Multi-shard (`gguf-split`) models load.** `Gguf::open` on any member of a
   `-NNNNN-of-MMMMM.gguf` set follows `split.count` to the whole set, maps every
   shard separately (each keeping the shared file mapping that makes a

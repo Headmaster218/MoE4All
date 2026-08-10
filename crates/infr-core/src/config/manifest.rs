@@ -324,6 +324,11 @@ knobs! {
     // Same "`0` is a VALUE, not a bad one" grammar as the deadline above: `0` disables the periodic
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
+
+    // ── hub (§6.9) ───────────────────────────────────────────────────────────
+    // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one file at a
+    // time", so the env layer must not filter it out.
+    "INFR_PULL_JOBS" => "hub.pull_jobs", Int, Ignored, "4", migrated;
 }
 
 /// `INFR_*` keys that exist in `crates/*/src` (or a `build.rs`) and deliberately do NOT become

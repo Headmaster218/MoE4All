@@ -257,3 +257,13 @@ moe_counts = false
 poison_uninit = false # fill fresh buffers with a poison pattern
 no_barrier = false
 full_barrier = false
+
+# ── hub ──────────────────────────────────────────────────────────────────────
+
+[hub]
+# How many files of ONE model download at the same time. A split model is
+# `-NNNNN-of-MMMMM` shards fetched one per connection, and the CONNECTION is the
+# ceiling, not the link (measured here: 1 connection 8.8 MB/s, 5 connections
+# 78.7 MB/s). The bound matters because shard counts come from the repo, not
+# from you — some ship 236. 0 and 1 both mean strictly sequential.
+pull_jobs = 8

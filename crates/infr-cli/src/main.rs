@@ -676,7 +676,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
 
 fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::Result<()> {
     match cmd {
-        Cmd::Pull { model } => cmd_pull(&model),
+        Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
         Cmd::Run {
             model,
@@ -846,7 +846,7 @@ fn is_local_gguf(path: &Path) -> bool {
 /// Accept a path to a `.gguf` FILE or an `org/repo[:quant]` HuggingFace ref resolved via infr-hub.
 /// The tokenizer is the `tokenizer.json` beside the GGUF if present, else `None` → derived from the
 /// GGUF's embedded vocab (HF Hub blobs are content-addressed with no sidecar).
-fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+fn resolve(model: &str, cfg: &Config) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
     let p = Path::new(model);
     let gguf = if is_local_gguf(p) {
         PathBuf::from(model)
@@ -856,7 +856,7 @@ fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
         // non-`.gguf` file that happens to exist) instead of a bare parse error dressed as a
         // network pull.
         match infr_hub::ModelRef::parse(model) {
-            Ok(r) => infr_hub::ensure(&r).map_err(|e| anyhow!("{e}"))?,
+            Ok(r) => infr_hub::ensure(&r, cfg).map_err(|e| anyhow!("{e}"))?,
             Err(e) if p.exists() => {
                 anyhow::bail!(
                     "`{model}` exists but is not a `.gguf` file — pass a path to a `.gguf`, or an \
@@ -927,11 +927,11 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_pull(model: &str) -> anyhow::Result<()> {
+fn cmd_pull(model: &str, cfg: &Config) -> anyhow::Result<()> {
     let r = infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?;
     // `pull` checks HF for the repo's latest commit and updates a stale cache (run/serve stay
     // cache-first via `ensure`). Offline → falls back to the cached copy.
-    let path = infr_hub::ensure_latest(&r).map_err(|e| anyhow!("{e}"))?;
+    let path = infr_hub::ensure_latest(&r, cfg).map_err(|e| anyhow!("{e}"))?;
     // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
     println!("{}", path.display());
     Ok(())
@@ -1106,7 +1106,7 @@ fn cmd_run(
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    let (gguf, tok) = resolve(model)?;
+    let (gguf, tok) = resolve(model, cfg)?;
     // Stamped next to the mapping it guards, then checked before every turn below.
     let watch = infr_llama::WeightWatch::open(&gguf)?;
     // diffusion-gemma (block text-diffusion, Phase 3 — docs/diffusion-gemma.md): a cheap arch peek
@@ -2073,7 +2073,7 @@ fn cmd_bench(
             Ok((p.trim().parse()?, g.trim().parse()?))
         })
         .transpose()?;
-    let (gguf, tok) = resolve(model)?;
+    let (gguf, tok) = resolve(model, cfg)?;
     // Stamped before the model loads and checked before any arm reports, so the timed window is
     // covered end to end. Each sub-bench arm below stamps its own for the same reason.
     let watch = infr_llama::WeightWatch::open(&gguf)?;
@@ -3105,7 +3105,7 @@ impl ModelBench {
         // hand BOTH tools the same reference: `infr bench` takes `model` verbatim, and llama-bench
         // gets the matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so
         // `--offline` holds.
-        let (resolved, tok_path) = resolve(model)?;
+        let (resolved, tok_path) = resolve(model, &cfg)?;
         // diffusion-gemma (Phase 4/E, docs/diffusion-gemma.md): the arch's PR isn't merged into
         // mainline llama.cpp, so `llama-bench` can't run it — but the reference fork at
         // `~/Projects/mxaddict/llama.cpp-dg` builds `llama-diffusion-cli`, which IS a usable
@@ -3936,7 +3936,7 @@ fn cmd_serve(
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
-    let (gguf, tok) = resolve(model)?;
+    let (gguf, tok) = resolve(model, cfg)?;
     let model_id = gguf
         .file_stem()
         .and_then(|s| s.to_str())
@@ -4126,7 +4126,7 @@ fn cmd_multi(
                 devices.len()
             );
         }
-        let (gguf, tok) = resolve(model_ref)?;
+        let (gguf, tok) = resolve(model_ref, cfg)?;
         if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
             anyhow::bail!(
                 "`{model_ref}` is a diffusion-gemma model, which `infr multi` does not host \
