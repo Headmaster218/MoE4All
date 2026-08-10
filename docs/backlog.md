@@ -1121,18 +1121,139 @@ the tests that exist would then gain teeth for free.
 
 ### B53 — V4's KV geometry is a placeholder (2026-08-10)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** the stage-4 compressed-KV
-slice, which owns the real answer
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** the stage-4 wiring slice (§
+B-DSV4-WIRING), which is the first thing that reads it
 
-`seam::kv_row_elems` currently answers `n_kv * head_dim` for `deepseek4`, which
-is only the raw sliding-window cache. The real thing is the seven-structure
-state machine in llama.cpp's `llama-kv-cache-dsv4.cpp` (1978 lines): three
-compressor states holding in-flight partial blocks, an overlapping 2×ratio
-pooling window with `-inf` sentinel rows, and absolute position-in-block
-embeddings. Buffers are allocated on that placeholder geometry today, before the
-graph-build refusal fires — harmless because nothing reads them, and wrong the
-moment the emit slice lands. `docs/deepseek.md` § Stage 4 calls this the largest
-single porting risk in the family.
+`seam::kv_row_elems` has no `deepseek4` branch, so V4 falls through to the
+generic `layer_n_kv(l) * layer_head_dim(l)` arm. The geometry is now known
+exactly — `llama-kv-cache-dsv4.cpp` has been read in full and the inventory is
+tabulated in `docs/deepseek.md` § Stage 4, "The compressed-KV state machine" —
+so this entry records the answer rather than the question.
+
+**What the generic arm gets right:** V4 is MQA (`attn_kv` is
+`[n_embd, head_dim]`, one KV head for every query head), so
+`layer_n_kv(l) * layer_head_dim(l)` is `1 * head_dim`, which IS the raw
+sliding-window cache's K row width. A ratio-0 layer needs nothing else, which is
+why the wiring slice can start there.
+
+**What it gets wrong, in order of how much it costs:**
+
+- **The V side is a duplicate.** V4's attention is
+  `build_attn_mha(q, k_all, k_all, …)` — K and V are the same rows, exactly as
+  MLA aliases V into the K row. The generic arm returns `(row, row)`, allocating
+  and copying a V cache nothing distinct ever writes. Whether the answer is
+  `(head_dim, 0)` (MLA's aliasing, with `kv_side_elems` supplying the
+  placeholder) depends on whether `Op::Attention` can be pointed at one buffer
+  for both sides; decide it with the emit, not before.
+- **The compressed caches are unmodelled.** A ratio-4 layer additionally needs a
+  CSA cache (`PAD(ceil(ctx/4), 256)` rows × `head_dim`) and a LID cache (same
+  rows × `indexer_head_size`); a ratio-128 layer needs an HCA cache
+  (`PAD(ceil(ctx/128), 256)` rows × `head_dim`). These are per-layer and keyed
+  on `layer_compress_ratio(l)`, so unlike deepseek32's indexer cache they cannot
+  ride a free side uniformly — layers genuinely differ in how many caches they
+  own.
+- **The compressor states are unmodelled and are not per-token.** Three of them,
+  each TWO f32 tensors (`kv` and `score`), `[n_embd_state, state_size]` per
+  stream, always f32 regardless of `type_k`: CSA `8 × 2*head_dim`, HCA
+  `128 × head_dim`, LID `8 × 2*indexer_head_size`. Fixed-size recurrent state,
+  so the precedent is `MixerW::DeltaNet`'s conv/S-state allocation, not
+  `kv_row_elems`.
+
+Buffers are allocated on the placeholder geometry today, before the graph-build
+refusal fires — harmless because nothing reads them, and wrong the moment the
+emit slice lands. Note `kv_rows` already handles V4's sliding window correctly
+(`Config::is_swa_layer` returns `swa_window > 0` for every layer when
+`deepseek4`, matching `set_swa_pattern(0)`), so only the row WIDTHS are at
+issue.
+
+### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
+
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; this is the next
+stage-4 slice
+
+The op layer is finished (`HyperConnectMix`/`Pre`/`Post`, `Attention::sinks`,
+`Rope::backward`, `QkNorm { weight: None }`, `GatedAct::swiglu_clamp`,
+`MoeFfn::expert_ids`, `MoeGating::SqrtSoftplus` — all three backends, all with
+parity tests), config parsing is finished, and every V4 tensor already uploads.
+What is missing is the seam graph build. Scoped as two slices, because the
+ratio-0 half needs no new ops and the compressed half needs several.
+
+**Slice A — ratio 0 end to end.** Four insertions, in dependency order:
+
+1. A `deepseek4` branch in `seam::kv_row_elems` (§ B53).
+2. A `MixerW::Dsv4` variant in `seam/weights.rs` plus a matching `wpush` arm in
+   `runner.rs`'s handle loop, in the **exact** order of the existing `is_dsv4`
+   upload arm — `wpush` consumes `wspecs` sequentially, so one missing handle
+   binds every later weight in the layer one buffer off, silently. The per-layer
+   hyper-connection triples and the model-level `output_hc_*` triple are not
+   mixer weights and need somewhere of their own on `LayerW`.
+3. V4-gated scratch declarations beside the existing `mla_*` block.
+4. An emit arm where the residual is a `[batch, hc, n_embd]` widened stream and
+   `HyperConnectMix → HyperConnectPre → sublayer → HyperConnectPost`
+   **replaces** the `Op::Add { a: hidden, b: sub, dst: hidden }` pattern at both
+   the attention and the FFN tail. The head is
+   `HyperConnectMix { gates: None }` + `HyperConnectPre` collapsing back to
+   `[batch, n_embd]` before `output_norm`.
+
+Design questions to settle before writing it, each of which was verified against
+the code rather than assumed:
+
+- **`HyperConnectPost` cannot run in place.** Every output element
+  `dst[t, dst_h, i]` reads `residual[t, src, i]` for all `src`, so aliasing
+  `dst` onto `residual` corrupts the second and later streams. The widened
+  stream needs two buffers, ping-ponged per wrap — four wraps per layer pair, so
+  pick the convention once.
+- **`w_off` on an f32 weight is refused on Vulkan.** The grouped output
+  projection wants `Op::Linear { w_off: g * o_lora_rank * o_group_dim }` to
+  select group `g`'s rows of `wo_a`, but the adapter errors with "Linear w_off
+  on a non-native weight" unless the dtype is in `native_dense_dtypes()`, which
+  excludes F32 and F16. The synthetic fixture writes f32, so the CPU-vs-Vulkan
+  parity test cannot use `w_off` as-is. Options: emit `wo_a` in a native-block
+  dtype in the fixture, pack-copy the weight slice per group, or run the whole
+  `wo_a` per group and slice the output. Setting `o_group_count == 1` in the
+  fixture is NOT an option — it would leave the grouped path untested, which is
+  a check that cannot fail.
+- **The rope slice is a TAIL, not a prefix.** V4's q, kv and indexer heads are
+  all `[nope | rope]`, with the roped dims LAST. `Op::Rope` rotates
+  `[0, rope_dim)` of each head, so V4 needs the extract → rope → copy-back dance
+  the MLA arm already does for `k_pe`, at three sites (q, kv, and the `backward`
+  de-rope of the attention output).
+- **The de-rope is per head over the attention output**, before the grouped
+  projection — `Op::Rope { backward: true }` at the same `theta` and layout as
+  the forward q rope. Ratio-0 layers rope at `rope_theta` plain (no YaRN:
+  llama.cpp passes `freq_scale = 1`, `ext_factor = 0`, both betas 0,
+  `n_ctx_orig = 0`), so `backward` is an exact inverse there.
+- **Every V4 layer is sliding-window**, including ratio-0 ones, so the mask is
+  `AttnMask::SlidingWindow(swa_window)` — never `Causal`.
+- **`kq_scale` is a plain `1/sqrt(head_dim)`** at all three attention call
+  sites. None of stage 2's mscale² games apply.
+
+The tripwire to replace when this lands is
+`synthetic_deepseek4_refuses_to_generate`, which asserts the refusal string
+verbatim; it becomes a CPU `prefill_is_finite` plus a `gpu_..._matches_cpu`
+modelled on the deepseek32 pair. The refusal and its `assert!` backstop must
+stay for ratios 4 and 128 until slice B.
+
+**Slice B — ratios 4 and 128.** Needs new ops, not just wiring:
+
+- A **per-channel softmax pooling** op (softmax over the block axis, then a
+  weighted sum) — no current op does it.
+- Persistent **compressor state** buffers with the ring-update and commit plan
+  of `dsv4_build_comp_plan`, including the `[persistent | scratch | sentinel]`
+  gather layout and the two-contiguous-halves read order for the overlapping
+  compressors.
+- **`Op::Attention` has no `key_bias` field.** `Op::TopkMask` exists and
+  `Op::Mla` consumes it, but the CSA path needs a top-k mask on ordinary
+  attention over a concatenated `[raw | compressed]` K, which has nowhere to go
+  today.
+- **`Op::LightningIndexer`'s contract is written for V3.2's per-token key
+  cache.** V4's keys come out of the compressor, so `top_k` counts compressed
+  blocks; re-read the op's `k_cache`/`kv_len` meaning before reusing it.
+- The four boundary conditions in `docs/deepseek.md` § Stage 4 each need a test
+  that fails without them — in particular the one where a prefill shorter than
+  the ratio produces `n_kv == 0` and llama.cpp silently builds a **different
+  graph** (pure raw attention), which is not a masking difference and cannot be
+  tested as one.
 
 ### B54 — `WeightWatch` watches one file of a shard set (2026-08-10)
 

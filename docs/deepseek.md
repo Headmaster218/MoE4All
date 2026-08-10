@@ -688,11 +688,25 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: the LOAD path and the four attention PRIMITIVES are done; nothing is
-emitted yet.** Slice 2 added the op-level pieces V4's attention needs, on CPU,
-Vulkan and Metal, with op-level parity tests in
-`crates/infr-llama/tests/seam_op_parity.rs` and
-`crates/infr-metal/tests/parity.rs`:
+**Progress: the LOAD path and every attention/HC/MoE PRIMITIVE are done, the
+compressed-KV state machine is now SPECIFIED from the source, and nothing is
+emitted yet.** The graph-build refusal in `seam::runner::generate_dense_backend`
+and its `assert!` backstop are both still in place, for every compression ratio
+including 0.
+
+The most recent slice (2026-08-10) was a read, not a port:
+`llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
+account of the compressed caches the least trustworthy part of the document. It
+has been, and "The compressed-KV state machine" below is rewritten off it — the
+real inventory, the per-ubatch index plan, four boundary conditions, and two
+corrections to what this document previously claimed about V4's indexer (its
+rope type and its head order were both stated backwards). No graph code was
+written. What the wiring slice still owes, and the design questions it has to
+answer first, are in `docs/backlog.md` § B53 and § B-DSV4-WIRING.
+
+Slice 2 added the op-level pieces V4's attention needs, on CPU, Vulkan and
+Metal, with op-level parity tests in `crates/infr-llama/tests/seam_op_parity.rs`
+and `crates/infr-metal/tests/parity.rs`:
 
 1. **Unweighted per-head RMS norm on Q** — `Op::QkNorm { weight: Option<_> }`.
    `None` is the bare `ggml_rms_norm` V4 calls after `wq_b`; a ones-vector
@@ -823,14 +837,22 @@ recall comes exclusively from the compressed caches.
 |     4 | CSA + lightning indexer | raw SWA + CSA(4:1) + LID(4:1) + two compressor states |
 |   128 | HCA                     | raw SWA + HCA(128:1) + compressor state               |
 
+The two ratio-4 compressor states are **overlapping** (`state_size == 2*ratio`,
+so each committed row pools a 2×ratio window); the ratio-128 one is **not**
+(`state_size == ratio`). That asymmetry is in the constructor, not in the graph
+— see "The compressed-KV state machine" below.
+
 Only `{0, 4, 128}` are accepted. Compressed layers use YaRN at
 `compress_rope_theta`; ratio-0 layers use plain unscaled rope. `kq_scale` is
 plain `1/sqrt(n_embd_head)` at all three call sites — none of stage 2's mscale²
 games.
 
-V4's indexer differs from V3.2's in one structural way: **there is no
-`indexer_attn_k` and no `indexer_k_norm`.** The indexer keys come from the
-compressor, so `index_topk` counts _compressed blocks_, not tokens.
+V4's indexer differs from V3.2's in three structural ways. **There is no
+`indexer_attn_k` and no `indexer_k_norm`** — the indexer keys come from the
+compressor, so `index_topk` counts _compressed blocks_, not tokens. And its rope
+is **NORM** with a **`[nope | rope]`** head, both the opposite of V3.2: see "Two
+corrections to what this document said about V4's indexer" below, which reads
+them off the source.
 
 ### Sinkhorn hyper-connections
 
@@ -899,15 +921,158 @@ deviations below was injected into the CPU arm and shown to go red):
 
 ### The compressed-KV state machine
 
-This is the **largest single porting risk in the family**. Seven cache
-structures, three compressor states holding in-flight partial blocks, an
-overlapping 2×ratio pooling window with `-inf` sentinel rows, absolute
-position-in-block embeddings indexed by `pos % ratio`, and per-channel softmax
-pooling. The index planning lives in `llama-kv-cache-dsv4.cpp` (1978 lines),
-which **was not read in full** — the graph code is only meaningful given those
-index plans, and the boundary conditions (partial block at the end of a prefill,
-how visible length interacts with padded `n_kv`) are unspecified in what was
-reviewed.
+This is the **largest single porting risk in the family**, and it is now
+specified rather than guessed: `llama-kv-cache-dsv4.cpp` (1978 lines) has been
+read in full, together with its header, `deepseek4.cpp`'s consumers and
+`llama-graph.cpp`'s input setters. Everything below is read off those files;
+where an earlier revision of this document disagreed, the file won and the
+paragraph was rewritten.
+
+#### The inventory, exactly
+
+Not "seven cache structures" — the constructor
+(`llama-kv-cache-dsv4.cpp:1013-1131`) builds **five caches and three compressor
+states**, and only four of the caches are reachable from a V4 graph:
+
+| structure   | kind                | rows                            | row width             |
+| ----------- | ------------------- | ------------------------------- | --------------------- |
+| `kv_raw`    | ISWA base half      | —                               | never read by V4      |
+| `kv_raw`    | ISWA **SWA** half   | the sliding window              | `n_embd_head_k`       |
+| `kv_csa`    | K-only block cache  | `PAD(ceil(kv_size/4), 256)`     | `n_embd_head_k`       |
+| `kv_hca`    | K-only block cache  | `PAD(ceil(kv_size/128), 256)`   | `n_embd_head_k`       |
+| `kv_lid`    | K-only block cache  | `PAD(ceil(kv_size/4), 256)`     | `indexer_head_size`   |
+| `csa_state` | compressor state ×2 | `state_size = 2*4 = 8`          | `2*n_embd_head_k`     |
+| `hca_state` | compressor state ×2 | `state_size = 128` (**not** 2×) | `n_embd_head_k`       |
+| `lid_state` | compressor state ×2 | `state_size = 2*4 = 8`          | `2*indexer_head_size` |
+
+"×2" is literal: each compressor state is **two** f32 tensors, `kv` and `score`,
+both `[n_embd_state, state_size, n_stream]` and both always f32 regardless of
+`type_k`. The raw base half is allocated for generic ISWA bookkeeping and the
+header says so outright: "DSV4 raw attention only uses the SWA half of
+`kv_raw`."
+
+Two consequences the old prose hid. **`state_size == 2*ratio` is what makes a
+compressor overlapping, and only CSA and LID are** — `hca_state` gets
+`state_size == ratio`, so HCA pools a single non-overlapping block. And **the
+LID plan is not computed at all**: `plans_lid(plans_csa)` (line 1785) copies the
+CSA plan verbatim, because both run at ratio 4 with `overlap = true` and the
+same `state_size`. Only the row widths differ.
+
+#### The per-ubatch plan
+
+`dsv4_build_comp_plan` (lines 418-599) is the whole state machine. Per token, at
+absolute position `pos`:
+
+```text
+state_pos[i]  = pos % ratio                 // APE row id, gathers attn_comp_ape
+n_visible[i]  = (pos + 1) / ratio           // FLOOR — completed blocks only
+plan.n_kv     = GGML_PAD(max_i n_visible[i], 256)
+```
+
+The compressor state is a **ring of `state_size` rows** indexed
+`pos % state_size`, and `state_persist_{src,dst}_idxs` carry one entry per
+distinct ring row the ubatch touches, keeping the highest `pos` when several
+tokens collide (lines 496-505) and sorted by destination (line 576) so the write
+order is deterministic.
+
+A compressed row is committed **only on a block boundary**,
+`(pos + 1) % ratio == 0` (line 507), to cache row `pos / ratio`, with
+`state_write_pos = pos + 1 - ratio` — the block's FIRST position, which is what
+the compressed row then ropes at.
+
+`state_source_idx` (lines 461-476) is the join that makes this work. It
+addresses a graph-local tensor laid out
+`[persistent_state | current_ubatch_scratch | sentinel]`:
+
+- `pos < 0` → `state_rows + n_tokens`, the appended zero/`-inf` sentinel row;
+- `pos` present in this ubatch → `state_rows + i`, the scratch row;
+- otherwise → `stream_off + pos % state_size`, the persistent ring row.
+
+For the overlapping compressors the reads are collected into **two contiguous
+halves** — every block's previous-window indices, then every block's
+current-window indices (lines 565-572) — which is exactly how
+`build_overlap_compressed_kv_from_state` slices them back apart
+(`deepseek4.cpp:463-489`). Getting that concatenation order wrong swaps the two
+halves of every pooling window and still runs.
+
+The pooling itself (`deepseek4.cpp:407-413`, and the same four lines in the HCA
+variant) is **per-channel softmax over the block axis**, not over the feature
+axis: values and scores are both permuted so the block index becomes the fast
+axis, `soft_max` runs, and `sum_rows` collapses it. Then RMS-norm by
+`attn_comp_norm`, rope the `[nope | rope]` tail at `compress_rope_base`, and
+write.
+
+#### The four boundary conditions
+
+Each is a place where a plausible implementation runs and is wrong.
+
+1. **A partial block at the end of a prefill is invisible, and is never
+   committed.** `n_visible` floors, and the commit is gated on
+   `(pos + 1) % ratio == 0`. Tokens in a trailing partial block are recalled
+   through the raw sliding window alone; their compressor-state rows persist and
+   the block completes on a later ubatch. An implementation that ceils
+   `n_visible`, or that flushes the partial block at the end of a prefill,
+   exposes a row built from a half-filled window.
+
+2. **`n_kv == 0` changes the GRAPH, not just the mask.**
+   `dsv4_build_comp_inputs` builds `inp.kq_mask` only `if (plan.n_kv > 0)`
+   (`llama-graph.cpp:839`), and `build_attention` dispatches on that mask being
+   non-null (`deepseek4.cpp:1050-1063`). So a ubatch in which **no** token has
+   completed a block — any prefill shorter than 128 tokens on an HCA layer,
+   shorter than 4 on a CSA layer — runs `build_raw_attention` instead: pure
+   sliding window, no compressed half at all. This is the first thing a short
+   synthetic prefill will hit, and it is a different graph, so it cannot be
+   papered over with masking.
+
+3. **Padded `n_kv` versus per-token visible length.** `plan.n_kv` is padded to
+   256 so the graph shape does not change at every block boundary, and the mask
+   is a plain per-token prefix:
+   `data[i*ne0 + j] = j < n_visible[i] ? 0 : -INFINITY`
+   (`llama-graph.cpp:659-681`). Rows in `[n_visible[i], n_kv)` therefore cover
+   committed-but-not-yet-visible data and never-written zeros alike, and both
+   are masked identically. A token whose `n_visible` is 0 while others in the
+   ubatch are larger gets an **all-`-inf` compressed half** and must survive on
+   the raw half plus the attention sink — which is exactly why the sink joins
+   the softmax max as well as the denominator.
+
+4. **The CSA scratch write.** On a non-boundary CSA step, lines 534-563 push a
+   dummy commit to `cache_off + kv_size - 1` — the cache's LAST row — sourced
+   from one repeated row, purely so a decode step's graph matches a boundary
+   step's. It is garbage, and it is safe only because `n_visible < kv_size`
+   always keeps it masked. **HCA has no such fallback** (the branch is gated
+   `ratio == DSV4_CSA_RATIO`), so an HCA layer's commit op genuinely appears and
+   disappears with the block boundary.
+
+#### Two corrections to what this document said about V4's indexer
+
+Both are contradicted by the source, and both would produce silent wrongness.
+
+- **V4's indexer ropes NORM, not NEOX.** Stage 3 above makes much of V3.2's
+  indexer being NEOX-hardcoded while the main rope is NORM. V4 does **not**
+  inherit that: `build_lid_top_k` ropes `indexer_q_pe` with the graph's
+  `rope_type` (`deepseek4.cpp:555-557`), and `llama_model::rope_type` puts
+  `LLM_ARCH_DEEPSEEK4` in the NORM group (`llama-model.cpp:2530`). Every V4 rope
+  call site — q, kv, both compressors, the indexer — is NORM. The
+  `hparams_lid.rope_type = LLAMA_ROPE_TYPE_NEOX` at
+  `llama-kv-cache-dsv4.cpp:1063` is dead: it feeds only the KV-shift path, and
+  `llama_kv_cache_dsv4::get_can_shift()` returns `false`.
+- **V4's indexer head layout is `[nope | rope]`** — the opposite of V3.2's, and
+  the same order as V4's own q and kv heads. `indexer_q_nope` is the view at
+  offset 0, `indexer_q_pe` the view at `row_size(nope)`, concatenated in that
+  order (`deepseek4.cpp:546-560`).
+
+#### What the Hadamard rotation actually gates
+
+`attn_rot_k` is normally on only for a quantized KV cache, but
+`llama-kv-cache.cpp:346-356` force-enables it when the arch is DEEPSEEK32,
+DEEPSEEK4 or GLM_DSA **and** `n_embd_head_k_full == indexer_head_size` — which
+is true for the LID cache by construction (`hparams_lid` sets both, lines
+1059-1062) and generally false for raw/CSA/HCA. That matters because
+`build_attention`'s CSA dispatch is guarded on `inp_dsv4->get_lid().k_rot` being
+non-null (`deepseek4.cpp:1053`): the guard passes for the reason above, but it
+is keyed on a quantisation artifact rather than on anything semantic. The
+rotation itself is orthogonal and applied to both sides of every dot product, so
+an unquantised port skips it entirely — as stage 3 already does.
 
 Budget stage 4 accordingly, and do not start it until stages 2–3 are solid.
 
