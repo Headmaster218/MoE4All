@@ -82,6 +82,8 @@ fn moe_layer_wall() {
             exp_probs_b: None,
             n_expert_groups: 0,
             n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
         });
         cur = dst;
     }

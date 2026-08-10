@@ -2027,6 +2027,7 @@ fn lower_op(
             up_stride,
             gate_stride,
             gate_block_width,
+            swiglu_clamp,
             ..
         } => {
             let n = *rows as usize * *nff as usize;
@@ -2047,12 +2048,17 @@ fn lower_op(
                             "vulkan adapter: GatedAct Silu gate_stride/gate_block_width!=0 unsupported",
                         ));
                     }
-                    rec.silu_mul(g_, u_, y, n);
+                    rec.silu_mul(g_, u_, y, n, *swiglu_clamp);
                 }
                 Activation::Sigmoid => {
                     if *up_off != 0 || *up_stride != 0 {
                         return Err(be(
                             "vulkan adapter: GatedAct Sigmoid up_off/stride!=0 unsupported",
+                        ));
+                    }
+                    if swiglu_clamp.is_some() {
+                        return Err(be(
+                            "vulkan adapter: GatedAct Sigmoid swiglu_clamp unsupported",
                         ));
                     }
                     rec.mul_sigmoid(
@@ -2066,6 +2072,12 @@ fn lower_op(
                     );
                 }
                 Activation::Gelu => {
+                    // `gelu_mul_off` is the strided form, which pushes the clamp words as zero —
+                    // no GELU caller clamps (V4 is SiLU), so this stays a refusal rather than a
+                    // second clamped kernel variant nothing exercises.
+                    if swiglu_clamp.is_some() {
+                        return Err(be("vulkan adapter: GatedAct Gelu swiglu_clamp unsupported"));
+                    }
                     rec.gelu_mul_off(
                         g_,
                         u_,
@@ -2089,12 +2101,13 @@ fn lower_op(
             rows,
             nff,
             act,
+            swiglu_clamp,
         } => {
             let (rows, nff) = (*rows as usize, *nff as usize);
             let (gu_, y) = (r(*gu)?, r(*dst)?);
             match act {
-                Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff),
-                Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff),
+                Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
+                Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Sigmoid => {
                     return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"))
                 }
@@ -3777,6 +3790,8 @@ fn lower_op(
             exp_probs_b,
             n_expert_groups,
             n_expert_groups_used,
+            swiglu_clamp,
+            expert_ids,
         } => {
             // Router gating (softmax vs sigmoid) and renormalization are `moe_topk` push-constant
             // flags — see its shader doc. `weight_before` (llama4: the routing weight scales the
@@ -3798,6 +3813,28 @@ fn lower_op(
                 &*be_.alloc_uninit(4, BufferUsage::Weights)?
             };
             let has_bias = exp_probs_b.is_some();
+            // DeepSeek V4 hash routing: the selection arrives pre-gathered, so `moe_topk` copies
+            // it in and skips its whole selection phase (see `moe_topk.comp`). Same dummy-bind
+            // shape as `bias_buf` when absent. The two SELECTION-only inputs have nothing left to
+            // select on a hash layer, so refuse rather than ignore them.
+            let hash_buf: &dyn Buffer = if let Some(hid) = expert_ids {
+                r(*hid)?
+            } else {
+                &*be_.alloc_uninit(4, BufferUsage::Activations)?
+            };
+            let hash = expert_ids.is_some();
+            if hash && (has_bias || *n_expert_groups > 1) {
+                return Err(be(
+                    "vulkan adapter: MoeFfn expert_ids (hash routing) supplies the selection — \
+                     exp_probs_b and group routing have nothing to select",
+                ));
+            }
+            if swiglu_clamp.is_some() && (matches!(act, Activation::Sigmoid) || *weight_before) {
+                return Err(be(
+                    "vulkan adapter: MoeFfn swiglu_clamp needs a gated SiLU/GELU with \
+                     output-side weighting",
+                ));
+            }
             let (ne, n_expert, n_used, nff) = (
                 *ne as usize,
                 *n_expert as usize,
@@ -3985,6 +4022,8 @@ fn lower_op(
                     has_bias,
                     *n_expert_groups,
                     *n_expert_groups_used,
+                    hash_buf,
+                    hash,
                 );
                 // EP: rewrite the global top-k ids into this rank's local shard indices before the
                 // bucket sort (out-of-band → id 0, weight 0 — those assignments bucket harmlessly
@@ -4102,6 +4141,7 @@ fn lower_op(
                         pool[&ue].as_ref(),
                         pool[&ae].as_ref(),
                         n_pairs * nff,
+                        *swiglu_clamp,
                     );
                 } else {
                     // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second
@@ -4115,12 +4155,20 @@ fn lower_op(
                         );
                     }
                     match act {
-                        Activation::Silu => {
-                            rec.silu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                        }
-                        Activation::Gelu => {
-                            rec.gelu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                        }
+                        Activation::Silu => rec.silu_mul_fused(
+                            pool[&ge].as_ref(),
+                            pool[&ae].as_ref(),
+                            n_pairs,
+                            nff,
+                            *swiglu_clamp,
+                        ),
+                        Activation::Gelu => rec.gelu_mul_fused(
+                            pool[&ge].as_ref(),
+                            pool[&ae].as_ref(),
+                            n_pairs,
+                            nff,
+                            *swiglu_clamp,
+                        ),
                         Activation::Sigmoid => {
                             return Err(be(
                                 "vulkan adapter: fused_gate_up batched MoeFfn Sigmoid unsupported",
@@ -4272,6 +4320,8 @@ fn lower_op(
                 has_bias,
                 *n_expert_groups,
                 *n_expert_groups_used,
+                hash_buf,
+                hash,
             );
             // EP: rewrite the global top-k ids into this rank's local shard indices (out-of-band →
             // id 0, weight 0). The id-indexed GEMVs below then read the local bank; the weighted
@@ -4309,12 +4359,20 @@ fn lower_op(
                     rec.moe_weight_scale(gubuf.get(pool), wts.get(pool), n_slots, 2 * nff);
                 }
                 match act {
-                    Activation::Silu => {
-                        rec.silu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
-                    }
-                    Activation::Gelu => {
-                        rec.gelu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
-                    }
+                    Activation::Silu => rec.silu_mul_fused(
+                        gubuf.get(pool),
+                        abuf.get(pool),
+                        n_slots,
+                        nff,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Gelu => rec.gelu_mul_fused(
+                        gubuf.get(pool),
+                        abuf.get(pool),
+                        n_slots,
+                        nff,
+                        *swiglu_clamp,
+                    ),
                     Activation::Sigmoid => {
                         return Err(be(
                             "vulkan adapter: fused_gate_up MoeFfn Sigmoid unsupported",
@@ -4355,9 +4413,13 @@ fn lower_op(
                     rec.moe_weight_scale(ubuf.get(pool), wts.get(pool), n_slots, nff);
                 }
                 match act {
-                    Activation::Silu => {
-                        rec.silu_mul(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
-                    }
+                    Activation::Silu => rec.silu_mul(
+                        gbuf.get(pool),
+                        ubuf.get(pool),
+                        abuf.get(pool),
+                        n_act,
+                        *swiglu_clamp,
+                    ),
                     Activation::Sigmoid => rec.mul_sigmoid(
                         gbuf.get(pool),
                         ubuf.get(pool),
@@ -5570,6 +5632,8 @@ fn execute_paged_moe<'a>(
         exp_probs_b,
         n_expert_groups,
         n_expert_groups_used,
+        swiglu_clamp,
+        expert_ids,
         ..
     } = op
     else {
@@ -5606,6 +5670,22 @@ fn execute_paged_moe<'a>(
         &*be_.alloc_uninit(4, BufferUsage::Weights)?
     };
     let has_bias = exp_probs_b.is_some();
+    // Hash routing through the PAGER is unreached: the pager serves an expert bank too big for
+    // VRAM (Llama-4-Scout), and DeepSeek V4's hash layers are not that model. Rather than carry a
+    // second untested hash path here, bind the dummy and refuse — the resident arms above are
+    // where hash routing is implemented and tested.
+    let hash_buf: &dyn Buffer = &*be_.alloc_uninit(4, BufferUsage::Activations)?;
+    if expert_ids.is_some() {
+        return Err(be(
+            "vulkan adapter: paged MoeFfn does not implement hash routing (expert_ids)",
+        ));
+    }
+    if swiglu_clamp.is_some() && (matches!(act, Activation::Sigmoid) || *weight_before) {
+        return Err(be(
+            "vulkan adapter: paged MoeFfn swiglu_clamp needs a gated SiLU/GELU with \
+             output-side weighting",
+        ));
+    }
 
     // ── Router GEMV + top-k, recorded into the AMBIENT segment (no dedicated submit). `ids` is
     // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
@@ -5646,6 +5726,8 @@ fn execute_paged_moe<'a>(
             has_bias,
             *n_expert_groups,
             *n_expert_groups_used,
+            hash_buf,
+            false,
         );
     }
 
@@ -5883,16 +5965,25 @@ fn execute_paged_moe<'a>(
                     pool[ue].as_ref(),
                     pool[&ae].as_ref(),
                     n_pairs * nff,
+                    *swiglu_clamp,
                 ),
                 // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
                 // row) from the single wide GEMM above — the resident batched fused arm's shape.
                 None => match act {
-                    Activation::Silu => {
-                        rec2.silu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                    }
-                    Activation::Gelu => {
-                        rec2.gelu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                    }
+                    Activation::Silu => rec2.silu_mul_fused(
+                        pool[&ge].as_ref(),
+                        pool[&ae].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Gelu => rec2.gelu_mul_fused(
+                        pool[&ge].as_ref(),
+                        pool[&ae].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    ),
                     Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
                 },
             }
@@ -6007,6 +6098,7 @@ fn execute_paged_moe<'a>(
                 pool[ubuf].as_ref(),
                 pool[&abuf].as_ref(),
                 n_act,
+                *swiglu_clamp,
             ),
             Activation::Sigmoid => rec2.mul_sigmoid(
                 pool[&gbuf].as_ref(),
@@ -6034,12 +6126,20 @@ fn execute_paged_moe<'a>(
         // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
         // like the resident small-m fused arm.
         None => match act {
-            Activation::Silu => {
-                rec2.silu_mul_fused(pool[&gbuf].as_ref(), pool[&abuf].as_ref(), n_slots, nff)
-            }
-            Activation::Gelu => {
-                rec2.gelu_mul_fused(pool[&gbuf].as_ref(), pool[&abuf].as_ref(), n_slots, nff)
-            }
+            Activation::Silu => rec2.silu_mul_fused(
+                pool[&gbuf].as_ref(),
+                pool[&abuf].as_ref(),
+                n_slots,
+                nff,
+                *swiglu_clamp,
+            ),
+            Activation::Gelu => rec2.gelu_mul_fused(
+                pool[&gbuf].as_ref(),
+                pool[&abuf].as_ref(),
+                n_slots,
+                nff,
+                *swiglu_clamp,
+            ),
             Activation::Sigmoid => {
                 return Err(be(
                     "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
@@ -6413,6 +6513,7 @@ mod tests {
             up_stride: 0,
             gate_stride: (2 * nff) as u32, // strided gate — unsupported by silu_mul
             gate_block_width: 0,
+            swiglu_clamp: None,
         });
         let gb = be_.alloc(rows * nff * 4, BufferUsage::Activations).unwrap();
         let ub = be_.alloc(rows * nff * 4, BufferUsage::Activations).unwrap();
@@ -6860,6 +6961,7 @@ mod tests {
             gate_stride: 0,
             up_stride: 0,
             gate_block_width: 0,
+            swiglu_clamp: None,
         });
         let got = infr_testkit::run_graph(
             &be_,
@@ -7484,6 +7586,7 @@ mod tests {
             gate_stride: 0,
             up_stride: 0,
             gate_block_width: 0,
+            swiglu_clamp: None,
         });
         g.push(Op::Linear {
             x: act_i,
@@ -7902,6 +8005,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8045,6 +8150,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             g.push(Op::Copy {
                 src: sub,
@@ -8244,6 +8351,8 @@ mod tests {
             exp_probs_b: None,
             n_expert_groups: 0,
             n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
         });
         let mk = |bytes: &[u8], usage| {
             let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8367,6 +8476,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8499,6 +8610,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9217,6 +9330,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9369,6 +9484,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9508,6 +9625,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9641,6 +9760,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9778,6 +9899,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9954,6 +10077,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();

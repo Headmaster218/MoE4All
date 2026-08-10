@@ -20,6 +20,14 @@
 // the previous version — the thread-0 pre-phase sets `ssel_adj` to all zeros, and every lane adds
 // zero to its local scores, so the arithmetic is unchanged.
 //
+// DeepSeek V4 HASH ROUTING (`hash != 0`): the selection arrives pre-gathered in `hash_ids`
+// (`ffn_gate_tid2eid` indexed by token id, llama.cpp's `selected_experts_in`). Everything above
+// the weight phase — the `ssel_adj` pre-fill, the per-lane sentinel loads, and the whole `n_used`
+// reduction — is SKIPPED, not run and overwritten: it exists only to rank experts. The weight
+// phase is unchanged and needs no special case, because `build_moe_ffn` takes the weights from
+// `ggml_get_rows(probs, selected_experts)` on both paths — it already reads `ids[]` rather than
+// its own picks. `has_bias`/`n_expert_groups` are selection-only and the host refuses them here.
+//
 // General `n_expert`: each lane owns `ceil(n_expert / 128)` experts (lane `t` owns `t, t+128,
 // t+256, ...`, up to MAX_CHUNKS). Out-of-range/absent slots load the -1e30 sentinel.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -32,11 +40,15 @@ layout(push_constant) uniform PC {
     uint has_bias;        // 1 when exp_probs_b buffer is bound (DeepSeek V3+)
     uint n_expert_groups; // > 1 for group-limited routing (DeepSeek V3+)
     uint n_expert_groups_used; // how many groups to keep
+    uint hash;            // 1 = take the selection from `hash_ids` (DeepSeek V4 hash-routed layer)
 } pc;
+// Binding order is INPUTS FIRST: the recorder marks the last N bound buffers as the dispatch's
+// outputs for hazard tracking, so `hash_ids` (read-only) has to precede `ids`/`wts`.
 layout(binding = 0) readonly buffer LB { float logits[]; };
 layout(binding = 1) readonly buffer BB { float bias[]; }; // exp_probs_b, always bound
-layout(binding = 2) buffer IB { uint ids[]; };
-layout(binding = 3) writeonly buffer WB { float wts[]; };
+layout(binding = 2) readonly buffer HB { uint hash_ids[]; }; // tid2eid gather, always bound
+layout(binding = 3) buffer IB { uint ids[]; };
+layout(binding = 4) writeonly buffer WB { float wts[]; };
 
 shared float sval[128];
 shared uint sidx[128];
@@ -90,12 +102,38 @@ float sel_score(float logit) {
     }
 }
 
+void select_topk(uint t, uint lbase, uint obase);
+void weights_of(uint t, uint lbase, uint obase);
+
 void main() {
     uint tok = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
     uint lbase = tok * pc.n_expert;
     uint obase = tok * pc.n_used;
 
+    // ── Hash-routed layer: copy the supplied selection in and jump straight to the weights ──
+    // Lane 0 alone writes `ids`, exactly as the top-k path does, so the weight phase (also lane 0)
+    // reads back its own writes and needs no cross-lane visibility. A lane-parallel copy would:
+    // `barrier()` orders SHARED memory, not buffer memory, and would need an explicit
+    // `memoryBarrierBuffer()` — not worth it for `n_used` (single digits) elements.
+    if (pc.hash != 0u) {
+        if (t == 0u) {
+            for (uint k = 0u; k < pc.n_used; k++) {
+                // Clamped for the same reason the top-k winner is: an out-of-range id would make
+                // the downstream id-indexed GEMV read past the expert bank and fault the GPU.
+                ids[obase + k] = min(hash_ids[obase + k], pc.n_expert - 1u);
+            }
+        }
+    } else {
+        select_topk(t, lbase, obase);
+    }
+    weights_of(t, lbase, obase);
+}
+
+// Top-`n_used` selection into `ids` — everything a hash-routed layer skips. `pc.hash` is a push
+// constant, so the caller's branch is workgroup-uniform and the barriers below are reached by
+// every lane or by none.
+void select_topk(uint t, uint lbase, uint obase) {
     // ── Load per-lane logits ──
     float llog[MAX_CHUNKS];
     bool taken[MAX_CHUNKS];
@@ -196,8 +234,12 @@ void main() {
         }
         barrier();
     }
+}
 
-    // ── Weight computation (uses ORIGINAL unbiased logits) ──
+// ── Weight computation (uses ORIGINAL unbiased logits) ── Runs on BOTH routing paths: llama.cpp
+// takes the weights from `ggml_get_rows(probs, selected_experts)` whether the selection came from
+// `ggml_argsort_top_k` or from the hash table, so this reads `ids[]` and never re-derives it.
+void weights_of(uint t, uint lbase, uint obase) {
     if (t == 0u) {
         // The softmax shift: max of the ORIGINAL (unbiased) logits over the whole SELECTION, so
         // every `exp(logit - mx)` below has a non-positive exponent. It is the selection max and

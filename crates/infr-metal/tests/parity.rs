@@ -3245,6 +3245,7 @@ fn gated_test(act: infr_core::graph::Activation, up_off: usize, seed: u64) {
         up_stride: 0,
         gate_stride: 0,
         gate_block_width: 0,
+        swiglu_clamp: None,
     });
     let bound = vec![
         (gate, f32_bytes(&rand_f32(rows * nff, seed))),
@@ -3284,6 +3285,7 @@ fn gatedactfused_parity() {
         rows: rows as u32,
         nff: nff as u32,
         act: infr_core::graph::Activation::Silu,
+        swiglu_clamp: None,
     });
     let bound = vec![(gu, f32_bytes(&rand_f32(rows * 2 * nff, 270)))];
     assert_parity(&g, &bound, dst, rows * nff, 1e-5);
@@ -3323,6 +3325,8 @@ fn moe_ffn_parity() {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(ne, 60))),
@@ -3369,6 +3373,8 @@ fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(ne, seed as u64))),
@@ -3428,6 +3434,8 @@ fn moe_ffn_batched_rows_parity() {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     // x scaled down: the ~50x-real synthetic weights would push gate/up activations past f16
     // range (the kernels' operand precision) with unit-scale inputs — real hidden states don't.
@@ -5028,4 +5036,133 @@ fn hyper_connect_post_parity() {
             1e-5,
         );
     }
+}
+
+// ── DeepSeek V4: per-layer SwiGLU clamping + hash-routed MoE (docs/deepseek.md § Stage 4). ──
+// CPU is the oracle, as everywhere in this file; the arithmetic itself is pinned against a
+// from-definition reference in infr-llama's `seam_op_parity.rs` (`swiglu_clamp_*`, `moe_hash_*`).
+
+/// `Op::GatedAct` / `Op::GatedActFused` with V4's clamp: `act(min(gate, limit)) * clamp(up, ±limit)`.
+/// Inputs are scaled past the limit on BOTH sides so the one-sided gate bound and the symmetric
+/// `up` bound both bite (an unclamped range would make this a no-op test).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn gatedact_swiglu_clamp_parity() {
+    let (rows, nff) = (3usize, 512usize);
+    let limit = 0.5f32;
+    let clamp = infr_core::graph::swiglu_clamp(limit);
+    let wide =
+        |n: usize, seed: u64| -> Vec<f32> { rand_f32(n, seed).iter().map(|v| v * 6.0).collect() };
+    let gi = wide(rows * nff, 910);
+    let ui = wide(rows * nff, 911);
+
+    let mut g = Graph::new();
+    let gate = g.input(TensorDesc::new(vec![rows, nff], DType::F32));
+    let up = g.input(TensorDesc::new(vec![rows, nff], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nff], DType::F32));
+    g.push(Op::GatedAct {
+        gate,
+        up,
+        dst,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: infr_core::graph::Activation::Silu,
+        up_off: 0,
+        up_stride: 0,
+        gate_stride: 0,
+        gate_block_width: 0,
+        swiglu_clamp: clamp,
+    });
+    assert_parity(
+        &g,
+        &[(gate, f32_bytes(&gi)), (up, f32_bytes(&ui))],
+        dst,
+        rows * nff,
+        1e-5,
+    );
+
+    let gu: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            gi[r * nff..(r + 1) * nff]
+                .iter()
+                .chain(&ui[r * nff..(r + 1) * nff])
+                .copied()
+                .collect::<Vec<f32>>()
+        })
+        .collect();
+    let mut g2 = Graph::new();
+    let gub = g2.input(TensorDesc::new(vec![rows, 2 * nff], DType::F32));
+    let dst2 = g2.output(TensorDesc::new(vec![rows, nff], DType::F32));
+    g2.push(Op::GatedActFused {
+        gu: gub,
+        dst: dst2,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: infr_core::graph::Activation::Silu,
+        swiglu_clamp: clamp,
+    });
+    assert_parity(&g2, &[(gub, f32_bytes(&gu))], dst2, rows * nff, 1e-5);
+}
+
+/// `Op::MoeFfn` with V4's hash routing (pre-gathered `[rows, n_used]` expert ids) and the routed-
+/// expert SwiGLU clamp. f32 expert banks, so this exercises Metal's HOST MoE fallback; the device
+/// path's own `moe_topk` hash branch and clamped `gatedact_f32` push are covered by the quantized
+/// tests' shapes only once a quantized V4 bank exists — see docs/backlog.md.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_hash_routing_parity() {
+    let (ne, n_expert, n_used, nff) = (64usize, 8usize, 2usize, 128usize);
+    let rows = 2usize;
+    // Row 0 → {5, 2}; row 1 → {7, 0}. Disjoint, so a fallback to top-k moves the output.
+    let ids: [u32; 4] = [5, 2, 7, 0];
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+    let eids = g.input(TensorDesc::new(vec![rows, n_used], DType::I32));
+    let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+    let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::F32));
+    let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::F32));
+    let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+    g.push(Op::MoeFfn {
+        x,
+        router_x: x,
+        router,
+        gate_exps: gate,
+        up_exps: up,
+        down_exps: down,
+        down_scale: None,
+        fused_gate_up: false,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: nff as u32,
+        scale: 1.0,
+        act: infr_core::graph::Activation::Silu,
+        // Metal's MoE arm implements softmax gating only (V4's sqrt-softplus is refused there),
+        // so this covers the ROUTING and CLAMP changes on the gating Metal does support.
+        gating: infr_core::graph::MoeGating::Softmax,
+        norm_w: true,
+        weight_before: false,
+        ep_band: None,
+        exp_probs_b: None,
+        n_expert_groups: 0,
+        n_expert_groups_used: 0,
+        swiglu_clamp: infr_core::graph::swiglu_clamp(0.5),
+        expert_ids: Some(eids),
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * ne, 920))),
+        (
+            eids,
+            ids.iter()
+                .flat_map(|e| e.to_ne_bytes())
+                .collect::<Vec<u8>>(),
+        ),
+        (router, f32_bytes(&rand_f32(n_expert * ne, 921))),
+        (gate, f32_bytes(&rand_f32(n_expert * nff * ne, 922))),
+        (up, f32_bytes(&rand_f32(n_expert * nff * ne, 923))),
+        (down, f32_bytes(&rand_f32(n_expert * ne * nff, 924))),
+    ];
+    assert_parity(&g, &bound, dst, rows * ne, 1e-3);
 }

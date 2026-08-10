@@ -23,7 +23,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, G
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
-use infr_core::graph::{AttnMask, Graph, MoeGating, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
+    dot, dot_bf16, dot_f16, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
     vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
     vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
     vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
@@ -1898,8 +1898,14 @@ impl Backend for CpuBackend {
                     up_stride,
                     gate_stride,
                     gate_block_width,
+                    swiglu_clamp,
                     ..
                 } => {
+                    assert!(
+                        swiglu_clamp.is_none() || !matches!(act, Activation::Sigmoid),
+                        "cpu Op::GatedAct: swiglu_clamp is defined for the gated SiLU/GELU forms \
+                         only (llama.cpp clamps in its LLM_FFN_SILU arm); got {act:?}"
+                    );
                     let (rows, nff, up_off, up_stride, gate_stride, gate_block_width) = (
                         rows as usize,
                         nff as usize,
@@ -1931,7 +1937,7 @@ impl Backend for CpuBackend {
                             } else {
                                 gb + i
                             };
-                            orow[i] = act_fn(act, gs[gi]) * us[ub + i];
+                            orow[i] = gated_act_fn(act, swiglu_clamp, gs[gi], us[ub + i]);
                         }
                     });
                     vals[dst.0 as usize] = out;
@@ -1942,7 +1948,13 @@ impl Backend for CpuBackend {
                     rows,
                     nff,
                     act,
+                    swiglu_clamp,
                 } => {
+                    assert!(
+                        swiglu_clamp.is_none() || !matches!(act, Activation::Sigmoid),
+                        "cpu Op::GatedActFused: swiglu_clamp is defined for the gated SiLU/GELU \
+                         forms only (llama.cpp clamps in its LLM_FFN_SILU arm); got {act:?}"
+                    );
                     // Combined [rows, 2*nff] gate|up buffer: gate half first, up half second. Rows
                     // are independent — spin-pool over rows, bit-identical to the serial version.
                     let (rows, nff) = (rows as usize, nff as usize);
@@ -1951,7 +1963,8 @@ impl Backend for CpuBackend {
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * 2 * nff;
                         for i in 0..nff {
-                            orow[i] = act_fn(act, gus[gb + i]) * gus[gb + nff + i];
+                            orow[i] =
+                                gated_act_fn(act, swiglu_clamp, gus[gb + i], gus[gb + nff + i]);
                         }
                     });
                     vals[dst.0 as usize] = out;
@@ -2232,7 +2245,29 @@ impl Backend for CpuBackend {
                     exp_probs_b,
                     n_expert_groups,
                     n_expert_groups_used,
+                    expert_ids,
+                    swiglu_clamp,
                 } => {
+                    // `weight_before` folds the routing weight into gate/up BEFORE the activation,
+                    // so a clamp alongside it would clamp the weighted values — a combination no
+                    // reference defines (llama4 has no clamp, V4 has no weight_before).
+                    assert!(
+                        swiglu_clamp.is_none()
+                            || (!matches!(act, Activation::Sigmoid) && !weight_before),
+                        "cpu Op::MoeFfn: swiglu_clamp is defined for the gated SiLU/GELU forms \
+                         with output-side weighting only (llama.cpp clamps in its LLM_FFN_SILU \
+                         arm); got act={act:?} weight_before={weight_before}"
+                    );
+                    // Hash routing supplies the selection outright, so the two SELECTION-only
+                    // inputs have nothing left to act on — llama.cpp nulls `exp_probs_b` on a hash
+                    // layer for exactly this reason. Refuse rather than ignore them silently.
+                    assert!(
+                        expert_ids.is_none() || (exp_probs_b.is_none() && n_expert_groups <= 1),
+                        "cpu Op::MoeFfn: expert_ids (hash routing) supplies the selection, so \
+                         exp_probs_b (bias: {}) and group routing (groups: {n_expert_groups}) \
+                         have nothing to select — they must be absent",
+                        exp_probs_b.is_some(),
+                    );
                     let (ne, n_expert, n_used, nffx) = (
                         ne as usize,
                         n_expert as usize,
@@ -2322,11 +2357,28 @@ impl Backend for CpuBackend {
                     };
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
-                        /// original per-row loop accumulated in.
+                        /// original per-row loop accumulated in. On a HASH-routed layer these are
+                        /// the supplied ids in their table order instead (nothing sorts them).
                         idx: Vec<usize>,
                         /// Final per-expert weight (renormalized top-k prob × `scale`), aligned to `idx`.
                         w: Vec<f32>,
                     }
+                    // DeepSeek V4 hash routing: the selection arrives as an already-gathered
+                    // `[rows, n_used]` I32 tensor, widened to f32 by `bytes_to_f32` like every
+                    // other integer input, so every selection step below is SKIPPED, not computed
+                    // and overwritten. The router GEMM above still ran: llama.cpp's `build_moe_ffn`
+                    // takes the routing WEIGHTS from `ggml_get_rows(probs, selected_experts)` even
+                    // when the ids are supplied, so the probs are still needed.
+                    let hash_ids: Option<Vec<f32>> = expert_ids.map(|id| {
+                        let v = vals[id.0 as usize].clone();
+                        assert!(
+                            v.len() >= rows * n_used,
+                            "cpu Op::MoeFfn: expert_ids holds {} slots but the op routes {rows} \
+                             rows × {n_used} experts",
+                            v.len(),
+                        );
+                        v
+                    });
                     let routes: Vec<RouteRow> = pool.collect(rows, &|r| {
                         let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
                         // Router probabilities: softmax over all experts (qwen3moe/…) or a per-expert
@@ -2362,64 +2414,86 @@ impl Backend for CpuBackend {
                                     .collect()
                             }
                         };
-                        // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
-                        // top-k selection; original probs still used for per-expert weights.
-                        let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
-                            let epb_w = weight(epb);
-                            probs
-                                .iter()
-                                .enumerate()
-                                .map(|(e, &p)| p + epb_w[e])
+                        let idx: Vec<usize> = if let Some(hids) = &hash_ids {
+                            // Hash-routed (V4): the token's table row IS the selection. Everything
+                            // the `else` branch computes — the biased copy, the group scores, the
+                            // sort — exists only to RANK experts, so on this path none of it runs
+                            // at all rather than running and being overwritten.
+                            (0..n_used)
+                                .map(|k| {
+                                    let e = hids[r * n_used + k] as usize;
+                                    assert!(
+                                        e < n_expert,
+                                        "cpu Op::MoeFfn: hash-routed expert id {e} at (row {r}, \
+                                         slot {k}) is past n_expert {n_expert} — the ids did not \
+                                         come from a matching ffn_gate_tid2eid table"
+                                    );
+                                    e
+                                })
                                 .collect()
                         } else {
-                            probs.clone()
+                            // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
+                            // top-k selection; original probs still used for per-expert weights.
+                            let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
+                                let epb_w = weight(epb);
+                                probs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(e, &p)| p + epb_w[e])
+                                    .collect()
+                            } else {
+                                probs.clone()
+                            };
+                            // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
+                            // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
+                            if n_expert_groups > 1 && n_expert_groups_used > 0 {
+                                let n_exp_per_group = n_expert / n_expert_groups as usize;
+                                let ng = n_expert_groups as usize;
+                                let ng_used = n_expert_groups_used as usize;
+                                // Compute per-group score: sum of top-2 within each group.
+                                let mut gscores = vec![f32::NEG_INFINITY; ng];
+                                for g in 0..ng {
+                                    let base = g * n_exp_per_group;
+                                    let mut best = [f32::NEG_INFINITY; 2];
+                                    for &s in &sel_probs[base..base + n_exp_per_group] {
+                                        if s > best[0] {
+                                            best[1] = best[0];
+                                            best[0] = s;
+                                        } else if s > best[1] {
+                                            best[1] = s;
+                                        }
+                                    }
+                                    gscores[g] = best[0] + best[1];
+                                }
+                                // Top ng_used groups by score.
+                                let mut gidx: Vec<usize> = (0..ng).collect();
+                                gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
+                                gidx.truncate(ng_used);
+                                // Mask non-chosen groups to -inf.
+                                let mut chosen = vec![false; ng];
+                                for &g in &gidx {
+                                    chosen[g] = true;
+                                }
+                                for g in 0..ng {
+                                    if !chosen[g] {
+                                        for s in sel_probs
+                                            [g * n_exp_per_group..(g + 1) * n_exp_per_group]
+                                            .iter_mut()
+                                        {
+                                            *s = f32::NEG_INFINITY;
+                                        }
+                                    }
+                                }
+                            }
+                            let mut idx: Vec<usize> = (0..n_expert).collect();
+                            idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
+                            idx.truncate(n_used);
+                            idx
                         };
-                        // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
-                        // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
-                        if n_expert_groups > 1 && n_expert_groups_used > 0 {
-                            let n_exp_per_group = n_expert / n_expert_groups as usize;
-                            let ng = n_expert_groups as usize;
-                            let ng_used = n_expert_groups_used as usize;
-                            // Compute per-group score: sum of top-2 within each group.
-                            let mut gscores = vec![f32::NEG_INFINITY; ng];
-                            for g in 0..ng {
-                                let base = g * n_exp_per_group;
-                                let mut best = [f32::NEG_INFINITY; 2];
-                                for &s in &sel_probs[base..base + n_exp_per_group] {
-                                    if s > best[0] {
-                                        best[1] = best[0];
-                                        best[0] = s;
-                                    } else if s > best[1] {
-                                        best[1] = s;
-                                    }
-                                }
-                                gscores[g] = best[0] + best[1];
-                            }
-                            // Top ng_used groups by score.
-                            let mut gidx: Vec<usize> = (0..ng).collect();
-                            gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
-                            gidx.truncate(ng_used);
-                            // Mask non-chosen groups to -inf.
-                            let mut chosen = vec![false; ng];
-                            for &g in &gidx {
-                                chosen[g] = true;
-                            }
-                            for g in 0..ng {
-                                if !chosen[g] {
-                                    for s in sel_probs
-                                        [g * n_exp_per_group..(g + 1) * n_exp_per_group]
-                                        .iter_mut()
-                                    {
-                                        *s = f32::NEG_INFINITY;
-                                    }
-                                }
-                            }
-                        }
-                        let mut idx: Vec<usize> = (0..n_expert).collect();
-                        idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
-                        idx.truncate(n_used);
                         // `norm_w`: renormalize the selected weights to sum to 1 before scaling
                         // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
+                        // Hash routing changes nothing here — llama.cpp reads the weights out of
+                        // the same unbiased `probs` at the selected ids on either path.
                         let w: Vec<f32> = if norm_w {
                             let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                             idx.iter().map(|&e| probs[e] / wsum * scale).collect()
@@ -2725,14 +2799,23 @@ impl Backend for CpuBackend {
                         if fused_gate_up {
                             let gu = &gu_all[gu_off[b]..gu_off[b] + 2 * nffx * count];
                             for (f, v) in row.iter_mut().enumerate() {
-                                *v = act_fn(act, wp * gu[f * count + i])
-                                    * (wp * gu[(nffx + f) * count + i]);
+                                *v = gated_act_fn(
+                                    act,
+                                    swiglu_clamp,
+                                    wp * gu[f * count + i],
+                                    wp * gu[(nffx + f) * count + i],
+                                );
                             }
                         } else {
                             let gt = &gu_all[gu_off[b]..gu_off[b] + nffx * count];
                             let ut = &up_all[gu_off[b]..gu_off[b] + nffx * count];
                             for (f, v) in row.iter_mut().enumerate() {
-                                *v = act_fn(act, wp * gt[f * count + i]) * (wp * ut[f * count + i]);
+                                *v = gated_act_fn(
+                                    act,
+                                    swiglu_clamp,
+                                    wp * gt[f * count + i],
+                                    wp * ut[f * count + i],
+                                );
                             }
                         }
                         row

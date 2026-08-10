@@ -527,6 +527,8 @@ mod tests {
             exp_probs_b: None,
             n_expert_groups: 0,
             n_expert_groups_used: 0,
+            expert_ids: None,
+            swiglu_clamp: None,
         });
         g.push(Op::Add {
             a: hidden,
@@ -669,6 +671,8 @@ mod tests {
             exp_probs_b: None,
             n_expert_groups: 0,
             n_expert_groups_used: 0,
+            expert_ids: None,
+            swiglu_clamp: None,
         });
         g.push(Op::Add {
             a: hidden,

@@ -204,10 +204,16 @@ kernel void moe_reduce(device const float* y   [[buffer(0)]],
     dst[(p.row0 + row) * p.ne + i] = s;
 }
 
-struct MoeTopkParams { uint n_expert; uint n_used; float scale; };
+// `hash != 0` = DeepSeek V4 hash-routed layer: the selection arrives pre-gathered in `hash_ids`
+// (`ffn_gate_tid2eid` indexed by token id, llama.cpp's `selected_experts_in`), so the whole top-k
+// reduction is SKIPPED rather than run and overwritten — it exists only to rank experts. The
+// softmax shift/denominator and the weight formula are unchanged: `build_moe_ffn` reads the
+// weights out of `ggml_get_rows(probs, selected_experts)` on both routing paths.
+struct MoeTopkParams { uint n_expert; uint n_used; float scale; uint hash; };
 kernel void moe_topk(device const float* logits_all [[buffer(0)]],
-                     device uint*        tbl_all    [[buffer(1)]],
-                     constant MoeTopkParams& p  [[buffer(2)]],
+                     device const uint*  hash_ids   [[buffer(1)]],
+                     device uint*        tbl_all    [[buffer(2)]],
+                     constant MoeTopkParams& p  [[buffer(3)]],
                      uint gid [[thread_position_in_grid]]) {
     // one simdgroup (32 threads) per token row; each lane owns experts e = lane + 32j
     uint row = gid / 32u;
@@ -228,17 +234,25 @@ kernel void moe_topk(device const float* logits_all [[buffer(0)]],
     // and simd_min the lowest tied index — exactly the reference's stable-sort order
     uint taken = 0u;   // bitmask over this lane's stride slots j
     uint sel[16];
-    for (uint u = 0; u < p.n_used; u++) {
-        float bv = -MAXFLOAT;
-        uint be = 0xFFFFFFFFu;
-        uint j = 0u;
-        for (uint e = lane; e < p.n_expert; e += 32u, j++) {
-            if ((taken & (1u << j)) == 0u && logits[e] > bv) { bv = logits[e]; be = e; }
+    if (p.hash != 0u) {
+        // Hash-routed: the table row IS the selection. Clamped for the same reason the top-k
+        // winner is — an out-of-range id would send the expert GEMV past its weight bank.
+        for (uint u = 0; u < p.n_used; u++) {
+            sel[u] = min(hash_ids[row * p.n_used + u], p.n_expert - 1u);
         }
-        float m = simd_max(bv);
-        uint pick = simd_min(bv == m ? be : 0xFFFFFFFFu);
-        sel[u] = pick;
-        if ((pick & 31u) == lane) taken |= 1u << (pick >> 5);
+    } else {
+        for (uint u = 0; u < p.n_used; u++) {
+            float bv = -MAXFLOAT;
+            uint be = 0xFFFFFFFFu;
+            uint j = 0u;
+            for (uint e = lane; e < p.n_expert; e += 32u, j++) {
+                if ((taken & (1u << j)) == 0u && logits[e] > bv) { bv = logits[e]; be = e; }
+            }
+            float m = simd_max(bv);
+            uint pick = simd_min(bv == m ? be : 0xFFFFFFFFu);
+            sel[u] = pick;
+            if ((pick & 31u) == lane) taken |= 1u << (pick >> 5);
+        }
     }
     if (lane == 0u) {
         float wsum = 0.0f;

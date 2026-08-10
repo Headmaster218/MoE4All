@@ -53,6 +53,23 @@ pub enum Activation {
     Sigmoid,
 }
 
+/// Largest per-layer SwiGLU clamp limit that still means "this layer does NOT clamp". llama.cpp
+/// gates both of its clamp sites on `limit > 1e-6` (`llm_graph_context::build_ffn` and
+/// `build_moe_ffn`, `LLM_FFN_SILU` arms), so a per-layer entry at or below this is the DISABLED
+/// state — not a request to squash the whole FFN into `[-limit, +limit]`, which is what a literal
+/// `clamp(x, -0.0, 0.0)` on a layer whose configured limit is `0.0` would do.
+pub const SWIGLU_CLAMP_MIN: f32 = 1e-6;
+
+/// Resolve a per-layer clamp limit (DeepSeek V4's `swiglu_clamp_exp[il]` / `swiglu_clamp_shexp[il]`)
+/// into the `swiglu_clamp` field [`Op::GatedAct`], [`Op::GatedActFused`] and [`Op::MoeFfn`] carry.
+///
+/// This is the ONE place llama.cpp's `limit > 1e-6` gate lives: a caller hands over the raw
+/// per-layer array entry and gets `None` for the layers that do not clamp, so no backend has to
+/// re-derive the threshold and no caller can pass `Some(0.0)` by reading the array directly.
+pub fn swiglu_clamp(limit: f32) -> Option<f32> {
+    (limit > SWIGLU_CLAMP_MIN).then_some(limit)
+}
+
 /// Router gating function for a routed-expert FFN ([`Op::MoeFfn`]) — how the per-expert logits
 /// (`router · x`) become the selection scores + per-expert weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -698,6 +715,25 @@ pub enum Op {
         up_stride: u32,
         gate_stride: u32,
         gate_block_width: u32,
+        /// DeepSeek V4's per-layer SwiGLU clamp — `swiglu_clamp_shexp[il]` on this (dense /
+        /// shared-expert) path, resolved through [`swiglu_clamp`] so `None` is the disabled state.
+        ///
+        /// `Some(limit)` replaces `act(gate) * up` with
+        /// **`act(min(gate, limit)) * clamp(up, -limit, limit)`**: `up` is clamped SYMMETRICALLY,
+        /// the gate ONE-SIDED (upper bound only, `ggml_clamp(gate, -INFINITY, limit)`), and the
+        /// gate clamp happens **BEFORE** the activation. Every other arch llama.cpp clamps
+        /// (gpt-oss) clamps the gate AFTER its SiLU; V4 is the exception, and `deepseek4.cpp` is
+        /// the only reason this field exists, so the post-activation order is not representable
+        /// here — the moment an arch needing it lands, that is when the mode flag earns its place.
+        /// Read off `llm_graph_context::build_ffn`'s `LLM_FFN_SILU` arm
+        /// (`arch == LLM_ARCH_DEEPSEEK4` branch) in llama.cpp's `src/llama-graph.cpp`.
+        ///
+        /// The orders are NOT interchangeable: SiLU is non-monotone below zero and is not the
+        /// identity, so a gate above the limit and a gate below zero both move. Only
+        /// [`Activation::Silu`] and [`Activation::Gelu`] carry it (the two the reference's gated
+        /// arms use); a clamped [`Activation::Sigmoid`] has no caller and every backend refuses it.
+        /// `None` for every existing arch, so no current model's numerics move.
+        swiglu_clamp: Option<f32>,
     },
     /// Gated FFN activation over a COMBINED `gu` buffer `[rows, 2*nff]` (gate half first, up half
     /// second per row): `dst[r,i] = act(gu[r,i]) * gu[r, nff+i]`. Produced when the runner
@@ -709,6 +745,9 @@ pub enum Op {
         rows: u32,
         nff: u32,
         act: Activation,
+        /// Per-layer SwiGLU clamp, same arithmetic and same constraints as
+        /// [`Op::GatedAct::swiglu_clamp`] — see there.
+        swiglu_clamp: Option<f32>,
     },
     /// `dst[i] = a[i] + b[i]` (residual add). In place when `dst == a`.
     Add {
@@ -884,6 +923,13 @@ pub enum Op {
         n_ff_exp: u32,
         scale: f32,
         act: Activation,
+        /// DeepSeek V4's per-layer SwiGLU clamp for the ROUTED experts — `swiglu_clamp_exp[il]`,
+        /// resolved through [`swiglu_clamp`]. Identical arithmetic to
+        /// [`Op::GatedAct::swiglu_clamp`] (see there for the pre-activation / one-sided-gate
+        /// details), applied per selected expert to that expert's own gate/up projections, i.e.
+        /// between the gate/up GEMMs and the down GEMM. llama.cpp reads it from a different
+        /// hparam array than the shared expert's, so the two clamps can differ within a layer.
+        swiglu_clamp: Option<f32>,
         /// Router gating (softmax over experts vs per-expert sigmoid). `Softmax` for
         /// qwen3moe/qwen35moe/diffusion-gemma; `Sigmoid` for llama4.
         gating: MoeGating,
@@ -909,11 +955,36 @@ pub enum Op {
         ep_band: Option<(u32, u32)>,
         /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for SELECTION only;
         /// the unbias'd probs are still used for the per-expert routing weights. `None` = no bias.
+        /// Must be `None` when [`Op::MoeFfn::expert_ids`] is set — there is no selection to bias.
         exp_probs_b: Option<TensorId>,
-        /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping).
+        /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping). Must be
+        /// `0`/`1` when [`Op::MoeFfn::expert_ids`] is set (same reason as `exp_probs_b`).
         n_expert_groups: u32,
         /// DeepSeek V3+: number of groups selected per routing decision.
         n_expert_groups_used: u32,
+        /// DeepSeek V4 **hash-routed MoE** (its first `hash_layer_count` layers): the selected
+        /// expert ids `[rows, n_used]`, i32, ALREADY gathered by the caller — llama.cpp's
+        /// `selected_experts = ggml_get_rows(layer.ffn_gate_tid2eid, inp_tokens)`, a
+        /// `{n_expert_used, n_vocab}` lookup table indexed by TOKEN ID (`deepseek4.cpp`'s MoE
+        /// block), handed to `build_moe_ffn` as its `selected_experts_in`. The tensor is an
+        /// [`crate::DType::I32`] handle whose values are read as PLAIN INTEGERS — the convention
+        /// [`Op::EmbedGather`]'s `ids` uses, not [`Op::Argmax`]'s bit-pattern-in-an-f32-slot
+        /// carrier (that one exists for handles a backend declares f32).
+        ///
+        /// What supplying them changes, read off `build_moe_ffn` (`src/llama-graph.cpp`): **only
+        /// the selection**. The router matmul still runs, the [`MoeGating`] function still turns
+        /// its logits into `probs`, and the routing WEIGHTS are still
+        /// `ggml_get_rows(probs, selected_experts)` — i.e. the router's own probability at each
+        /// hash-chosen expert, then `norm_w` and `scale` exactly as on a top-k layer. They are NOT
+        /// uniform. What is bypassed is `ggml_argsort_top_k` and everything feeding only it:
+        /// `exp_probs_b` and the group masking build `selection_probs`, which nothing reads once
+        /// `selected_experts_in` is non-null (llama.cpp passes `exp_probs_b = nullptr` on a hash
+        /// layer for the same reason). Backends must SKIP that work rather than compute and
+        /// overwrite it, and refuse `exp_probs_b`/`n_expert_groups > 1` alongside these ids.
+        ///
+        /// `None` = ordinary top-k routing, the path every other arch and every non-hash V4 layer
+        /// takes, byte-identical to before this field existed.
+        expert_ids: Option<TensorId>,
     },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and
@@ -1172,11 +1243,13 @@ impl Op {
                 up_exps,
                 down_exps,
                 down_scale,
+                expert_ids,
                 dst,
                 ..
             } => {
                 let mut r = vec![x, router_x, router, gate_exps, up_exps, down_exps];
                 r.extend(down_scale);
+                r.extend(expert_ids);
                 (r, vec![dst])
             }
             Op::Conv1dSilu {

@@ -197,6 +197,7 @@ fn gated_sigmoid_parity() {
         up_stride: 0,
         gate_stride: 0,
         gate_block_width: 0,
+        swiglu_clamp: None,
     });
     let gi = gen(rows * nff, 2);
     let ui = gen(rows * nff, 3);
@@ -231,6 +232,7 @@ fn gated_gelu_offset_parity() {
         up_stride: 0,
         gate_stride: 0,
         gate_block_width: 0,
+        swiglu_clamp: None,
     });
     let gi = gen(rows * nff, 2);
     let ui = gen(up_off + rows * nff + 8, 3);
@@ -1362,6 +1364,8 @@ fn moe_sqrt_softplus_parity() {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     // Router rows = lead[e] * [1, 0, 0, …] → logits (x = 1) are [24, 1, 0.75, 0.5, -1.5, -1.0]:
     // expert 0's logit 24 > 20 exercises the softplus shortcut (`sp = v`), the rest take the exact
@@ -1460,6 +1464,8 @@ fn moe_groups_bias_parity() {
         exp_probs_b: Some(exp_probs_b),
         n_expert_groups: 2,
         n_expert_groups_used: 1,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     // Group 0 (experts 0-3, sigmoid of logits 3.0/2.5/2.0/1.5) has the higher unbiased probs and
     // would win top-k (group score 1.877 vs 1.442); group 1 (experts 4-7, logits 1.0/0.9/0.8/0.7)
@@ -4311,4 +4317,543 @@ fn hyper_connect_refuses_hc_above_the_bound() {
             "Vulkan refused hc = {hc} for the wrong reason: {msg}"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// DeepSeek V4: per-layer SwiGLU clamping + hash-routed MoE (`docs/deepseek.md` § Stage 4, 8-10).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Hand-written f64 reference for one clamped gated-FFN element, written from the DEFINITION in
+/// `llm_graph_context::build_ffn` / `build_moe_ffn` (llama.cpp `src/llama-graph.cpp`, the
+/// `LLM_FFN_SILU` arms' `arch == LLM_ARCH_DEEPSEEK4` branch), NOT transcribed from infr's CPU arm:
+///
+/// ```text
+/// up   = ggml_clamp(up,   -limit, +limit);          // symmetric
+/// gate = ggml_clamp(gate, -INFINITY, limit);        // one-sided, UPPER bound only
+/// out  = silu(gate) * up;                            // clamp is BEFORE the activation
+/// ```
+///
+/// Every other arch llama.cpp clamps runs `silu` first and clamps the RESULT; V4 does not.
+fn swiglu_clamp_ref(gate: f64, up: f64, limit: Option<f64>) -> f64 {
+    let silu = |z: f64| z / (1.0 + (-z).exp());
+    match limit {
+        None => silu(gate) * up,
+        Some(l) => {
+            let u = up.clamp(-l, l);
+            let g = gate.min(l); // ggml_clamp(gate, -INFINITY, limit)
+            silu(g) * u
+        }
+    }
+}
+
+/// The gate values the clamp cases run on. Chosen so the pre-SiLU and post-SiLU orders genuinely
+/// disagree: values ABOVE the limit (where clamping the gate changes what SiLU sees) and values
+/// BELOW ZERO, which is where SiLU's non-monotone lobe makes the two orders diverge most —
+/// `silu(-4) = -0.072`, so clamping after SiLU at limit 0.5 leaves it untouched while clamping
+/// before does nothing there either, but at limit `-0.05` (exercised by `limit` sweeps below) the
+/// orders separate. The `up` values straddle ±limit so the symmetric bound bites on both signs.
+const CLAMP_GATES: [f32; 12] = [
+    -6.0, -4.0, -2.5, -1.5, -0.75, -0.25, 0.1, 0.6, 1.2, 2.0, 4.0, 9.0,
+];
+const CLAMP_UPS: [f32; 12] = [
+    3.0, -3.0, 0.4, -0.4, 1.1, -1.1, 0.9, -0.9, 5.0, -5.0, 0.05, -0.05,
+];
+
+/// `Op::GatedAct` and `Op::GatedActFused` with DeepSeek V4's per-layer SwiGLU clamp, on the CPU
+/// reference and (when a GPU is present) on Vulkan, against `swiglu_clamp_ref`.
+///
+/// Four things this pins, each shown red before green by injecting the deviation into the CPU arm
+/// (`infr-cpu`'s `gated_act_fn`) — see the commit message for the pasted failures:
+/// 1. the gate clamp is PRE-activation, not post;
+/// 2. the gate clamp is ONE-SIDED (upper bound only);
+/// 3. the `up` clamp is SYMMETRIC;
+/// 4. `infr_core::graph::swiglu_clamp(limit)` disables at `limit <= 1e-6`, and the disabled path
+///    is BIT-identical to a graph built with no clamp at all.
+#[test]
+fn swiglu_clamp_gated_act_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let rows = 4usize;
+    let nff = CLAMP_GATES.len();
+    // One row per (gate, up) rotation so every gate meets several `up` signs/magnitudes.
+    let gi: Vec<f32> = (0..rows * nff)
+        .map(|i| CLAMP_GATES[i % nff])
+        .collect::<Vec<_>>();
+    let ui: Vec<f32> = (0..rows * nff)
+        .map(|i| CLAMP_UPS[(i + i / nff) % nff])
+        .collect();
+    let gu: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            gi[r * nff..(r + 1) * nff]
+                .iter()
+                .chain(&ui[r * nff..(r + 1) * nff])
+                .copied()
+                .collect::<Vec<f32>>()
+        })
+        .collect();
+
+    for limit in [0.5f32, 1.0, 3.0] {
+        let clamp = infr_core::graph::swiglu_clamp(limit);
+        assert_eq!(clamp, Some(limit), "limit {limit} must clamp");
+        let want: Vec<f64> = (0..rows * nff)
+            .map(|i| swiglu_clamp_ref(gi[i] as f64, ui[i] as f64, Some(limit as f64)))
+            .collect();
+
+        // Split gate/up form.
+        let mut g = Graph::new();
+        let gate = g.input(f32d(rows * nff));
+        let up = g.input(f32d(rows * nff));
+        let dst = g.output(f32d(rows * nff));
+        g.push(Op::GatedAct {
+            gate,
+            up,
+            dst,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+            swiglu_clamp: clamp,
+        });
+        let ins = [(gate, &gi[..]), (up, &ui[..])];
+        let c = run(&cpu, &g, &ins, &[], dst, rows * nff);
+        let e = maxerr64(&c, &want);
+        println!("GatedAct(clamp={limit}) cpu-vs-ref max_err={e:e}");
+        assert!(e < 1e-6, "GatedAct clamp={limit} diverges: max_err={e:e}");
+        if let Some(vk) = gpu() {
+            let v = run(&vk, &g, &ins, &[], dst, rows * nff);
+            let e = maxerr64(&v, &want);
+            println!("GatedAct(clamp={limit}) vulkan-vs-ref max_err={e:e}");
+            assert!(e < 1e-5, "GatedAct clamp={limit} diverges on Vulkan: {e:e}");
+        }
+
+        // Fused [rows, 2*nff] gate|up form — same reference, different buffer layout.
+        let mut g2 = Graph::new();
+        let gub = g2.input(f32d(rows * 2 * nff));
+        let dst2 = g2.output(f32d(rows * nff));
+        g2.push(Op::GatedActFused {
+            gu: gub,
+            dst: dst2,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Silu,
+            swiglu_clamp: clamp,
+        });
+        let ins2 = [(gub, &gu[..])];
+        let c2 = run(&cpu, &g2, &ins2, &[], dst2, rows * nff);
+        let e = maxerr64(&c2, &want);
+        println!("GatedActFused(clamp={limit}) cpu-vs-ref max_err={e:e}");
+        assert!(e < 1e-6, "GatedActFused clamp={limit} diverges: {e:e}");
+        if let Some(vk) = gpu() {
+            let v = run(&vk, &g2, &ins2, &[], dst2, rows * nff);
+            let e = maxerr64(&v, &want);
+            println!("GatedActFused(clamp={limit}) vulkan-vs-ref max_err={e:e}");
+            assert!(e < 1e-5, "GatedActFused clamp={limit} on Vulkan: {e:e}");
+        }
+    }
+}
+
+/// The pre-SiLU vs post-SiLU orders are not interchangeable, and the two one-sidedness choices are
+/// not either — stated as a property of the REFERENCE so the numbers this suite asserts on are
+/// known to be capable of separating the variants. Without this, a backend that clamped in the
+/// wrong order could still pass `swiglu_clamp_gated_act_parity` if the inputs happened not to
+/// distinguish them.
+///
+/// One thing worth writing down because it is the opposite of what one expects: for a POSITIVE
+/// limit the two orders agree everywhere the gate is negative. `silu(g) < 0 < limit` there, so
+/// `min(silu(g), limit) == silu(g) == silu(min(g, limit))` — the whole negative lobe is inert, and
+/// the orders separate only where `gate > limit`. The separation therefore grows with the limit
+/// (`|silu(l) - l|` times the clamped `up`), not with how far the gate reaches below zero.
+#[test]
+fn swiglu_clamp_orders_are_distinguishable() {
+    let silu = |z: f64| z / (1.0 + (-z).exp());
+    for limit in [0.5f64, 1.0, 3.0] {
+        // Post-SiLU (every arch but V4): silu first, then clamp the ACTIVATION.
+        let post = |gate: f64, up: f64| silu(gate).min(limit) * up.clamp(-limit, limit);
+        // Symmetric gate clamp instead of one-sided.
+        let sym = |gate: f64, up: f64| silu(gate.clamp(-limit, limit)) * up.clamp(-limit, limit);
+        // One-sided `up` clamp instead of symmetric.
+        let one_up = |gate: f64, up: f64| silu(gate.min(limit)) * up.min(limit);
+
+        let (mut d_post, mut d_sym, mut d_up) = (0.0f64, 0.0f64, 0.0f64);
+        let mut neg_lobe = 0.0f64;
+        // Full cross product, matching the parity test's row rotation: pairing each gate with ONE
+        // `up` would let the largest gate land on the smallest `|up|` and understate every gap.
+        for &gz in CLAMP_GATES.iter() {
+            for &uz in CLAMP_UPS.iter() {
+                let (gz, uz) = (gz as f64, uz as f64);
+                let want = swiglu_clamp_ref(gz, uz, Some(limit));
+                d_post = d_post.max((want - post(gz, uz)).abs());
+                d_sym = d_sym.max((want - sym(gz, uz)).abs());
+                d_up = d_up.max((want - one_up(gz, uz)).abs());
+                if gz < 0.0 {
+                    neg_lobe = neg_lobe.max((want - post(gz, uz)).abs());
+                }
+            }
+        }
+        println!(
+            "clamp variant separation @limit={limit}: post-SiLU={d_post:e} sym-gate={d_sym:e} \
+             one-sided-up={d_up:e} (negative-gate-only post-SiLU={neg_lobe:e})"
+        );
+        assert!(
+            d_post > 1e-2,
+            "post-SiLU clamp indistinguishable @{limit}: {d_post:e}"
+        );
+        assert!(
+            d_sym > 1e-2,
+            "symmetric gate clamp indistinguishable @{limit}: {d_sym:e}"
+        );
+        assert!(
+            d_up > 1e-2,
+            "one-sided up clamp indistinguishable @{limit}: {d_up:e}"
+        );
+        assert_eq!(
+            neg_lobe, 0.0,
+            "a positive limit cannot separate the orders on a negative gate — if this fires the \
+             reasoning above is wrong, not the number"
+        );
+    }
+}
+
+/// `limit <= 1e-6` is llama.cpp's DISABLED state, not "clamp everything to zero".
+/// [`infr_core::graph::swiglu_clamp`] is the single place that gate lives, and a graph built from a
+/// disabled per-layer entry must be BIT-identical to one with no clamp field set at all.
+#[test]
+fn swiglu_clamp_disabled_is_bit_identical() {
+    for off in [0.0f32, 1e-9, 1e-7, 1e-6] {
+        assert_eq!(
+            infr_core::graph::swiglu_clamp(off),
+            None,
+            "limit {off} must read as DISABLED (llama.cpp gates on `limit > 1e-6`)"
+        );
+    }
+    assert_eq!(infr_core::graph::swiglu_clamp(1.1e-6), Some(1.1e-6));
+
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nff) = (4usize, CLAMP_GATES.len());
+    let gi: Vec<f32> = (0..rows * nff).map(|i| CLAMP_GATES[i % nff]).collect();
+    let ui: Vec<f32> = (0..rows * nff).map(|i| CLAMP_UPS[i % nff]).collect();
+    let build = |clamp: Option<f32>| {
+        let mut g = Graph::new();
+        let gate = g.input(f32d(rows * nff));
+        let up = g.input(f32d(rows * nff));
+        let dst = g.output(f32d(rows * nff));
+        g.push(Op::GatedAct {
+            gate,
+            up,
+            dst,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+            swiglu_clamp: clamp,
+        });
+        (g, gate, up, dst)
+    };
+    let go = |be: &dyn Backend, clamp: Option<f32>| -> Vec<f32> {
+        let (g, gate, up, dst) = build(clamp);
+        run(
+            be,
+            &g,
+            &[(gate, &gi[..]), (up, &ui[..])],
+            &[],
+            dst,
+            rows * nff,
+        )
+    };
+    // `swiglu_clamp(0.0)` is the per-layer array entry a non-clamping V4 layer carries.
+    let disabled = go(&cpu, infr_core::graph::swiglu_clamp(0.0));
+    let none = go(&cpu, None);
+    assert_eq!(
+        disabled.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        none.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "a disabled clamp must be bit-identical to no clamp on CPU"
+    );
+    if let Some(vk) = gpu() {
+        let d = go(&vk, infr_core::graph::swiglu_clamp(0.0));
+        let n = go(&vk, None);
+        assert_eq!(
+            d.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            n.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a disabled clamp must be bit-identical to no clamp on Vulkan"
+        );
+    }
+}
+
+/// Hand-written f64 reference for a hash-routed / clamped `Op::MoeFfn`, written from
+/// `deepseek4.cpp`'s MoE block plus `llm_graph_context::build_moe_ffn` (llama.cpp
+/// `src/llama-graph.cpp`), NOT transcribed from infr's CPU arm.
+///
+/// `expert_ids = Some(ids)` is llama.cpp's `selected_experts_in`. Read off `build_moe_ffn`: the
+/// router matmul STILL runs and the gating function still produces `probs`; only `ggml_argsort_top_k`
+/// (and the `selection_probs` it consumes) is skipped. The routing weights stay
+/// `ggml_get_rows(probs, selected_experts)` — the ROUTER's probability at each hash-chosen expert —
+/// then `norm_w` renormalizes over the selected set and `w_scale` scales. They are NOT uniform.
+#[allow(clippy::too_many_arguments)]
+fn moe_v4_ref(
+    x: &[f32],
+    router: &[f32],
+    gate: &[f32],
+    up: &[f32],
+    down: &[f32],
+    ne: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_ff_exp: usize,
+    scale: f64,
+    expert_ids: Option<&[usize]>,
+    swiglu_clamp: Option<f64>,
+) -> Vec<f64> {
+    let rows = x.len() / ne;
+    let dot = |w: &[f32], v: &[f64]| w.iter().zip(v).map(|(a, b)| *a as f64 * b).sum::<f64>();
+    let mut out = vec![0f64; rows * ne];
+    for row in 0..rows {
+        let xr: Vec<f64> = x[row * ne..(row + 1) * ne]
+            .iter()
+            .map(|&v| v as f64)
+            .collect();
+        // Router logits → sqrt(softplus) probs (V4's mandatory gating).
+        let probs: Vec<f64> = (0..n_expert)
+            .map(|e| {
+                let l = dot(&router[e * ne..(e + 1) * ne], &xr);
+                (1.0 + l.exp()).ln().sqrt()
+            })
+            .collect();
+        let idx: Vec<usize> = match expert_ids {
+            Some(ids) => ids[row * n_used..(row + 1) * n_used].to_vec(),
+            None => {
+                let mut i: Vec<usize> = (0..n_expert).collect();
+                i.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                i.truncate(n_used);
+                i
+            }
+        };
+        let wsum: f64 = idx.iter().map(|&e| probs[e]).sum::<f64>().max(1e-20);
+        for &e in &idx {
+            let gs = e * n_ff_exp * ne;
+            let ds = e * ne * n_ff_exp;
+            let actv: Vec<f64> = (0..n_ff_exp)
+                .map(|j| {
+                    let gv = dot(&gate[gs + j * ne..gs + (j + 1) * ne], &xr);
+                    let uv = dot(&up[gs + j * ne..gs + (j + 1) * ne], &xr);
+                    swiglu_clamp_ref(gv, uv, swiglu_clamp)
+                })
+                .collect();
+            let w_e = probs[e] / wsum * scale;
+            for i in 0..ne {
+                out[row * ne + i] += w_e
+                    * down[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp]
+                        .iter()
+                        .zip(&actv)
+                        .map(|(a, b)| *a as f64 * b)
+                        .sum::<f64>();
+            }
+        }
+    }
+    out
+}
+
+/// Two tokens whose `ffn_gate_tid2eid` rows name DIFFERENT experts, plus a per-layer SwiGLU clamp
+/// on the routed experts. Pins, red-then-green (deviations injected into the CPU arm — see the
+/// commit message):
+/// * the ids drive the selection (falling back to top-k routes both rows the same and goes red);
+/// * the routing WEIGHTS are the router's own `sqrt(softplus)` probs at the hash ids, renormalized
+///   — the other plausible reading, uniform `1/n_used`, is asserted to differ and to fail;
+/// * the routed-expert clamp is the same pre-SiLU / one-sided-gate arithmetic as the dense path.
+///
+/// `ne`/`n_ff_exp` = 32: the Vulkan expert id-GEMV decodes 32-element sub-blocks, so anything
+/// smaller would cross-check against a silent all-zero GPU output.
+#[test]
+fn moe_hash_routing_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (ne, n_expert, n_used, n_ff_exp) = (32usize, 6usize, 2usize, 32usize);
+    let rows = 2usize;
+    // Row 0 → experts {4, 1}; row 1 → experts {0, 5}. Disjoint, and NEITHER is the top-2 the
+    // router would pick (the router's lead terms below rank 0 > 1 > 2 > 3 > 5 > 4 for both rows).
+    let ids: [usize; 4] = [4, 1, 0, 5];
+    // The handle is I32; `run` uploads an f32 slice verbatim, so carry the i32 BYTES through the
+    // f32 wire type. Backends widen them back to plain integers (`bytes_to_f32`'s I32 arm).
+    let idwire: Vec<f32> = ids.iter().map(|&e| f32::from_bits(e as u32)).collect();
+    let limit = 0.5f32;
+
+    let build = |hash: bool, clamp: Option<f32>| {
+        let mut g = Graph::new();
+        let x = g.input(f32d(rows * ne));
+        let router_x = g.input(f32d(rows * ne));
+        let eids = g.input(TensorDesc::new(vec![rows, n_used], DType::I32));
+        let router = g.weight(f32d(n_expert * ne));
+        let gate_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+        let up_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+        let down_exps = g.weight(f32d(n_expert * ne * n_ff_exp));
+        let dst = g.output(f32d(rows * ne));
+        g.push(Op::MoeFfn {
+            x,
+            router_x,
+            router,
+            gate_exps,
+            up_exps,
+            down_exps,
+            down_scale: None,
+            fused_gate_up: false,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: n_ff_exp as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            swiglu_clamp: clamp,
+            gating: MoeGating::SqrtSoftplus,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            expert_ids: hash.then_some(eids),
+        });
+        (
+            g, x, router_x, eids, router, gate_exps, up_exps, down_exps, dst,
+        )
+    };
+
+    // Router rows = lead[e] * [1, 0, …]; `x` rows differ in their first element, so the two tokens
+    // get different logits (and different weights) while the top-2 ranking stays 0, 1 for both.
+    let lead = [3.0f32, 2.0, 1.5, 1.0, -1.0, 0.5];
+    let mut xi = gen(rows * ne, 21);
+    xi[0] = 1.0;
+    xi[ne] = 0.6;
+    let ri: Vec<f32> = (0..n_expert * ne)
+        .map(|i| if i % ne == 0 { lead[i / ne] } else { 0.0 })
+        .collect();
+    // Scaled up so the gate/up projections land well outside ±limit and the clamp actually bites.
+    let gi: Vec<f32> = gen(n_expert * n_ff_exp * ne, 12)
+        .iter()
+        .map(|v| v * 4.0)
+        .collect();
+    let ui: Vec<f32> = gen(n_expert * n_ff_exp * ne, 13)
+        .iter()
+        .map(|v| v * 4.0)
+        .collect();
+    let di = gen(n_expert * ne * n_ff_exp, 14);
+
+    let go = |be: &dyn Backend, hash: bool, clamp: Option<f32>| -> Vec<f32> {
+        let (g, x, rx, eids, router, ge, ue, de, dst) = build(hash, clamp);
+        run(
+            be,
+            &g,
+            &[(x, &xi[..]), (rx, &xi[..]), (eids, &idwire[..])],
+            &[
+                (router, &ri[..]),
+                (ge, &gi[..]),
+                (ue, &ui[..]),
+                (de, &di[..]),
+            ],
+            dst,
+            rows * ne,
+        )
+    };
+    let reference = |hash: bool, clamp: Option<f32>| -> Vec<f64> {
+        moe_v4_ref(
+            &xi,
+            &ri,
+            &gi,
+            &ui,
+            &di,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            1.0,
+            hash.then_some(&ids[..]),
+            clamp.map(|l| l as f64),
+        )
+    };
+
+    for clamp in [None, infr_core::graph::swiglu_clamp(limit)] {
+        let want = reference(true, clamp);
+        let c = go(&cpu, true, clamp);
+        let e = maxerr64(&c, &want);
+        println!("MoeFfn(hash, clamp={clamp:?}) cpu-vs-ref max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "hash-routed MoeFfn diverges (clamp={clamp:?}): {e:e}"
+        );
+        if let Some(vk) = gpu() {
+            let v = go(&vk, true, clamp);
+            let e = maxerr(&c, &v);
+            println!("MoeFfn(hash, clamp={clamp:?}) cpu-vs-vulkan max_err={e:e}");
+            assert!(e < 1e-3, "hash-routed MoeFfn diverges on Vulkan: {e:e}");
+        }
+    }
+
+    // The ids must actually SELECT: top-k routing over the same inputs picks experts {0, 1} for
+    // both rows, so ignoring them is a visibly different output rather than a no-op.
+    let hashed = go(&cpu, true, None);
+    let topk = go(&cpu, false, None);
+    let sep = maxerr(&hashed, &topk);
+    println!("hash-vs-topk separation: {sep:e}");
+    assert!(
+        sep > 1e-2,
+        "hash ids and top-k route to the same experts here — the test cannot fail"
+    );
+    // And the two ROWS must route differently from each other: rows 0/1 share `x` up to their
+    // first element, so with a single shared selection their outputs would be near-identical.
+    let cross = maxerr(&hashed[..ne], &hashed[ne..]);
+    println!("row0-vs-row1 separation: {cross:e}");
+    assert!(
+        cross > 1e-2,
+        "the two tokens' hash rows did not route differently"
+    );
+
+    // The WEIGHTS are the router's probs at the hash ids, not uniform. Assert the other plausible
+    // reading is measurably different and does NOT match the backend.
+    let uniform: Vec<f64> = {
+        let mut r = vec![0f64; rows * ne];
+        for row in 0..rows {
+            let xr: Vec<f64> = xi[row * ne..(row + 1) * ne]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            for k in 0..n_used {
+                let e = ids[row * n_used + k];
+                let (gs, ds) = (e * n_ff_exp * ne, e * ne * n_ff_exp);
+                let actv: Vec<f64> = (0..n_ff_exp)
+                    .map(|j| {
+                        let gv: f64 = gi[gs + j * ne..gs + (j + 1) * ne]
+                            .iter()
+                            .zip(&xr)
+                            .map(|(a, b)| *a as f64 * b)
+                            .sum();
+                        let uv: f64 = ui[gs + j * ne..gs + (j + 1) * ne]
+                            .iter()
+                            .zip(&xr)
+                            .map(|(a, b)| *a as f64 * b)
+                            .sum();
+                        swiglu_clamp_ref(gv, uv, None)
+                    })
+                    .collect();
+                for i in 0..ne {
+                    r[row * ne + i] += (1.0 / n_used as f64)
+                        * di[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp]
+                            .iter()
+                            .zip(&actv)
+                            .map(|(a, b)| *a as f64 * b)
+                            .sum::<f64>();
+                }
+            }
+        }
+        r
+    };
+    let d_uniform = maxerr64(&hashed, &uniform);
+    println!("hash weights: router-probs-vs-uniform separation={d_uniform:e}");
+    assert!(
+        d_uniform > 1e-2,
+        "uniform 1/n_used weights are indistinguishable from the router probs here — the \
+         weight-source assertion cannot fail"
+    );
 }

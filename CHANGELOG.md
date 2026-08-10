@@ -29,6 +29,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   length is no longer the one the weights were loaded against (which would shift
   every offset in every later shard).
 
+- **DeepSeek V4 hash-routed MoE and per-layer SwiGLU clamping** (stage 4, op
+  level — nothing emits them yet). `Op::MoeFfn` gains `expert_ids`: an optional
+  pre-gathered `[rows, n_expert_used]` I32 handle (llama.cpp's
+  `selected_experts_in`, gathered from `ffn_gate_tid2eid` by token id) that
+  replaces the top-k selection on V4's first `hash_layer_count` layers. The
+  router matmul and gating still run — the routing WEIGHTS remain the router's
+  own probabilities at the hash-chosen experts, renormalised and scaled — while
+  `argsort_top_k`, `exp_probs_b` and group-limited routing are skipped; the last
+  two are refused alongside `expert_ids` rather than silently ignored.
+  `Op::GatedAct`, `Op::GatedActFused` and `Op::MoeFfn` also gain
+  `swiglu_clamp: Option<f32>`, built through the new
+  `infr_core::graph::swiglu_clamp(limit)` which carries llama.cpp's
+  `limit > 1e-6` disabled gate so no caller can pass a layer's `0.0` through as
+  a real clamp. V4 clamps `up` symmetrically and the gate one-sided and
+  **pre**-activation, where every other arch clamps post-SiLU. All of it runs on
+  CPU, Vulkan and Metal; `None` leaves every existing model's numerics
+  bit-identical. See `docs/deepseek.md` § Stage 4.
+- **DeepSeek V4 Sinkhorn hyper-connections** (stage 4, op level — nothing emits
+  them yet): three new ops that replace `x = x + f(x)` with `hc_mult` parallel
+  residual streams. `Op::HyperConnectMix` turns the mixing matmul's output into
+  the `pre` collapse weights, the `post` output gates and the `comb` mixing
+  matrix (Sinkhorn-normalised to approximately doubly stochastic);
+  `Op::HyperConnectPre` collapses the streams to one vector for a sublayer; and
+  `Op::HyperConnectPost` re-expands that sublayer's output back across the
+  streams. `Op::HyperConnectMix`'s `gates` is `None` for the model head
+  (llama.cpp's `build_hc_head`), which is the same arithmetic over a narrower
+  `mixes`. All three run on CPU, Vulkan and Metal; `hc_mult` is accepted in
+  `1..=infr_core::graph::HYPER_CONNECT_MAX_MULT` (8) and refused loudly on the
+  host beyond that. See `docs/deepseek.md` § "Sinkhorn hyper-connections".
 - **DeepSeek V4 attention primitives** (stage 4, op level — nothing emits them
   yet): `Op::QkNorm`'s `weight` became optional, so a weightless per-head
   RMSNorm is expressible without a fake ones-vector operand; `Op::Attention`

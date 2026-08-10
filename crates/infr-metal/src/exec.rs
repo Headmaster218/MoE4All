@@ -3771,7 +3771,13 @@ impl MetalBackend {
                 up_stride,
                 gate_stride,
                 gate_block_width,
+                swiglu_clamp,
             } => {
+                if swiglu_clamp.is_some() && matches!(act, infr_core::graph::Activation::Sigmoid) {
+                    return Err(Error::Unsupported(
+                        "metal backend: Op::GatedAct swiglu_clamp needs a gated SiLU/GELU".into(),
+                    ));
+                }
                 let (rows, nff) = (rows as usize, nff as usize);
                 let bg = self.ensure_device(r, gate);
                 let bu = self.ensure_device(r, up);
@@ -3789,6 +3795,8 @@ impl MetalBackend {
                 p.extend_from_slice(&up_stride.to_ne_bytes());
                 p.extend_from_slice(&gate_stride.to_ne_bytes());
                 p.extend_from_slice(&gate_block_width.to_ne_bytes());
+                p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                 self.encode_w(
                     r,
                     &pso,
@@ -3807,7 +3815,14 @@ impl MetalBackend {
                 rows,
                 nff,
                 act,
+                swiglu_clamp,
             } => {
+                if swiglu_clamp.is_some() && matches!(act, infr_core::graph::Activation::Sigmoid) {
+                    return Err(Error::Unsupported(
+                        "metal backend: Op::GatedActFused swiglu_clamp needs a gated SiLU/GELU"
+                            .into(),
+                    ));
+                }
                 let (rows, nff) = (rows as usize, nff as usize);
                 let bg = self.ensure_device(r, gu);
                 let bd = self.dev_dst(r, dst, rows * nff);
@@ -3820,7 +3835,9 @@ impl MetalBackend {
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
-                p.extend_from_slice(&0u32.to_ne_bytes()); // pad to GatedParams
+                p.extend_from_slice(&0u32.to_ne_bytes()); // up_off: unused by the fused form
+                p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                 self.encode_w(r, &pso, &[bg.as_ref(), bd.as_ref()], 1 << 1, &p, rows * nff);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -4546,7 +4563,8 @@ impl MetalBackend {
                 exp_probs_b,
                 n_expert_groups,
                 n_expert_groups_used,
-                ..
+                expert_ids,
+                swiglu_clamp,
             } => {
                 // The Metal MoE path implements only softmax gating + top-k renorm + output-
                 // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see
@@ -4570,6 +4588,9 @@ impl MetalBackend {
                      {n_expert_groups_used}) — run this model on the CPU or Vulkan backend",
                     exp_probs_b.is_some(),
                 );
+                // DeepSeek V4 hash routing supplies the selection outright, so the two
+                // SELECTION-only inputs above have nothing left to act on — the assert already
+                // rules them out here, which is the same exclusion the CPU reference enforces.
                 let (ne, n_expert, n_used, nffx) = (
                     ne as usize,
                     n_expert as usize,
@@ -4631,15 +4652,23 @@ impl MetalBackend {
                         32,
                     );
                     let tbl = self.scratch_buf(rows * 32, 1);
+                    // Hash routing: the pre-gathered `[rows, n_used]` ids replace the kernel's
+                    // top-k. Absent, `logits` is rebound as a harmless placeholder the kernel
+                    // never reads (`hash == 0`) — Metal needs every declared buffer bound.
+                    let hb = match expert_ids {
+                        Some(hid) => self.ensure_device(r, hid),
+                        None => logits.clone(),
+                    };
                     let pso = self.pipelines.get("moe_topk")?;
                     let mut p = (n_expert as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&u32::from(expert_ids.is_some()).to_ne_bytes());
                     self.encode_tg_w(
                         r,
                         &pso,
-                        &[logits.as_ref(), tbl.as_ref()],
-                        1 << 1,
+                        &[logits.as_ref(), hb.as_ref(), tbl.as_ref()],
+                        1 << 2,
                         &p,
                         rows * 32,
                         32,
@@ -4780,9 +4809,11 @@ impl MetalBackend {
                             p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                             p.extend_from_slice(&act_code.to_ne_bytes());
                             // up_off + up_stride/gate_stride/gate_block_width — all 0 (packed):
-                            // the shader reads the full 7-field GatedActParams, so every dispatch
-                            // site must push all of it or the tail fields read garbage.
+                            // the shader reads the full GatedActParams, so every dispatch site
+                            // must push all of it or the tail fields read garbage.
                             p.extend_from_slice(&[0u8; 16]);
+                            p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                            p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                             self.encode(
                                 r,
                                 &pso,
@@ -4847,9 +4878,11 @@ impl MetalBackend {
                         p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                         p.extend_from_slice(&act_code.to_ne_bytes());
                         // up_off + up_stride/gate_stride/gate_block_width — all 0 (packed): the
-                        // shader reads the full 7-field GatedActParams, so every dispatch site
-                        // must push all of it or the tail fields read garbage.
+                        // shader reads the full GatedActParams, so every dispatch site must push
+                        // all of it or the tail fields read garbage.
                         p.extend_from_slice(&[0u8; 16]);
+                        p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                        p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                         self.encode_w(
                             r,
                             &pso,
@@ -4916,6 +4949,10 @@ impl MetalBackend {
                     (Some(b), dt, s)
                 };
                 let dscale = down_scale.map(|id| self.weight_host(id, g, bindings));
+                let hash_ids: Option<Vec<f32>> = expert_ids.map(|id| {
+                    self.ensure_host(r, g, id);
+                    r.vals[id.0 as usize].clone()
+                });
                 let mut out = vec![0f32; rows * ne];
                 for (row, orow) in out.chunks_mut(ne).enumerate() {
                     let xr = &xs[row * ne..row * ne + ne];
@@ -4929,13 +4966,32 @@ impl MetalBackend {
                     for p in probs.iter_mut() {
                         *p /= psum;
                     }
-                    let mut idx: Vec<usize> = (0..n_expert).collect();
-                    idx.sort_by(|&a, &b| {
-                        probs[b]
-                            .partial_cmp(&probs[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    idx.truncate(n_used);
+                    // Hash routing (V4): the pre-gathered ids ARE the selection, so the sort
+                    // below never runs — it exists only to RANK experts. The I32 handle's values
+                    // are plain integers widened to f32 by the host read.
+                    let idx: Vec<usize> = match &hash_ids {
+                        Some(h) => (0..n_used)
+                            .map(|k| {
+                                let e = h[row * n_used + k] as usize;
+                                assert!(
+                                    e < n_expert,
+                                    "metal Op::MoeFfn: hash-routed expert id {e} at (row {row}, \
+                                     slot {k}) is past n_expert {n_expert}"
+                                );
+                                e
+                            })
+                            .collect(),
+                        None => {
+                            let mut idx: Vec<usize> = (0..n_expert).collect();
+                            idx.sort_by(|&a, &b| {
+                                probs[b]
+                                    .partial_cmp(&probs[a])
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            idx.truncate(n_used);
+                            idx
+                        }
+                    };
                     let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                     for &e in &idx {
                         // Dequant only this expert's slices, then matvec on the GPU.
@@ -4953,8 +5009,12 @@ impl MetalBackend {
                                 self.gpu_matvec(xr, &uw, ne, nffx)?,
                             )
                         };
-                        let actv: Vec<f32> =
-                            (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
+                        let actv: Vec<f32> = (0..nffx)
+                            .map(|i| match swiglu_clamp {
+                                None => act_fn(act, gate[i]) * up[i],
+                                Some(l) => act_fn(act, gate[i].min(l)) * up[i].clamp(-l, l),
+                            })
+                            .collect();
                         let dw = bytes_to_f32(&Self::read_bytes_range(dbuf, e * dsz, dsz), ddt);
                         let mut y = self.gpu_matvec(&actv, &dw, nffx, ne)?;
                         if let Some(ds) = &dscale {

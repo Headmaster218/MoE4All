@@ -6584,6 +6584,18 @@ pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
     }
 }
 
+/// One gated-FFN output element, `act(gate) * up`, with DeepSeek V4's optional per-layer SwiGLU
+/// clamp: `Some(limit)` gives `act(min(gate, limit)) * clamp(up, -limit, limit)` — `up` clamped
+/// symmetrically, the gate one-sided and BEFORE the activation (see `Op::GatedAct::swiglu_clamp`).
+/// `None` compiles to exactly the un-clamped expression this replaced.
+#[inline]
+pub(crate) fn gated_act_fn(act: Activation, clamp: Option<f32>, gate: f32, up: f32) -> f32 {
+    match clamp {
+        None => act_fn(act, gate) * up,
+        Some(l) => act_fn(act, gate.min(l)) * up.clamp(-l, l),
+    }
+}
+
 #[cfg(test)]
 mod kernel_tests {
     use super::*;

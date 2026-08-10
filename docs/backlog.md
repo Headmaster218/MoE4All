@@ -1549,6 +1549,87 @@ and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
   a real V4 GGUF turns out to use a small eps, a backend that dropped the
   over-dst eps would pass every test here.
 
+### B-DSV4-HASH — what the hash-routed MoE / SwiGLU-clamp ops do NOT cover yet (2026-08-10)
+
+**Tag:** deepseek · vulkan · metal · **Blocked on:** nothing; scoped out of the
+op-level slice, which was explicitly "extend the ops, emit nothing"
+
+`Op::MoeFfn::expert_ids`, and `swiglu_clamp` on `Op::GatedAct` /
+`Op::GatedActFused` / `Op::MoeFfn`, are implemented and parity-tested on CPU +
+Vulkan (real RX 7900 XTX, validation layer clean) and typechecked on Metal. What
+is left:
+
+- **Nothing emits them.** `crates/infr-llama/src` got only the mechanical
+  `None`/`None` defaults at existing construction sites; no V4 layer builds a
+  `MoeFfn` and `generate_dense_backend` still refuses V4 outright.
+- **The GATHER that produces `expert_ids` does not exist.** The op takes the ids
+  ALREADY gathered; nothing in the tree can produce them from
+  `blk.N.ffn_gate_tid2eid.weight` + the token-id input. `Op::EmbedGather` was
+  checked and cannot be reused as-is on Vulkan: `embed_gather.comp` iterates
+  whole 32-element sub-blocks (`nsub = pc.ne / 32u`), and a tid2eid row is
+  `n_expert_used` wide (8 in every V4 config seen), so the loop body never runs
+  and the kernel writes NOTHING — a silent all-zero gather, i.e. every token
+  routing to expert 0. It also decodes through `native_decode.glsl`, which has
+  no I32 format, while llama.cpp's `ggml_get_rows` preserves I32 only for an I32
+  source and `ggml_mul_mat_id` asserts its ids are I32 — so a real V4 file's
+  table is I32. The wiring slice needs either a small-`ne` I32 path in
+  `embed_gather.comp` or a dedicated gather op. `infr`'s own synthetic V4
+  fixture (`crates/infr-llama/tests/synthetic_deepseek2.rs`) writes the table as
+  a FLOAT weight, so it will not surface this.
+- **`Op::io` still omits `exp_probs_b`.** Pre-existing (it lists `x`,
+  `router_x`, `router`, the three banks and `down_scale`); `expert_ids` was
+  added, `exp_probs_b` deliberately left alone as out of scope. It matters only
+  for the multi-device pipeline executor, which infers each op's device and cut
+  tensors from `Op::io` — an `exp_probs_b` on a pipeline boundary would not be
+  marked as read. No shipped pipeline config routes a deepseek2/3 MoE across a
+  cut, so this has never fired.
+- **The Vulkan PAGED MoE path refuses both features.** `execute_paged_moe`
+  returns an error for `expert_ids` and for a clamp with
+  Sigmoid/`weight_before`. The pager exists for an expert bank too large for
+  VRAM (Llama-4-Scout); a V4 hash layer is not that model, and a second untested
+  hash path there would have had no caller. If a V4 checkpoint ever needs the
+  pager this is the gap.
+- **Metal's DEVICE MoE path is only reachable for softmax gating.** Its arm
+  asserts `MoeGating::Softmax`, and V4's gating is mandatory `SqrtSoftplus`, so
+  a real V4 MoE layer on Metal would abort at that assert before hash routing or
+  the clamp mattered. Both are implemented anyway (`moe_topk`'s `hash` flag,
+  `gatedact_f32`'s `do_clamp`/`limit`) and `moe_ffn_hash_routing_parity` covers
+  the softmax shape, but the sqrt-softplus refusal is the real blocker for V4 on
+  Metal and is untouched.
+- **Metal has never been executed.** No Apple hardware was available. The
+  changed kernels (`moe_topk`, `gatedact_f32`, `gatedactfused_f32`) typecheck
+  via `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`;
+  MSL compiles on-device, so the macOS CI job is their first real compile and
+  first execution. `gatedact_swiglu_clamp_parity` and
+  `moe_ffn_hash_routing_parity` in `crates/infr-metal/tests/parity.rs` are what
+  will report it. Note in particular that `GatedActParams` and `GatedParams`
+  both GREW by two words — every dispatch site had to be updated to push the
+  longer struct, and a missed one reads garbage into `do_clamp`.
+- **Vulkan's strided/sigmoid gated forms refuse the clamp.** `gelu_mul_off`
+  (gemma4's per-layer-embd gate) and `mul_sigmoid` push the clamp words as zero
+  and the adapter returns an error if a clamp reaches them. V4 is SiLU, so
+  nothing needs them; a future clamped GELU-with-strides would.
+- **Performance was not considered.** The clamp adds a workgroup-uniform branch
+  and one `min`/`clamp` per element to `silu_mul`/`silu_mul_fused` — expected to
+  be free, not measured. `moe_topk`'s hash branch replaces the whole `n_used`
+  reduction with an `n_used`-element copy, so it can only be faster; also not
+  measured.
+
+### B-DSV4-METAL-CLIPPY — `cargo clippy --target x86_64-apple-darwin` is red at HEAD (2026-08-10)
+
+**Tag:** metal · lint · **Blocked on:** nothing; pre-existing, not this slice's
+
+`crates/infr-metal/src/exec.rs`'s `Op::Mla` arm has two `manual_map` clippy
+errors (the `freq_factors` and `key_bias`
+`match … { Some(x) => Some(f(x)), None => None }` pairs), so
+`cargo clippy -p infr-metal --all-targets --target x86_64-apple-darwin -- -D warnings`
+fails. Confirmed present at `HEAD`
+(`git show HEAD:crates/infr-metal/src/exec.rs`), i.e. it came in with the MLA
+`key_bias` work, not with the hash-routing slice — left alone on scope grounds.
+The workspace clippy run is green because those lines are Apple-only and a Linux
+build never compiles them. Worth checking whether CI lints that target at all;
+if it does, it has been red since `key_bias` landed.
+
 ### W1 — VRAM guard check-then-act race (CR-N7)
 
 **Claim:** `check_vram_budget` / `vram_budget_fits` read the budget then

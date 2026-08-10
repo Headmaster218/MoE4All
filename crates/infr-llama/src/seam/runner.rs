@@ -2227,6 +2227,7 @@ pub(crate) fn generate_dense_backend(
                     up_stride: 0,
                     gate_stride: 0,
                     gate_block_width: 0,
+                    swiglu_clamp: None,
                 });
                 let sc_sig = g.internal(f32d(batch * ne));
                 g.push(Op::Linear {
@@ -2459,6 +2460,7 @@ pub(crate) fn generate_dense_backend(
                         up_stride: 0,
                         gate_stride: 0,
                         gate_block_width: 0,
+                        swiglu_clamp: None,
                     });
                 }
                 g.push(Op::Linear {
@@ -3197,6 +3199,7 @@ pub(crate) fn generate_dense_backend(
                         up_stride: 0,
                         gate_stride: (nh * 2 * hd) as u32, // per-row stride in qg
                         gate_block_width: (2 * hd) as u32, // query+gate block per head
+                        swiglu_clamp: None,
                     });
                 }
                 // bitnet SubLN: RMSNorm the concatenated-heads attention output (`attn`, width
@@ -3265,6 +3268,7 @@ pub(crate) fn generate_dense_backend(
                         rows: batch as u32,
                         nff: nff_l as u32,
                         act,
+                        swiglu_clamp: None,
                     });
                     // bitnet SubLN: RMSNorm the FFN intermediate (`actbuf`, width `nff_l`) BEFORE
                     // the down projection — matches llama.cpp `build_bitnet`'s `ffn_sub_norm`.
@@ -3318,6 +3322,7 @@ pub(crate) fn generate_dense_backend(
                         up_stride: 0,
                         gate_stride: 0,
                         gate_block_width: 0,
+                        swiglu_clamp: None,
                     });
                     // bitnet SubLN: RMSNorm the FFN intermediate BEFORE the down projection (see the
                     // `FfnW::DenseFused` arm above; same `ffn_sub_norm` from llama.cpp `build_bitnet`).
@@ -3377,6 +3382,8 @@ pub(crate) fn generate_dense_backend(
                         exp_probs_b,
                         n_expert_groups: mc.n_expert_groups,
                         n_expert_groups_used: mc.n_expert_groups_used,
+                        swiglu_clamp: None,
+                        expert_ids: None,
                     });
                     if let Some(MoeSharedW {
                         gate_inp,
@@ -3435,6 +3442,7 @@ pub(crate) fn generate_dense_backend(
                             up_stride: 0,
                             gate_stride: 0,
                             gate_block_width: 0,
+                            swiglu_clamp: None,
                         });
                         g.push(Op::Linear {
                             x: actbuf,
@@ -3502,6 +3510,7 @@ pub(crate) fn generate_dense_backend(
                             rows: batch as u32,
                             nff: nff_l as u32,
                             act,
+                            swiglu_clamp: None,
                         });
                     } else {
                         g.push(Op::Linear {
@@ -3533,6 +3542,7 @@ pub(crate) fn generate_dense_backend(
                             up_stride: 0,
                             gate_stride: 0,
                             gate_block_width: 0,
+                            swiglu_clamp: None,
                         });
                     }
                     g.push(Op::Linear {
@@ -3611,6 +3621,8 @@ pub(crate) fn generate_dense_backend(
                         exp_probs_b: None,
                         n_expert_groups: 0,
                         n_expert_groups_used: 0,
+                        swiglu_clamp: None,
+                        expert_ids: None,
                     });
                     g.push(Op::RmsNorm {
                         x: moe_out,
@@ -3675,6 +3687,7 @@ pub(crate) fn generate_dense_backend(
                     up_stride: (c.n_layer * npl) as u32,
                     gate_stride: 0,
                     gate_block_width: 0,
+                    swiglu_clamp: None,
                 });
                 g.push(Op::Linear {
                     x: plg,

@@ -752,12 +752,65 @@ limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
 6. **Three-tier per-layer attention** keyed on
    `compress_ratios[il] ∈ {0, 4, 128}`.
 7. **Compressor blocks** that softmax-pool blocks of tokens into single KV rows.
-8. **Hash-routed MoE** on the first `hash_layer_count` layers.
-9. **`sqrt(softplus)` gating**, mandatory.
+8. **Hash-routed MoE** on the first `hash_layer_count` layers. ✓ op level.
+9. **`sqrt(softplus)` gating**, mandatory (`MoeGating::SqrtSoftplus`, already
+   there since stage 2).
 10. **Per-layer SwiGLU clamping**, with V4 clamping the gate **pre-SiLU** where
-    every other arch clamps post-SiLU.
+    every other arch clamps post-SiLU. ✓ op level.
 
 No dense-lead layers, no NextN.
+
+#### ✓ LANDED at the op level (2026-08-10) — items 8 and 10, nothing emits them yet
+
+**Per-layer SwiGLU clamping** is `swiglu_clamp: Option<f32>` on `Op::GatedAct`,
+`Op::GatedActFused` (the dense / shared-expert path, `swiglu_clamp_shexp[il]`)
+and `Op::MoeFfn` (the routed experts, `swiglu_clamp_exp[il]`). One arithmetic,
+read off `llm_graph_context::build_ffn` and `build_moe_ffn`:
+
+```text
+up   = clamp(up, -limit, +limit)      // symmetric
+gate = clamp(gate, -INFINITY, limit)  // ONE-SIDED, upper bound only
+out  = silu(gate) * up                // the gate clamp is BEFORE the activation
+```
+
+- The `limit > 1e-6` disabled gate lives in exactly one place,
+  `infr_core::graph::swiglu_clamp(limit)`, which turns a raw per-layer array
+  entry into the field. Passing a non-clamping layer's `0.0` straight through as
+  `Some(0.0)` would clamp that whole FFN to zero — verified by injection, the
+  output goes to all ±0.
+- **Where the pre/post orders actually differ is narrower than it looks.** For a
+  positive limit the two agree everywhere the gate is negative
+  (`silu(g) < 0 < limit`, so the upper bound never bites either way), and the
+  whole negative lobe is inert. They separate only where `gate > limit`, by
+  `|silu(limit) − limit|` times the clamped `up` — the gap therefore grows with
+  the LIMIT, not with how far the gate reaches below zero. `seam_op_parity.rs`'s
+  `swiglu_clamp_orders_are_distinguishable` asserts both halves of that.
+- Only the gated SiLU/GELU forms carry it (llama.cpp clamps in its
+  `LLM_FFN_SILU` arm); a clamped `Activation::Sigmoid`, and a clamp alongside
+  llama4's `weight_before` (which would clamp the already-weighted values), are
+  refused on every backend rather than silently approximated.
+
+**Hash-routed MoE** is `expert_ids: Option<TensorId>` on `Op::MoeFfn` — the
+`[rows, n_expert_used]` I32 selection already gathered from `ffn_gate_tid2eid`
+by TOKEN ID, i.e. llama.cpp's `selected_experts_in`. What supplying it changes,
+read off `build_moe_ffn`, is **only the selection**:
+
+- The router matmul still runs and the gating function still produces `probs`.
+  The routing WEIGHTS stay `ggml_get_rows(probs, selected_experts)` — the
+  router's own probability at each hash-chosen expert, then `norm_w` and
+  `w_scale` exactly as on a top-k layer. **They are not uniform**; the uniform
+  `1/n_used` reading is asserted to differ and shown to fail.
+- `ggml_argsort_top_k` is skipped, and with it everything that only feeds
+  `selection_probs`: `exp_probs_b` and the group masking. llama.cpp nulls
+  `exp_probs_b` on a hash layer for the same reason, so the two are refused
+  alongside `expert_ids` instead of being computed and discarded. Every backend
+  branches around the selection rather than overwriting it.
+
+**The gather itself still needs work the wiring slice must do.**
+`Op::EmbedGather` cannot serve it: its Vulkan kernel iterates whole 32-element
+sub-blocks (`nsub = ne / 32`), so an `ne = n_expert_used` row (8) writes NOTHING
+and yields a silent zero, and it decodes through `native_decode.glsl`, which has
+no I32 format. See `docs/backlog.md` § B-DSV4-HASH.
 
 ### `compress_ratio` is the master per-layer switch
 

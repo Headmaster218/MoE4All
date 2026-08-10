@@ -7,11 +7,17 @@
 //     Gate starts at offset gate_row_width within each block. gate_stride = per-row stride.
 //   gate_block_width == 0 && gate_stride > 0: simple per-row strided gate read.
 //   gate_block_width == 0 && gate_stride == 0: flat gate read.
+// do_clamp/limit: DeepSeek V4's per-layer SwiGLU clamp — y = act(min(g, limit)) * clamp(u, -limit,
+// limit). The gate bound is ONE-SIDED and applied BEFORE the activation (V4 clamps pre-SiLU where
+// every other arch clamps post-SiLU); `up` is clamped symmetrically. `do_clamp == 0` (every model
+// but V4) takes the identical instruction sequence this kernel had before the field existed — the
+// branch is uniform across the whole dispatch (a push constant).
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint n; uint up_off; uint up_stride; uint row_width;
     uint gate_stride; uint gate_row_width; uint gate_block_width;
+    uint do_clamp; float limit;
 } pc;
 layout(binding = 0) readonly buffer GB { float gate[]; };
 layout(binding = 1) readonly buffer UB { float up[]; };
@@ -39,6 +45,7 @@ void main() {
         g = gate[i];
     }
 
+    if (pc.do_clamp != 0u) { g = min(g, pc.limit); }
 #ifdef GELU
     float a = 0.5 * g * (1.0 + tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
 #else
@@ -52,5 +59,7 @@ void main() {
         uint c = i % pc.row_width;
         up_idx = pc.up_off + r * pc.up_stride + c;
     }
-    y[i] = a * up[up_idx];
+    float u = up[up_idx];
+    if (pc.do_clamp != 0u) { u = clamp(u, -pc.limit, pc.limit); }
+    y[i] = a * u;
 }

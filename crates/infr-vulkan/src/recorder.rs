@@ -7446,14 +7446,24 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
-    pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+    /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`. `clamp` is DeepSeek
+    /// V4's per-layer SwiGLU limit (`Op::GatedActFused::swiglu_clamp`); `None` for every other arch.
+    pub fn silu_mul_fused(
+        &self,
+        gu: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nff: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
-            .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
-        let mut push = [0u8; 8];
+            .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
         self.dispatch(
             k,
@@ -7466,13 +7476,22 @@ impl<'a> Recorder<'a> {
 
     /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
-    pub fn gelu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+    pub fn gelu_mul_fused(
+        &self,
+        gu: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nff: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
-            .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 8);
-        let mut push = [0u8; 8];
+            .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
         self.dispatch(
             k,
@@ -7483,12 +7502,23 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
+    /// SwiGLU over separate contiguous `gate`/`up` buffers. `clamp` is DeepSeek V4's per-layer
+    /// SwiGLU limit (`Op::GatedAct::swiglu_clamp`); `None` for every other arch.
+    pub fn silu_mul(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
-            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 28);
-        let mut push = [0u8; 28];
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
@@ -8141,8 +8171,12 @@ impl<'a> Recorder<'a> {
     ) {
         let k = self
             .be
-            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 28);
-        let mut push = [0u8; 28];
+            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 36);
+        // The strided GeGLU shares silu_mul.comp (`-DGELU`), so it pushes that kernel's FULL
+        // params — the trailing `do_clamp`/`limit` pair included, left zero here: no caller clamps
+        // through this form (gemma4's per-layer-embd gate), and a short push would leave the
+        // shader reading whatever the last dispatch left in those two words.
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&((up_off_bytes / 4) as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&((up_stride_bytes / 4) as u32).to_ne_bytes());
@@ -8188,11 +8222,13 @@ impl<'a> Recorder<'a> {
         has_bias: bool,
         n_expert_groups: u32,
         n_expert_groups_used: u32,
+        hash_ids: &dyn Buffer,
+        hash: bool,
     ) {
         let k = self
             .be
-            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 4, 32);
-        let mut push = [0u8; 32];
+            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&scale.to_ne_bytes());
@@ -8201,11 +8237,13 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&(has_bias as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&n_expert_groups.to_ne_bytes());
         push[28..32].copy_from_slice(&n_expert_groups_used.to_ne_bytes());
+        push[32..36].copy_from_slice(&(hash as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[
                 Self::vkb(logits),
                 Self::vkb(bias),
+                Self::vkb(hash_ids),
                 Self::vkb(ids),
                 Self::vkb(wts),
             ],
@@ -12447,12 +12485,14 @@ mod tests {
             n_tokens,
             n_expert,
             n_used,
-            1.0,  // scale
-            0,    // gating: softmax
-            true, // norm_w — the branch that used to read the first-pick max
-            true, // has_bias
-            0,    // n_expert_groups
-            0,    // n_expert_groups_used
+            1.0,            // scale
+            0,              // gating: softmax
+            true,           // norm_w — the branch that used to read the first-pick max
+            true,           // has_bias
+            0,              // n_expert_groups
+            0,              // n_expert_groups_used
+            bbias.as_ref(), // hash_ids: unused dummy (hash == false)
+            false,          // hash
         );
         rec.finish().unwrap();
         let mut idb = vec![0u8; n_tokens * n_used * 4];

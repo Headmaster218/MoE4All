@@ -139,7 +139,18 @@ inline float gated_act(uint act, float g) {
     // GELU (gelu_pytorch_tanh)
     return 0.5f * g * (1.0f + tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
 }
-struct GatedParams { uint rows; uint nff; uint act; uint up_off; };
+// DeepSeek V4's per-layer SwiGLU clamp: y = act(min(g, limit)) * clamp(u, -limit, limit). The gate
+// bound is ONE-SIDED and applied BEFORE the activation (V4 clamps pre-SiLU where every other arch
+// clamps post-SiLU); `up` is clamped symmetrically. `do_clamp == 0` (every model but V4) is the
+// identical expression these kernels computed before the field existed.
+inline float gated_act_clamped(uint act, uint do_clamp, float limit, float g, float u) {
+    if (do_clamp != 0u) {
+        g = min(g, limit);
+        u = clamp(u, -limit, limit);
+    }
+    return gated_act(act, g) * u;
+}
+struct GatedParams { uint rows; uint nff; uint act; uint up_off; uint do_clamp; float limit; };
 // Fused-projection form (`combined_gu`): gate|up live in ONE [rows, 2*nff] buffer (gate half
 // first), produced by a single Linear over the concatenated weights.
 kernel void gatedactfused_f32(device const float* gu  [[buffer(0)]],
@@ -150,12 +161,12 @@ kernel void gatedactfused_f32(device const float* gu  [[buffer(0)]],
     uint r = gid / p.nff;
     uint i = gid % p.nff;
     ulong gb = (ulong)r * 2u * p.nff;
-    dst[gid] = gated_act(p.act, gu[gb + i]) * gu[gb + p.nff + i];
+    dst[gid] = gated_act_clamped(p.act, p.do_clamp, p.limit, gu[gb + i], gu[gb + p.nff + i]);
 }
 // `up_stride`/`gate_stride`/`gate_block_width` read gate/up from wider interleaved buffers (qwen35
 // attn output gate reads the query+gate block layout; Gemma E2B reads a per-layer up slice) —
 // mirrors infr-cpu GatedAct. All zero = tightly-packed rows (stride = nff). `dst` is packed.
-struct GatedActParams { uint rows; uint nff; uint act; uint up_off; uint up_stride; uint gate_stride; uint gate_block_width; };
+struct GatedActParams { uint rows; uint nff; uint act; uint up_off; uint up_stride; uint gate_stride; uint gate_block_width; uint do_clamp; float limit; };
 kernel void gatedact_f32(device const float* gate [[buffer(0)]],
                          device const float* up   [[buffer(1)]],
                          device float*       dst  [[buffer(2)]],
@@ -175,5 +186,5 @@ kernel void gatedact_f32(device const float* gate [[buffer(0)]],
         gi = grow + i;
     }
     uint ub = (p.up_stride == 0u ? r * p.nff : r * p.up_stride) + p.up_off + i;
-    dst[gid] = gated_act(p.act, gate[gi]) * up[ub];
+    dst[gid] = gated_act_clamped(p.act, p.do_clamp, p.limit, gate[gi], up[ub]);
 }

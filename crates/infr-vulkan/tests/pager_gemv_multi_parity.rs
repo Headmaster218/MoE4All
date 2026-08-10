@@ -154,7 +154,13 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
         out_f,
         1,
     );
-    rec.silu_mul(gbuf.as_ref(), ubuf.as_ref(), abuf.as_ref(), n_used * out_f);
+    rec.silu_mul(
+        gbuf.as_ref(),
+        ubuf.as_ref(),
+        abuf.as_ref(),
+        n_used * out_f,
+        None,
+    );
     rec.finish().unwrap();
 
     let mut out = vec![0u8; n_used * out_f * 4];

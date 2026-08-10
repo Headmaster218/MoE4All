@@ -2,9 +2,11 @@
 // Fused gated-GLU over a combined gate||up buffer gu[rows, 2*nff]:
 // y[r,i] = act(gu[r,i]) * gu[r, nff+i]. One thread per output element.
 // Default act = SiLU (SwiGLU); -DGELU = GELU tanh-approx (GeGLU, used by gemma).
+// do_clamp/limit: DeepSeek V4's per-layer SwiGLU clamp — see shaders/silu_mul.comp for the
+// arithmetic and for why `do_clamp == 0` leaves every other model's numerics untouched.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint rows; uint nff; } pc;
+layout(push_constant) uniform PC { uint rows; uint nff; uint do_clamp; float limit; } pc;
 layout(binding = 0) readonly buffer GU { float gu[]; };
 layout(binding = 1) buffer YB { float y[]; };
 
@@ -15,11 +17,14 @@ void main() {
     uint i = idx % pc.nff;
     uint base = r * 2u * pc.nff;
     float g = gu[base + i];
+    if (pc.do_clamp != 0u) { g = min(g, pc.limit); }
 #ifdef GELU
     // gelu_pytorch_tanh: 0.5*g*(1+tanh(sqrt(2/pi)*(g+0.044715*g^3)))
     float a = 0.5 * g * (1.0 + tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
 #else
     float a = g / (1.0 + exp(-g));
 #endif
-    y[idx] = a * gu[base + pc.nff + i];
+    float u = gu[base + pc.nff + i];
+    if (pc.do_clamp != 0u) { u = clamp(u, -pc.limit, pc.limit); }
+    y[idx] = a * u;
 }
