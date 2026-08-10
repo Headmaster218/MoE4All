@@ -73,7 +73,11 @@ pub struct TensorInfo {
     pub name: String,
     pub shape: Vec<usize>,
     pub dtype: DType,
-    /// Byte offset into the tensor-data region of the file.
+    /// Byte offset of this tensor's bytes in the weight source's file address space — the data
+    /// region's start already added in. A `gguf-split` model is several files, addressed end to
+    /// end in shard order, so this is an offset into that concatenated space (see
+    /// `infr_gguf::Gguf::tensor_file_range`, which reports it, and
+    /// `crate::blockio::FileBlockIo::open_shards`, which reads it).
     pub offset: u64,
     pub nbytes: usize,
 }

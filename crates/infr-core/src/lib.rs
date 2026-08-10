@@ -13,6 +13,9 @@ pub mod decode_spec;
 pub mod error;
 pub mod exec;
 pub mod fusion;
+/// llama.cpp's `gguf-split` filename convention — shared by the hub (is the set complete?) and the
+/// GGUF loader (which files make up this model?).
+pub mod gguf_split;
 pub mod graph;
 pub mod hostmem;
 pub mod hostpager;

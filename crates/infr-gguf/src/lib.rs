@@ -14,12 +14,18 @@ pub mod watch;
 
 use infr_core::{
     error::{Error, Result},
+    gguf_split::{parse_shard, shard_set},
     loader::{MetaValue, Metadata, TensorInfo},
     tensor::DType,
     WeightSource,
 };
 use memmap2::Mmap;
-use std::{collections::HashMap, fs::File, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -60,21 +66,43 @@ const MAX_TENSOR_DIMS: usize = 4;
 /// uses a comparable bound. Well-formed files never see this guard.
 const MAX_META_DEPTH: usize = 64;
 
+/// The `gguf-split` metadata keys (llama.cpp `LLM_KV_SPLIT_*`), written on EVERY shard of a split
+/// model. `split.no` is ZERO-based while the filename's `-NNNNN-` field is one-based; the two must
+/// agree, which is one of the checks [`Gguf::open`] makes.
+const KEY_SPLIT_NO: &str = "split.no";
+const KEY_SPLIT_COUNT: &str = "split.count";
+const KEY_SPLIT_TENSORS_COUNT: &str = "split.tensors.count";
+
 // ─── public struct ────────────────────────────────────────────────────────────
 
-/// A parsed, mmap-backed GGUF file.
+/// A parsed, mmap-backed GGUF model — one file, or a whole `gguf-split` shard set.
 ///
-/// The `Mmap` handle keeps the backing memory alive for the lifetime of this
-/// struct; `tensor_bytes` returns slices directly into that region.
+/// Each `Mmap` handle keeps its shard's backing memory alive for the lifetime of this struct;
+/// `tensor_bytes` returns slices directly into the mapping of the shard that holds the tensor.
 pub struct Gguf {
-    mmap: Arc<Mmap>,
+    /// The files backing this model, in shard order (`split.no` 0, 1, …), each mapped whole. A
+    /// single-file model has exactly one, and then every field below reads as it did before shard
+    /// sets existed.
+    shards: Vec<ShardFile>,
+    /// Metadata from the FIRST shard, which is the only one carrying the model's own keys —
+    /// llama.cpp's `gguf-split` copies the source KV store into shard 1 and writes only the three
+    /// `split.*` keys into the rest.
     metadata: Metadata,
+    /// Every shard's tensors, concatenated in shard order. `TensorInfo::offset` is an offset into
+    /// the SET's concatenated address space (see [`Gguf::tensor_file_range`]), so it alone locates
+    /// the tensor: the shard is the one whose byte range contains it.
     tensors: Vec<TensorInfo>,
-    /// Absolute byte offset into `mmap` where tensor data begins.
-    data_region_start: usize,
-    /// The path this was opened from, for a reader that wants the FILE rather than this mapping —
-    /// see [`Gguf::path`].
-    path: std::path::PathBuf,
+}
+
+/// One shard's mapping and where its bytes sit in the set's concatenated address space.
+struct ShardFile {
+    mmap: Arc<Mmap>,
+    /// The path this shard was opened from, for a reader that wants the FILE rather than this
+    /// mapping — see [`Gguf::shards`].
+    path: PathBuf,
+    /// Offset of this shard's first byte in the concatenated address space: the sum of every
+    /// earlier shard's file length. Zero for the first shard, hence for every single-file model.
+    file_base: u64,
 }
 
 /// An owning, ref-counted view of a tensor's bytes in the mmap'd file — a zero-copy `[u8]` slice that
@@ -85,6 +113,9 @@ pub struct TensorBytes {
     mmap: Arc<Mmap>,
     off: usize,
     len: usize,
+    /// The owning shard's [`ShardFile::file_base`], so [`Self::file_range`] can report the range in
+    /// the concatenated address space rather than in one shard's file.
+    file_base: u64,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -103,14 +134,16 @@ impl AsRef<[u8]> for TensorBytes {
 }
 
 impl TensorBytes {
-    /// This view's `(offset, len)` in the FILE, for a reader that opens it instead of using the
-    /// mapping (the pager's disk tier — see [`Gguf::tensor_file_range`], which reports the same
-    /// numbers by tensor name).
+    /// This view's `(offset, len)` in the model's concatenated file address space, for a reader
+    /// that opens the files instead of using the mapping (the pager's disk tier — see
+    /// [`Gguf::tensor_file_range`], which reports the same numbers by tensor name).
     ///
-    /// The offset is a file offset and not merely a mapping offset because `Gguf::open` maps the
-    /// whole file from byte 0, so the two coincide; `mapping_covers_the_whole_file` pins that.
+    /// For a single-file model the offset is a plain file offset, because `Gguf::open` maps the
+    /// whole file from byte 0 so the mapping and the file agree; `mapping_covers_the_whole_file`
+    /// pins that. For a shard set it is that offset PLUS the lengths of the earlier shards, which
+    /// is the same space `infr_core::blockio::FileBlockIo::open_shards` reads.
     pub fn file_range(&self) -> (u64, usize) {
-        (self.off as u64, self.len)
+        (self.file_base + self.off as u64, self.len)
     }
 }
 
@@ -420,7 +453,258 @@ impl Gguf {
     /// 10.5 s, and 14 GiB of evictable page cache became 20.2 GiB of anonymous RSS. Weights that
     /// the kernel could previously reclaim under pressure become swap-only, so a model larger
     /// than RAM stops being merely slow and starts being unrunnable.
+    ///
+    /// # Shard sets
+    /// A model written by llama.cpp's `gguf-split` is N files, each a complete GGUF carrying part
+    /// of the tensor index at offsets relative to its OWN data region, with only the first holding
+    /// the model's metadata. Opening any one of them yields the WHOLE model: `split.count` names
+    /// the set, [`infr_core::gguf_split::shard_set`] names its files, and each is mapped
+    /// separately — every shard keeps the shared file mapping described above, which is the point
+    /// (the alternative, one concatenated anonymous buffer, is the copy this doc rejects, at five
+    /// times the size).
+    ///
+    /// Everything the set claims about itself is checked rather than trusted, because a
+    /// downloaded model's metadata and filenames are remote input: the filename's `-of-MMMMM`
+    /// total must equal `split.count`, every shard's zero-based `split.no` must equal the position
+    /// its own filename claims, every shard must agree on `split.count`, and the assembled tensor
+    /// index must be exactly `split.tensors.count` entries with no name appearing twice. A missing
+    /// shard fails naming the file.
     pub fn open(path: &Path) -> Result<Self> {
+        let first = Self::map_and_parse(path)?;
+        match first.metadata.u64(KEY_SPLIT_COUNT) {
+            // `gguf-split` writes `split.count` only when it actually splits, and a count of one
+            // names this file and nothing else — so anything below two is the ordinary single-file
+            // path, byte for byte what it was before shard sets existed.
+            Some(count) if count > 1 => Self::open_split(first, count),
+            _ => Self::assemble(vec![first], None),
+        }
+    }
+
+    /// Follow the opened shard's `split.count` to the rest of the set, then assemble the model.
+    ///
+    /// `opened` is the shard the CALLER named, which need not be the first: a later shard carries
+    /// no model metadata at all (no architecture, no hyperparameters — `gguf-split` copies the KV
+    /// store into shard 1 and writes only the three `split.*` keys into the rest), so loading one
+    /// on its own could never produce a runnable model. The set is therefore re-rooted at shard 1,
+    /// which the filename convention names without needing anything else from the user, and
+    /// `infr run <any shard>` loads the whole model. The shard already mapped is placed at its own
+    /// index rather than mapped a second time.
+    fn open_split(opened: ShardParts, count: u64) -> Result<Self> {
+        let (names, dir, opened_idx) = {
+            let fname = opened
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| {
+                    Error::Loader(format!(
+                        "GGUF: {} declares {KEY_SPLIT_COUNT} = {count}, but its filename is not \
+                         usable text, so the other shards cannot be named",
+                        opened.path.display()
+                    ))
+                })?;
+            // The filename is what BOUNDS the set: `parse_shard` refuses a field wider than
+            // `gguf-split` writes, so a hostile `split.count` cannot make us enumerate (or open)
+            // more files than a five-digit total allows.
+            let Some(shard) = parse_shard(fname) else {
+                return Err(Error::Loader(format!(
+                    "GGUF: {fname} declares {KEY_SPLIT_COUNT} = {count}, but its name is not a \
+                     `<base>-NNNNN-of-MMMMM.gguf` shard name, so the rest of the set cannot be \
+                     found — rename the shards to the `gguf-split` convention"
+                )));
+            };
+            if u64::from(shard.total) != count {
+                return Err(Error::Loader(format!(
+                    "GGUF: {fname} is named as one of {} shards but declares \
+                     {KEY_SPLIT_COUNT} = {count} — the file's name and its metadata disagree \
+                     about how many shards this model has",
+                    shard.total
+                )));
+            }
+            // The index is 1-based, so `0` is not a position at all (and would underflow the
+            // conversion below), and a shard numbered past the total is not in the set it names.
+            if shard.index < 1 || u64::from(shard.index) > count {
+                return Err(Error::Loader(format!(
+                    "GGUF: {fname} is numbered {} of {count} — a shard's index runs from 1 to the \
+                     total, so this file is not a member of the set its own name describes",
+                    shard.index
+                )));
+            }
+            (
+                shard_set(fname),
+                opened.path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                shard.index as usize - 1,
+            )
+        };
+        // `shard.index` is 1-based and `split.no` is 0-based; this is the check that they agree for
+        // the shard we were handed, and it is what makes `opened_idx` trustworthy as a position.
+        Self::check_shard_position(&opened, opened_idx, count)?;
+
+        let mut opened = Some(opened);
+        let mut parts = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let part = match opened.take_if(|_| i == opened_idx) {
+                Some(p) => p,
+                None => {
+                    let path = dir.join(name);
+                    let p = Self::map_and_parse(&path).map_err(|e| {
+                        Error::Loader(format!(
+                            "GGUF: shard {} of {count} ({}): {e}",
+                            i + 1,
+                            path.display()
+                        ))
+                    })?;
+                    Self::check_shard_position(&p, i, count)?;
+                    p
+                }
+            };
+            parts.push(part);
+        }
+
+        // Written by `gguf-split` on every shard; read from the FIRST, which is the shard whose
+        // metadata this model is loaded with. Its absence leaves nothing to check the assembled
+        // index against, which for a format that always carries it means the file is not what it
+        // says it is.
+        let expect = parts[0]
+            .metadata
+            .u64(KEY_SPLIT_TENSORS_COUNT)
+            .ok_or_else(|| {
+                Error::Loader(format!(
+                    "GGUF: {} declares {KEY_SPLIT_COUNT} = {count} but carries no \
+                     {KEY_SPLIT_TENSORS_COUNT}, so the assembled tensor index cannot be checked \
+                     for completeness",
+                    parts[0].path.display()
+                ))
+            })?;
+        Self::assemble(parts, Some(expect))
+    }
+
+    /// Check one shard's `split.no` / `split.count` against the position its FILENAME claims.
+    ///
+    /// Both numbers are how the set is stitched together, so a disagreement means these files are
+    /// not the set they say they are — a renamed file, a mixed-up download, one shard from a
+    /// different quantisation — and every tensor in the offending shard would be read from the
+    /// wrong file. `index0` is the ZERO-based position, matching `split.no`.
+    fn check_shard_position(parts: &ShardParts, index0: usize, count: u64) -> Result<()> {
+        let path = parts.path.display();
+        let Some(no) = parts.metadata.u64(KEY_SPLIT_NO) else {
+            return Err(Error::Loader(format!(
+                "GGUF: {path} is named as shard {} of {count} but carries no {KEY_SPLIT_NO} — it \
+                 is not part of a `gguf-split` set",
+                index0 + 1
+            )));
+        };
+        if no != index0 as u64 {
+            return Err(Error::Loader(format!(
+                "GGUF: {path} is named as shard {} of {count} but declares {KEY_SPLIT_NO} = {no} \
+                 (shard {}) — its name and its metadata disagree about which shard it is",
+                index0 + 1,
+                no + 1
+            )));
+        }
+        let Some(declared) = parts.metadata.u64(KEY_SPLIT_COUNT) else {
+            return Err(Error::Loader(format!(
+                "GGUF: {path} is named as shard {} of {count} but carries no {KEY_SPLIT_COUNT}",
+                index0 + 1
+            )));
+        };
+        if declared != count {
+            return Err(Error::Loader(format!(
+                "GGUF: {path} declares {KEY_SPLIT_COUNT} = {declared} but the rest of the set \
+                 declares {count} — these files are not one model"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Place mapped shards end to end into one model: shard 1's metadata, every shard's tensors in
+    /// order, and each tensor's offset rewritten into the set's concatenated address space.
+    ///
+    /// `expect_tensors` is `split.tensors.count` for a shard set, `None` for a single file (which
+    /// has nothing to compare against — its header's own `tensor_count` already drove the parse).
+    fn assemble(parts: Vec<ShardParts>, expect_tensors: Option<u64>) -> Result<Self> {
+        let mut shards: Vec<ShardFile> = Vec::with_capacity(parts.len());
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut metadata: Option<Metadata> = None;
+        let mut file_base: u64 = 0;
+
+        for part in parts {
+            let ShardParts {
+                mmap,
+                metadata: md,
+                tensors: mut ts,
+                data_region_start,
+                path,
+            } = part;
+            // Rewrite each tensor's shard-local data-region offset into the SET's concatenated
+            // address space ONCE, here. That single number then locates the tensor completely —
+            // `resolve` finds the owning shard from it — so there is no second per-tensor table
+            // that could drift out of step with the tensor list it describes.
+            let this_base = file_base;
+            let data_base = this_base
+                .checked_add(data_region_start as u64)
+                .ok_or_else(|| Error::Loader("GGUF: shard set is larger than u64 bytes".into()))?;
+            for t in ts.iter_mut() {
+                t.offset = data_base.checked_add(t.offset).ok_or_else(|| {
+                    Error::Loader(format!("tensor '{}' offset overflows u64", t.name))
+                })?;
+            }
+            file_base = this_base
+                .checked_add(mmap.len() as u64)
+                .ok_or_else(|| Error::Loader("GGUF: shard set is larger than u64 bytes".into()))?;
+            tensors.append(&mut ts);
+            // Only the first shard's metadata is kept: the rest carry nothing but `split.*`.
+            metadata.get_or_insert(md);
+            shards.push(ShardFile {
+                mmap: Arc::new(mmap),
+                path,
+                file_base: this_base,
+            });
+        }
+
+        // Duplicate tensor names are malformed input and must not be silently accepted.
+        // `resolve` looks a tensor up with a linear `find`, so with two entries sharing a
+        // name the FIRST always wins and the second is unreachable — different offsets,
+        // different shapes, possibly a different dtype, and nothing anywhere reports that
+        // half the file was ignored. Rejecting at load is the only place the ambiguity is
+        // visible; afterwards every consumer just gets a plausible-looking answer. One
+        // `HashSet` pass over the (few thousand, at most) names costs nothing measurable.
+        // Across a shard set it also catches the same tensor arriving from two shards.
+        {
+            let mut seen: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(tensors.len());
+            for t in &tensors {
+                if !seen.insert(t.name.as_str()) {
+                    return Err(Error::Loader(format!(
+                        "GGUF: duplicate tensor name '{}' — the file declares it more than \
+                         once, so which entry a lookup resolves to is ambiguous",
+                        t.name
+                    )));
+                }
+            }
+        }
+
+        if let Some(expect) = expect_tensors {
+            if tensors.len() as u64 != expect {
+                return Err(Error::Loader(format!(
+                    "GGUF: the {} shards hold {} tensors between them but the model declares \
+                     {KEY_SPLIT_TENSORS_COUNT} = {expect} — the set is incomplete or mismatched",
+                    shards.len(),
+                    tensors.len()
+                )));
+            }
+        }
+
+        Ok(Gguf {
+            shards,
+            metadata: metadata.expect("a model is assembled from at least one shard"),
+            tensors,
+        })
+    }
+
+    /// Map and parse ONE GGUF file: its metadata, its own tensor index (offsets still relative to
+    /// its own data region), and where that data region starts. The unit [`Self::assemble`] places
+    /// into a model, whether the model is one file or a shard set.
+    fn map_and_parse(path: &Path) -> Result<ShardParts> {
         let file = File::open(path)?;
         // SAFETY: the file is not modified while this Mmap is live — see the invariant above.
         let mmap = unsafe { Mmap::map(&file) }?;
@@ -587,32 +871,11 @@ impl Gguf {
                 });
             }
 
-            // Duplicate tensor names are malformed input and must not be silently accepted.
-            // `resolve` looks a tensor up with a linear `find`, so with two entries sharing a
-            // name the FIRST always wins and the second is unreachable — different offsets,
-            // different shapes, possibly a different dtype, and nothing anywhere reports that
-            // half the file was ignored. Rejecting at load is the only place the ambiguity is
-            // visible; afterwards every consumer just gets a plausible-looking answer. One
-            // `HashSet` pass over the (few thousand, at most) names costs nothing measurable.
-            {
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::with_capacity(tensors.len());
-                for t in &tensors {
-                    if !seen.insert(t.name.as_str()) {
-                        return Err(Error::Loader(format!(
-                            "GGUF: duplicate tensor name '{}' — the file declares it more than \
-                             once, so which entry a lookup resolves to is ambiguous",
-                            t.name
-                        )));
-                    }
-                }
-            }
-
             (metadata, tensors, data_region_start)
         }; // ← borrow of `mmap` ends here
 
-        Ok(Gguf {
-            mmap: Arc::new(mmap),
+        Ok(ShardParts {
+            mmap,
             metadata,
             tensors,
             data_region_start,
@@ -624,61 +887,94 @@ impl Gguf {
     /// [`WeightSource::tensor_bytes`] the result is not borrow-bound to `&self`, so a backend can hold
     /// it as a weight buffer and read straight from the mapping — no `memcpy` into owned RAM.
     pub fn tensor_bytes_arc(&self, name: &str) -> Result<TensorBytes> {
-        let (off, len) = self.resolve(name)?;
+        let (shard, off, len) = self.resolve(name)?;
         Ok(TensorBytes {
-            mmap: Arc::clone(&self.mmap),
+            mmap: Arc::clone(&shard.mmap),
             off,
             len,
+            file_base: shard.file_base,
         })
     }
 
-    /// One tensor's byte range in the FILE — the same `(absolute_offset, len)` the mapping uses,
-    /// for a reader that opens the file itself instead of going through this mapping.
+    /// One tensor's byte range in the model's concatenated file address space — the same
+    /// `(absolute_offset, len)` the mapping uses, for a reader that opens the files itself instead
+    /// of going through these mappings.
     ///
     /// That is the weight pager's disk tier (`infr_core::blockio`): it reads at explicit offsets so
     /// residency is its own decision rather than the page cache's. Bounds-checked identically to
-    /// every mapped read, so a descriptor built from this can never name bytes outside the file.
+    /// every mapped read, so a descriptor built from this can never name bytes outside the model.
+    ///
+    /// For a single file the offset IS a file offset. For a shard set the shards are addressed end
+    /// to end in `split.no` order, and `infr_core::blockio::FileBlockIo::open_shards` — given the
+    /// same files in the same order by [`Self::shards`] — maps an offset back to the shard that
+    /// holds it. A tensor never straddles that boundary: each lives wholly inside one shard.
     pub fn tensor_file_range(&self, name: &str) -> Result<(u64, usize)> {
-        let (off, len) = self.resolve(name)?;
-        Ok((off as u64, len))
+        let (shard, off, len) = self.resolve(name)?;
+        Ok((shard.file_base + off as u64, len))
     }
 
-    /// The file this was opened from — what a second reader (the pager's disk tier) opens.
+    /// The files this model was opened from, in shard order, each with the byte length its offsets
+    /// were computed against — what a second reader (the pager's disk tier) opens.
     ///
-    /// A path, not a descriptor, and that is a real difference: re-opening it can land on a
+    /// Paths, not descriptors, and that is a real difference: re-opening one can land on a
     /// DIFFERENT inode if the model was replaced meanwhile. `infr_core::blockio::FileBlockIo`
     /// stamps whatever it opens and re-checks that, so a mid-run replacement is caught rather than
-    /// silently read (the same guarantee, and the same blind spot, as `watch::WeightWatch`).
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
+    /// silently read (the same guarantee, and the same blind spot, as `watch::WeightWatch`). The
+    /// lengths are what makes that check possible ACROSS a shard set: a shard whose size changed
+    /// would shift every offset in every later shard, so `open_shards` refuses a file whose length
+    /// is no longer the one these offsets were built on.
+    pub fn shards(&self) -> Vec<(&Path, u64)> {
+        self.shards
+            .iter()
+            .map(|s| (s.path.as_path(), s.mmap.len() as u64))
+            .collect()
     }
 
-    /// Look up a tensor by name and return its `(absolute_offset, len)` in the mmap,
-    /// bounds-checked against the file size with `checked_add` so a crafted
-    /// offset/length can't overflow. Shared by [`Self::tensor_bytes_arc`] and
+    /// Look up a tensor by name and return the shard holding it plus its `(offset, len)` within
+    /// THAT shard's mapping, bounds-checked against the shard's size with `checked_add` so a
+    /// crafted offset/length can't overflow. Shared by [`Self::tensor_bytes_arc`] and
     /// [`WeightSource::tensor_bytes`] so the lookup + overflow-safe bounds check lives
     /// in exactly one place.
-    fn resolve(&self, name: &str) -> Result<(usize, usize)> {
+    fn resolve(&self, name: &str) -> Result<(&ShardFile, usize, usize)> {
         let info = self
             .tensors
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| Error::Loader(format!("tensor not found: '{name}'")))?;
-        let off = self
-            .data_region_start
-            .checked_add(info.offset as usize)
-            .ok_or_else(|| Error::Loader(format!("tensor '{name}' offset overflows usize")))?;
+        // `shards` is ordered by `file_base` and each covers its whole file, so the shard holding
+        // an offset is the last one starting at or before it. A single-file model has one shard at
+        // base 0, so this is always index 0 and the arithmetic below is the identity it used to be.
+        let idx = self
+            .shards
+            .partition_point(|s| s.file_base <= info.offset)
+            .saturating_sub(1);
+        let shard = &self.shards[idx];
+        let off = usize::try_from(info.offset - shard.file_base)
+            .map_err(|_| Error::Loader(format!("tensor '{name}' offset overflows usize")))?;
         let end = off
             .checked_add(info.nbytes)
             .ok_or_else(|| Error::Loader(format!("tensor '{name}' byte range overflows usize")))?;
-        if end > self.mmap.len() {
+        if end > shard.mmap.len() {
             return Err(Error::Loader(format!(
-                "tensor '{name}' byte range {off}..{end} exceeds file size {}",
-                self.mmap.len()
+                "tensor '{name}' byte range {off}..{end} exceeds the {} bytes of {}",
+                shard.mmap.len(),
+                shard.path.display()
             )));
         }
-        Ok((off, info.nbytes))
+        Ok((shard, off, info.nbytes))
     }
+}
+
+/// One shard parsed on its own, before the set is assembled: its position in the concatenated
+/// address space is not known until every earlier shard has been mapped, so its tensor offsets are
+/// still relative to its OWN data region.
+struct ShardParts {
+    mmap: Mmap,
+    metadata: Metadata,
+    tensors: Vec<TensorInfo>,
+    /// Absolute byte offset into `mmap` where this shard's tensor data begins.
+    data_region_start: usize,
+    path: PathBuf,
 }
 
 // ─── WeightSource impl ────────────────────────────────────────────────────────
@@ -693,13 +989,13 @@ impl WeightSource for Gguf {
         &self.tensors
     }
 
-    /// Returns a slice into the mmap'd data region for the named tensor.
+    /// Returns a slice into the mmap'd data region of the shard holding the named tensor.
     ///
     /// The slice lifetime is tied to `&self` (i.e. the `Gguf` struct keeps
-    /// the `Mmap` alive).
+    /// every shard's `Mmap` alive).
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        let (start, len) = self.resolve(name)?;
-        Ok(&self.mmap[start..start + len])
+        let (shard, start, len) = self.resolve(name)?;
+        Ok(&shard.mmap[start..start + len])
     }
 
     fn chat_template(&self) -> Option<&str> {
@@ -867,9 +1163,10 @@ mod tests {
     }
 
     /// The pager's disk tier reads a tensor by `(offset, len)` taken from
-    /// [`Gguf::tensor_file_range`] and opens [`Gguf::path`] itself. Both halves must land on
-    /// exactly the bytes the MAPPING serves — an off-by-one against `data_region_start` here is
-    /// weights shifted by a few bytes, which decodes to plausible garbage rather than failing.
+    /// [`Gguf::tensor_file_range`] and opens the files [`Gguf::shards`] names. Both halves must
+    /// land on exactly the bytes the MAPPING serves — an off-by-one against `data_region_start`
+    /// here is weights shifted by a few bytes, which decodes to plausible garbage rather than
+    /// failing.
     #[test]
     fn the_file_range_reads_what_the_mapping_reads() {
         use std::io::{Read, Seek};
@@ -877,13 +1174,17 @@ mod tests {
         let tmp = write_temp_gguf(&bytes);
         let gguf = Gguf::open(tmp.path()).expect("open fixture");
 
+        // A single-file model is one shard, at base 0, of its own full length.
+        assert_eq!(gguf.shards().len(), 1);
+        assert_eq!(gguf.shards()[0], (tmp.path(), bytes.len() as u64));
+
         let mapped = gguf.tensor_bytes("tensor0").expect("tensor_bytes").to_vec();
         let (off, len) = gguf
             .tensor_file_range("tensor0")
             .expect("tensor_file_range");
         assert_eq!(len, mapped.len());
 
-        let mut f = std::fs::File::open(gguf.path()).expect("re-open by path");
+        let mut f = std::fs::File::open(gguf.shards()[0].0).expect("re-open by path");
         let mut from_file = vec![0u8; len];
         f.seek(std::io::SeekFrom::Start(off)).expect("seek");
         f.read_exact(&mut from_file).expect("read");
@@ -1250,6 +1551,370 @@ mod tests {
     fn unquantised_numel_is_never_rejected() {
         let tmp = write_temp_gguf(&build_fixture());
         Gguf::open(tmp.path()).expect("F32 tensors have no block-alignment constraint");
+    }
+
+    // ── multi-shard (`gguf-split`) fixtures ───────────────────────────────────
+
+    /// Build ONE shard of a synthetic `gguf-split` set.
+    ///
+    /// Mirrors what llama.cpp's `gguf-split` writes: the three `split.*` keys on every shard (with
+    /// `split.no`/`split.count` as UINT16 and `split.tensors.count` as INT32, the types it uses),
+    /// the model's own metadata on the first shard only, and a tensor directory whose offsets are
+    /// relative to THIS shard's data region. Every tensor is 1-D F32 so the fixture can carry
+    /// distinguishable values; each is padded to the 32-byte alignment the next offset assumes.
+    ///
+    /// `split_no` and `split_count` are written verbatim rather than derived, because the
+    /// validation tests exist to make a shard LIE about its own position.
+    fn build_split_shard(
+        split_no: u64,
+        split_count: u64,
+        tensors_total: u64,
+        tensors: &[(&str, &[f32])],
+    ) -> Vec<u8> {
+        let first = split_no == 0;
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, tensors.len() as u64);
+        push_u64(&mut b, if first { 4 } else { 3 }); // kv_count
+
+        if first {
+            // Only shard 1 carries the model's own metadata — the rest hold `split.*` and nothing
+            // else, which is why a later shard can never be loaded on its own.
+            push_gguf_str(&mut b, "general.architecture");
+            push_u32(&mut b, 8); // STRING
+            push_gguf_str(&mut b, "shardtest");
+        }
+        push_gguf_str(&mut b, KEY_SPLIT_NO);
+        push_u32(&mut b, 2); // UINT16
+        b.extend_from_slice(&(split_no as u16).to_le_bytes());
+        push_gguf_str(&mut b, KEY_SPLIT_COUNT);
+        push_u32(&mut b, 2); // UINT16
+        b.extend_from_slice(&(split_count as u16).to_le_bytes());
+        push_gguf_str(&mut b, KEY_SPLIT_TENSORS_COUNT);
+        push_u32(&mut b, 5); // INT32
+        push_u32(&mut b, tensors_total as u32);
+
+        let mut off = 0u64;
+        for (name, vals) in tensors {
+            push_gguf_str(&mut b, name);
+            push_u32(&mut b, 1); // n_dims
+            push_u64(&mut b, vals.len() as u64);
+            push_u32(&mut b, 0); // F32
+            push_u64(&mut b, off);
+            off += (vals.len() * 4).next_multiple_of(32) as u64;
+        }
+
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        for (_, vals) in tensors {
+            let start = b.len();
+            for v in *vals {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            while !(b.len() - start).is_multiple_of(32) {
+                b.push(0);
+            }
+        }
+        b
+    }
+
+    /// Write `shards` into a fresh temp dir under `gguf-split`'s `-NNNNN-of-MMMMM.gguf` naming.
+    /// Returns the dir (which must outlive the paths) and the shard paths in order.
+    fn write_shard_set(shards: &[Vec<u8>]) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let total = shards.len();
+        let paths = shards
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let p = dir
+                    .path()
+                    .join(format!("m-Q4_K_M-{:05}-of-{total:05}.gguf", i + 1));
+                std::fs::write(&p, bytes).expect("write shard");
+                p
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    /// The ordinary two-shard set: `a`/`b` in shard 1, `c` in shard 2, all with distinct values.
+    fn two_shard_fixture() -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+        write_shard_set(&[
+            build_split_shard(0, 2, 3, &[("a", &[1.0, 2.0, 3.0, 4.0]), ("b", &[5.0, 6.0])]),
+            build_split_shard(1, 2, 3, &[("c", &[7.0, 8.0, 9.0])]),
+        ])
+    }
+
+    fn f32s(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn open_err(path: &Path) -> String {
+        match Gguf::open(path).map(|_| ()) {
+            Err(Error::Loader(msg)) => msg,
+            other => panic!("expected an Error::Loader, got {other:?}"),
+        }
+    }
+
+    /// Opening shard 1 of a split model yields the WHOLE model: shard 1's metadata, every shard's
+    /// tensors, and — the part a presence-only check would miss — a shard-2 tensor reading back its
+    /// OWN bytes rather than whatever sits at that offset in shard 1.
+    #[test]
+    fn a_shard_set_reads_each_tensor_from_its_own_file() {
+        let (_dir, paths) = two_shard_fixture();
+        let gguf = Gguf::open(&paths[0]).expect("open shard 1");
+
+        assert_eq!(
+            gguf.metadata().str("general.architecture"),
+            Some("shardtest")
+        );
+        let names: Vec<&str> = gguf.tensors().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+
+        assert_eq!(
+            f32s(gguf.tensor_bytes("a").expect("a")),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(f32s(gguf.tensor_bytes("b").expect("b")), vec![5.0, 6.0]);
+        // `c` lives in shard 2, and shard 1 is long enough that `c`'s offset is inside it too — so
+        // a `c` resolved against the wrong mapping comes back readable and the length check passes.
+        // Asserting the VALUES is what tells the two files apart.
+        assert_eq!(
+            f32s(gguf.tensor_bytes("c").expect("c")),
+            vec![7.0, 8.0, 9.0]
+        );
+
+        // Both shards are mapped, laid end to end at their own file lengths.
+        let shard1_len = std::fs::metadata(&paths[0]).unwrap().len();
+        assert_eq!(
+            gguf.shards(),
+            vec![
+                (paths[0].as_path(), shard1_len),
+                (
+                    paths[1].as_path(),
+                    std::fs::metadata(&paths[1]).unwrap().len()
+                ),
+            ]
+        );
+        // `c`'s reported file range is in the CONCATENATED space, i.e. past all of shard 1.
+        let (off, len) = gguf.tensor_file_range("c").expect("range");
+        assert_eq!(len, 12);
+        assert!(
+            off >= shard1_len,
+            "a shard-2 tensor must be addressed past shard 1 ({off} < {shard1_len})"
+        );
+    }
+
+    /// The pager's disk tier reads those same concatenated offsets through
+    /// `FileBlockIo::open_shards`. This is the seam where a disagreement about the address space
+    /// would surface as silently wrong weights, so it is checked end to end: the bytes the block
+    /// reader returns for a shard-2 tensor must be the bytes the mapping serves.
+    #[test]
+    fn the_block_reader_and_the_mapping_agree_across_shards() {
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo, FileBlockIo};
+        let (_dir, paths) = two_shard_fixture();
+        let gguf = Gguf::open(&paths[0]).expect("open shard 1");
+        let io = FileBlockIo::open_shards(&gguf.shards()).expect("open shard set");
+
+        for name in ["a", "b", "c"] {
+            let mapped = gguf.tensor_bytes(name).expect("mapped").to_vec();
+            let (offset, len) = gguf.tensor_file_range(name).expect("range");
+            let mut got = vec![0u8; len];
+            io.read_block(
+                &BlockDesc {
+                    id: 0,
+                    extents: vec![BlockExtent { offset, len }],
+                },
+                &mut got,
+            )
+            .expect("read block");
+            assert_eq!(
+                got, mapped,
+                "block read for '{name}' must match the mapping"
+            );
+        }
+    }
+
+    /// A later shard carries no model metadata at all, so opening one alone could only ever fail.
+    /// Its filename names the whole set, so the loader re-roots at shard 1 and yields the same
+    /// model — `infr run <any shard>` works.
+    #[test]
+    fn opening_a_later_shard_loads_the_whole_model() {
+        let (_dir, paths) = two_shard_fixture();
+        let from_first = Gguf::open(&paths[0]).expect("open shard 1");
+        let from_second = Gguf::open(&paths[1]).expect("open shard 2");
+
+        assert_eq!(
+            from_second.metadata().str("general.architecture"),
+            Some("shardtest"),
+            "the metadata must come from shard 1 even when shard 2 was named"
+        );
+        assert_eq!(from_second.tensors().len(), 3);
+        for name in ["a", "b", "c"] {
+            assert_eq!(
+                from_second.tensor_bytes(name).expect("bytes"),
+                from_first.tensor_bytes(name).expect("bytes"),
+                "'{name}' must read identically whichever shard was opened"
+            );
+        }
+        assert_eq!(from_second.shards(), from_first.shards());
+    }
+
+    /// A shard named by `split.count` that is not on disk must fail naming the file, not silently
+    /// load a model missing a third of its weights.
+    #[test]
+    fn a_missing_shard_errors_by_name() {
+        let (_dir, paths) = two_shard_fixture();
+        std::fs::remove_file(&paths[1]).expect("remove shard 2");
+        let msg = open_err(&paths[0]);
+        assert!(
+            msg.contains("m-Q4_K_M-00002-of-00002.gguf") && msg.contains("shard 2 of 2"),
+            "{msg}"
+        );
+    }
+
+    /// A shard whose `split.no` disagrees with the position its filename claims means the files
+    /// are not the set they say they are — every tensor in it would be read from the wrong file.
+    #[test]
+    fn a_shard_no_disagreeing_with_its_filename_errors() {
+        // Shard 2's file says `split.no = 2` (i.e. the third shard) while being named `-00002-`.
+        let (_dir, paths) = write_shard_set(&[
+            build_split_shard(0, 2, 3, &[("a", &[1.0]), ("b", &[2.0])]),
+            build_split_shard(2, 2, 3, &[("c", &[3.0])]),
+        ]);
+        let msg = open_err(&paths[0]);
+        assert!(
+            msg.contains("m-Q4_K_M-00002-of-00002.gguf")
+                && msg.contains(KEY_SPLIT_NO)
+                && msg.contains("shard 2 of 2"),
+            "{msg}"
+        );
+    }
+
+    /// Two shards disagreeing about how many shards the model has are not one model.
+    #[test]
+    fn a_split_count_mismatch_between_shards_errors() {
+        let (_dir, paths) = write_shard_set(&[
+            build_split_shard(0, 2, 3, &[("a", &[1.0]), ("b", &[2.0])]),
+            build_split_shard(1, 5, 3, &[("c", &[3.0])]),
+        ]);
+        let msg = open_err(&paths[0]);
+        assert!(
+            msg.contains("m-Q4_K_M-00002-of-00002.gguf")
+                && msg.contains(KEY_SPLIT_COUNT)
+                && msg.contains('5'),
+            "{msg}"
+        );
+    }
+
+    /// The filename's `-of-MMMMM` is what BOUNDS the set — it is the reason a hostile
+    /// `split.count` cannot make the loader enumerate millions of files — so it must agree with
+    /// the metadata rather than be quietly overridden by it.
+    #[test]
+    fn a_filename_total_disagreeing_with_split_count_errors() {
+        let (_dir, paths) = write_shard_set(&[
+            build_split_shard(0, 7, 3, &[("a", &[1.0]), ("b", &[2.0])]),
+            build_split_shard(1, 7, 3, &[("c", &[3.0])]),
+        ]);
+        let msg = open_err(&paths[0]);
+        assert!(
+            msg.contains("m-Q4_K_M-00001-of-00002.gguf") && msg.contains('7'),
+            "{msg}"
+        );
+    }
+
+    /// `split.count` on a file that is not named as a shard leaves the rest of the set unnameable.
+    #[test]
+    fn a_split_file_without_a_shard_name_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("renamed.gguf");
+        std::fs::write(&p, build_split_shard(0, 2, 3, &[("a", &[1.0])])).expect("write");
+        let msg = open_err(&p);
+        assert!(
+            msg.contains("renamed.gguf") && msg.contains("gguf-split"),
+            "{msg}"
+        );
+    }
+
+    /// The assembled index must be exactly as long as the model says it is: a shard set that
+    /// parses cleanly but is short a tensor is the failure this whole path exists to prevent.
+    #[test]
+    fn a_tensor_total_disagreeing_with_split_tensors_count_errors() {
+        let (_dir, paths) = write_shard_set(&[
+            build_split_shard(0, 2, 4, &[("a", &[1.0]), ("b", &[2.0])]),
+            build_split_shard(1, 2, 4, &[("c", &[3.0])]),
+        ]);
+        let msg = open_err(&paths[0]);
+        assert!(
+            msg.contains(KEY_SPLIT_TENSORS_COUNT) && msg.contains('4') && msg.contains('3'),
+            "{msg}"
+        );
+    }
+
+    /// Without `split.tensors.count` there is nothing to check the assembled index against, and
+    /// `gguf-split` always writes it — so its absence is the file not being what it claims.
+    #[test]
+    fn a_split_model_without_a_tensor_total_errors() {
+        // Hand-built: the first shard's KV block minus `split.tensors.count`.
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 0); // tensor_count
+        push_u64(&mut b, 2); // kv_count
+        push_gguf_str(&mut b, KEY_SPLIT_NO);
+        push_u32(&mut b, 2);
+        b.extend_from_slice(&0u16.to_le_bytes());
+        push_gguf_str(&mut b, KEY_SPLIT_COUNT);
+        push_u32(&mut b, 2);
+        b.extend_from_slice(&2u16.to_le_bytes());
+        let (_dir, paths) = write_shard_set(&[b, build_split_shard(1, 2, 0, &[])]);
+        let msg = open_err(&paths[0]);
+        assert!(msg.contains(KEY_SPLIT_TENSORS_COUNT), "{msg}");
+    }
+
+    /// The duplicate-name check must span the SET, not each shard: one name arriving from two
+    /// shards is the same ambiguity, and `resolve`'s linear `find` would silently serve the first.
+    #[test]
+    fn a_tensor_name_repeated_across_shards_errors() {
+        let (_dir, paths) = write_shard_set(&[
+            build_split_shard(0, 2, 3, &[("a", &[1.0]), ("b", &[2.0])]),
+            build_split_shard(1, 2, 3, &[("a", &[3.0])]),
+        ]);
+        let msg = open_err(&paths[0]);
+        assert!(msg.contains("duplicate tensor name 'a'"), "{msg}");
+    }
+
+    /// A shard numbered outside the set its own name describes — `-00000-` (there is no shard
+    /// zero; the index is 1-based) or one past the total — is not a member of it.
+    #[test]
+    fn a_shard_index_outside_its_own_set_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, shown) in [
+            ("m-00000-of-00002.gguf", "numbered 0 of 2"),
+            ("m-00003-of-00002.gguf", "numbered 3 of 2"),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, build_split_shard(0, 2, 1, &[("a", &[1.0])])).expect("write");
+            let msg = open_err(&p);
+            assert!(msg.contains(name) && msg.contains(shown), "{name}: {msg}");
+        }
+    }
+
+    /// A file with a shard-shaped NAME but no `split.*` metadata is an ordinary single-file model
+    /// — the loader follows metadata, never the filename, so nothing goes looking for siblings.
+    #[test]
+    fn a_shard_shaped_name_without_split_metadata_is_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("m-00001-of-00003.gguf");
+        std::fs::write(&p, build_fixture()).expect("write");
+        let gguf = Gguf::open(&p).expect("a plain GGUF must load whatever it is named");
+        assert_eq!(gguf.tensors().len(), 1);
+        assert_eq!(gguf.shards().len(), 1);
     }
 
     // ── gated real-model test (skipped offline) ───────────────────────────────

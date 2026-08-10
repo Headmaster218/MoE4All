@@ -165,7 +165,7 @@ fn cpu_paged_store(
         return Ok(None);
     }
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open(g.path()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
     );
     let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
     tracing::info!(
@@ -234,7 +234,8 @@ fn vulkan_host_tier(
             // mapping, which is what lets a big model run on these machines at all.
             infr_core::hostmem::ArenaPlan::StreamOnly => {
                 let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open(g.path()).map_err(|e| anyhow!("{e}"))?,
+                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                        .map_err(|e| anyhow!("{e}"))?,
                 );
                 tracing::info!(
                     "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
@@ -300,7 +301,7 @@ fn vulkan_host_tier(
         return Ok(unpaged());
     }
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open(g.path()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
     );
     let mut arena = 0usize;
     let mut out = Vec::with_capacity(classes.len());

@@ -11,9 +11,13 @@
 //! cache evicts by recency, which is the pathological policy for the cyclic sweep a forward pass
 //! performs (measured: `docs/perf/results.md`, "Weights that do not fit memory").
 //!
+//! A `gguf-split` model is several files rather than one, and they are addressed end to end in
+//! shard order ([`FileBlockIo::open_shards`]) so a [`BlockExtent`] stays one number. A single-file
+//! model is the one-shard case of that, at base 0, and reads exactly as it did before.
+//!
 //! That freedom is also what makes a block's read CONCURRENT rather than one syscall: an NVMe
 //! reaches its bandwidth only with several requests in flight, so one block is split across
-//! [`IO_FANOUT`] positioned reads (see [`read_extents`]). This is what puts the tier's reader on
+//! [`IO_FANOUT`] positioned reads (see [`read_pieces`]). This is what puts the tier's reader on
 //! even footing with the mapping it replaces, whose faults the kernel already issues in parallel.
 //!
 //! The file can also change under a live run. A mapping makes that a `SIGBUS` or silently
@@ -29,7 +33,9 @@ use std::path::Path;
 /// One contiguous byte range of the model file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockExtent {
-    /// Absolute offset in the file (the tensor-data region's start already added in).
+    /// Absolute offset in the model's file address space (the tensor-data region's start already
+    /// added in). A `gguf-split` model is several files addressed end to end in shard order — see
+    /// [`FileBlockIo::open_shards`] — and a single file is the one-shard case of that, at base 0.
     pub offset: u64,
     pub len: usize,
 }
@@ -97,51 +103,134 @@ impl FileStamp {
     }
 }
 
-/// Reads blocks from an open model file with positioned reads.
-pub struct FileBlockIo {
+/// One file of the model, and where its bytes sit in the address space the extents are written in.
+struct ShardIo {
     file: File,
     stamp: FileStamp,
     /// Path kept for error messages only — every read and every re-stat goes through `file`.
     path: String,
+    /// First offset of the concatenated address space this file serves. Zero for the first shard,
+    /// hence for every single-file model.
+    base: u64,
+}
+
+/// Reads blocks from the open model file (or shard set) with positioned reads.
+pub struct FileBlockIo {
+    /// The model's files in shard order, each covering `[base, base + stamp.len)` of the address
+    /// space [`BlockExtent::offset`] is written in. A single-file model has exactly one.
+    shards: Vec<ShardIo>,
 }
 
 impl FileBlockIo {
+    /// Open a single-file model — the one-shard case of [`Self::open_shards`], with no length to
+    /// check because nothing before it computed offsets against one.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let file = Self::open_one(path.as_ref(), None, 0)?;
+        Ok(Self { shards: vec![file] })
+    }
+
+    /// Open a `gguf-split` shard set, addressing the files end to end in the given order.
+    ///
+    /// Each entry is `(path, length)` as `infr_gguf::Gguf::shards` reports it: the length its
+    /// tensor offsets were computed against. It is checked, not assumed — a shard that grew or
+    /// shrank between the load and this open shifts every offset in every LATER shard, which is
+    /// not a read that fails but a read that silently returns other weights. `verify_unchanged`
+    /// covers the same file changing after this point; this covers it having changed before.
+    pub fn open_shards(shards: &[(impl AsRef<Path>, u64)]) -> Result<Self> {
+        let mut out = Vec::with_capacity(shards.len());
+        let mut base = 0u64;
+        for (path, expect_len) in shards {
+            let s = Self::open_one(path.as_ref(), Some(*expect_len), base)?;
+            base = base.checked_add(s.stamp.len).ok_or_else(|| {
+                Error::Loader("model shard set is larger than u64 bytes".to_string())
+            })?;
+            out.push(s);
+        }
+        Ok(Self { shards: out })
+    }
+
+    fn open_one(path: &Path, expect_len: Option<u64>, base: u64) -> Result<ShardIo> {
         let file = File::open(path)?;
-        Ok(Self {
-            stamp: FileStamp::of(&file)?,
+        let stamp = FileStamp::of(&file)?;
+        if let Some(expect) = expect_len {
+            if stamp.len != expect {
+                return Err(Error::Loader(format!(
+                    "model shard changed size before it was streamed: {} is {} bytes, but the \
+                     weights were loaded against {expect} — every offset past it would name the \
+                     wrong bytes",
+                    path.display(),
+                    stamp.len
+                )));
+            }
+        }
+        Ok(ShardIo {
             file,
+            stamp,
             path: path.display().to_string(),
+            base,
         })
     }
 
-    /// The file's length at open — what a caller bounds-checks its extents against.
+    /// The model's total length at open — what a caller bounds-checks its extents against. The sum
+    /// over a shard set, which is the space those extents are written in.
     pub fn len(&self) -> u64 {
-        self.stamp.len
+        self.shards.last().map_or(0, |s| s.base + s.stamp.len)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stamp.len == 0
+        self.len() == 0
     }
 
-    /// Fail if the file changed since [`Self::open`].
+    /// Fail if any of the model's files changed since it was opened.
     ///
     /// Callers run this at a coarse boundary (once per forward pass), not per read: it is one
-    /// `fstat`, and the failure it catches — the model being rewritten mid-generation — turns what
-    /// would be silently different weights into an error. The known blind spot is a same-length
-    /// in-place write whose mtime is restored; catching that means hashing gigabytes per check
-    /// (backlog B30 records the same limit for `WeightWatch`).
+    /// `fstat` per shard, and the failure it catches — the model being rewritten mid-generation —
+    /// turns what would be silently different weights into an error. The known blind spot is a
+    /// same-length in-place write whose mtime is restored; catching that means hashing gigabytes
+    /// per check (backlog B30 records the same limit for `WeightWatch`).
     pub fn verify_unchanged(&self) -> Result<()> {
-        let now = FileStamp::of(&self.file)?;
-        if now == self.stamp {
-            return Ok(());
+        for s in &self.shards {
+            let now = FileStamp::of(&s.file)?;
+            if now != s.stamp {
+                return Err(Error::Loader(format!(
+                    "model file changed while it was being streamed: {} (was {} bytes, now {} \
+                     bytes) — weights read after this point would not match the ones already \
+                     loaded",
+                    s.path, s.stamp.len, now.len
+                )));
+            }
         }
-        Err(Error::Loader(format!(
-            "model file changed while it was being streamed: {} (was {} bytes, now {} bytes) — \
-             weights read after this point would not match the ones already loaded",
-            self.path, self.stamp.len, now.len
-        )))
+        Ok(())
+    }
+
+    /// The shard holding `[offset, offset + len)`, and that range's offset within it.
+    ///
+    /// A range that runs off the end of its shard is refused rather than continued into the next
+    /// one: the shards are separate files laid end to end for addressing only, so bytes never
+    /// actually span the join, and a request that claims they do is a corrupt descriptor.
+    fn locate(&self, offset: u64, len: usize) -> Result<(&ShardIo, u64)> {
+        // Ordered by `base`, each covering its whole file, so the owner is the last shard starting
+        // at or before `offset`. One shard at base 0 → always index 0.
+        let idx = self
+            .shards
+            .partition_point(|s| s.base <= offset)
+            .saturating_sub(1);
+        let shard = self.shards.get(idx).ok_or_else(|| {
+            Error::Loader(format!("read at {offset}+{len} of a model with no files"))
+        })?;
+        let local = offset - shard.base;
+        // `checked_add`: a descriptor carrying a near-`u64::MAX` length must be refused, never wrap
+        // the sum into a range that looks in-bounds.
+        if local
+            .checked_add(len as u64)
+            .is_none_or(|e| e > shard.stamp.len)
+        {
+            return Err(Error::Loader(format!(
+                "read at {offset}+{len} runs past the end of {} ({} bytes at offset {})",
+                shard.path, shard.stamp.len, shard.base
+            )));
+        }
+        Ok((shard, local))
     }
 }
 
@@ -155,10 +244,25 @@ impl BlockIo for FileBlockIo {
                 dst.len()
             )));
         }
-        read_extents(&self.file, &desc.extents, &mut dst[..need]).map_err(|(e, err)| {
+        // Resolve every piece to the file that holds it BEFORE any read runs, so a descriptor
+        // naming bytes outside the model fails by name instead of being read from a neighbour.
+        let pieces = plan_pieces(&desc.extents)
+            .into_iter()
+            .map(|p| {
+                let (shard, local) = self.locate(p.offset, p.len)?;
+                Ok((
+                    shard,
+                    BlockExtent {
+                        offset: local,
+                        len: p.len,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        read_pieces(pieces, &mut dst[..need]).map_err(|(shard, e, err)| {
             Error::Loader(format!(
                 "reading block {} at {}+{} of {}: {err}",
-                desc.id, e.offset, e.len, self.path
+                desc.id, e.offset, e.len, shard.path
             ))
         })
     }
@@ -213,50 +317,53 @@ fn plan_pieces(extents: &[BlockExtent]) -> Vec<BlockExtent> {
     out
 }
 
-/// Fill `dst` with `extents`, in order, using up to [`IO_FANOUT`] concurrent positioned reads.
+/// Fill `dst` with `pieces`, in order, using up to [`IO_FANOUT`] concurrent positioned reads.
 ///
-/// `dst` must be exactly the extents' total length; the caller has already length-checked. On
-/// failure returns the PIECE that failed alongside the error — a sub-range of one extent, which
-/// names the failing bytes more precisely than the extent enclosing them would.
+/// Each piece is already resolved to the shard that holds it and carries that shard's LOCAL offset
+/// (see [`FileBlockIo::locate`]); their total must be exactly `dst.len()`, which the caller has
+/// already length-checked. On failure returns the piece that failed and its shard alongside the
+/// error — a sub-range of one extent, which names the failing bytes more precisely than the extent
+/// enclosing them would.
 ///
 /// Ordering is preserved by construction rather than by sequencing the reads: each piece is handed
 /// a disjoint `&mut` sub-slice of `dst` carved at the position that piece belongs at, so the reads
 /// may complete in any order and still land where they must. Nothing is shared between them — the
-/// file is read at explicit offsets, so there is no cursor to race on.
-fn read_extents(
-    file: &File,
-    extents: &[BlockExtent],
+/// files are read at explicit offsets, so there is no cursor to race on.
+fn read_pieces<'a>(
+    pieces: Vec<(&'a ShardIo, BlockExtent)>,
     dst: &mut [u8],
-) -> std::result::Result<(), (BlockExtent, std::io::Error)> {
+) -> std::result::Result<(), (&'a ShardIo, BlockExtent, std::io::Error)> {
     debug_assert_eq!(
-        extents.iter().map(|e| e.len).sum::<usize>(),
+        pieces.iter().map(|(_, e)| e.len).sum::<usize>(),
         dst.len(),
-        "dst must be exactly the extents' total"
+        "dst must be exactly the pieces' total"
     );
     let mut rest = dst;
-    let mut pieces: Vec<(BlockExtent, &mut [u8])> = Vec::new();
-    for e in plan_pieces(extents) {
+    let mut placed: Vec<(&ShardIo, BlockExtent, &mut [u8])> = Vec::with_capacity(pieces.len());
+    for (shard, e) in pieces {
         let (mine, tail) = rest.split_at_mut(e.len);
         rest = tail;
-        pieces.push((e, mine));
+        placed.push((shard, e, mine));
     }
     debug_assert!(rest.is_empty(), "the pieces must cover dst exactly");
 
     // The calling thread takes the last piece rather than parking on a join, so a single-piece
     // block spawns nothing at all and the common case costs no threads.
-    let Some((last, last_dst)) = pieces.pop() else {
+    let Some((last_shard, last, last_dst)) = placed.pop() else {
         return Ok(());
     };
     let mut first_err = None;
     std::thread::scope(|s| {
-        let handles: Vec<_> = pieces
+        let handles: Vec<_> = placed
             .into_iter()
-            .map(|(e, buf)| {
-                s.spawn(move || read_exact_at(file, e.offset, buf).map_err(|err| (e, err)))
+            .map(|(shard, e, buf)| {
+                s.spawn(move || {
+                    read_exact_at(&shard.file, e.offset, buf).map_err(|err| (shard, e, err))
+                })
             })
             .collect();
-        first_err = read_exact_at(file, last.offset, last_dst)
-            .map_err(|err| (last, err))
+        first_err = read_exact_at(&last_shard.file, last.offset, last_dst)
+            .map_err(|err| (last_shard, last, err))
             .err();
         for h in handles {
             // A panicking reader is a bug in this function, not an I/O condition: propagate it
@@ -410,7 +517,10 @@ mod tests {
         );
     }
 
-    /// Reading past EOF must error rather than silently leaving the slot half-filled.
+    /// An extent naming bytes the file does not have must error rather than silently leaving the
+    /// slot half-filled. It is refused by `locate` before any read is issued: with a shard set the
+    /// next file's bytes sit immediately after this one in the address space, so "runs off the end
+    /// of shard k" has to be a refusal and not something the reader could paper over.
     #[test]
     fn reading_past_the_end_errors() {
         let (f, _) = ramp_file(512);
@@ -424,7 +534,111 @@ mod tests {
         };
         let mut dst = vec![0u8; 512];
         let err = io.read_block(&desc, &mut dst).expect_err("must reject");
+        assert!(
+            err.to_string().contains("runs past the end of"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// The other half of that: an extent that WAS in range when the model was loaded, on a file
+    /// that has since been truncated. `locate` passes (it checks the length stamped at open), so
+    /// this is the path where `read_exact_at`'s EOF branch is what stops a half-filled slot.
+    #[test]
+    fn a_file_truncated_after_open_short_reads() {
+        let (f, _) = ramp_file(512);
+        let io = FileBlockIo::open(f.path()).expect("open");
+        std::fs::File::create(f.path())
+            .expect("truncate")
+            .set_len(64)
+            .expect("set_len");
+        let desc = BlockDesc {
+            id: 4,
+            extents: vec![BlockExtent {
+                offset: 256,
+                len: 128,
+            }],
+        };
+        let mut dst = vec![0u8; 128];
+        let err = io.read_block(&desc, &mut dst).expect_err("must reject");
         assert!(err.to_string().contains("short read"), "unexpected: {err}");
+    }
+
+    /// Two shards addressed end to end: an extent past the first file's length must be read from
+    /// the SECOND file, at its own offset. Both files hold the same ramp pattern, so an extent
+    /// resolved against the wrong file would still return readable bytes of the right length —
+    /// what tells them apart here is that shard 2's ramp is offset by one.
+    #[test]
+    fn open_shards_reads_across_the_join() {
+        let (a, a_bytes) = ramp_file(4096);
+        let b_bytes: Vec<u8> = (0..4096usize).map(|i| (i + 1) as u8).collect();
+        let mut b = tempfile::NamedTempFile::new().expect("temp file");
+        b.write_all(&b_bytes).expect("write");
+        b.flush().expect("flush");
+
+        let io = FileBlockIo::open_shards(&[(a.path(), 4096), (b.path(), 4096)]).expect("open set");
+        assert_eq!(
+            io.len(),
+            8192,
+            "the set is addressed as one 8192-byte space"
+        );
+
+        // One extent inside shard 1, one inside shard 2, in one block — the fused-group shape.
+        let desc = BlockDesc {
+            id: 9,
+            extents: vec![
+                BlockExtent {
+                    offset: 100,
+                    len: 64,
+                },
+                BlockExtent {
+                    offset: 4096 + 100,
+                    len: 64,
+                },
+            ],
+        };
+        let mut dst = vec![0u8; 128];
+        io.read_block(&desc, &mut dst).expect("read");
+        assert_eq!(&dst[..64], &a_bytes[100..164]);
+        assert_eq!(&dst[64..], &b_bytes[100..164]);
+    }
+
+    /// A read that would run off the end of one shard is refused, never continued into the next —
+    /// the shards are separate files laid end to end for ADDRESSING, and no tensor spans the join.
+    #[test]
+    fn a_read_never_spans_the_shard_join() {
+        let (a, _) = ramp_file(4096);
+        let (b, _) = ramp_file(4096);
+        let io = FileBlockIo::open_shards(&[(a.path(), 4096), (b.path(), 4096)]).expect("open set");
+        let desc = BlockDesc {
+            id: 3,
+            extents: vec![BlockExtent {
+                offset: 4032,
+                len: 128,
+            }],
+        };
+        let mut dst = vec![0u8; 128];
+        let err = io.read_block(&desc, &mut dst).expect_err("must reject");
+        assert!(
+            err.to_string().contains("runs past the end of"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A shard whose length is no longer the one the weights were loaded against shifts every
+    /// offset in every LATER shard — not a read that fails, a read that returns other weights. It
+    /// must be refused at open, naming the file and both lengths.
+    #[test]
+    fn open_shards_refuses_a_shard_of_the_wrong_length() {
+        let (a, _) = ramp_file(4096);
+        let (b, _) = ramp_file(4096);
+        let msg = match FileBlockIo::open_shards(&[(a.path(), 2048), (b.path(), 4096)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a resized shard must be refused"),
+        };
+        assert!(
+            msg.contains("changed size") && msg.contains("4096") && msg.contains("2048"),
+            "unexpected: {msg}"
+        );
     }
 
     /// The file-replaced check: unchanged is silent, and a rewrite through the SAME path (the
@@ -555,11 +769,21 @@ mod tests {
     /// The FIRST extent is the one that runs off the end and the last is in range, because the
     /// calling thread keeps the last piece: a failure placed at the end would be caught by the
     /// caller's own read and would say nothing about whether a spawned reader's error is joined.
+    ///
+    /// The file is TRUNCATED after opening so the descriptor stays inside the length `locate`
+    /// checks (an extent naming bytes past the stamped length never reaches a reader at all) while
+    /// the read itself still hits EOF — which is the condition a spawned reader has to report.
     #[test]
     fn a_failing_piece_fails_the_block() {
         let each = 2 * MIN_CHUNK;
-        let (f, _) = ramp_file(each);
+        let (f, _) = ramp_file(2 * each);
         let io = FileBlockIo::open(f.path()).expect("open");
+        std::fs::File::options()
+            .write(true)
+            .open(f.path())
+            .expect("reopen")
+            .set_len(each as u64)
+            .expect("truncate");
         let desc = BlockDesc {
             id: 11,
             extents: vec![

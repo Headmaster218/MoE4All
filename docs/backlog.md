@@ -1134,6 +1134,53 @@ graph-build refusal fires — harmless because nothing reads them, and wrong the
 moment the emit slice lands. `docs/deepseek.md` § Stage 4 calls this the largest
 single porting risk in the family.
 
+### B54 — `WeightWatch` watches one file of a shard set (2026-08-10)
+
+**Tag:** multi-shard GGUF slice · **Blocked on:** nothing; scoped out of the
+loading slice that surfaced it
+
+`Gguf::open` now loads a whole `gguf-split` set, but `WeightWatch::open` is
+still called from `infr-cli` with the single path the user typed, so on a split
+model it stamps shard 1 and notices nothing about shards 2..N being replaced
+mid-run. The detection it provides is per-inode (see B30), so extending it means
+holding one stamp per shard — the shape `FileBlockIo::open_shards` already has,
+where every shard's descriptor is stamped and `verify_unchanged` walks them.
+
+The pieces to connect: `Gguf::shards` reports `(path, length)` per shard, which
+is what a set-aware `WeightWatch::open` would take instead of a path, and every
+`WeightWatch::open` call site in `infr-cli/src/main.rs` passes a path it got
+from model resolution rather than from the loaded `Gguf`. Note the streaming
+tier is already covered on a split model — `FileBlockIo::open_shards` stamps
+every shard and refuses one whose length no longer matches what the weights were
+loaded against — so this gap is only about the non-streaming mmap path.
+
+### B55 — multi-shard GGUF: what the slice did NOT verify (2026-08-10)
+
+**Tag:** multi-shard GGUF slice coverage · **Blocked on:** nothing; each line is
+a gap, stated as one
+
+Shard-set loading is covered by synthetic two-shard fixtures in `infr-gguf`
+(round trip, byte values from the second shard's own file, opening a later shard
+directly, and one test per validation) plus `FileBlockIo::open_shards` tests in
+`infr-core`, and end to end by one real run of a 5-shard 229 GB
+`DeepSeek-V3.2-Q2_K` on the CPU backend. Not reached by any of that:
+
+- **Windows and macOS.** The shard reader is `read_exact_at` per shard, the same
+  positioned-read path as before, so nothing new is platform-gated — but the
+  real-model run was Linux/NVMe only, and B35 already records that the fanout's
+  benefit is unverified off Linux.
+- **A sharded model on Vulkan or Metal.** Only the CPU backend was exercised end
+  to end. The GPU paths reach the same `Gguf` API (`tensor_bytes_arc`,
+  `tensor_file_range`, and `vulkan_host_tier`'s `FileBlockIo::open_shards`), so
+  the seam is shared, but no sharded model has been run on a device.
+- **A sharded model that fits memory.** The one real run streamed. The resident
+  path differs only in which binder is chosen, and both go through `resolve`.
+- **A shard set whose members have different `general.alignment`.** Each shard's
+  data region is computed from its own header, so this should just work; no
+  fixture asserts it.
+- **More than two shards in the unit fixtures.** The real model has five, but
+  the synthetic sets are two — the assembly loop is uniform in the count.
+
 ### B46 — what the MLA and DeepSeek MoE work was NOT verified against (2026-08-09)
 
 **Tag:** CR-2026-08-09 deepseek coverage · **Blocked on:** nothing; stated as

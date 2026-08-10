@@ -8,6 +8,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Multi-shard (`gguf-split`) models load.** `Gguf::open` on any member of a
+  `-NNNNN-of-MMMMM.gguf` set follows `split.count` to the whole set, maps every
+  shard separately (each keeping the shared file mapping that makes a
+  larger-than-RAM model runnable), takes the metadata from shard 1 and unions
+  the tensor index across all of them — so a tensor resolves against the file
+  that actually holds it instead of failing with `tensor not found`. Opening a
+  LATER shard works too: it carries no model metadata, so the set is re-rooted
+  at shard 1. The set is validated rather than trusted — the filename's
+  `-of-MMMMM` must equal `split.count`, every shard's `split.no` must match the
+  position its filename claims, all shards must agree on `split.count`, the
+  assembled index must be exactly `split.tensors.count` entries with no repeated
+  name, and a missing shard fails naming the file. Tested against a 5-shard 229
+  GB DeepSeek-V3.2-Q2_K.
+- `infr_core::gguf_split` — the `-NNNNN-of-MMMMM.gguf` naming convention, parsed
+  in one place instead of two. `infr-hub` (is the cached set complete?) and
+  `infr-gguf` (which files is this model?) now share it.
+- `infr_core::blockio::FileBlockIo::open_shards` — the weight pager's disk tier
+  reads a shard set as one address space, refusing at open any shard whose
+  length is no longer the one the weights were loaded against (which would shift
+  every offset in every later shard).
+
 - **DeepSeek V4 attention primitives** (stage 4, op level — nothing emits them
   yet): `Op::QkNorm`'s `weight` became optional, so a weightless per-head
   RMSNorm is expressible without a fake ones-vector operand; `Op::Attention`
@@ -135,6 +156,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on is the only way to put a resident model on the layer-major path.
 
 ### Changed
+
+- `Gguf::path()` → `Gguf::shards()`, which returns `(path, length)` per shard in
+  order. `TensorBytes::file_range` / `Gguf::tensor_file_range` now report
+  offsets in the model's concatenated file address space; for a single-file
+  model that is the file offset it always was.
 
 - **A streamed model now prefills LAYER-MAJOR: the prompt sweeps the weight set
   once instead of once per prefill chunk.** Prefill runs in `device.ubatch`
