@@ -1303,7 +1303,10 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
                     return false;
                 }
             }
-            Op::Mla { .. } => return false,
+            // MLA has no params-driven twin, and the lightning indexer bakes its causal bound from
+            // the `pos` param at encode time — a replayed tape would select keys for the position
+            // it was recorded at.
+            Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
             Op::Attention {
                 rows,
                 head_dim,
@@ -1392,6 +1395,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::WriteKv { .. } => "WriteKv",
         Op::Attention { .. } => "Attention",
         Op::Mla { .. } => "Mla",
+        Op::LightningIndexer { .. } => "LightningIndexer",
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
@@ -5368,6 +5372,98 @@ impl MetalBackend {
                     bufs.push(bff.as_ref());
                 }
                 self.encode_tg_w(r, &pso, &bufs, 1 << 4, &p, threads, 0);
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::LightningIndexer {
+                q,
+                k_cache,
+                weights,
+                dst,
+                rows,
+                kv_len,
+                n_head,
+                head_dim,
+                top_k,
+                scale,
+                pos,
+            } => {
+                // DeepSeek V3.2's top-k key selector, ported from the Vulkan
+                // `lightning_indexer.comp`: one threadgroup of 256 threads per query row scores
+                // every cached key and then runs `top_k` argmax rounds over those scores. Like
+                // `Op::Mla` the kernel reads the cache in its native f16 (`device const half*`).
+                if g.desc(k_cache).dtype != DType::F16 {
+                    return Err(Error::Unsupported(
+                        "metal Op::LightningIndexer: f16 indexer KV cache required (kernel reads \
+                         the cache as f16 halves — no unpacked/dense path yet)"
+                            .into(),
+                    ));
+                }
+                // Every output slot must name a key that exists. llama.cpp clamps at graph-build
+                // time (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`); the kernel cannot
+                // refuse the work, so refuse it here rather than emit a duplicated index.
+                if top_k > kv_len {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — \
+                         there are not that many keys to name"
+                    )));
+                }
+                // Key `j` is row `j` — no ring fold (see `Op::LightningIndexer`'s doc: causal
+                // masking makes position 0 eligible for every query, so a wrapped cache has
+                // already lost a key this op must score). Refuse one rather than read a row that
+                // holds another position.
+                let cap_rows = (g.desc(k_cache).numel() / (head_dim as usize).max(1)) as u32;
+                if cap_rows < kv_len {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::LightningIndexer: indexer cache holds {cap_rows} rows but \
+                         kv_len is {kv_len} — a wrapped indexer cache has already lost keys this \
+                         op must score"
+                    )));
+                }
+                let bq = self.ensure_device(r, q);
+                let bw = self.ensure_device(r, weights);
+                let bcache = metal_buf(
+                    bindings
+                        .get(k_cache)
+                        .expect("metal backend: unbound indexer KV cache"),
+                );
+                // Score scratch — the `[n_kv, n_tokens]` tensor llama.cpp materializes too. Phase 1
+                // fills every slot the row reads before phase 2 reads any of them.
+                let bs = self.scratch_buf((rows as usize) * (kv_len as usize), 23);
+                let bd = self.dev_dst(r, dst, (rows as usize) * (top_k as usize));
+                // LidxParams, byte layout mirrored from recorder.lightning_indexer's push constant.
+                let mut p = rows.to_ne_bytes().to_vec();
+                p.extend_from_slice(&kv_len.to_ne_bytes());
+                p.extend_from_slice(&n_head.to_ne_bytes());
+                p.extend_from_slice(&head_dim.to_ne_bytes());
+                p.extend_from_slice(&top_k.to_ne_bytes());
+                p.extend_from_slice(&scale.to_ne_bytes());
+                p.extend_from_slice(&pos.to_ne_bytes());
+                let pso = self.pipelines.get("lightning_indexer_f16kv")?;
+                let bufs: Vec<&MtlBuffer> = vec![
+                    bq.as_ref(),
+                    &bcache.raw,
+                    bw.as_ref(),
+                    bs.as_ref(),
+                    bd.as_ref(),
+                ];
+                // ONE threadgroup per row — the kernel reads its row from
+                // `threadgroup_position_in_grid`, so the thread count must be an exact multiple of
+                // the width actually launched. Metal clamps a requested width to the pipeline's
+                // `maxTotalThreadsPerThreadgroup`, so ask the pipeline first instead of assuming
+                // 256 and silently getting two threadgroups per row on a device that caps lower.
+                let tgw = 256
+                    .min(pso.max_total_threads_per_threadgroup() as usize)
+                    .max(1);
+                // scratch (3) and dst (4) are the writes.
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &bufs,
+                    (1 << 3) | (1 << 4),
+                    &p,
+                    (rows as usize) * tgw,
+                    tgw,
+                );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::MoeSharedExpertAdd { .. } => {

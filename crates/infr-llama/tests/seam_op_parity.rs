@@ -1626,3 +1626,461 @@ fn layernorm_parity() {
         );
     }
 }
+
+// ── Op::LightningIndexer (deepseek32's top-k key selector) ───────────────────────────────────
+
+/// Hand-written reference for one `Op::LightningIndexer` dispatch, derived from the FORMULA in
+/// `docs/deepseek.md` § "The lightning indexer" (equivalently llama.cpp `deepseek32.cpp`'s
+/// non-fused `// lightning indexer` block) — deliberately NOT transcribed from the CPU interpreter
+/// arm, which is the thing under test:
+///
+/// ```text
+/// score[t, j] = Σ_h (w[t, h] * scale) * ReLU( q[t, h] · k[j] )   for j <= pos + t
+/// dst[t, :]   = the top_k key positions by (score DESC, index ASC)
+/// ```
+///
+/// Two things it does differently from every backend on purpose. It accumulates in **f64**, so it
+/// is an accuracy oracle and not a re-run of the same f32 rounding (which is why
+/// `assert_scores_separated` exists: the two precisions may only be asked to agree about scores
+/// that are either exactly equal or comfortably apart); and it takes `keys[j]` as the key for
+/// position `j` from a list the caller builds, never touching the cache layout the backends read.
+/// The ordering is expressed as a STABLE sort over the ascending index list, which is what makes
+/// "ties break toward the lower index" fall out of the spec rather than out of a hand-written
+/// comparison.
+///
+/// Returns the selected indices AND the f64 scores, so callers can check their case is well posed
+/// (see `assert_scores_separated`).
+#[allow(clippy::too_many_arguments)]
+fn lightning_indexer_ref(
+    q: &[f32],
+    keys: &[Vec<f32>],
+    w: &[f32],
+    rows: usize,
+    n_head: usize,
+    head_dim: usize,
+    kv_len: usize,
+    top_k: usize,
+    scale: f32,
+    pos: usize,
+) -> (Vec<u32>, Vec<Vec<f64>>) {
+    let mut idx_out = Vec::with_capacity(rows * top_k);
+    let mut score_out = Vec::with_capacity(rows);
+    for t in 0..rows {
+        // Causal: a key at an absolute position past the query's is not eligible; the cache only
+        // holds `kv_len` positions.
+        let hi = (pos + t + 1).min(kv_len);
+        let mut sc = vec![0f64; kv_len];
+        for (j, s) in sc.iter_mut().enumerate().take(hi) {
+            let mut acc = 0f64;
+            for h in 0..n_head {
+                let qo = (t * n_head + h) * head_dim;
+                let dot: f64 = (0..head_dim)
+                    .map(|i| q[qo + i] as f64 * keys[j][i] as f64)
+                    .sum();
+                // ReLU INSIDE the head-weighted sum, and `scale` on the WEIGHT.
+                acc += (w[t * n_head + h] as f64 * scale as f64) * dot.max(0.0);
+            }
+            *s = acc;
+        }
+        let mut order: Vec<usize> = (0..kv_len).collect();
+        order.sort_by(|&a, &b| {
+            let (ea, eb) = (a < hi, b < hi);
+            // Eligible (true) before ineligible, then score descending among the eligible. The
+            // sort is STABLE and `order` starts ascending, so every tie — and the whole
+            // ineligible tail — keeps ascending index order, which IS the op's tie-break.
+            eb.cmp(&ea).then_with(|| {
+                if ea {
+                    sc[b].partial_cmp(&sc[a]).expect("scores are never NaN")
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+        });
+        idx_out.extend(order[..top_k].iter().map(|&j| j as u32));
+        score_out.push(sc);
+    }
+    (idx_out, score_out)
+}
+
+/// A top-k over f32 scores only has ONE right answer when the eligible scores are either exactly
+/// equal (a deliberate tie, which every precision reproduces) or far enough apart that f32 and the
+/// f64 reference cannot disagree about their order. Assert that here rather than discover it as a
+/// flake: `hi` is the case's causal bound for this row.
+fn assert_scores_separated(sc: &[f64], hi: usize, what: &str) {
+    for a in 0..hi {
+        for b in (a + 1)..hi {
+            let (x, y) = (sc[a], sc[b]);
+            if x == y {
+                continue; // an exact tie: decided by index at every precision
+            }
+            let rel = (x - y).abs() / x.abs().max(y.abs()).max(1e-12);
+            assert!(
+                rel > 1e-4,
+                "{what}: keys {a}/{b} score {x} vs {y} (rel {rel:e}) — too close for f32 and the \
+                 f64 reference to be guaranteed to agree on the order; the case is not well posed"
+            );
+        }
+    }
+}
+
+/// One `lightning_indexer_parity` case.
+struct LidxCase {
+    name: &'static str,
+    rows: usize,
+    pos: usize,
+    kv_len: usize,
+    /// Ring row capacity — the K cache tensor is declared `cap * head_dim` wide, which is where
+    /// the backends read `cap_rows` from. `cap < kv_len` is a genuinely wrapped cache.
+    cap: usize,
+    n_head: usize,
+    head_dim: usize,
+    top_k: usize,
+}
+
+/// Test data for `lightning_indexer_parity`. Values are 1/16ths so the f16 KV cache round-trip is
+/// EXACT — the tolerance then measures the kernel, not the cast — and keys 2 and 5 are deliberately
+/// IDENTICAL, so their scores tie exactly at every precision and the selection has to fall through
+/// to the index tie-break.
+fn lidx_key_at(j: usize, head_dim: usize) -> Vec<f32> {
+    let src = if j == 5 { 2 } else { j }; // exact-tie pair
+    (0..head_dim)
+        .map(|d| (((src * 11 + d * 5) % 17) as f32 - 8.0) / 16.0)
+        .collect()
+}
+
+/// `Op::LightningIndexer` — CPU backend vs the from-formula f64 reference above, plus a
+/// CPU-vs-Vulkan cross-check when a GPU is present. Indices are discrete, so both comparisons are
+/// EXACT equality: there is no tolerance to hide behind.
+///
+/// The case table moves the axes that decide the answer: several query rows so the causal cut
+/// differs per row (and, at `pos = 0`, so the first rows have FEWER eligible keys than `top_k` —
+/// the short case); a case where `top_k` exceeds the eligible count outright; the exact-tie pair
+/// above; a wrapped ring (`cap < kv_len`), which only agrees with the reference if the kernels'
+/// `j % cap_rows` lands on the row the writer used; and a wide case whose `kv_len` is not a
+/// multiple of the 256-lane Vulkan/Metal workgroup (so the strided key loop runs a partial tail)
+/// with an odd `n_head` (the head sum is serial inside a lane, so the head count never divides the
+/// workgroup — the axis the workgroup splits is the KEY axis).
+#[test]
+fn lightning_indexer_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let cases = [
+        // pos=0 with top_k=3: row 0 has ONE eligible key, row 1 two, row 2 exactly three — the
+        // short case on the first two rows and an exact fit on the third, in one dispatch.
+        LidxCase {
+            name: "prefill pos=0, causal cut per row (short on rows 0-1)",
+            rows: 4,
+            pos: 0,
+            kv_len: 6,
+            cap: 6,
+            n_head: 3,
+            head_dim: 8,
+            top_k: 3,
+        },
+        // Decode at a position where the exact-tie pair (keys 2 and 5) is BOTH eligible and inside
+        // the selected prefix.
+        LidxCase {
+            name: "decode pos=7, exact-tie pair eligible",
+            rows: 1,
+            pos: 7,
+            kv_len: 8,
+            cap: 8,
+            n_head: 4,
+            head_dim: 8,
+            top_k: 6,
+        },
+        // top_k far past the eligible count: one eligible key, seven slots to fill from the
+        // ineligible tail.
+        LidxCase {
+            name: "top_k 8 over 1 eligible key",
+            rows: 1,
+            pos: 0,
+            kv_len: 8,
+            cap: 8,
+            n_head: 2,
+            head_dim: 8,
+            top_k: 8,
+        },
+        // The production cache shape: allocated for the whole context, only `kv_len` rows in use.
+        // `cap != kv_len` is what tells the backends' `cap_rows` derivation apart from `kv_len`.
+        LidxCase {
+            name: "cache wider than kv_len (cap=32, kv_len=9)",
+            rows: 2,
+            pos: 7,
+            kv_len: 9,
+            cap: 32,
+            n_head: 3,
+            head_dim: 8,
+            top_k: 4,
+        },
+        // kv_len 300 is not a multiple of 256, so the strided key loop runs a partial tail;
+        // n_head 5 and head_dim 6 are both awkward widths for the serial inner loops.
+        LidxCase {
+            name: "wide kv_len=300 (not a workgroup multiple), n_head=5",
+            rows: 3,
+            pos: 296,
+            kv_len: 300,
+            cap: 300,
+            n_head: 5,
+            head_dim: 6,
+            top_k: 17,
+        },
+    ];
+
+    for case in cases {
+        let LidxCase {
+            name,
+            rows,
+            pos,
+            kv_len,
+            cap,
+            n_head,
+            head_dim,
+            top_k,
+        } = case;
+        let scale = 1.0 / ((head_dim * n_head) as f32).sqrt();
+        let keys: Vec<Vec<f32>> = (0..kv_len).map(|j| lidx_key_at(j, head_dim)).collect();
+        // Cache writer: position j at row j, the layout the op requires (no ring fold — see
+        // `Op::LightningIndexer`'s doc). Rows past kv_len stay zeroed and must never be read.
+        assert!(cap >= kv_len, "{name}: the op refuses cap_rows < kv_len");
+        let mut cache = vec![0f32; cap * head_dim];
+        for (j, k) in keys.iter().enumerate() {
+            cache[j * head_dim..][..head_dim].copy_from_slice(k);
+        }
+        // q and w: mixed-sign 1/8ths and 1/4ths. NEGATIVE weights matter — they are what makes the
+        // ReLU's placement (inside the head sum, before the weight) observable at all.
+        let qi: Vec<f32> = (0..rows * n_head * head_dim)
+            .map(|i| (((i * 7 + 3) % 13) as f32 - 6.0) / 8.0)
+            .collect();
+        let wi: Vec<f32> = (0..rows * n_head)
+            .map(|i| (((i * 5 + 1) % 9) as f32 - 4.0) / 4.0)
+            .collect();
+
+        let mut g = Graph::new();
+        let q = g.input(f32d(rows * n_head * head_dim));
+        let k_cache = g.input(TensorDesc::new(vec![cap * head_dim], DType::F16));
+        let w = g.input(f32d(rows * n_head));
+        let dst = g.output(TensorDesc::new(vec![rows * top_k], DType::I32));
+        g.push(Op::LightningIndexer {
+            q,
+            k_cache,
+            weights: w,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            top_k: top_k as u32,
+            scale,
+            pos: pos as u32,
+        });
+
+        // The cache is f16 (what `WriteKv` produces and what both GPU kernels read), so the shared
+        // `run` helper — which uploads f32 — cannot carry it.
+        let kf: Vec<u8> = cache
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let runner = |be: &dyn Backend| -> Vec<u32> {
+            let plan = be.compile(&g).unwrap();
+            let qb = be.alloc(qi.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(qb.as_ref(), bytemuck::cast_slice(&qi)).unwrap();
+            let wb = be.alloc(wi.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(wb.as_ref(), bytemuck::cast_slice(&wi)).unwrap();
+            let kb = be.alloc(kf.len(), BufferUsage::Activations).unwrap();
+            be.upload(kb.as_ref(), &kf).unwrap();
+            let ob = be.alloc(rows * top_k * 4, BufferUsage::Readback).unwrap();
+            let mut b = Bindings::new();
+            b.bind(q, qb.as_ref());
+            b.bind(w, wb.as_ref());
+            b.bind(k_cache, kb.as_ref());
+            b.bind(dst, ob.as_ref());
+            be.execute(plan.as_ref(), &b).unwrap();
+            let mut bytes = vec![0u8; rows * top_k * 4];
+            be.download(ob.as_ref(), &mut bytes).unwrap();
+            bytemuck::cast_slice::<u8, u32>(&bytes).to_vec()
+        };
+
+        let (want, scores) = lightning_indexer_ref(
+            &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos,
+        );
+        for (t, sc) in scores.iter().enumerate() {
+            assert_scores_separated(sc, (pos + t + 1).min(kv_len), &format!("{name} row {t}"));
+        }
+        let c = runner(&cpu);
+        println!("LightningIndexer {name}: cpu={c:?}\n  ref ={want:?}");
+        assert_eq!(
+            c, want,
+            "LightningIndexer {name}: CPU diverges from reference"
+        );
+
+        if let Some(vk) = gpu() {
+            let v = runner(&vk);
+            println!("LightningIndexer {name}: vulkan={v:?}");
+            assert_eq!(v, c, "LightningIndexer {name}: Vulkan diverges from CPU");
+        }
+    }
+}
+
+/// The head-weighted score is a SUM over heads, not a max: a key with one big positive dot must
+/// lose to a key that scores moderately in EVERY head. With `n_head = 4` unit queries (head `h`
+/// selects component `h`) and unit weights:
+///
+/// * key 0 = `[9,0,0,0]` — dots `(9,0,0,0)`, so `max` is 9 and the SUM is 9;
+/// * key 1 = `[3,3,3,3]` — dots `(3,3,3,3)`, so `max` is 3 and the SUM is 12.
+///
+/// The right answer ranks key 1 first. A max-over-heads (or any single-head) reduction ranks key 0
+/// first, and — the reason this case is spelled out rather than left to the random table — so does
+/// a reduction that only ever sees head 0.
+#[test]
+fn lightning_indexer_head_sum_is_a_sum_not_a_max() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n_head, head_dim, kv_len, top_k) = (1usize, 4usize, 4usize, 3usize, 3usize);
+    // q[h] = e_h, so head h reads component h of the key.
+    let mut qi = vec![0f32; rows * n_head * head_dim];
+    for h in 0..n_head {
+        qi[h * head_dim + h] = 1.0;
+    }
+    let wi = vec![1.0f32; rows * n_head];
+    let keys: Vec<Vec<f32>> = vec![
+        vec![9.0, 0.0, 0.0, 0.0], // one big head:  max 9, sum 9
+        vec![3.0, 3.0, 3.0, 3.0], // every head:    max 3, sum 12
+        vec![0.0, 0.0, 0.0, 0.0], // nothing:       max 0, sum 0
+    ];
+    let mut cache = vec![0f32; kv_len * head_dim];
+    for (j, k) in keys.iter().enumerate() {
+        cache[j * head_dim..][..head_dim].copy_from_slice(k);
+    }
+
+    let mut g = Graph::new();
+    let q = g.input(f32d(rows * n_head * head_dim));
+    let k_cache = g.input(TensorDesc::new(vec![kv_len * head_dim], DType::F16));
+    let w = g.input(f32d(rows * n_head));
+    let dst = g.output(TensorDesc::new(vec![rows * top_k], DType::I32));
+    g.push(Op::LightningIndexer {
+        q,
+        k_cache,
+        weights: w,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        top_k: top_k as u32,
+        scale: 1.0,
+        pos: (kv_len - 1) as u32, // every key eligible
+    });
+
+    let kf: Vec<u8> = cache
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let runner = |be: &dyn Backend| -> Vec<u32> {
+        let plan = be.compile(&g).unwrap();
+        let qb = be.alloc(qi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(qb.as_ref(), bytemuck::cast_slice(&qi)).unwrap();
+        let wb = be.alloc(wi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(wb.as_ref(), bytemuck::cast_slice(&wi)).unwrap();
+        let kb = be.alloc(kf.len(), BufferUsage::Activations).unwrap();
+        be.upload(kb.as_ref(), &kf).unwrap();
+        let ob = be.alloc(rows * top_k * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(w, wb.as_ref());
+        b.bind(k_cache, kb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut bytes = vec![0u8; rows * top_k * 4];
+        be.download(ob.as_ref(), &mut bytes).unwrap();
+        bytemuck::cast_slice::<u8, u32>(&bytes).to_vec()
+    };
+
+    let c = runner(&cpu);
+    println!("LightningIndexer head-sum: cpu={c:?} (want [1, 0, 2])");
+    assert_eq!(c, vec![1, 0, 2], "the head reduction is not a sum");
+    if let Some(vk) = gpu() {
+        let v = runner(&vk);
+        println!("LightningIndexer head-sum: vulkan={v:?}");
+        assert_eq!(v, c, "LightningIndexer head-sum: Vulkan diverges from CPU");
+    }
+}
+
+/// `Op::LightningIndexer::scale` cannot be guarded through this op's output, and this test exists
+/// to SAY so rather than let someone add a test that only looks like it does.
+///
+/// The op emits ranks, and multiplying every per-head weight by one positive constant multiplies
+/// every score by that constant, which is order-preserving — so dropping the `1/sqrt(head_dim *
+/// n_head)` normaliser, or moving it from the weight onto the score, leaves the selected indices
+/// identical. (Verified by injection while writing this: removing the `* scale` from the CPU arm
+/// left every case in `lightning_indexer_parity` green.) The field is still carried, and still
+/// applied to the WEIGHT rather than the score, because that is where llama.cpp's `ggml_scale` on
+/// `indexer_weights` puts it — which is what keeps the intermediate SCORES comparable with the
+/// reference during bring-up, and the only thing that could ever make the placement observable is
+/// a knife-edge tie that rounding collapses.
+///
+/// So: this asserts the invariance, not the arithmetic. It goes red only if the op stops being a
+/// pure ranking (e.g. if it ever emitted scores), which is exactly when a real scale test would
+/// become possible.
+#[test]
+fn lightning_indexer_scale_cannot_change_the_selection() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n_head, head_dim, kv_len, top_k, pos) = (2usize, 3usize, 8usize, 9usize, 5usize, 7);
+    let keys: Vec<Vec<f32>> = (0..kv_len).map(|j| lidx_key_at(j, head_dim)).collect();
+    let mut cache = vec![0f32; kv_len * head_dim];
+    for (j, k) in keys.iter().enumerate() {
+        cache[j * head_dim..][..head_dim].copy_from_slice(k);
+    }
+    let qi: Vec<f32> = (0..rows * n_head * head_dim)
+        .map(|i| (((i * 7 + 3) % 13) as f32 - 6.0) / 8.0)
+        .collect();
+    let wi: Vec<f32> = (0..rows * n_head)
+        .map(|i| (((i * 5 + 1) % 9) as f32 - 4.0) / 4.0)
+        .collect();
+    let kf: Vec<u8> = cache
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+
+    let select = |scale: f32| -> Vec<u32> {
+        let mut g = Graph::new();
+        let q = g.input(f32d(rows * n_head * head_dim));
+        let k_cache = g.input(TensorDesc::new(vec![kv_len * head_dim], DType::F16));
+        let w = g.input(f32d(rows * n_head));
+        let dst = g.output(TensorDesc::new(vec![rows * top_k], DType::I32));
+        g.push(Op::LightningIndexer {
+            q,
+            k_cache,
+            weights: w,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            top_k: top_k as u32,
+            scale,
+            pos: pos as u32,
+        });
+        let be: &dyn Backend = &cpu;
+        let plan = be.compile(&g).unwrap();
+        let qb = be.alloc(qi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(qb.as_ref(), bytemuck::cast_slice(&qi)).unwrap();
+        let wb = be.alloc(wi.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(wb.as_ref(), bytemuck::cast_slice(&wi)).unwrap();
+        let kb = be.alloc(kf.len(), BufferUsage::Activations).unwrap();
+        be.upload(kb.as_ref(), &kf).unwrap();
+        let ob = be.alloc(rows * top_k * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(w, wb.as_ref());
+        b.bind(k_cache, kb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut bytes = vec![0u8; rows * top_k * 4];
+        be.download(ob.as_ref(), &mut bytes).unwrap();
+        bytemuck::cast_slice::<u8, u32>(&bytes).to_vec()
+    };
+
+    let normalised = select(1.0 / ((head_dim * n_head) as f32).sqrt());
+    println!("LightningIndexer scale invariance: {normalised:?}");
+    assert_eq!(normalised, select(1.0), "scale 1 changed the selection");
+    assert_eq!(normalised, select(64.0), "scale 64 changed the selection");
+}

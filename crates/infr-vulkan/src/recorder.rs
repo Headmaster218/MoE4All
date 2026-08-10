@@ -4104,6 +4104,59 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
+    /// every cached key against the row's indexer heads and writes the top-`top_k` key indices.
+    /// One workgroup per query row — the dispatch below is `rows` groups, and each group's 256
+    /// lanes split the KEY axis.
+    ///
+    /// `scores` is caller-provided scratch of at least `rows * kv_len` f32s; the kernel fills it
+    /// (phase 1) and reads it back (phase 2), so it must not alias anything else live. It is
+    /// counted as a written binding alongside `dst` so the hazard tracker barriers it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lightning_indexer(
+        &self,
+        q: &dyn Buffer,
+        k_cache: &dyn Buffer,
+        w: &dyn Buffer,
+        scores: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_k: u32,
+        scale: f32,
+        pos: u32,
+    ) {
+        let k = self.be.kernel(
+            "lightning_indexer",
+            crate::gemm::lightning_indexer_spv(),
+            5,
+            28,
+        );
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
+        push[8..12].copy_from_slice(&n_head.to_ne_bytes());
+        push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&top_k.to_ne_bytes());
+        push[20..24].copy_from_slice(&scale.to_ne_bytes());
+        push[24..28].copy_from_slice(&pos.to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(q),
+                Self::vkb(k_cache),
+                Self::vkb(w),
+                Self::vkb(scores),
+                Self::vkb(dst),
+            ],
+            2, // scores + dst are both written
+            &push,
+            rows,
+        );
+    }
+
     pub fn rmsnorm(
         &self,
         x: &dyn Buffer,

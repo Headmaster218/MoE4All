@@ -4420,3 +4420,152 @@ fn mla_mask_ring_parity() {
         assert_parity(&g, &bound, dst, c.rows * nh * vhd, 1e-3);
     }
 }
+
+// ---- Op::LightningIndexer (deepseek32's top-k key selector) — `lightning_indexer_f16kv`.
+//
+// The output is INDICES, so this cannot go through `assert_parity` (an f32 relative error over
+// index bit patterns is meaningless): CPU and Metal must agree EXACTLY, element for element.
+//
+// The cases mirror `infr-llama`'s `lightning_indexer_parity` case for case — same data generator,
+// same axes (a causal cut that moves per row, `top_k` past the eligible count, an exact-score tie
+// decided by the index rule, a cache wider than `kv_len`, and a `kv_len` that is not a multiple of
+// the 256-thread threadgroup) — so a Metal-only divergence is identifiable by case. That test is
+// where the semantics are pinned against a from-formula f64 reference; this one only asks whether
+// the Metal kernel reproduces the CPU oracle.
+
+/// One `lightning_indexer_parity` case.
+struct LidxCase {
+    name: &'static str,
+    rows: usize,
+    pos: usize,
+    kv_len: usize,
+    /// Cache row capacity. Must be >= kv_len: the op refuses a wrapped indexer cache (causal
+    /// masking makes position 0 eligible for every query, so a wrap has already lost it).
+    cap: usize,
+    n_head: usize,
+    head_dim: usize,
+    top_k: usize,
+}
+
+/// Keys as 1/16ths so the f16 cache round-trip is EXACT, with keys 2 and 5 deliberately IDENTICAL
+/// so their scores tie and the selection has to fall through to the index tie-break. Byte-identical
+/// to `infr-llama`'s `lidx_key_at`.
+fn lidx_key_at(j: usize, head_dim: usize) -> Vec<f32> {
+    let src = if j == 5 { 2 } else { j };
+    (0..head_dim)
+        .map(|d| (((src * 11 + d * 5) % 17) as f32 - 8.0) / 16.0)
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn lightning_indexer_parity() {
+    let cases = [
+        LidxCase {
+            name: "prefill pos=0, causal cut per row (short on rows 0-1)",
+            rows: 4,
+            pos: 0,
+            kv_len: 6,
+            cap: 6,
+            n_head: 3,
+            head_dim: 8,
+            top_k: 3,
+        },
+        LidxCase {
+            name: "decode pos=7, exact-tie pair eligible",
+            rows: 1,
+            pos: 7,
+            kv_len: 8,
+            cap: 8,
+            n_head: 4,
+            head_dim: 8,
+            top_k: 6,
+        },
+        LidxCase {
+            name: "top_k 8 over 1 eligible key",
+            rows: 1,
+            pos: 0,
+            kv_len: 8,
+            cap: 8,
+            n_head: 2,
+            head_dim: 8,
+            top_k: 8,
+        },
+        LidxCase {
+            name: "cache wider than kv_len (cap=32, kv_len=9)",
+            rows: 2,
+            pos: 7,
+            kv_len: 9,
+            cap: 32,
+            n_head: 3,
+            head_dim: 8,
+            top_k: 4,
+        },
+        LidxCase {
+            name: "wide kv_len=300 (not a threadgroup multiple), n_head=5",
+            rows: 3,
+            pos: 296,
+            kv_len: 300,
+            cap: 300,
+            n_head: 5,
+            head_dim: 6,
+            top_k: 17,
+        },
+    ];
+
+    for c in cases {
+        let scale = 1.0 / ((c.head_dim * c.n_head) as f32).sqrt();
+        let mut cache = vec![0f32; c.cap * c.head_dim];
+        for j in 0..c.kv_len {
+            cache[j * c.head_dim..][..c.head_dim].copy_from_slice(&lidx_key_at(j, c.head_dim));
+        }
+        let qi: Vec<f32> = (0..c.rows * c.n_head * c.head_dim)
+            .map(|i| (((i * 7 + 3) % 13) as f32 - 6.0) / 8.0)
+            .collect();
+        let wi: Vec<f32> = (0..c.rows * c.n_head)
+            .map(|i| (((i * 5 + 1) % 9) as f32 - 4.0) / 4.0)
+            .collect();
+
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(
+            vec![c.rows * c.n_head * c.head_dim],
+            DType::F32,
+        ));
+        // F16 KV cache — the Metal kernel reads `device const half*`, one half per element.
+        let k_cache = g.input(TensorDesc::new(vec![c.cap * c.head_dim], DType::F16));
+        let w = g.input(TensorDesc::new(vec![c.rows * c.n_head], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![c.rows * c.top_k], DType::I32));
+        g.push(Op::LightningIndexer {
+            q,
+            k_cache,
+            weights: w,
+            dst,
+            rows: c.rows as u32,
+            kv_len: c.kv_len as u32,
+            n_head: c.n_head as u32,
+            head_dim: c.head_dim as u32,
+            top_k: c.top_k as u32,
+            scale,
+            pos: c.pos as u32,
+        });
+        let bound = vec![
+            (q, f32_bytes(&qi)),
+            (k_cache, f16_bytes(&cache)),
+            (w, f32_bytes(&wi)),
+        ];
+        let n = c.rows * c.top_k;
+        // `run` hands back f32s; the indices ride as u32 bit patterns (the `Op::Argmax` carrier
+        // convention), so compare the BITS — a float compare would read them as denormals.
+        let bits = |v: Vec<f32>| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        let cpu = bits(run(&CpuBackend::new(), &g, &bound, dst, n));
+        let mtl = bits(run(
+            &MetalBackend::new().expect("metal backend"),
+            &g,
+            &bound,
+            dst,
+            n,
+        ));
+        println!("LightningIndexer metal {}: cpu={cpu:?}", c.name);
+        assert_eq!(mtl, cpu, "LightningIndexer metal {}: diverges", c.name);
+    }
+}

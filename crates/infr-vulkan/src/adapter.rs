@@ -197,8 +197,11 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
     for op in &graph.ops {
         match op {
             // MLA attention (DeepSeek V2/V3) uses its own non-standard kernel — not eligible for
-            // the split-K record-once replay pipeline.
-            Op::Mla { .. } => return false,
+            // the split-K record-once replay pipeline. Nor is the V3.2 lightning indexer, which
+            // bakes its causal bound from the `pos` push constant at record time (there is no
+            // params-driven `_dyn` twin), so a replayed tape would select keys for the position it
+            // was recorded at.
+            Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -4406,6 +4409,71 @@ fn lower_op(
                 cache_cap_rows,
                 canvas_lo,
                 ff,
+            );
+        }
+        Op::LightningIndexer {
+            q,
+            k_cache,
+            weights,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            head_dim,
+            top_k,
+            scale,
+            pos,
+        } => {
+            // Every output slot must name a key that exists. llama.cpp clamps at graph-build time
+            // (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`); the kernel cannot refuse
+            // the work, so refuse it here with the dims to name rather than emit a duplicated or
+            // sentinel index.
+            if top_k > kv_len {
+                return Err(be(format!(
+                    "vulkan Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — there \
+                     are not that many keys to name"
+                )));
+            }
+            // The shader reads the indexer cache as u32-packed f16 PAIRS, so a row must not start
+            // mid-word.
+            if !head_dim.is_multiple_of(2) {
+                return Err(be(format!(
+                    "vulkan Op::LightningIndexer: head_dim {head_dim} is odd — the f16 cache is \
+                     read as u32-packed pairs, which needs an even row width"
+                )));
+            }
+            // Key `j` is row `j` — no ring fold (see `Op::LightningIndexer`'s doc: causal masking
+            // makes position 0 eligible for every query, so a wrapped cache has already lost a key
+            // this op must score). Refuse one rather than read a row that holds another position.
+            let cap_rows = (graph.desc(*k_cache).numel() / (*head_dim as usize).max(1)) as u32;
+            if cap_rows < *kv_len {
+                return Err(be(format!(
+                    "vulkan Op::LightningIndexer: indexer cache holds {cap_rows} rows but kv_len \
+                     is {kv_len} — a wrapped indexer cache has already lost keys this op must score"
+                )));
+            }
+            // Score scratch, the `[n_kv, n_tokens]` tensor llama.cpp materializes too. Pooled: one
+            // buffer per (rows, kv_len) shape shared by every indexer layer in the graph, since the
+            // layers are serialized by dataflow. Fully written by phase 1 before phase 2 reads it.
+            let sk = pooled(
+                pool,
+                be_,
+                "lidx_scores",
+                (*rows as usize) * (*kv_len as usize) * 4,
+            )?;
+            rec.lightning_indexer(
+                r(*q)?,
+                r(*k_cache)?,
+                r(*weights)?,
+                pool[&sk].as_ref(),
+                r(*dst)?,
+                *rows,
+                *kv_len,
+                *n_head,
+                *head_dim,
+                *top_k,
+                *scale,
+                *pos,
             );
         }
     }

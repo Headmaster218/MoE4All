@@ -480,6 +480,32 @@ fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
         .expect("cpu backend: buffer is not a CpuBuffer (mixed backends?)")
 }
 
+/// Dequantize the first `need` elements of a one-row-per-token KV cache at its declared `dtype`.
+///
+/// The DeepSeek ops (`Op::Mla`, `Op::LightningIndexer`) read their cache straight out of the bound
+/// buffer rather than through the interpreter's f32 store, and both want only the `kv_len` rows in
+/// use — never the whole `max_ctx`-row allocation, which at DeepSeek's 576-wide latent is most of
+/// the cost of a decode step. Every dtype `WriteKv` can produce is covered; anything else is read
+/// as plain f32.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dequant_cache_prefix(b: &[u8], dtype: DType, need: usize) -> Vec<f32> {
+    match dtype {
+        DType::F16 => bytemuck::cast_slice::<u8, u16>(b)[..need]
+            .iter()
+            .map(|&x| half::f16::from_bits(x).to_f32())
+            .collect(),
+        DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
+        dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
+            crate::turbo::dequant_prefix_orig(dt, b, need)
+        }
+        DType::Bf16 | DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl => {
+            let pb = infr_gguf::nbytes(dtype, need);
+            infr_gguf::dequant::dequant_block(dtype, &b[..pb]).expect("cpu backend: KV dequant")
+        }
+        _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
+    }
+}
+
 /// Dequantize the first `need` elements of a Q8_0-block buffer (34 B / 32 elems, y = d*q).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dequant_prefix_q8_0(bytes: &[u8], need: usize) -> Vec<f32> {
@@ -2897,30 +2923,7 @@ impl Backend for CpuBackend {
                     let kguard = cpu_buf(kbuf).read();
                     let cap_rows = g.desc(k_cache).numel() / key_len.max(1);
                     let need = kv_len.min(cap_rows) * key_len;
-                    let deq = |b: &[u8], dt: DType| -> Vec<f32> {
-                        match dt {
-                            DType::F16 => bytemuck::cast_slice::<u8, u16>(b)[..need]
-                                .iter()
-                                .map(|&x| half::f16::from_bits(x).to_f32())
-                                .collect(),
-                            DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
-                            dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
-                                crate::turbo::dequant_prefix_orig(dt, b, need)
-                            }
-                            DType::Bf16
-                            | DType::Q4_0
-                            | DType::Q4_1
-                            | DType::Q5_0
-                            | DType::Q5_1
-                            | DType::Iq4Nl => {
-                                let pb = infr_gguf::nbytes(dt, need);
-                                infr_gguf::dequant::dequant_block(dt, &b[..pb])
-                                    .expect("cpu backend: MLA KV dequant")
-                            }
-                            _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
-                        }
-                    };
-                    let ks = deq(&kguard, g.desc(k_cache).dtype);
+                    let ks = dequant_cache_prefix(&kguard, g.desc(k_cache).dtype, need);
                     // Weights: wk_b [n_head, kv_lora, qk_nope], wv_b [n_head, kv_lora, v_head].
                     let wk = weight(wk_b);
                     let wv = weight(wv_b);
@@ -3014,6 +3017,105 @@ impl Backend for CpuBackend {
                                     }
                                     ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
                                 }
+                            }
+                        });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::LightningIndexer {
+                    q,
+                    k_cache,
+                    weights,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    head_dim,
+                    top_k,
+                    scale,
+                    pos,
+                } => {
+                    let (rows, kv_len, nh, hd, top_k, pos) = (
+                        rows as usize,
+                        kv_len as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        top_k as usize,
+                        pos as usize,
+                    );
+                    assert!(
+                        top_k <= kv_len,
+                        "cpu Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — there \
+                         are not that many keys to name (llama.cpp clamps with \
+                         `min(n_kv, n_indexer_top_k)`)"
+                    );
+                    let qs = &vals[q.0 as usize];
+                    let ws = &vals[weights.0 as usize];
+                    // Indexer K cache: ONE head_dim-wide row per token (MQA), key j at row j — no
+                    // ring fold (see `Op::LightningIndexer`'s doc: a causal-only mask makes every
+                    // position back to 0 eligible, so a wrapped cache could not serve this op).
+                    let kbuf = bindings
+                        .get(k_cache)
+                        .expect("cpu backend: unbound indexer k_cache");
+                    let kguard = cpu_buf(kbuf).read();
+                    let cap_rows = g.desc(k_cache).numel() / hd.max(1);
+                    assert!(
+                        cap_rows >= kv_len,
+                        "cpu Op::LightningIndexer: indexer cache holds {cap_rows} rows but kv_len \
+                         is {kv_len} — a wrapped indexer cache has already lost keys this op must \
+                         score"
+                    );
+                    let need = kv_len * hd;
+                    let ks = dequant_cache_prefix(&kguard, g.desc(k_cache).dtype, need);
+                    let mut out = vec![0f32; rows * top_k];
+                    self.pool()
+                        .for_chunks_mut(&mut out, top_k, 1, &|ti, slots| {
+                            // Causal: a key at an absolute position past the query's is not eligible,
+                            // and the cache holds only kv_len positions.
+                            let hi = (pos + ti + 1).min(kv_len);
+                            // score[j] = Σ_h (w[t,h] * scale) * relu(q[t,h] · k[j]), the head sum in
+                            // ASCENDING h (ggml_sum_rows' order over the contiguous head axis). Only
+                            // the eligible prefix is computed — nothing reads the rest.
+                            let mut sc = vec![0f32; hi];
+                            for (j, s) in sc.iter_mut().enumerate() {
+                                let kb = j * hd;
+                                let mut acc = 0f32;
+                                for h in 0..nh {
+                                    let qo = (ti * nh + h) * hd;
+                                    let d = crate::kernels::dot(&qs[qo..qo + hd], &ks[kb..kb + hd]);
+                                    acc += (ws[ti * nh + h] * scale) * d.max(0.0);
+                                }
+                                *s = acc;
+                            }
+                            // Select top_k by (eligible first, score DESC, index ASC). Scanning `j`
+                            // ascending and taking only a STRICTLY better candidate is what makes the
+                            // tie-break the lower index — the same rule as `Op::Argmax`.
+                            let mut taken = vec![false; kv_len];
+                            for slot in slots.iter_mut() {
+                                let mut bi = usize::MAX;
+                                for j in 0..kv_len {
+                                    if taken[j] {
+                                        continue;
+                                    }
+                                    let better = match (j < hi, bi < hi) {
+                                        // Nothing chosen yet.
+                                        _ if bi == usize::MAX => true,
+                                        // An eligible key outranks every ineligible one.
+                                        (true, false) => true,
+                                        (false, true) => false,
+                                        // Both eligible: strictly higher score wins (a tie keeps the
+                                        // lower index, which `bi` already holds).
+                                        (true, true) => sc[j] > sc[bi],
+                                        // Both ineligible: index order, so `bi` keeps it.
+                                        (false, false) => false,
+                                    };
+                                    if better {
+                                        bi = j;
+                                    }
+                                }
+                                taken[bi] = true;
+                                // i32 index carried as a u32 bit pattern in the f32 slot — the same
+                                // convention `Op::Argmax` uses for a token id.
+                                *slot = f32::from_bits(bi as u32);
                             }
                         });
                     vals[dst.0 as usize] = out;

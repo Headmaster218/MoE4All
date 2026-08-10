@@ -518,6 +518,8 @@ fn main() {
         // Mean-centred LayerNorm (deepseek32's `indexer_k_norm`, Op::LayerNorm) — a separate
         // shader, not an rmsnorm build: it needs two cooperative reductions and a bias binding.
         ("layernorm", "layernorm", &[]),
+        // DeepSeek V3.2 lightning indexer top-k key selection (Op::LightningIndexer).
+        ("lightning_indexer", "lightning_indexer", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).

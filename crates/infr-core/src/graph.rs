@@ -307,6 +307,98 @@ pub enum Op {
         /// rotation angle is DIVIDED by `ff[p]` for pair p. `None` = plain RoPE.
         freq_factors: Option<TensorId>,
     },
+    /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
+    /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
+    /// the only ones that layer's real MLA attention may then see. Per query row `t` at absolute
+    /// position `abs = pos + t`:
+    ///
+    /// ```text
+    /// score[t, j] = Σ_h  (w[t, h] * scale) * ReLU( q[t, h] · k[j] )     for j <= abs
+    /// dst[t, :]   = the top_k key positions j by (score DESC, j ASC)
+    /// ```
+    ///
+    /// Four things the reference pins down that a plausible-looking variant gets silently wrong:
+    ///
+    /// * **One key head shared by every indexer query head** (MQA): `k_cache` holds ONE
+    ///   `head_dim`-wide row per token, dotted against all `n_head` query heads. (llama.cpp's
+    ///   `indexer_k` is `{head_size, 1, n_tokens}` against `indexer_q`'s `{head_size,
+    ///   n_indexer_head, n_tokens}`.)
+    /// * **The ReLU is INSIDE the head-weighted sum**, applied to each head's raw dot before the
+    ///   `w` multiply — `ggml_relu` then `ggml_mul` then `ggml_sum_rows`. A ReLU on the summed
+    ///   score instead would only clamp negatives and would leave the ordering of the positive
+    ///   scores untouched, so it passes any test whose winners all score positive.
+    /// * **`scale` multiplies the per-head WEIGHT, never the score.** It is the `1/sqrt(head_dim *
+    ///   n_head)` normaliser, which llama.cpp folds into `indexer_weights` with a `ggml_scale`
+    ///   ("pre-scale weights to avoid scaling operations on huge indexer_score tensor") rather than
+    ///   scaling the `[n_kv, rows]` score tensor. Same value, different rounding, so it is carried
+    ///   here as an op field applied to `w[t, h]` instead of being left to the caller. Note this is
+    ///   the one part of the arithmetic **no test can guard through this op's output**: a positive
+    ///   uniform factor is order-preserving, so dropping it or moving it onto the score selects the
+    ///   same keys (`lightning_indexer_scale_cannot_change_the_selection` asserts exactly that
+    ///   invariance). It is kept faithful so the intermediate SCORES stay comparable with the
+    ///   reference during bring-up.
+    /// * **The head sum runs `h` ASCENDING** (`ggml_sum_rows` over the contiguous head axis), which
+    ///   is the accumulation order every backend here reproduces.
+    ///
+    /// What the CALLER owes (deepseek32's traps, see `docs/deepseek.md` § "The lightning indexer"):
+    /// `q` arrives ALREADY ASSEMBLED and ALREADY ROPE'D — this op does no rope of its own (unlike
+    /// [`Op::Mla`], which ropes its q_pe internally). The indexer head is laid out `[rope | nope]`,
+    /// the OPPOSITE of the MLA head, and its rope is NEOX where the main rope is NORM; both are the
+    /// graph builder's problem, and by the time the head reaches here it is just `head_dim` floats.
+    /// The **Hadamard rotation** llama.cpp applies to `q` and `k` is deliberately NOT ported: it is
+    /// one orthogonal transform applied identically to both sides, so it preserves every dot
+    /// product and exists only for quantisation friendliness — nothing to reproduce in an
+    /// unquantised port, and the caller must not apply it to one side alone.
+    ///
+    /// `dst` holds `rows * top_k` **i32 key indices** (the shape `ggml_top_k` produces), written as
+    /// raw i32 words on a device and as u32 bit patterns in the host interpreter's f32 slots —
+    /// the same carrier convention as [`Op::Argmax`]'s token id. Each index is a key position in
+    /// `[0, kv_len)`, which is also its cache ROW: unlike [`Op::Mla`], this op does NOT fold `j %
+    /// cap_rows`, and every backend refuses a cache with fewer than `kv_len` rows. A wrapped ring
+    /// cannot arise here and could not be served if it did — masking is causal only, so position 0
+    /// is eligible for every query row, and a ring that had wrapped would have overwritten row 0
+    /// with a later position before this op ever ran. (V3.2's indexer has no sliding window; the
+    /// caches that wrap in this codebase are the SWA ones.) Emitting indices rather than a `-inf`
+    /// mask keeps both the mask expansion and a later gather open to the consumer (see
+    /// `docs/deepseek.md` § "How top-k feeds attention"): llama.cpp itself expands them back into a
+    /// mask and runs dense attention, realising none of the FLOP saving.
+    ///
+    /// **Ordering is total and identical on every backend**: by score descending, ties broken
+    /// toward the LOWER key index. Keys past the causal bound (`j > abs`) rank below every eligible
+    /// key and among themselves by ascending index, so when fewer than `top_k` keys are eligible
+    /// the tail fills with the lowest ineligible positions. That short case is llama.cpp's too —
+    /// it clamps only against `n_kv` (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`) and
+    /// never against the causal count, so `ggml_top_k`'s `std::partial_sort` returns masked
+    /// `-INFINITY` entries in the tail; their order there is genuinely unspecified (it is not a
+    /// stable sort, and the kernel then swaps `dst[0]`/`dst[1]` "to emphasize that the order is not
+    /// important"), which is harmless only because the consumer re-applies the causal mask. This op
+    /// picks the deterministic member of that family rather than inheriting the ambiguity.
+    ///
+    /// `top_k <= kv_len` is a precondition (the caller clamps, as llama.cpp's `min` does); each
+    /// backend refuses a larger `top_k` rather than naming keys that do not exist. Masking is
+    /// causal only — V3.2's indexer has no sliding window, so there is no [`AttnMask`] here.
+    LightningIndexer {
+        /// Indexer queries `[rows, n_head, head_dim]`, f32, rope already applied.
+        q: TensorId,
+        /// Indexer key cache `[cap_rows, head_dim]` — ONE row per token (MQA). `cap_rows = numel /
+        /// head_dim` must be at least `kv_len`; key `j` is row `j` (see above on why there is no
+        /// ring fold here).
+        k_cache: TensorId,
+        /// Per-head indexer weights `w` `[rows, n_head]`, f32 — `indexer_proj · x`, UNSCALED (this
+        /// op applies `scale`).
+        weights: TensorId,
+        /// Selected key indices `[rows, top_k]`, i32.
+        dst: TensorId,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_k: u32,
+        /// `1/sqrt(head_dim * n_head)` — multiplies `w[t, h]`, NOT the score (see above).
+        scale: f32,
+        /// Absolute position of the first query row (the causal bound is `pos + t`).
+        pos: u32,
+    },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
     /// shifts the `up` read by a whole-element offset so a layer-major slice of a bigger buffer can
@@ -627,6 +719,7 @@ impl Op {
             Op::WriteKv { .. } => "WriteKv",
             Op::Attention { .. } => "Attention",
             Op::Mla { .. } => "Mla",
+            Op::LightningIndexer { .. } => "LightningIndexer",
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
@@ -721,6 +814,13 @@ impl Op {
                 dst,
                 ..
             } => (vec![q, k_cache, wk_b, wv_b], vec![dst]),
+            Op::LightningIndexer {
+                q,
+                k_cache,
+                weights,
+                dst,
+                ..
+            } => (vec![q, k_cache, weights], vec![dst]),
             Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
             Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),
@@ -866,7 +966,11 @@ impl Graph {
                         set.insert(*k_cache);
                         set.insert(*v_cache);
                     }
-                    Op::Mla { k_cache, .. } => {
+                    // Both DeepSeek ops read a one-row-per-token cache the same way: straight out
+                    // of its BOUND buffer at the op's own dtype, never through the interpreter's
+                    // f32 working store. `Skip` is what keeps the store from mirroring (and, for
+                    // an f32-declared cache, writing back) a buffer no op here ever wrote.
+                    Op::Mla { k_cache, .. } | Op::LightningIndexer { k_cache, .. } => {
                         set.insert(*k_cache);
                     }
                     _ => {}

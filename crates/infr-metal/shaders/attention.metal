@@ -965,3 +965,130 @@ kernel void mla_f16kv_ff(device const float* q       [[buffer(0)]],
                          uint gid [[thread_position_in_grid]]) {
     mla_f16kv_one(q, k_cache, wk_b, wv_b, dst, p, gid, true, ff);
 }
+
+// ---- DeepSeek V3.2 lightning indexer (`Op::LightningIndexer`) — the top-k KEY SELECTOR that
+// decides which keys that layer's MLA attention may see. One THREADGROUP per query row; the 256
+// threads split the KEY axis (not the head axis: a key's score needs every head summed, so heads
+// stay serial inside a thread, which is also what keeps the sum in `ggml_sum_rows`' ascending-h
+// order). Port of the Vulkan `lightning_indexer.comp`, with the same two phases and the same total
+// order; the Metal f16 cache is `device half*` (one half per element), so there is no
+// u32-packed-pair unpacking — index it directly.
+//
+//   score[t, j] = Sum_h (w[t, h] * scale) * relu( q[t, h] . k[j] )     for j <= pos + t
+//   dst[t, :]   = the top_k key positions by (score DESC, index ASC)
+//
+// The ReLU is INSIDE the head-weighted sum and `scale` multiplies the WEIGHT, never the score —
+// llama.cpp `deepseek32.cpp`'s non-fused branch. See `Op::LightningIndexer`'s doc for the rest of
+// the contract (MQA: ONE key head shared by every query head; q arrives already assembled and
+// roped; the Hadamard rotation is deliberately not ported).
+//
+// `scores` is host-provided scratch of `rows * kv_len` floats — the same `[n_kv, n_tokens]` score
+// tensor llama.cpp materializes. Phase 2 never mutates it: the order is TOTAL (the index breaks
+// every tie), so "already picked" is exactly "ranks at or above the previous winner".
+struct LidxParams {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint head_dim;
+    uint top_k;
+    float scale;           // 1/sqrt(head_dim * n_head) — applied to the WEIGHT
+    uint pos;              // absolute position of the first query row
+};
+
+constant constexpr uint LIDX_NTHREAD = 256u;
+constant constexpr uint LIDX_INVALID = 0xFFFFFFFFu;
+
+// Does candidate `a` rank ABOVE candidate `b`? An eligible key (index below the causal bound `hi`)
+// outranks every ineligible one; two eligible keys go by score descending; everything else — a
+// score tie, and the whole ineligible tail — by ascending index. Strict and total, so no two
+// distinct indices ever compare equal. An empty thread carries `LIDX_INVALID`, which is not below
+// `hi` and is the largest index, so it loses to every real candidate with no special case.
+static inline bool lidx_ranks_above(uint ai, float av, uint bi, float bv, uint hi) {
+    bool ae = ai < hi;
+    bool be = bi < hi;
+    if (ae != be) return ae;
+    if (ae && av != bv) return av > bv;
+    return ai < bi;
+}
+
+kernel void lightning_indexer_f16kv(device const float* q       [[buffer(0)]],
+                                    device const half*  k_cache [[buffer(1)]],
+                                    device const float* w       [[buffer(2)]],
+                                    device float*       scores  [[buffer(3)]],
+                                    device uint*        dst     [[buffer(4)]],
+                                    constant LidxParams& p      [[buffer(5)]],
+                                    uint t    [[thread_position_in_threadgroup]],
+                                    uint row  [[threadgroup_position_in_grid]],
+                                    uint ntgr [[threads_per_threadgroup]]) {
+    threadgroup float sval[LIDX_NTHREAD];
+    threadgroup uint  sidx[LIDX_NTHREAD];
+    threadgroup uint  prev_idx;
+    threadgroup float prev_val;
+    if (row >= p.rows) return;
+    // The encoder asks for LIDX_NTHREAD threads but Metal CLAMPS to the pipeline's
+    // maxTotalThreadsPerThreadgroup, so the real width is whatever was launched: stride the key
+    // loop by it and never read a `sval`/`sidx` slot no thread wrote.
+    uint ntg = min(ntgr, LIDX_NTHREAD);
+
+    // Causal bound: a key at an absolute position past the query's is not eligible, and only
+    // `kv_len` positions are cached.
+    uint hi = min(p.pos + row + 1u, p.kv_len);
+    uint sbase = row * p.kv_len;
+
+    // -- Phase 1: score every key --
+    for (uint j = t; j < p.kv_len; j += ntg) {
+        if (j >= hi) {
+            // Ineligible: `lidx_ranks_above` never reads this slot, but it is still initialized —
+            // the scratch is reused across dispatches and a stale NaN here would be read back by
+            // the reduction's `av != bv` on a thread that carried it.
+            scores[sbase + j] = 0.0f;
+            continue;
+        }
+        float acc = 0.0f;
+        for (uint h = 0u; h < p.n_head; h++) {
+            uint qo = (row * p.n_head + h) * p.head_dim;
+            float d = 0.0f;
+            for (uint i = 0u; i < p.head_dim; i++) {
+                // Key j is row j: no ring fold (the host rejects cap_rows < kv_len — causal
+                // masking makes position 0 eligible for every query, so a wrapped cache has
+                // already lost it).
+                d += q[qo + i] * (float)k_cache[j * p.head_dim + i];
+            }
+            acc += (w[row * p.n_head + h] * p.scale) * max(d, 0.0f);
+        }
+        scores[sbase + j] = acc;
+    }
+    // Phase 2 reads slots other threads wrote, so the device stores must be VISIBLE, not merely
+    // retired — hence `mem_device` and not the threadgroup-only flag used inside the rounds.
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    // -- Phase 2: `top_k` selection rounds --
+    for (uint k = 0u; k < p.top_k; k++) {
+        uint bi = LIDX_INVALID;
+        float bv = 0.0f;
+        for (uint j = t; j < p.kv_len; j += ntg) {
+            float s = scores[sbase + j];
+            // Already picked: rounds go in descending rank, so anything at or above the previous
+            // winner is spent.
+            if (k > 0u && !lidx_ranks_above(prev_idx, prev_val, j, s, hi)) continue;
+            if (bi == LIDX_INVALID || lidx_ranks_above(j, s, bi, bv, hi)) { bi = j; bv = s; }
+        }
+        sval[t] = bv;
+        sidx[t] = bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = LIDX_NTHREAD / 2u; stride > 0u; stride >>= 1u) {
+            if (t < stride && t + stride < ntg
+                && lidx_ranks_above(sidx[t + stride], sval[t + stride], sidx[t], sval[t], hi)) {
+                sval[t] = sval[t + stride];
+                sidx[t] = sidx[t + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0u) {
+            dst[row * p.top_k + k] = sidx[0];
+            prev_idx = sidx[0];
+            prev_val = sval[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup); // publish the winner before the next round
+    }
+}
