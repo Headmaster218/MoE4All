@@ -8,6 +8,10 @@
 // ROPE_TYPE_NEOX vs ROPE_TYPE_NORM (see `Op::Rope::neox`). Only the STATIC f32 builds carry it
 // (`rope_neox`, `rope_ff_neox`); its one caller is deepseek32's lightning indexer, which ropes an
 // f32 scratch in place, and the adapter refuses neox on the f16/dyn paths rather than drop it.
+// -DBACKWARD negates `sin` and leaves `cos` alone — llama.cpp's `ggml_rope_ext_back` is literally
+// this kernel with `sin_sign = -1` (see `Op::Rope::backward`); deepseek4 de-ropes its attention
+// OUTPUT before the grouped output projection. Same static-f32-only rule as NEOX (`rope_back`,
+// `rope_ff_back`).
 #ifdef OUT_F16
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -85,7 +89,11 @@ void main() {
 #ifdef FREQ_FACTORS
         ang /= ff[i];
 #endif
+#ifdef BACKWARD
+        float s = -sin(ang);
+#else
         float s = sin(ang);
+#endif
         float co = cos(ang);
 #ifdef NEOX
         uint i0 = i, i1 = i + hf;

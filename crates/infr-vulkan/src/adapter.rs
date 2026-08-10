@@ -212,10 +212,17 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                 k_cache,
                 v_cache,
                 kv_len,
+                sinks,
                 ..
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
+                    return false;
+                }
+                // Attention sinks have ONE kernel (`attention_kv.comp`'s -DSINKS static build) and
+                // no params-driven `_dyn` twin, so a replayed tape would run the sink-free split-K
+                // family instead. Force static.
+                if sinks.is_some() {
                     return false;
                 }
                 // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
@@ -2388,6 +2395,7 @@ fn lower_op(
             theta,
             freq_factors,
             neox,
+            backward,
             ..
         } => {
             let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
@@ -2407,6 +2415,15 @@ fn lower_op(
                 return Err(be(
                     "vulkan adapter: standalone NEOX Rope unsupported on this path (f16-out / \
                      record-once decode have no -DNEOX kernel build)",
+                ));
+            }
+            // Same again for BACKWARD (deepseek4's attention-output de-rope, `Op::Rope::backward`):
+            // only the static f32 NORM builds carry `-DBACKWARD`. A dropped sign is the same class
+            // of silent-wrong-numbers as a dropped pairing, so refuse.
+            if *backward && (f16_out || *neox || !matches!(mode, RopeMode::Static(_))) {
+                return Err(be(
+                    "vulkan adapter: backward (de-)Rope unsupported on this path (f16-out / NEOX / \
+                     record-once decode have no -DBACKWARD kernel build)",
                 ));
             }
             let ff = freq_factors.map(&r).transpose()?;
@@ -2459,6 +2476,7 @@ fn lower_op(
                             rope_pos[&positions.0],
                             ff,
                             *neox,
+                            *backward,
                         );
                     }
                 }
@@ -2512,6 +2530,7 @@ fn lower_op(
             scale,
             mask,
             pos,
+            sinks,
         } => {
             let (rows, kv_len, nh, nkv, hd, pos) = (
                 *rows as usize,
@@ -2539,6 +2558,55 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
+            // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
+            // kernel — `attention_kv.comp`'s -DSINKS build. Nothing else in the tier ladder below
+            // (flash, non-FA coopmat, split-K, the Q8/BDA/params twins) knows about them, and a
+            // tier that quietly ignored the sink would produce a correct-looking softmax over the
+            // wrong denominator. So a sinks op takes the scalar path unconditionally, and the
+            // shapes that path cannot serve are refused here rather than silently mis-served.
+            // `decode_eligible` already forces sinks graphs off the record-once replay tape.
+            if let Some(sk) = sinks {
+                // The scalar sinks build reads `q` and both caches as f16 (the seam's own
+                // producer→consumer dtype flow). Every other KV dtype reaches the tier ladder
+                // through the dequant→f16 prepass below, which this early return skips — so
+                // require f16 outright rather than hand the kernel bytes it will misread.
+                let f16 = |t: infr_core::tensor::TensorId| {
+                    matches!(graph.desc(t).dtype, infr_core::DType::F16)
+                };
+                if !f16(*k_cache) || !f16(*v_cache) {
+                    return Err(be(
+                        "vulkan adapter: Op::Attention with sinks needs an f16 K/V cache — the \
+                         sinks build (attention_kv_sinks) has no quant read and no dequant prepass",
+                    ));
+                }
+                let window = match mask {
+                    AttnMask::Causal => 0,
+                    AttnMask::SlidingWindow(w) => *w,
+                    AttnMask::Canvas { .. } => {
+                        return Err(be(
+                            "vulkan adapter: Op::Attention with sinks under AttnMask::Canvas has \
+                             no kernel — the scalar sinks path carries no bidirectional `lo`",
+                        ));
+                    }
+                };
+                rec.attention_kv_sinks(
+                    r(*q)?,
+                    r(*k_cache)?,
+                    r(*v_cache)?,
+                    r(*sk)?,
+                    r(*dst)?,
+                    rows,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                    window,
+                    *scale,
+                    cap,
+                );
+                return Ok(());
+            }
             if let RopeMode::Dynamic(params) = mode {
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
                 // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
@@ -3313,7 +3381,8 @@ fn lower_op(
         // Per-head RMSNorm == rmsnorm over rows*n_head rows of head_dim (gemma4's weightless
         // V-norm passes a ones weight → out = x/rms; llama4's post-rope weightless Q/K L2-norm
         // runs in-place on the f16 rope scratch — `x`'s dtype picks the f16 or f32 kernel, `w`
-        // (the ones-vector weight) stays f32 either way).
+        // (the ones-vector weight) stays f32 either way). `weight: None` (deepseek4's Q norm) is
+        // the genuinely weightless build with no `w` binding at all.
         Op::QkNorm {
             x,
             weight,
@@ -3325,10 +3394,19 @@ fn lower_op(
             ..
         } => {
             let (rows_n, dim) = ((*rows * *n_head) as usize, *head_dim as usize);
-            if matches!(graph.desc(*x).dtype, infr_core::DType::F16) {
-                rec.rmsnorm_f16(r(*x)?, r(*weight)?, r(*dst)?, rows_n, dim, *eps);
-            } else {
-                rec.rmsnorm(r(*x)?, r(*weight)?, r(*dst)?, rows_n, dim, *eps);
+            let f16 = matches!(graph.desc(*x).dtype, infr_core::DType::F16);
+            match (weight, f16) {
+                (Some(w), true) => rec.rmsnorm_f16(r(*x)?, r(*w)?, r(*dst)?, rows_n, dim, *eps),
+                (Some(w), false) => rec.rmsnorm(r(*x)?, r(*w)?, r(*dst)?, rows_n, dim, *eps),
+                (None, false) => rec.rmsnorm_nw(r(*x)?, r(*dst)?, rows_n, dim, *eps),
+                // No -DNO_WEIGHT -DF16IO build: deepseek4's weightless Q norm runs on the f32
+                // wq_b output, and a variant nothing dispatches is a variant nothing tests.
+                (None, true) => {
+                    return Err(be(
+                        "vulkan adapter: Op::QkNorm { weight: None } over an f16 x has no kernel \
+                         — the weightless per-head RMSNorm is built f32-only (rmsnorm_nw)",
+                    ));
+                }
             }
         }
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — one dispatch
@@ -6840,7 +6918,7 @@ mod tests {
         let wi = g.weight(TensorDesc::new(vec![hd], DType::F32));
         g.push(Op::QkNorm {
             x: xi,
-            weight: wi,
+            weight: Some(wi),
             dst: xi, // in-place — matches the runner's q16/k16 usage exactly
             rows: 1,
             n_head: nh as u32,
@@ -6986,6 +7064,7 @@ mod tests {
             scale,
             mask: AttnMask::Causal,
             pos: pos as u32,
+            sinks: None,
         });
         let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
         let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -7482,6 +7561,7 @@ mod tests {
                     AttnMask::Causal
                 },
                 pos: pos as u32,
+                sinks: None,
             });
             let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
             let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();

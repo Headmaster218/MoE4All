@@ -2440,7 +2440,7 @@ pub(crate) fn generate_dense_backend(
                 } else {
                     g.push(Op::QkNorm {
                         x: dn_out,
-                        weight: dw.ssm_norm,
+                        weight: Some(dw.ssm_norm),
                         dst: dn_out,
                         rows: batch as u32,
                         n_head: q35_nv as u32,
@@ -2612,6 +2612,7 @@ pub(crate) fn generate_dense_backend(
                             freq_factors: yarn_ff,
                             x_stride: 0,
                             neox: true,
+                            backward: false,
                         });
                         // The indexer's own KV cache — a SECOND per-token cache alongside the
                         // 576-wide MLA one, carried on the V side this arch leaves unused (see
@@ -2646,6 +2647,7 @@ pub(crate) fn generate_dense_backend(
                             freq_factors: yarn_ff,
                             x_stride: 0,
                             neox: true,
+                            backward: false,
                         });
                         // Per-head weights `w[t, h]`, UNSCALED — `Op::LightningIndexer` applies
                         // the `1/sqrt(head_dim * n_head)` normaliser to the WEIGHT, which is where
@@ -2754,6 +2756,7 @@ pub(crate) fn generate_dense_backend(
                     // indexer above hardcodes. All five DeepSeek arches report
                     // `LLAMA_ROPE_TYPE_NORM` from `llama_model_rope_type`.
                     neox: false,
+                    backward: false,
                 });
                 // Copy roped k_pe back.
                 g.push(Op::CopyStrided {
@@ -2997,7 +3000,7 @@ pub(crate) fn generate_dense_backend(
                     if let Some(ones) = v_ones {
                         g.push(Op::QkNorm {
                             x: v,
-                            weight: ones,
+                            weight: Some(ones),
                             dst: v,
                             rows: batch as u32,
                             n_head: nkv as u32,
@@ -3059,12 +3062,13 @@ pub(crate) fn generate_dense_backend(
                                 // llama-family NORM (interleaved) rope. `Config::permute_qk_neox`
                                 // is what makes this reproduce NEOX for a rotate-half GGUF.
                                 neox: false,
+                                backward: false,
                             });
                             // llama4 rope layer: weightless per-head L2-norm on the roped K.
                             if let Some(ones) = l2norm {
                                 g.push(Op::QkNorm {
                                     x: k16,
-                                    weight: ones,
+                                    weight: Some(ones),
                                     dst: k16,
                                     rows: batch as u32,
                                     n_head: nkv as u32,
@@ -3146,12 +3150,13 @@ pub(crate) fn generate_dense_backend(
                             freq_factors: layer_ff,
                             x_stride: 0,
                             neox: false,
+                            backward: false,
                         });
                         // llama4 rope layer: weightless per-head L2-norm on the roped Q.
                         if let Some(ones) = l2norm {
                             g.push(Op::QkNorm {
                                 x: q16,
-                                weight: ones,
+                                weight: Some(ones),
                                 dst: q16,
                                 rows: batch as u32,
                                 n_head: nh as u32,
@@ -3176,6 +3181,7 @@ pub(crate) fn generate_dense_backend(
                     scale,
                     mask,
                     pos: start_pos as u32,
+                    sinks: None,
                 });
                 // qwen35: per-head SIGMOID output gate applied to the attention output BEFORE the
                 // o-projection (`gate_a` was split out of the interleaved `attn_q` projection above).

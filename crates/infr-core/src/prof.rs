@@ -326,6 +326,7 @@ mod tests {
                 scale: 1.0,
                 mask: AttnMask::Causal,
                 pos: 0,
+                sinks: None,
             },
             Op::RmsNorm {
                 x,

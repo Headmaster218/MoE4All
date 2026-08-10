@@ -2213,7 +2213,7 @@ fn qknorm_parity() {
     let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     g.push(Op::QkNorm {
         x,
-        weight: w,
+        weight: Some(w),
         dst,
         rows: rows as u32,
         n_head: nh as u32,
@@ -2279,6 +2279,7 @@ fn rope_parity() {
         freq_factors: None,
         x_stride: 0,
         neox: false,
+        backward: false,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i + 3).collect();
     let bound = vec![
@@ -2310,6 +2311,7 @@ fn rope_partial_with_freq_factors_parity() {
         freq_factors: Some(ff),
         x_stride: 0,
         neox: false,
+        backward: false,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i * 2 + 1).collect();
     let ffv: Vec<f32> = (0..rd / 2).map(|i| 1.0 + i as f32 * 0.1).collect();
@@ -2494,6 +2496,7 @@ fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2595,6 +2598,7 @@ fn kvquant_attention_test(
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2728,6 +2732,7 @@ fn attention_gqa_causal_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 41))),
@@ -2767,6 +2772,7 @@ fn attention_decode_hd256_short_kv_parity() {
             scale: 1.0 / (hd as f32).sqrt(),
             mask: infr_core::graph::AttnMask::Causal,
             pos: pos as u32,
+            sinks: None,
         });
         let bound = vec![
             (q, f32_bytes(&rand_f32(rows * nh * hd, 71 + kv_len as u64))),
@@ -2807,6 +2813,7 @@ fn attention_prefill_wide_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
@@ -2842,6 +2849,7 @@ fn attention_flash_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 71))),
@@ -2876,6 +2884,7 @@ fn attention_flash_hd72_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
@@ -2910,6 +2919,7 @@ fn attention_flash2_hd128_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
@@ -2944,6 +2954,7 @@ fn attention_flash2_four_row_prefill_match(
         scale: 1.0 / (hd as f32).sqrt(),
         mask,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
@@ -2999,6 +3010,7 @@ fn attention_flash2_hd256_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(64),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 401))),
@@ -3032,6 +3044,7 @@ fn attention_vec_hd256_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(96),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 404))),
@@ -3066,6 +3079,7 @@ fn attention_flash2_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(64),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
@@ -3100,6 +3114,7 @@ fn attention_long_context_split32_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
@@ -3133,6 +3148,7 @@ fn attention_long_context_split32_hd96_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
@@ -3168,6 +3184,7 @@ fn attention_vec_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(win),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
@@ -3200,6 +3217,7 @@ fn attention_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(win),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 44))),
@@ -3727,6 +3745,7 @@ fn attention_canvas_split32_matches_reference() {
         // `pos` is unused by Canvas (every row's bound is `[lo, kv_len)` regardless of position)
         // — 0 here matches how the denoise call site sizes it (see `Op::Attention`'s doc).
         pos: 0,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 501))),
@@ -3760,6 +3779,7 @@ fn attention_canvas_split8_hd256_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Canvas { lo },
         pos: 0,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 511))),
@@ -4573,4 +4593,208 @@ fn lightning_indexer_parity() {
         println!("LightningIndexer metal {}: cpu={cpu:?}", c.name);
         assert_eq!(mtl, cpu, "LightningIndexer metal {}: diverges", c.name);
     }
+}
+
+// ── DeepSeek V4 attention primitives (docs/deepseek.md § Stage 4) ─────────────────────────────
+//
+// Metal-vs-CPU for the three ops slice 2 of stage 4 extended. The op-level references live with
+// the Vulkan probes (`infr-llama/tests/seam_op_parity.rs`); here the CPU interpreter — which those
+// references already validated — is the oracle, exactly as every other test in this file.
+// NOTE: this file has never run on Apple hardware in this session (no Apple hardware available);
+// the macOS CI job is the first real execution of these three.
+
+/// `Op::QkNorm { weight: None }` — deepseek4's weightless per-head Q norm. Heads with wildly
+/// different magnitudes, so a whole-row reduction (the mistake) cannot pass.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn qknorm_weightless_parity() {
+    let (rows, nh, hd) = (5usize, 8usize, 128usize);
+    let n = rows * nh * hd;
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::QkNorm {
+        x,
+        weight: None,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        eps: 1e-6,
+        x_stride: 0,
+    });
+    // Per-head magnitudes spanning 1e-2 .. 1e2: a row-wide norm would crush all but the largest.
+    let base = rand_f32(n, 4242);
+    let xi: Vec<f32> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * [100.0f32, 0.01, 1.0, 30.0][((i / hd) % nh) % 4])
+        .collect();
+    let bound = vec![(x, f32_bytes(&xi))];
+    assert_parity(&g, &bound, dst, n, 1e-5);
+}
+
+/// `Op::Rope { backward: true }` — deepseek4's attention-output de-rope. Both legs are asserted:
+/// the backward rope against the CPU interpreter, and forward∘backward against the input (the
+/// property `Op::Rope::backward` claims). `rope_dim < head_dim` and non-trivial positions.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rope_backward_parity() {
+    let (rows, nh, hd, rd) = (3usize, 4usize, 128usize, 64usize);
+    let n = rows * nh * hd;
+    let positions: Vec<i32> = vec![37, 38, 39];
+    let xi = rand_f32(n, 4243);
+    let ffv: Vec<f32> = (0..rd / 2).map(|i| 1.0 + i as f32 * 0.1).collect();
+
+    // Leg 1: a standalone backward rope, Metal vs CPU.
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let pos = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let ff = g.input(TensorDesc::new(vec![rd / 2], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Rope {
+        x,
+        positions: pos,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        rope_dim: rd as u32,
+        theta: 10000.0,
+        freq_factors: Some(ff),
+        x_stride: 0,
+        neox: false,
+        backward: true,
+    });
+    let bound = vec![
+        (x, f32_bytes(&xi)),
+        (pos, i32_bytes(&positions)),
+        (ff, f32_bytes(&ffv)),
+    ];
+    assert_parity(&g, &bound, dst, n, 1e-4);
+
+    // Leg 2: forward then backward must return the input, on the device.
+    let mut g2 = Graph::new();
+    let x2 = g2.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let pos2 = g2.input(TensorDesc::new(vec![rows], DType::I32));
+    let ff2 = g2.input(TensorDesc::new(vec![rd / 2], DType::F32));
+    let mid = g2.internal(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let dst2 = g2.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    for (src, out, backward) in [(x2, mid, false), (mid, dst2, true)] {
+        g2.push(Op::Rope {
+            x: src,
+            positions: pos2,
+            dst: out,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: rd as u32,
+            theta: 10000.0,
+            freq_factors: Some(ff2),
+            x_stride: 0,
+            neox: false,
+            backward,
+        });
+    }
+    let bound2 = vec![
+        (x2, f32_bytes(&xi)),
+        (pos2, i32_bytes(&positions)),
+        (ff2, f32_bytes(&ffv)),
+    ];
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g2,
+        &bound2,
+        dst2,
+        n,
+    );
+    assert_close(
+        &xi,
+        &mtl,
+        1e-4,
+        "metal rope forward∘backward is not the identity",
+    );
+}
+
+/// `Op::Attention { sinks }` — deepseek4's `attn_sinks`. Two regimes: a DOMINANT sink (which
+/// suppresses every real key, so an implementation that left the sink out of the denominator would
+/// return the sink-free output) and a NEGLIGIBLE one (which must leave the output alone). The
+/// sink-free run is taken on the same graph shape so the comparison isolates the sink.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_sinks_parity() {
+    let (rows, nh, nkv, hd) = (4usize, 4usize, 2usize, 64usize);
+    let kv_len = rows;
+    let n_out = rows * nh * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let qi = rand_f32(n_out, 4244);
+    let ki = rand_f32(kv_len * nkv * hd, 4245);
+    let vi = rand_f32(kv_len * nkv * hd, 4246);
+
+    let build = |with_sinks: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let sk = g.weight(TensorDesc::new(vec![nh], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: 0,
+            sinks: with_sinks.then_some(sk),
+        });
+        (g, q, kc, vc, sk, dst)
+    };
+    let bind = |q, kc, vc, sk, sinks: Option<&[f32]>| {
+        let mut b = vec![
+            (q, f32_bytes(&qi)),
+            (kc, f32_bytes(&ki)),
+            (vc, f32_bytes(&vi)),
+        ];
+        if let Some(s) = sinks {
+            b.push((sk, f32_bytes(s)));
+        }
+        b
+    };
+
+    let dominant = vec![18.0f32; nh];
+    let negligible = vec![-18.0f32; nh];
+    for sinks in [&dominant, &negligible] {
+        let (g, q, kc, vc, sk, dst) = build(true);
+        assert_parity(&g, &bind(q, kc, vc, sk, Some(sinks)), dst, n_out, 1e-4);
+    }
+
+    // The dominant sink must actually change the answer, or the test above compares two runs that
+    // both ignored it.
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    let (gs, q, kc, vc, sk, dst) = build(true);
+    let with = run(
+        &mtl_be,
+        &gs,
+        &bind(q, kc, vc, sk, Some(&dominant)),
+        dst,
+        n_out,
+    );
+    let (gn, q, kc, vc, sk, dst) = build(false);
+    let without = run(&mtl_be, &gn, &bind(q, kc, vc, sk, None), dst, n_out);
+    let gap = with
+        .iter()
+        .zip(&without)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        gap > 0.05,
+        "metal: a sink 18 above every score changed nothing (gap={gap:e}) — it never reached the \
+         denominator"
+    );
 }

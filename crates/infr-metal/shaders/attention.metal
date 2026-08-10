@@ -84,6 +84,61 @@ kernel void attention_f16kv(device const float* q   [[buffer(0)]],
     for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
 }
 
+// ---- Attention with per-head SINKS (Op::Attention::sinks, deepseek4's attn_sinks). Identical to
+// attention_f32/attention_f16kv above, plus one extra logit per head that joins the softmax MAX and
+// DENOMINATOR and contributes NO value row — `ggml_compute_forward_soft_max_f32`'s src2 handling.
+// Folded into the finished (m, l) the same way the loop folds each key: the sink joins the max, the
+// running accumulator is rescaled by exp(m - mfin), and only the denominator gains exp(sink - mfin).
+// One macro over the KV element type, following ATTNSPLIT_KERNEL's idiom — the sinks arithmetic is
+// the same three lines on both, and two hand-copies of it are two places to fix a sign.
+// The host routes EVERY sinks op here (no split/flash/vec sibling knows about sinks); see
+// `Op::Attention::sinks` and the exec arm's sinks branch.
+#define ATTN_SINKS_KERNEL(NAME, KVT)                                                               \
+kernel void NAME(device const float* q     [[buffer(0)]],                                          \
+                 device const KVT*   k     [[buffer(1)]],                                          \
+                 device const KVT*   v     [[buffer(2)]],                                          \
+                 device const float* sinks [[buffer(3)]],                                          \
+                 device float*       dst   [[buffer(4)]],                                          \
+                 constant AttnParams& p    [[buffer(5)]],                                          \
+                 uint gid  [[thread_position_in_grid]],                                            \
+                 uint lane [[thread_index_in_simdgroup]]) {                                        \
+    uint sg = gid / 32u;                                                                           \
+    if (sg >= p.rows * p.n_head) return;                                                           \
+    uint ti = sg / p.n_head;                                                                       \
+    uint h = sg % p.n_head;                                                                        \
+    uint group = p.n_head / p.n_kv;                                                                \
+    uint kvh = h / group;                                                                          \
+    uint qb = sg * p.head_dim;                                                                     \
+    uint abs = p.pos + ti;                                                                         \
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;                 \
+    float acc[MAX_DPL];                                                                            \
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;                                              \
+    float m = -INFINITY, l = 0.0f;                                                                 \
+    for (uint j = lo; j <= abs; j++) {                                                             \
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;                                                 \
+        float part = 0.0f;                                                                         \
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * (float)k[kb + d];        \
+        float sc = simd_sum(part) * p.scale;                                                       \
+        float mnew = max(m, sc);                                                                   \
+        float corr = exp(m - mnew);                                                                \
+        float pw = exp(sc - mnew);                                                                 \
+        l = l * corr + pw;                                                                         \
+        uint vb = (j * p.n_kv + kvh) * p.head_dim;                                                 \
+        uint t = 0;                                                                                \
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * (float)v[vb + d]; t++; } \
+        m = mnew;                                                                                  \
+    }                                                                                              \
+    float sk = sinks[h];                                                                           \
+    float mfin = max(m, sk);                                                                       \
+    float scorr = exp(m - mfin);                                                                   \
+    l = l * scorr + exp(sk - mfin);                                                                \
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] *= scorr;                                            \
+    uint t = 0;                                                                                    \
+    for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }               \
+}
+ATTN_SINKS_KERNEL(attention_sinks_f32, float)
+ATTN_SINKS_KERNEL(attention_sinks_f16kv, half)
+
 // ---- Split-KV ("flash-decode") attention: same math as attention_*, but NSG simdgroups per
 // (query, head) threadgroup, each running a private online softmax over a strided slice of the KV
 // positions, merged at the end through threadgroup memory (rescale each partial to the global max,

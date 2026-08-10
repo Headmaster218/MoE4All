@@ -4,7 +4,9 @@
 // deepseek32's lightning indexer hardcodes while the MLA rope beside it stays NORM. Angles and the
 // pass-through tail are identical either way; the styles are NOT interchangeable. Rotates the
 // first rope_dim of each head; dims beyond pass through. One thread per (row, head).
-struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; uint neox; };
+// `backward` negates `sin` and leaves `cos` — llama.cpp's `ggml_rope_ext_back` is the same kernel
+// with `sin_sign = -1` (see `Op::Rope::backward`); deepseek4 de-ropes its attention OUTPUT.
+struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; uint neox; uint backward; };
 // One thread per (row, head, rotation pair) — the previous one-thread-per-head form rotated
 // rope_dim/2 pairs SERIALLY (trig included) and copied the whole head, which left a decode row
 // on a single simdgroup (the counter profiler measured it at 19% of TinyLlama decode). Threads
@@ -32,7 +34,7 @@ kernel void rope_f32(device const float* x   [[buffer(0)]],
     float p0 = pos[r];
     float ang = p0 * pow(p.theta, -2.0f * (float)k / (float)p.rope_dim);
     if (p.has_ff != 0) ang /= ff[k];
-    float c = cos(ang), s = sin(ang);
+    float c = cos(ang), s = p.backward != 0 ? -sin(ang) : sin(ang);
     float a = x[base + i0], b = x[base + i1];
     dst[base + i0] = a * c - b * s;
     dst[base + i1] = a * s + b * c;

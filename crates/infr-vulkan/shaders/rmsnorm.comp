@@ -5,6 +5,11 @@
 // -DF16IO build (`rmsnorm_f16`): x/y are f16 instead of f32 (llama4's post-rope weightless Q/K
 // L2-norm, `Op::QkNorm` on the f16 rope scratch — `w` stays f32 either way). Mutually exclusive
 // with GATE/ADD (no in-tree caller needs the combination).
+// -DNO_WEIGHT build (`rmsnorm_nw`): NO `w` binding and no multiply — `y[i] = x[i] * scale`
+// (`Op::QkNorm { weight: None }`, DeepSeek V4's bare per-head `ggml_rms_norm` on Q). `y` moves up
+// to binding 1, so the recorder's trailing-binding-is-the-write convention still holds. f32 only:
+// the adapter refuses a weightless f16 QkNorm rather than build a variant nothing dispatches.
+// Mutually exclusive with GATE/ADD/F16IO/WIDE.
 //
 // -DWIDE build (`rmsnorm_wide`): the DECODE norm. This kernel is one-workgroup-per-row, so at
 // decode (rows==1) the whole dispatch is a SINGLE 256-thread workgroup — one WGP of 48 — and the
@@ -49,7 +54,11 @@ layout(binding = 0) readonly buffer XB { float16_t x[]; };
 #else
 layout(binding = 0) readonly buffer XB { float x[]; };
 #endif
+#ifdef NO_WEIGHT
+layout(binding = 1) buffer YB { float y[]; };
+#else
 layout(binding = 1) readonly buffer WB { float w[]; };
+#endif
 #ifdef GATE
 layout(binding = 2) readonly buffer ZB { float z[]; };
 layout(binding = 3) buffer YB { float y[]; };
@@ -57,7 +66,7 @@ layout(binding = 3) buffer YB { float y[]; };
 layout(binding = 2) buffer DB { float dst[]; };
 #elif defined(F16IO)
 layout(binding = 2) buffer YB { float16_t y[]; };
-#else
+#elif !defined(NO_WEIGHT)
 layout(binding = 2) buffer YB { float y[]; };
 #endif
 #endif
@@ -116,6 +125,8 @@ void main() {
     for (uint i = t; i < pc.dim; i += NTHREAD) {
         y[base + i] = float16_t(float(x[base + i]) * scale * w[i]);
     }
+#elif defined(NO_WEIGHT)
+    for (uint i = t; i < pc.dim; i += NTHREAD) { y[base + i] = x[base + i] * scale; }
 #else
     for (uint i = t; i < pc.dim; i += NTHREAD) { y[base + i] = x[base + i] * scale * w[i]; }
 #endif

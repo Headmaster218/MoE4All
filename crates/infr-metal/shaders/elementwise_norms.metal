@@ -217,6 +217,26 @@ kernel void qknorm_f32(device const float* x   [[buffer(0)]],
     for (uint i = lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
 }
 
+// WEIGHTLESS per-head RMSNorm (Op::QkNorm { weight: None }) — deepseek4's bare per-head
+// `ggml_rms_norm` on Q, which has no `attn_q_norm` tensor to bind. Identical 32-lane reduction to
+// qknorm_f32 above; a separate kernel rather than a `has_w` flag because Metal wants every declared
+// buffer argument bound, and a dummy ones-vector is exactly the fake operand `weight: None` exists
+// to avoid.
+kernel void qknorm_nw_f32(device const float* x   [[buffer(0)]],
+                          device float*       dst [[buffer(1)]],
+                          constant QkNormParams& p [[buffer(2)]],
+                          uint gid  [[thread_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    uint grp = gid / 32u;
+    if (grp >= p.rows * p.n_head) return;
+    uint base = grp * p.head_dim;
+    float ss = 0.0f;
+    for (uint i = lane; i < p.head_dim; i += 32u) { float v = x[base + i]; ss += v * v; }
+    ss = simd_sum(ss) / (float)p.head_dim;
+    float s = 1.0f / sqrt(ss + p.eps);
+    for (uint i = lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s;
+}
+
 // Qwen3.5 DeltaNet output normalization: per-head RMSNorm followed by an elementwise SiLU gate.
 // This keeps qknorm_f32's exact 32-lane reduction and folds the dependent GatedAct dispatch into
 // the store pass. x and dst may alias; simd_sum completes every lane's reads before stores begin.

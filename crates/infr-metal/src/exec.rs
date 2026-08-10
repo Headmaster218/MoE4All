@@ -540,6 +540,7 @@ mod tests {
             freq_factors: None,
             x_stride: 0,
             neox: false,
+            backward: false,
         });
 
         let norm_weight = g.weight(TensorDesc::new(vec![64], DType::F32));
@@ -572,6 +573,7 @@ mod tests {
             scale: 0.125,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         });
 
         let ids = g.input(TensorDesc::new(vec![1], DType::I32));
@@ -763,6 +765,7 @@ mod tests {
             freq_factors: None,
             x_stride: 0,
             neox: false,
+            backward: false,
         });
         let bad_ids = unsupported.input(TensorDesc::new(vec![1], DType::I32));
         let bad_table = unsupported.weight(TensorDesc::new(vec![8, 64], DType::F16));
@@ -2642,23 +2645,41 @@ impl MetalBackend {
                 );
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
-                let bw = self.weight_buf(weight, g, bindings)?;
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                let pso = self.pipelines.get("qknorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                // One simdgroup per (row, head) — see `qknorm_f32`.
-                self.encode_tg_w(
-                    r,
-                    &pso,
-                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
-                    1 << 2,
-                    &p,
-                    rows * nh * 32,
-                    32,
-                );
+                // One simdgroup per (row, head) — see `qknorm_f32`. `weight: None` (deepseek4's
+                // bare per-head `ggml_rms_norm` on Q) takes the weightless kernel: same reduction,
+                // one buffer fewer, so the write mask shifts with the binding count.
+                match weight {
+                    Some(w) => {
+                        let bw = self.weight_buf(w, g, bindings)?;
+                        let pso = self.pipelines.get("qknorm_f32")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                            1 << 2,
+                            &p,
+                            rows * nh * 32,
+                            32,
+                        );
+                    }
+                    None => {
+                        let pso = self.pipelines.get("qknorm_nw_f32")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bd.as_ref()],
+                            1 << 1,
+                            &p,
+                            rows * nh * 32,
+                            32,
+                        );
+                    }
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::GatedRmsNorm {
@@ -3319,6 +3340,7 @@ impl MetalBackend {
                 freq_factors,
                 x_stride,
                 neox,
+                backward,
             } => {
                 // The runner only strides the fused QkNormRope (qwen35 q+g interleave); the plain
                 // llama-family Rope always reads packed rows.
@@ -3342,6 +3364,7 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
                 p.extend_from_slice(&u32::from(neox).to_ne_bytes());
+                p.extend_from_slice(&u32::from(backward).to_ne_bytes());
                 // One thread per (row, head, pair) + pass-through dims — see `rope_f32`.
                 let per = (rope_dim as usize / 2) + (hd - rope_dim as usize);
                 self.encode_w(
@@ -3886,6 +3909,7 @@ impl MetalBackend {
                 scale,
                 mask,
                 pos,
+                sinks,
             } => {
                 let (rows, kv_len, nh, nkv, hd) = (
                     rows as usize,
@@ -3948,6 +3972,55 @@ impl MetalBackend {
                          — f16 cache (native or block-quant dequant-prepassed) only so far"
                             .into(),
                     ));
+                }
+                // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
+                // kernel pair (`ATTN_SINKS_KERNEL` in attention.metal). None of the split / flash /
+                // vec / q8 tiers below knows about them, and a tier that quietly ignored the sink
+                // would produce a plausible softmax over the wrong denominator — so route here
+                // unconditionally and refuse the shapes this pair cannot serve.
+                if let Some(sk) = sinks {
+                    let (kdt, vdt) = (g.desc(k_cache).dtype, g.desc(v_cache).dtype);
+                    if canvas_lo.is_some() || r.posbuf.is_some() {
+                        return Err(Error::Unsupported(
+                            "metal attention: sinks under AttnMask::Canvas or on a decode-replay \
+                             tape have no kernel (the sinks pair is causal/SWA, static)"
+                                .into(),
+                        ));
+                    }
+                    if kdt != vdt || !matches!(kdt, DType::F32 | DType::F16) {
+                        return Err(Error::Unsupported(format!(
+                            "metal attention: sinks need a coupled f32 or f16 KV cache, got \
+                             K={kdt:?} V={vdt:?} — the sinks kernels have no quant read and skip \
+                             the dequant prepass"
+                        )));
+                    }
+                    let bsk = self.weight_buf(sk, g, bindings)?;
+                    let kern = if kdt == DType::F16 {
+                        "attention_sinks_f16kv"
+                    } else {
+                        "attention_sinks_f32"
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&window.to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    // One simdgroup per (query, head), like the sink-free `attention_*` pair.
+                    self.encode_tg_w(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bsk.as_ref(), bd.as_ref()],
+                        1 << 4,
+                        &p,
+                        rows * nh * 32,
+                        32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
                 }
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape (rows==1, f16/q8/coupled-q4_0/iq4_nl cache, hd

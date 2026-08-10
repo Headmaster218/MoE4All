@@ -4207,6 +4207,26 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// WEIGHTLESS RMSNorm: `y[i] = x[i] * inversesqrt(mean(x²) + eps)`, one workgroup per row
+    /// (`rmsnorm.comp`'s -DNO_WEIGHT build) — `Op::QkNorm { weight: None }`, deepseek4's bare
+    /// per-head `ggml_rms_norm` on Q. Same reduction as [`Self::rmsnorm`], one binding fewer.
+    pub fn rmsnorm_nw(&self, x: &dyn Buffer, y: &dyn Buffer, rows: usize, dim: usize, eps: f32) {
+        let k = self
+            .be
+            .kernel_sg("rmsnorm_nw", crate::gemm::rmsnorm_nw_spv(), 2, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32, // one workgroup per row (cooperative reduction)
+        );
+    }
+
     /// Mean-centred LayerNorm: `y[i] = (x[i] - mean) * inversesqrt(var + eps) * w[i] + b[i]` per
     /// row (`layernorm.comp`, `Op::LayerNorm`) — deepseek32's `indexer_k_norm`, the only non-RMS
     /// norm in the family. One workgroup per row, like [`Self::rmsnorm`], but two cooperative
@@ -4363,6 +4383,10 @@ impl<'a> Recorder<'a> {
         // second compile-time build rather than a push-constant branch, so the existing NORM
         // pipelines and their push layout are untouched.
         neox: bool,
+        // De-rope: negate `sin`, leave `cos` (`Op::Rope::backward` / `ggml_rope_ext_back`). Same
+        // compile-time-build treatment as `neox`. NORM only — deepseek4's de-rope is NORM, and a
+        // build nothing dispatches is a build nothing tests, so the adapter refuses neox+backward.
+        backward: bool,
     ) {
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
@@ -4377,6 +4401,9 @@ impl<'a> Recorder<'a> {
                 let k = if neox {
                     self.be
                         .kernel("rope_ff_neox", crate::gemm::rope_ff_neox_spv(), 3, 28)
+                } else if backward {
+                    self.be
+                        .kernel("rope_ff_back", crate::gemm::rope_ff_back_spv(), 3, 28)
                 } else {
                     self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28)
                 };
@@ -4395,6 +4422,9 @@ impl<'a> Recorder<'a> {
                 let k = if neox {
                     self.be
                         .kernel("rope_neox", crate::gemm::rope_neox_spv(), 2, 28)
+                } else if backward {
+                    self.be
+                        .kernel("rope_back", crate::gemm::rope_back_spv(), 2, 28)
                 } else {
                     self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28)
                 };
@@ -4527,6 +4557,64 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
+    /// [`Self::attention_kv`] plus per-head ATTENTION SINKS (`attention_kv.comp`'s -DSINKS build,
+    /// `Op::Attention::sinks`): `sinks[nh]` f32 binds at slot 3 (output last at 4), and each head's
+    /// sink logit joins the softmax max and denominator without contributing a value row.
+    ///
+    /// f16 KV, bound, static — no Q8/BDA/params twins, so the adapter must have already refused
+    /// those shapes. Doing it that way (rather than adding SINKS to every tier) keeps the sinks
+    /// arithmetic in ONE kernel; deepseek4's wiring slice can widen it if the perf demands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_sinks(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        sinks: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+    ) {
+        let kern = self.be.kernel(
+            "attention_kv_sinks",
+            crate::gemm::attention_kv_sinks_spv(),
+            5,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            // `o` LAST: the trailing `n_out` bindings are the hazard-tracked writes, so the sinks
+            // weight must bind before it (same rule as `rope_ff`'s divisors and `mla_bias`).
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(sinks),
+                Self::vkb(o),
+            ],
             1,
             &push,
             (q_len * nh) as u32,

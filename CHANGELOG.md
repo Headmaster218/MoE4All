@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DeepSeek V4 attention primitives** (stage 4, op level — nothing emits them
+  yet): `Op::QkNorm`'s `weight` became optional, so a weightless per-head
+  RMSNorm is expressible without a fake ones-vector operand; `Op::Attention`
+  gained an optional per-head `sinks` input (one extra logit per head joining
+  the softmax max and denominator, contributing no value); and `Op::Rope` gained
+  a `backward` flag for de-roping (llama.cpp's `ggml_rope_ext_back` — the
+  forward rotation with `sin` negated). All three run on CPU, Vulkan and Metal;
+  `sinks: None` / `backward: false` / `weight: Some(..)` reproduce the previous
+  code path exactly, so no existing model's numerics move. V4's grouped low-rank
+  output projection needs no new op — it composes from `Op::CopyStrided` and
+  `Op::Linear`'s existing `w_off`.
 - **DeepSeek V2 architecture support** (stage 2): registered `deepseek2` arch
   string, parsed MLA hyperparameters (`q_lora_rank`, `kv_lora_rank`,
   `qk_rope_dim`, `head_k_mla`, `v_head_dim`, lite detection via tensor

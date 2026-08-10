@@ -998,6 +998,17 @@ sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
 seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
 constraint in their comments.
 
+**The DENSE native path has the same hazard (2026-08-10).** Writing
+`grouped_output_projection_composes_from_linear_and_copystrided` (deepseek4
+slice 2), a plain `Op::Linear` with a bf16 weight at `in_f = 8` returned all
+zeros on Vulkan while the CPU interpreter returned the right answer — same
+graph, same bindings, no error anywhere. Raising `in_f` to 32 made both agree
+exactly. So whatever `native_dense_dtypes` weights dispatch through inherits the
+same `in_f/32` floor as the MoE id-GEMV, and a fix should cover both. NOT
+root-caused to a specific kernel (the dense path picks among several by
+`m`/dtype/tier); the observation is the m=3 bf16 case. The seam test documents
+the constraint in its comment and uses block-aligned dims.
+
 ### B48 — a failing op leaks its in-flight Vulkan recorder on most error paths (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; surfaced by the B45
@@ -1386,6 +1397,57 @@ while throughput moves 9%, `adaptive_chunk` is a pure function of the KV span,
 and every rung that could move a chunk logs at WARN and never fired. The real
 cause was a warmup at the wrong shape (B6), and pinning would have fixed
 nothing.
+
+### B-DSV4 — what the V4 attention primitives do NOT cover yet (2026-08-10)
+
+**Tag:** deepseek · vulkan · metal · **Blocked on:** nothing; scoped out of the
+op-level slice, which was explicitly "add the primitives, emit nothing"
+
+Each of the three new capabilities lives in exactly ONE kernel per backend
+rather than across the whole attention/norm/rope tier ladder. That was
+deliberate — a tier that quietly ignored a sink or a sign would produce
+plausible wrong numbers, and there is no caller yet to justify the fan-out — but
+the V4 wiring slice inherits the list. Every refusal below is a loud error, not
+a silent fallback.
+
+- **`Op::Attention { sinks }` on Vulkan** runs only `attention_kv.comp`'s
+  `-DSINKS` build: f16 K/V, bound descriptors, static recording, causal/SWA.
+  Refused: a Q8_0 or any other non-f16 cache (the dequant→f16 prepass sits below
+  the early return that routes to the sinks kernel), and `AttnMask::Canvas`.
+  `decode_eligible` also returns false for any graph containing a sinks op, so a
+  V4 decode loses the record-once replay tape. Nothing routes to flash,
+  non-FA-coopmat, split-K or the mrows tier, so a sinks layer runs the scalar
+  one-workgroup-per-(row, head) kernel at every depth — the thing `attn_partial`
+  exists to avoid. A perf pass means teaching at least `attn_partial` +
+  `attn_combine` the sink (it folds cleanly into the combine's final `(m, l)`,
+  which is where the split-K partials already merge).
+- **`Op::Attention { sinks }` on Metal** runs only `ATTN_SINKS_KERNEL`'s two
+  instantiations (`attention_sinks_f32`, `attention_sinks_f16kv`). Refused: a
+  decoupled or quantized K/V pair, `AttnMask::Canvas`, and the decode-replay
+  tape. Same tier story as Vulkan.
+- **`Op::QkNorm { weight: None }` on Vulkan** is `rmsnorm.comp`'s `-DNO_WEIGHT`
+  f32 build only; an f16 `x` (llama4's post-rope L2-norm shape) errors. V4's Q
+  norm reads the f32 `wq_b` output, so nothing needs the f16 twin yet, and a
+  build nothing dispatches is a build nothing tests.
+- **`Op::Rope { backward: true }` on Vulkan** is static f32 NORM only
+  (`rope_back`, `rope_ff_back`). NEOX+backward, f16-out and the record-once
+  `_dyn` path all error. V4's de-rope is NORM on an f32 scratch. Metal's rope is
+  one runtime-parameterised kernel, so it carries `backward` on every path
+  already.
+- **gemma4's V-norm and llama4's L2-norm still pass a ones-vector weight** to
+  `Op::QkNorm`. They could now pass `None` and drop a per-graph `head_dim`-float
+  allocation each; the numbers are bit-identical (`x * s * 1.0` is `x * s` in
+  IEEE, which `qknorm_weightless_matches_a_ones_weight` asserts at
+  `max_err == 0`). Left alone because it is an edit to `crates/infr-llama/src`,
+  which the op-level slice did not own.
+- **Metal has never been executed.** No Apple hardware was available; the three
+  new kernels (`qknorm_nw_f32`, the `backward` arm of `rope_f32`, and the two
+  `ATTN_SINKS_KERNEL` instantiations) typecheck via
+  `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`, and
+  MSL is compiled on-device at runtime, so the macOS CI job is their first real
+  compile AND their first execution. The three `#[ignore]`d tests
+  (`qknorm_weightless_parity`, `rope_backward_parity`, `attention_sinks_parity`)
+  are what will report it.
 
 ### W1 — VRAM guard check-then-act race (CR-N7)
 

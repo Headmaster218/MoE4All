@@ -854,7 +854,9 @@ impl Backend for CpuBackend {
                 } => {
                     let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let xs = &vals[x.0 as usize];
-                    let ws = weight(w);
+                    // `None` = V4's weightless Q norm (bare `ggml_rms_norm` per head): the scale is
+                    // the only factor. The reduction is identical either way.
+                    let ws = w.map(&weight);
                     let mut out = vec![0f32; rows * nh * hd];
                     for r in 0..rows {
                         for h in 0..nh {
@@ -862,8 +864,17 @@ impl Backend for CpuBackend {
                             let ss: f32 =
                                 (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
                             let s = 1.0 / (ss + eps).sqrt();
-                            for i in 0..hd {
-                                out[b + i] = xs[b + i] * s * ws[i];
+                            match &ws {
+                                Some(ws) => {
+                                    for i in 0..hd {
+                                        out[b + i] = xs[b + i] * s * ws[i];
+                                    }
+                                }
+                                None => {
+                                    for i in 0..hd {
+                                        out[b + i] = xs[b + i] * s;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1423,6 +1434,7 @@ impl Backend for CpuBackend {
                     theta,
                     freq_factors,
                     neox,
+                    backward,
                     ..
                 } => {
                     let (rows, nh, hd, rd) = (
@@ -1458,7 +1470,12 @@ impl Backend for CpuBackend {
                                 if let Some(ff) = &ff {
                                     ang /= ff[p];
                                 }
-                                let (s, c) = (ang.sin(), ang.cos());
+                                // `ggml_rope_ext_back` is this rotation with `sin` negated and
+                                // `cos` untouched (`sin_sign` in ggml_compute_forward_rope_flt) —
+                                // the transpose, which is the inverse because nothing scales the
+                                // magnitude here. See `Op::Rope::backward`.
+                                let sin_sign = if backward { -1.0 } else { 1.0 };
+                                let (s, c) = (ang.sin() * sin_sign, ang.cos());
                                 let a = xs[b + i0];
                                 let bb = xs[b + i1];
                                 out[b + i0] = a * c - bb * s;
@@ -1670,6 +1687,7 @@ impl Backend for CpuBackend {
                     scale,
                     mask,
                     pos,
+                    sinks,
                 } => {
                     let (rows, kv_len, nh, nkv, hd) = (
                         rows as usize,
@@ -1725,6 +1743,10 @@ impl Backend for CpuBackend {
                     };
                     let ks = deq(&kguard, g.desc(k_cache).dtype);
                     let vs = deq(&vguard, g.desc(v_cache).dtype);
+                    // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
+                    // extra logit per head in the max AND the denominator, never in the numerator.
+                    // See `Op::Attention::sinks`.
+                    let sk = sinks.map(&weight);
                     let group = nh / nkv;
                     // `Causal`/`SlidingWindow` clip the causal END at `abs+1` (per-row, from
                     // `pos`); `Canvas` (DiffusionGemma denoise — see `AttnMask::Canvas`'s doc)
@@ -1771,9 +1793,19 @@ impl Backend for CpuBackend {
                             *scj = dot(qrow, &ks[kb..kb + hd]) * scale;
                             mx = mx.max(*scj);
                         }
+                        // The sink joins the max first (so a dominating sink can't overflow the
+                        // exps), then the denominator — `ggml_compute_forward_soft_max_f32`'s two
+                        // `if (sk)` lines, in that order.
+                        let sink = sk.as_ref().map(|w| w[h]);
+                        if let Some(sv) = sink {
+                            mx = mx.max(sv);
+                        }
                         let mut l = 0f32;
                         for &s in &sc {
                             l += (s - mx).exp();
+                        }
+                        if let Some(sv) = sink {
+                            l += (sv - mx).exp();
                         }
                         for (jj, &s) in sc.iter().enumerate() {
                             let j = lo + jj;

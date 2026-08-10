@@ -255,7 +255,7 @@ fn qknorm_parity() {
     let dst = g.output(f32d(rows * n_head * head_dim));
     g.push(Op::QkNorm {
         x,
-        weight: w,
+        weight: Some(w),
         dst,
         rows: rows as u32,
         n_head: n_head as u32,
@@ -399,6 +399,7 @@ fn qknormrope_attn_chain() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: AttnMask::Causal,
         pos: 0,
+        sinks: None,
     });
     let xi = gen(rows * nh * hd, 4);
     let wi = gen(hd, 5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
@@ -520,6 +521,7 @@ fn qwen35_attn_core_writekv() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: AttnMask::Causal,
         pos: 0,
+        sinks: None,
     });
     let qi = gen(rows * nh * hd, 4);
     let ki = gen(rows * nkv * hd, 8);
@@ -2092,9 +2094,13 @@ fn lightning_indexer_scale_cannot_change_the_selection() {
 /// Hand-written reference for one `Op::Rope` dispatch, from the DEFINITION of the two rope types
 /// (llama.cpp `ggml_compute_forward_rope_f32`'s `is_neox` fork), not transcribed from the CPU arm.
 ///
-/// Pair `p` (of `rope_dim/2`) rotates by `position * theta^(-2p/rope_dim)`; the two elements it
-/// rotates are `(2p, 2p+1)` for NORM and `(p, p + rope_dim/2)` for NEOX. Dims at or past
-/// `rope_dim` pass through untouched in both.
+/// Pair `p` (of `rope_dim/2`) rotates by `position * theta^(-2p/rope_dim)`, DIVIDED by `ff[p]` when
+/// YaRN freq_factors are present; the two elements it rotates are `(2p, 2p+1)` for NORM and
+/// `(p, p + rope_dim/2)` for NEOX. Dims at or past `rope_dim` pass through untouched in both.
+///
+/// `backward` is `ggml_rope_ext_back`: `ggml_compute_forward_rope_back` runs the SAME kernel with
+/// `forward = false`, whose only effect is `sin_sign = -1` applied to the cached sine
+/// (`ggml_rope_cache_init`) — `cos` untouched. See `Op::Rope::backward`.
 #[allow(clippy::too_many_arguments)]
 fn rope_ref(
     x: &[f32],
@@ -2105,9 +2111,12 @@ fn rope_ref(
     rope_dim: usize,
     theta: f32,
     neox: bool,
+    freq_factors: Option<&[f32]>,
+    backward: bool,
 ) -> Vec<f32> {
     let mut out = x.to_vec();
     let hf = rope_dim / 2;
+    let sin_sign = if backward { -1.0f32 } else { 1.0 };
     for (r, &p0) in positions.iter().enumerate().take(rows) {
         for h in 0..n_head {
             let b = (r * n_head + h) * head_dim;
@@ -2117,8 +2126,11 @@ fn rope_ref(
                 } else {
                     (2 * p, 2 * p + 1)
                 };
-                let ang = p0 as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
-                let (s, c) = (ang.sin(), ang.cos());
+                let mut ang = p0 as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
+                if let Some(ff) = freq_factors {
+                    ang /= ff[p];
+                }
+                let (s, c) = (ang.sin() * sin_sign, ang.cos());
                 out[b + i0] = x[b + i0] * c - x[b + i1] * s;
                 out[b + i1] = x[b + i0] * s + x[b + i1] * c;
             }
@@ -2160,6 +2172,7 @@ fn rope_neox_and_norm_parity() {
             freq_factors: None,
             x_stride: 0,
             neox,
+            backward: false,
         });
         // `run` uploads f32 for every bound input; the positions tensor is I32, so bind by hand.
         let runner = |be: &dyn Backend| -> Vec<f32> {
@@ -2180,7 +2193,7 @@ fn rope_neox_and_norm_parity() {
             bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
         };
         let want = rope_ref(
-            &xi, &positions, rows, n_head, head_dim, rope_dim, theta, neox,
+            &xi, &positions, rows, n_head, head_dim, rope_dim, theta, neox, None, false,
         );
         let c = runner(&cpu);
         let e = maxerr(&c, &want);
@@ -2459,5 +2472,754 @@ fn mla_key_bias_removes_the_masked_keys() {
             d > 1e-3,
             "Mla {name}: masking a key changed nothing — key_bias is not reaching the kernel"
         );
+    }
+}
+
+// ── DeepSeek V4 attention primitives (docs/deepseek.md § Stage 4) ─────────────────────────────
+//
+// Four op-level capabilities, each with a reference written from the DEFINITION (llama.cpp's
+// `deepseek4.cpp` / `ggml`), in f64, deliberately NOT transcribed from the interpreter arms under
+// test. Nothing emits any of them yet.
+
+/// Hand-written reference for `Op::QkNorm { weight: None }` — DeepSeek V4's Q norm, which is a bare
+/// `ggml_rms_norm` over a `[head_dim, n_head, n_tokens]` reshape (`deepseek4.cpp`'s `build_attention`,
+/// the `q_norm` callback). `ggml_rms_norm` normalizes over `ne[0]`, so the reduction is PER HEAD:
+/// `out = x / sqrt(mean_head(x²) + eps)`, no weight anywhere. f64, from the definition.
+fn head_rmsnorm_ref(x: &[f32], rows: usize, n_head: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0f32; rows * n_head * head_dim];
+    for hh in 0..rows * n_head {
+        let b = hh * head_dim;
+        let ss: f64 = (0..head_dim)
+            .map(|i| (x[b + i] as f64).powi(2))
+            .sum::<f64>()
+            / head_dim as f64;
+        let s = 1.0 / (ss + eps as f64).sqrt();
+        for i in 0..head_dim {
+            out[b + i] = (x[b + i] as f64 * s) as f32;
+        }
+    }
+    out
+}
+
+/// The MISTAKE this test exists to catch: one reduction over the whole `n_head*head_dim` row
+/// instead of one per head. Same formula, wrong `dim`.
+fn row_rmsnorm_ref(x: &[f32], rows: usize, n_head: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+    head_rmsnorm_ref(x, rows, 1, n_head * head_dim, eps)
+}
+
+/// Rows whose per-head vectors have WILDLY different magnitudes (1e2 / 1e-2 / 1e0 / 3e1). A norm
+/// taken across the whole row is dominated by head 0 and crushes heads 1-3 toward zero, so the two
+/// references are far apart — which is what makes this input able to fail.
+fn head_scale_rows(rows: usize, n_head: usize, head_dim: usize) -> Vec<f32> {
+    let mag = [100.0f32, 0.01, 1.0, 30.0];
+    (0..rows * n_head * head_dim)
+        .map(|i| {
+            let h = (i / head_dim) % n_head;
+            let c = i % head_dim;
+            mag[h % mag.len()] * ((((c * 7 + h * 3) % 13) as f32 - 6.0) * 0.15 + 1.0)
+        })
+        .collect()
+}
+
+/// `Op::QkNorm` with NO weight (V4's Q norm) normalizes PER HEAD, on CPU and on Vulkan.
+///
+/// The input's four heads span four orders of magnitude, so the whole-row reduction — the one
+/// plausible wrong answer — is not merely different, it is off by orders of magnitude on three of
+/// the four heads. That gap is asserted explicitly (`well-posed`), so the test cannot pass by
+/// comparing two things that happen to agree.
+#[test]
+fn qknorm_weightless_normalizes_per_head() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (2usize, 4usize, 16usize);
+    let eps = 1e-6f32;
+    let n = rows * nh * hd;
+
+    let mut g = Graph::new();
+    let x = g.input(f32d(n));
+    let dst = g.output(f32d(n));
+    g.push(Op::QkNorm {
+        x,
+        weight: None,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        eps,
+        x_stride: 0,
+    });
+
+    let xi = head_scale_rows(rows, nh, hd);
+    let ins = [(x, &xi[..])];
+    let per_head = head_rmsnorm_ref(&xi, rows, nh, hd, eps);
+    let per_row = row_rmsnorm_ref(&xi, rows, nh, hd, eps);
+    let gap = maxerr(&per_head, &per_row);
+    println!("QkNorm(weightless) per-head-vs-per-row reference gap={gap:e}");
+    assert!(
+        gap > 0.5,
+        "input is not well posed: a whole-row norm would pass this test (gap={gap:e})"
+    );
+
+    let c = run(&cpu, &g, &ins, &[], dst, n);
+    let e = maxerr(&c, &per_head);
+    println!("QkNorm(weightless) cpu-vs-ref max_err={e:e}");
+    assert!(e < 1e-5, "weightless QkNorm diverges on CPU: max_err={e:e}");
+
+    if let Some(vk) = gpu() {
+        let v = run(&vk, &g, &ins, &[], dst, n);
+        let e = maxerr(&v, &per_head);
+        println!("QkNorm(weightless) vulkan-vs-ref max_err={e:e}");
+        assert!(
+            e < 1e-5,
+            "weightless QkNorm diverges on Vulkan: max_err={e:e}"
+        );
+    }
+}
+
+/// A weightless `Op::QkNorm` must equal a weighted one whose weight is all ones — the convention
+/// `Op::RmsNorm`'s doc records, and the reason `weight: None` is a REPRESENTATION change and not a
+/// numerics change. Pins that both arms compute the same thing on every backend.
+#[test]
+fn qknorm_weightless_matches_a_ones_weight() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (2usize, 4usize, 16usize);
+    let eps = 1e-6f32;
+    let n = rows * nh * hd;
+    let xi = head_scale_rows(rows, nh, hd);
+    let ones = vec![1.0f32; hd];
+
+    let build = |weighted: bool| {
+        let mut g = Graph::new();
+        let x = g.input(f32d(n));
+        let w = g.weight(f32d(hd));
+        let dst = g.output(f32d(n));
+        g.push(Op::QkNorm {
+            x,
+            weight: weighted.then_some(w),
+            dst,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            eps,
+            x_stride: 0,
+        });
+        (g, x, w, dst)
+    };
+    let each = |be: &dyn Backend, name: &str| {
+        let (gw, xw, ww, dw) = build(true);
+        let with = run(be, &gw, &[(xw, &xi)], &[(ww, &ones)], dw, n);
+        let (gn, xn, _, dn) = build(false);
+        let without = run(be, &gn, &[(xn, &xi)], &[], dn, n);
+        let e = maxerr(&with, &without);
+        println!("QkNorm ones-weight vs weightless ({name}) max_err={e:e}");
+        assert!(
+            e == 0.0,
+            "{name}: weightless QkNorm is not x*1.0 (err={e:e})"
+        );
+    };
+    each(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        each(&vk, "vulkan");
+    }
+}
+
+// ── Op::Attention sinks (deepseek4's attn_sinks) ─────────────────────────────────────────────
+
+/// Hand-written softmax attention with per-head SINKS, in f64, from
+/// `ggml_compute_forward_soft_max_f32`'s `src2` handling (llama.cpp `ggml/src/ggml-cpu/ops.cpp`):
+///
+/// ```text
+/// m = max_j(score[j]);  if sinks: m = max(m, sink[h])
+/// l = Σ_j exp(score[j] - m);  if sinks: l += exp(sink[h] - m)
+/// out = Σ_j (exp(score[j] - m) / l) * V[j]
+/// ```
+///
+/// `sink` is `None` for the plain softmax, `Some((s, extra_value))` otherwise: `extra_value` is the
+/// deliberate WRONG variant — the sink also contributing a value row (`Σ` gains `exp(sink-m)/l *
+/// V[extra]`), which is what "attention sinks" means in the register-token reading and is a
+/// different function from the one llama.cpp implements. The correct call passes `None` for it.
+#[allow(clippy::too_many_arguments)]
+fn attention_sinks_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    rows: usize,
+    kv_len: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    scale: f32,
+    pos: usize,
+    sink: Option<(&[f32], Option<usize>)>,
+) -> Vec<f32> {
+    let group = n_head / n_kv;
+    let mut out = vec![0f32; rows * n_head * hd];
+    for ti in 0..rows {
+        for h in 0..n_head {
+            let kvh = h / group;
+            let qb = (ti * n_head + h) * hd;
+            let hi = (pos + ti + 1).min(kv_len);
+            let sc: Vec<f64> = (0..hi)
+                .map(|j| {
+                    let kb = (j * n_kv + kvh) * hd;
+                    (0..hd)
+                        .map(|d| q[qb + d] as f64 * k[kb + d] as f64)
+                        .sum::<f64>()
+                        * scale as f64
+                })
+                .collect();
+            let mut m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if let Some((s, _)) = sink {
+                m = m.max(s[h] as f64);
+            }
+            let mut l: f64 = sc.iter().map(|&s| (s - m).exp()).sum();
+            if let Some((s, _)) = sink {
+                l += (s[h] as f64 - m).exp();
+            }
+            for (j, &s) in sc.iter().enumerate() {
+                let p = (s - m).exp() / l;
+                let vb = (j * n_kv + kvh) * hd;
+                for d in 0..hd {
+                    out[qb + d] += (p * v[vb + d] as f64) as f32;
+                }
+            }
+            // The wrong variant: the sink ALSO carries a value.
+            if let Some((s, Some(extra))) = sink {
+                let p = (s[h] as f64 - m).exp() / l;
+                let vb = (extra * n_kv + kvh) * hd;
+                for d in 0..hd {
+                    out[qb + d] += (p * v[vb + d] as f64) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Op::Attention`'s sinks join the softmax MAX and DENOMINATOR only — never the numerator.
+///
+/// Two regimes, because they fail differently:
+///
+/// * **Dominant sink** (`+18`, far above every real score): every real key's weight collapses
+///   toward `exp(-18)`, so the output is ~1e-8 of the sink-free one. This is the case that catches
+///   "sink left out of the denominator" (which would return the sink-free output outright) and
+///   "sink also contributes a value" (which would return ≈`V[0]`). Both wrong answers are asserted
+///   to be far from the right one, so the test provably discriminates.
+/// * **Negligible sink** (`-18`): `exp(sink - m) ≈ 0`, so the output must be the sink-free one to
+///   within f32 noise. This is the case that catches a sink applied with the wrong sign or scaled
+///   by `scale`.
+///
+/// q and the KV cache are f16 — the seam's real producer→consumer dtype flow, and what the Vulkan
+/// `attention_kv` family reads (`qknormrope_attn_chain` above pins the same convention). The CPU
+/// interpreter converts them to f32 on load, so both backends see identical values.
+#[test]
+fn attention_sinks_are_denominator_only() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, nkv, hd) = (3usize, 2usize, 1usize, 8usize);
+    let kv_len = rows;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let n_out = rows * nh * hd;
+
+    let to_f16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect()
+    };
+    let deq = |b: &[u8]| -> Vec<f32> {
+        b.chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    };
+    let qf = to_f16(&gen(rows * nh * hd, 4));
+    let kf = to_f16(&gen(kv_len * nkv * hd, 8));
+    let vf = to_f16(&gen(kv_len * nkv * hd, 9));
+    // The references must see the SAME f16-rounded values the kernels read.
+    let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+
+    let build = |with_sinks: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+        let kc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let sk = g.weight(f32d(nh));
+        let dst = g.output(f32d(n_out));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: with_sinks.then_some(sk),
+        });
+        (g, q, kc, vc, sk, dst)
+    };
+
+    // Bespoke runner: q/K/V are f16 BYTES, which `run` (f32 slices) cannot upload.
+    let go = |be: &dyn Backend, sinks: Option<&[f32]>| -> Vec<f32> {
+        let (g, q, kc, vc, sk, dst) = build(sinks.is_some());
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let qb = up(&qf, BufferUsage::Activations);
+        let kb = up(&kf, BufferUsage::KvCache);
+        let vb = up(&vf, BufferUsage::KvCache);
+        let sb = sinks.map(|s| up(bytemuck::cast_slice(s), BufferUsage::Weights));
+        let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(kc, kb.as_ref());
+        b.bind(vc, vb.as_ref());
+        if let Some(sb) = &sb {
+            b.bind(sk, sb.as_ref());
+        }
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; n_out];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let r = |sink: Option<(&[f32], Option<usize>)>| {
+        attention_sinks_ref(&qd, &kd, &vd, rows, kv_len, nh, nkv, hd, scale, 0, sink)
+    };
+    let no_sink = r(None);
+    let dominant = vec![18.0f32; nh];
+    let negligible = vec![-18.0f32; nh];
+    let want_dom = r(Some((&dominant, None)));
+    let want_neg = r(Some((&negligible, None)));
+    // The two wrong answers, computed from the same reference with one clause changed.
+    let dom_no_denom = no_sink.clone(); // sink dropped from the denominator
+    let dom_with_value = r(Some((&dominant, Some(0)))); // sink also contributes V[0]
+
+    let gap_denom = maxerr(&want_dom, &dom_no_denom);
+    let gap_numer = maxerr(&want_dom, &dom_with_value);
+    println!("Attention sinks: dominant-vs-no-denominator gap={gap_denom:e}");
+    println!("Attention sinks: dominant-vs-sink-has-value gap={gap_numer:e}");
+    assert!(
+        gap_denom > 0.1,
+        "input not well posed: dropping the sink from the denominator would pass (gap={gap_denom:e})"
+    );
+    assert!(
+        gap_numer > 0.1,
+        "input not well posed: giving the sink a value row would pass (gap={gap_numer:e})"
+    );
+
+    let check = |be: &dyn Backend, name: &str| {
+        let plain = go(be, None);
+        let e = maxerr(&plain, &no_sink);
+        println!("Attention sinks({name}) none-vs-ref max_err={e:e}");
+        assert!(e < 1e-3, "{name}: sink-free attention moved: max_err={e:e}");
+
+        let dom = go(be, Some(&dominant));
+        let e = maxerr(&dom, &want_dom);
+        println!("Attention sinks({name}) dominant-vs-ref max_err={e:e}");
+        assert!(e < 1e-4, "{name}: dominant sink wrong: max_err={e:e}");
+        // ...and it is genuinely a different answer from both wrong variants on this backend.
+        assert!(
+            maxerr(&dom, &dom_no_denom) > 0.1,
+            "{name}: dominant-sink output equals the sink-free one — the sink never reached the \
+             denominator"
+        );
+        assert!(
+            maxerr(&dom, &dom_with_value) > 0.1,
+            "{name}: dominant-sink output equals the sink-has-a-value one — the sink is in the \
+             numerator"
+        );
+
+        let neg = go(be, Some(&negligible));
+        let e = maxerr(&neg, &want_neg);
+        println!("Attention sinks({name}) negligible-vs-ref max_err={e:e}");
+        assert!(e < 1e-3, "{name}: negligible sink wrong: max_err={e:e}");
+        let e = maxerr(&neg, &no_sink);
+        println!("Attention sinks({name}) negligible-vs-sinkless max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "{name}: a sink 18 below the max changed the output: max_err={e:e}"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
+    }
+}
+
+// ── Op::Rope { backward } (deepseek4's attention-output de-rope) ──────────────────────────────
+
+/// De-roping is the exact inverse of roping: `Rope { backward: false }` then
+/// `Rope { backward: true }` at the SAME position/theta/freq_factors returns the input.
+///
+/// That is the property, so it is what is asserted — and it is a property only because
+/// `Op::Rope` carries no magnitude scale (see `Op::Rope::backward`: ggml's own `rope_back` is the
+/// transpose, not the inverse, whenever YaRN's `mscale != 1`, and V4's `dsv4_rope_attn_factor`
+/// is precisely the constant that makes `mscale == 1` at every one of its call sites).
+///
+/// The roundtrip alone would also pass if BOTH directions were no-ops, so the backward leg is
+/// additionally compared against the f64 reference and asserted to differ from the forward leg.
+/// Positions are non-trivial (37/38/39) and `rope_dim < head_dim`, so the pass-through tail is
+/// exercised too.
+#[test]
+fn rope_back_inverts_rope_forward() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd, rope_dim) = (3usize, 2usize, 8usize, 4usize);
+    let theta = 1e4f32;
+    let n = rows * nh * hd;
+    let xi = gen(n, 11);
+    // Non-trivial positions: 37/38/39, not 0/1/2 (a de-rope at position 0 is the identity, so a
+    // dropped sign would pass unnoticed there).
+    let posv: Vec<i32> = vec![37, 38, 39];
+    // YaRN per-pair divisors: V4's compressed layers rope (and de-rope) with a ramp, its ratio-0
+    // layers plain. Both must invert, so both are run.
+    let ffi: Vec<f32> = (0..rope_dim / 2).map(|p| 1.0 + p as f32 * 0.37).collect();
+
+    for (name, use_ff) in [("plain", false), ("freq_factors", true)] {
+        let rope = |backward: bool| {
+            let mut g = Graph::new();
+            let x = g.input(f32d(n));
+            let p = g.input(TensorDesc::new(vec![rows], DType::I32));
+            let ff = g.input(f32d(rope_dim / 2));
+            let mid = g.internal(f32d(n));
+            let dst = g.output(f32d(n));
+            g.push(Op::Rope {
+                x,
+                positions: p,
+                dst: if backward { mid } else { dst },
+                rows: rows as u32,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: rope_dim as u32,
+                theta,
+                freq_factors: use_ff.then_some(ff),
+                x_stride: 0,
+                neox: false,
+                backward: false,
+            });
+            if backward {
+                g.push(Op::Rope {
+                    x: mid,
+                    positions: p,
+                    dst,
+                    rows: rows as u32,
+                    n_head: nh as u32,
+                    head_dim: hd as u32,
+                    rope_dim: rope_dim as u32,
+                    theta,
+                    freq_factors: use_ff.then_some(ff),
+                    x_stride: 0,
+                    neox: false,
+                    backward: true,
+                });
+            }
+            (g, x, p, ff, dst)
+        };
+        // A standalone backward rope, for the direct comparison against the reference.
+        let back_only = || {
+            let mut g = Graph::new();
+            let x = g.input(f32d(n));
+            let p = g.input(TensorDesc::new(vec![rows], DType::I32));
+            let ff = g.input(f32d(rope_dim / 2));
+            let dst = g.output(f32d(n));
+            g.push(Op::Rope {
+                x,
+                positions: p,
+                dst,
+                rows: rows as u32,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: rope_dim as u32,
+                theta,
+                freq_factors: use_ff.then_some(ff),
+                x_stride: 0,
+                neox: false,
+                backward: true,
+            });
+            (g, x, p, ff, dst)
+        };
+        // `positions` is an I32 input; `run` uploads f32 words, so bind the bit-patterns.
+        let posi: Vec<f32> = posv.iter().map(|&p| f32::from_bits(p as u32)).collect();
+        let ff_used = use_ff.then_some(&ffi[..]);
+        let fwd_ref = rope_ref(
+            &xi, &posv, rows, nh, hd, rope_dim, theta, false, ff_used, false,
+        );
+        let back_ref = rope_ref(
+            &xi, &posv, rows, nh, hd, rope_dim, theta, false, ff_used, true,
+        );
+        let sep = maxerr(&fwd_ref, &back_ref);
+        println!("Rope({name}) forward-vs-backward reference separation={sep:e}");
+        assert!(
+            sep > 0.01,
+            "{name}: input not well posed — forward and backward agree (sep={sep:e})"
+        );
+
+        let check = |be: &dyn Backend, bname: &str| {
+            let (g, x, p, ff, dst) = back_only();
+            let b = run(be, &g, &[(x, &xi), (p, &posi), (ff, &ffi)], &[], dst, n);
+            let e = maxerr(&b, &back_ref);
+            println!("Rope back({name},{bname}) vs ref max_err={e:e}");
+            assert!(e < 1e-5, "{bname} {name}: backward rope wrong: {e:e}");
+            let e = maxerr(&b, &fwd_ref);
+            assert!(
+                e > 0.01,
+                "{bname} {name}: backward rope equals the forward one — the sign flip never landed"
+            );
+
+            let (g, x, p, ff, dst) = rope(true);
+            let rt = run(be, &g, &[(x, &xi), (p, &posi), (ff, &ffi)], &[], dst, n);
+            let e = maxerr(&rt, &xi);
+            println!("Rope roundtrip({name},{bname}) vs input max_err={e:e}");
+            assert!(
+                e < 1e-5,
+                "{bname} {name}: forward∘backward is not the identity: max_err={e:e}"
+            );
+        };
+        check(&cpu, "cpu");
+        if let Some(vk) = gpu() {
+            check(&vk, "vulkan");
+        }
+    }
+}
+
+// ── The grouped low-rank output projection (deepseek4's wo_a/wo_b) ───────────────────────────
+//
+// NO new op: `deepseek4.cpp` reshapes the (de-roped) attention output to `[o_group_dim, n_groups,
+// nt]`, permutes, and runs ONE batched `ggml_mul_mat` against `wo_a` reshaped to `[o_group_dim,
+// o_lora_rank, n_groups]`. Because that batch axis is the OUTERMOST axis of both operands, group
+// `g` is exactly `Op::Linear` over rows `[g*o_lora_rank, (g+1)*o_lora_rank)` of `wo_a` — which is
+// what `Op::Linear::w_off` already selects (`w_off = g*o_lora_rank*o_group_dim`, row-aligned) —
+// applied to columns `[g*o_group_dim, (g+1)*o_group_dim)` of the output row, which is what
+// `Op::CopyStrided` already slices. So the composition below IS the batched matmul, built out of
+// two ops the seam already emits for exactly this shape of job (qwen35 splits its interleaved q|k|v
+// rows the same way). A batched-GEMM op would have one caller and one shape.
+
+/// Hand-written reference for the grouped projection, in f64, from `deepseek4.cpp`'s
+/// `attn_wo_a` block: for each token row and each group `g`,
+/// `oa[r, g*o_lora_rank + i] = Σ_d out[r, g*o_group_dim + d] * wo_a[g][i, d]`, then the plain
+/// `wo_b` Linear over the concatenated `[nt, o_lora_rank*n_groups]`.
+#[allow(clippy::too_many_arguments)]
+fn grouped_out_proj_ref(
+    out: &[f32],
+    wo_a: &[f32],
+    wo_b: &[f32],
+    m: usize,
+    n_groups: usize,
+    o_group_dim: usize,
+    o_lora_rank: usize,
+    n_embd: usize,
+    // Force every group to read group 0's weights AND group 0's input slice — the mistake a
+    // hard-coded offset makes.
+    pin_group0: bool,
+) -> Vec<f32> {
+    let oa_w = o_lora_rank * n_groups;
+    let mut oa = vec![0f64; m * oa_w];
+    for r in 0..m {
+        for g in 0..n_groups {
+            let sg = if pin_group0 { 0 } else { g };
+            for i in 0..o_lora_rank {
+                let wrow = (sg * o_lora_rank + i) * o_group_dim;
+                let xoff = r * (n_groups * o_group_dim) + sg * o_group_dim;
+                oa[r * oa_w + g * o_lora_rank + i] = (0..o_group_dim)
+                    .map(|d| out[xoff + d] as f64 * wo_a[wrow + d] as f64)
+                    .sum();
+            }
+        }
+    }
+    let mut dst = vec![0f32; m * n_embd];
+    for r in 0..m {
+        for o in 0..n_embd {
+            dst[r * n_embd + o] = (0..oa_w)
+                .map(|i| oa[r * oa_w + i] * wo_b[o * oa_w + i] as f64)
+                .sum::<f64>() as f32;
+        }
+    }
+    dst
+}
+
+/// V4's grouped low-rank output projection composes out of ops that already exist:
+/// `CopyStrided` (slice group `g`'s columns) → `Linear { w_off }` (group `g`'s `wo_a` rows) →
+/// `CopyStrided` (place into the concatenated `oa`) per group, then one `Linear` for `wo_b`.
+///
+/// The groups genuinely differ — group `g`'s weights are scaled by `(g+1)` — so a version that
+/// reused group 0's weights (or group 0's input slice) for every group produces a different answer.
+/// That variant is not merely described: the test BUILDS it (`pin_group0`, both offsets forced to
+/// 0) and asserts the real graph does not match it, so the offsets are proven load-bearing.
+///
+/// `wo_a` is **bf16**, not f32, and that is load-bearing rather than incidental: Vulkan's
+/// `Op::Linear` accepts `w_off` only on the offset-capable NATIVE-block kernels
+/// (`native_dense_dtypes` — every quant format plus bf16), and refuses it outright on the f32/f16
+/// fallbacks ("Linear w_off on a non-native weight"). A real V4 GGUF's `wo_a` is quantized, so the
+/// composition holds in production; an f32 `wo_a` would need a per-group pack copy instead. The
+/// reference rounds `wo_a` through bf16 first, so the comparison stays a test of the grouping and
+/// not of the weight's precision.
+#[test]
+fn grouped_output_projection_composes_from_linear_and_copystrided() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // `o_group_dim` (the per-group `in_f`) and `oa_w` are multiples of 32: the native-block GEMV /
+    // GEMM kernels `w_off` rides on quantize the activation in 32-wide blocks, and an `in_f` below
+    // that granularity yields all-zero output rather than an error. V4's real `o_group_dim` is
+    // `n_head*head_dim/o_groups`, comfortably above it.
+    let (m, nh, hd, n_groups, o_lora_rank, n_embd) =
+        (3usize, 4usize, 32usize, 4usize, 8usize, 32usize);
+    let o_group_dim = nh * hd / n_groups;
+    let oa_w = o_lora_rank * n_groups;
+
+    // Group g's weights scaled by (g+1): the groups are unmistakably different. Rounded through
+    // bf16, which is the dtype actually uploaded (see this test's doc on `w_off`).
+    let wo_a: Vec<f32> = gen(n_groups * o_lora_rank * o_group_dim, 21)
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            half::bf16::from_f32(v * ((i / (o_lora_rank * o_group_dim)) + 1) as f32).to_f32()
+        })
+        .collect();
+    let wo_a_bytes: Vec<u8> = wo_a
+        .iter()
+        .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+        .collect();
+    let wo_b = gen(n_embd * oa_w, 23);
+    let outi = gen(m * nh * hd, 25);
+
+    let build = |pin_group0: bool| {
+        let mut g = Graph::new();
+        let out = g.input(f32d(m * nh * hd));
+        let wa = g.weight(TensorDesc::new(
+            vec![n_groups * o_lora_rank * o_group_dim],
+            DType::Bf16,
+        ));
+        let wb = g.weight(f32d(n_embd * oa_w));
+        let oa = g.internal(f32d(m * oa_w));
+        let dst = g.output(f32d(m * n_embd));
+        for gi in 0..n_groups {
+            let src_g = if pin_group0 { 0 } else { gi };
+            let packed = g.internal(f32d(m * o_group_dim));
+            let proj = g.internal(f32d(m * o_lora_rank));
+            g.push(Op::CopyStrided {
+                src: out,
+                src_off: (src_g * o_group_dim) as u32,
+                src_stride: (nh * hd) as u32,
+                dst: packed,
+                dst_off: 0,
+                dst_stride: o_group_dim as u32,
+                rows: m as u32,
+                n: o_group_dim as u32,
+            });
+            g.push(Op::Linear {
+                x: packed,
+                weight: wa,
+                dst: proj,
+                m: m as u32,
+                in_f: o_group_dim as u32,
+                out_f: o_lora_rank as u32,
+                w_off: (src_g * o_lora_rank * o_group_dim) as u32,
+            });
+            g.push(Op::CopyStrided {
+                src: proj,
+                src_off: 0,
+                src_stride: o_lora_rank as u32,
+                dst: oa,
+                dst_off: (gi * o_lora_rank) as u32,
+                dst_stride: oa_w as u32,
+                rows: m as u32,
+                n: o_lora_rank as u32,
+            });
+        }
+        g.push(Op::Linear {
+            x: oa,
+            weight: wb,
+            dst,
+            m: m as u32,
+            in_f: oa_w as u32,
+            out_f: n_embd as u32,
+            w_off: 0,
+        });
+        (g, out, wa, wb, dst)
+    };
+
+    let want = grouped_out_proj_ref(
+        &outi,
+        &wo_a,
+        &wo_b,
+        m,
+        n_groups,
+        o_group_dim,
+        o_lora_rank,
+        n_embd,
+        false,
+    );
+    let pinned = grouped_out_proj_ref(
+        &outi,
+        &wo_a,
+        &wo_b,
+        m,
+        n_groups,
+        o_group_dim,
+        o_lora_rank,
+        n_embd,
+        true,
+    );
+    let gap = maxerr(&want, &pinned);
+    println!("GroupedOutProj grouped-vs-pinned reference gap={gap:e}");
+    assert!(
+        gap > 0.1,
+        "input not well posed: pinning every group to group 0 would pass (gap={gap:e})"
+    );
+
+    // Bespoke runner: `wa` is bf16 BYTES, which `run` (f32 slices) cannot upload.
+    let go = |be: &dyn Backend, pin_group0: bool| -> Vec<f32> {
+        let (g, out, wa, wb, dst) = build(pin_group0);
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let xb = up(bytemuck::cast_slice(&outi), BufferUsage::Activations);
+        let ab = up(&wo_a_bytes, BufferUsage::Weights);
+        let bb = up(bytemuck::cast_slice(&wo_b), BufferUsage::Weights);
+        let ob = be.alloc(m * n_embd * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(out, xb.as_ref());
+        b.bind(wa, ab.as_ref());
+        b.bind(wb, bb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; m * n_embd];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let check = |be: &dyn Backend, name: &str| {
+        let got = go(be, false);
+        let e = maxerr(&got, &want);
+        println!("GroupedOutProj({name}) vs ref max_err={e:e}");
+        assert!(e < 1e-4, "{name}: grouped projection wrong: max_err={e:e}");
+
+        // The RED case, executed: same graph with both offsets pinned to group 0.
+        let got_p = go(be, true);
+        let e = maxerr(&got_p, &pinned);
+        println!("GroupedOutProj({name}) pinned vs pinned-ref max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "{name}: the pinned variant does not even match its own reference ({e:e}) — the test \
+             is not measuring what it claims"
+        );
+        assert!(
+            maxerr(&got, &got_p) > 0.1,
+            "{name}: pinning every group to group 0 changed nothing — w_off/src_off are not \
+             reaching the kernels"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
     }
 }

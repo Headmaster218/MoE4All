@@ -76,6 +76,14 @@ layout(binding = 2) readonly buffer VB { float16_t v[]; };
 // `o` moves to binding 4 (params takes binding 3) so the recorder's reads|writes split is output-last.
 layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 4) buffer OB { float o[]; };
+#elif defined(SINKS)
+// -DSINKS build (`attention_kv_sinks`): per-head attention-sink logits `[nh]` at binding 3, `o`
+// last at 4. One extra logit per head that joins the softmax MAX and DENOMINATOR and contributes
+// no value — deepseek4's `attn_sinks`, see `Op::Attention::sinks`. Only the plain f16-KV static
+// build carries it (no Q8/BDA/params twins): the adapter routes a sinks op here and refuses the
+// shapes this build can't serve rather than silently dropping the sink.
+layout(binding = 3) readonly buffer SB { float sink[]; };
+layout(binding = 4) buffer OB { float o[]; };
 #else
 layout(binding = 3) buffer OB { float o[]; };
 #endif
@@ -186,6 +194,18 @@ void main() {
     }
 
     uint obase = (ti * pc.nh + h) * hd;
+#ifdef SINKS
+    // Fold the sink into the finished (m, l) the same way the tile loop folds each new tile: it
+    // joins the max, the running sum is rescaled by exp(m - mfin), and the sink's own exp is added
+    // to the DENOMINATOR only. Algebraically identical to ggml's single-pass
+    // `max = MAX(max, sk[h]); sum += expf(sk[h] - max)`, and the acc rescale is what keeps the
+    // numerators on the new max.
+    float sk_h = sink[h];
+    float mfin = max(m, sk_h);
+    float scorr = exp(m - mfin);
+    l = l * scorr + exp(sk_h - mfin);
+    for (uint c = 0u; c < 8u; c++) { acc[c] *= scorr; }
+#endif
     float inv = 1.0 / l;
     for (uint c = 0u; c < 8u; c++) {
         uint d = t + c * 64u;

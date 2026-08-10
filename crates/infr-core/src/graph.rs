@@ -177,7 +177,18 @@ pub enum Op {
     /// (Qwen3 / Gemma Q-norm and K-norm). In place when `dst == x`.
     QkNorm {
         x: TensorId,
-        weight: TensorId,
+        /// Per-`head_dim` scale, or `None` for a genuinely WEIGHTLESS per-head RMSNorm —
+        /// `dst = x / sqrt(mean_head(x²) + eps)` with no multiply at all.
+        ///
+        /// `None` is DeepSeek V4's Q norm: after `wq_b` it reshapes to `[head_dim, n_head,
+        /// n_tokens]` and calls bare `ggml_rms_norm` (`deepseek4.cpp`'s `build_attention`, the
+        /// `q_norm` callback) — there is no `attn_q_norm` tensor in the file to bind.
+        ///
+        /// A ones-vector weight would compute the same numbers ([`Op::RmsNorm`]'s doc records that
+        /// convention, and gemma4's V-norm/llama4's L2-norm use it), but it is a fake operand: it
+        /// costs a real `head_dim`-float allocation and upload per graph, and it makes a reader
+        /// look for the weight in the GGUF. `Option` says what the reference says.
+        weight: Option<TensorId>,
         dst: TensorId,
         rows: u32,
         n_head: u32,
@@ -244,6 +255,29 @@ pub enum Op {
         /// GGUF that stayed in HF rotate-half order. It is model-wide and keyed on tensor names, so
         /// it cannot express "this one projection ropes NEOX while the model's main rope is NORM".
         neox: bool,
+        /// Rotate BACKWARDS by the position — llama.cpp's `ggml_rope_ext_back`
+        /// (`GGML_OP_ROPE_BACK`), which DeepSeek V4 applies to the rope slice of the ATTENTION
+        /// OUTPUT before the grouped output projection (`deepseek4.cpp`'s `attn_derope`). Nothing
+        /// else in the family de-ropes.
+        ///
+        /// It is the SAME kernel with one sign flipped. `ggml_compute_forward_rope_back` calls
+        /// `ggml_compute_forward_rope_flt(..., forward = false)`, whose only use of that flag is
+        /// `sin_sign = forward ? 1 : -1`, applied as `cache[i0 + 1] *= sin_sign` in
+        /// `ggml_rope_cache_init` — `cos` untouched, `sin` negated, i.e. the TRANSPOSE of the 2×2
+        /// rotation. Same angles, same `freq_factors` division, same pairing, same pass-through
+        /// tail: `dst[i0] = a·cos + b·sin`, `dst[i1] = −a·sin + b·cos`.
+        ///
+        /// The transpose is the INVERSE only when the rotation is orthonormal, and ggml's is not in
+        /// general: `rope_yarn` multiplies BOTH `cos` and `sin` by `mscale` (the `attn_factor`, with
+        /// YaRN's `1 + 0.1·ln(1/freq_scale)` correction folded in when `ext_factor != 0`), and
+        /// `sin_sign` does not invert that — so ggml's forward-then-back scales by `mscale²`, not 1.
+        /// V4 cancels it exactly: `dsv4_rope_attn_factor` returns `1/(1 + 0.1·ln(1/freq_scale))`
+        /// when `ext_factor != 0` and `1.0` otherwise, making the effective `mscale` 1 at every V4
+        /// rope call site. [`Op::Rope`] carries no magnitude scale at all (YaRN reaches it only as
+        /// `freq_factors`, a per-pair ANGLE divisor), so `backward` here is an exact inverse of the
+        /// forward rope with the same fields — the property `rope_back_inverts_rope_forward`
+        /// asserts.
+        backward: bool,
     },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
@@ -290,6 +324,38 @@ pub enum Op {
         scale: f32,
         mask: AttnMask,
         pos: u32,
+        /// Optional per-head ATTENTION SINK logits `[n_head]`, f32 — one extra logit per head that
+        /// joins the softmax denominator and contributes NO value. DeepSeek V4's `attn_sinks`
+        /// (`deepseek4.cpp` passes `layer.attn_sinks` into `build_attn` at all three of its
+        /// attention call sites); nothing else in this codebase has sinks.
+        ///
+        /// The arithmetic is `ggml_compute_forward_soft_max_f32`'s `src2` handling, verbatim — it is
+        /// two lines, and both matter:
+        ///
+        /// ```text
+        /// m = max_j(score[j])                 // score = q·K[j]*scale (+ mask), masked keys only
+        /// m = max(m, sink[h])                 // the sink JOINS THE MAX
+        /// l = Σ_j exp(score[j] - m)
+        /// l = l + exp(sink[h] - m)            // and the DENOMINATOR
+        /// dst = Σ_j (exp(score[j] - m) / l) * V[j]
+        /// ```
+        ///
+        /// Two ways to get it wrong that still produce plausible numbers. Leaving the sink out of the
+        /// MAX is a pure precision bug — it is algebraically identical while `sink[h] <= max_j
+        /// score[j]`, and only overflows `exp` once a sink dominates, which is exactly the regime a
+        /// sink is FOR. Including the sink in the NUMERATOR (giving it a value row) still yields a
+        /// row summing to 1 and reads like a softmax; it is a different function, and it is what
+        /// `attention_sinks_are_denominator_only` is written to catch.
+        ///
+        /// `sink[h]` is the RAW weight value: not multiplied by `scale` (which has already been
+        /// applied to the scores), not touched by the ALiBi slope, not masked. A head whose sink is
+        /// far below its running max costs essentially nothing (`exp(sink - m) → 0`); a head whose
+        /// sink dominates suppresses every real key's weight toward 0, which is the "attend to
+        /// nothing" escape valve.
+        ///
+        /// `None` for every arch in this codebase today, and on that path each backend runs the code
+        /// it ran before this field existed — no current model's numerics can move.
+        sinks: Option<TensorId>,
     },
     /// Multi-head Latent Attention (DeepSeek V2/V3). Absorbed form: one compressed K row per token
     /// (V is an aliased prefix view), `wk_b` absorbs Q nope into the latent space before the dot
@@ -829,7 +895,11 @@ impl Op {
                 (r, vec![dst])
             }
             Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
-            Op::QkNorm { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::QkNorm { x, weight, dst, .. } => {
+                let mut r = vec![x];
+                r.extend(weight);
+                (r, vec![dst])
+            }
             Op::GatedRmsNorm {
                 x,
                 weight,
@@ -866,8 +936,13 @@ impl Op {
                 k_cache,
                 v_cache,
                 dst,
+                sinks,
                 ..
-            } => (vec![q, k_cache, v_cache], vec![dst]),
+            } => {
+                let mut r = vec![q, k_cache, v_cache];
+                r.extend(sinks);
+                (r, vec![dst])
+            }
             Op::Mla {
                 q,
                 k_cache,
@@ -1159,6 +1234,7 @@ mod tests {
             scale: 1.0,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         };
         assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
     }
@@ -1179,9 +1255,51 @@ mod tests {
             freq_factors: ff,
             x_stride: 0,
             neox: false,
+            backward: false,
         };
         assert_eq!(rope(None).io(), (vec![t(0), t(1)], vec![t(0)]));
         assert_eq!(rope(Some(t(2))).io(), (vec![t(0), t(1), t(2)], vec![t(0)]));
+        // `Op::QkNorm`'s weight and `Op::Attention`'s sinks are the same shape of optional read.
+        let qkn = |w: Option<TensorId>| Op::QkNorm {
+            x: t(0),
+            weight: w,
+            dst: t(0),
+            rows: 1,
+            n_head: 2,
+            head_dim: 4,
+            eps: 1e-6,
+            x_stride: 0,
+        };
+        assert_eq!(
+            qkn(None).io(),
+            (vec![t(0)], vec![t(0)]),
+            "V4's weightless Q norm reads no weight at all"
+        );
+        assert_eq!(qkn(Some(t(1))).io(), (vec![t(0), t(1)], vec![t(0)]));
+        let attn = |sk: Option<TensorId>| Op::Attention {
+            q: t(0),
+            k_cache: t(1),
+            v_cache: t(2),
+            dst: t(3),
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 8,
+            scale: 1.0,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: sk,
+        };
+        assert_eq!(
+            attn(None).io(),
+            (vec![t(0), t(1), t(2)], vec![t(3)]),
+            "every existing arch (sinks None) reads exactly what it always did"
+        );
+        assert_eq!(
+            attn(Some(t(4))).io(),
+            (vec![t(0), t(1), t(2), t(4)], vec![t(3)])
+        );
         // `Op::Mla`'s optional top-k score mask is the same shape of optional read operand.
         let mla = |kb: Option<TensorId>| Op::Mla {
             q: t(0),
@@ -1247,6 +1365,7 @@ mod tests {
             scale: 1.0,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {

@@ -688,10 +688,46 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: the LOAD path is done, nothing else.** A `deepseek4` GGUF registers,
-parses into a `Config` — including the per-layer `compress_ratios` array, the
-per-layer SwiGLU clamps and the mandatory sqrt-softplus gating — and loads every
-tensor, with each layer's set chosen by its ratio and its hash/bias routing.
+**Progress: the LOAD path and the four attention PRIMITIVES are done; nothing is
+emitted yet.** Slice 2 added the op-level pieces V4's attention needs, on CPU,
+Vulkan and Metal, with op-level parity tests in
+`crates/infr-llama/tests/seam_op_parity.rs` and
+`crates/infr-metal/tests/parity.rs`:
+
+1. **Unweighted per-head RMS norm on Q** — `Op::QkNorm { weight: Option<_> }`.
+   `None` is the bare `ggml_rms_norm` V4 calls after `wq_b`; a ones-vector
+   weight would be a fake operand costing a real allocation.
+2. **Attention sinks** — `Op::Attention { sinks: Option<_> }`, `[n_head]` f32.
+   Read off `ggml_compute_forward_soft_max_f32`'s `src2` handling: the sink
+   joins the softmax MAX **and** the DENOMINATOR, and never the numerator.
+   `None` for every existing arch, so no current model's numerics move.
+3. **Rope BACKWARD** — `Op::Rope { backward: bool }`. `ggml_rope_ext_back` is
+   the same kernel with `sin_sign = -1`: `cos` untouched, `sin` negated, i.e.
+   the TRANSPOSE. That is only the INVERSE when `mscale == 1` — ggml applies
+   `attn_factor` to both `cos` and `sin` and `sin_sign` does not undo it, so a
+   YaRN'd forward-then-back scales by `mscale²`. V4 sidesteps it exactly:
+   `dsv4_rope_attn_factor` returns `1/(1 + 0.1·ln(1/freq_scale))` whenever
+   `ext_factor != 0`, cancelling YaRN's correction to `mscale == 1` at every V4
+   rope call site. `Op::Rope` carries no magnitude scale at all, so `backward`
+   is an exact inverse there.
+4. **The grouped low-rank output projection needs NO new op.** `wo_a`'s batch
+   axis is the OUTERMOST axis of both operands in `ggml_mul_mat`, so group `g`
+   is exactly `Op::Linear` over `wo_a` rows `[g·o_lora_rank, (g+1)·o_lora_rank)`
+   — which `Op::Linear::w_off` already selects — over output columns
+   `[g·o_group_dim, (g+1)·o_group_dim)`, which `Op::CopyStrided` already slices.
+   One caveat for the wiring slice: Vulkan accepts `w_off` only on the
+   offset-capable NATIVE-block kernels (every quant format plus bf16) and
+   refuses it on the f32/f16 fallbacks, so this holds for a real quantized
+   `wo_a` and would need a pack copy for an f32 one.
+
+The GPU coverage is deliberately narrow, because each new capability lives in
+ONE kernel rather than across the whole tier ladder — see `docs/backlog.md` (§
+B-DSV4) for exactly which shapes are refused and what a perf pass would need.
+
+**The rest of stage 4 is untouched.** A `deepseek4` GGUF registers, parses into
+a `Config` — including the per-layer `compress_ratios` array, the per-layer
+SwiGLU clamps and the mandatory sqrt-softplus gating — and loads every tensor,
+with each layer's set chosen by its ratio and its hash/bias routing.
 `Config::deepseek2` is FALSE for V4 (unlike V3.2, which genuinely is V2 plus an
 indexer); every reader of that flag was enumerated and is MLA-specific.
 `generate_dense_backend` then refuses, with an `assert!` at the top of the build

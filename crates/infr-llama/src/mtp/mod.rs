@@ -721,6 +721,7 @@ fn build_mtp_graph(
         scale,
         mask: AttnMask::Causal,
         pos: start_pos as u32,
+        sinks: None,
     });
     // sigmoid out-gate BEFORE the o-projection — seam.rs:2686-2698, qwen35.cpp:602.
     g.push(Op::GatedAct {
@@ -1186,6 +1187,7 @@ fn build_mtp_draft_chain_graph(
             scale,
             mask: AttnMask::Causal,
             pos: sp as u32,
+            sinks: None,
         });
         g.push(Op::GatedAct {
             gate: gate_a,

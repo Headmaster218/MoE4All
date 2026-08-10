@@ -201,6 +201,7 @@ mod tests {
             scale: 1.0,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         });
         g.push(Op::RmsNorm {
             x: hidden,
