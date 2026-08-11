@@ -4153,7 +4153,9 @@ fn cpu_deepseek_v32_golden() {
 fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
     let tok_path = PathBuf::from(format!(
         "{}-tokens.bin",
-        bin.to_str().expect("dump path is UTF-8").trim_end_matches(".bin")
+        bin.to_str()
+            .expect("dump path is UTF-8")
+            .trim_end_matches(".bin")
     ));
     let raw = std::fs::read(bin).expect("read llama.cpp logits dump");
     let raw_tok = std::fs::read(&tok_path).expect("read llama.cpp token dump");
