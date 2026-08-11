@@ -2,6 +2,27 @@
 
 2026-07-31
 
+> **Partly superseded — read this first (noted 2026-08-11).** Finding #2
+> ("Vendor detection should be capability detection") and the architectural note
+> and tables that build on it describe a `vendor_intel` flag on `Capabilities`
+> and four vendor-keyed routing decisions. **That flag no longer exists** —
+> `vendor_intel` has no occurrences anywhere in `crates/`, `Capabilities` has no
+> vendor field, and `adapter.rs`'s `unified_mmv_row1` comment records the
+> removal as deliberate ("new hardware needs no vendor quirk here"). The
+> recommendation was carried out; treat #2, the "Architectural note" section and
+> the "What the unified defaults would look like" table as a record of what was
+> decided, not as a description of the current tree.
+>
+> Every line number in this file predates that change and several other slices,
+> so re-locate by symbol rather than trusting them.
+>
+> The 2026-08-11 hardware-capability audit re-derived the detection inventory
+> against current `HEAD` and found one thing this review did not consider: the
+> capability-first design trusts what the device enumerates, and llama.cpp
+> documents two drivers that misreport cooperative-matrix support. See
+> `backlog.md` § B-HWDET-DRIVERID, and § B-HWDET-LIMITS / §
+> B-HWDET-I8CM-FRAGLAYOUT for the rest.
+
 ## Scope
 
 Vulkan implementation (`crates/infr-vulkan/`), focused on per-vendor kernel
@@ -201,9 +222,9 @@ of the nc_fa kernel. **Cost:** one new shader variant, one new `build.rs` entry,
 
 **What happens:** Every tiled GEMM (coopmat, nc*mmq, nc_fma) that writes to a
 non-Internal tensor (e.g., the lm_head `logits` Output) allocates a temporary
-`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the `m`
-real rows back. This allocation happens ONCE per forward on the lm_head path —
-intermediate layers produce Internal tensors and skip the copy.
+`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the
+`m` real rows back. This allocation happens ONCE per forward on the lm_head path
+— intermediate layers produce Internal tensors and skip the copy.
 
 **Impact:** Low. The lm_head is one op near the end of the forward, allocating a
 buffer sized `vocab_size * n_embd * dtype_bytes`. For Qwen3-8B (vocab 152064,

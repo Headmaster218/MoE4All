@@ -15,11 +15,21 @@ checklist).
 
 Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
 
-The reference implementation is llama.cpp at `b10218-1-gc629da5`, checked out
-locally at `~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths
+The reference implementation is llama.cpp, checked out locally at
+`~/Projects/mxaddict/llama.cpp`, now at `b10356-2-g030ebb5`
+(`030ebb558a5820b444a8f836ed5cdd46c9b4bd7a`). Every claim about DeepSeek's maths
 in this document was read out of that tree, and every claim about what `infr`
 already has was read out of this one. Where something was **not** verified it
 says so — those lines are the ones to check first, not to trust.
+
+The document was originally written against `b10218-1-gc629da5`
+(`c629da565c80b0b17fac6262acdca4d772e745d8`). The 2026-08-11 pull advanced the
+checkout by 139 commits and touched all four files this document draws from, so
+each maths claim was re-checked at the new pin: the trunk YaRN pre-scale, the
+lightning indexer, the V4 hyper-connection helpers and `build_moe_ffn`'s router
+bias are all **unchanged**. What did move — a second YaRN copy in the new
+`graph_mtp`, the SwiGLU-clamp arm widening to `LLM_ARCH_DFLASH`, and the V3.2
+layer-count switch — is itemised in `backlog.md` § B-DSHW-PULL.
 
 Re-verified against both trees on 2026-08-05. That pass corrected the stage-1
 rope-type mapping (it prescribed a permute that would have corrupted output),
