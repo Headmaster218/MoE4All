@@ -1740,12 +1740,13 @@ unjustified:
   Recorded as a decision, not a gap. `DeviceArch::AmdGcn` exists only so such a
   part is classified as known-unsupported rather than unknown.
 
-### B-NVSHAPE-COOPMAT2 — `VK_NV_cooperative_matrix2` is fully researched, entirely absent from production (2026-08-11)
+### B-NVSHAPE-COOPMAT2 — `VK_NV_cooperative_matrix2` is gated and researched; the kernel path does not exist (2026-08-11)
 
 **Tag:** vulkan · nvidia · **Blocked on:** NVIDIA hardware; nothing else
 
-The adapter has no coopmat2 path — the only occurrences anywhere in `crates/`
-are `examples/coopmat2_test.rs`, a standalone probe with its own instance and
+The adapter has no coopmat2 kernel — apart from the capability gate described
+below, the only coopmat2 code anywhere in `crates/` is
+`examples/coopmat2_test.rs`, a standalone probe with its own instance and
 device. It is unusually well prepared: its header records the
 `coopMatPerElementNV` signature (a `void` with an `out` result, not a
 value-returning call), confirms via `spirv-dis` that it lowers to
@@ -1760,35 +1761,81 @@ The direct motivation is B-HWDET-I8CM-FRAGLAYOUT: coopmat2's per-element
 callback addresses `(row, col)` **portably**, which would retire the empirically
 derived fragment mapping entirely on hardware that has it.
 
-For reference, llama.cpp's coopmat2 gate is not just the extension — it requires
-all of `cooperativeMatrixWorkgroupScope`, `FlexibleDimensions`, `Reductions`,
-`Conversions`, `PerElementOperations`, `TensorAddressing`, `BlockLoads` plus
-`bufferDeviceAddress`, then queries the flexible-dimensions properties and
-insists on specific fp16/fp32 128- and 256-invocation tile shapes and
-`maxDimension >= 512`. Read directly. Anyone wiring this should copy that gate
-rather than checking the extension string.
+**The GATE now exists** (`caps::check_coopmat2_support` over `Coopmat2Probe`,
+probed by `probe_coopmat2` in `lib.rs` and reported as `cm2:` in the device
+banner). It is a transcription of llama.cpp's — all seven coopmat2 feature bits
+plus `bufferDeviceAddress`, then fp16 A/B with fp16 AND fp32 accumulators at
+BOTH 128- and 256-invocation workgroup sizes, then `maxDimension >= 512` — and
+it fails closed on anything it cannot establish. What is still missing is the
+kernel path: nothing consumes an `Ok`.
 
-### B-NVSHAPE-CORECOUNT — no shader-core count on NVIDIA, so occupancy-driven decisions cannot be made there (2026-08-11)
+What has actually been exercised here: the refusal path on lavapipe, which
+**does** advertise `VK_NV_cooperative_matrix2` on this box (device `Vulkan2`)
+and is refused because `cooperativeMatrixWorkgroupScope` is clear — i.e. the
+case that proves an extension-string check would have been wrong. No device here
+has ever reached `Ok`, so the ACCEPT side of the gate rests on unit tests alone.
+The optional bf16 half of upstream's gate was deliberately not copied: it only
+feeds bf16 coopmat2 shaders, and there is no coopmat2 shader of any kind.
 
-**Tag:** vulkan · nvidia · **Blocked on:** NVIDIA hardware to validate
+`examples/coopmat2_test.rs` deliberately does NOT go through this gate. It uses
+only `coopMatPerElementNV`, not flexible dimensions / tensor addressing / block
+loads, so the full gate would make it skip on hardware where its own experiment
+would run.
 
-`infr` reads a compute-unit count only from `VK_AMD_shader_core_properties`, and
-uses it only to scale the integrated-GPU prefill chunk. On NVIDIA there is no
-count at all.
+### B-NVSHAPE-CORECOUNT — the shader-core count now exists on every vendor; nothing occupancy-driven consumes it (2026-08-11)
 
-llama.cpp treats `shader_core_count` as a first-class tuning input from three
-sources: `VK_NV_shader_sm_builtins` on NVIDIA, `VK_AMD_shader_core_properties2`
-on AMD, and a **hardcoded PCI-device-ID table** on Intel
-(`ggml_vk_intel_shader_core_count`) because Intel exposes neither. When it is 0,
-`ggml_vk_guess_split_k` never activates split-K at all — the guess is otherwise
-purely shape-driven (tile counts vs core count, only for `k >= 2048`, capped at
-8). Its coopmat2 S/M/L tile pick is likewise occupancy-aware. All read directly.
+**Tag:** vulkan · nvidia · intel · **Blocked on:** NVIDIA/Intel hardware to
+validate; a decision on whether the split-K constants should be device-derived
+at all
 
-`infr` does have split-K (the flash path's split-K reduce, and a GEMM split-K
-arm), so the input is relevant, not hypothetical. What it would change here is
-**not known** — `infr`'s split-K selection was not traced in this audit, which
-is a coverage gap stated plainly. Whether an NVIDIA SM count would improve it is
-a guess.
+`caps::shader_core_count` now sources the count the way llama.cpp does —
+`VK_NV_shader_sm_builtins`' `shaderSMCount` on NVIDIA,
+`VK_AMD_shader_core_properties2`' `activeComputeUnitCount` on AMD, and a PCI
+device-id table on Intel transcribed verbatim from
+`ggml_vk_intel_shader_core_count` — with the old `VK_AMD_shader_core_properties`
+(v1) product kept as a fourth fallback so an AMD driver advertising only v1 does
+not regress to 0. It lands in the existing `Capabilities::compute_units` (0 =
+unknown), so the field name and every consumer are unchanged.
+
+Verified on this box: both AMD devices report the same number through v2 as they
+did through the v1 product (RX 7900 XTX 96, Raphael iGPU 2), so preferring v2 is
+a no-op here. **The NVIDIA and Intel branches have never executed** — no such
+part exists on this machine.
+
+**Consequence nobody has watched run:** the only consumer is
+`infr_core::integrated_ubatch_rows` via `infr_llama::seam::default_ubatch_rows`,
+which scales the integrated prefill chunk from the count. An Intel iGPU in the
+table (0xB080, Panther Lake Xe3 LPG, 12) previously got 0 → the 128-row floor
+and would now get 768 rows. That is what the scaling function means, but it is a
+6x larger per-submit chunk on a watchdog-sensitive part, unvalidated. If an
+Intel iGPU ever hangs in prefill, this is the first thing to look at;
+`INFR_UBATCH` overrides it.
+
+**Deliberately NOT wired into split-K or tile selection.** The audit that
+produced this entry left `infr`'s split-K selection untraced; it has now been
+traced, and the answer is that a core count does not obviously improve it:
+
+- Four independent sites carry a hardcoded "workgroups needed to fill this GPU"
+  number — `split_k_plan` (`adapter.rs`, threshold 128 / target 256), the two
+  flash split-K formulas and the PV split-K formula (`recorder.rs`, threshold
+  1024 / target 2048), plus the `wide_grid >= 128` wide-tile gates and
+  `ATTN_SPLIT.target_chunks = 32`.
+- Their implied workgroups-per-core ratios are not the same number: 256/96 ≈ 2.7
+  for the GEMM, 2048/96 ≈ 21 for attention. So the constants encode per-kernel
+  occupancy (waves in flight, register/LDS pressure), not core count, and
+  nothing in the probe knows that factor.
+- Replacing them with `cores * K` therefore means inventing a `K` per site,
+  chosen so that 96 reproduces today's empirically tuned constant, and then
+  extrapolating it onto hardware nobody here can measure. That is a guess with a
+  silent failure mode, so it was not built.
+- Two extra costs if someone does: `split_k_plan` is pinned by a formula
+  equivalence test in `adapter.rs`, and the attention chunk policy is
+  **duplicated in GLSL** (`attn_live.comp` recomputes it on the GPU), so a
+  device-derived target needs a new push constant.
+
+The honest next step is a measurement, not a refactor: a second GPU with a
+different core count, running the four sites' current constants against
+core-derived ones.
 
 ### B-NVSHAPE-MMQ-PER-ARCH — upstream tunes quantized-GEMM tile shape per microarchitecture; infr has one shape (2026-08-11)
 

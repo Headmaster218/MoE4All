@@ -63,6 +63,13 @@
 //! prints a clear message and exits 0. It never attempts to create a device with an unsupported
 //! extension/feature enabled.
 //!
+//! NOT the production gate. `caps::check_coopmat2_support` (a transcription of llama.cpp's) is what
+//! the backend uses to decide whether a device may run a coopmat2 PATH, and it is far stricter:
+//! all seven feature bits, `bufferDeviceAddress`, and specific fp16/fp32 flexible-dimension tile
+//! shapes. This probe deliberately does not go through it, because it exercises only
+//! `coopMatPerElementNV` — flexible dimensions, tensor addressing and block loads are irrelevant
+//! here, and requiring them would make this skip on hardware where its experiment would run.
+//!
 //! ash 0.38.0+1.3.281 has NO bindings for `VK_NV_cooperative_matrix2` (checked: no
 //! `CooperativeMatrix2FeaturesNV`/`PropertiesNV` in `ash::vk::definitions`). The feature struct is
 //! hand-rolled here (`#[repr(C)]`, layout + `sType` value taken from the locally installed

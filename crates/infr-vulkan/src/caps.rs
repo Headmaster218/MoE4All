@@ -48,9 +48,10 @@ pub(crate) fn select_coopmat_shape(
 
 // ── architecture bucket ──────────────────────────────────────────────────────────────────────────
 
-/// The raw device facts an architecture/trust decision may key on. Every field is a direct copy of
-/// a Vulkan query result — no policy, no env, no config — so a test can state a device by writing
-/// one of these down.
+/// The raw device facts the architecture, trust and shader-core-count decisions key on. Every field
+/// is a direct copy of a Vulkan query result — no policy, no env, no config — so a test can state a
+/// device by writing one of these down. (`VK_NV_cooperative_matrix2` has its own probe struct,
+/// [`Coopmat2Probe`], because its shape list is not `Copy`.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeviceProbe {
     /// `VkPhysicalDeviceProperties::vendorID` — the PCI vendor id (0x1002 AMD, 0x8086 Intel,
@@ -69,11 +70,25 @@ pub(crate) struct DeviceProbe {
     /// subgroup-size control (then no architecture below AMD/Intel can be identified).
     pub subgroup_min: u32,
     pub subgroup_max: u32,
+    /// `VkPhysicalDeviceProperties::deviceID` — the PCI device id. Read for exactly one decision:
+    /// Intel exposes no shader-core count in any property struct, so [`shader_core_count`] has to
+    /// look the part up in a table (see [`intel_shader_core_count`]).
+    pub device_id: u32,
     /// `VkPhysicalDeviceShaderCorePropertiesAMD::wavefrontsPerSimd`, 0 when the AMD extension is
     /// absent (which is itself the signal that the AMD probe cannot classify).
     pub wavefronts_per_simd: u32,
     /// `VK_AMD_shader_core_properties` advertised.
     pub has_amd_shader_core: bool,
+    /// The three `VkPhysicalDeviceShaderCorePropertiesAMD` counts whose PRODUCT is the device's
+    /// total compute-unit count; all 0 when `VK_AMD_shader_core_properties` is absent.
+    pub shader_engine_count: u32,
+    pub shader_arrays_per_engine_count: u32,
+    pub compute_units_per_shader_array: u32,
+    /// `VK_AMD_shader_core_properties2` advertised.
+    pub has_amd_shader_core2: bool,
+    /// `VkPhysicalDeviceShaderCoreProperties2AMD::activeComputeUnitCount` — the count with harvested
+    /// CUs already excluded, which the v1 product above does not do. 0 when the extension is absent.
+    pub active_compute_unit_count: u32,
     /// `VK_KHR_shader_integer_dot_product` advertised (the properties struct is core in 1.3, but
     /// upstream keys off the extension string and so does this).
     pub has_integer_dot: bool,
@@ -88,6 +103,10 @@ pub(crate) struct DeviceProbe {
     pub has_nv_sm_builtins: bool,
     /// `VkPhysicalDeviceShaderSMBuiltinsPropertiesNV::shaderWarpsPerSM`, 0 when absent.
     pub warps_per_sm: u32,
+    /// `VkPhysicalDeviceShaderSMBuiltinsPropertiesNV::shaderSMCount`, 0 when absent. A DIFFERENT
+    /// field from [`warps_per_sm`](Self::warps_per_sm) above: that one buckets the architecture,
+    /// this one counts the cores.
+    pub sm_count: u32,
 }
 
 /// PCI vendor ids (PCI-SIG registry values — fixed outside this codebase, same three llama.cpp
@@ -183,6 +202,88 @@ pub(crate) fn device_architecture(p: &DeviceProbe) -> DeviceArch {
     }
 }
 
+// ── shader core count ────────────────────────────────────────────────────────────────────────────
+
+/// How many independent shader cores this device has — NVIDIA SMs, AMD compute units, Intel
+/// Xe-cores — or **0 when it cannot be determined**.
+///
+/// 0 is the codebase's existing spelling of "unknown" for this quantity
+/// (`Capabilities::compute_units`, and `infr_core::integrated_ubatch_rows` already branches on it),
+/// and it must never be read as "zero cores": a caller that cannot answer without a count has to
+/// keep whatever it did before rather than derive something from 0.
+///
+/// The source order is llama.cpp's, from the `shader_core_count` assignment in `ggml_vk_get_device`
+/// (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:6363-6371`, read at pin 030ebb5):
+///
+/// 1. `VK_NV_shader_sm_builtins`' `shaderSMCount` — NVIDIA's only report of the number.
+/// 2. `VK_AMD_shader_core_properties2`' `activeComputeUnitCount`.
+/// 3. Intel: a device-id table, because Intel exposes the count nowhere ([`intel_shader_core_count`]).
+///
+/// infr adds a FOURTH step upstream does not have: the `VK_AMD_shader_core_properties` (v1) product,
+/// which is what this codebase read before this function existed. Dropping it would hand 0 to
+/// `integrated_ubatch_rows` on any AMD part whose driver advertises v1 but not v2 — a behaviour
+/// change on the one consumer that exists, in the direction of a smaller prefill chunk, for no gain.
+/// v2 is preferred over it because `activeComputeUnitCount` excludes harvested CUs and the v1 product
+/// counts the physical array.
+///
+/// UNVALIDATED per vendor: only the AMD steps run on hardware here (an RX 7900 XTX and a Raphael
+/// iGPU, both RADV, both advertising v1 and v2). The NVIDIA and Intel steps have never executed —
+/// there is no such part on this machine — and their correctness rests on the transcription and the
+/// tests below, nothing more.
+pub(crate) fn shader_core_count(p: &DeviceProbe) -> u32 {
+    if p.has_nv_sm_builtins && p.sm_count > 0 {
+        return p.sm_count;
+    }
+    if p.has_amd_shader_core2 && p.active_compute_unit_count > 0 {
+        return p.active_compute_unit_count;
+    }
+    if p.vendor_id == VENDOR_INTEL {
+        let n = intel_shader_core_count(p.device_id);
+        if n > 0 {
+            return n;
+        }
+    }
+    if p.has_amd_shader_core {
+        return p.shader_engine_count
+            * p.shader_arrays_per_engine_count
+            * p.compute_units_per_shader_array;
+    }
+    0
+}
+
+/// Intel Xe-core counts keyed on PCI device id, because Intel reports the number in no property
+/// struct at all.
+///
+/// **Transcribed verbatim** from llama.cpp's `ggml_vk_intel_shader_core_count`
+/// (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:18805-18846`, read at pin 030ebb5). Every id and count
+/// here is upstream's; none was inferred, and an id upstream does not list returns 0 (unknown)
+/// rather than a nearby part's number. The comments are the SKU names upstream records.
+///
+/// UNVALIDATED: no Intel GPU exists on this machine, so not one of these ids has ever been matched
+/// by this code against a real device. The test below checks the transcription, not the hardware.
+fn intel_shader_core_count(device_id: u32) -> u32 {
+    match device_id {
+        0x56A6 => 6,  // A310
+        0x5693 => 8,  // A370M
+        0x56A5 => 8,  // A380
+        0x56B1 => 8,  // Pro A40/A50
+        0x5697 => 12, // A530M
+        0x5692 => 16, // A550M
+        0x56B3 => 16, // Pro A60
+        0x56A2 => 24, // A580
+        0x5691 => 28, // A730M
+        0x56A1 => 28, // A750
+        0x56A0 => 32, // A770
+        0x5690 => 32, // A770M
+        0xE212 => 16, // Pro B50
+        0xE20C => 18, // B570
+        0xE20B => 20, // B580
+        0xE211 => 20, // Pro B60
+        0xB080 => 12, // PTL Xe3 LPG 2x6 (12 subslices)
+        _ => 0,
+    }
+}
+
 // ── cooperative-matrix trust ─────────────────────────────────────────────────────────────────────
 
 /// How far this driver's cooperative-matrix ENUMERATION may be believed.
@@ -275,6 +376,159 @@ pub(crate) fn coopmat_shape_trusted(trust: CoopmatTrust, shape: (u32, u32, u32))
         CoopmatTrust::Tile8Only(_) => shape == COOPMAT_TILE_8,
         CoopmatTrust::Refused(_) => false,
     }
+}
+
+// ── VK_NV_cooperative_matrix2 gate ───────────────────────────────────────────────────────────────
+
+/// One row of `vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV` — a
+/// (component types, granularity, workgroup size) combination the device can build a
+/// flexible-dimension cooperative matrix for. Field-for-field
+/// `VkCooperativeMatrixFlexibleDimensionsPropertiesNV` minus its `sType`/`pNext`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FlexibleDimension {
+    pub m_granularity: u32,
+    pub n_granularity: u32,
+    pub k_granularity: u32,
+    pub a_type: vk::ComponentTypeKHR,
+    pub b_type: vk::ComponentTypeKHR,
+    pub c_type: vk::ComponentTypeKHR,
+    pub result_type: vk::ComponentTypeKHR,
+    pub saturating_accumulation: bool,
+    pub scope: vk::ScopeKHR,
+    pub workgroup_invocations: u32,
+}
+
+/// Everything `VK_NV_cooperative_matrix2` reports about a device, as probed. Every field is a
+/// direct copy of a query result; the policy is [`check_coopmat2_support`] alone.
+///
+/// The `*_reported` flag matters more here than anywhere else in this file, because a coopmat2
+/// kernel that runs on a device which merely LOOKS capable produces wrong numbers rather than an
+/// error. A query that could not be made leaves its flag false, and the gate refuses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Coopmat2Probe {
+    /// `VK_NV_cooperative_matrix2` in the device's extension list.
+    pub has_ext: bool,
+    /// `VkPhysicalDeviceCooperativeMatrix2FeaturesNV`, in declaration order. All false when the
+    /// features struct could not be chained (i.e. when `has_ext` is false).
+    pub workgroup_scope: bool,
+    pub flexible_dimensions: bool,
+    pub reductions: bool,
+    pub conversions: bool,
+    pub per_element_operations: bool,
+    pub tensor_addressing: bool,
+    pub block_loads: bool,
+    /// `VkPhysicalDeviceVulkan12Features::bufferDeviceAddress` — not part of the extension, but
+    /// upstream's gate requires it because its coopmat2 shaders address tensors by pointer.
+    pub buffer_device_address: bool,
+    /// `VkPhysicalDeviceCooperativeMatrix2PropertiesNV::cooperativeMatrixFlexibleDimensionsMaxDimension`.
+    pub flexible_dimensions_max_dimension: u32,
+    /// Whether `vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV` was actually
+    /// resolved and called. False means the shape list below is UNKNOWN, not empty — and the gate
+    /// treats the two the same way (refuse) rather than reading silence as agreement.
+    pub flexible_dimensions_reported: bool,
+    pub flexible_dimensions_list: Vec<FlexibleDimension>,
+}
+
+/// Required workgroup sizes and the largest granularity acceptable at each, from upstream's gate.
+/// A granularity is a *minimum step*, so a device qualifies when its value is at or below the
+/// number here — the tile upstream's shaders want is `32x16x16` at 128 invocations and `32x32x16`
+/// at 256.
+const COOPMAT2_REQUIRED_TILES: [(u32, u32, u32, u32); 2] = [
+    // (workgroupInvocations, max MGranularity, max NGranularity, max KGranularity)
+    (128, 32, 16, 16),
+    (256, 32, 32, 16),
+];
+
+/// The smallest `cooperativeMatrixFlexibleDimensionsMaxDimension` upstream will accept.
+const COOPMAT2_MIN_MAX_DIMENSION: u32 = 512;
+
+/// Whether this device may run a `VK_NV_cooperative_matrix2` path.
+///
+/// A transcription of llama.cpp's coopmat2 gate (`ggml-vulkan.cpp:6675-6776`, read at pin 030ebb5),
+/// which is deliberately much more than the extension string: the extension can be present while the
+/// features that make it usable are off (RADV exposes it only behind the `radv_cooperative_matrix2_nv`
+/// driconf flag, and lavapipe exposes it with a different feature set again). Upstream requires all
+/// seven feature bits, `bufferDeviceAddress`, then fp16 A/B with BOTH an fp16 and an fp32 accumulator
+/// at BOTH the 128- and 256-invocation workgroup sizes, and `maxDimension >= 512`.
+///
+/// **Fails closed.** Every path that cannot establish a positive answer returns `Err`: no extension,
+/// a clear feature bit, a flexible-dimensions list that could not be queried, a missing tile shape,
+/// a `maxDimension` the device did not report (0 < 512). "Unknown" is never "supported".
+///
+/// infr does NOT copy upstream's optional bf16 probe: that only sets a separate
+/// `coopmat2_bf16_support` flag feeding bf16 coopmat2 shaders, and infr has no coopmat2 shader of any
+/// kind yet.
+///
+/// **NEVER EXERCISED ON QUALIFYING HARDWARE.** This machine has an RX 7900 XTX (RADV, which does not
+/// advertise the extension) and a lavapipe software device (which does). What has actually been run
+/// here is the refusal path; no device on this box has ever reached `Ok`, so the accept side is
+/// checked by the unit tests below and by nothing else.
+pub(crate) fn check_coopmat2_support(p: &Coopmat2Probe) -> Result<(), String> {
+    if !p.has_ext {
+        return Err("VK_NV_cooperative_matrix2 is not in this device's extension list".into());
+    }
+    for (present, name) in [
+        (p.workgroup_scope, "cooperativeMatrixWorkgroupScope"),
+        (p.flexible_dimensions, "cooperativeMatrixFlexibleDimensions"),
+        (p.reductions, "cooperativeMatrixReductions"),
+        (p.conversions, "cooperativeMatrixConversions"),
+        (
+            p.per_element_operations,
+            "cooperativeMatrixPerElementOperations",
+        ),
+        (p.tensor_addressing, "cooperativeMatrixTensorAddressing"),
+        (p.block_loads, "cooperativeMatrixBlockLoads"),
+        (p.buffer_device_address, "bufferDeviceAddress"),
+    ] {
+        if !present {
+            return Err(format!(
+                "VK_NV_cooperative_matrix2 is advertised but the {name} feature is not enabled — \
+                 every one of the seven coopmat2 features plus bufferDeviceAddress is required"
+            ));
+        }
+    }
+    if !p.flexible_dimensions_reported {
+        return Err(
+            "vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV could not be \
+             called, so this device's flexible-dimension shapes are unknown — refusing rather than \
+             assuming"
+                .into(),
+        );
+    }
+    for (invocations, max_m, max_n, max_k) in COOPMAT2_REQUIRED_TILES {
+        for (acc, name) in [
+            (vk::ComponentTypeKHR::FLOAT16, "fp16"),
+            (vk::ComponentTypeKHR::FLOAT32, "fp32"),
+        ] {
+            let found = p.flexible_dimensions_list.iter().any(|d| {
+                !d.saturating_accumulation
+                    && d.scope == vk::ScopeKHR::WORKGROUP
+                    && d.a_type == vk::ComponentTypeKHR::FLOAT16
+                    && d.b_type == vk::ComponentTypeKHR::FLOAT16
+                    && d.c_type == acc
+                    && d.result_type == acc
+                    && d.workgroup_invocations == invocations
+                    && d.m_granularity <= max_m
+                    && d.n_granularity <= max_n
+                    && d.k_granularity <= max_k
+            });
+            if !found {
+                return Err(format!(
+                    "this device enumerates no fp16xfp16 -> {name} workgroup-scope flexible \
+                     dimension at {invocations} invocations with granularity \
+                     <= {max_m}x{max_n}x{max_k}"
+                ));
+            }
+        }
+    }
+    if p.flexible_dimensions_max_dimension < COOPMAT2_MIN_MAX_DIMENSION {
+        return Err(format!(
+            "cooperativeMatrixFlexibleDimensionsMaxDimension is {}, below the \
+             {COOPMAT2_MIN_MAX_DIMENSION} a coopmat2 path needs",
+            p.flexible_dimensions_max_dimension
+        ));
+    }
+    Ok(())
 }
 
 // ── int8 coopmat accumulator fragment layout ─────────────────────────────────────────────────────
@@ -429,14 +683,25 @@ mod tests {
             integrated: false,
             subgroup_min: 32,
             subgroup_max: 64,
+            device_id: 0x744c,
             wavefronts_per_simd: 16,
             has_amd_shader_core: true,
+            // Both AMD sources agree on this box: the v1 PRODUCT and the v2 active count each came
+            // back as the banner's `cores:96` when the other branch was disabled. The three v1
+            // factors below are a synthetic factorisation of that measured product — the individual
+            // fields were never read out, only their product.
+            shader_engine_count: 6,
+            shader_arrays_per_engine_count: 2,
+            compute_units_per_shader_array: 8,
+            has_amd_shader_core2: true,
+            active_compute_unit_count: 96,
             has_integer_dot: true,
             dot4x8_signed_accelerated: true,
             dot4x8_mixed_accelerated: true,
             has_coopmat_ext: true,
             has_nv_sm_builtins: false,
             warps_per_sm: 0,
+            sm_count: 0,
         }
     }
 
@@ -448,14 +713,21 @@ mod tests {
             integrated: false,
             subgroup_min: 8,
             subgroup_max: 32,
+            device_id: 0x56A0,
             wavefronts_per_simd: 0,
             has_amd_shader_core: false,
+            shader_engine_count: 0,
+            shader_arrays_per_engine_count: 0,
+            compute_units_per_shader_array: 0,
+            has_amd_shader_core2: false,
+            active_compute_unit_count: 0,
             has_integer_dot: true,
             dot4x8_signed_accelerated: true,
             dot4x8_mixed_accelerated: false,
             has_coopmat_ext: true,
             has_nv_sm_builtins: false,
             warps_per_sm: 0,
+            sm_count: 0,
         }
     }
 
@@ -467,14 +739,21 @@ mod tests {
             integrated: false,
             subgroup_min: 32,
             subgroup_max: 32,
+            device_id: 0x2684,
             wavefronts_per_simd: 0,
             has_amd_shader_core: false,
+            shader_engine_count: 0,
+            shader_arrays_per_engine_count: 0,
+            compute_units_per_shader_array: 0,
+            has_amd_shader_core2: false,
+            active_compute_unit_count: 0,
             has_integer_dot: true,
             dot4x8_signed_accelerated: true,
             dot4x8_mixed_accelerated: true,
             has_coopmat_ext: coopmat,
             has_nv_sm_builtins: warps > 0,
             warps_per_sm: warps,
+            sm_count: if warps > 0 { 128 } else { 0 },
         }
     }
 
@@ -536,6 +815,88 @@ mod tests {
         let mut turing_no_builtins = nvidia(32, true);
         turing_no_builtins.has_nv_sm_builtins = false;
         assert_eq!(device_architecture(&turing_no_builtins), DeviceArch::Other);
+    }
+
+    // ── shader core count ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shader_core_count_per_vendor() {
+        // (probe, expected count, what the case is)
+        let mut amd_v1_only = rdna3_radv();
+        amd_v1_only.has_amd_shader_core2 = false;
+        amd_v1_only.active_compute_unit_count = 0;
+        let mut amd_harvested = rdna3_radv();
+        amd_harvested.active_compute_unit_count = 84; // v2 reports the harvested part, v1 the array
+        let mut amd_none = rdna3_radv();
+        amd_none.has_amd_shader_core = false;
+        amd_none.has_amd_shader_core2 = false;
+        amd_none.active_compute_unit_count = 0;
+        let mut nv_no_builtins = nvidia(48, true);
+        nv_no_builtins.has_nv_sm_builtins = false;
+        let mut intel_unlisted = arc_a770_anv();
+        intel_unlisted.device_id = 0xDEAD;
+        let mut intel_b580 = arc_a770_anv();
+        intel_b580.device_id = 0xE20B;
+        let cases = [
+            (rdna3_radv(), 96, "AMD with both extensions prefers v2"),
+            (amd_v1_only, 96, "AMD v1 product is the fallback infr keeps"),
+            (
+                amd_harvested,
+                84,
+                "v2's active count wins over the v1 product",
+            ),
+            (amd_none, 0, "AMD with neither extension is unknown"),
+            (nvidia(48, true), 128, "NVIDIA shaderSMCount"),
+            (nv_no_builtins, 0, "NVIDIA without the extension is unknown"),
+            (arc_a770_anv(), 32, "Intel A770 from the transcribed table"),
+            (intel_b580, 20, "Intel B580 from the transcribed table"),
+            (intel_unlisted, 0, "an Intel id upstream does not list"),
+            (DeviceProbe::default(), 0, "a device that reported nothing"),
+        ];
+        for (probe, want, why) in cases {
+            assert_eq!(shader_core_count(&probe), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn intel_core_table_matches_upstream() {
+        // The full transcription of `ggml_vk_intel_shader_core_count`, re-stated here so a typo in
+        // either copy fails rather than silently mis-sizing an Intel part. Ids upstream groups on a
+        // shared `return` are listed individually.
+        let upstream = [
+            (0x56A6u32, 6u32),
+            (0x5693, 8),
+            (0x56A5, 8),
+            (0x56B1, 8),
+            (0x5697, 12),
+            (0x5692, 16),
+            (0x56B3, 16),
+            (0x56A2, 24),
+            (0x5691, 28),
+            (0x56A1, 28),
+            (0x56A0, 32),
+            (0x5690, 32),
+            (0xE212, 16),
+            (0xE20C, 18),
+            (0xE20B, 20),
+            (0xE211, 20),
+            (0xB080, 12),
+        ];
+        for (id, want) in upstream {
+            assert_eq!(intel_shader_core_count(id), want, "device id {id:#06x}");
+        }
+        // Anything not in the table is UNKNOWN, never a nearby part's count.
+        for id in [0u32, 0x56A7, 0xE20D, 0xFFFF] {
+            assert_eq!(intel_shader_core_count(id), 0, "device id {id:#06x}");
+        }
+        // …and the table is only consulted for Intel: an AMD part whose deviceID happens to collide
+        // with an Arc id must not pick up its count.
+        let mut collide = rdna3_radv();
+        collide.device_id = 0x56A0;
+        collide.has_amd_shader_core = false;
+        collide.has_amd_shader_core2 = false;
+        collide.active_compute_unit_count = 0;
+        assert_eq!(shader_core_count(&collide), 0);
     }
 
     // ── coopmat trust (the two lying drivers) ───────────────────────────────────────────────────
@@ -652,6 +1013,163 @@ mod tests {
             select_coopmat_shape(keep(CoopmatTrust::Enumerated), false),
             Some(COOPMAT_TILE_16)
         );
+    }
+
+    // ── coopmat2 gate ───────────────────────────────────────────────────────────────────────────
+
+    fn flex(
+        invocations: u32,
+        (m, n, k): (u32, u32, u32),
+        acc: vk::ComponentTypeKHR,
+    ) -> FlexibleDimension {
+        FlexibleDimension {
+            m_granularity: m,
+            n_granularity: n,
+            k_granularity: k,
+            a_type: vk::ComponentTypeKHR::FLOAT16,
+            b_type: vk::ComponentTypeKHR::FLOAT16,
+            c_type: acc,
+            result_type: acc,
+            saturating_accumulation: false,
+            scope: vk::ScopeKHR::WORKGROUP,
+            workgroup_invocations: invocations,
+        }
+    }
+
+    /// A synthetic device that satisfies upstream's gate exactly. No hardware here produces this —
+    /// it is the shape the gate is written against, not one that was observed.
+    fn coopmat2_ok() -> Coopmat2Probe {
+        Coopmat2Probe {
+            has_ext: true,
+            workgroup_scope: true,
+            flexible_dimensions: true,
+            reductions: true,
+            conversions: true,
+            per_element_operations: true,
+            tensor_addressing: true,
+            block_loads: true,
+            buffer_device_address: true,
+            flexible_dimensions_max_dimension: 512,
+            flexible_dimensions_reported: true,
+            flexible_dimensions_list: vec![
+                flex(128, (32, 16, 16), vk::ComponentTypeKHR::FLOAT16),
+                flex(128, (32, 16, 16), vk::ComponentTypeKHR::FLOAT32),
+                flex(256, (32, 32, 16), vk::ComponentTypeKHR::FLOAT16),
+                flex(256, (32, 32, 16), vk::ComponentTypeKHR::FLOAT32),
+            ],
+        }
+    }
+
+    #[test]
+    fn coopmat2_gate_accepts_a_device_meeting_every_requirement() {
+        assert_eq!(check_coopmat2_support(&coopmat2_ok()), Ok(()));
+        // Finer granularity than required is still a pass (the value is a minimum STEP), and extra
+        // rows the gate does not care about are ignored.
+        let mut finer = coopmat2_ok();
+        for d in &mut finer.flexible_dimensions_list {
+            d.m_granularity = 16;
+            d.n_granularity = 8;
+            d.k_granularity = 8;
+        }
+        finer
+            .flexible_dimensions_list
+            .push(flex(64, (8, 8, 8), vk::ComponentTypeKHR::FLOAT64));
+        finer.flexible_dimensions_max_dimension = 4096;
+        assert_eq!(check_coopmat2_support(&finer), Ok(()));
+    }
+
+    #[test]
+    fn coopmat2_gate_refuses_the_extension_string_alone() {
+        // The case the gate exists for: the extension is advertised, so a string check would say
+        // yes, and one required feature is off.
+        for (name, clear) in [
+            (
+                "cooperativeMatrixWorkgroupScope",
+                (|p: &mut Coopmat2Probe| p.workgroup_scope = false) as fn(&mut Coopmat2Probe),
+            ),
+            ("cooperativeMatrixFlexibleDimensions", |p| {
+                p.flexible_dimensions = false
+            }),
+            ("cooperativeMatrixReductions", |p| p.reductions = false),
+            ("cooperativeMatrixConversions", |p| p.conversions = false),
+            ("cooperativeMatrixPerElementOperations", |p| {
+                p.per_element_operations = false
+            }),
+            ("cooperativeMatrixTensorAddressing", |p| {
+                p.tensor_addressing = false
+            }),
+            ("cooperativeMatrixBlockLoads", |p| p.block_loads = false),
+            ("bufferDeviceAddress", |p| p.buffer_device_address = false),
+        ] {
+            let mut p = coopmat2_ok();
+            clear(&mut p);
+            let err =
+                check_coopmat2_support(&p).expect_err(&format!("{name} cleared must be refused"));
+            assert!(err.contains(name), "{err}");
+        }
+    }
+
+    #[test]
+    fn coopmat2_gate_fails_closed_on_anything_unknown() {
+        // No extension at all.
+        assert!(check_coopmat2_support(&Coopmat2Probe::default()).is_err());
+        // The shape list could not be queried: UNKNOWN must not read as "the shapes are fine".
+        let mut unqueried = coopmat2_ok();
+        unqueried.flexible_dimensions_reported = false;
+        let err = check_coopmat2_support(&unqueried).unwrap_err();
+        assert!(err.contains("unknown"), "{err}");
+        // Reported, but empty — same verdict by a different route.
+        let mut empty = coopmat2_ok();
+        empty.flexible_dimensions_list.clear();
+        assert!(check_coopmat2_support(&empty).is_err());
+        // A device that reported no maxDimension (the struct default) is below the floor.
+        let mut no_dim = coopmat2_ok();
+        no_dim.flexible_dimensions_max_dimension = 0;
+        assert!(check_coopmat2_support(&no_dim).is_err());
+        let mut small_dim = coopmat2_ok();
+        small_dim.flexible_dimensions_max_dimension = COOPMAT2_MIN_MAX_DIMENSION - 1;
+        assert!(check_coopmat2_support(&small_dim).is_err());
+    }
+
+    #[test]
+    fn coopmat2_gate_requires_every_tile_shape() {
+        // Drop each of the four required rows in turn.
+        for drop in 0..4usize {
+            let mut p = coopmat2_ok();
+            p.flexible_dimensions_list.remove(drop);
+            assert!(
+                check_coopmat2_support(&p).is_err(),
+                "row {drop} removed must refuse"
+            );
+        }
+        // Present at the right workgroup size but too COARSE a granularity: 256-invocation rows
+        // need N <= 32, and a device offering only 64 cannot build the tile.
+        let mut coarse = coopmat2_ok();
+        for d in &mut coarse.flexible_dimensions_list {
+            if d.workgroup_invocations == 256 {
+                d.n_granularity = 64;
+            }
+        }
+        assert!(check_coopmat2_support(&coarse).is_err());
+        // Right shapes, wrong scope — coopmat2's whole point is workgroup scope.
+        let mut subgroup = coopmat2_ok();
+        for d in &mut subgroup.flexible_dimensions_list {
+            d.scope = vk::ScopeKHR::SUBGROUP;
+        }
+        assert!(check_coopmat2_support(&subgroup).is_err());
+        // Saturating accumulation is a different operation and upstream excludes it explicitly.
+        let mut saturating = coopmat2_ok();
+        for d in &mut saturating.flexible_dimensions_list {
+            d.saturating_accumulation = true;
+        }
+        assert!(check_coopmat2_support(&saturating).is_err());
+        // bf16 inputs do not substitute for the required fp16 ones.
+        let mut bf16 = coopmat2_ok();
+        for d in &mut bf16.flexible_dimensions_list {
+            d.a_type = vk::ComponentTypeKHR::from_raw(1_000_141_000);
+            d.b_type = vk::ComponentTypeKHR::from_raw(1_000_141_000);
+        }
+        assert!(check_coopmat2_support(&bf16).is_err());
     }
 
     // ── int8 coopmat fragment layout ────────────────────────────────────────────────────────────

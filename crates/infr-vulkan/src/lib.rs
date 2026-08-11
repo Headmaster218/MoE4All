@@ -1800,6 +1800,22 @@ impl VulkanBackend {
             crate::caps::coopmat_shape_trusted(coopmat_trust, (m, n, k))
         };
 
+        // ── VK_NV_cooperative_matrix2: capability only, no kernel path ──────────────────────────
+        // There is no coopmat2 shader in this backend (the only coopmat2 code anywhere is
+        // `examples/coopmat2_test.rs`, a standalone research probe). This runs the full gate anyway
+        // and REPORTS it, so "would this box qualify?" is answered by the log line rather than by
+        // reading the extension list — the extension being present says almost nothing, which is the
+        // whole reason `caps::check_coopmat2_support` exists. Warn only when the extension IS
+        // advertised and the gate still says no; silent on every device that lacks it entirely.
+        let coopmat2_probe = probe_coopmat2(&entry, &instance, physical_device, &has_ext, has_bda);
+        let coopmat2 = crate::caps::check_coopmat2_support(&coopmat2_probe);
+        if let (true, Err(why)) = (coopmat2_probe.has_ext, &coopmat2) {
+            tracing::warn!(
+                "[infr] VK_NV_cooperative_matrix2 advertised but NOT usable on this device \
+                 ({device_arch:?}, {driver_label}) — {why}"
+            );
+        }
+
         let f16c = vk::ComponentTypeKHR::FLOAT16;
         let cm8_env = vkcfg.coopmat_8x8;
         let coopmat_f16 = crate::caps::select_coopmat_shape(
@@ -2202,19 +2218,11 @@ impl VulkanBackend {
         // buffer — past the ~10 s `gfx`-ring watchdog it is a GPU reset, not merely slow. Detect the
         // device class here and let the seam bound its per-submit work (`Capabilities::integrated`).
         let integrated = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
-        // Best-effort CU count (AMD only; 0 = unknown). `VK_AMD_shader_core_properties` is a
-        // properties2 pNext, so it needs no device-extension ENABLE — only that the driver
-        // advertises it, hence the `has_ext` guard (chaining an unsupported struct is UB).
-        let compute_units = if has_ext(c"VK_AMD_shader_core_properties") {
-            let mut sc = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sc);
-            unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
-            sc.shader_engine_count
-                * sc.shader_arrays_per_engine_count
-                * sc.compute_units_per_shader_array
-        } else {
-            0
-        };
+        // Shader-core count (0 = unknown), from whichever of the four per-vendor sources this
+        // device actually reports — see `caps::shader_core_count`, which owns that order. The
+        // property structs it reads were already chained by `probe_device_facts` above; nothing here
+        // queries the device again.
+        let compute_units = crate::caps::shader_core_count(&device_probe);
 
         let caps = Capabilities {
             name: device_name,
@@ -2289,7 +2297,7 @@ impl VulkanBackend {
         let yn = |b: bool| if b { "y" } else { "n" };
         tracing::info!(
             "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
-             i8dot:{} i8cm:{} subgroup:{}-{} sgp:{} shared:{}KB",
+             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB",
             caps.name,
             device_arch,
             driver_label,
@@ -2302,9 +2310,17 @@ impl VulkanBackend {
             yn(caps.i8),
             yn(caps.i8_dot),
             yn(caps.i8_coopmat()),
+            yn(coopmat2.is_ok()),
             caps.subgroup_min,
             caps.subgroup_max,
             caps.sg_pref,
+            // Shader cores (AMD CUs / NVIDIA SMs / Intel Xe-cores), "?" when this device reports
+            // none — see `caps::shader_core_count`.
+            if caps.compute_units > 0 {
+                caps.compute_units.to_string()
+            } else {
+                "?".to_string()
+            },
             caps.max_shared_memory_bytes / 1024,
         );
         // Submit splitter (see `VulkanShared::submit_dispatch_cap`): the initial, pre-measurement
@@ -3932,6 +3948,187 @@ impl Backend for VulkanBackend {
     }
 }
 
+// ── VK_NV_cooperative_matrix2 structs (ash 0.38 has no bindings for this extension) ──────────────
+// Field order, types and `sType` values transcribed from the locally installed
+// /usr/include/vulkan/vulkan_core.h. `#[repr(C)]` and the field ORDER are the driver ABI — do not
+// reorder. Nothing here is ever chained unless the device advertises the extension (see
+// `probe_coopmat2`), because chaining a struct a driver does not know is undefined behaviour.
+
+const ST_COOPMAT2_FEATURES_NV: i32 = 1_000_593_000;
+const ST_COOPMAT2_FLEXIBLE_DIMENSIONS_NV: i32 = 1_000_593_001;
+const ST_COOPMAT2_PROPERTIES_NV: i32 = 1_000_593_002;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Coopmat2FeaturesNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope: vk::Bool32,
+    flexible_dimensions: vk::Bool32,
+    reductions: vk::Bool32,
+    conversions: vk::Bool32,
+    per_element_operations: vk::Bool32,
+    tensor_addressing: vk::Bool32,
+    block_loads: vk::Bool32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Coopmat2PropertiesNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope_max_workgroup_size: u32,
+    flexible_dimensions_max_dimension: u32,
+    workgroup_scope_reserved_shared_memory: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CoopmatFlexibleDimensionsNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    m_granularity: u32,
+    n_granularity: u32,
+    k_granularity: u32,
+    a_type: vk::ComponentTypeKHR,
+    b_type: vk::ComponentTypeKHR,
+    c_type: vk::ComponentTypeKHR,
+    result_type: vk::ComponentTypeKHR,
+    saturating_accumulation: vk::Bool32,
+    scope: vk::ScopeKHR,
+    workgroup_invocations: u32,
+}
+
+type PfnGetCoopmatFlexibleDimensionsNv = unsafe extern "system" fn(
+    vk::PhysicalDevice,
+    *mut u32,
+    *mut CoopmatFlexibleDimensionsNv,
+) -> vk::Result;
+
+/// Probe `VK_NV_cooperative_matrix2` into the facts [`crate::caps::check_coopmat2_support`] decides
+/// over. Pure query, no policy: every early return leaves the corresponding fact at its "not
+/// established" value (`has_ext` false, `flexible_dimensions_reported` false), which is what makes
+/// the gate refuse.
+///
+/// NOT VALIDATED against a device that PASSES the gate. The only device on this machine advertising
+/// the extension is lavapipe (the software rasterizer), and it is refused; the discrete RX 7900 XTX
+/// on RADV does not advertise it at all, so this function returns at the first line there. What has
+/// been run here is the extension-absent path and lavapipe's extension-present path — never a
+/// successful one.
+fn probe_coopmat2(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    has_ext: &dyn Fn(&CStr) -> bool,
+    buffer_device_address: bool,
+) -> crate::caps::Coopmat2Probe {
+    let mut probe = crate::caps::Coopmat2Probe {
+        buffer_device_address,
+        ..Default::default()
+    };
+    if !has_ext(c"VK_NV_cooperative_matrix2") {
+        return probe;
+    }
+    probe.has_ext = true;
+
+    // Feature bits. ash cannot `push_next` a struct it has no `Extends` impl for, so splice it in
+    // as the chain head by raw pointer — `p_next` is a public field in ash 0.38.
+    let mut feats = Coopmat2FeaturesNv {
+        s_type: vk::StructureType::from_raw(ST_COOPMAT2_FEATURES_NV),
+        p_next: std::ptr::null_mut(),
+        workgroup_scope: vk::FALSE,
+        flexible_dimensions: vk::FALSE,
+        reductions: vk::FALSE,
+        conversions: vk::FALSE,
+        per_element_operations: vk::FALSE,
+        tensor_addressing: vk::FALSE,
+        block_loads: vk::FALSE,
+    };
+    let mut feat2 = vk::PhysicalDeviceFeatures2::default();
+    feats.p_next = feat2.p_next;
+    feat2.p_next = std::ptr::addr_of_mut!(feats).cast();
+    unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+    probe.workgroup_scope = feats.workgroup_scope != 0;
+    probe.flexible_dimensions = feats.flexible_dimensions != 0;
+    probe.reductions = feats.reductions != 0;
+    probe.conversions = feats.conversions != 0;
+    probe.per_element_operations = feats.per_element_operations != 0;
+    probe.tensor_addressing = feats.tensor_addressing != 0;
+    probe.block_loads = feats.block_loads != 0;
+
+    let mut cm2_props = Coopmat2PropertiesNv {
+        s_type: vk::StructureType::from_raw(ST_COOPMAT2_PROPERTIES_NV),
+        p_next: std::ptr::null_mut(),
+        workgroup_scope_max_workgroup_size: 0,
+        flexible_dimensions_max_dimension: 0,
+        workgroup_scope_reserved_shared_memory: 0,
+    };
+    let mut props2 = vk::PhysicalDeviceProperties2::default();
+    cm2_props.p_next = props2.p_next;
+    props2.p_next = std::ptr::addr_of_mut!(cm2_props).cast();
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+    probe.flexible_dimensions_max_dimension = cm2_props.flexible_dimensions_max_dimension;
+
+    // The flexible-dimension shape list, through a `vkGetInstanceProcAddr` lookup because ash has
+    // no wrapper. A missing entry point or a failed call leaves `flexible_dimensions_reported`
+    // false, i.e. UNKNOWN, and the gate refuses rather than reading an empty list as agreement.
+    let Some(raw) = (unsafe {
+        entry.get_instance_proc_addr(
+            instance.handle(),
+            c"vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV".as_ptr(),
+        )
+    }) else {
+        return probe;
+    };
+    let get_dims: PfnGetCoopmatFlexibleDimensionsNv = unsafe { std::mem::transmute(raw) };
+    let mut count = 0u32;
+    if unsafe { get_dims(physical_device, &mut count, std::ptr::null_mut()) } != vk::Result::SUCCESS
+    {
+        return probe;
+    }
+    let mut list = vec![
+        CoopmatFlexibleDimensionsNv {
+            s_type: vk::StructureType::from_raw(ST_COOPMAT2_FLEXIBLE_DIMENSIONS_NV),
+            p_next: std::ptr::null_mut(),
+            m_granularity: 0,
+            n_granularity: 0,
+            k_granularity: 0,
+            a_type: vk::ComponentTypeKHR::FLOAT16,
+            b_type: vk::ComponentTypeKHR::FLOAT16,
+            c_type: vk::ComponentTypeKHR::FLOAT16,
+            result_type: vk::ComponentTypeKHR::FLOAT16,
+            saturating_accumulation: vk::FALSE,
+            scope: vk::ScopeKHR::WORKGROUP,
+            workgroup_invocations: 0,
+        };
+        count as usize
+    ];
+    if count > 0
+        && unsafe { get_dims(physical_device, &mut count, list.as_mut_ptr()) }
+            != vk::Result::SUCCESS
+    {
+        return probe;
+    }
+    list.truncate(count as usize);
+    probe.flexible_dimensions_reported = true;
+    probe.flexible_dimensions_list = list
+        .iter()
+        .map(|d| crate::caps::FlexibleDimension {
+            m_granularity: d.m_granularity,
+            n_granularity: d.n_granularity,
+            k_granularity: d.k_granularity,
+            a_type: d.a_type,
+            b_type: d.b_type,
+            c_type: d.c_type,
+            result_type: d.result_type,
+            saturating_accumulation: d.saturating_accumulation != 0,
+            scope: d.scope,
+            workgroup_invocations: d.workgroup_invocations,
+        })
+        .collect();
+    probe
+}
+
 /// Read the device facts [`crate::caps`]'s decisions are stated over — the PROBE half of the
 /// capability split. No policy here: every field is a straight copy of a Vulkan query result.
 ///
@@ -3962,7 +4159,10 @@ fn probe_device_facts(
     let mut driver = vk::PhysicalDeviceDriverProperties::default();
     let mut sgctl = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
     let mut intdot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let want_amd_core2 = has_ext(c"VK_AMD_shader_core_properties2");
+
     let mut amd_core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+    let mut amd_core2 = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
     let mut nv_sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
     let mut props2 = vk::PhysicalDeviceProperties2::default();
     if want_driver {
@@ -3976,6 +4176,9 @@ fn probe_device_facts(
     }
     if want_amd_core {
         props2 = props2.push_next(&mut amd_core);
+    }
+    if want_amd_core2 {
+        props2 = props2.push_next(&mut amd_core2);
     }
     if want_nv_sm {
         props2 = props2.push_next(&mut nv_sm);
@@ -3997,8 +4200,14 @@ fn probe_device_facts(
         } else {
             0
         },
+        device_id: base.device_id,
         wavefronts_per_simd: amd_core.wavefronts_per_simd,
         has_amd_shader_core: want_amd_core,
+        shader_engine_count: amd_core.shader_engine_count,
+        shader_arrays_per_engine_count: amd_core.shader_arrays_per_engine_count,
+        compute_units_per_shader_array: amd_core.compute_units_per_shader_array,
+        has_amd_shader_core2: want_amd_core2,
+        active_compute_unit_count: amd_core2.active_compute_unit_count,
         has_integer_dot: want_intdot,
         dot4x8_signed_accelerated: intdot.integer_dot_product4x8_bit_packed_signed_accelerated != 0,
         dot4x8_mixed_accelerated: intdot
@@ -4007,6 +4216,7 @@ fn probe_device_facts(
         has_coopmat_ext: has_ext(c"VK_KHR_cooperative_matrix"),
         has_nv_sm_builtins: want_nv_sm,
         warps_per_sm: nv_sm.shader_warps_per_sm,
+        sm_count: nv_sm.shader_sm_count,
     }
 }
 

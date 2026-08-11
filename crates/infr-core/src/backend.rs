@@ -683,8 +683,9 @@ mod tests {
     /// knob — and it must never return 0 (a zero-row prefill chunk would not terminate).
     #[test]
     fn integrated_ubatch_rows_is_a_bounded_shrink() {
-        // Unknown CU count (the common case: only AMD reports one) takes the conservative floor —
-        // the ~2-CU RDNA2 iGPU the 128-row figure is calibrated on.
+        // Unknown CU count takes the conservative floor — the ~2-CU RDNA2 iGPU the 128-row figure
+        // is calibrated on. Still reachable: `caps::shader_core_count` covers AMD, NVIDIA and the
+        // Intel parts in its table, but a device outside all three sources reports nothing.
         assert_eq!(integrated_ubatch_rows(0), 128);
         assert_eq!(integrated_ubatch_rows(2), 128); // the calibrated part
         assert_eq!(integrated_ubatch_rows(1), 128); // never below the floor
