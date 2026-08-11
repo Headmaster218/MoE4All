@@ -1964,67 +1964,214 @@ speed alone until that bug is closed.
 **Vulkan** backend has no fused indexer either (see B-DSHW-FUSED-REF). `infr` is
 behind llama.cpp's CUDA backend here, not its Vulkan one.
 
-### B-DSV2-DEGENERATE — DeepSeek-V2-Lite output decays into repetition as the context grows (2026-08-11)
+### B-DSV2-DEGENERATE — DeepSeek-V2-Lite output decays into repetition as the context grows (2026-08-11, re-diagnosed 2026-08-12)
 
-**Tag:** deepseek · correctness · **Blocked on:** nothing — this is a real bug,
-undiagnosed
+**Tag:** deepseek · correctness · **Blocked on:** a decision on the
+activation-precision trade below; the residual cause is still open
 
 `infr` produces text that starts correct and then collapses into a repeating
 phrase on `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF` — **on Vulkan only**.
-Measured on Vulkan (RX 7900 XTX / RADV), `INFR_TEMP=0`, `--max-new 60`, prompt
-`Why is the sky blue?`:
+Reproduced at 31cf3b3 on an RX 7900 XTX / RADV, `INFR_TEMP=0 --max-new 60`,
+prompt `Why is the sky blue?`:
 
 ```
 The sky is blue due to a phenomenon called Rayleigh scattering, which is the
 scattering of light particles, such as photons, off particles in space, in
-space, in space, in space, in the physical environment, in the physical
-environment, in the physical environment, in the physical regard, in the
+space, in space, in space, in the physical environment, …
 ```
 
-llama.cpp on the **same GGUF blob**, `--temp 0 -st -no-cnv -ngl 99`, stays
-coherent all the way
-(`...Blue light is scattered more than other colors because it travels as shorter, smaller waves.`).
-So the file is fine and the divergence is ours.
+`INFR_DEV=cpu` on the identical file and prompt is coherent
+(`…which is caused by the scattering of sunlight in Earth's atmosphere. Specifically, it occurs in the blue and violet light wavelengths…`),
+and llama.cpp is coherent on both its CPU and its Vulkan backend, with the two
+producing **identical** text
+(`The sky appears blue due to a phenomenon called Rayleigh scattering. When sunlight enters the Earth's atmosphere…`).
 
-**Shape of the failure, which is the part that decides where to look:**
+#### Ruled OUT, each by measurement (do not re-walk these)
 
-- It is **not** wrong from the first token. The opening clause is right, and it
-  tracks llama.cpp's own wording (`a phenomenon called Rayleigh scattering`) for
-  roughly twenty tokens before decaying.
-- A short answer is **correct**:
-  `What is the capital of France? Answer with only the city name.` → ` Paris`,
-  greedy.
-- So it degrades as the context lengthens rather than diverging at the forward's
-  first output. An earlier note in this backlog claimed divergence at the first
-  sampled token and degeneration into repeated `**`; both were checked against
-  the runs above and are wrong. Do not start from them.
-- The `deepseek` V1 GGUF (`mradermacher/deepseek-moe-16b-chat-GGUF`, same
-  dense-lead MoE shape, **no MLA**) is coherent, which localizes this to the
-  deepseek2/MLA path and not to dense-lead MoE routing.
-- **The CPU backend is COHERENT on the identical prompt and file.**
-  `INFR_DEV=cpu INFR_TEMP=0 --max-new 60` runs clean to the end
-  (`...Specifically, it occurs in the blue and violet light wavelengths of sunlight...`).
-  This is the discriminator: same weights, same config, same tokenizer, same
-  sampler — only the backend differs. An earlier note claimed the CPU backend
-  degenerates too; it was checked and it does not.
+- **`mla.comp` is not the defect.** Two independent checks. (1) A DeepSeek-sized
+  sweep (`n_head` 16, `kv_lora_rank` 512, `qk_nope_dim` 128, `qk_rope_dim` 64,
+  `v_head_dim` 128) over `kv_len` 2…2048, with and without the `-DFREQ_FACTORS`
+  build, against an f64 reference: max relative error 6e-7…4e-6. (2) The REAL
+  layer-0 `Op::Mla` inputs (`q`, the f16 KV rows, `wk_b`, `wv_b`,
+  `freq_factors`, `rows`=59, `kv_len`=59) captured out of the CPU backend's own
+  arm and replayed through `Recorder::mla`: per-row cosine 1.00000000 against
+  the CPU's output, max absolute error 1.8e-7. The kernel computes the right
+  function on the exact data the model feeds it.
+- **Not a decode/KV-ring bug.** For the degenerate 40-token generation,
+  `prefill_logits_vulkan(prompt ++ gen[..k])`'s argmax equals `gen[k]` at k = 0,
+  4, 8, 12, 16, 20, 24, 28, 32, 36 — 10 of 10. Vulkan's decode and its batched
+  prefill agree with each other and both diverge from the CPU.
+- **Not a barrier / hazard bug.** `INFR_FULLBARRIER=1` reproduces the degenerate
+  text byte for byte.
+- **Not the MoE.** The `deepseek` V1 control
+  (`mradermacher/deepseek-moe-16b-chat-GGUF` Q4_K_M — same dense-lead MoE
+  family, same quant, no MLA) holds CPU/Vulkan per-layer K-cache cosine FLAT at
+  0.9994–0.9999 across all 28 layers and whole-vocab logits cosine at
+  0.9993–0.9997 across prompt lengths 13…53, where V2-Lite decays (below). And
+  forcing the 60-row prefill off the dp4a batched expert GEMM onto the
+  f32-activation per-token expert GEMVs (`kernels.vulkan.moe_small_m = 64`)
+  moved the depth-60 logits cosine 0.9671 → 0.9648, i.e. nowhere.
+- **Not the YaRN trunk scale, not the rope type, not the freq_factors ramp.**
+  Read out of llama.cpp at the pinned revision and compared to the values infr
+  actually dispatches: `kq_scale` 0.11472137 on both (`mscale` 1.26081,
+  `attn_factor_org` 1.0 — llama.cpp's `setting new yarn_attn_factor = 1.0000`
+  WARN prints the value BEFORE `llama-context.cpp` cancels it to 0.730518, which
+  is what makes `attn_factor_org` land on 1.0 and the rope's own vector `mscale`
+  on 1.0, so folding it into the score as `mscale²` is right);
+  `llama_model_rope_type(LLM_ARCH_DEEPSEEK2)` is `LLAMA_ROPE_TYPE_NORM`,
+  matching `neox: false`; and infr's `yarn_ff` divisors reproduce llama.cpp's
+  `rope_yarn_ramp` exactly at the ends and at the ramp (p=0 → 1.0, p=11 →
+  1.081081 = 1/0.925, p≥23 → 40.0).
+- **Not one GEMM tier.**
+  `kernels.vulkan.{mmq, mmq_fallback, coopmat, f16, bm16, small_bm, gemm_warp, i8_dot}`
+  — every one of them, alone and together — leaves the layer-0 KV-latent
+  CPU/Vulkan cosine at 0.99948…0.99952.
 
-**So the defect is in the Vulkan MLA path**, and the CPU implementation is a
-working reference to difference against. `Op::Mla` on Vulkan is served by the
-single `mla.comp` (B-DSHW-MLA-SCALAR-TIER), so that shader and the KV rows it
-reads are the search space — not the config, the YaRN ramp, or the graph, all of
-which the coherent CPU run exercises identically.
+#### What IS measured
 
-Given "correct for ~20 tokens, then decays", look at what changes with `pos`:
-the second pass over the key range, the causal bound, and the compressed-KV rows
-as the cache fills. `gpu_seam_matches_cpu_deepseek2` passes, so whatever this is
-either needs more tokens than that test drives or lies outside the seam it
-compares — establishing which is the cheapest next step. Same question for the
-blessed `cpu_deepseek_v32_golden`: it passes, and it is a CPU test, so it could
-never have caught a Vulkan-only fault.
+**The divergence is an amplification, not a broken op.** Per-layer CPU/Vulkan
+cosine of the compressed-KV row on a 60-token prefill: layer 0 latent 0.99952,
+layer 8 0.99518, layer 16 0.98730, layer 22 0.87084, layer 26 0.92787 — a smooth
+~1.3×-per-layer growth with no step anywhere. Whole-vocab logits cosine grows
+with sequence length the same way: 0.9977 at 8 tokens, 0.9954 at 16, 0.9860 at
+32, 0.9456 at 60. The V1 control does neither.
 
-The decode-at-depth throughput collapse in B-DSHW-MLA-SCALAR-TIER (tg64 111 →
-6.3 at `-d 2048`) is in the same kernel and the same depth-dependent direction;
-whether the two share a cause is **a guess, not a finding**.
+**infr's deepseek2 forward differs from llama.cpp on BOTH backends** — this is
+the finding that reframes the bug, and it is new. Using
+`llama-debug --save-logits` over llama.cpp's own token ids, prompt
+`The sky is blue due to a phenomenon called`:
+
+| engine      | top-5 (id, logit)                                                            |
+| ----------- | ---------------------------------------------------------------------------- |
+| llama.cpp   | (90256 ` Rayleigh`, 28.81), (17255, 25.31), (440, 24.98), …                  |
+| infr CPU    | (5501, 26.35), (17255, 25.86), (1327, 24.90), (17069, 23.70), (90256, 23.55) |
+| infr Vulkan | (17255, 26.87), (5501, 26.15), (1327, 25.59), (90256, 24.27), …              |
+
+llama.cpp names ` Rayleigh` first with a 3.5-logit margin; infr ranks it FIFTH
+on the CPU backend, 5.3 logits below llama.cpp's value. The same probe on the V1
+model at the same position has infr CPU at (90256, 28.70) against llama.cpp's
+(90256, 28.32), probability cosine 0.999997 — so the harness is sound and the
+gap is deepseek2-specific. **The CPU backend is coherent but it is not
+correct**, and the Vulkan symptom sits on top of a shared inaccuracy that is
+still unfound.
+
+**Where Vulkan itself first goes wrong.** The layer-0 `wkv_a_mqa` output (the
+raw `Op::Linear` result, before `kv_a_norm` and before the k_pe rope) for row 0,
+first three elements: llama.cpp `0.1219, -0.2906, 0.0505`; infr CPU
+`0.12189, -0.29053, 0.05048` (an exact match); infr Vulkan
+`0.11017, -0.30249, 0.05954` — ~10% per element. The error is roughly
+ABSOLUTE-uniform across the 576 outputs, so it shows up ~4× larger on the 512
+latent columns (|value| ~0.45) than on the 64 k_pe columns (~1.7), which is
+exactly the ratio the per-column measurement gives (3.5% vs 0.8%). That row is
+written to the KV cache and read by every later query.
+
+#### The activation-precision lead, and the trade it costs
+
+Every Vulkan `Op::Linear` tier reduces the ACTIVATIONS before the matmul: the
+dp4a `mmq`/`mmv`/`mrow` arms run a `quant_q8` int8 prepass (per-32-block scale),
+and the coopmat warp GEMM stages A through f16. `attn_kv_a_mqa` is Q4_K 2048→576
+and 576 is not a multiple of 128, so it takes the int8 arm. Measured directly on
+that shape at m=32 with one O(100) outlier per 32-element block (what a
+DeepSeek-V2 residual row looks like), against an f64 oracle over the DEQUANTIZED
+weight: the default route's relative error is **1.43e-2**, and the
+in-shader-dequant f32-activation GEMV (`Recorder::linear_native`) is
+**1.52e-7**.
+
+A `Graph`-level flag (`exact_linear_acts`, set for `cfg.deepseek2`, honored in
+the Vulkan `Op::Linear` arm by routing native-quant weights to `linear_native`)
+was built and measured, then **reverted**:
+
+- depth-60 CPU/Vulkan logits cosine 0.9456 → 0.9671
+- `pp512` 981.6 → 709.6 t/s (−28%); `tg64` 111.6 → 111.8 t/s (unchanged)
+- the real-model output **still degenerates**
+
+It was reverted because the brief for the slice named "disabling the fast path"
+as a non-fix, and a 28% prefill regression on every deepseek2 model that does
+not fix the reported bug is the user's call, not ours. The flag is one small
+commit away if that call goes the other way (one `pub` field on `Graph`, one
+line in `runner.rs`'s graph builder next to `g.mtp_verify`, one early return in
+`adapter.rs`'s `Op::Linear` arm plus its fused-add and streamed twins).
+
+**Watch out for one trap here.** A single run with every tier knob off
+(`INFR_NO_COOPMAT` + `INFR_NO_MMQ_FALLBACK` + `INFR_NO_MMV` + `INFR_NO_MROW` +
+`INFR_NO_MROW16` + `INFR_NO_GEMV_RM` + `INFR_NO_GEMV_SG` + `INFR_NO_GEMV_REG` +
+`INFR_NO_F32_MROW`) produced a fully coherent 60-token answer, and it is
+tempting to read that as proof. It is not: the same knob set on a build where
+the Linears were ALREADY on the f32-activation route produced degenerate text.
+Greedy decode on this model is chaotic enough that one coherent sample means
+nothing — score with the depth cosine or the llama.cpp oracle, never with one
+generation.
+
+#### What is still open, and where to look next
+
+Vulkan's layer-0 KV row stays ~2% off the CPU/llama.cpp value even with the
+Linear on the f32-activation route (latent cosine 0.99977 vs 0.99979 — the
+element-wise errors halve but do not vanish). Since `Op::Linear`'s activation
+side and `Op::Mla` are both cleared, what is left upstream of that row is:
+`Op::EmbedGather`'s in-shader Q4_K dequant of `token_embd` (the CPU path
+host-dequants the same table), `Op::RmsNorm` on `attn_norm`, and the in-shader
+Q4_K WEIGHT dequant that every Vulkan tier shares — a ~1–3% weight-dequant
+disagreement would be tier-invariant, which is what the knob sweep saw. Compare
+one dequantized Q4_K row from the GPU against `infr_llama::dequant_block` before
+anything else.
+
+The backend-independent half of this is tracked separately as
+B-DSV2-FORWARD-ACCURACY below, and is probably the bigger defect of the two.
+
+#### Coverage gaps, stated plainly
+
+- `gpu_seam_matches_cpu_deepseek2` prefills ten tokens and floors the cosine at
+  0.5; it passed for the whole life of this bug and is not a guard against it. A
+  depth-60 version of it measures 0.9456 today, so it cannot be added until the
+  bug is fixed without landing a red test.
+- No test was added this pass, because nothing was fixed.
+- The Metal MLA path was not looked at at all.
+
+### B-DSV2-FORWARD-ACCURACY — infr's deepseek2 forward disagrees with llama.cpp on BOTH backends (2026-08-12)
+
+**Tag:** deepseek · correctness · **Blocked on:** nothing — undiagnosed
+
+Split out of B-DSV2-DEGENERATE, whose Vulkan-only degeneration sits on top of
+this. **This one is backend-independent and is likely the larger defect**, but
+it is invisible in normal use: the CPU backend's output is coherent and
+on-topic, so nothing flags it. Only the logit oracle catches it.
+
+Measured with `llama-debug --save-logits` over llama.cpp's own token ids, prompt
+`The sky is blue due to a phenomenon called`:
+
+| engine      | top-5 (id, logit)                                                            |
+| ----------- | ---------------------------------------------------------------------------- |
+| llama.cpp   | (90256 ` Rayleigh`, 28.81), (17255, 25.31), (440, 24.98), …                  |
+| infr CPU    | (5501, 26.35), (17255, 25.86), (1327, 24.90), (17069, 23.70), (90256, 23.55) |
+| infr Vulkan | (17255, 26.87), (5501, 26.15), (1327, 25.59), (90256, 24.27), …              |
+
+llama.cpp names ` Rayleigh` first by a 3.5-logit margin; infr's CPU backend
+ranks it **fifth**, 5.3 logits below llama.cpp's value.
+
+**The control that makes this a finding rather than harness noise:** the same
+probe at the same position on the `deepseek` V1 model puts infr CPU at (90256,
+28.70) against llama.cpp's (90256, 28.32), probability cosine **0.999997**. Same
+harness, same oracle, same tokenizer path — so the harness is sound and the
+disagreement is deepseek2-specific.
+
+**Note the shared-vs-diverging split**, which is the useful constraint: infr's
+CPU backend matches llama.cpp _exactly_ at layer 0's `wkv_a_mqa` output
+(`0.12189, -0.29053, 0.05048` vs `0.1219, -0.2906, 0.0505`). So the disagreement
+is not present at the first Linear and accumulates somewhere deeper.
+
+**Where to start:** it is backend-independent, so it lives in the shared graph
+or in an op both backends implement the same wrong way — not in a kernel. The
+MLA sub-graph is `MixerW::Mla` in `seam/runner.rs`. `Op::Mla` itself is already
+byte-verified against llama.cpp's `deepseek2.cpp` concat order, `wk_b`/`wv_b`
+index conventions and `kq_scale`, and the YaRN/rope constants are verified in
+B-DSV2-DEGENERATE's ruled-out list. So start on `wkv_a_mqa`'s _inputs_ (`hn`)
+and on `kv_a_norm`, then walk the per-layer residual against a llama.cpp dump
+rather than re-checking the ops already cleared.
+
+Caveat on scope: this was found on V2-Lite. Whether V3/V3.2/V4 share it is
+**untested** — the 671B V3.2 has no llama.cpp oracle on this box (it cannot load
+there), so the blessed `cpu_deepseek_v32_golden` locks in whatever infr does
+today, correct or not.
 
 ### B-DSHW-FUSED-REF — upstream's fused DeepSeek kernels exist on CUDA and SYCL only (2026-08-11)
 
