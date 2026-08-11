@@ -511,6 +511,32 @@ Order matters:
       `mla_ff_parity` in the Metal parity suite on the macOS CI job (2026-08-07)
       — which also caught and fixed an ff/params buffer-index swap in the kernel
       declaration.
+- [x] **The doubled MLA residual** — found 2026-08-12 with a per-op tap on the
+      CPU interpreter compared against `llama-debug --verbose`'s per-tensor
+      `sum =` lines. `MixerW::Mla` pushed its own `hidden += sub` and then fell
+      through to the shared post-mixer residual add, so every layer computed
+      `x + 2·Wo·attn`. At layer 0 of a ten-token prefill, llama.cpp's
+      `ffn_inp-0` last row reads `[-0.0645, 0.0322, -0.1029, …]` and infr's
+      residual read `[-0.0921, 0.0076, -0.2065, …]` =
+      `[-0.0636, 0.0309, -0.1029, …]` plus the attention output a second time.
+      Everything upstream of it matched llama.cpp to four printed decimals,
+      `k_pe` rope included. Next-token probability cosine against llama.cpp at
+      ten tokens: 0.3336 → 0.9998 (CPU), 0.3156 → 0.99998 (Vulkan). Guarded by
+      `synthetic_deepseek2_attention_enters_the_residual_once`, which recomputes
+      a one-token MLA layer by hand — the only kind of check that can see it, as
+      a doubled residual is indistinguishable from a `Wo` scaled by 2 to any
+      test that only varies weights. Two goldens moved with it and were
+      re-blessed in the same change, both because the residual stream they were
+      blessed off was wrong: `cpu_deepseek2_golden` (V2-Lite now generates
+      `" Paris."`, llama.cpp's own greedy continuation of that prompt at pin
+      030ebb5, token for token) and `GOLDEN_DS32_TOPK5` /
+      `synthetic_deepseek32_indexer_selection_is_locked` (the indexer's queries
+      and keys are both projections of the attn-normed residual, so on every
+      layer but the first the blessed key set came off the doubled stream). The
+      indexer's own mechanism tests —
+      `synthetic_deepseek32_top_k_restricts_attention` and
+      `synthetic_deepseek32_full_top_k_matches_no_indexer_at_all` — were green
+      before and after, and are what still holds that arithmetic in place.
 - [x] YaRN per-dimension frequency ramp in `Op::Rope` and MLA kernels — the
       `freq_factors` divisors (`ff[p] = 1/s(p)` from the corr_dims spectral
       ramp) + the constant `mla_scale = mscale²/√(qk_nope+qk_rope)` landed in

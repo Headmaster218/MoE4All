@@ -288,6 +288,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every DeepSeek V2/V3 model added its attention output to the residual stream
+  twice.** The MLA mixer arm in `seam/runner.rs` pushed its own `hidden += sub`
+  and then fell through to the shared post-mixer residual add, so every layer of
+  every `deepseek2`-family model (V2, V2-Lite, V3, V3.1, V3.2) ran
+  `x + 2·Wo·attn` instead of `x + Wo·attn` — on the CPU, Vulkan and Metal
+  backends alike, because the defect was in the shared graph rather than in a
+  kernel. V4 is NOT affected: it builds `MixerW::Dsv4`, whose hyper-connection
+  POST closes the residual wrap in place of the shared add, so it never emitted
+  the second one. It never produced obviously broken text, which is why it
+  survived: the only thing that catches it is an external oracle. Scored against
+  llama.cpp 030ebb5's own logits over its own token ids, on
+  `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, next-token probability cosine
+  (CPU / Vulkan) goes 0.956/0.955 → 0.997/0.995 at 2 tokens, 0.334/0.316 →
+  0.9998/0.99998 at 10, 0.862/0.862 → 0.997/0.999 at 27, and 0.980/0.920 →
+  0.9999/0.9997 at 56. `infr`'s greedy continuation of "The capital of France
+  is" is now llama.cpp's token for token, and the Vulkan repetition loop that
+  DeepSeek-V2-Lite fell into after a dozen tokens is gone.
+
 - **Every DeepSeek model prefilled one token per submit.** The batched-prefill
   eligibility scan (`moe_batched_ok` in `seam/runner.rs`) demanded a dp4a-mmq
   expert bank on EVERY layer, but DeepSeek's leading dense blocks ship a plain

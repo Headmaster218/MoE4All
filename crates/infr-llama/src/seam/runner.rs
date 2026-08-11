@@ -3349,7 +3349,13 @@ pub(crate) fn generate_dense_backend(
                     freq_factors: yarn_ff,
                     key_bias: key_mask,
                 });
-                // wo projection, residual add.
+                // wo projection into `sub`. The residual add is NOT emitted here: every mixer arm
+                // leaves its sublayer output in `sub` and the shared tail below closes the wrap
+                // (`hidden += sub`, or the hyper-connection POST for V4). Pushing one here too
+                // added the attention output to the residual stream TWICE on every DeepSeek2
+                // layer, which cost V2-Lite's next-token distribution 0.33 probability cosine
+                // against llama.cpp at a ten-token prompt. Guarded by
+                // `synthetic_deepseek2_attention_enters_the_residual_once`.
                 g.push(Op::Linear {
                     x: attn,
                     weight: mw.wo,
@@ -3358,12 +3364,6 @@ pub(crate) fn generate_dense_backend(
                     in_f: (c.n_head as u32) * v_hd,
                     out_f: ne as u32,
                     w_off: 0,
-                });
-                g.push(Op::Add {
-                    a: hidden,
-                    b: sub,
-                    dst: hidden,
-                    n: (batch * ne) as u32,
                 });
                 // Skip the standard attention code below (q/k/v, RoPE, Attn, o-proj).
                 // Continue to FFN.

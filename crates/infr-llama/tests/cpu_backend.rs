@@ -3923,9 +3923,9 @@ fn cpu_deepseek2_config() {
 /// Greedy generation on "The capital of France is" — the full forward pass (MLA attention +
 /// MoE + output) must produce COHERENT text. This was the test that caught the whole DeepSeek
 /// V2 bug family: it printed `"Reply CollaborReply Collabor CollaborReplyReplyReply"` before the
-/// YaRN ramp + wk_b/wv_b orientation fixes, and `" The capital of France is Paris. This"` after
-/// (verified against llama.cpp c629da5's greedy continuation " Paris.", which differs only in the
-/// top-2 dead heat between " Paris" and " The" — llama.cpp's own margin is 0.034).
+/// YaRN ramp + wk_b/wv_b orientation fixes. Since the doubled MLA residual was
+/// removed it prints `" Paris."` — llama.cpp's own greedy continuation of the
+/// same prompt at pin 030ebb5, token for token, EOS included.
 #[test]
 fn cpu_deepseek2_prefill_paris() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
@@ -3951,7 +3951,10 @@ fn cpu_deepseek2_golden() {
         &model,
         &[
             // (prompt, n_tokens, fnv1a hash of the generated text)
-            ("The capital of France is", 8, 0xc822e10860ea343b),
+            // Re-blessed 2026-08-12 when the doubled MLA residual was removed: the text is now
+            // `" Paris."`, which is llama.cpp's own greedy continuation of this prompt at pin
+            // 030ebb5 rather than merely a coherent one.
+            ("The capital of France is", 8, 0xe1c67fd1b7e0de68),
         ],
     );
 }
@@ -3988,6 +3991,12 @@ fn cpu_deepseek2_prefill_finite() {
 /// and MoE both have discrete-selection steps (MLA's absorbed form with its
 /// own kernel, MoE top-k routing), so this follows the qwen35moe precedent:
 /// top-5 overlap + cosine floor, NOT bit-identical.
+///
+/// The prompt is 55 tokens, not the ten-token one this carried while the
+/// doubled MLA residual was in the tree: that divergence was LENGTH-driven
+/// (0.9996 at two tokens, 0.9385 at fifty-six), so a short prompt was the one
+/// length at which it could not show. It measures 0.99861 here today, against
+/// 0.9385 before the fix.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_deepseek2() {
@@ -3995,7 +4004,7 @@ fn gpu_seam_matches_cpu_deepseek2() {
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model
-        .encode("What is the capital of France? Answer briefly.")
+        .encode("The sky appears blue because of a phenomenon called Rayleigh scattering, which is the scattering of sunlight by the molecules of the atmosphere. Shorter wavelengths of light are scattered much more strongly than longer ones, so the light that reaches our eyes from every direction of the sky is blue.")
         .expect("encode");
     let vocab = model.config().vocab;
     let cpu_last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
@@ -4020,8 +4029,10 @@ fn gpu_seam_matches_cpu_deepseek2() {
     );
     let cos = cosine(&cpu_last, &gpu_last);
     println!("cpu/vulkan whole-vocab cosine similarity: {cos}");
+    // 0.99, not the 0.5 this floor carried until 2026-08-12: a forward whose MLA residual was
+    // doubled still cleared 0.5 comfortably, so the old floor guarded nothing.
     assert!(
-        cos > 0.5,
+        cos > 0.99,
         "CPU/Vulkan last-row logits diverged too far: cosine={cos}"
     );
 }
@@ -4138,9 +4149,17 @@ fn cpu_deepseek_v32_golden() {
         &model,
         &[
             // (prompt, n_tokens, fnv1a hash of the generated text)
-            // Blessed 2026-08-11 from "The capital of France is Paris. This" — read and confirmed
-            // coherent before the hash was locked, per the bless path's own reason for printing it.
-            ("The capital of France is", 8, 0x2e3af827a5496d49),
+            // Re-blessed 2026-08-12 when the doubled MLA residual was removed — V3.2 is
+            // `deepseek2`-family, so it rode the same defective graph and its old hash encoded it.
+            // Now generates `"Hmm, the user is asking for"`: `model_default` applies the chat
+            // template, so the prompt arrives as a user turn and V3.2 — a reasoning model — opens
+            // with chain-of-thought. Read and confirmed coherent before the hash was locked.
+            //
+            // Unlike `cpu_deepseek2_golden`, this one cannot be checked against llama.cpp: the
+            // 671B model does not load there on this box, so it locks what infr does, not what is
+            // correct. What carries the correctness claim is the V2-Lite oracle over the SAME
+            // shared MLA graph (`gpu_prefill_matches_llama_debug_dump` and its CPU twin).
+            ("The capital of France is", 8, 0x407f00c3711378bf),
         ],
     );
 }
@@ -4211,6 +4230,19 @@ fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
 /// that produced it.
 #[test]
 fn cpu_prefill_matches_llama_debug_dump() {
+    prefill_matches_llama_debug_dump(false);
+}
+
+/// The same external oracle against the VULKAN seam. Same dump, same ids, same floors — the two
+/// backends are scored separately because a shared-graph defect shows up on both (which is exactly
+/// how the doubled MLA residual of `MixerW::Mla` was found) while a kernel defect shows up on one.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_prefill_matches_llama_debug_dump() {
+    prefill_matches_llama_debug_dump(true);
+}
+
+fn prefill_matches_llama_debug_dump(vulkan: bool) {
     let (Ok(dump), Ok(model_path)) = (
         std::env::var("INFR_LLAMA_DUMP"),
         std::env::var("INFR_LLAMA_DUMP_MODEL"),
@@ -4228,10 +4260,17 @@ fn cpu_prefill_matches_llama_debug_dump() {
         "the dump is for a different model: vocab mismatch"
     );
     let t0 = std::time::Instant::now();
-    let ours = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    let ours = if vulkan {
+        model
+            .prefill_logits_vulkan(&tokens)
+            .expect("vulkan prefill")
+    } else {
+        model.prefill_logits_cpu(&tokens).expect("cpu prefill")
+    };
     eprintln!(
-        "llama.cpp oracle: {} tokens, infr prefill {:.1}s",
+        "llama.cpp oracle: {} tokens, infr {} prefill {:.1}s",
         tokens.len(),
+        if vulkan { "vulkan" } else { "cpu" },
         t0.elapsed().as_secs_f64()
     );
     assert!(
@@ -4263,6 +4302,7 @@ fn cpu_prefill_matches_llama_debug_dump() {
     );
     if let Some(n) = std::env::var("INFR_LLAMA_DUMP_GEN")
         .ok()
+        .filter(|_| !vulkan)
         .map(|v| v.parse::<usize>().expect("INFR_LLAMA_DUMP_GEN is a count"))
     {
         let t0 = std::time::Instant::now();

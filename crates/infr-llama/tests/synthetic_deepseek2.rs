@@ -1015,6 +1015,116 @@ fn synthetic_deepseek2_uniform_router_bias_is_a_no_op() {
     );
 }
 
+/// One dense MLA layer and nothing else — the shape the residual test below can compute by hand.
+/// `n_dense_lead = n_layer = 1` keeps the single layer off the MoE branch, and the MoE metadata
+/// stays declared (no layer reads it) so the file is still an ordinary deepseek2.
+fn ds2_one_dense_layer_dims() -> Ds2Dims {
+    Ds2Dims {
+        n_layer: 1,
+        n_dense_lead: 1,
+        ..ds2_dims(1, 1, None)
+    }
+}
+
+/// **The attention sublayer enters the residual stream exactly ONCE.**
+///
+/// A SINGLE-token prefill makes a whole MLA layer closed-form: with one key the softmax is `1`
+/// whatever the query is, so the attention output is just `wv_b · kv_cmpr` and every query, rope,
+/// mask and score term drops out. The rest of the layer is a norm, a matvec and a SwiGLU. So this
+/// test recomputes the forward itself and compares — which is the ONLY way to catch a doubled
+/// residual: adding `wo·attn` to the stream twice is exactly a model whose `attn_output.weight` is
+/// scaled by 2, so no test that varies weights and compares outputs can tell the two apart. The
+/// emit did add it twice for the whole life of `MixerW::Mla`, on both backends, and nothing here
+/// or in `cpu_backend.rs` noticed — it cost V2-Lite 0.33 probability cosine against llama.cpp at a
+/// ten-token prompt, and nothing short of an external oracle flagged it.
+///
+/// The tolerance is set by the KV cache, which is f16: `kv_cmpr` makes the round trip through it
+/// before `Op::Mla` reads it back as V. Both bounds below were measured, and the doubled-residual
+/// arm is asserted too — a reference that matched BOTH would be measuring nothing.
+#[test]
+fn synthetic_deepseek2_attention_enters_the_residual_once() {
+    let d = ds2_one_dense_layer_dims();
+    let model = deepseek2_model(&d);
+    let w: std::collections::HashMap<String, Vec<f32>> = weights_of(&model).into_iter().collect();
+    let get = |n: &str| {
+        w.get(n)
+            .unwrap_or_else(|| panic!("{n} is not in the model"))
+            .as_slice()
+    };
+
+    let (ne, nff, eps) = (d.n_embd, d.n_ff, d.rms_eps);
+    let (kl, vh) = (d.kv_lora_rank, d.value_length_mla);
+    let tok = 3usize;
+
+    // GGUF stores a matrix `[in, out]` with `in` fastest, so it is out-major rows of `in` elements
+    // — the same indexing `ggml_mul_mat(w, x)` reads.
+    let mv = |wm: &[f32], x: &[f32], inf: usize, outf: usize| -> Vec<f32> {
+        assert_eq!(wm.len(), inf * outf, "matvec shape");
+        assert_eq!(x.len(), inf, "matvec input shape");
+        (0..outf)
+            .map(|o| (0..inf).map(|i| wm[o * inf + i] * x[i]).sum())
+            .collect()
+    };
+    let norm = |x: &[f32], g: &[f32]| -> Vec<f32> {
+        let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+        let s = 1.0 / (ss + eps).sqrt();
+        x.iter().zip(g).map(|(v, gain)| v * s * gain).collect()
+    };
+
+    let h = get("token_embd.weight")[tok * ne..][..ne].to_vec();
+    let x = norm(&h, get("blk.0.attn_norm.weight"));
+    let kv = mv(get("blk.0.attn_kv_a_mqa.weight"), &x, ne, d.kv_row());
+    let c = norm(&kv[..kl], get("blk.0.attn_kv_a_norm.weight"));
+    // One key ⇒ the attention weight is 1 ⇒ each head's output is its slice of `wv_b` times the
+    // compressed latent. `wv_b` is `[kv_lora, v_head, n_head]`, so `(head, v)` is row `head*vh + v`.
+    let vb = get("blk.0.attn_v_b.weight");
+    let attn: Vec<f32> = (0..d.n_head * vh)
+        .map(|r| (0..kl).map(|l| vb[r * kl + l] * c[l]).sum())
+        .collect();
+    let sub = mv(get("blk.0.attn_output.weight"), &attn, d.n_head * vh, ne);
+
+    // Everything downstream of the attention residual, so both arms below go through it.
+    let rest = |resid: &[f32]| -> Vec<f32> {
+        let y = norm(resid, get("blk.0.ffn_norm.weight"));
+        let gate = mv(get("blk.0.ffn_gate.weight"), &y, ne, nff);
+        let up = mv(get("blk.0.ffn_up.weight"), &y, ne, nff);
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+        let down = mv(get("blk.0.ffn_down.weight"), &act, nff, ne);
+        let out: Vec<f32> = resid.iter().zip(&down).map(|(a, b)| a + b).collect();
+        let o = norm(&out, get("output_norm.weight"));
+        mv(get("output.weight"), &o, ne, d.vocab)
+    };
+    let once = rest(&h.iter().zip(&sub).map(|(a, b)| a + b).collect::<Vec<_>>());
+    let twice = rest(
+        &h.iter()
+            .zip(&sub)
+            .map(|(a, b)| a + 2.0 * b)
+            .collect::<Vec<_>>(),
+    );
+
+    let ours = cpu_logits_of("ds2-residual-once", &model, &[tok as u32]);
+    let scale = rms(&once);
+    let (d_once, d_twice) = (
+        max_abs_diff(&ours, &once) / scale,
+        max_abs_diff(&ours, &twice) / scale,
+    );
+    println!("cpu vs one residual add: {d_once:e};  vs two: {d_twice:e}  (logit rms {scale:e})");
+    assert!(
+        d_once < 0.01,
+        "the CPU forward does not match a hand-computed MLA layer with ONE residual add \
+         (relative max|Δ| = {d_once:e}); against a DOUBLED attention residual it is {d_twice:e}"
+    );
+    assert!(
+        d_twice > 0.1,
+        "the two references are indistinguishable (relative max|Δ| = {d_twice:e}) — this fixture \
+         cannot tell a doubled attention residual from a single one, so it guards nothing"
+    );
+}
+
 // ─── deepseek32 (V3.2) ───────────────────────────────────────────────────────────
 //
 // Stage 3. There is no V3.2 GGUF anywhere — the model is 671B — so this is the only place the arch
@@ -1028,24 +1138,31 @@ const RESTRICT_TOP_K: usize = 5;
 
 /// The blessed value of [`synthetic_deepseek32_indexer_selection_is_locked`] — see that test for
 /// what it does and does not prove.
+///
+/// Re-blessed 2026-08-12, when the doubled MLA residual was removed from `MixerW::Mla` — the emit
+/// pushed its own `hidden += sub` and then fell through to the shared post-mixer one, so every
+/// layer ran `x + 2·Wo·attn`. That is upstream of the indexer on every layer but the first (its
+/// queries and keys are both projections of the attn-normed residual), so the selected key set was
+/// blessed off a wrong residual stream. `docs/deepseek.md` § Stage 2 records the fix and the
+/// llama.cpp-oracle numbers behind it.
 #[rustfmt::skip]
 const GOLDEN_DS32_TOPK5: [f32; 64] = [
-    1.1634496, 0.55583966, -1.083919, -2.9751287,
-    -1.6523329, -0.0013271719, 0.23705888, 0.002301976,
-    1.4342694, 1.050138, 1.3096284, 1.5038577,
-    0.32831174, -0.52826184, 0.72379166, 0.4672855,
-    0.3796335, 1.1862715, 0.44356698, -1.1651667,
-    1.0941807, -2.219788, -0.4968652, 0.84665793,
-    -1.7739847, -0.12243594, 1.1845412, 0.7563032,
-    0.09609932, -0.60896444, -0.14078188, -0.023309775,
-    -0.2940429, 0.66930676, 0.12828845, 1.2945883,
-    0.49087483, 0.8542345, -0.9175889, 2.0058444,
-    -0.6591824, -0.07517361, -0.7924243, 1.1822766,
-    1.1122972, -0.25596488, -0.8652606, 0.77131444,
-    0.793506, 1.4103872, -1.080347, 0.035427153,
-    -1.0616684, 0.86063415, 0.9556941, -0.24923778,
-    0.37757862, 0.25142026, 2.1608865, -0.8568267,
-    -0.6813617, -1.491607, 0.504219, 1.2186759,
+    2.3043902, -0.013076313, -1.3234324, -3.1375747,
+    -1.1055682, 0.3865136, -0.61020446, -0.42360878,
+    0.47180915, 0.006694615, 1.9045272, -0.40047073,
+    -0.3978482, -1.3176585, -0.56353354, 0.52467525,
+    1.6318357, 1.4591132, 1.0790904, -1.0457753,
+    0.7399634, -0.81923497, -0.11123766, 1.189652,
+    -2.0899749, -0.26460132, 0.9941017, -0.2332978,
+    -0.054522276, -0.8965335, 0.027967453, 0.4384708,
+    -0.513962, 0.9273385, 0.08457941, 0.93586993,
+    0.32814872, 0.4685019, -0.84589684, 0.75260216,
+    -0.1974082, 1.203459, -0.62066716, -0.04214284,
+    1.0034301, 0.12772137, 1.1859127, 0.690035,
+    0.030040681, -0.0072492315, 0.18085498, 1.7273784,
+    -0.2152873, 1.1123147, 2.048271, 0.15031701,
+    1.7194147, 0.9783655, 2.044341, -0.24221498,
+    -0.82331073, -0.18149722, 0.8100693, 0.76498055,
 ];
 
 /// A `top_k` past every `kv_len` this harness can produce (prompt 8 + the one decode step). The
@@ -1492,7 +1609,8 @@ fn synthetic_deepseek32_top_k_variants_differ_only_in_top_k() {
 /// cross-machine float noise (SIMD width, reduction order) is many orders below it.
 #[test]
 fn synthetic_deepseek32_indexer_selection_is_locked() {
-    /// `cpu_logits("ds32-topk-5", &deepseek32_model())`, blessed 2026-08-10.
+    /// `cpu_logits("ds32-topk-5", &deepseek32_model())`, blessed 2026-08-10,
+    /// re-blessed 2026-08-12 — see [`GOLDEN_DS32_TOPK5`].
     const GOLDEN: [f32; 64] = GOLDEN_DS32_TOPK5;
     let got = cpu_logits("ds32-lock", &deepseek32_model());
     let d = max_abs_diff(&got, &GOLDEN);
