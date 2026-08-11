@@ -1177,45 +1177,6 @@ tier is already covered on a split model — `FileBlockIo::open_shards` stamps
 every shard and refuses one whose length no longer matches what the weights were
 loaded against — so this gap is only about the non-streaming mmap path.
 
-### B56 — ranged parallelism WITHIN one file is not implemented (2026-08-10)
-
-**Tag:** concurrent-pull slice · **Blocked on:** nothing; scoped out, and it
-needs a persisted-state decision before it can be written safely
-
-`infr pull` now fetches several FILES at once (`hub.pull_jobs`,
-`infr_hub::pull`'s `fetch_all`), which is worth ~9x on a split model because a
-single HF CDN connection is the ceiling, not the link (measured on this host
-against the DeepSeek-V3.2 Q2_K objects: 1 connection 8.8 MB/s, 5 connections
-78.7 MB/s aggregate). It does nothing for a model that ships as ONE file —
-`unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` variant is a single 161 GB GGUF, and
-it will still take the ~9 MB/s path. The same gap shows up as the tail of every
-shard set: once fewer files remain than there are workers, the pull falls back
-to one connection.
-
-**The mechanism exists.** HF serves ranges — that is what
-`download::download_to_blob`'s resume already relies on — so N workers could
-each `GET Range: bytes=A-B` and `pwrite` their slice into the one temp file, and
-the existing end-of-body sha256 over the assembled file would still be the
-integrity gate, unchanged.
-
-**What stops it being a small change is RESUME.** Today "how much do I already
-have" is `metadata(tmp).len()`, which is only meaningful because exactly one
-writer appends. With N sparse writers the file's length stops being the amount
-downloaded, so an interrupted pull would need a persisted per-range progress
-sidecar next to the `.dl-` temp, plus a rule for what happens when the range
-plan changes between attempts (different `pull_jobs`, a resized object) and for
-an `If-Range` validator that is now per-range. Getting that wrong reproduces
-exactly the failure class the sha256 gate exists for — a plausible-sized file
-assembled from two different uploads — which cost a day of "the quant is broken"
-debugging once already (memory `verify-gguf-downloads`).
-
-**If it is picked up:** the honest cheap version is to make it opt-in and
-resume-less — a single-file download splits into ranges only when there is no
-partial on disk, and any interruption discards the temp and starts over. That
-keeps the state machine as it is and still fixes the 161 GB single-file case;
-the cost is that a failure at 150 GB is a full restart, which is the trade to
-put in front of the user rather than decide here.
-
 ### B57 — `infr pull` ignores the shutdown latch (2026-08-10)
 
 **Tag:** concurrent-pull slice · **Blocked on:** nothing; PRE-EXISTING, left out
@@ -1234,14 +1195,19 @@ from `metadata(tmp).len()`, and a real 229 GB pull was in fact killed and
 resumed exactly this way. The defect is that the first Ctrl-C appears to do
 nothing.
 
-**The fix is two polls**, both of which keep today's "partial kept for resume"
-contract: `fetch_all`'s `while !stop` becomes
+**The fix is three polls now**, all of which keep today's "partial kept for
+resume" contract: `fetch_all`'s `while !stop` becomes
 `while !stop && !shutdown_requested()` so a fan-out over 236 shards stops
-claiming files, and `stream_into` checks per 64 KiB chunk and returns
-`Error::Aborted`. The second one is why this was not just done: `Aborted` would
-have to travel out through `StreamError`, and the caller must treat it as the
-KEEP-the-partial case rather than the discard case — a distinction the current
-two-variant enum makes by accident of which error it is, not deliberately.
+claiming files; `ranged::worker`'s claim loop gets the same, so a 161 GB
+single-file pull stops claiming CHUNKS (its sidecar already makes that a clean
+stopping point — every completed cell is recorded); and `stream_into` checks per
+64 KiB chunk and returns `Error::Aborted`. The last one is why this was not just
+done: `Aborted` would have to travel out through `StreamError`, and the caller
+must treat it as the KEEP-the-partial case rather than the discard case — a
+distinction the current two-variant enum makes by accident of which error it is,
+not deliberately. `RangedError` already makes exactly that distinction
+deliberately (`Fatal` keeps the partial, `Changed`/`NoRanges` discard it), so
+the ranged half is the cheap one.
 
 ### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
 
@@ -1255,12 +1221,13 @@ resumes under concurrency, a stale `If-Range` restarts rather than splices, a
 sha256 mismatch is refused and unlinked, and a failure stops the fan-out — plus
 one real 229 GB five-shard pull. Not covered:
 
-- **A concurrency bound above 5 in anger.** The real run had five shards and the
-  default is 8, so the default has never actually bounded anything on the
-  network; only the local-origin test has run it at a bound below the file
-  count. Where the per-connection rate finally bends is therefore unmeasured —
-  the 1-vs-5 curl comparison shows five is not it (per-connection throughput
-  ROSE from 8.8 to 15.7 MB/s), and nothing above five was tried.
+- **A concurrency bound above 5 in anger.** SUPERSEDED in part by the ranged
+  slice, which ran the default 8 against one object: aggregate 79.9 MB/s, 10.0
+  MB/s per connection against 15.6 MB/s for a lone one. So the knee is somewhere
+  between 5 and 8 and the AGGREGATE is flat across it (78.7 MB/s at five, 79.9
+  at eight) — this host tops out near 80 MB/s whatever the count. What is still
+  unmeasured is a bound above 8, and whether the ceiling is the link, the CDN or
+  a per-client cap.
 - **Two `infr` processes pulling the same model at once.** The per-blob `flock`
   that serialises them is unchanged and still unit-tested
   (`file_lock_is_exclusive`), but no test starts a second process, and the
@@ -1285,6 +1252,58 @@ one real 229 GB five-shard pull. Not covered:
   was captured from a `script`-allocated pty and inspected as escape sequences
   (one line per shard, `MultiProgress::suspend` clearing the block around each
   log line), not watched on a real terminal.
+
+### B59 — what the ranged-download slice did NOT verify (2026-08-11)
+
+**Tag:** ranged-pull slice coverage · **Blocked on:** nothing; each line is a
+gap, stated so the coverage claim stays honest
+
+Intra-file ranged parallelism (`infr_hub::ranged`, `infr_hub::parts`) is covered
+by twelve tests against the local origin (`infr-hub/src/testhttp.rs`) plus
+eleven unit tests for the sidecar, the grid, the identity check and the
+connection budget — each one shown red before green by breaking what it guards —
+and by one real pull of `unsloth/DeepSeek-V3.2-GGUF:UD-TQ1_0`: 161 280 830 528
+bytes over 2 404 ranges through two deliberate `SIGKILL`s, 33.6 minutes at 80.0
+MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
+
+- **A re-upload of a REAL object mid-download.** The splice guard is exercised
+  only against the local origin. In production the guard that actually fires is
+  the plan-time comparison of HF's LFS oid (`x-linked-etag`) with the one in the
+  sidecar; the per-chunk `If-Range` has never been seen to reject anything,
+  because the CDN answered all 2 404 chunk requests `206`.
+- **A connection freed mid-chunk.** A range worker only tries to grow the
+  fan-out between chunks (`ranged::worker`), so a download already inside its
+  last chunk cannot pick up a permit another file just released. Bounded by one
+  chunk time (64 MiB, seconds), and not worth a wake-up mechanism until
+  something measures it.
+- **An `ETag` that differs between CDN edges.** If one ever did, `If-Range`
+  would make that chunk come back `200` and the file would restart as a single
+  stream — correct, but slow, and nothing would say why beyond one `warn!`.
+  Unobserved in a 2 404-chunk pull, so the risk is bounded but not zero.
+- **Chunk-level retry.** A failed chunk aborts the whole file (its partial and
+  sidecar are kept, so the next run resumes). Retrying that one range in place
+  would be strictly better on a flaky link and is not implemented.
+- **The 64 MiB chunk size was not swept.** It was picked from the two costs it
+  trades (a request per chunk against work lost on interruption) and the real
+  pull confirms the request overhead is not visible at 80 MB/s, but 32 or 128
+  MiB were never run.
+- **`hub.pull_jobs` above 8.** See B58: aggregate throughput is flat between
+  five and eight connections on this host (78.7 → 79.9 MB/s), so the interesting
+  question is now whether anything is left above 8 — untried.
+- **Two processes pulling the same big file.** The per-blob `flock` that
+  serialises them is unchanged and still unit-tested, and both modes take it
+  from the same `.dl-…lock` name so a mode difference cannot dodge it. No test
+  starts a second process.
+- **Windows.** `ranged::fetch_chunk` writes with `std::os::unix::fs::FileExt`,
+  so it is one more unix-only dependency in a crate that already does not build
+  there (B30).
+- **A gated repo over ranges.** The bearer token is attached to the probe and to
+  every chunk request, but reqwest drops `Authorization` across the cross-origin
+  redirect to the CDN (as it should — the CDN URL is pre-signed), and no gated
+  repo was pulled.
+- **The progress block was read, not eyeballed.** One bar per file is what the
+  code does (chunk workers all `inc` the same bar); the real pull ran with
+  stderr redirected to a file, where bars are hidden.
 
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 

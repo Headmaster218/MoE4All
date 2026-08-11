@@ -326,8 +326,8 @@ knobs! {
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
 
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
-    // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one file at a
-    // time", so the env layer must not filter it out.
+    // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",
+    // so the env layer must not filter it out.
     "INFR_PULL_JOBS" => "hub.pull_jobs", Int, Ignored, "4", migrated;
 }
 

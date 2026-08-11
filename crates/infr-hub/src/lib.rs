@@ -8,7 +8,9 @@
 mod download;
 mod http;
 mod model_ref;
+mod parts;
 mod pull;
+mod ranged;
 mod store;
 #[cfg(test)]
 mod testhttp;

@@ -23,9 +23,9 @@ use std::time::Duration;
 /// How long a request occupies a body slot before its bytes are written.
 const BODY_DELAY: Duration = Duration::from_millis(25);
 
-/// The `ETag` every file is served with, and the `If-Range` value a resume must present to be
-/// honoured. One constant because these tests never need two generations of the same object except
-/// where they deliberately present a STALE validator, which is any other string.
+/// The `ETag` a freshly registered file is served with, and the `If-Range` value a resume must
+/// present to be honoured. [`TestHub::reupload`] moves a file to a new one, which is what a
+/// re-published object looks like from the client's side.
 const ETAG: &str = "\"v1\"";
 
 struct FileEntry {
@@ -33,7 +33,20 @@ struct FileEntry {
     /// The sha256 the `X-Linked-Etag` header advertises. Equal to the body's real digest unless a
     /// test made it lie.
     advertised_sha: String,
+    /// This generation's `ETag` — the `If-Range` validator, and what a re-upload changes.
+    etag: String,
     present: bool,
+}
+
+/// One GET body this hub served, as the server saw it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Served {
+    /// The `Range` the request carried, if any: `(first, last)` — `last` absent for an open
+    /// `bytes=N-`.
+    pub(crate) range: Option<(u64, Option<u64>)>,
+    /// Whether the range was actually honoured (a `206`). `false` means the whole object went out,
+    /// which is what a stale `If-Range` or a range-refusing server produces.
+    pub(crate) honoured: bool,
 }
 
 #[derive(Default)]
@@ -41,9 +54,24 @@ struct State {
     files: Mutex<HashMap<String, FileEntry>>,
     in_flight: AtomicUsize,
     peak: AtomicUsize,
-    /// Per file, the `Range` start offset of every request that carried one.
-    ranges: Mutex<HashMap<String, Vec<u64>>>,
+    /// Per file, every GET body served, in the order they arrived.
+    served: Mutex<HashMap<String, Vec<Served>>>,
+    /// Per file, bodies in flight now and the most there ever were. Separate from the global peak
+    /// because "this ONE file reached four connections" is a different claim from "the pull did",
+    /// and the connection hand-off between files can only be seen per file.
+    per_file: Mutex<HashMap<String, (usize, usize)>>,
     stop: AtomicBool,
+    /// Answer every request with the whole object, whatever `Range` it carried — the server that
+    /// cannot be split across.
+    refuse_ranges: AtomicBool,
+    /// Advertise `Accept-Ranges: bytes` anyway. Separate from actually honouring them, because a
+    /// server that advertises ranges and then declines one is the case the mid-flight fallback
+    /// exists for, and it is invisible if the two are the same flag.
+    advertise_ranges: AtomicBool,
+    /// Bodies served so far, and how many are allowed through intact before the rest are cut in
+    /// half — a download dying mid-flight, without a second process to kill.
+    bodies: AtomicUsize,
+    cut_after: AtomicUsize,
 }
 
 pub(crate) struct TestHub {
@@ -57,6 +85,8 @@ impl TestHub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test hub");
         let addr = listener.local_addr().expect("test hub addr");
         let state = Arc::new(State::default());
+        state.cut_after.store(usize::MAX, Ordering::Relaxed); // nothing is cut by default
+        state.advertise_ranges.store(true, Ordering::Relaxed);
         let acceptor = state.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -91,6 +121,7 @@ impl TestHub {
                 FileEntry {
                     body,
                     advertised_sha,
+                    etag: ETAG.to_string(),
                     present: true,
                 },
             );
@@ -121,6 +152,65 @@ impl TestHub {
             .advertised_sha = sha.to_string();
     }
 
+    /// Replace `name`'s bytes with a DIFFERENT object of the same length, under a new `ETag` and a
+    /// new advertised sha256 — a repo whose file was re-published between two runs of `infr pull`.
+    ///
+    /// Same length on purpose: a re-upload that changed the size would be caught by the size check
+    /// alone, and the case worth testing is the one where every number still lines up and only the
+    /// bytes differ. Resuming across it is precisely the splice that produced a corrupt blob and a
+    /// day of "the quant is broken" (memory `verify-gguf-downloads`).
+    pub(crate) fn reupload(&self, name: &str) {
+        let mut files = self.state.files.lock().unwrap();
+        let entry = files.get_mut(name).expect("unknown file");
+        for (j, b) in entry.body.iter_mut().enumerate() {
+            *b = (j.wrapping_mul(17) ^ 0xA5) as u8;
+        }
+        entry.advertised_sha = hex_sha256(&entry.body);
+        entry.etag = "\"v2\"".to_string();
+    }
+
+    /// Re-upload `name` at a DIFFERENT length — the second shape of "the plan no longer describes
+    /// this object", and the one that leaves a partial whose file is longer than the object it is
+    /// now supposed to become.
+    pub(crate) fn reupload_resized(&self, name: &str, len: usize) {
+        let mut files = self.state.files.lock().unwrap();
+        let entry = files.get_mut(name).expect("unknown file");
+        entry.body = (0..len)
+            .map(|j| (j.wrapping_mul(11) ^ 0x5A) as u8)
+            .collect();
+        entry.advertised_sha = hex_sha256(&entry.body);
+        entry.etag = "\"v3\"".to_string();
+    }
+
+    /// Serve the whole object for every request and advertise no `Accept-Ranges`, whatever was
+    /// asked for — an origin, proxy or mirror that does not do ranges.
+    pub(crate) fn refuse_ranges(&self) {
+        self.state.refuse_ranges.store(true, Ordering::Relaxed);
+        self.state.advertise_ranges.store(false, Ordering::Relaxed);
+    }
+
+    /// Advertise `Accept-Ranges: bytes` and then serve the whole object anyway — the mirror or
+    /// middlebox whose advertisement is worth nothing, and the reason a `206` is REQUIRED per chunk
+    /// rather than assumed from the probe.
+    pub(crate) fn lie_about_ranges(&self) {
+        self.state.refuse_ranges.store(true, Ordering::Relaxed);
+    }
+
+    /// Let `n` more bodies out intact, then cut every one after that in half and hang up. Kills a
+    /// download mid-flight from the server's side, which is the only way to interrupt one from
+    /// inside a test.
+    pub(crate) fn cut_after(&self, n: usize) {
+        self.state.cut_after.store(
+            self.state.bodies.load(Ordering::SeqCst) + n,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Stop cutting: the next run of the same download completes normally.
+    pub(crate) fn heal(&self) {
+        self.state.cut_after.store(usize::MAX, Ordering::SeqCst);
+    }
+
     /// Answer `404` for `name` from now on.
     pub(crate) fn remove(&self, name: &str) {
         self.state
@@ -137,10 +227,29 @@ impl TestHub {
         self.state.peak.load(Ordering::Relaxed)
     }
 
+    /// The most bodies of ONE file that were ever in flight at one moment.
+    pub(crate) fn peak_for(&self, name: &str) -> usize {
+        self.state
+            .per_file
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|(_, peak)| *peak)
+            .unwrap_or(0)
+    }
+
     /// The `Range` start offsets served for `name`, in the order they arrived.
     pub(crate) fn ranges_served(&self, name: &str) -> Vec<u64> {
+        self.served_bodies(name)
+            .into_iter()
+            .filter_map(|s| s.range.map(|(start, _)| start))
+            .collect()
+    }
+
+    /// Every GET body served for `name`, in order.
+    pub(crate) fn served_bodies(&self, name: &str) -> Vec<Served> {
         self.state
-            .ranges
+            .served
             .lock()
             .unwrap()
             .get(name)
@@ -155,6 +264,19 @@ impl Drop for TestHub {
         // Unblock the `accept` sitting in the listener thread so it can see the flag.
         let _ = TcpStream::connect(self.addr);
     }
+}
+
+/// `bytes=A-B` → `(A, Some(B))`, `bytes=A-` → `(A, None)`. Anything else is not a range this
+/// client sends, and is treated as no range at all.
+fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    let (first, last) = spec.split_once('-')?;
+    let first = first.trim().parse().ok()?;
+    let last = last.trim();
+    if last.is_empty() {
+        return Some((first, None));
+    }
+    Some((first, Some(last.parse().ok()?)))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -177,7 +299,8 @@ fn serve(state: &State, stream: TcpStream) {
         parts.next().unwrap_or("").to_string(),
     );
 
-    let mut range_from: Option<u64> = None;
+    // Only `bytes=A-B` and `bytes=A-` are ever sent by the download path.
+    let mut range: Option<(u64, Option<u64>)> = None;
     let mut if_range: Option<String> = None;
     loop {
         let mut line = String::new();
@@ -189,13 +312,7 @@ fn serve(state: &State, stream: TcpStream) {
         };
         let value = value.trim().to_string();
         match name.to_ascii_lowercase().as_str() {
-            // Only `bytes=N-` is ever sent by the resume path.
-            "range" => {
-                range_from = value
-                    .strip_prefix("bytes=")
-                    .and_then(|r| r.strip_suffix('-'))
-                    .and_then(|n| n.parse().ok());
-            }
+            "range" => range = parse_range(&value),
             "if-range" => if_range = Some(value),
             _ => {}
         }
@@ -209,11 +326,13 @@ fn serve(state: &State, stream: TcpStream) {
     let entry = {
         let files = state.files.lock().unwrap();
         match files.get(&file) {
-            Some(e) if e.present => Some((e.body.clone(), e.advertised_sha.clone())),
+            Some(e) if e.present => {
+                Some((e.body.clone(), e.advertised_sha.clone(), e.etag.clone()))
+            }
             _ => None,
         }
     };
-    let Some((body, advertised_sha)) = entry else {
+    let Some((body, advertised_sha, etag)) = entry else {
         let _ = write!(
             &stream,
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -223,49 +342,55 @@ fn serve(state: &State, stream: TcpStream) {
     };
 
     // A stale `If-Range` means the object moved on: ignore the Range and send the whole body, which
-    // is what stops a resume splicing new bytes onto an old prefix.
-    let honour_range = if_range.as_deref().is_none_or(|v| v == ETAG);
-    let start = match range_from {
-        Some(n) if honour_range && (n as usize) < body.len() => {
-            state
-                .ranges
-                .lock()
-                .unwrap()
-                .entry(file.clone())
-                .or_default()
-                .push(n);
-            Some(n as usize)
+    // is what stops a resume splicing new bytes onto an old prefix. A hub told to `refuse_ranges`
+    // does the same to every request, however fresh the validator.
+    let ranges_ok = !state.refuse_ranges.load(Ordering::Relaxed);
+    let honour = ranges_ok && if_range.as_deref().is_none_or(|v| v == etag);
+    let advertise = state.advertise_ranges.load(Ordering::Relaxed);
+    let span = match range {
+        Some((first, last)) if honour && (first as usize) < body.len() => {
+            let last = last
+                .unwrap_or(body.len() as u64 - 1)
+                .min(body.len() as u64 - 1);
+            Some((first as usize, last as usize))
         }
-        Some(n) => {
-            state
-                .ranges
-                .lock()
-                .unwrap()
-                .entry(file.clone())
-                .or_default()
-                .push(n);
-            None
-        }
-        None => None,
+        _ => None,
     };
+    if method == "GET" {
+        state
+            .served
+            .lock()
+            .unwrap()
+            .entry(file.clone())
+            .or_default()
+            .push(Served {
+                range,
+                honoured: span.is_some(),
+            });
+    }
 
-    let slice = &body[start.unwrap_or(0)..];
+    let slice = match span {
+        Some((first, last)) => &body[first..=last],
+        None => &body[..],
+    };
     let mut head = String::new();
-    head.push_str(match start {
+    head.push_str(match span {
         Some(_) => "HTTP/1.1 206 Partial Content\r\n",
         None => "HTTP/1.1 200 OK\r\n",
     });
-    if let Some(s) = start {
+    if let Some((first, last)) = span {
         head.push_str(&format!(
-            "Content-Range: bytes {s}-{}/{}\r\n",
-            body.len() - 1,
+            "Content-Range: bytes {first}-{last}/{}\r\n",
             body.len()
         ));
     }
     head.push_str(&format!("Content-Length: {}\r\n", slice.len()));
-    head.push_str(&format!("ETag: {ETAG}\r\n"));
+    head.push_str(&format!("ETag: {etag}\r\n"));
     head.push_str(&format!("X-Linked-Etag: \"{advertised_sha}\"\r\n"));
-    head.push_str("Accept-Ranges: bytes\r\nConnection: close\r\n\r\n");
+    if advertise {
+        head.push_str("Accept-Ranges: bytes\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
     let mut out = &stream;
     if out.write_all(head.as_bytes()).is_err() {
         return;
@@ -276,6 +401,21 @@ fn serve(state: &State, stream: TcpStream) {
         return;
     }
 
+    // Past the cut point the body is truncated and the connection dropped, which is what an
+    // interrupted transfer looks like to the client: fewer bytes than `Content-Length` promised.
+    {
+        let mut per = state.per_file.lock().unwrap();
+        let e = per.entry(file.clone()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = e.1.max(e.0);
+    }
+    let nth = state.bodies.fetch_add(1, Ordering::SeqCst);
+    let slice = if nth >= state.cut_after.load(Ordering::SeqCst) {
+        &slice[..slice.len() / 2]
+    } else {
+        slice
+    };
+
     // The slot is occupied for the whole delay and released once the bytes are handed to the
     // kernel — see the module header for why the pause comes first.
     let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -284,6 +424,7 @@ fn serve(state: &State, stream: TcpStream) {
     let _ = out.write_all(slice);
     let _ = out.flush();
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
+    state.per_file.lock().unwrap().entry(file).or_default().0 -= 1;
     // `shutdown` (unlike a hard close) still delivers what is already in the send buffer, then
     // sends FIN — which is the `Connection: close` the header promised.
     let _ = stream.shutdown(Shutdown::Both);

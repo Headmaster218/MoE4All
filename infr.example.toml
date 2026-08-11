@@ -261,9 +261,11 @@ full_barrier = false
 # ── hub ──────────────────────────────────────────────────────────────────────
 
 [hub]
-# How many files of ONE model download at the same time. A split model is
-# `-NNNNN-of-MMMMM` shards fetched one per connection, and the CONNECTION is the
-# ceiling, not the link (measured here: 1 connection 8.8 MB/s, 5 connections
-# 78.7 MB/s). The bound matters because shard counts come from the repo, not
-# from you — some ship 236. 0 and 1 both mean strictly sequential.
+# How many CONNECTIONS one model's download may use at once. The CONNECTION is
+# the ceiling, not the link (measured here: 1 connection 8.8 MB/s, 5 connections
+# 78.7 MB/s). They go to whatever the model offers: a split model gets one file
+# per connection, a single-file model is split into byte ranges and reassembled
+# (measured on a 161 GB one-file GGUF: 11.4 MB/s at 1, 80.5 MB/s at 8). One
+# number for both, because a bound per axis would multiply — some repos ship 236
+# shards. 0 and 1 both mean strictly one connection, never split.
 pull_jobs = 8

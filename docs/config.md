@@ -274,15 +274,25 @@ prompt text**.
 
 **`[hub]`** — model acquisition (`infr pull`, and the auto-pull `infr run` /
 `infr serve` do when a model is missing). One knob: `pull_jobs`
-(`INFR_PULL_JOBS`, default `8`) — how many files of one model download at the
-same time. A split model is `-NNNNN-of-MMMMM` shards fetched one per connection,
-and it is the CONNECTION that is slow, not the link: measured against the same
-CDN objects, one connection sustained 8.8 MB/s and five sustained 78.7 MB/s —
-15.7 MB/s each, so the per-connection rate rose rather than fell. Shard counts
-come from whoever published the repo (`DeepSeek-V3.2-REAP` ships 236), so the
-bound is what keeps the fan-out from becoming one socket per shard. `0` and `1`
-both mean strictly sequential — the setting for a metered link, or for a proxy
-that objects to several connections from one client.
+(`INFR_PULL_JOBS`, default `8`) — how many CONNECTIONS one model's download may
+use at once. It is the CONNECTION that is slow, not the link: measured against
+the same CDN objects, one connection sustained 8.8 MB/s and five sustained 78.7
+MB/s — 15.7 MB/s each, so the per-connection rate rose rather than fell.
+
+What the connections are spent on depends on the model, and the setting does not
+have to say: a split model is `-NNNNN-of-MMMMM` shards fetched one file per
+connection, while a model shipped as one file is split into byte ranges instead
+and reassembled (on `unsloth/DeepSeek-V3.2-GGUF`'s single 161 GB `UD-TQ1_0`,
+same 60-second window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole
+161 GB pull ran at 80.0 MB/s end to end). One number covers both because a bound
+per axis would multiply — 8 files x 8 ranges is 64 sockets on a repo whose file
+count is the publisher's choice (`DeepSeek-V3.2-REAP` ships 236).
+
+Ranges need the server to support them; one that does not (no `Accept-Ranges`,
+or a `200` where a `206` was asked for) falls back to a single stream, and a
+file of 64 MiB or less is never split at all. `0` and `1` both mean strictly one
+connection — the setting for a metered link, or for a proxy that objects to
+several connections from one client.
 
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,

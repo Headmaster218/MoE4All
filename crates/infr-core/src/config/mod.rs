@@ -612,23 +612,36 @@ cfg_struct! {
     /// Model acquisition from the HuggingFace hub (`infr pull`, and the auto-pull `infr run` and
     /// `infr serve` do when a model is missing).
     HubCfg / PartialHubCfg {
-        /// `INFR_PULL_JOBS`: how many files of one model may download AT THE SAME TIME.
+        /// `INFR_PULL_JOBS`: how many CONNECTIONS one model's download may use at the same time.
         ///
-        /// A split model is `-NNNNN-of-MMMMM` shards that are fetched one per connection, and a
-        /// single HTTPS connection to the HF CDN is the ceiling, not the link. Measured against
-        /// `unsloth/DeepSeek-V3.2-GGUF`'s Q2_K shards (`curl` to `/dev/null`, 25 s per run): one
-        /// connection sustained 8.8 MB/s, five sustained 78.7 MB/s — 15.7 MB/s EACH, so the
-        /// per-connection rate went UP rather than down. Five connections were nowhere near the
-        /// point where they start competing, which is why the default sits above five.
+        /// A single HTTPS connection to the HF CDN is the ceiling, not the link, so a pull is
+        /// worth spreading over several. Measured against `unsloth/DeepSeek-V3.2-GGUF`'s Q2_K
+        /// shards (`curl` to `/dev/null`, 25 s per run): one connection sustained 8.8 MB/s, five
+        /// sustained 78.7 MB/s — 15.7 MB/s EACH, so the per-connection rate went UP rather than
+        /// down. Five were nowhere near the point where they start competing, which is why the
+        /// default sits above five.
         ///
-        /// It also has to stay a fan-OUT rather than a fan-EVERYTHING: shard counts are set by
-        /// whoever published the repo (`DeepSeek-V3.2-REAP` ships 236 shards), so "one connection
-        /// per shard" is not a bound at all. Each in-flight download holds its own socket, its own
-        /// `.dl-` temp file and its own progress LINE — and a bar block taller than the terminal
+        /// The connections are spent on whatever the model gives them to do, and the setting
+        /// deliberately does NOT say which:
+        ///
+        /// * a split model is `-NNNNN-of-MMMMM` shards, fetched one file per connection;
+        /// * a model shipped as ONE file — `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is a single
+        ///   161 GB GGUF — is split into byte ranges instead, fetched several at a time and
+        ///   reassembled (measured on that object through `infr pull` itself, same 60-second
+        ///   window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole 161 GB pull ran at
+        ///   80.0 MB/s end to end);
+        /// * and the tail of a shard set, where fewer files remain than there are connections,
+        ///   gives the leftovers to the files still going.
+        ///
+        /// ONE number for both because the axes MULTIPLY: a per-file bound and a per-range bound
+        /// of 8 each is 64 sockets on a repo whose file count is the publisher's choice
+        /// (`DeepSeek-V3.2-REAP` ships 236 shards). Every in-flight transfer holds a socket, and
+        /// each file holds a temp file and a progress LINE — a bar block taller than the terminal
         /// is the first of those to stop being free.
         ///
-        /// `0` and `1` both mean strictly sequential — today's behaviour, and the value to set
-        /// when a proxy or a metered link wants exactly one connection.
+        /// `0` and `1` both mean strictly one connection: one file at a time, never split. That is
+        /// the pre-concurrency behaviour, and the value to set when a proxy or a metered link wants
+        /// exactly one connection.
         pull_jobs: usize = 8,
     }
 }

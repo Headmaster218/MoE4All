@@ -8,6 +8,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr pull` splits ONE file across connections too.** Shard-level
+  concurrency did nothing for a model that ships as a single file, which most
+  do: `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is one 161 GB GGUF and still
+  went over one connection. It is now fetched as a grid of 64 MiB byte ranges,
+  several at a time, and reassembled — measured on that object, in the same
+  60-second window: 11.4 MB/s before, 80.5 MB/s after, and the whole 161 GB pull
+  ran at 80.0 MB/s end to end (33.6 minutes against a projected 3.9 hours).
+  `hub.pull_jobs` (default `8`) is now the TOTAL connection bound rather than a
+  file count, so shards and ranges share one allowance and a 236-shard repo
+  cannot turn into 64 sockets; `0` and `1` still mean strictly one connection,
+  never split. An interrupted ranged download resumes from a per-range sidecar
+  next to the partial, and a partial whose object was re-published upstream is
+  discarded rather than continued — a resumed splice of two uploads is a
+  plausible-sized corrupt file, and it is bound to HF's LFS sha256 rather than
+  to an `ETag` so a different CDN edge cannot look like a different file.
+  Servers that do not serve ranges (no `Accept-Ranges`, or a `200` where a `206`
+  was asked for) fall back to the single stream, files of 64 MiB or less are
+  never split, and the end-of-download sha256 gate is unchanged: one bar per
+  file, one digest, one decision.
+
 - **`infr pull` fetches a split model's shards concurrently.** A single
   connection to the HF CDN is what caps a download, not the link — measured
   against the same objects, one connection sustained 8.8 MB/s and five sustained

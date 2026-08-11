@@ -8,7 +8,7 @@
 //! are [`crate::download`]'s business.
 
 use crate::download::download_to_blob;
-use crate::http::{api_client, head_client, token};
+use crate::http::{api_client, head_client, token, ConnBudget};
 use crate::{model_ref::ModelRef, store::Store};
 use indicatif::MultiProgress;
 use infr_core::config::Config;
@@ -130,6 +130,7 @@ fn fetch_and_link(
     snap: &Path,
     repo: &str,
     filename: &str,
+    budget: &ConnBudget,
     progress: &MultiProgress,
 ) -> Result<PathBuf> {
     let filename = check_relative(filename)?;
@@ -147,6 +148,7 @@ fn fetch_and_link(
                 filename,
                 want.as_deref(),
                 None, // model blobs are legitimately multi-GB — never capped
+                budget,
                 progress,
             )?
             .1
@@ -163,12 +165,21 @@ fn fetch_and_link(
     Ok(link)
 }
 
-/// Fetch and link every file in `files`, at most `jobs` of them AT THE SAME TIME.
+/// Fetch and link every file in `files`, over at most `jobs` connections IN TOTAL.
 ///
-/// One HTTPS connection to the HF CDN — not the link — is what caps a single-file download (see
-/// [`infr_core::config::HubCfg::pull_jobs`] for the measurement), so a split model's shards are
-/// fetched on several connections at once. `jobs` bounds that fan-out: shard counts come from
-/// whoever published the repo, so "one connection per shard" is not a bound.
+/// One HTTPS connection to the HF CDN — not the link — is what caps a download (see
+/// [`infr_core::config::HubCfg::pull_jobs`] for the measurement), and there are two ways to spend
+/// more of them: on several FILES at once, and on several RANGES of one file
+/// ([`crate::ranged`]). `jobs` bounds the two TOGETHER, through one [`ConnBudget`] shared by
+/// everything this pull starts — the alternative, a bound per axis, multiplies into `jobs × jobs`
+/// sockets on a repo whose shard count is the publisher's choice (`DeepSeek-V3.2-REAP` ships 236).
+///
+/// How the allowance divides is decided by the work rather than by a setting. Each file worker
+/// holds one permit for its lifetime, so `min(files, jobs)` of them run and a 236-shard repo has
+/// nothing left over and splits nothing; a single-file repo starts one worker and its file takes
+/// the other seven permits as ranges; and in between, a worker that runs out of files returns its
+/// permit to whichever download is still going. Range workers only ever TRY to take a permit, so
+/// they can never keep a file worker waiting.
 ///
 /// The work queue is one shared cursor, so each file is handed to exactly one worker and the order
 /// is still shard 1 first. A failure sets `stop`, which keeps the other workers from CLAIMING more
@@ -176,8 +187,8 @@ fn fetch_and_link(
 /// missing shard 1 would be followed by cheerfully downloading the other 200 GB. That matches the
 /// sequential loop this replaced, which stopped at the first `?`.
 ///
-/// `jobs = 0` and `jobs = 1` both mean strictly sequential, which is the pre-concurrency behaviour
-/// and stays available for a metered link.
+/// `jobs = 0` and `jobs = 1` both mean strictly one connection: one file at a time, unsplit, which
+/// is the pre-concurrency behaviour and stays available for a metered link.
 fn fetch_all(
     origin: &str,
     blobs: &Path,
@@ -187,7 +198,11 @@ fn fetch_all(
     jobs: usize,
     progress: &MultiProgress,
 ) -> Result<()> {
-    let workers = files.len().min(jobs.max(1));
+    let budget = ConnBudget::new(jobs.max(1));
+    // One permit per file worker, taken up front — so `workers` is what the budget actually
+    // granted rather than a number computed alongside it that could drift from it.
+    let primaries = budget.acquire_up_to(files.len().min(jobs.max(1)));
+    let workers = primaries.len();
     if files.len() > 1 {
         info!(
             "hf:{repo}: {} files to fetch, {workers} at a time",
@@ -197,14 +212,21 @@ fn fetch_all(
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let failures: Vec<Error> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
+        let handles: Vec<_> = primaries
+            .into_iter()
+            .map(|permit| {
                 scope.spawn(|| {
+                    // Dropped when this worker runs out of files, handing its connection to
+                    // whichever download is still going — the tail of a shard set is one file with
+                    // the whole budget, not one file on one connection.
+                    let _permit = permit;
                     while !stop.load(Ordering::Relaxed) {
                         let Some(f) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             break;
                         };
-                        if let Err(e) = fetch_and_link(origin, blobs, snap, repo, f, progress) {
+                        if let Err(e) =
+                            fetch_and_link(origin, blobs, snap, repo, f, &budget, progress)
+                        {
                             stop.store(true, Ordering::Relaxed);
                             return Some(e);
                         }
@@ -475,12 +497,15 @@ fn fetch_companions(
         // file is not LFS, so no digest exists; a HEAD transport error degrades to the same
         // unverified-but-capped path rather than skipping the companion.
         let want = head_lfs_sha(origin, repo, name).ok().flatten();
+        // No connection budget: a companion is a sub-2-KB file and splitting it across ranges
+        // would be more requests than bytes.
         let dl = download_to_blob(
             &url,
             blobs,
             name,
             want.as_deref(),
             Some(MAX_COMPANION_BYTES),
+            &ConnBudget::new(0),
             progress,
         );
         match dl {
@@ -512,6 +537,7 @@ fn write_text(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parts;
     use crate::testhttp::TestHub;
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -695,18 +721,17 @@ mod tests {
         }
     }
 
-    /// The overwhelmingly common case — ONE file — goes over exactly ONE connection however high
-    /// the bound is set, and still lands.
+    /// A file of one chunk or less is fetched by ONE connection however high the bound is set —
+    /// the "small files are not split at all" rule, whose threshold is the chunk size itself
+    /// ([`crate::parts::CHUNK_BYTES`]) so that there is one number rather than two.
     ///
     /// The assertion is on the CONNECTION count, not the worker count, and that is deliberate:
     /// `min(files, jobs)` spawning one worker is today's reason, but an extra worker that finds the
-    /// queue empty would be harmless, whereas a second connection would not. So this guards the
-    /// change actually capable of breaking the single-file path — splitting one file across ranges
-    /// (backlog B56) — rather than the arithmetic that happens to make it true now.
+    /// queue empty would be harmless, whereas a second connection would not.
     #[test]
-    fn a_single_file_never_fans_out() {
+    fn a_small_file_is_not_split() {
         let hub = TestHub::start();
-        let files = hub.add_shards("m-solo", 1, 30_000);
+        let files = hub.add_shards("m-solo", 1, parts::chunk_bytes() as usize - 1);
         let cache = TempRepo::new();
         let (blobs, snap) = (cache.blobs(), cache.snapshot());
 
@@ -869,5 +894,420 @@ mod tests {
             "{fetched} of {} shards were fetched anyway",
             files.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ranged (intra-file) parallelism
+    // -----------------------------------------------------------------------
+
+    /// A file big enough to be split: ten cells of the test grid.
+    fn big() -> usize {
+        10 * parts::chunk_bytes() as usize
+    }
+
+    /// The chunk requests the hub honoured for `f`, as `(start, end)`, IN THE ORDER THEY ARRIVED —
+    /// so a test can slice off "what the second run asked for".
+    ///
+    /// The one-byte planning probe (`bytes=0-0`) is filtered out: it is how the size and the
+    /// server's range support are learned, not a piece of the file.
+    fn chunk_spans(hub: &TestHub, f: &str) -> Vec<(u64, u64)> {
+        hub.served_bodies(f)
+            .into_iter()
+            .filter(|s| s.honoured && s.range != Some((0, Some(0))))
+            .filter_map(|s| s.range)
+            .map(|(a, b)| (a, b.expect("a chunk request is a closed range")))
+            .collect()
+    }
+
+    /// The ranged partial and its sidecar for `f` inside `blobs`.
+    fn partial_of(blobs: &Path, f: &str) -> PathBuf {
+        blobs.join(crate::download::ranged_partial_name(f))
+    }
+
+    /// The starts of the cells a partial has already got, per its own sidecar.
+    fn landed_starts(blobs: &Path, f: &str) -> Vec<u64> {
+        let plan = parts::load(&partial_of(blobs, f)).expect("an interrupted run leaves a plan");
+        (0..plan.chunks())
+            .filter(|i| plan.is_done(*i))
+            .map(|i| plan.range(i).0)
+            .collect()
+    }
+
+    fn pull_one(hub: &TestHub, cache: &TempRepo, files: &[String], jobs: usize) -> Result<()> {
+        fetch_all(
+            &hub.origin(),
+            &cache.blobs(),
+            &cache.snapshot(),
+            "org/repo",
+            files,
+            jobs,
+            &progress::group(),
+        )
+    }
+
+    /// The core claim: a file assembled from N ranges is byte-for-byte the file one stream would
+    /// have fetched, and is stored under the sha256 of exactly those bytes.
+    ///
+    /// Both halves are downloaded from the same origin in the same test so the comparison is
+    /// between the two PATHS and not between a fixture and itself — and the request log is asserted
+    /// on too, because "identical to the single stream" is only interesting if the ranged side
+    /// really did use ranges.
+    #[test]
+    fn a_ranged_file_equals_the_single_stream_fetch() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-wide", 1, big());
+        let f = &files[0];
+        let (ranged, single) = (TempRepo::new(), TempRepo::new());
+
+        pull_one(&hub, &ranged, &files, 8).unwrap();
+        let spans = chunk_spans(&hub, f);
+        assert_eq!(
+            spans.len(),
+            10,
+            "the file should have been fetched in cells"
+        );
+        // The cells tile the file exactly: no gap, no overlap, no byte fetched twice.
+        let mut sorted = spans.clone();
+        sorted.sort();
+        let mut want = 0u64;
+        for (a, b) in &sorted {
+            assert_eq!(*a, want, "cells must tile: {sorted:?}");
+            want = b + 1;
+        }
+        assert_eq!(want, big() as u64, "cells must cover the file: {sorted:?}");
+
+        pull_one(&hub, &single, &files, 1).unwrap();
+
+        let a = fs::read(ranged.snapshot().join(f)).unwrap();
+        let b = fs::read(single.snapshot().join(f)).unwrap();
+        assert_eq!(a, b, "the ranged file differs from the single-stream file");
+        assert_eq!(a, hub.body(f));
+        assert!(ranged.blobs().join(hub.sha(f)).exists());
+        assert!(single.blobs().join(hub.sha(f)).exists());
+        // Nothing is left behind once the blob is committed.
+        assert!(!partial_of(&ranged.blobs(), f).exists());
+        assert!(parts::load(&partial_of(&ranged.blobs(), f)).is_none());
+    }
+
+    /// Killed mid-flight, the cells that LANDED stay landed: the next run fetches the rest and
+    /// nothing else, and the assembled file still verifies.
+    ///
+    /// This is the case a sparse download cannot do without the sidecar — the temp file's length
+    /// says nothing about how much of it is real — and "it resumed" is asserted as "it did not
+    /// re-request what it already had", since a run that quietly started over would also produce a
+    /// correct file and prove nothing.
+    #[test]
+    fn a_ranged_download_resumes_the_cells_it_missed() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-cut", 1, big());
+        let f = &files[0];
+        let cache = TempRepo::new();
+
+        // The probe plus three cells get through; everything after that is truncated.
+        hub.cut_after(4);
+        pull_one(&hub, &cache, &files, 4).expect_err("a cut body must fail the pull");
+        let landed = landed_starts(&cache.blobs(), f);
+        assert!(
+            (1..10).contains(&landed.len()),
+            "the interrupted run should have kept some but not all cells, got {landed:?}"
+        );
+
+        hub.heal();
+        let before = chunk_spans(&hub, f).len();
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        let second = chunk_spans(&hub, f).split_off(before);
+        assert!(!second.is_empty(), "the second run fetched nothing");
+        for start in &landed {
+            assert!(
+                !second.iter().any(|(a, _)| a == start),
+                "cell at {start} was already on disk and was fetched again: {second:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(cache.snapshot().join(f)).unwrap(),
+            hub.body(f),
+            "the resumed file is not the object"
+        );
+        assert!(cache.blobs().join(hub.sha(f)).exists());
+    }
+
+    /// `hub.pull_jobs` may change between an interrupted run and the next one. The grid is fixed by
+    /// the OBJECT (size and chunk size, both recorded in the sidecar) rather than by the worker
+    /// count, so a different job count claims different cells of the same plan instead of
+    /// re-planning — which is the step that could otherwise write a cell at an offset the file was
+    /// never planned on.
+    #[test]
+    fn the_plan_survives_a_changed_job_count() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-jobs", 1, big());
+        let f = &files[0];
+        let cache = TempRepo::new();
+
+        hub.cut_after(3);
+        pull_one(&hub, &cache, &files, 2).expect_err("a cut body must fail the pull");
+        let plan = parts::load(&partial_of(&cache.blobs(), f)).expect("a plan survives the kill");
+        let landed = landed_starts(&cache.blobs(), f);
+        assert!(!landed.is_empty(), "nothing landed, so nothing is resumed");
+
+        hub.heal();
+        pull_one(&hub, &cache, &files, 7).unwrap();
+
+        let after = parts::load(&partial_of(&cache.blobs(), f));
+        assert!(after.is_none(), "the sidecar outlived the download");
+        assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+        assert!(cache.blobs().join(hub.sha(f)).exists());
+        // The second run used the FIRST run's grid, not one sized for seven workers.
+        assert_eq!(plan.chunk, parts::chunk_bytes());
+        assert_eq!(plan.chunks(), 10);
+    }
+
+    /// The object is REPLACED between two runs, at the same length. Continuing the partial would
+    /// splice half of one upload onto half of another at exactly the right size — the failure that
+    /// read as "this quant is broken" for a day (memory `verify-gguf-downloads`).
+    ///
+    /// The partial must be thrown away and every cell fetched again, and the blob must be the NEW
+    /// object. Asserting on the request log is what makes this test able to fail: a spliced result
+    /// would be caught by the sha256 gate as an error, but a resume that happened to re-fetch
+    /// everything anyway would pass a bytes-only assertion while leaving the bug in place.
+    #[test]
+    fn a_reupload_between_runs_restarts_rather_than_splicing() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-reup", 1, big());
+        let f = &files[0];
+        let cache = TempRepo::new();
+        let old_sha = hub.sha(f);
+
+        hub.cut_after(4);
+        pull_one(&hub, &cache, &files, 4).expect_err("a cut body must fail the pull");
+        let landed = landed_starts(&cache.blobs(), f);
+        assert!(
+            !landed.is_empty(),
+            "nothing landed, so nothing could splice"
+        );
+
+        hub.heal();
+        hub.reupload(f); // same size, new bytes, new ETag, new advertised sha256
+        let before = chunk_spans(&hub, f).len();
+        pull_one(&hub, &cache, &files, 4).unwrap();
+        let second = chunk_spans(&hub, f).split_off(before);
+
+        // Every cell of the new object was fetched — the stale ones were NOT kept.
+        let mut starts: Vec<u64> = second.iter().map(|(a, _)| *a).collect();
+        starts.sort();
+        starts.dedup();
+        assert_eq!(
+            starts.len(),
+            10,
+            "a re-upload must re-fetch the whole object, got {starts:?}"
+        );
+        let got = fs::read(cache.snapshot().join(f)).unwrap();
+        assert_eq!(got, hub.body(f), "the blob is not the new object");
+        assert_ne!(hub.sha(f), old_sha, "the fixture did not actually change");
+        assert!(cache.blobs().join(hub.sha(f)).exists());
+        assert!(!cache.blobs().join(&old_sha).exists());
+    }
+
+    /// The other way a plan stops describing its object: the file is re-uploaded at a DIFFERENT
+    /// length. The partial's bytes have to GO, not just its flags — a temp file left longer than
+    /// the object it is now supposed to hold assembles to the wrong size even when every cell of
+    /// the new plan lands.
+    #[test]
+    fn a_resized_object_discards_the_partial() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-resize", 1, big());
+        let f = &files[0];
+        let cache = TempRepo::new();
+
+        hub.cut_after(4);
+        pull_one(&hub, &cache, &files, 4).expect_err("a cut body must fail the pull");
+        assert!(!landed_starts(&cache.blobs(), f).is_empty());
+
+        hub.heal();
+        hub.reupload_resized(f, big() / 2); // half the size, all new bytes
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        let got = fs::read(cache.snapshot().join(f)).unwrap();
+        assert_eq!(got.len(), big() / 2, "the old partial's length survived");
+        assert_eq!(got, hub.body(f));
+        assert!(cache.blobs().join(hub.sha(f)).exists());
+    }
+
+    /// The sha256 gate still fires on the ranged path, and takes the sidecar with it: a partial
+    /// whose bytes are known bad must not be resumable, or the next run "continues" corruption.
+    #[test]
+    fn a_ranged_sha_mismatch_is_refused_and_unlinked() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-wrong", 1, big());
+        let f = &files[0];
+        hub.lie_about_sha(f, SHA_A);
+        let cache = TempRepo::new();
+
+        let err = pull_one(&hub, &cache, &files, 6)
+            .expect_err("a sha256 mismatch must fail the pull")
+            .to_string();
+        assert!(err.contains("sha256 mismatch"), "{err}");
+
+        let blobs = cache.blobs();
+        assert!(!blobs.join(SHA_A).exists(), "a mismatched blob was stored");
+        assert!(!blobs.join(hub.sha(f)).exists());
+        assert!(!cache.snapshot().join(f).exists(), "a bad file was linked");
+        assert!(!partial_of(&blobs, f).exists(), "bad bytes kept for resume");
+        assert!(parts::load(&partial_of(&blobs, f)).is_none());
+    }
+
+    /// A server that does not do ranges gets a single stream, and the file still lands. The
+    /// fallback is what keeps this feature from being a hard dependency on an origin behaviour
+    /// nothing guarantees.
+    #[test]
+    fn a_server_that_refuses_ranges_falls_back_to_one_stream() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-noranges", 1, big());
+        let f = &files[0];
+        hub.refuse_ranges();
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 8).unwrap();
+
+        assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+        assert!(cache.blobs().join(hub.sha(f)).exists());
+        assert!(chunk_spans(&hub, f).is_empty(), "ranges were used anyway");
+        assert_eq!(
+            hub.peak_concurrent_bodies(),
+            1,
+            "a range-refusing server must not be hammered with connections"
+        );
+        assert!(!partial_of(&cache.blobs(), f).exists());
+    }
+
+    /// A server that ADVERTISES ranges and then serves the whole object anyway is caught mid-flight
+    /// and the download falls back to one stream.
+    ///
+    /// The `206`-per-chunk requirement is what catches it: a `200` carries the object from byte 0,
+    /// and writing that at a chunk's offset is a spliced file of exactly the right length. So the
+    /// bytes are refused, the holed partial is thrown away rather than left for a resume that could
+    /// not use it, and the file is fetched again in one piece.
+    #[test]
+    fn a_server_that_lies_about_ranges_falls_back_mid_flight() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-liar", 1, big());
+        let f = &files[0];
+        hub.lie_about_ranges();
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+        assert!(cache.blobs().join(hub.sha(f)).exists());
+        assert!(
+            chunk_spans(&hub, f).is_empty(),
+            "a 200 was treated as a chunk"
+        );
+        assert!(
+            !partial_of(&cache.blobs(), f).exists(),
+            "a holed partial was left behind for a resume that cannot use it"
+        );
+    }
+
+    /// The TOTAL bound holds across both axes at once. Three files of ten cells each with a bound
+    /// of four may never put a fifth body in flight — not `4 files × 4 ranges`, and not one
+    /// connection per cell.
+    ///
+    /// An implementation that bounded the two axes separately would peak at 16 here, and one that
+    /// split without a budget at 30, so the ceiling is what this asserts; the floor is asserted too,
+    /// or "never exceeded four" would also be true of a sequential download.
+    #[test]
+    fn the_bound_covers_files_and_ranges_together() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-bound", 3, big());
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        let peak = hub.peak_concurrent_bodies();
+        assert!(peak <= 4, "peak {peak} bodies in flight, bound was 4");
+        assert!(peak >= 3, "peak {peak}: the fan-out did not happen");
+        for f in &files {
+            assert_eq!(
+                fs::read(cache.snapshot().join(f)).unwrap(),
+                hub.body(f),
+                "{f}"
+            );
+        }
+    }
+
+    /// ONE file spends the WHOLE allowance on itself — the case this slice exists for, since a
+    /// 161 GB single-file model has no shards to spread over connections.
+    #[test]
+    fn one_big_file_uses_the_whole_budget() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-alone", 1, big());
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        let peak = hub.peak_concurrent_bodies();
+        assert_eq!(peak, 4, "one file should have used all four connections");
+        assert_eq!(
+            fs::read(cache.snapshot().join(&files[0])).unwrap(),
+            hub.body(&files[0])
+        );
+    }
+
+    /// A file that finishes hands its connection to the one still going.
+    ///
+    /// This is the tail of every shard set: once fewer files remain than there are connections, a
+    /// download that fixed its fan-out when it started would crawl on one connection while the rest
+    /// of the allowance sat idle. Here the small file takes a worker and the big one starts with
+    /// only ONE spare connection — the assertion is that the big file's OWN peak reaches the whole
+    /// bound anyway, which it can only do by picking up the permit the small file gave back.
+    #[test]
+    fn a_finished_file_hands_over_its_connection() {
+        let hub = TestHub::start();
+        let small = hub.add_shards("m-tail-small", 1, 1024)[0].clone();
+        let large = hub.add_shards("m-tail-large", 1, big())[0].clone();
+        let files = vec![small.clone(), large.clone()];
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 3).unwrap();
+
+        // Two file workers, so the large file could only take ONE spare connection at its start.
+        assert_eq!(
+            hub.peak_for(&large),
+            3,
+            "the large file never grew past {} connections",
+            hub.peak_for(&large)
+        );
+        assert!(hub.peak_concurrent_bodies() <= 3, "the bound was 3");
+        assert_eq!(
+            fs::read(cache.snapshot().join(&large)).unwrap(),
+            hub.body(&large)
+        );
+        assert_eq!(
+            fs::read(cache.snapshot().join(&small)).unwrap(),
+            hub.body(&small)
+        );
+    }
+
+    /// `hub.pull_jobs = 1` stays ONE connection and one request per file: no splitting, and not even
+    /// the planning probe — the setting for a metered link or a proxy that objects to parallelism
+    /// must not quietly cost an extra round trip.
+    #[test]
+    fn one_job_never_splits_a_file() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-metered", 1, big());
+        let f = &files[0];
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 1).unwrap();
+
+        assert_eq!(hub.peak_concurrent_bodies(), 1);
+        assert_eq!(
+            hub.served_bodies(f).len(),
+            1,
+            "one job means one request: {:?}",
+            hub.served_bodies(f)
+        );
+        assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
     }
 }

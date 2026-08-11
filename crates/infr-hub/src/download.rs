@@ -1,11 +1,14 @@
-//! The streaming blob download: resume (HTTP Range + `If-Range`), a progress bar, a size cap for
-//! the unverified case, and the end-of-body sha256 gate that decides whether the bytes become a
-//! content-addressed blob at all.
+//! One blob's download: choosing between a single stream and a ranged fan-out, resume for both,
+//! a progress bar, a size cap for the unverified case, and the end-of-body sha256 gate that decides
+//! whether the bytes become a content-addressed blob at all.
 //!
-//! Everything here is about ONE file. Which files a model is made of, and how many are fetched at
-//! a time, belongs to [`crate::pull`].
+//! Everything here is about ONE file. Which files a model is made of, and how many are fetched at a
+//! time, belongs to [`crate::pull`]; how one file is split across connections belongs to
+//! [`crate::ranged`], and what an interrupted split leaves on disk to [`crate::parts`].
 
-use crate::http::{download_client, token};
+use crate::http::{download_client, token, ConnBudget};
+use crate::parts;
+use crate::ranged::{self, RangedError};
 use indicatif::{MultiProgress, ProgressBar};
 use infr_core::error::{Error, Result};
 use infr_core::progress::{self, Unit};
@@ -39,7 +42,15 @@ use tracing::{debug, info};
 /// chunked encoding, which is exactly why the loop counts for itself.
 ///
 /// `progress` owns the bar's line. Several of these run at once (one per shard), so the bar joins a
-/// group rather than addressing the terminal itself — see [`infr_core::progress::group`].
+/// group rather than addressing the terminal itself — see [`infr_core::progress::group`]. There is
+/// ONE bar per file however many connections carry it: a ranged download's chunk workers all
+/// advance the same line, because "which slice of shard 3 is at 40%" is not a thing anyone wants
+/// eight lines of.
+///
+/// `budget` is the pull's whole allowance of simultaneous connections ([`ConnBudget`]). A single
+/// large file spends what the file fan-out left over on fetching ITSELF in parallel; when there is
+/// nothing spare — `hub.pull_jobs = 1`, or a 236-shard repo with every permit already on a file —
+/// the download is one stream, exactly as before.
 ///
 /// The HF bearer token ([`crate::http::token`]) is attached when the environment carries one, so a
 /// gated repo works the same on this path as on the metadata calls.
@@ -49,6 +60,7 @@ pub(crate) fn download_to_blob(
     label: &str,
     expected_sha: Option<&str>,
     max_bytes: Option<u64>,
+    budget: &ConnBudget,
     progress: &MultiProgress,
 ) -> Result<(PathBuf, String, u64)> {
     fs::create_dir_all(blobs).map_err(Error::from)?;
@@ -63,14 +75,24 @@ pub(crate) fn download_to_blob(
     } else {
         debug!("no expected sha256 for {label}; download will not be integrity-checked");
     }
+    let obj = Object {
+        url,
+        label,
+        oid: expected_sha,
+    };
     let partial = partial_name(label);
-    let tmp = blobs.join(&partial);
-    let meta = blobs.join(format!("{partial}.meta")); // stored If-Range validator for the partial
+    let temps = Temps {
+        stream: blobs.join(&partial),
+        meta: blobs.join(format!("{partial}.meta")), // If-Range validator for a stream partial
+        ranged: blobs.join(ranged_partial_name(label)),
+    };
 
     // Serialize concurrent pulls of the SAME blob (auto-pull racing a manual `pull`, two `run`s).
     // An advisory `flock` on a per-blob lockfile is chosen over unique-per-process temp names ON
     // PURPOSE: it PRESERVES resume — the one shared temp keeps accumulating across processes instead
-    // of each starting a fresh partial from byte 0. The lock releases when `_lock` drops.
+    // of each starting a fresh partial from byte 0. The lock releases when `_lock` drops. It is
+    // named off the STREAM partial for both modes, so two processes that picked different modes for
+    // the same blob still serialise.
     let _lock = FileLock::acquire(&blobs.join(format!("{partial}.lock")))?;
     // Re-check the content-addressed short-circuit now that we hold the lock: a racing process may
     // have finished this exact blob while we waited.
@@ -82,10 +104,188 @@ pub(crate) fn download_to_blob(
         }
     }
 
-    let have = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    // Ranged first when there is a ranged partial to continue, or when a fresh download has budget
+    // to split; `None` means "not this one" and falls through to the single stream below.
+    let (tmp, pb) = match fetch_ranged(&obj, &temps, max_bytes, budget, progress)? {
+        Some(done) => done,
+        None => fetch_stream(&obj, &temps, max_bytes, progress)?,
+    };
+    commit(&obj, &temps, &tmp, blobs, &pb, progress)
+}
+
+/// The object being fetched: where it is, what to call it on screen, and the LFS sha256 HF says it
+/// hashes to. Passed as one value because every stage of a download needs all three — the request,
+/// the progress line, the identity a partial is bound to and the gate at the end.
+pub(crate) struct Object<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) label: &'a str,
+    /// HF's advertised LFS sha256, or `None` for a non-LFS file (which is then unverifiable).
+    pub(crate) oid: Option<&'a str>,
+}
+
+/// The three on-disk names one download can leave behind, all derived from [`temp_stem`]: the
+/// single-stream partial, its `If-Range` validator, and the ranged partial (whose `.plan` sidecar
+/// hangs off it in [`crate::parts`]).
+struct Temps {
+    stream: PathBuf,
+    meta: PathBuf,
+    ranged: PathBuf,
+}
+
+/// Hash the assembled temp file, gate it on the advertised sha256, and — only then — commit it as
+/// the content-addressed blob.
+///
+/// This is the same last line of defence it has always been, and it is deliberately the ONE place
+/// that decides: whether the bytes arrived on one connection or on eight, whether they were resumed
+/// or not, they become a blob here or not at all.
+fn commit(
+    obj: &Object,
+    temps: &Temps,
+    tmp: &Path,
+    blobs: &Path,
+    pb: &ProgressBar,
+    progress: &MultiProgress,
+) -> Result<(PathBuf, String, u64)> {
+    let label = obj.label;
+    // Hash the COMPLETE file ONCE at the end. The old code folded the on-disk prefix into the digest
+    // on every resume (O(K·size) over K flaky-link retries); since the whole body is sha-verified
+    // here anyway, a single final pass is equivalent and cheaper.
+    let mut hasher = Sha256::new();
+    hash_file(tmp, &mut hasher)?;
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let size = fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+
+    // Integrity gate: the body MUST hash to HF's advertised LFS sha256. On mismatch discard the temp
+    // (do NOT keep it for resume — a resumed corrupt prefix stays corrupt) and fail loudly.
+    if let Err(e) = verify_sha(label, &hex, obj.oid) {
+        pb.abandon_with_message(format!("⚠ {label} sha256 mismatch"));
+        let _ = fs::remove_file(tmp);
+        let _ = fs::remove_file(&temps.meta);
+        parts::discard(&temps.ranged);
+        return Err(e);
+    }
+    pb.finish_with_message(format!("✓ {label} ({} MiB)", size / (1024 * 1024)));
+
+    let blob = blobs.join(&hex); // HF blob name = bare sha256 hex
+    fs::rename(tmp, &blob).map_err(Error::from)?;
+    let _ = fs::remove_file(&temps.meta); // partial committed; validator no longer needed
+    let _ = fs::remove_file(parts::plan_path(&temps.ranged));
+    progress.suspend(|| info!("Saved blob: {blob:?}"));
+    Ok((blob, hex, size))
+}
+
+/// Try to fetch the object as a grid of ranges, returning `Ok(None)` when it should be a single
+/// stream instead: no budget for a second connection, a capped (companion) download, an object of
+/// one chunk or less, or a server that will not serve ranges.
+///
+/// A stream partial on disk also keeps its own mode: it is an append-only prefix, and continuing it
+/// with sparse writers is not something the sidecar can describe. Nothing is lost by that — the
+/// next fresh download of that object splits.
+fn fetch_ranged(
+    obj: &Object,
+    temps: &Temps,
+    max_bytes: Option<u64>,
+    budget: &ConnBudget,
+    progress: &MultiProgress,
+) -> Result<Option<(PathBuf, ProgressBar)>> {
+    let (label, ranged_tmp) = (obj.label, temps.ranged.as_path());
+    let existing = ranged_tmp
+        .exists()
+        .then(|| parts::load(ranged_tmp))
+        .flatten();
+    if existing.is_none() {
+        // Junk from an interrupted run whose sidecar is gone or unreadable: it cannot be resumed by
+        // either mode, and leaving it would let a later run mistake it for progress. The sidecar
+        // goes too, since without its file it describes nothing.
+        if ranged_tmp.exists() {
+            debug!("{label}: ranged partial has no usable plan; starting over");
+        }
+        parts::discard(ranged_tmp);
+        let stream_have = fs::metadata(&temps.stream).map(|m| m.len()).unwrap_or(0);
+        // A capped download is a sub-1 MiB companion — one request is already the whole of it.
+        if max_bytes.is_some() || stream_have > 0 || budget.available() == 0 {
+            return Ok(None);
+        }
+    }
+
+    let Some(probe) = ranged::probe(obj)? else {
+        if existing.is_some() {
+            // The partial is a grid of holes and no single-stream resume can use it.
+            ranged::warn_restart(
+                progress,
+                &format!("{label}: the server no longer serves ranges; restarting as one stream"),
+            );
+            parts::discard(ranged_tmp);
+        }
+        return Ok(None);
+    };
+    if existing.is_none() && probe.total <= parts::chunk_bytes() {
+        return Ok(None); // one cell: splitting it would be one request either way
+    }
+
+    let pb = progress::bar_in(progress, Some(probe.total), label, Unit::Bytes);
+    let mut existing = existing;
+    let mut restarted = false;
+    loop {
+        match ranged::run(obj, ranged_tmp, existing.take(), &probe, budget, &pb) {
+            Ok(()) => return Ok(Some((ranged_tmp.to_path_buf(), pb))),
+            // The object is not the one the partial belongs to — the case that must never become
+            // "continue anyway". Throw those bytes away and try once from nothing.
+            Err(RangedError::Changed(why)) if !restarted => {
+                restarted = true;
+                parts::discard(ranged_tmp);
+                ranged::warn_restart(
+                    progress,
+                    &format!("{label}: {why}; the partial was discarded, downloading it again"),
+                );
+                if probe.total <= parts::chunk_bytes() {
+                    progress.remove(&pb);
+                    return Ok(None);
+                }
+            }
+            // Twice in one run means the object is being rewritten under us; stop rather than loop.
+            Err(RangedError::Changed(why)) => {
+                parts::discard(ranged_tmp);
+                pb.abandon_with_message(format!("⚠ {label} keeps changing upstream"));
+                return Err(Error::Other(format!("{label}: {why} (again) — giving up")));
+            }
+            Err(RangedError::NoRanges(why)) => {
+                ranged::warn_restart(
+                    progress,
+                    &format!("{label}: {why}; falling back to a single stream"),
+                );
+                parts::discard(ranged_tmp);
+                progress.remove(&pb);
+                return Ok(None);
+            }
+            Err(RangedError::Fatal(e)) => {
+                pb.abandon_with_message(format!("⚠ {label} interrupted (resumable)"));
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// The single-stream download: one connection, appending, resumed from the temp file's own length.
+/// Unchanged by ranged parallelism on purpose — it is what every server that will not range, every
+/// companion file, every object below the split threshold and `hub.pull_jobs = 1` still get.
+fn fetch_stream(
+    obj: &Object,
+    temps: &Temps,
+    max_bytes: Option<u64>,
+    progress: &MultiProgress,
+) -> Result<(PathBuf, ProgressBar)> {
+    let (url, label) = (obj.url, obj.label);
+    let (tmp, meta) = (temps.stream.as_path(), temps.meta.as_path());
+    parts::discard(&temps.ranged); // nothing here can use a ranged partial
+    let have = fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
     // Validator captured when THIS partial was first written; only meaningful with bytes on disk.
     let validator = (have > 0)
-        .then(|| fs::read_to_string(&meta).ok())
+        .then(|| fs::read_to_string(meta).ok())
         .flatten()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -134,10 +334,10 @@ pub(crate) fn download_to_blob(
     if !resuming {
         match response_validator(resp.headers()) {
             Some(v) => {
-                let _ = fs::write(&meta, v);
+                let _ = fs::write(meta, v);
             }
             None => {
-                let _ = fs::remove_file(&meta);
+                let _ = fs::remove_file(meta);
             }
         }
     }
@@ -149,10 +349,10 @@ pub(crate) fn download_to_blob(
         progress.suspend(|| info!("resuming {label} at {have} bytes"));
         fs::OpenOptions::new()
             .append(true)
-            .open(&tmp)
+            .open(tmp)
             .map_err(Error::from)?
     } else {
-        fs::File::create(&tmp).map_err(Error::from)? // truncates any stale partial (changed object)
+        fs::File::create(tmp).map_err(Error::from)? // truncates any stale partial (changed object)
     };
     let start = if resuming { have } else { 0 };
 
@@ -171,8 +371,8 @@ pub(crate) fn download_to_blob(
         Err(StreamError::TooLarge { cap }) => {
             pb.abandon_with_message(format!("⚠ {label} exceeds {cap} bytes"));
             drop(file);
-            let _ = fs::remove_file(&tmp);
-            let _ = fs::remove_file(&meta);
+            let _ = fs::remove_file(tmp);
+            let _ = fs::remove_file(meta);
             return Err(Error::Other(format!(
                 "{label}: body exceeds the {cap}-byte cap; download aborted"
             )));
@@ -186,34 +386,7 @@ pub(crate) fn download_to_blob(
         }
     }
     drop(file); // flush + close before re-reading for the digest
-
-    // Hash the COMPLETE file ONCE at the end. The old code folded the on-disk prefix into the digest
-    // on every resume (O(K·size) over K flaky-link retries); since the whole body is sha-verified
-    // here anyway, a single final pass is equivalent and cheaper.
-    let mut hasher = Sha256::new();
-    hash_file(&tmp, &mut hasher)?;
-    let hex: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-
-    // Integrity gate: the body MUST hash to HF's advertised LFS sha256. On mismatch discard the temp
-    // (do NOT keep it for resume — a resumed corrupt prefix stays corrupt) and fail loudly.
-    if let Err(e) = verify_sha(label, &hex, expected_sha) {
-        pb.abandon_with_message(format!("⚠ {label} sha256 mismatch"));
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&meta);
-        return Err(e);
-    }
-    pb.finish_with_message(format!("✓ {label} ({} MiB)", size / (1024 * 1024)));
-
-    let blob = blobs.join(&hex); // HF blob name = bare sha256 hex
-    fs::rename(&tmp, &blob).map_err(Error::from)?;
-    let _ = fs::remove_file(&meta); // partial committed; validator no longer needed
-    progress.suspend(|| info!("Saved blob: {blob:?}"));
-    Ok((blob, hex, size))
+    Ok((tmp.to_path_buf(), pb))
 }
 
 /// Build the resume request directives: the `Range` value and an optional `If-Range` value. Returns
@@ -379,6 +552,19 @@ fn temp_stem(label: &str) -> String {
 /// a test plants a half-finished download at.
 pub(crate) fn partial_name(label: &str) -> String {
     format!(".dl-{}", temp_stem(label))
+}
+
+/// `label`'s RANGED partial download, and the stem its `.plan` sidecar hangs off.
+///
+/// A different name from [`partial_name`], and that is the point rather than tidiness. The two
+/// partials mean incompatible things: a stream partial is a prefix, so its LENGTH is how much of
+/// the file it holds, while a ranged partial is a sparse file whose length says nothing at all —
+/// its last chunk landing first makes it full-length with holes. Share one name and a run that
+/// loses the sidecar reads a hole-ridden file as a complete prefix and resumes past it, which is a
+/// corrupt blob that only the sha256 gate stands between and the model directory — and a non-LFS
+/// file has no gate. Separate names make that confusion unrepresentable.
+pub(crate) fn ranged_partial_name(label: &str) -> String {
+    format!(".dlr-{}", temp_stem(label))
 }
 
 /// Replace characters unsafe in a filename with `_`.
