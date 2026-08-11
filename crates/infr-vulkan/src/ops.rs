@@ -41,6 +41,8 @@ fn hash_spv(spv: &[u32]) -> u64 {
     h.finish()
 }
 
+/// Build a kernel, PANICKING on any failure — the surface every production dispatch path uses (see
+/// [`try_make_compute_kernel`] for the fallible one and for why the panics read the way they do).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn make_compute_kernel(
     device: &ash::Device,
@@ -51,17 +53,59 @@ pub(crate) fn make_compute_kernel(
     push_size: u32,
     required_sg: Option<u32>,
     push_descriptor: bool,
+    max_push_constants: u32,
 ) -> ComputeKernel {
+    try_make_compute_kernel(
+        device,
+        pcache,
+        name,
+        spv,
+        n_buf,
+        push_size,
+        required_sg,
+        push_descriptor,
+        max_push_constants,
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{e} — kernel build does not yet thread Result to this call site (see docs/audit.md \
+             ops.rs finding 2)"
+        )
+    })
+}
+
+/// Build one kernel's Vulkan objects, returning an error instead of aborting the process.
+///
+/// The fallible surface exists for capability PROBES: a probe dispatched to find out whether a
+/// device can honour a tier must be able to answer "no" (a driver that returns a null pipeline for
+/// an unsupported coopmat config is exactly the case being probed for), and a panic there would
+/// turn a refused tier into a crashed process.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_make_compute_kernel(
+    device: &ash::Device,
+    pcache: vk::PipelineCache,
+    name: &'static str,
+    spv: &[u32],
+    n_buf: usize,
+    push_size: u32,
+    required_sg: Option<u32>,
+    push_descriptor: bool,
+    max_push_constants: u32,
+) -> Result<ComputeKernel> {
+    // The device's real `maxPushConstantsSize` — Vulkan only GUARANTEES 128 bytes, and every push
+    // block here was sized against that floor by inspection. Checked before the layout is built so
+    // an oversize block names itself instead of surfacing as a driver-side VUID.
+    crate::caps::check_push_constant_size(name, push_size, max_push_constants).map_err(be)?;
     let shader = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
     }
-    .unwrap_or_else(|e| {
-        panic!(
+    .map_err(|e| {
+        be(format!(
             "create_shader_module failed for kernel {name:?}: {e} — recoverable driver/alloc \
-             failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not yet \
-             thread Result (see docs/audit.md ops.rs finding 2)"
-        )
-    });
+             failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile"
+        ))
+    })?;
 
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
         .map(|i| {
@@ -79,14 +123,16 @@ pub(crate) fn make_compute_kernel(
     if push_descriptor {
         ds_ci = ds_ci.flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
     }
-    let ds_layout =
-        unsafe { device.create_descriptor_set_layout(&ds_ci, None) }.unwrap_or_else(|e| {
-            panic!(
+    let ds_layout = match unsafe { device.create_descriptor_set_layout(&ds_ci, None) } {
+        Ok(l) => l,
+        Err(e) => {
+            unsafe { device.destroy_shader_module(shader, None) };
+            return Err(be(format!(
                 "create_descriptor_set_layout failed for kernel {name:?}: {e} — recoverable \
-                 driver/alloc failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel \
-                 build does not yet thread Result (see docs/audit.md ops.rs finding 2)"
-            )
-        });
+                 driver/alloc failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile"
+            )));
+        }
+    };
 
     let mut plinfo =
         vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&ds_layout));
@@ -97,14 +143,19 @@ pub(crate) fn make_compute_kernel(
     if push_size > 0 {
         plinfo = plinfo.push_constant_ranges(std::slice::from_ref(&push_range));
     }
-    let pipeline_layout =
-        unsafe { device.create_pipeline_layout(&plinfo, None) }.unwrap_or_else(|e| {
-            panic!(
+    let pipeline_layout = match unsafe { device.create_pipeline_layout(&plinfo, None) } {
+        Ok(l) => l,
+        Err(e) => {
+            unsafe {
+                device.destroy_descriptor_set_layout(ds_layout, None);
+                device.destroy_shader_module(shader, None);
+            }
+            return Err(be(format!(
                 "create_pipeline_layout failed for kernel {name:?}: {e} — recoverable driver/alloc \
-                 failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not \
-                 yet thread Result (see docs/audit.md ops.rs finding 2)"
-            )
-        });
+                 failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile"
+            )));
+        }
+    };
 
     let entry = c"main";
     let mut req_sz =
@@ -119,7 +170,14 @@ pub(crate) fn make_compute_kernel(
             .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
             .push_next(&mut req_sz);
     }
-    let pipeline = unsafe {
+    // Everything built so far, for the error paths below (nothing else may return early past here
+    // without releasing them).
+    let undo = |device: &ash::Device| unsafe {
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_descriptor_set_layout(ds_layout, None);
+        device.destroy_shader_module(shader, None);
+    };
+    let pipeline = match unsafe {
         device.create_compute_pipelines(
             pcache, // disk-persisted device cache (see pcache.rs); null = caching off
             &[vk::ComputePipelineCreateInfo::default()
@@ -127,46 +185,54 @@ pub(crate) fn make_compute_kernel(
                 .layout(pipeline_layout)],
             None,
         )
-    }
-    .unwrap_or_else(|(_, e)| {
-        panic!(
-            "create_compute_pipelines failed for kernel {name:?}: {e} — a device whose \
-             coopmat/subgroup config doesn't match this kernel should have been filtered out by \
-             capability detection before reaching here"
-        )
-    })[0];
+    } {
+        Ok(p) => p[0],
+        Err((_, e)) => {
+            undo(device);
+            return Err(be(format!(
+                "create_compute_pipelines failed for kernel {name:?}: {e} — a device whose \
+                 coopmat/subgroup config doesn't match this kernel should have been filtered out \
+                 by capability detection before reaching here"
+            )));
+        }
+    };
     // A driver can return VK_SUCCESS with a VK_NULL_HANDLE pipeline (observed as the root cause of
     // a segfault on Intel/Mesa ANV: a coopmat pipeline whose tile size the device doesn't support).
     // Binding/dispatching that handle later is the actual crash — fail loudly HERE instead, with
     // the offending kernel named, rather than deref garbage downstream.
-    assert!(
-        pipeline != vk::Pipeline::null(),
-        "create_compute_pipelines returned VK_SUCCESS with a null pipeline handle for kernel \
-         {name:?} — likely an unsupported coopmat/subgroup config that slipped past capability \
-         detection"
-    );
+    if pipeline == vk::Pipeline::null() {
+        undo(device);
+        return Err(be(format!(
+            "create_compute_pipelines returned VK_SUCCESS with a null pipeline handle for kernel \
+             {name:?} — likely an unsupported coopmat/subgroup config that slipped past capability \
+             detection"
+        )));
+    }
 
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
         descriptor_count: n_buf as u32,
     }];
-    let desc_pool = unsafe {
+    let desc_pool = match unsafe {
         device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes),
             None,
         )
-    }
-    .unwrap_or_else(|e| {
-        panic!(
-            "create_descriptor_pool failed for kernel {name:?}: {e} — recoverable driver/alloc \
-             failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not yet \
-             thread Result (see docs/audit.md ops.rs finding 2)"
-        )
-    });
+    } {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe { device.destroy_pipeline(pipeline, None) };
+            undo(device);
+            return Err(be(format!(
+                "create_descriptor_pool failed for kernel {name:?}: {e} — recoverable driver/alloc \
+                 failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile"
+            )));
+        }
+    };
 
-    ComputeKernel {
+    Ok(ComputeKernel {
         name,
         shader,
         ds_layout,
@@ -176,7 +242,7 @@ pub(crate) fn make_compute_kernel(
         n_buf,
         push_size,
         spv_hash: hash_spv(spv),
-    }
+    })
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -315,6 +381,7 @@ impl VulkanBackend {
                 push_size,
                 required_sg,
                 self.shared.push_descriptor.is_some(),
+                self.shared.max_push_constants,
             )
         });
         drop(map);

@@ -1614,209 +1614,131 @@ if it does, it has been red since `key_bias` landed.
      evidence; anything about NVIDIA or Intel BEHAVIOUR is read off llama.cpp's
      source, never observed here. -->
 
-### B-HWDET-DRIVERID — capability-first detection trusts enumeration, and at least one driver lies (2026-08-11)
+### B-HWDET-VENDOR-RULES — the coopmat driver rules and the arch bucket exist now, and NONE of their non-RADV arms can be run here (2026-08-11)
 
-**Tag:** vulkan · detection · **Blocked on:** a decision (below); no hardware
-needed to implement, only to validate
+**Tag:** vulkan · detection · **Blocked on:** NVIDIA / Intel / AMD-proprietary
+hardware; nothing else
 
-`infr`'s Vulkan backend reads **no** `vendorID`, no `driverID`, and no driver
-name for any gating decision. Verified by reading: `vendor_id`/`device_id` occur
-only in `pcache.rs` as the on-disk pipeline-cache filename key, and
-`driver_version` only in that same cache key. The Intel carve-out the 2026-07-31
-review recommended removing is **gone** — `vendor_intel` no longer exists
-anywhere in `crates/`, and `adapter.rs`'s `unified_mmv_row1` comment records the
-removal deliberately ("new hardware needs no vendor quirk here"). Every
-remaining vendor-shaped behaviour keys off a probe: `sg_pref` off the subgroup
-range, the coopmat tier off `select_coopmat_shape`'s enumeration of
-`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`, the flash tile off
-`max_shared_memory_bytes`. That is the right default and should stay.
+The capability-first design now has exactly one vendor-keyed exception, landed
+as `caps::coopmat_trust` + `caps::device_architecture`
+(`crates/infr-vulkan/src/caps.rs`), applied in `VulkanBackend::new` as a FILTER
+over the enumerated coopmat shape list. Both rules are transcriptions of
+llama.cpp's `ggml_vk_khr_cooperative_matrix_support` / `get_device_architecture`
+(read at pin 030ebb5): AMD proprietary + AMDVLK are believed only on RDNA3+, and
+Intel pre-Xe2 loses the 16x16x16 tier while keeping the 8x8x16 tile that already
+sits behind `INFR_CM_8X8=1`.
 
-**The blind spot it buys:** capability-first assumes the device tells the truth.
-llama.cpp has found two places it does not, both read out of
-`ggml_vk_khr_cooperative_matrix_support` in
-`ggml/src/ggml-vulkan/ggml-vulkan.cpp` (read directly at the new pin, see
-B-DSHW-PULL):
+**What is actually verified:** only the RADV/RDNA3 arm, on this box — the banner
+now prints `AmdRdna3/MESA_RADV` and every coopmat tier stayed live
+(`f16cm:y i8cm:y`), i.e. the filter is a no-op here. Everything else is
+unit-tested over synthetic `DeviceProbe` values only (`caps::tests`), which
+proves the RULE, not the PROBE that feeds it: no NVIDIA, Intel or
+AMD-proprietary device has ever filled a `DeviceProbe` in this tree.
 
-- **AMD's proprietary driver reports cooperative-matrix support on all GPUs.**
-  llama.cpp's own comment says exactly that, and restricts
-  `driverID ∈ {eAmdProprietary, eAmdOpenSource}` to `AMD_RDNA3` only. RADV is
-  trusted for any architecture — which is why this has never bitten us: this box
-  runs RADV. On amdgpu-pro or AMDVLK, `infr` would enumerate a coopmat shape and
-  dispatch the coopmat tier where llama.cpp refuses it.
-- **Intel Arc A770 (Xe1 discrete) advertises coopmat and regresses on it.**
-  llama.cpp allows Intel coopmat only on `INTEL_XE2`, or `INTEL_XE1` when it is
-  an _integrated_ part on the Windows proprietary driver. `infr` reaches the
-  same end state for A770 today but by accident, not by rule: A770 enumerates
-  only the 8×8×16 shape and `select_coopmat_shape` returns `None` for it unless
-  `INFR_CM_8X8=1`. An Arc part that enumerated 16×16×16 would sail through.
+**The specific things a machine with one of those parts should check first:**
 
-**The decision this needs:** whether `infr` takes on a driver-quirk deny-list at
-all. It is a genuine architectural trade — the capability-first design is the
-reason new hardware needs no code, and a deny-list is exactly the vendor
-coupling that was just removed. Options, with the actual cost:
+- That `probe_device_facts` actually fills `wavefronts_per_simd` /
+  `warps_per_sm` / the packed-dot bits on that driver. A silently-zero field
+  misfiles the device as `DeviceArch::Other`, which on an AMD proprietary driver
+  means coopmat REFUSED (fail-safe) but on Intel means the 16x16x16 tier refused
+  too.
+- Whether the Intel `Tile8Only` verdict is the right shape for `infr` at all. It
+  was chosen so the `_cm8` `native_gemm_warp` builds stay reachable on Alchemist
+  (they are the only kernels at that shape, and the only reason the opt-in
+  exists); the alternative — refusing Intel pre-Xe2 coopmat outright, as
+  upstream does — would make those builds dead code on every Intel part.
+- That an `AMD_PROPRIETARY` refusal is survivable: it drops the device to the
+  non-coopmat ladder, which is a large prefill regression, not a failure. There
+  is no force-on knob to override the deny-list; adding one is the obvious
+  escape hatch if a real device is misjudged.
 
-1. **Do nothing.** Correct on RADV/NVIDIA; wrong-by-omission on AMDVLK and on a
-   hypothetical 16×16×16 Arc. Costs nothing until someone runs one.
-2. **Probe `VK_KHR_driver_properties` for `driverID` and add a narrow
-   deny-list** mirroring llama.cpp's two rules. Small, but re-introduces a
-   vendor table and needs a home (`Capabilities` currently has no vendor field
-   at all).
-3. **Validate rather than deny** — run a tiny known-answer coopmat GEMM at init
-   and fall to the non-coopmat tier if it disagrees. Vendor-free and catches the
-   fragment-layout hazard in B-HWDET-I8CM-FRAGLAYOUT too, but adds init latency
-   and a new failure mode to reason about.
+**Considered and declined:** generalizing the known-answer validation (option 3
+of the retired B-HWDET-DRIVERID entry) to the f16/bf16/f8 coopmat tiers. The
+int8 one was built because that kernel reads accumulator elements at an
+implementation-defined mapping; every other coopmat kernel here moves data in
+and out of fragments only through `coopMatLoad`/`coopMatStore` with an explicit
+layout enum, so there is no per-element assumption to falsify — a known-answer
+GEMM there would test the driver's arithmetic, not infr's assumption, and would
+cost init latency on every run.
 
-Nothing here was measured. The two llama.cpp rules are evidence that upstream
-hit real regressions; that they would reproduce on `infr`'s kernels is a
-**guess** — different kernels, different shapes.
+### B-HWDET-LIMITS — three device limits are still assumed at the spec minimum (2026-08-11)
 
-### B-HWDET-I8CM-FRAGLAYOUT — the int8 coopmat kernel hardcodes a driver-derived fragment layout, and nothing checks it (2026-08-11)
+**Tag:** vulkan · detection · **Blocked on:** nothing; the remaining items are
+perf-unmeasured or currently unreachable
 
-**Tag:** vulkan · soundness · **Blocked on:** nothing; latent because the path
-is opt-in and default-off
+Two of the five items in the original audit entry are closed:
+`maxPushConstantsSize` is queried and every kernel's block is checked against it
+(`caps::check_push_constant_size`, called from `ops::try_make_compute_kernel`),
+and `maxStorageBufferRange` is queried into `crate::max_storage_buffer_range()`
+with `Recorder::vkb`'s bind check promoted from `debug_assert!` to a release
+`assert!` against the device's real number. What is left:
 
-`shaders/native_gemm_i8cm_q8_0.comp` applies its per-block rank-1 descale by
-reading accumulator fragment elements directly — `csub[i]` at
-`(row, col) = (2*i + (lane>>4), lane&15)`. Its own header says where that
-mapping came from: **empirically derived on this driver/config** (16×16×16
-SINT32 accumulator, wave32) by running `examples/coopmat_int8_test.rs`'s
-`--fragment_layout` probe. The kernel comment argues it is safe because
-`KHR_cooperative_matrix` fixes the component-index↔element mapping for a given
-`(type, use, rows, cols, scope)`. That is true and it is the right reading of
-the spec — but it fixes the mapping **per implementation**, not across them. A
-different driver, a different Mesa, NVIDIA, or ANV may lay the fragment out
-differently, and the spec permits it.
-
-**What makes this a backlog item rather than a comment:** nothing would tell
-you. The mapping is not asserted at runtime, and the probe that derived it is a
-**manual example binary**, not a test — verified by grep: `fragment_layout`
-appears only in `examples/coopmat_int8_test.rs` and in
-`examples/coopmat2_test.rs`'s prose. There is no automated coverage, so a wrong
-mapping on new hardware produces plausible wrong numbers, not a failure. This is
-precisely the shape the repo's own verification rule calls out — a guard whose
-scope silently matches nothing.
-
-**Why it is not urgent:** the path is gated on `INFR_I8_COOPMAT=1` in
-`adapter.rs`'s `i8cm_ok` (`Q8_0` weights AND `caps.i8_coopmat()` AND the config
-flag), and that config defaults to **false**. So the hazard is latent on every
-default run. Verified by reading the gate and the config default.
-
-**What would close it:** a known-answer test that loads an identity-ish matrix
-through `coopMatMulAdd` and asserts the `(i → row,col)` mapping the kernel
-assumes, run at init or as a `#[ignore]`d GPU test, refusing the tier on
-mismatch. That is the same mechanism option 3 in B-HWDET-DRIVERID proposes, and
-the two should probably be built together.
-
-### B-HWDET-LIMITS — every device limit except shared memory is assumed at its spec minimum (2026-08-11)
-
-**Tag:** vulkan · detection · **Blocked on:** nothing; mostly a lost-perf and
-unenforced-assumption item, not a correctness bug
-
-Exactly one `VkPhysicalDeviceLimits` field is read anywhere in `infr-vulkan`:
-`max_compute_shared_memory_size`, surfaced as
-`Capabilities::max_shared_memory_bytes`. It is genuinely used — `Recorder`'s
-flash-attention tile pick chooses BM=64 vs BM=32 (and BR=128 vs BR=64 for the
-register-O variant) by comparing the tile's byte footprint against it. That part
-is exemplary capability-driven behaviour.
-
-Everything else is a hardcoded constant pinned to the Vulkan-guaranteed minimum:
-
-- **`maxComputeWorkGroupCount[0]`** → `Recorder::MAX_GROUP_COUNT_X`, fixed at
-  the spec minimum. Its comment explains why (an Intel A770 on Mesa ANV enforces
-  exactly the minimum, and a wide lm_head GEMV can dispatch past it), and the
-  split is correct everywhere. But RDNA3 and most desktop parts report far more,
-  so every wide dispatch pays a 2-D split it does not need. Whether that costs
-  anything measurable is **not known** — never profiled.
+- **`maxComputeWorkGroupCount[0]`** → `Recorder::MAX_GROUP_COUNT_X` is still
+  pinned at the guaranteed minimum, so every dispatch wider than that pays a 2-D
+  split RDNA3 does not need. Reading the real limit is a few lines; whether the
+  split costs anything measurable has **never been profiled**, and that
+  measurement is the actual blocker — not the code.
 - **`maxComputeWorkGroupInvocations` / `maxComputeWorkGroupSize`** → never
-  queried; `local_size_x` is a compile-time constant per shader
-  (`rmsnorm.comp`'s `NTHREAD`, `native_gemv_sg.comp`'s `SG`, `softmax.comp`).
-  All sit at or under the guaranteed 1024, so this is safe by spec, not by
-  check.
-- **`maxPushConstantsSize`** → never queried. Observed push-constant blocks stay
-  well under the guaranteed 128 bytes, so nothing is at risk today; there is no
-  guard that keeps it that way as blocks grow.
-- **`maxStorageBufferRange`** → assumed `u32::MAX`. The only check is a
-  `debug_assert!` in `Recorder`, i.e. **absent from release builds**, and it
-  compares against the assumed 4 GiB rather than the device's actual limit,
-  which is never queried. Oversized buffers are routed to the BDA `-DSTREAMED`
-  path instead, which is the real mitigation.
-- **`minStorageBufferOffsetAlignment`** → never queried; 256-byte alignment is
-  hardcoded in the range padding.
+  queried; every `local_size_x` is a compile-time constant at or under the
+  guaranteed 1024. Safe by spec, not by check. A guard would have to live in the
+  build (the sizes are baked into SPIR-V), which is why it was not added with
+  the push-constant one.
+- **`minStorageBufferOffsetAlignment`** → never queried; 256 (the spec's MAXIMUM
+  for this limit, so it over-aligns on every device) is hardcoded in the range
+  padding. Correct everywhere, wasteful nowhere that has been measured.
 
-`maxMemoryAllocationSize` (via `PhysicalDeviceMaintenance3Properties`) **is**
-queried and used to cap the weight arena's block reservation, with a 1 GiB
-guaranteed-floor fallback — so the pattern is not absent, just narrowly applied.
+**Not verified:** the new release `assert!` in `vkb` has never been seen to FIRE
+— no tensor in any model here comes near this device's 4 GiB
+`maxStorageBufferRange`, and the streamed/BDA path is what carries the big ones.
+It is a guard for a device that reports a smaller limit, which is not this one.
 
-**Honest framing:** none of this is unsound. Assuming the spec minimum is always
-_safe_ on a conformant device; a queried limit can only ever be larger. The
-items worth acting on are the release-build gap on `maxStorageBufferRange` and
-the unqueried `maxPushConstantsSize`, both cheap. The workgroup-count split is a
-perf question nobody has measured.
+### B-HWDET-FEATUREBITS — the bf16/f8 feature-bit code is written and cannot be exercised on this box (2026-08-11)
 
-### B-HWDET-FEATUREBITS — bf16 and f8 are gated on extension presence with no feature bit (2026-08-11)
+**Tag:** vulkan · detection · **Blocked on:** RDNA4-class hardware
 
-**Tag:** vulkan · detection · **Blocked on:** nothing; no hardware here
-enumerates either, so it cannot be exercised
+`VK_KHR_shader_bfloat16` and `VK_EXT_shader_float8` are no longer gated on the
+extension string alone. `crates/infr-vulkan/src/vkext.rs` supplies the two
+feature structs ash 0.38 predates (layout and `sType` transcribed from the
+system `vulkan_core.h`), `caps.bf16`/`caps.f8` now mean extension AND feature
+bit, the coopmat tiers additionally require `shaderBFloat16CooperativeMatrix` /
+`shaderFloat8CooperativeMatrix` (the bits the `-DBF16CM` and fp8 kernels'
+operand types actually need), and both extension+feature are ENABLED on the
+device when their tier is live — which they never were before, so those kernels'
+SPIR-V would have violated its VUID on the first RDNA4 run.
 
-`infr`'s probe is deliberate about not trusting extension presence alone: the
-comment beside `has_coop_ext_feat` in `lib.rs` says so outright, and f16,
-cooperative matrix, integer dot product and timeline semaphores are each gated
-on **extension AND feature bit**, with the feature then actually enabled on the
-device (the `shaderIntegerDotProduct` VUID bug the comments record is exactly
-what happens when you skip that).
+**None of that has run.** RDNA3 advertises neither extension, so the query is
+skipped and the enables are absent; this box's device-create chain is byte
+identical to before. What IS exercised here is the raw `sType`/`pNext` chaining
+those structs depend on: `vkext::tests::raw_chaining_matches_ash` hand-rolls
+`VkPhysicalDeviceShaderFloat16Int8Features` and asserts the bits match ash's
+typed query (passes on the 7900 XTX). So the mechanism is tested and the two
+payloads are not.
 
-`VK_KHR_shader_bfloat16` and `VK_EXT_shader_float8` are the two exceptions: both
-are matched by **raw extension string** — ash 0.38 ships no typed constant,
-which the code says — and no corresponding features struct is chained into the
-device create info. `caps.bf16` / `caps.f8` therefore mean "the string was
-present", not "the device will run it".
+**First thing to check on an RDNA4 part:** that `create_device` still succeeds
+with `INFR_BF16_COOPMAT=1` — enabling a feature the device reports false is a
+device create FAILURE, and `ShaderBfloat16Features::enable` only asks for bits
+the query returned, which is exactly the code path nobody has run.
 
-**Why nothing has broken:** neither the bf16 nor the f8 coopmat dispatch keys
-off those flags alone. Both additionally require an enumerated coopmat shape
-(`coopmat_bf16` / `coopmat_f8`, from the same properties query as f16) **and** a
-default-off opt-in (`INFR_BF16_COOPMAT`, `INFR_F8_COOPMAT`). Read directly in
-`adapter.rs`'s `bf16cm_ok` / `f8cm_ok`. So the weak gate is currently
-backstopped by two stronger ones. This is a hazard for whoever removes an
-opt-in, not a live bug — and it cannot be tested here: RDNA3 enumerates neither
-(`caps.bf16` and `caps.f8` are both false on this box, per the `Capabilities`
-field docs).
+### B-HWDET-NO-ARCH-BUCKET — the per-op subgroup-width table is still not representable, and is still a guess (2026-08-11)
 
-### B-HWDET-NO-ARCH-BUCKET — there is no architecture bucketing, and some tuning genuinely needs one (2026-08-11)
+**Tag:** vulkan · detection · **Blocked on:** a measurement nobody can take here
 
-**Tag:** vulkan · detection · **Blocked on:** a decision; overlaps
-B-HWDET-DRIVERID
+The architecture bucket itself now exists (`caps::DeviceArch`, see
+B-HWDET-VENDOR-RULES) and has exactly one consumer: coopmat trust. What the
+audit listed as the thing a bucket would BUY is still absent and still
+unjustified:
 
-`Capabilities` describes a device with: a name, per-type compute/coopmat/dot
-flags and shapes, `max_shared_memory_bytes`, `sg_pref`, `integrated`, and an
-advisory `compute_units` (AMD-only, from `VK_AMD_shader_core_properties`). There
-is no notion of _which_ architecture generation it is.
-
-llama.cpp has one: `get_device_architecture` in `ggml-vulkan.cpp` buckets into
-`AMD_GCN / AMD_RDNA1 / AMD_RDNA2 / AMD_RDNA3 / INTEL_XE1 / INTEL_XE2 / NVIDIA_PRE_TURING / NVIDIA_TURING / OTHER`,
-derived from probes rather than PCI IDs — AMD by wave mode (`min==max==64` ⇒
-GCN; `[32,64]` ⇒ RDNA, then split by `wavefrontsPerSimd` and the
-mixed-signedness dot-product flag), Intel by `minSubgroupSize` (8 ⇒ Xe1, 16 ⇒
-Xe2), NVIDIA by absence of coopmat (pre-Turing) then `shaderWarpsPerSM`. All
-read directly.
-
-What it buys upstream, and `infr` cannot express today:
-
-- A **per-architecture, per-pipeline subgroup-size table**
-  (`gpu_pipeline_configs` with `rdna1_pipelines` / `rdna2_pipelines`): RDNA1
-  wants subgroup 64 for `soft_max`, `im2col`, `argmax` and `mul_mat_vec` but 32
-  for the f16 mat-vec variants; RDNA2 wants 64 for just `soft_max` and `im2col`.
-  `infr` has exactly two pinned widths — a global 32 and `sg_pref` (16 or 32)
-  for one curated decode family — so a per-op width is not currently
-  representable.
-- Wave64-only hardware. `infr` **hard-refuses** any device that cannot pin 32 (a
-  clean `Err` that falls back to CPU, with a comment naming the excluded
-  classes) — so GCN is not a silent-wrong-answer risk, it is simply unsupported.
-  That is a defensible choice and should be recorded as one, not treated as a
-  gap to close.
-
-**Guess, not evidence:** that any of these per-architecture widths would help
-`infr`. The kernels are not llama.cpp's, and the only architecture in the room
-is RDNA3, which upstream does not special-case for subgroup size either.
+- **A per-architecture, per-pipeline subgroup-size table** (upstream's
+  `gpu_pipeline_configs` / `rdna1_pipelines` / `rdna2_pipelines`). `infr` has
+  two pinned widths — a global 32 and `sg_pref` for one curated decode family —
+  so a per-op width cannot be expressed at all. Adding the table is a real
+  change to the kernel-cache key, and the evidence for it is upstream's tuning
+  of DIFFERENT kernels on hardware that is not here. Still a guess, deliberately
+  not built.
+- **Wave64-only hardware stays unsupported by rule**: the backend hard-refuses
+  any device that cannot pin subgroup 32, before the bucket is ever consulted.
+  Recorded as a decision, not a gap. `DeviceArch::AmdGcn` exists only so such a
+  part is classified as known-unsupported rather than unknown.
 
 ### B-NVSHAPE-COOPMAT2 — `VK_NV_cooperative_matrix2` is fully researched, entirely absent from production (2026-08-11)
 

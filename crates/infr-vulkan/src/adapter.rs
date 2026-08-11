@@ -1532,9 +1532,12 @@ fn lower_op(
                         && be_.caps().f8_coopmat()
                         && (f8_wide || f8_narrow)
                         && be_.cfg().kernels.vulkan.f8_coopmat;
-                    let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
-                        && be_.caps().i8_coopmat()
-                        && be_.cfg().kernels.vulkan.i8_coopmat;
+                    // `i8_coopmat_ready` is `caps.i8_coopmat()` AND the `INFR_I8_COOPMAT=1` opt-in
+                    // AND this driver having PASSED the accumulator-layout known-answer probe at
+                    // init (see `VulkanBackend::verify_i8_coopmat_layout`): the kernel's
+                    // in-fragment descale reads accumulator elements at a mapping that is fixed per
+                    // implementation, so enumeration alone does not make it safe to dispatch.
+                    let i8cm_ok = matches!(dt, infr_core::DType::Q8_0) && be_.i8_coopmat_ready();
                     // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
                     // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
                     // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the

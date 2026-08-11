@@ -3209,6 +3209,10 @@ fn main() {
             ],
         ),
         ("splitk_reduce", "splitk_reduce", &[]),
+        // Known-answer probe for the int8 coopmat accumulator fragment layout the i8cm GEMM reads
+        // its `csub[i]` elements with — dispatched at init when that tier is opted into, and the
+        // tier is REFUSED when the readback disagrees (see caps.rs `check_i8_coopmat_layout`).
+        ("coopmat_i8_layout", "coopmat_i8_layout", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),

@@ -288,6 +288,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The int8 cooperative-matrix prefill GEMM assumed a fragment layout no device
+  was ever asked about.** `native_gemm_i8cm_q8_0.comp` reads its accumulator
+  elements at `(row, col) = (2*i + (lane>>4), lane&15)`, a mapping
+  `KHR_cooperative_matrix` fixes per IMPLEMENTATION and which was derived
+  empirically on RADV/RDNA3 — on a driver that lays the fragment out differently
+  the kernel would have returned plausible wrong numbers with no error. The
+  Vulkan backend now multiplies two known matrices on the device and reads the
+  product back through that same mapping before arming the tier
+  (`INFR_I8_COOPMAT=1` runs the check at init; a mismatch logs the offending
+  element and leaves the tier off). Verified passing on an RX 7900 XTX, and
+  verified to REFUSE when the mapping is perturbed.
+- **Two drivers that misreport cooperative-matrix support are no longer
+  believed.** AMD's proprietary and AMDVLK drivers advertise the unit on all
+  GPUs, and Intel pre-Xe2 regresses on it (both documented upstream in
+  llama.cpp). Cooperative matrix is now refused on `AMD_PROPRIETARY` /
+  `AMD_OPEN_SOURCE` below RDNA3, and Intel pre-Xe2 keeps only the 8x8x16 tile
+  that already required `INFR_CM_8X8=1`. The device is bucketed by probes (wave
+  mode, wavefronts/SIMD, packed-dot bits, subgroup width, warps/SM), never by
+  PCI device id, and the bucket plus driver id are printed in the GPU banner.
+  Mesa RADV and NVIDIA are unaffected.
+- **bf16 and fp8 were gated on an extension STRING with no feature bit, and the
+  features were never enabled on the device.** `VK_KHR_shader_bfloat16` /
+  `VK_EXT_shader_float8` now go through their feature structs like every other
+  capability: `Capabilities::bf16` / `f8` mean the device will run it, the bf16
+  and fp8 coopmat tiers additionally require `shaderBFloat16CooperativeMatrix` /
+  `shaderFloat8CooperativeMatrix`, and both extension and feature are enabled on
+  the logical device when a tier is live — without which those kernels' SPIR-V
+  violated its VUID.
+- **`maxPushConstantsSize` and `maxStorageBufferRange` are queried instead of
+  assumed.** A kernel whose push block exceeds the device limit is refused by
+  name at build time rather than failing a driver-side VUID, and the
+  descriptor-range bind check now runs in RELEASE builds against the limit the
+  device reported (it was a `debug_assert!` against an assumed 4 GiB).
 - **DeepSeek `deepseek-llm` pre-tokenizer split on the wrong character
   classes**: `DEEPSEEK_LLM_PRE_RES[2]` opened its quote range with `'` (U+0027)
   instead of `‘` (U+2018), so the class covered U+0027–U+201F — most of the BMP,

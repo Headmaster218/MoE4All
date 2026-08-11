@@ -1477,11 +1477,17 @@ impl<'a> Recorder<'a> {
         let range = (vb.size as u64)
             .next_multiple_of(256)
             .min(block_len - vb.sub_offset as u64);
-        debug_assert!(
-            range <= u32::MAX as u64,
-            "resident-BDA sub-tensor range ({range} bytes) exceeds 4 GiB — this tensor must be \
-             read through its 64-bit device_addr() via a -DSTREAMED twin, never bound as a \
-             descriptor"
+        // Checked in RELEASE too, and against the limit this DEVICE reported rather than the 4 GiB
+        // a `u32` range field could hold (see `crate::max_storage_buffer_range`): a bind past
+        // `maxStorageBufferRange` is a VUID violation whose consequence is whatever the driver
+        // does with an out-of-range descriptor, and the old debug-only assert never ran in the
+        // builds that ship. One compare on a path that already does two.
+        let range_cap = crate::max_storage_buffer_range() as u64;
+        assert!(
+            range <= range_cap,
+            "resident-BDA sub-tensor range ({range} bytes) exceeds this device's \
+             maxStorageBufferRange ({range_cap}) — this tensor must be read through its 64-bit \
+             device_addr() via a -DSTREAMED twin, never bound as a descriptor"
         );
         vk::DescriptorBufferInfo {
             buffer: vb.buffer,
@@ -2445,9 +2451,13 @@ impl<'a> Recorder<'a> {
     }
 
     /// int8 cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — MEASUREMENT kernel, gated by
-    /// the adapter behind `INFR_I8_COOPMAT=1` + `caps.i8_coopmat` (see
+    /// the adapter behind [`VulkanBackend::i8_coopmat_ready`] (`INFR_I8_COOPMAT=1` +
+    /// `caps.i8_coopmat` + this driver having PASSED the accumulator-layout probe; see
     /// `native_gemm_i8cm_q8_0.comp` for the design doc: 16x16 tile per workgroup, per-Q8_0-block
-    /// int32 WMMA dot + shared-mem store/scale epilogue). `qa`/`dact` from `quant_q8`. `c` is
+    /// int32 WMMA dot + in-fragment scale epilogue). The layout gate is the ADAPTER's, not this
+    /// method's — a direct caller (the `parity`-feature resident-vs-streamed test) dispatches the
+    /// kernel deliberately and compares two spellings of it against each other, which stays
+    /// meaningful whatever the fragment layout is. `qa`/`dact` from `quant_q8`. `c` is
     /// `ceil(m/64)*64` rows (same padding convention as `matmul_native_off`). Requires `n%16==0`,
     /// `k%32==0`.
     #[allow(clippy::too_many_arguments)]

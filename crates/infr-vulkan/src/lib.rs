@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod adapter;
+mod caps;
 pub mod ep;
 mod gemm;
 pub mod linear;
@@ -23,6 +24,7 @@ mod recorder;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
+mod vkext;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use p2p::{P2pExport, P2pHandleType};
@@ -45,8 +47,8 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
 use gpu_allocator::vulkan::{
@@ -191,6 +193,23 @@ pub fn device_class() -> Option<DeviceClass> {
     DEVICE_CLASS.get().copied()
 }
 
+/// The SMALLEST `maxStorageBufferRange` any device opened in this process reported — the real
+/// ceiling on one descriptor binding's reach, which used to be assumed at 4 GiB and checked only in
+/// debug builds.
+///
+/// Process-global for the same reason as [`DEVICE_CLASS`]: its consumer is `Recorder::vkb`, the
+/// single choke point every descriptor binding goes through, which is reached from ~360 expression
+/// positions that hold no backend handle. Taking the MINIMUM keeps it conservative if a process
+/// ever opens two devices with different limits (a multi-GPU run) — a bind that fits the smallest
+/// device's limit fits every device's.
+static MAX_STORAGE_BUFFER_RANGE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// See [`MAX_STORAGE_BUFFER_RANGE`]. `u32::MAX` before any device has been opened, i.e. the check
+/// it feeds is inert until a real limit has been reported.
+pub(crate) fn max_storage_buffer_range() -> u32 {
+    MAX_STORAGE_BUFFER_RANGE.load(Ordering::Relaxed)
+}
+
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
 /// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
@@ -251,6 +270,16 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
+    /// `maxPushConstantsSize` — every kernel's push block is checked against THIS rather than
+    /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
+    /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
+    max_push_constants: u32,
+    /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
+    /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
+    /// UNSET when the probe was never run, which is every default run — the tier it guards is
+    /// opt-in (`INFR_I8_COOPMAT=1`), so the probe's init cost is only paid by a caller asking for
+    /// it. Read through [`VulkanBackend::i8_coopmat_ready`], where unset means "not usable".
+    i8cm_layout_ok: OnceLock<bool>,
     /// `VK_KHR_push_descriptor` loader, when the device supports it — every dispatch's
     /// descriptor binding then records via `cmd_push_descriptor_set` (recorder.rs
     /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
@@ -1522,6 +1551,21 @@ impl VulkanBackend {
         // bf16 (bfloat16) storage/convert. ash 0.38 has no constant for the ext → match the raw
         // name. Absent on RDNA3 → caps.bf16 false; present on RDNA4/Navi44.
         let has_bf16_ext = has_ext(c"VK_KHR_shader_bfloat16");
+        // …and their FEATURE bits, which ash 0.38 also has no struct for (see `vkext`). These two
+        // were the only capabilities here gated on an extension string alone; the kernels that use
+        // them declare `bfloat16_t` / `floate4m3_t` coopmat operands, which the spec requires the
+        // matching feature to be enabled for — so "the string was present" was never the same claim
+        // as "the device will run it". Skipped entirely (all-false) unless the extension is
+        // advertised: chaining a struct a driver does not know is UB.
+        // UNEXERCISED ON THIS HARDWARE — RDNA3 advertises neither extension (see the module doc).
+        let post_ash = unsafe {
+            crate::vkext::query_post_ash_features(
+                &instance,
+                physical_device,
+                has_bf16_ext,
+                has_f8_ext,
+            )
+        };
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
         // External-memory (host-LESS cross-device P2P): export a buffer's memory as an fd on one
@@ -1718,11 +1762,50 @@ impl VulkanBackend {
         // device fall back to the non-coopmat ladder instead of crashing. Derived from the
         // enumeration, not assumed from the ext bit. `has_coop_matrix` (any usable f16 shape)
         // keeps its downstream role (ext-enable, feature chain).
+        // ── driver trust: the ONE place a vendor/driver id reaches a decision ────────────────────
+        // Every other gate here is capability-first (probe, don't ask who made it), and that is why
+        // new hardware needs no code. This exception exists because capability-first assumes the
+        // device tells the truth, and llama.cpp has documented two drivers that do not — see
+        // `caps::coopmat_trust` for both rules and their upstream citation. The verdict is applied
+        // as a FILTER over the enumerated shape list below, so a shape this driver may not be
+        // believed about never reaches the tile preference order.
+        let device_probe = probe_device_facts(&instance, physical_device, &has_ext);
+        let device_arch = crate::caps::device_architecture(&device_probe);
+        // A driver that never reported an id must not be PRINTED as one either (ash's `DriverId`
+        // default is `AMD_PROPRIETARY`).
+        let driver_label = if device_probe.driver_id_reported {
+            format!("{:?}", device_probe.driver_id)
+        } else {
+            "driver-unreported".to_string()
+        };
+        let coopmat_trust = crate::caps::coopmat_trust(&device_probe, device_arch);
+        match coopmat_trust {
+            crate::caps::CoopmatTrust::Enumerated => {}
+            crate::caps::CoopmatTrust::Tile8Only(why) if has_coop_matrix => {
+                tracing::warn!(
+                    "[infr] cooperative matrix: 16x16x16 REFUSED on this device ({device_arch:?}, \
+                     {driver_label}) — {why}"
+                );
+            }
+            crate::caps::CoopmatTrust::Refused(why) if has_coop_matrix => {
+                tracing::warn!(
+                    "[infr] cooperative matrix REFUSED on this device ({device_arch:?}, \
+                     {driver_label}) — {why}"
+                );
+            }
+            // The device enumerates no coopmat at all: nothing to refuse, so stay silent.
+            _ => {}
+        }
+        let trusted = |&&(m, n, k, ..): &&CoopmatConfig| {
+            crate::caps::coopmat_shape_trusted(coopmat_trust, (m, n, k))
+        };
+
         let f16c = vk::ComponentTypeKHR::FLOAT16;
         let cm8_env = vkcfg.coopmat_8x8;
-        let coopmat_f16 = select_coopmat_shape(
+        let coopmat_f16 = crate::caps::select_coopmat_shape(
             coopmat_configs
                 .iter()
+                .filter(trusted)
                 .filter(|&&(_, _, _, a, b, _, _)| a == f16c && b == f16c)
                 .map(|&(m, n, k, ..)| (m, n, k)),
             cm8_env,
@@ -1740,23 +1823,31 @@ impl VulkanBackend {
         // matched bf16 (`CT_BF16` is ext-range too) and would false-positive f8 on a bf16-only
         // unit. Also requires the float8 storage ext. NEVER Some on RDNA3 (enumerates no fp8
         // config).
-        let coopmat_f8 = select_coopmat_shape(
+        let coopmat_f8 = crate::caps::select_coopmat_shape(
             coopmat_configs
                 .iter()
+                .filter(trusted)
                 .filter(|&&(_, _, _, a, b, _, _)| is_f8(a.as_raw()) && is_f8(b.as_raw()))
                 .map(|&(m, n, k, ..)| (m, n, k)),
             false,
         )
-        .filter(|_| has_f8_ext);
+        // The shader declares `floate4m3_t` coopmat operands, so the tier needs the extension AND
+        // `shaderFloat8CooperativeMatrix` — not merely an enumerated fp8 config.
+        .filter(|_| has_f8_ext && post_ash.f8_coopmat);
         // bf16 coopmat: BFLOAT16 A AND B operands, 16x16x16 only. Confirmed on RDNA4/Navi44
         // (bf16×bf16→bf16 and →f32); RDNA3 enumerates none. Same discipline as f8/f16 above.
-        let coopmat_bf16 = select_coopmat_shape(
+        let coopmat_bf16 = crate::caps::select_coopmat_shape(
             coopmat_configs
                 .iter()
+                .filter(trusted)
                 .filter(|&&(_, _, _, a, b, _, _)| a.as_raw() == CT_BF16 && b.as_raw() == CT_BF16)
                 .map(|&(m, n, k, ..)| (m, n, k)),
             false,
-        );
+        )
+        // `native_gemm_warp.comp`'s -DBF16CM build declares `bfloat16_t` coopmat operands
+        // (GL_EXT_bfloat16), so the tier needs the extension AND `shaderBFloat16CooperativeMatrix`
+        // enabled on the device, not just a bf16 config in the enumeration.
+        .filter(|_| has_bf16_ext && post_ash.bf16_coopmat);
         // i8 coopmat: configs with SINT8 A AND B operands and a SINT32 result, 16x16x16 only (the
         // shape every int8 coopmat shader here uses) — same discipline as `coopmat_f16`'s shape
         // selection above. DETECTION ONLY (see the `coopmat_i8` doc comment on `Capabilities`):
@@ -1764,13 +1855,15 @@ impl VulkanBackend {
         // (SINT8xSINT8->SINT32, subgroup-pinned 32, A RowMajor/B ColumnMajor) dispatches correctly
         // on this driver, but int8 coopmat hung an OLDER Mesa (commit ad82a77) despite enumerating
         // fine there too — so detection alone does NOT make this capability a safe default; the
-        // adapter requires `INFR_I8_COOPMAT=1` in addition to `caps.i8_coopmat()` before ever
-        // dispatching the kernel.
+        // adapter requires `INFR_I8_COOPMAT=1` in addition to `caps.i8_coopmat()`, AND that the
+        // accumulator-layout known-answer probe passed on this driver
+        // (`verify_i8_coopmat_layout`), before ever dispatching the kernel.
         let i8c = vk::ComponentTypeKHR::SINT8;
         let i32c = vk::ComponentTypeKHR::SINT32;
-        let coopmat_i8 = select_coopmat_shape(
+        let coopmat_i8 = crate::caps::select_coopmat_shape(
             coopmat_configs
                 .iter()
+                .filter(trusted)
                 .filter(|&&(_, _, _, a, b, _, r)| a == i8c && b == i8c && r == i32c)
                 .map(|&(m, n, k, ..)| (m, n, k)),
             false,
@@ -1879,6 +1972,17 @@ impl VulkanBackend {
         if has_i8_dot {
             ext_ptrs.push(c"VK_KHR_shader_integer_dot_product".as_ptr());
         }
+        // bf16/fp8: enabled ONLY when the coopmat tier that needs them survived the selection
+        // above, since that tier's shaders are the only code here declaring `bfloat16_t` /
+        // `floate4m3_t`. The matching feature structs are chained into `device_ci` below — a
+        // SPIR-V module using those types with the feature un-enabled violates its VUID, which is
+        // the gap the extension-string-only gate left. Never taken on this box (no such device).
+        if coopmat_bf16.is_some() {
+            ext_ptrs.push(c"VK_KHR_shader_bfloat16".as_ptr());
+        }
+        if coopmat_f8.is_some() {
+            ext_ptrs.push(c"VK_EXT_shader_float8".as_ptr());
+        }
         // External-memory fd ops + dma-buf handle type for the cross-device P2P transport (gated —
         // see the probe above). `VK_KHR_external_memory` itself is core in 1.1 and needs no enable.
         if has_ext_mem_fd {
@@ -1964,6 +2068,17 @@ impl VulkanBackend {
         }
         if has_ext_sem {
             device_ci = device_ci.push_next(&mut timeline_sem_ci);
+        }
+        // The two post-ash feature structs (see `vkext`): chained by hand, asking for exactly the
+        // bits the device reported, and only when their tier is live. Both must outlive
+        // `create_device`, which the block below guarantees.
+        let mut bf16_ci = crate::vkext::ShaderBfloat16Features::enable(&post_ash);
+        let mut f8_ci = crate::vkext::ShaderFloat8Features::enable(&post_ash);
+        if coopmat_bf16.is_some() {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut bf16_ci) };
+        }
+        if coopmat_f8.is_some() {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut f8_ci) };
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
@@ -2105,12 +2220,13 @@ impl VulkanBackend {
             name: device_name,
             f16: has_f16,
             coopmat_f16,
-            f8: has_f8_ext,
+            // Extension AND feature bit, like every other capability here (see `vkext`).
+            f8: has_f8_ext && post_ash.f8,
             coopmat_f8,
             i8: has_int8,
             i8_dot: has_i8_dot,
             coopmat_i8,
-            bf16: has_bf16_ext,
+            bf16: has_bf16_ext && post_ash.bf16_type,
             coopmat_bf16,
             subgroup_min,
             subgroup_max,
@@ -2149,6 +2265,11 @@ impl VulkanBackend {
             graph_input_inplace: true,
         };
 
+        // Publish this device's descriptor-range ceiling before anything can record a binding
+        // against it (see `MAX_STORAGE_BUFFER_RANGE`).
+        MAX_STORAGE_BUFFER_RANGE
+            .fetch_min(props.limits.max_storage_buffer_range, Ordering::Relaxed);
+
         // Publish the device class BEFORE any caller can size a prefill chunk against it (the seam
         // reads this in `ubatch_rows`, which runs on the first session/KV allocation — strictly
         // after `VulkanBackend::new` returns).
@@ -2167,9 +2288,11 @@ impl VulkanBackend {
         // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
         let yn = |b: bool| if b { "y" } else { "n" };
         tracing::info!(
-            "[infr] GPU: {} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} i8cm:{} \
-             subgroup:{}-{} sgp:{} shared:{}KB",
+            "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
+             i8dot:{} i8cm:{} subgroup:{}-{} sgp:{} shared:{}KB",
             caps.name,
+            device_arch,
+            driver_label,
             yn(caps.f16),
             yn(caps.f16_coopmat()),
             yn(caps.bf16),
@@ -2294,7 +2417,7 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
-        Ok(Self {
+        let backend = Self {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
@@ -2311,6 +2434,8 @@ impl VulkanBackend {
                 caps,
                 has_mem_budget,
                 max_mem_alloc_size,
+                max_push_constants: props.limits.max_push_constants_size,
+                i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
                 external_memory_fd,
                 has_dma_buf: has_ext_mem_dma_buf,
@@ -2328,7 +2453,117 @@ impl VulkanBackend {
                 kv_spill: SpillTally::default(),
                 staging_ring: Mutex::new(None),
             }),
-        })
+        };
+
+        // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
+        // once the backend exists. No-op unless that tier is actually asked for.
+        backend.verify_i8_coopmat_layout();
+
+        Ok(backend)
+    }
+
+    /// The int8 cooperative-matrix GEMM tier is usable on this device: the hardware enumerates the
+    /// SINT8 16x16x16 config, the caller opted in (`INFR_I8_COOPMAT=1`), AND this driver was MEASURED
+    /// to lay its accumulator fragment out the way the kernel reads it (see
+    /// [`Self::verify_i8_coopmat_layout`]). The adapter's dispatch gate reads exactly this.
+    pub(crate) fn i8_coopmat_ready(&self) -> bool {
+        self.shared.i8cm_layout_ok.get() == Some(&true)
+    }
+
+    /// Known-answer check of this driver's int8 coopmat accumulator fragment layout, run once at
+    /// init when the i8 coopmat tier is opted in — and the ONLY thing standing between a driver
+    /// that lays that fragment out differently and silently wrong GEMM results.
+    ///
+    /// `native_gemm_i8cm_q8_0.comp` applies its per-block descale IN-FRAGMENT, reading `csub[i]` as
+    /// matrix element `(2*i + (lane>>4), lane&15)`. `KHR_cooperative_matrix` fixes that mapping per
+    /// IMPLEMENTATION, not across implementations: it was derived empirically on RADV/RDNA3 and no
+    /// other device here has ever run it. So the tier is only armed once this device has multiplied
+    /// two known matrices and read the product back through that same mapping — anything else
+    /// leaves the tier OFF with a loud error, which is the one behaviour that cannot produce
+    /// plausible wrong numbers on hardware nobody can test.
+    ///
+    /// Does nothing (and costs nothing) unless the tier is both enumerated and opted into, so the
+    /// default run pays no init dispatch.
+    fn verify_i8_coopmat_layout(&self) {
+        if !(self.shared.caps.i8_coopmat() && self.cfg.kernels.vulkan.i8_coopmat) {
+            return; // tier unreachable this run — nothing to arm, nothing to check
+        }
+        match self.run_i8_coopmat_layout_probe() {
+            Ok(out) => match crate::caps::check_i8_coopmat_layout(&out) {
+                Ok(()) => {
+                    let _ = self.shared.i8cm_layout_ok.set(true);
+                    tracing::info!(
+                        "[infr] int8 coopmat: accumulator fragment layout verified on this driver \
+                         — INFR_I8_COOPMAT tier armed"
+                    );
+                }
+                Err(why) => {
+                    let _ = self.shared.i8cm_layout_ok.set(false);
+                    tracing::error!(
+                        "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): {why}. The GEMM \
+                         would return plausible wrong numbers on this driver, so the tier stays \
+                         off and the dp4a/coopmat-f16 tiers run instead."
+                    );
+                }
+            },
+            Err(e) => {
+                let _ = self.shared.i8cm_layout_ok.set(false);
+                tracing::error!(
+                    "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): the accumulator \
+                     layout probe could not run on this device ({e}) — the tier stays off."
+                );
+            }
+        }
+    }
+
+    /// Dispatch `coopmat_i8_layout.comp` once and return its readback (see
+    /// [`crate::caps::check_i8_coopmat_layout`] for what the words mean). Built through the
+    /// FALLIBLE kernel path and torn down immediately: a driver that refuses the pipeline for this
+    /// coopmat config is answering the probe's question, not crashing the process.
+    fn run_i8_coopmat_layout_probe(&self) -> Result<Vec<i32>> {
+        let k = crate::ops::try_make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            "coopmat_i8_layout",
+            crate::gemm::coopmat_i8_layout_spv(),
+            3,
+            0,
+            // The kernel this probes is dispatched at a pinned subgroup 32, and its lane->element
+            // arithmetic only holds there; pin the probe identically.
+            Some(32),
+            self.shared.push_descriptor.is_some(),
+            self.shared.max_push_constants,
+        )?;
+        let run = || -> Result<Vec<i32>> {
+            let (a, b) = crate::caps::frag_probe_inputs();
+            let abuf = self.alloc(a.len(), BufferUsage::Staging)?;
+            let bbuf = self.alloc(b.len(), BufferUsage::Staging)?;
+            self.upload(abuf.as_ref(), bytemuck::cast_slice(&a))?;
+            self.upload(bbuf.as_ref(), bytemuck::cast_slice(&b))?;
+            // Zero-initialised (the `alloc` calloc contract) — which is what makes an element the
+            // device never writes detectable as a mismatch rather than as stale VRAM.
+            let out = self.alloc(crate::caps::FRAG_PROBE_WORDS * 4, BufferUsage::Readback)?;
+            let vk_bufs = [
+                as_vk_buf(abuf.as_ref())?.buffer,
+                as_vk_buf(bbuf.as_ref())?.buffer,
+                as_vk_buf(out.as_ref())?.buffer,
+            ];
+            let binding = self.eager_bind(&k, &vk_bufs)?;
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                binding.bind(shared, cmd, k.pipeline_layout);
+                shared.device.cmd_dispatch(cmd, 1, 1, 1);
+            })?;
+            let mut bytes = vec![0u8; crate::caps::FRAG_PROBE_WORDS * 4];
+            self.download(out.as_ref(), &mut bytes)?;
+            Ok(bytemuck::cast_slice(&bytes).to_vec())
+        };
+        let res = run();
+        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        res
     }
 
     /// The submit splitter's current cap — see `VulkanShared::submit_dispatch_cap`. `0` =
@@ -3697,32 +3932,82 @@ impl Backend for VulkanBackend {
     }
 }
 
-/// Pick ONE cooperative-matrix (M,N,K) tile for a component type from the device's enumerated
-/// shape list, by preference order:
+/// Read the device facts [`crate::caps`]'s decisions are stated over — the PROBE half of the
+/// capability split. No policy here: every field is a straight copy of a Vulkan query result.
 ///
-/// 1. [`infr_core::COOPMAT_TILE_16`] (16x16x16) — the shape EVERY production coopmat shader is
-///    built for; a device that enumerates it (RADV/RDNA3+, NVIDIA, and reportedly some
-///    Battlemage drivers) always gets it, regardless of `allow_8x8x16` — the env knob must never
-///    move a device off the proven kernel set.
-/// 2. [`infr_core::COOPMAT_TILE_8`] (8x8x16, Intel Arc/ANV XMX) — only when `allow_8x8x16`
-///    (the `INFR_CM_8X8=1` opt-in; only `native_gemm_warp`'s `_cm8` builds exist at this shape,
-///    and Alchemist coopmat is a llama.cpp-documented regression, so it stays default-OFF).
-/// 3. `None` — no shape any kernel here is built for; the non-coopmat tiers take over.
-///
-/// Pure function of the enumerated list + the opt-in flag (no env reads) so the selection is
-/// unit-testable with synthetic property lists.
-fn select_coopmat_shape(
-    shapes: impl IntoIterator<Item = (u32, u32, u32)>,
-    allow_8x8x16: bool,
-) -> Option<(u32, u32, u32)> {
-    let mut has_8x8x16 = false;
-    for s in shapes {
-        if s == infr_core::COOPMAT_TILE_16 {
-            return Some(infr_core::COOPMAT_TILE_16);
-        }
-        has_8x8x16 |= s == infr_core::COOPMAT_TILE_8;
+/// Each chained property struct is guarded by the thing that makes chaining it legal — the core
+/// version that promoted it, or the extension that defines it. Chaining a struct the driver does
+/// not know is undefined behaviour (same rule as the `VK_AMD_shader_core_properties` guard in
+/// `new`), and a driver that ignores a struct leaves it at ash's `Default`, which for
+/// `DriverId` is `AMD_PROPRIETARY` and NOT a safe "unknown" — hence `driver_id_reported`.
+fn probe_device_facts(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    has_ext: &dyn Fn(&CStr) -> bool,
+) -> crate::caps::DeviceProbe {
+    let base = unsafe { instance.get_physical_device_properties(physical_device) };
+    let (major, minor) = (
+        vk::api_version_major(base.api_version),
+        vk::api_version_minor(base.api_version),
+    );
+    let at_least = |want_minor: u32| major > 1 || (major == 1 && minor >= want_minor);
+    // Core 1.2 (promoted from VK_KHR_driver_properties).
+    let want_driver = at_least(2) || has_ext(c"VK_KHR_driver_properties");
+    // Core 1.3 (promoted from VK_EXT_subgroup_size_control / VK_KHR_shader_integer_dot_product).
+    let want_sgctl = at_least(3) || has_ext(c"VK_EXT_subgroup_size_control");
+    let want_intdot = at_least(3) || has_ext(c"VK_KHR_shader_integer_dot_product");
+    let want_amd_core = has_ext(c"VK_AMD_shader_core_properties");
+    let want_nv_sm = has_ext(c"VK_NV_shader_sm_builtins");
+
+    let mut driver = vk::PhysicalDeviceDriverProperties::default();
+    let mut sgctl = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+    let mut intdot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let mut amd_core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+    let mut nv_sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default();
+    if want_driver {
+        props2 = props2.push_next(&mut driver);
     }
-    (allow_8x8x16 && has_8x8x16).then_some(infr_core::COOPMAT_TILE_8)
+    if want_sgctl {
+        props2 = props2.push_next(&mut sgctl);
+    }
+    if want_intdot {
+        props2 = props2.push_next(&mut intdot);
+    }
+    if want_amd_core {
+        props2 = props2.push_next(&mut amd_core);
+    }
+    if want_nv_sm {
+        props2 = props2.push_next(&mut nv_sm);
+    }
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+
+    crate::caps::DeviceProbe {
+        vendor_id: base.vendor_id,
+        driver_id: driver.driver_id,
+        driver_id_reported: want_driver,
+        integrated: base.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+        subgroup_min: if want_sgctl {
+            sgctl.min_subgroup_size
+        } else {
+            0
+        },
+        subgroup_max: if want_sgctl {
+            sgctl.max_subgroup_size
+        } else {
+            0
+        },
+        wavefronts_per_simd: amd_core.wavefronts_per_simd,
+        has_amd_shader_core: want_amd_core,
+        has_integer_dot: want_intdot,
+        dot4x8_signed_accelerated: intdot.integer_dot_product4x8_bit_packed_signed_accelerated != 0,
+        dot4x8_mixed_accelerated: intdot
+            .integer_dot_product4x8_bit_packed_mixed_signedness_accelerated
+            != 0,
+        has_coopmat_ext: has_ext(c"VK_KHR_cooperative_matrix"),
+        has_nv_sm_builtins: want_nv_sm,
+        warps_per_sm: nv_sm.shader_warps_per_sm,
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -4077,33 +4362,6 @@ mod tests {
         drop(dflt);
         assert_eq!(build(Some(7)).submit_dispatch_cap(), 7);
         assert_eq!(build(Some(0)).submit_dispatch_cap(), 0, "0 = no split");
-    }
-
-    /// Shape selection over synthetic property lists (no GPU needed) — the caps-table core of the
-    /// shape-aware coopmat gate. RADV-like (16x16x16 present, plus the other shapes RADV
-    /// enumerates) must pick 16x16x16 regardless of the 8x8 opt-in; ANV-like (8x8x16 only) must
-    /// stay dark by default and pick 8x8x16 only under the opt-in; empty (no coopmat) is None.
-    #[test]
-    fn coopmat_shape_selection() {
-        let t16 = infr_core::COOPMAT_TILE_16;
-        let t8 = infr_core::COOPMAT_TILE_8;
-        // RADV-like: 16x16x16 f16 (RDNA3 WMMA). Opt-in must NOT move it off 16x16x16.
-        let radv = [t16];
-        assert_eq!(select_coopmat_shape(radv, false), Some(t16));
-        assert_eq!(select_coopmat_shape(radv, true), Some(t16));
-        // Device enumerating BOTH shapes: 16x16x16 preferred, opt-in irrelevant.
-        let both = [t8, t16];
-        assert_eq!(select_coopmat_shape(both, false), Some(t16));
-        assert_eq!(select_coopmat_shape(both, true), Some(t16));
-        // ANV-like (Intel Arc A770): 8x8x16 only — default OFF, opt-in selects it.
-        let anv = [t8];
-        assert_eq!(select_coopmat_shape(anv, false), None);
-        assert_eq!(select_coopmat_shape(anv, true), Some(t8));
-        // No configs (ext absent / feature off): None either way.
-        assert_eq!(select_coopmat_shape([], false), None);
-        assert_eq!(select_coopmat_shape([], true), None);
-        // A shape no kernel is built for (e.g. a hypothetical 32x32x16): None even with opt-in.
-        assert_eq!(select_coopmat_shape([(32, 32, 16)], true), None);
     }
 
     /// Resident-BDA weight arena: sub-allocate three odd-sized weight buffers directly from

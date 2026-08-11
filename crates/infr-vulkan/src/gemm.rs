@@ -2165,6 +2165,19 @@ pub(crate) fn mla_ff_bias_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/mla_ff_bias.spv"))))
 }
+/// SPIR-V for the int8 coopmat accumulator-layout known-answer probe (`coopmat_i8_layout.comp`) —
+/// dispatched once at init when the i8 coopmat tier is opted into, to check that this driver lays a
+/// 16x16 SINT32 accumulator fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn coopmat_i8_layout_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/coopmat_i8_layout.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
