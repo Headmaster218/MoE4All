@@ -1897,29 +1897,134 @@ compile-time claim only.
 
 **Tag:** deepseek · vulkan · perf · **Blocked on:** nothing
 
-Two costs, both read directly and both structural rather than incidental:
+**Now measured** (2026-08-11, RX 7900 XTX / RADV,
+`JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, oracle = `llama-bench` on
+llama.cpp's **Vulkan** backend, same GGUF; the built binary reports
+`build: c629da5 (417)`, i.e. the pin BEFORE B-DSHW-PULL's — the `build-vk` tree
+was not rebuilt at `030ebb5`):
 
-- **`mla.comp` is the only MLA kernel.** There is no coopmat variant, no flash
-  variant, no split-K arm, no mrows tier — the whole tier ladder that
-  `Op::Attention` picks from does not exist for `Op::Mla`. Its shared arrays are
-  fixed-size, and the adapter enforces the ceiling on its behalf
-  (`MLA_MAX_KEY_LEN` = 576, `MLA_MAX_KV_LORA_RANK` = 512, both mirroring
-  `#define`s in the shader) with a loud error, because "shared memory is not
-  bounds checked — the symptom is corrupted neighbours or a lost device". The
-  refusal is right; the missing tiers are the perf item.
+| bench       | infr  | llama.cpp Vulkan | ratio |
+| ----------- | ----- | ---------------- | ----- |
+| pp512       | 975.5 | 4435.92 ± 110.89 | 4.5×  |
+| pp2048      | 673.4 | 3999.80 ± 24.79  | 5.9×  |
+| tg64        | 111.2 | 228.15 ± 7.64    | 2.1×  |
+| tg64 @ 2048 | 6.3   | 215.11 ± 4.79    | 34×   |
+
+The two costs, re-read against those numbers — the first is now the whole
+remaining gap, the second is noise:
+
+- **`mla.comp` is the only MLA kernel, and it is where all the time goes.**
+  There is no coopmat variant, no flash variant, no split-K arm, no mrows tier —
+  the whole tier ladder that `Op::Attention` picks from does not exist for
+  `Op::Mla`. Its shared arrays are fixed-size, and the adapter enforces the
+  ceiling on its behalf (`MLA_MAX_KEY_LEN` = 576, `MLA_MAX_KV_LORA_RANK` = 512,
+  both mirroring `#define`s in the shader) with a loud error, because "shared
+  memory is not bounds checked — the symptom is corrupted neighbours or a lost
+  device". The refusal is right; the missing tiers are the perf item.
+  `INFR_PROF_OPS` puts `mla_ff` at **51.9%** of decode GPU time at a short
+  context and **97.3%** at `-d 2048` (1.22s of a 1.26s 8-token decode, 5.7ms per
+  layer dispatch). That is the 34× row above, and nothing else in the profile is
+  within two orders of magnitude of it. The shape explains it: one workgroup per
+  (row, head) — `n_head` = 16 workgroups on a 96-CU part at decode — and TWO
+  serialized passes over the whole key range, each doing a 128-lane tree
+  reduction with 7 `barrier()`s **per key**.
 - **`Op::Mla` and `Op::LightningIndexer` each disqualify a graph from
-  record-once decode replay.** The decode-eligibility loop in `adapter.rs`
-  returns false on either, for stated reasons: MLA uses a non-standard kernel,
-  and the indexer bakes its causal bound from the `pos` push constant at record
-  time with no params-driven `_dyn` twin, so a replayed tape would select keys
-  for the position it was recorded at. So **every DeepSeek decode token rebuilds
-  and re-records its graph** — the same per-token host cost B-DSV4-WIRING
-  records for V4, but this one applies to V2/V3/V3.2 as well.
+  record-once decode replay — and that costs almost nothing.** The
+  decode-eligibility loop in `adapter.rs` returns false on either, for stated
+  reasons: MLA uses a non-standard kernel, and the indexer bakes its causal
+  bound from the `pos` push constant at record time with no params-driven `_dyn`
+  twin, so a replayed tape would select keys for the position it was recorded
+  at. So every DeepSeek decode token does rebuild and re-record its graph — but
+  `INFR_PROF_STAGES` prices that rebuild at **0.039 ms/tok of an 8.9 ms/tok**
+  decode step, 0.44%, both from the same run. A separate `INFR_PROF_OPS` run
+  puts GPU at 8.2 ms/tok, which INFERS (across runs, so the profiler's own
+  overhead is in it) that record+submit is the only other ~0.7 ms and a replay
+  tape's whole ceiling is under a tenth of the step. Do the kernel tiers first;
+  this is not the DeepSeek decode problem.
+
+**A third cost was found by measuring, and is FIXED** (`session_stable`'s
+`moe_batched_ok` in `seam/runner.rs`): the expert-bank dtype scan ran over EVERY
+layer, so DeepSeek's leading dense blocks (`Config::is_moe_layer` false, no
+`ffn_*_exps` tensor to look up) read `None`, failed the scan, and set
+`batched_prefill_ok` false for every DeepSeek model — the whole prompt was
+prefilled one token per submit. Measured before/after, alternating arms: V2-Lite
+pp512 39.1 → 975.5 (25×), pp2048 12.3 → 673.4 (54×); `deepseek` V1
+(`mradermacher/deepseek-moe-16b-chat-GGUF` Q4_K_M, same dense-lead shape, no
+MLA) pp512 229.0 → 4185.0, which is parity with llama.cpp Vulkan's 4320.07 ±
+358.49 on that model. Decode is untouched by it (tg64 111.0 → 111.2). The V1
+parity is the useful control: the batched MoE path itself is fine, so V2-Lite's
+remaining 4.5× prefill gap is `mla.comp` too.
+
+**These are throughput numbers on a model whose output is wrong** — see
+B-DSV2-DEGENERATE below. That does not invalidate the ratios (both engines run
+the same shapes either way), but no `mla.comp` rewrite should be blessed on
+speed alone until that bug is closed.
 
 **Calibration, so this is not read as further behind than it is:** llama.cpp's
 **Vulkan** backend has no fused indexer either (see B-DSHW-FUSED-REF). `infr` is
-behind llama.cpp's CUDA backend here, not its Vulkan one. Not measured — no
-DeepSeek perf numbers were taken in this audit.
+behind llama.cpp's CUDA backend here, not its Vulkan one.
+
+### B-DSV2-DEGENERATE — DeepSeek-V2-Lite output decays into repetition as the context grows (2026-08-11)
+
+**Tag:** deepseek · correctness · **Blocked on:** nothing — this is a real bug,
+undiagnosed
+
+`infr` produces text that starts correct and then collapses into a repeating
+phrase on `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF` — **on Vulkan only**.
+Measured on Vulkan (RX 7900 XTX / RADV), `INFR_TEMP=0`, `--max-new 60`, prompt
+`Why is the sky blue?`:
+
+```
+The sky is blue due to a phenomenon called Rayleigh scattering, which is the
+scattering of light particles, such as photons, off particles in space, in
+space, in space, in space, in the physical environment, in the physical
+environment, in the physical environment, in the physical regard, in the
+```
+
+llama.cpp on the **same GGUF blob**, `--temp 0 -st -no-cnv -ngl 99`, stays
+coherent all the way
+(`...Blue light is scattered more than other colors because it travels as shorter, smaller waves.`).
+So the file is fine and the divergence is ours.
+
+**Shape of the failure, which is the part that decides where to look:**
+
+- It is **not** wrong from the first token. The opening clause is right, and it
+  tracks llama.cpp's own wording (`a phenomenon called Rayleigh scattering`) for
+  roughly twenty tokens before decaying.
+- A short answer is **correct**:
+  `What is the capital of France? Answer with only the city name.` → ` Paris`,
+  greedy.
+- So it degrades as the context lengthens rather than diverging at the forward's
+  first output. An earlier note in this backlog claimed divergence at the first
+  sampled token and degeneration into repeated `**`; both were checked against
+  the runs above and are wrong. Do not start from them.
+- The `deepseek` V1 GGUF (`mradermacher/deepseek-moe-16b-chat-GGUF`, same
+  dense-lead MoE shape, **no MLA**) is coherent, which localizes this to the
+  deepseek2/MLA path and not to dense-lead MoE routing.
+- **The CPU backend is COHERENT on the identical prompt and file.**
+  `INFR_DEV=cpu INFR_TEMP=0 --max-new 60` runs clean to the end
+  (`...Specifically, it occurs in the blue and violet light wavelengths of sunlight...`).
+  This is the discriminator: same weights, same config, same tokenizer, same
+  sampler — only the backend differs. An earlier note claimed the CPU backend
+  degenerates too; it was checked and it does not.
+
+**So the defect is in the Vulkan MLA path**, and the CPU implementation is a
+working reference to difference against. `Op::Mla` on Vulkan is served by the
+single `mla.comp` (B-DSHW-MLA-SCALAR-TIER), so that shader and the KV rows it
+reads are the search space — not the config, the YaRN ramp, or the graph, all of
+which the coherent CPU run exercises identically.
+
+Given "correct for ~20 tokens, then decays", look at what changes with `pos`:
+the second pass over the key range, the causal bound, and the compressed-KV rows
+as the cache fills. `gpu_seam_matches_cpu_deepseek2` passes, so whatever this is
+either needs more tokens than that test drives or lies outside the seam it
+compares — establishing which is the cheapest next step. Same question for the
+blessed `cpu_deepseek_v32_golden`: it passes, and it is a CPU test, so it could
+never have caught a Vulkan-only fault.
+
+The decode-at-depth throughput collapse in B-DSHW-MLA-SCALAR-TIER (tg64 111 →
+6.3 at `-d 2048`) is in the same kernel and the same depth-dependent direction;
+whether the two share a cause is **a guess, not a finding**.
 
 ### B-DSHW-FUSED-REF — upstream's fused DeepSeek kernels exist on CUDA and SYCL only (2026-08-11)
 

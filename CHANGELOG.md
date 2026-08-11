@@ -288,6 +288,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every DeepSeek model prefilled one token per submit.** The batched-prefill
+  eligibility scan (`moe_batched_ok` in `seam/runner.rs`) demanded a dp4a-mmq
+  expert bank on EVERY layer, but DeepSeek's leading dense blocks ship a plain
+  `ffn_gate/up/down` and no `ffn_*_exps` tensor at all — the missing lookup read
+  as "unsupported dtype" and disqualified the whole model, so the entire prompt
+  went through the per-token decode path. The scan now covers the layers that
+  actually hold expert banks (`Config::is_moe_layer`), which also picks up
+  llama4 checkpoints with a non-`1` `interleave_moe_layer_step`. Measured on an
+  RX 7900 XTX: DeepSeek-V2-Lite-Chat Q4_K_M pp512 39.1 → 975.5 t/s and pp2048
+  12.3 → 673.4 t/s; DeepSeek-MoE-16B-Chat Q4_K_M pp512 229.0 → 4185.0 t/s, level
+  with llama.cpp's Vulkan backend on the same file. Decode is unchanged.
 - **The int8 cooperative-matrix prefill GEMM assumed a fragment layout no device
   was ever asked about.** `native_gemm_i8cm_q8_0.comp` reads its accumulator
   elements at `(row, col) = (2*i + (lane>>4), lane&15)`, a mapping

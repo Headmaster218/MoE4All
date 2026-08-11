@@ -265,21 +265,34 @@ fn session_stable(
     let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
     // Batched-prefill eligibility for MoE: every layer's expert banks must have a dp4a-mmq kernel
     // (`MOE_MMQ_DTYPES`) — see the decode_start call site's comment for the full rationale.
+    // Scanned over the layers that actually HOLD expert banks (`Config::is_moe_layer`), not every
+    // layer: DeepSeek's leading `n_layer_dense_lead` blocks (and llama4's non-interleaved ones)
+    // ship a plain `ffn_gate/up/down` and no `_exps` tensor at all, so an unfiltered scan looked
+    // up a name that does not exist, read `None`, and disqualified the whole model — which is what
+    // made every DeepSeek prefill run one token per submit (see the CHANGELOG entry for the
+    // before/after prefill throughput that fixing it bought).
     let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
     let moe_batched_ok = c.moe.is_some() && {
         let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
-        if c.dual_moe() {
-            (0..c.n_layer).all(|l| {
-                moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
-                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
-            })
-        } else {
-            (0..c.n_layer).all(|l| {
-                moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
-                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
-                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
-            })
-        }
+        let moe_layers = || (0..c.n_layer).filter(|&l| c.is_moe_layer(l));
+        // `all` over an EMPTY iterator is `true`, and this filter can be empty on a file whose
+        // metadata disagrees with itself — `leading_dense_block_count >= block_count`, or an
+        // interleave step past the last layer. That would enable batched expert prefill for a model
+        // carrying no expert banks, so require at least one MoE layer to have been scanned. The
+        // pre-filter `(0..n_layer)` scan could not be vacuous; this one can.
+        moe_layers().next().is_some()
+            && if c.dual_moe() {
+                moe_layers().all(|l| {
+                    moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
+                        && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                })
+            } else {
+                moe_layers().all(|l| {
+                    moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
+                        && moe_mmq_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
+                        && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                })
+            }
     };
     Ok(SessionStable {
         has_wv,
