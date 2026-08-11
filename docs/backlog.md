@@ -1305,6 +1305,35 @@ MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
   code does (chunk workers all `inc` the same bar); the real pull ran with
   stderr redirected to a file, where bars are hidden.
 
+### B60 — every infr-vs-llama.cpp cosine in the docs is the wrong metric (2026-08-11)
+
+**Tag:** CR-2026-08-11 · **Blocked on:** nothing; the replacement metric exists
+and is in use
+
+`cpu_prefill_matches_llama_debug_dump` scores infr's prefill against llama.cpp's
+on the same GGUF over llama.cpp's own token ids. Running it produced a result
+that invalidates how this repo has been reporting agreement:
+
+| pair                                         | logit cosine | probability cosine |
+| -------------------------------------------- | -----------: | -----------------: |
+| V2-Lite, same prompt, **both pick " Paris"** |    **0.774** |             0.9969 |
+| Qwen3-0.6B, same prompt                      |       0.9985 |             0.9994 |
+| Qwen3-0.6B, **unrelated prompt**             |    **0.851** |             0.0164 |
+
+A **correct** deepseek2 match scores BELOW an **unrelated** Qwen pair. A
+whole-vocab logit cosine is dominated by the per-token bias every row of a model
+shares, so it cannot separate a match from a mismatch, and the "~0.79–0.91
+established range" the docs quoted was measuring that bias rather than
+agreement. `docs/deepseek.md`'s YaRN checklist entry is corrected; the
+greedy-token identities it reports are real evidence and stand.
+
+Where this still needs sweeping: any other cosine figure quoted as evidence in
+`docs/`, and — separately — the CPU-vs-**Vulkan** cosines (`0.9955` for
+deepseek2, `0.99999992` for V4). Those compare two runs of the SAME model and
+weights, so the shared bias argument is weaker and they may well be fine, but
+they have not been re-examined against a probability cosine and should not be
+assumed sound just because they are high.
+
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing

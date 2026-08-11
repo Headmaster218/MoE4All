@@ -493,8 +493,18 @@ Order matters:
     (549). The seam's ff divisors / mscale are context-independent (llama.cpp
     runs the full ramp at every context length), so the short-CPU and long-GPU
     runs exercise the same numbers; both greedy tokens match.
-  - Both cosines sit in the established deepseek2 infr-vs-llama.cpp range
-    (~0.79–0.91; MLA adds f16 cache + norm + rope stages per layer).
+  - **Ignore those two cosine numbers; the greedy tokens are the result.** This
+    entry used to say both sat "in the established deepseek2 infr-vs-llama.cpp
+    range (~0.79–0.91)". That range means nothing. Measured 2026-08-11 by
+    `cpu_prefill_matches_llama_debug_dump`, on the same V2-Lite GGUF and over
+    llama.cpp's own token ids: a **correct** match — both engines picking token
+    8913 (" Paris"), probability cosine 0.9969 — scores a logit cosine of only
+    **0.774**, while two **unrelated** rows of Qwen3-0.6B score **0.851**. A
+    whole-vocab logit cosine is dominated by the per-token bias every row of a
+    model shares, so a correct row can score below an unrelated one and the
+    metric cannot separate them. Score agreement on mutual top-5 containment and
+    a cosine over softmax **probabilities** (0.9969 vs 0.0164 for that unrelated
+    pair). The greedy-token identity above is real evidence and stands.
 - [x] Metal MLA kernel — `mla_f16kv` in `attention.metal` + `exec.rs` dispatch
       (2026-08-06; ported from `mla.comp`, f16 KV cache), plus the YaRN
       `mla_f16kv_ff` twin. Executed for the first time by `mla_parity` /
