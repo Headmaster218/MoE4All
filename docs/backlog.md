@@ -2026,6 +2026,26 @@ producing **identical** text
   `kernels.vulkan.{mmq, mmq_fallback, coopmat, f16, bm16, small_bm, gemm_warp, i8_dot}`
   — every one of them, alone and together — leaves the layer-0 KV-latent
   CPU/Vulkan cosine at 0.99948…0.99952.
+- **Not the in-shader Q4_K WEIGHT dequant** — the tier-invariance lead, and it
+  is dead. `native_decode.glsl`'s `dqblk` was read out of the device for EVERY
+  element of the real `blk.0.attn_kv_a_mqa.weight` (Q4_K, 2048→576) by
+  dispatching `native_gemv.comp` with one-hot activations (each output is then
+  an exact `w·1 + Σ0`, so the GEMV returns the decoded weight bit-for-bit):
+  1179648 elements, **0 not bit-identical** to
+  `infr_gguf::dequant::dequant_block`, max_abs 0.0.
+- **Not `Op::EmbedGather`'s dequant of `token_embd`.** Same table (`token_embd`
+  is Q4_K here too, 2048×102400), 64 rows spread across the vocabulary gathered
+  on the GPU at `scale = 1.0`: 131072 elements, **0 not bit-identical** to
+  `dequant_block`.
+- **Not `Op::RmsNorm` on `attn_norm`.** Real `blk.0.attn_norm.weight` (F32) over
+  real embedding rows, eps read from the file
+  (`deepseek2.attention.layer_norm_rms_epsilon`), against an f64 reference: max
+  relative error **2.365e-7** on the 256-thread prefill build and **1.191e-7**
+  on the `-DWIDE` decode build.
+
+All three are guarded by `crates/infr-vulkan/tests/weight_dequant_parity.rs`,
+and each assertion was shown to go red before being trusted (a single flipped qs
+nibble in the GPU's copy of the weight; a 5% change in eps).
 
 #### What IS measured
 
@@ -2104,19 +2124,43 @@ generation.
 
 #### What is still open, and where to look next
 
-Vulkan's layer-0 KV row stays ~2% off the CPU/llama.cpp value even with the
-Linear on the f32-activation route (latent cosine 0.99977 vs 0.99979 — the
-element-wise errors halve but do not vanish). Since `Op::Linear`'s activation
-side and `Op::Mla` are both cleared, what is left upstream of that row is:
-`Op::EmbedGather`'s in-shader Q4_K dequant of `token_embd` (the CPU path
-host-dequants the same table), `Op::RmsNorm` on `attn_norm`, and the in-shader
-Q4_K WEIGHT dequant that every Vulkan tier shares — a ~1–3% weight-dequant
-disagreement would be tier-invariant, which is what the knob sweep saw. Compare
-one dequantized Q4_K row from the GPU against `infr_llama::dequant_block` before
-anything else.
+**Layer 0's whole Vulkan error is now accounted for, and it is the `quant_q8`
+activation prepass — nothing else.** Everything upstream of layer 0's first
+Linear is bit-exact (the three ruled-out items above), so the layer-0 chain was
+priced directly: real `token_embd` rows → `Op::RmsNorm` with the real
+`blk.0.attn_norm.weight` → `wkv_a_mqa` (Q4_K 2048→576) at the reported 60-row
+prefill shape, both Vulkan routes fed by the SAME GPU rmsnorm output, scored
+against an f64 reference of the same chain
+(`layer0_kv_a_mqa_error_is_the_int8_activation_prepass`):
 
-The backend-independent half of this is tracked separately as
-B-DSV2-FORWARD-ACCURACY below, and is probably the bigger defect of the two.
+| route                                             | relative L2 | worst element |
+| ------------------------------------------------- | ----------- | ------------- |
+| f32-activation GEMV (`linear_native`)             | 9.081e-8    | 1.513e-6      |
+| int8 dp4a `mmq` (`quant_q8` + `matmul_mmq`, prod) | 6.423e-3    | 1.260e-1      |
+
+`n = 576` is a multiple of 64 but not of 128, which is why production takes the
+`mmq` arm. The 12.6% worst element is the same order as the ~10% per-element
+layer-0 gap reported above, and 0.64% relative L2 is what per-32-block symmetric
+int8 costs on a normalized row — it is a precision property of the prepass, not
+a miscomputation in it.
+
+**This contradicts the "~2% residual on the f32-activation route" claim above,
+which should be re-verified before it is built on.** Measured directly on the
+real tensors, that route is 9e-8, not 2e-2. Either the reverted
+`exact_linear_acts` flag did not actually cover every Linear feeding the
+latent-cosine measurement (its early return lives in `adapter.rs`'s `Op::Linear`
+arm, whose fused-add and streamed twins are separate branches), or that 2% came
+from further down the layer than `wkv_a_mqa`. Re-run the depth cosine with the
+flag on and a per-op tap before treating the residual as real.
+
+So the remaining Vulkan-side question is not "which op is wrong" — it is why the
+same class of activation-reduction error that llama.cpp's Vulkan backend also
+carries amplifies ~1.3× per layer HERE and not on the `deepseek` V1 control.
+That points at the MLA sub-graph's conditioning rather than at any single
+kernel, and it is entangled with B-DSV2-FORWARD-ACCURACY below
+(backend-independent, probably the bigger defect of the two): a forward that is
+already wrong on the CPU is a forward whose sensitivity to a 0.6% perturbation
+says nothing about the kernel. Close that one first.
 
 #### Coverage gaps, stated plainly
 
@@ -2124,7 +2168,16 @@ B-DSV2-FORWARD-ACCURACY below, and is probably the bigger defect of the two.
   0.5; it passed for the whole life of this bug and is not a guard against it. A
   depth-60 version of it measures 0.9456 today, so it cannot be added until the
   bug is fixed without landing a red test.
-- No test was added this pass, because nothing was fixed.
+- `weight_dequant_parity` covers Q4_K only, because that is what this model is.
+  Every other format's `dqblk` arm in `native_decode.glsl` is still compared
+  only against another Vulkan build (`weight_addr_parity`), never against the
+  host.
+- The layer-0 chain probe uses token ids spread across the vocabulary, NOT the
+  reported prompt's ids — infr-vulkan has no tokenizer. The error magnitudes are
+  representative; the absolute values are not the ones quoted elsewhere in this
+  entry.
+- Nothing was fixed, so nothing shipped. The int8 prepass number above is a
+  measurement of a trade the entry already describes, not a defect found.
 - The Metal MLA path was not looked at at all.
 
 ### B-DSV2-FORWARD-ACCURACY — infr's deepseek2 forward disagrees with llama.cpp on BOTH backends (2026-08-12)
