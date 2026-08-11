@@ -4025,3 +4025,252 @@ fn gpu_seam_matches_cpu_deepseek2() {
         "CPU/Vulkan last-row logits diverged too far: cosine={cos}"
     );
 }
+
+// ── DeepSeek V3.2, at real V3 scale ────────────────────────────────────────────
+//
+// `unsloth/DeepSeek-V3.2-GGUF` declares `general.architecture = "deepseek2"`, not `deepseek32`:
+// every public V3.2 GGUF does, because the converters emit the model as dense MLA and drop the
+// lightning indexer. So these tests exercise the `deepseek2` path at 671B/61-layer/256-expert
+// scale, and they are the FIRST time group-limited routing (`n_expert_groups`) and the
+// `exp_probs_b` router bias run on a real file rather than the synthetic GGUFs of
+// `tests/synthetic_deepseek2.rs`.
+//
+// The file is 245 GB of Q2_K across five shards and the box has 60 GB of RAM, so every weight
+// streams from disk through the host pager on EVERY forward: one prefill costs minutes and one
+// decoded token ~1.5 minutes. Only the metadata test runs unattended; the two that load weights
+// are `#[ignore]`d and self-skip on top of that.
+
+/// Locate the real DeepSeek-V3.2 Q2_K shard set in the HF cache (shard 1 of 5; the loader follows
+/// the split naming for the rest). `INFR_TEST_DEEPSEEK_V32` overrides — point it at the
+/// single-file `DeepSeek-V3.2-UD-TQ1_0.gguf` to run these against TQ1_0 instead. `None` ⇒ skip.
+fn deepseek_v32() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_DEEPSEEK_V32") {
+        return Some(PathBuf::from(p));
+    }
+    find_gguf(
+        "unsloth--DeepSeek-V3.2-GGUF",
+        "Q2_K/DeepSeek-V3.2-Q2_K-00001-of-00005.gguf",
+    )
+}
+
+/// Metadata only (no weight load, so this one is cheap enough to run unattended): the V3-scale
+/// hyperparameters that the V2-Lite config test cannot reach. Group-limited routing, the sigmoid
+/// gate, the router-bias normalisation and the 2.5 routed-weight scale are all V3-only, and until
+/// this file existed they were asserted only on a synthetic GGUF this repo wrote itself.
+#[test]
+fn cpu_deepseek_v32_config() {
+    let path = need_model!(deepseek_v32(), "DeepSeek-V3.2");
+    let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("parse config");
+    assert_eq!(
+        g.metadata().str("general.architecture"),
+        Some(infr_llama::arch::DEEPSEEK2),
+        "every public V3.2 GGUF declares deepseek2, not deepseek32"
+    );
+    assert!(cfg.deepseek2, "deepseek2 gate");
+    assert!(
+        !cfg.deepseek32,
+        "the indexer path must stay off: this file has no indexer tensors"
+    );
+    assert!(!cfg.deepseek4, "deepseek4 must be false");
+    // MLA geometry — V3's, not V2-Lite's.
+    assert_eq!(cfg.n_layer, 61, "V3 layer count");
+    assert_eq!(cfg.q_lora_rank, 1536, "V3 q_lora_rank (V2-Lite has none)");
+    assert_eq!(cfg.kv_lora_rank, 512, "V3 kv_lora_rank");
+    assert_eq!(cfg.key_length, 192, "attention.key_length_mla");
+    assert_eq!(cfg.qk_rope_dim, 64, "rope.dimension_count");
+    assert_eq!(cfg.head_k_mla, 128, "key_length_mla - rope.dimension_count");
+    assert_eq!(cfg.v_head_dim, 128, "attention.value_length_mla");
+    assert_eq!(cfg.n_kv, 1, "MLA caches one compressed row per token");
+    // Routing — the half that has never run on a real file.
+    let moe = cfg.moe.expect("V3 is MoE");
+    assert_eq!(moe.n_expert, 256, "V3 routed-expert count");
+    assert_eq!(moe.n_used, 8, "V3 experts per token");
+    assert_eq!(moe.n_expert_groups, 8, "group-limited routing: groups");
+    assert_eq!(moe.n_expert_groups_used, 4, "group-limited routing: used");
+    assert_eq!(cfg.expert_gating_func, 2, "sigmoid gate");
+    assert_eq!(moe.gating, infr_core::graph::MoeGating::Sigmoid);
+    assert!(moe.norm_w, "expert_weights_norm");
+    assert!(!moe.weight_before, "weight applies to the expert OUTPUT");
+    assert_eq!(moe.scale, 2.5, "expert_weights_scale");
+    assert!(
+        cfg.n_layer_dense_lead > 0,
+        "V3 leads with dense layers before the MoE stack"
+    );
+    // YaRN — factor 40 over a 4096-token original context.
+    assert!(cfg.rope_scaling_yarn, "rope.scaling.type == yarn");
+    assert_eq!(cfg.rope_scaling_factor, 40.0, "rope.scaling.factor");
+    assert_eq!(
+        cfg.rope_scaling_orig_ctx, 4096,
+        "the ramp's n_ctx_orig, NOT context_length"
+    );
+    eprintln!(
+        "deepseek2 V3.2: n_layer={} n_head={} n_embd={} vocab={} n_ff={} \
+         moe.n_ff_exp={} n_layer_dense_lead={} shexp_ff={} yarn_log_mul={} attn_factor={}",
+        cfg.n_layer,
+        cfg.n_head,
+        cfg.n_embd,
+        cfg.vocab,
+        cfg.n_ff,
+        moe.n_ff_exp,
+        cfg.n_layer_dense_lead,
+        cfg.shexp_ff,
+        cfg.rope_yarn_log_mul,
+        cfg.rope_attn_factor,
+    );
+}
+
+/// CPU golden-hash lock at V3 scale, same shape as [`cpu_deepseek2_golden`]. `#[ignore]`d: this
+/// is ~26 minutes of disk streaming (the run it was blessed from spent 814 s in prefill and ~95 s
+/// per decoded token), so it is a deliberate `--include-ignored` run, not part of the suite.
+///
+/// Six prompt tokens and eight generated ones is the shortest case that still locks REAL
+/// behaviour: the answer token itself plus enough continuation that a routing or MLA regression
+/// cannot land on the same stream by chance. Going shorter would not buy much anyway — prefill,
+/// not the token count, is what dominates the wall time here.
+#[test]
+#[ignore = "streams 245 GB per forward: ~26 min. Run with --include-ignored"]
+fn cpu_deepseek_v32_golden() {
+    let path = need_model!(deepseek_v32(), "DeepSeek-V3.2");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(
+        &model,
+        &[
+            // (prompt, n_tokens, fnv1a hash of the generated text)
+            // Blessed 2026-08-11 from "The capital of France is Paris. This" — read and confirmed
+            // coherent before the hash was locked, per the bless path's own reason for printing it.
+            ("The capital of France is", 8, 0x2e3af827a5496d49),
+        ],
+    );
+}
+
+/// Read a `llama-debug --save-logits` dump: `(tokens, last-row logits)`. `bin` is the
+/// `llamacpp-<model>.bin` written by that tool (f32, one per vocab entry, for the LAST prompt
+/// position); the token ids it prefilled sit beside it in `llamacpp-<model>-tokens.bin` as i32.
+/// Taking the ids from llama.cpp — rather than re-tokenizing here — is what makes the comparison
+/// below an oracle rather than two engines agreeing about a prompt they read differently.
+fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
+    let tok_path = PathBuf::from(format!(
+        "{}-tokens.bin",
+        bin.to_str().expect("dump path is UTF-8").trim_end_matches(".bin")
+    ));
+    let raw = std::fs::read(bin).expect("read llama.cpp logits dump");
+    let raw_tok = std::fs::read(&tok_path).expect("read llama.cpp token dump");
+    assert_eq!(raw.len() % 4, 0, "logits dump is not a whole f32 array");
+    assert_eq!(raw_tok.len() % 4, 0, "token dump is not a whole i32 array");
+    let logits = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let tokens = raw_tok
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    (tokens, logits)
+}
+
+/// **The external oracle.** infr's CPU prefill against llama.cpp's, on the same GGUF, over the
+/// token ids llama.cpp itself produced — the only check in this file that scores infr against
+/// another implementation instead of against its own past output.
+///
+/// Self-skips unless BOTH `INFR_LLAMA_DUMP` (the `llamacpp-<model>.bin` from
+/// `llama-debug -m <gguf> -p <prompt> --save-logits`) and `INFR_LLAMA_DUMP_MODEL` (that same
+/// `<gguf>`) are set, so it is model-agnostic: it was exercised on Qwen3-0.6B, where the two
+/// engines agree to within f32 noise, before being pointed at DeepSeek-V3.2.
+///
+/// Scored on mutual top-5 containment plus a cosine over the SOFTMAX PROBABILITIES — not on token
+/// equality (a quantized near-tie flips the argmax), and above all not on the raw logits. The raw
+/// cosine is still reported, for continuity with docs/deepseek.md, but it is nearly worthless as a
+/// check: it is dominated by the per-token bias every row of a given model shares, so it stays
+/// high for rows that have nothing to do with each other. Every row below was measured on this
+/// box:
+///
+/// | pair                                            | logits cosine | probability cosine |
+/// | ----------------------------------------------- | ------------: | -----------------: |
+/// | Qwen3-0.6B, same prompt                         |        0.9985 |             0.9994 |
+/// | Qwen3-0.6B, dump vs a DIFFERENT prompt          |        0.8514 |             0.0164 |
+/// | V3.2 Q2_K after "…France is"                    |        0.9907 |             0.9890 |
+/// | V3.2 Q2_K after "…France is Paris." (dead heat) |        0.9950 |             0.8586 |
+///
+/// Two things are baked into the floor. 0.851 for two UNRELATED rows is inside the ~0.79–0.91
+/// range docs/deepseek.md records as deepseek2 agreement, so the raw cosine cannot be the check.
+/// And the last row is a real three-way tie the two engines AGREE on — same top-3 set, spread
+/// ~0.3 logits — where the argmax still flips, and it drags the probability cosine to 0.859. So
+/// the floor sits below that legitimate value while staying far above the 0.016 of an unrelated
+/// row; a top-20 overlap was tried as a third metric and dropped, because an unrelated row still
+/// shares 10 of 20 (against 17 for a matching one) and it separates nothing.
+///
+/// `INFR_LLAMA_DUMP_GEN=N` additionally generates N tokens greedily from llama.cpp's own prompt
+/// ids and prints them. That is the GREEDY half of the same oracle — the text to hold beside
+/// `llama-cli -m <gguf> -p <prompt> -n N --temp 0 -st -no-cnv`, which starts from exactly those
+/// ids. It prints rather than asserts because llama.cpp's continuation is not a value this test
+/// can hold: it is the other engine's output, and it belongs in docs/deepseek.md next to the run
+/// that produced it.
+#[test]
+fn cpu_prefill_matches_llama_debug_dump() {
+    let (Ok(dump), Ok(model_path)) = (
+        std::env::var("INFR_LLAMA_DUMP"),
+        std::env::var("INFR_LLAMA_DUMP_MODEL"),
+    ) else {
+        eprintln!("skip: INFR_LLAMA_DUMP / INFR_LLAMA_DUMP_MODEL not set");
+        return;
+    };
+    let mut _tlk = test_serial_lock();
+    let (tokens, llama_logits) = read_llama_debug_dump(std::path::Path::new(&dump));
+    assert!(!tokens.is_empty(), "llama.cpp dumped no prompt tokens");
+    let model = model_default(std::path::Path::new(&model_path));
+    assert_eq!(
+        llama_logits.len(),
+        model.config().vocab,
+        "the dump is for a different model: vocab mismatch"
+    );
+    let t0 = std::time::Instant::now();
+    let ours = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    eprintln!(
+        "llama.cpp oracle: {} tokens, infr prefill {:.1}s",
+        tokens.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    assert!(
+        ours.iter().all(|v| v.is_finite()),
+        "non-finite logit in infr's prefill output"
+    );
+    let (ours_top, theirs_top) = (top_k(&ours, 20), top_k(&llama_logits, 20));
+    eprintln!("infr      top-5: {:?}", &ours_top[..5]);
+    eprintln!("llama.cpp top-5: {:?}", &theirs_top[..5]);
+    let softmax = |v: &[f32]| {
+        let max = v.iter().copied().fold(f32::MIN, f32::max);
+        let e: Vec<f32> = v.iter().map(|&x| (x - max).exp()).collect();
+        let sum: f32 = e.iter().sum();
+        e.into_iter().map(|x| x / sum).collect::<Vec<f32>>()
+    };
+    let cos = cosine(&ours, &llama_logits);
+    let cos_p = cosine(&softmax(&ours), &softmax(&llama_logits));
+    eprintln!("infr/llama.cpp whole-vocab cosine: logits {cos}, probabilities {cos_p}");
+    assert!(
+        ours_top[..5].iter().any(|&(id, _)| id == theirs_top[0].0)
+            && theirs_top[..5].iter().any(|&(id, _)| id == ours_top[0].0),
+        "infr and llama.cpp do not even agree in each other's top-5: infr={:?} llama.cpp={:?}",
+        ours_top[0],
+        theirs_top[0]
+    );
+    assert!(
+        cos_p > 0.7,
+        "infr and llama.cpp next-token distributions diverged: cosine={cos_p} (logits {cos})"
+    );
+    if let Some(n) = std::env::var("INFR_LLAMA_DUMP_GEN")
+        .ok()
+        .map(|v| v.parse::<usize>().expect("INFR_LLAMA_DUMP_GEN is a count"))
+    {
+        let t0 = std::time::Instant::now();
+        let ids = model
+            .generate_cpu_ids(&tokens, n, |_| {})
+            .expect("cpu generate");
+        eprintln!(
+            "infr greedy continuation of llama.cpp's ids ({:.1}s): {:?}\n  ids {ids:?}",
+            t0.elapsed().as_secs_f64(),
+            model.decode(&ids).expect("decode"),
+        );
+    }
+}
