@@ -341,13 +341,17 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
         21 => Ok(DType::Iq3S),   // GGML_TYPE_IQ3_S: 256 elems, 110 bytes/block
         22 => Ok(DType::Iq2S),   // GGML_TYPE_IQ2_S: 256 elems, 82 bytes/block
         23 => Ok(DType::Iq4Xs),  // GGML_TYPE_IQ4_XS: 256 elems, 136 bytes/block
-        29 => Ok(DType::Iq1M),   // GGML_TYPE_IQ1_M: 256 elems, 56 bytes/block
-        30 => Ok(DType::Bf16),   // GGML_TYPE_BF16
-        34 => Ok(DType::Tq1_0),  // GGML_TYPE_TQ1_0: 256 elems, 54 bytes/block
-        35 => Ok(DType::Tq2_0),  // GGML_TYPE_TQ2_0: 256 elems, 66 bytes/block
-        39 => Ok(DType::Mxfp4),  // GGML_TYPE_MXFP4: 32 elems, 17 bytes/block
-        40 => Ok(DType::Nvfp4),  // GGML_TYPE_NVFP4: 64 elems, 36 bytes/block
-        42 => Ok(DType::Q2_0),   // GGML_TYPE_Q2_0: 64 elems, 18 bytes/block (Bonsai ternary)
+        // GGML_TYPE_I32: a plain 4-byte integer tensor, not a weight. Shipped models carry these as
+        // lookup TABLES that a kernel indexes with — DeepSeek V4's `blk.N.ffn_gate_tid2eid.weight`
+        // hash-routing table (token id → expert ids) is the first one infr meets.
+        26 => Ok(DType::I32),
+        29 => Ok(DType::Iq1M),  // GGML_TYPE_IQ1_M: 256 elems, 56 bytes/block
+        30 => Ok(DType::Bf16),  // GGML_TYPE_BF16
+        34 => Ok(DType::Tq1_0), // GGML_TYPE_TQ1_0: 256 elems, 54 bytes/block
+        35 => Ok(DType::Tq2_0), // GGML_TYPE_TQ2_0: 256 elems, 66 bytes/block
+        39 => Ok(DType::Mxfp4), // GGML_TYPE_MXFP4: 32 elems, 17 bytes/block
+        40 => Ok(DType::Nvfp4), // GGML_TYPE_NVFP4: 64 elems, 36 bytes/block
+        42 => Ok(DType::Q2_0),  // GGML_TYPE_Q2_0: 64 elems, 18 bytes/block (Bonsai ternary)
         36 => Ok(DType::I2S), // GGML_TYPE_I2_S (microsoft/BitNet): ternary 2bpw + per-tensor f32 scale
         _ => Err(Error::Unsupported(format!("ggml type {t}"))),
     }
@@ -1543,6 +1547,35 @@ mod tests {
             ),
             other => panic!("misaligned i2_s numel should be Error::Loader, got {other:?}"),
         }
+    }
+
+    /// `GGML_TYPE_I32` is a real on-disk tensor type, not a weight format: shipped models use it
+    /// for integer LOOKUP TABLES a kernel indexes with. DeepSeek V4's `blk.N.ffn_gate_tid2eid`
+    /// hash-routing table is one, so a file carrying it must open and hand its values back as
+    /// 4-byte little-endian integers rather than being refused as an unsupported ggml type.
+    #[test]
+    fn i32_tensor_opens_and_reads_back() {
+        // 6 i32s — the real table's row width (`expert_used_count` expert ids per token).
+        const IDS: [i32; 6] = [0, 1, -1, 255, i32::MIN, i32::MAX];
+        let mut b = build_typed_fixture(26, IDS.len() as u64, size_of_val(&IDS));
+        let data = b.len() - size_of_val(&IDS);
+        for (i, id) in IDS.iter().enumerate() {
+            b[data + i * 4..data + i * 4 + 4].copy_from_slice(&id.to_le_bytes());
+        }
+
+        let tmp = write_temp_gguf(&b);
+        let gguf = Gguf::open(tmp.path()).expect("an I32 tensor must open");
+        let t = &gguf.tensors()[0];
+        assert_eq!(t.dtype, DType::I32, "ggml type 26 is GGML_TYPE_I32");
+        assert_eq!(t.shape, vec![IDS.len()]);
+        assert_eq!(t.nbytes, size_of_val(&IDS), "I32 is 4 bytes per element");
+
+        let bytes = gguf.tensor_bytes("tensor0").expect("bytes");
+        let got: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, IDS, "the sized range must cover the table's own bytes");
     }
 
     /// The F32 round-trip fixture (`block_elems == 1`) must be unaffected — every element count is

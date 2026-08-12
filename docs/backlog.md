@@ -1331,10 +1331,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each
-`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
-%64 && k %32`) and several take `k` with different meanings, so a uniform guard
-needs its own read of the family rather than a mechanical sweep.
+stop was scope: each `matmul*\*` entry carries its own tiling constraints
+(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
+with different meanings, so a uniform guard needs its own read of the family
+rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -1394,8 +1394,27 @@ change.
   backend-generic, so Metal will take it as soon as its own gaps close — but its
   DEVICE MoE path asserts `MoeGating::Softmax` and V4's gating is mandatory
   `SqrtSoftplus` (§ B-DSV4-HASH), so a V4 MoE layer aborts there first.
-- **No real V4 GGUF has been opened.** Every dimension in the fixture came from
-  the reference's formulas — see `docs/deepseek.md` § "Open questions" 1.
+- **A real V4 GGUF HAS now been opened** (2026-08-12) —
+  `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S`, 43 layers, 1328 tensors. Every
+  tensor name and every shape `dsv4_model`'s formulas derive, evaluated at the
+  real file's hyperparameters, matches the file exactly: no missing tensor, no
+  extra tensor, no shape mismatch. `Config::from_gguf` and `wload`'s `is_dsv4`
+  arm both run clean and the model reaches the designed compressed-layer
+  refusal. The formulas that were only inferred and are now MEASURED:
+  `attn_output_a` = `[n_head·key_length/o_groups, o_lora_rank·o_groups]`,
+  `attn_output_b` = `[o_groups·o_lora_rank, n_embd]`, `hc_*_fn` =
+  `[hc_mult·n_embd, (2+hc_mult)·hc_mult]` with a `[3]` scale, the compressor's
+  `coff = 2 iff ratio == 4` channel doubling, and `attn_compressor_norm` staying
+  `[key_length]` in BOTH tiers while `_kv`/`_gate`/`_ape` widen with `coff`.
+  What is still NOT verified against a real file: any NUMBER the graph computes
+  — the refusal fires before a single forward pass, so shapes and names are all
+  this proves.
+- **The real file's dtype set is wider than the fixture's.** The fixture writes
+  f32 for everything but `ffn_gate_tid2eid` (now i32, matching); the real file
+  is `{Q2_K: 129, Q8_0: 660, F32: 492, BF16: 43, Q6_K: 1, I32: 3}`. The 43 BF16
+  tensors are the per-layer `ffn_gate_inp.weight` routers — a bf16 router has
+  never been exercised by any V4 test, and the fixture cannot express one
+  without a per-tensor dtype beyond the i32 arm added for the routing table.
 
 ### B-DSV4 — what the V4 attention primitives do NOT cover yet (2026-08-10)
 
@@ -1618,6 +1637,50 @@ fails. Confirmed present at `HEAD`
 The workspace clippy run is green because those lines are Apple-only and a Linux
 build never compiles them. Worth checking whether CI lints that target at all;
 if it does, it has been red since `key_bias` landed.
+
+### B-DSV4-REAL — the shipped V4 file needs BOTH missing slices, not either (2026-08-12)
+
+**Tag:** deepseek · **Blocked on:** B-DSV4-WIRING slice B and B-DSV4-HASH
+
+Measured from `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (`block_count = 43`,
+`hash_layer_count = 3`, `compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over
+the 43 layers, then three surplus zeros): **no layer of the real model is both
+ratio-0 and bias-routed.** Layers 0 and 1 are the only ratio-0 layers and both
+are hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer
+2 is compressed AND hash-routed.
+
+So the implemented ratio-0 tier covers 2 of 43 layers, and neither of those two
+can run either. Landing slice B alone, or B-DSV4-HASH alone, still leaves this
+checkpoint refusing — worth knowing before either is scheduled as "the one that
+makes V4 work". The order of the two refusals in `generate_dense_backend` means
+the compressed-layer message is what a user sees today (layer 2, ratio 4); the
+hash message is behind it.
+
+Verified by running `infr run` against the file on the CPU backend: config
+parses, `wload` resolves every tensor, and the refusal is reached.
+
+### B-GGUF-META-IGNORED — keys the reference conversion carries that infr never reads (2026-08-12)
+
+**Tag:** gguf · **Blocked on:** a decision on whether to honour them
+
+Two metadata families the real DeepSeek-V4 file declares and infr has no reader
+for. Neither is a V4 problem — both are general — and neither is wrong today,
+but both are silent.
+
+- **`general.sampling.*`** (`llama-arch.h`'s `LLM_KV_GENERAL_SAMPLING_*`:
+  `temp`, `top_k`, `top_p`, `min_p`, `xtc_*`, `penalty_last_n`, `sequence`). The
+  V4 file sets `general.sampling.temp = 1.0` and `general.sampling.top_p = 1.0`;
+  infr applied its own per-arch defaults (`temp = 0.6, top_k = 20, top_p = 0.95`
+  for `deepseek4`) and never looked. `grep -rn "general.sampling" crates/` is
+  empty. The question is precedence: a model-declared sampler should presumably
+  sit between infr's arch defaults and the user's flags, but nothing implements
+  any of the three orderings today.
+- **`{arch}.embedding_length_out`** = 16384 on V4 (= `hc_mult · n_embd`, the
+  un-collapsed hyper-connection residual). In llama.cpp this feeds
+  `llama_hparams::n_embd_out()`, which sizes the EMBEDDINGS output buffer only —
+  never the logits path — so ignoring it costs nothing while infr has no
+  embeddings endpoint. It becomes wrong the moment one exists for an arch whose
+  output width differs from `embedding_length`.
 
 <!-- ── hardware-capability audit, 2026-08-11 ─────────────────────────────────
      Three follow-up slices came out of one read-only audit of what infr detects

@@ -168,6 +168,12 @@ enum Fill {
     Gain,
     /// Verbatim values — the router bias, whose exact numbers are the point (see [`FORCE_BIAS`]).
     Exact(Vec<f32>),
+    /// Expert ids drawn from `0..n_expert`, written as a `GGML_TYPE_I32` tensor. The one fill in
+    /// this harness that is not f32 on disk, because the one tensor that uses it —
+    /// `deepseek4`'s `ffn_gate_tid2eid` hash-routing table — is i32 in the reference conversion
+    /// (`ggml-org/DeepSeek-V4-Flash-0731-GGUF`). Writing it f32 like everything else is what let
+    /// the loader's missing `GGML_TYPE_I32` arm go unnoticed until a real file was opened.
+    ExpertIds(usize),
 }
 
 /// One tensor of the synthetic model. `shape` is in GGUF/ggml order — `ne0` (the fastest,
@@ -204,6 +210,31 @@ impl TensorSpec {
                 assert_eq!(v.len(), self.numel(), "{}: Exact fill length", self.name);
                 v.clone()
             }
+            // `uniform` is in [-1, 1); fold to [0, 1) before scaling so every id is in range.
+            Fill::ExpertIds(n_expert) => (0..self.numel())
+                .map(|i| ((uniform(seed, i) * 0.5 + 0.5) * *n_expert as f32).floor())
+                .collect(),
+        }
+    }
+
+    /// The `ggml_type` this tensor is written as — `GGML_TYPE_I32` for [`Fill::ExpertIds`],
+    /// `GGML_TYPE_F32` for every other fill. Both are 4 bytes per element, so the directory's
+    /// offset arithmetic is the same either way.
+    fn ggml_type(&self) -> u32 {
+        match self.fill {
+            Fill::ExpertIds(_) => 26,
+            _ => 0,
+        }
+    }
+
+    /// The tensor's on-disk bytes: [`Self::values`] encoded in [`Self::ggml_type`]. The two are
+    /// separate so the differential tests can compare LOGICAL values across variants without
+    /// caring which encoding each tensor landed in.
+    fn bytes(&self) -> Vec<u8> {
+        let v = self.values();
+        match self.fill {
+            Fill::ExpertIds(_) => v.iter().flat_map(|x| (*x as i32).to_le_bytes()).collect(),
+            _ => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
         }
     }
 }
@@ -221,9 +252,10 @@ struct SyntheticModel {
 }
 
 impl SyntheticModel {
-    /// Serialize to GGUF v3 bytes. Every tensor is F32 (ggml type 0): the seam host-dequants
-    /// `attn_k_b`/`attn_v_b` anyway (`seam/runner.rs`'s `wload`), and a quantized fixture would test
-    /// the dequantizers rather than the routing this file is about.
+    /// Serialize to GGUF v3 bytes. Every tensor is F32 (ggml type 0) except the i32 routing table
+    /// [`Fill::ExpertIds`] writes: the seam host-dequants `attn_k_b`/`attn_v_b` anyway
+    /// (`seam/runner.rs`'s `wload`), and a quantized fixture would test the dequantizers rather
+    /// than the routing this file is about.
     fn to_gguf_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         push_u32(&mut b, 0x4655_4747); // "GGUF"
@@ -247,7 +279,7 @@ impl SyntheticModel {
             for d in &t.shape {
                 push_u64(&mut b, *d as u64);
             }
-            push_u32(&mut b, 0); // GGML_TYPE_F32
+            push_u32(&mut b, t.ggml_type());
             push_u64(&mut b, *off as u64);
         }
         while !b.len().is_multiple_of(ALIGN) {
@@ -257,9 +289,8 @@ impl SyntheticModel {
         b.resize(data_start + offset, 0);
         for (t, off) in self.tensors.iter().zip(&offsets) {
             let base = data_start + off;
-            for (i, v) in t.values().iter().enumerate() {
-                b[base + i * 4..base + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-            }
+            let bytes = t.bytes();
+            b[base..base + bytes.len()].copy_from_slice(&bytes);
         }
         b
     }
@@ -2204,10 +2235,12 @@ fn dsv4_model(d: &Dsv4Dims) -> SyntheticModel {
             w.clone(),
         ));
         if l < d.hash_layer_count {
+            // `[n_expert_used, n_vocab]` of PLAIN INTEGERS, i32 on disk — the real file's dtype
+            // (see [`Fill::ExpertIds`]), not the f32 every other tensor here uses.
             tensors.push(TensorSpec::new(
                 p("ffn_gate_tid2eid.weight"),
                 vec![d.n_used, d.vocab],
-                w.clone(),
+                Fill::ExpertIds(d.n_expert),
             ));
         } else {
             tensors.push(TensorSpec::new(
@@ -2426,6 +2459,48 @@ fn synthetic_deepseek4_shared_expert_clamp_is_read_when_present() {
     let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
     assert_eq!(cfg.swiglu_clamp_shexp, vec![2.5; dsv4_dims().n_layer()]);
+}
+
+/// **The hash-routing table is `GGML_TYPE_I32` on disk, and the loader carries it as integers.**
+///
+/// Every other tensor this harness writes is f32, and so was this one until a real V4 file was
+/// opened: `ggml-org/DeepSeek-V4-Flash-0731-GGUF` writes `blk.{0,1,2}.ffn_gate_tid2eid.weight` as
+/// ggml type 26, which `Gguf::open` refused outright as an unsupported type. The whole fixture is
+/// now unopenable if that mapping goes away, so this test is the one that names WHY.
+#[test]
+fn synthetic_deepseek4_routing_table_is_i32_on_disk() {
+    let d = dsv4_dims();
+    let tmp = TempGguf::write("ds4-tid2eid", &deepseek4_model());
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic deepseek4 GGUF");
+    let t = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == "blk.0.ffn_gate_tid2eid.weight")
+        .expect("the hash layer's routing table");
+    assert_eq!(t.dtype, infr_core::DType::I32, "the table is i32, not f32");
+    assert_eq!(t.shape, vec![d.n_used, d.vocab]);
+
+    // The table's entries are expert IDS: they must decode as integers a router can index a bank
+    // with, not as whatever the bytes happen to be. A fill that ran off the end of `0..n_expert`
+    // would read as an out-of-range expert and index past the bank.
+    let raw = g
+        .tensor_bytes_arc(&t.name)
+        .expect("routing table bytes")
+        .to_vec();
+    let ids: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(ids.len(), d.n_used * d.vocab);
+    assert!(
+        ids.iter().all(|&e| (0..d.n_expert as i32).contains(&e)),
+        "every entry must be a valid expert id in 0..{}",
+        d.n_expert
+    );
+    assert!(
+        ids.iter().any(|&e| e != ids[0]),
+        "a constant table would route every token identically"
+    );
 }
 
 /// **The weight loader consumes every tensor the file declares.**

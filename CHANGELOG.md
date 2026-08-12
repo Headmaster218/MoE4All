@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **GGUFs carrying `GGML_TYPE_I32` tensors open.** Integer tensors are lookup
+  tables a kernel indexes with rather than weights, and `Gguf::open` refused
+  them outright (`unsupported: ggml type 26`). The first shipped model to need
+  one is DeepSeek-V4, whose hash-routed layers each carry an i32
+  `blk.N.ffn_gate_tid2eid.weight` token-id → expert-id table: the reference
+  conversion `ggml-org/DeepSeek-V4-Flash-0731-GGUF` would not open at all,
+  failing before a single tensor shape was read. It now loads end to end — the
+  config parses, every one of its 1328 tensors resolves, and the model reaches
+  the existing designed refusal naming its compressed (ratio 4/128) layers,
+  which are still unimplemented.
+
 - **`infr pull` splits ONE file across connections too.** Shard-level
   concurrency did nothing for a model that ships as a single file, which most
   do: `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is one 161 GB GGUF and still
