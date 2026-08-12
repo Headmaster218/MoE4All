@@ -249,6 +249,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.pv_splits = opt_num(get, "INFR_PV_SPLITS");
     v.no_attn_hd_spec = presence(get, "INFR_NO_ATTN_HD");
     v.attn_decode = presence_inv(get, "INFR_NO_ATTN_DECODE");
+    v.mla_sg = presence_inv(get, "INFR_NO_MLA_SG");
     // Asymmetric pair: the `NO_` key wins over the opt-in when BOTH are set.
     v.mrows_attn = if get("INFR_NO_MROWS_ATTN").is_some() {
         Some(Some(false))

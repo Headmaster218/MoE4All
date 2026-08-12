@@ -207,6 +207,7 @@ knobs! {
     "INFR_NO_ATTN_DECODE" => "kernels.vulkan.attn_decode",      PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  migrated;
     "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;
+    "INFR_NO_MLA_SG"      => "kernels.vulkan.mla_sg",           PresenceInv,      Ignored, "1",  migrated;
 
     // ── kernels.vulkan — DeltaNet + misc (§6.5) ──────────────────────────────
     "INFR_DN_CHUNK_SCAN"      => "kernels.vulkan.dn_chunk_scan",      PresenceInv, Ignored, "1", migrated;

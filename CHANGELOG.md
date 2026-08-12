@@ -234,6 +234,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **DeepSeek MLA attention gained a subgroup kernel tier, and it is the whole
+  DeepSeek frame.** `mla.comp` was the only MLA kernel at any depth, and
+  `INFR_PROF_OPS` measured it at 97.3% of decode GPU time at `-d 2048` and 89.4%
+  of prefill. Its `-DMLA_SG` builds now walk the key range ONCE with an online
+  softmax instead of twice, and score eight keys per `barrier()` with
+  `subgroupAdd` instead of running a 128-lane shared-memory tree costing 18
+  barriers per key. On an RX 7900 XTX with
+  `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, three reps with the arms
+  alternated: pp512 965.8 → 1035.5, pp2048 671.3 → 851.1, tg64 111.6 → 128.7,
+  and tg64 at depth 2048 **6.3 → 11.9** t/s. Output is not bit-identical to the
+  kernel it replaces (the online softmax sums the same terms in a different
+  order); the CPU/Vulkan whole-vocab cosine on the 55-token seam test is
+  0.99872, against 0.99861 for the kernel it replaces. `INFR_NO_MLA_SG` selects
+  the scalar builds, which are unchanged and are also what a device that cannot
+  pin a 32-wide subgroup gets.
+
 - `Gguf::path()` → `Gguf::shards()`, which returns `(path, length)` per shard in
   order. `TensorBytes::file_range` / `Gguf::tensor_file_range` now report
   offsets in the model's concatenated file address space; for a single-file

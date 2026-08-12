@@ -1778,8 +1778,6 @@ const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_
 const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_warp.spv"));
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
-const MLA_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mla.spv"));
-const MLA_FF_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mla_ff.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
 const RMSNORM_GATE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
@@ -2138,32 +2136,66 @@ pub(crate) fn attn_pv_warp_spv() -> &'static [u32] {
 pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
     ATTN_PV_REDUCE_SPV.get_or_init(|| spv_words(ATTN_PV_REDUCE_SPV_BYTES))
 }
-/// SPIR-V for MLA attention (`mla.comp`) — DeepSeek V2/V3 absorbed-form latent attention.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn mla_spv() -> &'static [u32] {
-    static MLA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    MLA_SPV.get_or_init(|| spv_words(MLA_SPV_BYTES))
+/// The subgroup width `mla.comp`'s `-DMLA_SG` builds are compiled against and the pipeline pins.
+/// The shader's own `MLA_SG_WIDTH` define must agree — `mla_sg_width_matches_host` reads it back
+/// out of the shader text and compares, because nothing in the toolchain ties the two together and
+/// a silent disagreement would leave `sgred[]` half-summed (a wrong score, not a crash).
+pub(crate) const MLA_SG_WIDTH: u32 = 32;
+
+/// Whether `Recorder::mla` takes the subgroup single-pass tier. Two conditions, both explicit:
+///
+/// * `caps` must be able to pin `MLA_SG_WIDTH` — the tier's cross-subgroup fixup sums exactly
+///   `128 / MLA_SG_WIDTH` slots, so a workgroup split into any other number of subgroups would
+///   read uninitialized shared memory. (The backend already refuses a device that cannot pin 32,
+///   in `lib.rs`; this is the check at the point of use, so the kernel does not depend on that
+///   one staying where it is.)
+/// * `INFR_NO_MLA_SG` (`kernels.vulkan.mla_sg` = false) forces the scalar two-pass builds.
+///
+/// False on either count degrades to the plain `mla*` builds, which need no subgroup capability
+/// at all. NOT a bit-identical A/B: the tier's online softmax sums the same terms in a different
+/// order.
+pub(crate) fn mla_sg_tier(
+    vk: &infr_core::config::VulkanCfg,
+    caps: &infr_core::backend::Capabilities,
+) -> bool {
+    vk.mla_sg && caps.subgroup_min <= MLA_SG_WIDTH && MLA_SG_WIDTH <= caps.subgroup_max
 }
-/// SPIR-V for MLA attention with YaRN freq_factors (`mla.comp`'s -DFREQ_FACTORS build): the
-/// internal q_pe rope DIVIDES its angle by the bound per-pair divisor `ff[p]`.
+
+/// Name + SPIR-V for MLA attention (`mla.comp`) — DeepSeek V2/V3 absorbed-form latent attention.
+///
+/// Three independent axes, hence the eight builds. `ff` is YaRN's per-pair frequency divisor
+/// binding (`-DFREQ_FACTORS`: the internal q_pe rope DIVIDES its angle by `ff[p]`); `bias` is
+/// deepseek32's additive `[rows, kv_len]` top-k score mask (`-DKEY_BIAS`, `Op::Mla::key_bias`) —
+/// those two decide the BINDING layout. `sg` is the tier: `-DMLA_SG` is the subgroup single-pass
+/// build, which needs the pinned wave32 the scalar builds do not, so its name must differ (kernels
+/// are cached by name, and `kernel_sg` and `kernel` would otherwise collide on one entry).
+///
+/// Returned as a pair, not as eight getters, so a caller cannot pair a name with another build's
+/// SPIR-V.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn mla_ff_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(MLA_FF_SPV_BYTES))
-}
-/// SPIR-V for MLA attention with deepseek32's additive top-k score mask (`mla.comp`'s -DKEY_BIAS
-/// build, `Op::Mla::key_bias`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn mla_bias_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/mla_bias.spv"))))
-}
-/// SPIR-V for MLA attention with BOTH the YaRN divisors and the top-k score mask (`mla.comp`'s
-/// -DFREQ_FACTORS -DKEY_BIAS build) — deepseek32's production shape.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn mla_ff_bias_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/mla_ff_bias.spv"))))
+pub(crate) fn mla_kernel(sg: bool, ff: bool, bias: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! mla_build {
+        ($name:literal, $spv:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $spv, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (sg, ff, bias) {
+        (false, false, false) => mla_build!("mla", "mla"),
+        (false, true, false) => mla_build!("mla_ff", "mla_ff"),
+        (false, false, true) => mla_build!("mla_bias", "mla_bias"),
+        (false, true, true) => mla_build!("mla_ff_bias", "mla_ff_bias"),
+        (true, false, false) => mla_build!("mla_sg", "mla_sg"),
+        (true, true, false) => mla_build!("mla_sg_ff", "mla_sg_ff"),
+        (true, false, true) => mla_build!("mla_sg_bias", "mla_sg_bias"),
+        (true, true, true) => mla_build!("mla_sg_ff_bias", "mla_sg_ff_bias"),
+    }
 }
 /// SPIR-V for the int8 coopmat accumulator-layout known-answer probe (`coopmat_i8_layout.comp`) —
 /// dispatched once at init when the i8 coopmat tier is opted into, to check that this driver lays a

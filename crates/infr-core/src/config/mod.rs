@@ -315,6 +315,12 @@ cfg_struct! {
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.
         mrows_attn: Option<bool> = None,
+        /// `INFR_NO_MLA_SG` (inverted) — the subgroup single-pass MLA tier (`mla.comp`'s
+        /// `-DMLA_SG` builds). Setting the env var drops DeepSeek attention back to the scalar
+        /// two-pass builds. NOT bit-identical either way: the tier carries an online softmax
+        /// (running max, rescaled accumulator) where the scalar builds take two full passes, so
+        /// the summation order differs.
+        mla_sg: bool = true,
 
         /// `INFR_DN_CHUNK_SCAN` — spelled POSITIVELY but read with `.is_err()`: setting it
         /// DISABLES the chunked scan. The name lies about its polarity; R2 freezes it (§10.11).

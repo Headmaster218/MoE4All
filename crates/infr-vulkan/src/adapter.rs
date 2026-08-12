@@ -6293,6 +6293,89 @@ mod tests {
         );
     }
 
+    /// Same drift guard, one axis over: the `-DMLA_SG` builds size their cross-subgroup scratch as
+    /// `128 / MLA_SG_WIDTH` and sum exactly that many slots, while the HOST is what actually pins
+    /// the pipeline's `requiredSubgroupSize` (`gemm::MLA_SG_WIDTH`, passed to `kernel_sg` by
+    /// `Recorder::mla`). Let the two drift apart and every score comes out summed over the wrong
+    /// number of subgroups — a wrong number, not a crash, and every shape check still passes.
+    #[test]
+    fn mla_sg_width_matches_host() {
+        let src = include_str!("../shaders/mla.comp");
+        assert_eq!(
+            glsl_define_u32(src, "MLA_SG_WIDTH"),
+            crate::gemm::MLA_SG_WIDTH,
+            "mla.comp's MLA_SG_WIDTH drifted from the width Recorder::mla pins"
+        );
+        assert!(
+            src.contains("shared float sgred[2 * MLA_SG_KB * MLA_NSG];")
+                && src.contains("#define MLA_NSG (128 / MLA_SG_WIDTH)"),
+            "mla.comp's sgred[] is no longer sized through MLA_SG_WIDTH"
+        );
+    }
+
+    /// The `-DMLA_SG` tier is capability-gated at the point of use, not just by the backend's
+    /// device-level wave32 refusal: a device whose subgroup range excludes the pinned width must
+    /// get the scalar two-pass builds, whose eight-way selector must in turn never hand a `sg`
+    /// name a scalar build's SPIR-V (kernels are cached by NAME, so a mismatch would poison the
+    /// cache entry for the whole process).
+    #[test]
+    fn mla_sg_tier_degrades_without_the_pinnable_width() {
+        let mut caps = infr_core::backend::Capabilities::default();
+        let vk = infr_core::config::VulkanCfg::default();
+        assert!(vk.mla_sg, "the subgroup MLA tier is on by default");
+
+        caps.subgroup_min = 32;
+        caps.subgroup_max = 64;
+        assert!(
+            crate::gemm::mla_sg_tier(&vk, &caps),
+            "a device that can pin 32 must take the subgroup tier"
+        );
+
+        // Subgroup-size control absent (`(0, 0)`), and a range that simply excludes the width.
+        for (lo, hi) in [(0, 0), (64, 64), (8, 16)] {
+            caps.subgroup_min = lo;
+            caps.subgroup_max = hi;
+            assert!(
+                !crate::gemm::mla_sg_tier(&vk, &caps),
+                "subgroup range [{lo}, {hi}] excludes {} — must degrade to the scalar builds",
+                crate::gemm::MLA_SG_WIDTH
+            );
+        }
+
+        // And the env knob overrides a capable device.
+        caps.subgroup_min = 32;
+        caps.subgroup_max = 64;
+        let mut off = vk.clone();
+        off.mla_sg = false;
+        assert!(
+            !crate::gemm::mla_sg_tier(&off, &caps),
+            "INFR_NO_MLA_SG must force the scalar builds"
+        );
+
+        // Every (tier, ff, bias) build is distinct, and the `sg` axis only ever moves the name
+        // onto an `mla_sg` one.
+        let mut names = std::collections::HashSet::new();
+        let mut modules = std::collections::HashSet::new();
+        for sg in [false, true] {
+            for ff in [false, true] {
+                for bias in [false, true] {
+                    let (name, spv) = crate::gemm::mla_kernel(sg, ff, bias);
+                    assert_eq!(
+                        name.starts_with("mla_sg"),
+                        sg,
+                        "{name} does not name the tier it was asked for"
+                    );
+                    assert!(!spv.is_empty(), "{name} has no SPIR-V");
+                    assert!(names.insert(name), "duplicate MLA kernel name {name}");
+                    assert!(
+                        modules.insert(spv),
+                        "{name} shares another build's SPIR-V — the -D variants collapsed"
+                    );
+                }
+            }
+        }
+    }
+
     /// B45 guard: `mla.comp` keeps its whole working state in FIXED-size shared arrays, so an
     /// `Op::Mla` whose latent does not fit must be refused BEFORE dispatch — a shared-memory
     /// overrun has no diagnostic (corrupted neighbours or a lost device, not a fault). Both halves

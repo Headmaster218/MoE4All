@@ -4090,13 +4090,18 @@ impl<'a> Recorder<'a> {
         bufs.extend(freq_factors.map(Self::vkb));
         bufs.extend(key_bias.map(Self::vkb));
         bufs.push(Self::vkb(dst));
-        let (name, spv) = match (freq_factors.is_some(), key_bias.is_some()) {
-            (false, false) => ("mla", crate::gemm::mla_spv()),
-            (true, false) => ("mla_ff", crate::gemm::mla_ff_spv()),
-            (false, true) => ("mla_bias", crate::gemm::mla_bias_spv()),
-            (true, true) => ("mla_ff_bias", crate::gemm::mla_ff_bias_spv()),
+        let sg = crate::gemm::mla_sg_tier(self.vk(), self.be.caps());
+        let (name, spv) = crate::gemm::mla_kernel(sg, freq_factors.is_some(), key_bias.is_some());
+        // The `-DMLA_SG` builds read `gl_SubgroupID` and index a `MLA_NSG`-wide shared array, both
+        // sized from the pinned width — so they go through `kernel_sg`, which sets
+        // `requiredSubgroupSize` AND `REQUIRE_FULL_SUBGROUPS`. The scalar builds need neither and
+        // keep the unpinned pipeline they have always had.
+        let k = if sg {
+            self.be
+                .kernel_sg(name, spv, bufs.len(), 60, crate::gemm::MLA_SG_WIDTH)
+        } else {
+            self.be.kernel(name, spv, bufs.len(), 60)
         };
-        let k = self.be.kernel(name, spv, bufs.len(), 60);
         self.dispatch_wide(k, &bufs, 1, &push, rows * n_head);
     }
 
@@ -12534,10 +12539,21 @@ mod tests {
     /// smallest possible dispatch of `recorder.mla` (no model, no seam). Mirrors `mla_parity`'s
     /// synthetic inputs in infr-llama/tests/seam_op_parity.rs. This is the regression test for the
     /// "logical device has been lost" hang the kernel caused on RDNA3 (see the .comp's header).
+    ///
+    /// Run against BOTH tiers. They are separate SPIR-V with separate reductions and separate
+    /// softmax structure (`mla.comp`'s `-DMLA_SG`), and the shipped default only ever dispatches
+    /// one of them — so a scalar-only regression would otherwise sit unexecuted behind a knob
+    /// nothing exercises, which is the same thing as not having a fallback.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn mla_matches_cpu_reference() {
-        let be = be_with(|_| {});
+        for sg in [true, false] {
+            mla_matches_cpu_reference_at(sg);
+        }
+    }
+
+    fn mla_matches_cpu_reference_at(sg: bool) {
+        let be = be_with(|c| c.mla_sg = sg);
         // Seam-family shape (rows=1 decode, ring cap=12) but with TWO attended keys (pos=1, causal)
         // so the absorbed-query scores actually shape the softmax — at kv_len=1 softmax is trivial
         // and the output is independent of q, which hid the wk_b transposition bug for months.
@@ -12688,8 +12704,9 @@ mod tests {
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        println!("mla vulkan max_err={err:e}");
-        assert!(err < 1e-3, "MLA vulkan diverges: max_err={err:e}");
+        let tier = if sg { "mla_sg" } else { "mla" };
+        println!("mla vulkan {tier} max_err={err:e}");
+        assert!(err < 1e-3, "MLA vulkan {tier} diverges: max_err={err:e}");
     }
 
     /// One `mla_ring_and_mask_matches_cpu_reference` case.
@@ -12721,10 +12738,18 @@ mod tests {
     /// Dims are tiny (and mirror `infr-llama`'s `mla_mask_ring_parity` case for case) so a failure
     /// is hand-checkable; `mla_matches_cpu_reference` above keeps the DeepSeek-sized dispatch that
     /// guards the shared-memory/lane layout.
+    ///
+    /// Run against BOTH tiers, for the reason `mla_matches_cpu_reference` gives.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn mla_ring_and_mask_matches_cpu_reference() {
-        let be = be_with(|_| {});
+        for sg in [true, false] {
+            mla_ring_and_mask_matches_cpu_reference_at(sg);
+        }
+    }
+
+    fn mla_ring_and_mask_matches_cpu_reference_at(sg: bool) {
+        let be = be_with(|c| c.mla_sg = sg);
         // key_len = kv_lora + qk_rope must be EVEN: `kread` addresses the f16 cache as u32-packed
         // PAIRS, so an odd row width would put a row's last element in a half-word past the end of
         // the allocation.
@@ -12981,13 +13006,14 @@ mod tests {
                 .zip(&want)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
+            let tier = if sg { "mla_sg" } else { "mla" };
             println!(
-                "mla vulkan {}: max_err={err:e}\n  got ={got:?}\n  want={want:?}",
+                "mla vulkan {tier} {}: max_err={err:e}\n  got ={got:?}\n  want={want:?}",
                 c.name
             );
             assert!(
                 err < 1e-4,
-                "MLA vulkan {} diverges: max_err={err:e}",
+                "MLA vulkan {tier} {} diverges: max_err={err:e}",
                 c.name
             );
         }

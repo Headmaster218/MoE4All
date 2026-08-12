@@ -499,7 +499,8 @@ fn main() {
         ("attn_pv", "attn_pv", &[]),
         ("attn_pv_warp", "attn_pv_warp", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
-        // MLA attention (DeepSeek V2/V3): one workgroup per token, 128 lanes covering all heads.
+        // MLA attention (DeepSeek V2/V3): one workgroup per (token, head), 128 lanes on that
+        // head's math. Dispatched by `Recorder::mla`.
         ("mla", "mla", &[]),
         // YaRN freq_factors variant: the internal q_pe rope DIVIDES its angle by ff[pair]
         // (`-DFREQ_FACTORS` adds the binding-4 ff buffer — see `Recorder::mla`).
@@ -509,6 +510,18 @@ fn main() {
         // four combinations exist; the optional reads bind before `dst`, which stays last.
         ("mla", "mla_bias", &["-DKEY_BIAS"]),
         ("mla", "mla_ff_bias", &["-DFREQ_FACTORS", "-DKEY_BIAS"]),
+        // `-DMLA_SG`: the subgroup single-pass tier — one pass over the keys with an online
+        // softmax, and `subgroupAdd` in place of the 128-lane shared-memory tree. Needs the
+        // pinned wave32 the plain builds do not (`kernel_sg`), so it is a separate SPIR-V rather
+        // than a runtime branch; `INFR_NO_MLA_SG` selects the four builds above instead.
+        ("mla", "mla_sg", &["-DMLA_SG"]),
+        ("mla", "mla_sg_ff", &["-DMLA_SG", "-DFREQ_FACTORS"]),
+        ("mla", "mla_sg_bias", &["-DMLA_SG", "-DKEY_BIAS"]),
+        (
+            "mla",
+            "mla_sg_ff_bias",
+            &["-DMLA_SG", "-DFREQ_FACTORS", "-DKEY_BIAS"],
+        ),
         ("rmsnorm", "rmsnorm", &[]),
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).

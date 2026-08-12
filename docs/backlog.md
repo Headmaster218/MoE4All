@@ -1893,41 +1893,97 @@ opt-in specifically because "this dev box has none" (read in `adapter.rs`'s
 `bf16cm_ok` comment). Any claim that those tiers are correct is currently a
 compile-time claim only.
 
-### B-DSHW-MLA-SCALAR-TIER — DeepSeek attention runs one scalar kernel at every depth and loses the decode replay tape (2026-08-11)
+### B-DSHW-MLA-SCALAR-TIER — DeepSeek attention has one subgroup tier now; the occupancy arm is still missing (2026-08-11, re-measured 2026-08-12)
 
 **Tag:** deepseek · vulkan · perf · **Blocked on:** nothing
 
-**Now measured** (2026-08-11, RX 7900 XTX / RADV,
+**Re-measured 2026-08-12** on the forward that adds attention to the residual
+ONCE (7e778ee) — every number below is from this box today, RX 7900 XTX / RADV,
 `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, oracle = `llama-bench` on
-llama.cpp's **Vulkan** backend, same GGUF; the built binary reports
-`build: c629da5 (417)`, i.e. the pin BEFORE B-DSHW-PULL's — the `build-vk` tree
-was not rebuilt at `030ebb5`):
+llama.cpp's **Vulkan** backend, same GGUF, `build: c629da5 (417)`. `infr` rows
+are the means of three reps with the arms ALTERNATED (`INFR_NO_MLA_SG` toggled
+between reps, not run in blocks):
 
-| bench       | infr  | llama.cpp Vulkan | ratio |
-| ----------- | ----- | ---------------- | ----- |
-| pp512       | 975.5 | 4435.92 ± 110.89 | 4.5×  |
-| pp2048      | 673.4 | 3999.80 ± 24.79  | 5.9×  |
-| tg64        | 111.2 | 228.15 ± 7.64    | 2.1×  |
-| tg64 @ 2048 | 6.3   | 215.11 ± 4.79    | 34×   |
+| bench       | before (scalar `mla`) | after (`mla_sg`)       | gain  | llama.cpp Vulkan | ratio now |
+| ----------- | --------------------- | ---------------------- | ----- | ---------------- | --------- |
+| pp512       | 965.8 [963.3–969.7]   | 1035.5 [1030.2–1042.8] | 1.07× | 4470.77 ± 100.32 | 4.3×      |
+| pp2048      | 671.3 [670.6–672.0]   | 851.1 [847.2–855.4]    | 1.27× | 4001.94 ± 13.56  | 4.7×      |
+| tg64        | 111.6 [111.5–111.8]   | 128.7 [127.9–129.4]    | 1.15× | 225.73 ± 7.17    | 1.8×      |
+| tg64 @ 2048 | 6.3 [6.3–6.3]         | 11.9 [11.9–11.9]       | 1.89× | 216.52 ± 2.95    | 18×       |
 
-The two costs, re-read against those numbers — the first is now the whole
-remaining gap, the second is noise:
+The pre-7e778ee numbers this entry used to carry (975.5 / 673.4 / 111.2 / 6.3)
+are within noise of the "before" column, so the doubled-residual fix moved
+throughput by nothing — it removed one `Op::Add` per layer against a kernel that
+was 90%+ of the frame.
 
-- **`mla.comp` is the only MLA kernel, and it is where all the time goes.**
-  There is no coopmat variant, no flash variant, no split-K arm, no mrows tier —
-  the whole tier ladder that `Op::Attention` picks from does not exist for
-  `Op::Mla`. Its shared arrays are fixed-size, and the adapter enforces the
-  ceiling on its behalf (`MLA_MAX_KEY_LEN` = 576, `MLA_MAX_KV_LORA_RANK` = 512,
-  both mirroring `#define`s in the shader) with a loud error, because "shared
-  memory is not bounds checked — the symptom is corrupted neighbours or a lost
-  device". The refusal is right; the missing tiers are the perf item.
-  `INFR_PROF_OPS` puts `mla_ff` at **51.9%** of decode GPU time at a short
-  context and **97.3%** at `-d 2048` (1.22s of a 1.26s 8-token decode, 5.7ms per
-  layer dispatch). That is the 34× row above, and nothing else in the profile is
-  within two orders of magnitude of it. The shape explains it: one workgroup per
-  (row, head) — `n_head` = 16 workgroups on a 96-CU part at decode — and TWO
-  serialized passes over the whole key range, each doing a 128-lane tree
-  reduction with 7 `barrier()`s **per key**.
+**What shipped: `mla.comp`'s `-DMLA_SG` builds** (`mla_sg`, `mla_sg_ff`,
+`mla_sg_bias`, `mla_sg_ff_bias`), selected by `gemm::mla_sg_tier` and dispatched
+through `kernel_sg(.., MLA_SG_WIDTH)`. Two structural changes to the key loop,
+nothing else — same dispatch shape, same bindings, same push constants:
+
+- **One pass, not two.** The scalar build walks the key range twice (once for
+  the row max, once to exponentiate), computing every `sq · K[j]` dot twice. The
+  tier carries a running max and running denominator and rescales `sv` by
+  `exp(m_old − m_new)` on the keys that raise the max — the same online softmax
+  `attn_flash_partial.comp` already uses.
+- **`subgroupAdd` + a batch, not a 7-deep tree per key.** The scalar reduction
+  is a 128-lane shared-memory tree costing 9 `barrier()`s per key per pass, 18
+  per key in total. The tier scores `MLA_SG_KB` keys per barrier (a
+  `subgroupAdd` each, then one ping-ponged cross-subgroup fixup), so it pays ONE
+  barrier per 8 keys — and the batch's V contributions sum in a register,
+  turning 8 read-modify-writes of `sv` into one.
+
+`MLA_SG_KB` = 8 was picked by sweeping it, everything else held (3 reps each):
+
+| `MLA_SG_KB` | 1     | 2     | 4     | 6     | 8      | 16     |
+| ----------- | ----- | ----- | ----- | ----- | ------ | ------ |
+| pp2048      | 839.8 | 904.9 | 936.1 | 947.8 | 852.7¹ | 834.9¹ |
+| tg64 @ 2048 | 10.7  | 12.1  | 13.2  | —     | 11.8¹  | 11.6¹  |
+
+¹ the 8/16 columns are the SHIPPED (re-reading) form; 1–6 were measured on the
+held-K form below, so the two halves of that row are not directly comparable —
+they are here for the shape, and the shipped column is the A/B table above.
+
+**Still open, and now the whole remaining gap: occupancy at decode.**
+`INFR_PROF_OPS` at `-d 2048` (8 tokens, `INFR_SEAM_NO_REPLAY=1`) puts
+`mla_sg_ff` at **94.9%** of decode GPU time — 621.2 ms of 654.4 ms, 2.9 ms per
+layer dispatch, down from 5.6 ms and 97.3% before. At prefill (`-p 2048`) it is
+**86.8%**, 2.08 s of 2.40 s, 38.5 ms per dispatch, from 50.1 ms and 89.4%. So
+the kernel is still the frame, and the shape that has NOT been touched is the
+one the original entry named first: **one workgroup per (row, head)**, i.e.
+`n_head` = 16 workgroups on a 96-CU part at decode, ~83% of the device idle.
+`Op::Attention`'s split-K decomposition (`attn_partial` + `attn_combine`, chunk
+policy in `infr_core::tier::adaptive_chunk`, partials pooled as
+`split_pm`/`split_pl`/`split_pacc`) is the pattern to copy; `Op::Mla` has no arm
+of it. Note prefill CANNOT be an occupancy story — 16384 workgroups there — so a
+split-K arm buys the decode rows only.
+
+**Measured and NOT shipped: holding the fetched K across the barrier.** V is the
+leading `kv_lora_rank` columns of the same K row, so the V accumulation re-reads
+columns the score loop already fetched. Holding them in registers
+(`kk[MLA_SG_KB][MLA_SG_VSLOTS]`) was implemented and benched at `MLA_SG_KB` = 8:
+pp512 857.2, pp2048 955.3, tg64 130.9, tg64 @ 2048 13.8 — i.e. **+12% pp2048 and
++17% tg64@2048 against the shipped form, but −18% pp512**, a regression against
+the kernel it replaces on the short-prompt row. Shipped the form that regresses
+nothing and recorded the trade here rather than defending a 12% prefill loss.
+
+The mechanism is NOT understood, and the obvious hypothesis is RULED OUT:
+`RADV_DEBUG=shaderstats` reports **96 VGPRs and 0 scratch for BOTH forms** (the
+mla build is the largest compute shader in the dump — code size 18548 held vs
+14692 re-reading), so occupancy per SIMD is identical and register pressure
+cannot be the explanation. Trimming the provably-dead fifth held slot moved
+pp512 by 3 t/s (857.2 vs 854), which also says registers are not the lever.
+Whoever picks this up: the two forms differ only in the V loop, so a selection
+on `rows`/`kv_len` (the way `flash_min_rows` and the `rows >= 64` gates already
+work for `Op::Attention`) would take both wins — but find the mechanism first.
+
+**Not tried, and the next cheap idea:** `kread` issues one dword load per column
+and throws half of it away — the f16 cache packs two adjacent columns per
+`uint`. Giving each lane a PAIR of adjacent columns instead of a stride-128
+single would halve the load instruction count outright. `key_len` is already
+required to be even (`kread` addresses the row as u32 pairs), so the shape
+allows it.
+
 - **`Op::Mla` and `Op::LightningIndexer` each disqualify a graph from
   record-once decode replay — and that costs almost nothing.** The
   decode-eligibility loop in `adapter.rs` returns false on either, for stated
@@ -1953,13 +2009,20 @@ pp512 39.1 → 975.5 (25×), pp2048 12.3 → 673.4 (54×); `deepseek` V1
 MLA) pp512 229.0 → 4185.0, which is parity with llama.cpp Vulkan's 4320.07 ±
 358.49 on that model. Decode is untouched by it (tg64 111.0 → 111.2). The V1
 parity is the useful control: the batched MoE path itself is fine, so V2-Lite's
-remaining 4.5× prefill gap is `mla.comp` too.
+remaining prefill gap is `mla.comp` too.
 
-**These are throughput numbers on a model whose output is wrong** — see a
-doubled MLA residual. That defect is FIXED (see B-DSV2-ACTIVATION-PRECISION
-below for what it was), and the ratios were never invalidated by it — both
-engines ran the same shapes either way — but the numbers above have not been
-re-taken since.
+**A coverage gap in the kernel's own parity test, found while landing the
+tier.** `recorder::tests::mla_matches_cpu_reference` is the DeepSeek-SIZED
+dispatch (`kv_lora_rank` 512, 16 heads) and it is SATURATED: its synthetic q and
+K make the two attended keys' scores differ by ~1e7, so the softmax is a hard
+argmax and the output is the winner's V regardless of the scores. Multiplying
+every score by 1.01 inside the kernel leaves its `max_err` at exactly 0 — the
+test cannot see a score-path defect at all, only a V/absorption/layout one. (It
+already carries a comment worrying about this shape for a different reason.)
+`mla_ring_and_mask_matches_cpu_reference` DOES catch it (the same perturbation
+takes it to `max_err` 1.97e-4 against a 1e-4 floor), so the pair is covered —
+but the big-shape test is not the guard its size suggests. Fix would be scaling
+its synthetic inputs so the scores land within a few units of each other.
 
 **Calibration, so this is not read as further behind than it is:** llama.cpp's
 **Vulkan** backend has no fused indexer either (see B-DSHW-FUSED-REF). `infr` is
