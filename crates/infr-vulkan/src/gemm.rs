@@ -1297,6 +1297,14 @@ pub(crate) fn embed_gather_spv(dtype: infr_core::DType) -> Option<(&'static str,
         _ => None,
     }
 }
+/// SPIR-V for the I32 lookup-table row gather (`gather_i32.comp`, `Op::GatherI32`). One build, no
+/// dtype ladder: the table is I32 and its values are copied, not decoded.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn gather_i32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gather_i32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the chained-decode id ring log (ring[pos & 63] = sampled id).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn id_log_spv() -> &'static [u32] {

@@ -2109,6 +2109,45 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::GatherI32 {
+                    ids,
+                    table,
+                    dst,
+                    rows,
+                    ne,
+                } => {
+                    // `ggml_get_rows` on an I32 table: values are copied, never dequantized. Both
+                    // `ids` and `dst` are I32 handles, which this interpreter carries as f32-widened
+                    // plain integers (`bytes_to_f32`'s I32 arm) — the same representation
+                    // `Op::MoeFfn::expert_ids` reads back.
+                    let (rows, ne) = (rows as usize, ne as usize);
+                    let buf = bindings.get(table).expect("cpu backend: unbound Weight");
+                    let dt = g.desc(table).dtype;
+                    assert_eq!(
+                        dt,
+                        DType::I32,
+                        "cpu Op::GatherI32: the table must be an I32 tensor"
+                    );
+                    // Widen only the ROWS asked for, straight out of the raw (mmap'd) table bytes
+                    // — same shape as `Op::EmbedGather` above, and for the same reason: the whole
+                    // table is `n_expert_used * n_vocab` entries and converting all of it per op
+                    // would allocate megabytes per token to read a handful of integers.
+                    let bytes = cpu_buf(buf).read();
+                    let bpr = ne * 4; // I32, one row of `ne`
+                    let ids_v = vals[ids.0 as usize].clone();
+                    let mut out = vec![0f32; rows * ne];
+                    for r in 0..rows {
+                        let tok = ids_v[r] as usize;
+                        assert!(
+                            (tok + 1) * bpr <= bytes.len(),
+                            "cpu Op::GatherI32: id {tok} is past the {} rows of the table",
+                            bytes.len() / bpr
+                        );
+                        let row = bytes_to_f32(&bytes[tok * bpr..(tok + 1) * bpr], dt);
+                        out[r * ne..(r + 1) * ne].copy_from_slice(&row);
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Sample {
                     x,
                     u,

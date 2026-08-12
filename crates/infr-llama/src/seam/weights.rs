@@ -31,6 +31,15 @@ pub(super) enum FfnW {
         /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for selection only
         /// (the unbias'd probs are still used for routing weights). `None` = no bias.
         exp_probs_b: Option<TensorId>,
+        /// DeepSeek V4 HASH-routed layer: `ffn_gate_tid2eid.weight`, the I32
+        /// `[n_expert_used, n_vocab]` token-id → expert-id table. `Op::GatherI32` turns it plus the
+        /// graph's token-id Input into the `[batch, n_expert_used]` selection
+        /// `Op::MoeFfn::expert_ids` consumes.
+        ///
+        /// Mutually exclusive with `exp_probs_b` — `deepseek4.cpp` creates exactly one of them per
+        /// layer, and they occupy the SAME slot of the upload order (see `wload`'s `c.deepseek4`
+        /// arm and the matching `wpush`). `None` on every other arch and on a bias-routed V4 layer.
+        tid2eid: Option<TensorId>,
     },
     /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
     /// 128-expert MoE branch (fused `gate_up_exps` + per-expert `down_exps` scale), summed and

@@ -174,6 +174,10 @@ enum Fill {
     /// (`ggml-org/DeepSeek-V4-Flash-0731-GGUF`). Writing it f32 like everything else is what let
     /// the loader's missing `GGML_TYPE_I32` arm go unnoticed until a real file was opened.
     ExpertIds(usize),
+    /// [`Fill::Exact`]'s i32 twin — verbatim expert ids, written as `GGML_TYPE_I32`. What the
+    /// hash-routing tests build a `ffn_gate_tid2eid` with when WHICH expert each token names is
+    /// the thing under test.
+    ExactIds(Vec<i32>),
 }
 
 /// One tensor of the synthetic model. `shape` is in GGUF/ggml order — `ne0` (the fastest,
@@ -214,15 +218,19 @@ impl TensorSpec {
             Fill::ExpertIds(n_expert) => (0..self.numel())
                 .map(|i| ((uniform(seed, i) * 0.5 + 0.5) * *n_expert as f32).floor())
                 .collect(),
+            Fill::ExactIds(v) => {
+                assert_eq!(v.len(), self.numel(), "{}: ExactIds fill length", self.name);
+                v.iter().map(|&e| e as f32).collect()
+            }
         }
     }
 
-    /// The `ggml_type` this tensor is written as — `GGML_TYPE_I32` for [`Fill::ExpertIds`],
-    /// `GGML_TYPE_F32` for every other fill. Both are 4 bytes per element, so the directory's
-    /// offset arithmetic is the same either way.
+    /// The `ggml_type` this tensor is written as — `GGML_TYPE_I32` for the integer fills,
+    /// `GGML_TYPE_F32` for every other. Both are 4 bytes per element, so the directory's offset
+    /// arithmetic is the same either way.
     fn ggml_type(&self) -> u32 {
         match self.fill {
-            Fill::ExpertIds(_) => 26,
+            Fill::ExpertIds(_) | Fill::ExactIds(_) => 26,
             _ => 0,
         }
     }
@@ -233,7 +241,9 @@ impl TensorSpec {
     fn bytes(&self) -> Vec<u8> {
         let v = self.values();
         match self.fill {
-            Fill::ExpertIds(_) => v.iter().flat_map(|x| (*x as i32).to_le_bytes()).collect(),
+            Fill::ExpertIds(_) | Fill::ExactIds(_) => {
+                v.iter().flat_map(|x| (*x as i32).to_le_bytes()).collect()
+            }
             _ => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
         }
     }
@@ -2805,22 +2815,29 @@ fn synthetic_deepseek4_refuses_a_compressed_layer() {
     );
 }
 
-/// **A hash-routed layer is refused too, and separately** — `Op::MoeFfn::expert_ids` is implemented
-/// on every backend, but nothing in this tree can GATHER the ids out of `ffn_gate_tid2eid`. Falling
-/// back to the router's own top-k would pick different experts with no error at all, which is
-/// exactly the silent-wrongness class the refusal exists for. See `docs/backlog.md` § B-DSV4-HASH.
+/// **A `ffn_gate_tid2eid` that is not one row per vocabulary entry is refused.** The gather indexes
+/// the table by TOKEN ID with no clamp, exactly as `Op::EmbedGather` indexes `token_embd`, so a
+/// short table would read the wrong row — or past the end of the tensor.
 #[test]
-fn synthetic_deepseek4_refuses_a_hash_routed_layer() {
-    // Ratio 0 everywhere, so the compressed-tier refusal above cannot be what fires.
-    let mut d = dsv4_dims();
+fn synthetic_deepseek4_refuses_a_mis_shaped_routing_table() {
+    let mut d = dsv4_hash_dims();
+    // Ratio 0 everywhere, so the compressed-tier refusal cannot be what fires.
     d.compress_ratios = vec![0; d.n_layer()];
-    let err = dsv4_err("ds4-refusal-hash", &dsv4_model(&d));
-    println!("deepseek4 hash-routed graph build: {err}");
+    let mut m = dsv4_model(&d);
+    // Halve the row count: still a valid i32 tensor, still loads, still `n_used`-wide rows.
+    for t in m.tensors.iter_mut() {
+        if t.name.ends_with("ffn_gate_tid2eid.weight") {
+            t.shape = vec![d.n_used, d.vocab / 2];
+            t.fill = Fill::ExpertIds(d.n_expert);
+        }
+    }
+    let err = dsv4_err("ds4-short-tid2eid", &m);
+    println!("deepseek4 short routing table: {err}");
     assert!(
-        err.contains("layer 0 is hash-routed (hash_layer_count=2)")
-            && err.contains("blk.0.ffn_gate_tid2eid")
-            && err.contains("B-DSV4-HASH"),
-        "a hash-routed layer must be refused naming the table it cannot gather, got: {err}"
+        err.contains("ffn_gate_tid2eid.weight` holds")
+            && err.contains("expert_used_count*vocab")
+            && err.contains("TOKEN ID"),
+        "a short routing table must be refused naming the shape it needs, got: {err}"
     );
 }
 
@@ -2828,9 +2845,10 @@ fn synthetic_deepseek4_refuses_a_hash_routed_layer() {
 //
 // `generate_dense_backend` emits `compress_ratio == 0` layers end to end: hyper-connections
 // wrapping both sublayers, MQA attention with a weightless per-head Q norm, a `[nope | rope]` tail
-// rope, attention sinks, a de-roped grouped low-rank output projection, and bias-routed
-// sqrt-softplus MoE with the per-layer SwiGLU clamps. Everything below drives that through the real
-// loader and the real seam, on CPU unconditionally and on Vulkan behind `#[ignore]`.
+// rope, attention sinks, a de-roped grouped low-rank output projection, and sqrt-softplus MoE with
+// the per-layer SwiGLU clamps under EITHER routing — the `exp_probs_b` router bias, or the
+// `ffn_gate_tid2eid` hash table gathered by `Op::GatherI32`. Everything below drives that through
+// the real loader and the real seam, on CPU unconditionally and on Vulkan behind `#[ignore]`.
 
 /// The all-ratio-0 V4 fixture. Everything is [`dsv4_dims`] verbatim except the two things the emit
 /// refuses: every layer's compression ratio is 0, and no layer is hash-routed.
@@ -2879,6 +2897,196 @@ fn with_meta(mut m: SyntheticModel, key: &str, v: Meta) -> SyntheticModel {
     }
     assert!(found, "{key} is not in the model — nothing was overwritten");
     m
+}
+
+// ─── deepseek4 hash-routed MoE ────────────────────────────────────────────────────
+//
+// A hash-routed layer takes its experts from `blk.N.ffn_gate_tid2eid` — an i32
+// `[n_expert_used, n_vocab]` table indexed by TOKEN ID — instead of the router's top-k.
+// `Op::GatherI32` produces the `[batch, n_expert_used]` selection and `Op::MoeFfn::expert_ids`
+// runs it. The router still runs: the routing WEIGHTS are its own sqrt-softplus probs at the
+// hash-chosen experts (`seam_op_parity.rs`'s `moe_hash_routing_parity` pins that arithmetic; what
+// is pinned HERE is that the whole-model emit reads the right table row for the right token).
+//
+// Every test below is built so that it CANNOT pass if the emit fell back to `expert_ids: None`:
+// each pair of files differs in the routing table and in nothing else, so an emit that never reads
+// the table produces two bit-identical runs.
+
+/// The all-ratio-0, ALL-HASH-ROUTED V4 fixture: [`dsv4_ratio0_dims`] with every layer taking its
+/// experts from `ffn_gate_tid2eid`. `hash_layer_count == n_layer` means no layer carries an
+/// `exp_probs_b` at all, so nothing here can be passing on the bias-routed path by accident.
+fn dsv4_hash_dims() -> Dsv4Dims {
+    let base = dsv4_ratio0_dims();
+    Dsv4Dims {
+        hash_layer_count: base.n_layer(),
+        ..base
+    }
+}
+
+/// A `ffn_gate_tid2eid` fill of `d` whose row for token `t` names `pick(t)` — the same
+/// `[n_used, vocab]` table every hash layer of the fixture gets.
+fn dsv4_tid2eid(d: &Dsv4Dims, pick: impl Fn(usize) -> Vec<i32>) -> Fill {
+    let mut v = Vec::with_capacity(d.n_used * d.vocab);
+    for t in 0..d.vocab {
+        let row = pick(t);
+        assert_eq!(row.len(), d.n_used, "a table row is n_expert_used wide");
+        assert!(
+            row.iter().all(|&e| (0..d.n_expert as i32).contains(&e)),
+            "expert id out of range: {row:?}"
+        );
+        v.extend(row);
+    }
+    Fill::ExactIds(v)
+}
+
+/// The three all-hash V4 files the token-id-indexing check compares, as
+/// `(inside, outside, [base, bumped_inside, bumped_outside])`. They differ in `ffn_gate_tid2eid`
+/// and in NOTHING else, which is what makes the comparison a check on the gather rather than on
+/// the model: an emit that never reads the table returns three identical runs.
+///
+/// The baseline routes token `t` to experts `{t, t+1} mod n_expert`, so the selection is
+/// token-dependent before anything is perturbed; each perturbation rotates ONE token's row by one
+/// expert — `inside` is a token the shared [`PROMPT`] contains, `outside` one it never does.
+fn dsv4_hash_row_variants(d: &Dsv4Dims) -> (usize, usize, [SyntheticModel; 3]) {
+    let inside = PROMPT[PROMPT.len() - 1] as usize;
+    let outside = (0..d.vocab)
+        .find(|t| !PROMPT.contains(&(*t as u32)))
+        .expect("the fixture's vocab is wider than the prompt");
+    let row = |t: usize, target: Option<usize>| -> Vec<i32> {
+        let bump = i32::from(target == Some(t));
+        (0..d.n_used)
+            .map(|k| ((t + k) as i32 + bump).rem_euclid(d.n_expert as i32))
+            .collect()
+    };
+    let model = |target: Option<usize>| {
+        with_fill(
+            dsv4_model(d),
+            "ffn_gate_tid2eid.weight",
+            dsv4_tid2eid(d, |t| row(t, target)),
+        )
+    };
+    (
+        inside,
+        outside,
+        [model(None), model(Some(inside)), model(Some(outside))],
+    )
+}
+
+/// **The hash table drives the selection, and it is read BY TOKEN ID.** Two halves, and the second
+/// is what makes the first mean something:
+///
+/// 1. Changing the table row of a token that IS in the prompt moves the logits — the gather ran and
+///    its value reached the experts.
+/// 2. Changing the table row of a token that is NOT in the prompt is EXACTLY inert — the gather
+///    read that token's row and no other. A gather that ignored `ids` (a constant row, row 0, a
+///    whole-table reduction) fails this half while passing the first.
+///
+/// Neither half can pass on a `expert_ids: None` emit: the three files differ only in
+/// `ffn_gate_tid2eid`, so an emit that never reads it makes all three runs bit-identical and
+/// half (1) goes red.
+#[test]
+fn synthetic_deepseek4_hash_table_is_read_by_token_id() {
+    let d = dsv4_hash_dims();
+    let (inside, outside, m) = dsv4_hash_row_variants(&d);
+    let plain = cpu_logits("ds4-hash-base", &m[0]);
+    let moved = cpu_logits("ds4-hash-inside", &m[1]);
+    let inert = cpu_logits("ds4-hash-outside", &m[2]);
+    assert!(
+        plain.iter().all(|v| v.is_finite()),
+        "non-finite logit in the hash-routed V4 prefill: {plain:?}"
+    );
+    assert_moves(
+        &format!("deepseek4 tid2eid row for prompt token {inside}"),
+        &plain,
+        &moved,
+        "the ffn_gate_tid2eid gather (a top-k fallback never reads the table at all)",
+    );
+    let dv = max_abs_diff(&plain, &inert);
+    println!(
+        "deepseek4 tid2eid row for non-prompt token {outside}: max|Δ| = {dv:e} (logit rms {:e})",
+        rms(&plain)
+    );
+    assert_eq!(
+        dv, 0.0,
+        "changing the table row of token {outside}, which the prompt never contains, moved the \
+         logits — the gather is not indexing the table by token id"
+    );
+}
+
+/// **Hash routing picks experts the router's own top-k does not.** Three tables naming three
+/// different constant expert pairs, plus a top-k control: the control is the same model with
+/// `hash_layer_count = 0` and an all-zero `exp_probs_b`, i.e. plain top-k over the same router.
+///
+/// Top-k picks ONE pair per token, so at most one of the three hash variants can agree with the
+/// control — hence the `>= 2` bound, which is exactly what "the selection does not come from the
+/// router" means here and is falsifiable: on a `expert_ids: None` emit all three variants ARE the
+/// control and the count is 0.
+#[test]
+fn synthetic_deepseek4_hash_routing_overrides_the_router_topk() {
+    let d = dsv4_hash_dims();
+    let pairs: [[i32; 2]; 3] = [[0, 1], [2, 3], [1, 2]];
+    assert_eq!(
+        d.n_used, 2,
+        "the constant pairs below are n_expert_used wide"
+    );
+    let runs: Vec<Vec<f32>> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let fill = dsv4_tid2eid(&d, |_| p.to_vec());
+            cpu_logits(
+                &format!("ds4-hash-pair{i}"),
+                &with_fill(dsv4_model(&d), "ffn_gate_tid2eid.weight", fill),
+            )
+        })
+        .collect();
+
+    // Every pair of variants must differ: the tables are the only difference between the files.
+    for (i, a) in runs.iter().enumerate() {
+        for (j, b) in runs.iter().enumerate().skip(i + 1) {
+            assert_moves(
+                &format!("deepseek4 hash pair {:?} vs {:?}", pairs[i], pairs[j]),
+                a,
+                b,
+                "the ffn_gate_tid2eid selection",
+            );
+        }
+    }
+
+    // The top-k control: same dims, bias routing with a ZERO bias, so selection is the router's
+    // own ranking with nothing added.
+    let mut ctl_dims = d.clone();
+    ctl_dims.hash_layer_count = 0;
+    let control = cpu_logits(
+        "ds4-hash-topk-control",
+        &with_fill(
+            dsv4_model(&ctl_dims),
+            "exp_probs_b.bias",
+            Fill::Exact(vec![0.0; d.n_expert]),
+        ),
+    );
+    let differing = runs
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            let dv = max_abs_diff(r, &control);
+            println!(
+                "deepseek4 hash pair {:?} vs router top-k: max|Δ| = {dv:e}",
+                pairs[*i]
+            );
+            dv > 0.01 * rms(&control).max(rms(r))
+        })
+        .count();
+    assert!(
+        differing >= 2,
+        "only {differing} of the three constant hash tables routed differently from the router's \
+         own top-k — top-k picks one pair per token, so at least two must differ; this is what \
+         goes to 0 if the emit ignores the table and re-runs top-k"
+    );
+    assert!(
+        rms(&control) > 1e-3,
+        "the top-k control produced degenerate logits, so the comparison proves nothing"
+    );
 }
 
 /// **A ratio-0 V4 model generates.** The end-to-end claim: the real loader, the real `wload`/`wpush`
@@ -3081,6 +3289,60 @@ fn gpu_synthetic_deepseek4_ratio0_matches_cpu() {
     assert!(
         cos > 0.9999,
         "CPU/Vulkan logits diverged on the synthetic ratio-0 deepseek4 model: cosine = {cos}"
+    );
+}
+
+/// **Hash routing on Vulkan: the same numbers as the CPU, and the same token-id indexing.**
+/// `gather_i32.comp` is a separate implementation of the gather, so the CPU test above says nothing
+/// about it. Three claims on one fixture:
+///
+/// 1. the logits agree with the CPU reference (cosine + top token) — a gather that read a
+///    neighbouring row would run a different expert and land here;
+/// 2. perturbing the table row of a prompt token moves the Vulkan logits;
+/// 3. perturbing the row of a non-prompt token is EXACTLY inert on Vulkan too.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek4_hash_routing_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let d = dsv4_hash_dims();
+    let (inside, outside, m) = dsv4_hash_row_variants(&d);
+    let cpu = cpu_logits("ds4-hash-parity-cpu", &m[0]);
+    let gpu = vulkan_logits("ds4-hash-parity-vk", &m[0]);
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan hash-routed V4 prefill: {gpu:?}"
+    );
+    let cos = cosine(&cpu, &gpu);
+    let (cpu_top, gpu_top) = (argmax(&cpu), argmax(&gpu));
+    println!("synthetic deepseek4 hash-routed cpu-vs-vulkan cosine = {cos}");
+    println!("cpu argmax = {cpu_top}, vulkan argmax = {gpu_top}");
+    assert_eq!(
+        cpu_top, gpu_top,
+        "CPU and Vulkan disagree on the top token of a hash-routed model — the two gathers \
+         selected different experts"
+    );
+    assert!(
+        cos > 0.9999,
+        "CPU/Vulkan logits diverged on the hash-routed deepseek4 model: cosine = {cos}"
+    );
+
+    let moved = vulkan_logits("ds4-hash-inside-vk", &m[1]);
+    let inert = vulkan_logits("ds4-hash-outside-vk", &m[2]);
+    assert_moves(
+        &format!("vulkan deepseek4 tid2eid row for prompt token {inside}"),
+        &gpu,
+        &moved,
+        "the ffn_gate_tid2eid gather",
+    );
+    let dv = max_abs_diff(&gpu, &inert);
+    println!(
+        "vulkan deepseek4 tid2eid row for non-prompt token {outside}: max|Δ| = {dv:e} (rms {:e})",
+        rms(&gpu)
+    );
+    assert_eq!(
+        dv, 0.0,
+        "vulkan: changing the table row of token {outside}, which the prompt never contains, moved \
+         the logits — gather_i32.comp is not indexing the table by token id"
     );
 }
 

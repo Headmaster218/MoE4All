@@ -1416,6 +1416,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::ArgmaxProb { .. } => "ArgmaxProb",
         Op::Sample { .. } => "Sample",
         Op::EmbedGather { .. } => "EmbedGather",
+        Op::GatherI32 { .. } => "GatherI32",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
@@ -5794,6 +5795,19 @@ impl MetalBackend {
                 // silent wrong-output run rather than pretending to support it blind.
                 return Err(Error::Unsupported(
                     "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
+                        .into(),
+                ));
+            }
+            Op::GatherI32 { .. } => {
+                // DeepSeek V4's hash-routing gather (`ffn_gate_tid2eid` by token id) — CPU +
+                // Vulkan only. No Metal kernel, and no host arm either: a V4 MoE layer cannot run
+                // on this backend regardless, because the DEVICE `Op::MoeFfn` path asserts
+                // `MoeGating::Softmax` and V4's gating is mandatory `SqrtSoftplus` (see
+                // `docs/backlog.md` § B-DSV4-HASH). Implementing the gather alone would move the
+                // failure one op later without making anything work, so it refuses HERE, by name.
+                return Err(Error::Unsupported(
+                    "Metal Op::GatherI32 (DeepSeek V4 ffn_gate_tid2eid hash routing) not \
+                     implemented — Metal's device MoE path refuses V4's sqrt-softplus gating too"
                         .into(),
                 ));
             }

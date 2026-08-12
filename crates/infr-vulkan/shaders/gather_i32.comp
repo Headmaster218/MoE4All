@@ -1,0 +1,39 @@
+#version 460
+// I32 row gather (Op::GatherI32): dst[r, j] = table[ids[r] * ne + j]. `ggml_get_rows` on an integer
+// lookup table — DeepSeek V4's `selected_experts = ggml_get_rows(ffn_gate_tid2eid, inp_tokens)`,
+// whose result feeds `moe_topk`'s hash branch as `hash_ids`.
+//
+// Nothing here is a narrower embed_gather: that kernel walks the table in whole 32-element
+// sub-blocks through native_decode.glsl (`nsub = ne / 32`) and multiplies by a scale, so a row of
+// `n_expert_used` integers (6 on the shipped V4 file, 8 on every config the docs record) is
+// narrower than one sub-block and would gather nothing at all. This one is index arithmetic on
+// dwords: no block structure, no decode, no scale.
+//
+// The table is BOUND as an ordinary storage buffer rather than read through the resident-BDA arena
+// (native_weight_addr.glsl): it is `n_expert_used * n_vocab` dwords — 3.1 MB on the shipped V4 file
+// — which is orders of magnitude under any device's maxStorageBufferRange, and one descriptor is
+// cheaper to reason about than a second addressing mode.
+//
+// One thread per OUTPUT element. `rows * ne` is the batch times `n_expert_used`, so a 1-D grid of
+// `ceil(total / 64)` workgroups cannot approach `MAX_GROUP_COUNT_X` for any batch this seam builds
+// — no `dispatch_wide` two-dimensional recovery is needed, only the tail bounds check.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows;
+    uint ne;
+} pc;
+layout(binding = 0) readonly buffer TB { int table[]; };
+layout(binding = 1) readonly buffer IB { int ids[]; };
+layout(binding = 2) writeonly buffer DB { int dst[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = pc.rows * pc.ne;
+    if (i >= total) { return; }
+    uint r = i / pc.ne;
+    uint j = i - r * pc.ne;
+    // In-range by the same contract embed_gather's `ids` carries: these are the model's own token
+    // ids, and the host refuses a `ffn_gate_tid2eid` whose row count is not the vocabulary
+    // (see the deepseek4 checks in `generate_dense_backend`).
+    dst[i] = table[uint(ids[r]) * pc.ne + j];
+}

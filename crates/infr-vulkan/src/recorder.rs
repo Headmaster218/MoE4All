@@ -3889,6 +3889,35 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// I32 lookup-table row gather (`gather_i32.comp`, `Op::GatherI32`):
+    /// `dst[r, j] = table[ids[r], j]`, integers copied verbatim. One thread per output element.
+    ///
+    /// The table is BOUND (not read through the resident-BDA arena like [`Self::embed_gather`]'s):
+    /// `ffn_gate_tid2eid` is `n_expert_used * n_vocab` dwords, far inside `maxStorageBufferRange`,
+    /// which [`Self::vkb`] asserts for a resident-BDA sub-tensor anyway.
+    pub fn gather_i32(
+        &self,
+        table: &dyn Buffer,
+        ids: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],
+            1,
+            &push,
+            (rows * ne).div_ceil(64) as u32,
+        );
+    }
+
     /// Int8 dp4a decode GEMV (m=1): `y = x·Wᵀ` with `x` pre-quantized via [`Self::quant_q8`]
     /// (qa/dact/sact). NUM_ROWS=2 — one workgroup per 2 consecutive outputs (`ceil(out_f/2)`
     /// grid), the activation block read once for both. `w_base` = element offset (fused-QKV

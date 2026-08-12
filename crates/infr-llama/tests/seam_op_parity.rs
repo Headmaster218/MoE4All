@@ -4861,3 +4861,163 @@ fn moe_hash_routing_parity() {
          weight-source assertion cannot fail"
     );
 }
+
+/// `Op::GatherI32` feeding `Op::MoeFfn::expert_ids` — the two-op chain a DeepSeek V4 hash-routed
+/// layer emits, against the same from-definition f64 reference [`moe_hash_routing_parity`] uses.
+///
+/// The reference is fed ids gathered ON THE HOST out of the same table bytes, so the assertion
+/// pins the GATHERED IDS themselves, not merely that something ran: one wrong id runs a different
+/// expert, and the separation that buys is measured and printed below (`right-row-vs-row-0`)
+/// rather than assumed. Both backends are held to the same reference, so CPU and Vulkan are
+/// cross-checked on the ids as well as on the MoE arithmetic.
+#[test]
+fn gather_i32_hash_selection_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (ne, n_expert, n_used, n_ff_exp) = (32usize, 6usize, 2usize, 32usize);
+    let (rows, vocab) = (2usize, 8usize);
+    // The two tokens this "prompt" feeds. Neither is row 0, so a gather that ignored `ids` and read
+    // the first row would be caught, and they differ from each other, so one that read a single
+    // shared row would be too.
+    let toks: [i32; 2] = [5, 2];
+    // `[n_used, vocab]` table: token t names experts {(3t) % 6, (5t + 1) % 6}. Every row is
+    // distinct, so gathering the wrong ROW is a different selection.
+    let table: Vec<i32> = (0..vocab)
+        .flat_map(|t| [((3 * t) % n_expert) as i32, ((5 * t + 1) % n_expert) as i32])
+        .collect();
+    // The i32 handles ride the f32 wire type `run` uploads (see `moe_hash_routing_parity`).
+    let wire = |v: &[i32]| -> Vec<f32> { v.iter().map(|&e| f32::from_bits(e as u32)).collect() };
+    let (tokwire, tabwire) = (wire(&toks), wire(&table));
+    // What the gather must produce: row r = the table row of token `toks[r]`.
+    let want_ids: Vec<usize> = toks
+        .iter()
+        .flat_map(|&t| {
+            let b = t as usize * n_used;
+            table[b..b + n_used].iter().map(|&e| e as usize)
+        })
+        .collect();
+    println!("gather_i32 expects ids {want_ids:?} for tokens {toks:?}");
+
+    let build = || {
+        let mut g = Graph::new();
+        let x = g.input(f32d(rows * ne));
+        let ids = g.input(TensorDesc::new(vec![rows], DType::I32));
+        let tbl = g.weight(TensorDesc::new(vec![n_used, vocab], DType::I32));
+        let sel = g.internal(TensorDesc::new(vec![rows, n_used], DType::I32));
+        let router = g.weight(f32d(n_expert * ne));
+        let gate_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+        let up_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+        let down_exps = g.weight(f32d(n_expert * ne * n_ff_exp));
+        let dst = g.output(f32d(rows * ne));
+        g.push(Op::GatherI32 {
+            ids,
+            table: tbl,
+            dst: sel,
+            rows: rows as u32,
+            ne: n_used as u32,
+        });
+        g.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router,
+            gate_exps,
+            up_exps,
+            down_exps,
+            down_scale: None,
+            fused_gate_up: false,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: n_ff_exp as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            swiglu_clamp: None,
+            gating: MoeGating::SqrtSoftplus,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            expert_ids: Some(sel),
+        });
+        (g, x, ids, tbl, router, gate_exps, up_exps, down_exps, dst)
+    };
+
+    let mut xi = gen(rows * ne, 21);
+    xi[0] = 1.0;
+    xi[ne] = 0.6;
+    let ri = gen(n_expert * ne, 5);
+    let gi = gen(n_expert * n_ff_exp * ne, 12);
+    let ui = gen(n_expert * n_ff_exp * ne, 13);
+    let di = gen(n_expert * ne * n_ff_exp, 14);
+
+    let go = |be: &dyn Backend| -> Vec<f32> {
+        let (g, x, ids, tbl, router, ge, ue, de, dst) = build();
+        run(
+            be,
+            &g,
+            &[(x, &xi[..]), (ids, &tokwire[..])],
+            &[
+                (tbl, &tabwire[..]),
+                (router, &ri[..]),
+                (ge, &gi[..]),
+                (ue, &ui[..]),
+                (de, &di[..]),
+            ],
+            dst,
+            rows * ne,
+        )
+    };
+    let reference = |ids: &[usize]| -> Vec<f64> {
+        moe_v4_ref(
+            &xi,
+            &ri,
+            &gi,
+            &ui,
+            &di,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            1.0,
+            Some(ids),
+            None,
+        )
+    };
+
+    let want = reference(&want_ids);
+    let c = go(&cpu);
+    let e = maxerr64(&c, &want);
+    println!("GatherI32+MoeFfn cpu-vs-ref max_err={e:e}");
+    assert!(e < 1e-4, "the CPU gather selected different experts: {e:e}");
+
+    // The separation that makes the assertion above meaningful: reading the WRONG table row (token
+    // 0's, for both output rows) is a different answer by a whole signal, not a rounding.
+    let wrong: Vec<usize> = (0..rows)
+        .flat_map(|_| table[..n_used].iter().map(|&e| e as usize))
+        .collect();
+    let sep = maxerr64(&c, &reference(&wrong));
+    println!("GatherI32 right-row-vs-row-0 separation={sep:e} (wrong ids {wrong:?})");
+    assert!(
+        sep > 1e-2,
+        "gathering row 0 instead of the token's row is indistinguishable here — the test cannot \
+         fail"
+    );
+
+    if let Some(vk) = gpu() {
+        let v = go(&vk);
+        let e = maxerr64(&v, &want);
+        println!("GatherI32+MoeFfn vulkan-vs-ref max_err={e:e}");
+        assert!(
+            e < 1e-3,
+            "the Vulkan gather selected different experts: {e:e}"
+        );
+        let cv = maxerr(&c, &v);
+        println!("GatherI32+MoeFfn cpu-vs-vulkan max_err={cv:e}");
+        assert!(
+            cv < 1e-3,
+            "GatherI32 diverges between CPU and Vulkan: {cv:e}"
+        );
+    }
+}

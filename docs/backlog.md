@@ -1542,47 +1542,59 @@ and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
   a real V4 GGUF turns out to use a small eps, a backend that dropped the
   over-dst eps would pass every test here.
 
-### B-DSV4-HASH — what the hash-routed MoE / SwiGLU-clamp ops do NOT cover yet (2026-08-10)
+### B-DSV4-HASH — what hash-routed MoE / the SwiGLU clamp do NOT cover yet (2026-08-13)
 
-**Tag:** deepseek · vulkan · metal · **Blocked on:** nothing; scoped out of the
-op-level slice, which was explicitly "extend the ops, emit nothing"
+**Tag:** deepseek · vulkan · metal · **Blocked on:** nothing
 
-`Op::MoeFfn::expert_ids`, and `swiglu_clamp` on `Op::GatedAct` /
-`Op::GatedActFused` / `Op::MoeFfn`, are implemented and parity-tested on CPU +
-Vulkan (real RX 7900 XTX, validation layer clean) and typechecked on Metal. What
+Hash routing now EMITS and generates on CPU + Vulkan: `Op::GatherI32`
+(`gather_i32.comp`, and the CPU interpreter arm) reads the token's row of
+`blk.N.ffn_gate_tid2eid` into the `[batch, n_expert_used]` selection
+`Op::MoeFfn::expert_ids` consumes, and `generate_dense_backend` no longer
+refuses a hash-routed layer. See `docs/deepseek.md` § Stage 4, "Slice A2". What
 is left:
 
-- **The CLAMPS now emit; hash routing does not.** A ratio-0 V4 layer builds a
-  real `Op::MoeFfn` with `swiglu_clamp: swiglu_clamp(swiglu_clamp_exp[il])` and
-  a shared expert at `swiglu_clamp_shexp[il]`, on CPU and Vulkan. A HASH-ROUTED
-  layer is refused by name in `generate_dense_backend`, because of the gather
-  below — emitting it with `expert_ids: None` would silently run the router's
-  own top-k and pick different experts. That refusal is what the ratio-0
-  generating fixture avoids by setting `hash_layer_count = 0`; the canonical
-  fixture keeps `hash_layer_count = 2` and pins the refusal.
-- **The GATHER that produces `expert_ids` does not exist.** The op takes the ids
-  ALREADY gathered; nothing in the tree can produce them from
-  `blk.N.ffn_gate_tid2eid.weight` + the token-id input. `Op::EmbedGather` was
-  checked and cannot be reused as-is on Vulkan: `embed_gather.comp` iterates
-  whole 32-element sub-blocks (`nsub = pc.ne / 32u`), and a tid2eid row is
-  `n_expert_used` wide (8 in every V4 config seen), so the loop body never runs
-  and the kernel writes NOTHING — a silent all-zero gather, i.e. every token
-  routing to expert 0. It also decodes through `native_decode.glsl`, which has
-  no I32 format, while llama.cpp's `ggml_get_rows` preserves I32 only for an I32
-  source and `ggml_mul_mat_id` asserts its ids are I32 — so a real V4 file's
-  table is I32. The wiring slice needs either a small-`ne` I32 path in
-  `embed_gather.comp` or a dedicated gather op. `infr`'s own synthetic V4
-  fixture (`crates/infr-llama/tests/synthetic_deepseek2.rs`) writes the table as
-  a FLOAT weight, so it will not surface this.
-
-  A third option the ratio-0 wiring slice considered and did NOT take: gather on
-  the HOST. The token ids are known there, the table is
-  `[n_expert_used, n_vocab]`, and the result would be one
-  `[batch, n_expert_used]` i32 Input per hash layer per step — no new kernel at
-  all. Declined on scope (it needs a host-side dequant of every hash layer's
-  table on `SessionStable`, one extra graph Input per hash layer, and a per-step
-  upload), and because a small-`ne` I32 `embed_gather` path is the reusable
-  answer. Revisit if the kernel work looks worse than the plumbing.
+- **`Op::GatherI32` is REFUSED on Metal**, by name, in `run_op`. Implementing it
+  alone would move the failure one op later without making anything work: the
+  Metal DEVICE `Op::MoeFfn` path asserts `MoeGating::Softmax` and V4's gating is
+  mandatory `SqrtSoftplus`, so a V4 MoE layer cannot run there either way (the
+  same blocker this entry has recorded since 2026-08-10). Whoever lifts the
+  sqrt-softplus assert owns the gather too — it is one small MSL kernel, or a
+  host arm beside `Op::MoeFfn`'s existing host fallback, which already
+  implements `expert_ids`.
+- **The gather has NO `_dyn` twin and was not considered for the replay tape.**
+  It falls through `decode_eligible`'s `_ => {}`, i.e. it is treated as
+  replay-safe (it is: pos-independent, and its `ids` input is the same buffer
+  `Op::EmbedGather` reads under the chained decode). Nothing exercises that,
+  because V4 is excluded from the tape outright for four other reasons (§
+  B-DSV4). Re-examine when V4 gets its tape.
+- **The gather runs once per hash layer per step, un-fused and unmeasured.** All
+  `hash_layer_count` layers gather the SAME token's ids at the same `n_used`
+  width, so the whole selection could be one dispatch over a stacked table (or
+  cached across layers) instead of one dispatch each. At `hash_layer_count = 3`
+  on the shipped file that is 3 dispatches of 6 threads — expected to be noise
+  next to the MoE itself, but nothing was profiled.
+- **The table is read as ONE bound storage buffer**, not through the
+  resident-BDA arena. Fine at `n_expert_used * n_vocab` dwords (3.1 MB on the
+  shipped file, 8 MB at a 256k vocab and `n_used = 8`), and `Recorder::vkb`
+  asserts the range against the device's real `maxStorageBufferRange` — but a
+  future table that tripped that assert would need a `-DSTREAMED` twin, which
+  does not exist.
+- **The host-gather alternative was reconsidered and declined again.** The token
+  ids ARE host-known on every V4 path today (V4 takes neither the record-once
+  tape nor the chained decode, so every step goes through the per-token loop
+  where the host has just fed `cur[pos]`), so a host gather would have worked
+  with no new kernel. Declined because it needs one extra graph Input and one
+  extra per-step upload PER HASH LAYER, a host dequant of every table, and
+  because it would have to be undone the moment V4 gets a GPU-resident decode —
+  where the sampled id never reaches the host. The device gather costs one small
+  shader and reuses the ids Input that already exists.
+- **Only `batch == 1` has been executed.** `Op::GatherI32` is written for any
+  `rows` and the op-level parity test drives `rows = 2`, but the WHOLE-MODEL
+  path is per-token: V4 is excluded from batched prefill (§ B-DSV4-WIRING), and
+  `build` asserts a hash-routed span cannot be built without the ids Input,
+  which the chunked prefill has nowhere to bind. Re-enabling batched V4 prefill
+  means giving `PfChunk` an ids buffer that is separate from its host-embedded
+  rows.
 
 - **`Op::io` still omits `exp_probs_b`.** Pre-existing (it lists `x`,
   `router_x`, `router`, the three banks and `down_scale`); `expert_ids` was
@@ -1599,11 +1611,12 @@ is left:
   pager this is the gap.
 - **Metal's DEVICE MoE path is only reachable for softmax gating.** Its arm
   asserts `MoeGating::Softmax`, and V4's gating is mandatory `SqrtSoftplus`, so
-  a real V4 MoE layer on Metal would abort at that assert before hash routing or
-  the clamp mattered. Both are implemented anyway (`moe_topk`'s `hash` flag,
-  `gatedact_f32`'s `do_clamp`/`limit`) and `moe_ffn_hash_routing_parity` covers
-  the softmax shape, but the sqrt-softplus refusal is the real blocker for V4 on
-  Metal and is untouched.
+  a real V4 MoE layer on Metal would abort at that assert even with the gather
+  in hand. Hash routing and the clamp are implemented there anyway (`moe_topk`'s
+  `hash` flag, `gatedact_f32`'s `do_clamp`/`limit`) and
+  `moe_ffn_hash_routing_parity` covers the softmax shape; the sqrt-softplus
+  refusal is the real blocker for V4 on Metal and is untouched. Lifting it is
+  what makes the refused `Op::GatherI32` above worth writing.
 - **Metal has never been executed.** No Apple hardware was available. The
   changed kernels (`moe_topk`, `gatedact_f32`, `gatedactfused_f32`) typecheck
   via `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`;
@@ -1638,9 +1651,9 @@ The workspace clippy run is green because those lines are Apple-only and a Linux
 build never compiles them. Worth checking whether CI lints that target at all;
 if it does, it has been red since `key_bias` landed.
 
-### B-DSV4-REAL — the shipped V4 file needs BOTH missing slices, not either (2026-08-12)
+### B-DSV4-REAL — the shipped V4 file now needs ONLY the compressed tiers (2026-08-13)
 
-**Tag:** deepseek · **Blocked on:** B-DSV4-WIRING slice B and B-DSV4-HASH
+**Tag:** deepseek · **Blocked on:** B-DSV4-WIRING slice B
 
 Measured from `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (`block_count = 43`,
 `hash_layer_count = 3`, `compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over
@@ -1649,15 +1662,24 @@ ratio-0 and bias-routed.** Layers 0 and 1 are the only ratio-0 layers and both
 are hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer
 2 is compressed AND hash-routed.
 
-So the implemented ratio-0 tier covers 2 of 43 layers, and neither of those two
-can run either. Landing slice B alone, or B-DSV4-HASH alone, still leaves this
-checkpoint refusing — worth knowing before either is scheduled as "the one that
-makes V4 work". The order of the two refusals in `generate_dense_backend` means
-the compressed-layer message is what a user sees today (layer 2, ratio 4); the
-hash message is behind it.
+Hash routing landed on 2026-08-13 (§ B-DSV4-HASH), so layers 0 and 1 — 2 of the
+43 — are now fully covered, and **the only thing between this checkpoint and a
+forward pass is B-DSV4-WIRING slice B**, the compressed (ratio 4/128) tiers.
+That is also the only refusal left in `generate_dense_backend` for this file:
+`arch=deepseek4 … layer 2 has compress_ratio 4`.
 
-Verified by running `infr run` against the file on the CPU backend: config
-parses, `wload` resolves every tensor, and the refusal is reached.
+What is NOT established by this entry: any NUMBER the graph computes on a real
+file. The refusal still fires before the first forward pass, so what has been
+verified against the real GGUF is names, shapes and the two hash-routing
+prerequisites (an i32 `blk.{0,1,2}.ffn_gate_tid2eid.weight` of shape
+`[6, 129280]` = `[n_expert_used, vocab]`, which is exactly what the new shape
+check demands) — nothing about its logits. The hash-routing correctness evidence
+is the synthetic fixture and the op-level parity tests, on CPU and Vulkan.
+
+Verified by running `infr run` against the file on the CPU backend (2026-08-12):
+config parses, `wload` resolves every tensor, and the refusal is reached. NOT
+re-run after the hash slice — the compressed-layer refusal is ordered first and
+fires at layer 2 regardless, so the observable would not have moved.
 
 ### B-GGUF-META-IGNORED — keys the reference conversion carries that infr never reads (2026-08-12)
 

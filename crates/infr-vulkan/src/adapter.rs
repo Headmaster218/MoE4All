@@ -3737,6 +3737,22 @@ fn lower_op(
                 *scale,
             );
         }
+        Op::GatherI32 {
+            ids,
+            table,
+            dst,
+            rows,
+            ne,
+        } => {
+            let dt = graph.desc(*table).dtype;
+            if dt != infr_core::DType::I32 {
+                return Err(be(format!(
+                    "vulkan adapter: Op::GatherI32 copies integers verbatim — its table must be \
+                     I32, got {dt:?}"
+                )));
+            }
+            rec.gather_i32(r(*table)?, r(*ids)?, r(*dst)?, *rows as usize, *ne as usize);
+        }
         Op::Sample {
             x,
             u,

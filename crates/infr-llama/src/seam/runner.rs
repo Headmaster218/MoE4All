@@ -488,6 +488,11 @@ pub(crate) fn generate_dense_backend(
             .find(|t| t.name == "token_embd.weight")
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
         && ec.spec.gpu_embed;
+    // DeepSeek V4 hash-routed MoE: `build` declares the token-id Input for its `Op::GatherI32`
+    // selection gathers even when `gpu_embed` is false, so the decode loop uploads the id and the
+    // binder binds it under this flag too. Mirrors `build`'s own `hash_gather` (which is per-SPAN;
+    // V4 is only ever built as the whole model, see the assert there).
+    let hash_ids = c.deepseek4 && (0..c.n_layer).any(|l| c.is_hash_moe_layer(l));
     // gemma4-E2B: gather the per-layer TOKEN embedding rows on-device too (the same
     // Op::EmbedGather, table = per_layer_token_embd, scale = sqrt(npl)) — the last host-side
     // per-token gather. Costs the quantized table's on-disk size in VRAM (uploaded once);
@@ -1463,11 +1468,12 @@ pub(crate) fn generate_dense_backend(
         && ec.spec.gpu_sample;
 
     // DeepSeek V4: the `compress_ratio == 0` tier emits (hyper-connections, MQA attention with
-    // sinks and the grouped output projection, bias-routed MoE with the per-layer SwiGLU clamp).
-    // Everything below is what does NOT, refused by name rather than approximated — each of these
-    // would otherwise run and produce plausible wrong numbers. Placed after the weight upload on
-    // purpose, exactly as the deepseek32 slice was: a `deepseek4` GGUF still gets every tensor it
-    // declares validated end to end. See docs/deepseek.md § Stage 4.
+    // sinks and the grouped output projection, MoE with the per-layer SwiGLU clamp under EITHER
+    // routing — the router bias, or the `ffn_gate_tid2eid` hash table). What is left below is the
+    // compressed tiers, refused by name rather than approximated because they would otherwise run
+    // and produce plausible wrong numbers, plus the shape facts the emit assumes. Placed after the
+    // weight upload on purpose, exactly as the deepseek32 slice was: a `deepseek4` GGUF still gets
+    // every tensor it declares validated end to end. See docs/deepseek.md § Stage 4.
     if c.deepseek4 {
         // Ratios 4 and 128. Their compressed caches, the three compressor states, the per-channel
         // softmax pooling op and the block-counting lightning indexer are all still missing — see
@@ -1490,22 +1496,38 @@ pub(crate) fn generate_dense_backend(
                 },
             ));
         }
-        // Hash-routed layers. `Op::MoeFfn::expert_ids` exists and every backend implements it, but
-        // NOTHING can produce the ids: they are `ggml_get_rows(ffn_gate_tid2eid, inp_tokens)`, an
-        // I32 `[n_expert_used, n_vocab]` lookup by TOKEN ID, and `Op::EmbedGather` cannot serve it
-        // (its Vulkan kernel iterates whole 32-element sub-blocks, so an `n_expert_used`-wide row
-        // writes nothing and every token silently routes to expert 0). Emitting the layer with
-        // `expert_ids: None` would run the ordinary top-k instead — different experts, no error.
-        // See docs/backlog.md § B-DSV4-HASH.
-        if let Some(l) = (0..c.n_layer).find(|&l| c.is_hash_moe_layer(l)) {
-            return Err(anyhow!(
-                "arch=deepseek4 (DeepSeek V4) layer {l} is hash-routed (hash_layer_count={}): its \
-                 experts come from the `blk.{l}.ffn_gate_tid2eid` token-id table, and no op in this \
-                 tree can gather an i32 `[rows, n_expert_used]` selection from it. Running the \
-                 layer's router top-k instead would pick DIFFERENT experts silently. See \
-                 docs/backlog.md § B-DSV4-HASH.",
-                c.hash_layer_count,
-            ));
+        // Hash-routed layers: `Op::GatherI32` reads the token's row of `ffn_gate_tid2eid` and
+        // `Op::MoeFfn::expert_ids` runs those experts. Two things the emit assumes and the file
+        // could break, both checked here because the graph builder has no way to report them.
+        //
+        // The gather indexes the table by TOKEN ID with no clamp (`gather_i32.comp`, and the CPU
+        // arm's bounds assert), so the table must have exactly one row per vocabulary entry — the
+        // same contract `Op::EmbedGather` reads `token_embd` under.
+        let n_used = c.moe.map_or(0, |m| m.n_used);
+        for l in (0..c.n_layer).filter(|&l| c.is_hash_moe_layer(l)) {
+            if !c.is_moe_layer(l) {
+                return Err(anyhow!(
+                    "arch=deepseek4 (DeepSeek V4) layer {l} is hash-routed but is not a MoE layer, \
+                     so its `blk.{l}.ffn_gate_tid2eid` selection has no expert bank to select from"
+                ));
+            }
+            let name = format!("blk.{l}.ffn_gate_tid2eid.weight");
+            let want = n_used * c.vocab;
+            let got = g
+                .tensors()
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.shape.iter().product::<usize>())
+                .unwrap_or(0);
+            if got != want {
+                return Err(anyhow!(
+                    "arch=deepseek4 (DeepSeek V4): `{name}` holds {got} entries, not \
+                     expert_used_count*vocab = {n_used}*{} = {want}. The hash gather indexes it by \
+                     TOKEN ID, so a table that is not one row per vocabulary entry would read the \
+                     wrong row — or past the end.",
+                    c.vocab,
+                ));
+            }
         }
         // The hyper-connection shape every backend's fixed-size per-token scratch is built for.
         // `Op::HyperConnectMix` asserts both on the host; catching them here names the GGUF key.
@@ -1631,19 +1653,29 @@ pub(crate) fn generate_dense_backend(
         let kd = |n: usize| TensorDesc::new(vec![n], k_fmt);
         let vd = |n: usize| TensorDesc::new(vec![n], v_fmt);
         let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+        // DeepSeek V4 hash-routed MoE: every such layer gathers its expert selection from its own
+        // `ffn_gate_tid2eid` table BY TOKEN ID, so the graph needs the ids whether or not the
+        // EMBEDDING is gathered on-device — `gpu_embed` gates on a `token_embd` dtype the gather
+        // kernels cover, which a model can fail while still being hash-routed. The ids Input is
+        // therefore declared for either reason; only `use_ids` also makes `hidden` an Internal.
+        let hash_gather = c.deepseek4 && (l_first..l_end).any(|l| c.is_hash_moe_layer(l));
+        // A chunked batched prefill uploads HOST-EMBEDDED f32 rows into the buffer it would
+        // otherwise bind to the ids (see the `PfChunk::input` bind), so there is nowhere to put
+        // them on a `use_ids == false` span. `batched_prefill_ok` excludes V4 outright; this names
+        // the reason at the point that depends on it.
+        assert!(
+            !hash_gather || use_ids || span.is_none(),
+            "a hash-routed deepseek4 layer span cannot be built without the token-id input"
+        );
         // GPU embed gather: `hidden` becomes an Internal computed by the Op::EmbedGather pushed
         // just before the first layer op (after the table weight handle is declared) — unless a
         // layer span asked for it in a caller-owned buffer, where the gather writes the Input.
-        let (hidden, tok_ids) = if use_ids {
-            let ids = g.input(TensorDesc::new(vec![batch], DType::I32));
-            let h = if span.is_some() {
-                g.input(f32d(batch * ne))
-            } else {
-                g.internal(f32d(batch * ne))
-            };
-            (h, Some(ids))
+        let tok_ids =
+            (use_ids || hash_gather).then(|| g.input(TensorDesc::new(vec![batch], DType::I32)));
+        let hidden = if use_ids && span.is_none() {
+            g.internal(f32d(batch * ne))
         } else {
-            (g.input(f32d(batch * ne)), None)
+            g.input(f32d(batch * ne))
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
@@ -1906,7 +1938,16 @@ pub(crate) fn generate_dense_backend(
                     gate_exps: wpush(&mut g, &mut weights),
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
+                    // ONE slot, two possible tensors: `wload`'s deepseek4 arm uploads
+                    // `ffn_gate_tid2eid.weight` on a hash-routed layer and `exp_probs_b.bias` on
+                    // every other, exclusively — so exactly one handle is pushed here, in that
+                    // slot, or every later weight in the model binds one buffer off.
                     exp_probs_b: if layer_has_epb[l] {
+                        Some(wpush(&mut g, &mut weights))
+                    } else {
+                        None
+                    },
+                    tid2eid: if c.is_hash_moe_layer(l) {
                         Some(wpush(&mut g, &mut weights))
                     } else {
                         None
@@ -3897,6 +3938,7 @@ pub(crate) fn generate_dense_backend(
                     up_exps,
                     down_exps,
                     exp_probs_b,
+                    tid2eid,
                     shexp,
                 } => {
                     let mc = c.moe.expect("moe layer without MoeConfig");
@@ -3904,6 +3946,28 @@ pub(crate) fn generate_dense_backend(
                     // `Op::MoeSharedExpertAdd` combines it into `sub` below; with none (qwen3moe)
                     // it writes `sub` directly, unchanged from before this arm grew a `shexp` field.
                     let moe_dst = if shexp.is_some() { moe_out } else { sub };
+                    // DeepSeek V4 hash routing: this layer's experts are the token's row of
+                    // `ffn_gate_tid2eid`, not the router's top-k. `Op::GatherI32` reads that row
+                    // out of the I32 table by TOKEN ID — llama.cpp's
+                    // `ggml_get_rows(layer.ffn_gate_tid2eid, inp_tokens)` — into the
+                    // `[batch, n_used]` selection `Op::MoeFfn::expert_ids` consumes. `exp_probs_b`
+                    // is `None` on such a layer by construction (the file carries one tensor or the
+                    // other), which is also what the op requires: a bias only ranks a selection
+                    // nothing is ranking here.
+                    let expert_ids = tid2eid.map(|table| {
+                        let ids = tok_ids.expect(
+                            "a hash-routed layer declares the token-id input (hash_gather)",
+                        );
+                        let sel = g.internal(TensorDesc::new(vec![batch, mc.n_used], DType::I32));
+                        g.push(Op::GatherI32 {
+                            ids,
+                            table,
+                            dst: sel,
+                            rows: batch as u32,
+                            ne: mc.n_used as u32,
+                        });
+                        sel
+                    });
                     g.push(Op::MoeFfn {
                         x: hn,
                         router_x: hn, // qwen3moe/qwen35moe: router reads the SAME normed input as the experts
@@ -3928,11 +3992,9 @@ pub(crate) fn generate_dense_backend(
                         n_expert_groups: mc.n_expert_groups,
                         n_expert_groups_used: mc.n_expert_groups_used,
                         swiglu_clamp: clamp_exp,
-                        // DeepSeek V4's HASH-routed layers would supply the ids here; they are
-                        // refused before the graph is built because nothing can gather them
-                        // (docs/backlog.md § B-DSV4-HASH), so every layer that reaches this arm
-                        // routes by the router's own top-k.
-                        expert_ids: None,
+                        // `Some` only on a DeepSeek V4 hash-routed layer (see the gather above);
+                        // `None` everywhere else, which is the router's own top-k.
+                        expert_ids,
                     });
                     if let Some(MoeSharedW {
                         gate_inp,
@@ -5085,6 +5147,26 @@ pub(crate) fn generate_dense_backend(
     } else {
         tok_id_buf.as_ref()
     };
+    // A decode step's two possible per-step inputs, which are INDEPENDENT rather than either/or.
+    // The token-id Input exists whenever `build` declared it — for the on-device embed gather, and
+    // (deepseek4) for a hash-routed layer's `ffn_gate_tid2eid` selection gather, which needs the
+    // ids even when the embedding stayed on the host because `token_embd`'s dtype has no gather
+    // kernel. `hidden` is an Input exactly when the embedding did NOT come from the device gather.
+    // Both binds live here so the record-once and per-token paths cannot drift apart.
+    fn bind_step_input<'b>(
+        b: &mut Bindings<'b>,
+        h: &DecodeHandles,
+        gpu_embed: bool,
+        ids_buf: &'b dyn Buffer,
+        hidden_buf: &'b dyn Buffer,
+    ) {
+        if let Some(ids) = h.tok_ids {
+            b.bind(ids, ids_buf);
+        }
+        if !gpu_embed {
+            b.bind(h.hidden, hidden_buf);
+        }
+    }
     let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
@@ -5477,14 +5559,13 @@ pub(crate) fn generate_dense_backend(
         );
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
-        match h.tok_ids {
-            Some(ids) => {
-                b.bind(ids, dec_ids_buf.as_ref());
-            }
-            None => {
-                b.bind(h.hidden, hidden_buf.as_ref());
-            }
-        }
+        bind_step_input(
+            &mut b,
+            &h,
+            gpu_embed,
+            dec_ids_buf.as_ref(),
+            hidden_buf.as_ref(),
+        );
         b.bind(h.positions, pos_buf.as_ref());
         if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
             b.bind(pid, ib.as_ref());
@@ -5660,12 +5741,16 @@ pub(crate) fn generate_dense_backend(
         }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
-        if gpu_embed {
-            // GPU embed gather: feed the 4-byte token id — the device dequantizes the row.
+        // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
+        // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
+        // selection gather (`hash_ids`), which needs it independently of how the embedding was
+        // produced. Not a round trip — this is the id the host already fed this step.
+        if gpu_embed || hash_ids {
             be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
                 .map_err(|e| anyhow!("{e}"))?;
-        } else {
-            // embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
+        }
+        if !gpu_embed {
+            // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
             // table slice is already the row to upload — hand it straight to the backend rather
             // than allocating a throwaway `Vec<f32>` per token to copy it.
             let row = &token_embd.get()?[tok * ne..tok * ne + ne];
@@ -5738,14 +5823,13 @@ pub(crate) fn generate_dense_backend(
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
-            match h.tok_ids {
-                Some(ids) => {
-                    b.bind(ids, dec_ids_buf.as_ref());
-                }
-                None => {
-                    b.bind(h.hidden, hidden_buf.as_ref());
-                }
-            }
+            bind_step_input(
+                &mut b,
+                &h,
+                gpu_embed,
+                dec_ids_buf.as_ref(),
+                hidden_buf.as_ref(),
+            );
             b.bind(h.positions, pos_buf.as_ref());
             if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
                 b.bind(pid, ib.as_ref());

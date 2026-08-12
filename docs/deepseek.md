@@ -734,10 +734,13 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: a V4 model whose `compress_ratios` are ALL ZERO generates.** The
-ratio-0 tier is emitted end to end and runs on CPU and Vulkan; ratios 4 and 128,
-and hash-routed layers, are refused by name. See "Slice A — ratio 0" below for
-what that covers and `docs/backlog.md` § B-DSV4-WIRING for what slice B owes.
+**Progress: a V4 model whose `compress_ratios` are ALL ZERO generates, under
+either routing.** The ratio-0 tier is emitted end to end and runs on CPU and
+Vulkan; ratios 4 and 128 are refused by name. See "Slice A — ratio 0" below for
+what that covers, "Slice A2 — hash routing" for the `ffn_gate_tid2eid` gather,
+and `docs/backlog.md` § B-DSV4-WIRING for what slice B owes. Note that no layer
+of the SHIPPED V4-Flash file is both ratio-0 and bias-routed — see
+`docs/backlog.md` § B-DSV4-REAL.
 
 The 2026-08-10 read slice that preceded it was a read, not a port:
 `llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
@@ -762,7 +765,9 @@ attention      : wq_a -> q_a_norm -> wq_b -> QkNorm{weight:None}
                  -> Linear(wo_b)
 hc post (attn) : HyperConnectPost  res[0] -> res[1]
 hc wrap (ffn)  : ... on res[1] -> RmsNorm(ffn_norm)
-ffn            : MoeFfn{ SqrtSoftplus, exp_probs_b, swiglu_clamp_exp[il] }
+ffn            : [hash layers only] GatherI32(tok_ids, ffn_gate_tid2eid)
+                 MoeFfn{ SqrtSoftplus, swiglu_clamp_exp[il],
+                         exp_probs_b XOR expert_ids }
                  + shared expert (swiglu_clamp_shexp[il]), summed
 hc post (ffn)  : HyperConnectPost  res[1] -> res[0]
 ```
@@ -804,8 +809,55 @@ Two things outside the emit had to move with it:
   correct) stayed exact and hid it.
 
 What ratio 0 does NOT cover, and is refused rather than approximated: compressed
-layers (ratios 4/128) and hash-routed layers, whose expert ids nothing in the
-tree can gather.
+layers (ratios 4/128).
+
+### Slice A2 — hash routing end to end (2026-08-13)
+
+A layer below `hash_layer_count` takes its experts from its own
+`blk.N.ffn_gate_tid2eid` — an i32 `{n_expert_used, n_vocab}` table indexed by
+TOKEN ID — instead of the router's top-k. The op that consumes the selection
+(`Op::MoeFfn::expert_ids`) already existed; what was missing was the gather that
+produces it, so the layer was refused by name. It now emits:
+
+- **`Op::GatherI32`** — `ggml_get_rows` on an integer table:
+  `dst[r, :] = table[ids[r], :]`, values copied, no dequant and no scale. CPU
+  interpreter arm plus `gather_i32.comp` on Vulkan; **Metal refuses it by name**
+  (its device MoE path already refuses V4's mandatory sqrt-softplus gating, so a
+  V4 MoE layer could not run there either way — `docs/backlog.md` §
+  B-DSV4-HASH).
+- **Not a mode of `Op::EmbedGather`.** That kernel walks the table in whole
+  32-element sub-blocks (`nsub = ne / 32`), so a row of `n_expert_used` integers
+  (6 on the shipped file) is narrower than one sub-block and gathers nothing —
+  since `c5f542a` a hard host-side assert rather than silent zeros. It also
+  dequantizes through `native_decode.glsl`, which has no I32 format, and scales
+  the result. Three semantics that do not belong on an integer lookup.
+- **The table is BOUND as a storage buffer**, not read through the resident-BDA
+  arena the way `embed_gather` reads `token_embd`: it is
+  `n_expert_used * n_vocab` dwords (3.1 MB on the shipped V4 file), far inside
+  `maxStorageBufferRange`, and one addressing mode is cheaper to reason about
+  than two.
+- **The token-id Input is declared for the gather's sake too.** It used to exist
+  only under `gpu_embed` (the on-device embed gather), which gates on a
+  `token_embd` dtype the gather kernels cover — a model can fail that and still
+  be hash-routed. `build` now declares the ids whenever a hash-routed layer is
+  in the span, and `hidden` stays an Input unless the EMBEDDING really is
+  gathered on-device. Both binds live in one place (`bind_step_input`) so the
+  per-token and record-once paths cannot drift.
+- **No host round trip is added.** V4 is excluded from the record-once replay
+  tape and from the chained decode, so every V4 step already goes through the
+  per-token loop, where the host has just fed `cur[pos]`; the gather's input is
+  the same 4-byte id upload that path already does (or, under `gpu_embed`, the
+  identical buffer the embed gather reads).
+- **The table's shape is validated, not clamped.** `generate_dense_backend`
+  refuses a `ffn_gate_tid2eid` that is not `expert_used_count * vocab` entries,
+  because the gather indexes it by token id with no bounds clamp — the same
+  contract `Op::EmbedGather` reads `token_embd` under.
+
+What the routing weights are is unchanged and was already pinned at the op
+level: `build_moe_ffn` takes them from `ggml_get_rows(probs, selected_experts)`,
+i.e. the router's own sqrt-softplus probability at each hash-chosen expert, so
+the router matmul still runs and only `argsort_top_k` (with `exp_probs_b` and
+the group masking that feed only it) is skipped.
 
 Slice 2 added the op-level pieces V4's attention needs, on CPU, Vulkan and
 Metal, with op-level parity tests in `crates/infr-llama/tests/seam_op_parity.rs`
@@ -846,10 +898,12 @@ clamps and the mandatory sqrt-softplus gating — and loads every tensor, with
 each layer's set chosen by its ratio and its hash/bias routing.
 `Config::deepseek2` is FALSE for V4 (unlike V3.2, which genuinely is V2 plus an
 indexer); every reader of that flag was enumerated and is MLA-specific. A model
-with any non-zero ratio or any hash-routed layer is then refused by name, with
-an `assert!` at the top of the build closure as the backstop — `wpush`'s Dsv4
-arm declares the ratio-0 tensor set only, so a compressed layer reaching the
-builder would bind every later weight one buffer off.
+with any non-zero ratio is then refused by name, with an `assert!` at the top of
+the build closure as the backstop — `wpush`'s Dsv4 arm declares the ratio-0
+tensor set only, so a compressed layer reaching the builder would bind every
+later weight one buffer off. Hash-routed layers are no longer refused: their
+`ffn_gate_tid2eid` occupies the SAME slot of the upload order that a bias-routed
+layer's `exp_probs_b` does, and `wpush` pushes exactly one of the two.
 
 A genuinely different architecture, not an increment. Sharing with stage 2 is
 limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
@@ -870,15 +924,16 @@ limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
 6. **Three-tier per-layer attention** keyed on
    `compress_ratios[il] ∈ {0, 4, 128}`.
 7. **Compressor blocks** that softmax-pool blocks of tokens into single KV rows.
-8. **Hash-routed MoE** on the first `hash_layer_count` layers. ✓ op level.
+8. **Hash-routed MoE** on the first `hash_layer_count` layers. ✓ emitted (see
+   "Slice A2").
 9. **`sqrt(softplus)` gating**, mandatory (`MoeGating::SqrtSoftplus`, already
    there since stage 2).
 10. **Per-layer SwiGLU clamping**, with V4 clamping the gate **pre-SiLU** where
-    every other arch clamps post-SiLU. ✓ op level.
+    every other arch clamps post-SiLU. ✓ emitted.
 
 No dense-lead layers, no NextN.
 
-#### ✓ LANDED at the op level (2026-08-10) — items 8 and 10, nothing emits them yet
+#### ✓ LANDED (2026-08-10 at the op level, 2026-08-13 emitted) — items 8 and 10
 
 **Per-layer SwiGLU clamping** is `swiglu_clamp: Option<f32>` on `Op::GatedAct`,
 `Op::GatedActFused` (the dense / shared-expert path, `swiglu_clamp_shexp[il]`)
@@ -924,11 +979,10 @@ read off `build_moe_ffn`, is **only the selection**:
   alongside `expert_ids` instead of being computed and discarded. Every backend
   branches around the selection rather than overwriting it.
 
-**The gather itself still needs work the wiring slice must do.**
-`Op::EmbedGather` cannot serve it: its Vulkan kernel iterates whole 32-element
-sub-blocks (`nsub = ne / 32`), so an `ne = n_expert_used` row (8) writes NOTHING
-and yields a silent zero, and it decodes through `native_decode.glsl`, which has
-no I32 format. See `docs/backlog.md` § B-DSV4-HASH.
+**The gather is `Op::GatherI32`** — see "Slice A2 — hash routing end to end"
+above for why it is a separate op rather than a mode of `Op::EmbedGather`, and
+`docs/backlog.md` § B-DSV4-HASH for what it still does not cover (Metal, the
+paged MoE path, perf).
 
 ### `compress_ratio` is the master per-layer switch
 

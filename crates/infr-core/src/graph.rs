@@ -863,6 +863,29 @@ pub enum Op {
         ne: u32,
         scale: f32,
     },
+    /// Gather rows of an **I32 lookup table**: `dst[r, :] = table[ids[r], :]` for `rows` rows of
+    /// `ne` integers, values copied verbatim. `ids` and `dst` are [`crate::DType::I32`] handles
+    /// holding plain integers (the convention [`Op::EmbedGather`]'s `ids` uses); `table` is an I32
+    /// Weight.
+    ///
+    /// This is `ggml_get_rows` on an integer tensor — llama.cpp preserves I32 there rather than
+    /// dequantizing. Its one caller is DeepSeek V4's hash-routed MoE:
+    /// `selected_experts = ggml_get_rows(layer.ffn_gate_tid2eid, inp_tokens)` produces the
+    /// `[rows, n_expert_used]` selection [`Op::MoeFfn::expert_ids`] consumes, so `ids` is the
+    /// graph's token-id Input and `ne` is `n_expert_used`.
+    ///
+    /// Deliberately NOT a mode of [`Op::EmbedGather`], which dequantizes a quantized row through the
+    /// per-format block decoders into f32 and scales it: this op has no dtype ladder, no scale, and
+    /// an integer destination. It also has no 32-element block structure to walk, which is what
+    /// makes `EmbedGather` unusable here — an `n_expert_used`-wide row (6 or 8) is narrower than one
+    /// sub-block.
+    GatherI32 {
+        ids: TensorId,
+        table: TensorId,
+        dst: TensorId,
+        rows: u32,
+        ne: u32,
+    },
     /// Copy `n` elements `src[src_off..] -> dst[dst_off..]` (extract last row, gather a slice).
     Copy {
         src: TensorId,
@@ -1084,6 +1107,7 @@ impl Op {
             Op::ArgmaxProb { .. } => "ArgmaxProb",
             Op::Sample { .. } => "Sample",
             Op::EmbedGather { .. } => "EmbedGather",
+            Op::GatherI32 { .. } => "GatherI32",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
@@ -1231,6 +1255,9 @@ impl Op {
             } => (vec![x], vec![dst_id, dst_prob]),
             Op::Sample { x, u, dst, .. } => (vec![x, u], vec![dst]),
             Op::EmbedGather {
+                ids, table, dst, ..
+            } => (vec![ids, table], vec![dst]),
+            Op::GatherI32 {
                 ids, table, dst, ..
             } => (vec![ids, table], vec![dst]),
             Op::Copy { src, dst, .. } => (vec![src], vec![dst]),

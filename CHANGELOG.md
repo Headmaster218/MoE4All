@@ -8,6 +8,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DeepSeek V4's hash-routed MoE layers run, on CPU and Vulkan.** Such a layer
+  takes its experts from an i32 `blk.N.ffn_gate_tid2eid`
+  `[n_expert_used, n_vocab]` table indexed by TOKEN ID rather than from the
+  router's top-k, and nothing in the tree could gather that selection, so `infr`
+  refused the layer by name rather than silently running a different set of
+  experts. A new `Op::GatherI32` (`ggml_get_rows` on an integer table — CPU
+  interpreter arm and the `gather_i32.comp` Vulkan kernel) produces the
+  `[batch, n_expert_used]` selection that `Op::MoeFfn::expert_ids` already
+  consumed, and the seam emits it per hash-routed layer. `Op::EmbedGather` could
+  not serve this: its kernel walks the table in whole 32-element sub-blocks, so
+  a 6- or 8-wide row gathers nothing. The graph's token-id Input is now declared
+  whenever a hash-routed layer needs it, not only when the token EMBEDDING is
+  gathered on-device — a model whose `token_embd` dtype has no gather kernel is
+  still hash-routed. A `ffn_gate_tid2eid` that is not
+  `expert_used_count * vocab` entries is refused, because the gather indexes it
+  by token id with no clamp. Metal refuses `Op::GatherI32` by name (its device
+  MoE path already refuses V4's mandatory sqrt-softplus gating). This does NOT
+  make the shipped `DeepSeek-V4-Flash-0731-GGUF` generate: every layer of that
+  file past 1 is compressed (ratio 4/128), which is still unimplemented, and it
+  refuses there.
+
 - **GGUFs carrying `GGML_TYPE_I32` tensors open.** Integer tensors are lookup
   tables a kernel indexes with rather than weights, and `Gguf::open` refused
   them outright (`unsupported: ggml type 26`). The first shipped model to need
@@ -78,17 +99,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (stage 4, slice A). The `ratio == 0` tier — hyper-connections wrapping both
   sublayers, single-head MQA attention with a weightless per-head Q norm, a
   `[nope | rope]` tail rope, attention sinks, a de-roped grouped low-rank output
-  projection, and bias-routed sqrt-softplus MoE with the per-layer SwiGLU clamps
-  — is emitted end to end and runs on CPU and Vulkan. Compressed layers (ratio 4
-  or 128) and hash-routed layers are refused by name, each message saying which
-  layer and what is missing, rather than approximated by the ratio-0 graph. Two
-  supporting changes ship with it: Vulkan's `Op::Linear` now accepts `w_off` on
-  an **F32** weight (by shifting the weight's `bufferDeviceAddress` base — the
-  float GEMVs already address their weight by pointer, and `w_off` is
-  row-aligned), which is what lets the grouped output projection run there at
-  all; and V4 is excluded from the record-once decode replay tape, like
-  `deepseek2`, because its ops have no dynamic twins. See `docs/deepseek.md` §
-  Stage 4.
+  projection, and sqrt-softplus MoE with the per-layer SwiGLU clamps — is
+  emitted end to end and runs on CPU and Vulkan. Compressed layers (ratio 4
+  or 128) are refused by name, the message saying which layer and what is
+  missing, rather than approximated by the ratio-0 graph. Two supporting changes
+  ship with it: Vulkan's `Op::Linear` now accepts `w_off` on an **F32** weight
+  (by shifting the weight's `bufferDeviceAddress` base — the float GEMVs already
+  address their weight by pointer, and `w_off` is row-aligned), which is what
+  lets the grouped output projection run there at all; and V4 is excluded from
+  the record-once decode replay tape, like `deepseek2`, because its ops have no
+  dynamic twins. See `docs/deepseek.md` § Stage 4.
 - **DeepSeek V4 hash-routed MoE and per-layer SwiGLU clamping** (stage 4, op
   level). `Op::MoeFfn` gains `expert_ids`: an optional pre-gathered
   `[rows, n_expert_used]` I32 handle (llama.cpp's `selected_experts_in`,

@@ -2700,6 +2700,9 @@ fn main() {
         // Q2_0 (Bonsai ternary): the shipped Bonsai GGUFs quantize token_embd.weight itself as
         // Q2_0, so the gather kernel needs the format or prefill falls back to host embedding.
         ("embed_gather", "embed_gather_q2_0", &["-DFMT_Q2_0"]),
+        // I32 lookup-table row gather (Op::GatherI32): DeepSeek V4's token-id → expert-id
+        // `ffn_gate_tid2eid` selection. Format-free (integers are copied), so one build.
+        ("gather_i32", "gather_i32", &[]),
         // Chained-decode id ring log (ring[pos & 63] = sampled id) — see id_log.comp.
         ("id_log", "id_log", &[]),
         // Device-side decode-replay params advance ([pos, kv_len] += 1) — see params_advance.comp.
