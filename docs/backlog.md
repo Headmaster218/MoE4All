@@ -371,7 +371,8 @@ changing it; either way it is one `spec.resolve` argument per arm.
 
 ### B12 — an explicit `--ctx N` never reaches the refuse rung
 
-**Tag:** raised 2026-08-02 · **Blocked on:** a product decision
+**Tag:** raised 2026-08-02 · **Blocked on:** nothing — the product decision was
+made 2026-08-12, see "DECIDED" at the end of this entry
 
 `SeamModel::clamp_default_ctx` gained a refuse rung: when neither f16 nor q8_0
 can serve even `MIN_SESSION_CTX` tokens it returns an `Err` naming the requested
@@ -404,6 +405,25 @@ fit the device's measured free memory, before honoring the one that was asked
 for. The decision above is now only about whether to escalate that warning to an
 error — and the "provable check" it asks for is exactly what that path already
 computes.
+
+**DECIDED 2026-08-12 (user).** An explicit `--ctx N` that does not fit **must
+try q8_0 KV before doing anything else**: _"when setting `--ctx` that would not
+fit in VRAM using k/v cache, have infr auto quant the context to Q8_0 if it will
+fit."_ So the explicit path walks the same ladder `clamp_default_ctx` already
+has — f16, then q8_0, then refuse — instead of being taken verbatim and failing
+later at the alloc guard. Quantizing to serve the window the user asked for is
+preferred over clamping the window; refusing stays the last rung.
+
+To implement: route `vulkan_session_on` and `vulkan_slot_ctx`'s
+`SizeSpec::Bytes` arm through the fit math rather than returning the value
+verbatim. Two constraints from above still bind — the check must be **provable**
+(exact KV bytes + weights vs `alloc_room()`, no activation reserve in it), and
+the DEFAULT-path refuse rung must not widen (only "no usable context at all" may
+refuse, or every ordinary long-context model breaks on a 24 GiB card).
+
+Sequencing note: this is one rung of the ladder in `vram-audit-2026-07-12` (SWA
+→ q8 → clamp → stream → KV-overflow last), and the rung ORDER itself is what B62
+asks someone to verify.
 
 ### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
 
@@ -1331,10 +1351,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each `matmul*\*` entry carries its own tiling constraints
-(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
-with different meanings, so a uniform guard needs its own read of the family
-rather than a mechanical sweep.
+stop was scope: each
+`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
+%64 && k %32`) and several take `k` with different meanings, so a uniform guard
+needs its own read of the family rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -2369,3 +2389,98 @@ at load.
 — a few hundred thousand short comparisons once, i.e. microseconds. A `HashMap`
 index would be complexity for no measurable gain. The _other_ half of N2
 (duplicate tensor names silently accepted, first-wins) was real and is fixed.
+
+### B62 — is host-RAM KV spill actually the LAST rung? (2026-08-12)
+
+**Tag:** vram · kv · **Blocked on:** nothing; this is a trace someone has to do
+
+User, 2026-08-12: _"Only spill K/V cache to system ram when absolutely
+necessary."_
+
+The surface exists — `crates/infr-core/src/config/manifest.rs` carries
+`INFR_KV_OVERFLOW` → `kv.overflow`, plus `kv.overflow_vram_mb` and
+`kv.overflow_reserve_mb` — and it is documented as VRAM-first. What has **never
+been established** is whether the rung ORDER is enforced in code: that q8_0 KV
+quantization and context clamping are both attempted, and exhausted, before a
+single KV row is placed in host memory.
+
+The intended ladder, from `vram-audit-2026-07-12`: SWA → q8 → clamp → stream →
+KV-overflow **last**.
+
+**The task is to trace it and then either prove the order with a test or fix
+it** — and to say plainly which of the two it turned out to be. A test is the
+point: an ordering that holds today because of how two independent branches
+happen to be arranged is one refactor away from silently spilling first, and
+spilling is invisible in output. It only shows up as throughput.
+
+Related: B12's DECIDED note makes q8_0 mandatory on the explicit `--ctx` path,
+which is the rung immediately above this one.
+
+### B63 — deep-context performance is unmeasured across the whole model matrix (2026-08-12)
+
+**Tag:** perf · coverage-gap · **Blocked on:** nothing
+
+Every performance number this repo records is short-context: pp512 / tg128, or
+pp2048 at most (`perf-state-2026-07-20`, the cross-model sweep in
+`bench-profile-commands`). **Nothing has ever been measured at agentic-workload
+depth.**
+
+User, 2026-08-12: _"benchmark deep context for some models and optimize deep
+context, i.e. 35k context prefill + tg512 at depth 35k, so we can see which
+parts of infr are slow at those deeper context … I want to be able to run Qwen
+3.6 27b locally with larger context for agentic workflow"_, then: _"We should
+probably have the same perf sweep for all our supported models."_
+
+**The measurement**, per model: `pp35000`, `tg512 @ depth 35000`, and an
+`INFR_PROF_OPS` per-op profile **at depth** — the profile is the deliverable,
+not the throughput, because the question is WHICH parts degrade. Score against
+llama.cpp's Vulkan backend on the same GGUF wherever it can load it. One size
+per family that fits 24 GiB, and always name the quant.
+
+**The matrix** is README's own supported-model table (that table is the
+authority; do not re-derive it): `llama`, `llama4`, `qwen2`, `qwen3`,
+`qwen3moe`, `gemma3`, `gemma4` (dense / E2B / MoE), `qwen35`, `qwen35moe`,
+`diffusion-gemma`, `deepseek`, `deepseek2`/`deepseek32`, and the ternary
+`bitnet` / Ternary-Bonsai models.
+
+Two cells are worth more than the rest:
+
+- **SWA models (`gemma3`, and anything with a sliding window) should be FLAT in
+  depth by construction** — the window caps the key range, so cost per token
+  must not grow with context. If they are not flat, that is a BUG, not a perf
+  item, and it is the single most informative measurement in the sweep.
+- **`qwen35` / `qwen35moe` are hybrid**: DeltaNet layers are linear in sequence
+  length, the attention layers are not, so their depth curve should bend
+  differently from every dense model. Nobody has measured it — and this is the
+  family the user's Qwen3.6-27B target rides.
+
+**Precedent that this will find something.** DeepSeek V2-Lite decode collapsed
+111 → 6.3 t/s between short context and `-d 2048` (34× off llama.cpp), and one
+kernel's inner loop was the entire cause — see `B-DSHW-MLA-SCALAR-TIER`, fixed
+in fa9dd2c to 11.9 t/s. An identical collapse in any Qwen or Gemma model would
+be invisible today, because no measurement in this repo would show it.
+
+Methodology, learned the hard way this session: benches run ONE AT A TIME (a
+concurrent GPU process skews everything), arms alternate across reps, and the
+spread is reported rather than just the mean.
+
+### B64 — the i32 gathers trust their ids, and robust buffer access is not requested (2026-08-12)
+
+**Tag:** vulkan · soundness · **Blocked on:** nothing; small
+
+`gather_i32.comp` indexes `table[uint(ids[r]) * ne + j]` and `embed_gather.comp`
+does the equivalent, neither validating that `ids[r]` is inside the table. Both
+document the contract in a comment — the ids are the model's own token ids, and
+`generate_dense_backend` refuses a `ffn_gate_tid2eid` whose row count is not the
+vocabulary — but nothing enforces it at the boundary the shader reads.
+
+`grep -rn 'robust' crates/infr-vulkan/src/` finds nothing, so
+`robustBufferAccess` is not requested and an out-of-range id is an undefined
+read rather than a clamped or zeroed one.
+
+This is **pre-existing, not introduced** by `Op::GatherI32` — `embed_gather` has
+carried it since it was written, and no path currently produces an out-of-vocab
+id. Worth closing anyway, per CLAUDE.md's "enforce a contract, don't document
+one": either request `robustBufferAccess` on the device, or clamp in-shader, or
+validate the id range host-side where the ids are uploaded. Say which, and why
+the other two were not chosen.
