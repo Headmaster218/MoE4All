@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`infr serve --parallel` (`-n`, `--np`) defaults to 1 slot, was 4.** Each
+  slot owns a full KV cache and, with `--ctx` unset, the per-slot window is the
+  VRAM-fit context divided by N — so the old default handed every user a quarter
+  of the context window whether or not they ever issued a concurrent request.
+  Concurrency is now opt-in and a single request gets the whole window; pass
+  `--parallel N` for the previous behaviour. `infr multi` already defaulted to
+  1, so the two now agree. The engine is unchanged: the concurrent seam runs at
+  one slot exactly as before.
+
 ### Added
 
 - **DeepSeek V4's hash-routed MoE layers run, on CPU and Vulkan.** Such a layer

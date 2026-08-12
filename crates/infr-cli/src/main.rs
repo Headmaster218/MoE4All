@@ -375,9 +375,12 @@ enum Cmd {
         /// `--np` is accepted as an alias (llama-server spells this `-np`; clap shorts are a single
         /// character, so `-n` is the short form and `--np` the familiar long one).
         ///
-        /// Unset defaults to 4 slots on the Vulkan seam. `Option` (rather than a `default_value_t`)
-        /// so the CPU/Metal/diffusion serialised backends can tell an EXPLICIT `--parallel` (worth
-        /// a "no multi-slot engine, ignored" note) from the default (silent).
+        /// Unset means ONE slot, which gives a single request the whole VRAM-fit context window.
+        /// Concurrency is opt-in: a default above 1 divides that window N ways for every user,
+        /// including the ones serving a single request at a time, and `infr multi` already spells
+        /// the same flag with the same default. `Option` (rather than a `default_value_t`) so the
+        /// CPU/Metal/diffusion serialised backends can tell an EXPLICIT `--parallel` (worth a "no
+        /// multi-slot engine, ignored" note) from the default (silent).
         #[arg(long = "parallel", visible_alias = "np", short = 'n', value_name = "N")]
         parallel: Option<usize>,
         /// `--ctx` here is the PER-SLOT window (divided from the VRAM fit by `--parallel` when
@@ -3943,9 +3946,11 @@ fn cmd_serve(
         .unwrap_or("model")
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
-    // `--parallel` was EXPLICITLY set iff `Some`; the concurrent-path slot count defaults to 4.
+    // `--parallel` was EXPLICITLY set iff `Some`; the concurrent-path slot count defaults to 1, so
+    // an unflagged `infr serve` hands one request the whole context window rather than a quarter of
+    // it. Raising it is the user's call, and `--ctx` still pins the per-slot window either way.
     let parallel_explicit = parallel;
-    let parallel = parallel.unwrap_or(4).max(1);
+    let parallel = parallel.unwrap_or(1).max(1);
 
     // `--ctx` is the PER-SLOT context. `DeviceOpts::overrides` already validated it into
     // `device.ctx` (shared size grammar `8192`/`256k`/`50%`); the ParallelSeam below takes it from
