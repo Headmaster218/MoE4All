@@ -362,3 +362,121 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
         println!("{dt:?}: paged id + idm under eviction churn OK");
     }
 }
+
+/// Backlog B39: the native-block kernels walk K as `nsub = in_f / 32` whole 32-element sub-blocks,
+/// so an expert bank narrower than 32 ran ZERO iterations — and since the GEMV writes its
+/// accumulator unconditionally, `linear_native_id_multi` completed cleanly and stored an exact
+/// `0.0` over every output (a `-7.0` sentinel in `y` came back as zeros against a host reference of
+/// ~3.1). No driver error, no validation message, no seam error, and nothing a zero-init check
+/// could tell from a real answer. The dense `Op::Linear` path had the identical hazard at
+/// `in_f = 8`.
+///
+/// The floor is now asserted at dispatch rather than lifted. A partial sub-block is only decodable
+/// for the three UNBLOCKED dtypes here (BF16/F16/F32); every blocked format's own GGUF layout
+/// already forbids a row shorter than its block, so a masked-tail kernel would have to be written
+/// into the whole `native_gemv*`/`native_mmv*`/`embed_gather` family to buy correctness in a case
+/// no model can reach.
+///
+/// Both halves are pinned so the guard cannot pass by rejecting everything: BF16 at the smallest
+/// LEGAL width (`in_f = 32`) still matches the host reference with a non-degenerate answer, and
+/// the same bank at `in_f = 8` panics instead of quietly writing zeros. The recorder survives the
+/// caught panic — the guard runs before any recording, so the segment below is finished normally
+/// and no in-flight recorder leaks its descriptor pools (the validation layer reports those at
+/// `vkDestroyDevice`). No panic-hook fiddling: `set_hook` is process-global and `cargo test` runs
+/// tests in parallel, so silencing it would swallow a genuinely failing test's backtrace too;
+/// libtest captures per-test stderr and prints it only on failure.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn id_gemv_multi_rejects_sub_block_in_f() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // BF16 is one of the three dtypes for which a sub-32 bank is even representable — a blocked
+    // format cannot express in_f = 8 at all, which is why the floor is a guard and not a kernel.
+    let dt = DType::Bf16;
+    let (in_f, out_f, n_expert) = (32usize, 4usize, 2usize);
+    let stride = in_f * out_f;
+    let bank = synth_bank(dt, n_expert * stride, 0x5eed ^ 0xb39);
+    let host_w = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
+    let wbuf = be
+        .alloc(pad_to_u32_align(&bank).len(), BufferUsage::Weights)
+        .unwrap();
+    be.upload(wbuf.as_ref(), &pad_to_u32_align(&bank)).unwrap();
+
+    let x: Vec<f32> = (0..in_f).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let ids: Vec<u32> = vec![1, 0];
+    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let y = be
+        .alloc(n_expert * out_f * 4, BufferUsage::Activations)
+        .unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.linear_native_id_multi(
+        dt,
+        wbuf.as_ref(),
+        ids_buf.as_ref(),
+        n_expert,
+        stride,
+        x_buf.as_ref(),
+        false,
+        y.as_ref(),
+        in_f,
+        out_f,
+        1,
+    );
+    // Same bank, same buffers, K one sub-block short of the floor.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rec.linear_native_id_multi(
+            dt,
+            wbuf.as_ref(),
+            ids_buf.as_ref(),
+            n_expert,
+            stride,
+            x_buf.as_ref(),
+            false,
+            y.as_ref(),
+            8,
+            out_f,
+            1,
+        );
+    }));
+    let payload = caught.expect_err(
+        "in_f = 8 must be refused at dispatch: the kernel's `nsub = in_f / 32` loop runs zero \
+         times and writes dst all-zero, which no later check can distinguish from a real answer",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .expect("the K guard panics with a formatted message")
+        .clone();
+    assert!(
+        msg.contains("in_f=8") && msg.contains("multiple of 32"),
+        "refused for the wrong reason: {msg}"
+    );
+    rec.finish().unwrap();
+
+    // The legal-width dispatch recorded before the refusal still ran, and still agrees with the
+    // host dequant — so the guard rejects the off-grid K only, and "all zeros" would be a
+    // detectable answer here rather than a coincidence.
+    let mut out = vec![0u8; n_expert * out_f * 4];
+    be.download(y.as_ref(), &mut out).unwrap();
+    let got: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out).to_vec();
+    for (slot, &eid) in ids.iter().enumerate() {
+        let e = eid as usize;
+        let want = host_gemv(&host_w[e * stride..(e + 1) * stride], &x, in_f, out_f);
+        assert!(
+            want.iter().any(|v| v.abs() > 1e-3),
+            "reference for slot {slot} is ~zero — the fixture cannot tell a no-op dispatch apart"
+        );
+        assert_close(
+            dt,
+            &format!("idm slot {slot} at the in_f=32 floor"),
+            &got[slot * out_f..(slot + 1) * out_f],
+            &want,
+        );
+    }
+}

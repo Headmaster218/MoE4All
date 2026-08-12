@@ -1325,13 +1325,15 @@ fn moe_ref(
 /// including the `v > 20` softplus shortcut branch): CPU backend vs a hand-written f32 reference,
 /// plus a CPU-vs-Vulkan cross-check when a GPU is present. V2-Lite (the only real deepseek model
 /// exercised here) uses plain softmax, so this gating path has never run in any model test.
-/// ne/n_ff_exp = 32 (not tiny): the Vulkan expert id-GEMV decodes 32-element sub-blocks, so
-/// smaller dims would make the cross-check compare against a silent all-zero GPU output.
+/// ne/n_ff_exp = 32 (not tiny): the Vulkan expert id-GEMV decodes 32-element sub-blocks, which is
+/// a hard floor the dispatch now asserts — smaller dims panic instead of cross-checking against a
+/// silent all-zero GPU output.
 #[test]
 fn moe_sqrt_softplus_parity() {
     let cpu = infr_cpu::CpuBackend::new();
     // ne/n_ff_exp ≥ 32: the Vulkan expert id-GEMV decodes 32-element sub-blocks
-    // (`nsub = in_f/32`), so below that its MoE output is a silent all-zero no-op.
+    // (`nsub = in_f/32`). Below that the dispatch is refused outright by the recorder's
+    // `assert_native_k` guard; before that guard it was a silent all-zero no-op (backlog B39).
     let (ne, n_expert, n_used, n_ff_exp) = (32usize, 6usize, 2usize, 32usize);
     let mut g = Graph::new();
     let x = g.input(f32d(ne));
@@ -1424,13 +1426,15 @@ fn moe_sqrt_softplus_parity() {
 /// routing (`n_expert_groups`/`n_expert_groups_used`, per-group top-2 score, non-chosen groups
 /// masked out): CPU backend vs a hand-written f32 reference, plus a CPU-vs-Vulkan cross-check when
 /// a GPU is present. V2-Lite uses no bias and no groups, so neither feature has ever run in a model
-/// test. ne/n_ff_exp = 32 (not tiny): the Vulkan expert id-GEMV decodes 32-element sub-blocks, so
-/// smaller dims would make the cross-check compare against a silent all-zero GPU output.
+/// test. ne/n_ff_exp = 32 (not tiny): the Vulkan expert id-GEMV decodes 32-element sub-blocks,
+/// which is a hard floor the dispatch now asserts — smaller dims panic instead of cross-checking
+/// against a silent all-zero GPU output.
 #[test]
 fn moe_groups_bias_parity() {
     let cpu = infr_cpu::CpuBackend::new();
     // ne/n_ff_exp ≥ 32: the Vulkan expert id-GEMV decodes 32-element sub-blocks
-    // (`nsub = in_f/32`), so below that its MoE output is a silent all-zero no-op.
+    // (`nsub = in_f/32`). Below that the dispatch is refused outright by the recorder's
+    // `assert_native_k` guard; before that guard it was a silent all-zero no-op (backlog B39).
     let (ne, n_expert, n_used, n_ff_exp) = (32usize, 8usize, 2usize, 32usize);
     let mut g = Graph::new();
     let x = g.input(f32d(ne));

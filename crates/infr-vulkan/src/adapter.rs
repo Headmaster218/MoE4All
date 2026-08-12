@@ -8051,6 +8051,11 @@ mod tests {
         let Ok(be_) = VulkanBackend::new() else {
             return; // no GPU — self-skip
         };
+        // ne/nff = 32 is the native-block K floor, not an arbitrary small number: the expert
+        // id-GEMV decodes whole 32-element sub-blocks (`nsub = in_f/32`), and the recorder's
+        // `assert_native_k` refuses anything below or off that grid. See
+        // `id_gemv_multi_rejects_sub_block_in_f` (infr-vulkan tests) for what the unguarded
+        // dispatch used to return instead.
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
         let scale = 1.3f32;
         let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5; // deterministic weight/act filler

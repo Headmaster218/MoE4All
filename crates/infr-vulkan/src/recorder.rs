@@ -261,6 +261,34 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
+/// Reject a native-block dispatch whose K axis is off the 32-element sub-block grid.
+///
+/// Every `native_decode.glsl` consumer walks K as `nsub = in_f / 32` whole 32-element sub-blocks —
+/// the `native_gemv*`, `native_mmv*` and `embed_gather` shader families. That integer division
+/// turns an off-grid K into a wrong answer with nothing to notice it by. A ragged `in_f % 32`
+/// drops the leftover elements from the dot product; `in_f < 32` runs ZERO iterations, and because
+/// the GEMV kernels write their accumulator unconditionally, the dispatch completes cleanly and
+/// stores an exact `0.0` over every output — measured, not inferred: a BF16 id-GEMV at `in_f = 8`
+/// overwrote a `-7.0` sentinel with zeros while the host reference was ~3.1. No driver error, no
+/// validation-layer message, no seam error, and no zero-init check can tell it from a real answer.
+/// (`embed_gather` differs in shape only — it writes inside the sub-block loop, so a short row
+/// leaves `dst` untouched instead — not in consequence.)
+///
+/// No GGUF reaches either case — quant block sizes are 32/64/256, and every float projection width
+/// in a real model is 32-aligned — so this guards the floor rather than lifting it with a masked
+/// tail block across the whole shader family. A hard `assert!` and not a `debug_assert!`: the
+/// failure being guarded is a plausible-looking RELEASE-build result, which is exactly what a
+/// debug-only check does not catch. Cost is two integer ops in front of a GPU dispatch.
+#[track_caller]
+fn assert_native_k(kernel: &str, in_f: usize) {
+    assert!(
+        in_f != 0 && in_f.is_multiple_of(32),
+        "{kernel}: native-block K must be a nonzero multiple of 32 (got in_f={in_f}) — the \
+         shaders loop `nsub = in_f / 32` whole sub-blocks, so an off-grid K silently drops the \
+         tail, and in_f < 32 silently yields all-zero output"
+    );
+}
+
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
@@ -3140,6 +3168,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_native_at", in_f);
         self.label_gemv("gemv_streamed", rows, in_f, out_f);
         let (name, spv) =
             crate::gemm::native_streamed_build_spv(dtype, false).expect("native streamed GEMV spv");
@@ -3227,6 +3256,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         debug_assert!((2..=8).contains(&rows));
+        assert_native_k("linear_native_mrow_at", in_f);
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
         let (name, spv) = crate::gemm::native_mrow_spv(dtype).expect("native mrow streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
@@ -3263,6 +3293,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         nr: u32,
     ) {
+        assert_native_k("linear_native_sg_at", in_f);
         self.label_gemv("gemv_sg_streamed", 1, in_f, out_f);
         let (name, spv) = crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
             .expect("native sg streamed spv");
@@ -3316,6 +3347,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rm: u32,
     ) {
+        assert_native_k("linear_native_rm_at", in_f);
         self.label_gemv("gemv_rm_streamed", 1, in_f, out_f);
         let (name, spv) = crate::gemm::native_rm_streamed_build_spv(dtype, false, rm)
             .expect("native rm streamed spv");
@@ -3369,6 +3401,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_native_rm_v2_at", in_f);
         self.label_gemv("gemv_rm_v2_streamed", 1, in_f, out_f);
         let (name, spv) = crate::gemm::native_rm_v2_streamed_build_spv(variant, dtype, false)
             .expect("native rm_v2 streamed spv");
@@ -3424,6 +3457,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_mmv_at", in_f);
         self.label_gemv("mmv_streamed", 1, in_f, out_f);
         let (name, spv) =
             crate::gemm::native_mmv_spv(dtype, false).expect("native mmv streamed spv");
@@ -3485,6 +3519,7 @@ impl<'a> Recorder<'a> {
             residual.is_none() || crate::gemm::native_mmv_mrow_res_supported(dtype),
             "no fused-residual mrow build for {dtype:?} — dtype is decode-eligible but res-illegal"
         );
+        assert_native_k("linear_mmv_mrow_at", in_f);
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
         let o4 = in_f < 2048 && self.vk().mmv_o4;
         let m4 = rows <= 4 && self.vk().mmv_m4;
@@ -3540,6 +3575,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_mmv_mw_at", in_f);
         self.label_gemv("mmv_mw_streamed", 1, in_f, out_f);
         let res = residual.is_some();
         let (name, spv) = crate::gemm::native_mmv_mw_spv(dtype, res, warps, self.sg16())
@@ -3702,6 +3738,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_add_native_at", in_f);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -3827,17 +3864,11 @@ impl<'a> Recorder<'a> {
         scale: f32,
         row_bytes: u32,
     ) {
-        // The shader gathers in whole 32-element sub-blocks (`nsub = ne / 32`); a ragged tail of
-        // `ne % 32` elements would be left unwritten (uninitialized embedding rows). Every current
-        // model's row width is a multiple of 32 (quant block sizes are 32/256; f16/f32 dims are
-        // 32-aligned), so guard the invariant rather than emit a masked tail block.
-        debug_assert_eq!(
-            ne % 32,
-            0,
-            "embed_gather: row width ne={ne} is not a multiple of 32; the whole-32-block gather \
-             would drop the final {} elements",
-            ne % 32
-        );
+        // The shader gathers in whole 32-element sub-blocks (`nsub = ne / 32`), so a ragged tail of
+        // `ne % 32` elements is left unwritten (uninitialized embedding rows) and `ne < 32` writes
+        // nothing at all — the same silent-zeros class as the GEMV families, guarded the same way
+        // (see [`assert_native_k`], which also says why this is a hard assert and not debug-only).
+        assert_native_k("embed_gather_at (row width ne)", ne);
         let (name, spv) = crate::gemm::embed_gather_spv(dtype).expect("embed_gather streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
@@ -3923,6 +3954,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_add_mmv_at", in_f);
         self.label_gemv("mmv_add_streamed", 1, in_f, out_f);
         let (name, spv) =
             crate::gemm::native_mmv_spv(dtype, true).expect("native mmv res streamed spv");
@@ -9141,6 +9173,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_native_id_at", in_f);
         self.label_gemv("gemv_id_streamed", rows, in_f, out_f);
         let (name, spv) = crate::gemm::native_id_build_spv(dtype).expect("native id streamed spv");
         let k = self.be.kernel(name, spv, 4, 28);
@@ -9182,6 +9215,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
+        assert_native_k("linear_native_id_multi_at", in_f);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
@@ -9236,6 +9270,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_native_id_paged", in_f);
         self.label_gemv("gemv_id_paged", rows, in_f, out_f);
         let name =
             crate::linear::native_id_paged_kernel_name(dtype).expect("native id paged kernel");
@@ -9295,6 +9330,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
+        assert_native_k("linear_native_id_multi_paged", in_f);
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
@@ -9408,6 +9444,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        assert_native_k("linear_mmv_id_multi_q4k_at", in_f);
         let k = self.be.kernel(
             "native_mmv_id_q4k",
             crate::gemm::native_mmv_id_q4k_spv(),

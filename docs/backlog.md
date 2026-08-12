@@ -982,33 +982,6 @@ on 2026-08-05:
   was standing in for. Count is from
   `grep -rn "config-plan.md" --include=*.md --include=*.rs .`
 
-### B39 — Vulkan MoE id-GEMV silently no-ops for `in_f < 32` (2026-08-07)
-
-**Tag:** vulkan · **Blocked on:** nothing; found while writing the deepseek2 MoE
-op-parity tests, which needed ne=32 to make the Vulkan cross-check meaningful
-
-`native_gemv_id_multi.comp` computes `nsub = pc.in_f/32` (integer division), so
-an expert bank with `in_f < 32` runs **zero** sub-blocks and the dispatched op
-leaves `dst` all-zero — a silent wrong output, no error. The existing adapter
-test `moe_ffn_graph_matches_host` deliberately uses ne=32 (the kernels' floor),
-and every production model has ne/n_ff ≥ 32, so no real GGUF hits it — the
-hazard is synthetic tests and any future small-`ne` arch. Fix options: assert
-`in_f >= 32` at adapter dispatch (fail loudly instead of zeros), or add a
-sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
-seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
-constraint in their comments.
-
-**The DENSE native path has the same hazard (2026-08-10).** Writing
-`grouped_output_projection_composes_from_linear_and_copystrided` (deepseek4
-slice 2), a plain `Op::Linear` with a bf16 weight at `in_f = 8` returned all
-zeros on Vulkan while the CPU interpreter returned the right answer — same
-graph, same bindings, no error anywhere. Raising `in_f` to 32 made both agree
-exactly. So whatever `native_dense_dtypes` weights dispatch through inherits the
-same `in_f/32` floor as the MoE id-GEMV, and a fix should cover both. NOT
-root-caused to a specific kernel (the dense path picks among several by
-`m`/dtype/tier); the observation is the m=3 bf16 case. The seam test documents
-the constraint in its comment and uses block-aligned dims.
-
 ### B48 — a failing op leaks its in-flight Vulkan recorder on most error paths (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; surfaced by the B45
@@ -1333,6 +1306,49 @@ deepseek2, `0.99999992` for V4). Those compare two runs of the SAME model and
 weights, so the shared bias argument is weaker and they may well be fine, but
 they have not been re-examined against a probability cosine and should not be
 assumed sound just because they are high.
+
+### B61 — the native-block GEMM/MMQ family keeps the unguarded `k/BLK` floor (2026-08-12)
+
+**Tag:** vulkan · **Blocked on:** nothing; a decision about how far the B39
+guard should reach, not a discovery
+
+B39 (Vulkan native-block GEMV silently returning zeros below the 32-element
+sub-block floor) was fixed by asserting the K invariant at dispatch —
+`assert_native_k` in `crates/infr-vulkan/src/recorder.rs`, called from every
+terminal native GEMV/gather dispatcher (the `linear_native*`, `linear_mmv*`,
+`linear_native_id*` and `embed_gather_at` entry points). The **prefill GEMM /
+batched-MoE MMQ** family was checked and deliberately left alone: every
+`shaders/native_gemm_mmq_*.comp` opens with `nblk = pc.k / BLK` (plus
+`kw = pc.k / 4`), and `native_gemm_i8cm_q8_0.comp` with `nblk = pc.k / BK`, all
+of which floor to zero exactly the same way. Their host entry points
+(`Recorder::matmul_mmq_at`, `matmul_mmq_experts`, `matmul_mmq_experts_paged`,
+`matmul_i8cm_q8_0_at`, …) assert nothing about `k`.
+
+Why it was not swept in with B39: those particular shaders are reachable only
+for quantized dtypes (the `native_gemm_mmq_*` kernel tables and
+`infr_core::tensor::MOE_MMQ_DTYPES`; `i8cm` is Q8*0 only), whose GGUF block
+sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
+GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
+row. Reaching it needs a hand-built synthetic tensor, which is precisely the
+hazard B39 was about, so this is a real gap and not a non-issue. The reason to
+stop was scope: each
+`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
+%64 && k %32`) and several take `k` with different meanings, so a uniform guard
+needs its own read of the family rather than a mechanical sweep.
+
+**Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
+prefill GEMM, the one path that DOES take BF16) steps
+`for (k0 = 0; k0 < pc.k; k0 += BK)`, so it never runs zero iterations — an
+off-grid `k` makes its `dqblk` over-read past the row instead. Its tier is
+already gated on `in_f % 32 == 0` in `adapter.rs`'s `Op::Linear` arm
+(`gemm_ok`), so it is unreachable off-grid today; noted so a future reader does
+not mistake it for another instance of the floor-to-zero bug.
+
+To finish: audit the `matmul_*` dispatchers in `recorder.rs` for what each one's
+`k` actually indexes, then add `assert_native_k` (or a tile-aware equivalent) at
+each. Not verified: whether any existing test drives a `matmul_*` entry with an
+off-grid `k` — that is what would turn the sweep from mechanical into a real
+change.
 
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 
