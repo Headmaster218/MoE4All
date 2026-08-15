@@ -1221,7 +1221,8 @@ impl SeamModel {
 
     /// Token-level bench on the Vulkan seam, llama-bench-comparable: ONE weight upload (a
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
-    /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,
+    /// `depth` (untimed), or mark a synthetic cached prefix when `synthetic_depth` is set, and time
+    /// ONE metric: `pg` = a whole (P prefill + G decode) turn,
     /// `n_gen > 0` = decode at depth, else prefill of `n_prompt` at depth. Returns the per-rep
     /// tokens/sec samples AND the [`BenchPlacement`] the run actually used, so the number can be
     /// attributed after the fact instead of being an unlabelled throughput figure.
@@ -1230,16 +1231,19 @@ impl SeamModel {
         n_prompt: usize,
         n_gen: usize,
         depth: usize,
+        synthetic_depth: Option<usize>,
         pg: Option<(usize, usize)>,
         reps: usize,
     ) -> Result<(Vec<f64>, BenchPlacement)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
+        let synthetic_depth = synthetic_depth.filter(|&d| d > 0);
+        let measured_depth = synthetic_depth.unwrap_or(depth);
         // +16: the untimed warmup runs an 8-prompt + 2-gen turn through the SAME session, so the
         // KV must fit it even when the measured shape is tiny (pp2 with +8 sized the cache to 10
         // and the warmup itself overflowed it).
-        let want = depth + p_eff.max(1) + g_eff + 16;
+        let want = measured_depth + p_eff.max(1) + g_eff + 16;
         let dummy = |n: usize| -> Vec<u32> { (0..n.max(1)).map(|i| (i % 100) as u32).collect() };
         let mut state: Option<crate::seam::SeamKv> = None;
         let run = |prompt_len: usize,
@@ -1278,6 +1282,17 @@ impl SeamModel {
          -> Result<crate::GenStats> {
             crate::with_profiling_suppressed(|| run(prompt_len, gen, state))
         };
+        let seed_synthetic = |state: &mut Option<crate::seam::SeamKv>| -> Result<()> {
+            let Some(st) = state.as_mut() else {
+                return Err(anyhow!(
+                    "synthetic depth requested before the Vulkan benchmark session was initialized"
+                ));
+            };
+            if let Some(depth) = synthetic_depth {
+                st.set_synthetic_cached(&vk, &self.cfg, dummy(depth))?;
+            }
+            Ok(())
+        };
         // ONE rep, exactly as measured: reset the KV, warm it to `depth` (untimed), time the
         // metric, return it as tokens/sec. A closure so the discarded warm rep below and the
         // measured reps run BYTE-IDENTICAL code — a warm rep that differs from a timed one in any
@@ -1286,7 +1301,9 @@ impl SeamModel {
             if let Some(st) = state.as_mut() {
                 st.reset();
             }
-            if depth > 0 {
+            if synthetic_depth.is_some() {
+                seed_synthetic(state)?;
+            } else if depth > 0 {
                 // `depth + 1`, for the SAME reason the timed prefill below adds one: at `gen == 0`
                 // the decode loop breaks before feeding the frontier token, so a warm of `n` tokens
                 // materializes only `n - 1` KV rows and records exactly those as resident (see
@@ -1305,11 +1322,11 @@ impl SeamModel {
             }
             if let Some((p, g)) = pg {
                 // coding-agent turn: prompt ingest + reply generation timed together.
-                let s = run(depth + p, g, state)?;
+                let s = run(measured_depth + p, g, state)?;
                 Ok((p + g) as f64 / (s.prompt_secs + s.decode_secs).max(1e-9))
             } else if n_gen > 0 {
                 // decode at depth: 1-token suffix feeds the loop, the timed part is the decode.
-                let s = run(depth + 1, n_gen, state)?;
+                let s = run(measured_depth + 1, n_gen, state)?;
                 Ok(n_gen as f64 / s.decode_secs.max(1e-9))
             } else {
                 // +1: the suffix's LAST token is the decode feed and is never processed at
@@ -1317,12 +1334,18 @@ impl SeamModel {
                 // measured N-1 batched rows (and pp2 measured nothing, reporting the 1e-9
                 // floor). With +1, exactly N rows batch-prefill (positions depth..depth+N) and
                 // prompt_secs covers precisely them — llama-bench's -p N semantics.
-                let s = run(depth + n_prompt + 1, 0, state)?;
+                let s = run(measured_depth + n_prompt + 1, 0, state)?;
                 Ok(n_prompt as f64 / s.prompt_secs.max(1e-9))
             }
         };
-        // Untimed warmup: uploads the weights and compiles the pipelines a generic turn hits.
-        unprofiled(8, 2, &mut state)?;
+        // Untimed warmup. Synthetic-depth mode uses a no-op one-token call to upload weights and
+        // allocate zeroed KV without first writing a short real prefix into rows 0...
+        if synthetic_depth.is_some() {
+            unprofiled(1, 0, &mut state)?;
+        } else {
+            // Real-depth mode preserves the historical generic warmup.
+            unprofiled(8, 2, &mut state)?;
+        }
         // Untimed warm rep AT THE MEASURED SHAPE, discarded (backlog B6/B16). The (8, 2) turn
         // above does NOT cover the shape being timed — it prefills 7 rows and decodes 2 — so the
         // first TIMED rep was paying that shape's one-time costs (its pipeline variants, its

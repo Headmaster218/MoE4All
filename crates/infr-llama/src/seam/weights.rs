@@ -421,6 +421,41 @@ impl SeamKv {
         self.cached.clear();
     }
 
+    /// Benchmark-only synthetic context: mark the first `tokens.len()` positions as resident without
+    /// running the model over them. KV buffers are zero-initialized at allocation; for qwen35's
+    /// fixed recurrent state, clear the small state buffers here so repeated synthetic reps start
+    /// from deterministic data too.
+    pub(crate) fn set_synthetic_cached(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        tokens: Vec<u32>,
+    ) -> AResult<()> {
+        if tokens.len() > self.max_ctx {
+            return Err(anyhow!(
+                "synthetic depth {} exceeds the session KV capacity {}",
+                tokens.len(),
+                self.max_ctx
+            ));
+        }
+        if cfg.qwen35 {
+            let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+            let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+            let conv_zero = vec![0f32; conv_elems];
+            let s_zero = vec![0f32; s_elems];
+            for l in 0..cfg.n_layer {
+                if !cfg.is_qwen35_attn_layer(l) {
+                    be.upload(self.kbufs[l].as_ref(), bytemuck::cast_slice(&conv_zero))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    be.upload(self.vbufs[l].as_ref(), bytemuck::cast_slice(&s_zero))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
+            }
+        }
+        self.cached = tokens;
+        Ok(())
+    }
+
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
     /// Snapshot the qwen35 DeltaNet recurrent state (every DeltaNet layer's conv + S buffers) plus
     /// the current `cached` length into the device-resident [`MtpDeltaCkpt`] (allocated once on the

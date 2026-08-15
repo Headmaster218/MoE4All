@@ -436,6 +436,10 @@ enum Cmd {
         /// Context depth pre-filled (untimed) before measuring — matches llama-bench -d.
         #[arg(short = 'd', long = "n-depth", default_value_t = 0)]
         depth: usize,
+        /// Pretend this many tokens are already resident in the benchmark KV cache, without
+        /// actually prefilling them. Mutually exclusive with -d/--n-depth.
+        #[arg(long = "synthetic-depth")]
+        synthetic_depth: Option<usize>,
         /// Combined prompt+gen turn `P,G` (matches llama-bench -pg): time ingesting P tokens THEN
         /// generating G; throughput = (P+G)/time. Models one coding-agent turn (read a file/tool
         /// result, then emit a reply). Overrides -p/-n when set.
@@ -711,12 +715,24 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             n_prompt,
             n_gen,
             depth,
+            synthetic_depth,
             pg,
             reps,
             ngl,
             json,
             ..
-        } => cmd_bench(&model, n_prompt, n_gen, depth, pg, reps, ngl, json, cfg),
+        } => cmd_bench(
+            &model,
+            n_prompt,
+            n_gen,
+            depth,
+            synthetic_depth,
+            pg,
+            reps,
+            ngl,
+            json,
+            cfg,
+        ),
         Cmd::Compare {
             models,
             sweep,
@@ -2057,6 +2073,7 @@ fn cmd_bench(
     n_prompt: usize,
     n_gen: usize,
     depth: usize,
+    synthetic_depth: Option<usize>,
     pg: Option<String>,
     reps: usize,
     ngl: usize,
@@ -2071,6 +2088,10 @@ fn cmd_bench(
     // count (llama-bench semantics) and never stop at EOS — a model that emits EOS instantly on the
     // dummy context would otherwise report fictional tok/s.
     // -pg "P,G": a coding-agent turn (ingest P then generate G); throughput = (P+G)/time.
+    let synthetic_depth = synthetic_depth.filter(|&d| d > 0);
+    if synthetic_depth.is_some() && depth != 0 {
+        anyhow::bail!("--synthetic-depth is an alternative to -d/--n-depth; use only one");
+    }
     let pg = pg
         .map(|s| -> anyhow::Result<(usize, usize)> {
             let (p, g) = s.split_once(',').context("--pg expects `P,G`")?;
@@ -2089,6 +2110,9 @@ fn cmd_bench(
     } else {
         selected_backend(cfg)?
     };
+    if synthetic_depth.is_some() && !matches!(backend, Backend::Vulkan(_)) {
+        anyhow::bail!("--synthetic-depth currently supports the Vulkan benchmark path only");
+    }
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
@@ -2149,7 +2173,9 @@ fn cmd_bench(
     // `VulkanBackend::new_with` when it picks the physical device; the prefill chunk
     // (`-u`/`device.ubatch`) rides the same config. Nothing to set here — straight to the seam.
     let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let (samples, placement) = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
+    let (samples, placement) =
+        model.bench_vulkan(n_prompt, n_gen, depth, synthetic_depth, pg, reps)?;
+    let reported_depth = synthetic_depth.unwrap_or(depth);
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
     } else if n_gen > 0 {
@@ -2165,6 +2191,7 @@ fn cmd_bench(
     // head take the exact path above unchanged — `mtp` stays `None`, `print_bench_avg_mtp` falls
     // straight through to the pre-existing `print_bench_avg` line.
     let mtp = if infr_llama::mtp::mtp_enabled()
+        && synthetic_depth.is_none()
         && pg.is_none()
         && n_gen > 0
         && model.config().n_layer_nextn > 0
@@ -2179,7 +2206,7 @@ fn cmd_bench(
     print_bench_avg_mtp(
         &samples,
         &label,
-        depth,
+        reported_depth,
         "",
         reps,
         json,
@@ -4595,12 +4622,43 @@ mod tests {
             n_prompt: 512,
             n_gen: 0,
             depth: 0,
+            synthetic_depth: None,
             pg: None,
             reps: 3,
             ngl: 999,
             json: false,
             device: device_opts(None),
         }
+    }
+
+    #[test]
+    fn bench_parses_synthetic_depth() {
+        let cli = Cli::try_parse_from([
+            "infr",
+            "bench",
+            "-p",
+            "0",
+            "-n",
+            "128",
+            "--synthetic-depth",
+            "100000",
+            "model.gguf",
+        ])
+        .unwrap();
+        let Some(Cmd::Bench {
+            depth,
+            synthetic_depth,
+            n_prompt,
+            n_gen,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected bench command");
+        };
+        assert_eq!(depth, 0);
+        assert_eq!(synthetic_depth, Some(100000));
+        assert_eq!(n_prompt, 0);
+        assert_eq!(n_gen, 128);
     }
 
     fn no_sampling_opts() -> SamplingOpts {
