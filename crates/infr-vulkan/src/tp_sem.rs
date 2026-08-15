@@ -16,6 +16,9 @@
 //! [`VulkanBackend::external_semaphore_supported`] — a device/driver that can't import one makes the
 //! all-reduce fall back to the host fence.
 
+#[cfg(target_os = "windows")]
+type RawFd = std::os::raw::c_int;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::RawFd;
 use std::sync::Arc;
 

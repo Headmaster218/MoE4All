@@ -17,7 +17,6 @@ use infr_core::progress;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     fs,
-    os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
 };
 use tracing::{debug, info};
@@ -160,7 +159,7 @@ fn fetch_and_link(
     }
     let _ = fs::remove_file(&link); // replace a stale/dangling link
     let target = blob_link_target(filename, &hex);
-    symlink(&target, &link).map_err(Error::from)?;
+    link_blob(&target, &link).map_err(Error::from)?;
     debug!("linked {link:?} -> {target}");
     Ok(link)
 }
@@ -282,6 +281,30 @@ pub(crate) fn blob_link_target(rel: &str, hex: &str) -> String {
     target.push_str("blobs/");
     target.push_str(hex);
     target
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn link_blob(target: impl AsRef<Path>, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn link_blob(target: impl AsRef<Path>, link: &Path) -> std::io::Result<()> {
+    let target = target.as_ref();
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => Ok(()),
+        Err(symlink_err) => {
+            let source = link.parent().unwrap_or_else(|| Path::new("")).join(target);
+            fs::hard_link(&source, link).map_err(|hard_link_err| {
+                std::io::Error::new(
+                    hard_link_err.kind(),
+                    format!(
+                        "symlink_file {link:?} -> {target:?} failed: {symlink_err}; hard_link fallback from {source:?} failed: {hard_link_err}"
+                    ),
+                )
+            })
+        }
+    }
 }
 
 /// True when `name` may be `join`ed onto a local directory without escaping it: non-empty, relative,
@@ -511,7 +534,7 @@ fn fetch_companions(
         match dl {
             Ok((_, hex, _)) => {
                 let _ = fs::remove_file(&link);
-                match symlink(blob_link_target(name, &hex), &link) {
+                match link_blob(blob_link_target(name, &hex), &link) {
                     Ok(()) => info!("hf:{repo}: cached companion {name}"),
                     Err(e) => debug!("hf:{repo}: companion {name} symlink failed: {e}"),
                 }

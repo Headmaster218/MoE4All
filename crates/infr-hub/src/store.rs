@@ -296,7 +296,6 @@ fn gguf_match(fname: &str, sel: &str) -> Match {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
 
     /// Build a fake HF Hub repo dir: blobs/<sha> + snapshots/<commit>/<file> -> blob + refs/main.
     ///
@@ -313,7 +312,7 @@ mod tests {
         fs::write(blobs.join(sha), b"fake gguf bytes").unwrap();
         let link = snap.join(file);
         fs::create_dir_all(link.parent().unwrap()).unwrap();
-        symlink(crate::pull::blob_link_target(file, sha), link).unwrap();
+        crate::pull::link_blob(crate::pull::blob_link_target(file, sha), &link).unwrap();
         fs::create_dir_all(dir.join("refs")).unwrap();
         fs::write(dir.join("refs").join("main"), commit).unwrap();
     }

@@ -34,8 +34,7 @@ use reqwest::header::{
 };
 use reqwest::StatusCode;
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::FileExt;
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -308,6 +307,32 @@ impl Job<'_> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+fn write_all_at(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(target_os = "windows")]
+fn write_all_at(file: &fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::windows::fs::FileExt;
+
+    while !buf.is_empty() {
+        let n = file.seek_write(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                ErrorKind::WriteZero,
+                "failed to write the full chunk at its offset",
+            ));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
 /// Start one more chunk worker, holding `permit` for as long as it runs. The permit rides with the
 /// thread so the budget gets it back the moment this worker runs out of chunks to claim, even if it
 /// returns early or panics.
@@ -442,9 +467,7 @@ fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
                 job.label
             ))));
         }
-        job.file
-            .write_all_at(&buf[..n], at)
-            .map_err(|e| RangedError::Fatal(Error::from(e)))?;
+        write_all_at(&job.file, &buf[..n], at).map_err(|e| RangedError::Fatal(Error::from(e)))?;
         at += n as u64;
         left -= n as u64;
         job.pb.inc(n as u64);
