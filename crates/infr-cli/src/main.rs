@@ -631,6 +631,7 @@ fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::load(&overrides)?);
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
+    let _pager_profile = infr_core::pager_profile::SummaryGuard::new(cfg.prof.pager_profile);
     // WHICH paths a layer actually specified — the one thing a resolved `Config` cannot answer,
     // and the input the model-recommended sampling defaults need (they may only fill a knob nobody
     // named). S1 answered it by re-publishing the values into the environment and probing it back;

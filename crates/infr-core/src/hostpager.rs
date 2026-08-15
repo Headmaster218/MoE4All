@@ -25,6 +25,7 @@
 use crate::blockio::{BlockDesc, BlockIo};
 use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
+use crate::pager_profile;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -362,7 +363,8 @@ impl HostPager {
                  tier serves `fill` into a caller's buffer and has nothing to borrow"
             )));
         }
-        let (slot, desc) = loop {
+        let prof = pager_profile::active();
+        let (slot, desc, evicted_slot) = loop {
             let mut inner = self.inner.lock().unwrap();
             if !inner.descs.contains_key(&id) {
                 return Err(Error::backend(format!(
@@ -372,12 +374,21 @@ impl HostPager {
             // Resident and readable? Take the pin and go.
             if inner.state.get(&id) == Some(&SlotState::Ready) {
                 if let Some(slot) = inner.pager.pin_if_resident(id) {
-                    return Ok(self.pinned(id, slot, &inner));
+                    let pin = self.pinned(id, slot, &inner);
+                    if prof {
+                        pager_profile::record_host_hit(pin.len());
+                    }
+                    return Ok(pin);
                 }
             }
             // Being filled by someone else: wait for them rather than read a half-written slot.
             if inner.state.get(&id) == Some(&SlotState::Loading) {
-                let _unused = self.ready.wait(inner).unwrap();
+                let t0 = prof.then(std::time::Instant::now);
+                let waited = self.ready.wait(inner).unwrap();
+                if let Some(t0) = t0 {
+                    pager_profile::record_host_wait(t0.elapsed());
+                }
+                drop(waited);
                 continue;
             }
             match inner.pager.resolve_and_pin(id, insert) {
@@ -387,14 +398,15 @@ impl HostPager {
                     // rather than handing out bytes nothing wrote.
                     debug_assert!(false, "resident block {id} had no slot state");
                     inner.state.insert(id, SlotState::Loading);
-                    break (slot, inner.descs[&id].clone());
+                    break (slot, inner.descs[&id].clone(), false);
                 }
                 Some(Resolution::Miss { slot, evicted }) => {
+                    let evicted_slot = evicted.is_some();
                     if let Some(e) = evicted {
                         inner.state.remove(&e);
                     }
                     inner.state.insert(id, SlotState::Loading);
-                    break (slot, inner.descs[&id].clone());
+                    break (slot, inner.descs[&id].clone(), evicted_slot);
                 }
                 None => {
                     return Err(Error::backend(format!(
@@ -417,10 +429,18 @@ impl HostPager {
         // reading. That makes this `&mut` the only reference to these bytes for its whole life,
         // which ends before the state flips to `Ready` below. `len <= slot_bytes` per `register`.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
+        let read_t0 = prof.then(std::time::Instant::now);
         let read = self.io.read_block(&desc, dst);
+        let read_elapsed = read_t0.map(|t| t.elapsed());
         let mut inner = self.inner.lock().unwrap();
         match read {
             Ok(()) => {
+                if prof {
+                    pager_profile::record_host_miss(len, evicted_slot);
+                    if let Some(elapsed) = read_elapsed {
+                        pager_profile::record_host_read(len, elapsed, false);
+                    }
+                }
                 inner.state.insert(id, SlotState::Ready);
                 self.reads.fetch_add(1, Ordering::Relaxed);
                 self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
@@ -470,8 +490,9 @@ impl HostPager {
     /// pager would make the order matter again — nothing does, and the cold-end insert below is the
     /// conservative choice if one ever did.
     pub fn fill(&self, id: BlockId, dst: &mut [u8]) -> Result<Fill> {
+        let prof = pager_profile::active();
         // `(admitted slot, descriptor)` — the slot is `None` when this call will stream.
-        let (slot, desc) = loop {
+        let (slot, desc, evicted_slot) = loop {
             let mut inner = self.inner.lock().unwrap();
             let Some(desc) = inner.descs.get(&id).cloned() else {
                 return Err(Error::backend(format!(
@@ -482,12 +503,25 @@ impl HostPager {
                 if let Some(slot) = inner.pager.pin_if_resident(id) {
                     let pin = self.pinned(id, slot, &inner);
                     drop(inner); // copy out of the arena without holding every other block's lock
-                    dst[..pin.len()].copy_from_slice(&pin);
+                    let n = pin.len();
+                    if prof {
+                        pager_profile::record_host_hit(n);
+                    }
+                    let copy_t0 = prof.then(std::time::Instant::now);
+                    dst[..n].copy_from_slice(&pin);
+                    if let Some(t0) = copy_t0 {
+                        pager_profile::record_memcpy(n, t0.elapsed());
+                    }
                     return Ok(Fill::Hit);
                 }
             }
             if inner.state.get(&id) == Some(&SlotState::Loading) {
-                let _unused = self.ready.wait(inner).unwrap();
+                let t0 = prof.then(std::time::Instant::now);
+                let waited = self.ready.wait(inner).unwrap();
+                if let Some(t0) = t0 {
+                    pager_profile::record_host_wait(t0.elapsed());
+                }
+                drop(waited);
                 continue;
             }
             // Room to admit, and has this block earned admission? Only a FREE slot counts —
@@ -498,23 +532,31 @@ impl HostPager {
             if inner.pager.resident_count() < self.max_resident && !inner.missed_once.insert(id) {
                 match inner.pager.resolve_and_pin(id, Insert::Cold) {
                     Some(Resolution::Miss { slot, evicted }) => {
+                        let evicted_slot = evicted.is_some();
                         debug_assert!(evicted.is_none(), "a free slot cannot have evicted");
                         inner.state.insert(id, SlotState::Loading);
-                        break (Some(slot), desc);
+                        break (Some(slot), desc, evicted_slot);
                     }
                     // Resident without a state entry, or every slot pinned. Neither is reachable
                     // here (the `Ready` arm above covers the first, and this path pins only across
                     // its own fill), and both are correctly served by streaming the block.
-                    _ => break (None, desc),
+                    _ => break (None, desc, false),
                 }
             }
-            break (None, desc);
+            break (None, desc, false);
         };
 
         let Some(slot) = slot else {
             // Streamed: no arena involvement at all, so no lock and no residency change.
             let n = desc.nbytes();
+            let read_t0 = prof.then(std::time::Instant::now);
             self.io.read_block(&desc, &mut dst[..n])?;
+            if prof {
+                pager_profile::record_host_miss(n, false);
+                if let Some(t0) = read_t0 {
+                    pager_profile::record_host_read(n, t0.elapsed(), true);
+                }
+            }
             self.reads.fetch_add(1, Ordering::Relaxed);
             self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
             self.streamed.fetch_add(1, Ordering::Relaxed);
@@ -526,10 +568,18 @@ impl HostPager {
         let n = desc.nbytes();
         // SAFETY: see `pin`'s fill — identical claim, identical proof.
         let arena = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, n), n) };
+        let read_t0 = prof.then(std::time::Instant::now);
         let read = self.io.read_block(&desc, arena);
+        let read_elapsed = read_t0.map(|t| t.elapsed());
         let mut inner = self.inner.lock().unwrap();
         match read {
             Ok(()) => {
+                if prof {
+                    pager_profile::record_host_miss(n, evicted_slot);
+                    if let Some(elapsed) = read_elapsed {
+                        pager_profile::record_host_read(n, elapsed, false);
+                    }
+                }
                 inner.state.insert(id, SlotState::Ready);
                 self.reads.fetch_add(1, Ordering::Relaxed);
                 self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
@@ -537,7 +587,11 @@ impl HostPager {
                 // copy below runs with the slot un-evictable and nothing is released twice.
                 let pin = self.pinned(id, slot, &inner);
                 drop(inner);
+                let copy_t0 = prof.then(std::time::Instant::now);
                 dst[..n].copy_from_slice(&pin);
+                if let Some(t0) = copy_t0 {
+                    pager_profile::record_memcpy(n, t0.elapsed());
+                }
                 drop(pin);
                 self.ready.notify_all();
                 Ok(Fill::Admitted)

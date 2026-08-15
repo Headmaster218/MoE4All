@@ -344,6 +344,11 @@ struct VulkanShared {
     /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
     /// bound tracks whatever the device actually is rather than a table of magic numbers.
     submit_dispatch_cap: AtomicUsize,
+    /// Whether `submit_dispatch_cap` came from `device.submit_dispatches`
+    /// (`INFR_SUBMIT_DISPATCHES` / `--set`) rather than the automatic initial default. When true,
+    /// feedback must not re-tune the cap: `0` is an explicit no-split experiment, and `N > 0` is a
+    /// fixed cap experiment.
+    submit_dispatch_cap_explicit: bool,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
@@ -2328,6 +2333,7 @@ impl VulkanBackend {
         // split) — the kill switch if this ever misjudges a device. A non-numeric value is still
         // rejected loudly, now by the env layer, with the SAME text
         // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
+        let submit_dispatch_cap_explicit = cfg.device.submit_dispatches.is_some();
         let submit_dispatch_cap = cfg
             .device
             .submit_dispatches
@@ -2464,6 +2470,7 @@ impl VulkanBackend {
                 act_live: AtomicU64::new(0),
                 act_peak: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
+                submit_dispatch_cap_explicit,
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -2600,6 +2607,9 @@ impl VulkanBackend {
     /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
     /// simply ignored.
     pub(crate) fn observe_forward(&self, elapsed: std::time::Duration, dispatches: usize) {
+        if self.shared.submit_dispatch_cap_explicit {
+            return;
+        }
         let ns = elapsed.as_nanos() as u64;
         let cur = self.submit_dispatch_cap();
         // A device that has never split (every discrete GPU) only starts splitting if a forward
@@ -4570,8 +4580,14 @@ mod tests {
             infr_core::initial_submit_dispatch_cap(integrated)
         );
         drop(dflt);
-        assert_eq!(build(Some(7)).submit_dispatch_cap(), 7);
-        assert_eq!(build(Some(0)).submit_dispatch_cap(), 0, "0 = no split");
+        let fixed = build(Some(7));
+        fixed.observe_forward(std::time::Duration::from_secs(2), 1_000);
+        assert_eq!(fixed.submit_dispatch_cap(), 7);
+        drop(fixed);
+
+        let disabled = build(Some(0));
+        disabled.observe_forward(std::time::Duration::from_secs(2), 1_000);
+        assert_eq!(disabled.submit_dispatch_cap(), 0, "0 = no split");
     }
 
     /// Resident-BDA weight arena: sub-allocate three odd-sized weight buffers directly from

@@ -44,6 +44,7 @@ use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::error::Result;
 use infr_core::hostpager::HostPager;
 use infr_core::pager::{BlockId, Insert, Pager, PagerStats, Resolution, NOT_RESIDENT};
+use infr_core::pager_profile;
 use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
@@ -207,18 +208,31 @@ impl GpuPager {
         // `scan`: full-set sweep (batched prefill's touch-all) → the scan-resistant cold-end
         // policy; otherwise classic LRU (decode's routed-only touches). See
         // `infr_core::pager::Pager::touch_cold`.
+        let prof = pager_profile::active();
+        let lookup_t0 = prof.then(std::time::Instant::now);
         let resolution = if scan {
             self.pager.touch_cold(id)
         } else {
             self.pager.touch(id)
         };
+        if let Some(t0) = lookup_t0 {
+            let (hit, evicted) = match resolution {
+                Resolution::Hit { .. } => (true, false),
+                Resolution::Miss { evicted, .. } => (false, evicted.is_some()),
+            };
+            pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
+        }
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
                 let base = as_vk_buf(ring)?
                     .mapped_ptr()
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                let copy_t0 = prof.then(std::time::Instant::now);
                 par_copy_to_mapped(bytes, unsafe { base.add(ring_off) });
+                if let Some(t0) = copy_t0 {
+                    pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+                }
                 rec.copy(
                     ring,
                     ring_off,
@@ -226,6 +240,9 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     self.slot_bytes,
                 );
+                if prof {
+                    pager_profile::record_gpu_copy(self.slot_bytes);
+                }
                 self.record_placement(id, slot, evicted);
                 Ok(self.slot_bytes)
             }
@@ -250,11 +267,20 @@ impl GpuPager {
         host: &HostPager,
         scan: bool,
     ) -> Result<usize> {
+        let prof = pager_profile::active();
+        let lookup_t0 = prof.then(std::time::Instant::now);
         let resolution = if scan {
             self.pager.touch_cold(id)
         } else {
             self.pager.touch(id)
         };
+        if let Some(t0) = lookup_t0 {
+            let (hit, evicted) = match resolution {
+                Resolution::Hit { .. } => (true, false),
+                Resolution::Miss { evicted, .. } => (false, evicted.is_some()),
+            };
+            pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
+        }
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
@@ -282,6 +308,9 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     self.slot_bytes,
                 );
+                if prof {
+                    pager_profile::record_gpu_copy(self.slot_bytes);
+                }
                 self.record_placement(id, slot, evicted);
                 Ok(self.slot_bytes)
             }
@@ -333,7 +362,17 @@ impl GpuPager {
         bytes: &DenseBytes,
         host: Option<&HostPager>,
     ) -> Result<(u32, usize)> {
-        match self.pager.schedule(id) {
+        let prof = pager_profile::active();
+        let lookup_t0 = prof.then(std::time::Instant::now);
+        let resolution = self.pager.schedule(id);
+        if let Some(t0) = lookup_t0 {
+            let (hit, evicted) = match resolution {
+                Resolution::Hit { .. } => (true, false),
+                Resolution::Miss { evicted, .. } => (false, evicted.is_some()),
+            };
+            pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
+        }
+        match resolution {
             Resolution::Hit { slot } => Ok((slot, 0)),
             Resolution::Miss { slot, evicted } => {
                 let slot_bytes = self.slot_bytes;
@@ -350,11 +389,17 @@ impl GpuPager {
                     DenseBytes::Mmap(segments) => {
                         let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
                         fits(total);
+                        let copy_t0 = prof.then(std::time::Instant::now);
                         let mut off = ring_off;
                         for s in segments {
                             let seg = expert_bytes(s);
                             par_copy_to_mapped(seg, unsafe { base.add(off) });
                             off += seg.len();
+                        }
+                        if let Some(t0) = copy_t0 {
+                            let elapsed = t0.elapsed();
+                            pager_profile::record_memcpy(total, elapsed);
+                            pager_profile::record_mmap_fallback(total, elapsed);
                         }
                         total
                     }
@@ -395,6 +440,9 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     total.next_multiple_of(4),
                 );
+                if prof {
+                    pager_profile::record_gpu_copy(total.next_multiple_of(4));
+                }
                 self.record_placement(id, slot, evicted);
                 Ok((slot, self.slot_bytes))
             }
@@ -425,11 +473,30 @@ impl GpuPager {
             self.slot_bytes,
             "block byte size must match the arena's slot size"
         );
-        match self.pager.touch(id) {
+        let prof = pager_profile::active();
+        let lookup_t0 = prof.then(std::time::Instant::now);
+        let resolution = self.pager.touch(id);
+        if let Some(t0) = lookup_t0 {
+            let (hit, evicted) = match resolution {
+                Resolution::Hit { .. } => (true, false),
+                Resolution::Miss { evicted, .. } => (false, evicted.is_some()),
+            };
+            pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
+        }
+        match resolution {
             Resolution::Hit { slot } => Ok(slot),
             Resolution::Miss { slot, evicted } => {
+                let upload_t0 = prof.then(std::time::Instant::now);
                 vk.upload(staging, bytes)?;
+                if let Some(t0) = upload_t0 {
+                    pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+                }
+                let sync_t0 = prof.then(std::time::Instant::now);
                 copy_into_slot(vk, staging, self.arena.as_ref(), slot, self.slot_bytes)?;
+                if let Some(t0) = sync_t0 {
+                    pager_profile::record_gpu_copy(self.slot_bytes);
+                    pager_profile::record_paging_sync_wait(t0.elapsed());
+                }
                 self.record_placement(id, slot, evicted);
                 Ok(slot)
             }
@@ -910,8 +977,21 @@ impl MoePagerSession {
         let layer_base = src.layer_base;
         let pager = &mut self.pools[*pool].pager;
         pager.begin_batch();
+        let prof = pager_profile::active();
         for e in 0..n_expert as u32 {
+            let t0 = prof.then(std::time::Instant::now);
             let r = pager.pager.touch(layer_base + e);
+            if let Some(t0) = t0 {
+                let evicted = match r {
+                    Resolution::Hit { .. } => false,
+                    Resolution::Miss { evicted, .. } => evicted.is_some(),
+                };
+                pager_profile::record_gpu_cache_lookup(
+                    matches!(r, Resolution::Hit { .. }),
+                    evicted,
+                    t0.elapsed(),
+                );
+            }
             debug_assert!(
                 matches!(r, Resolution::Hit { .. }),
                 "touch_all_hits on a non-resident block (all_resident gate violated)"
@@ -981,19 +1061,33 @@ impl MoePagerSession {
             half_bytes >= pager.slot_bytes(),
             "ring half smaller than a slot (construction floor violated)"
         );
+        let prof = pager_profile::active();
         for (i, &lid) in local_ids.iter().enumerate() {
             let id = layer_base + lid;
-            if !pager.is_resident(id) && *cursor + pager.slot_bytes() > half_bytes {
+            let needs_slot = !pager.is_resident(id);
+            if needs_slot && *cursor + pager.slot_bytes() > half_bytes {
                 return Ok(i); // half full — caller rotates and continues from here
             }
+            let acquire_t0 = (needs_slot && prof).then(std::time::Instant::now);
             let ring_off = half_base + *cursor;
+            if let Some(t0) = acquire_t0 {
+                pager_profile::record_staging_acquire(t0.elapsed());
+            }
             *cursor += match bank {
                 Some(bytes) => {
                     let off = lid as usize * stride;
                     let slice = bytes.get(off..off + stride).ok_or_else(|| {
                         be("moe pager: expert id out of range for this layer's bank")
                     })?;
-                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, slice, scan)?
+                    let stage_t0 = pager_profile::start();
+                    let consumed =
+                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, slice, scan)?;
+                    if consumed > 0 {
+                        if let Some(elapsed) = pager_profile::elapsed(stage_t0) {
+                            pager_profile::record_mmap_fallback(slice.len(), elapsed);
+                        }
+                    }
+                    consumed
                 }
                 // Tier below, under the SAME policy the arena above uses for this batch: a
                 // full-set prefill sweep inserts cold, a routed decode touch inserts MRU.
@@ -1375,16 +1469,22 @@ impl DensePagerSession {
             .ok_or_else(|| be("dense pager: stage on an unregistered buffer"))?;
         let pool = &mut pools[*pool_idx];
         let id = src.block_id;
-        if !pool.pager.is_resident(id) && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
+        let needs_slot = !pool.pager.is_resident(id);
+        if needs_slot && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
             return Ok(None); // half full — caller rotates and re-calls
         }
         pool.pager.begin_batch();
+        let acquire_t0 = (needs_slot && pager_profile::active()).then(std::time::Instant::now);
+        let ring_off = half_base + *cursor;
+        if let Some(t0) = acquire_t0 {
+            pager_profile::record_staging_acquire(t0.elapsed());
+        }
         // Pass the source through by reference — `schedule_staged` derefs mmap segments via
         // `expert_bytes` and pins a host block in place, so neither tier materializes a copy here.
         let (slot, consumed) = pool.pager.schedule_staged(
             rec,
             ring.as_ref(),
-            half_base + *cursor,
+            ring_off,
             id,
             &src.bytes,
             pool.spec.host.as_deref(),

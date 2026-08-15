@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use ash::vk;
 
-use infr_core::{backend::Buffer, error::Result};
+use infr_core::{backend::Buffer, error::Result, pager_profile};
 
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
@@ -9764,6 +9764,7 @@ impl<'a> Recorder<'a> {
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;
+        let dispatches = self.dispatches.get();
         let t_record = self.t0.elapsed();
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
@@ -9786,6 +9787,8 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
+        let prof = pager_profile::active();
+        let submit_t0 = prof.then(std::time::Instant::now);
         let submit = unsafe {
             device.queue_submit(
                 queue,
@@ -9793,11 +9796,19 @@ impl<'a> Recorder<'a> {
                 vk::Fence::null(),
             )
         };
+        if let Some(t0) = submit_t0 {
+            pager_profile::record_queue_submit(dispatches, t0.elapsed());
+        }
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
-        if let Err(e) = unsafe { device.queue_wait_idle(queue) } {
+        let wait_t0 = prof.then(std::time::Instant::now);
+        let wait = unsafe { device.queue_wait_idle(queue) };
+        if let Some(t0) = wait_t0 {
+            pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
+        }
+        if let Err(e) = wait {
             self.free_transient();
             return Err(be(format!("queue_wait_idle: {e}")));
         }
@@ -9888,6 +9899,8 @@ impl<'a> Recorder<'a> {
                 return Err(be(format!("create fence: {e}")));
             }
         };
+        let prof = pager_profile::active();
+        let submit_t0 = prof.then(std::time::Instant::now);
         let submit = unsafe {
             device.queue_submit(
                 self.be.shared.queue,
@@ -9895,6 +9908,9 @@ impl<'a> Recorder<'a> {
                 fence,
             )
         };
+        if let Some(t0) = submit_t0 {
+            pager_profile::record_queue_submit(dispatches, t0.elapsed());
+        }
         if let Err(e) = submit {
             unsafe { device.destroy_fence(fence, None) };
             self.free_transient();
@@ -10128,18 +10144,25 @@ impl RecordedCmd {
         };
         let device = &self.shared.device;
         let cmds = vec![seg.cmd; n];
-        unsafe {
-            device
-                .queue_submit(
-                    self.shared.queue,
-                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                    vk::Fence::null(),
-                )
-                .map_err(|e| be(format!("replay_n submit: {e}")))?;
-            device
-                .queue_wait_idle(self.shared.queue)
-                .map_err(|e| be(format!("replay_n wait: {e}")))?;
+        let prof = pager_profile::active();
+        let submit_t0 = prof.then(std::time::Instant::now);
+        let submit = unsafe {
+            device.queue_submit(
+                self.shared.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                vk::Fence::null(),
+            )
+        };
+        if let Some(t0) = submit_t0 {
+            pager_profile::record_queue_submit(seg.dispatches * n, t0.elapsed());
         }
+        submit.map_err(|e| be(format!("replay_n submit: {e}")))?;
+        let wait_t0 = prof.then(std::time::Instant::now);
+        let wait = unsafe { device.queue_wait_idle(self.shared.queue) };
+        if let Some(t0) = wait_t0 {
+            pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
+        }
+        wait.map_err(|e| be(format!("replay_n wait: {e}")))?;
         Ok(())
     }
 
@@ -10152,21 +10175,27 @@ impl RecordedCmd {
     /// single submit + wait — byte-identical to the record-once fast path.
     pub fn replay(&self) -> Result<()> {
         let device = &self.shared.device;
-        unsafe {
-            for seg in &self.segments {
-                device
-                    .queue_submit(
-                        self.shared.queue,
-                        &[vk::SubmitInfo::default()
-                            .command_buffers(std::slice::from_ref(&seg.cmd))],
-                        vk::Fence::null(),
-                    )
-                    .map_err(|e| be(format!("replay submit: {e}")))?;
+        let prof = pager_profile::active();
+        for seg in &self.segments {
+            let submit_t0 = prof.then(std::time::Instant::now);
+            let submit = unsafe {
+                device.queue_submit(
+                    self.shared.queue,
+                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
+                    vk::Fence::null(),
+                )
+            };
+            if let Some(t0) = submit_t0 {
+                pager_profile::record_queue_submit(seg.dispatches, t0.elapsed());
             }
-            device
-                .queue_wait_idle(self.shared.queue)
-                .map_err(|e| be(format!("replay wait: {e}")))?;
+            submit.map_err(|e| be(format!("replay submit: {e}")))?;
         }
+        let wait_t0 = prof.then(std::time::Instant::now);
+        let wait = unsafe { device.queue_wait_idle(self.shared.queue) };
+        if let Some(t0) = wait_t0 {
+            pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
+        }
+        wait.map_err(|e| be(format!("replay wait: {e}")))?;
         Ok(())
     }
 }
@@ -10221,7 +10250,11 @@ impl PendingSegment {
             return Ok(()); // already drained
         };
         let device = &self.shared.device;
+        let wait_t0 = pager_profile::start();
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
+            pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
+        }
         unsafe {
             device.destroy_fence(fence, None);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();

@@ -998,6 +998,7 @@ fn every_prof_knob_is_reachable_by_set() {
         "prof.stages=true",
         "prof.vram=true",
         "prof.diffusion_trace=true",
+        "prof.pager_profile=true",
         "prof.out=/tmp/p.json",
         "prof.metal_device_time=counters",
         "prof.metal_debug=true",
@@ -1007,6 +1008,7 @@ fn every_prof_knob_is_reachable_by_set() {
     assert!(cfg.prof.stages);
     assert!(cfg.prof.vram);
     assert!(cfg.prof.diffusion_trace);
+    assert!(cfg.prof.pager_profile);
     assert_eq!(cfg.prof.out.as_deref(), Some(Path::new("/tmp/p.json")));
     assert_eq!(cfg.prof.metal_device_time, MetalDeviceTime::Counters);
     assert!(cfg.prof.metal_debug);
@@ -1067,6 +1069,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MOE_SMALL_M",
         "INFR_NO_FUSE_ADD",
         "INFR_PAGER_RING",
+        "INFR_PAGER_PROFILE",
     ];
 
     /// S3 — `infr-cpu`: the three `kernels.cpu` knobs plus the three diagnostics its interpreter

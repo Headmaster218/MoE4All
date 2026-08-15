@@ -104,6 +104,7 @@ pub struct Pager {
     /// whole op, spanning batches.
     pinned: HashMap<BlockId, u32>,
     stats: PagerStats,
+    profile_work: crate::pager_profile::LruWorkStats,
 }
 
 /// Where a miss inserts into the LRU order — the two policies this pager already had, named so a
@@ -155,6 +156,7 @@ impl Pager {
             cur_epoch: 0,
             pinned: HashMap::new(),
             stats: PagerStats::default(),
+            profile_work: crate::pager_profile::LruWorkStats::default(),
         }
     }
 
@@ -193,7 +195,19 @@ impl Pager {
     /// Move `id` to the most-recently-used end without changing residency (internal to `touch`,
     /// exposed for the doubly-recorded case: a batch that touches the same id twice).
     fn mark_mru(&mut self, id: BlockId) {
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
+        let pos = if crate::pager_profile::active() {
+            let queue_len = self.lru.len();
+            let mut scan_steps = 0usize;
+            let pos = self.lru.iter().position(|&x| {
+                scan_steps += 1;
+                x == id
+            });
+            self.profile_work.record_mark_mru(queue_len, scan_steps);
+            pos
+        } else {
+            self.lru.iter().position(|&x| x == id)
+        };
+        if let Some(pos) = pos {
             self.lru.remove(pos);
         }
         self.lru.push_back(id);
@@ -381,9 +395,23 @@ impl Pager {
         // find no victim at all. (The infallible `take_slot` expresses the same exemption as its
         // `cur_epoch == 0` assert.)
         let batches = self.cur_epoch != 0;
-        let idx = self.lru.iter().position(|b| {
-            !(batches && self.epoch.get(b) == Some(&self.cur_epoch)) && !self.pinned.contains_key(b)
-        })?;
+        let idx = if crate::pager_profile::active() {
+            let queue_len = self.lru.len();
+            let mut scan_steps = 0usize;
+            let idx = self.lru.iter().position(|b| {
+                scan_steps += 1;
+                !(batches && self.epoch.get(b) == Some(&self.cur_epoch))
+                    && !self.pinned.contains_key(b)
+            });
+            self.profile_work
+                .record_victim_select(queue_len, scan_steps);
+            idx
+        } else {
+            self.lru.iter().position(|b| {
+                !(batches && self.epoch.get(b) == Some(&self.cur_epoch))
+                    && !self.pinned.contains_key(b)
+            })
+        }?;
         let victim = self.lru.remove(idx).expect("index from position()");
         let vslot = self
             .resident
@@ -411,39 +439,50 @@ impl Pager {
         if let Some(s) = self.free.pop() {
             return (s, None);
         }
-        let idx = self
-            .lru
-            .iter()
-            .position(|b| self.epoch.get(b) != Some(&self.cur_epoch))
-            // Every resident block touched by the CURRENT batch means the batch exceeded
-            // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
-            // back to pop_front would silently evict a batch sibling mid-flight (the
-            // coherent-but-wrong class); fail loudly instead when batches are in use.
-            .unwrap_or_else(|| {
-                // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
-                // was asked for, say why it cannot be tolerated rather than degraded, and name the
-                // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
-                // seam splits proportionally into per-pool slot counts, so raising it is what makes
-                // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
-                // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
-                // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
-                // streaming path opens a fresh batch around each single `schedule` call, so both
-                // shipping callers satisfy the floor by construction — reaching this means an
-                // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
-                // the floor.
-                assert!(
-                    self.cur_epoch == 0,
-                    "pager: a single dispatch batch touched more distinct blocks than the \
+        let idx = if crate::pager_profile::active() {
+            let queue_len = self.lru.len();
+            let mut scan_steps = 0usize;
+            let idx = self.lru.iter().position(|b| {
+                scan_steps += 1;
+                self.epoch.get(b) != Some(&self.cur_epoch)
+            });
+            self.profile_work
+                .record_victim_select(queue_len, scan_steps);
+            idx
+        } else {
+            self.lru
+                .iter()
+                .position(|b| self.epoch.get(b) != Some(&self.cur_epoch))
+        }
+        // Every resident block touched by the CURRENT batch means the batch exceeded
+        // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
+        // back to pop_front would silently evict a batch sibling mid-flight (the
+        // coherent-but-wrong class); fail loudly instead when batches are in use.
+        .unwrap_or_else(|| {
+            // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
+            // was asked for, say why it cannot be tolerated rather than degraded, and name the
+            // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
+            // seam splits proportionally into per-pool slot counts, so raising it is what makes
+            // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
+            // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
+            // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
+            // streaming path opens a fresh batch around each single `schedule` call, so both
+            // shipping callers satisfy the floor by construction — reaching this means an
+            // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
+            // the floor.
+            assert!(
+                self.cur_epoch == 0,
+                "pager: a single dispatch batch touched more distinct blocks than the \
                      n_slots={} this cache holds — within-batch eviction safety is unsatisfiable. \
                      Refusing to degrade: evicting a block this same batch already resolved \
                      doesn't fail cleanly, it feeds the dispatch another block's bytes (silent \
                      wrong output, not an error). Raise the paging budget (INFR_CACHE) so every \
                      pool gets at least one slot per block a batch touches, or leave it unset to \
                      take the auto budget, which is sized to that floor.",
-                    self.n_slots
-                );
-                0 // epoch never used (legacy caller): plain LRU
-            });
+                self.n_slots
+            );
+            0 // epoch never used (legacy caller): plain LRU
+        });
         let victim = self.lru.remove(idx).expect("index from position()");
         let vslot = self
             .resident
@@ -455,6 +494,12 @@ impl Pager {
         self.epoch.remove(&victim);
         self.stats.evictions += 1;
         (vslot, Some(victim))
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        crate::pager_profile::record_lru_work(self.profile_work);
     }
 }
 

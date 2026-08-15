@@ -5176,6 +5176,8 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
     let cap = be_.submit_dispatch_cap();
+    let pager_prof = infr_core::pager_profile::active();
+    let submit_before = pager_prof.then(infr_core::pager_profile::queue_submit_count);
     let t_forward = std::time::Instant::now();
     let mut submitted_dispatches = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
@@ -5352,6 +5354,15 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
     // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
     be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
+    if let Some(before) = submit_before {
+        let submits = infr_core::pager_profile::queue_submit_count().saturating_sub(before);
+        infr_core::pager_profile::record_splitter_forward(
+            cap,
+            be_.submit_dispatch_cap(),
+            submitted_dispatches,
+            submits,
+        );
+    }
     Ok(())
 }
 
@@ -5415,6 +5426,7 @@ fn rotate_stream<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
+    let acquire_t0 = infr_core::pager_profile::start();
     let seg = rec
         .take()
         .expect("segment always Some between ops")
@@ -5424,11 +5436,18 @@ fn rotate_stream<'a>(
     ps.half ^= 1;
     ps.cursor = 0;
     if let Some(prev) = ps.pending[ps.half].take() {
+        let wait_t0 = infr_core::pager_profile::start();
         prev.wait().map_err(|e| be(e.to_string()))?;
+        if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
+            infr_core::pager_profile::record_staging_wait(elapsed);
+        }
     }
     let fresh = be_.recorder()?;
     fresh.seed_barrier();
     *rec = Some(fresh);
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(acquire_t0) {
+        infr_core::pager_profile::record_staging_acquire(elapsed);
+    }
     Ok(())
 }
 
@@ -5441,6 +5460,7 @@ fn sync_stream<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
+    let sync_t0 = infr_core::pager_profile::start();
     rec.take()
         .expect("segment always Some between ops")
         .finish()
@@ -5449,6 +5469,9 @@ fn sync_stream<'a>(
     ps.cursor = 0;
     ps.tape_cursor = 0;
     *rec = Some(be_.recorder()?);
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(sync_t0) {
+        infr_core::pager_profile::record_paging_sync_wait(elapsed);
+    }
     Ok(())
 }
 

@@ -364,6 +364,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.prof.stages = presence(get, "INFR_PROF_STAGES");
     p.prof.vram = presence(get, "INFR_PROF_VRAM");
     p.prof.diffusion_trace = presence(get, "INFR_PROF_DIFFUSION_TRACE");
+    p.prof.pager_profile = presence(get, "INFR_PAGER_PROFILE");
     p.prof.out = opt_path(get, "INFR_PROF_OUT");
     // Unlike its predecessor's exact-literal `"2"`/`"3"` compare, an unrecognized mode here falls
     // back to the default rather than silently meaning "on, level unrecognized".

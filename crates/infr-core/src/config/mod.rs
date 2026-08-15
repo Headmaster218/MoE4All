@@ -590,6 +590,10 @@ cfg_struct! {
         /// `INFR_PROF_DIFFUSION_TRACE`: per-step schedule/entropy trace for diffusion models.
         /// A sampler trace, not a timing measurement — [`stages`](Self::stages) covers the timing.
         diffusion_trace: bool = false,
+        /// `INFR_PAGER_PROFILE`: aggregate pager/cache/upload/submit timings at process exit.
+        /// Runtime-only wall timing, deliberately separate from `INFR_PROF_OPS` because Vulkan
+        /// timestamp profiling changes the paged ring's nowait behaviour.
+        pager_profile: bool = false,
         /// `INFR_PROF_OUT`: write the exit report as JSON to this path, in addition to stderr.
         /// (`INFR_PROFILE` — the BUILD-time host-instrumentation input read by `build.rs` — is
         /// deliberately NOT config; see [`manifest::NOT_MIGRATED`].)
