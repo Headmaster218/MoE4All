@@ -390,6 +390,11 @@ impl SeamKv {
         self.max_ctx
     }
 
+    /// Whether this slot's allocated KV caches are coupled Q8_0 on both K and V sides.
+    pub(crate) fn kv_q8(&self) -> bool {
+        self.k_fmt == DType::Q8_0 && self.v_fmt == DType::Q8_0
+    }
+
     /// Longest common prefix of this slot's materialized tokens and `prompt` — the slot-selection
     /// score for multi-conversation serve.
     pub(crate) fn prefix_score(&self, prompt: &[u32]) -> usize {

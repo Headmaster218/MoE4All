@@ -28,7 +28,7 @@ pub struct BenchPlacement {
     pub ubatch: usize,
     /// The height came from the user (`-u` / `INFR_UBATCH`), not from the placement ladder.
     pub ubatch_pinned: bool,
-    /// The placement ladder chose a q8_0 KV cache to keep the session resident.
+    /// The benchmark session actually allocated coupled q8_0 KV caches.
     pub kv_q8: bool,
     /// Dispatches per submit; `0` = unlimited, one command buffer per forward (every healthy
     /// discrete GPU). Anything else means the submit splitter armed during this run.
@@ -1354,7 +1354,7 @@ impl SeamModel {
             BenchPlacement {
                 ubatch: crate::seam::ubatch_rows(&self.ecfg),
                 ubatch_pinned: self.ecfg.device.ubatch_specified,
-                kv_q8: crate::seam::kv_auto_q8(),
+                kv_q8: state.as_ref().is_some_and(crate::seam::SeamKv::kv_q8),
                 submit_cap: vk.submit_cap_now(),
             },
         ))
