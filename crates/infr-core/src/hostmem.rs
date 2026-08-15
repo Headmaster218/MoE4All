@@ -21,11 +21,8 @@
 /// a new allocation can have without swapping — it already accounts for reclaimable page cache, so
 /// it is exactly the figure this tier wants and not something derivable from `MemTotal`.
 ///
-/// **Every other platform answers `None` today**, and that is a gap rather than a design: macOS
-/// would need `host_statistics64`'s free/inactive/purgeable split and Windows
-/// `GlobalMemoryStatusEx`, neither of which is reachable through this workspace's existing
-/// dependencies, and neither of which could be verified on the machine this was written on. Adding
-/// either means adding a dependency, which is the user's call. Backlog B36.
+/// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`. Every other platform answers
+/// `None` today; macOS would need `host_statistics64`'s free/inactive/purgeable split.
 ///
 /// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
 /// limit a container or a `systemd-run --scope -p MemoryMax=` puts on this process — measured on
@@ -41,10 +38,24 @@ pub fn available_bytes() -> Option<u64> {
             None => host,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        Some(windows_memory_status()?.ullAvailPhys)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
     }
+}
+
+#[cfg(windows)]
+fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::MEMORYSTATUSEX> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX::default();
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
+    Some(status)
 }
 
 /// Memory this process may still commit before its cgroup kills it, or `None` when no ancestor
@@ -320,6 +331,22 @@ mod tests {
             * 1024;
         assert!(avail > 0, "available must be non-zero");
         assert!(avail <= total, "available {avail} exceeds total {total}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_live_probe_is_plausible() {
+        let avail = available_bytes().expect("windows GlobalMemoryStatusEx should answer");
+        let status = windows_memory_status().expect("GlobalMemoryStatusEx");
+        assert!(
+            status.ullTotalPhys > 0,
+            "total physical memory must be non-zero"
+        );
+        assert!(
+            avail <= status.ullTotalPhys,
+            "available {avail} exceeds total {}",
+            status.ullTotalPhys
+        );
     }
 
     /// Headroom is the point: the budget never equals what is available, however much there is.

@@ -427,6 +427,7 @@ mod tests {
     /// A pid that is guaranteed DEAD (spawned and reaped). Reusing a just-reaped pid is
     /// theoretically possible but the kernel hands out pids sequentially, so it will not happen
     /// within one test.
+    #[cfg(unix)]
     fn spawn_and_reap() -> u32 {
         let mut c = std::process::Command::new("true")
             .spawn()
@@ -517,6 +518,7 @@ mod tests {
 
     /// THE TRIPWIRE. A blob that hangs the GPU is perfectly well-formed, so no envelope check can
     /// see it — the only evidence is that the run which SEEDED from it never came back.
+    #[cfg(unix)]
     #[test]
     fn tripwire_discards_a_blob_whose_seeded_run_died() {
         let dir = tmp_dir("tripwire");
@@ -570,6 +572,7 @@ mod tests {
     /// Sibling caches in ONE process (distinct nonces on the same path) own SEPARATE markers — so
     /// one instance's clean `disarm()` never deletes a live sibling's, and a still-armed sibling
     /// that later dies uncleanly is still caught.
+    #[cfg(unix)]
     #[test]
     fn sibling_markers_are_independent() {
         let dir = tmp_dir("siblings");

@@ -18,5 +18,8 @@ toml.workspace = true
 libc.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 tempfile = "3"
