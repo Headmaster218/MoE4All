@@ -21,7 +21,7 @@
 //! demand/LRU. The PREFETCH side (staging layer `l+1`'s bytes while `l` executes) is the
 //! backend's job — `infr-vulkan`'s `DensePagerSession` records uploads ahead of GPU execution
 //! through its pipelined ring; this module stays pure residency/eviction bookkeeping.
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 /// Opaque identifier for one pageable block. The pager never interprets this — callers pack
 /// whatever key space they need (an expert id, a `(layer, role, expert)` tuple, a layer index for
@@ -67,6 +67,13 @@ impl PagerStats {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct LruNode {
+    id: Option<BlockId>,
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
 /// Fixed-`n_slots` LRU residency map. `n_slots` slots are handed out first-come (no eviction)
 /// until exhausted, then every further miss evicts the least-recently-touched resident block.
 ///
@@ -88,7 +95,10 @@ pub struct Pager {
     /// `touch` on an existing entry removes-then-repushes it (O(n_slots), fine at the slot counts
     /// this cache runs at — tens to low hundreds; an intrusive doubly-linked list is the upgrade
     /// path if that ever isn't true, per the module doc's SLRU note).
-    lru: VecDeque<BlockId>,
+    lru: Vec<LruNode>,
+    lru_head: Option<u32>,
+    lru_tail: Option<u32>,
+    lru_len: usize,
     /// Slot indices never yet handed out (drained before any eviction kicks in).
     free: Vec<u32>,
     /// block_id -> the [`Self::begin_batch`] epoch of its last touch. Eviction skips blocks
@@ -150,7 +160,10 @@ impl Pager {
         Self {
             n_slots,
             resident: HashMap::with_capacity(n_slots),
-            lru: VecDeque::with_capacity(n_slots),
+            lru: vec![LruNode::default(); n_slots],
+            lru_head: None,
+            lru_tail: None,
+            lru_len: 0,
             free: (0..n_slots as u32).rev().collect(), // pop() hands out slot 0 first
             epoch: HashMap::with_capacity(n_slots),
             cur_epoch: 0,
@@ -188,6 +201,118 @@ impl Pager {
         self.epoch.len()
     }
 
+    fn slot_idx(&self, slot: u32) -> usize {
+        let idx = slot as usize;
+        debug_assert!(idx < self.lru.len(), "slot {slot} out of range");
+        idx
+    }
+
+    fn push_back_lru(&mut self, slot: u32, id: BlockId) {
+        let idx = self.slot_idx(slot);
+        debug_assert!(
+            self.lru[idx].id.is_none(),
+            "slot {slot} already has an LRU node"
+        );
+        self.lru[idx] = LruNode {
+            id: Some(id),
+            prev: self.lru_tail,
+            next: None,
+        };
+        if let Some(tail) = self.lru_tail {
+            let tail_idx = self.slot_idx(tail);
+            self.lru[tail_idx].next = Some(slot);
+        } else {
+            self.lru_head = Some(slot);
+        }
+        self.lru_tail = Some(slot);
+        self.lru_len += 1;
+    }
+
+    fn push_front_lru(&mut self, slot: u32, id: BlockId) {
+        let idx = self.slot_idx(slot);
+        debug_assert!(
+            self.lru[idx].id.is_none(),
+            "slot {slot} already has an LRU node"
+        );
+        self.lru[idx] = LruNode {
+            id: Some(id),
+            prev: None,
+            next: self.lru_head,
+        };
+        if let Some(head) = self.lru_head {
+            let head_idx = self.slot_idx(head);
+            self.lru[head_idx].prev = Some(slot);
+        } else {
+            self.lru_tail = Some(slot);
+        }
+        self.lru_head = Some(slot);
+        self.lru_len += 1;
+    }
+
+    fn unlink_lru(&mut self, slot: u32) -> Option<BlockId> {
+        let idx = self.slot_idx(slot);
+        let node = self.lru[idx];
+        let id = node.id?;
+        if let Some(prev) = node.prev {
+            let prev_idx = self.slot_idx(prev);
+            self.lru[prev_idx].next = node.next;
+        } else {
+            self.lru_head = node.next;
+        }
+        if let Some(next) = node.next {
+            let next_idx = self.slot_idx(next);
+            self.lru[next_idx].prev = node.prev;
+        } else {
+            self.lru_tail = node.prev;
+        }
+        self.lru[idx] = LruNode::default();
+        self.lru_len -= 1;
+        Some(id)
+    }
+
+    fn move_to_back_lru(&mut self, slot: u32) {
+        if self.lru_tail == Some(slot) {
+            let idx = self.slot_idx(slot);
+            debug_assert!(self.lru[idx].id.is_some());
+            return;
+        }
+        let id = self
+            .unlink_lru(slot)
+            .expect("resident block has an LRU node");
+        self.push_back_lru(slot, id);
+    }
+
+    fn first_lru_slot_matching<F>(&self, mut eligible: F) -> (Option<u32>, usize)
+    where
+        F: FnMut(BlockId) -> bool,
+    {
+        let mut scan_steps = 0usize;
+        let mut slot = self.lru_head;
+        while let Some(s) = slot {
+            let node = self.lru[self.slot_idx(s)];
+            let id = node.id.expect("linked LRU node has a block id");
+            scan_steps += 1;
+            if eligible(id) {
+                return (Some(s), scan_steps);
+            }
+            slot = node.next;
+        }
+        (None, scan_steps)
+    }
+
+    #[cfg(test)]
+    fn lru_order(&self) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        let mut slot = self.lru_head;
+        while let Some(s) = slot {
+            let node = self.lru[self.slot_idx(s)];
+            out.push(node.id.expect("linked LRU node has a block id"));
+            slot = node.next;
+            assert!(out.len() <= self.n_slots, "LRU list contains a cycle");
+        }
+        out
+    }
+
     pub fn slot_of(&self, id: BlockId) -> Option<u32> {
         self.resident.get(&id).copied()
     }
@@ -195,22 +320,14 @@ impl Pager {
     /// Move `id` to the most-recently-used end without changing residency (internal to `touch`,
     /// exposed for the doubly-recorded case: a batch that touches the same id twice).
     fn mark_mru(&mut self, id: BlockId) {
-        let pos = if crate::pager_profile::active() {
-            let queue_len = self.lru.len();
-            let mut scan_steps = 0usize;
-            let pos = self.lru.iter().position(|&x| {
-                scan_steps += 1;
-                x == id
-            });
-            self.profile_work.record_mark_mru(queue_len, scan_steps);
-            pos
-        } else {
-            self.lru.iter().position(|&x| x == id)
-        };
-        if let Some(pos) = pos {
-            self.lru.remove(pos);
+        let slot = *self
+            .resident
+            .get(&id)
+            .expect("mark_mru is only called for resident blocks");
+        if crate::pager_profile::active() {
+            self.profile_work.record_mark_mru(self.lru_len, 0);
         }
-        self.lru.push_back(id);
+        self.move_to_back_lru(slot);
     }
 
     /// Ensure `id` is resident, evicting the least-recently-used unprotected block if the cache
@@ -227,7 +344,7 @@ impl Pager {
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
         self.resident.insert(id, slot);
-        self.lru.push_back(id);
+        self.push_back_lru(slot, id);
         Resolution::Miss { slot, evicted }
     }
 
@@ -261,8 +378,8 @@ impl Pager {
         self.stats.misses += 1;
         self.resident.insert(id, slot);
         match insert {
-            Insert::Mru => self.lru.push_back(id),
-            Insert::Cold => self.lru.push_front(id),
+            Insert::Mru => self.push_back_lru(slot, id),
+            Insert::Cold => self.push_front_lru(slot, id),
         }
         *self.pinned.entry(id).or_insert(0) += 1;
         Some(Resolution::Miss { slot, evicted })
@@ -331,9 +448,8 @@ impl Pager {
             "pager: evict of pinned block {id}"
         );
         let slot = self.resident.remove(&id)?;
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
-            self.lru.remove(pos);
-        }
+        let removed = self.unlink_lru(slot);
+        debug_assert_eq!(removed, Some(id));
         self.epoch.remove(&id);
         self.free.push(slot);
         Some(slot)
@@ -378,7 +494,7 @@ impl Pager {
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
         self.resident.insert(id, slot);
-        self.lru.push_front(id);
+        self.push_front_lru(slot, id);
         Resolution::Miss { slot, evicted }
     }
 
@@ -395,28 +511,26 @@ impl Pager {
         // find no victim at all. (The infallible `take_slot` expresses the same exemption as its
         // `cur_epoch == 0` assert.)
         let batches = self.cur_epoch != 0;
-        let idx = if crate::pager_profile::active() {
-            let queue_len = self.lru.len();
-            let mut scan_steps = 0usize;
-            let idx = self.lru.iter().position(|b| {
-                scan_steps += 1;
-                !(batches && self.epoch.get(b) == Some(&self.cur_epoch))
-                    && !self.pinned.contains_key(b)
-            });
+        let cur_epoch = self.cur_epoch;
+        let epoch = &self.epoch;
+        let pinned = &self.pinned;
+        let queue_len = self.lru_len;
+        let (victim_slot, scan_steps) = self.first_lru_slot_matching(|b| {
+            !(batches && epoch.get(&b) == Some(&cur_epoch)) && !pinned.contains_key(&b)
+        });
+        if crate::pager_profile::active() {
             self.profile_work
                 .record_victim_select(queue_len, scan_steps);
-            idx
-        } else {
-            self.lru.iter().position(|b| {
-                !(batches && self.epoch.get(b) == Some(&self.cur_epoch))
-                    && !self.pinned.contains_key(b)
-            })
-        }?;
-        let victim = self.lru.remove(idx).expect("index from position()");
+        }
+        let victim_slot = victim_slot?;
+        let victim = self
+            .unlink_lru(victim_slot)
+            .expect("victim slot has an LRU node");
         let vslot = self
             .resident
             .remove(&victim)
             .expect("every lru entry has a resident mapping");
+        debug_assert_eq!(vslot, victim_slot);
         // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
@@ -439,55 +553,53 @@ impl Pager {
         if let Some(s) = self.free.pop() {
             return (s, None);
         }
-        let idx = if crate::pager_profile::active() {
-            let queue_len = self.lru.len();
-            let mut scan_steps = 0usize;
-            let idx = self.lru.iter().position(|b| {
-                scan_steps += 1;
-                self.epoch.get(b) != Some(&self.cur_epoch)
-            });
+        let cur_epoch = self.cur_epoch;
+        let epoch = &self.epoch;
+        let queue_len = self.lru_len;
+        let (victim_slot, scan_steps) =
+            self.first_lru_slot_matching(|b| epoch.get(&b) != Some(&cur_epoch));
+        if crate::pager_profile::active() {
             self.profile_work
                 .record_victim_select(queue_len, scan_steps);
-            idx
-        } else {
-            self.lru
-                .iter()
-                .position(|b| self.epoch.get(b) != Some(&self.cur_epoch))
         }
-        // Every resident block touched by the CURRENT batch means the batch exceeded
-        // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
-        // back to pop_front would silently evict a batch sibling mid-flight (the
-        // coherent-but-wrong class); fail loudly instead when batches are in use.
-        .unwrap_or_else(|| {
-            // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
-            // was asked for, say why it cannot be tolerated rather than degraded, and name the
-            // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
-            // seam splits proportionally into per-pool slot counts, so raising it is what makes
-            // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
-            // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
-            // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
-            // streaming path opens a fresh batch around each single `schedule` call, so both
-            // shipping callers satisfy the floor by construction — reaching this means an
-            // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
-            // the floor.
-            assert!(
-                self.cur_epoch == 0,
-                "pager: a single dispatch batch touched more distinct blocks than the \
+        let victim_slot = victim_slot
+            // Every resident block touched by the CURRENT batch means the batch exceeded
+            // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
+            // back to pop_front would silently evict a batch sibling mid-flight (the
+            // coherent-but-wrong class); fail loudly instead when batches are in use.
+            .unwrap_or_else(|| {
+                // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
+                // was asked for, say why it cannot be tolerated rather than degraded, and name the
+                // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
+                // seam splits proportionally into per-pool slot counts, so raising it is what makes
+                // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
+                // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
+                // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
+                // streaming path opens a fresh batch around each single `schedule` call, so both
+                // shipping callers satisfy the floor by construction — reaching this means an
+                // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
+                // the floor.
+                assert!(
+                    self.cur_epoch == 0,
+                    "pager: a single dispatch batch touched more distinct blocks than the \
                      n_slots={} this cache holds — within-batch eviction safety is unsatisfiable. \
                      Refusing to degrade: evicting a block this same batch already resolved \
                      doesn't fail cleanly, it feeds the dispatch another block's bytes (silent \
                      wrong output, not an error). Raise the paging budget (INFR_CACHE) so every \
                      pool gets at least one slot per block a batch touches, or leave it unset to \
                      take the auto budget, which is sized to that floor.",
-                self.n_slots
-            );
-            0 // epoch never used (legacy caller): plain LRU
-        });
-        let victim = self.lru.remove(idx).expect("index from position()");
+                    self.n_slots
+                );
+                self.lru_head.expect("full pager has an LRU head")
+            });
+        let victim = self
+            .unlink_lru(victim_slot)
+            .expect("victim slot has an LRU node");
         let vslot = self
             .resident
             .remove(&victim)
             .expect("every lru entry has a resident mapping");
+        debug_assert_eq!(vslot, victim_slot);
         // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
@@ -669,6 +781,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_evict_unlinks_head_middle_and_tail() {
+        let mut p = Pager::new(4);
+        for id in [1, 2, 3, 4] {
+            p.touch(id);
+        }
+        assert_eq!(p.lru_order(), vec![1, 2, 3, 4]);
+
+        assert!(p.evict(1).is_some());
+        assert_eq!(p.lru_order(), vec![2, 3, 4]);
+
+        assert!(p.evict(3).is_some());
+        assert_eq!(p.lru_order(), vec![2, 4]);
+
+        assert!(p.evict(4).is_some());
+        assert_eq!(p.lru_order(), vec![2]);
+
+        p.touch(5);
+        assert_eq!(p.lru_order(), vec![2, 5]);
+    }
+
+    #[test]
     fn slot_reuse_after_eviction_is_exact() {
         // The freed slot from an eviction is the ONLY slot available for the next miss (n_slots
         // fixed) — assert the pager actually reuses it rather than growing.
@@ -803,7 +936,7 @@ mod tests {
     #[should_panic(expected = "n_slots must be at least 1")]
     fn zero_slot_pager_is_rejected_at_construction() {
         // A 0-slot pager used to build fine and then die on the FIRST touch, inside `take_slot`,
-        // with `expect("index from position()")` — a message about a `VecDeque` index that says
+        // with a victim-selection assertion several frames away from the caller — a message that
         // nothing about the actual mistake (a paging budget that couldn't buy a single slot). The
         // guard must fire in the constructor, at the mistake.
         let _ = Pager::new(0);
