@@ -273,6 +273,9 @@ struct VulkanShared {
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
+    /// Architecture bucket retained for narrow Vulkan kernel-policy decisions that must not leak
+    /// vendor-specific flags into infr-core's backend-neutral `Capabilities`.
+    device_arch: crate::caps::DeviceArch,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
     /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
@@ -1173,6 +1176,12 @@ impl VulkanBackend {
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
         &self.shared.caps
+    }
+
+    /// The measured Windows/RDNA3 decode policy. Keep the unmeasured Linux/RADV path unchanged,
+    /// and keep architecture quirks out of the backend-neutral capability API.
+    pub(crate) fn prefers_generic_hd256_decode(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -2474,6 +2483,7 @@ impl VulkanBackend {
                 recorder_fences: Mutex::new(Vec::new()),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
+                device_arch,
                 has_mem_budget,
                 max_mem_alloc_size,
                 max_push_constants: props.limits.max_push_constants_size,

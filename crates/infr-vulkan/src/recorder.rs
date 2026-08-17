@@ -6646,7 +6646,14 @@ impl<'a> Recorder<'a> {
                     None
                 }
             } else {
-                crate::gemm::attn_decode_kernel(hd, window > 0, false)
+                // On Windows/RDNA3 the general hd256 full-context kernel overtakes the decode-only
+                // build at deep context (and is neutral shallow). Keep every unmeasured platform,
+                // other head dim and the SWA/ring builds on the existing specialization.
+                if hd == 256 && window == 0 && self.be.prefers_generic_hd256_decode() {
+                    None
+                } else {
+                    crate::gemm::attn_decode_kernel(hd, window > 0, false)
+                }
             }
         } else {
             None
@@ -7443,7 +7450,15 @@ impl<'a> Recorder<'a> {
             // builds ARE it, so leave those dims on `attn_partial_dynac_nohd_bda` when it is set.
             && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
-            crate::gemm::attn_decode_kernel(hd, window > 0, true)
+            // The replay graph cannot change pipelines as live kv_len grows. On Windows/RDNA3 the
+            // general hd256 full-context build is already neutral at shallow depth and faster at
+            // 100k/200k, so bake that build for the whole replay. Q8 is excluded above; SWA and
+            // every unmeasured platform retain their existing specialization.
+            if hd == 256 && window == 0 && self.be.prefers_generic_hd256_decode() {
+                None
+            } else {
+                crate::gemm::attn_decode_kernel(hd, window > 0, true)
+            }
         } else {
             None
         };
