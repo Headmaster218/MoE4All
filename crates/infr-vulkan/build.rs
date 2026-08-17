@@ -519,6 +519,11 @@ fn main() {
         ),
         (
             "attn_flash_reg",
+            "attn_flash_reg_hd256_br64_cw4",
+            &["-DHEAD_DIM=256", "-DBR_TILE=64", "-DCW4"],
+        ),
+        (
+            "attn_flash_reg",
             "attn_flash_reg_hd256_bda",
             &["-DHEAD_DIM=256", "-DKV_COOPMAT_BDA"],
         ),
@@ -526,6 +531,16 @@ fn main() {
             "attn_flash_reg",
             "attn_flash_reg_hd256_br64_bda",
             &["-DHEAD_DIM=256", "-DKV_COOPMAT_BDA", "-DBR_TILE=64"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256_br64_cw4_bda",
+            &[
+                "-DHEAD_DIM=256",
+                "-DKV_COOPMAT_BDA",
+                "-DBR_TILE=64",
+                "-DCW4",
+            ],
         ),
         ("attn_flash_combine", "attn_flash_combine", &[]),
         ("attn_flash_combine_hd256", "attn_flash_combine_hd256", &[]),

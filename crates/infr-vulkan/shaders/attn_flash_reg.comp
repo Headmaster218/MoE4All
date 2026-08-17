@@ -28,15 +28,30 @@
 #extension GL_EXT_control_flow_attributes : require
 
 // workgroup = WARPS_M*WARPS_N subgroups of 32 = (BR/32)*2*32 = BR*2 threads.
+#ifdef CW4
+#if HEAD_DIM != 256 || BR_TILE != 64
+#error "CW4 is specialized for HEAD_DIM=256, BR_TILE=64"
+#endif
+layout(local_size_x = (BR_TILE * 4), local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = (BR_TILE * 2), local_size_y = 1, local_size_z = 1) in;
+#endif
 
 const uint BR = BR_TILE;        // query rows per tile
 const uint BC = 64u;            // kv cols per block
 const uint HD = HEAD_DIM;
+#ifdef CW4
+const uint DPT_HD = HD / 16u;
+const uint CT_PER_CW = HD / 64u;
+const uint QK_ROWS = 1u;
+const uint WARPS_M = BR_TILE / 16u;
+#else
 const uint DPT_HD = HD / 8u;
 const uint CT_PER_CW = HD / 32u;
+const uint QK_ROWS = 2u;
+const uint WARPS_M = BR_TILE / 32u;
+#endif
 const uint DPT = 16u;           // vec4 per thread = (HD/2)/4 — each thread owns 64 dims of its row
-const uint WARPS_M = BR_TILE / 32u; // QK warptile row-warps (each owns 32 rows); WARPS_N = BC/32 = 2
 
 layout(push_constant) uniform PC {
     uint q_len;     // mpad (multiple of BR)
@@ -75,7 +90,9 @@ layout(binding = 5) writeonly buffer PLB { float pl[]; };    // [n_splits, mpad,
 
 shared float sfsh[BR * BC];      // scores (f32)
 shared float16_t Psh[BR * BC];   // probs (f16) for PV coopmat
+#ifndef CW4
 shared float pvsh[(BR_TILE / 16u) * 256u]; // per-subgroup PV tile (16×16), one per subgroup (BR/16)
+#endif
 shared float mrow[BR];
 shared float lrow[BR];
 shared float corr[BR];
@@ -101,9 +118,17 @@ void main() {
 #endif
 
     // this thread's logical row + column-worker (for softmax + register O)
+#ifdef CW4
+    uint pair = sg / 2u;
+    uint pair_side = sg & 1u;
+    uint row = pair * 16u + lane / 2u;
+    uint lcw = lane & 1u;
+    uint cw = pair_side * 2u + lcw;
+#else
     uint row = sg * 16u + lane / 2u;  // 0..127
     uint cw = lane & 1u;              // 0/1 → owns dims [cw*64, +64)
 
+#endif
     vec4 Of[DPT_HD];
     [[unroll]] for (uint d = 0u; d < DPT_HD; d++) Of[d] = vec4(0.0);
     if (tid < BR) { mrow[tid] = -1e30; lrow[tid] = 0.0; }
@@ -113,14 +138,14 @@ void main() {
     uint kvend = min(min(pc.kv_len, qmax + 1u), split * pc.ksplit + pc.ksplit);
     for (uint kv0 = split * pc.ksplit; kv0 < kvend; kv0 += BC) {
         // ---- QK: S = Q·Kᵀ, 8-warp register-blocked (4×2), warp owns rows [warp_r*32,+32) ----
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc[2][2];
-        [[unroll]] for (uint a = 0u; a < 2u; a++)
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc[QK_ROWS][2];
+        [[unroll]] for (uint a = 0u; a < QK_ROWS; a++)
             [[unroll]] for (uint b = 0u; b < 2u; b++)
                 sacc[a][b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
         [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A[2];
-            [[unroll]] for (uint a = 0u; a < 2u; a++)
-                coopMatLoad(A[a], q, (qr0 + warp_r * 32u + a * 16u) * nhhd + h * HD + kf, nhhd,
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A[QK_ROWS];
+            [[unroll]] for (uint a = 0u; a < QK_ROWS; a++)
+                coopMatLoad(A[a], q, (qr0 + warp_r * QK_ROWS * 16u + a * 16u) * nhhd + h * HD + kf, nhhd,
                             gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint b = 0u; b < 2u; b++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
@@ -131,22 +156,28 @@ void main() {
                 // with +128 pad rows for exactly this read — see run_flash_reg_bytes.)
                 coopMatLoad(B, KMAT, (kv0 + warp_c * 32u + b * 16u) * nkvhd + kvh * HD + kf, nkvhd,
                             gl_CooperativeMatrixLayoutColumnMajor);
-                [[unroll]] for (uint a = 0u; a < 2u; a++) sacc[a][b] = coopMatMulAdd(A[a], B, sacc[a][b]);
+                [[unroll]] for (uint a = 0u; a < QK_ROWS; a++) sacc[a][b] = coopMatMulAdd(A[a], B, sacc[a][b]);
             }
         }
-        [[unroll]] for (uint a = 0u; a < 2u; a++)
+        [[unroll]] for (uint a = 0u; a < QK_ROWS; a++)
             [[unroll]] for (uint b = 0u; b < 2u; b++)
-                coopMatStore(sacc[a][b], sfsh, (warp_r * 32u + a * 16u) * BC + warp_c * 32u + b * 16u,
+                coopMatStore(sacc[a][b], sfsh, (warp_r * QK_ROWS * 16u + a * 16u) * BC + warp_c * 32u + b * 16u,
                              BC, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
         // ---- online softmax: 2 lanes/row (cluster of 2), each owns cols [cw*32,+32) ----
         {
+#ifdef CW4
+            if (pair_side == 0u) {
+            uint sm_cw = lcw;
+#else
+            uint sm_cw = cw;
+#endif
             uint qpos = pc.pos_offset + qr0 + row;
             float oldm = mrow[row];
             float lmax = -1e30;
             [[unroll]] for (uint jj = 0u; jj < 32u; jj++) {
-                uint j = cw * 32u + jj;
+                uint j = sm_cw * 32u + jj;
                 uint kpos = kv0 + j;
                 float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : sfsh[row * BC + j] * scale;
                 sfsh[row * BC + j] = s;
@@ -156,13 +187,16 @@ void main() {
             float cf = exp(oldm - rmax);
             float lsum = 0.0;
             [[unroll]] for (uint jj = 0u; jj < 32u; jj++) {
-                uint j = cw * 32u + jj;
+                uint j = sm_cw * 32u + jj;
                 float p = exp(sfsh[row * BC + j] - rmax);
                 Psh[row * BC + j] = float16_t(p);
                 lsum += p;
             }
             float rsum = subgroupClusteredAdd(lsum, 2u);
-            if (cw == 0u) { lrow[row] = lrow[row] * cf + rsum; mrow[row] = rmax; corr[row] = cf; }
+            if (sm_cw == 0u) { lrow[row] = lrow[row] * cf + rsum; mrow[row] = rmax; corr[row] = cf; }
+#ifdef CW4
+            }
+#endif
         }
         barrier();
 
@@ -171,13 +205,21 @@ void main() {
         [[unroll]] for (uint d = 0u; d < DPT_HD; d++) Of[d] *= e;
 
         // ---- PV: subgroup sg computes panel sg (rows [sg*16,+16)) × HD, 8 col-tiles ----
+#ifdef CW4
+        uint pv_row0 = pair * 16u;
+        uint pvb = sg * 256u;
+        [[unroll]] for (uint ctl = 0u; ctl < HD / 32u; ctl++) {
+            uint ct = pair_side * (HD / 32u) + ctl;
+#else
+        uint pv_row0 = sg * 16u;
         uint pvb = sg * 256u;
         [[unroll]] for (uint ct = 0u; ct < HD / 16u; ct++) {
+#endif
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> pacc =
                 coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
             [[unroll]] for (uint bc = 0u; bc < BC; bc += 16u) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Pm;
-                coopMatLoad(Pm, Psh, (sg * 16u) * BC + bc, BC, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(Pm, Psh, pv_row0 * BC + bc, BC, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vm;
                 // Direct global V read: same bounded over-read as the K load above — rows past kv_len
                 // stay inside the row-capacity allocation and carry a 0 P weight (Psh masked).
@@ -185,7 +227,11 @@ void main() {
                             gl_CooperativeMatrixLayoutRowMajor);
                 pacc = coopMatMulAdd(Pm, Vm, pacc);
             }
+#ifdef CW4
+            coopMatStore(pacc, sfsh, pvb, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#else
             coopMatStore(pacc, pvsh, pvb, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             // owned lanes (cw matches this ct) add the 16 dims of this tile into register O
@@ -194,10 +240,17 @@ void main() {
                 uint base = (ct - cw * CT_PER_CW) * 16u;
                 [[unroll]] for (uint q4 = 0u; q4 < 4u; q4++) {
                     uint ld = base + q4 * 4u;
+#ifdef CW4
+                    Of[ld / 4u] += vec4(sfsh[pvb + rl * 16u + q4 * 4u + 0u],
+                                        sfsh[pvb + rl * 16u + q4 * 4u + 1u],
+                                        sfsh[pvb + rl * 16u + q4 * 4u + 2u],
+                                        sfsh[pvb + rl * 16u + q4 * 4u + 3u]);
+#else
                     Of[ld / 4u] += vec4(pvsh[pvb + rl * 16u + q4 * 4u + 0u],
                                         pvsh[pvb + rl * 16u + q4 * 4u + 1u],
                                         pvsh[pvb + rl * 16u + q4 * 4u + 2u],
                                         pvsh[pvb + rl * 16u + q4 * 4u + 3u]);
+#endif
                 }
             }
             subgroupBarrier();

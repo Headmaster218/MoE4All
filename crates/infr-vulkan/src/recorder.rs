@@ -5483,30 +5483,41 @@ impl<'a> Recorder<'a> {
         };
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let bda = kv_addr.is_some();
-        let (rname, rspv): (&'static str, &[u32]) = match (hd, br == 64, bda) {
-            (128, true, true) => (
+        let cw4 = hd == 256 && br == 64 && self.be.prefers_hd256_prefill_cw4();
+        let (rname, rspv): (&'static str, &[u32]) = match (hd, br == 64, bda, cw4) {
+            (128, true, true, false) => (
                 "attn_flash_reg_br64_bda",
                 crate::gemm::attn_flash_reg_br64_bda_spv(),
             ),
-            (128, true, false) => (
+            (128, true, false, false) => (
                 "attn_flash_reg_br64",
                 crate::gemm::attn_flash_reg_br64_spv(),
             ),
-            (128, false, true) => ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv()),
-            (128, false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
-            (256, true, true) => (
+            (128, false, true, false) => {
+                ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv())
+            }
+            (128, false, false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
+            (256, true, true, true) => (
+                "attn_flash_reg_hd256_br64_cw4_bda",
+                crate::gemm::attn_flash_reg_hd256_br64_cw4_bda_spv(),
+            ),
+            (256, true, false, true) => (
+                "attn_flash_reg_hd256_br64_cw4",
+                crate::gemm::attn_flash_reg_hd256_br64_cw4_spv(),
+            ),
+            (256, true, true, false) => (
                 "attn_flash_reg_hd256_br64_bda",
                 crate::gemm::attn_flash_reg_hd256_br64_bda_spv(),
             ),
-            (256, true, false) => (
+            (256, true, false, false) => (
                 "attn_flash_reg_hd256_br64",
                 crate::gemm::attn_flash_reg_hd256_br64_spv(),
             ),
-            (256, false, true) => (
+            (256, false, true, false) => (
                 "attn_flash_reg_hd256_bda",
                 crate::gemm::attn_flash_reg_hd256_bda_spv(),
             ),
-            (256, false, false) => (
+            (256, false, false, false) => (
                 "attn_flash_reg_hd256",
                 crate::gemm::attn_flash_reg_hd256_spv(),
             ),

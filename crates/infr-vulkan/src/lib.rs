@@ -1184,6 +1184,12 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// The four-column-worker hd256 prefill layout measured on Windows/Navi 31. Other drivers
+    /// retain the established shader until separately validated.
+    pub(crate) fn prefers_hd256_prefill_cw4(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
     /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering
     /// (`docs/config-plan.md` R6).
