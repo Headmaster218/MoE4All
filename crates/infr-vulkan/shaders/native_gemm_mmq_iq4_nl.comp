@@ -139,6 +139,21 @@ void main() {
     [[unroll]] for (uint i = 0u; i < TM; i++)
         [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
 
+#ifdef EXPERT_GRID
+    // Dead-row mask — see native_gemm_mmq_q4k.comp for the full rationale. The grid-level guard
+    // above only rejects tiles whose FIRST row is past this expert's segment. In the surviving
+    // partial tile, rows at/after `rowEnd` used to run every IQ4_NL codebook lookup + dp4a and have
+    // their accumulators discarded by the clipped store below. Qwen3.6-MoE routes roughly 16 rows
+    // per expert at pp512, so even the recorder's BM=32 tile is about half dead on average.
+    //
+    // Thread-to-row is `tr = li / (BN/TN)`, making `live` uniform over each 8-row wave stripe.
+    // Staging and both barriers remain unconditional: every invocation must reach the barriers,
+    // and live threads still consume the As/Bs/Bdl values staged cooperatively by all threads.
+    bool live = (wgRow + tr * TM) < rowEnd;
+#else
+    const bool live = true;
+#endif
+
     for (uint blk = 0u; blk < nblk; blk++) {
         // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
         for (uint idx = li; idx < BM * WPB; idx += THREADS) {
@@ -169,6 +184,7 @@ void main() {
         }
         barrier();
 
+        if (live) {
         int qsum[TM][TN];
         [[unroll]] for (uint i = 0u; i < TM; i++)
             [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
@@ -190,6 +206,7 @@ void main() {
             [[unroll]] for (uint i = 0u; i < TM; i++) {
                 acc[i][j] += dval[i] * dl * float(qsum[i][j]);
             }
+        }
         }
         // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
         // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete
