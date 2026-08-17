@@ -505,6 +505,28 @@ fn main() {
             "attn_flash_reg_br64_bda",
             &["-DKV_COOPMAT_BDA", "-DBR_TILE=64"],
         ),
+        // M10: hd256 register-O twins. Keep separate SPIR-V so hd128 and the established BM16
+        // production fallback are unchanged.
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256",
+            &["-DHEAD_DIM=256"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256_br64",
+            &["-DHEAD_DIM=256", "-DBR_TILE=64"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256_bda",
+            &["-DHEAD_DIM=256", "-DKV_COOPMAT_BDA"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256_br64_bda",
+            &["-DHEAD_DIM=256", "-DKV_COOPMAT_BDA", "-DBR_TILE=64"],
+        ),
         ("attn_flash_combine", "attn_flash_combine", &[]),
         ("attn_flash_combine_hd256", "attn_flash_combine_hd256", &[]),
         ("attn_softmax", "attn_softmax", &[]),

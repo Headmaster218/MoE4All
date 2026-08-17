@@ -5224,13 +5224,15 @@ impl<'a> Recorder<'a> {
             1,
         );
         // combine → attn
-        let kc2 = self.be.kernel_sg(
-            "attn_flash_combine",
-            crate::gemm::attn_flash_combine_spv(),
-            4,
-            16,
-            32,
-        );
+        let (cname, cspv) = if hd == 256 {
+            (
+                "attn_flash_combine_hd256",
+                crate::gemm::attn_flash_combine_hd256_spv(),
+            )
+        } else {
+            ("attn_flash_combine", crate::gemm::attn_flash_combine_spv())
+        };
+        let kc2 = self.be.kernel_sg(cname, cspv, 4, 16, 32);
         let mut pc2 = [0u8; 16];
         pc2[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pc2[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -5264,9 +5266,32 @@ impl<'a> Recorder<'a> {
         nh: usize,
         nkv: usize,
         pos_offset: usize,
+        kv_addr: Option<(u64, u64)>,
     ) {
         const HD: u32 = 256;
         const BM: u32 = 16;
+        // Register-O is profitable at deep context but requires its 128-row padded contract. Full
+        // 128-row tiles use it; arbitrary tail chunks stay on the established BM16 kernel. The
+        // existing flash_warp knob is the same-binary A/B/fallback escape hatch.
+        if self.vk().flash_warp && n.is_multiple_of(128) {
+            self.attention_prefill_flash_reg(
+                q,
+                kc,
+                vc,
+                attn,
+                po,
+                pm,
+                pl,
+                n,
+                kv_len,
+                nh,
+                nkv,
+                HD as usize,
+                pos_offset,
+                kv_addr,
+            );
+            return;
+        }
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / BM) * nh as u32;
         let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
@@ -5431,17 +5456,34 @@ impl<'a> Recorder<'a> {
         };
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let bda = kv_addr.is_some();
-        let (rname, rspv): (&'static str, &[u32]) = match (br == 64, bda) {
-            (true, true) => (
+        let (rname, rspv): (&'static str, &[u32]) = match (hd, br == 64, bda) {
+            (128, true, true) => (
                 "attn_flash_reg_br64_bda",
                 crate::gemm::attn_flash_reg_br64_bda_spv(),
             ),
-            (true, false) => (
+            (128, true, false) => (
                 "attn_flash_reg_br64",
                 crate::gemm::attn_flash_reg_br64_spv(),
             ),
-            (false, true) => ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv()),
-            (false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
+            (128, false, true) => ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv()),
+            (128, false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
+            (256, true, true) => (
+                "attn_flash_reg_hd256_br64_bda",
+                crate::gemm::attn_flash_reg_hd256_br64_bda_spv(),
+            ),
+            (256, true, false) => (
+                "attn_flash_reg_hd256_br64",
+                crate::gemm::attn_flash_reg_hd256_br64_spv(),
+            ),
+            (256, false, true) => (
+                "attn_flash_reg_hd256_bda",
+                crate::gemm::attn_flash_reg_hd256_bda_spv(),
+            ),
+            (256, false, false) => (
+                "attn_flash_reg_hd256",
+                crate::gemm::attn_flash_reg_hd256_spv(),
+            ),
+            _ => unreachable!("register-O head dim must be 128 or 256"),
         };
         let plen: usize = if bda { 48 } else { 32 };
         let kp = self.be.kernel_sg(rname, rspv, 6, plen as u32, 32);
@@ -5476,13 +5518,15 @@ impl<'a> Recorder<'a> {
             n_splits,
             1,
         );
-        let kc2 = self.be.kernel_sg(
-            "attn_flash_combine",
-            crate::gemm::attn_flash_combine_spv(),
-            4,
-            16,
-            32,
-        );
+        let (cname, cspv) = if hd == 256 {
+            (
+                "attn_flash_combine_hd256",
+                crate::gemm::attn_flash_combine_hd256_spv(),
+            )
+        } else {
+            ("attn_flash_combine", crate::gemm::attn_flash_combine_spv())
+        };
+        let kc2 = self.be.kernel_sg(cname, cspv, 4, 16, 32);
         let mut pc2 = [0u8; 16];
         pc2[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pc2[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -11531,6 +11575,7 @@ mod tests {
                 nh,
                 nkv,
                 pos_offset,
+                None,
             );
         } else {
             rec.attention_prefill_flash(
@@ -12287,6 +12332,9 @@ mod tests {
         let split = be_with(|v| v.flash_splits = Some(4));
         run_attn_flash_reg(&split, 128, 2000, 16, 8, 128);
         run_attn_flash_reg(&split, 200, 600, 2, 1, 128);
+        // M10 hd256 register-O: one unsplit and one forced split-K/GQA case.
+        run_attn_flash_reg(&be, 128, 300, 4, 2, 256);
+        run_attn_flash_reg(&split, 128, 2000, 8, 4, 256);
     }
 
     fn run_attn_flash_reg(

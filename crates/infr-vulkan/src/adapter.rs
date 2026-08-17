@@ -3219,6 +3219,7 @@ fn lower_op(
                             nh,
                             nkv,
                             pos,
+                            kv_addr,
                         );
                     } else {
                         rec.attention_prefill_flash(

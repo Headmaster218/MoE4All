@@ -13,6 +13,12 @@
 #ifndef BR_TILE
 #define BR_TILE 128
 #endif
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#if HEAD_DIM != 128 && HEAD_DIM != 256
+#error "HEAD_DIM must be 128 or 256"
+#endif
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -26,7 +32,9 @@ layout(local_size_x = (BR_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 
 const uint BR = BR_TILE;        // query rows per tile
 const uint BC = 64u;            // kv cols per block
-const uint HD = 128u;
+const uint HD = HEAD_DIM;
+const uint DPT_HD = HD / 8u;
+const uint CT_PER_CW = HD / 32u;
 const uint DPT = 16u;           // vec4 per thread = (HD/2)/4 — each thread owns 64 dims of its row
 const uint WARPS_M = BR_TILE / 32u; // QK warptile row-warps (each owns 32 rows); WARPS_N = BC/32 = 2
 
@@ -96,8 +104,8 @@ void main() {
     uint row = sg * 16u + lane / 2u;  // 0..127
     uint cw = lane & 1u;              // 0/1 → owns dims [cw*64, +64)
 
-    vec4 Of[DPT];
-    [[unroll]] for (uint d = 0u; d < DPT; d++) Of[d] = vec4(0.0);
+    vec4 Of[DPT_HD];
+    [[unroll]] for (uint d = 0u; d < DPT_HD; d++) Of[d] = vec4(0.0);
     if (tid < BR) { mrow[tid] = -1e30; lrow[tid] = 0.0; }
     barrier();
 
@@ -160,7 +168,7 @@ void main() {
 
         // rescale register O by this block's per-row correction
         float e = corr[row];
-        [[unroll]] for (uint d = 0u; d < DPT; d++) Of[d] *= e;
+        [[unroll]] for (uint d = 0u; d < DPT_HD; d++) Of[d] *= e;
 
         // ---- PV: subgroup sg computes panel sg (rows [sg*16,+16)) × HD, 8 col-tiles ----
         uint pvb = sg * 256u;
@@ -181,9 +189,9 @@ void main() {
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             // owned lanes (cw matches this ct) add the 16 dims of this tile into register O
-            if (ct >= cw * 4u && ct < cw * 4u + 4u) {
+            if (ct >= cw * CT_PER_CW && ct < cw * CT_PER_CW + CT_PER_CW) {
                 uint rl = lane / 2u; // row within panel
-                uint base = (ct - cw * 4u) * 16u; // local dim offset 0..63
+                uint base = (ct - cw * CT_PER_CW) * 16u;
                 [[unroll]] for (uint q4 = 0u; q4 < 4u; q4++) {
                     uint ld = base + q4 * 4u;
                     Of[ld / 4u] += vec4(pvsh[pvb + rl * 16u + q4 * 4u + 0u],
@@ -200,8 +208,8 @@ void main() {
     // emit un-normalized partial: Of, m, l
     uint sl = split * pc.q_len;
     uint orow = qr0 + row;
-    uint obase = (sl + orow) * pc.nh * (HD / 4u) + h * (HD / 4u) + cw * 16u;
-    [[unroll]] for (uint d = 0u; d < DPT; d++) po[obase + d] = Of[d];
+    uint obase = (sl + orow) * pc.nh * (HD / 4u) + h * (HD / 4u) + cw * DPT_HD;
+    [[unroll]] for (uint d = 0u; d < DPT_HD; d++) po[obase + d] = Of[d];
     if (cw == 0u) {
         uint idx = (sl + orow) * pc.nh + h;
         pm[idx] = mrow[row];
