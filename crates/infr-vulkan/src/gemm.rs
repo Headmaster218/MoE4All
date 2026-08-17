@@ -533,6 +533,49 @@ pub(crate) fn native_idm_sg_build_spv(
         _ => None,
     }
 }
+
+/// Paged twin of [`native_idm_sg_build_spv`]. The arithmetic and NR/subgroup policy are identical;
+/// only expert-base resolution changes from `arena + id * expert_stride` to
+/// `arena + lut[lut_base + id] * slot_bytes` in `native_gemv_id_multi_sg.comp -DPAGED`.
+pub(crate) fn native_idm_sg_paged_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+    sg16: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr, sg16) {
+        (Q6K, 2, false) => v!("native_idm_q6k_sg2_paged"),
+        (Q6K, 4, false) => v!("native_idm_q6k_sg4_paged"),
+        (Q6K, 8, false) => v!("native_idm_q6k_sg8_paged"),
+        (Q6K, 2, true) => v!("native_idm_q6k_sg2_paged_sg16"),
+        (Q6K, 4, true) => v!("native_idm_q6k_sg4_paged_sg16"),
+        (Q6K, 8, true) => v!("native_idm_q6k_sg8_paged_sg16"),
+        (Q5K, 2, false) => v!("native_idm_q5k_sg2_paged"),
+        (Q5K, 4, false) => v!("native_idm_q5k_sg4_paged"),
+        (Q5K, 8, false) => v!("native_idm_q5k_sg8_paged"),
+        (Q5K, 2, true) => v!("native_idm_q5k_sg2_paged_sg16"),
+        (Q5K, 4, true) => v!("native_idm_q5k_sg4_paged_sg16"),
+        (Q5K, 8, true) => v!("native_idm_q5k_sg8_paged_sg16"),
+        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2_paged"),
+        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4_paged"),
+        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8_paged"),
+        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_sg16"),
+        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_sg16"),
+        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_sg16"),
+        _ => None,
+    }
+}
 /// The id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant. Env-gated
 /// measurement entry ([`crate::recorder::Recorder::linear_mmv_id_multi_q4k`]) + parity tests.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

@@ -9371,10 +9371,8 @@ impl<'a> Recorder<'a> {
     /// ids[slot_idx]]) * slot_bytes` with the layer-LOCAL expert ids moe_topk produced (no host
     /// global-id rewrite; see `shaders/native_gemv_id.comp`'s `-DPAGED` branch — `lut_base` rides
     /// the otherwise-unused `stride` push slot). `lut` is the session's write-once LUT tape window in the inline paths
-    /// (see `MoePagerSession::lut_window`). Always the tree kernel — the SG variant has no paged
-    /// build (Q6_K/Q5_K only, gated off; see `native_id_sg_choice`'s doc — a paged model never
-    /// reaches that gate today since MoE auto-fit picks the pager only on overflow, but this
-    /// keeps the two builds from silently diverging if that changes).
+    /// (see `MoePagerSession::lut_window`). This single-slot helper stays on the tree kernel; the
+    /// production all-slots helper below has paged SG twins for its format-specific decode band.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_paged(
         &self,
@@ -9431,9 +9429,9 @@ impl<'a> Recorder<'a> {
 
     /// [`linear_native_id_multi`]'s paged twin — same local-ids + LUT-window hop as
     /// [`linear_native_id_paged`] (`w_addr = arena_base + uint64_t(lut[lut_base + ids[slot]]) *
-    /// slot_bytes`), for the decode/small-m all-`n_used`-experts-in-one-dispatch path. Always the
-    /// tree kernel (see
-    /// [`linear_native_id_paged`]'s doc for why the SG fast path is skipped).
+    /// slot_bytes`), for the decode/small-m all-`n_used`-experts-in-one-dispatch path. At `rows=1`,
+    /// Q5_K/Q6_K/IQ3_S in the projection band use the same subgroup+NR policy as resident experts;
+    /// all other formats/shapes stay on this function's original tree kernel.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_multi_paged(
         &self,
@@ -9472,6 +9470,18 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
+        if rows == 1 {
+            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
+                if let Some((name, spv)) =
+                    crate::gemm::native_idm_sg_paged_build_spv(dtype, nr, self.sg16())
+                {
+                    let k = self.be.kernel_sg(name, spv, 5, 36, self.sgp());
+                    let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
+                    self.dispatch_wide(k, &bufs, 1, &push, groups);
+                    return;
+                }
+            }
+        }
         let name =
             crate::linear::native_idm_paged_kernel_name(dtype).expect("native idm paged kernel");
         let spv = crate::gemm::native_idm_paged_build_spv(dtype).expect("native idm paged spv");
@@ -10625,6 +10635,24 @@ mod tests {
             );
             assert_eq!(k.variant, old_variant);
         }
+    }
+
+    /// The id-SG tier is deliberately format-specific. Paged and resident dispatchers share this
+    /// selector, so freezing the enrolled set also prevents a future refactor from sending Q4_K or
+    /// IQ4_NL through a subgroup kernel that measured slower (and has no build).
+    #[test]
+    fn id_sg_policy_is_quant_specific() {
+        use infr_core::DType as D;
+        let cfg = infr_core::config::Config::default();
+        let k = &cfg.kernels.vulkan.gemv;
+        for dt in [D::Q5K, D::Q6K, D::Iq3S] {
+            assert_eq!(native_id_sg_choice(dt, 512, 2048, k), Some(2), "{dt:?}");
+        }
+        for dt in [D::Q4K, D::Iq4Nl, D::Iq2S] {
+            assert_eq!(native_id_sg_choice(dt, 512, 2048, k), None, "{dt:?}");
+        }
+        assert_eq!(native_id_sg_choice(D::Q6K, 512, 1024, k), None);
+        assert_eq!(native_id_sg_choice(D::Q6K, 512, 8193, k), None);
     }
 
     /// #4 drift guard: the ONE unified [`moe_mmq_desc`] table must produce, for every dtype in

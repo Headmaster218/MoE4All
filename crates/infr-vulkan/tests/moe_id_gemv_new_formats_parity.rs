@@ -48,6 +48,8 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Iq2S => (256, 82),
         DType::Iq3Xxs => (256, 98),
         DType::Iq3S => (256, 110),
+        DType::Q5K => (256, 176),
+        DType::Q6K => (256, 210),
         DType::Iq1S => (256, 50),
         DType::Iq1M => (256, 56),
         DType::Bf16 | DType::F16 => (1, 2),
@@ -79,6 +81,13 @@ fn synth_block(dt: DType, rng: &mut Rng) -> Vec<u8> {
         DType::Iq2Xxs | DType::Iq2Xs | DType::Iq2S | DType::Iq3Xxs | DType::Iq3S | DType::Iq1S => {
             b[0..2].copy_from_slice(&d16)
         }
+        // K-quants used by the paged-SG regression below. Q5_K carries leading d/dmin; Q6_K's
+        // single d follows ql[128] + qh[64] + scales[16]. Random payload is otherwise valid.
+        DType::Q5K => {
+            b[0..2].copy_from_slice(&d16);
+            b[2..4].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        }
+        DType::Q6K => b[208..210].copy_from_slice(&d16),
         // IQ1_M spreads its f16 d across the four scale-u16s' TOP NIBBLES (bytes 48..56); keep
         // the low 12 bits random (real 3-bit sub-scales) and plant d's nibbles on top.
         DType::Iq1M => {
@@ -360,6 +369,83 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
         }
         assert!(evicted, "{dt:?}: churn sequence must actually evict");
         println!("{dt:?}: paged id + idm under eviction churn OK");
+    }
+}
+
+/// The paged decode route must use the same reassociation-tolerant subgroup+NR kernels as the
+/// resident route for the three deliberately enrolled heavy formats. `out_f=2048` enters the
+/// default SG band; `rows=1` is decode. Scrambled ids and a nontrivial LUT placement prove the
+/// paged shader resolves `lut[lut_base + id]` rather than treating ids as physical slots.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn paged_sg_id_gemv_matches_host() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f, n_expert) = (256usize, 2048usize, 4usize);
+    let stride = in_f * out_f;
+    let ids = [3u32, 0, 2];
+    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let x: Vec<f32> = (0..in_f).map(|i| ((i % 17) as f32 - 8.0) * 0.015).collect();
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    for &dt in &[DType::Q5K, DType::Q6K, DType::Iq3S] {
+        let (epb, bpb) = block_geom(dt);
+        let stride_bytes = stride / epb * bpb;
+        let banks: Vec<Vec<u8>> = (0..n_expert)
+            .map(|e| synth_bank(dt, stride, 0xa117 ^ dt as u64 ^ ((e as u64) << 32)))
+            .collect();
+        let host: Vec<Vec<f32>> = banks
+            .iter()
+            .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+            .collect();
+        let mut pager = GpuPager::new(&be, n_expert, ids.len(), stride_bytes).unwrap();
+        let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
+        // Load in a different order from ids so logical expert id != physical slot.
+        for &eid in &[0u32, 2, 3] {
+            pager
+                .ensure_resident(&be, staging.as_ref(), eid, &banks[eid as usize])
+                .unwrap();
+        }
+        pager.flush_lut(&be).unwrap();
+        let y = be
+            .alloc(ids.len() * out_f * 4, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native_id_multi_paged(
+            dt,
+            pager.arena_addr(),
+            pager.slot_bytes() as u32,
+            pager.lut_buffer(),
+            ids_buf.as_ref(),
+            ids.len(),
+            0,
+            x_buf.as_ref(),
+            false,
+            y.as_ref(),
+            in_f,
+            out_f,
+            1,
+        );
+        rec.finish().unwrap();
+
+        let mut out = vec![0u8; ids.len() * out_f * 4];
+        be.download(y.as_ref(), &mut out).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&out);
+        for (slot, &eid) in ids.iter().enumerate() {
+            let want = host_gemv(&host[eid as usize], &x, in_f, out_f);
+            assert_close(
+                dt,
+                &format!("paged SG expert {eid}"),
+                &got[slot * out_f..(slot + 1) * out_f],
+                &want,
+            );
+        }
+        println!("{dt:?}: paged SG idm OK");
     }
 }
 

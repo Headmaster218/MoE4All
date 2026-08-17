@@ -1529,6 +1529,21 @@ fn main() {
             "native_idm_q6k_sg8",
             &["-DFMT_Q6K", "-DNR=8"],
         ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q6k_sg2_paged",
+            &["-DFMT_Q6K", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q6k_sg4_paged",
+            &["-DFMT_Q6K", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q6k_sg8_paged",
+            &["-DFMT_Q6K", "-DNR=8", "-DPAGED"],
+        ),
         // Q5_K SG id variant: the Qwen3.6-A3B UD-quant stores most expert down-projections as Q5_K
         // (not Q6_K) at the same out_f≈2048 down shape — the heavy K-quant decode still nets out on
         // wave32+subgroupAdd (A/B-confirmed a win; Q4_K stays on the tree). NR ∈ {2,4,8}.
@@ -1546,6 +1561,21 @@ fn main() {
             "native_gemv_id_multi_sg",
             "native_idm_q5k_sg8",
             &["-DFMT_Q5K", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q5k_sg2_paged",
+            &["-DFMT_Q5K", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q5k_sg4_paged",
+            &["-DFMT_Q5K", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q5k_sg8_paged",
+            &["-DFMT_Q5K", "-DNR=8", "-DPAGED"],
         ),
         // IQ3_S SG id variant: the Qwen3.6-35B-A3B UD-IQ3_S quant stores the expert DOWN projection
         // as IQ3_S at the same out_f≈2048 shape the Q5_K/Q6_K band was cut for, and the grid
@@ -1568,6 +1598,21 @@ fn main() {
             "native_gemv_id_multi_sg",
             "native_idm_iq3s_sg8",
             &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg2_paged",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg4_paged",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg8_paged",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
         ),
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),

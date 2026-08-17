@@ -28,17 +28,28 @@ layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
 
 // `rows`: total dispatched-should-be workgroup count is rows*n_used*ceil(out_f/NR) — needed ONLY
 // to bound-check the flat index against a padding workgroup from a possibly-2-D dispatch grid.
-// Resident-BDA (STREAMED is the only weight build): the stacked role tensor lives in a resident
-// BDA arena at the 64-bit base passed as arena_lo/arena_hi; the expert base is `ids[slot_global]`
-// scaled by `stride`, REPURPOSED as the per-expert BYTE stride on the 64-bit pointer (see
-// native_gemv_id.comp's STREAMED doc). No bound weight SSBO exists.
+// Resident-BDA: the stacked role tensor lives at arena_lo/arena_hi; `stride` is the per-expert
+// BYTE stride. -DPAGED instead appends slot_bytes and repurposes `stride` as the layer's LUT-window
+// base, exactly like native_gemv_id_multi.comp. No bound weight SSBO exists in either build.
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#else
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
     uint arena_lo; uint arena_hi;
 } pc;
+#endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
+#ifdef PAGED
+layout(binding = 3) readonly buffer LUTB { uint lut[]; };
+layout(binding = 4) buffer YB { float y_buf[]; };
+#else
 layout(binding = 3) buffer YB { float y_buf[]; };
+#endif
 
 #ifndef NR
 #define NR 2
@@ -81,10 +92,17 @@ void main() {
     uint slot_global = unit / og;                    // (row, slot) flattened — see native_gemv_id_multi
     uint o0 = (unit - slot_global * og) * uint(NR);  // first output row this workgroup owns
     uint row = slot_global / pc.n_used;
-    // Expert base BYTE address straight from `ids`; `pc.stride` is the per-expert BYTE stride.
     // wexp keeps only the small within-expert element offset (0 — the pointer IS the expert base).
+#ifdef PAGED
+    // Layer-local expert id -> frozen LUT-window slot -> 64-bit arena byte address. This is the
+    // same lookup as the tree paged kernel; only the K reduction / NR output grouping differs.
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(lut[pc.stride + ids[slot_global]]) * uint64_t(pc.slot_bytes);
+#else
+    // Resident expert base BYTE address straight from `ids`; `pc.stride` is the expert stride.
     w_addr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
+#endif
     uint wexp = 0u;
     uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
     uint nsub = pc.in_f / 32u;
