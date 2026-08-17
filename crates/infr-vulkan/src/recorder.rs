@@ -928,15 +928,22 @@ impl<'a> Recorder<'a> {
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
         let device = &backend.shared.device;
         let cmd_pool = *backend.shared.cmd_pool.lock().unwrap();
-        let cmd = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0];
+        let cmd = match backend.shared.recorder_cmds.lock().unwrap().pop() {
+            Some(cmd) => {
+                unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
+                    .map_err(|e| be(format!("reset recycled cmd buffer: {e}")))?;
+                cmd
+            }
+            None => unsafe {
+                device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            }
+            .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0],
+        };
         let begin_flags = if persistent {
             // SIMULTANEOUS_USE: the chained decode submits the SAME recorded command buffer n
             // times in one vkQueueSubmit (see RecordedCmd::replay_n) — the buffer must be legal
@@ -945,16 +952,36 @@ impl<'a> Recorder<'a> {
         } else {
             vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
         };
-        unsafe {
+        if let Err(e) = unsafe {
             device.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo::default().flags(begin_flags),
             )
+        } {
+            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+            return Err(be(format!("begin cmd buffer: {e}")));
         }
-        .map_err(|e| be(format!("begin cmd buffer: {e}")))?;
 
         // Big pool: one descriptor set per recorded op.
-        let pool = Self::new_desc_pool(device)?;
+        let pool = match backend.shared.recorder_desc_pools.lock().unwrap().pop() {
+            Some(pool) => {
+                if let Err(e) = unsafe {
+                    device.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+                } {
+                    unsafe { device.destroy_descriptor_pool(pool, None) };
+                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    return Err(be(format!("reset recycled descriptor pool: {e}")));
+                }
+                pool
+            }
+            None => match Self::new_desc_pool(device) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    return Err(e);
+                }
+            },
+        };
 
         // Per-DISPATCH stamps (auto-labels): a batched prefill chunk can record tens of
         // thousands of dispatches; 64k × 8 B = 512 KiB of query pool, profiling runs only.
@@ -9907,12 +9934,14 @@ impl<'a> Recorder<'a> {
             if self.query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.query_pool, None);
             }
-            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in self.pools.borrow().iter() {
-                device.destroy_descriptor_pool(*p, None);
-            }
         }
+        self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        self.be
+            .shared
+            .recorder_desc_pools
+            .lock()
+            .unwrap()
+            .extend(self.pools.borrow_mut().drain(..));
     }
 
     /// End recording, submit once, wait, and release transient objects.
@@ -10005,12 +10034,14 @@ impl<'a> Recorder<'a> {
             if self.prof_ops {
                 device.destroy_query_pool(self.query_pool, None);
             }
-            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in self.pools.borrow().iter() {
-                device.destroy_descriptor_pool(*p, None);
-            }
         }
+        self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        self.be
+            .shared
+            .recorder_desc_pools
+            .lock()
+            .unwrap()
+            .extend(self.pools.borrow_mut().drain(..));
         Ok(())
     }
 
@@ -10046,12 +10077,22 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
-        let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
-            Ok(f) => f,
-            Err(e) => {
-                self.free_transient();
-                return Err(be(format!("create fence: {e}")));
+        let fence = match self.be.shared.recorder_fences.lock().unwrap().pop() {
+            Some(fence) => {
+                if let Err(e) = unsafe { device.reset_fences(&[fence]) } {
+                    unsafe { device.destroy_fence(fence, None) };
+                    self.free_transient();
+                    return Err(be(format!("reset recycled fence: {e}")));
+                }
+                fence
             }
+            None => match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                Ok(f) => f,
+                Err(e) => {
+                    self.free_transient();
+                    return Err(be(format!("create fence: {e}")));
+                }
+            },
         };
         let prof = pager_profile::active();
         let submit_t0 = prof.then(std::time::Instant::now);
@@ -10066,7 +10107,7 @@ impl<'a> Recorder<'a> {
             pager_profile::record_queue_submit(dispatches, t0.elapsed());
         }
         if let Err(e) = submit {
-            unsafe { device.destroy_fence(fence, None) };
+            self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
@@ -10360,13 +10401,14 @@ impl Drop for RecordedCmd {
         let device = &self.shared.device;
         unsafe {
             let _ = device.queue_wait_idle(self.shared.queue);
-            let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
-            for seg in &self.segments {
-                device.free_command_buffers(cmd_pool, &[seg.cmd]);
-                for p in &seg.pools {
-                    device.destroy_descriptor_pool(*p, None);
-                }
-            }
+        }
+        for seg in &self.segments {
+            self.shared.recorder_cmds.lock().unwrap().push(seg.cmd);
+            self.shared
+                .recorder_desc_pools
+                .lock()
+                .unwrap()
+                .extend(seg.pools.iter().copied());
         }
     }
 }
@@ -10409,14 +10451,13 @@ impl PendingSegment {
         if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
             pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
         }
-        unsafe {
-            device.destroy_fence(fence, None);
-            let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in self.pools.drain(..) {
-                device.destroy_descriptor_pool(p, None);
-            }
-        }
+        self.shared.recorder_fences.lock().unwrap().push(fence);
+        self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        self.shared
+            .recorder_desc_pools
+            .lock()
+            .unwrap()
+            .extend(self.pools.drain(..));
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
     }
 }

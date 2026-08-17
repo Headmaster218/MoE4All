@@ -264,6 +264,12 @@ struct VulkanShared {
     queue_family_index: u32,
     /// Serialises all one-shot command-buffer submissions.
     cmd_pool: Mutex<vk::CommandPool>,
+    /// Completed transient recorder command buffers. Acquisition resets one before recording.
+    recorder_cmds: Mutex<Vec<vk::CommandBuffer>>,
+    /// Completed transient recorder descriptor-pool tranches. They are reset on acquisition.
+    recorder_desc_pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// Completed fences from non-blocking recorder submissions. They are reset on acquisition.
+    recorder_fences: Mutex<Vec<vk::Fence>>,
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
@@ -444,6 +450,12 @@ impl Drop for VulkanShared {
             }
             self.device
                 .destroy_pipeline_cache(self.pipeline_cache, None);
+            for pool in self.recorder_desc_pools.lock().unwrap().drain(..) {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            for fence in self.recorder_fences.lock().unwrap().drain(..) {
+                self.device.destroy_fence(fence, None);
+            }
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
@@ -2457,6 +2469,9 @@ impl VulkanBackend {
                 queue,
                 queue_family_index,
                 cmd_pool: Mutex::new(cmd_pool),
+                recorder_cmds: Mutex::new(Vec::new()),
+                recorder_desc_pools: Mutex::new(Vec::new()),
+                recorder_fences: Mutex::new(Vec::new()),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 has_mem_budget,
