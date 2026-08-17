@@ -479,6 +479,10 @@ fn main() {
             "attn_flash_warp_deq_q5_1_bm32",
             &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_1", "-DBM_TILE=32"],
         ),
+        // hd=256 production FlashAttention for 32 KB-shared devices. BM=16 and four column
+        // subgroups plus safe final-tile staging fit in 30,912 B; this is a separate shader so
+        // the established hd=128 variants remain byte-for-byte untouched.
+        ("attn_flash_warp_hd256", "attn_flash_warp_hd256_bm16", &[]),
         ("attn_flash_reg", "attn_flash_reg", &[]),
         // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KB shared devices (NVIDIA, MoltenVK).
         ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),
@@ -495,6 +499,7 @@ fn main() {
             &["-DKV_COOPMAT_BDA", "-DBR_TILE=64"],
         ),
         ("attn_flash_combine", "attn_flash_combine", &[]),
+        ("attn_flash_combine_hd256", "attn_flash_combine_hd256", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),
         ("attn_pv_warp", "attn_pv_warp", &[]),

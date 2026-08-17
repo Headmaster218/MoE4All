@@ -1,0 +1,215 @@
+#version 460
+// Register-blocked FlashAttention partial specialized for head_dim=256 on devices with a 32 KB
+// shared-memory limit. BM=16 plus a final-tile staging slab uses 30,912 bytes. Four subgroup
+// column workers split both the BN=64 QK tile and the HD=256 PV tile, so each subgroup owns one
+// 16x16 score fragment and four 16x16 output fragments. Full tiles read K/V directly; only the
+// capacity-short final tile is staged with bounds checks. Split-K partials are merged by
+// attn_flash_combine_hd256.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = 16u;
+const uint BN = 64u;
+const uint HD = 256u;
+const uint WARPS_N = 4u;
+const uint PV_CMS_N = (HD / WARPS_N) / 16u; // 4
+
+layout(push_constant) uniform PC {
+    uint q_len;     // mpad, multiple of 64 (and therefore BM)
+    uint kv_len;
+    uint nh;
+    uint nkv;
+    uint hd;        // == 256
+    uint pos_offset;
+    uint n_splits;
+    uint ksplit;
+} pc;
+
+layout(binding = 0) readonly buffer QB { float16_t q[]; };
+layout(binding = 1) readonly buffer KB { float16_t k[]; };
+layout(binding = 2) readonly buffer VB { float16_t v[]; };
+layout(binding = 3) writeonly buffer POB { float po[]; }; // [n_splits, mpad, nh, hd]
+layout(binding = 4) writeonly buffer PMB { float pm[]; }; // [n_splits, mpad, nh]
+layout(binding = 5) writeonly buffer PLB { float pl[]; }; // [n_splits, mpad, nh]
+
+shared float Ss[BM * BN];
+shared float16_t Ps[BM * BN];
+shared float Os[BM * HD];
+shared float mrow[BM];
+shared float lrow[BM];
+shared float corr[BM];
+// Reused only for the capacity-short final BN tile. QK uses the first BN*16 values for one K
+// depth slice; PV uses BN*64 values for one 64-dimension V band across the four subgroups.
+shared float16_t KVtail[BN * 64u];
+
+void main() {
+    uint qt = gl_WorkGroupID.x / pc.nh;
+    uint h = gl_WorkGroupID.x % pc.nh;
+    uint split = gl_WorkGroupID.y;
+    uint qr0 = qt * BM;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint li = gl_LocalInvocationIndex;
+    uint warp = gl_SubgroupID; // 0..3, one 16-column QK / 64-column PV band each
+    uint warp_c = warp;
+    uint nhhd = pc.nh * HD;
+    uint nkvhd = pc.nkv * HD;
+    float scale = 1.0 / sqrt(float(HD));
+
+    for (uint i = li; i < BM * HD; i += gl_WorkGroupSize.x) { Os[i] = 0.0; }
+    if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
+    barrier();
+
+    uint qmax = pc.pos_offset + qr0 + BM - 1u;
+    uint kvend = min(min(pc.kv_len, qmax + 1u), split * pc.ksplit + pc.ksplit);
+    for (uint kv0 = split * pc.ksplit; kv0 < kvend; kv0 += BN) {
+        bool tail = kv0 + BN > pc.kv_len;
+        // QK: each subgroup computes all 16 query rows and one 16-column band.
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        if (tail) {
+            [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
+                for (uint i = li; i < BN * 16u; i += gl_WorkGroupSize.x) {
+                    uint kr = i / 16u;
+                    uint d = i % 16u;
+                    KVtail[i] = (kv0 + kr < pc.kv_len)
+                        ? k[(kv0 + kr) * nkvhd + kvh * HD + kf + d]
+                        : float16_t(0.0);
+                }
+                barrier();
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopMatLoad(A, q, qr0 * nhhd + h * HD + kf, nhhd,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                uint col = warp_c * 16u;
+                coopMatLoad(B, KVtail, col * 16u, 16u,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                sacc = coopMatMulAdd(A, B, sacc);
+                barrier();
+            }
+        } else {
+            [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopMatLoad(A, q, qr0 * nhhd + h * HD + kf, nhhd,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                uint col = warp_c * 16u;
+                coopMatLoad(B, k, (kv0 + col) * nkvhd + kvh * HD + kf, nkvhd,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                sacc = coopMatMulAdd(A, B, sacc);
+            }
+        }
+        uint scol = warp_c * 16u;
+        coopMatStore(sacc, Ss, scol, BN, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // Two subgroups cover the 16 rows with four consecutive lanes per row. The other two
+        // subgroups remain active for QK/PV but do not duplicate the online-softmax work.
+        if (warp < 2u) {
+            uint lane = gl_SubgroupInvocationID;
+            uint r = warp * 8u + lane / 4u;
+            uint cg = lane % 4u;
+            uint qpos = pc.pos_offset + qr0 + r;
+            float oldm = mrow[r];
+            float oldl = lrow[r];
+            float lmax = -1e30;
+            [[unroll]] for (uint jj = 0u; jj < 16u; jj++) {
+                uint j = cg * 16u + jj;
+                uint kpos = kv0 + j;
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
+                Ss[r * BN + j] = s;
+                lmax = max(lmax, s);
+            }
+            float rmax = max(oldm, subgroupClusteredMax(lmax, 4u));
+            float cf = exp(oldm - rmax);
+            float lsum = 0.0;
+            [[unroll]] for (uint jj = 0u; jj < 16u; jj++) {
+                uint j = cg * 16u + jj;
+                float p = exp(Ss[r * BN + j] - rmax);
+                Ps[r * BN + j] = float16_t(p);
+                lsum += p;
+            }
+            float rsum = subgroupClusteredAdd(lsum, 4u);
+            if (cg == 0u) {
+                lrow[r] = oldl * cf + rsum;
+                mrow[r] = rmax;
+                corr[r] = cf;
+            }
+        }
+        barrier();
+
+        for (uint i = li; i < BM * HD; i += gl_WorkGroupSize.x) { Os[i] *= corr[i / HD]; }
+        barrier();
+
+        // PV: each subgroup owns all 16 rows and one 64-dimension output band. The tail arm stages
+        // one 16-dimension fragment per subgroup (64 dimensions total) before each fragment GEMM.
+        if (tail) {
+            [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+                uint col = warp_c * (HD / WARPS_N) + j * 16u;
+                for (uint i = li; i < BN * 64u; i += gl_WorkGroupSize.x) {
+                    uint vr = i / 64u;
+                    uint band_d = i % 64u;
+                    uint owner = band_d / 16u;
+                    uint d = band_d % 16u;
+                    uint src_col = owner * (HD / WARPS_N) + j * 16u + d;
+                    KVtail[i] = (kv0 + vr < pc.kv_len)
+                        ? v[(kv0 + vr) * nkvhd + kvh * HD + src_col]
+                        : float16_t(0.0);
+                }
+                barrier();
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+                coopMatLoad(acc, Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint kf = 0u; kf < BN; kf += 16u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                    coopMatLoad(A, Ps, kf, BN, gl_CooperativeMatrixLayoutRowMajor);
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                    coopMatLoad(B, KVtail, kf * 64u + warp_c * 16u, 64u,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc = coopMatMulAdd(A, B, acc);
+                }
+                coopMatStore(acc, Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
+                barrier();
+            }
+        } else {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> oacc[PV_CMS_N];
+            [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+                uint col = warp_c * (HD / WARPS_N) + j * 16u;
+                coopMatLoad(oacc[j], Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint kf = 0u; kf < BN; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopMatLoad(A, Ps, kf, BN, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+                    uint col = warp_c * (HD / WARPS_N) + j * 16u;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                    coopMatLoad(B, v, (kv0 + kf) * nkvhd + kvh * HD + col, nkvhd,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    oacc[j] = coopMatMulAdd(A, B, oacc[j]);
+                }
+            }
+            [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+                uint col = warp_c * (HD / WARPS_N) + j * 16u;
+                coopMatStore(oacc[j], Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+    }
+
+    uint sl = split * pc.q_len;
+    for (uint i = li; i < BM * HD; i += gl_WorkGroupSize.x) {
+        uint r = i / HD;
+        uint d = i % HD;
+        po[(sl + (qr0 + r)) * pc.nh * HD + h * HD + d] = Os[i];
+    }
+    if (li < BM) {
+        uint idx = (sl + (qr0 + li)) * pc.nh + h;
+        pm[idx] = mrow[li];
+        pl[idx] = lrow[li];
+    }
+}

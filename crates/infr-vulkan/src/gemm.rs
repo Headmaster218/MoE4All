@@ -1736,6 +1736,8 @@ const ATTN_FLASH_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp.spv"));
 const ATTN_FLASH_WARP_BM32_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bm32.spv"));
+const ATTN_FLASH_WARP_HD256_BM16_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_hd256_bm16.spv"));
 // Lever 2 on the warp kernel: dequant-in-flash builds that keep the register-tiled warp path.
 const ATTN_FLASH_WARP_DEQ_Q4_0_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q4_0.spv"));
@@ -1781,6 +1783,8 @@ const ATTN_FLASH_REG_BR64_BDA_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg_br64_bda.spv"));
 const ATTN_FLASH_COMBINE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_combine.spv"));
+const ATTN_FLASH_COMBINE_HD256_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_combine_hd256.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
 const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
 const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_warp.spv"));
@@ -1845,6 +1849,7 @@ static ATTN_FLASH_PARTIAL_DEQ_Q5_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_HD256_BM16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q4_0_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q4_0_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q4_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1862,6 +1867,7 @@ static ATTN_FLASH_WARP_BM32_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_BR64_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_COMBINE_HD256_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2120,7 +2126,17 @@ pub(crate) fn attn_flash_reg_bda_spv() -> &'static [u32] {
 pub(crate) fn attn_flash_reg_br64_bda_spv() -> &'static [u32] {
     ATTN_FLASH_REG_BR64_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_BR64_BDA_SPV_BYTES))
 }
-/// Flash-attention split-K combine (merge partials → final O). Recorder use.
+/// hd=256 BM=16 FlashAttention partial (30,912 B shared, four subgroup column workers).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_warp_hd256_bm16_spv() -> &'static [u32] {
+    ATTN_FLASH_WARP_HD256_BM16_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_HD256_BM16_SPV_BYTES))
+}
+/// hd=256 split-K combine: 128 invocations write two output dimensions each.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_combine_hd256_spv() -> &'static [u32] {
+    ATTN_FLASH_COMBINE_HD256_SPV.get_or_init(|| spv_words(ATTN_FLASH_COMBINE_HD256_SPV_BYTES))
+}
+/// Flash-attention split-K combine used by the established hd<=128 path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_combine_spv() -> &'static [u32] {
     ATTN_FLASH_COMBINE_SPV.get_or_init(|| spv_words(ATTN_FLASH_COMBINE_SPV_BYTES))

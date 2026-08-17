@@ -1,0 +1,38 @@
+#version 460
+// Split-K combine for the hd256 FlashAttention partial. The established hd128 combine has one
+// invocation per output dimension; this independent variant lets each of 128 invocations write
+// two dimensions, leaving the existing SPIR-V and dispatch geometry untouched.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint mpad; uint nh; uint hd; uint n_splits; } pc;
+layout(binding = 0) readonly buffer POB { float po[]; }; // [n_splits, mpad, nh, hd]
+layout(binding = 1) readonly buffer PMB { float pm[]; }; // [n_splits, mpad, nh]
+layout(binding = 2) readonly buffer PLB { float pl[]; }; // [n_splits, mpad, nh]
+layout(binding = 3) writeonly buffer OB  { float o[]; }; // [mpad, nh*hd]
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint row = unit / pc.nh;
+    uint h = unit % pc.nh;
+    uint tid = gl_LocalInvocationID.x;
+
+    float m = -1e30;
+    for (uint s = 0u; s < pc.n_splits; s++) {
+        m = max(m, pm[(s * pc.mpad + row) * pc.nh + h]);
+    }
+    float l = 0.0;
+    for (uint s = 0u; s < pc.n_splits; s++) {
+        float ms = pm[(s * pc.mpad + row) * pc.nh + h];
+        l += exp(ms - m) * pl[(s * pc.mpad + row) * pc.nh + h];
+    }
+
+    for (uint d = tid; d < pc.hd; d += 128u) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.n_splits; s++) {
+            float ms = pm[(s * pc.mpad + row) * pc.nh + h];
+            acc += exp(ms - m) * po[((s * pc.mpad + row) * pc.nh + h) * pc.hd + d];
+        }
+        o[row * (pc.nh * pc.hd) + h * pc.hd + d] = (l > 0.0) ? acc / l : 0.0;
+    }
+}

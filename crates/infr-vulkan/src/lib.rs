@@ -39,6 +39,11 @@ pub use tp_sem::{TpExportSemaphore, TpImportSemaphore};
 /// `rows * FLASH_SHARED_PER_ROW <= maxComputeSharedMemorySize`; `use_flash` needs the smallest
 /// tile (`BM=32`) to fit. Keep in sync with `attn_flash{,_warp,_partial}.comp`.
 pub const FLASH_SHARED_PER_ROW: u32 = 908;
+/// Shared-memory bytes used by the dedicated hd256 BM=16 FlashAttention tile. Unlike the hd128
+/// family this is a fixed complete-tile size: `Ss` (4096) + `Ps` (2048) + `Os` (16384) + three
+/// 16-row f32 softmax arrays (192) + the final-tile f16 staging slab (8192) = 30,912 bytes. Keep
+/// in sync with `attn_flash_warp_hd256.comp`.
+pub const FLASH_HD256_BM16_SHARED: u32 = 30_912;
 /// Same, for the register-O flash tile (`sfsh` + `Psh` + `pvsh` + state); smallest tile is `BR=64`.
 /// Keep in sync with `attn_flash_reg.comp`.
 pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;

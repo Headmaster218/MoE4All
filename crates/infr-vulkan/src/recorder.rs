@@ -5245,6 +5245,97 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// hd=256 FlashAttention prefill for 32 KB-shared devices. A fixed BM=16 tile and four
+    /// subgroup column workers plus safe final-tile staging fit in 30,912 B shared memory.
+    /// This is deliberately separate from [`Self::attention_prefill_flash`]: its hd=128 shader
+    /// selection, split heuristic and combine SPIR-V remain untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_flash_hd256(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        attn: &dyn Buffer,
+        po: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        n: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        pos_offset: usize,
+    ) {
+        const HD: u32 = 256;
+        const BM: u32 = 16;
+        let mpad = (n.div_ceil(64) * 64) as u32;
+        let base_wg = (mpad / BM) * nh as u32;
+        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
+            Some(v) => v,
+            None => {
+                if base_wg >= 1024 || kv_len < 4096 {
+                    1u32
+                } else {
+                    (2048 / base_wg.max(1))
+                        .clamp(2, 8)
+                        .min((kv_len / 2048).max(1) as u32)
+                }
+            }
+        };
+        let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
+        let kp = self.be.kernel_sg(
+            "attn_flash_warp_hd256_bm16",
+            crate::gemm::attn_flash_warp_hd256_bm16_spv(),
+            6,
+            32,
+            32,
+        );
+        let mut pp = [0u8; 32];
+        pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        pp[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        pp[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        pp[16..20].copy_from_slice(&HD.to_ne_bytes());
+        pp[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        pp[24..28].copy_from_slice(&n_splits.to_ne_bytes());
+        pp[28..32].copy_from_slice(&ksplit.to_ne_bytes());
+        self.dispatch3(
+            kp,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(po),
+                Self::vkb(pm),
+                Self::vkb(pl),
+            ],
+            3,
+            &pp,
+            base_wg,
+            n_splits,
+            1,
+        );
+
+        let kc2 = self.be.kernel_sg(
+            "attn_flash_combine_hd256",
+            crate::gemm::attn_flash_combine_hd256_spv(),
+            4,
+            16,
+            32,
+        );
+        let mut pc2 = [0u8; 16];
+        pc2[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        pc2[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+        pc2[8..12].copy_from_slice(&HD.to_ne_bytes());
+        pc2[12..16].copy_from_slice(&n_splits.to_ne_bytes());
+        self.dispatch(
+            kc2,
+            &[Self::vkb(po), Self::vkb(pm), Self::vkb(pl), Self::vkb(attn)],
+            1,
+            &pc2,
+            mpad * nh as u32,
+        );
+    }
+
     /// Non-coopmat shared-memory fma flash-attention prefill (`attn_nc_fa.comp`, adapter.rs
     /// `nc_fa_ok` — the Intel Arc tier): fused tile QK^T → online softmax → PV, one workgroup per
     /// (BM-row query tile, head), no subgroup ops, no pinned subgroup size, no scratch buffers.
@@ -11200,6 +11291,9 @@ mod tests {
             (192, 500, 2, 1, 128),
             (80, 300, 9, 3, 64),
             (448, 2000, 16, 8, 128), // qwen3-shaped, multi-block kv
+            (16, 64, 4, 2, 256),     // hd256 minimum BM tile
+            (70, 200, 8, 2, 256),    // hd256 padded query rows + GQA
+            (128, 500, 8, 2, 256),   // hd256 multi-BN-block kv
         ] {
             run_attn_prefill_flash(&be, q, kv, nh, nkv, hd);
         }
@@ -11207,6 +11301,7 @@ mod tests {
         let split = be_with(|v| v.flash_splits = Some(4));
         run_attn_prefill_flash(&split, 64, 2000, 16, 8, 128);
         run_attn_prefill_flash(&split, 128, 500, 2, 1, 128);
+        run_attn_prefill_flash(&split, 64, 2000, 8, 2, 256);
         // Force the bm=32 tile (otherwise only selected on sub-64 KB-shared devices like NVIDIA /
         // MoltenVK) so the small shaders get numeric-parity coverage on any GPU: the fused kernel
         // (hd=64), the warp split-K partial+combine (hd=128), and the non-warp partial
@@ -11260,23 +11355,40 @@ mod tests {
             .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
             .unwrap();
         let rec = be.recorder().unwrap();
-        rec.attention_prefill_flash(
-            bq.as_ref(),
-            bk.as_ref(),
-            bv.as_ref(),
-            bo.as_ref(),
-            po.as_ref(),
-            pmb.as_ref(),
-            plb.as_ref(),
-            q_len,
-            kv_len,
-            nh,
-            nkv,
-            hd,
-            pos_offset,
-            FlashStage::Off,
-            None,
-        );
+        if hd == 256 {
+            rec.attention_prefill_flash_hd256(
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                bo.as_ref(),
+                po.as_ref(),
+                pmb.as_ref(),
+                plb.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                pos_offset,
+            );
+        } else {
+            rec.attention_prefill_flash(
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                bo.as_ref(),
+                po.as_ref(),
+                pmb.as_ref(),
+                plb.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                FlashStage::Off,
+                None,
+            );
+        }
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();

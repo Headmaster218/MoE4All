@@ -2881,23 +2881,27 @@ fn lower_op(
                 // Read ONCE and share: `flash_geom` (below) and `nc_fa_ok` (further down) both floor
                 // on this row count and MUST agree — two reads risked a divergence trap.
                 let flash_min_rows: usize = be_.cfg().kernels.vulkan.flash_min_rows;
+                let flash_hd = hd == 128
+                    || (hd == 256
+                        && be_.max_shared_memory_bytes() >= crate::FLASH_HD256_BM16_SHARED);
                 let flash_geom = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
-                    && hd == 128
-                    // The flash kernels read K/V in BN=64 column tiles, so the last tile over-reads up
-                    // to kv_len.div_ceil(64)*64 rows (masked in softmax, but a real global read the
-                    // direct coopMatLoad arm can't guard). Require the PADDED read width to fit the
-                    // cache's row capacity — the flash analogue of `cap_short` below (nonfa's 256-row
-                    // guard). Byte-identical to the old `kv_len <= att_cap_rows` whenever att_cap_rows
-                    // is 64-aligned / has >=64 slack (the golden ctx sizes); only a tightly-sized,
-                    // non-64-aligned cache (e.g. MTP whole-prompt verify) reroutes to the safe split-K
-                    // path instead of over-reading past the allocation.
-                    && kv_len.div_ceil(64) * 64 <= att_cap_rows
+                    && flash_hd
+                    // The established hd128 shaders directly read a padded final BN=64 tile, so
+                    // require that padded width to fit the cache. The hd256 BM16 shader instead
+                    // stages only its capacity-short final tile with explicit bounds checks, hence
+                    // it is safe when the cache ends at an arbitrary row (notably synthetic d100k).
+                    && (if hd == 256 {
+                        kv_len <= att_cap_rows
+                    } else {
+                        kv_len.div_ceil(64) * 64 <= att_cap_rows
+                    })
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && be_.caps().f16_coopmat()
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 let flash_deq_fmt = if flash_geom
+                    && hd == 128
                     && kdt == vdt
                     // GGUF-block low-bit set only (native_decode dqblk substrate). Q8_0 (planar
                     // cache) and iq4_nl (codebook) stay on the dequant_kv_f16 prepass — see
@@ -2993,7 +2997,7 @@ fn lower_op(
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
                 let flash_stage = if let Some(dt) = flash_deq_fmt {
                     crate::recorder::FlashStage::Dequant(dt)
-                } else if flash_geom && be_.cfg().kernels.vulkan.flash_stage {
+                } else if flash_geom && hd == 128 && be_.cfg().kernels.vulkan.flash_stage {
                     crate::recorder::FlashStage::Stage
                 } else {
                     crate::recorder::FlashStage::Off
@@ -3003,7 +3007,8 @@ fn lower_op(
                 // Only meaningful on the Off (f16) path — the Stage/Dequant builds have no BDA arm — so
                 // gate it there. On RADV/RDNA3 this REGRESSES prefill (~0.8x, no saddr from a
                 // buffer_reference coopmat base), so it stays off by default; kept for other silicon.
-                let kv_coopmat_bda = matches!(flash_stage, crate::recorder::FlashStage::Off)
+                let kv_coopmat_bda = hd == 128
+                    && matches!(flash_stage, crate::recorder::FlashStage::Off)
                     && be_.cfg().kv.coopmat_bda;
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
@@ -3200,23 +3205,40 @@ fn lower_op(
                         (true, Some(ka), Some(va)) => Some((ka, va)),
                         _ => None,
                     };
-                    rec.attention_prefill_flash(
-                        r(*q)?,
-                        kcb,
-                        vcb,
-                        r(*dst)?,
-                        pool[&po].as_ref(),
-                        pool[&pm].as_ref(),
-                        pool[&pl].as_ref(),
-                        rows,
-                        kv_len,
-                        nh,
-                        nkv,
-                        hd,
-                        pos,
-                        flash_stage,
-                        kv_addr,
-                    );
+                    if hd == 256 {
+                        rec.attention_prefill_flash_hd256(
+                            r(*q)?,
+                            kcb,
+                            vcb,
+                            r(*dst)?,
+                            pool[&po].as_ref(),
+                            pool[&pm].as_ref(),
+                            pool[&pl].as_ref(),
+                            rows,
+                            kv_len,
+                            nh,
+                            nkv,
+                            pos,
+                        );
+                    } else {
+                        rec.attention_prefill_flash(
+                            r(*q)?,
+                            kcb,
+                            vcb,
+                            r(*dst)?,
+                            pool[&po].as_ref(),
+                            pool[&pm].as_ref(),
+                            pool[&pl].as_ref(),
+                            rows,
+                            kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            pos,
+                            flash_stage,
+                            kv_addr,
+                        );
+                    }
                 } else if nonfa_ok {
                     let window = match mask {
                         AttnMask::Causal => 0,
