@@ -672,7 +672,16 @@ impl SeamModel {
         // that the rest of this math is exact rather than 5%-shy — that overhang landed as a
         // mid-prefill alloc failure. The placement sweeps derive from the same function, so the
         // context this validates is one placement will actually take (`seam`'s drift tests).
-        crate::seam::kv_fit_ctx_for(&self.cfg, &self.ecfg, fp.total(), &vram, k_fmt, v_fmt)
+        let caps = vk.capabilities();
+        crate::seam::kv_fit_ctx_for(
+            &self.cfg,
+            &caps,
+            &self.ecfg,
+            fp.total(),
+            &vram,
+            k_fmt,
+            v_fmt,
+        )
     }
 
     /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit

@@ -11,7 +11,7 @@
 
 use crate::{dequant_block, Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
-use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Buffer, BufferUsage, Capabilities};
 use infr_core::tensor::DType;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
@@ -596,13 +596,19 @@ pub(crate) fn generate_dense_vulkan_session(
 /// - `nonfa_pv`/`flash_po`: `8*rows*n_head*head_dim*4` per DISTINCT head shape — gemma4 alternates
 ///   SWA(256)/full(512) head dims, so BOTH pools live at once →
 ///   `32*n_head*(head_dim + head_dim_swa-if-distinct)` per row.
-/// - `nonfa_s` (score tiles, non-flash tier only — any model with SWA layers or head_dim != 128):
+/// - `nonfa_s` (score tiles, non-flash tier only): full-context layers whose head dim has no
+///   FlashAttention implementation reserve the full context; when all full-context layers use
+///   flash and only SWA layers miss it, the score span is just `window + chunk`. The established
+///   hd128 path is always scoreless. The hd256 path is scoreless only on a device with the exact
+///   f16 coopmat/shared-memory capabilities its Vulkan shader requires; other devices retain the
+///   conservative non-flash reserve.
 ///   `n_head*rows*kv_pad*2`, kv_pad = kv_len rounded up to 256, i.e. `2*n_head*ctx_pad` per row at
 ///   the final context. ONE live tile, not two: the pool key includes the byte size, so a deep
 ///   prefill does allocate a fresh (larger) tile per chunk, but each chunk's `execute` drops its
 ///   pool before the next one builds — and every layer of a chunk shares one kv_len, so one size
-///   is live at a time. Uniform-hd-128 no-SWA models (llama/qwen3) ride the single-pass flash
-///   tier: no score tiles, only the (negligible) flash_pm/pl partials — term skipped.
+///   is live at a time. Uniform-hd-128 models, plus capability-qualified hd256 models, ride the
+///   single-pass flash tier: no score tiles, only the (negligible) flash_pm/pl partials — term
+///   skipped when no SWA layer remains.
 ///
 /// Times [`ACT_RESERVE_PAD`]. What is deliberately NOT here any more: a fixed 256 MiB that stood
 /// in for gpu-allocator block granularity, retained upload staging and weight-buffer padding.
@@ -614,7 +620,12 @@ pub(crate) fn generate_dense_vulkan_session(
 /// budget, the context-fit math) walks [`ubatch_candidates`] rather than assuming the default
 /// 1024-row chunk — assuming it is what let the KV-format decision and the placement decision
 /// disagree.
-pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
+pub(crate) fn dense_act_reserve_at(
+    cfg: &Config,
+    caps: &Capabilities,
+    want_ctx: usize,
+    ubatch: usize,
+) -> u64 {
     // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
     let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
     // Attention pv accumulators: one pool per distinct (n_head, head_dim) shape.
@@ -624,20 +635,30 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
         cfg.head_dim
     };
     let attn_pv = 32 * cfg.n_head * hd_shapes;
-    // Non-flash score tiles (see the doc above): skipped for uniform-hd-128 no-SWA models.
-    // When ONLY the SWA layers miss the flash tier (hd == 128, e.g. gemma3-12b: full layers are
-    // Causal+hd128 = flash), the widest score tile is the SWA ring's `window + chunk` rows, not
-    // the full context.
-    let attn_s = if cfg.swa_window == 0 && cfg.max_head_dim() == 128 {
-        0
-    } else {
-        let kv_span = if cfg.max_head_dim() == 128 {
-            want_ctx.min(cfg.swa_window + ubatch)
-        } else {
-            want_ctx
-        };
-        2 * cfg.n_head * kv_span.next_multiple_of(256)
+    // Non-flash score tiles (see the doc above). Keep hd128's established reservation behavior;
+    // hd256 is scoreless only when the device can actually take M2's dedicated shader. This must
+    // mirror the adapter's `flash_hd` gate rather than infer support from model geometry alone:
+    // NVIDIA/Intel/older drivers with a smaller shared-memory or coopmat tier still run non-FA.
+    let flash_scoreless = |hd: usize| {
+        hd == 128
+            || (hd == 256
+                && caps.f16_coopmat()
+                && caps.max_shared_memory_bytes >= infr_vulkan::FLASH_HD256_BM16_SHARED)
     };
+    // `n_layer == 0` appears in geometry-only tests/config fragments; preserve the historical
+    // conservative assumption that such a shape represents at least one full-attention layer.
+    let has_full = cfg.n_layer == 0 || (0..cfg.n_layer).any(|l| !cfg.is_swa_layer(l));
+    let has_swa = (0..cfg.n_layer).any(|l| cfg.is_swa_layer(l));
+    let full_needs_scores = has_full && !flash_scoreless(cfg.head_dim);
+    let kv_span = if full_needs_scores {
+        want_ctx
+    } else if has_swa {
+        // FlashAttention is causal-only; SWA layers still use non-FA, but their cache is bounded.
+        want_ctx.min(cfg.swa_window.saturating_add(ubatch))
+    } else {
+        0
+    };
+    let attn_s = 2 * cfg.n_head * kv_span.next_multiple_of(256);
     // MoE expert scratch (`moe_*` / `moe_pgb_*` in the Vulkan adapter). Its pools are sized by
     // (row, expert) PAIRS, not rows — the batched path buckets every row's `n_used` picks and runs
     // them through the expert FFN together — so the per-row cost carries an `n_used` multiplier.
@@ -646,7 +667,12 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     // element plus two f16 scales per 32-element block, on both the `n_embd` and `n_ff_exp` sides).
     let moe = cfg.moe.as_ref().map_or(0, |m| {
         let per_pair = 3 * m.n_ff_exp * 4 + cfg.n_embd * 4 + m.n_ff_exp + cfg.n_embd;
-        m.n_used * per_pair
+        // The paged/batched MoE executor also holds routing, bucket/scatter and quantized-
+        // activation pools beside the expert pair buffers. Their exact set varies with expert
+        // dtype, so use the backend high-water measurement's stable n_embd envelope. Qwen3.6
+        // A3B at 512 rows measured 540 MiB live against 476 MiB without this term; 48*n_embd
+        // raises the reserve to 548 MiB while leaving dense models unchanged.
+        m.n_used * per_pair + 48 * cfg.n_embd
     });
     // qwen35's gated-DeltaNet mixer scratch, which the `n_embd` umbrella above does not cover: its
     // buffers are keyed on the SSM dims, not on n_embd, and a hybrid model held 1.53x the umbrella
@@ -1325,6 +1351,7 @@ pub(crate) fn placement_ring(cfg: &Config, ec: &EngineConfig, k_fmt: DType, v_fm
 /// against the ceiling, in one place so the two cannot price a session differently.
 pub(crate) fn dense_resident_need(
     cfg: &Config,
+    caps: &Capabilities,
     weights: u64,
     want_ctx: usize,
     ring: bool,
@@ -1336,7 +1363,7 @@ pub(crate) fn dense_resident_need(
         .saturating_add(kv_bytes_estimate_fmt(
             cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
         ))
-        .saturating_add(dense_act_reserve_at(cfg, want_ctx, ubatch))
+        .saturating_add(dense_act_reserve_at(cfg, caps, want_ctx, ubatch))
 }
 
 /// Does a fully-resident dense session at this chunk height fit the ALLOCATOR's ceiling?
@@ -1347,6 +1374,7 @@ pub(crate) fn dense_resident_need(
 /// hand out — and then fail on an activation alloc mid-prefill.
 pub(crate) fn dense_placement_fits(
     cfg: &Config,
+    caps: &Capabilities,
     ec: &EngineConfig,
     weights: u64,
     vram: &infr_vulkan::VramInfo,
@@ -1365,7 +1393,7 @@ pub(crate) fn dense_placement_fits(
     } else {
         0
     };
-    dense_resident_need(cfg, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
+    dense_resident_need(cfg, caps, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
         <= vram.alloc_room()
 }
 
@@ -1374,6 +1402,7 @@ pub(crate) fn dense_placement_fits(
 /// walk [`kv_fit_ctx_for`] makes when it decides a context fits.
 pub(crate) fn dense_resident_rung(
     cfg: &Config,
+    caps: &Capabilities,
     ec: &EngineConfig,
     weights: u64,
     vram: &infr_vulkan::VramInfo,
@@ -1383,7 +1412,7 @@ pub(crate) fn dense_resident_rung(
 ) -> Option<usize> {
     ubatch_candidates(ec)
         .into_iter()
-        .find(|&ub| dense_placement_fits(cfg, ec, weights, vram, want_ctx, ub, k_fmt, v_fmt))
+        .find(|&ub| dense_placement_fits(cfg, caps, ec, weights, vram, want_ctx, ub, k_fmt, v_fmt))
 }
 
 /// Streaming budget: what is left of the allocator's ceiling for the dense weight-streaming arenas
@@ -1392,6 +1421,7 @@ pub(crate) fn dense_resident_rung(
 /// and the guard then refuses.
 pub(crate) fn dense_stream_budget_at(
     cfg: &Config,
+    caps: &Capabilities,
     ec: &EngineConfig,
     resident_weights: u64,
     vram: &infr_vulkan::VramInfo,
@@ -1412,6 +1442,7 @@ pub(crate) fn dense_stream_budget_at(
     vram.alloc_room()
         .saturating_sub(dense_resident_need(
             cfg,
+            caps,
             resident_weights,
             want_ctx,
             ring,
@@ -1471,6 +1502,7 @@ const CTX_FIT_SEARCH_CAP: usize = 1 << 22;
 /// separately from this and never walks the dense chunk ladder.
 pub(crate) fn kv_fit_ctx_for(
     cfg: &Config,
+    caps: &Capabilities,
     ec: &EngineConfig,
     weights: u64,
     vram: &infr_vulkan::VramInfo,
@@ -1487,6 +1519,7 @@ pub(crate) fn kv_fit_ctx_for(
         .then(|| (vram.total / 12).max(1024 * 1024 * 1024));
     kv_fit_ctx_in_budget(
         cfg,
+        caps,
         ec,
         vram.alloc_room().saturating_sub(weights),
         moe_reserve,
@@ -1510,6 +1543,7 @@ pub(crate) fn kv_fit_ctx_for(
 /// for a dense model).
 pub(crate) fn kv_fit_ctx_in_budget(
     cfg: &Config,
+    caps: &Capabilities,
     ec: &EngineConfig,
     budget: u64,
     moe_reserve: Option<u64>,
@@ -1525,7 +1559,8 @@ pub(crate) fn kv_fit_ctx_in_budget(
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
             let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
-            let reserve = moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, ctx, ubatch));
+            let reserve =
+                moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, caps, ctx, ubatch));
             kv.saturating_add(reserve) <= budget
         })
     };
@@ -1602,6 +1637,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     let Some(room) = be.device_alloc_room() else {
         return want_ctx;
     };
+    let caps = be.capabilities();
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
     // Walk the chunk ladder HERE too, and price each rung on its own: a shorter chunk shrinks both
@@ -1614,7 +1650,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
-    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt);
+    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, &caps, ec, budget, None, &[ub], k_fmt, v_fmt);
     let Some(_) = at(cands[0]) else {
         return want_ctx; // pure recurrent-state arch: no per-token KV to size.
     };
@@ -1662,7 +1698,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
          memory; set INFR_CTX to override",
         gib(room),
         gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)),
-        gib(dense_act_reserve_at(cfg, fit, ubatch)),
+        gib(dense_act_reserve_at(cfg, &caps, fit, ubatch)),
         gib(POST_KV_DEVICE_RESERVE),
     );
     fit
@@ -1744,6 +1780,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // of layers' banks to a wider format) split into per-(role, slot_bytes) arena pools — see
     // `infr_vulkan::pager`'s MoE-session doc.
     let cache_override = ec.paging.cache;
+    let caps = vk.capabilities();
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut pager_budget_bytes = 0u64;
@@ -2087,7 +2124,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // the fit math validated the context at 256 rows while this went resident at 512).
         let fits = |ubatch: usize, q8: bool| {
             let (k, v) = kv_fmts(q8);
-            dense_placement_fits(cfg, ec, fp.total(), &vram, want_ctx, ubatch, k, v)
+            dense_placement_fits(cfg, &caps, ec, fp.total(), &vram, want_ctx, ubatch, k, v)
         };
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
@@ -2117,7 +2154,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // to decide a context fits, so the rung it lands on here is the rung that math priced.
             // Its first entry is the height `resident` above already priced and rejected.
             let (k, v) = kv_fmts(kv_auto_q8());
-            if let Some(cand) = dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, k, v) {
+            if let Some(cand) =
+                dense_resident_rung(cfg, &caps, ec, fp.total(), &vram, want_ctx, k, v)
+            {
                 pin_ubatch(cand);
                 // Re-read through the pin (a racing earlier set wins — use whatever stuck).
                 if fits(ubatch_rows(ec), kv_auto_q8()) {
@@ -2150,7 +2189,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             && kv_q8_layout_ok(cfg)
         {
             let (k, v) = kv_fmts(true);
-            if let Some(cand) = dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, k, v) {
+            if let Some(cand) =
+                dense_resident_rung(cfg, &caps, ec, fp.total(), &vram, want_ctx, k, v)
+            {
                 pin_kv_auto_q8();
                 if cand != ubatch_rows(ec) {
                     pin_ubatch(cand);
@@ -2209,7 +2250,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // over-states is an arena slot the allocator then refuses.
                 let budget_at = |ub: usize| {
                     let (k, v) = kv_fmts(q8);
-                    dense_stream_budget_at(cfg, ec, base, &vram, want_ctx, ub, k, v)
+                    dense_stream_budget_at(cfg, &caps, ec, base, &vram, want_ctx, ub, k, v)
                 };
                 if !user_pinned_ubatch(ec) && !eligible.is_empty() {
                     let need: u64 = eligible
@@ -3624,6 +3665,21 @@ mod bda_cap_tests {
 #[cfg(test)]
 mod seam_helper_tests {
     use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
+    use infr_core::backend::{Capabilities, COOPMAT_TILE_16};
+
+    /// Arithmetic tests that predate capability-aware hd256 flash use the conservative device:
+    /// it preserves their old non-FA reserve exactly. Dedicated M4 cases opt into the XTX tier.
+    fn conservative_caps() -> Capabilities {
+        Capabilities::default()
+    }
+
+    fn hd256_flash_caps() -> Capabilities {
+        Capabilities {
+            coopmat_f16: Some(COOPMAT_TILE_16),
+            max_shared_memory_bytes: infr_vulkan::FLASH_HD256_BM16_SHARED,
+            ..Default::default()
+        }
+    }
 
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
     // (S4 deleted this crate's duplicate of that grammar — §6.11).
@@ -3975,7 +4031,7 @@ mod seam_helper_tests {
         let need = |ctx: usize, ub: usize| {
             weights
                 + super::kv_bytes_estimate_fmt(cfg, ctx, ring, ub, k, v)
-                + super::dense_act_reserve_at(cfg, ctx, ub)
+                + super::dense_act_reserve_at(cfg, &conservative_caps(), ctx, ub)
         };
         let cands = super::ubatch_candidates(ec);
         let best = |ctx: usize| cands.iter().map(|&ub| need(ctx, ub)).min().expect("ladder");
@@ -4002,16 +4058,39 @@ mod seam_helper_tests {
         let ec = EngineConfig::default();
         let weights = 9 * (1u64 << 30);
         for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
-            let fit =
-                super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), k, v).expect("has KV");
+            let fit = super::kv_fit_ctx_for(
+                &cfg,
+                &conservative_caps(),
+                &ec,
+                weights,
+                &xtx(XTX_FREE),
+                k,
+                v,
+            )
+            .expect("has KV");
             assert_exact_boundary(&cfg, &ec, weights, XTX_ROOM, k, v, fit);
         }
         // q8 is ~half the bytes per token, so it must buy materially more context than f16.
-        let f16 = super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), DType::F16, DType::F16)
-            .expect("has KV");
-        let q8 =
-            super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), DType::Q8_0, DType::Q8_0)
-                .expect("has KV");
+        let f16 = super::kv_fit_ctx_for(
+            &cfg,
+            &conservative_caps(),
+            &ec,
+            weights,
+            &xtx(XTX_FREE),
+            DType::F16,
+            DType::F16,
+        )
+        .expect("has KV");
+        let q8 = super::kv_fit_ctx_for(
+            &cfg,
+            &conservative_caps(),
+            &ec,
+            weights,
+            &xtx(XTX_FREE),
+            DType::Q8_0,
+            DType::Q8_0,
+        )
+        .expect("has KV");
         assert!(q8 > f16, "q8 {q8} must beat f16 {f16}");
         assert!(q8 < 2 * f16, "q8 {q8} is ~2x f16 {f16}, not more");
     }
@@ -4033,10 +4112,26 @@ mod seam_helper_tests {
         let ring = EngineConfig::default();
         assert!(super::kv_ring_wanted(&cfg, &ring) && !super::kv_ring_wanted(&cfg, &no_ring));
         for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
-            let a = super::kv_fit_ctx_for(&cfg, &ring, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), k, v)
-                .expect("has KV");
-            let b = super::kv_fit_ctx_for(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), k, v)
-                .expect("has KV");
+            let a = super::kv_fit_ctx_for(
+                &cfg,
+                &conservative_caps(),
+                &ring,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                k,
+                v,
+            )
+            .expect("has KV");
+            let b = super::kv_fit_ctx_for(
+                &cfg,
+                &conservative_caps(),
+                &no_ring,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                k,
+                v,
+            )
+            .expect("has KV");
             assert_exact_boundary(&cfg, &ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, a);
             assert_exact_boundary(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, b);
             assert!(
@@ -4069,7 +4164,7 @@ mod seam_helper_tests {
         let need = |ub: usize| {
             GEMMA3_12B_WEIGHTS
                 + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, DType::F16, DType::F16)
-                + super::dense_act_reserve_at(&cfg, want, ub)
+                + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
         let cands = super::ubatch_candidates(&ec);
         assert_eq!(cands[0], 1024, "the default chunk leads the ladder");
@@ -4086,6 +4181,7 @@ mod seam_helper_tests {
 
         let fit = super::kv_fit_ctx_for(
             &cfg,
+            &conservative_caps(),
             &ec,
             GEMMA3_12B_WEIGHTS,
             &xtx(XTX_FREE),
@@ -4125,7 +4221,7 @@ mod seam_helper_tests {
         let attn_s: u64 = 2 * 32 * 16384; // ONE non-flash score tile: hd 512 misses the flash tier
         let per_row = 12 * 21504 + 96 * 5376 + attn_pv + attn_s;
         let unpadded = rows * per_row;
-        let got = super::dense_act_reserve_at(&cfg, ctx, ubatch);
+        let got = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
         assert_eq!(
             got,
             unpadded * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1,
@@ -4133,8 +4229,100 @@ mod seam_helper_tests {
         );
         assert_eq!(got, 500_957_184);
         // No fixed term: halving the rows must halve the reserve, which a constant would floor.
-        let half = super::dense_act_reserve_at(&cfg, ctx, 64);
+        let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, 64);
         assert_eq!(half * 2, got, "the reserve is purely per-row");
+    }
+
+    /// M4: M2's hd256 FlashAttention no longer materializes `nonfa_s`, so the placement/context
+    /// budget must not keep charging for that multi-GiB score tile. The discount is capability-
+    /// exact: one byte less shared memory, no 16x16 f16 coopmat, hd512, or an SWA layer all keep
+    /// the corresponding non-flash reserve.
+    #[test]
+    fn hd256_flash_reserve_drops_only_the_score_tile_it_avoids() {
+        let cfg = Config {
+            n_layer: 40,
+            n_head: 16,
+            n_kv: 2,
+            head_dim: 256,
+            head_dim_swa: 256,
+            n_embd: 4096,
+            n_ff: 11008,
+            ..Default::default()
+        };
+        let (ctx, ubatch) = (200_000usize, 1024usize);
+        let conservative = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
+        let flash = super::dense_act_reserve_at(&cfg, &hd256_flash_caps(), ctx, ubatch);
+        let rows = ubatch as u64;
+        let score_per_row = (2 * cfg.n_head * ctx.next_multiple_of(256)) as u64;
+        let expected_score =
+            rows * score_per_row * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1;
+        assert_eq!(
+            conservative - flash,
+            expected_score,
+            "the only removed bytes are the padded nonfa_s score pool"
+        );
+
+        let mut moe_cfg = cfg.clone();
+        moe_cfg.moe = Some(crate::MoeConfig {
+            n_expert: 256,
+            n_used: 8,
+            n_ff_exp: 512,
+            scale: 1.0,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+        });
+        let moe_reserve = super::dense_act_reserve_at(&moe_cfg, &hd256_flash_caps(), ctx, ubatch);
+        let m = moe_cfg.moe.expect("just installed");
+        let per_pair = 3 * m.n_ff_exp * 4 + moe_cfg.n_embd * 4 + m.n_ff_exp + moe_cfg.n_embd;
+        let moe_per_row = m.n_used * per_pair + 48 * moe_cfg.n_embd;
+        let expected_moe =
+            rows * moe_per_row as u64 * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1;
+        assert_eq!(
+            moe_reserve - flash,
+            expected_moe,
+            "MoE keeps its pair scratch plus the measured executor envelope"
+        );
+
+        let mut short_shared = hd256_flash_caps();
+        short_shared.max_shared_memory_bytes = infr_vulkan::FLASH_HD256_BM16_SHARED - 1;
+        assert_eq!(
+            super::dense_act_reserve_at(&cfg, &short_shared, ctx, ubatch),
+            conservative,
+            "a device that cannot fit the shader must retain non-FA scratch"
+        );
+        let mut no_coopmat = hd256_flash_caps();
+        no_coopmat.coopmat_f16 = None;
+        assert_eq!(
+            super::dense_act_reserve_at(&cfg, &no_coopmat, ctx, ubatch),
+            conservative,
+            "scalar/f16 fallback devices must retain non-FA scratch"
+        );
+
+        let mut hd512 = cfg.clone();
+        hd512.head_dim = 512;
+        hd512.head_dim_swa = 512;
+        assert_eq!(
+            super::dense_act_reserve_at(&hd512, &hd256_flash_caps(), ctx, ubatch),
+            super::dense_act_reserve_at(&hd512, &conservative_caps(), ctx, ubatch),
+            "M4 must not discount an unsupported head dimension"
+        );
+
+        let mut mixed_swa = cfg.clone();
+        mixed_swa.swa_window = 1024;
+        mixed_swa.swa_pattern = 6;
+        let mixed = super::dense_act_reserve_at(&mixed_swa, &hd256_flash_caps(), ctx, ubatch);
+        let no_score = flash;
+        let swa_span = (mixed_swa.swa_window + ubatch).next_multiple_of(256);
+        let swa_score = rows * (2 * mixed_swa.n_head * swa_span) as u64 * super::ACT_RESERVE_PAD.0
+            / super::ACT_RESERVE_PAD.1;
+        assert_eq!(
+            mixed - no_score,
+            swa_score,
+            "SWA remains non-flash but reserves only its bounded window"
+        );
     }
 
     /// The ladder is ONE list. Both readers — `vulkan_moe_binder`'s residency / auto-q8 /
@@ -4191,9 +4379,22 @@ mod seam_helper_tests {
         let f16 = (DType::F16, DType::F16);
         // Weights that make a resident session land EXACTLY on the ceiling (KV + reserve priced
         // from the shared primitives, weights = whatever is left of the ceiling).
-        let kv_and_act = super::dense_resident_need(&cfg, 0, ctx, true, ub, f16.0, f16.1);
+        let kv_and_act =
+            super::dense_resident_need(&cfg, &conservative_caps(), 0, ctx, true, ub, f16.0, f16.1);
         let exact = XTX_ROOM - kv_and_act;
-        let fits = |w: u64| super::dense_placement_fits(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
+        let fits = |w: u64| {
+            super::dense_placement_fits(
+                &cfg,
+                &conservative_caps(),
+                &ec,
+                w,
+                &vram,
+                ctx,
+                ub,
+                f16.0,
+                f16.1,
+            )
+        };
         assert!(
             fits(exact),
             "a session that exactly fills the ceiling is resident"
@@ -4215,8 +4416,19 @@ mod seam_helper_tests {
             lm > 0,
             "the layer-major term must be a real subtraction here"
         );
-        let budget =
-            |w: u64| super::dense_stream_budget_at(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
+        let budget = |w: u64| {
+            super::dense_stream_budget_at(
+                &cfg,
+                &conservative_caps(),
+                &ec,
+                w,
+                &vram,
+                ctx,
+                ub,
+                f16.0,
+                f16.1,
+            )
+        };
         assert_eq!(
             budget(exact),
             0,
@@ -4239,6 +4451,7 @@ mod seam_helper_tests {
         assert_eq!(
             super::dense_stream_budget_at(
                 &cfg,
+                &conservative_caps(),
                 &chunk_major,
                 exact - (1 << 30),
                 &vram,
@@ -4285,7 +4498,7 @@ mod seam_helper_tests {
         let need = |ctx: usize, ub: usize| {
             GEMMA3_12B_WEIGHTS
                 + super::kv_bytes_estimate_fmt(&cfg, ctx, true, ub, k, v)
-                + super::dense_act_reserve_at(&cfg, ctx, ub)
+                + super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ub)
         };
         let expect_rung = |ctx: usize| cands.iter().copied().find(|&ub| need(ctx, ub) <= XTX_ROOM);
 
@@ -4299,11 +4512,11 @@ mod seam_helper_tests {
         let want = cfg.n_ctx_train;
         let heavy = XTX_ROOM
             - super::kv_bytes_estimate_fmt(&cfg, want, true, 512, k, v)
-            - super::dense_act_reserve_at(&cfg, want, 512);
+            - super::dense_act_reserve_at(&cfg, &conservative_caps(), want, 512);
         let need_heavy = |ub: usize| {
             heavy
                 + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, k, v)
-                + super::dense_act_reserve_at(&cfg, want, ub)
+                + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
         assert!(need_heavy(1024) > XTX_ROOM, "the default chunk must miss");
         assert!(
@@ -4311,25 +4524,61 @@ mod seam_helper_tests {
             "…and the 512-row rung must save it"
         );
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, heavy, &vram, want, k, v),
+            super::dense_resident_rung(&cfg, &conservative_caps(), &ec, heavy, &vram, want, k, v,),
             Some(512),
             "placement must settle on the rung the fit math priced"
         );
 
         // And at the exact boundary the fit math hands out: placement takes it resident, and one
         // token past it neither of them accepts.
-        let fit =
-            super::kv_fit_ctx_for(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, k, v).expect("has KV");
+        let fit = super::kv_fit_ctx_for(
+            &cfg,
+            &conservative_caps(),
+            &ec,
+            GEMMA3_12B_WEIGHTS,
+            &vram,
+            k,
+            v,
+        )
+        .expect("has KV");
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit, k, v),
+            super::dense_resident_rung(
+                &cfg,
+                &conservative_caps(),
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &vram,
+                fit,
+                k,
+                v,
+            ),
             expect_rung(fit),
         );
         assert!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit, k, v).is_some(),
+            super::dense_resident_rung(
+                &cfg,
+                &conservative_caps(),
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &vram,
+                fit,
+                k,
+                v,
+            )
+            .is_some(),
             "the advertised context must be one placement can hold resident"
         );
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit + 1, k, v),
+            super::dense_resident_rung(
+                &cfg,
+                &conservative_caps(),
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &vram,
+                fit + 1,
+                k,
+                v,
+            ),
             None,
             "one token past the advertised context must miss at EVERY rung — a placement that \
              still says yes here is budgeting against a wider ceiling than the fit math"
@@ -4348,6 +4597,7 @@ mod seam_helper_tests {
         // Weights fill the card: room left is under the 256 MiB fixed activation reserve alone.
         let fit = super::kv_fit_ctx_for(
             &cfg,
+            &conservative_caps(),
             &ec,
             XTX_ROOM - 64 * 1024 * 1024,
             &xtx(XTX_FREE),
@@ -4373,6 +4623,7 @@ mod seam_helper_tests {
         };
         assert!(super::kv_fit_ctx_for(
             &cfg,
+            &conservative_caps(),
             &EngineConfig::default(),
             1 << 30,
             &xtx(XTX_FREE),
@@ -4457,7 +4708,7 @@ mod seam_helper_tests {
 
         // Roomy: the fit is past `want`, so the window is kept rather than raised.
         let roomy = super::kv_bytes_estimate_fmt(&cfg, want, true, 1024, k, v)
-            + super::dense_act_reserve_at(&cfg, want, 1024)
+            + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, 1024)
             + super::POST_KV_DEVICE_RESERVE
             + (1 << 30);
         assert_eq!(call(&RoomOnly(Some(roomy)), &ec), want);
@@ -4468,7 +4719,7 @@ mod seam_helper_tests {
         assert!(got < want, "a tight device must shrink the window: {got}");
         let ub = super::ubatch_rows(&ec);
         let need = super::kv_bytes_estimate_fmt(&cfg, got, true, ub, k, v)
-            + super::dense_act_reserve_at(&cfg, got, ub);
+            + super::dense_act_reserve_at(&cfg, &conservative_caps(), got, ub);
         assert!(
             need <= tight - super::POST_KV_DEVICE_RESERVE,
             "the clamped window must fit the measured budget: {need} > {tight}"

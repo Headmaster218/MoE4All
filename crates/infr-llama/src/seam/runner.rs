@@ -6018,7 +6018,7 @@ pub(crate) fn generate_dense_backend(
         // Both halves of what a prefill holds live, so the comparison stays honest in either
         // order: the per-chunk scratch, plus — layer-major only — the whole prompt's residual
         // stream, which is exactly what the placement budgets were told to leave room for.
-        let reserved = crate::seam::dense_act_reserve_at(c, max_ctx, rows).saturating_add(
+        let reserved = crate::seam::dense_act_reserve_at(c, &caps, max_ctx, rows).saturating_add(
             if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b) {
                 crate::seam::layer_major_act_bytes(c, max_ctx, rows)
             } else {
