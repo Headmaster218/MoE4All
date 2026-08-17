@@ -212,6 +212,13 @@ fn main() {
             &["-DSWA", "-DRING", "-DUSE_PARAMS", "-DSELF_CHUNK"],
         ),
         ("attn_decode", "attn_decode_hd256", &["-DDHD4=64"]),
+        // M9: coupled planar-Q8 decode keeps the compact cache but uses the same arm-pruned hd256
+        // kernel as f16 instead of the multi-purpose attn_partial shader.
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8",
+            &["-DDHD4=64", "-DKVQ8"],
+        ),
         (
             "attn_decode",
             "attn_decode_hd256_dynac",

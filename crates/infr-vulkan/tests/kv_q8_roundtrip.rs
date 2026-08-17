@@ -121,7 +121,9 @@ fn planar_q8_attn_partial_matches_f16() {
         eprintln!("skip: no Vulkan device");
         return;
     };
-    let (nh, nkv, hd) = (4usize, 2usize, 128usize);
+    // hd256 exercises the decode-only coupled-Q8 specialization; the mixed and dynac tests below
+    // retain hd128 coverage of the general attn_partial variants.
+    let (nh, nkv, hd) = (4usize, 2usize, 256usize);
     let kv_len = 96usize;
     let n = kv_len * nkv * hd;
     // Deterministic small values so QK/softmax is well-conditioned.

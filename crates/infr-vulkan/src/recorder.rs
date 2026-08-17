@@ -6556,8 +6556,6 @@ impl<'a> Recorder<'a> {
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
             && kv_ml.is_none()
-            && !k_q8
-            && !v_q8
             && rows == 1
             && canvas_lo.is_none()
             && chunk <= 512
@@ -6568,7 +6566,17 @@ impl<'a> Recorder<'a> {
             // unaffected by NO_HD_SPEC either way.
             && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
-            crate::gemm::attn_decode_kernel(hd, window > 0, false)
+            if k_q8 || v_q8 {
+                // The specialized Q8 build is coupled only. Mixed K/V formats keep
+                // attn_partial's independently typed readers.
+                if k_q8 && v_q8 {
+                    crate::gemm::attn_decode_q8_kernel(hd, window > 0, false)
+                } else {
+                    None
+                }
+            } else {
+                crate::gemm::attn_decode_kernel(hd, window > 0, false)
+            }
         } else {
             None
         };

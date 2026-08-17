@@ -3431,6 +3431,7 @@ dyn_spv!(attn_decode_dynac_spv, "attn_decode_dynac");
 dyn_spv!(attn_decode_swa_spv, "attn_decode_swa");
 dyn_spv!(attn_decode_swa_dynac_spv, "attn_decode_swa_dynac");
 dyn_spv!(attn_decode_hd256_spv, "attn_decode_hd256");
+dyn_spv!(attn_decode_hd256_q8_spv, "attn_decode_hd256_q8");
 dyn_spv!(attn_decode_hd256_dynac_spv, "attn_decode_hd256_dynac");
 dyn_spv!(attn_decode_hd256_swa_spv, "attn_decode_hd256_swa");
 dyn_spv!(
@@ -3483,6 +3484,20 @@ pub(crate) fn attn_decode_kernel(
         ),
         _ => return None,
     })
+}
+
+/// Coupled planar-Q8 decode-only specialization. Keep this deliberately narrow: Qwen3.6's hd256
+/// full-context static decode is the measured bottleneck; every other Q8 shape retains the mature
+/// `attn_partial` path until it has its own parity and performance evidence.
+pub(crate) fn attn_decode_q8_kernel(
+    hd: usize,
+    swa: bool,
+    dynac: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    match (hd, swa, dynac) {
+        (256, false, false) => Some(("attn_decode_hd256_q8", attn_decode_hd256_q8_spv())),
+        _ => None,
+    }
 }
 // PROBE (B7 slice 1): LDS-staged K-tile decode pass 1 — one whole 128-dim dot per THREAD out of
 // shared memory instead of attn_partial's per-key cross-lane `subgroupAdd`. Reachable ONLY from

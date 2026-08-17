@@ -100,6 +100,19 @@ shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-
 
 // f16 K/V vec4 by device address: one f16vec4 (8 B) = two adjacent u32 words = ONE KV2 b64 read with
 // a saddr scalar base. Character-for-character `attn_partial.comp`'s KV_BDA `kread4`/`vread4`.
+#ifdef KVQ8
+// Coupled planar-Q8 K/V: codes int8[cap], then f16 scales[cap/32]. Keep this decode identical to
+// attn_partial_q8_bda while deleting that shader's unrelated format, row-batch and canvas arms.
+vec4 q8read4(uint64_t addr, uint i4) {
+    int cw = int(kv_word(addr, i4));
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(kv_word(addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+vec4 kread4(uint i4) { return q8read4(k_addr, i4); }
+vec4 vread4(uint i4) { return q8read4(v_addr, i4); }
+#else
 vec4 kread4(uint i4) {
     uvec2 w = KV2(k_addr, i4 << 1u);
     return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
@@ -108,6 +121,7 @@ vec4 vread4(uint i4) {
     uvec2 w = KV2(v_addr, i4 << 1u);
     return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
 }
+#endif
 
 void main() {
     uint t = gl_LocalInvocationIndex;
