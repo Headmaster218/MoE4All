@@ -7757,7 +7757,8 @@ impl<'a> Recorder<'a> {
     }
 
     /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
-    /// Env-gated via INFR_DELTA_STRIDED=1. Push constants 32B (adds src_stride to standard).
+    /// Selected for Vulkan single-token decode unless disabled. Push constants 32B (adds
+    /// src_stride to standard).
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_strided(
         &self,
@@ -11050,6 +11051,131 @@ mod tests {
         let b = be.alloc(v.len() * 4, BufferUsage::Staging).unwrap();
         be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
         b
+    }
+
+    fn download_f32(be: &VulkanBackend, b: &dyn Buffer, n: usize) -> Vec<f32> {
+        let mut bytes = vec![0u8; n * 4];
+        be.download(b, &mut bytes).unwrap();
+        bytemuck::cast_slice(&bytes).to_vec()
+    }
+
+    fn run_deltanet_strided_parity(rows: usize, nv: usize, nk: usize, kd: usize, vd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let stride = 2 * nk * kd + nv * vd + 7;
+        let gen = |n: usize, salt: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 17 + salt) % 41) as f32 - 20.0) * scale)
+                .collect()
+        };
+
+        let q = gen(rows * nk * kd, 1, 0.02);
+        let k = gen(rows * nk * kd, 3, 0.018);
+        let v = gen(rows * nv * vd, 5, 0.015);
+        let blog = gen(rows * nv, 7, 0.03);
+        let alpha = gen(rows * nv, 9, 0.025);
+        let acoef: Vec<f32> = gen(nv, 11, 0.01).into_iter().map(|x| x - 0.3).collect();
+        let dtbias = gen(nv, 13, 0.02);
+        let state = gen(nv * kd * vd, 15, 0.002);
+
+        let mut packed = vec![123.0f32; rows * stride];
+        for r in 0..rows {
+            let qb = r * nk * kd;
+            let vb = r * nv * vd;
+            let pb = r * stride;
+            packed[pb..pb + nk * kd].copy_from_slice(&q[qb..qb + nk * kd]);
+            packed[pb + nk * kd..pb + 2 * nk * kd].copy_from_slice(&k[qb..qb + nk * kd]);
+            packed[pb + 2 * nk * kd..pb + 2 * nk * kd + nv * vd]
+                .copy_from_slice(&v[vb..vb + nv * vd]);
+        }
+
+        let bq = upf32(&be, &q);
+        let bk = upf32(&be, &k);
+        let bv = upf32(&be, &v);
+        let bp = upf32(&be, &packed);
+        let bb = upf32(&be, &blog);
+        let ba = upf32(&be, &alpha);
+        let bac = upf32(&be, &acoef);
+        let bdt = upf32(&be, &dtbias);
+        let state_dense = be.alloc(state.len() * 4, BufferUsage::Readback).unwrap();
+        let state_strided = be.alloc(state.len() * 4, BufferUsage::Readback).unwrap();
+        be.upload(state_dense.as_ref(), bytemuck::cast_slice(&state))
+            .unwrap();
+        be.upload(state_strided.as_ref(), bytemuck::cast_slice(&state))
+            .unwrap();
+        let out_len = rows * nv * vd;
+        let out_dense = be.alloc(out_len * 4, BufferUsage::Readback).unwrap();
+        let out_strided = be.alloc(out_len * 4, BufferUsage::Readback).unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.deltanet(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bb.as_ref(),
+            ba.as_ref(),
+            bac.as_ref(),
+            bdt.as_ref(),
+            state_dense.as_ref(),
+            out_dense.as_ref(),
+            rows,
+            nv,
+            nk,
+            kd,
+            vd,
+            1e-6,
+        );
+        rec.finish().unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.deltanet_strided(
+            bp.as_ref(),
+            bp.as_ref(),
+            bp.as_ref(),
+            bb.as_ref(),
+            ba.as_ref(),
+            bac.as_ref(),
+            bdt.as_ref(),
+            state_strided.as_ref(),
+            out_strided.as_ref(),
+            rows,
+            nv,
+            nk,
+            kd,
+            vd,
+            1e-6,
+            stride,
+        );
+        rec.finish().unwrap();
+
+        let dense_out = download_f32(&be, out_dense.as_ref(), out_len);
+        let strided_out = download_f32(&be, out_strided.as_ref(), out_len);
+        let dense_state = download_f32(&be, state_dense.as_ref(), state.len());
+        let strided_state = download_f32(&be, state_strided.as_ref(), state.len());
+        let out_err = dense_out
+            .iter()
+            .zip(&strided_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let state_err = dense_state
+            .iter()
+            .zip(&strided_state)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "deltanet dense/strided rows={rows} output max_err={out_err:e} state max_err={state_err:e}"
+        );
+        assert!(out_err <= 1e-6, "strided output mismatch: {out_err:e}");
+        assert!(state_err <= 1e-6, "strided state mismatch: {state_err:e}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn deltanet_strided_matches_dense() {
+        // Small irregular shape catches row-stride/output-offset mistakes without hiding behind
+        // power-of-two dimensions; the second case is Qwen3.6's production DeltaNet shape.
+        run_deltanet_strided_parity(1, 2, 1, 32, 37);
+        run_deltanet_strided_parity(3, 2, 1, 32, 37);
+        run_deltanet_strided_parity(1, 16, 16, 128, 128);
     }
 
     /// CPU reference for fused per-head QK-norm (RMSNorm over hd) + NEOX RoPE (optional freq_factors).

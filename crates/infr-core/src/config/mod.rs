@@ -329,8 +329,10 @@ cfg_struct! {
         dn_chunk: bool = true,
         /// `INFR_NO_DN_SPLIT` (inverted).
         dn_split: bool = true,
-        /// `INFR_DELTA_STRIDED`. Also read in `infr-llama`'s runner.
-        delta_strided: bool = false,
+        /// Direct interleaved q/k/v reads for single-token Vulkan DeltaNet decode.  Enabled by
+        /// default after dense-vs-strided output/state parity; `INFR_NO_DELTA_STRIDED` disables it
+        /// and the historical `INFR_DELTA_STRIDED` opt-in remains accepted.
+        delta_strided: bool = true,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).

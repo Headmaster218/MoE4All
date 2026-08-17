@@ -87,6 +87,10 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kernels.vulkan.moe_small_m, 8);
     assert_eq!(d.kernels.vulkan.canvas_chunk_n, 3);
     assert!(
+        d.kernels.vulkan.delta_strided,
+        "single-token Vulkan decode should use the copy-free DeltaNet path by default"
+    );
+    assert!(
         d.kernels.vulkan.dn_chunk_scan,
         "positively spelled, read is_err()"
     );
@@ -545,6 +549,25 @@ fn mrows_attn_pair_is_asymmetric() {
     let opt_in = Config::load_from_layers(&[env_layer(&[("INFR_MROWS_ATTN", "1")])]);
     assert_eq!(opt_in.kernels.vulkan.mrows_attn, Some(true));
     assert_eq!(Config::default().kernels.vulkan.mrows_attn, None);
+}
+
+/// M6 ships the copy-free Vulkan decode path by default.  The negative escape hatch must win over
+/// the historical positive opt-in so operators can disable it without first editing old launchers.
+#[test]
+fn delta_strided_defaults_on_and_no_key_wins() {
+    assert!(Config::default().kernels.vulkan.delta_strided);
+
+    let disabled = Config::load_from_layers(&[env_layer(&[("INFR_NO_DELTA_STRIDED", "1")])]);
+    assert!(!disabled.kernels.vulkan.delta_strided);
+
+    let both = Config::load_from_layers(&[env_layer(&[
+        ("INFR_DELTA_STRIDED", "1"),
+        ("INFR_NO_DELTA_STRIDED", "1"),
+    ])]);
+    assert!(
+        !both.kernels.vulkan.delta_strided,
+        "INFR_NO_DELTA_STRIDED must override the legacy opt-in"
+    );
 }
 
 /// `INFR_NO_GEMV_REG` silently wins over `INFR_GEMV_VARIANT` — R1-frozen (§10.11).
@@ -1205,6 +1228,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_ATTN_DECODE",
         "INFR_NO_ATTN_HD",
         "INFR_NO_BM16",
+        "INFR_NO_DELTA_STRIDED",
         "INFR_NO_DN_CHUNK",
         "INFR_NO_DN_SPLIT",
         "INFR_NO_F32_MROW",

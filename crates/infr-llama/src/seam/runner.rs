@@ -2681,10 +2681,12 @@ pub(crate) fn generate_dense_backend(
                     channels: q35_cc as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                // Strided DeltaNet: when INFR_DELTA_STRIDED=1 and batch==1 (decode only —
-                // the chunked prefill path doesn't support stride), q/k/v read from conv_out,
-                // skipping 3 CopyStrided dispatches per layer.
-                let delta_strided = batch == 1 && ec.kernels.vulkan.delta_strided;
+                // Strided DeltaNet: on Vulkan single-token decode, q/k/v read directly from
+                // conv_out, skipping 3 CopyStrided dispatches per layer.  Keep the backend gate
+                // here: CPU/Metal do not lower the Vulkan-only interleaved kernel and must retain
+                // their packed q/k/v buffers even though the shared config default is enabled.
+                let delta_strided =
+                    batch == 1 && be.name() == "vulkan" && ec.kernels.vulkan.delta_strided;
                 if !delta_strided {
                     g.push(Op::CopyStrided {
                         src: dn_convout,

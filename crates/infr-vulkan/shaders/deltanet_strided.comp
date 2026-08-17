@@ -34,7 +34,7 @@ layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [rows, nv]
 layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
 layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
-layout(binding = 8) writeonly buffer OB { float outp[]; };    // [nv*vd]
+layout(binding = 8) writeonly buffer OB { float outp[]; };    // [rows,nv*vd]
 
 shared float ss[128u * COL_BLOCK]; // state block [kd, COL_BLOCK] cached in LDS (kd ≤ 128)
 shared float qn[128];              // normalized q for the current token (kd ≤ 128)
@@ -68,6 +68,7 @@ void main() {
         uint qbase = row_off + hqbase;
         uint kbase = row_off + pc.nk * pc.kd + hqbase; // k at offset nk*kd within row
         uint vbase = row_off + pc.nk * pc.kd * 2u + hvbase; // v at offset 2*nk*kd
+        uint obase = tk * pc.nv * pc.vd + hvbase;
         uint ga = tk * pc.nv + h;
 
         // ── L2-normalize q,k over kd into shared (all threads cooperate; 32 lanes) ──
@@ -123,7 +124,9 @@ void main() {
                 ss[kk * COL_BLOCK + t] = sval;
                 o += qn[kk] * sval;
             }
-            outp[vbase + d] = o;
+            // `vbase` includes the q+k prefix in the interleaved SOURCE.  Output is packed and
+            // must not inherit that prefix (doing so wrote past `outp` even for rows==1).
+            outp[obase + d] = o;
         }
         barrier(); // finish reading qn/kn before the next token overwrites them
     }

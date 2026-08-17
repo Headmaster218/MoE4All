@@ -3686,8 +3686,10 @@ fn lower_op(
                 );
                 transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
-                // Strided DeltaNet (env-gated): when q==k==v (all same source buffer), derive
-                // stride from dimensions: 2*nk*kd + nv*vd.
+                // Strided DeltaNet: when q==k==v (all same source buffer), derive stride from
+                // dimensions: 2*nk*kd + nv*vd.  The runner only forms this graph for Vulkan
+                // single-token decode; the equality check keeps malformed/custom graphs on the
+                // packed fallback.
                 let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
                 if strided {
                     let stride = 2 * nk_ * kd_ + nv_ * vd_;

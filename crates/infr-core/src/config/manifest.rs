@@ -214,6 +214,7 @@ knobs! {
     "INFR_NO_DN_CHUNK"        => "kernels.vulkan.dn_chunk",           PresenceInv, Ignored, "1", migrated;
     "INFR_NO_DN_SPLIT"        => "kernels.vulkan.dn_split",           PresenceInv, Ignored, "1", migrated;
     "INFR_DELTA_STRIDED"      => "kernels.vulkan.delta_strided",      Presence,    Ignored, "1", migrated;
+    "INFR_NO_DELTA_STRIDED"   => "kernels.vulkan.delta_strided",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_PUSH_DESC"       => "kernels.vulkan.push_desc",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_PIPELINE_CACHE"  => "kernels.vulkan.pipeline_cache_disk", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_VRAM_GUARD"      => "kernels.vulkan.no_vram_guard",      Presence,    Ignored, "1", migrated;

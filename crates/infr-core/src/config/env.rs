@@ -263,7 +263,13 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.dn_chunk_scan = presence_inv(get, "INFR_DN_CHUNK_SCAN");
     v.dn_chunk = presence_inv(get, "INFR_NO_DN_CHUNK");
     v.dn_split = presence_inv(get, "INFR_NO_DN_SPLIT");
-    v.delta_strided = presence(get, "INFR_DELTA_STRIDED");
+    // Default-on since M6.  The new NO_ spelling wins when both are present; retain the historical
+    // positive opt-in so old launchers/configuration continue to resolve to the same value.
+    v.delta_strided = if get("INFR_NO_DELTA_STRIDED").is_some() {
+        Some(false)
+    } else {
+        presence(get, "INFR_DELTA_STRIDED")
+    };
     v.push_desc = presence_inv(get, "INFR_NO_PUSH_DESC");
     v.pipeline_cache_disk = presence_inv(get, "INFR_NO_PIPELINE_CACHE");
     v.no_vram_guard = presence(get, "INFR_NO_VRAM_GUARD");
