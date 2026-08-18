@@ -3088,6 +3088,48 @@ impl VulkanBackend {
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
     }
 
+    /// Allocate the paged-MoE arena in DEVICE_LOCAL, HOST_VISIBLE ReBAR memory.
+    ///
+    /// The arena remains the same bounded VRAM cache used by decode and reinterpreted as
+    /// resident layers plus two streaming lanes during prefill. Mapping that VRAM into the CPU
+    /// address space does not create a second physical payload: it only lets the CPU push bytes
+    /// from the unique ordinary-RAM expert store directly into the final cache/LRU destination.
+    /// Requiring DEVICE_LOCAL here is intentional. Falling back to a host-visible system-memory
+    /// heap would silently recreate the full GPU-visible HostWeights mirror this path removes.
+    pub fn alloc_mapped_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        let info = vk::BufferCreateInfo::default()
+            .size(fill_span(bytes))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+            .map_err(|e| be(format!("create_buffer(moe-arena-rebar): {e}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(ty) = self.find_memory_type(requirements.memory_type_bits, want) else {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(be(
+                "paged MoE CPU-push needs DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT ReBAR memory; \
+                 this device exposes no compatible memory type",
+            ));
+        };
+        let buf = self
+            .alloc_vram_mapped(buffer, bytes, &requirements, ty, false, true, true)
+            .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })?;
+        let addr = buf
+            .own_addr
+            .expect("mapped MoE arena built with device_address=true carries an own_addr");
+        tracing::info!(
+            "[infr] paged-MoE arena: {} ReBAR VRAM (DEVICE_LOCAL|HOST_VISIBLE), one CPU mapping, no mirror",
+            fmt_bytes(requirements.size),
+        );
+        Ok((Box::new(buf) as Box<dyn Buffer>, addr))
+    }
+
     /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
     /// [`BdaWeightArena`]). Bump-allocates within the current block at [`BDA_WEIGHT_ALIGN`]; when the
     /// request doesn't fit the current block's remainder, opens a fresh dedicated block (never

@@ -1,8 +1,9 @@
-//! GPU-resident paged weight caches. MoE owns one permanent layer-major HostWeights store and a
-//! shared VRAM arena: Prefill copies complete layers directly into resident/A-B placements, while
-//! Decode resolves `(layer, expert)` offsets into the same store and directly fills expert-LRU
-//! slots. No runtime pin/pack/staging copy exists on the MoE path. Dense streaming retains its
-//! independent staging ring because its sources and scheduling contract are different.
+//! GPU-resident paged weight caches. MoE owns one CPU-only layer-major expert store and a mapped
+//! ReBAR VRAM arena: Prefill CPU-pushes complete layers into resident/A-B placements, while Decode
+//! resolves `(layer, expert)` offsets into the same store and pushes misses into expert-LRU slots.
+//! The full payload exists in physical RAM once and is never exposed as a GPU-visible HostWeights
+//! mirror. Dense streaming retains its independent staging ring because its sources and scheduling
+//! contract are different.
 //!
 //! # Design (block-agnostic core, MoE plugs in today)
 //! [`GpuPager`] only knows about uniform `slot_bytes`-sized blocks keyed by an opaque
@@ -132,6 +133,28 @@ impl GpuPager {
         // Pointer-addressed: no per-arena binding cap — a pool spans as much VRAM as the budget
         // allows (the alloc-time VRAM budget guard is the only backstop).
         let (arena, arena_addr) = vk.alloc_arena_bda(n_slots * slot_bytes)?;
+        Self::new_in_arena(
+            vk,
+            n_blocks,
+            n_slots,
+            slot_bytes,
+            Arc::from(arena),
+            arena_addr,
+            0,
+        )
+    }
+
+    /// MoE twin of [`Self::new`] whose final cache allocation is mapped ReBAR VRAM. Each pool gets
+    /// one allocation so Windows AMD never has to map the whole multi-GiB logical cache as one
+    /// `VkDeviceMemory`; the shader already consumes a per-pool BDA base.
+    fn new_mapped(
+        vk: &VulkanBackend,
+        n_blocks: usize,
+        n_slots: usize,
+        slot_bytes: usize,
+    ) -> Result<Self> {
+        validate_pager_dims(n_slots, slot_bytes)?;
+        let (arena, arena_addr) = vk.alloc_mapped_arena_bda(n_slots * slot_bytes)?;
         Self::new_in_arena(
             vk,
             n_blocks,
@@ -294,17 +317,10 @@ impl GpuPager {
         }
     }
 
-    /// Resolve one block and record a direct DMA from the permanent host expert store into its
-    /// LRU slot. Unlike `plan_staged`, there is no CPU copy and no ring-region lifetime: the
-    /// source allocation lives for the whole model session and its byte offset never changes.
-    fn plan_host_dma(
-        &mut self,
-        rec: &crate::recorder::Recorder<'_>,
-        host_store: &dyn Buffer,
-        host_offset: usize,
-        id: BlockId,
-        scan: bool,
-    ) -> Result<bool> {
+    /// Resolve one block and return its final mapped-ReBAR LRU destination on a miss. The caller
+    /// CPU-pushes from the unique host store straight into that byte range; no GPU-visible host
+    /// source or staging mirror exists.
+    fn plan_cpu_push(&mut self, id: BlockId, scan: bool) -> Result<Option<usize>> {
         let prof = pager_profile::active();
         let lookup_t0 = prof.then(std::time::Instant::now);
         let resolution = if scan {
@@ -320,20 +336,10 @@ impl GpuPager {
             pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
         }
         match resolution {
-            Resolution::Hit { .. } => Ok(false),
+            Resolution::Hit { .. } => Ok(None),
             Resolution::Miss { slot, evicted } => {
-                rec.copy(
-                    host_store,
-                    host_offset,
-                    self.arena.as_ref(),
-                    self.arena_offset + slot as usize * self.slot_bytes,
-                    self.slot_bytes,
-                );
-                if prof {
-                    pager_profile::record_gpu_copy(self.slot_bytes);
-                }
                 self.record_placement(id, slot, evicted);
-                Ok(true)
+                Ok(Some(self.arena_offset + slot as usize * self.slot_bytes))
             }
         }
     }
@@ -677,8 +683,8 @@ fn copy_into_slot(
 //
 // The pieces above are the block-agnostic host<->VRAM cache; everything below is the MoE-specific
 // glue: one [`GpuPager`] POOL per (expert role, per-expert byte size) pair, a table mapping a
-// bound weight BUFFER's identity to its offset in the unique permanent layer-major HostWeights
-// store, and the layer-granular Prefill interpretation of the same VRAM arena.
+// bound weight BUFFER's identity to its offset in the unique CPU-only layer-major store, and the
+// layer-granular Prefill interpretation of the same VRAM arena.
 //
 // Why (role, slot_bytes) pools and not one pager per role: the arena/LUT design requires every
 // block sharing an arena to have the SAME byte size (fixed slot offsets + a word-base LUT), and
@@ -766,8 +772,8 @@ fn stats_suffix(s: &PagerStats) -> String {
 }
 
 /// Load-time description of one paged layer's per-role expert bank. `register` copies this bank
-/// once into the session's permanent layer-major [`BufferUsage::HostWeights`] store, then drops
-/// the `Arc`; runtime paths retain only offsets and never pin, repack, or reread the GGUF mapping.
+/// once into the session's CPU-only layer-major store, then drops the `Arc`; runtime paths retain
+/// only offsets and never pin, repack, or reread the GGUF mapping.
 pub struct ExpertSource {
     pub bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
     pub stride_bytes: usize,
@@ -794,7 +800,10 @@ struct RegisteredExpertSource {
 
 struct HostStoreChunk {
     base_offset: usize,
-    buffer: Box<dyn Buffer>,
+    /// Ordinary CPU-owned memory. It has no VkBuffer, device address, GPU VA, shared-VRAM
+    /// accounting, or second staging allocation. Chunks only avoid one enormous virtual address
+    /// reservation; together they are the sole owned copy of the complete expert payload.
+    bytes: Box<[u8]>,
 }
 
 /// One arena pool: every block in it shares `slot_bytes` (see the section doc above for why the
@@ -817,7 +826,7 @@ struct PrefillPlacement {
     /// identity expert id times the role's expert stride to this base; the decode pool ranges and
     /// their LUTs are deliberately bypassed.
     byte_offset: usize,
-    fixed: bool,
+    pool: usize,
     /// `None` for a resident layer, A=0/B=1 for a streamed layer.
     lane: Option<usize>,
     layer_base: u32,
@@ -827,12 +836,6 @@ struct PrefillPlacement {
 struct PrefillLayerPlacement {
     layer_base: u32,
     banks: Vec<usize>,
-    host_chunk: usize,
-    host_offset: usize,
-    byte_offset: usize,
-    bytes: usize,
-    fixed: bool,
-    lane: Option<usize>,
 }
 
 const PREFILL_BANK_ALIGN: usize = 256;
@@ -843,7 +846,7 @@ fn prefill_align(bytes: usize) -> usize {
 }
 
 /// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools plus the permanent
-/// layer-major HostWeights transfer source. Lives on the `VulkanBackend` HANDLE
+/// CPU-only layer-major source. Lives on the `VulkanBackend` HANDLE
 /// (NOT `VulkanShared` — the session's buffers hold `Arc<VulkanShared>` clones, and parking it on
 /// the shared state made an Arc cycle that leaked the device's whole VRAM footprint until process
 /// exit; see the `moe_pager` field doc in lib.rs) for as long as the backend that loaded the
@@ -851,15 +854,8 @@ fn prefill_align(bytes: usize) -> usize {
 /// cost, zero behavior change on the common (fits-in-VRAM) path.
 pub struct MoePagerSession {
     pools: Vec<Pool>,
-    /// One physical BDA allocation shared by every decode pool and reinterpreted globally by
-    /// layer-granular prefill. Decode pool slot counts are unchanged; each pager owns only a byte
-    /// range in this allocation. Prefill's resident layers and A/B slabs use these same bytes.
-    arena: Arc<dyn Buffer>,
-    arena_addr: u64,
-    arena_bytes: usize,
-    /// The only owned host copy of all paged MoE weights. `HostWeights` is HOST_VISIBLE,
-    /// HOST_CACHED system memory and a Vulkan TRANSFER_SRC, so Prefill and Decode DMA directly
-    /// from these load-time offsets without a runtime staging memcpy.
+    /// The only owned host copy of all paged MoE weights. Plain CPU memory, deliberately not a
+    /// Vulkan buffer: the full payload cannot be counted or accessed as shared/virtual VRAM.
     host_store: Vec<HostStoreChunk>,
     /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
     /// every PAGED `_exps` tensor. A non-paged layer's gate/up/down buffer is never registered
@@ -899,7 +895,7 @@ pub struct MoePagerSession {
 /// shared slot count is dragged down to fit the LARGEST pool's per-slot bytes within the VRAM
 /// budget and strands budget the smaller pools could have used as real hit rate (Scout: uniform
 /// 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-pool sizing gives gate/up 312
-/// each). Each pool has its own LRU/LUT and `stage_role_dma` resolves pools independently, so
+/// each). Each pool has its own LRU/LUT and `push_role_cpu` resolves pools independently, so
 /// unequal counts are correctness-neutral — a pool with fewer slots just misses more often. Computed by
 /// the caller (budget-driven count, then per-pool split — see `seam::mod`'s placement policy).
 pub struct MoePoolSpec {
@@ -908,9 +904,8 @@ pub struct MoePoolSpec {
     pub n_slots: usize,
 }
 
-/// One allocation of the unique permanent HostWeights store. Chunks are split only at complete
-/// layer boundaries to stay below Windows driver allocation limits without ever turning one
-/// Prefill layer into multiple DMA commands.
+/// One chunk of the unique permanent CPU store. Chunks are split only at complete layer boundaries
+/// to avoid one enormous host allocation without ever splitting a Prefill layer push.
 pub struct MoeHostChunkSpec {
     pub base_offset: usize,
     pub bytes: usize,
@@ -955,22 +950,6 @@ fn ring_region_bytes(total: usize, slots: usize, min_slot_bytes: usize) -> usize
 
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
-        let mut pool_offsets = Vec::with_capacity(layout.pools.len());
-        let mut arena_bytes = 0usize;
-        for spec in &layout.pools {
-            arena_bytes = prefill_align(arena_bytes);
-            pool_offsets.push(arena_bytes);
-            let pool_bytes = spec
-                .n_slots
-                .checked_mul(spec.slot_bytes)
-                .ok_or_else(|| be("moe pager: shared arena pool byte size overflow"))?;
-            arena_bytes = arena_bytes
-                .checked_add(pool_bytes)
-                .ok_or_else(|| be("moe pager: shared arena byte size overflow"))?;
-        }
-        arena_bytes = prefill_align(arena_bytes);
-        let (arena_box, arena_addr) = vk.alloc_arena_bda(arena_bytes)?;
-        let arena: Arc<dyn Buffer> = Arc::from(arena_box);
         if layout.host_chunks.is_empty() {
             return Err(be("moe pager: permanent host-store plan has no chunks"));
         }
@@ -984,27 +963,33 @@ impl MoePagerSession {
                 .base_offset
                 .checked_add(spec.bytes)
                 .ok_or_else(|| be("moe pager: host-store chunk range overflow"))?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(spec.bytes).map_err(|e| {
+                be(format!(
+                    "moe pager: cannot reserve {} bytes for the unique CPU expert store: {e}",
+                    spec.bytes,
+                ))
+            })?;
+            bytes.resize(spec.bytes, 0);
             host_store.push(HostStoreChunk {
                 base_offset: spec.base_offset,
-                buffer: vk.alloc_uninit(spec.bytes, BufferUsage::HostWeights)?,
+                bytes: bytes.into_boxed_slice(),
             });
             previous_end = end;
         }
+        let host_payload_bytes: usize = host_store.iter().map(|chunk| chunk.bytes.len()).sum();
+        tracing::info!(
+            "[infr] paged-MoE host store: {} bytes in {} CPU-only layer chunks; GPU-visible host payload = 0 bytes",
+            host_payload_bytes,
+            host_store.len(),
+        );
         let mut pools = Vec::with_capacity(layout.pools.len());
-        for (spec, &pool_offset) in layout.pools.iter().zip(&pool_offsets) {
+        for spec in &layout.pools {
             pools.push(Pool {
                 role: spec.role,
                 slot_bytes: spec.slot_bytes,
                 // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
-                pager: GpuPager::new_in_arena(
-                    vk,
-                    layout.n_blocks,
-                    spec.n_slots,
-                    spec.slot_bytes,
-                    Arc::clone(&arena),
-                    arena_addr + pool_offset as u64,
-                    pool_offset,
-                )?,
+                pager: GpuPager::new_mapped(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
             });
         }
         // One graph's windows = paged layers x roles x n_expert words (Scout: 48 x 3 x 16 = 2.3k)
@@ -1014,9 +999,6 @@ impl MoePagerSession {
         let tape = vk.alloc_uninit(tape_words * 4, BufferUsage::Staging)?;
         Ok(Self {
             pools,
-            arena,
-            arena_addr,
-            arena_bytes,
             host_store,
             sources: HashMap::new(),
             tape,
@@ -1076,11 +1058,11 @@ impl MoePagerSession {
             .ok_or_else(|| be("moe pager: host-store offset overflow"))?;
         let (host_chunk, chunk) = self
             .host_store
-            .iter()
+            .iter_mut()
             .enumerate()
             .find(|(_, chunk)| {
                 source.host_offset >= chunk.base_offset
-                    && end <= chunk.base_offset + chunk.buffer.len_bytes()
+                    && end <= chunk.base_offset + chunk.bytes.len()
             })
             .ok_or_else(|| {
                 be(format!(
@@ -1089,10 +1071,11 @@ impl MoePagerSession {
                 ))
             })?;
         let chunk_offset = source.host_offset - chunk.base_offset;
-        let host_base = as_vk_buf(chunk.buffer.as_ref())?
-            .mapped_ptr()
-            .ok_or_else(|| be("moe pager: permanent host store is not mapped"))?;
-        par_copy_to_mapped(bank, unsafe { host_base.add(chunk_offset) });
+        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
+        chunk.bytes[chunk_offset..chunk_offset + bank.len()].copy_from_slice(bank);
+        if let Some(t0) = copy_t0 {
+            pager_profile::record_memcpy(bank.len(), t0.elapsed());
+        }
         self.sources.insert(
             buf_id,
             (
@@ -1153,8 +1136,9 @@ impl MoePagerSession {
         if !self.prefill_placement.is_empty() {
             return Ok(());
         }
-        let mut grouped: BTreeMap<u32, Vec<(u8, usize, usize, usize, usize)>> = BTreeMap::new();
-        for (&buf_id, (role, _, src)) in &self.sources {
+        let mut grouped: BTreeMap<u32, Vec<(u8, usize, usize, usize, usize, usize)>> =
+            BTreeMap::new();
+        for (&buf_id, (role, pool, src)) in &self.sources {
             let role_order = match role {
                 Role::Gate => 0,
                 Role::Up => 1,
@@ -1163,6 +1147,7 @@ impl MoePagerSession {
             grouped.entry(src.layer_base).or_default().push((
                 role_order,
                 buf_id,
+                *pool,
                 src.bank_bytes,
                 src.host_chunk,
                 src.host_offset,
@@ -1174,16 +1159,16 @@ impl MoePagerSession {
             ));
         }
 
-        let mut layers: Vec<(u32, Vec<(usize, usize, usize)>, usize, usize, usize)> = Vec::new();
+        let mut layers: Vec<(u32, Vec<(usize, usize, usize, usize)>, usize)> = Vec::new();
         for (layer_base, mut banks) in grouped {
-            banks.sort_unstable_by_key(|&(role, buf_id, _, _, _)| (role, buf_id));
+            banks.sort_unstable_by_key(|&(role, buf_id, _, _, _, _)| (role, buf_id));
             let mut offset = 0usize;
             let mut packed = Vec::with_capacity(banks.len());
             let (layer_host_chunk, layer_host_offset) = banks
                 .first()
-                .map(|&(_, _, _, host_chunk, host_offset)| (host_chunk, host_offset))
+                .map(|&(_, _, _, _, host_chunk, host_offset)| (host_chunk, host_offset))
                 .ok_or_else(|| be("moe pager: empty expert layer in host-store plan"))?;
-            for (_, buf_id, bytes, host_chunk, host_offset) in banks {
+            for (_, buf_id, pool, bytes, host_chunk, host_offset) in banks {
                 offset = prefill_align(offset);
                 if host_chunk != layer_host_chunk {
                     return Err(be(format!(
@@ -1199,112 +1184,114 @@ impl MoePagerSession {
                          contiguous (expected {expected})"
                     )));
                 }
-                packed.push((buf_id, offset, bytes));
+                packed.push((buf_id, pool, offset, bytes));
                 offset = offset
                     .checked_add(bytes)
                     .ok_or_else(|| be("moe pager: prefill layer byte size overflow"))?;
             }
-            layers.push((
-                layer_base,
-                packed,
-                prefill_align(offset),
-                layer_host_chunk,
-                layer_host_offset,
-            ));
+            layers.push((layer_base, packed, prefill_align(offset)));
         }
 
-        // Pick complete resident layers globally, not merely a prefix. Large mixed-quant layers
-        // are the best residents twice over: they save the most steady-state PCIe traffic and can
-        // reduce the exact maximum that sizes both A/B slabs. For every possible streamed-size
-        // ceiling, first pin every layer above it (mandatory), then greedily fill the remaining
-        // resident capacity with the largest layers below it. Forty layers and a handful of size
-        // classes make this exhaustive ceiling scan deterministic and negligible at load time.
-        let mut ceilings = vec![0usize];
-        ceilings.extend(layers.iter().map(|(_, _, bytes, _, _)| *bytes));
-        ceilings.sort_unstable();
-        ceilings.dedup();
-        let mut best: Option<(usize, usize, usize, Vec<bool>)> = None;
-        for ceiling in ceilings {
-            let Some(slab_budget) = ceiling.checked_mul(2) else {
-                continue;
-            };
-            if slab_budget > self.arena_bytes {
-                continue;
-            }
-            let mut selected = vec![false; layers.len()];
-            let mut resident_bytes = 0usize;
-            for (idx, (_, _, bytes, _, _)) in layers.iter().enumerate() {
-                if *bytes > ceiling {
-                    selected[idx] = true;
-                    resident_bytes = resident_bytes.saturating_add(*bytes);
+        // Windows AMD rejects one mapped allocation spanning the whole logical cache, so each
+        // existing (role, expert-size) pool is its own ReBAR allocation. Reserve two complete
+        // BANK lanes in every pool, then choose only whole LAYERS whose every bank fits the
+        // remaining resident capacity. A streamed layer uses the same A/B lane in all its pools.
+        let mut pool_bank_bytes = vec![0usize; self.pools.len()];
+        let mut pool_layer_counts = vec![0usize; self.pools.len()];
+        for (_, banks, _) in &layers {
+            for &(_, pool, _, bytes) in banks {
+                if pool_bank_bytes[pool] != 0 && pool_bank_bytes[pool] != bytes {
+                    return Err(be(
+                        "moe pager: one pool contains unequal whole-bank byte sizes",
+                    ));
                 }
+                pool_bank_bytes[pool] = bytes;
+                pool_layer_counts[pool] += 1;
             }
-            let capacity = self.arena_bytes - slab_budget;
-            if resident_bytes > capacity {
+        }
+        let mut resident_capacity = vec![0usize; self.pools.len()];
+        let mut stream_base = vec![0usize; self.pools.len()];
+        let mut total_arena_bytes = 0usize;
+        let mut total_ab_bytes = 0usize;
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
+            let arena_bytes = pool
+                .pager
+                .n_slots()
+                .checked_mul(pool.slot_bytes)
+                .ok_or_else(|| be("moe pager: pool arena byte size overflow"))?;
+            total_arena_bytes = total_arena_bytes.saturating_add(arena_bytes);
+            let bank_bytes = pool_bank_bytes[pool_idx];
+            if bank_bytes == 0 {
                 continue;
             }
-            let mut optional: Vec<usize> =
-                (0..layers.len()).filter(|&idx| !selected[idx]).collect();
-            optional.sort_unstable_by_key(|&idx| std::cmp::Reverse(layers[idx].2));
-            for idx in optional {
-                let bytes = layers[idx].2;
-                if resident_bytes + bytes <= capacity {
-                    selected[idx] = true;
-                    resident_bytes += bytes;
-                }
+            let whole_banks = arena_bytes / bank_bytes;
+            if whole_banks < 2 {
+                return Err(be(format!(
+                    "moe pager: pool {pool_idx} ({arena_bytes} bytes) cannot hold two {bank_bytes}-byte Prefill lanes"
+                )));
             }
-            let max_streamed = layers
+            resident_capacity[pool_idx] = whole_banks
+                .saturating_sub(2)
+                .min(pool_layer_counts[pool_idx]);
+            stream_base[pool_idx] = arena_bytes - 2 * bank_bytes;
+            total_ab_bytes = total_ab_bytes.saturating_add(2 * bank_bytes);
+        }
+
+        let mut resident = vec![false; layers.len()];
+        let mut resident_used = vec![0usize; self.pools.len()];
+        let mut order: Vec<usize> = (0..layers.len()).collect();
+        order.sort_unstable_by_key(|&idx| std::cmp::Reverse(layers[idx].2));
+        for idx in order {
+            let mut need = vec![0usize; self.pools.len()];
+            for &(_, pool, _, _) in &layers[idx].1 {
+                need[pool] += 1;
+            }
+            if need
                 .iter()
                 .enumerate()
-                .filter(|(idx, _)| !selected[*idx])
-                .map(|(_, (_, _, bytes, _, _))| *bytes)
-                .max()
-                .unwrap_or(0);
-            if resident_bytes + 2 * max_streamed > self.arena_bytes {
-                continue;
-            }
-            let count = selected.iter().filter(|&&v| v).count();
-            let better = best
-                .as_ref()
-                .is_none_or(|(best_bytes, best_max, best_count, _)| {
-                    (resident_bytes, std::cmp::Reverse(max_streamed), count)
-                        > (*best_bytes, std::cmp::Reverse(*best_max), *best_count)
-                });
-            if better {
-                best = Some((resident_bytes, max_streamed, count, selected));
+                .all(|(pool, &n)| resident_used[pool].saturating_add(n) <= resident_capacity[pool])
+            {
+                resident[idx] = true;
+                for (pool, n) in need.into_iter().enumerate() {
+                    resident_used[pool] += n;
+                }
             }
         }
-        let Some((resident_bytes, max_streamed, resident_count, resident)) = best else {
-            return Err(be(format!(
-                "moe pager: shared arena ({}) cannot hold two copies of any streamed expert layer",
-                self.arena_bytes,
-            )));
-        };
 
-        let stream_base = self.arena_bytes - 2 * max_streamed;
-        let mut resident_cursor = 0usize;
+        let mut resident_cursor = vec![0usize; self.pools.len()];
         let mut streamed_ordinal = 0usize;
-        for (idx, (layer_base, banks, layer_bytes, host_chunk, host_offset)) in
-            layers.into_iter().enumerate()
-        {
+        let mut resident_bytes = 0usize;
+        let mut max_streamed = 0usize;
+        for (idx, (layer_base, banks, layer_bytes)) in layers.into_iter().enumerate() {
             let fixed = resident[idx];
-            let (layer_offset, lane) = if fixed {
-                resident_cursor = prefill_align(resident_cursor);
-                let off = resident_cursor;
-                resident_cursor += layer_bytes;
-                (off, None)
+            let lane = if fixed {
+                resident_bytes += layer_bytes;
+                None
             } else {
                 let lane = streamed_ordinal % 2;
                 streamed_ordinal += 1;
-                (stream_base + lane * max_streamed, Some(lane))
+                max_streamed = max_streamed.max(layer_bytes);
+                Some(lane)
             };
             let mut bank_ids = Vec::with_capacity(banks.len());
-            for (buf_id, bank_offset, _) in banks {
+            for (buf_id, pool, _host_bank_offset, bank_bytes) in banks {
+                let byte_offset = if fixed {
+                    let off = resident_cursor[pool];
+                    resident_cursor[pool] = resident_cursor[pool]
+                        .checked_add(bank_bytes)
+                        .ok_or_else(|| be("moe pager: resident bank offset overflow"))?;
+                    if resident_cursor[pool] > stream_base[pool] {
+                        return Err(be("moe pager: resident banks overlap a Prefill A/B lane"));
+                    }
+                    off
+                } else {
+                    stream_base[pool] + lane.expect("streamed layer has a lane") * bank_bytes
+                };
                 self.prefill_placement.insert(
                     buf_id,
                     PrefillPlacement {
-                        byte_offset: layer_offset + bank_offset,
-                        fixed,
+                        byte_offset,
+                        pool,
                         lane,
                         layer_base,
                     },
@@ -1314,27 +1301,18 @@ impl MoePagerSession {
             self.prefill_layers.push(PrefillLayerPlacement {
                 layer_base,
                 banks: bank_ids,
-                host_chunk,
-                host_offset,
-                byte_offset: layer_offset,
-                bytes: layer_bytes,
-                fixed,
-                lane,
             });
         }
         self.prefill_max_streamed_layer_bytes = max_streamed;
-        if self.print_stats || pager_profile::active() {
-            eprintln!(
-                "[moe-prefill] shared_arena={} resident_layers={}/{} resident_bytes={} resident_region={} streamed_layer_max={} A/B={} (decode reuses full arena)",
-                self.arena_bytes,
-                resident_count,
-                self.prefill_layers.len(),
-                resident_bytes,
-                stream_base,
-                max_streamed,
-                2 * max_streamed,
-            );
-        }
+        tracing::info!(
+            "[moe-prefill] rebar_pool_arenas={} resident_layers={}/{} resident_bytes={} streamed_layer_max={} per_pool_A/B={} (decode reuses every pool)",
+            total_arena_bytes,
+            resident.iter().filter(|&&v| v).count(),
+            self.prefill_layers.len(),
+            resident_bytes,
+            max_streamed,
+            total_ab_bytes,
+        );
         Ok(())
     }
 
@@ -1466,7 +1444,7 @@ impl MoePagerSession {
     }
 
     /// Open a touch batch on `buf_id`'s pool — call once per (layer, role) residency resolution,
-    /// BEFORE [`Self::stage_role_dma`] resolves that batch. The epoch protects earlier ids from
+    /// BEFORE [`Self::push_role_cpu`] resolves that batch. The epoch protects earlier ids from
     /// later misses while multiple direct copies are recorded.
     pub fn begin_batch(&mut self, buf_id: usize) -> Result<()> {
         let (_, pool, _) = self
@@ -1477,16 +1455,10 @@ impl MoePagerSession {
         Ok(())
     }
 
-    /// Runtime MoE upload path backed by the permanent host-visible expert store. Every miss is a
-    /// direct `vkCmdCopyBuffer(host_store[offset], arena[slot])`; the CPU only updates LRU/LUT
-    /// metadata and never pins or repacks weight bytes.
-    pub fn stage_role_dma(
-        &mut self,
-        rec: &crate::recorder::Recorder<'_>,
-        buf_id: usize,
-        local_ids: &[u32],
-        scan: bool,
-    ) -> Result<usize> {
+    /// Runtime Decode upload path backed by the unique CPU expert store. Every miss is copied
+    /// directly into its final mapped-ReBAR LRU slot. The caller must have drained earlier arena
+    /// readers before invoking this method; small-m Decode already does so before reading route ids.
+    pub fn push_role_cpu(&mut self, buf_id: usize, local_ids: &[u32], scan: bool) -> Result<usize> {
         let (pool_idx, stride, layer_base, host_chunk, host_base) = {
             let (_, pool, src) = self
                 .sources
@@ -1504,26 +1476,35 @@ impl MoePagerSession {
             pools, host_store, ..
         } = self;
         let pager = &mut pools[pool_idx].pager;
-        let host = host_store[host_chunk].buffer.as_ref();
+        let arena_base = as_vk_buf(pager.arena_buffer())?
+            .mapped_ptr()
+            .ok_or_else(|| be("moe pager: ReBAR arena is not mapped"))?;
+        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
+        let mut copied = 0usize;
         for &lid in local_ids {
             let local = lid as usize;
             let src = host_base
                 .checked_add(local.saturating_mul(stride))
                 .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
-            pager.plan_host_dma(rec, host, src, layer_base + lid, scan)?;
+            if let Some(dst) = pager.plan_cpu_push(layer_base + lid, scan)? {
+                let bytes = host_store[host_chunk]
+                    .bytes
+                    .get(src..src + stride)
+                    .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
+                par_copy_to_mapped(bytes, unsafe { arena_base.add(dst) });
+                copied += bytes.len();
+            }
+        }
+        if let Some(t0) = copy_t0 {
+            pager_profile::record_memcpy(copied, t0.elapsed());
         }
         Ok(local_ids.len())
     }
 
-    /// Record one whole-layer DMA straight from the permanent host store to its resident/A-B
-    /// placement. Load-time layout validation guarantees that every role bank and each alignment
-    /// gap have the same relative offset on both sides, so this is exactly one `vkCmdCopyBuffer`
-    /// regardless of split/fused gate-up or mixed quantization.
-    pub fn stage_prefill_layer_dma(
-        &mut self,
-        rec: &crate::recorder::Recorder<'_>,
-        buf_id: usize,
-    ) -> Result<bool> {
+    /// CPU-push one whole layer from the unique host store straight into its final resident/A-B
+    /// ReBAR placement. Load-time layout validation guarantees that every role bank and alignment
+    /// gap has the same relative offset on both sides, so there is no pack/reorder/staging pass.
+    pub fn push_prefill_layer_cpu(&mut self, buf_id: usize) -> Result<bool> {
         self.enter_prefill_layer()?;
         if self.layer_bank_current(buf_id)? {
             return Ok(false);
@@ -1533,28 +1514,38 @@ impl MoePagerSession {
             .get(&buf_id)
             .map(|(_, _, src)| src.layer_base)
             .ok_or_else(|| be("moe pager: layer DMA on an unregistered buffer"))?;
-        let (host_chunk, src_offset, dst_offset, bytes) = self
+        let banks = self
             .prefill_layers
             .iter()
             .find(|layer| layer.layer_base == layer_base)
-            .map(|layer| {
-                (
-                    layer.host_chunk,
-                    layer.host_offset,
-                    layer.byte_offset,
-                    layer.bytes,
-                )
-            })
+            .map(|layer| layer.banks.clone())
             .ok_or_else(|| be("moe pager: layer DMA missing from prefill layout"))?;
-        rec.copy(
-            self.host_store[host_chunk].buffer.as_ref(),
-            src_offset,
-            self.arena.as_ref(),
-            dst_offset,
-            bytes,
-        );
-        if pager_profile::active() {
-            pager_profile::record_gpu_copy(bytes);
+        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
+        let mut copied = 0usize;
+        for bank_id in banks {
+            let placement = *self
+                .prefill_placement
+                .get(&bank_id)
+                .ok_or_else(|| be("moe pager: layer bank has no Prefill placement"))?;
+            let (_, pool, source) = self
+                .sources
+                .get(&bank_id)
+                .ok_or_else(|| be("moe pager: layer bank source disappeared"))?;
+            if *pool != placement.pool {
+                return Err(be("moe pager: Prefill placement points at the wrong pool"));
+            }
+            let src = self.host_store[source.host_chunk]
+                .bytes
+                .get(source.host_offset..source.host_offset + source.bank_bytes)
+                .ok_or_else(|| be("moe pager: prefill CPU-store bank range out of bounds"))?;
+            let dst = as_vk_buf(self.pools[*pool].pager.arena_buffer())?
+                .mapped_ptr()
+                .ok_or_else(|| be("moe pager: ReBAR pool arena is not mapped"))?;
+            par_copy_to_mapped(src, unsafe { dst.add(placement.byte_offset) });
+            copied += src.len();
+        }
+        if let Some(t0) = copy_t0 {
+            pager_profile::record_memcpy(copied, t0.elapsed());
         }
         self.mark_layer_bank_current(buf_id)?;
         Ok(true)
@@ -1589,7 +1580,7 @@ impl MoePagerSession {
     /// Freeze `buf_id`'s layer LUT window — `n_expert` slot indices starting at its `layer_base`,
     /// copied from the pool's host mirror into the tape at `*tape_cursor` — and return the tape
     /// word offset the layer's dispatches pass as `lut_base` (`lut[base + local_id]`). Must be
-    /// called AFTER `stage_role_dma` for that (layer, role) batch completed (the
+    /// called AFTER `push_role_cpu` for that (layer, role) batch completed (the
     /// within-batch LUT rule: the window must reflect every id the batch touched). Errors on
     /// tape overflow instead of wrapping — a wrapped window could alias one an in-flight segment
     /// still reads (the cursor only resets after a full drain; see the `tape` field's doc).
@@ -1641,15 +1632,18 @@ impl MoePagerSession {
     /// The arena buffer `buf_id`'s pool dispatches against (callers gate on [`Self::is_paged`]
     /// first — this errors on an unregistered buffer).
     pub fn arena(&self, buf_id: usize) -> Result<&dyn Buffer> {
-        self.pool_of(buf_id)?;
-        Ok(self.arena.as_ref())
+        Ok(self.pool_of(buf_id)?.pager.arena_buffer())
     }
 
     /// `buf_id`'s pool arena's 64-bit `VkDeviceAddress` — the base the paged kernels scale the LUT
     /// slot index onto (`arena_addr + slot * slot_bytes`). Passed to the shader as a push constant.
     pub fn arena_addr(&self, buf_id: usize) -> Result<u64> {
         if self.mode == MoeArenaMode::PrefillLayer {
-            return Ok(self.arena_addr + self.layer_byte_offset(buf_id)? as u64);
+            let placement = self
+                .prefill_placement
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: no Prefill placement for arena address"))?;
+            return Ok(self.pools[placement.pool].pager.arena_addr() + placement.byte_offset as u64);
         }
         Ok(self.pool_of(buf_id)?.pager.arena_addr())
     }

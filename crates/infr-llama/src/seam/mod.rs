@@ -2021,7 +2021,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // pointer, so it is NOT capped by one SSBO binding's maxStorageBufferRange (~4 GiB on
             // RADV) the way it was when the arena was a bound SSBO. A pool now holds as many experts
             // as its budget share allows — the whole point of the u64 addressing lift. The only
-            // backstop is the alloc-time VRAM budget guard (`GpuPager::new` -> `alloc_arena_bda`);
+            // backstop is the alloc-time VRAM budget guard (`GpuPager::new_mapped` -> per-pool
+            // ReBAR BDA allocation);
             // the proportional split below never over-subscribes VRAM because it partitions
             // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
             let pools: Vec<infr_vulkan::pager::MoePoolSpec> = pool_blocks
@@ -2067,7 +2068,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .collect();
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GB GPU budget; {:.2} GB permanent HostWeights in {host_chunk_count} \
+             {:.2} GB mapped ReBAR pool budget; {:.2} GB CPU-only host store in {host_chunk_count} \
              layer-boundary chunks; ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),

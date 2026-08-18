@@ -8712,7 +8712,8 @@ impl<'a> Recorder<'a> {
             .src_access_mask(
                 vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
-                    | vk::AccessFlags::TRANSFER_WRITE,
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::HOST_WRITE,
             )
             .dst_access_mask(
                 vk::AccessFlags::SHADER_READ
@@ -8722,7 +8723,9 @@ impl<'a> Recorder<'a> {
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[mb],
@@ -10169,7 +10172,11 @@ impl<'a> Recorder<'a> {
     /// this one barrier orders the whole segment after everything already submitted.
     pub fn seed_barrier(&self) {
         let mb = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .src_access_mask(
+                vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::HOST_WRITE,
+            )
             .dst_access_mask(
                 vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
@@ -10179,7 +10186,9 @@ impl<'a> Recorder<'a> {
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[mb],

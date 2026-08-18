@@ -689,7 +689,7 @@ pub fn print_summary_if_enabled() {
     );
     let _ = writeln!(
         out,
-        "host->staging memcpy: count={} bytes={} time={} bw={:.2} GB/s",
+        "host memcpy / ReBAR push: count={} bytes={} time={} bw={:.2} GB/s",
         s.memcpys,
         fmt_bytes(s.memcpy_bytes),
         fmt_ns(s.memcpy_ns),
@@ -705,7 +705,7 @@ pub fn print_summary_if_enabled() {
     );
     let _ = writeln!(
         out,
-        "layer prefetch enqueue overlap: windows={} compute_live_at_copy_start={} ({:.1}%) compute_live_after_all_copies_enqueued={} ({:.1}%) [GPU completion: verify with RGP]",
+        "layer prefetch overlap: windows={} compute_live_at_push_start={} ({:.1}%) compute_live_after_push={} ({:.1}%) [GPU completion: verify with RGP]",
         s.prefetch_windows,
         s.prefetch_compute_live_at_start,
         if s.prefetch_windows == 0 {
