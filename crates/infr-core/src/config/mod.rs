@@ -151,6 +151,9 @@ cfg_struct! {
         /// Two preserves the historical double buffer; larger values let CPU staging run farther
         /// ahead of queued GPU work without changing the ring's total byte budget.
         ring_slots: usize = 2,
+        /// Keep as many complete expert layers resident as fit and stream the remainder as whole
+        /// layers during prefill. Decode reuses the same arena as the ordinary expert LRU.
+        moe_layer_stream: bool = true,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier

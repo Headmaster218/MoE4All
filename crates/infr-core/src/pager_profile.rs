@@ -44,6 +44,9 @@ struct Counters {
     staging_acquire_ns: AtomicU64,
     staging_waits: AtomicU64,
     staging_wait_ns: AtomicU64,
+    prefetch_windows: AtomicU64,
+    prefetch_compute_live_at_start: AtomicU64,
+    prefetch_compute_live_after_enqueue: AtomicU64,
 
     gpu_copies: AtomicU64,
     gpu_copy_bytes: AtomicU64,
@@ -114,6 +117,9 @@ impl Counters {
             staging_acquire_ns: AtomicU64::new(0),
             staging_waits: AtomicU64::new(0),
             staging_wait_ns: AtomicU64::new(0),
+            prefetch_windows: AtomicU64::new(0),
+            prefetch_compute_live_at_start: AtomicU64::new(0),
+            prefetch_compute_live_after_enqueue: AtomicU64::new(0),
 
             gpu_copies: AtomicU64::new(0),
             gpu_copy_bytes: AtomicU64::new(0),
@@ -230,6 +236,9 @@ pub struct Snapshot {
     pub staging_acquire_ns: u64,
     pub staging_waits: u64,
     pub staging_wait_ns: u64,
+    pub prefetch_windows: u64,
+    pub prefetch_compute_live_at_start: u64,
+    pub prefetch_compute_live_after_enqueue: u64,
 
     pub gpu_copies: u64,
     pub gpu_copy_bytes: u64,
@@ -436,6 +445,25 @@ pub fn record_staging_wait(elapsed: Duration) {
         .fetch_add(ns(elapsed), Ordering::Relaxed);
 }
 
+/// Record whether layer N was still executing when N+1's copy window opened and after every
+/// N+1 copy command had been enqueued. This is a non-blocking host-side fence sample; GPU
+/// completion overlap still belongs to an RGP timeline, but this proves the scheduler did not
+/// serialize the copy submission behind N.
+#[inline]
+pub fn record_prefetch_window(compute_live_at_start: bool, compute_live_after_enqueue: bool) {
+    COUNTERS.prefetch_windows.fetch_add(1, Ordering::Relaxed);
+    if compute_live_at_start {
+        COUNTERS
+            .prefetch_compute_live_at_start
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if compute_live_after_enqueue {
+        COUNTERS
+            .prefetch_compute_live_after_enqueue
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[inline]
 pub fn record_gpu_copy(bytes: usize) {
     COUNTERS.gpu_copies.fetch_add(1, Ordering::Relaxed);
@@ -576,6 +604,9 @@ pub fn snapshot() -> Snapshot {
         staging_acquire_ns: load(&COUNTERS.staging_acquire_ns),
         staging_waits: load(&COUNTERS.staging_waits),
         staging_wait_ns: load(&COUNTERS.staging_wait_ns),
+        prefetch_windows: load(&COUNTERS.prefetch_windows),
+        prefetch_compute_live_at_start: load(&COUNTERS.prefetch_compute_live_at_start),
+        prefetch_compute_live_after_enqueue: load(&COUNTERS.prefetch_compute_live_after_enqueue),
 
         gpu_copies: load(&COUNTERS.gpu_copies),
         gpu_copy_bytes: load(&COUNTERS.gpu_copy_bytes),
@@ -671,6 +702,23 @@ pub fn print_summary_if_enabled() {
         fmt_ns(s.staging_acquire_ns),
         s.staging_waits,
         fmt_ns(s.staging_wait_ns),
+    );
+    let _ = writeln!(
+        out,
+        "layer prefetch enqueue overlap: windows={} compute_live_at_copy_start={} ({:.1}%) compute_live_after_all_copies_enqueued={} ({:.1}%) [GPU completion: verify with RGP]",
+        s.prefetch_windows,
+        s.prefetch_compute_live_at_start,
+        if s.prefetch_windows == 0 {
+            0.0
+        } else {
+            100.0 * s.prefetch_compute_live_at_start as f64 / s.prefetch_windows as f64
+        },
+        s.prefetch_compute_live_after_enqueue,
+        if s.prefetch_windows == 0 {
+            0.0
+        } else {
+            100.0 * s.prefetch_compute_live_after_enqueue as f64 / s.prefetch_windows as f64
+        },
     );
     let _ = writeln!(
         out,

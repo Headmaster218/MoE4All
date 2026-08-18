@@ -5425,9 +5425,8 @@ fn pooled_usage(
     Ok(key)
 }
 
-/// Host side of the paged-MoE execution stream, per `execute_static` call: the pipelined
-/// in-flight segments plus the cursors into the session's upload ring and LUT tape (the buffers
-/// live on `MoePagerSession`; every call ends fully drained, so cursors start at zero).
+/// Host side of paged execution, per `execute_static` call: Dense streaming owns the ring cursor,
+/// MoE owns the LUT cursor plus direct HostWeights copy/compute queues, and both end fully drained.
 ///
 /// Ring rotation (`rotate_stream`): when the current ring half can't hold a miss, the ambient
 /// recorder is submitted WITHOUT waiting (`Recorder::finish_nowait`) and staging continues into
@@ -5445,6 +5444,12 @@ struct PagedStream {
     cursor: usize,
     /// Words used in the session's LUT tape (reset only after full drains — `sync_stream`).
     tape_cursor: usize,
+    /// Prefill compute segments that do not consume a staging-ring region.
+    compute_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
+    /// Direct HostWeights→arena copy segments. Their source is permanent and consumes no ring
+    /// region, so coupling them to `pending[half]` would create false backpressure and retain the
+    /// old staging-ring lifetime model on the new MoE path.
+    copy_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
 }
 
 impl PagedStream {
@@ -5462,6 +5467,12 @@ impl PagedStream {
             if let Some(s) = p.take() {
                 s.wait().map_err(|e| be(e.to_string()))?;
             }
+        }
+        while let Some(s) = self.compute_pending.pop_front() {
+            s.wait().map_err(|e| be(e.to_string()))?;
+        }
+        while let Some(s) = self.copy_pending.pop_front() {
+            s.wait().map_err(|e| be(e.to_string()))?;
         }
         Ok(())
     }
@@ -5500,6 +5511,69 @@ fn rotate_stream<'a>(
         infr_core::pager_profile::record_staging_acquire(elapsed);
     }
     Ok(())
+}
+
+/// Submit a direct copy-only prefetch recorder. The permanent HostWeights source needs no ring
+/// lifetime; retain only a bounded number of command-buffer/fence objects.
+fn submit_prefetch_copy<'a>(rec: &mut Option<Recorder<'a>>, ps: &mut PagedStream) -> Result<()> {
+    let seg = rec
+        .take()
+        .expect("prefetch copy recorder is present")
+        .finish_nowait()
+        .map_err(|e| be(e.to_string()))?;
+    ps.copy_pending.push_back(seg);
+    while ps.copy_pending.len() > 2 {
+        let old = ps.copy_pending.pop_front().expect("len > 2");
+        old.wait().map_err(|e| be(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Close layer N's compute segment before recording N+1's copy segment. If N staged bytes from
+/// the current ring region, its fence owns that region; otherwise it joins a small general
+/// in-flight queue. No barrier is emitted here: that absence is what permits transfer N+1 to
+/// overlap compute N. The new compute recorder created after the copies uses `seed_barrier` and
+/// therefore waits for both before consuming N+1.
+#[derive(Clone, Copy)]
+enum PrefetchComputeProbe {
+    Ring(usize),
+    General,
+}
+
+fn prefetch_compute_live(ps: &PagedStream, probe: PrefetchComputeProbe) -> Result<bool> {
+    let segment = match probe {
+        PrefetchComputeProbe::Ring(slot) => ps.pending.get(slot).and_then(Option::as_ref),
+        PrefetchComputeProbe::General => ps.compute_pending.back(),
+    };
+    segment
+        .map(|seg| seg.is_complete().map(|complete| !complete))
+        .unwrap_or(Ok(false))
+}
+
+fn submit_prefill_compute<'a>(
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+) -> Result<PrefetchComputeProbe> {
+    let seg = rec
+        .take()
+        .expect("segment always Some between ops")
+        .finish_nowait()
+        .map_err(|e| be(e.to_string()))?;
+    if ps.cursor > 0 {
+        let slot = ps.half;
+        debug_assert!(ps.pending[ps.half].is_none());
+        ps.pending[ps.half] = Some(seg);
+        ps.half = (ps.half + 1) % ps.pending.len();
+        ps.cursor = 0;
+        Ok(PrefetchComputeProbe::Ring(slot))
+    } else {
+        ps.compute_pending.push_back(seg);
+        while ps.compute_pending.len() > 2 {
+            let old = ps.compute_pending.pop_front().expect("len > 2");
+            old.wait().map_err(|e| be(e.to_string()))?;
+        }
+        Ok(PrefetchComputeProbe::General)
+    }
 }
 
 /// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
@@ -5642,11 +5716,9 @@ fn stage_dense_linear<'a>(
     }
 }
 
-/// Stage `ids` (layer-LOCAL) of `buf_id`'s role — recorded ring→arena copies for the misses,
-/// rotating the stream whenever the ring half fills (`MoePagerSession::stage_role` never splits
-/// one expert across a rotation, so progress per iteration is guaranteed) — then freeze the
-/// layer's LUT window in the tape and return its word base. `ids` empty = residency already
-/// guaranteed by the caller (`touch_all_hits`); only the window is written.
+/// Stage `ids` (layer-LOCAL) of `buf_id`'s role as direct permanent-HostWeights→LRU-slot copies,
+/// then freeze the layer's LUT window in the tape and return its word base. `ids` empty means
+/// residency is already guaranteed by the caller (`touch_all_hits`).
 fn stage_and_window<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
@@ -5656,37 +5728,128 @@ fn stage_and_window<'a>(
     n_expert: usize,
     scan: bool,
 ) -> Result<u32> {
-    // One epoch batch per (layer, role) — spans ring rotations (the epoch, not LRU position, is
-    // what protects this batch's earlier ids from its later misses on the cold-insert path).
+    // One epoch batch per (layer, role): the epoch, not LRU position, protects this batch's
+    // earlier ids from its later misses on the cold-insert path.
     {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
         sess.begin_batch(buf_id)?;
     }
-    let mut start = 0;
-    while start < ids.len() {
-        let done = {
-            let mut guard = be_.moe_pager().lock().unwrap();
-            let sess = guard.as_mut().expect("paged execution requires a session");
-            ps.ensure_slots(sess.ring_slots());
-            let half_base = ps.half * sess.ring_half_bytes();
-            sess.stage_role(
-                rec.as_ref().expect("segment always Some between ops"),
-                half_base,
-                &mut ps.cursor,
-                buf_id,
-                &ids[start..],
-                scan,
-            )?
-        };
-        start += done;
-        if start < ids.len() {
-            rotate_stream(be_, rec, ps)?;
-        }
+    if !ids.is_empty() {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("paged execution requires a session");
+        sess.stage_role_dma(
+            rec.as_ref().expect("segment always Some between ops"),
+            buf_id,
+            ids,
+            scan,
+        )?;
     }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
     sess.lut_window(&mut ps.tape_cursor, buf_id, n_expert)
+}
+
+/// Whole-layer Prefill twin of [`stage_and_window`]. The first role encountered records exactly
+/// one contiguous layer copy; the other role windows reuse it. No expert pager/LRU is touched.
+fn stage_layer_and_window<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+    buf_id: usize,
+    n_expert: usize,
+) -> Result<u32> {
+    let already_current = {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("paged execution requires a session");
+        sess.enter_prefill_layer()?;
+        sess.layer_bank_current(buf_id)?
+    };
+    let mut guard = be_.moe_pager().lock().unwrap();
+    let sess = guard.as_mut().expect("paged execution requires a session");
+    if !already_current {
+        sess.stage_prefill_layer_dma(
+            rec.as_ref().expect("segment always Some between ops"),
+            buf_id,
+        )?;
+    }
+    sess.layer_lut_window(&mut ps.tape_cursor, buf_id, n_expert)
+}
+
+/// Copy one complete prefetched layer without allocating LUT windows. The next layer creates
+/// those windows only when it is dispatched; prefetch changes bytes, not routing state.
+fn stage_prefetch_layer<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    _ps: &mut PagedStream,
+    buf_id: usize,
+) -> Result<()> {
+    let already_current = {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("paged execution requires a session");
+        sess.enter_prefill_layer()?;
+        sess.layer_bank_current(buf_id)?
+    };
+    if already_current {
+        return Ok(());
+    }
+    be_.moe_pager()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .expect("paged execution requires a session")
+        .stage_prefill_layer_dma(
+            rec.as_ref().expect("prefetch copy recorder is present"),
+            buf_id,
+        )?;
+    Ok(())
+}
+
+/// After layer N's compute has been recorded, upload N+1 with one HostWeights→opposite-slab copy
+/// while N executes. Resident/already-prefetched layers are free. The final seeded
+/// recorder is the only dependency edge: N+1 compute waits for its upload, but the upload itself
+/// has no dependency on N and can occupy the transfer engine concurrently.
+fn prefetch_next_moe_layer<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+    current_gate_id: usize,
+) -> Result<()> {
+    let next = {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("paged execution requires a session");
+        sess.enter_prefill_layer()?;
+        sess.next_layer(current_gate_id)?
+    };
+    let Some(next) = next else {
+        return Ok(());
+    };
+    let needs_upload = {
+        let guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_ref().expect("paged execution requires a session");
+        !sess.layer_bank_current(next)?
+    };
+    if !needs_upload {
+        return Ok(());
+    }
+
+    let probe = submit_prefill_compute(rec, ps)?;
+    let profile = infr_core::pager_profile::active();
+    let compute_live_at_start = profile && prefetch_compute_live(ps, probe)?;
+    let mut copy_rec = Some(be_.recorder()?); // no seed: N+1 transfer may overlap N compute
+    stage_prefetch_layer(be_, &mut copy_rec, ps, next)?;
+    submit_prefetch_copy(&mut copy_rec, ps)?;
+    if profile {
+        infr_core::pager_profile::record_prefetch_window(
+            compute_live_at_start,
+            prefetch_compute_live(ps, probe)?,
+        );
+    }
+
+    let compute = be_.recorder()?;
+    compute.seed_barrier();
+    *rec = Some(compute);
+    Ok(())
 }
 
 /// Execute ONE paged `Op::MoeFfn`, recording INLINE into the ambient segment wherever residency
@@ -5698,9 +5861,8 @@ fn stage_and_window<'a>(
 ///     routing that wide touches every expert of the layer with overwhelming probability
 ///     (P(expert unrouted) < 1e-8 at the 3x bound), so all `n_expert` are staged up front and
 ///     the GPU-side bucket count/scan/scatter pipeline needs no host decision at all. The whole
-///     chunk records into one submission; misses ride recorded ring→arena copies whose only
-///     backpressure is the fenced ring-half rotation (`rotate_stream` — CPU staging overlaps GPU
-///     execution instead of serializing with it).
+///     chunk records inline. Layer mode uses one complete-layer direct DMA and N+1 overlap;
+///     expert mode directly copies the required expert offsets into LRU slots.
 ///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (LRU upkeep,
 ///     no residency/LUT mutation) + a frozen LUT window, recorded inline — zero host syncs.
 ///   - Small-m layers with any absent expert: the ONE remaining blocking sync (`sync_stream`) to
@@ -5713,15 +5875,15 @@ fn stage_and_window<'a>(
 /// flight. The arena itself is BDA-addressed (`48ad9c1`): the paged dispatches deref it by 64-bit
 /// pointer (`native_weight_addr.glsl`) and deliberately never bind it as a descriptor (binding 0
 /// takes a small `lut` filler instead), so the generic buffer hazard tracker (`Recorder::sync`)
-/// never sees the read and cannot order it against the ring→arena staging copies on its own.
+/// never sees the read and cannot order it against the direct transfer writes on its own.
 /// Ordering is instead explicit, mirroring the dense streamer's `arena_stream_barrier` (`36bcbf5`):
 /// one WAR `arena_stream_barrier()` before this op's staging begins (orders every prior arena read
 /// — this layer's or an earlier one's — before any copy that may overwrite a slot still being
 /// read) and one RAW `arena_stream_barrier()` after all of this op's staging completes and before
 /// the first dispatch that reads the arena (`matmul_mmq_experts_paged` batched /
 /// `linear_native_id_multi_paged` small-m). A rotation's `seed_barrier` additionally covers the
-/// cross-segment case (a miss that spills into a fresh ring half); the two `arena_stream_barrier`
-/// calls here cover the within-segment case a rotation never reaches.
+/// seeded recorders cover the cross-segment Prefill dependency; the two `arena_stream_barrier`
+/// calls here cover copies recorded in the ambient segment.
 ///
 /// Only reached from `execute_static`'s loop, and only for a `MoeFfn` whose `gate_exps` buffer is
 /// registered in the backend's `MoePagerSession` (see `pager.rs`'s module doc for why that check —
@@ -5878,11 +6040,28 @@ fn execute_paged_moe<'a>(
     // ── Residency: pick the staging strategy (see the fn doc), ending with every needed expert
     // resident-at-execution and a frozen per-role LUT window in the session tape.
     let touch_all = rows * n_used >= 3 * n_expert;
+    let layer_stream = touch_all && be_.cfg().paging.moe_layer_stream;
     // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
     let mut stage_ids: Vec<u32> = Vec::new();
-    if touch_all {
+    if layer_stream {
+        // Whole-layer staging below bypasses expert-level LRU bookkeeping entirely.
+    } else if touch_all {
         stage_ids = (0..n_expert as u32).collect();
     } else {
+        // A preceding prefill may have reinterpreted the arena as contiguous layer storage.
+        // The prior execute drained before returning, so it is safe to invalidate its mappings.
+        {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let changed = guard
+                .as_mut()
+                .expect("paged execution requires a session")
+                .enter_decode();
+            if changed && infr_core::pager_profile::active() {
+                eprintln!(
+                    "[moe-prefill] arena switched to decode-LRU: rows={rows} n_used={n_used} n_expert={n_expert}"
+                );
+            }
+        }
         let inline_ok = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard
@@ -5916,21 +6095,30 @@ fn execute_paged_moe<'a>(
     }
     // WAR: order every arena read recorded so far (this layer's prior roles, or an earlier
     // layer's dispatch still in the ambient segment — a raw pointer deref, invisible to the buffer
-    // hazard tracker) before this op's staging copies below, which may overwrite a slot that read
-    // still targets. One call covers all three roles' copy loops (`stage_and_window` batches many
-    // misses per role); harmless when `stage_ids` is empty (the inline all-resident path records
-    // no copies at all).
+    // hazard tracker) before this op's direct copies below, which may overwrite a slot that read
+    // still targets. One call covers the whole-layer copy or all three roles' expert copies;
+    // harmless when `stage_ids` is empty.
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
-    let gate_w = stage_and_window(be_, rec, ps, gate_id, &stage_ids, n_expert, touch_all)?;
+    let gate_w = if layer_stream {
+        stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
+    } else {
+        stage_and_window(be_, rec, ps, gate_id, &stage_ids, n_expert, touch_all)?
+    };
     let up_w = if *fused_gate_up {
         gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
+    } else if layer_stream {
+        stage_layer_and_window(be_, rec, ps, up_id, n_expert)?
     } else {
         stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
     };
-    let down_w = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
-    // RAW: order every ring→arena copy this op just staged (gate/up/down, TRANSFER writes
+    let down_w = if layer_stream {
+        stage_layer_and_window(be_, rec, ps, down_id, n_expert)?
+    } else {
+        stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?
+    };
+    // RAW: order every HostWeights→arena copy this op just staged (TRANSFER writes
     // invisible to the buffer hazard tracker) before the first dispatch below that reads the
     // arena by pointer — covers both the batched `matmul_mmq_experts_paged` arm and the small-m
     // `linear_native_id_multi_paged` arm, whichever this op takes.
@@ -6164,6 +6352,9 @@ fn execute_paged_moe<'a>(
                 n_used,
                 *weight_before,
             );
+            if layer_stream {
+                prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+            }
             return Ok(()); // recorded inline — the ambient segment stays open
         }
     }

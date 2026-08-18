@@ -1465,10 +1465,16 @@ const MOE_ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
 /// [`MOE_ACT_HEADROOM`] — against the allocator's ceiling, like every other budget here. `None`
 /// when the dense half alone does not fit, which is not a paging decision but a hard error (dense
 /// layer streaming does not cover an MoE model's dense part).
-pub(crate) fn moe_expert_budget(vram: &infr_vulkan::VramInfo, dense: u64, kv: u64) -> Option<u64> {
+pub(crate) fn moe_expert_budget(
+    vram: &infr_vulkan::VramInfo,
+    dense: u64,
+    kv: u64,
+    activation_reserve: u64,
+) -> Option<u64> {
     let room = vram.alloc_room();
     let base = dense.saturating_add(kv);
-    (base <= room).then(|| room.saturating_sub(base.saturating_add(MOE_ACT_HEADROOM)))
+    let headroom = MOE_ACT_HEADROOM.max(activation_reserve);
+    (base <= room).then(|| room.saturating_sub(base.saturating_add(headroom)))
 }
 
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
@@ -1831,7 +1837,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // scope for dense layer streaming — `None`, and we fail with a clear message
                 // instead of letting a degenerate expert budget stumble into the alloc-time VRAM
                 // guard's generic over-commit error.
-                let Some(budget) = moe_expert_budget(&vram, fp.dense, kv_bytes) else {
+                // Layer-granular MoE prefill is tuned for a 4096-row microbatch. Price that
+                // shape even when the ordinary adaptive default is smaller, so the shared
+                // expert arena cannot consume memory its activation pools need at runtime.
+                let prefill_4k_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, 4096);
+                let Some(budget) = moe_expert_budget(&vram, fp.dense, kv_bytes, prefill_4k_reserve)
+                else {
                     return Err(anyhow!(
                         "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed \
                          the allocatable VRAM ({:.2} GB, free minus the guard headroom) — dense \
@@ -1893,15 +1904,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // The MoE twin, keyed by the `(role, per-expert bytes)` pair that identifies an expert pool —
     // the binder receives a tensor, not a pool index, and re-derives that key the same way
     // `MoePagerSession::register` does.
-    let mut moe_host: Vec<(
-        infr_vulkan::pager::Role,
-        usize,
-        Option<std::sync::Arc<infr_core::hostpager::HostPager>>,
-    )> = Vec::new();
+    let mut moe_host_offsets =
+        std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
         let n_expert = moe.n_expert.max(1);
+        // MoE runtime weights DMA directly from one permanent HOST_CACHED transfer source; no
+        // upload ring or host pager is allocated for this path.
         // Enumerate every paged `_exps` weight bank's (role, per-expert bytes): one arena POOL
         // per distinct pair. A uniform split-bank model (Scout) yields the classic three pools;
         // a fused-bank model (gemma-4 MoE / DiffusionGemma) yields a double-width Gate pool and
@@ -1909,14 +1919,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // exactly the layers whose banks match it (`MoePagerSession::register` re-derives the
         // same key from the tensor bytes). `(slot_bytes, blocks-in-pool)` per pool.
         let mut pool_blocks: Vec<(Role, usize, usize)> = Vec::new();
+        let mut host_banks: Vec<(usize, Role, usize)> = Vec::new();
         for t in g.tensors() {
-            if exps_layer(&t.name).is_none_or(|l| l >= n_paged) {
+            let Some(layer) = exps_layer(&t.name).filter(|&l| l < n_paged) else {
                 continue; // not a paged layer's `_exps` tensor
-            }
+            };
             let Some(role) = moe_role_of(&t.name) else {
                 continue; // `_exps` but not a weight bank (e.g. the per-expert `.scale` vector)
             };
             let sb = (t.nbytes / n_expert).max(4);
+            host_banks.push((layer, role, t.nbytes));
             match pool_blocks
                 .iter_mut()
                 .find(|(r, s, _)| *r == role && *s == sb)
@@ -1925,6 +1937,66 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None => pool_blocks.push((role, sb, n_expert)),
             }
         }
+        host_banks.sort_unstable_by_key(|&(layer, role, _)| {
+            let role_order = match role {
+                Role::Gate => 0usize,
+                Role::Up => 1,
+                Role::Down => 2,
+            };
+            (layer, role_order)
+        });
+        let mut host_bytes = 0usize;
+        let mut host_layers = Vec::<(usize, usize)>::new();
+        let mut current_layer = None;
+        let mut layer_start = 0usize;
+        for (layer, role, bytes) in host_banks {
+            if current_layer != Some(layer) {
+                if current_layer.is_some() {
+                    host_bytes = host_bytes.next_multiple_of(256);
+                    host_layers.push((layer_start, host_bytes));
+                }
+                host_bytes = host_bytes.next_multiple_of(256);
+                layer_start = host_bytes;
+                current_layer = Some(layer);
+            }
+            host_bytes = host_bytes.next_multiple_of(256);
+            moe_host_offsets.insert((layer, role), host_bytes);
+            host_bytes = host_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow!("MoE permanent host-store size overflow"))?;
+        }
+        host_bytes = host_bytes.next_multiple_of(256);
+        if current_layer.is_some() {
+            host_layers.push((layer_start, host_bytes));
+        }
+        // Windows' AMD Vulkan driver rejects one ~20+ GiB host-visible allocation. Preserve one
+        // logical layer-major store while splitting its VkDeviceMemory only BETWEEN layers. A
+        // layer therefore always remains one contiguous transfer source and one Prefill DMA.
+        const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
+        let mut chunk_ranges = Vec::<(usize, usize)>::new();
+        for (start, end) in host_layers {
+            if end - start > HOST_CHUNK_MAX {
+                return Err(anyhow!(
+                    "MoE expert layer requires {:.2} GiB, above the {:.2} GiB permanent \
+                     host-store chunk limit",
+                    (end - start) as f64 / 2f64.powi(30),
+                    HOST_CHUNK_MAX as f64 / 2f64.powi(30),
+                ));
+            }
+            match chunk_ranges.last_mut() {
+                Some((chunk_start, chunk_end)) if end - *chunk_start <= HOST_CHUNK_MAX => {
+                    *chunk_end = end;
+                }
+                _ => chunk_ranges.push((start, end)),
+            }
+        }
+        let host_chunks: Vec<infr_vulkan::pager::MoeHostChunkSpec> = chunk_ranges
+            .into_iter()
+            .map(|(base_offset, end)| infr_vulkan::pager::MoeHostChunkSpec {
+                base_offset,
+                bytes: end - base_offset,
+            })
+            .collect();
         if pool_blocks.is_empty() {
             // Defensive: an MoE config with NO pageable `_exps` weight banks (no arch this crate
             // loads ships that). Nothing to page — stay fully resident and let the alloc-time
@@ -1938,12 +2010,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         if n_paged > 0 {
             let n_blocks = n_paged * n_expert;
-            // The session's pinned upload ring (two fence-rotated halves — see
-            // `MoePagerSession`'s `ring` doc) lives in the same VRAM the arenas do: subtract it
-            // from the budget BEFORE splitting arena shares so the paged footprint stays within
-            // what the caller granted (INFR_CACHE) / what the auto tier measured as free.
-            let ring_bytes = infr_core::pager::ring_bytes(pager_budget_bytes, vk.cfg().paging.ring);
-            pager_budget_bytes = pager_budget_bytes.saturating_sub(ring_bytes as u64);
+            // The permanent HostWeights store is system RAM, so the entire configured MoE cache
+            // budget remains available to the shared GPU arena.
             let total_bytes: u64 = pool_blocks
                 .iter()
                 .map(|&(_, sb, nb)| (sb * nb) as u64)
@@ -1956,21 +2024,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // backstop is the alloc-time VRAM budget guard (`GpuPager::new` -> `alloc_arena_bda`);
             // the proportional split below never over-subscribes VRAM because it partitions
             // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
-            // The tier below VRAM, one host pager per expert pool, sized before the pools so a
-            // `Host` bank can name it. Pool order is preserved, so pool `i`'s tier is `moe_host[i]`.
-            let classes: Vec<(usize, usize)> =
-                pool_blocks.iter().map(|&(_, sb, nb)| (sb, nb)).collect();
-            let host_tier =
-                vulkan_host_tier(ec, g, "MoE", &classes, vk.capabilities().unified_memory)?;
-            moe_host = pool_blocks
-                .iter()
-                .zip(&host_tier)
-                .map(|(&(role, sb, _), h)| (role, sb, h.clone()))
-                .collect();
             let pools: Vec<infr_vulkan::pager::MoePoolSpec> = pool_blocks
                 .iter()
-                .zip(&host_tier)
-                .map(|(&(role, sb, nb), host)| {
+                .map(|&(role, sb, nb)| {
                     // Budget split PROPORTIONALLY to each pool's total bank bytes — the byte share is
                     // also the access share under uniform routing (every (layer, expert) read touches
                     // gate+up+down alike), so proportional slots equalize expected hit rates across
@@ -1986,17 +2042,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
                     // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
                     // point holding more slots than the pool has distinct experts).
-                    let floor = n_expert.min(nb).max(1);
+                    let batch_floor = if ec.paging.moe_layer_stream {
+                        n_expert.saturating_mul(2)
+                    } else {
+                        n_expert
+                    };
+                    let floor = batch_floor.min(nb).max(1);
                     let budget_slots = ((share / sb as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::MoePoolSpec {
                         role,
                         slot_bytes: sb,
                         n_slots: budget_slots,
-                        host: host.clone(),
                     }
                 })
                 .collect();
             let cached: usize = pools.iter().map(|p| p.n_slots).sum();
+            let host_chunk_count = host_chunks.len();
             let pool_desc: Vec<String> = pool_blocks
                 .iter()
                 .zip(&pools)
@@ -2006,15 +2067,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .collect();
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GB budget; ctx={want_ctx})",
+             {:.2} GB GPU budget; {:.2} GB permanent HostWeights in {host_chunk_count} \
+             layer-boundary chunks; ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),
                 pager_budget_bytes as f64 / 1e9,
+                host_bytes as f64 / 1e9,
             );
             vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
                 n_blocks,
                 pools,
-                ring_bytes,
+                host_chunks,
             })
             .map_err(|e| anyhow!("{e}"))?;
         }
@@ -2461,44 +2524,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map_err(|e| anyhow!("{e}"))?;
                 let buf_id = infr_vulkan::pager::buffer_identity(placeholder.as_ref());
                 let layer_base = (l * n_expert) as u32;
-                // With a host tier under this pool, register the bank's experts INDIVIDUALLY — one
-                // block per expert, at its own file offset within the bank, under the same global
-                // id the arena uses. That is what lets a routed miss read one expert instead of
-                // faulting in the whole bank through the mapping.
-                let host = moe_host
-                    .iter()
-                    .find(|&&(r, sb, _)| r == role && sb == stride_bytes)
-                    .and_then(|(_, _, h)| h.as_ref());
-                let source_bytes = match host {
-                    Some(h) => {
-                        let (base, len) = bytes.file_range();
-                        if len != stride_bytes * n_expert {
-                            return Err(anyhow!(
-                                "MoE host tier: {name}'s file range is {len} bytes, but the pool \
-                                 expects {n_expert} x {stride_bytes}"
-                            ));
-                        }
-                        for e in 0..n_expert {
-                            h.register(infr_core::blockio::BlockDesc {
-                                id: layer_base + e as u32,
-                                extents: vec![infr_core::blockio::BlockExtent {
-                                    offset: base + (e * stride_bytes) as u64,
-                                    len: stride_bytes,
-                                }],
-                            })
-                            .map_err(|e| anyhow!("{e}"))?;
-                        }
-                        infr_vulkan::pager::ExpertBytes::Host
-                    }
-                    None => {
-                        infr_vulkan::pager::ExpertBytes::Mmap(std::sync::Arc::new(bytes.clone())
-                            as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
-                    }
-                };
+                let bank = std::sync::Arc::new(bytes.clone())
+                    as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>;
+                let host_offset = *moe_host_offsets.get(&(l, role)).ok_or_else(|| {
+                    anyhow!("MoE permanent host-store plan has no offset for {name}")
+                })?;
                 let source = infr_vulkan::pager::ExpertSource {
-                    bytes: source_bytes,
+                    bank,
                     stride_bytes,
                     layer_base,
+                    host_offset,
                 };
                 vk.register_paged_expert(role, buf_id, source, n_expert)
                     .map_err(|e| anyhow!("{e}"))?;
@@ -4466,12 +4501,12 @@ mod seam_helper_tests {
 
         // MoE expert placement: same ceiling, minus the pager's own headroom.
         assert_eq!(
-            super::moe_expert_budget(&vram, 0, 0),
+            super::moe_expert_budget(&vram, 0, 0, 0),
             Some(XTX_ROOM - super::MOE_ACT_HEADROOM)
         );
-        assert_eq!(super::moe_expert_budget(&vram, XTX_ROOM, 0), Some(0));
+        assert_eq!(super::moe_expert_budget(&vram, XTX_ROOM, 0, 0), Some(0));
         assert_eq!(
-            super::moe_expert_budget(&vram, XTX_ROOM + 1, 0),
+            super::moe_expert_budget(&vram, XTX_ROOM + 1, 0, 0),
             None,
             "a dense half past the ceiling is a hard error, not a 256 MiB overdraft"
         );

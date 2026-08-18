@@ -10474,6 +10474,16 @@ impl PendingSegment {
     pub fn dispatches(&self) -> usize {
         self.dispatches
     }
+
+    /// Non-blocking fence probe used only by pager profiling. It does not alter submission,
+    /// synchronization or object lifetime, so the measured prefetch path stays identical.
+    pub fn is_complete(&self) -> Result<bool> {
+        let Some(fence) = self.fence else {
+            return Ok(true);
+        };
+        unsafe { self.shared.device.get_fence_status(fence) }
+            .map_err(|e| be(format!("probe segment fence: {e}")))
+    }
 }
 
 impl PendingSegment {

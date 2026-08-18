@@ -4767,7 +4767,7 @@ mod tests {
 
     /// Dropping the backend must actually drop `VulkanShared` (device, allocator, weight arena —
     /// i.e. free the VRAM) even after a paged-MoE session was installed. The session's arena/LUT/
-    /// ring buffers each hold an `Arc<VulkanShared>` clone, so parking the session ON
+    /// HostWeights buffers each hold an `Arc<VulkanShared>` clone, so parking the session ON
     /// `VulkanShared` formed an Arc cycle that leaked the whole device (~23 GiB after the Scout
     /// paged test) until process exit — every later model load in the same process then hit the
     /// VRAM budget guard with "N GiB already in use" (the cpu_backend gpu_ suite flake).
@@ -4787,9 +4787,11 @@ mod tests {
                 role: crate::pager::Role::Gate,
                 slot_bytes: 4096,
                 n_slots: 2,
-                host: None,
             }],
-            ring_bytes: 1 << 20,
+            host_chunks: vec![crate::pager::MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: 4096,
+            }],
         })
         .expect("init_moe_pager");
         let weak = Arc::downgrade(&be.shared);
