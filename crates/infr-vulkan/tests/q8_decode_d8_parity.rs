@@ -18,14 +18,15 @@ fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn backend(d8: bool) -> Option<VulkanBackend> {
+fn backend(d8: bool, ls128: bool) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
     cfg.kernels.vulkan.q8_decode_d8 = d8;
+    cfg.kernels.vulkan.q8_decode_ls128 = ls128;
     VulkanBackend::new_with(Arc::new(cfg)).ok()
 }
 
-fn run_case(d8: bool, kv_len: usize) -> Option<Vec<f32>> {
-    let be = backend(d8)?;
+fn run_case(d8: bool, ls128: bool, kv_len: usize) -> Option<Vec<f32>> {
+    let be = backend(d8, ls128)?;
     let (nh, nkv, hd) = (4usize, 2usize, 256usize);
     let n = kv_len * nkv * hd;
     let q: Vec<f32> = (0..nh * hd)
@@ -99,28 +100,34 @@ fn run_case(d8: bool, kv_len: usize) -> Option<Vec<f32>> {
 #[test]
 fn q8_hd256_d8_matches_d32_for_tail_ragged_and_deep_contexts() {
     for kv_len in [1usize, 97, 8193] {
-        let Some(d32) = run_case(false, kv_len) else {
+        let Some(d32) = run_case(false, false, kv_len) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8) = run_case(true, kv_len) else {
+        let Some(d8_ls64) = run_case(true, false, kv_len) else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let Some(d8_ls128) = run_case(true, true, kv_len) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
 
-        let mut max_err = 0.0f32;
-        for (i, (&reference, &clustered)) in d32.iter().zip(&d8).enumerate() {
-            assert!(
-                reference.is_finite() && clustered.is_finite(),
-                "kv_len={kv_len} out {i}: D32={reference}, D8={clustered}"
-            );
-            let err = (reference - clustered).abs();
-            max_err = max_err.max(err);
-            assert!(
-                err <= 5.0e-4,
-                "kv_len={kv_len} out {i}: D32={reference}, D8={clustered}, err={err}"
-            );
+        for (name, candidate) in [("D8-LS64", d8_ls64), ("D8-LS128", d8_ls128)] {
+            let mut max_err = 0.0f32;
+            for (i, (&reference, &clustered)) in d32.iter().zip(&candidate).enumerate() {
+                assert!(
+                    reference.is_finite() && clustered.is_finite(),
+                    "kv_len={kv_len} out {i}: D32={reference}, {name}={clustered}"
+                );
+                let err = (reference - clustered).abs();
+                max_err = max_err.max(err);
+                assert!(
+                    err <= 5.0e-4,
+                    "kv_len={kv_len} out {i}: D32={reference}, {name}={clustered}, err={err}"
+                );
+            }
+            eprintln!("Q8 hd256 D32/{name} parity: kv_len={kv_len}, max_err={max_err}");
         }
-        eprintln!("Q8 hd256 D8/D32 parity: kv_len={kv_len}, max_err={max_err}");
     }
 }

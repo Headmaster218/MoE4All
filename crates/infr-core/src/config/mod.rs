@@ -315,6 +315,9 @@ cfg_struct! {
         /// of the 8-lane clustered Q8 hd256 decode kernel. Kept as a narrow A/B/fallback knob;
         /// f16 and every other KV/head-dim shape ignore it.
         q8_decode_d8: bool = true,
+        /// `INFR_NO_Q8_DECODE_LS128` (inverted) — retain the 64-thread D8 kernel as a runtime
+        /// fallback while the default Q8 hd256 path uses four waves to expose more key parallelism.
+        q8_decode_ls128: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.

@@ -51,7 +51,11 @@
 #endif
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#ifdef LS128
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #ifndef DHD4
 #define DHD4 32
@@ -96,9 +100,15 @@ layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, h
 // the slab takes the workgroup's LDS from 4.75 KB to 2.75 KB, which is what stops LDS from capping
 // occupancy below the 16 waves/SIMD the 96-VGPR footprint allows.
 shared float sc[512];
+#ifdef LS128
+shared float red[128];
+#else
 shared float red[64];
+#endif
 #if DHD4 == 32
 shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-occupancy V pass)
+#elif DHD4 == 64 && defined(KVQ8_D8) && defined(LS128)
+shared vec4 vsh[64];
 #endif
 
 // f16 K/V vec4 by device address: one f16vec4 (8 B) = two adjacent u32 words = ONE KV2 b64 read with
@@ -353,7 +363,11 @@ void main() {
 #endif
     red[t] = lmax;
     barrier();
+#ifdef LS128
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+#else
     for (uint s = 32u; s > 0u; s >>= 1u) {
+#endif
         if (t < s) { red[t] = max(red[t], red[t + s]); }
         barrier();
     }
@@ -362,14 +376,22 @@ void main() {
 
     // exp(s - m) → sc, sum l
     float lsum = 0.0;
+#ifdef LS128
+    for (uint jj = j0 + t; jj < j1; jj += 128u) {
+#else
     for (uint jj = j0 + t; jj < j1; jj += 64u) {
+#endif
         float p = exp(sc[jj - j0] - m);
         sc[jj - j0] = p;
         lsum += p;
     }
     red[t] = lsum;
     barrier();
+#ifdef LS128
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+#else
     for (uint s = 32u; s > 0u; s >>= 1u) {
+#endif
         if (t < s) { red[t] += red[t + s]; }
         barrier();
     }
@@ -402,6 +424,32 @@ void main() {
         pacc[pbase + 4u * lane + 3u] = acc.w;
     }
 #elif DHD4 == 64
+#if defined(KVQ8_D8) && defined(LS128)
+    // Four waves keep twice as many QK keys in flight. For P.V, paired 64-thread halves split the
+    // key range and meet in LDS, shortening the serial dependency chain without duplicating reads.
+    uint dim = t & 63u;
+    uint half_id = t >> 6u;
+    uint vb = kvh * 64u + dim;
+    uint stride = pc.nkv * 64u;
+    vec4 acc = vec4(0.0);
+    uint jv = j0 + half_id;
+    for (; jv + 2u < j1; jv += 4u) {
+        vec4 b0 = vread4(RROW(jv) * stride + vb);
+        vec4 b1 = vread4(RROW(jv + 2u) * stride + vb);
+        acc += sc[jv - j0] * b0;
+        acc += sc[jv + 2u - j0] * b1;
+    }
+    if (jv < j1) { acc += sc[jv - j0] * vread4(RROW(jv) * stride + vb); }
+    if (half_id == 1u) { vsh[dim] = acc; }
+    barrier();
+    if (half_id == 0u) {
+        acc += vsh[dim];
+        pacc[pbase + 4u * dim] = acc.x;
+        pacc[pbase + 4u * dim + 1u] = acc.y;
+        pacc[pbase + 4u * dim + 2u] = acc.z;
+        pacc[pbase + 4u * dim + 3u] = acc.w;
+    }
+#else
     // hd=256: every one of the 64 threads owns exactly one dim-vec4 and walks the whole key range
     // (no `vsh` hand-off needed, so that 512 B of LDS disappears); 2-key software pipeline.
     uint vb = kvh * 64u + t;
@@ -419,6 +467,7 @@ void main() {
     pacc[pbase + 4u * t + 1u] = acc.y;
     pacc[pbase + 4u * t + 2u] = acc.z;
     pacc[pbase + 4u * t + 3u] = acc.w;
+#endif
 #else
     // hd=512: thread owns dims t and t+64 in ONE pass over keys — 2 independent loads per key, `sc`
     // read once.
