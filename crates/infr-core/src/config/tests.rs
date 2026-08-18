@@ -1256,6 +1256,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_Q8_DECODE_LS128",
         "INFR_NO_Q8_DECODE_LS256",
         "INFR_NO_Q8_QK_F16",
+        "INFR_NO_Q8_PV_F16",
         "INFR_NO_SMALL_BM",
         "INFR_PROF_OPS",
         "INFR_PROF_OP_SHAPES",

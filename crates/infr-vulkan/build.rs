@@ -217,7 +217,14 @@ fn main() {
         (
             "attn_decode",
             "attn_decode_hd256_q8",
-            &["-DDHD4=64", "-DKVQ8", "-DKVQ8_D8", "-DLS256", "-DQK_F16"],
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+            ],
         ),
         (
             "attn_decode",
@@ -233,6 +240,11 @@ fn main() {
             "attn_decode",
             "attn_decode_hd256_q8_ls256_f32",
             &["-DDHD4=64", "-DKVQ8", "-DKVQ8_D8", "-DLS256"],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8_ls256_qkf16",
+            &["-DDHD4=64", "-DKVQ8", "-DKVQ8_D8", "-DLS256", "-DQK_F16"],
         ),
         (
             "attn_decode",

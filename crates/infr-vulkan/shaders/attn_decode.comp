@@ -129,7 +129,7 @@ vec4 q8read4(uint64_t addr, uint i4) {
     return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
-#ifdef QK_F16
+#if defined(QK_F16) || defined(PV_F16)
 f16vec4 q8read4h(uint64_t addr, uint i4) {
     int cw = int(kv_word(addr, i4));
     uint bk = i4 >> 3u;
@@ -475,12 +475,25 @@ void main() {
     vec4 acc = vec4(0.0);
     uint jv = j0 + quarter;
     for (; jv + 4u < j1; jv += 8u) {
+#ifdef PV_F16
+        f16vec4 b0 = q8read4h(v_addr, RROW(jv) * stride + vb);
+        f16vec4 b1 = q8read4h(v_addr, RROW(jv + 4u) * stride + vb);
+        acc += sc[jv - j0] * vec4(b0);
+        acc += sc[jv + 4u - j0] * vec4(b1);
+#else
         vec4 b0 = vread4(RROW(jv) * stride + vb);
         vec4 b1 = vread4(RROW(jv + 4u) * stride + vb);
         acc += sc[jv - j0] * b0;
         acc += sc[jv + 4u - j0] * b1;
+#endif
     }
-    if (jv < j1) { acc += sc[jv - j0] * vread4(RROW(jv) * stride + vb); }
+    if (jv < j1) {
+#ifdef PV_F16
+        acc += sc[jv - j0] * vec4(q8read4h(v_addr, RROW(jv) * stride + vb));
+#else
+        acc += sc[jv - j0] * vread4(RROW(jv) * stride + vb);
+#endif
+    }
     if (quarter > 0u) { vsh[(quarter - 1u) * 64u + dim] = acc; }
     barrier();
     if (quarter == 0u) {
