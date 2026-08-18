@@ -205,6 +205,28 @@ impl GpuPager {
             self.slot_bytes,
             "block byte size must match the arena's slot size"
         );
+        let Some(dst) = self.plan_staged(rec, ring, ring_off, id, scan)? else {
+            return Ok(0);
+        };
+        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
+        par_copy_to_mapped(bytes, dst as *mut u8);
+        if let Some(t0) = copy_t0 {
+            pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+        }
+        Ok(self.slot_bytes)
+    }
+
+    /// Resolve and record one staged upload without copying its host bytes yet. The MoE session
+    /// uses this to collect a whole layer/role's independent expert copies and execute them in one
+    /// rayon batch; [`Self::touch_staged`] remains the one-copy wrapper for other callers.
+    fn plan_staged(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        ring: &dyn Buffer,
+        ring_off: usize,
+        id: BlockId,
+        scan: bool,
+    ) -> Result<Option<usize>> {
         // `scan`: full-set sweep (batched prefill's touch-all) → the scan-resistant cold-end
         // policy; otherwise classic LRU (decode's routed-only touches). See
         // `infr_core::pager::Pager::touch_cold`.
@@ -223,16 +245,11 @@ impl GpuPager {
             pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
         }
         match resolution {
-            Resolution::Hit { .. } => Ok(0),
+            Resolution::Hit { .. } => Ok(None),
             Resolution::Miss { slot, evicted } => {
                 let base = as_vk_buf(ring)?
                     .mapped_ptr()
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                let copy_t0 = prof.then(std::time::Instant::now);
-                par_copy_to_mapped(bytes, unsafe { base.add(ring_off) });
-                if let Some(t0) = copy_t0 {
-                    pager_profile::record_memcpy(bytes.len(), t0.elapsed());
-                }
                 rec.copy(
                     ring,
                     ring_off,
@@ -244,7 +261,7 @@ impl GpuPager {
                     pager_profile::record_gpu_copy(self.slot_bytes);
                 }
                 self.record_placement(id, slot, evicted);
-                Ok(self.slot_bytes)
+                Ok(Some(unsafe { base.add(ring_off) } as usize))
             }
         }
     }
@@ -533,6 +550,23 @@ fn par_copy_to_mapped(src: &[u8], dst: *mut u8) {
     let dst_addr = dst as usize; // Send-able; each chunk writes a disjoint range
     src.par_chunks(CHUNK).enumerate().for_each(|(i, c)| unsafe {
         std::ptr::copy_nonoverlapping(c.as_ptr(), (dst_addr + i * CHUNK) as *mut u8, c.len());
+    });
+}
+
+#[derive(Clone, Copy)]
+struct StagingCopy {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+/// Copy independent expert blocks with one rayon entry per staged layer/role. Parallelizing
+/// *inside* each sub-MiB expert costs more scheduler time than it saves; batching experts exposes
+/// tens to hundreds of naturally independent, coarse jobs at once.
+fn run_staging_copies(copies: &[StagingCopy]) {
+    use rayon::prelude::*;
+    copies.par_iter().for_each(|job| unsafe {
+        std::ptr::copy_nonoverlapping(job.src as *const u8, job.dst as *mut u8, job.len);
     });
 }
 
@@ -1083,10 +1117,28 @@ impl MoePagerSession {
             "ring half smaller than a slot (construction floor violated)"
         );
         let prof = pager_profile::active();
+        let mut copies = Vec::new();
+        let mut pins: Vec<infr_core::hostpager::Pin<'_>> = Vec::new();
+        let finish_copies = |copies: &[StagingCopy], mmap_source: bool| {
+            if copies.is_empty() {
+                return;
+            }
+            let total = copies.iter().map(|job| job.len).sum::<usize>();
+            let t0 = prof.then(std::time::Instant::now);
+            run_staging_copies(copies);
+            if let Some(t0) = t0 {
+                let elapsed = t0.elapsed();
+                pager_profile::record_memcpy(total, elapsed);
+                if mmap_source {
+                    pager_profile::record_mmap_fallback(total, elapsed);
+                }
+            }
+        };
         for (i, &lid) in local_ids.iter().enumerate() {
             let id = layer_base + lid;
             let needs_slot = !pager.is_resident(id);
             if needs_slot && *cursor + pager.slot_bytes() > half_bytes {
+                finish_copies(&copies, bank.is_some());
                 return Ok(i); // half full — caller rotates and continues from here
             }
             let acquire_t0 = (needs_slot && prof).then(std::time::Instant::now);
@@ -1100,15 +1152,16 @@ impl MoePagerSession {
                     let slice = bytes.get(off..off + stride).ok_or_else(|| {
                         be("moe pager: expert id out of range for this layer's bank")
                     })?;
-                    let stage_t0 = pager_profile::start();
-                    let consumed =
-                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, slice, scan)?;
-                    if consumed > 0 {
-                        if let Some(elapsed) = pager_profile::elapsed(stage_t0) {
-                            pager_profile::record_mmap_fallback(slice.len(), elapsed);
-                        }
+                    if let Some(dst) = pager.plan_staged(rec, ring.as_ref(), ring_off, id, scan)? {
+                        copies.push(StagingCopy {
+                            src: slice.as_ptr() as usize,
+                            dst,
+                            len: slice.len(),
+                        });
+                        pager.slot_bytes()
+                    } else {
+                        0
                     }
-                    consumed
                 }
                 // Tier below, under the SAME policy the arena above uses for this batch: a
                 // full-set prefill sweep inserts cold, a routed decode touch inserts MRU.
@@ -1117,9 +1170,28 @@ impl MoePagerSession {
                         .as_ref()
                         .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
                     if host.caches() {
-                        let insert = if scan { Insert::Cold } else { Insert::Mru };
-                        let pin = host.pin(id, insert)?;
-                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, &pin, scan)?
+                        if needs_slot {
+                            // Pin before mutating GPU residency: a host-tier error cannot leave
+                            // the GPU pager claiming an upload whose bytes were never filled.
+                            let insert = if scan { Insert::Cold } else { Insert::Mru };
+                            let pin = host.pin(id, insert)?;
+                            debug_assert_eq!(pin.len(), pager.slot_bytes());
+                            let dst = pager
+                                .plan_staged(rec, ring.as_ref(), ring_off, id, scan)?
+                                .expect("needs_slot was checked immediately before plan_staged");
+                            copies.push(StagingCopy {
+                                src: pin.as_ptr() as usize,
+                                dst,
+                                len: pin.len(),
+                            });
+                            pins.push(pin);
+                            pager.slot_bytes()
+                        } else {
+                            debug_assert!(pager
+                                .plan_staged(rec, ring.as_ref(), ring_off, id, scan)?
+                                .is_none());
+                            0
+                        }
                     } else {
                         // Unified memory: nothing is cached below, so read the expert straight
                         // into the ring rather than through an arena that does not exist.
@@ -1128,6 +1200,8 @@ impl MoePagerSession {
                 }
             };
         }
+        finish_copies(&copies, bank.is_some());
+        drop(pins);
         Ok(local_ids.len())
     }
 
@@ -1616,6 +1690,29 @@ mod tests {
     fn ring_region_floor_is_aligned_when_one_upload_exceeds_its_share() {
         let region = ring_region_bytes(1024, 8, 513);
         assert_eq!(region, 768);
+    }
+
+    #[test]
+    fn staging_copy_batch_copies_disjoint_experts_exactly() {
+        let sources = [vec![0x11u8; 257], vec![0x7au8; 513], vec![0xe3u8; 129]];
+        let offsets = [0usize, 320, 896];
+        let mut dst = vec![0u8; 1100];
+        let jobs = sources
+            .iter()
+            .zip(offsets)
+            .map(|(src, off)| StagingCopy {
+                src: src.as_ptr() as usize,
+                dst: unsafe { dst.as_mut_ptr().add(off) } as usize,
+                len: src.len(),
+            })
+            .collect::<Vec<_>>();
+
+        run_staging_copies(&jobs);
+
+        for (src, off) in sources.iter().zip(offsets) {
+            assert_eq!(&dst[off..off + src.len()], src);
+        }
+        assert!(dst[257..320].iter().all(|&b| b == 0));
     }
 
     // ── #5: record_placement / apply_placement LUT bookkeeping is byte-identical to the old
