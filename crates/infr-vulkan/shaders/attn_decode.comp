@@ -129,6 +129,17 @@ vec4 q8read4(uint64_t addr, uint i4) {
     return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
+#ifdef QK_F16
+f16vec4 q8read4h(uint64_t addr, uint i4) {
+    int cw = int(kv_word(addr, i4));
+    uint bk = i4 >> 3u;
+    float16_t d = float16_t(unpackHalf2x16(kv_word(addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u]);
+    return d * f16vec4(float16_t(bitfieldExtract(cw, 0, 8)),
+                       float16_t(bitfieldExtract(cw, 8, 8)),
+                       float16_t(bitfieldExtract(cw, 16, 8)),
+                       float16_t(bitfieldExtract(cw, 24, 8)));
+}
+#endif
 vec4 kread4(uint i4) { return q8read4(k_addr, i4); }
 vec4 vread4(uint i4) { return q8read4(v_addr, i4); }
 #else
@@ -226,10 +237,18 @@ void main() {
     // cache's scale granularity.
     uint dl = lane & 7u;
     uint kl = lane >> 3u;
+#ifdef QK_F16
+    f16vec4 qreg[8];
+#else
     vec4 qreg[8];
+#endif
     uint qbase = h * 64u;
     for (uint i = 0u; i < 8u; i++) {
+#ifdef QK_F16
+        qreg[i] = q4[qbase + dl + 8u * i];
+#else
         qreg[i] = vec4(q4[qbase + dl + 8u * i]);
+#endif
     }
 #else
     // hd4 == 64/128: DHD4/32 loop-invariant q vec4s per lane. The trip count is a compile-time
@@ -275,13 +294,25 @@ void main() {
         uint key = jb + kl;
         bool ok = key < j1;
         uint rb = RROW(ok ? key : j0) * kb + kh;
+#ifdef QK_F16
+        f16vec4 a[8];
+#else
         vec4 a[8];
+#endif
         for (uint i = 0u; i < 8u; i++) {
+#ifdef QK_F16
+            a[i] = q8read4h(k_addr, rb + 8u * i);
+#else
             a[i] = kread4(rb + 8u * i);
+#endif
         }
         float part = 0.0;
         for (uint i = 0u; i < 8u; i++) {
+#ifdef QK_F16
+            part += float(dot(qreg[i], a[i]));
+#else
             part += dot(qreg[i], a[i]);
+#endif
         }
         float d = subgroupClusteredAdd(part, 8u) * scale;
         if (ok) {

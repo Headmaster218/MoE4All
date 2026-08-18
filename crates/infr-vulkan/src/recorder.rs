@@ -6659,6 +6659,7 @@ impl<'a> Recorder<'a> {
                         self.vk().q8_decode_d8,
                         self.vk().q8_decode_ls128,
                         self.vk().q8_decode_ls256,
+                        self.vk().q8_qk_f16,
                     )
                 } else {
                     None
