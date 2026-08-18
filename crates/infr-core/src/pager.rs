@@ -107,6 +107,12 @@ pub struct Pager {
     /// inserts at the COLD end, so it needs the epoch guard instead).
     epoch: HashMap<BlockId, u64>,
     cur_epoch: u64,
+    /// Next LRU node the scan-resistant cold path should inspect in this batch. `touch_cold`
+    /// inserts new misses before this cursor and every node skipped by the cursor is protected by
+    /// `cur_epoch`, so a node never needs to be visited twice until [`Self::begin_batch`] resets
+    /// the cursor. This turns a wide cold batch from O(batch_width * protected_prefix) victim
+    /// scans into one amortized pass over the LRU list.
+    cold_victim_cursor: Option<u32>,
     /// block_id -> outstanding pin count, for blocks a caller is READING right now
     /// ([`Self::resolve_and_pin`]). Only present while non-zero. A pinned block is never an
     /// eviction victim: the epoch guard above cannot express this, because it is scoped to one
@@ -167,6 +173,7 @@ impl Pager {
             free: (0..n_slots as u32).rev().collect(), // pop() hands out slot 0 first
             epoch: HashMap::with_capacity(n_slots),
             cur_epoch: 0,
+            cold_victim_cursor: None,
             pinned: HashMap::new(),
             stats: PagerStats::default(),
             profile_work: crate::pager_profile::LruWorkStats::default(),
@@ -179,6 +186,7 @@ impl Pager {
     /// cold-end scan inserts, where LRU position alone no longer protects batch siblings).
     pub fn begin_batch(&mut self) {
         self.cur_epoch += 1;
+        self.cold_victim_cursor = self.lru_head;
     }
 
     pub fn n_slots(&self) -> usize {
@@ -492,10 +500,75 @@ impl Pager {
             return Resolution::Hit { slot };
         }
         self.stats.misses += 1;
-        let (slot, evicted) = self.take_slot();
+        let (slot, evicted) = self.take_slot_cold();
         self.resident.insert(id, slot);
         self.push_front_lru(slot, id);
         Resolution::Miss { slot, evicted }
+    }
+
+    /// Cold-path counterpart of [`Self::take_slot`]. Within one batch it resumes from the node
+    /// after the previous victim instead of restarting at `lru_head`: nodes it passes are current-
+    /// epoch protected, the victim is removed, and newly admitted cold blocks are inserted before
+    /// the cursor and are current-epoch protected too. Consequently every linked node is examined
+    /// at most once per cold batch while victim choice remains identical to a fresh head scan.
+    fn take_slot_cold(&mut self) -> (u32, Option<BlockId>) {
+        if self.free.is_empty() {
+            debug_assert!(
+                self.pinned.is_empty(),
+                "pins are for the fallible resolve_and_pin path; touch/schedule cannot see them"
+            );
+        }
+        if let Some(s) = self.free.pop() {
+            return (s, None);
+        }
+
+        let queue_len = self.lru_len;
+        let mut scan_steps = 0usize;
+        let mut cursor = self.cold_victim_cursor;
+        let victim_slot = loop {
+            let Some(slot) = cursor else {
+                break None;
+            };
+            let node = self.lru[self.slot_idx(slot)];
+            let id = node.id.expect("linked LRU node has a block id");
+            scan_steps += 1;
+            cursor = node.next;
+            if self.epoch.get(&id) != Some(&self.cur_epoch) {
+                break Some(slot);
+            }
+        };
+        // Advance before unlinking: `victim_slot`'s node is cleared by `unlink_lru`, while its
+        // saved successor remains linked and is exactly where the next cold miss must resume.
+        self.cold_victim_cursor = cursor;
+        if crate::pager_profile::active() {
+            self.profile_work
+                .record_victim_select(queue_len, scan_steps);
+        }
+        let victim_slot = victim_slot.unwrap_or_else(|| {
+            assert!(
+                self.cur_epoch == 0,
+                "pager: a single dispatch batch touched more distinct blocks than the \
+                 n_slots={} this cache holds — within-batch eviction safety is unsatisfiable. \
+                 Refusing to degrade: evicting a block this same batch already resolved \
+                 doesn't fail cleanly, it feeds the dispatch another block's bytes (silent \
+                 wrong output, not an error). Raise the paging budget (INFR_CACHE) so every \
+                 pool gets at least one slot per block a batch touches, or leave it unset to \
+                 take the auto budget, which is sized to that floor.",
+                self.n_slots
+            );
+            self.lru_head.expect("full pager has an LRU head")
+        });
+        let victim = self
+            .unlink_lru(victim_slot)
+            .expect("victim slot has an LRU node");
+        let vslot = self
+            .resident
+            .remove(&victim)
+            .expect("every lru entry has a resident mapping");
+        debug_assert_eq!(vslot, victim_slot);
+        self.epoch.remove(&victim);
+        self.stats.evictions += 1;
+        (vslot, Some(victim))
     }
 
     /// A free slot, evicting if none remain, or `None` when every resident block is protected
@@ -918,6 +991,42 @@ mod tests {
         for id in [7u32, 8, 9] {
             assert!(p.slot_of(id).is_some(), "batch sibling {id} was evicted");
         }
+    }
+
+    #[test]
+    fn cold_batch_cursor_keeps_the_same_victim_order_as_head_scans() {
+        let mut p = Pager::new(4);
+        p.begin_batch();
+        for id in [10u32, 11, 12, 13] {
+            p.touch_cold(id);
+        }
+
+        // The cold order is [13, 12, 11, 10]. Protecting 13 makes 12 the first victim; later
+        // misses must resume at 11 and 10 rather than revisiting the protected prefix.
+        p.begin_batch();
+        assert!(matches!(p.touch_cold(13), Resolution::Hit { .. }));
+        for (id, expected_victim) in [(20u32, 12u32), (21, 11), (22, 10)] {
+            assert!(matches!(
+                p.touch_cold(id),
+                Resolution::Miss {
+                    evicted: Some(victim),
+                    ..
+                } if victim == expected_victim
+            ));
+        }
+        for id in [13u32, 20, 21, 22] {
+            assert!(p.slot_of(id).is_some());
+        }
+
+        // A new batch resets the cursor to the new cold head.
+        p.begin_batch();
+        assert!(matches!(
+            p.touch_cold(30),
+            Resolution::Miss {
+                evicted: Some(22),
+                ..
+            }
+        ));
     }
 
     #[test]
