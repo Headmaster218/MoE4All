@@ -101,7 +101,11 @@ layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, h
 // by the SELF_CHUNK policy's own `min(.., 512)`), and the host gate refuses a larger `chunk`. Halving
 // the slab takes the workgroup's LDS from 4.75 KB to 2.75 KB, which is what stops LDS from capping
 // occupancy below the 16 waves/SIMD the 96-VGPR footprint allows.
+#ifdef Q8_CHUNK1024
+shared float sc[1024];
+#else
 shared float sc[512];
+#endif
 #ifdef LS256
 shared float red[256];
 #elif defined(LS128)

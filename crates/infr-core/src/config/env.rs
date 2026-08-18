@@ -252,6 +252,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.q8_decode_d8 = presence_inv(get, "INFR_NO_Q8_DECODE_D8");
     v.q8_decode_ls128 = presence_inv(get, "INFR_NO_Q8_DECODE_LS128");
     v.q8_decode_ls256 = presence_inv(get, "INFR_NO_Q8_DECODE_LS256");
+    v.q8_decode_chunk1024 = presence_inv(get, "INFR_NO_Q8_DECODE_CHUNK1024");
     v.q8_qk_f16 = presence_inv(get, "INFR_NO_Q8_QK_F16");
     v.q8_pv_f16 = presence_inv(get, "INFR_NO_Q8_PV_F16");
     v.mla_sg = presence_inv(get, "INFR_NO_MLA_SG");

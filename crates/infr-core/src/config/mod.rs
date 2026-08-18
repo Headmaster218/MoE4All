@@ -321,6 +321,10 @@ cfg_struct! {
         /// `INFR_NO_Q8_DECODE_LS256` (inverted) — prefer eight waves for the Q8 hd256 kernel.
         /// Disabling it falls back to LS128, then LS64 according to `q8_decode_ls128`.
         q8_decode_ls256: bool = true,
+        /// `INFR_NO_Q8_DECODE_CHUNK1024` (inverted) — allow the coupled Q8 hd256 decode-only
+        /// kernel to use 1024-key chunks. All f16, prefill and other head-dim paths stay capped at
+        /// 512; disabling this restores the previous Q8 split/combine geometry.
+        q8_decode_chunk1024: bool = true,
         /// `INFR_NO_Q8_QK_F16` (inverted) — use packed fp16 products for the Q8 hd256 Q.K pass;
         /// softmax and P.V accumulation remain fp32. The fp32 Q.K build remains a fallback.
         q8_qk_f16: bool = true,

@@ -825,6 +825,15 @@ const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg 
     rounding: infr_core::tier::ChunkRounding::Down,
 };
 
+// Probe the wider coupled-Q8 hd256 decode kernel independently from every f16/prefill tier.
+// The specialized shader owns a 1024-score slab; all other paths retain ATTN_SPLIT's 512 cap.
+const Q8_HD256_DECODE_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
+    target_chunks: 32,
+    min_chunk: 64,
+    max_chunk: 1024,
+    rounding: infr_core::tier::ChunkRounding::Down,
+};
+
 /// Canvas-mask (`AttnMask::Canvas`) chunk DIVISOR: the canvas span is cut into ~this many chunks
 /// rather than sized adaptively (the fixed `lo` override makes the span short and known). The
 /// floor of 1 keeps the `kv_len.div_ceil(n)` below from dividing by zero.
@@ -3165,6 +3174,13 @@ fn lower_op(
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
                     // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
+                } else if rows == 1
+                    && k_q8_eff
+                    && v_q8_eff
+                    && hd == 256
+                    && be_.cfg().kernels.vulkan.q8_decode_chunk1024
+                {
+                    infr_core::tier::adaptive_chunk(span, &Q8_HD256_DECODE_SPLIT)
                 } else {
                     infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT)
                 };

@@ -24,6 +24,7 @@ fn backend(
     ls256: bool,
     qk_f16: bool,
     pv_f16: bool,
+    chunk1024: bool,
 ) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
     cfg.kernels.vulkan.q8_decode_d8 = d8;
@@ -31,6 +32,7 @@ fn backend(
     cfg.kernels.vulkan.q8_decode_ls256 = ls256;
     cfg.kernels.vulkan.q8_qk_f16 = qk_f16;
     cfg.kernels.vulkan.q8_pv_f16 = pv_f16;
+    cfg.kernels.vulkan.q8_decode_chunk1024 = chunk1024;
     VulkanBackend::new_with(Arc::new(cfg)).ok()
 }
 
@@ -49,8 +51,9 @@ fn run_case(
     qk_f16: bool,
     pv_f16: bool,
     kv_len: usize,
+    chunk_max: usize,
 ) -> Option<Vec<f32>> {
-    let be = backend(d8, ls128, ls256, qk_f16, pv_f16)?;
+    let be = backend(d8, ls128, ls256, qk_f16, pv_f16, chunk_max > 512)?;
     let (nh, nkv, hd) = (4usize, 2usize, 256usize);
     let n = kv_len * nkv * hd;
     let q: Vec<f32> = (0..nh * hd)
@@ -73,7 +76,7 @@ fn run_case(
     let vq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let out = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
 
-    let chunk = (kv_len / 32).clamp(64, 512);
+    let chunk = (kv_len / 32).clamp(64, chunk_max);
     let n_chunks = kv_len.div_ceil(chunk);
     let pm = be
         .alloc(nh * n_chunks * 4, BufferUsage::Activations)
@@ -122,27 +125,27 @@ fn run_case(
 #[test]
 fn q8_hd256_d8_matches_d32_for_tail_ragged_and_deep_contexts() {
     for kv_len in [1usize, 97, 8193] {
-        let Some(d32) = run_case(false, false, false, false, false, kv_len) else {
+        let Some(d32) = run_case(false, false, false, false, false, kv_len, 512) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls64) = run_case(true, false, false, false, false, kv_len) else {
+        let Some(d8_ls64) = run_case(true, false, false, false, false, kv_len, 512) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls128) = run_case(true, true, false, false, false, kv_len) else {
+        let Some(d8_ls128) = run_case(true, true, false, false, false, kv_len, 512) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls256_f32) = run_case(true, true, true, false, false, kv_len) else {
+        let Some(d8_ls256_f32) = run_case(true, true, true, false, false, kv_len, 512) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls256_qkf16) = run_case(true, true, true, true, false, kv_len) else {
+        let Some(d8_ls256_qkf16) = run_case(true, true, true, true, false, kv_len, 512) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls256_qkpvf16) = run_case(true, true, true, true, true, kv_len) else {
+        let Some(d8_ls256_qkpvf16) = run_case(true, true, true, true, true, kv_len, 512) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
@@ -170,4 +173,31 @@ fn q8_hd256_d8_matches_d32_for_tail_ragged_and_deep_contexts() {
             eprintln!("Q8 hd256 D32/{name} parity: kv_len={kv_len}, max_err={max_err}");
         }
     }
+}
+
+#[test]
+fn q8_hd256_chunk1024_matches_chunk512() {
+    let kv_len = 32_769usize;
+    let Some(narrow) = run_case(true, true, true, true, true, kv_len, 512) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let Some(wide) = run_case(true, true, true, true, true, kv_len, 1024) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let mut max_err = 0.0f32;
+    for (i, (&a, &b)) in narrow.iter().zip(&wide).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "out {i}: chunk512={a}, chunk1024={b}"
+        );
+        let err = (a - b).abs();
+        max_err = max_err.max(err);
+        assert!(
+            err <= 5.0e-4,
+            "out {i}: chunk512={a}, chunk1024={b}, err={err}"
+        );
+    }
+    eprintln!("Q8 hd256 chunk512/chunk1024 parity: kv_len={kv_len}, max_err={max_err}");
 }

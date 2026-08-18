@@ -6640,7 +6640,12 @@ impl<'a> Recorder<'a> {
             && kv_ml.is_none()
             && rows == 1
             && canvas_lo.is_none()
-            && chunk <= 512
+            && (chunk <= 512
+                || (k_q8
+                    && v_q8
+                    && hd == 256
+                    && chunk <= 1024
+                    && self.vk().q8_decode_chunk1024))
             && ring_safe
             // INFR_NO_ATTN_HD=1 exists to A/B the hd 256/512 specialization against the general
             // runtime-hd4 loops; the family's hd256/hd512 builds ARE that specialization, so honor
@@ -6661,6 +6666,7 @@ impl<'a> Recorder<'a> {
                         self.vk().q8_decode_ls256,
                         self.vk().q8_qk_f16,
                         self.vk().q8_pv_f16,
+                        self.vk().q8_decode_chunk1024,
                     )
                 } else {
                     None
