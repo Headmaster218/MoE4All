@@ -18,15 +18,16 @@ fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn backend(d8: bool, ls128: bool) -> Option<VulkanBackend> {
+fn backend(d8: bool, ls128: bool, ls256: bool) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
     cfg.kernels.vulkan.q8_decode_d8 = d8;
     cfg.kernels.vulkan.q8_decode_ls128 = ls128;
+    cfg.kernels.vulkan.q8_decode_ls256 = ls256;
     VulkanBackend::new_with(Arc::new(cfg)).ok()
 }
 
-fn run_case(d8: bool, ls128: bool, kv_len: usize) -> Option<Vec<f32>> {
-    let be = backend(d8, ls128)?;
+fn run_case(d8: bool, ls128: bool, ls256: bool, kv_len: usize) -> Option<Vec<f32>> {
+    let be = backend(d8, ls128, ls256)?;
     let (nh, nkv, hd) = (4usize, 2usize, 256usize);
     let n = kv_len * nkv * hd;
     let q: Vec<f32> = (0..nh * hd)
@@ -100,20 +101,28 @@ fn run_case(d8: bool, ls128: bool, kv_len: usize) -> Option<Vec<f32>> {
 #[test]
 fn q8_hd256_d8_matches_d32_for_tail_ragged_and_deep_contexts() {
     for kv_len in [1usize, 97, 8193] {
-        let Some(d32) = run_case(false, false, kv_len) else {
+        let Some(d32) = run_case(false, false, false, kv_len) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls64) = run_case(true, false, kv_len) else {
+        let Some(d8_ls64) = run_case(true, false, false, kv_len) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        let Some(d8_ls128) = run_case(true, true, kv_len) else {
+        let Some(d8_ls128) = run_case(true, true, false, kv_len) else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let Some(d8_ls256) = run_case(true, true, true, kv_len) else {
             eprintln!("skip: no Vulkan device");
             return;
         };
 
-        for (name, candidate) in [("D8-LS64", d8_ls64), ("D8-LS128", d8_ls128)] {
+        for (name, candidate) in [
+            ("D8-LS64", d8_ls64),
+            ("D8-LS128", d8_ls128),
+            ("D8-LS256", d8_ls256),
+        ] {
             let mut max_err = 0.0f32;
             for (i, (&reference, &clustered)) in d32.iter().zip(&candidate).enumerate() {
                 assert!(

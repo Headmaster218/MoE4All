@@ -318,6 +318,9 @@ cfg_struct! {
         /// `INFR_NO_Q8_DECODE_LS128` (inverted) — retain the 64-thread D8 kernel as a runtime
         /// fallback while the default Q8 hd256 path uses four waves to expose more key parallelism.
         q8_decode_ls128: bool = true,
+        /// `INFR_NO_Q8_DECODE_LS256` (inverted) — prefer eight waves for the Q8 hd256 kernel.
+        /// Disabling it falls back to LS128, then LS64 according to `q8_decode_ls128`.
+        q8_decode_ls256: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.
