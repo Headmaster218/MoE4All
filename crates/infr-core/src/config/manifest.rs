@@ -154,6 +154,7 @@ knobs! {
     // ── paging (§6.4) ────────────────────────────────────────────────────────
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
+    "INFR_PAGER_RING_SLOTS"     => "paging.ring_slots",                Int,      Ignored, "2",   migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
     "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8g",  migrated;
     "INFR_DRAM_BYPASS"          => "paging.dram_bypass",               Flag,     Ignored, "1",   migrated;

@@ -193,6 +193,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // ── paging ───────────────────────────────────────────────────────────────
     p.paging.cache = opt_size(get, "INFR_CACHE");
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
+    p.paging.ring_slots = num(get, "INFR_PAGER_RING_SLOTS");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");

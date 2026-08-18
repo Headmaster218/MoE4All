@@ -709,12 +709,13 @@ pub struct MoePagerSession {
     /// resident-weight path.
     sources: HashMap<usize, (Role, usize, ExpertSource)>,
     staging: Box<dyn Buffer>,
-    /// Pinned staging RING for the recorded-upload path ([`GpuPager::touch_staged`]): two
-    /// fence-rotated halves of [`Self::ring_half_bytes`] each, so the CPU stages the next
-    /// segment's misses while the GPU executes the previous one (see
+    /// Pinned staging RING for the recorded-upload path ([`GpuPager::touch_staged`]): independently
+    /// fenced regions of [`Self::ring_half_bytes`] each, so the CPU stages later segments' misses
+    /// while the GPU executes previous ones (see
     /// `adapter::execute_paged_moe`'s rotation). Sized by [`MoePagerLayout::ring_bytes`].
     ring: Box<dyn Buffer>,
     ring_half_bytes: usize,
+    ring_slots: usize,
     /// LUT tape: an append-only run of frozen per-(layer, role) LUT windows (`n_expert` u32 slot
     /// indices each, written by [`Self::lut_window`]). Dispatches read `tape[window + local_id]`
     /// instead of the live pool LUT, so host-side staging for LATER layers can keep mutating the
@@ -762,9 +763,9 @@ pub struct MoePagerLayout {
     /// it; other layers' entries stay `NOT_RESIDENT`).
     pub n_blocks: usize,
     pub pools: Vec<MoePoolSpec>,
-    /// Total bytes for the pinned upload ring (two fence-rotated halves — see
+    /// Total bytes for the pinned upload ring (independently fenced regions — see
     /// [`MoePagerSession`]'s `ring` field). `0` picks the default
-    /// ([`ring_bytes`]); either way each half is floored at the largest pool slot so one
+    /// ([`ring_bytes`]); either way each region is floored at the largest pool slot so one
     /// miss always fits. The seam's budget math subtracts this before splitting arena shares.
     pub ring_bytes: usize,
 }
@@ -775,6 +776,20 @@ pub struct MoePagerLayout {
 /// site here reads better next to them. The `paging.ring` override comes off the backend's
 /// `Config` (`INFR_PAGER_RING`), so the caller passes it in.
 pub use infr_core::pager::ring_bytes;
+
+// Vulkan permits 4-byte buffer-copy offsets, but 256 bytes also satisfies common
+// `optimalBufferCopyOffsetAlignment` values. More importantly, it prevents a configured ring
+// whose byte count is not evenly divisible by its slot count from giving every later region a
+// pathologically misaligned base address.
+const RING_REGION_ALIGN: usize = 256;
+
+fn ring_region_bytes(total: usize, slots: usize, min_slot_bytes: usize) -> usize {
+    debug_assert!(slots >= 2);
+    let fair_share = total / slots;
+    let aligned_share = fair_share / RING_REGION_ALIGN * RING_REGION_ALIGN;
+    let aligned_min = min_slot_bytes.div_ceil(RING_REGION_ALIGN) * RING_REGION_ALIGN;
+    aligned_share.max(aligned_min)
+}
 
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
@@ -791,7 +806,7 @@ impl MoePagerSession {
             staging_bytes = staging_bytes.max(spec.slot_bytes);
         }
         let staging = vk.alloc_uninit(staging_bytes, BufferUsage::Staging)?;
-        // Each ring half must hold the largest slot, or `touch_staged` could never make progress
+        // Each ring region must hold the largest slot, or `touch_staged` could never make progress
         // on that pool (the adapter rotates halves when one fills; a slot bigger than a half
         // would fit in neither).
         let ring_total = if layout.ring_bytes > 0 {
@@ -800,8 +815,9 @@ impl MoePagerSession {
             // 0 budget → the clamp floor; the configured `paging.ring` override still wins.
             ring_bytes(0, vk.cfg().paging.ring)
         };
-        let ring_half_bytes = (ring_total / 2).max(staging_bytes);
-        let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
+        let ring_slots = vk.cfg().paging.ring_slots.clamp(2, 8);
+        let ring_half_bytes = ring_region_bytes(ring_total, ring_slots, staging_bytes);
+        let ring = vk.alloc_uninit(ring_slots * ring_half_bytes, BufferUsage::Staging)?;
         // One graph's windows = paged layers x roles x n_expert words (Scout: 48 x 3 x 16 = 2.3k)
         // — 64k words (256 KiB) leaves an order of magnitude of headroom; `lut_window` hard-errors
         // on overflow rather than wrapping into a region an in-flight segment may still read.
@@ -813,6 +829,7 @@ impl MoePagerSession {
             staging,
             ring,
             ring_half_bytes,
+            ring_slots,
             tape,
             tape_words,
             print_stats: vk.cfg().paging.stats,
@@ -946,6 +963,10 @@ impl MoePagerSession {
 
     pub fn ring_half_bytes(&self) -> usize {
         self.ring_half_bytes
+    }
+
+    pub fn ring_slots(&self) -> usize {
+        self.ring_slots
     }
 
     /// The LUT tape buffer every windowed dispatch binds (see the `tape` field's doc).
@@ -1330,7 +1351,7 @@ struct DensePool {
 /// the first placeholder.
 pub struct DensePagerLayout {
     pub pools: Vec<DensePoolSpec>,
-    /// Pinned upload ring total bytes (two fence-rotated halves); `0` = [`ring_bytes`]'s
+    /// Pinned upload ring total bytes (independently fenced regions); `0` = [`ring_bytes`]'s
     /// floor. Each half is floored at the largest pool slot so one miss always fits.
     pub ring_bytes: usize,
 }
@@ -1347,6 +1368,7 @@ pub struct DensePagerSession {
     sources: HashMap<usize, (usize, DenseSource)>,
     ring: Box<dyn Buffer>,
     ring_half_bytes: usize,
+    ring_slots: usize,
     print_stats: bool,
 }
 
@@ -1379,13 +1401,15 @@ impl DensePagerSession {
             ring_bytes(0, vk.cfg().paging.ring)
         };
         // Each half must hold the largest slot or `stage` could never make progress on that pool.
-        let ring_half_bytes = (ring_total / 2).max(max_slot);
-        let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
+        let ring_slots = vk.cfg().paging.ring_slots.clamp(2, 8);
+        let ring_half_bytes = ring_region_bytes(ring_total, ring_slots, max_slot);
+        let ring = vk.alloc_uninit(ring_slots * ring_half_bytes, BufferUsage::Staging)?;
         Ok(Self {
             pools,
             sources: HashMap::new(),
             ring,
             ring_half_bytes,
+            ring_slots,
             print_stats: vk.cfg().paging.stats,
         })
     }
@@ -1501,6 +1525,10 @@ impl DensePagerSession {
         self.ring_half_bytes
     }
 
+    pub fn ring_slots(&self) -> usize {
+        self.ring_slots
+    }
+
     /// Per-pool `(VRAM residency, host tier)` counters, in pool order.
     ///
     /// The host half is what separates a VRAM miss the DRAM tier absorbed from one that reached the
@@ -1571,6 +1599,23 @@ mod tests {
     fn validate_pager_dims_accepts_valid() {
         assert!(validate_pager_dims(1, 4).is_ok());
         assert!(validate_pager_dims(238, 13 << 20).is_ok());
+    }
+
+    #[test]
+    fn ring_regions_are_aligned_without_exceeding_the_shared_budget() {
+        let total = 3584 * 1024 * 1024usize;
+        for slots in 2..=8 {
+            let region = ring_region_bytes(total, slots, 900_003);
+            assert_eq!(region % RING_REGION_ALIGN, 0);
+            assert!(region >= 900_003);
+            assert!(region * slots <= total);
+        }
+    }
+
+    #[test]
+    fn ring_region_floor_is_aligned_when_one_upload_exceeds_its_share() {
+        let region = ring_region_bytes(1024, 8, 513);
+        assert_eq!(region, 768);
     }
 
     // ── #5: record_placement / apply_placement LUT bookkeeping is byte-identical to the old

@@ -5437,17 +5437,26 @@ fn pooled_usage(
 /// read it has fully executed.
 #[derive(Default)]
 struct PagedStream {
-    /// Per-ring-half in-flight segment (the one whose recorded copies read that half).
-    pending: [Option<crate::recorder::PendingSegment>; 2],
-    /// Which ring half `cursor` allocates from.
+    /// Per-ring-region in-flight segment (the one whose recorded copies read that region).
+    pending: Vec<Option<crate::recorder::PendingSegment>>,
+    /// Which ring region `cursor` allocates from.
     half: usize,
-    /// Bytes used in the current half.
+    /// Bytes used in the current region.
     cursor: usize,
     /// Words used in the session's LUT tape (reset only after full drains — `sync_stream`).
     tape_cursor: usize,
 }
 
 impl PagedStream {
+    fn ensure_slots(&mut self, slots: usize) {
+        debug_assert!(slots >= 2);
+        if self.pending.is_empty() {
+            self.pending.resize_with(slots, || None);
+        } else {
+            debug_assert_eq!(self.pending.len(), slots);
+        }
+    }
+
     fn drain(&mut self) -> Result<()> {
         for p in &mut self.pending {
             if let Some(s) = p.take() {
@@ -5473,8 +5482,9 @@ fn rotate_stream<'a>(
         .expect("segment always Some between ops")
         .finish_nowait()
         .map_err(|e| be(e.to_string()))?;
+    debug_assert!(!ps.pending.is_empty());
     ps.pending[ps.half] = Some(seg);
-    ps.half ^= 1;
+    ps.half = (ps.half + 1) % ps.pending.len();
     ps.cursor = 0;
     if let Some(prev) = ps.pending[ps.half].take() {
         let wait_t0 = infr_core::pager_profile::start();
@@ -5609,6 +5619,7 @@ fn stage_dense_linear<'a>(
             let sess = guard
                 .as_mut()
                 .expect("dense streamed execution requires a session");
+            ps.ensure_slots(sess.ring_slots());
             let half_base = ps.half * sess.ring_half_bytes();
             sess.stage(
                 rec.as_ref().expect("segment always Some between ops"),
@@ -5657,6 +5668,7 @@ fn stage_and_window<'a>(
         let done = {
             let mut guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_mut().expect("paged execution requires a session");
+            ps.ensure_slots(sess.ring_slots());
             let half_base = ps.half * sess.ring_half_bytes();
             sess.stage_role(
                 rec.as_ref().expect("segment always Some between ops"),

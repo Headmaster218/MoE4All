@@ -339,6 +339,10 @@ fn mib_and_size_string_spellings() {
     }
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "1g")])]);
     assert_eq!(cfg.paging.ring, Some(super::SizeSpec::Bytes(1 << 30)));
+
+    assert_eq!(d.paging.ring_slots, 2);
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING_SLOTS", "8")])]);
+    assert_eq!(cfg.paging.ring_slots, 8);
 }
 
 /// The device-list grammar, inherited from `infr_llama::seam::parse_device_spec` when S4 deleted
@@ -1092,6 +1096,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MOE_SMALL_M",
         "INFR_NO_FUSE_ADD",
         "INFR_PAGER_RING",
+        "INFR_PAGER_RING_SLOTS",
         "INFR_PAGER_PROFILE",
     ];
 

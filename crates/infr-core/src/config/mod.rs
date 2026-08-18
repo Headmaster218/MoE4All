@@ -147,6 +147,10 @@ cfg_struct! {
         cache: Option<SizeSpec> = None,
         /// `INFR_PAGER_RING`: upload staging ring. `None` = the budget-fraction policy.
         ring: Option<SizeSpec> = None,
+        /// `INFR_PAGER_RING_SLOTS`: number of independently fenced regions in the upload ring.
+        /// Two preserves the historical double buffer; larger values let CPU staging run farther
+        /// ahead of queued GPU work without changing the ring's total byte budget.
+        ring_slots: usize = 2,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
