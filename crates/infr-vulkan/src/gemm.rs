@@ -3483,6 +3483,7 @@ dyn_spv!(attn_decode_swa_spv, "attn_decode_swa");
 dyn_spv!(attn_decode_swa_dynac_spv, "attn_decode_swa_dynac");
 dyn_spv!(attn_decode_hd256_spv, "attn_decode_hd256");
 dyn_spv!(attn_decode_hd256_q8_spv, "attn_decode_hd256_q8");
+dyn_spv!(attn_decode_hd256_q8_d32_spv, "attn_decode_hd256_q8_d32");
 dyn_spv!(attn_decode_hd256_dynac_spv, "attn_decode_hd256_dynac");
 dyn_spv!(attn_decode_hd256_swa_spv, "attn_decode_hd256_swa");
 dyn_spv!(
@@ -3544,9 +3545,11 @@ pub(crate) fn attn_decode_q8_kernel(
     hd: usize,
     swa: bool,
     dynac: bool,
+    d8: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     match (hd, swa, dynac) {
-        (256, false, false) => Some(("attn_decode_hd256_q8", attn_decode_hd256_q8_spv())),
+        (256, false, false) if d8 => Some(("attn_decode_hd256_q8", attn_decode_hd256_q8_spv())),
+        (256, false, false) => Some(("attn_decode_hd256_q8_d32", attn_decode_hd256_q8_d32_spv())),
         _ => None,
     }
 }

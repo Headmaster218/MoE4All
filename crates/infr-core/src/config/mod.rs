@@ -311,6 +311,10 @@ cfg_struct! {
         /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
         /// the decode fast path; the output is bit-identical either way, so this is an A/B knob.
         attn_decode: bool = true,
+        /// `INFR_NO_Q8_DECODE_D8` (inverted) — use the historical full-wave QK reduction instead
+        /// of the 8-lane clustered Q8 hd256 decode kernel. Kept as a narrow A/B/fallback knob;
+        /// f16 and every other KV/head-dim shape ignore it.
+        q8_decode_d8: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.

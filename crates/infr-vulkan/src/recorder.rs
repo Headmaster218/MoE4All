@@ -6652,7 +6652,12 @@ impl<'a> Recorder<'a> {
                 // The specialized Q8 build is coupled only. Mixed K/V formats keep
                 // attn_partial's independently typed readers.
                 if k_q8 && v_q8 {
-                    crate::gemm::attn_decode_q8_kernel(hd, window > 0, false)
+                    crate::gemm::attn_decode_q8_kernel(
+                        hd,
+                        window > 0,
+                        false,
+                        self.vk().q8_decode_d8,
+                    )
                 } else {
                     None
                 }

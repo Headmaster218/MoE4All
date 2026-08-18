@@ -46,6 +46,9 @@
 // prologue that writes the indirect grid needs no change because the grid shape is the same.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef KVQ8_D8
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -201,6 +204,17 @@ void main() {
 #if DHD4 == 32
     // hd4 == 32 means ONE loop-invariant q vec4 per lane, held in a register.
     vec4 qreg = vec4(q4[h * 32u + lane]);
+#elif defined(KVQ8_D8)
+    // Q8 hd256: four independent keys per wave, eight lanes per key. Each lane owns one
+    // 32-element Q8 block (eight vec4s), which also aligns the clustered reduction with the
+    // cache's scale granularity.
+    uint dl = lane & 7u;
+    uint kl = lane >> 3u;
+    vec4 qreg[8];
+    uint qbase = h * 64u;
+    for (uint i = 0u; i < 8u; i++) {
+        qreg[i] = vec4(q4[qbase + dl + 8u * i]);
+    }
 #else
     // hd4 == 64/128: DHD4/32 loop-invariant q vec4s per lane. The trip count is a compile-time
     // constant, so `qreg[]` stays in registers (attn_partial's dynamic `qreg[nq++]` index is what
@@ -235,6 +249,33 @@ void main() {
         lmax = max(max(max(max(lmax, d0), d1), d2), d3);
     }
 #elif DHD4 == 64
+#ifdef KVQ8_D8
+    // Two waves x four key groups cover eight consecutive keys. The final partial group reads
+    // j0 and discards its result so the clustered reduction remains in uniform control flow.
+    uint kb = pc.nkv * 64u;
+    uint kh = kvh * 64u + dl;
+    uint jb = j0 + sg * 4u;
+    for (; jb < j1; jb += nsg * 4u) {
+        uint key = jb + kl;
+        bool ok = key < j1;
+        uint rb = RROW(ok ? key : j0) * kb + kh;
+        vec4 a[8];
+        for (uint i = 0u; i < 8u; i++) {
+            a[i] = kread4(rb + 8u * i);
+        }
+        float part = 0.0;
+        for (uint i = 0u; i < 8u; i++) {
+            part += dot(qreg[i], a[i]);
+        }
+        float d = subgroupClusteredAdd(part, 8u) * scale;
+        if (ok) {
+            if (dl == 0u) { sc[key - j0] = d; }
+            lmax = max(lmax, d);
+        }
+    }
+    // This arm includes its own masked tail.
+    j = j1;
+#else
     // hd=256: 2 vec4/lane per key, software-pipeline 2 keys → 4 loads in flight per lane.
     uint kb = pc.nkv * 64u;
     uint kh = kvh * 64u + lane;
@@ -253,6 +294,7 @@ void main() {
         }
         lmax = max(lmax, max(d0, d1));
     }
+#endif
 #else
     // hd=512: 4 vec4/lane per key, software-pipeline 2 keys → 8 loads in flight per lane.
     uint kb = pc.nkv * 128u;
@@ -284,6 +326,7 @@ void main() {
     // the comment there: folding this to a constant is a measured 1-ULP change.
     uint hd4r = hd >> 2u;
 #endif
+#ifndef KVQ8_D8
     for (; j < j1; j += nsg) {
 #if DHD4 == 32
         float part = dot(qreg, kread4((RROW(j) * pc.nkv + kvh) * 32u + lane));
@@ -307,6 +350,7 @@ void main() {
         if (lane == 0u) { sc[j - j0] = d; }
         lmax = max(lmax, d);
     }
+#endif
     red[t] = lmax;
     barrier();
     for (uint s = 32u; s > 0u; s >>= 1u) {
