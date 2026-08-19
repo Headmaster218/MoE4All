@@ -2035,6 +2035,48 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 && [Role::Down, Role::Gate, Role::Up]
                     .into_iter()
                     .all(role_has_balanced_sizes);
+            // APEX Balanced has the same two physical matrix sizes for Gate/Up/Down. Merge those
+            // six historical role shards into two REAL logical pools (Q5 and Q6): one Pager/LRU/
+            // free-list per size. Physical Vulkan allocations may still be split below 3 GiB;
+            // that boundary is deliberately absent from this layout.
+            let logical_pools: Vec<(Option<Role>, usize, usize, [usize; 3])> =
+                if auto_size_bias_layout {
+                    let mut sizes: Vec<usize> = pool_blocks.iter().map(|&(_, sb, _)| sb).collect();
+                    sizes.sort_unstable();
+                    sizes.dedup();
+                    sizes
+                        .into_iter()
+                        .map(|sb| {
+                            let mut role_blocks = [0usize; 3];
+                            for &(role, pool_sb, blocks) in &pool_blocks {
+                                if pool_sb == sb {
+                                    let idx = match role {
+                                        Role::Gate => 0,
+                                        Role::Up => 1,
+                                        Role::Down => 2,
+                                    };
+                                    role_blocks[idx] += blocks;
+                                }
+                            }
+                            let blocks = role_blocks.iter().sum();
+                            (None, sb, blocks, role_blocks)
+                        })
+                        .collect()
+                } else {
+                    pool_blocks
+                        .iter()
+                        .map(|&(role, sb, blocks)| {
+                            let mut role_blocks = [0usize; 3];
+                            let idx = match role {
+                                Role::Gate => 0,
+                                Role::Up => 1,
+                                Role::Down => 2,
+                            };
+                            role_blocks[idx] = blocks;
+                            (Some(role), sb, blocks, role_blocks)
+                        })
+                        .collect()
+                };
             let (size_cache_bias, size_cache_bias_source) = match ec.paging.moe_size_cache_bias {
                 Some(value) => (value.clamp(-8.0, 8.0) as f64, "explicit"),
                 None if auto_size_bias_layout => (2.0, "auto"),
@@ -2043,9 +2085,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let weighted_total = if size_cache_bias == 0.0 {
                 0.0
             } else {
-                pool_blocks
+                logical_pools
                     .iter()
-                    .map(|&(_, sb, nb)| (sb * nb) as f64 * (sb as f64).powf(size_cache_bias))
+                    .map(|&(_, sb, nb, _)| (sb * nb) as f64 * (sb as f64).powf(size_cache_bias))
                     .sum::<f64>()
             };
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
@@ -2056,9 +2098,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // ReBAR BDA allocation);
             // the proportional split below never over-subscribes VRAM because it partitions
             // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
-            let pools: Vec<infr_vulkan::pager::MoePoolSpec> = pool_blocks
+            let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
                 .iter()
-                .map(|&(role, sb, nb)| {
+                .map(|&(role, sb, nb, role_blocks)| {
                     // Budget split PROPORTIONALLY to each pool's total bank bytes — the byte share is
                     // also the access share under uniform routing (every (layer, expert) read touches
                     // gate+up+down alike), so proportional slots equalize expected hit rates across
@@ -2079,11 +2121,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
                     // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
                     // point holding more slots than the pool has distinct experts).
-                    let batch_floor = if ec.paging.moe_layer_stream {
-                        n_expert.saturating_mul(2)
-                    } else {
-                        n_expert
-                    };
+                    let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
+                    let batch_floor = n_expert
+                        .saturating_mul(roles_per_layer)
+                        .saturating_mul(if ec.paging.moe_layer_stream { 2 } else { 1 });
                     let floor = batch_floor.min(nb).max(1);
                     let budget_slots = ((share / sb as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::MoePoolSpec {
@@ -2095,11 +2136,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .collect();
             let cached: usize = pools.iter().map(|p| p.n_slots).sum();
             let host_chunk_count = host_chunks.len();
-            let pool_desc: Vec<String> = pool_blocks
+            let pool_desc: Vec<String> = logical_pools
                 .iter()
                 .zip(&pools)
-                .map(|(&(role, sb, nb), p)| {
-                    format!("{role:?}[{:.1}MB] {}/{}", sb as f64 / 1e6, p.n_slots, nb)
+                .map(|(&(role, sb, nb, _), p)| {
+                    let label = role.map_or("Q5/Q6-shared".to_owned(), |r| format!("{r:?}"));
+                    format!("{label}[{:.1}MB] {}/{}", sb as f64 / 1e6, p.n_slots, nb)
                 })
                 .collect();
             tracing::info!(

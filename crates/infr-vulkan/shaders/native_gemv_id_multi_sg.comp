@@ -45,7 +45,7 @@ layout(push_constant) uniform PC {
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 #ifdef PAGED
-layout(binding = 3) readonly buffer LUTB { uint lut[]; };
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
 layout(binding = 4) buffer YB { float y_buf[]; };
 #else
 layout(binding = 3) buffer YB { float y_buf[]; };
@@ -96,8 +96,7 @@ void main() {
 #ifdef PAGED
     // Layer-local expert id -> frozen LUT-window slot -> 64-bit arena byte address. This is the
     // same lookup as the tree paged kernel; only the K reduction / NR output grouping differs.
-    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
-             + uint64_t(lut[pc.stride + ids[slot_global]]) * uint64_t(pc.slot_bytes);
+    w_addr = arena_base(lut[pc.stride + ids[slot_global]].x, lut[pc.stride + ids[slot_global]].y);
 #else
     // Resident expert base BYTE address straight from `ids`; `pc.stride` is the expert stride.
     w_addr = arena_base(pc.arena_lo, pc.arena_hi)

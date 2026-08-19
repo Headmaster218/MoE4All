@@ -5726,10 +5726,11 @@ fn stage_and_window<'a>(
     ids: &[u32],
     n_expert: usize,
     scan: bool,
+    batch_open: bool,
 ) -> Result<u32> {
     // One epoch batch per (layer, role): the epoch, not LRU position, protects this batch's
     // earlier ids from its later misses on the cold-insert path.
-    {
+    if !batch_open {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
         sess.begin_batch(buf_id)?;
@@ -6097,17 +6098,44 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
+    let shared_batch = if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        guard
+            .as_mut()
+            .expect("paged execution requires a session")
+            .begin_shared_batch(&[gate_id, up_id, down_id])?
+    } else {
+        false
+    };
     let gate_w = if layer_stream {
         stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
     } else {
-        stage_and_window(be_, rec, ps, gate_id, &stage_ids, n_expert, touch_all)?
+        stage_and_window(
+            be_,
+            rec,
+            ps,
+            gate_id,
+            &stage_ids,
+            n_expert,
+            touch_all,
+            shared_batch,
+        )?
     };
     let up_w = if *fused_gate_up {
         gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
     } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, up_id, n_expert)?
     } else {
-        stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
+        stage_and_window(
+            be_,
+            rec,
+            ps,
+            up_id,
+            &stage_ids,
+            n_expert,
+            touch_all,
+            shared_batch,
+        )?
     };
     let down_has_miss = if !layer_stream && !stage_ids.is_empty() {
         let guard = be_.moe_pager().lock().unwrap();
@@ -6127,7 +6155,14 @@ fn execute_paged_moe<'a>(
         Some(stage_layer_and_window(be_, rec, ps, down_id, n_expert)?)
     } else {
         Some(stage_and_window(
-            be_, rec, ps, down_id, &stage_ids, n_expert, touch_all,
+            be_,
+            rec,
+            ps,
+            down_id,
+            &stage_ids,
+            n_expert,
+            touch_all,
+            shared_batch,
         )?)
     };
     // RAW: make every direct HOST write to the mapped arena visible before the first dispatch
@@ -6493,7 +6528,16 @@ fn execute_paged_moe<'a>(
         let probe = submit_prefill_compute(rec, ps)?;
         let profile = infr_core::pager_profile::active();
         let compute_live_at_start = profile && prefetch_compute_live(ps, probe)?;
-        let window = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
+        let window = stage_and_window(
+            be_,
+            rec,
+            ps,
+            down_id,
+            &stage_ids,
+            n_expert,
+            touch_all,
+            shared_batch,
+        )?;
         if profile {
             infr_core::pager_profile::record_prefetch_window(
                 compute_live_at_start,

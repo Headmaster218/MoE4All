@@ -60,7 +60,7 @@ layout(binding = 3) readonly buffer WB { uint nw[]; };          // stacked Q5_1 
 // PAGED (implies EXPERT_GRID): `nw` is a GpuPager arena of uniform slots; see
 // native_gemm_mmq_q2_k.comp's PAGED doc (word base not slot index, pc.w_base = layer_base, pc.m
 // unused, rb() chokepoint).
-layout(binding = 4) readonly buffer LUT { uint lut[]; };
+layout(binding = 4) readonly buffer LUT { uvec2 lut[]; };
 layout(binding = 5) readonly buffer CNT { uint counts[]; };
 layout(binding = 6) readonly buffer OFF { uint offsets[]; };
 layout(binding = 7) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
@@ -125,8 +125,7 @@ void main() {
 #ifdef PAGED
     // Resolved AFTER the count early-exit: a bucket with count 0 was never routed, so its LUT
     // entry may be stale/absent — no workgroup that would read it gets here.
-    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
-             + uint64_t(lut[pc.w_base + ex]) * uint64_t(pc.slot_bytes);
+    w_addr = arena_base(lut[pc.w_base + ex].x, lut[pc.w_base + ex].y);
     uint wbase = 0u;
 #elif defined(STREAMED)
     // Expert base scaled onto the 64-bit pointer — pc.m is REPURPOSED as the per-expert BYTE

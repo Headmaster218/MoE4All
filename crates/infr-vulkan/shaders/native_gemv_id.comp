@@ -53,7 +53,7 @@ layout(binding = 2) readonly buffer IDB { uint ids[]; };
 // a read, silently skipping the barrier a LATER dispatch needs before reading `y_buf`. Binding LUT
 // ahead of Y here (and in the matching Rust buffer array) keeps Y last in both builds instead.
 #ifdef PAGED
-layout(binding = 3) readonly buffer LUTB { uint lut[]; };
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
 layout(binding = 4) buffer YB { float y_buf[]; };
 #else
 layout(binding = 3) buffer YB { float y_buf[]; };
@@ -94,8 +94,7 @@ void main() {
     // the small within-expert element offset. `pc.stride` is repurposed in this build as the LUT
     // WINDOW base and `ids` holds layer-LOCAL expert ids — same contract as
     // native_gemv_id_multi.comp's PAGED build (see its comment for the tape-window rationale).
-    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
-             + uint64_t(lut[pc.stride + ids[pc.slot]]) * uint64_t(pc.slot_bytes);
+    w_addr = arena_base(lut[pc.stride + ids[pc.slot]].x, lut[pc.stride + ids[pc.slot]].y);
     uint wbase = o * pc.in_f;
 #elif defined(STREAMED)
     // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE

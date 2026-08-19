@@ -58,7 +58,7 @@ layout(binding = 2) readonly buffer IDB { uint ids[]; };
 // `y_buf` as a read and `lut` as the write, silently dropping a barrier a later dispatch (e.g. the
 // small-m MoE arm's activation, reading this GEMV's `y`) needed.
 #ifdef PAGED
-layout(binding = 3) readonly buffer LUTB { uint lut[]; };
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
 layout(binding = 4) buffer YB { float y_buf[]; };
 #else
 layout(binding = 3) buffer YB { float y_buf[]; };
@@ -104,8 +104,7 @@ void main() {
     // indices for exactly this layer — a write-once window in the session's LUT tape (see
     // `MoePagerSession::lut_window` for why in-flight segments must read a frozen copy, not the
     // live pool LUT).
-    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
-             + uint64_t(lut[pc.stride + ids[slot_global]]) * uint64_t(pc.slot_bytes);
+    w_addr = arena_base(lut[pc.stride + ids[slot_global]].x, lut[pc.stride + ids[slot_global]].y);
     uint wbase = o * pc.in_f;
 #elif defined(STREAMED)
     // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE

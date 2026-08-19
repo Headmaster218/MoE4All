@@ -4840,7 +4840,7 @@ mod tests {
         be.init_moe_pager(crate::pager::MoePagerLayout {
             n_blocks: 4,
             pools: vec![crate::pager::MoePoolSpec {
-                role: crate::pager::Role::Gate,
+                role: Some(crate::pager::Role::Gate),
                 slot_bytes: 4096,
                 n_slots: 2,
             }],

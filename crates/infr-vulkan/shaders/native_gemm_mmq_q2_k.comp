@@ -74,7 +74,7 @@ layout(binding = 2) readonly buffer WB { uint nw[]; };          // stacked Q2_K 
 // past ~100 Scout-sized slots). pc.w_base is repurposed as the layer's GLOBAL id base (global id =
 // layer_base + local expert id) and pc.arena_lo/hi + pc.slot_bytes carry the arena address; pc.m is
 // unused. The slot base is resolved once in main and read at the single rb() chokepoint below.
-layout(binding = 3) readonly buffer LUT { uint lut[]; };
+layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
 layout(binding = 4) readonly buffer CNT { uint counts[]; };
 layout(binding = 5) readonly buffer OFF { uint offsets[]; };
 layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
@@ -126,8 +126,7 @@ void main() {
 #ifdef PAGED
     // Resolved AFTER the count early-exit: a bucket with count 0 was never routed, so its LUT
     // entry may be stale/absent — no workgroup that would read it gets here.
-    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
-             + uint64_t(lut[pc.w_base + ex]) * uint64_t(pc.slot_bytes);
+    w_addr = arena_base(lut[pc.w_base + ex].x, lut[pc.w_base + ex].y);
     uint wbase = 0u;
 #elif defined(STREAMED)
     // Expert base scaled onto the 64-bit pointer — pc.m is REPURPOSED as the per-expert BYTE
