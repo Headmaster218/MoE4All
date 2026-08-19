@@ -5480,7 +5480,12 @@ impl<'a> Recorder<'a> {
         let mpad = (n.div_ceil(128) * 128) as u32;
         // Register-O shared = BR*FLASH_REG_SHARED_PER_ROW: BR=128 → 58880 B (needs 64 KB); BR=64 →
         // 29440 B (NVIDIA 48 KB / MoltenVK 32 KB). Largest that fits; transformer skips reg if neither.
-        let br: u32 = if self.be.max_shared_memory_bytes() >= 128 * crate::FLASH_REG_SHARED_PER_ROW
+        let br128_f16score = hd == 256
+            && prefer_deep_splits
+            && kv_addr.is_none()
+            && self.be.prefers_hd256_prefill_br128_f16score();
+        let br: u32 = if br128_f16score
+            || self.be.max_shared_memory_bytes() >= 128 * crate::FLASH_REG_SHARED_PER_ROW
         {
             128
         } else {
@@ -5496,44 +5501,51 @@ impl<'a> Recorder<'a> {
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let bda = kv_addr.is_some();
         let cw4 = hd == 256 && br == 64 && self.be.prefers_hd256_prefill_cw4();
-        let (rname, rspv): (&'static str, &[u32]) = match (hd, br == 64, bda, cw4) {
-            (128, true, true, false) => (
-                "attn_flash_reg_br64_bda",
-                crate::gemm::attn_flash_reg_br64_bda_spv(),
-            ),
-            (128, true, false, false) => (
-                "attn_flash_reg_br64",
-                crate::gemm::attn_flash_reg_br64_spv(),
-            ),
-            (128, false, true, false) => {
-                ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv())
+        let (rname, rspv): (&'static str, &[u32]) = if br128_f16score {
+            (
+                "attn_flash_reg_hd256_br128_f16score",
+                crate::gemm::attn_flash_reg_hd256_br128_f16score_spv(),
+            )
+        } else {
+            match (hd, br == 64, bda, cw4) {
+                (128, true, true, false) => (
+                    "attn_flash_reg_br64_bda",
+                    crate::gemm::attn_flash_reg_br64_bda_spv(),
+                ),
+                (128, true, false, false) => (
+                    "attn_flash_reg_br64",
+                    crate::gemm::attn_flash_reg_br64_spv(),
+                ),
+                (128, false, true, false) => {
+                    ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv())
+                }
+                (128, false, false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
+                (256, true, true, true) => (
+                    "attn_flash_reg_hd256_br64_cw4_bda",
+                    crate::gemm::attn_flash_reg_hd256_br64_cw4_bda_spv(),
+                ),
+                (256, true, false, true) => (
+                    "attn_flash_reg_hd256_br64_cw4",
+                    crate::gemm::attn_flash_reg_hd256_br64_cw4_spv(),
+                ),
+                (256, true, true, false) => (
+                    "attn_flash_reg_hd256_br64_bda",
+                    crate::gemm::attn_flash_reg_hd256_br64_bda_spv(),
+                ),
+                (256, true, false, false) => (
+                    "attn_flash_reg_hd256_br64",
+                    crate::gemm::attn_flash_reg_hd256_br64_spv(),
+                ),
+                (256, false, true, false) => (
+                    "attn_flash_reg_hd256_bda",
+                    crate::gemm::attn_flash_reg_hd256_bda_spv(),
+                ),
+                (256, false, false, false) => (
+                    "attn_flash_reg_hd256",
+                    crate::gemm::attn_flash_reg_hd256_spv(),
+                ),
+                _ => unreachable!("register-O head dim must be 128 or 256"),
             }
-            (128, false, false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
-            (256, true, true, true) => (
-                "attn_flash_reg_hd256_br64_cw4_bda",
-                crate::gemm::attn_flash_reg_hd256_br64_cw4_bda_spv(),
-            ),
-            (256, true, false, true) => (
-                "attn_flash_reg_hd256_br64_cw4",
-                crate::gemm::attn_flash_reg_hd256_br64_cw4_spv(),
-            ),
-            (256, true, true, false) => (
-                "attn_flash_reg_hd256_br64_bda",
-                crate::gemm::attn_flash_reg_hd256_br64_bda_spv(),
-            ),
-            (256, true, false, false) => (
-                "attn_flash_reg_hd256_br64",
-                crate::gemm::attn_flash_reg_hd256_br64_spv(),
-            ),
-            (256, false, true, false) => (
-                "attn_flash_reg_hd256_bda",
-                crate::gemm::attn_flash_reg_hd256_bda_spv(),
-            ),
-            (256, false, false, false) => (
-                "attn_flash_reg_hd256",
-                crate::gemm::attn_flash_reg_hd256_spv(),
-            ),
-            _ => unreachable!("register-O head dim must be 128 or 256"),
         };
         let plen: usize = if bda { 48 } else { 32 };
         let kp = self.be.kernel_sg(rname, rspv, 6, plen as u32, 32);
@@ -12450,14 +12462,16 @@ mod tests {
             (448, 2000, 16, 8), // qwen3-shaped
             (100, 100, 2, 2),   // q<128 → padded tile
         ] {
-            run_attn_flash_reg(&be, q, kv, nh, nkv, 128);
+            run_attn_flash_reg(&be, q, kv, nh, nkv, 128, false);
         }
         let split = be_with(|v| v.flash_splits = Some(4));
-        run_attn_flash_reg(&split, 128, 2000, 16, 8, 128);
-        run_attn_flash_reg(&split, 200, 600, 2, 1, 128);
+        run_attn_flash_reg(&split, 128, 2000, 16, 8, 128, false);
+        run_attn_flash_reg(&split, 200, 600, 2, 1, 128, false);
         // M10 hd256 register-O: one unsplit and one forced split-K/GQA case.
-        run_attn_flash_reg(&be, 128, 300, 4, 2, 256);
-        run_attn_flash_reg(&split, 128, 2000, 8, 4, 256);
+        run_attn_flash_reg(&be, 128, 300, 4, 2, 256, false);
+        run_attn_flash_reg(&split, 128, 2000, 8, 4, 256, false);
+        // P2 deep-Q8 candidate: force the BR128/f16-score kernel on a small bound-buffer case.
+        run_attn_flash_reg(&split, 128, 2000, 8, 4, 256, true);
     }
 
     fn run_attn_flash_reg(
@@ -12467,6 +12481,7 @@ mod tests {
         nh: usize,
         nkv: usize,
         hd: usize,
+        prefer_deep_splits: bool,
     ) {
         let pos_offset = kv_len - q_len;
         let mpad = q_len.div_ceil(128) * 128;
@@ -12512,7 +12527,7 @@ mod tests {
             nkv,
             hd,
             pos_offset,
-            false,
+            prefer_deep_splits,
             None,
         );
         rec.finish().unwrap();

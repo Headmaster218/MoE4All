@@ -1818,6 +1818,10 @@ const ATTN_FLASH_REG_HD256_BR64_CW4_SPV_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/attn_flash_reg_hd256_br64_cw4.spv"
 ));
+const ATTN_FLASH_REG_HD256_BR128_F16SCORE_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_reg_hd256_br128_f16score.spv"
+));
 // KV-cache u64/BDA twins (#74 slice 4 resurrection): the coopmat flash-prefill kernels reading K/V by
 // device address (INFR_KV_COOPMAT_BDA=1, opt-in, default OFF). See attn_flash_partial.comp KV_COOPMAT_BDA.
 const ATTN_FLASH_PARTIAL_BDA_SPV_BYTES: &[u8] =
@@ -1924,6 +1928,7 @@ static ATTN_FLASH_REG_BR64_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_HD256_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_HD256_BR64_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_HD256_BR64_CW4_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_REG_HD256_BR128_F16SCORE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_BM32_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2205,6 +2210,12 @@ pub(crate) fn attn_flash_reg_hd256_br64_spv() -> &'static [u32] {
 pub(crate) fn attn_flash_reg_hd256_br64_cw4_spv() -> &'static [u32] {
     ATTN_FLASH_REG_HD256_BR64_CW4_SPV
         .get_or_init(|| spv_words(ATTN_FLASH_REG_HD256_BR64_CW4_SPV_BYTES))
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_reg_hd256_br128_f16score_spv() -> &'static [u32] {
+    ATTN_FLASH_REG_HD256_BR128_F16SCORE_SPV
+        .get_or_init(|| spv_words(ATTN_FLASH_REG_HD256_BR128_F16SCORE_SPV_BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_reg_hd256_bda_spv() -> &'static [u32] {

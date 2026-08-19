@@ -1190,6 +1190,12 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// The BR128/f16-score hd256 prefill layout measured on Windows/Navi 31. It halves repeated
+    /// long-context K/V reads while staying within RDNA3's 32 KiB workgroup-memory limit.
+    pub(crate) fn prefers_hd256_prefill_br128_f16score(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
     /// Overlap paged-MoE Decode's Down-role CPU push with Gate/Up GPU work. Valid on every
     /// backend, but enabled only where paired measurements proved that the hidden copy time
     /// exceeds the extra submit cost; unmeasured Linux/RADV and other architectures retain the

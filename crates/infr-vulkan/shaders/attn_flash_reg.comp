@@ -37,6 +37,12 @@ layout(local_size_x = (BR_TILE * 4), local_size_y = 1, local_size_z = 1) in;
 layout(local_size_x = (BR_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 #endif
 
+#ifdef F16_SCORE
+#if HEAD_DIM != 256 || BR_TILE != 128 || defined(CW4)
+#error "F16_SCORE is specialized for HEAD_DIM=256, BR_TILE=128, non-CW4"
+#endif
+#endif
+
 const uint BR = BR_TILE;        // query rows per tile
 const uint BC = 64u;            // kv cols per block
 const uint HD = HEAD_DIM;
@@ -88,8 +94,14 @@ layout(binding = 3) writeonly buffer POB { vec4 po[]; };     // [n_splits, mpad,
 layout(binding = 4) writeonly buffer PMB { float pm[]; };    // [n_splits, mpad, nh]
 layout(binding = 5) writeonly buffer PLB { float pl[]; };    // [n_splits, mpad, nh]
 
+#ifdef F16_SCORE
+// QK scores are narrowed once, then overwritten in place by softmax probabilities. This removes
+// the separate f32 score tile so BR=128 fits a 32 KiB LDS budget.
+shared float16_t Psh[BR * BC];
+#else
 shared float sfsh[BR * BC];      // scores (f32)
 shared float16_t Psh[BR * BC];   // probs (f16) for PV coopmat
+#endif
 #ifndef CW4
 shared float pvsh[(BR_TILE / 16u) * 256u]; // per-subgroup PV tile (16×16), one per subgroup (BR/16)
 #endif
@@ -161,8 +173,18 @@ void main() {
         }
         [[unroll]] for (uint a = 0u; a < QK_ROWS; a++)
             [[unroll]] for (uint b = 0u; b < 2u; b++)
+#ifdef F16_SCORE
+            {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> score16 =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(sacc[a][b]);
+                coopMatStore(score16, Psh,
+                             (warp_r * QK_ROWS * 16u + a * 16u) * BC + warp_c * 32u + b * 16u,
+                             BC, gl_CooperativeMatrixLayoutRowMajor);
+            }
+#else
                 coopMatStore(sacc[a][b], sfsh, (warp_r * QK_ROWS * 16u + a * 16u) * BC + warp_c * 32u + b * 16u,
                              BC, gl_CooperativeMatrixLayoutRowMajor);
+#endif
         barrier();
 
         // ---- online softmax: 2 lanes/row (cluster of 2), each owns cols [cw*32,+32) ----
@@ -179,8 +201,12 @@ void main() {
             [[unroll]] for (uint jj = 0u; jj < 32u; jj++) {
                 uint j = sm_cw * 32u + jj;
                 uint kpos = kv0 + j;
+#ifdef F16_SCORE
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : float(Psh[row * BC + j]) * scale;
+#else
                 float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : sfsh[row * BC + j] * scale;
                 sfsh[row * BC + j] = s;
+#endif
                 lmax = max(lmax, s);
             }
             float rmax = max(oldm, subgroupClusteredMax(lmax, 2u));
@@ -188,7 +214,13 @@ void main() {
             float lsum = 0.0;
             [[unroll]] for (uint jj = 0u; jj < 32u; jj++) {
                 uint j = sm_cw * 32u + jj;
+#ifdef F16_SCORE
+                uint kpos = kv0 + j;
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : float(Psh[row * BC + j]) * scale;
+                float p = exp(s - rmax);
+#else
                 float p = exp(sfsh[row * BC + j] - rmax);
+#endif
                 Psh[row * BC + j] = float16_t(p);
                 lsum += p;
             }
