@@ -29,6 +29,31 @@ pub enum FlashStage {
     Dequant(infr_core::DType),
 }
 
+/// Pick the FlashAttention KV split count. `prefer_deep_splits` is deliberately supplied by the
+/// lowering layer only for coupled-Q8 hd256 prefill: at 200K on Navi 31, eight splits improve the
+/// long-running register-O kernel while the established short-context and f16 policy stays exact.
+/// An explicit config value always wins so tuning/debug overrides retain their old semantics.
+fn flash_split_count(
+    configured: Option<usize>,
+    base_wg: u32,
+    kv_len: usize,
+    prefer_deep_splits: bool,
+) -> u32 {
+    match configured.and_then(|v| u32::try_from(v).ok()) {
+        Some(v) => v,
+        None if prefer_deep_splits && kv_len >= 65_536 => 8,
+        None => {
+            if base_wg >= 1024 || kv_len < 4096 {
+                1
+            } else {
+                (2048 / base_wg.max(1))
+                    .clamp(2, 8)
+                    .min((kv_len / 2048).max(1) as u32)
+            }
+        }
+    }
+}
+
 /// State columns carried per subgroup by the token-serial DeltaNet scan; must match
 /// `deltanet_seq.comp`'s `NCOL`.
 ///
@@ -5293,6 +5318,7 @@ impl<'a> Recorder<'a> {
         nh: usize,
         nkv: usize,
         pos_offset: usize,
+        prefer_deep_splits: bool,
         kv_addr: Option<(u64, u64)>,
     ) {
         const HD: u32 = 256;
@@ -5315,24 +5341,15 @@ impl<'a> Recorder<'a> {
                 nkv,
                 HD as usize,
                 pos_offset,
+                prefer_deep_splits,
                 kv_addr,
             );
             return;
         }
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / BM) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        let n_splits =
+            flash_split_count(self.vk().flash_splits, base_wg, kv_len, prefer_deep_splits);
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let kp = self.be.kernel_sg(
             "attn_flash_warp_hd256_bm16",
@@ -5454,6 +5471,7 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
         pos_offset: usize,
+        prefer_deep_splits: bool,
         // #74 slice 4 resurrection: Some((k_addr, v_addr)) → read KV by device address via the `_bda`
         // builds (kc/vc stay bound inert for the store→read hazard edge); None → bound, as before.
         kv_addr: Option<(u64, u64)>,
@@ -5469,18 +5487,12 @@ impl<'a> Recorder<'a> {
             64
         };
         let base_wg = (mpad / br) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        let n_splits = flash_split_count(
+            self.vk().flash_splits,
+            base_wg,
+            kv_len,
+            prefer_deep_splits && hd == 256,
+        );
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let bda = kv_addr.is_some();
         let cw4 = hd == 256 && br == 64 && self.be.prefers_hd256_prefill_cw4();
@@ -10688,6 +10700,14 @@ mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
 
+    #[test]
+    fn deep_q8_flash_split_hint_preserves_other_policies() {
+        assert_eq!(flash_split_count(None, 2048, 200_000, true), 8);
+        assert_eq!(flash_split_count(None, 2048, 65_535, true), 1);
+        assert_eq!(flash_split_count(None, 2048, 200_000, false), 1);
+        assert_eq!(flash_split_count(Some(2), 2048, 200_000, true), 2);
+    }
+
     /// A backend built on an EXPLICIT Vulkan kernel-tier configuration (`docs/config-plan.md` S5b).
     ///
     /// This is what replaced `EnvGuard::with([("INFR_FLASH_SPLITS", "4"), …])` in every test below:
@@ -11676,6 +11696,7 @@ mod tests {
                 nh,
                 nkv,
                 pos_offset,
+                false,
                 None,
             );
         } else {
@@ -12110,6 +12131,7 @@ mod tests {
             nkv,
             hd,
             pos_offset,
+            false,
             kv_addr,
         );
         rec.finish().unwrap();
@@ -12490,6 +12512,7 @@ mod tests {
             nkv,
             hd,
             pos_offset,
+            false,
             None,
         );
         rec.finish().unwrap();

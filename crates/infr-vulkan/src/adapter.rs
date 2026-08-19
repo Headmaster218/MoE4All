@@ -3235,6 +3235,7 @@ fn lower_op(
                             nh,
                             nkv,
                             pos,
+                            k_q8 && v_q8,
                             kv_addr,
                         );
                     } else {
