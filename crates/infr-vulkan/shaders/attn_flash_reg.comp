@@ -42,6 +42,11 @@ layout(local_size_x = (BR_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 #error "F16_SCORE is specialized for HEAD_DIM=256, BR_TILE=128, non-CW4"
 #endif
 #endif
+#ifdef QK_ROWS4
+#if !defined(F16_SCORE) || HEAD_DIM != 256 || BR_TILE != 128 || defined(CW4)
+#error "QK_ROWS4 is specialized for hd256 BR128 F16_SCORE"
+#endif
+#endif
 
 const uint BR = BR_TILE;        // query rows per tile
 const uint BC = 64u;            // kv cols per block
@@ -54,9 +59,15 @@ const uint WARPS_M = BR_TILE / 16u;
 #else
 const uint DPT_HD = HD / 8u;
 const uint CT_PER_CW = HD / 32u;
+#ifdef QK_ROWS4
+const uint QK_ROWS = 4u;
+const uint WARPS_M = BR_TILE / 64u;
+#else
 const uint QK_ROWS = 2u;
 const uint WARPS_M = BR_TILE / 32u;
 #endif
+#endif
+const uint QK_ACTIVE_WARPS = WARPS_M * 2u;
 const uint DPT = 16u;           // vec4 per thread = (HD/2)/4 — each thread owns 64 dims of its row
 
 layout(push_constant) uniform PC {
@@ -150,6 +161,7 @@ void main() {
     uint kvend = min(min(pc.kv_len, qmax + 1u), split * pc.ksplit + pc.ksplit);
     for (uint kv0 = split * pc.ksplit; kv0 < kvend; kv0 += BC) {
         // ---- QK: S = Q·Kᵀ, 8-warp register-blocked (4×2), warp owns rows [warp_r*32,+32) ----
+        if (sg < QK_ACTIVE_WARPS) {
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc[QK_ROWS][2];
         [[unroll]] for (uint a = 0u; a < QK_ROWS; a++)
             [[unroll]] for (uint b = 0u; b < 2u; b++)
@@ -185,6 +197,7 @@ void main() {
                 coopMatStore(sacc[a][b], sfsh, (warp_r * QK_ROWS * 16u + a * 16u) * BC + warp_c * 32u + b * 16u,
                              BC, gl_CooperativeMatrixLayoutRowMajor);
 #endif
+        }
         barrier();
 
         // ---- online softmax: 2 lanes/row (cluster of 2), each owns cols [cw*32,+32) ----

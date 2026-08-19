@@ -5503,8 +5503,8 @@ impl<'a> Recorder<'a> {
         let cw4 = hd == 256 && br == 64 && self.be.prefers_hd256_prefill_cw4();
         let (rname, rspv): (&'static str, &[u32]) = if br128_f16score {
             (
-                "attn_flash_reg_hd256_br128_f16score",
-                crate::gemm::attn_flash_reg_hd256_br128_f16score_spv(),
+                "attn_flash_reg_hd256_br128_f16score_qk4",
+                crate::gemm::attn_flash_reg_hd256_br128_f16score_qk4_spv(),
             )
         } else {
             match (hd, br == 64, bda, cw4) {

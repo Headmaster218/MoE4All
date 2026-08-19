@@ -574,6 +574,16 @@ fn main() {
         ),
         (
             "attn_flash_reg",
+            "attn_flash_reg_hd256_br128_f16score_qk4",
+            &[
+                "-DHEAD_DIM=256",
+                "-DBR_TILE=128",
+                "-DF16_SCORE",
+                "-DQK_ROWS4",
+            ],
+        ),
+        (
+            "attn_flash_reg",
             "attn_flash_reg_hd256_bda",
             &["-DHEAD_DIM=256", "-DKV_COOPMAT_BDA"],
         ),
