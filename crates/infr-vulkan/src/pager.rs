@@ -1408,6 +1408,19 @@ impl MoePagerSession {
         (0..n_expert as u32).all(|e| pager.is_resident(src.layer_base + e))
     }
 
+    /// Whether every routed layer-local expert in `ids` is already resident for this role. This
+    /// is a read-only scheduling query: it deliberately does not touch LRU order or begin a batch.
+    pub fn routed_all_resident(&self, buf_id: usize, ids: &[u32]) -> Result<bool> {
+        let (_, pool, src) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("moe pager: residency query on an unregistered buffer"))?;
+        let pager = &self.pools[*pool].pager;
+        Ok(ids
+            .iter()
+            .all(|&expert| pager.is_resident(src.layer_base + expert)))
+    }
+
     /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
     /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
     /// mutation (the property that makes inline recording safe while earlier segments are still

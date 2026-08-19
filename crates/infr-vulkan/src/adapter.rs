@@ -6109,8 +6109,16 @@ fn execute_paged_moe<'a>(
     } else {
         stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
     };
+    let down_has_miss = if !layer_stream && !stage_ids.is_empty() {
+        let guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_ref().expect("paged execution requires a session");
+        !sess.routed_all_resident(down_id, &stage_ids)?
+    } else {
+        false
+    };
     let overlap_down = !layer_stream
         && !stage_ids.is_empty()
+        && down_has_miss
         && rows <= moe_small_m_threshold(be_)
         && be_.prefers_decode_down_overlap();
     let down_w = if overlap_down {
