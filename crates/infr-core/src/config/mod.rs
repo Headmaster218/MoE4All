@@ -154,6 +154,12 @@ cfg_struct! {
         /// Keep as many complete expert layers resident as fit and stream the remainder as whole
         /// layers during prefill. Decode reuses the same arena as the ordinary expert LRU.
         moe_layer_stream: bool = true,
+        /// `INFR_MOE_SIZE_CACHE_BIAS`: optional Decode arena weighting between distinct per-expert
+        /// tensor sizes. Positive values favor larger tensors and negative values favor smaller.
+        /// `None` auto-enables the validated `+2` bias only for a balanced two-size/six-pool
+        /// layout; every other layout keeps the historical equal-residency-fraction split. An
+        /// explicit zero disables the auto choice. The seam clamps explicit values to `-8..=8`.
+        moe_size_cache_bias: Option<f32> = None,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier

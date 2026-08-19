@@ -343,6 +343,10 @@ fn mib_and_size_string_spellings() {
     assert_eq!(d.paging.ring_slots, 2);
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING_SLOTS", "8")])]);
     assert_eq!(cfg.paging.ring_slots, 8);
+
+    assert_eq!(d.paging.moe_size_cache_bias, None);
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_MOE_SIZE_CACHE_BIAS", "-1.5")])]);
+    assert_eq!(cfg.paging.moe_size_cache_bias, Some(-1.5));
 }
 
 /// The device-list grammar, inherited from `infr_llama::seam::parse_device_spec` when S4 deleted
@@ -1125,6 +1129,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     const S4: &[&str] = &[
         "INFR_CACHE",
         "INFR_DECODE_CHAIN",
+        "INFR_MOE_SIZE_CACHE_BIAS",
         "INFR_PROF_STAGES",
         "INFR_PROF_DIFFUSION_TRACE",
         "INFR_EP_HOST",

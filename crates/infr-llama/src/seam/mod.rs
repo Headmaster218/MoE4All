@@ -2017,6 +2017,37 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .map(|&(_, sb, nb)| (sb * nb) as u64)
                 .sum::<u64>()
                 .max(1);
+            // A miss has both a fixed paging/submit component and a size-proportional transfer
+            // component. APEX Balanced's six pools contain every role at each of two tensor sizes;
+            // on that validated geometry, assigning resident fraction proportional to size^2
+            // reduced transferred bytes and paging windows. Do not generalize it to arbitrary
+            // mixed quant layouts: IQ4_NL_XL and Q4_K_M regress. An explicit config value remains
+            // available for A/B work and zero always selects the exact historical integer path.
+            let role_has_balanced_sizes = |role| {
+                let mut sizes: Vec<usize> = pool_blocks
+                    .iter()
+                    .filter_map(|&(r, sb, _)| (r == role).then_some(sb))
+                    .collect();
+                sizes.sort_unstable();
+                sizes.len() == 2 && (1.1..=1.5).contains(&(sizes[1] as f64 / sizes[0] as f64))
+            };
+            let auto_size_bias_layout = pool_blocks.len() == 6
+                && [Role::Down, Role::Gate, Role::Up]
+                    .into_iter()
+                    .all(role_has_balanced_sizes);
+            let (size_cache_bias, size_cache_bias_source) = match ec.paging.moe_size_cache_bias {
+                Some(value) => (value.clamp(-8.0, 8.0) as f64, "explicit"),
+                None if auto_size_bias_layout => (2.0, "auto"),
+                None => (0.0, "off"),
+            };
+            let weighted_total = if size_cache_bias == 0.0 {
+                0.0
+            } else {
+                pool_blocks
+                    .iter()
+                    .map(|&(_, sb, nb)| (sb * nb) as f64 * (sb as f64).powf(size_cache_bias))
+                    .sum::<f64>()
+            };
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
             // pointer, so it is NOT capped by one SSBO binding's maxStorageBufferRange (~4 GiB on
             // RADV) the way it was when the arena was a bound SSBO. A pool now holds as many experts
@@ -2033,8 +2064,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // gate+up+down alike), so proportional slots equalize expected hit rates across
                     // pools; any fancier split would need routing statistics that don't exist at
                     // load time.
-                    let share = (pager_budget_bytes as u128 * (sb * nb) as u128
-                        / total_bytes as u128) as u64;
+                    let share = if size_cache_bias == 0.0 {
+                        (pager_budget_bytes as u128 * (sb * nb) as u128 / total_bytes as u128)
+                            as u64
+                    } else {
+                        let weight = (sb * nb) as f64 * (sb as f64).powf(size_cache_bias);
+                        (pager_budget_bytes as f64 * weight / weighted_total).floor() as u64
+                    };
                     // Floor at `min(n_expert, nb)`: a chunked batched-prefill `Op::MoeFfn` (rows>1)
                     // runs ALL of a layer's routed buckets in ONE dispatch
                     // (`matmul_mmq_experts_paged`), touching up to `n_expert` DISTINCT experts of
@@ -2068,7 +2104,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .collect();
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GB mapped ReBAR pool budget; {:.2} GB CPU-only host store in {host_chunk_count} \
+             {:.2} GB mapped ReBAR pool budget; Decode size bias {size_cache_bias:+.2} \
+             ({size_cache_bias_source}); {:.2} GB CPU-only host store in {host_chunk_count} \
              layer-boundary chunks; ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),

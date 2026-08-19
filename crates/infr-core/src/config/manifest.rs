@@ -156,6 +156,7 @@ knobs! {
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_RING_SLOTS"     => "paging.ring_slots",                Int,      Ignored, "2",   migrated;
     "INFR_NO_MOE_LAYER_STREAM"  => "paging.moe_layer_stream",          PresenceInv, Ignored, "1", migrated;
+    "INFR_MOE_SIZE_CACHE_BIAS"  => "paging.moe_size_cache_bias",       Float,    Ignored, "2",   migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
     "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8g",  migrated;
     "INFR_DRAM_BYPASS"          => "paging.dram_bypass",               Flag,     Ignored, "1",   migrated;
