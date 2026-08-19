@@ -1190,6 +1190,14 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// Overlap paged-MoE Decode's Down-role CPU push with Gate/Up GPU work. Valid on every
+    /// backend, but enabled only where paired measurements proved that the hidden copy time
+    /// exceeds the extra submit cost; unmeasured Linux/RADV and other architectures retain the
+    /// established single-segment schedule.
+    pub(crate) fn prefers_decode_down_overlap(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
     /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering
     /// (`docs/config-plan.md` R6).

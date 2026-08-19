@@ -6109,10 +6109,18 @@ fn execute_paged_moe<'a>(
     } else {
         stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
     };
-    let down_w = if layer_stream {
-        stage_layer_and_window(be_, rec, ps, down_id, n_expert)?
+    let overlap_down = !layer_stream
+        && !stage_ids.is_empty()
+        && rows <= moe_small_m_threshold(be_)
+        && be_.prefers_decode_down_overlap();
+    let down_w = if overlap_down {
+        None
+    } else if layer_stream {
+        Some(stage_layer_and_window(be_, rec, ps, down_id, n_expert)?)
     } else {
-        stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?
+        Some(stage_and_window(
+            be_, rec, ps, down_id, &stage_ids, n_expert, touch_all,
+        )?)
     };
     // RAW: make every direct HOST write to the mapped arena visible before the first dispatch
     // below reads it by pointer. Covers both batched and small-m paged expert kernels.
@@ -6325,7 +6333,7 @@ fn execute_paged_moe<'a>(
                     sess.arena_addr(down_id)?,
                     sess.slot_bytes(down_id)? as u32,
                     sess.tape(),
-                    down_w as usize,
+                    down_w.expect("batched path stages Down before dispatch") as usize,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
                     pool[&ye].as_ref(),
@@ -6467,6 +6475,30 @@ fn execute_paged_moe<'a>(
             }
         },
     }
+    let down_w = if let Some(window) = down_w {
+        window
+    } else {
+        // Gate/Up and activation do not read the Down role pool. Launch them first, then direct-
+        // push Down misses while that independent GPU work is live. The fresh recorder is queue-
+        // ordered after the first segment and its seed/barrier publishes the Host writes before
+        // the Down GEMV. The next layer's ordinary sync drains this pending segment and tape.
+        let probe = submit_prefill_compute(rec, ps)?;
+        let profile = infr_core::pager_profile::active();
+        let compute_live_at_start = profile && prefetch_compute_live(ps, probe)?;
+        let window = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
+        if profile {
+            infr_core::pager_profile::record_prefetch_window(
+                compute_live_at_start,
+                prefetch_compute_live(ps, probe)?,
+            );
+        }
+        let fresh = be_.recorder()?;
+        fresh.seed_barrier();
+        fresh.arena_stream_barrier();
+        *rec = Some(fresh);
+        window
+    };
+    let rec2 = rec.as_ref().expect("segment always Some between ops");
     {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
