@@ -1154,6 +1154,29 @@ pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
     !cfg.deepseek2 && kv_row_align_ok(cfg)
 }
 
+/// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
+/// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
+/// priced exactly instead of the MoE planner treating every non-auto choice as f16.
+fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
+    if cfg.deepseek2 {
+        return DType::F16;
+    }
+    let block_aligned = kv_row_align_ok(cfg);
+    let turbo_aligned = (0..cfg.n_layer).all(|l| cfg.layer_head_dim(l).is_multiple_of(128));
+    match requested {
+        Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if turbo_aligned => dt,
+        Some(DType::Q8_0) if block_aligned => DType::Q8_0,
+        Some(dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl))
+            if block_aligned =>
+        {
+            dt
+        }
+        Some(dt @ (DType::F16 | DType::Bf16 | DType::F32)) => dt,
+        _ if (ec.kv.force_q8 || kv_auto_q8()) && block_aligned => DType::Q8_0,
+        _ => DType::F16,
+    }
+}
+
 /// The KV formats an MLA (deepseek2) session may actually run with on `backend`, given the pair
 /// the dtype ladder resolved.
 ///
@@ -1335,6 +1358,20 @@ pub(crate) const MIN_SESSION_CTX: usize = 1024;
 // `budgets_agree_with_the_allocator_ceiling` and `fit_math_and_placement_pick_the_same_rung`
 // guard the drift.
 
+/// Placement-time view of the unified device-memory budget. Placement runs before this model has
+/// committed its weights, so `tracked_used=0`; the allocator applies the same helper later with its
+/// live per-backend allocation tally. The physical side starts at `VramInfo::alloc_room()` (already
+/// net of Vulkan's mandatory guard), then applies the caller's additional reserve.
+fn planned_vram_room(vram: &infr_vulkan::VramInfo, ec: &EngineConfig) -> u64 {
+    infr_core::budget::unified_vram_room(
+        vram.total,
+        vram.alloc_room(),
+        0,
+        ec.device.vram_budget,
+        ec.device.vram_reserve,
+    )
+}
+
 /// Will the KV cache a placement/fit decision is pricing actually RING (SWA rows capped at
 /// `window + chunk`)? The config/env gate AND f16/q8 on BOTH sides — the same pair of conditions
 /// the runner applies. A low-bit side keeps full-context caches, so pricing it as a ring would
@@ -1394,7 +1431,7 @@ pub(crate) fn dense_placement_fits(
         0
     };
     dense_resident_need(cfg, caps, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
-        <= vram.alloc_room()
+        <= planned_vram_room(vram, ec)
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
@@ -1439,7 +1476,7 @@ pub(crate) fn dense_stream_budget_at(
     } else {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
     };
-    vram.alloc_room()
+    planned_vram_room(vram, ec)
         .saturating_sub(dense_resident_need(
             cfg,
             caps,
@@ -1466,15 +1503,73 @@ const MOE_ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
 /// when the dense half alone does not fit, which is not a paging decision but a hard error (dense
 /// layer streaming does not cover an MoE model's dense part).
 pub(crate) fn moe_expert_budget(
-    vram: &infr_vulkan::VramInfo,
+    room: u64,
     dense: u64,
     kv: u64,
     activation_reserve: u64,
 ) -> Option<u64> {
-    let room = vram.alloc_room();
     let base = dense.saturating_add(kv);
     let headroom = MOE_ACT_HEADROOM.max(activation_reserve);
     (base <= room).then(|| room.saturating_sub(base.saturating_add(headroom)))
+}
+
+/// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
+/// receives enough slots for one worst-case Prefill layer; the remaining bytes are then assigned
+/// in weighted-fair order. Reserving the floors up front avoids the old `clamp(floor, nb)` corner
+/// case where several small proportional shares silently summed to more than the caller's budget.
+fn moe_pool_slot_counts(
+    pools: &[(usize, usize, [usize; 3])],
+    budget: u64,
+    n_expert: usize,
+    size_bias: f64,
+) -> Option<Vec<usize>> {
+    let floors: Vec<usize> = pools
+        .iter()
+        .map(|&(_, n_blocks, role_blocks)| {
+            let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
+            n_expert
+                .saturating_mul(roles_per_layer)
+                .min(n_blocks)
+                .max(1)
+        })
+        .collect();
+    let minimum =
+        pools
+            .iter()
+            .zip(&floors)
+            .try_fold(0u64, |sum, (&(slot_bytes, _, _), &slots)| {
+                sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
+            })?;
+    if minimum > budget {
+        return None;
+    }
+
+    let weights: Vec<f64> = pools
+        .iter()
+        .map(|&(slot_bytes, n_blocks, _)| {
+            slot_bytes as f64 * n_blocks as f64 * (slot_bytes as f64).powf(size_bias)
+        })
+        .collect();
+    let mut slots = floors;
+    let mut remaining = budget - minimum;
+    loop {
+        let next = pools
+            .iter()
+            .enumerate()
+            .filter(|(i, &(slot_bytes, n_blocks, _))| {
+                slots[*i] < n_blocks && slot_bytes as u64 <= remaining
+            })
+            .min_by(|(a, &(a_bytes, _, _)), (b, &(b_bytes, _, _))| {
+                let a_fill = (slots[*a] * a_bytes) as f64 / weights[*a];
+                let b_fill = (slots[*b] * b_bytes) as f64 / weights[*b];
+                a_fill.total_cmp(&b_fill).then_with(|| a.cmp(b))
+            })
+            .map(|(i, _)| i);
+        let Some(i) = next else { break };
+        slots[i] += 1;
+        remaining -= pools[i].0 as u64;
+    }
+    Some(slots)
 }
 
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
@@ -1527,7 +1622,7 @@ pub(crate) fn kv_fit_ctx_for(
         cfg,
         caps,
         ec,
-        vram.alloc_room().saturating_sub(weights),
+        planned_vram_room(vram, ec).saturating_sub(weights),
         moe_reserve,
         &ubatch_candidates(ec),
         k_fmt,
@@ -1782,9 +1877,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //      otherwise the pager with budget = remaining VRAM after dense+KV+headroom.
     // Paging rides the adapter's paged executor split (`infr_vulkan::adapter::execute_static`'s
     // paged branch). FUSED gate_up banks (gemma-4 MoE / DiffusionGemma) page under `Role::Gate`
-    // with a double-width slot, and MIXED-dtype roles (unsloth-dynamic quants bumping a subset
-    // of layers' banks to a wider format) split into per-(role, slot_bytes) arena pools — see
-    // `infr_vulkan::pager`'s MoE-session doc.
+    // with a double-width slot. Physical cache pools are keyed only by expert slot size, so roles
+    // share capacity while mixed-dtype layouts still receive the distinct geometries they need.
     let cache_override = ec.paging.cache;
     let caps = vk.capabilities();
 
@@ -1808,65 +1902,81 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // full dense native set plus F16/F32 for float banks), so
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
+        let fp = crate::weights::weight_footprint(g);
+        let vram = vk.vram();
+        let room = planned_vram_room(&vram, ec);
+        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
+        // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
+        // explicit Q8 and F16 choices must change the expert remainder just like the allocation.
+        let ring = kv_ring_wanted(cfg, ec);
+        let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
+        let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
+        let kv_bytes = match (k_fmt, v_fmt) {
+            (DType::Q8_0, DType::Q8_0) => {
+                kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), true)
+            }
+            (DType::F16, DType::F16) => {
+                kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), false)
+            }
+            _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch_rows(ec), k_fmt, v_fmt),
+        };
+        // Layer-granular MoE Prefill is tuned for a 4096-row microbatch. Price that shape even when
+        // the ordinary adaptive default is smaller, so the shared expert arena cannot consume the
+        // workspace the largest supported Prefill needs at runtime.
+        let prefill_4k_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, 4096);
+        let runtime_reserve = MOE_ACT_HEADROOM.max(prefill_4k_reserve);
+        let Some(auto_budget) = moe_expert_budget(room, fp.dense, kv_bytes, prefill_4k_reserve)
+        else {
+            return Err(anyhow!(
+                "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed the unified \
+                 VRAM room ({:.2} GB after guard/reserve/configured cap) — dense layer streaming \
+                 does not cover MoE models' dense parts; reduce ctx or run on the CPU backend \
+                 (INFR_DEV=cpu)",
+                fp.dense as f64 / 1e9,
+                kv_bytes as f64 / 1e9,
+                room as f64 / 1e9,
+            ));
+        };
         match cache_override {
             Some(spec) => {
                 n_paged = cfg.n_layer;
-                // Percent resolves against AVAILABLE VRAM at this (first-load, pre-upload)
-                // moment — the same consistent snapshot the auto tier uses below.
-                pager_budget_bytes = spec.resolve(vk.vram().available);
-            }
-            None => {
-                let fp = crate::weights::weight_footprint(g);
-                let vram = vk.vram();
-                // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a
-                // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
-                let ring = kv_ring_wanted(cfg, ec);
-                // Route through the shared q8-aware helper (the dense placement path already does),
-                // so a pinned auto-q8 KV cache is priced at ~half the bytes instead of the old
-                // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
-                let kv_bytes: u64 =
-                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), kv_auto_q8());
-                // Budgeted against the ALLOCATOR's ceiling (`VramInfo::alloc_room`), like the
-                // dense sweeps below and the context-fit math: the last 256 MiB of "free" VRAM is
-                // the guard's headroom and can never be handed out, so an expert budget sized
-                // against the raw figure hands the pager 256 MiB of arena the allocator refuses.
-                // `moe_expert_budget` also holds back `MOE_ACT_HEADROOM` for the pager's own
-                // arenas/staging and the activation scratch neither `fp` nor `kv_bytes` counts.
-                //
-                // Mixed oversize (an MoE model whose DENSE part alone doesn't fit) is out of
-                // scope for dense layer streaming — `None`, and we fail with a clear message
-                // instead of letting a degenerate expert budget stumble into the alloc-time VRAM
-                // guard's generic over-commit error.
-                // Layer-granular MoE prefill is tuned for a 4096-row microbatch. Price that
-                // shape even when the ordinary adaptive default is smaller, so the shared
-                // expert arena cannot consume memory its activation pools need at runtime.
-                let prefill_4k_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, 4096);
-                let Some(budget) = moe_expert_budget(&vram, fp.dense, kv_bytes, prefill_4k_reserve)
-                else {
-                    return Err(anyhow!(
-                        "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed \
-                         the allocatable VRAM ({:.2} GB, free minus the guard headroom) — dense \
-                         layer streaming does not cover MoE models' dense parts; reduce ctx or \
-                         run on the CPU backend (INFR_DEV=cpu)",
-                        fp.dense as f64 / 1e9,
-                        kv_bytes as f64 / 1e9,
-                        vram.alloc_room() as f64 / 1e9,
-                    ));
-                };
-                if budget < fp.expert {
-                    // Page EVERY expert layer with the WHOLE budget (tier-2 semantics), NOT
-                    // "keep the first gpu_layers banks resident and page the overflow with
-                    // the leftover": the leftover degenerates to a few slots and the paged
-                    // layers thrash at a 0% hit rate (measured, Scout Q2_K on 24GB:
-                    // resident-26-layers + 3-slot pager decoded at 3.3 t/s; all-paged with
-                    // the same total VRAM = 307 slots/role, 66% hits, 6.2 t/s). A shared LRU
-                    // arena keeps the hot experts of EVERY layer resident — strictly more
-                    // flexible than pinning whole layer banks.
-                    n_paged = cfg.n_layer;
-                    pager_budget_bytes = budget;
+                // Legacy expert-only override remains supported, but cannot punch through the new
+                // total-process budget or the physical allocator ceiling. Percent keeps its old
+                // AVAILABLE-VRAM base for compatibility.
+                let requested = spec.resolve(vram.available);
+                pager_budget_bytes = requested.min(auto_budget);
+                if requested > auto_budget {
+                    tracing::warn!(
+                        "INFR_CACHE requested {:.2} GB of expert arena but the unified VRAM plan \
+                         leaves {:.2} GB; clamping the arena to the safe remainder",
+                        requested as f64 / 1e9,
+                        auto_budget as f64 / 1e9,
+                    );
                 }
             }
+            None if auto_budget < fp.expert => {
+                // Page EVERY expert layer with the WHOLE remainder. A shared LRU arena keeps hot
+                // experts from every layer and is strictly more flexible than pinning a prefix of
+                // complete layers.
+                n_paged = cfg.n_layer;
+                pager_budget_bytes = auto_budget;
+            }
+            None => {}
         }
+        tracing::info!(
+            "VRAM plan: total_room={:.2} GB fixed={:.2} GB kv={:.2} GB runtime={:.2} GB \
+             expert_cache={:.2} GB (k={k_fmt:?}, v={v_fmt:?}, ctx={want_ctx})",
+            room as f64 / 1e9,
+            fp.dense as f64 / 1e9,
+            kv_bytes as f64 / 1e9,
+            runtime_reserve as f64 / 1e9,
+            (if n_paged > 0 {
+                pager_budget_bytes
+            } else {
+                fp.expert
+            }) as f64
+                / 1e9,
+        );
     }
     // The layer index of a `blk.{l}.…_exps…` tensor name.
     let exps_layer = |name: &str| -> Option<usize> {
@@ -1912,12 +2022,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let n_expert = moe.n_expert.max(1);
         // MoE runtime weights DMA directly from one permanent HOST_CACHED transfer source; no
         // upload ring or host pager is allocated for this path.
-        // Enumerate every paged `_exps` weight bank's (role, per-expert bytes): one arena POOL
-        // per distinct pair. A uniform split-bank model (Scout) yields the classic three pools;
-        // a fused-bank model (gemma-4 MoE / DiffusionGemma) yields a double-width Gate pool and
-        // no Up pool; a mixed-dtype role (UD quants) yields one pool per byte size, each holding
-        // exactly the layers whose banks match it (`MoePagerSession::register` re-derives the
-        // same key from the tensor bytes). `(slot_bytes, blocks-in-pool)` per pool.
+        // Enumerate every paged `_exps` bank's role and per-expert byte size. The role remains
+        // source/dispatch metadata, while all banks with the same physical size share one logical
+        // cache pool. Mixed-dtype layouts naturally create additional size pools.
         let mut pool_blocks: Vec<(Role, usize, usize)> = Vec::new();
         let mut host_banks: Vec<(usize, Role, usize)> = Vec::new();
         for t in g.tensors() {
@@ -2012,11 +2119,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let n_blocks = n_paged * n_expert;
             // The permanent HostWeights store is system RAM, so the entire configured MoE cache
             // budget remains available to the shared GPU arena.
-            let total_bytes: u64 = pool_blocks
-                .iter()
-                .map(|&(_, sb, nb)| (sb * nb) as u64)
-                .sum::<u64>()
-                .max(1);
             // Pool identity is ONLY the physical bytes per expert. Gate/Up/Down banks with the
             // same slot size are interchangeable cache occupants: the source metadata retains
             // the role and the dispatch retains the layer's dtype/shape. Mixed quant layouts
@@ -2050,14 +2152,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None if auto_size_bias_layout => (2.0, "auto"),
                 None => (0.0, "off"),
             };
-            let weighted_total = if size_cache_bias == 0.0 {
-                0.0
-            } else {
-                logical_pools
-                    .iter()
-                    .map(|&(sb, nb, _)| (sb * nb) as f64 * (sb as f64).powf(size_cache_bias))
-                    .sum::<f64>()
-            };
+            let slot_counts = moe_pool_slot_counts(
+                &logical_pools,
+                pager_budget_bytes,
+                n_expert,
+                size_cache_bias,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "MoE expert arena budget ({:.2} MiB) cannot hold one complete Prefill layer; \
+                     increase INFR_VRAM_BUDGET/INFR_CACHE or reduce context/runtime memory",
+                    pager_budget_bytes as f64 / 2f64.powi(20),
+                )
+            })?;
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
             // pointer, so it is NOT capped by one SSBO binding's maxStorageBufferRange (~4 GiB on
             // RADV) the way it was when the arena was a bound SSBO. A pool now holds as many experts
@@ -2068,19 +2175,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
             let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
                 .iter()
-                .map(|&(sb, nb, role_blocks)| {
+                .zip(slot_counts)
+                .map(|(&(sb, _nb, _role_blocks), budget_slots)| {
                     // Budget split PROPORTIONALLY to each pool's total bank bytes — the byte share is
                     // also the access share under uniform routing (every (layer, expert) read touches
                     // gate+up+down alike), so proportional slots equalize expected hit rates across
                     // pools; any fancier split would need routing statistics that don't exist at
                     // load time.
-                    let share = if size_cache_bias == 0.0 {
-                        (pager_budget_bytes as u128 * (sb * nb) as u128 / total_bytes as u128)
-                            as u64
-                    } else {
-                        let weight = (sb * nb) as f64 * (sb as f64).powf(size_cache_bias);
-                        (pager_budget_bytes as f64 * weight / weighted_total).floor() as u64
-                    };
                     // Floor at `min(n_expert, nb)`: a chunked batched-prefill `Op::MoeFfn` (rows>1)
                     // runs ALL of a layer's routed buckets in ONE dispatch
                     // (`matmul_mmq_experts_paged`), touching up to `n_expert` DISTINCT experts of
@@ -2089,13 +2190,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
                     // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
                     // point holding more slots than the pool has distinct experts).
-                    let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
                     // The dynamic Prefill ring can legally degrade to one lane when the user
                     // budget cannot hold its topology target. The old A/B implementation
                     // required two full layers here and could silently exceed that budget.
-                    let batch_floor = n_expert.saturating_mul(roles_per_layer);
-                    let floor = batch_floor.min(nb).max(1);
-                    let budget_slots = ((share / sb as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::MoePoolSpec {
                         slot_bytes: sb,
                         n_slots: budget_slots,
@@ -2233,9 +2330,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
         // (see `kv_rows`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
         // KV small enough to take the try-resident tier at real contexts instead of streaming.
-        let kv_fmts = |q8: bool| {
-            let side = if q8 { DType::Q8_0 } else { DType::F16 };
-            (side, side)
+        let configured_k = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
+        let configured_v = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
+        let has_explicit_kv = ec.kv.type_k.is_some() || ec.kv.type_v.is_some() || ec.kv.force_q8;
+        let kv_fmts = |try_auto_q8: bool| {
+            if try_auto_q8 {
+                (DType::Q8_0, DType::Q8_0)
+            } else if has_explicit_kv {
+                (configured_k, configured_v)
+            } else {
+                (DType::F16, DType::F16)
+            }
         };
         // Does weights + KV + the honest activation reserve fit at this (chunk, fmt)? Through the
         // SHARED predicate, so this decision and `kv_fit_ctx_for`'s price the same session against
@@ -2349,8 +2454,32 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let stride_of = |dt: infr_core::DType, raw: usize| {
             raw.next_multiple_of(lcm(infr_gguf::block_layout(dt).1, 4))
         };
+        let streamed_fixed = fp.total().saturating_sub(streamable_resident);
         let budget = match cache_override {
-            Some(spec) => Some(spec.resolve(vram.available)),
+            Some(spec) => {
+                let requested = spec.resolve(vram.available);
+                let (k, v) = kv_fmts(kv_auto_q8());
+                let safe = dense_stream_budget_at(
+                    cfg,
+                    &caps,
+                    ec,
+                    streamed_fixed,
+                    &vram,
+                    want_ctx,
+                    ubatch_rows(ec),
+                    k,
+                    v,
+                );
+                if requested > safe {
+                    tracing::warn!(
+                        "INFR_CACHE requested {:.2} GB of dense streaming arena but the unified \
+                         VRAM plan leaves {:.2} GB; clamping the arena to the safe remainder",
+                        requested as f64 / 1e9,
+                        safe as f64 / 1e9,
+                    );
+                }
+                Some(requested.min(safe))
+            }
             None if resident => None,
             None => {
                 // Streaming is inevitable. Edge-aware chunk sweep — the STREAMING twin of the
@@ -2366,12 +2495,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // from the reserve). Pinned via `PlacementPins` like the residency sweep, so the
                 // prefill loop, the runner's ring sizing, and this budget all agree.
                 let q8 = kv_auto_q8();
-                let base = fp.total() - streamable_resident;
                 // Same ceiling as `fits` above (`VramInfo::alloc_room`): every byte this
                 // over-states is an arena slot the allocator then refuses.
                 let budget_at = |ub: usize| {
                     let (k, v) = kv_fmts(q8);
-                    dense_stream_budget_at(cfg, &caps, ec, base, &vram, want_ctx, ub, k, v)
+                    dense_stream_budget_at(
+                        cfg,
+                        &caps,
+                        ec,
+                        streamed_fixed,
+                        &vram,
+                        want_ctx,
+                        ub,
+                        k,
+                        v,
+                    )
                 };
                 if !user_pinned_ubatch(ec) && !eligible.is_empty() {
                     let need: u64 = eligible
@@ -4559,12 +4697,12 @@ mod seam_helper_tests {
 
         // MoE expert placement: same ceiling, minus the pager's own headroom.
         assert_eq!(
-            super::moe_expert_budget(&vram, 0, 0, 0),
+            super::moe_expert_budget(XTX_ROOM, 0, 0, 0),
             Some(XTX_ROOM - super::MOE_ACT_HEADROOM)
         );
-        assert_eq!(super::moe_expert_budget(&vram, XTX_ROOM, 0, 0), Some(0));
+        assert_eq!(super::moe_expert_budget(XTX_ROOM, XTX_ROOM, 0, 0), Some(0));
         assert_eq!(
-            super::moe_expert_budget(&vram, XTX_ROOM + 1, 0, 0),
+            super::moe_expert_budget(XTX_ROOM, XTX_ROOM + 1, 0, 0),
             None,
             "a dense half past the ceiling is a hard error, not a 256 MiB overdraft"
         );
@@ -4572,6 +4710,31 @@ mod seam_helper_tests {
             XTX_ROOM < vram.available,
             "…again a case the raw free figure would have waved through"
         );
+    }
+
+    #[test]
+    fn moe_pool_split_never_exceeds_budget_and_keeps_a_prefill_floor() {
+        const MIB: usize = 1024 * 1024;
+        let pools = [
+            (MIB, 240usize, [80, 80, 80]),
+            (2 * MIB, 120usize, [40, 40, 40]),
+        ];
+        let floor_bytes = 24 * MIB + 24 * 2 * MIB;
+        assert!(super::moe_pool_slot_counts(&pools, (floor_bytes - 1) as u64, 8, 2.0).is_none());
+
+        let budget = 512 * MIB as u64;
+        let slots = super::moe_pool_slot_counts(&pools, budget, 8, 2.0).unwrap();
+        assert!(slots.iter().all(|&n| n >= 24));
+        let allocated = pools
+            .iter()
+            .zip(&slots)
+            .map(|(&(slot_bytes, _, _), &n)| slot_bytes as u64 * n as u64)
+            .sum::<u64>();
+        assert!(allocated <= budget);
+        assert!(pools
+            .iter()
+            .zip(&slots)
+            .all(|(&(_, max_slots, _), &n)| n <= max_slots));
     }
 
     /// **Drift guard (backlog B11), the rung half.** The shared `ubatch_candidates` ladder exists so

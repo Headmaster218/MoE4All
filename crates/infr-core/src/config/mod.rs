@@ -57,6 +57,14 @@ cfg_struct! {
         dev: Option<String> = None,
         /// `INFR_CTX`: context length (the shared size grammar).
         ctx: Option<SizeSpec> = None,
+        /// `INFR_VRAM_BUDGET`: total device-memory budget for this backend. Unlike
+        /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.
+        /// Percentages resolve against total device-local memory.
+        vram_budget: Option<SizeSpec> = None,
+        /// `INFR_VRAM_RESERVE`: additional device memory kept outside the backend's allocation
+        /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
+        /// against total device-local memory.
+        vram_reserve: Option<SizeSpec> = None,
         /// `INFR_UBATCH`: prefill micro-batch rows. `None` = no usable value; the 1024 /
         /// iGPU-adaptive fallback chain stays at its call site (R5).
         ubatch: Option<usize> = None,

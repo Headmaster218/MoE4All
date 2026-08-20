@@ -202,6 +202,23 @@ impl Pager {
         self.resident.len()
     }
 
+    /// Resident `(block, slot)` pairs from coldest to hottest.
+    ///
+    /// Stage-transition code uses this snapshot to borrow the coldest physical ranges for a
+    /// temporary whole-layer Prefill ring without discarding unrelated hot Decode entries. It is
+    /// intentionally a snapshot rather than an iterator borrowing the pager: callers may evict
+    /// selected blocks immediately afterwards.
+    pub fn resident_slots_lru(&self) -> Vec<(BlockId, u32)> {
+        let mut out = Vec::with_capacity(self.lru_len);
+        let mut slot = self.lru_head;
+        while let Some(s) = slot {
+            let node = self.lru[self.slot_idx(s)];
+            out.push((node.id.expect("linked LRU node has a block id"), s));
+            slot = node.next;
+        }
+        out
+    }
+
     /// Number of entries in the `epoch` map — test-only, to assert eviction keeps it bounded by
     /// `n_slots` rather than growing per distinct BlockId ever touched.
     #[cfg(test)]
@@ -851,6 +868,20 @@ mod tests {
         assert_eq!(p.slot_of(3), Some(slot));
         assert_eq!(p.slot_of(2), None);
         assert_eq!(p.stats().evictions, 1);
+    }
+
+    #[test]
+    fn resident_slot_snapshot_is_cold_to_hot_and_tracks_physical_slots() {
+        let mut p = Pager::new(3);
+        p.touch(10); // slot 0
+        p.touch(11); // slot 1
+        p.touch(12); // slot 2
+        p.touch(10); // move slot 0 to MRU
+
+        assert_eq!(p.resident_slots_lru(), vec![(11, 1), (12, 2), (10, 0)]);
+
+        p.evict(12);
+        assert_eq!(p.resident_slots_lru(), vec![(11, 1), (10, 0)]);
     }
 
     #[test]

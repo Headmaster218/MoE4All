@@ -266,6 +266,50 @@ impl GpuPager {
         self.pager.n_slots().saturating_mul(self.slot_bytes)
     }
 
+    /// Per-slot Decode heat: `None` is free, `Some(1)` is the coldest resident and larger values
+    /// approach the MRU end. A Prefill ring placement compares contiguous ranges with this once per
+    /// phase transition; it is never consulted on the token path.
+    fn slot_heat(&self) -> Vec<Option<usize>> {
+        let mut heat = vec![None; self.pager.n_slots()];
+        for (rank, (_, slot)) in self.pager.resident_slots_lru().into_iter().enumerate() {
+            heat[slot as usize] = Some(rank + 1);
+        }
+        heat
+    }
+
+    /// Invalidate only Decode entries whose physical slots overlap one temporary Prefill byte
+    /// range. The arena allocation itself is unchanged and the released slots return to the
+    /// ordinary free list, ready for Decode after the ring phase ends.
+    fn evict_virtual_range(&mut self, offset: usize, bytes: usize) -> Result<usize> {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| be("prefill reservation byte range overflow"))?;
+        if end > self.total_arena_bytes() {
+            return Err(be("prefill reservation exceeds its logical arena pool"));
+        }
+        let first_slot = offset / self.slot_bytes;
+        let end_slot = end.div_ceil(self.slot_bytes);
+        let victims: Vec<BlockId> = self
+            .pager
+            .resident_slots_lru()
+            .into_iter()
+            .filter_map(|(id, slot)| {
+                ((slot as usize) >= first_slot && (slot as usize) < end_slot).then_some(id)
+            })
+            .collect();
+        for id in &victims {
+            let removed = self.pager.evict(*id);
+            debug_assert!(removed.is_some());
+            if let Some(entry) = self.lut_host.get_mut(*id as usize) {
+                *entry = NOT_RESIDENT;
+            }
+        }
+        if !victims.is_empty() {
+            self.lut_dirty = true;
+        }
+        Ok(victims.len())
+    }
+
     /// Translate a virtual byte range in the concatenated logical pool to one physical arena.
     /// Prefill role banks inside dynamic lanes are required to be contiguous and may not cross a
     /// physical allocation boundary.
@@ -305,14 +349,6 @@ impl GpuPager {
     /// a hit).
     pub fn is_resident(&self, id: BlockId) -> bool {
         self.pager.slot_of(id).is_some()
-    }
-
-    /// Drop all host-side residency metadata without reallocating the arena. Used when the same
-    /// physical bytes stop being a contiguous prefill-layer slot and become a decode expert LRU.
-    fn reset_residency(&mut self) {
-        self.pager = Pager::new(self.pager.n_slots());
-        self.lut_host.fill(NOT_RESIDENT);
-        self.lut_dirty = true;
     }
 
     /// [`Self::ensure_resident`]'s RECORDED twin: on a miss, memcpy `bytes` into the caller's
@@ -976,6 +1012,25 @@ fn prefill_align(bytes: usize) -> usize {
     bytes.next_multiple_of(PREFILL_BANK_ALIGN)
 }
 
+/// Lexicographic cost of borrowing a contiguous arena range for Prefill. Fewer live Decode
+/// entries wins first; among equal counts, the lowest LRU-rank sum wins, so cold entries are
+/// displaced before hot ones. Free slots contribute neither count nor heat.
+fn prefill_range_cost(
+    heat: &[Option<usize>],
+    slot_bytes: usize,
+    offset: usize,
+    bytes: usize,
+) -> (usize, u128) {
+    let first = offset / slot_bytes;
+    let end = offset.saturating_add(bytes).div_ceil(slot_bytes);
+    heat[first..end]
+        .iter()
+        .fold((0usize, 0u128), |(count, score), value| match value {
+            Some(rank) => (count + 1, score + *rank as u128),
+            None => (count, score),
+        })
+}
+
 /// One model's whole paged-MoE session: uniform-size logical arena pools plus the permanent
 /// CPU-only layer-major source. Lives on the `VulkanBackend` HANDLE
 /// (NOT `VulkanShared` — the session's buffers hold `Arc<VulkanShared>` clones, and parking it on
@@ -1019,6 +1074,9 @@ pub struct MoePagerSession {
     prefill_placement: HashMap<usize, PrefillPlacement>,
     prefill_layers: Vec<PrefillLayerPlacement>,
     prefill_loaded: HashSet<usize>,
+    /// Byte ranges temporarily borrowed from each Decode pool by the current Prefill ring. Only
+    /// resident entries overlapping these ranges are invalidated; all other Decode heat survives.
+    prefill_reserved_ranges: Vec<Vec<(usize, usize)>>,
 }
 
 /// One size pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -1149,6 +1207,7 @@ impl MoePagerSession {
             prefill_placement: HashMap::new(),
             prefill_layers: Vec::new(),
             prefill_loaded: HashSet::new(),
+            prefill_reserved_ranges: vec![Vec::new(); layout.pools.len()],
         })
     }
 
@@ -1236,6 +1295,9 @@ impl MoePagerSession {
         self.prefill_layers.clear();
         self.prefill_loaded.clear();
         self.prefill_lane_layer.clear();
+        for ranges in &mut self.prefill_reserved_ranges {
+            ranges.clear();
+        }
         Ok(())
     }
 
@@ -1253,19 +1315,21 @@ impl MoePagerSession {
         Ok(src.bank_bytes)
     }
 
-    /// Switch the shared arenas back to expert-LRU interpretation. A preceding prefill may have
-    /// overwritten arbitrary LRU slots with contiguous whole-layer banks, so none of the old
-    /// mappings are valid. The caller only invokes this at a new static execute boundary; the
-    /// previous execute drained the queue before returning.
+    /// Switch the shared arenas back to expert-LRU interpretation. Entering Prefill already
+    /// invalidated exactly the Decode slots its temporary ring borrowed, so every mapping outside
+    /// those ranges remains valid and hot. The borrowed slots are already on each pager's free
+    /// list; Decode naturally repopulates only those misses.
     pub fn enter_decode(&mut self) -> bool {
         if self.mode == MoeArenaMode::DecodeLru {
             return false;
         }
-        for pool in &mut self.pools {
-            pool.pager.reset_residency();
-        }
         self.prefill_lane_layer.fill(None);
         self.prefill_loaded.clear();
+        self.prefill_placement.clear();
+        self.prefill_layers.clear();
+        for ranges in &mut self.prefill_reserved_ranges {
+            ranges.clear();
+        }
         self.mode = MoeArenaMode::DecodeLru;
         true
     }
@@ -1336,6 +1400,11 @@ impl MoePagerSession {
         // arena shards. This prevents a rare quantization pool (perhaps used by only one layer)
         // from forcing the whole model down to one lane while most of INFR_CACHE is idle.
         let requested_lanes = self.prefill_target_lanes.min(layers.len()).max(1);
+        let pool_heat: Vec<Vec<Option<usize>>> = self
+            .pools
+            .iter()
+            .map(|pool| pool.pager.slot_heat())
+            .collect();
         let mut chosen_layout = None;
         for candidate_lanes in (1..=requested_lanes).rev() {
             let mut lane_bank_bytes = vec![Vec::<usize>::new(); candidate_lanes];
@@ -1375,23 +1444,45 @@ impl MoePagerSession {
             bank_order.sort_unstable_by_key(|&(bytes, _, _)| std::cmp::Reverse(bytes));
             let mut fits = true;
             for (bytes, lane, bank) in bank_order {
-                let best = free_ranges
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, &(_, cursor, end))| {
-                        let start = prefill_align(cursor);
-                        let finish = start.checked_add(bytes)?;
-                        (finish <= end).then_some((end - finish, idx, start))
-                    })
-                    .min_by_key(|&(remaining, _, _)| remaining);
-                let Some((_, range, offset)) = best else {
+                let mut best: Option<(usize, u128, usize, usize, usize)> = None;
+                for (range, &(pool, cursor, end)) in free_ranges.iter().enumerate() {
+                    if end.saturating_sub(cursor) < bytes {
+                        continue;
+                    }
+                    let slot_bytes = self.pools[pool].slot_bytes;
+                    let first_slot = cursor / slot_bytes;
+                    let last_slot = end.saturating_sub(bytes) / slot_bytes;
+                    for slot in first_slot..=last_slot {
+                        let offset = prefill_align((slot * slot_bytes).max(cursor));
+                        let Some(finish) = offset.checked_add(bytes) else {
+                            continue;
+                        };
+                        if finish > end {
+                            continue;
+                        }
+                        let (resident, heat) =
+                            prefill_range_cost(&pool_heat[pool], slot_bytes, offset, bytes);
+                        let fragmentation = end.saturating_sub(cursor).saturating_sub(bytes);
+                        let candidate = (resident, heat, fragmentation, range, offset);
+                        if best.is_none_or(|current| candidate < current) {
+                            best = Some(candidate);
+                        }
+                    }
+                }
+                let Some((_, _, _, range, offset)) = best else {
                     fits = false;
                     break;
                 };
-                let pool = free_ranges[range].0;
-                free_ranges[range].1 = offset
+                let (pool, cursor, end) = free_ranges.swap_remove(range);
+                let finish = offset
                     .checked_add(bytes)
                     .ok_or_else(|| be("moe pager: Prefill bank range overflow"))?;
+                if cursor < offset {
+                    free_ranges.push((pool, cursor, offset));
+                }
+                if finish < end {
+                    free_ranges.push((pool, finish, end));
+                }
                 candidate_bases[lane][bank] = Some((pool, offset));
             }
             if fits {
@@ -1419,8 +1510,9 @@ impl MoePagerSession {
         let mut per_pool_ring_bytes = vec![0usize; self.pools.len()];
         for (lane, banks) in lane_bank_bytes.iter().enumerate() {
             for (bank, &bytes) in banks.iter().enumerate() {
-                let pool = lane_bank_bases[lane][bank].0;
+                let (pool, offset) = lane_bank_bases[lane][bank];
                 per_pool_ring_bytes[pool] = per_pool_ring_bytes[pool].saturating_add(bytes);
+                self.prefill_reserved_ranges[pool].push((offset, bytes));
             }
         }
 
@@ -1466,16 +1558,28 @@ impl MoePagerSession {
         Ok(())
     }
 
-    /// Select whole-layer interpretation for prefill. Direct layer staging ignores the decode
-    /// LRU metadata; it is invalidated lazily by [`Self::enter_decode`] when decode begins.
+    /// Select whole-layer interpretation for Prefill. The ring is placed over the coldest
+    /// contiguous Decode ranges that fit, and only mappings overlapped by those ranges are
+    /// invalidated. Everything outside the borrowed lanes survives the phase transition.
     pub fn enter_prefill_layer(&mut self) -> Result<()> {
-        self.build_prefill_layout()?;
         if self.mode != MoeArenaMode::PrefillLayer {
-            for pool in &mut self.pools {
-                pool.pager.reset_residency();
+            self.build_prefill_layout()?;
+            let mut evicted = 0usize;
+            let mut borrowed = 0usize;
+            for (pool, ranges) in self.pools.iter_mut().zip(&self.prefill_reserved_ranges) {
+                for &(offset, bytes) in ranges {
+                    borrowed = borrowed.saturating_add(bytes);
+                    evicted =
+                        evicted.saturating_add(pool.pager.evict_virtual_range(offset, bytes)?);
+                }
             }
             self.prefill_lane_layer.fill(None);
             self.prefill_loaded.clear();
+            tracing::info!(
+                "[moe-prefill] borrowed {} arena bytes and evicted {evicted} cold Decode blocks; \
+                 all non-overlapping hot entries retained",
+                borrowed,
+            );
         }
         self.mode = MoeArenaMode::PrefillLayer;
         Ok(())
@@ -1977,9 +2081,8 @@ pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
 // resident slot's base BYTE address (`arena_addr + slot * slot_bytes`, 64-bit — see
 // `GpuPager::arena_addr`/`DensePagerSession::stage`) and rides the op's own `w_off` on top as a
 // within-slot element offset, exactly like the resident path's binding + offset.
-// Pools are keyed per (dtype, padded byte stride) tensor class — same reasoning as the MoE
-// per-(role, slot_bytes) pools (fixed slot offsets require uniform strides; mixed-precision GGUFs
-// bump a subset of layers' tensors to a wider format).
+// Pools are keyed per (dtype, padded byte stride) tensor class — the same uniform-slot constraint
+// as the MoE size pools, with dtype retained here because dense dispatch metadata is pool-level.
 //
 // Rejected alternatives (design notes for the seam this replaces):
 //   - Descriptor-level (buffer, offset) rebinding: `Recorder::bind_descriptors` binds
@@ -2292,6 +2395,23 @@ mod tests {
     fn validate_pager_dims_accepts_valid() {
         assert!(validate_pager_dims(1, 4).is_ok());
         assert!(validate_pager_dims(238, 13 << 20).is_ok());
+    }
+
+    #[test]
+    fn prefill_range_cost_prefers_free_then_cold_contiguous_slots() {
+        // Slots 0 and 3 are free. Resident ranks increase from cold to hot.
+        let heat = [None, Some(1), Some(4), None, Some(2), Some(3)];
+        let slot_bytes = 1024;
+
+        assert_eq!(prefill_range_cost(&heat, slot_bytes, 0, 1024), (0, 0));
+        assert_eq!(prefill_range_cost(&heat, slot_bytes, 1024, 2048), (2, 5));
+        assert_eq!(prefill_range_cost(&heat, slot_bytes, 3072, 2048), (1, 2));
+    }
+
+    #[test]
+    fn prefill_range_cost_counts_every_partially_overlapped_slot() {
+        let heat = [Some(1), Some(2), Some(3)];
+        assert_eq!(prefill_range_cost(&heat, 1024, 768, 1024), (2, 3));
     }
 
     #[test]

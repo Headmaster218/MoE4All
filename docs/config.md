@@ -181,6 +181,14 @@ micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and two low-level
 device knobs (`submit_dispatches` for the iGPU submit splitter, `subgroup_pref`
 to force subgroup 16 or 32).
 
+`device.vram_budget` / `INFR_VRAM_BUDGET` caps the backend's total device-memory
+footprint: resident weights, KV, runtime allocations, and expert/dense paging
+arenas all count. `device.vram_reserve` / `INFR_VRAM_RESERVE` additionally keeps
+that much physical VRAM free, on top of Vulkan's built-in 256 MiB safety guard.
+For example, `INFR_VRAM_BUDGET=23g` and `INFR_VRAM_RESERVE=512m` are a hard
+23 GiB process cap plus 512 MiB of extra physical slack. Both are opt-in; when
+unset, placement and allocation retain the historical behavior.
+
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
 fill `temp` / `top_k` / `top_p` / `max_new` from the model's own recommended
@@ -199,7 +207,9 @@ spills KV to system RAM when VRAM runs out.
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
-hit/miss/eviction counts.
+hit/miss/eviction counts. `paging.cache` / `INFR_CACHE` remains an expert/dense
+arena override for compatibility, but is clamped when it would exceed the
+unified total-memory budget.
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a

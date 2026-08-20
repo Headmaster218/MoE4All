@@ -37,6 +37,7 @@
 
 use crate::decode_spec::block_layout;
 use crate::tensor::DType;
+use crate::SizeSpec;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── KV format sizing ─────────────────────────────────────────────────────────
@@ -150,6 +151,36 @@ pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
         return bytes;
     }
     (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+}
+
+/// Remaining bytes a backend may allocate under one unified VRAM policy.
+///
+/// `guarded_available` is the device's CURRENT free space after its mandatory allocator guard;
+/// `tracked_used` is this backend's already-live device allocation total. An explicit budget is a
+/// cap on that whole backend footprint (weights + KV + scratch + paging arenas), while `reserve`
+/// keeps extra physical VRAM free for the desktop or another process. Percentage values resolve
+/// against total device memory, never the already-shrinking free figure.
+///
+/// The two constraints are independent and the smaller wins:
+///
+/// - physical room: `guarded_available - reserve`;
+/// - configured process room: `budget - tracked_used`.
+///
+/// With both knobs unset this is exactly `guarded_available`, preserving the historical allocator
+/// ceiling and placement behavior.
+pub fn unified_vram_room(
+    total: u64,
+    guarded_available: u64,
+    tracked_used: u64,
+    budget: Option<SizeSpec>,
+    reserve: Option<SizeSpec>,
+) -> u64 {
+    let reserve = reserve.map_or(0, |spec| spec.resolve(total));
+    let physical_room = guarded_available.saturating_sub(reserve);
+    let configured_room = budget.map_or(u64::MAX, |spec| {
+        spec.resolve(total).min(total).saturating_sub(tracked_used)
+    });
+    physical_room.min(configured_room)
 }
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
@@ -515,6 +546,39 @@ mod tests {
         assert_eq!(
             reserve_bytes(24 * GIB, cfg.kv.overflow_reserve_mb),
             128 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn unified_vram_room_applies_total_cap_and_physical_reserve_independently() {
+        use crate::SizeSpec;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            unified_vram_room(24 * GIB, 20 * GIB, 0, None, None),
+            20 * GIB
+        );
+        assert_eq!(
+            unified_vram_room(
+                24 * GIB,
+                23 * GIB,
+                3 * GIB,
+                Some(SizeSpec::Bytes(18 * GIB)),
+                Some(SizeSpec::Bytes(512 * MIB)),
+            ),
+            15 * GIB,
+        );
+        assert_eq!(
+            unified_vram_room(
+                24 * GIB,
+                12 * GIB,
+                1 * GIB,
+                Some(SizeSpec::Percent(0.90)),
+                Some(SizeSpec::Bytes(2 * GIB)),
+            ),
+            10 * GIB,
+            "live physical pressure must beat a larger configured cap",
         );
     }
 

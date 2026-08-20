@@ -2823,9 +2823,10 @@ impl VulkanBackend {
         vram_info(&self.shared)
     }
 
-    /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it:
-    /// [`vram`](Self::vram)'s free figure minus the guard's own [`GUARD_HEADROOM`]. The live-device
-    /// spelling of [`VramInfo::alloc_room`], which carries the full rationale.
+    /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it.
+    /// This is the smaller of the live physical room and the configured per-backend total budget,
+    /// after `device.vram_reserve` has been held aside. With both unified-budget knobs unset this is
+    /// exactly [`VramInfo::alloc_room`], preserving the historical behavior.
     ///
     /// Sizing math must budget against this, not against `vram().available` — the guard enforces
     /// `used + want <= total - GUARD_HEADROOM`, so the last 256 MiB of "free" VRAM is reserved and
@@ -2838,7 +2839,14 @@ impl VulkanBackend {
     /// nets out everything held); on the fallback path `available` is the whole heap, so this is
     /// the room only before this backend has allocated — which is when placement runs.
     pub fn alloc_room(&self) -> u64 {
-        self.vram().alloc_room()
+        let vram = self.vram();
+        infr_core::budget::unified_vram_room(
+            vram.total,
+            vram.alloc_room(),
+            self.shared.device_used.load(Ordering::Relaxed),
+            self.cfg.device.vram_budget,
+            self.cfg.device.vram_reserve,
+        )
     }
 
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
@@ -2856,11 +2864,14 @@ impl VulkanBackend {
     /// block rounding) and driver-internal allocations. `INFR_NO_VRAM_GUARD=1` disables the check
     /// (restoring the old fail-late behavior).
     ///
-    /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
-    /// individually blow the budget and stay covered by the next large allocation's check).
+    /// Sub-MiB allocations skip the check only under the historical implicit policy (no
+    /// `vram_budget`/`vram_reserve`). An explicit unified limit checks every allocation so a tail
+    /// of small buffers cannot collectively cross the caller's hard cap.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
-        if want < CHECK_MIN || self.cfg.kernels.vulkan.no_vram_guard {
+        let unified_limit =
+            self.cfg.device.vram_budget.is_some() || self.cfg.device.vram_reserve.is_some();
+        if (want < CHECK_MIN && !unified_limit) || self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
         // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
@@ -2870,34 +2881,38 @@ impl VulkanBackend {
             return Ok(());
         }
         let v = self.vram();
-        let used = if v.live {
+        let global_used = if v.live {
             v.total.saturating_sub(v.available)
         } else {
             self.shared.device_used.load(Ordering::Relaxed)
         };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        let pool = if v.uma {
-            "unified memory (all heaps — this GPU shares system RAM)"
-        } else {
-            "device-local"
-        };
+        let process_used = self.shared.device_used.load(Ordering::Relaxed);
+        let physical_budget = v.total.saturating_sub(GUARD_HEADROOM).saturating_sub(
+            self.cfg
+                .device
+                .vram_reserve
+                .map_or(0, |spec| spec.resolve(v.total)),
+        );
+        let configured_budget = self
+            .cfg
+            .device
+            .vram_budget
+            .map(|spec| spec.resolve(v.total).min(v.total));
         Err(be(format!(
-            "{} budget exceeded: {} requested + {} already in use ({}) > {} budget ({} {pool} \
-                 minus 256 MiB headroom). Refusing to over-commit: exceeding it doesn't fail \
+            "{} budget exceeded: {} requested with {} physical / {} backend bytes already in use; \
+                 {} remains under the unified limit (physical cap {}, configured cap {}). \
+                 Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
                  (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
             if v.uma { "Unified-memory" } else { "VRAM" },
             fmt_bytes(want),
-            fmt_bytes(used),
-            if v.live {
-                "live driver budget"
-            } else {
-                "tracked by this process; no VK_EXT_memory_budget"
-            },
-            fmt_bytes(budget),
-            fmt_bytes(v.total),
+            fmt_bytes(global_used),
+            fmt_bytes(process_used),
+            fmt_bytes(self.alloc_room()),
+            fmt_bytes(physical_budget),
+            configured_budget.map_or_else(|| "unlimited".to_owned(), fmt_bytes),
         )))
     }
 
@@ -2910,14 +2925,7 @@ impl VulkanBackend {
     /// unlike the guard it ignores `INFR_NO_VRAM_GUARD` and the sub-MiB skip — it is a placement
     /// decision, not a safety gate, so it always reports the honest budget answer.
     fn vram_budget_fits(&self, want: u64) -> bool {
-        let v = self.vram();
-        let used = if v.live {
-            v.total.saturating_sub(v.available)
-        } else {
-            self.shared.device_used.load(Ordering::Relaxed)
-        };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        used.saturating_add(want) <= budget
+        want <= self.alloc_room()
     }
 
     /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
@@ -4840,7 +4848,6 @@ mod tests {
         be.init_moe_pager(crate::pager::MoePagerLayout {
             n_blocks: 4,
             pools: vec![crate::pager::MoePoolSpec {
-                role: Some(crate::pager::Role::Gate),
                 slot_bytes: 4096,
                 n_slots: 2,
             }],

@@ -71,6 +71,8 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.sampling.max_new, 2048);
     // §6.1: `Option` means "the user pinned it"; the 1024 / iGPU-adaptive chain stays at its site.
     assert_eq!(d.device.ubatch, None);
+    assert_eq!(d.device.vram_budget, None);
+    assert_eq!(d.device.vram_reserve, None);
     assert_eq!(d.device.ubatch_parallel, 256);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);
@@ -1158,6 +1160,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_TENSOR_PARALLEL",
         "INFR_TP_HOST",
         "INFR_UBATCH",
+        "INFR_VRAM_BUDGET",
+        "INFR_VRAM_RESERVE",
         "INFR_UBATCH_PARALLEL",
     ];
 

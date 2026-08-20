@@ -80,6 +80,16 @@ Gemma-4 MoE — one double-width slot per expert), and mixed-dtype roles
 one logical arena pool per expert byte size, shared across compatible roles). `INFR_PAGER_STATS=1` prints each pool's
 hit/miss/eviction counts.
 
+For a whole-process limit, use `INFR_VRAM_BUDGET=<size>` instead. It covers
+resident weights, KV, runtime workspace, and paging arenas together;
+`INFR_VRAM_RESERVE=<size>` keeps additional physical VRAM free above Vulkan's
+built-in guard. A legacy `INFR_CACHE` override still forces paging but is
+clamped to the remainder of this unified plan. During MoE Prefill, the
+whole-layer streaming ring borrows only the coldest contiguous ranges it needs
+from the Decode expert arena. Non-overlapping hot expert entries survive the
+Prefill→Decode transition, and the borrowed slots return to the ordinary LRU
+without a second allocation.
+
 **Dense layer streaming**: DENSE models bigger than VRAM stream their per-layer
 projection weights (attn q/k/v/o + FFN gate/up/down, as the same fused
 qkv/gate_up groups the loader uploads) through the same paged VRAM machinery —
@@ -105,14 +115,15 @@ CPU when the overflow is smaller — measured crossover on this box is around a
 quarter of the model overflowing). An MoE model whose DENSE part also doesn't
 fit is out of scope and errors clearly.
 
-**Size grammar** — `paging.cache` / `INFR_CACHE` and `device.ctx` / `INFR_CTX` /
-`--ctx` share one value grammar (`infr_core::parse_size`): a plain number is the
-base unit (bytes for `INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t`
-suffixes scale by 1024 (`INFR_CACHE=19g`, `INFR_CTX=256k`), and `%` resolves
-against the device-appropriate base — available VRAM for the expert cache, the
-free-VRAM KV capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`;
-on the CPU/Metal chat paths a ctx-`%` resolves against the model's trained
-context).
+**Size grammar** — `paging.cache` / `INFR_CACHE`, `device.vram_budget` /
+`INFR_VRAM_BUDGET`, `device.vram_reserve` / `INFR_VRAM_RESERVE`, and
+`device.ctx` / `INFR_CTX` / `--ctx` share one value grammar
+(`infr_core::parse_size`): a plain number is the base unit (bytes for memory
+budgets, tokens for `INFR_CTX`), and `k`/`m`/`g`/`t` suffixes scale by 1024
+(`INFR_VRAM_BUDGET=23g`, `INFR_CTX=256k`). A `%` total/reserve budget resolves
+against total device memory; `INFR_CACHE=%` keeps its historical available-VRAM
+base; context percentages use free-VRAM KV capacity on Vulkan (and the trained
+context on the CPU/Metal chat paths).
 
 **Resident-BDA weight arena** — always on; it is the only weight path. Routes
 every weight allocation into one `bufferDeviceAddress` arena and has the kernels
