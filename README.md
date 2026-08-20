@@ -173,6 +173,10 @@ CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).
 
+On Windows, `Start-INFR-GUI.cmd` builds and opens the server-hosted browser control plane on port
+8180. It manages model directories, downloads, profiles, memory estimates, and a supervised
+`infr serve` worker. See [`crates/infr-gui/README.md`](crates/infr-gui/README.md).
+
 ## Performance
 
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /

@@ -12,6 +12,7 @@ members = [
     "crates/infr-server",
     "crates/infr-llama",
     "crates/infr-cli",
+    "crates/infr-gui",
     "crates/infr-prof",
     "crates/infr-prof-rt",
     "crates/infr-testkit",

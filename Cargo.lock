@@ -1224,6 +1224,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "infr-gui"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "infr-core",
+ "infr-gguf",
+ "infr-llama",
+ "infr-vulkan",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "infr-hub"
 version = "0.0.0"
 dependencies = [

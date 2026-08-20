@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>INFR Control</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="login" class="overlay hidden">
+    <form id="login-form" class="dialog">
+      <div class="eyebrow">SECURE CONTROL PLANE</div>
+      <h1>连接 INFR</h1>
+      <p>输入启动窗口显示的管理密钥。密钥仅保存在当前浏览器。</p>
+      <input id="admin-key" type="password" autocomplete="current-password" placeholder="管理密钥">
+      <button type="submit">连接</button>
+      <div id="login-error" class="error"></div>
+    </form>
+  </div>
+
+  <header>
+    <div>
+      <div class="eyebrow">LOCAL INFERENCE CONTROL</div>
+      <h1>INFR</h1>
+    </div>
+    <div class="runtime-head">
+      <span id="phase-dot" class="dot"></span>
+      <div><strong id="phase">连接中</strong><small id="active-model">尚未载入模型</small></div>
+      <div class="metric"><b id="prefill">—</b><span>Prefill tok/s</span></div>
+      <div class="metric"><b id="decode">—</b><span>Decode tok/s</span></div>
+    </div>
+  </header>
+
+  <main>
+    <aside>
+      <section class="panel">
+        <div class="section-title"><h2>模型库</h2><button id="rescan" class="ghost">重新扫描</button></div>
+        <div class="row compact">
+          <input id="directory" placeholder="服务器目录，例如 D:\AILMStudioModels">
+          <button id="add-directory">添加</button>
+        </div>
+        <div id="directories" class="chips"></div>
+        <input id="model-filter" class="search" placeholder="筛选模型">
+        <div id="models" class="model-list empty">尚未添加模型目录</div>
+      </section>
+
+      <section class="panel">
+        <h2>后台下载</h2>
+        <input id="download-ref" placeholder="org/repo:Q4_K_M">
+        <div class="grid two">
+          <select id="download-source">
+            <option value="https://huggingface.co">HuggingFace</option>
+            <option value="https://hf-mirror.com">国内镜像 hf-mirror</option>
+            <option value="custom">自定义</option>
+          </select>
+          <input id="download-jobs" type="number" min="1" max="32" value="8" title="并发连接数">
+        </div>
+        <input id="download-custom" class="hidden" placeholder="https://mirror.example.com">
+        <button id="download" class="wide">开始下载</button>
+        <div id="download-state" class="subtle">空闲</div>
+        <details id="download-log-wrap" class="hidden">
+          <summary>下载日志</summary>
+          <pre id="download-logs" class="download-logs"></pre>
+        </details>
+      </section>
+    </aside>
+
+    <div class="content">
+      <section class="panel">
+        <div class="section-title">
+          <div><div class="eyebrow">DEPLOYMENT PROFILE</div><h2>模型与服务</h2></div>
+          <select id="profile-select"><option value="">新配置</option></select>
+        </div>
+        <input id="profile-id" type="hidden">
+        <div class="grid two">
+          <label>配置名称<input id="profile-name" value="Default"></label>
+          <label>任务类型<select id="task"><option value="chat">Chat / Completion</option><option value="embedding">Embedding（预留）</option><option value="rerank">Rerank（预留）</option></select></label>
+        </div>
+        <label>模型路径<input id="model-path" placeholder="选择左侧模型，或输入服务器上的 GGUF 路径"></label>
+        <div class="grid three">
+          <label>计算设备<select id="backend"></select></label>
+          <label>服务地址<input id="service-addr" value="0.0.0.0:8080"></label>
+          <label>并发槽<input id="parallel" type="number" min="1" max="64" value="1"></label>
+        </div>
+        <label>OpenAI API Key<input id="service-key" type="password" placeholder="留空表示不鉴权"></label>
+      </section>
+
+      <section class="panel">
+        <div class="section-title"><div><div class="eyebrow">MEMORY PLAN</div><h2>显存与内存预算</h2></div><button id="estimate" class="ghost">重新估算</button></div>
+        <div class="grid three">
+          <label>总 VRAM Budget<input id="vram-budget" value="23g" placeholder="23g / 90%"></label>
+          <label>VRAM Reserve<input id="vram-reserve" value="512m" placeholder="512m"></label>
+          <label>RAM 权重缓存<input id="ram-budget" placeholder="留空走 mmap / 例如 64g"></label>
+          <label>上下文<input id="context" value="200k"></label>
+          <label>KV K<select id="kv-k"><option>q8_0</option><option>f16</option><option>auto</option></select></label>
+          <label>KV V<select id="kv-v"><option>q8_0</option><option>f16</option><option>auto</option></select></label>
+          <label>Prefill ubatch<input id="ubatch" type="number" placeholder="自动"></label>
+          <label>Expert cache 覆盖<input id="expert-cache" placeholder="留空自动分配"></label>
+          <label>单请求最大输出<input id="max-tokens" type="number" value="131072"></label>
+        </div>
+        <div id="memory-estimate" class="memory-grid"><div class="subtle">选择本地模型后显示加载前估算</div></div>
+        <p class="hint">统一 VRAM Budget 是主控项；Expert cache 留空时由引擎在权重、KV、运行时和 Prefill 空间之间自动分配。</p>
+      </section>
+
+      <section class="panel">
+        <details>
+          <summary>高级参数</summary>
+          <p class="hint">每行一个 <code>config.path=value</code>。基础表单已有的字段不要重复。</p>
+          <div class="row compact">
+            <input id="config-path" list="config-paths" placeholder="选择或输入 config.path">
+            <input id="config-value" placeholder="value">
+            <button id="add-advanced" type="button">添加</button>
+          </div>
+          <textarea id="advanced" rows="7" placeholder="paging.ring_slots=5&#10;kernels.vulkan.flash_splits=2"></textarea>
+          <datalist id="config-paths"></datalist>
+        </details>
+        <div class="actions">
+          <button id="save" class="secondary">保存配置</button>
+          <button id="delete-profile" class="danger">删除配置</button>
+          <button id="start">启动 / 切换</button>
+          <button id="stop" class="warn">停止</button>
+          <button id="force-stop" class="danger">强制停止</button>
+        </div>
+        <div id="message" class="subtle"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title"><h2>运行日志</h2><span id="pid" class="subtle"></span></div>
+        <pre id="logs">等待 worker…</pre>
+      </section>
+
+      <section class="panel future">
+        <h2>已预留能力</h2>
+        <div class="chips"><span>Embedding API</span><span>视觉编码器 / mmproj</span><span>VRAM → RAM → SSD</span><span>多 worker 路由</span></div>
+      </section>
+    </div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
