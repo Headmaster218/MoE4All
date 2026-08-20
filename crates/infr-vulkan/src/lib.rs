@@ -4848,6 +4848,7 @@ mod tests {
                 base_offset: 0,
                 bytes: 4096,
             }],
+            prefill_target_lanes: 2,
         })
         .expect("init_moe_pager");
         let weak = Arc::downgrade(&be.shared);

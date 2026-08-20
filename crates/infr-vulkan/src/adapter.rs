@@ -5265,6 +5265,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 seg.wait().map_err(|e| be(e.to_string()))?;
             }
             pstream.drain()?;
+            pstream.finish_prefill_uploads(be_)?;
             // `transient`, `pool`, `dyn_args` and the scratch arena drop AFTER these waits (they
             // are locals of this fn), so nothing the GPU was reading is freed under it.
             return Err(Error::Aborted);
@@ -5393,6 +5394,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
     pstream.drain()?;
+    pstream.finish_prefill_uploads(be_)?;
     // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
     // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
     be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
@@ -5436,6 +5438,75 @@ fn pooled_usage(
 /// submitted. Before reusing a half, its previous segment's fence is waited (`pending`), which
 /// is the whole ring-region-lifetime story: a region is never rewritten until the recording that
 /// read it has fully executed.
+struct PrefillUploadCommand {
+    job: crate::pager::PrefillCopyJob,
+    /// The layer that previously owned this lane. The uploader may overwrite the lane only after
+    /// this GPU fence signals. Initial free-lane fills have no dependency.
+    after: Option<crate::recorder::PendingSegment>,
+}
+
+struct PrefillUploadCompletion {
+    buf_id: usize,
+    result: std::result::Result<(), String>,
+}
+
+struct PrefillUploader {
+    tx: std::sync::mpsc::Sender<Option<PrefillUploadCommand>>,
+    rx: std::sync::mpsc::Receiver<PrefillUploadCompletion>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PrefillUploader {
+    fn new() -> Self {
+        let (tx, jobs) = std::sync::mpsc::channel::<Option<PrefillUploadCommand>>();
+        let (done, rx) = std::sync::mpsc::channel::<PrefillUploadCompletion>();
+        let thread = std::thread::Builder::new()
+            .name("infr-moe-prefill-upload".to_owned())
+            .spawn(move || {
+                while let Ok(Some(command)) = jobs.recv() {
+                    let buf_id = command.job.buf_id();
+                    let result = command
+                        .after
+                        .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
+                    if result.is_ok() {
+                        command.job.execute();
+                    }
+                    if done
+                        .send(PrefillUploadCompletion { buf_id, result })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn Prefill uploader");
+        Self {
+            tx,
+            rx,
+            thread: Some(thread),
+        }
+    }
+
+    fn enqueue(&self, command: PrefillUploadCommand) -> Result<()> {
+        self.tx
+            .send(Some(command))
+            .map_err(|_| be("Prefill uploader stopped unexpectedly"))
+    }
+
+    fn finish(&mut self) {
+        let _ = self.tx.send(None);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PrefillUploader {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 #[derive(Default)]
 struct PagedStream {
     /// Per-ring-region in-flight segment (the one whose recorded copies read that region).
@@ -5448,6 +5519,10 @@ struct PagedStream {
     tape_cursor: usize,
     /// Prefill compute segments that do not consume a staging-ring region.
     compute_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
+    /// Dedicated producer for whole-layer Host -> mapped-ReBAR copies. It owns the layer fence
+    /// while waiting for a ring lane to become reusable, so upload progress is independent from
+    /// graph recording and from whether the active layer is Attention or DeltaNet.
+    prefill_uploader: Option<PrefillUploader>,
 }
 
 impl PagedStream {
@@ -5468,6 +5543,90 @@ impl PagedStream {
         }
         while let Some(s) = self.compute_pending.pop_front() {
             s.wait().map_err(|e| be(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn apply_prefill_completion(
+        be_: &VulkanBackend,
+        completion: PrefillUploadCompletion,
+    ) -> Result<()> {
+        completion
+            .result
+            .map_err(|e| be(format!("async Prefill upload dependency failed: {e}")))?;
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .complete_prefill_layer_cpu(completion.buf_id)
+    }
+
+    fn poll_prefill_uploads(&mut self, be_: &VulkanBackend) -> Result<()> {
+        let Some(uploader) = self.prefill_uploader.as_ref() else {
+            return Ok(());
+        };
+        while let Ok(completion) = uploader.rx.try_recv() {
+            Self::apply_prefill_completion(be_, completion)?;
+        }
+        Ok(())
+    }
+
+    /// Returns false when no async job owns this layer, allowing the caller's cold synchronous
+    /// path to seed the first current layer. A pending layer blocks only at actual consumption.
+    fn wait_prefill_layer(&mut self, be_: &VulkanBackend, buf_id: usize) -> Result<bool> {
+        loop {
+            self.poll_prefill_uploads(be_)?;
+            let (ready, pending) = {
+                let guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_ref().expect("paged execution requires a session");
+                (
+                    sess.layer_bank_current(buf_id)?,
+                    sess.layer_bank_pending(buf_id)?,
+                )
+            };
+            if ready {
+                return Ok(true);
+            }
+            if !pending {
+                return Ok(false);
+            }
+            // Reuse the existing blocked-wait counter: in layer-stream mode there is no dense
+            // staging-ring acquisition, so this is exactly the consumer time lost because the
+            // async producer had not filled the needed lane yet. Profiling disabled means only
+            // the cheap `start()` feature check remains.
+            let wait_t0 = infr_core::pager_profile::start();
+            let completion = self
+                .prefill_uploader
+                .as_ref()
+                .ok_or_else(|| be("Prefill layer is pending without an uploader"))?
+                .rx
+                .recv()
+                .map_err(|_| be("Prefill uploader disconnected before layer became ready"))?;
+            if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
+                infr_core::pager_profile::record_staging_wait(elapsed);
+            }
+            Self::apply_prefill_completion(be_, completion)?;
+        }
+    }
+
+    fn enqueue_prefill_upload(
+        &mut self,
+        job: crate::pager::PrefillCopyJob,
+        after: Option<crate::recorder::PendingSegment>,
+    ) -> Result<()> {
+        self.prefill_uploader
+            .get_or_insert_with(PrefillUploader::new)
+            .enqueue(PrefillUploadCommand { job, after })
+    }
+
+    fn finish_prefill_uploads(&mut self, be_: &VulkanBackend) -> Result<()> {
+        let Some(mut uploader) = self.prefill_uploader.take() else {
+            return Ok(());
+        };
+        uploader.finish();
+        while let Ok(completion) = uploader.rx.try_recv() {
+            Self::apply_prefill_completion(be_, completion)?;
         }
         Ok(())
     }
@@ -5508,9 +5667,26 @@ fn rotate_stream<'a>(
     Ok(())
 }
 
-/// Submit layer N without waiting. If N staged dense bytes from the current ring region, its fence
-/// owns that region; otherwise it joins the general in-flight queue. The caller retains N while it
-/// CPU-pushes MoE layer N+1 into the opposite ReBAR lane.
+/// Retain a submitted Prefill segment that has no future ring replacement to guard. This is only
+/// the tail of the model; steady-state segments move to the uploader together with the refill job
+/// whose destination becomes writable when that segment's fence signals.
+fn retain_prefill_compute(
+    ps: &mut PagedStream,
+    seg: crate::recorder::PendingSegment,
+) -> Result<()> {
+    ps.compute_pending.push_back(seg);
+    while ps.compute_pending.len() > 2 {
+        let old = ps.compute_pending.pop_front().expect("len > 2");
+        old.wait().map_err(|e| be(e.to_string()))?;
+    }
+    Ok(())
+}
+
+// The small-m Decode Down-overlap path also submits the Gate/Up work without waiting, then
+// observes whether it is still live while the missing Down weights are pushed. Keep that probe
+// independent from the Prefill layer-ring producer: Decode may use either the dense staging ring
+// or the general compute queue, but it never transfers ownership of its segment to the Prefill
+// uploader.
 #[derive(Clone, Copy)]
 enum PrefetchComputeProbe {
     Ring(usize),
@@ -5551,29 +5727,6 @@ fn submit_prefill_compute<'a>(
         }
         Ok(PrefetchComputeProbe::General)
     }
-}
-
-/// Retire every prefill segment older than the just-submitted layer N before the host overwrites
-/// the opposite A/B lane. N remains live and overlaps the CPU push of N+1; N-1 is the only layer
-/// that could still be reading the lane N+1 is about to reuse.
-fn retire_prefill_history(ps: &mut PagedStream, current: PrefetchComputeProbe) -> Result<()> {
-    for (slot, pending) in ps.pending.iter_mut().enumerate() {
-        if matches!(current, PrefetchComputeProbe::Ring(current_slot) if current_slot == slot) {
-            continue;
-        }
-        if let Some(old) = pending.take() {
-            old.wait().map_err(|e| be(e.to_string()))?;
-        }
-    }
-    let keep_general = usize::from(matches!(current, PrefetchComputeProbe::General));
-    while ps.compute_pending.len() > keep_general {
-        let old = ps
-            .compute_pending
-            .pop_front()
-            .expect("length checked above");
-        old.wait().map_err(|e| be(e.to_string()))?;
-    }
-    Ok(())
 }
 
 /// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
@@ -5754,12 +5907,12 @@ fn stage_layer_and_window<'a>(
     buf_id: usize,
     n_expert: usize,
 ) -> Result<u32> {
-    let already_current = {
+    {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
         sess.enter_prefill_layer()?;
-        sess.layer_bank_current(buf_id)?
-    };
+    }
+    let already_current = ps.wait_prefill_layer(be_, buf_id)?;
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
     if !already_current {
@@ -5768,71 +5921,82 @@ fn stage_layer_and_window<'a>(
     sess.layer_lut_window(&mut ps.tape_cursor, buf_id, n_expert)
 }
 
-/// Copy one complete prefetched layer without allocating LUT windows. The next layer creates
-/// those windows only when it is dispatched; prefetch changes bytes, not routing state.
-fn stage_prefetch_layer<'a>(
-    be_: &'a VulkanBackend,
-    _rec: &mut Option<Recorder<'a>>,
-    _ps: &mut PagedStream,
-    buf_id: usize,
-) -> Result<()> {
-    let already_current = {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.enter_prefill_layer()?;
-        sess.layer_bank_current(buf_id)?
-    };
-    if already_current {
-        return Ok(());
-    }
+fn run_prefill_job_sync(be_: &VulkanBackend, job: crate::pager::PrefillCopyJob) -> Result<()> {
+    let buf_id = job.buf_id();
+    job.execute();
     be_.moe_pager()
         .lock()
         .unwrap()
         .as_mut()
         .expect("paged execution requires a session")
-        .push_prefill_layer_cpu(buf_id)?;
-    Ok(())
+        .complete_prefill_layer_cpu(buf_id)
 }
 
-/// After submitting layer N, direct-copy N+1's load-time-contiguous CPU slice into the opposite
-/// ReBAR lane while N executes. N-1 is retired before lane reuse. The next seeded recorder makes
-/// the completed host push visible before N+1 reads it.
+/// Close every Prefill layer into its own asynchronous segment and hand its fence to a dedicated
+/// producer. Initial free lanes are filled immediately. Thereafter each completed GPU layer frees
+/// exactly its modulo lane and triggers the next layer at distance `lane_count`; the producer keeps
+/// draining that queue regardless of whether Attention or DeltaNet is active. The graph thread
+/// waits only if it catches the producer at the actual point of consumption.
 fn prefetch_next_moe_layer<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     current_gate_id: usize,
 ) -> Result<()> {
-    let next = {
+    ps.poll_prefill_uploads(be_)?;
+    // Dense streaming can attach staging-ring lifetime to this same segment. That uncommon mixed
+    // path keeps a synchronous correctness fallback; ordinary paged MoE has cursor=0 and uses the
+    // fully asynchronous worker below.
+    let synchronous = ps.cursor > 0;
+    if synchronous {
+        ps.finish_prefill_uploads(be_)?;
+    }
+
+    let (initial, replacement) = {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
         sess.enter_prefill_layer()?;
-        sess.next_layer(current_gate_id)?
+        sess.prefill_successors(current_gate_id)?
     };
-    let Some(next) = next else {
-        return Ok(());
+    let (initial_jobs, replacement_job) = {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("paged execution requires a session");
+        let mut jobs = Vec::with_capacity(initial.len());
+        for next in initial {
+            if let Some(job) = sess.prepare_prefill_layer_cpu(next)? {
+                jobs.push(job);
+            }
+        }
+        let replacement = replacement
+            .map(|next| sess.prepare_prefill_layer_cpu(next))
+            .transpose()?
+            .flatten();
+        (jobs, replacement)
     };
-    let needs_upload = {
-        let guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_ref().expect("paged execution requires a session");
-        !sess.layer_bank_current(next)?
-    };
-    if !needs_upload {
-        return Ok(());
-    }
 
-    let probe = submit_prefill_compute(rec, ps)?;
-    retire_prefill_history(ps, probe)?;
-    let profile = infr_core::pager_profile::active();
-    let compute_live_at_start = profile && prefetch_compute_live(ps, probe)?;
-    // Host bytes are already in final Layer -> role -> expert order. This is one direct CPU push
-    // into the opposite ReBAR lane: no gather, pack, pin, staging mirror, or GPU pull command.
-    stage_prefetch_layer(be_, rec, ps, next)?;
-    if profile {
-        infr_core::pager_profile::record_prefetch_window(
-            compute_live_at_start,
-            prefetch_compute_live(ps, probe)?,
-        );
+    let segment = rec
+        .take()
+        .expect("segment always Some between ops")
+        .finish_nowait()
+        .map_err(|e| be(e.to_string()))?;
+    if synchronous {
+        segment.wait().map_err(|e| be(e.to_string()))?;
+        ps.cursor = 0;
+        for job in initial_jobs {
+            run_prefill_job_sync(be_, job)?;
+        }
+        if let Some(job) = replacement_job {
+            run_prefill_job_sync(be_, job)?;
+        }
+    } else {
+        for job in initial_jobs {
+            ps.enqueue_prefill_upload(job, None)?;
+        }
+        if let Some(job) = replacement_job {
+            ps.enqueue_prefill_upload(job, Some(segment))?;
+        } else {
+            retain_prefill_compute(ps, segment)?;
+        }
     }
 
     let compute = be_.recorder()?;
@@ -5850,7 +6014,7 @@ fn prefetch_next_moe_layer<'a>(
 ///     routing that wide touches every expert of the layer with overwhelming probability
 ///     (P(expert unrouted) < 1e-8 at the 3x bound), so all `n_expert` are staged up front and
 ///     the GPU-side bucket count/scan/scatter pipeline needs no host decision at all. The whole
-///     chunk records inline. Layer mode uses one complete-layer direct DMA and N+1 overlap;
+///     chunk records inline. Layer mode uses a completion-driven whole-layer upload ring;
 ///     expert mode directly copies the required expert offsets into LRU slots.
 ///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (LRU upkeep,
 ///     no residency/LUT mutation) + a frozen LUT window, recorded inline — zero host syncs.
@@ -6085,8 +6249,8 @@ fn execute_paged_moe<'a>(
         }
     }
     // CPU writes are not commands in the ambient recorder. The non-layer compatibility path must
-    // drain earlier arena readers before overwriting LRU slots. Normal Prefill uses A/B lanes and
-    // `retire_prefill_history`; Decode already synced above in order to read router ids.
+    // drain earlier arena readers before overwriting LRU slots. Normal Prefill uses fenced dynamic
+    // lanes; Decode already synced above in order to read router ids.
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
         sync_stream(be_, rec, ps)?;
     }

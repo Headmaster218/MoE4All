@@ -2122,9 +2122,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
                     // point holding more slots than the pool has distinct experts).
                     let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
-                    let batch_floor = n_expert
-                        .saturating_mul(roles_per_layer)
-                        .saturating_mul(if ec.paging.moe_layer_stream { 2 } else { 1 });
+                    // The dynamic Prefill ring can legally degrade to one lane when the user
+                    // budget cannot hold its topology target. The old A/B implementation
+                    // required two full layers here and could silently exceed that budget.
+                    let batch_floor = n_expert.saturating_mul(roles_per_layer);
                     let floor = batch_floor.min(nb).max(1);
                     let budget_slots = ((share / sb as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::MoePoolSpec {
@@ -2154,10 +2155,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 pager_budget_bytes as f64 / 1e9,
                 host_bytes as f64 / 1e9,
             );
+            // Prefill streams every whole MoE layer through a topology-sized ring. Qwen3.6's
+            // full-attention interval includes three DeltaNet layers, so current + one complete
+            // interval gives five lanes and lets the long Attention cover all four successors.
+            // Other/all-Attention models request one lane per paged layer and let physical cache
+            // capacity be the sole cap; the Vulkan pager performs that exact fit per pool.
+            let prefill_target_lanes = if cfg.qwen35 && cfg.full_attn_interval > 0 {
+                cfg.full_attn_interval.saturating_add(1)
+            } else {
+                n_paged
+            };
             vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
                 n_blocks,
                 pools,
                 host_chunks,
+                prefill_target_lanes,
             })
             .map_err(|e| anyhow!("{e}"))?;
         }
