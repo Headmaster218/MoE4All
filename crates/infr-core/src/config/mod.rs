@@ -665,6 +665,9 @@ cfg_struct! {
     /// Model acquisition from the HuggingFace hub (`infr pull`, and the auto-pull `infr run` and
     /// `infr serve` do when a model is missing).
     HubCfg / PartialHubCfg {
+        /// `INFR_HF_ENDPOINT`: HuggingFace-compatible API/download origin. The official Hub is
+        /// the default; mirrors such as `https://hf-mirror.com` use the same URL layout.
+        endpoint: String = "https://huggingface.co".to_string(),
         /// `INFR_PULL_JOBS`: how many CONNECTIONS one model's download may use at the same time.
         ///
         /// A single HTTPS connection to the HF CDN is the ceiling, not the link, so a pull is
@@ -753,6 +756,10 @@ cfg_struct! {
         /// happened emits nothing, so an idle server's log stays clean and the knob is only worth
         /// reaching for when the log itself is expensive.
         stats_interval_secs: u64 = 5,
+        /// `INFR_SHUTDOWN_FILE`: optional supervisor-owned stop trigger. When this exact file
+        /// appears, the CLI latches the same graceful shutdown path as SIGTERM. This is primarily
+        /// for a GUI/service supervisor on Windows, where the POSIX signal handler is unavailable.
+        shutdown_file: Option<PathBuf> = None,
     }
 }
 

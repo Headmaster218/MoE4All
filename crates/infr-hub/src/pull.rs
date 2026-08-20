@@ -47,13 +47,16 @@ pub fn pull_latest(r: &ModelRef, cfg: &Config) -> Result<PathBuf> {
     }
 }
 
-/// The HuggingFace origin every `resolve`/API URL is built from.
-///
-/// A parameter rather than a hardcoded literal at each `format!` so the download path can be
-/// pointed at a local HTTP server in tests — the only way to exercise resume, the sha256 gate and
-/// the concurrency bound against real sockets without reaching huggingface.co from `cargo test`.
-/// Production has exactly one value and passes it from here.
-const HF_ORIGIN: &str = "https://huggingface.co";
+/// The HuggingFace-compatible origin every `resolve`/API URL is built from. Keeping the origin a
+/// config value lets the GUI and CLI use a mirror without duplicating the downloader.
+fn hf_origin(cfg: &Config) -> &str {
+    let endpoint = cfg.hub.endpoint.trim().trim_end_matches('/');
+    if endpoint.is_empty() {
+        "https://huggingface.co"
+    } else {
+        endpoint
+    }
+}
 
 /// The `resolve` URL for one file of a repo: what a browser would download.
 fn resolve_url(origin: &str, repo: &str, filename: &str) -> String {
@@ -62,9 +65,10 @@ fn resolve_url(origin: &str, repo: &str, filename: &str) -> String {
 
 fn pull_repo_latest(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathBuf> {
     let store = Store::discover()?;
+    let origin = hf_origin(cfg);
     // Ask HF for the current commit + concrete gguf filename. If the API is unreachable (offline),
     // serve whatever is cached rather than failing.
-    let (commit, filename, siblings) = match repo_info(HF_ORIGIN, repo, sel) {
+    let (commit, filename, siblings) = match repo_info(origin, repo, sel) {
         Ok(x) => x,
         Err(e) => {
             return match store.resolve_repo(repo, sel) {
@@ -88,7 +92,7 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathB
     if shards.iter().all(|f| snap.join(f).exists()) {
         info!("hf:{repo}:{filename} already up to date ({commit})");
         // Still ensure companions — a snapshot pulled before this feature won't have them yet.
-        fetch_companions(HF_ORIGIN, repo, &blobs, &snap, &siblings, &progress);
+        fetch_companions(origin, repo, &blobs, &snap, &siblings, &progress);
         return Ok(primary);
     }
 
@@ -98,7 +102,7 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathB
     write_text(&repo_dir.join("refs").join("main"), &commit)?;
     fs::create_dir_all(&snap).map_err(Error::from)?;
     fetch_all(
-        HF_ORIGIN,
+        origin,
         &blobs,
         &snap,
         repo,
@@ -106,7 +110,7 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathB
         cfg.hub.pull_jobs,
         &progress,
     )?;
-    fetch_companions(HF_ORIGIN, repo, &blobs, &snap, &siblings, &progress);
+    fetch_companions(origin, repo, &blobs, &snap, &siblings, &progress);
     Ok(primary)
 }
 
@@ -370,6 +374,7 @@ fn is_sha256(s: &str) -> bool {
 
 fn pull_repo(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathBuf> {
     let store = Store::discover()?;
+    let origin = hf_origin(cfg);
     // Already cached (any matching snapshot)?
     if let Some(p) = store.resolve_repo(repo, sel) {
         debug!("hf:{repo} ({}) already cached", sel.unwrap_or("default"));
@@ -377,7 +382,7 @@ fn pull_repo(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathBuf> {
     }
 
     // Resolve the repo's main commit + the concrete gguf filename for `sel` via the HF model API.
-    let (commit, filename, siblings) = repo_info(HF_ORIGIN, repo, sel)?;
+    let (commit, filename, siblings) = repo_info(origin, repo, sel)?;
     info!("Pulling hf:{repo}:{filename}");
 
     let repo_dir = store.repo_dir(repo);
@@ -391,7 +396,7 @@ fn pull_repo(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathBuf> {
     let shards = crate::store::shard_set(&filename);
     let progress = progress::group();
     fetch_all(
-        HF_ORIGIN,
+        origin,
         &blobs,
         &snap,
         repo,
@@ -399,7 +404,7 @@ fn pull_repo(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathBuf> {
         cfg.hub.pull_jobs,
         &progress,
     )?;
-    fetch_companions(HF_ORIGIN, repo, &blobs, &snap, &siblings, &progress);
+    fetch_companions(origin, repo, &blobs, &snap, &siblings, &progress);
     Ok(snap.join(&shards[0]))
 }
 
@@ -564,6 +569,16 @@ mod tests {
     use crate::testhttp::TestHub;
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn configured_huggingface_origin_is_normalized() {
+        let mut cfg = Config::default();
+        assert_eq!(hf_origin(&cfg), "https://huggingface.co");
+        cfg.hub.endpoint = " https://hf-mirror.com/// ".into();
+        assert_eq!(hf_origin(&cfg), "https://hf-mirror.com");
+        cfg.hub.endpoint = "   ".into();
+        assert_eq!(hf_origin(&cfg), "https://huggingface.co");
+    }
 
     /// A throwaway HF-cache repo dir with the REAL layout (`blobs/` beside `snapshots/<commit>/`).
     /// The layout is load-bearing for these tests: [`blob_link_target`] writes `../../blobs/<sha>`

@@ -338,8 +338,10 @@ knobs! {
     // Same "`0` is a VALUE, not a bad one" grammar as the deadline above: `0` disables the periodic
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
+    "INFR_SHUTDOWN_FILE" => "serve.shutdown_file", Path, Ignored, "worker.stop", migrated;
 
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
+    "INFR_HF_ENDPOINT" => "hub.endpoint", Text, Ignored, "https://hf-mirror.com", migrated;
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",
     // so the env layer must not filter it out.
     "INFR_PULL_JOBS" => "hub.pull_jobs", Int, Ignored, "4", migrated;

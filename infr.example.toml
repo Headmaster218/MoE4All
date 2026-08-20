@@ -246,6 +246,10 @@ request_timeout_secs = 0
 # nothing, so an idle server leaves a clean log.
 stats_interval_secs = 5
 
+# Supervisor stop trigger. Creating this file asks the process to stop accepting work, drain the
+# GPU at its normal poll boundary, and exit. Normally set only by infr-gui.
+# shutdown_file = "D:/AIinfr/infr/gui-data/worker.stop"
+
 # ── debug ────────────────────────────────────────────────────────────────────
 
 [debug]
@@ -261,6 +265,9 @@ full_barrier = false
 # ── hub ──────────────────────────────────────────────────────────────────────
 
 [hub]
+# HuggingFace-compatible origin. Domestic mirror example: https://hf-mirror.com
+endpoint = "https://huggingface.co"
+
 # How many CONNECTIONS one model's download may use at once. The CONNECTION is
 # the ceiling, not the link (measured here: 1 connection 8.8 MB/s, 5 connections
 # 78.7 MB/s). They go to whatever the model offers: a split model gets one file

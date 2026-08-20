@@ -563,6 +563,37 @@ fn install_signal_handlers() {
 #[cfg(not(unix))]
 fn install_signal_handlers() {}
 
+/// Install the supervisor stop-file watcher after configuration has resolved but before any model
+/// load starts. This gives Windows supervisors the same graceful, polled shutdown path as a first
+/// SIGTERM on Unix; the file is an IPC trigger, not a force-kill request.
+fn install_shutdown_file_watcher(path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("removing stale shutdown file {}", path.display()))
+        }
+    }
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("infr-shutdown-file".into())
+        .spawn(move || loop {
+            if infr_core::shutdown::shutdown_requested() {
+                break;
+            }
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+                infr_core::shutdown::request_shutdown(15);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        })
+        .context("starting shutdown-file watcher")?;
+    Ok(())
+}
+
 /// The conventional exit status for a signal-terminated process, `128 + signo` (130 for `SIGINT`,
 /// 143 for `SIGTERM`) — what a shell reports for a process killed by that signal, so scripts and
 /// `timeout` see what they expect.
@@ -633,6 +664,7 @@ fn main() -> anyhow::Result<()> {
         flags: cli_flag_layer(&cmd)?,
     };
     let cfg = Arc::new(Config::load(&overrides)?);
+    install_shutdown_file_watcher(cfg.serve.shutdown_file.as_deref())?;
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
     let _pager_profile = infr_core::pager_profile::SummaryGuard::new(cfg.prof.pager_profile);

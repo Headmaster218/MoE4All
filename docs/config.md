@@ -271,7 +271,9 @@ gates `/v1/chat/completions` and `/v1/models`, never `/health`),
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
 slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`
 — how often the server logs its throughput line, default `5`; `0` switches the
-line off). Per-request sampling is not here — it stays on the request.
+line off). `shutdown_file` (`INFR_SHUTDOWN_FILE`) is an optional supervisor IPC
+path: creating that file requests the same graceful drain as SIGTERM, including
+during model loading. Per-request sampling is not here — it stays on the request.
 
 The throughput line is **activity-only**: an interval in which nothing happened
 emits nothing, so an idle server leaves a clean log and there is no heartbeat to
@@ -283,7 +285,9 @@ which are that one request's own speeds (`prompt_tokens / TTFT` and
 prompt text**.
 
 **`[hub]`** — model acquisition (`infr pull`, and the auto-pull `infr run` /
-`infr serve` do when a model is missing). One knob: `pull_jobs`
+`infr serve` do when a model is missing). `endpoint` (`INFR_HF_ENDPOINT`) selects the
+HuggingFace-compatible origin: `https://huggingface.co` by default, or for example
+`https://hf-mirror.com`. `pull_jobs`
 (`INFR_PULL_JOBS`, default `8`) — how many CONNECTIONS one model's download may
 use at once. It is the CONNECTION that is slow, not the link: measured against
 the same CDN objects, one connection sustained 8.8 MB/s and five sustained 78.7

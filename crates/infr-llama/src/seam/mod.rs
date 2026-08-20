@@ -1300,6 +1300,20 @@ pub(crate) fn kv_bytes_estimate_fmt(
         .sum()
 }
 
+/// Read-only KV footprint estimate for control planes and launch planners. This is the same
+/// arithmetic placement uses before allocating anything; exposing it avoids a GUI maintaining a
+/// second approximation that silently drifts when an architecture's KV layout changes.
+pub fn estimate_kv_bytes(
+    cfg: &Config,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, k_fmt, v_fmt)
+}
+
 /// K+V byte footprint for ONE layer at `k_elems`/`v_elems` per-side elements, each side in its own
 /// dtype. The pure per-layer core of [`kv_bytes_estimate_fmt`].
 ///

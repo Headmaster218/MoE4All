@@ -412,8 +412,12 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // Ditto: `0` means "no periodic throughput line", a value the operator may need to set OVER a
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
+    p.serve.shutdown_file = opt_path(get, "INFR_SHUTDOWN_FILE");
 
     // ── hub ──────────────────────────────────────────────────────────────────
+    if let Some(endpoint) = get("INFR_HF_ENDPOINT") {
+        p.hub.endpoint = Some(endpoint);
+    }
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must
     // survive this layer to be able to turn concurrency back off over a config file that raised it.
     p.hub.pull_jobs = num::<usize>(get, "INFR_PULL_JOBS");
