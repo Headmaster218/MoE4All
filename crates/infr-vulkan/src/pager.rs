@@ -832,14 +832,6 @@ pub enum Role {
 }
 
 impl Role {
-    fn name(self) -> &'static str {
-        match self {
-            Role::Gate => "gate",
-            Role::Up => "up",
-            Role::Down => "down",
-        }
-    }
-
     fn index(self) -> usize {
         match self {
             Role::Gate => 0,
@@ -918,10 +910,9 @@ struct HostStoreChunk {
     bytes: Box<[u8]>,
 }
 
-/// One logical arena pool: every block in it shares `slot_bytes`; `role=None` means compatible
-/// Gate/Up/Down banks use this one global Pager/LRU/free-list.
+/// One logical arena pool: every block in it shares `slot_bytes`. Compatible Gate/Up/Down banks
+/// use this one global Pager/LRU/free-list; role is source/dispatch metadata, never cache identity.
 struct Pool {
-    role: Option<Role>,
     slot_bytes: usize,
     pager: GpuPager,
 }
@@ -1030,7 +1021,7 @@ pub struct MoePagerSession {
     prefill_loaded: HashSet<usize>,
 }
 
-/// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
+/// One size pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
 /// is a `bufferDeviceAddress` buffer (`48ad9c1`) addressed by 64-bit pointer — no per-arena
 /// `maxStorageBufferRange` ceiling — but per-pool sizing
 /// still matters because of unequal per-expert sizes (Scout: gate/up 13.8 MB, down 18 MB): a
@@ -1041,7 +1032,6 @@ pub struct MoePagerSession {
 /// unequal counts are correctness-neutral — a pool with fewer slots just misses more often. Computed by
 /// the caller (budget-driven count, then per-pool split — see `seam::mod`'s placement policy).
 pub struct MoePoolSpec {
-    pub role: Option<Role>,
     pub slot_bytes: usize,
     pub n_slots: usize,
 }
@@ -1131,7 +1121,6 @@ impl MoePagerSession {
         let mut pools = Vec::with_capacity(layout.pools.len());
         for spec in &layout.pools {
             pools.push(Pool {
-                role: spec.role,
                 slot_bytes: spec.slot_bytes,
                 pager: GpuPager::new_mapped(
                     vk,
@@ -1166,9 +1155,8 @@ impl MoePagerSession {
     /// Register one paged layer's `role` tensor — called from the seam's weight-load closure
     /// (once per paged `_exps` tensor) instead of uploading it. `buf_id` is the placeholder
     /// buffer's identity (see [`buffer_identity`]); `source` is where its bytes actually live.
-    /// The pool is picked by `(role, source.stride_bytes)` — errors if the layout has no matching
-    /// pool (a seam sizing bug: the layout enumeration and this registration must derive the slot
-    /// size from the same tensor bytes).
+    /// The pool is picked by `source.stride_bytes` — errors if the layout has no matching pool (a
+    /// seam sizing bug: layout enumeration and registration must derive the same expert size).
     ///
     /// `n_expert` is how many experts this layer's bank holds, checked against the tier below when
     /// there is one: every one of the layer's blocks must already be registered there, or a routed
@@ -1183,14 +1171,11 @@ impl MoePagerSession {
         let pool = self
             .pools
             .iter()
-            .position(|p| {
-                p.slot_bytes == source.stride_bytes
-                    && p.role.is_none_or(|pool_role| pool_role == role)
-            })
+            .position(|p| p.slot_bytes == source.stride_bytes)
             .ok_or_else(|| {
                 be(format!(
-                    "moe pager: no ({:?}, {} B/expert) pool in the layout for this tensor",
-                    role, source.stride_bytes,
+                    "moe pager: no {} B/expert pool in the layout for {:?}",
+                    source.stride_bytes, role,
                 ))
             })?;
         let bank = expert_bytes(&source.bank);
@@ -1727,7 +1712,7 @@ impl MoePagerSession {
         Ok(())
     }
 
-    /// Open one epoch for several roles that share the same logical Q5/Q6 pool. Gate, Up and Down
+    /// Open one epoch for several roles that share the same logical size pool. Gate, Up and Down
     /// then remain eviction-protected until the complete routed set has been resolved, even though
     /// their bytes may live in unrelated physical arenas.
     pub fn begin_shared_batch(&mut self, buf_ids: &[usize]) -> Result<bool> {
@@ -1746,9 +1731,6 @@ impl MoePagerSession {
         let Some(pool_idx) = pool_idx else {
             return Ok(false);
         };
-        if self.pools[pool_idx].role.is_some() {
-            return Ok(false);
-        }
         self.pools[pool_idx].pager.begin_batch();
         Ok(true)
     }
@@ -1960,23 +1942,6 @@ impl MoePagerSession {
         Ok(self.pool_of(buf_id)?.pager.lut_buffer())
     }
 
-    /// Aggregate stats across every pool of `role` (the pool split is a capacity detail; the
-    /// hit/miss story reads per role).
-    pub fn stats(&self, role: Role) -> PagerStats {
-        let mut agg = PagerStats::default();
-        for p in self
-            .pools
-            .iter()
-            .filter(|p| p.role.is_none_or(|pool_role| pool_role == role))
-        {
-            let s = p.pager.stats();
-            agg.hits += s.hits;
-            agg.misses += s.misses;
-            agg.evictions += s.evictions;
-        }
-        agg
-    }
-
     /// `paging.stats` (`INFR_PAGER_STATS=1`): print each pool's hit/miss/eviction counters. Called
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
@@ -1987,21 +1952,12 @@ impl MoePagerSession {
         for p in &self.pools {
             let s = p.pager.stats();
             tracing::info!(
-                "[moe pager] {}/{:.1}MB: {} slots={}",
-                p.role.map_or("shared", Role::name),
+                "[moe pager] shared/{:.1}MB: {} slots={}",
                 p.slot_bytes as f64 / 1e6,
                 stats_suffix(&s),
                 p.pager.n_slots(),
             );
         }
-    }
-
-    /// Per-pool `(role, VRAM residency)` counters, in pool order.
-    pub fn pool_stats(&self) -> Vec<(Option<Role>, PagerStats)> {
-        self.pools
-            .iter()
-            .map(|p| (p.role, p.pager.stats()))
-            .collect()
     }
 }
 

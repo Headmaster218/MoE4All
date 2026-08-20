@@ -77,7 +77,7 @@ for testing, or to free VRAM for a larger context). Every bank shape pages:
 split gate/up (llama4/Qwen3-MoE/Qwen3.6-MoE), fused gate_up (DiffusionGemma,
 Gemma-4 MoE — one double-width slot per expert), and mixed-dtype roles
 (unsloth-dynamic quants bumping a subset of layers' banks to a wider K-quant —
-one arena pool per (role, byte size)). `INFR_PAGER_STATS=1` prints each pool's
+one logical arena pool per expert byte size, shared across compatible roles). `INFR_PAGER_STATS=1` prints each pool's
 hit/miss/eviction counts.
 
 **Dense layer streaming**: DENSE models bigger than VRAM stream their per-layer
