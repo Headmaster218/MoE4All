@@ -19,6 +19,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Embedding serving through a managed llama.cpp worker.** `infr serve-embedding` exposes an
+  authenticated OpenAI-compatible `/v1/embeddings`, and `infr serve --embedding-model` can host it
+  beside chat on the same public endpoint. INFR owns routing, admission, process cleanup, and
+  resource accounting while reusing llama.cpp's mature GGUF/CPU/Vulkan implementation. The browser
+  GUI can create, estimate, start, stop, and switch Embedding profiles.
+
 - **DeepSeek V4's hash-routed MoE layers run, on CPU and Vulkan.** Such a layer
   takes its experts from an i32 `blk.N.ffn_gate_tid2eid`
   `[n_expert_used, n_vocab]` table indexed by TOKEN ID rather than from the

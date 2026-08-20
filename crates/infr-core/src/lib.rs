@@ -30,6 +30,7 @@ pub mod pager_profile;
 /// one report, one on/off predicate (`prof.per_op()` ANDed with the warmup-suppression flag).
 pub mod prof;
 pub mod progress;
+pub mod resource;
 pub mod shutdown;
 pub mod tensor;
 pub mod tier;
@@ -43,6 +44,7 @@ pub use error::{Error, Result};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};
 pub use loader::{MetaValue, Metadata, TensorInfo, WeightSource};
 pub use pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
+pub use resource::{MemoryTier, ResourceKind, ResourceLease, ResourceSnapshot, ResourceTracker};
 pub use tensor::{DType, Shape, TensorDesc, TensorId};
 
 /// A parsed human size/count value: an absolute amount, or a percentage the CALLER resolves

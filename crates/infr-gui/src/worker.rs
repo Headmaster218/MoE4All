@@ -103,9 +103,20 @@ impl WorkerManager {
         for (path, value) in profile_settings(&profile, &stop_file)? {
             command.arg("--set").arg(format!("{path}={value}"));
         }
+        match profile.task.as_str() {
+            "embedding" => {
+                command.arg("serve-embedding").arg(&profile.model_path);
+                if !profile.embedding_runner.trim().is_empty() {
+                    command
+                        .arg("--embedding-runner")
+                        .arg(profile.embedding_runner.trim());
+                }
+            }
+            _ => {
+                command.arg("serve").arg(&profile.model_path);
+            }
+        }
         command
-            .arg("serve")
-            .arg(&profile.model_path)
             .arg("--addr")
             .arg(&profile.service_addr)
             .arg("--parallel")
@@ -432,13 +443,25 @@ pub fn validate_profile(profile: &ModelProfile) -> Result<(), String> {
     if profile.model_path.trim().is_empty() {
         return Err("请选择模型".into());
     }
-    if profile.model_path.contains(['\r', '\n']) || profile.service_api_key.contains(['\r', '\n']) {
-        return Err("模型路径和 API Key 不能包含换行".into());
+    if profile.model_path.contains(['\r', '\n'])
+        || profile.embedding_runner.contains(['\r', '\n'])
+        || profile.service_api_key.contains(['\r', '\n'])
+    {
+        return Err("模型路径、Embedding runner 和 API Key 不能包含换行".into());
     }
-    if !matches!(profile.task.as_str(), "chat" | "completion") {
+    if !matches!(profile.task.as_str(), "chat" | "completion" | "embedding") {
         return Err(format!(
             "任务类型 `{}` 已预留，但当前推理内核尚未实现",
             profile.task
+        ));
+    }
+    if profile.task == "embedding"
+        && !profile.embedding_runner.trim().is_empty()
+        && !Path::new(profile.embedding_runner.trim()).is_file()
+    {
+        return Err(format!(
+            "找不到 Embedding runner：{}",
+            profile.embedding_runner.trim()
         ));
     }
     profile
@@ -468,24 +491,26 @@ fn profile_settings(
 ) -> Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
     insert_nonempty(&mut values, "device.dev", &profile.backend);
-    insert_nonempty(&mut values, "device.ctx", &profile.context);
-    insert_nonempty(&mut values, "device.vram_budget", &profile.vram_budget);
-    insert_nonempty(&mut values, "device.vram_reserve", &profile.vram_reserve);
-    if let Some(ubatch) = profile.ubatch {
-        values.insert("device.ubatch".into(), ubatch.to_string());
+    if matches!(profile.task.as_str(), "chat" | "completion") {
+        insert_nonempty(&mut values, "device.ctx", &profile.context);
+        insert_nonempty(&mut values, "device.vram_budget", &profile.vram_budget);
+        insert_nonempty(&mut values, "device.vram_reserve", &profile.vram_reserve);
+        if let Some(ubatch) = profile.ubatch {
+            values.insert("device.ubatch".into(), ubatch.to_string());
+        }
+        if !profile.kv_type_k.eq_ignore_ascii_case("auto") {
+            insert_nonempty(&mut values, "kv.type_k", &profile.kv_type_k);
+        }
+        if !profile.kv_type_v.eq_ignore_ascii_case("auto") {
+            insert_nonempty(&mut values, "kv.type_v", &profile.kv_type_v);
+        }
+        insert_nonempty(&mut values, "paging.dram", &profile.ram_budget);
+        insert_nonempty(&mut values, "paging.cache", &profile.expert_cache);
+        values.insert(
+            "serve.max_tokens_cap".into(),
+            profile.max_tokens_cap.max(1).to_string(),
+        );
     }
-    if !profile.kv_type_k.eq_ignore_ascii_case("auto") {
-        insert_nonempty(&mut values, "kv.type_k", &profile.kv_type_k);
-    }
-    if !profile.kv_type_v.eq_ignore_ascii_case("auto") {
-        insert_nonempty(&mut values, "kv.type_v", &profile.kv_type_v);
-    }
-    insert_nonempty(&mut values, "paging.dram", &profile.ram_budget);
-    insert_nonempty(&mut values, "paging.cache", &profile.expert_cache);
-    values.insert(
-        "serve.max_tokens_cap".into(),
-        profile.max_tokens_cap.max(1).to_string(),
-    );
     values.insert("serve.stats_interval_secs".into(), "1".into());
     values.insert(
         "serve.shutdown_file".into(),
@@ -640,6 +665,25 @@ mod tests {
             ..ModelProfile::default()
         };
         validate_profile(&p).unwrap();
+    }
+
+    #[test]
+    fn embedding_profile_uses_only_relevant_runtime_settings() {
+        let p = ModelProfile {
+            id: "embedding".into(),
+            model_path: "embedding.gguf".into(),
+            task: "embedding".into(),
+            ..ModelProfile::default()
+        };
+        validate_profile(&p).unwrap();
+        let settings = profile_settings(&p, Path::new("worker.stop")).unwrap();
+        assert_eq!(
+            settings.get("device.dev").map(String::as_str),
+            Some("Vulkan0")
+        );
+        assert!(!settings.contains_key("kv.type_k"));
+        assert!(!settings.contains_key("paging.cache"));
+        assert!(!settings.contains_key("serve.max_tokens_cap"));
     }
 
     #[test]

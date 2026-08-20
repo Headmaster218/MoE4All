@@ -339,6 +339,7 @@ knobs! {
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
     "INFR_SHUTDOWN_FILE" => "serve.shutdown_file", Path, Ignored, "worker.stop", migrated;
+    "INFR_EMBEDDING_RUNNER" => "serve.embedding_runner", Path, Ignored, "llama-server", migrated;
 
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
     "INFR_HF_ENDPOINT" => "hub.endpoint", Text, Ignored, "https://hf-mirror.com", migrated;

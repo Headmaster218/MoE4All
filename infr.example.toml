@@ -250,6 +250,10 @@ stats_interval_secs = 5
 # GPU at its normal poll boundary, and exit. Normally set only by infr-gui.
 # shutdown_file = "D:/AIinfr/infr/gui-data/worker.stop"
 
+# Optional llama-server executable used by `serve-embedding` and `serve --embedding-model`.
+# Unset = discover it from the INFR directory, PATH, or LM Studio backends.
+# embedding_runner = "C:/path/to/llama-server.exe"
+
 # ── debug ────────────────────────────────────────────────────────────────────
 
 [debug]

@@ -31,6 +31,7 @@ backbone, entropy-bound denoise decode) runs end-to-end on CPU + Vulkan
 infr pull   <model-ref>        # org/repo[:quant] (HuggingFace) | path to a .gguf
 infr run    <model-ref> [msg]  # terminal chat (auto-pulls)
 infr serve  <model-ref>        # OpenAI-compatible HTTP API
+infr serve-embedding <gguf>    # OpenAI-compatible /v1/embeddings (llama.cpp worker)
 infr bench / infr compare      # tok/s benchmarks vs llama.cpp
 ```
 
@@ -163,6 +164,15 @@ curl -s localhost:8080/v1/chat/completions -d '{
   "messages": [{"role": "user", "content": "What is the capital of France?"}],
   "stream": true
 }'
+```
+
+Embedding models use the mature llama.cpp implementation while INFR owns the public API,
+authentication, admission control, process lifecycle, and resource accounting:
+
+```bash
+infr serve-embedding nomic-embed-text-v1.5.f16.gguf --dev Vulkan0
+# Or host chat + embedding on one INFR endpoint:
+infr serve chat-model.gguf --embedding-model nomic-embed-text-v1.5.f16.gguf
 ```
 
 Works as a drop-in backend for OpenAI-API clients (opencode, the Claude Code

@@ -362,6 +362,12 @@ enum Cmd {
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
+        /// Optional GGUF embedding model hosted at /v1/embeddings through a managed llama.cpp worker.
+        #[arg(long, value_name = "MODEL")]
+        embedding_model: Option<String>,
+        /// llama-server executable used for --embedding-model (auto-detected when omitted).
+        #[arg(long, value_name = "PATH")]
+        embedding_runner: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
         /// Concurrent generation slots (llama-server's `-np`). N requests generate at once, each
@@ -390,6 +396,27 @@ enum Cmd {
         /// Sampling flags are the SERVER DEFAULTS — a per-request OpenAI field still overrides them.
         #[command(flatten)]
         sampling: SamplingOpts,
+    },
+    /// Start an embedding-only OpenAI-compatible HTTP API (llama.cpp GGUF, CPU or Vulkan).
+    ServeEmbedding {
+        model: String,
+        /// llama-server executable (auto-detected when omitted).
+        #[arg(long, value_name = "PATH")]
+        embedding_runner: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Concurrent HTTP slots. The initial model runner serializes device execution internally,
+        /// but this admission bound prevents an unbounded blocking-task queue.
+        #[arg(
+            long = "parallel",
+            visible_alias = "np",
+            short = 'n',
+            default_value_t = 1,
+            value_name = "N"
+        )]
+        parallel: usize,
+        #[command(flatten)]
+        device: DeviceOpts,
     },
     /// Host SEVERAL models at once, each pinned to a physical GPU, on ONE OpenAI-compatible server
     /// (routed by model name). Data-parallel multi-device serving: `infr multi qwen@Vulkan0
@@ -701,6 +728,9 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             device.overrides(&mut layer)?;
             sampling.overrides(&mut layer);
         }
+        Cmd::ServeEmbedding { device, .. } => {
+            device.overrides(&mut layer)?;
+        }
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
             // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a
@@ -732,10 +762,27 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         ),
         Cmd::Serve {
             model,
+            embedding_model,
+            embedding_runner,
             addr,
             parallel,
             ..
-        } => cmd_serve(&model, &addr, parallel, cfg, specified),
+        } => cmd_serve(
+            &model,
+            embedding_model.as_deref(),
+            embedding_runner.as_deref(),
+            &addr,
+            parallel,
+            cfg,
+            specified,
+        ),
+        Cmd::ServeEmbedding {
+            model,
+            embedding_runner,
+            addr,
+            parallel,
+            ..
+        } => cmd_serve_embedding(&model, embedding_runner.as_deref(), &addr, parallel, cfg),
         Cmd::Multi {
             models,
             addr,
@@ -1765,6 +1812,20 @@ struct ParallelGenerator {
     engine: infr_llama::parallel::ParallelSeam,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
+}
+
+struct NativeEmbeddingGenerator {
+    model: infr_embedding::EmbeddingModel,
+}
+
+impl infr_server::EmbeddingGenerator for NativeEmbeddingGenerator {
+    fn embed(&self, inputs: &[String]) -> anyhow::Result<infr_server::EmbeddingOutcome> {
+        let outcome = self.model.embed(inputs)?;
+        Ok(infr_server::EmbeddingOutcome {
+            embeddings: outcome.embeddings,
+            prompt_tokens: outcome.prompt_tokens,
+        })
+    }
 }
 
 impl ParallelGenerator {
@@ -3994,6 +4055,8 @@ fn apply_model_sampling_defaults(
 
 fn cmd_serve(
     model: &str,
+    embedding_model: Option<&str>,
+    embedding_runner: Option<&Path>,
     addr: &str,
     parallel: Option<usize>,
     cfg: &Arc<Config>,
@@ -4020,6 +4083,9 @@ fn cmd_serve(
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
     let cfg = &apply_model_sampling_defaults(cfg, specified, &gguf);
+    let embedding = embedding_model
+        .map(|model| load_embedding_generator(model, embedding_runner, 1, cfg))
+        .transpose()?;
 
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
@@ -4046,13 +4112,25 @@ fn cmd_serve(
             "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx)",
             if n_slots == 1 { "" } else { "s" },
         );
-        return rt.block_on(infr_server::serve(
-            generator,
-            model_id,
-            sockaddr,
-            n_slots,
-            cfg.clone(),
-        ));
+        return match embedding {
+            Some((embedding_id, embedding)) => rt.block_on(infr_server::serve_with_embedding(
+                generator,
+                model_id,
+                n_slots,
+                embedding,
+                embedding_id,
+                1,
+                sockaddr,
+                cfg.clone(),
+            )),
+            None => rt.block_on(infr_server::serve(
+                generator,
+                model_id,
+                sockaddr,
+                n_slots,
+                cfg.clone(),
+            )),
+        };
     }
 
     // ── the SERIALISED path: CPU / Metal / diffusion-gemma ────────────────────────────
@@ -4089,14 +4167,86 @@ fn cmd_serve(
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
-        rt.block_on(infr_server::serve(
-            generator,
-            model_id,
-            sockaddr,
-            1,
-            cfg.clone(),
-        ))
+        match embedding {
+            Some((embedding_id, embedding)) => rt.block_on(infr_server::serve_with_embedding(
+                generator,
+                model_id,
+                1,
+                embedding,
+                embedding_id,
+                1,
+                sockaddr,
+                cfg.clone(),
+            )),
+            None => rt.block_on(infr_server::serve(
+                generator,
+                model_id,
+                sockaddr,
+                1,
+                cfg.clone(),
+            )),
+        }
     }
+}
+
+fn load_embedding_generator(
+    model: &str,
+    runner: Option<&Path>,
+    parallel: usize,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<(String, Arc<dyn infr_server::EmbeddingGenerator>)> {
+    let (gguf, _) = resolve(model, cfg)?;
+    let model_id = gguf
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("embedding-model")
+        .to_owned();
+    let model = match selected_backend(cfg)? {
+        Backend::Cpu => infr_embedding::EmbeddingModel::load_cpu_with_runner(
+            &gguf,
+            cfg.clone(),
+            runner,
+            parallel,
+        )?,
+        Backend::Vulkan(device) => infr_embedding::EmbeddingModel::load_vulkan_on(
+            &gguf,
+            cfg.clone(),
+            device,
+            runner,
+            parallel,
+        )?,
+        Backend::Metal => anyhow::bail!(
+            "native embedding currently supports --dev cpu and Vulkan; Metal is not implemented"
+        ),
+    };
+    let snapshot = model.resource_snapshot();
+    tracing::info!(
+        resource = %snapshot.id,
+        bytes = snapshot.resident_bytes,
+        tier = ?snapshot.tier,
+        "embedding resource registered"
+    );
+    Ok((model_id, Arc::new(NativeEmbeddingGenerator { model })))
+}
+
+fn cmd_serve_embedding(
+    model: &str,
+    runner: Option<&Path>,
+    addr: &str,
+    parallel: usize,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
+    let (model_id, generator) = load_embedding_generator(model, runner, parallel, cfg)?;
+    let parallel = parallel.max(1);
+    println!("infr serve-embedding: {model_id} on http://{sockaddr}  (OpenAI /v1/embeddings)");
+    tokio::runtime::Runtime::new()?.block_on(infr_server::serve_embedding(
+        generator,
+        model_id,
+        sockaddr,
+        parallel,
+        cfg.clone(),
+    ))
 }
 
 /// Split a `MODEL[@VulkanN]` spec into (model_ref, Option<device_index>). The device suffix is the

@@ -7,6 +7,7 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
@@ -102,6 +103,18 @@ pub trait ChatGenerator: Send + Sync {
         cancel: &AtomicBool,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
+}
+
+/// Embedding backend driven by `/v1/embeddings`. Like [`ChatGenerator`], the server knows
+/// nothing about the model or device underneath it.
+pub trait EmbeddingGenerator: Send + Sync {
+    fn embed(&self, inputs: &[String]) -> anyhow::Result<EmbeddingOutcome>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingOutcome {
+    pub embeddings: Vec<Vec<f32>>,
+    pub prompt_tokens: u32,
 }
 
 /// What one [`ChatGenerator::chat`] call produced: why it ended, plus the real token counts the
@@ -486,6 +499,46 @@ pub struct ChatMessageDto {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Request/response DTOs — /v1/embeddings
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: EmbeddingInput,
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1101,26 @@ struct ModelEntry {
     capacity: usize,
 }
 
+#[derive(Clone)]
+struct EmbeddingEntry {
+    id: Arc<str>,
+    engine: Arc<dyn EmbeddingGenerator>,
+    slots: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl EmbeddingEntry {
+    fn new(id: &str, engine: Arc<dyn EmbeddingGenerator>, n_parallel: usize) -> Self {
+        let capacity = n_parallel.max(1);
+        Self {
+            id: Arc::from(id),
+            engine,
+            slots: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+}
+
 impl ModelEntry {
     fn new(id: &str, engine: Option<Arc<dyn ChatGenerator>>, n_parallel: usize) -> Self {
         let capacity = n_parallel.max(1);
@@ -1066,8 +1139,12 @@ impl ModelEntry {
 /// hot path — is byte-identical to before this became multi-model.
 #[derive(Clone)]
 pub struct AppState {
-    /// Invariant: non-empty. `models[0]` is the default route.
+    /// `models[0]` is the default chat route when chat is hosted. Embedding-only servers leave it
+    /// empty and reject chat requests cleanly.
     models: Arc<Vec<ModelEntry>>,
+    /// Independently routed embedding models. Their semaphores and engines do not share chat KV
+    /// slots; future unified memory policy coordinates the resources below this API boundary.
+    embeddings: Arc<Vec<EmbeddingEntry>>,
     /// The resolved process configuration (S7). The handler reads `serve.api_key` and
     /// `serve.max_tokens_cap` off it instead of the environment; it is an EXPLICIT constructor
     /// parameter on every entry point that can host a real model, so an embedder cannot silently
@@ -1095,6 +1172,7 @@ impl AppState {
                 Some(generator),
                 n_parallel,
             )]),
+            embeddings: Arc::new(Vec::new()),
             cfg,
             stats: Arc::default(),
         }
@@ -1118,6 +1196,7 @@ impl AppState {
             .collect();
         Self {
             models: Arc::new(models),
+            embeddings: Arc::new(Vec::new()),
             cfg,
             stats: Arc::default(),
         }
@@ -1129,6 +1208,7 @@ impl AppState {
     pub fn headless(model_id: impl Into<String>, cfg: Arc<Config>) -> Self {
         Self {
             models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
+            embeddings: Arc::new(Vec::new()),
             cfg,
             stats: Arc::default(),
         }
@@ -1137,7 +1217,11 @@ impl AppState {
     /// KV slot occupancy across every hosted model: `(busy, total)` permits. `busy` is what the
     /// semaphores are NOT handing out right now, which is exactly the set of generations in flight.
     fn slot_occupancy(&self) -> (u64, u64) {
-        self.models.iter().fold((0, 0), |(busy, total), m| {
+        let chat = self.models.iter().fold((0, 0), |(busy, total), m| {
+            let free = m.slots.available_permits().min(m.capacity);
+            (busy + (m.capacity - free) as u64, total + m.capacity as u64)
+        });
+        self.embeddings.iter().fold(chat, |(busy, total), m| {
             let free = m.slots.available_permits().min(m.capacity);
             (busy + (m.capacity - free) as u64, total + m.capacity as u64)
         })
@@ -1153,6 +1237,49 @@ impl AppState {
             .unwrap_or(&self.models[0])
             .clone()
     }
+
+    /// Attach one independently loaded embedding model to an existing chat state.
+    pub fn with_embedding(
+        mut self,
+        generator: Arc<dyn EmbeddingGenerator>,
+        model_id: impl Into<String>,
+        n_parallel: usize,
+    ) -> Self {
+        let mut embeddings = (*self.embeddings).clone();
+        embeddings.push(EmbeddingEntry::new(&model_id.into(), generator, n_parallel));
+        self.embeddings = Arc::new(embeddings);
+        self
+    }
+
+    /// State for a standalone embedding server.
+    pub fn embedding(
+        generator: Arc<dyn EmbeddingGenerator>,
+        model_id: impl Into<String>,
+        n_parallel: usize,
+        cfg: Arc<Config>,
+    ) -> Self {
+        Self {
+            models: Arc::new(Vec::new()),
+            embeddings: Arc::new(vec![EmbeddingEntry::new(
+                &model_id.into(),
+                generator,
+                n_parallel,
+            )]),
+            cfg,
+            stats: Arc::default(),
+        }
+    }
+
+    fn route_embedding(&self, requested: &str) -> Option<EmbeddingEntry> {
+        let default = self.embeddings.first()?;
+        Some(
+            self.embeddings
+                .iter()
+                .find(|m| &*m.id == requested)
+                .unwrap_or(default)
+                .clone(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,6 +1292,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/embeddings", post(embeddings_handler))
         .with_state(state)
 }
 
@@ -1199,10 +1327,45 @@ pub async fn serve_multi(
     serve_state(AppState::multi(entries, cfg), addr).await
 }
 
+/// Start an embedding-only OpenAI-compatible server.
+pub async fn serve_embedding(
+    generator: Arc<dyn EmbeddingGenerator>,
+    model_id: String,
+    addr: SocketAddr,
+    n_parallel: usize,
+    cfg: Arc<Config>,
+) -> anyhow::Result<()> {
+    serve_state(
+        AppState::embedding(generator, model_id, n_parallel, cfg),
+        addr,
+    )
+    .await
+}
+
+/// Start one chat model and one embedding model in the same process/API endpoint.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_embedding(
+    chat: Arc<dyn ChatGenerator>,
+    chat_id: String,
+    chat_parallel: usize,
+    embedding: Arc<dyn EmbeddingGenerator>,
+    embedding_id: String,
+    embedding_parallel: usize,
+    addr: SocketAddr,
+    cfg: Arc<Config>,
+) -> anyhow::Result<()> {
+    let state = AppState::new(chat, chat_id, chat_parallel, cfg).with_embedding(
+        embedding,
+        embedding_id,
+        embedding_parallel,
+    );
+    serve_state(state, addr).await
+}
+
 /// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
 /// place the listener, the graceful-shutdown latch, and `axum::serve` live.
 async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
-    let n_models = state.models.len();
+    let n_models = state.models.len() + state.embeddings.len();
     // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
     // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
     // server ends, no task is left ticking.
@@ -1268,19 +1431,117 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
     if let Some(denied) = auth_gate(&state.cfg, &headers) {
         return denied;
     }
-    Json(ModelsResponse {
-        object: "list",
-        data: state
-            .models
+    let mut data: Vec<ModelCard> = state
+        .models
+        .iter()
+        .map(|m| ModelCard {
+            id: m.id.to_string(),
+            object: "model",
+            owned_by: "local",
+        })
+        .collect();
+    for model in state.embeddings.iter() {
+        if !data
             .iter()
-            .map(|m| ModelCard {
-                id: m.id.to_string(),
+            .any(|card| card.id.as_str() == model.id.as_ref())
+        {
+            data.push(ModelCard {
+                id: model.id.to_string(),
                 object: "model",
                 owned_by: "local",
-            })
-            .collect(),
+            });
+        }
+    }
+    Json(ModelsResponse {
+        object: "list",
+        data,
     })
     .into_response()
+}
+
+async fn embeddings_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<EmbeddingRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(e) => return param_error(None, e.body_text()),
+    };
+    if !matches!(req.encoding_format.as_deref(), None | Some("float")) {
+        return param_error(
+            Some("encoding_format"),
+            "only encoding_format=\"float\" is supported".into(),
+        );
+    }
+    let inputs = match req.input {
+        EmbeddingInput::One(text) => vec![text],
+        EmbeddingInput::Many(texts) if texts.is_empty() => {
+            return param_error(Some("input"), "input array must not be empty".into())
+        }
+        EmbeddingInput::Many(texts) => texts,
+    };
+    let Some(entry) = state.route_embedding(&req.model) else {
+        return json_error(StatusCode::NOT_FOUND, "no embedding model is loaded".into());
+    };
+    let model_id = entry.id.to_string();
+    let queued = QueuedGuard::new(state.stats.clone());
+    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
+        state.stats.fold_failure();
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        );
+    };
+    drop(queued);
+    let active = ActiveGuard::new(state.stats.clone());
+    let engine = entry.engine.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _active = active;
+        engine.embed(&inputs)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    match result {
+        Err(error) => {
+            state.stats.fold_failure();
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+        Ok(outcome) => {
+            state
+                .stats
+                .interval_prompt_tokens
+                .fetch_add(u64::from(outcome.prompt_tokens), Ordering::Relaxed);
+            state
+                .stats
+                .interval_completed
+                .fetch_add(1, Ordering::Relaxed);
+            Json(EmbeddingResponse {
+                object: "list",
+                data: outcome
+                    .embeddings
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, embedding)| EmbeddingData {
+                        object: "embedding",
+                        embedding,
+                        index,
+                    })
+                    .collect(),
+                model: model_id,
+                usage: EmbeddingUsage {
+                    prompt_tokens: outcome.prompt_tokens,
+                    total_tokens: outcome.prompt_tokens,
+                },
+            })
+            .into_response()
+        }
+    }
 }
 
 async fn chat_completions_handler(
@@ -1321,6 +1582,10 @@ async fn chat_completions_handler(
     // would quietly generate ordinary text instead (B22).
     if let Err(e) = validate_tool_choice(tool_choice.as_deref(), tools.as_ref()) {
         return param_error(Some(e.param), e.message);
+    }
+
+    if state.models.is_empty() {
+        return json_error(StatusCode::NOT_FOUND, "no chat model is loaded".into());
     }
 
     // Route to the hosted model named in the request (exact id), else the default (first) entry.
@@ -2227,6 +2492,149 @@ mod tests {
                 completion_tokens: 2,
             })
         }
+    }
+
+    struct EchoEmbeddingGen;
+
+    impl EmbeddingGenerator for EchoEmbeddingGen {
+        fn embed(&self, inputs: &[String]) -> anyhow::Result<EmbeddingOutcome> {
+            Ok(EmbeddingOutcome {
+                embeddings: inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| vec![index as f32, input.len() as f32])
+                    .collect(),
+                prompt_tokens: inputs.iter().map(|input| input.len() as u32).sum(),
+            })
+        }
+    }
+
+    fn embedding_router() -> Router {
+        let generator: Arc<dyn EmbeddingGenerator> = Arc::new(EchoEmbeddingGen);
+        build_router(AppState::embedding(
+            generator,
+            "test-embedding",
+            2,
+            Arc::new(Config::default()),
+        ))
+    }
+
+    async fn post_embedding(body: &'static str) -> Response {
+        embedding_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn embeddings_accept_a_string_and_return_openai_shape() {
+        let resp = post_embedding(
+            r#"{"model":"test-embedding","input":"hello","encoding_format":"float"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["model"], "test-embedding");
+        assert_eq!(json["data"][0]["object"], "embedding");
+        assert_eq!(json["data"][0]["index"], 0);
+        assert_eq!(json["data"][0]["embedding"], serde_json::json!([0.0, 5.0]));
+        assert_eq!(json["usage"]["prompt_tokens"], 5);
+        assert_eq!(json["usage"]["total_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn embeddings_accept_an_array_and_preserve_order() {
+        let resp = post_embedding(r#"{"model":"test-embedding","input":["a","three"]}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"][0]["embedding"], serde_json::json!([0.0, 1.0]));
+        assert_eq!(json["data"][1]["embedding"], serde_json::json!([1.0, 5.0]));
+        assert_eq!(json["usage"]["prompt_tokens"], 6);
+    }
+
+    #[tokio::test]
+    async fn embeddings_reject_empty_input_and_base64_encoding() {
+        let empty = post_embedding(r#"{"model":"test-embedding","input":[]}"#).await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        let base64 = post_embedding(
+            r#"{"model":"test-embedding","input":"hello","encoding_format":"base64"}"#,
+        )
+        .await;
+        assert_eq!(base64.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn configured_api_key_gates_the_embedding_endpoint() {
+        let mut cfg = Config::default();
+        cfg.serve.api_key = Some("s3cret".into());
+        let generator: Arc<dyn EmbeddingGenerator> = Arc::new(EchoEmbeddingGen);
+        let state = AppState::embedding(generator, "test-embedding", 1, Arc::new(cfg));
+        let request = |authorization: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json");
+            if let Some(authorization) = authorization {
+                builder = builder.header("authorization", authorization);
+            }
+            builder
+                .body(Body::from(r#"{"model":"test-embedding","input":"hello"}"#))
+                .unwrap()
+        };
+
+        let denied = build_router(state.clone())
+            .oneshot(request(None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = build_router(state)
+            .oneshot(request(Some("Bearer s3cret")))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn embedding_model_is_listed_alongside_chat_model() {
+        let chat: Arc<dyn ChatGenerator> = Arc::new(EchoGen("chat"));
+        let embedding: Arc<dyn EmbeddingGenerator> = Arc::new(EchoEmbeddingGen);
+        let router = build_router(
+            AppState::new(chat, "chat-model", 1, Arc::new(Config::default())).with_embedding(
+                embedding,
+                "embedding-model",
+                1,
+            ),
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["chat-model", "embedding-model"]);
     }
 
     fn multi_router() -> Router {

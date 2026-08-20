@@ -266,14 +266,17 @@ And host-side stage timing was five knobs, one per pipeline (`INFR_PROF`,
 all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth — it
-gates `/v1/chat/completions` and `/v1/models`, never `/health`),
+gates `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models`, never `/health`),
 `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
 slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`
 — how often the server logs its throughput line, default `5`; `0` switches the
 line off). `shutdown_file` (`INFR_SHUTDOWN_FILE`) is an optional supervisor IPC
 path: creating that file requests the same graceful drain as SIGTERM, including
-during model loading. Per-request sampling is not here — it stays on the request.
+during model loading. `embedding_runner` (`INFR_EMBEDDING_RUNNER`) optionally
+selects the managed llama-server executable; otherwise INFR discovers a compatible
+runner from its own directory, `PATH`, or LM Studio. Per-request sampling is not
+here — it stays on the request.
 
 The throughput line is **activity-only**: an interval in which nothing happened
 emits nothing, so an idle server leaves a clean log and there is no heartbeat to

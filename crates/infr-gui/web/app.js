@@ -93,7 +93,7 @@ function renderModels() {
   $('models').innerHTML = models.length ? models.map(m => `
     <div class="model ${selectedModel===m.path?'selected':''}" data-model="${esc(m.path)}">
       <div class="model-title"><span>${esc(m.name)}</span><button class="star" data-star="${esc(m.path)}">${favorites.has(m.path)?'★':'☆'}</button></div>
-      <div class="model-meta">${esc(m.architecture||'未知架构')} · ${bytes(m.size_bytes)} · ${m.is_moe?'MoE':'Dense'}${m.modalities.includes('image')?' · Vision':''}${recent.has(m.path)?' · 最近使用':''}</div>
+      <div class="model-meta">${esc(m.architecture||'未知架构')} · ${bytes(m.size_bytes)} · ${m.is_moe?'MoE':'Dense'}${m.tasks.includes('embedding')?' · Embedding':''}${m.modalities.includes('image')?' · Vision':''}${recent.has(m.path)?' · 最近使用':''}</div>
       <div class="model-meta" title="${esc(m.path)}">${esc(m.path)}</div>
       ${m.error?`<div class="error">${esc(m.error)}</div>`:''}
     </div>`).join('') : '没有匹配的模型';
@@ -101,7 +101,9 @@ function renderModels() {
     if (ev.target.dataset.star) return;
     selectedModel = el.dataset.model; $('model-path').value = selectedModel; formDirty = true; renderModels();
     const model = data.catalog.find(m => m.path === selectedModel);
+    if (model?.tasks?.length === 1 && model.tasks[0] === 'embedding') $('task').value = 'embedding';
     if (model?.trained_context && !$('context').value) $('context').value = model.trained_context;
+    syncTaskFields();
   });
   document.querySelectorAll('[data-star]').forEach(b => b.onclick = async (ev) => { ev.stopPropagation(); await post('/api/favorites/toggle',{path:b.dataset.star},true); });
 }
@@ -124,6 +126,10 @@ function renderSchema() {
   $('config-paths').innerHTML = data.config_schema.map(f => `<option value="${esc(f.path)}">${esc(f.default_value)}</option>`).join('');
 }
 
+function syncTaskFields() {
+  $('embedding-runner-wrap').classList.toggle('hidden', $('task').value !== 'embedding');
+}
+
 function readProfile() {
   const extra = {};
   $('advanced').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean).forEach(line => {
@@ -133,6 +139,7 @@ function readProfile() {
   return {
     id: $('profile-id').value || `profile-${Date.now()}`,
     name: $('profile-name').value.trim() || 'Default', model_path:$('model-path').value.trim(), task:$('task').value,
+    embedding_runner:$('embedding-runner').value.trim(),
     backend:$('backend').value, context:$('context').value.trim(), ubatch:$('ubatch').value?Number($('ubatch').value):null,
     kv_type_k:$('kv-k').value, kv_type_v:$('kv-v').value, vram_budget:$('vram-budget').value.trim(),
     vram_reserve:$('vram-reserve').value.trim(), ram_budget:$('ram-budget').value.trim(), expert_cache:$('expert-cache').value.trim(),
@@ -143,12 +150,12 @@ function readProfile() {
 
 function fillProfile(p) {
   $('profile-id').value=p.id||''; $('profile-name').value=p.name||'Default'; $('model-path').value=p.model_path||''; selectedModel=p.model_path||'';
-  $('task').value=p.task||'chat'; $('backend').value=p.backend||'Vulkan0'; $('context').value=p.context||''; $('ubatch').value=p.ubatch||'';
+  $('task').value=p.task||'chat'; $('embedding-runner').value=p.embedding_runner||''; $('backend').value=p.backend||'Vulkan0'; $('context').value=p.context||''; $('ubatch').value=p.ubatch||'';
   $('kv-k').value=p.kv_type_k||'auto'; $('kv-v').value=p.kv_type_v||'auto'; $('vram-budget').value=p.vram_budget||'';
   $('vram-reserve').value=p.vram_reserve||''; $('ram-budget').value=p.ram_budget||''; $('expert-cache').value=p.expert_cache||'';
   $('parallel').value=p.parallel||1; $('service-addr').value=p.service_addr||'0.0.0.0:8080'; $('service-key').value=p.service_api_key||'';
   $('max-tokens').value=p.max_tokens_cap||131072; $('advanced').value=Object.entries(p.extra||{}).map(([k,v])=>`${k}=${v}`).join('\n');
-  formDirty=false; renderModels();
+  formDirty=false; syncTaskFields(); renderModels();
 }
 
 async function estimateProfile(profile) {
@@ -177,6 +184,7 @@ $('model-filter').oninput = renderModels;
 $('download-source').onchange = () => $('download-custom').classList.toggle('hidden',$('download-source').value!=='custom');
 $('download').onclick = () => { const source=$('download-source').value; post('/api/downloads/start',{model_ref:$('download-ref').value,endpoint:source==='custom'?$('download-custom').value:source,jobs:Number($('download-jobs').value)},false); };
 $('profile-select').onchange = () => { const p=data.saved.profiles.find(p=>p.id===$('profile-select').value); if(p) fillProfile(p); else fillProfile({}); };
+$('task').onchange = () => { syncTaskFields(); formDirty = true; };
 $('save').onclick = async () => { try{const p=readProfile(); await post('/api/profiles/save',p,true); $('profile-id').value=p.id; $('profile-select').value=p.id;}catch(e){} };
 $('delete-profile').onclick = async () => {
   const id = $('profile-id').value;
@@ -205,4 +213,4 @@ $('stop').onclick = () => post('/api/worker/stop',{force:false});
 $('force-stop').onclick = () => { if(confirm('强制停止可能中断正在执行的 GPU 命令。仅在优雅停止长期无响应时使用。')) post('/api/worker/stop',{force:true}); };
 document.querySelectorAll('input,select,textarea').forEach(el => el.addEventListener('change',()=>formDirty=true));
 
-(async()=>{ await refresh(true); setInterval(()=>refresh(false),1500); })();
+(async()=>{ syncTaskFields(); await refresh(true); setInterval(()=>refresh(false),1500); })();

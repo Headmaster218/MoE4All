@@ -9,6 +9,7 @@ const SCAN_DEPTH: usize = 8;
 const VULKAN_GUARD: u64 = 256 * 1024 * 1024;
 const MOE_RUNTIME_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 const DENSE_RUNTIME_RESERVE: u64 = 1024 * 1024 * 1024;
+const EMBEDDING_RUNTIME_RESERVE: u64 = 512 * 1024 * 1024;
 
 pub fn scan_state(state: &GuiState) -> Vec<ModelInfo> {
     let mut paths = Vec::new();
@@ -107,18 +108,41 @@ fn inspect(path: &Path) -> ModelInfo {
             if let Some(name) = gguf.metadata().str("general.name") {
                 info.name = name.to_string();
             }
-            match infr_llama::Config::from_gguf(&gguf) {
-                Ok(cfg) => {
-                    info.trained_context = Some(cfg.n_ctx_train);
-                    info.layers = Some(cfg.n_layer);
-                    info.is_moe = cfg.moe.is_some() || cfg.gemma4_moe;
+            if info
+                .architecture
+                .as_deref()
+                .is_some_and(is_embedding_architecture)
+            {
+                info.tasks = vec!["embedding".into()];
+                if let Some(architecture) = info.architecture.as_deref() {
+                    info.trained_context = metadata_usize(&gguf, architecture, "context_length");
+                    info.layers = metadata_usize(&gguf, architecture, "block_count");
                 }
-                Err(e) => info.error = Some(e.to_string()),
+            } else {
+                match infr_llama::Config::from_gguf(&gguf) {
+                    Ok(cfg) => {
+                        info.trained_context = Some(cfg.n_ctx_train);
+                        info.layers = Some(cfg.n_layer);
+                        info.is_moe = cfg.moe.is_some() || cfg.gemma4_moe;
+                    }
+                    Err(e) => info.error = Some(e.to_string()),
+                }
             }
         }
         Err(e) => info.error = Some(e.to_string()),
     }
     info
+}
+
+fn is_embedding_architecture(architecture: &str) -> bool {
+    architecture.to_ascii_lowercase().contains("bert")
+}
+
+fn metadata_usize(gguf: &Gguf, architecture: &str, suffix: &str) -> Option<usize> {
+    let key = format!("{architecture}.{suffix}");
+    gguf.metadata()
+        .u64(&key)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn find_projector(model: &Path) -> Option<String> {
@@ -145,7 +169,6 @@ pub fn estimate(
         return Err("模型尚未下载到本地，无法在加载前读取 GGUF 元数据".into());
     }
     let gguf = Gguf::open(path).map_err(|e| e.to_string())?;
-    let cfg = infr_llama::Config::from_gguf(&gguf).map_err(|e| e.to_string())?;
     let model_bytes = gguf.shards().iter().map(|(_, n)| *n).sum::<u64>();
     let requested_ram_budget_bytes = parse_absolute(&profile.ram_budget);
     let fits_ram_budget = requested_ram_budget_bytes.map(|budget| model_bytes <= budget);
@@ -153,6 +176,18 @@ pub fn estimate(
         .metadata()
         .str("general.architecture")
         .map(str::to_string);
+    if profile.task == "embedding" {
+        return estimate_embedding(
+            profile,
+            devices,
+            &gguf,
+            model_bytes,
+            requested_ram_budget_bytes,
+            fits_ram_budget,
+            architecture,
+        );
+    }
+    let cfg = infr_llama::Config::from_gguf(&gguf).map_err(|e| e.to_string())?;
     let is_moe = cfg.moe.is_some() || cfg.gemma4_moe;
     let context = parse_absolute(&profile.context);
     let k = parse_kv_dtype(&profile.kv_type_k);
@@ -242,6 +277,65 @@ pub fn estimate(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn estimate_embedding(
+    profile: &ModelProfile,
+    devices: &[infr_vulkan::DeviceInfo],
+    gguf: &Gguf,
+    model_bytes: u64,
+    requested_ram_budget_bytes: Option<u64>,
+    fits_ram_budget: Option<bool>,
+    architecture: Option<String>,
+) -> Result<MemoryEstimate, String> {
+    let total_vram_bytes = devices
+        .iter()
+        .find(|device| format!("Vulkan{}", device.index).eq_ignore_ascii_case(&profile.backend))
+        .map(|device| device.vram_bytes);
+    let requested_vram_budget_bytes = parse_budget(&profile.vram_budget, total_vram_bytes);
+    let reserve = parse_budget(&profile.vram_reserve, total_vram_bytes).unwrap_or(0);
+    let effective_vram_budget_bytes = total_vram_bytes.map(|total| {
+        requested_vram_budget_bytes
+            .unwrap_or(total)
+            .min(total.saturating_sub(reserve).saturating_sub(VULKAN_GUARD))
+    });
+    let fits_minimum = effective_vram_budget_bytes
+        .map(|budget| model_bytes.saturating_add(EMBEDDING_RUNTIME_RESERVE) <= budget);
+    let trained_context = architecture
+        .as_deref()
+        .and_then(|arch| metadata_usize(gguf, arch, "context_length"));
+    let mut notes = vec![
+        "Embedding 推理由 INFR 托管的 llama.cpp worker 执行；当前按整模型驻留估算。".into(),
+        "Embedding 没有生成式 KV cache；运行时预留按 512 MiB 保守估计。".into(),
+    ];
+    if profile.backend.eq_ignore_ascii_case("cpu") {
+        notes.push("CPU 模式不占用 Vulkan 显存，VRAM 适配结果不适用。".into());
+    }
+    if fits_ram_budget == Some(false) {
+        notes.push("RAM 权重预算小于模型文件总量。".into());
+    }
+    Ok(MemoryEstimate {
+        model_bytes,
+        requested_ram_budget_bytes,
+        fits_ram_budget,
+        kv_bytes: None,
+        runtime_reserve_bytes: EMBEDDING_RUNTIME_RESERVE,
+        total_vram_bytes,
+        requested_vram_budget_bytes,
+        effective_vram_budget_bytes,
+        estimated_cache_room_bytes: effective_vram_budget_bytes.map(|budget| {
+            budget
+                .saturating_sub(model_bytes)
+                .saturating_sub(EMBEDDING_RUNTIME_RESERVE)
+        }),
+        trained_context,
+        architecture,
+        is_moe: false,
+        fits_minimum,
+        confidence: "medium".into(),
+        notes,
+    })
+}
+
 fn parse_absolute(raw: &str) -> Option<u64> {
     match parse_size(raw.trim())? {
         SizeSpec::Bytes(v) => Some(v),
@@ -269,6 +363,13 @@ mod tests {
         assert_eq!(parse_absolute("75%"), None);
         assert_eq!(parse_budget("25%", Some(8 * 1024)), Some(2 * 1024));
         assert_eq!(parse_budget("", Some(8 * 1024)), None);
+    }
+
+    #[test]
+    fn bert_family_is_catalogued_as_embedding() {
+        assert!(is_embedding_architecture("nomic-bert"));
+        assert!(is_embedding_architecture("BERT"));
+        assert!(!is_embedding_architecture("qwen3moe"));
     }
 
     #[test]

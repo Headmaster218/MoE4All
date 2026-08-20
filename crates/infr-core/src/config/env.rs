@@ -413,6 +413,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
     p.serve.shutdown_file = opt_path(get, "INFR_SHUTDOWN_FILE");
+    p.serve.embedding_runner = opt_path(get, "INFR_EMBEDDING_RUNNER");
 
     // ── hub ──────────────────────────────────────────────────────────────────
     if let Some(endpoint) = get("INFR_HF_ENDPOINT") {

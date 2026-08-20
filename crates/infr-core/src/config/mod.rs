@@ -760,6 +760,9 @@ cfg_struct! {
         /// appears, the CLI latches the same graceful shutdown path as SIGTERM. This is primarily
         /// for a GUI/service supervisor on Windows, where the POSIX signal handler is unavailable.
         shutdown_file: Option<PathBuf> = None,
+        /// `INFR_EMBEDDING_RUNNER`: optional llama-server executable used by the managed embedding
+        /// worker. Unset lets the embedding adapter discover a compatible runner.
+        embedding_runner: Option<PathBuf> = None,
     }
 }
 

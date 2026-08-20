@@ -74,9 +74,10 @@
         <input id="profile-id" type="hidden">
         <div class="grid two">
           <label>配置名称<input id="profile-name" value="Default"></label>
-          <label>任务类型<select id="task"><option value="chat">Chat / Completion</option><option value="embedding">Embedding（预留）</option><option value="rerank">Rerank（预留）</option></select></label>
+          <label>任务类型<select id="task"><option value="chat">Chat / Completion</option><option value="embedding">Embedding</option><option value="rerank">Rerank（预留）</option></select></label>
         </div>
         <label>模型路径<input id="model-path" placeholder="选择左侧模型，或输入服务器上的 GGUF 路径"></label>
+        <label id="embedding-runner-wrap" class="hidden">Embedding runner<input id="embedding-runner" placeholder="留空自动查找 llama-server.exe，或填写完整路径"></label>
         <div class="grid three">
           <label>计算设备<select id="backend"></select></label>
           <label>服务地址<input id="service-addr" value="0.0.0.0:8080"></label>
@@ -85,7 +86,7 @@
         <label>OpenAI API Key<input id="service-key" type="password" placeholder="留空表示不鉴权"></label>
       </section>
 
-      <section class="panel">
+      <section id="memory-plan" class="panel">
         <div class="section-title"><div><div class="eyebrow">MEMORY PLAN</div><h2>显存与内存预算</h2></div><button id="estimate" class="ghost">重新估算</button></div>
         <div class="grid three">
           <label>总 VRAM Budget<input id="vram-budget" value="23g" placeholder="23g / 90%"></label>

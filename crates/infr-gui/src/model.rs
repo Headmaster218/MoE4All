@@ -37,8 +37,10 @@ pub struct ModelProfile {
     pub id: String,
     pub name: String,
     pub model_path: String,
-    /// Reserved task axis: chat/completion now; embedding and rerank later.
+    /// Workload hosted by the worker. Rerank remains reserved for a later backend.
     pub task: String,
+    /// Optional llama-server executable for embedding profiles. Empty means auto-discovery.
+    pub embedding_runner: String,
     pub backend: String,
     pub context: String,
     pub ubatch: Option<usize>,
@@ -62,6 +64,7 @@ impl Default for ModelProfile {
             name: "Default".into(),
             model_path: String::new(),
             task: "chat".into(),
+            embedding_runner: String::new(),
             backend: "Vulkan0".into(),
             context: "200k".into(),
             ubatch: None,

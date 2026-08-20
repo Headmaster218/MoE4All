@@ -1368,6 +1368,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_Q8_DECODE_CHUNK1024",
         "INFR_NO_MOE_LAYER_STREAM",
         "INFR_SHUTDOWN_FILE",
+        "INFR_EMBEDDING_RUNNER",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

@@ -15,6 +15,7 @@ infr-prof-rt.workspace = true
 infr-vulkan.workspace = true
 infr-hub.workspace = true
 infr-engine.workspace = true
+infr-embedding.workspace = true
 infr-server.workspace = true
 infr-llama = { path = "../infr-llama" }
 clap.workspace = true

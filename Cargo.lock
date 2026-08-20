@@ -1147,6 +1147,7 @@ dependencies = [
  "clap_complete_nushell",
  "clap_mangen",
  "infr-core",
+ "infr-embedding",
  "infr-engine",
  "infr-hub",
  "infr-llama",
@@ -1190,6 +1191,19 @@ dependencies = [
  "infr-prof-rt",
  "infr-testkit",
  "rayon",
+ "tracing",
+]
+
+[[package]]
+name = "infr-embedding"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "infr-core",
+ "infr-gguf",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

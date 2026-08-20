@@ -71,12 +71,14 @@ trusted.
 
 ## Current and reserved capabilities
 
-Chat/completion GGUF workers are active now. The catalog and profile model already keep task,
-modality, projector, memory-tier and advanced-config concepts separate so these can be added without
-replacing the GUI:
+Chat/completion and Embedding GGUF workers are active now. The catalog and profile model keep task,
+modality, projector, memory-tier and advanced-config concepts separate so the remaining engines can
+be added without replacing the GUI:
 
-- Embedding and rerank are visible as reserved tasks and are rejected until their engine endpoints
-  exist.
+- Embedding profiles start INFR's managed `llama.cpp` worker and expose it through INFR's own
+  authenticated `/v1/embeddings` endpoint. The runner is auto-discovered, or can be selected per
+  profile. CPU and Vulkan are supported; closing/switching the worker unloads its model.
+- Rerank remains a reserved task and is rejected until its endpoint exists.
 - Vision/mmproj files are discovered and shown, but are not yet passed into an inference worker.
 - VRAM and RAM budgets are active. SSD is currently the existing model/mmap storage tier; explicit
   VRAM -> RAM -> SSD policy controls are reserved for the later three-level pager.
