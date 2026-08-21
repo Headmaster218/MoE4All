@@ -1515,14 +1515,6 @@ pub(crate) fn dense_stream_budget_at(
         .saturating_sub(lm)
 }
 
-/// Headroom the MoE expert budget holds back on top of the dense weights and the KV cache: covers
-/// activation scratch (pooled, but per-tag sizes scale with n_embd/n_ff and the `fp`/`kv_bytes`
-/// terms are estimates, not the exact bytes gpu-allocator's block granularity commits) plus the
-/// pager's own arena+staging+LUT allocations, which aren't counted in `fp` at all. Sized
-/// empirically on Scout's 48-layer, 37 GB Q2_K pager placement — 512 MiB undershot by a few
-/// hundred MiB and the guard rightly refused to over-commit.
-const MOE_ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
-
 /// One lightweight account of the VRAM ceiling shared by placement, the loader and control planes.
 /// All inputs are already-resolved logical bytes; this type only prevents consumers from applying
 /// the subtraction in different orders or forgetting one category.
@@ -1564,12 +1556,7 @@ impl ModelMemoryPlan {
 /// Conservative load-time runtime reserve for control planes that do not own a live backend yet.
 /// Placement calls the same activation formula with the selected device's real capabilities.
 pub fn estimate_runtime_reserve_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
-    let activation = dense_act_reserve_at(cfg, &Capabilities::default(), want_ctx, ubatch);
-    if cfg.moe.is_some() || cfg.gemma4_moe {
-        MOE_ACT_HEADROOM.max(activation)
-    } else {
-        activation
-    }
+    dense_act_reserve_at(cfg, &Capabilities::default(), want_ctx, ubatch)
 }
 
 /// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
@@ -1658,8 +1645,6 @@ const CTX_FIT_SEARCH_CAP: usize = 1 << 22;
 /// Returns the RAW fit, which may be below [`MIN_SESSION_CTX`] (or `0`) — that is the signal the
 /// refuse rung reads. `None` for a pure recurrent-state arch: no per-token KV to size.
 ///
-/// MoE models keep the plain `total/12` heuristic: their placement budgets pager arenas
-/// separately from this and never walks the dense chunk ladder.
 pub(crate) fn kv_fit_ctx_for(
     cfg: &Config,
     caps: &Capabilities,
@@ -1671,18 +1656,11 @@ pub(crate) fn kv_fit_ctx_for(
 ) -> Option<usize> {
     // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
     // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
-    // MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are budgeted by
-    // `ModelMemoryPlan`, not by the dense activation reserve.
-    let moe_reserve = cfg
-        .moe
-        .is_some()
-        .then(|| (vram.total / 12).max(1024 * 1024 * 1024));
     kv_fit_ctx_in_budget(
         cfg,
         caps,
         ec,
         planned_vram_room(vram, ec).saturating_sub(weights),
-        moe_reserve,
         &ubatch_candidates(ec),
         k_fmt,
         v_fmt,
@@ -1699,14 +1677,11 @@ pub(crate) fn kv_fit_ctx_for(
 /// the tails, the retained staging and the driver's own memory already netted out, because they
 /// have been allocated. Same arithmetic either way; only the confidence in the input differs.
 ///
-/// `moe_reserve` is the MoE arm's flat headroom in place of the dense activation reserve (`None`
-/// for a dense model).
 pub(crate) fn kv_fit_ctx_in_budget(
     cfg: &Config,
     caps: &Capabilities,
     ec: &EngineConfig,
     budget: u64,
-    moe_reserve: Option<u64>,
     cands: &[usize],
     k_fmt: DType,
     v_fmt: DType,
@@ -1719,8 +1694,7 @@ pub(crate) fn kv_fit_ctx_in_budget(
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
             let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
-            let reserve =
-                moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, caps, ctx, ubatch));
+            let reserve = dense_act_reserve_at(cfg, caps, ctx, ubatch);
             kv.saturating_add(reserve) <= budget
         })
     };
@@ -1810,7 +1784,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
-    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, &caps, ec, budget, None, &[ub], k_fmt, v_fmt);
+    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, &caps, ec, budget, &[ub], k_fmt, v_fmt);
     let Some(_) = at(cands[0]) else {
         return want_ctx; // pure recurrent-state arch: no per-token KV to size.
     };
@@ -1979,11 +1953,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
             _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch_rows(ec), k_fmt, v_fmt),
         };
-        // Layer-granular MoE Prefill is tuned for a 4096-row microbatch. Price that shape even when
-        // the ordinary adaptive default is smaller, so the shared expert arena cannot consume the
-        // workspace the largest supported Prefill needs at runtime.
-        let prefill_4k_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, 4096);
-        let runtime_reserve = MOE_ACT_HEADROOM.max(prefill_4k_reserve);
+        // Reserve the workspace for the chunk this session will actually execute. A user selecting
+        // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
+        // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
+        // borrows only cold Decode arena ranges and returns them on `enter_decode`.
+        let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, ubatch_rows(ec));
         let Some(plan) = ModelMemoryPlan::new(room, fp.dense, kv_bytes, runtime_reserve) else {
             return Err(anyhow!(
                 "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed the unified \
@@ -4830,11 +4804,12 @@ mod seam_helper_tests {
             "paging.layer_major = false takes the residual-stream reserve back off the budget"
         );
 
-        // MoE expert placement: same ceiling, minus the pager's own headroom.
-        let empty = super::ModelMemoryPlan::new(XTX_ROOM, 0, 0, super::MOE_ACT_HEADROOM)
-            .expect("empty plan");
-        assert_eq!(empty.expert_cache_bytes, XTX_ROOM - super::MOE_ACT_HEADROOM);
-        assert_eq!(empty.minimum_required_bytes(), super::MOE_ACT_HEADROOM);
+        // MoE expert placement: same ceiling, minus the model/shape-derived phase workspace.
+        let workspace = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ub);
+        let empty =
+            super::ModelMemoryPlan::new(XTX_ROOM, 0, 0, workspace).expect("empty plan");
+        assert_eq!(empty.expert_cache_bytes, XTX_ROOM - workspace);
+        assert_eq!(empty.minimum_required_bytes(), workspace);
         let full = super::ModelMemoryPlan::new(XTX_ROOM, XTX_ROOM, 0, 0).expect("full plan");
         assert_eq!(full.expert_cache_bytes, 0);
         assert_eq!(
