@@ -542,25 +542,101 @@ where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stream).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let mut state = status.write().await;
-            if let Some(v) = metric(&line, "prefill_tps=") {
-                state.prefill_tps = Some(v);
+        let mut reader = BufReader::new(stream);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes).await {
+                Ok(0) => break,
+                Ok(_) => record_worker_log(&status, normalize_worker_log(&bytes)).await,
+                Err(e) => {
+                    record_worker_log(&status, format!("worker log read failed: {e}")).await;
+                    break;
+                }
             }
-            if let Some(v) = metric(&line, "decode_tps=") {
-                state.decode_tps = Some(v);
-            }
-            if line.to_ascii_lowercase().contains("error") {
-                state.last_error = Some(line.clone());
-            }
-            push_log(&mut state.logs, line);
         }
     });
 }
 
+async fn record_worker_log(status: &RwLock<RuntimeStatus>, line: String) {
+    let mut state = status.write().await;
+    if let Some(v) = metric(&line, "prefill_tps=") {
+        state.prefill_tps = Some(v);
+    }
+    if let Some(v) = metric(&line, "decode_tps=") {
+        state.decode_tps = Some(v);
+    }
+    if line.to_ascii_lowercase().contains("error") {
+        state.last_error = Some(line.clone());
+    }
+    push_log(&mut state.logs, line);
+}
+
+fn normalize_worker_log(bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    let line = decoded.trim_end_matches(&['\r', '\n'][..]);
+    strip_terminal_sequences(line)
+}
+
+/// Remove terminal-only control sequences before logs are rendered in the browser.
+///
+/// Tracing colors numeric field values independently, so leaving ANSI in a piped log is not only
+/// visual noise: an escape can occur directly after `prefill_tps=` and make metric parsing fail.
+fn strip_terminal_sequences(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut clean = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i == bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    // CSI: parameters/intermediates followed by one final byte in 0x40..=0x7e.
+                    i += 1;
+                    while i < bytes.len() {
+                        let final_byte = (0x40..=0x7e).contains(&bytes[i]);
+                        i += 1;
+                        if final_byte {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: terminated by BEL or the two-byte ST sequence ESC + backslash.
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        } else if bytes[i] < 0x20 || bytes[i] == 0x7f {
+            // A browser log has no terminal state. Keep tabs useful for alignment, drop the rest.
+            if bytes[i] == b'\t' {
+                clean.push(bytes[i]);
+            }
+            i += 1;
+        } else {
+            clean.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(clean).expect("removing ASCII controls preserves valid UTF-8")
+}
+
 fn metric(line: &str, marker: &str) -> Option<f64> {
-    let tail = line.split_once(marker)?.1;
+    let tail = line.split_once(marker)?.1.trim_start();
     let number: String = tail
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
@@ -655,6 +731,22 @@ mod tests {
             ),
             Some(56.7)
         );
+    }
+
+    #[test]
+    fn worker_log_normalization_preserves_utf8_and_exposes_colored_metrics() {
+        let line = normalize_worker_log(
+            b"\x1b[2mrequest done\x1b[0m prefill_tps=\x1b[3m523.4\x1b[0m decode_tps=\x1b[3m56.7\x1b[0m \xe6\xa8\xa1\xe5\x9e\x8b\r\n",
+        );
+        assert_eq!(line, "request done prefill_tps=523.4 decode_tps=56.7 模型");
+        assert_eq!(metric(&line, "prefill_tps="), Some(523.4));
+        assert_eq!(metric(&line, "decode_tps="), Some(56.7));
+    }
+
+    #[test]
+    fn worker_log_normalization_survives_invalid_utf8_and_osc() {
+        let line = normalize_worker_log(b"ok \xff\x1b]0;title\x07 done\n");
+        assert_eq!(line, "ok � done");
     }
 
     #[test]
