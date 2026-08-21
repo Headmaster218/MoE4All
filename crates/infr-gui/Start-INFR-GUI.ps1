@@ -5,7 +5,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
+$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$workspaceManifest = Join-Path $repoRoot 'Cargo.toml'
+if (-not (Test-Path -LiteralPath $workspaceManifest -PathType Leaf)) {
+    throw "INFR workspace Cargo.toml was not found: $workspaceManifest"
+}
 $dataDir = Join-Path $repoRoot 'gui-data'
 $keyFile = Join-Path $dataDir 'admin.key'
 $guiExe = Join-Path $repoRoot 'target\release\infr-gui.exe'
