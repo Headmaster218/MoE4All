@@ -1231,6 +1231,36 @@ pub(crate) fn kv_rows_at(
     }
 }
 
+/// Exact bytes allocated for the two persistent state buffers owned by one layer.
+///
+/// Most layers store context-scaled K/V rows. Qwen3.5/3.6 DeltaNet layers instead reuse the same
+/// two buffer slots for fixed-size f32 convolution history and recurrent S state. Keeping that
+/// architecture decision here lets allocation and budget accounting consume one answer without
+/// teaching either caller a second copy of the model-specific branch.
+pub(crate) fn layer_state_bytes(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> (usize, usize) {
+    if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+        let state_elems =
+            cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+        return (conv_elems * 4, state_elems * 4);
+    }
+
+    let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch);
+    let (k_row, v_row) = kv_row_elems(cfg, l);
+    (
+        kv_side_bytes(k_fmt, rows * k_row),
+        kv_side_bytes(v_fmt, rows * v_row),
+    )
+}
+
 /// Row capacity of layer `l`'s K/V cache at context `want_ctx`. With `ring` (SWA ring sizing on
 /// for this session — see [`kv_ring_wanted`] + the backend's `Capabilities::kv_swa_ring`), a
 /// sliding-window layer allocates only `min(want_ctx, round64(window + ubatch))` rows and the
@@ -4087,6 +4117,54 @@ mod seam_helper_tests {
         // allocation — and a real side is never rewritten.
         assert_eq!(super::kv_side_elems(v), super::KV_PLACEHOLDER_ELEMS);
         assert_eq!(super::kv_side_elems(k), k);
+    }
+
+    fn qwen35_hybrid_state() -> Config {
+        Config {
+            qwen35: true,
+            n_layer: 40,
+            full_attn_interval: 4,
+            n_kv: 4,
+            head_dim: 128,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 1024,
+            ssm_n_group: 8,
+            ssm_dt_rank: 16,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layer_state_bytes_distinguishes_qwen35_attention_and_deltanet() {
+        let cfg = qwen35_hybrid_state();
+        let ctx = 200_000;
+        let ubatch = 4096;
+
+        // Layer 0 is DeltaNet: its two persistent buffers are fixed f32 state and do not depend on
+        // context length or the session KV dtype.
+        let delta_q8 =
+            super::layer_state_bytes(&cfg, 0, ctx, false, ubatch, DType::Q8_0, DType::Q8_0);
+        let delta_f16 =
+            super::layer_state_bytes(&cfg, 0, 1, false, ubatch, DType::F16, DType::F16);
+        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+        let state_elems =
+            cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+        assert_eq!(delta_q8, (conv_elems * 4, state_elems * 4));
+        assert_eq!(delta_q8, delta_f16);
+
+        // Layer 3 is full attention and therefore scales with the requested context in the
+        // selected KV format.
+        let attention =
+            super::layer_state_bytes(&cfg, 3, ctx, false, ubatch, DType::Q8_0, DType::Q8_0);
+        let row = cfg.n_kv * cfg.head_dim;
+        assert_eq!(
+            attention,
+            (
+                super::kv_side_bytes(DType::Q8_0, ctx * row),
+                super::kv_side_bytes(DType::Q8_0, ctx * row),
+            )
+        );
     }
 
     /// The VRAM estimate must price the row the runner ALLOCATES. Before B41 it priced
