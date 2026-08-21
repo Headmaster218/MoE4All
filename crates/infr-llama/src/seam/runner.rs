@@ -1145,53 +1145,38 @@ pub(crate) fn generate_dense_backend(
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..c.n_layer {
-            if c.qwen35 && !c.is_qwen35_attn_layer(l) {
-                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
-                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
-                kbufs.push(
-                    be.alloc(conv_elems * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(s_elems * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                continue;
-            }
-            // Per-token row widths, MLA included: DeepSeek2 caches ONE compressed row
-            // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and
-            // `kv_side_bytes` allocates the placeholder buffer the backends still bind
-            // (`crate::seam::kv_row_elems` — the ONE definition every geometry site reads).
-            // deepseek32 puts its lightning-indexer cache on that otherwise-unused V side, so
-            // `v_row` there is `indexer_head_size` and this loop reserves it like any other side.
-            let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
-            // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows
-            // the window mask already excludes — `crate::seam::kv_rows` has the argument).
-            let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
             // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally
             // only, so position 0 stays eligible for every query row and a ring that had wrapped
             // would have overwritten it — every backend refuses `cap_rows < kv_len` rather than
             // score a row holding some other position. V3.2 declares no sliding window, so
             // `kv_rows` already returns `want_ctx` here; this is what keeps that true if the ring
             // gate ever widens, checked where the buffer is actually sized.
+            let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring, ec);
             assert!(
                 !c.deepseek32 || rows_l >= want_ctx,
                 "deepseek32 layer {l}: the lightning indexer's KV cache was sized at {rows_l} rows \
                  for a {want_ctx}-token context — it must not ring, because the indexer's \
                  causal-only mask keeps position 0 eligible for every query"
             );
+
+            // One sizing decision for allocation and budget accounting. On Attention/MLA layers
+            // these are the two context-scaled cache sides; on Qwen3.5/3.6 DeltaNet layers they
+            // are the fixed conv-history and recurrent-state buffers.
+            let (k_bytes, v_bytes) = crate::seam::layer_state_bytes(
+                c,
+                l,
+                want_ctx,
+                kv_ring,
+                crate::seam::ubatch_rows(ec),
+                k_fmt,
+                v_fmt,
+            );
             kbufs.push(
-                be.alloc(
-                    crate::seam::kv_side_bytes(k_fmt, rows_l * k_row),
-                    BufferUsage::KvCache,
-                )
+                be.alloc(k_bytes, BufferUsage::KvCache)
                 .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(
-                    crate::seam::kv_side_bytes(v_fmt, rows_l * v_row),
-                    BufferUsage::KvCache,
-                )
+                be.alloc(v_bytes, BufferUsage::KvCache)
                 .map_err(|e| anyhow!("{e}"))?,
             );
         }

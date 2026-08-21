@@ -1061,9 +1061,8 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 /// sliding-window layer, so `kv_rows` returns the whole context — and why the allocation asserts it
 /// (see `generate_dense_backend`'s KV loop).
 ///
-/// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
-/// to the fixed conv/S-state allocation BEFORE reaching here, and the estimates price them with
-/// this attention geometry as they always have.
+/// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size;
+/// [`layer_state_bytes`] branches to their fixed conv/S-state allocation before reaching here.
 /// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per side per token**, and the V side is a
 /// DUPLICATE of the K side rather than the MLA-style 0-width placeholder (docs/backlog.md B53).
 ///
@@ -1282,12 +1281,10 @@ pub(crate) fn kv_rows(
     kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows(ec))
 }
 
-/// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
-/// `q8` prices BOTH sides Q8_0 (34 B / 32-elem block, `next_multiple_of(4)`, mirroring
-/// [`kv_fmt_bytes`]), else f16 (2 B/elem); +64 rows/layer slop. The ONE pricing helper the dense
-/// placement sweep AND the MoE expert-placement budget share, so both reserve exactly the cache the
-/// runner will allocate — including a pinned auto-q8 cache. (The MoE path used to hard-code f16
-/// `*2*2` regardless, over-reserving ~2× under auto-q8 and forcing avoidable expert paging.)
+/// Persistent KV/recurrent-state footprint summed over all layers at chunk height `ubatch` and
+/// side format. Qwen3.5/3.6 DeltaNet layers contribute their fixed f32 conv/S state instead of a
+/// fictional context-scaled KV cache. The ONE pricing helper the dense placement sweep and MoE
+/// expert-placement budget share, so both price exactly what the runner allocates.
 pub(crate) fn kv_bytes_estimate(
     cfg: &Config,
     want_ctx: usize,
@@ -1298,14 +1295,6 @@ pub(crate) fn kv_bytes_estimate(
     let side = if q8 { DType::Q8_0 } else { DType::F16 };
     kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, side, side)
 }
-
-/// Rows of headroom every KV footprint estimate adds PER LAYER on top of the context's own rows.
-///
-/// The runner allocates exactly `kv_rows(..) * kv_row_elems(..)` elements per side (see
-/// `generate_dense_backend`'s KV loop and `SeamKv::fork`) — this is deliberate slop, not a
-/// pad the allocation actually contains, so every estimate that uses it is conservative by a
-/// bounded, layer-proportional amount rather than by an unexplained percentage.
-pub(crate) const KV_SLOP_ROWS: usize = 64;
 
 /// [`kv_bytes_estimate`] with the two sides priced INDEPENDENTLY. `INFR_KV_TYPE_K` and
 /// `INFR_KV_TYPE_V` are separate knobs and the runner allocates each side in its own dtype, so
@@ -1321,11 +1310,9 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
-            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS;
-            // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
-            // and it has no V side (see `kv_row_elems`).
-            let (k_row, v_row) = kv_row_elems(cfg, l);
-            kv_pair_bytes(k_row * rows, v_row * rows, k_fmt, v_fmt)
+            let (k_bytes, v_bytes) =
+                layer_state_bytes(cfg, l, want_ctx, ring, ubatch, k_fmt, v_fmt);
+            (k_bytes + v_bytes) as u64
         })
         .sum()
 }
@@ -1350,12 +1337,6 @@ pub fn estimate_kv_bytes(
 /// The two sides are counted SEPARATELY because they are not always the same width: an MLA layer
 /// caches a wide K row and no V at all, so a single `elems` argument (what this took while three of
 /// the five geometry sites had drifted) cannot express it.
-fn kv_pair_bytes(k_elems: usize, v_elems: usize, k_fmt: DType, v_fmt: DType) -> u64 {
-    // Priced through the SAME sizer the runner allocates with, so "mirrors `kv_fmt_bytes`" is
-    // now a call rather than a comment.
-    (kv_fmt_bytes(k_fmt, k_elems) + kv_fmt_bytes(v_fmt, v_elems)) as u64
-}
-
 /// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
 /// KV-footprint ESTIMATES (ctx clamp, dense/MoE placement) so they price the same allocation the
 /// runner will make. The runner additionally requires the backend capability
@@ -3939,7 +3920,7 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
-    use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
+    use super::{Config, DType, EngineConfig, PlacementPins, PlacementScope};
     use infr_core::backend::{Capabilities, COOPMAT_TILE_16};
 
     /// Arithmetic tests that predate capability-aware hd256 flash use the conservative device:
@@ -4043,11 +4024,11 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn kv_pair_bytes_prices_each_side_in_its_own_dtype() {
+    fn kv_side_bytes_prices_each_side_in_its_own_dtype() {
         // q8 prices K+V at ~half the f16 bytes (34 B / 32-elem block vs 2 B/elem, ×2 sides).
         let elems = 32_000usize;
-        let f16 = kv_pair_bytes(elems, elems, DType::F16, DType::F16);
-        let q8 = kv_pair_bytes(elems, elems, DType::Q8_0, DType::Q8_0);
+        let f16 = 2 * super::kv_side_bytes(DType::F16, elems) as u64;
+        let q8 = 2 * super::kv_side_bytes(DType::Q8_0, elems) as u64;
         assert_eq!(f16, 2 * 2 * elems as u64); // 128_000
         assert_eq!(q8, 2 * (elems as u64 / 32 * 34)); // 68_000, already u32-aligned
         assert!(
@@ -4056,12 +4037,13 @@ mod seam_helper_tests {
         );
         // The MIXED case the single-flag helper could not express: `INFR_KV_TYPE_K=q8_0` with V
         // left at f16 is exactly one of each, not two of either.
-        let mixed = kv_pair_bytes(elems, elems, DType::Q8_0, DType::F16);
+        let mixed = (super::kv_side_bytes(DType::Q8_0, elems)
+            + super::kv_side_bytes(DType::F16, elems)) as u64;
         assert_eq!(mixed, q8 / 2 + f16 / 2);
         assert!(mixed > q8 && mixed < f16);
-        // A side the arch does not cache at all (MLA's V) is priced at nothing, not at the K
-        // side's width — the two sides are independent widths, not one width used twice.
-        assert_eq!(kv_pair_bytes(elems, 0, DType::F16, DType::F16), f16 / 2);
+        // A side the arch does not cache at all (MLA's V) gets only the bindable placeholder the
+        // runner really allocates, not the K side's width.
+        assert_eq!(super::kv_side_bytes(DType::F16, 0), 8);
     }
 
     // ── MLA (deepseek2) KV geometry + dtype gate — docs/backlog.md B41/B42 ───────────────────
@@ -4167,6 +4149,26 @@ mod seam_helper_tests {
         );
     }
 
+    #[test]
+    fn qwen35_persistent_state_estimate_counts_only_full_attention_layers_as_kv() {
+        let cfg = qwen35_hybrid_state();
+        let ctx = 200_000;
+        let ubatch = 4096;
+        let fmt = DType::Q8_0;
+        let estimate =
+            super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, fmt, fmt);
+        let attention = super::layer_state_bytes(&cfg, 3, ctx, false, ubatch, fmt, fmt);
+        let delta = super::layer_state_bytes(&cfg, 0, ctx, false, ubatch, fmt, fmt);
+        let attention_bytes = attention.0 as u64 + attention.1 as u64;
+        let delta_bytes = delta.0 as u64 + delta.1 as u64;
+
+        assert_eq!(estimate, 10 * attention_bytes + 30 * delta_bytes);
+        assert!(
+            estimate < 40 * attention_bytes,
+            "DeltaNet layers must not be priced as full-context KV"
+        );
+    }
+
     /// The VRAM estimate must price the row the runner ALLOCATES. Before B41 it priced
     /// `2 x (n_kv x head_dim)` = 384 elements/token/layer against a reality of 576 K-only —
     /// under-reserving by exactly 1.5x, with the context clamp and the resident-fit sweep computing
@@ -4176,14 +4178,21 @@ mod seam_helper_tests {
         let cfg = deepseek_v2_lite_kv();
         let ec = EngineConfig::default();
         let (ctx, ubatch) = (4096usize, super::ubatch_rows(&ec));
-        let rows = ctx + super::KV_SLOP_ROWS;
         let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, DType::F16, DType::F16);
-        // 27 layers x (4096+64) rows x 576 elements x 2 bytes, K only.
-        let want = (cfg.n_layer * rows * (cfg.kv_lora_rank + cfg.qk_rope_dim) * 2) as u64;
+        // 27 layers × exact K allocation plus the bindable V placeholder.
+        let per_layer = super::kv_side_bytes(
+            DType::F16,
+            ctx * (cfg.kv_lora_rank + cfg.qk_rope_dim),
+        ) + super::kv_side_bytes(DType::F16, 0);
+        let want = (cfg.n_layer * per_layer) as u64;
         assert_eq!(est, want);
         // The pre-fix pricing, spelled out: K+V at the head-dim product.
-        let old = (cfg.n_layer * rows * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
-        assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
+        let old = (cfg.n_layer * ctx * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
+        assert_eq!(
+            est - (cfg.n_layer * super::kv_side_bytes(DType::F16, 0)) as u64,
+            old * 3 / 2,
+            "the estimate was 1.5x short before the placeholder"
+        );
     }
 
     /// `kv_q8_layout_ok` is the "may this model use a q8 cache" gate the Vulkan auto-q8 placement

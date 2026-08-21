@@ -550,39 +550,21 @@ impl SeamKv {
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..cfg.n_layer {
-            // qwen35 DeltaNet layers: fixed-size conv/S state, NOT a `max_ctx`-scaled KV cache (see
-            // the matching alloc in `generate_dense_backend`'s state init and `MixerW::DeltaNet`).
-            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
-                let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-                let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
-                kbufs.push(
-                    be.alloc(conv_elems * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(s_elems * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                continue;
-            }
-            // Same per-layer geometry as the original allocation — same widths from the same
-            // helper (`crate::seam::kv_row_elems`, MLA's compressed K row and placeholder V side
-            // included), and SWA layers ring at window+ubatch rows when this session was
-            // ring-sized (see `crate::seam::kv_rows`).
-            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
+            let (k_bytes, v_bytes) = crate::seam::layer_state_bytes(
+                cfg,
+                l,
+                self.max_ctx,
+                self.kv_ring,
+                crate::seam::ubatch_rows(ec),
+                self.k_fmt,
+                self.v_fmt,
+            );
             kbufs.push(
-                be.alloc(
-                    crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
-                    BufferUsage::KvCache,
-                )
+                be.alloc(k_bytes, BufferUsage::KvCache)
                 .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(
-                    crate::seam::kv_side_bytes(self.v_fmt, rows_l * v_row),
-                    BufferUsage::KvCache,
-                )
+                be.alloc(v_bytes, BufferUsage::KvCache)
                 .map_err(|e| anyhow!("{e}"))?,
             );
         }
