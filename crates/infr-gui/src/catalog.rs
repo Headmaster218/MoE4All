@@ -7,8 +7,6 @@ use crate::model::{GuiState, MemoryEstimate, ModelInfo, ModelProfile};
 
 const SCAN_DEPTH: usize = 8;
 const VULKAN_GUARD: u64 = 256 * 1024 * 1024;
-const MOE_RUNTIME_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
-const DENSE_RUNTIME_RESERVE: u64 = 1024 * 1024 * 1024;
 const EMBEDDING_RUNTIME_RESERVE: u64 = 512 * 1024 * 1024;
 
 pub fn scan_state(state: &GuiState) -> Vec<ModelInfo> {
@@ -189,7 +187,11 @@ pub fn estimate(
     }
     let cfg = infr_llama::Config::from_gguf(&gguf).map_err(|e| e.to_string())?;
     let is_moe = cfg.moe.is_some() || cfg.gemma4_moe;
+    let footprint = infr_llama::weight_footprint(&gguf);
+    let fixed_vram_bytes = footprint.dense;
     let context = parse_absolute(&profile.context);
+    let planning_context = context.unwrap_or(cfg.n_ctx_train as u64) as usize;
+    let planning_ubatch = profile.ubatch.unwrap_or(1024).max(1);
     let k = parse_kv_dtype(&profile.kv_type_k);
     let v = parse_kv_dtype(&profile.kv_type_v);
     let kv_bytes = match (context, k, v) {
@@ -198,7 +200,7 @@ pub fn estimate(
                 &cfg,
                 ctx as usize,
                 true,
-                profile.ubatch.unwrap_or(1024).max(1),
+                planning_ubatch,
                 k,
                 v,
             ) * profile.parallel.max(1) as u64,
@@ -216,29 +218,29 @@ pub fn estimate(
             .unwrap_or(total)
             .min(total.saturating_sub(reserve).saturating_sub(VULKAN_GUARD))
     });
-    let runtime_reserve_bytes = if is_moe {
-        MOE_RUNTIME_RESERVE
-    } else {
-        DENSE_RUNTIME_RESERVE
-    };
-    let estimated_cache_room_bytes = effective_vram_budget_bytes.map(|budget| {
-        budget
-            .saturating_sub(kv_bytes.unwrap_or(0))
-            .saturating_sub(runtime_reserve_bytes)
-    });
+    let runtime_reserve_bytes =
+        infr_llama::seam::estimate_runtime_reserve_bytes(&cfg, planning_context, planning_ubatch);
+    let memory_plan = effective_vram_budget_bytes
+        .zip(kv_bytes)
+        .and_then(|(budget, state)| {
+            infr_llama::seam::ModelMemoryPlan::new(
+                budget,
+                fixed_vram_bytes,
+                state,
+                runtime_reserve_bytes,
+            )
+        });
+    let estimated_cache_room_bytes = memory_plan.map(|plan| plan.expert_cache_bytes);
     let fits_minimum = effective_vram_budget_bytes
         .zip(kv_bytes)
-        .map(|(budget, kv)| {
-            let minimum_weights = if is_moe {
-                // MoE may page most expert weights; keep this deliberately conservative but nonzero.
-                model_bytes.min(2 * 1024 * 1024 * 1024)
-            } else {
-                model_bytes
-            };
-            minimum_weights
-                .saturating_add(kv)
-                .saturating_add(runtime_reserve_bytes)
-                <= budget
+        .map(|(budget, state)| {
+            infr_llama::seam::ModelMemoryPlan::new(
+                budget,
+                fixed_vram_bytes,
+                state,
+                runtime_reserve_bytes,
+            )
+            .is_some_and(|plan| plan.minimum_required_bytes() <= budget)
         });
 
     let mut notes = vec![
@@ -256,6 +258,7 @@ pub fn estimate(
     }
     Ok(MemoryEstimate {
         model_bytes,
+        fixed_vram_bytes: Some(fixed_vram_bytes),
         requested_ram_budget_bytes,
         fits_ram_budget,
         kv_bytes,
@@ -315,6 +318,7 @@ fn estimate_embedding(
     }
     Ok(MemoryEstimate {
         model_bytes,
+        fixed_vram_bytes: (!profile.backend.eq_ignore_ascii_case("cpu")).then_some(model_bytes),
         requested_ram_budget_bytes,
         fits_ram_budget,
         kv_bytes: None,

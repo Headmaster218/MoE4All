@@ -160,7 +160,7 @@ function fillProfile(p) {
 
 async function estimateProfile(profile) {
   const e = await api('/api/estimate',{method:'POST',body:JSON.stringify(profile)});
-  const cards = [['Host 权重上限',e.model_bytes],['RAM 权重预算',e.requested_ram_budget_bytes],['KV Cache',e.kv_bytes],['运行时预留',e.runtime_reserve_bytes],['有效 VRAM 预算',e.effective_vram_budget_bytes],['可用于权重/Expert',e.estimated_cache_room_bytes]];
+  const cards = [['Host 权重上限',e.model_bytes],['固定 VRAM 权重',e.fixed_vram_bytes],['RAM 权重预算',e.requested_ram_budget_bytes],['KV / 持久状态',e.kv_bytes],['运行时预留',e.runtime_reserve_bytes],['有效 VRAM 预算',e.effective_vram_budget_bytes],['Expert Cache',e.estimated_cache_room_bytes]];
   const ramState = e.fits_ram_budget === false ? ' · RAM 预算偏小' : '';
   $('memory-estimate').innerHTML = cards.map(([n,v])=>`<div class="memory-card"><b>${bytes(v)}</b><span>${n}</span></div>`).join('') + `<div class="memory-card"><b>${e.fits_minimum===false?'可能不足':'可规划'}</b><span>${esc(e.architecture||'未知')} · ${e.confidence}${ramState}</span></div>`;
   msg(e.notes.join(' '));

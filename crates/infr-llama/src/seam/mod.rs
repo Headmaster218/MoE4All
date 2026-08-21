@@ -1523,19 +1523,53 @@ pub(crate) fn dense_stream_budget_at(
 /// hundred MiB and the guard rightly refused to over-commit.
 const MOE_ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Bytes left for the MoE expert banks after this model's dense weights, its KV cache and
-/// [`MOE_ACT_HEADROOM`] — against the allocator's ceiling, like every other budget here. `None`
-/// when the dense half alone does not fit, which is not a paging decision but a hard error (dense
-/// layer streaming does not cover an MoE model's dense part).
-pub(crate) fn moe_expert_budget(
-    room: u64,
-    dense: u64,
-    kv: u64,
-    activation_reserve: u64,
-) -> Option<u64> {
-    let base = dense.saturating_add(kv);
-    let headroom = MOE_ACT_HEADROOM.max(activation_reserve);
-    (base <= room).then(|| room.saturating_sub(base.saturating_add(headroom)))
+/// One lightweight account of the VRAM ceiling shared by placement, the loader and control planes.
+/// All inputs are already-resolved logical bytes; this type only prevents consumers from applying
+/// the subtraction in different orders or forgetting one category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelMemoryPlan {
+    pub total_room_bytes: u64,
+    pub fixed_weight_bytes: u64,
+    pub persistent_state_bytes: u64,
+    pub runtime_reserve_bytes: u64,
+    pub expert_cache_bytes: u64,
+}
+
+impl ModelMemoryPlan {
+    pub fn new(
+        total_room_bytes: u64,
+        fixed_weight_bytes: u64,
+        persistent_state_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Option<Self> {
+        let persistent = fixed_weight_bytes.saturating_add(persistent_state_bytes);
+        (persistent <= total_room_bytes).then(|| Self {
+            total_room_bytes,
+            fixed_weight_bytes,
+            persistent_state_bytes,
+            runtime_reserve_bytes,
+            expert_cache_bytes: total_room_bytes
+                .saturating_sub(persistent)
+                .saturating_sub(runtime_reserve_bytes),
+        })
+    }
+
+    pub fn minimum_required_bytes(self) -> u64 {
+        self.fixed_weight_bytes
+            .saturating_add(self.persistent_state_bytes)
+            .saturating_add(self.runtime_reserve_bytes)
+    }
+}
+
+/// Conservative load-time runtime reserve for control planes that do not own a live backend yet.
+/// Placement calls the same activation formula with the selected device's real capabilities.
+pub fn estimate_runtime_reserve_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
+    let activation = dense_act_reserve_at(cfg, &Capabilities::default(), want_ctx, ubatch);
+    if cfg.moe.is_some() || cfg.gemma4_moe {
+        MOE_ACT_HEADROOM.max(activation)
+    } else {
+        activation
+    }
 }
 
 /// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
@@ -1638,7 +1672,7 @@ pub(crate) fn kv_fit_ctx_for(
     // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
     // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
     // MoE keeps the plain `total/12` heuristic: expert banks and pager arenas are budgeted by
-    // `moe_expert_budget`, not by the dense activation reserve.
+    // `ModelMemoryPlan`, not by the dense activation reserve.
     let moe_reserve = cfg
         .moe
         .is_some()
@@ -1950,8 +1984,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // workspace the largest supported Prefill needs at runtime.
         let prefill_4k_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, 4096);
         let runtime_reserve = MOE_ACT_HEADROOM.max(prefill_4k_reserve);
-        let Some(auto_budget) = moe_expert_budget(room, fp.dense, kv_bytes, prefill_4k_reserve)
-        else {
+        let Some(plan) = ModelMemoryPlan::new(room, fp.dense, kv_bytes, runtime_reserve) else {
             return Err(anyhow!(
                 "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed the unified \
                  VRAM room ({:.2} GB after guard/reserve/configured cap) — dense layer streaming \
@@ -1962,6 +1995,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 room as f64 / 1e9,
             ));
         };
+        let auto_budget = plan.expert_cache_bytes;
         match cache_override {
             Some(spec) => {
                 n_paged = cfg.n_layer;
@@ -1989,12 +2023,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
             None => {}
         }
         tracing::info!(
-            "VRAM plan: total_room={:.2} GB fixed={:.2} GB kv={:.2} GB runtime={:.2} GB \
+            "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime={:.2} GB \
              expert_cache={:.2} GB (k={k_fmt:?}, v={v_fmt:?}, ctx={want_ctx})",
             room as f64 / 1e9,
-            fp.dense as f64 / 1e9,
-            kv_bytes as f64 / 1e9,
-            runtime_reserve as f64 / 1e9,
+            plan.fixed_weight_bytes as f64 / 1e9,
+            plan.persistent_state_bytes as f64 / 1e9,
+            plan.runtime_reserve_bytes as f64 / 1e9,
             (if n_paged > 0 {
                 pager_budget_bytes
             } else {
@@ -4797,13 +4831,14 @@ mod seam_helper_tests {
         );
 
         // MoE expert placement: same ceiling, minus the pager's own headroom.
+        let empty = super::ModelMemoryPlan::new(XTX_ROOM, 0, 0, super::MOE_ACT_HEADROOM)
+            .expect("empty plan");
+        assert_eq!(empty.expert_cache_bytes, XTX_ROOM - super::MOE_ACT_HEADROOM);
+        assert_eq!(empty.minimum_required_bytes(), super::MOE_ACT_HEADROOM);
+        let full = super::ModelMemoryPlan::new(XTX_ROOM, XTX_ROOM, 0, 0).expect("full plan");
+        assert_eq!(full.expert_cache_bytes, 0);
         assert_eq!(
-            super::moe_expert_budget(XTX_ROOM, 0, 0, 0),
-            Some(XTX_ROOM - super::MOE_ACT_HEADROOM)
-        );
-        assert_eq!(super::moe_expert_budget(XTX_ROOM, XTX_ROOM, 0, 0), Some(0));
-        assert_eq!(
-            super::moe_expert_budget(XTX_ROOM, XTX_ROOM + 1, 0, 0),
+            super::ModelMemoryPlan::new(XTX_ROOM, XTX_ROOM + 1, 0, 0),
             None,
             "a dense half past the ceiling is a hard error, not a 256 MiB overdraft"
         );

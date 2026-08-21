@@ -199,6 +199,7 @@ pub struct StatusSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryEstimate {
     pub model_bytes: u64,
+    pub fixed_vram_bytes: Option<u64>,
     pub requested_ram_budget_bytes: Option<u64>,
     pub fits_ram_budget: Option<bool>,
     pub kv_bytes: Option<u64>,
