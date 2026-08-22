@@ -2134,7 +2134,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
     let mut moe_host_by_size = std::collections::BTreeMap::<
         usize,
-        std::sync::Arc<infr_core::hostpager::ExclusiveHostCache>,
+        std::sync::Arc<infr_core::hostpager::InclusiveHostCache>,
     >::new();
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
@@ -2261,8 +2261,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // The Host tier has two honest modes. If the configured/automatic RAM budget covers
             // the whole expert payload, retain the existing layer-contiguous store (fastest
             // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
-            // caches and leave the remaining Experts on SSD. VRAM and those RAM caches are
-            // exclusive: a promotion consumes its RAM slot and the displaced VRAM block takes it.
+            // caches and leave the remaining Experts on SSD. GPU-resident Experts retain a pinned
+            // RAM shadow when capacity permits, making GPU eviction metadata-only.
             let requested = infr_core::hostmem::Requested::from_config(
                 ec.paging.dram.map(|s| s.resolve(0)),
                 ec.paging.dram_bypass,
@@ -2287,7 +2287,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 for (&(slot_bytes, _, _), &slots) in logical_pools.iter().zip(&ram_slots) {
-                    let cache = infr_core::hostpager::ExclusiveHostCache::new(
+                    let cache = infr_core::hostpager::InclusiveHostCache::new(
                         slots,
                         slot_bytes,
                         io.clone(),
@@ -2296,7 +2296,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     moe_host_by_size.insert(slot_bytes, std::sync::Arc::new(cache));
                 }
                 tracing::info!(
-                    "MoE host plan: bounded exclusive RAM cache {:.2} GB / {:.2} GB expert payload; remaining Experts stream from SSD",
+                    "MoE host plan: bounded inclusive RAM cache {:.2} GB / {:.2} GB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
                     ram_budget as f64 / 1e9,
                     host_bytes as f64 / 1e9,
                 );
@@ -2387,7 +2387,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 pool_desc.join(", "),
                 pager_budget_bytes as f64 / 1e9,
                 if bounded_host {
-                    "exclusive-RAM/SSD"
+                    "inclusive-RAM/SSD"
                 } else {
                     "full-RAM"
                 },

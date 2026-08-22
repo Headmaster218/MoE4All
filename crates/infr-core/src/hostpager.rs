@@ -221,39 +221,45 @@ pub struct HostPager {
     streamed: AtomicU64,
 }
 
-/// Activity of the exclusive RAM tier used underneath the discrete-GPU MoE cache. Unlike
-/// [`HostPagerStats`], these counters describe promotions and demotions rather than independent
-/// cache fills: an Expert exists in VRAM OR in this arena, never both after an exchange settles.
+/// Activity of the inclusive RAM tier used underneath the discrete-GPU MoE cache. GPU-resident
+/// blocks remain pinned in this arena when capacity permits, so an upper-tier eviction releases a
+/// shadow rather than copying immutable bytes back from mapped VRAM.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ExclusiveHostStats {
+pub struct InclusiveHostStats {
     pub preload_reads: u64,
     pub bytes_preloaded: u64,
     pub ram_hits: u64,
     pub ssd_reads: u64,
     pub ram_evictions: u64,
-    pub demotions: u64,
+    pub gpu_evictions: u64,
+    pub shadow_promotions: u64,
+    pub shadow_releases: u64,
+    pub shadow_resident: usize,
     pub bytes_read: u64,
     pub bytes_promoted: u64,
-    pub bytes_demoted: u64,
 }
 
-struct ExclusiveInner {
+struct InclusiveInner {
     pager: Option<Pager>,
     state: HashMap<BlockId, SlotState>,
     descs: HashMap<BlockId, BlockDesc>,
+    /// GPU-resident blocks whose immutable bytes are retained in the host arena. Each member owns
+    /// exactly one long-lived Pager pin and therefore cannot be selected as a cold RAM victim.
+    shadows: HashSet<BlockId>,
     /// One per-size-class read buffer. It is transient working memory, not a weight mirror: an
-    /// SSD miss is read here, pushed upward, and immediately reusable.
+    /// SSD miss uses it only when every RAM slot is already pinned by another GPU shadow.
     scratch: Box<[u8]>,
 }
 
-/// Fixed-budget, EXCLUSIVE RAM victim cache beneath a faster cache of the same uniform blocks.
+/// Fixed-budget, inclusive RAM cache beneath a faster cache of the same uniform blocks.
 ///
-/// A promotion always happens before the old upper-tier victim is copied down. On a RAM hit the
-/// victim takes the promoted block's exact slot; on an SSD hit it takes a free slot or replaces
-/// the RAM LRU. The resulting two physical lists are therefore exactly the two contiguous
-/// segments of one logical LRU: hot VRAM entries followed by warm RAM entries.
-pub struct ExclusiveHostCache {
-    inner: Mutex<ExclusiveInner>,
+/// A promoted block stays in RAM and is pinned while it remains in GPU cache. When the GPU evicts
+/// it, the pin is released and the same bytes become the MRU cold entry. This spends part of the
+/// RAM budget on GPU shadows but makes GPU eviction metadata-only: no CPU read from mapped ReBAR.
+/// If RAM has fewer slots than the GPU cache, additional GPU residents stream from SSD through the
+/// scratch buffer and simply have no shadow; correctness never depends on a shadow being present.
+pub struct InclusiveHostCache {
+    inner: Mutex<InclusiveInner>,
     ready: Condvar,
     arena: Arena,
     io: Arc<dyn BlockIo>,
@@ -263,52 +269,28 @@ pub struct ExclusiveHostCache {
     ram_hits: AtomicU64,
     ssd_reads: AtomicU64,
     ram_evictions: AtomicU64,
-    demotions: AtomicU64,
+    gpu_evictions: AtomicU64,
+    shadow_promotions: AtomicU64,
+    shadow_releases: AtomicU64,
     bytes_read: AtomicU64,
     bytes_promoted: AtomicU64,
-    bytes_demoted: AtomicU64,
 }
 
-/// Deferred second half of one exclusive promotion. The requested bytes have already reached
-/// the upper-tier exchange slot; executing this job copies the old upper-tier victim into the RAM
-/// slot reserved for it and marks that block ready. Raw addresses are stable because both arenas
-/// are fixed-size allocations owned for longer than the worker that executes the job.
-pub struct ExclusiveDemotion {
-    cache: Arc<ExclusiveHostCache>,
-    id: BlockId,
-    src: usize,
-    dst: usize,
-    len: usize,
-}
-
-// SAFETY: the job owns no Rust references. `src` is an upper-tier slot kept reserved until the
-// worker completes; `dst` is a RAM slot in `Loading` state and cannot be read or evicted. The
-// cache and its arena stay alive through the Arc.
-unsafe impl Send for ExclusiveDemotion {}
-
-impl ExclusiveDemotion {
-    pub fn execute(self) {
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.src as *const u8, self.dst as *mut u8, self.len);
-        }
-        self.cache.finish_demotion(self.id, self.len);
-    }
-}
-
-impl ExclusiveHostCache {
+impl InclusiveHostCache {
     /// Build one RAM size class. `n_slots == 0` is a valid SSD-through mode; the one-block
-    /// scratch still lets a miss be read before its VRAM victim is released.
+    /// scratch still lets a miss be uploaded without retaining a host shadow.
     pub fn new(n_slots: usize, slot_bytes: usize, io: Arc<dyn BlockIo>) -> Result<Self> {
         if slot_bytes == 0 {
             return Err(Error::backend(
-                "exclusive host cache needs a non-zero block stride".to_string(),
+                "inclusive host cache needs a non-zero block stride".to_string(),
             ));
         }
         Ok(Self {
-            inner: Mutex::new(ExclusiveInner {
+            inner: Mutex::new(InclusiveInner {
                 pager: (n_slots > 0).then(|| Pager::new(n_slots)),
                 state: HashMap::new(),
                 descs: HashMap::new(),
+                shadows: HashSet::new(),
                 scratch: vec![0u8; slot_bytes].into_boxed_slice(),
             }),
             ready: Condvar::new(),
@@ -320,10 +302,11 @@ impl ExclusiveHostCache {
             ram_hits: AtomicU64::new(0),
             ssd_reads: AtomicU64::new(0),
             ram_evictions: AtomicU64::new(0),
-            demotions: AtomicU64::new(0),
+            gpu_evictions: AtomicU64::new(0),
+            shadow_promotions: AtomicU64::new(0),
+            shadow_releases: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             bytes_promoted: AtomicU64::new(0),
-            bytes_demoted: AtomicU64::new(0),
         })
     }
 
@@ -331,7 +314,7 @@ impl ExclusiveHostCache {
         let n = desc.nbytes();
         if n > self.slot_bytes {
             return Err(Error::backend(format!(
-                "exclusive host cache: block {} is {n} bytes, slot stride is {}",
+                "inclusive host cache: block {} is {n} bytes, slot stride is {}",
                 desc.id, self.slot_bytes
             )));
         }
@@ -356,17 +339,20 @@ impl ExclusiveHostCache {
         self.arena.total / self.slot_bytes
     }
 
-    pub fn stats(&self) -> ExclusiveHostStats {
-        ExclusiveHostStats {
+    pub fn stats(&self) -> InclusiveHostStats {
+        let shadow_resident = self.inner.lock().unwrap().shadows.len();
+        InclusiveHostStats {
             preload_reads: self.preload_reads.load(Ordering::Relaxed),
             bytes_preloaded: self.bytes_preloaded.load(Ordering::Relaxed),
             ram_hits: self.ram_hits.load(Ordering::Relaxed),
             ssd_reads: self.ssd_reads.load(Ordering::Relaxed),
             ram_evictions: self.ram_evictions.load(Ordering::Relaxed),
-            demotions: self.demotions.load(Ordering::Relaxed),
+            gpu_evictions: self.gpu_evictions.load(Ordering::Relaxed),
+            shadow_promotions: self.shadow_promotions.load(Ordering::Relaxed),
+            shadow_releases: self.shadow_releases.load(Ordering::Relaxed),
+            shadow_resident,
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             bytes_promoted: self.bytes_promoted.load(Ordering::Relaxed),
-            bytes_demoted: self.bytes_demoted.load(Ordering::Relaxed),
         }
     }
 
@@ -374,8 +360,8 @@ impl ExclusiveHostCache {
     ///
     /// This is a cold-load operation: callers choose the block set and invoke it after all model
     /// banks are registered but before execution starts. It seeds the same Pager/LRU used by
-    /// [`Self::promote`], so a later request is an ordinary RAM hit and the existing exclusive
-    /// exchange semantics take over unchanged. Already-ready ids are harmless and skipped.
+    /// [`Self::promote`], so a later request is an ordinary RAM hit and can become a pinned GPU
+    /// shadow without another disk read. Already-ready ids are harmless and skipped.
     pub fn preload(&self, ids: &[BlockId]) -> Result<(usize, usize)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.pager.is_none() || ids.is_empty() {
@@ -393,14 +379,14 @@ impl ExclusiveHostCache {
             }
             let desc = inner.descs.get(&id).cloned().ok_or_else(|| {
                 Error::backend(format!(
-                    "exclusive host cache: preload block {id} was never registered"
+                    "inclusive host cache: preload block {id} was never registered"
                 ))
             })?;
             let len = desc.nbytes();
             let pager = inner.pager.as_mut().expect("preload checked the arena");
             if pager.resident_count() >= self.n_slots() {
                 return Err(Error::backend(format!(
-                    "exclusive host cache: preload selected more than {} RAM slots",
+                    "inclusive host cache: preload selected more than {} RAM slots",
                     self.n_slots()
                 )));
             }
@@ -411,7 +397,7 @@ impl ExclusiveHostCache {
                 }
                 Resolution::Hit { .. } => {
                     return Err(Error::backend(format!(
-                        "exclusive host cache: preload block {id} is resident without ready bytes"
+                        "inclusive host cache: preload block {id} is resident without ready bytes"
                     )));
                 }
             };
@@ -441,31 +427,36 @@ impl ExclusiveHostCache {
         Ok((loaded, bytes))
     }
 
-    /// Promote `requested` through `upload`, then reserve a RAM slot for `demoted` and return the
-    /// deferred VRAM->RAM copy. This order is deliberate: the upper tier writes into its spare
-    /// slot first, so the old victim remains intact until its new RAM destination is available.
-    ///
-    /// `demoted` is `(block id, mapped upper-tier source address)`. `None` is the warm-up case
-    /// where the upper tier still had a genuinely free ordinary slot.
-    pub fn promote<U>(
-        self: &Arc<Self>,
-        requested: BlockId,
-        demoted: Option<(BlockId, usize)>,
-        upload: U,
-    ) -> Result<Option<ExclusiveDemotion>>
+    /// Promote `requested` through `upload` while retaining its RAM bytes as a pinned GPU shadow.
+    /// `evicted` is released to the cold RAM LRU before resolving the request, making one host slot
+    /// eligible even when every retained byte was previously a shadow. No upper-tier bytes are
+    /// ever read. `None` is the warm-up case where the GPU still had a free ordinary slot.
+    pub fn promote<U>(&self, requested: BlockId, evicted: Option<BlockId>, upload: U) -> Result<()>
     where
         U: FnOnce(&[u8]) -> Result<()>,
     {
+        let prof = pager_profile::active();
         let mut inner = self.inner.lock().unwrap();
         while inner.state.get(&requested) == Some(&SlotState::Loading) {
+            let wait_t0 = prof.then(std::time::Instant::now);
             inner = self.ready.wait(inner).unwrap();
+            if let Some(t0) = wait_t0 {
+                pager_profile::record_host_wait(t0.elapsed());
+            }
         }
         let desc = inner.descs.get(&requested).cloned().ok_or_else(|| {
             Error::backend(format!(
-                "exclusive host cache: block {requested} was never registered"
+                "inclusive host cache: block {requested} was never registered"
             ))
         })?;
         let len = desc.nbytes();
+
+        if let Some(victim) = evicted {
+            self.gpu_evictions.fetch_add(1, Ordering::Relaxed);
+            if Self::release_shadow_locked(&mut inner, victim) {
+                self.shadow_releases.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         let ram_slot = inner
             .state
@@ -473,108 +464,129 @@ impl ExclusiveHostCache {
             .filter(|&&state| state == SlotState::Ready)
             .and_then(|_| inner.pager.as_ref()?.slot_of(requested));
         if let Some(slot) = ram_slot {
-            let src = unsafe { self.arena.slot_ref(slot, len) };
-            upload(src)?;
-            self.ram_hits.fetch_add(1, Ordering::Relaxed);
-            self.bytes_promoted.fetch_add(len as u64, Ordering::Relaxed);
-
-            inner.state.remove(&requested);
-            if let Some((victim, victim_src)) = demoted {
-                let victim_len =
-                    inner
-                        .descs
-                        .get(&victim)
-                        .map(BlockDesc::nbytes)
-                        .ok_or_else(|| {
-                            Error::backend(format!(
-                                "exclusive host cache: demoted block {victim} was never registered"
-                            ))
-                        })?;
-                if victim_len != len {
-                    return Err(Error::backend(format!(
-                        "exclusive host cache: cannot exchange {len}-byte block {requested} with \
-                         {victim_len}-byte block {victim}"
-                    )));
-                }
-                let pager = inner.pager.as_mut().expect("RAM hit requires an arena");
-                let replaced = pager.replace_resident(requested, victim, Insert::Mru);
-                debug_assert_eq!(replaced, Some(slot));
-                inner.state.insert(victim, SlotState::Loading);
-                self.demotions.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(ExclusiveDemotion {
-                    cache: Arc::clone(self),
-                    id: victim,
-                    src: victim_src,
-                    dst: self.arena.slot_ptr(slot, victim_len) as usize,
-                    len: victim_len,
-                }));
-            }
-            let removed = inner
+            let pinned_slot = inner
                 .pager
                 .as_mut()
-                .expect("RAM hit requires an arena")
-                .evict(requested);
-            debug_assert_eq!(removed, Some(slot));
-            return Ok(None);
+                .and_then(|pager| pager.pin_if_resident(requested))
+                .expect("ready RAM resident must still have a pager slot");
+            debug_assert_eq!(pinned_slot, slot);
+            let inserted = inner.shadows.insert(requested);
+            debug_assert!(inserted, "GPU miss requested an existing host shadow");
+            let src = unsafe { self.arena.slot_ref(slot, len) };
+            if let Err(err) = upload(src) {
+                inner.shadows.remove(&requested);
+                inner
+                    .pager
+                    .as_mut()
+                    .expect("RAM hit requires an arena")
+                    .unpin(requested);
+                return Err(err);
+            }
+            self.ram_hits.fetch_add(1, Ordering::Relaxed);
+            self.bytes_promoted.fetch_add(len as u64, Ordering::Relaxed);
+            self.shadow_promotions.fetch_add(1, Ordering::Relaxed);
+            if prof {
+                pager_profile::record_host_hit(len);
+            }
+            return Ok(());
         }
 
-        // SSD miss: finish the read and upward copy before reserving/overwriting any RAM slot.
-        self.io.read_block(&desc, &mut inner.scratch[..len])?;
-        upload(&inner.scratch[..len])?;
+        // Admit the SSD result directly into an eligible cold RAM slot. If all host slots are
+        // shadows (possible when the RAM budget is smaller than GPU capacity), stream through the
+        // scratch buffer and leave this GPU resident unshadowed.
+        let admission = inner
+            .pager
+            .as_mut()
+            .and_then(|pager| pager.resolve_and_pin(requested, Insert::Mru));
+        if let Some(Resolution::Miss { slot, evicted }) = admission {
+            let host_evicted = evicted.is_some();
+            if let Some(old) = evicted {
+                let removed = inner.state.remove(&old);
+                debug_assert_eq!(removed, Some(SlotState::Ready));
+                self.ram_evictions.fetch_add(1, Ordering::Relaxed);
+            }
+            inner.state.insert(requested, SlotState::Loading);
+            let dst = unsafe { self.arena.slot_mut(slot, len) };
+            let read_t0 = prof.then(std::time::Instant::now);
+            if let Err(err) = self.io.read_block(&desc, dst) {
+                inner.state.remove(&requested);
+                let pager = inner.pager.as_mut().expect("admission requires an arena");
+                pager.unpin(requested);
+                let removed = pager.evict(requested);
+                debug_assert_eq!(removed, Some(slot));
+                drop(inner);
+                self.ready.notify_all();
+                return Err(err);
+            }
+            if let Some(t0) = read_t0 {
+                pager_profile::record_host_read(len, t0.elapsed(), false);
+            }
+            if let Err(err) = upload(dst) {
+                inner.state.remove(&requested);
+                let pager = inner.pager.as_mut().expect("admission requires an arena");
+                pager.unpin(requested);
+                let removed = pager.evict(requested);
+                debug_assert_eq!(removed, Some(slot));
+                drop(inner);
+                self.ready.notify_all();
+                return Err(err);
+            }
+            inner.state.insert(requested, SlotState::Ready);
+            let inserted = inner.shadows.insert(requested);
+            debug_assert!(inserted);
+            self.shadow_promotions.fetch_add(1, Ordering::Relaxed);
+            if prof {
+                pager_profile::record_host_miss(len, host_evicted);
+            }
+            self.ready.notify_all();
+        } else if admission.is_none() {
+            let read_t0 = prof.then(std::time::Instant::now);
+            self.io.read_block(&desc, &mut inner.scratch[..len])?;
+            if let Some(t0) = read_t0 {
+                pager_profile::record_host_read(len, t0.elapsed(), true);
+            }
+            upload(&inner.scratch[..len])?;
+            if prof {
+                pager_profile::record_host_miss(len, false);
+            }
+        } else {
+            return Err(Error::backend(format!(
+                "inclusive host cache: block {requested} became resident without ready bytes"
+            )));
+        }
         self.ssd_reads.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
         self.bytes_promoted.fetch_add(len as u64, Ordering::Relaxed);
-
-        let Some((victim, victim_src)) = demoted else {
-            return Ok(None);
-        };
-        let victim_len = inner
-            .descs
-            .get(&victim)
-            .map(BlockDesc::nbytes)
-            .ok_or_else(|| {
-                Error::backend(format!(
-                    "exclusive host cache: demoted block {victim} was never registered"
-                ))
-            })?;
-        if victim_len != len {
-            return Err(Error::backend(format!(
-                "exclusive host cache: size-class mismatch {len} vs {victim_len}"
-            )));
-        }
-        let Some(pager) = inner.pager.as_mut() else {
-            return Ok(None); // zero-RAM direct SSD -> VRAM mode
-        };
-        let (slot, evicted) = match pager.touch(victim) {
-            Resolution::Miss { slot, evicted } => (slot, evicted),
-            Resolution::Hit { .. } => {
-                return Err(Error::backend(format!(
-                    "exclusive host cache: VRAM victim {victim} was already in RAM"
-                )))
-            }
-        };
-        if let Some(old) = evicted {
-            inner.state.remove(&old);
-            self.ram_evictions.fetch_add(1, Ordering::Relaxed);
-        }
-        inner.state.insert(victim, SlotState::Loading);
-        self.demotions.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(ExclusiveDemotion {
-            cache: Arc::clone(self),
-            id: victim,
-            src: victim_src,
-            dst: self.arena.slot_ptr(slot, victim_len) as usize,
-            len: victim_len,
-        }))
+        Ok(())
     }
 
-    fn finish_demotion(&self, id: BlockId, len: usize) {
+    /// Notify the host tier that GPU residency ended outside ordinary decode replacement, such as
+    /// unified-arena borrowing or a Prefill lane overwriting Decode slots.
+    pub fn release_gpu_blocks(&self, ids: &[BlockId]) {
+        if ids.is_empty() {
+            return;
+        }
         let mut inner = self.inner.lock().unwrap();
-        debug_assert_eq!(inner.state.get(&id), Some(&SlotState::Loading));
-        inner.state.insert(id, SlotState::Ready);
-        self.bytes_demoted.fetch_add(len as u64, Ordering::Relaxed);
-        drop(inner);
-        self.ready.notify_all();
+        let mut released = 0u64;
+        for &id in ids {
+            released += u64::from(Self::release_shadow_locked(&mut inner, id));
+        }
+        self.gpu_evictions
+            .fetch_add(ids.len() as u64, Ordering::Relaxed);
+        self.shadow_releases.fetch_add(released, Ordering::Relaxed);
+    }
+
+    fn release_shadow_locked(inner: &mut InclusiveInner, id: BlockId) -> bool {
+        if !inner.shadows.remove(&id) {
+            return false;
+        }
+        debug_assert_eq!(inner.state.get(&id), Some(&SlotState::Ready));
+        inner
+            .pager
+            .as_mut()
+            .expect("a host shadow requires an arena")
+            .unpin_mru(id);
+        true
     }
 
     /// Read a whole Prefill bank without admitting its individual Experts into the Decode LRU.
@@ -1153,175 +1165,150 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_cache_promotes_first_and_reuses_the_freed_ram_slot() {
+    fn inclusive_cache_preload_becomes_gpu_shadows_without_runtime_reads() {
         let io = Arc::new(FakeIo::new());
-        let cache = Arc::new(ExclusiveHostCache::new(1, 16, io.clone()).expect("cache"));
-        for id in 1..=3 {
-            cache.register(desc(id, 16)).expect("register");
-        }
-
-        // Cold block 1 goes SSD -> VRAM. There was no VRAM victim yet, so RAM remains empty.
-        let mut promoted = [0u8; 16];
-        assert!(cache
-            .promote(1, None, |bytes| {
-                promoted.copy_from_slice(bytes);
-                Ok(())
-            })
-            .expect("promote 1")
-            .is_none());
-        assert_eq!(promoted, [1u8; 16]);
-
-        // Block 2 is read and promoted BEFORE block 1 is copied down into the sole RAM slot.
-        let vram_one = [1u8; 16];
-        let mut promoted = [0u8; 16];
-        let demotion = cache
-            .promote(2, Some((1, vram_one.as_ptr() as usize)), |bytes| {
-                promoted.copy_from_slice(bytes);
-                Ok(())
-            })
-            .expect("promote 2")
-            .expect("victim demotion");
-        assert_eq!(promoted, [2u8; 16]);
-        demotion.execute();
-
-        // Promoting 1 now hits RAM (no third disk read), and block 2 takes the same RAM slot.
-        let vram_two = [2u8; 16];
-        let demotion = cache
-            .promote(1, Some((2, vram_two.as_ptr() as usize)), |bytes| {
-                promoted.copy_from_slice(bytes);
-                Ok(())
-            })
-            .expect("promote 1 from RAM")
-            .expect("second victim demotion");
-        assert_eq!(promoted, [1u8; 16]);
-        demotion.execute();
-
-        let stats = cache.stats();
-        assert_eq!(stats.ssd_reads, 2);
-        assert_eq!(stats.ram_hits, 1);
-        assert_eq!(stats.demotions, 2);
-        assert_eq!(stats.ram_evictions, 0);
-        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn exclusive_cache_preload_seeds_real_ram_hits_without_runtime_ssd_reads() {
-        let io = Arc::new(FakeIo::new());
-        let cache = Arc::new(ExclusiveHostCache::new(2, 16, io.clone()).expect("cache"));
+        let cache = InclusiveHostCache::new(2, 16, io.clone()).expect("cache");
         for id in 1..=3 {
             cache.register(desc(id, 16)).expect("register");
         }
 
         assert_eq!(cache.preload(&[1, 3]).expect("preload"), (2, 32));
-        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
-
         let mut promoted = [0u8; 16];
-        assert!(cache
-            .promote(3, None, |bytes| {
-                promoted.copy_from_slice(bytes);
-                Ok(())
-            })
-            .expect("preloaded RAM promotion")
-            .is_none());
-        assert_eq!(promoted, [3u8; 16]);
-        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+        for (requested, victim) in [(3, None), (1, Some(3)), (3, Some(1))] {
+            cache
+                .promote(requested, victim, |bytes| {
+                    promoted.copy_from_slice(bytes);
+                    Ok(())
+                })
+                .expect("RAM promotion");
+            assert_eq!(promoted, [requested as u8; 16]);
+        }
 
         let stats = cache.stats();
         assert_eq!(stats.preload_reads, 2);
         assert_eq!(stats.bytes_preloaded, 32);
-        assert_eq!(stats.ram_hits, 1);
+        assert_eq!(stats.ram_hits, 3);
         assert_eq!(stats.ssd_reads, 0);
+        assert_eq!(stats.gpu_evictions, 2);
+        assert_eq!(stats.shadow_promotions, 3);
+        assert_eq!(stats.shadow_releases, 2);
+        assert_eq!(stats.shadow_resident, 1);
+        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn exclusive_cache_evicts_ram_lru_only_after_an_ssd_promotion() {
+    fn inclusive_cache_evicts_cold_ram_but_never_a_gpu_shadow() {
         let io = Arc::new(FakeIo::new());
-        let cache = Arc::new(ExclusiveHostCache::new(1, 16, io.clone()).expect("cache"));
+        let cache = InclusiveHostCache::new(2, 16, io.clone()).expect("cache");
         for id in 1..=3 {
             cache.register(desc(id, 16)).expect("register");
         }
+        cache.preload(&[1, 2]).expect("preload");
 
-        let mut promoted = [0u8; 16];
+        cache.promote(1, None, |_| Ok(())).expect("shadow 1");
         cache
-            .promote(1, None, |bytes| {
-                promoted.copy_from_slice(bytes);
-                Ok(())
-            })
-            .expect("SSD -> VRAM 1");
-        let vram_one = [1u8; 16];
-        cache
-            .promote(2, Some((1, vram_one.as_ptr() as usize)), |bytes| {
-                promoted.copy_from_slice(bytes);
-                Ok(())
-            })
-            .expect("SSD -> VRAM 2")
-            .expect("demote 1")
-            .execute();
-
-        // RAM currently holds 1. The SSD read of 3 must complete before 1 is evicted and before
-        // the old VRAM block 2 is installed in that slot.
-        let vram_two = [2u8; 16];
-        cache
-            .promote(3, Some((2, vram_two.as_ptr() as usize)), |bytes| {
+            .promote(3, Some(1), |bytes| {
                 assert_eq!(bytes, &[3u8; 16]);
-                promoted.copy_from_slice(bytes);
                 Ok(())
             })
-            .expect("SSD -> VRAM 3")
-            .expect("demote 2")
-            .execute();
-
-        // The newly demoted block is now the RAM resident. Bringing it back is a hit, not a
-        // fourth file read, and the former VRAM block takes precisely the slot it releases.
-        let vram_three = [3u8; 16];
+            .expect("SSD promotion 3");
         cache
-            .promote(2, Some((3, vram_three.as_ptr() as usize)), |bytes| {
-                assert_eq!(bytes, &[2u8; 16]);
+            .promote(1, Some(3), |bytes| {
+                assert_eq!(bytes, &[1u8; 16]);
                 Ok(())
             })
-            .expect("RAM -> VRAM 2")
-            .expect("demote 3")
-            .execute();
+            .expect("retained cold block 1");
 
         let stats = cache.stats();
-        assert_eq!(stats.ssd_reads, 3);
-        assert_eq!(stats.ram_hits, 1);
+        assert_eq!(stats.ram_hits, 2);
+        assert_eq!(stats.ssd_reads, 1);
         assert_eq!(stats.ram_evictions, 1);
-        assert_eq!(stats.demotions, 3);
+        assert_eq!(stats.gpu_evictions, 2);
+        assert_eq!(stats.shadow_resident, 1);
         assert_eq!(io.reads.load(Ordering::SeqCst), 3);
     }
 
     #[test]
-    fn exclusive_zero_ram_mode_reads_first_and_discards_the_victim() {
+    fn inclusive_cache_streams_when_every_host_slot_is_a_shadow() {
         let io = Arc::new(FakeIo::new());
-        let cache = Arc::new(ExclusiveHostCache::new(0, 16, io.clone()).expect("cache"));
+        let cache = InclusiveHostCache::new(2, 16, io.clone()).expect("cache");
+        for id in 1..=4 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+
+        for id in [1, 2, 3] {
+            cache
+                .promote(id, None, |bytes| {
+                    assert_eq!(bytes, &[id as u8; 16]);
+                    Ok(())
+                })
+                .expect("warm GPU promotion");
+        }
+        cache
+            .promote(4, Some(3), |bytes| {
+                assert_eq!(bytes, &[4u8; 16]);
+                Ok(())
+            })
+            .expect("unshadowed victim");
+        cache
+            .promote(3, Some(1), |bytes| {
+                assert_eq!(bytes, &[3u8; 16]);
+                Ok(())
+            })
+            .expect("released shadow makes an admission slot");
+
+        let stats = cache.stats();
+        assert_eq!(stats.ssd_reads, 5);
+        assert_eq!(stats.ram_evictions, 1);
+        assert_eq!(stats.gpu_evictions, 2);
+        assert_eq!(stats.shadow_promotions, 3);
+        assert_eq!(stats.shadow_releases, 1);
+        assert_eq!(stats.shadow_resident, 2);
+    }
+
+    #[test]
+    fn inclusive_cache_external_gpu_release_makes_shadow_cold() {
+        let io = Arc::new(FakeIo::new());
+        let cache = InclusiveHostCache::new(2, 16, io.clone()).expect("cache");
+        for id in 1..=3 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+        cache.preload(&[1, 2]).expect("preload");
+        cache.promote(1, None, |_| Ok(())).expect("shadow 1");
+        cache.promote(2, None, |_| Ok(())).expect("shadow 2");
+
+        cache.release_gpu_blocks(&[1]);
+        cache.promote(3, None, |_| Ok(())).expect("admit 3");
+
+        let stats = cache.stats();
+        assert_eq!(stats.gpu_evictions, 1);
+        assert_eq!(stats.shadow_releases, 1);
+        assert_eq!(stats.shadow_resident, 2);
+        assert_eq!(stats.ram_evictions, 1);
+    }
+
+    #[test]
+    fn inclusive_zero_ram_mode_streams_and_drops_gpu_victims() {
+        let io = Arc::new(FakeIo::new());
+        let cache = InclusiveHostCache::new(0, 16, io.clone()).expect("cache");
         for id in 1..=2 {
             cache.register(desc(id, 16)).expect("register");
         }
 
-        let mut promoted = [0u8; 16];
         for (requested, victim) in [(1, None), (2, Some(1)), (1, Some(2))] {
-            let old = victim.map(|id| (id, [id as u8; 16]));
-            let demotion = cache
-                .promote(
-                    requested,
-                    old.as_ref()
-                        .map(|(id, bytes)| (*id, bytes.as_ptr() as usize)),
-                    |bytes| {
-                        assert_eq!(bytes, &[requested as u8; 16]);
-                        promoted.copy_from_slice(bytes);
-                        Ok(())
-                    },
-                )
+            cache
+                .promote(requested, victim, |bytes| {
+                    assert_eq!(bytes, &[requested as u8; 16]);
+                    Ok(())
+                })
                 .expect("direct SSD promotion");
-            assert!(demotion.is_none(), "zero RAM must not retain the victim");
         }
-        assert_eq!(promoted, [1u8; 16]);
         let stats = cache.stats();
         assert_eq!(stats.ssd_reads, 3);
         assert_eq!(stats.ram_hits, 0);
-        assert_eq!(stats.demotions, 0);
-        assert_eq!(stats.ram_evictions, 0);
+        assert_eq!(stats.gpu_evictions, 2);
+        assert_eq!(stats.shadow_promotions, 0);
+        assert_eq!(stats.shadow_resident, 0);
         assert_eq!(cache.arena_bytes(), 0);
         assert_eq!(io.reads.load(Ordering::SeqCst), 3);
     }

@@ -39,7 +39,7 @@ use ash::vk;
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::blockio::BlockDesc;
 use infr_core::error::Result;
-use infr_core::hostpager::{ExclusiveDemotion, ExclusiveHostCache, HostPager};
+use infr_core::hostpager::{HostPager, InclusiveHostCache};
 use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::pager_profile;
 use infr_core::Backend;
@@ -128,9 +128,9 @@ struct CpuPushPlan {
     evicted: Option<BlockId>,
 }
 
-struct ExclusiveCpuPushPlan {
+struct InclusiveCpuPushPlan {
     dst: usize,
-    demoted: Option<(BlockId, usize)>,
+    evicted: Option<BlockId>,
 }
 
 impl GpuPager {
@@ -421,11 +421,12 @@ impl GpuPager {
             .collect()
     }
 
-    fn loan_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn loan_slots(&mut self, slots: &[usize]) -> Result<Vec<BlockId>> {
         let unified = self
             .unified
             .as_mut()
             .ok_or_else(|| be("cannot loan a slot from a legacy pager arena"))?;
+        let mut victims = Vec::new();
         for &slot in slots {
             if unified.slots[slot].allocation.is_none() {
                 continue;
@@ -436,6 +437,7 @@ impl GpuPager {
                 ));
             }
             if let Some(evicted) = self.pager.disable_slot(slot as u32) {
+                victims.push(evicted);
                 if let Some(entry) = self.lut_host.get_mut(evicted as usize) {
                     *entry = NOT_RESIDENT;
                 }
@@ -443,7 +445,7 @@ impl GpuPager {
             }
             unified.slots[slot].allocation.take();
         }
-        Ok(())
+        Ok(victims)
     }
 
     fn try_restore_loaned_slots(&mut self) -> usize {
@@ -486,7 +488,7 @@ impl GpuPager {
     /// Invalidate only Decode entries whose physical slots overlap one temporary Prefill byte
     /// range. The arena allocation itself is unchanged and the released slots return to the
     /// ordinary free list, ready for Decode after the ring phase ends.
-    fn evict_virtual_range(&mut self, offset: usize, bytes: usize) -> Result<usize> {
+    fn evict_virtual_range(&mut self, offset: usize, bytes: usize) -> Result<Vec<BlockId>> {
         let end = offset
             .checked_add(bytes)
             .ok_or_else(|| be("prefill reservation byte range overflow"))?;
@@ -513,7 +515,7 @@ impl GpuPager {
         if !victims.is_empty() {
             self.lut_dirty = true;
         }
-        Ok(victims.len())
+        Ok(victims)
     }
 
     /// Translate a virtual byte range in the concatenated logical pool to one physical arena.
@@ -677,7 +679,7 @@ impl GpuPager {
     /// promotion rotates into it; the evicted slot then becomes the next disabled spare.
     fn reserve_exchange_slot(&mut self) -> Result<u32> {
         if self.pager.n_slots() < 2 {
-            return Err(be("exclusive MoE cache needs at least two physical slots"));
+            return Err(be("tiered MoE cache needs at least two physical slots"));
         }
         let slot = (self.pager.n_slots() - 1) as u32;
         let resident = self.pager.disable_slot(slot);
@@ -688,16 +690,15 @@ impl GpuPager {
         Ok(slot)
     }
 
-    /// Resolve one exclusive VRAM/RAM promotion. A full-cache miss is written into the currently
-    /// disabled exchange slot; the old LRU slot remains byte-for-byte intact and is returned as
-    /// the demotion source. Only after the caller has copied the requested bytes upward may that
-    /// old slot be copied down and recycled as the next exchange slot.
-    fn plan_exclusive_cpu_push(
+    /// Resolve one inclusive VRAM/RAM promotion. A full-cache miss is written into the currently
+    /// disabled exchange slot, then the old LRU slot immediately becomes the next spare. The host
+    /// tier already retains immutable shadow bytes, so only the victim id crosses this boundary.
+    fn plan_inclusive_cpu_push(
         &mut self,
         id: BlockId,
         exchange_slot: &mut u32,
         scan: bool,
-    ) -> Result<Option<ExclusiveCpuPushPlan>> {
+    ) -> Result<Option<InclusiveCpuPushPlan>> {
         let prof = pager_profile::active();
         let lookup_t0 = prof.then(std::time::Instant::now);
         let resolution = if scan {
@@ -719,9 +720,9 @@ impl GpuPager {
                 evicted: None,
             } => {
                 self.record_placement(id, slot, None);
-                Ok(Some(ExclusiveCpuPushPlan {
+                Ok(Some(InclusiveCpuPushPlan {
                     dst: self.slot_mapped_ptr(slot)?,
-                    demoted: None,
+                    evicted: None,
                 }))
             }
             Resolution::Miss {
@@ -733,9 +734,9 @@ impl GpuPager {
                 debug_assert_eq!(old_slot, slot);
                 *exchange_slot = old_slot;
                 self.record_placement(id, promoted_slot, Some(victim));
-                Ok(Some(ExclusiveCpuPushPlan {
+                Ok(Some(InclusiveCpuPushPlan {
                     dst: self.slot_mapped_ptr(promoted_slot)?,
-                    demoted: Some((victim, self.slot_mapped_ptr(old_slot)?)),
+                    evicted: Some(victim),
                 }))
             }
         }
@@ -1230,86 +1231,12 @@ struct HostStoreChunk {
 struct Pool {
     slot_bytes: usize,
     pager: GpuPager,
-    /// Present only in bounded-RAM / SSD mode. Together with `pager`, this is one logical LRU
-    /// split at the VRAM/RAM boundary; neither tier retains a duplicate of the other.
-    host: Option<Arc<ExclusiveHostCache>>,
+    /// Present only in bounded-RAM / SSD mode. GPU-resident blocks remain pinned shadows here
+    /// when capacity permits; otherwise Decode sources the permanent full host store.
+    host: Option<Arc<InclusiveHostCache>>,
     /// Disabled physical VRAM slot used as the next promotion destination. It rotates with the
     /// evicted slot after every full-cache miss.
     exchange_slot: Option<u32>,
-    demoter: Option<DemotionWorker>,
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        // `ExclusiveDemotion::src` points into `pager`'s mapped VRAM. Struct fields are dropped
-        // after this hook, so drain the worker here while that mapping is guaranteed to be alive.
-        // The worker's own Drop still closes and joins its thread afterwards.
-        if let Some(worker) = &mut self.demoter {
-            let _ = worker.wait();
-        }
-    }
-}
-
-struct DemotionWorker {
-    tx: Option<std::sync::mpsc::SyncSender<ExclusiveDemotion>>,
-    done: std::sync::mpsc::Receiver<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    pending: bool,
-}
-
-impl DemotionWorker {
-    fn new(name: String) -> Result<Self> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<ExclusiveDemotion>(1);
-        let (done_tx, done) = std::sync::mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name(name)
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    job.execute();
-                    if done_tx.send(()).is_err() {
-                        break;
-                    }
-                }
-            })
-            .map_err(|e| be(format!("cannot spawn MoE demotion worker: {e}")))?;
-        Ok(Self {
-            tx: Some(tx),
-            done,
-            thread: Some(thread),
-            pending: false,
-        })
-    }
-
-    fn wait(&mut self) -> Result<()> {
-        if self.pending {
-            self.done
-                .recv()
-                .map_err(|_| be("MoE demotion worker stopped unexpectedly"))?;
-            self.pending = false;
-        }
-        Ok(())
-    }
-
-    fn submit(&mut self, job: ExclusiveDemotion) -> Result<()> {
-        self.wait()?;
-        self.tx
-            .as_ref()
-            .ok_or_else(|| be("MoE demotion worker is closed"))?
-            .send(job)
-            .map_err(|_| be("MoE demotion worker stopped unexpectedly"))?;
-        self.pending = true;
-        Ok(())
-    }
-}
-
-impl Drop for DemotionWorker {
-    fn drop(&mut self) {
-        let _ = self.wait();
-        self.tx.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1350,7 +1277,7 @@ pub(crate) struct PrefillCopyJob {
 enum PrefillCopy {
     Memory(StagingCopy),
     Disk {
-        host: Arc<ExclusiveHostCache>,
+        host: Arc<InclusiveHostCache>,
         desc: BlockDesc,
         dst: usize,
     },
@@ -1520,9 +1447,9 @@ pub struct MoePagerSession {
 pub struct MoePoolSpec {
     pub slot_bytes: usize,
     pub n_slots: usize,
-    /// Bounded exclusive RAM cache below this VRAM size class. `None` selects the permanent
+    /// Bounded inclusive RAM cache below this VRAM size class. `None` selects the permanent
     /// full-Host-Store fast path.
-    pub host: Option<Arc<ExclusiveHostCache>>,
+    pub host: Option<Arc<InclusiveHostCache>>,
 }
 
 /// One chunk of the unique permanent CPU store. Chunks are split only at complete layer boundaries
@@ -1626,7 +1553,7 @@ impl MoePagerSession {
                 .map(|host| host.arena_bytes())
                 .sum();
             tracing::info!(
-                "[infr] paged-MoE host tier: exclusive bounded cache={} bytes; permanent full Host Store=0 bytes",
+                "[infr] paged-MoE host tier: inclusive bounded cache={} bytes; permanent full Host Store=0 bytes",
                 cache_bytes,
             );
         } else {
@@ -1643,7 +1570,7 @@ impl MoePagerSession {
             .collect();
         let unified_pool = vk.init_unified_vram_for_expert_slots(&unified_specs)?;
         let mut pools = Vec::with_capacity(layout.pools.len());
-        for (pool_idx, spec) in layout.pools.iter().enumerate() {
+        for spec in &layout.pools {
             let mut pager = GpuPager::new_unified(
                 vk,
                 Arc::clone(&unified_pool),
@@ -1661,11 +1588,6 @@ impl MoePagerSession {
                 pager,
                 host: spec.host.clone(),
                 exchange_slot,
-                demoter: spec
-                    .host
-                    .as_ref()
-                    .map(|_| DemotionWorker::new(format!("infr-moe-demote-{pool_idx}")))
-                    .transpose()?,
             });
         }
         // One graph's windows = paged layers x roles x n_expert addresses. 64k entries (512 KiB)
@@ -1706,9 +1628,8 @@ impl MoePagerSession {
         bytes
     }
 
-    /// Seed every bounded exclusive RAM pool after all expert banks have been registered. Runtime
-    /// promotion, demotion and replacement are untouched; this only gives the existing lower-tier
-    /// LRU a balanced initial resident set before the first Decode miss.
+    /// Seed every bounded inclusive RAM pool after all expert banks have been registered. This
+    /// gives the lower tier a balanced cold set before Decode pins its GPU shadows.
     pub fn preload_host_tier(&self) -> Result<(usize, usize)> {
         let mut total_blocks = 0usize;
         let mut total_bytes = 0usize;
@@ -1989,7 +1910,10 @@ impl MoePagerSession {
         let mut loaned = 0usize;
         for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
             loaned = loaned.saturating_add(slots.len());
-            pool.pager.loan_slots(&slots)?;
+            let evicted = pool.pager.loan_slots(&slots)?;
+            if let Some(host) = &pool.host {
+                host.release_gpu_blocks(&evicted);
+            }
         }
         self.unified_generation = self.unified_pool.generation();
         Ok(loaned)
@@ -2258,19 +2182,17 @@ impl MoePagerSession {
     /// invalidated. Everything outside the borrowed lanes survives the phase transition.
     pub fn enter_prefill_layer(&mut self) -> Result<()> {
         if self.mode != MoeArenaMode::PrefillLayer {
-            for pool in &mut self.pools {
-                if let Some(worker) = &mut pool.demoter {
-                    worker.wait()?;
-                }
-            }
             self.build_prefill_layout()?;
             let mut evicted = 0usize;
             let mut borrowed = 0usize;
             for (pool, ranges) in self.pools.iter_mut().zip(&self.prefill_reserved_ranges) {
                 for &(offset, bytes) in ranges {
                     borrowed = borrowed.saturating_add(bytes);
-                    evicted =
-                        evicted.saturating_add(pool.pager.evict_virtual_range(offset, bytes)?);
+                    let victims = pool.pager.evict_virtual_range(offset, bytes)?;
+                    evicted = evicted.saturating_add(victims.len());
+                    if let Some(host) = &pool.host {
+                        host.release_gpu_blocks(&victims);
+                    }
                 }
             }
             self.prefill_lane_layer.fill(None);
@@ -2583,7 +2505,7 @@ impl MoePagerSession {
             let id = block_base + lid;
             if let Some(host) = pool.host.as_ref().cloned() {
                 if pool.pager.is_resident(id) {
-                    let plan = pool.pager.plan_exclusive_cpu_push(
+                    let plan = pool.pager.plan_inclusive_cpu_push(
                         id,
                         pool.exchange_slot
                             .as_mut()
@@ -2593,13 +2515,9 @@ impl MoePagerSession {
                     debug_assert!(plan.is_none());
                     continue;
                 }
-                pool.demoter
-                    .as_mut()
-                    .expect("tiered pool has a demotion worker")
-                    .wait()?;
                 let plan = pool
                     .pager
-                    .plan_exclusive_cpu_push(
+                    .plan_inclusive_cpu_push(
                         id,
                         pool.exchange_slot
                             .as_mut()
@@ -2607,17 +2525,11 @@ impl MoePagerSession {
                         scan,
                     )?
                     .expect("a nonresident block must produce an upload plan");
-                let job = host.promote(id, plan.demoted, |bytes| {
+                host.promote(id, plan.evicted, |bytes| {
                     par_copy_to_mapped(bytes, plan.dst as *mut u8);
                     Ok(())
                 })?;
                 copied = copied.saturating_add(stride);
-                if let Some(job) = job {
-                    pool.demoter
-                        .as_mut()
-                        .expect("tiered pool has a demotion worker")
-                        .submit(job)?;
-                }
             } else {
                 let host_chunk = host_chunk
                     .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
@@ -2822,18 +2734,20 @@ impl MoePagerSession {
             if let Some(host) = &p.host {
                 let hs = host.stats();
                 tracing::info!(
-                    "[moe pager]   exclusive RAM: slots={} preload={} ({:.3}GB) hits={} \
-                     ssd_reads={} ram_evictions={} demotions={} promoted={:.3}GB \
-                     demoted={:.3}GB disk={:.3}GB",
+                    "[moe pager]   inclusive RAM: slots={} shadows={} preload={} ({:.3}GB) \
+                     hits={} ssd_reads={} ram_evictions={} gpu_evictions={} \
+                     shadow_promotions={} shadow_releases={} promoted={:.3}GB disk={:.3}GB",
                     host.n_slots(),
+                    hs.shadow_resident,
                     hs.preload_reads,
                     hs.bytes_preloaded as f64 / 1e9,
                     hs.ram_hits,
                     hs.ssd_reads,
                     hs.ram_evictions,
-                    hs.demotions,
+                    hs.gpu_evictions,
+                    hs.shadow_promotions,
+                    hs.shadow_releases,
                     hs.bytes_promoted as f64 / 1e9,
-                    hs.bytes_demoted as f64 / 1e9,
                     hs.bytes_read as f64 / 1e9,
                 );
             }

@@ -514,6 +514,14 @@ impl Pager {
         }
     }
 
+    /// Release one pin and make the still-resident block MRU without counting another access.
+    /// An inclusive tier uses this when an upper-tier resident becomes a cold lower-tier entry:
+    /// the bytes stay in the same slot, but their replacement priority starts at the warm end.
+    pub fn unpin_mru(&mut self, id: BlockId) {
+        self.unpin(id);
+        self.mark_mru(id);
+    }
+
     /// How many distinct blocks are pinned right now — the number a caller sizes `n_slots`
     /// against (see [`Self::resolve_and_pin`]'s `None`).
     pub fn pinned_blocks(&self) -> usize {
