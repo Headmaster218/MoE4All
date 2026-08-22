@@ -89,6 +89,12 @@ struct LruNode {
 /// configuration error the caller should surface, not silently thrash.
 pub struct Pager {
     n_slots: usize,
+    /// Slots temporarily loaned to another consumer of a shared device-memory arena. Disabled
+    /// slots keep their stable numeric identity but never appear in `free` or the LRU until they
+    /// are enabled again. This lets a backend carve a contiguous module allocation out of an
+    /// expert cache without rebuilding every block -> slot mapping.
+    disabled: Vec<bool>,
+    enabled_slots: usize,
     /// block_id -> slot index for every currently-resident block.
     resident: HashMap<BlockId, u32>,
     /// LRU order, oldest (least-recently-used) at the front. A block appears at most once;
@@ -165,6 +171,8 @@ impl Pager {
         );
         Self {
             n_slots,
+            disabled: vec![false; n_slots],
+            enabled_slots: n_slots,
             resident: HashMap::with_capacity(n_slots),
             lru: vec![LruNode::default(); n_slots],
             lru_head: None,
@@ -191,6 +199,60 @@ impl Pager {
 
     pub fn n_slots(&self) -> usize {
         self.n_slots
+    }
+
+    /// Number of slots currently available to this pager. This can be smaller than `n_slots`
+    /// while part of the backing arena is loaned to another model component.
+    pub fn enabled_slots(&self) -> usize {
+        self.enabled_slots
+    }
+
+    /// Temporarily remove one physical slot from the cache, returning the resident block evicted
+    /// from it (if any). The slot number remains stable and can later be restored with
+    /// [`Self::enable_slot`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the slot is out of range or its block is pinned. A caller must only resize a
+    /// cache between dispatches; removing memory a live reader owns would be silent corruption.
+    pub fn disable_slot(&mut self, slot: u32) -> Option<BlockId> {
+        let idx = self.slot_idx(slot);
+        assert!(
+            !self.disabled[idx],
+            "pager: slot {slot} is already disabled"
+        );
+        let resident = self.lru[idx].id;
+        if let Some(id) = resident {
+            assert!(
+                !self.pinned.contains_key(&id),
+                "pager: disable of pinned block {id}"
+            );
+            let removed = self.resident.remove(&id);
+            debug_assert_eq!(removed, Some(slot));
+            let unlinked = self.unlink_lru(slot);
+            debug_assert_eq!(unlinked, Some(id));
+            self.epoch.remove(&id);
+            self.stats.evictions += 1;
+        } else if let Some(pos) = self.free.iter().position(|&free| free == slot) {
+            self.free.swap_remove(pos);
+        }
+        self.disabled[idx] = true;
+        self.enabled_slots -= 1;
+        resident
+    }
+
+    /// Return a previously disabled physical slot to the free list.
+    pub fn enable_slot(&mut self, slot: u32) {
+        let idx = self.slot_idx(slot);
+        assert!(self.disabled[idx], "pager: slot {slot} is already enabled");
+        debug_assert!(self.lru[idx].id.is_none());
+        self.disabled[idx] = false;
+        self.enabled_slots += 1;
+        self.free.push(slot);
+    }
+
+    pub fn slot_enabled(&self, slot: u32) -> bool {
+        !self.disabled[self.slot_idx(slot)]
     }
 
     pub fn stats(&self) -> PagerStats {
@@ -1095,6 +1157,72 @@ mod tests {
                 evicted: None
             }
         );
+    }
+
+    #[test]
+    fn disabled_slot_is_never_reused_until_enabled() {
+        let mut p = Pager::new(3);
+        assert_eq!(
+            p.touch(10),
+            Resolution::Miss {
+                slot: 0,
+                evicted: None
+            }
+        );
+        assert_eq!(
+            p.touch(11),
+            Resolution::Miss {
+                slot: 1,
+                evicted: None
+            }
+        );
+        assert_eq!(p.disable_slot(0), Some(10));
+        assert_eq!(p.enabled_slots(), 2);
+        assert!(!p.slot_enabled(0));
+        assert_eq!(p.slot_of(10), None);
+
+        // Slot 2 is the only never-used enabled slot. Once full, eviction must recycle slot 1 or
+        // 2 rather than handing the loaned slot 0 back to the pager.
+        assert_eq!(
+            p.touch(12),
+            Resolution::Miss {
+                slot: 2,
+                evicted: None
+            }
+        );
+        let replacement = p.touch(13);
+        assert!(matches!(replacement, Resolution::Miss { slot: 1 | 2, .. }));
+
+        p.enable_slot(0);
+        assert_eq!(p.enabled_slots(), 3);
+        assert!(p.slot_enabled(0));
+        assert!(matches!(
+            p.touch(14),
+            Resolution::Miss {
+                slot: 0,
+                evicted: None
+            }
+        ));
+    }
+
+    #[test]
+    fn disabling_a_free_slot_removes_it_from_the_free_list() {
+        let mut p = Pager::new(2);
+        assert_eq!(p.disable_slot(0), None);
+        assert_eq!(
+            p.touch(1),
+            Resolution::Miss {
+                slot: 1,
+                evicted: None
+            }
+        );
+        assert!(matches!(
+            p.touch(2),
+            Resolution::Miss {
+                slot: 1,
+                evicted: Some(1)
+            }
+        ));
     }
 
     #[test]
