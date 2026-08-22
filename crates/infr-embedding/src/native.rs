@@ -153,6 +153,15 @@ impl NativeEmbeddingEngine {
         Self::load(path, Box::new(backend), MemoryTier::Vram)
     }
 
+    /// Load on a Vulkan client derived from an already-warm LLM backend. The client shares the
+    /// device and unified VRAM arena while keeping a separate Embedding execution graph.
+    pub fn load_vulkan_with_backend(
+        path: &Path,
+        backend: infr_vulkan::VulkanBackend,
+    ) -> Result<Self> {
+        Self::load(path, Box::new(backend), MemoryTier::Vram)
+    }
+
     fn load(path: &Path, backend: Box<dyn Backend>, tier: MemoryTier) -> Result<Self> {
         if !path.is_file() {
             bail!("embedding model does not exist: {}", path.display());

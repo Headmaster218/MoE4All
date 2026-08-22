@@ -4084,9 +4084,16 @@ fn cmd_serve(
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
     let cfg = &apply_model_sampling_defaults(cfg, specified, &gguf);
-    let embedding = embedding_model
-        .map(|model| load_embedding_generator(model, embedding_runner, 1, cfg))
-        .transpose()?;
+    // The Vulkan path must warm the LLM first: that creates the unified expert arena from which
+    // the native Embedding client borrows. Other backends and the llama.cpp compatibility runner
+    // retain their established independent loading path.
+    let embedding = if is_vulkan {
+        None
+    } else {
+        embedding_model
+            .map(|model| load_embedding_generator(model, embedding_runner, 1, cfg))
+            .transpose()?
+    };
 
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
@@ -4099,6 +4106,17 @@ fn cmd_serve(
         let want_ctx = cfg.device.ctx;
         let t0 = std::time::Instant::now();
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
+        let embedding = embedding_model
+            .map(|model| {
+                let compatibility_runner = embedding_runner.or(cfg.serve.embedding_runner.as_deref());
+                if compatibility_runner.is_some() {
+                    load_embedding_generator(model, embedding_runner, 1, cfg)
+                } else {
+                    let backend = engine.fork_embedding_backend()?;
+                    load_native_embedding_generator_on(model, cfg, backend)
+                }
+            })
+            .transpose()?;
         tracing::info!(
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()
@@ -4242,6 +4260,30 @@ fn load_embedding_generator(
         bytes = snapshot.resident_bytes,
         tier = ?snapshot.tier,
         "embedding resource registered"
+    );
+    Ok((model_id, Arc::new(EmbeddingGeneratorAdapter { model })))
+}
+
+fn load_native_embedding_generator_on(
+    model: &str,
+    cfg: &Arc<Config>,
+    backend: infr_vulkan::VulkanBackend,
+) -> anyhow::Result<(String, Arc<dyn infr_server::EmbeddingGenerator>)> {
+    let (gguf, _) = resolve(model, cfg)?;
+    let model_id = gguf
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("embedding-model")
+        .to_owned();
+    let model: Box<dyn infr_embedding::EmbeddingEngine> = Box::new(
+        infr_embedding::NativeEmbeddingEngine::load_vulkan_with_backend(&gguf, backend)?,
+    );
+    let snapshot = model.resource_snapshot();
+    tracing::info!(
+        resource = %snapshot.id,
+        bytes = snapshot.resident_bytes,
+        tier = ?snapshot.tier,
+        "embedding resource registered in unified VRAM"
     );
     Ok((model_id, Arc::new(EmbeddingGeneratorAdapter { model })))
 }

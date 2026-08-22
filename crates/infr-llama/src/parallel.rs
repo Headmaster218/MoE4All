@@ -159,6 +159,19 @@ impl ParallelSeam {
             None => infr_vulkan::VulkanBackend::new_with(ecfg)
                 .map_err(|e| anyhow!("vulkan init: {e}"))?,
         };
+        Self::new_with_backend(model, n_slots, want_ctx, vk)
+    }
+
+    /// Build on a caller-owned Vulkan backend. Used by the unified service path so auxiliary
+    /// engines can later derive clients from the exact device and elastic arena initialized by
+    /// this LLM warmup.
+    pub fn new_with_backend(
+        model: SeamModel,
+        n_slots: usize,
+        want_ctx: Option<infr_core::SizeSpec>,
+        vk: infr_vulkan::VulkanBackend,
+    ) -> Result<Self> {
+        let n_slots = n_slots.max(1);
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
@@ -182,6 +195,12 @@ impl ParallelSeam {
         engine.init_slots(n_slots)?;
         drop(scope);
         Ok(engine)
+    }
+
+    pub fn fork_embedding_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
+        self.vk
+            .fork_embedding_client()
+            .map_err(|error| anyhow!("derive unified Embedding backend: {error}"))
     }
 
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the

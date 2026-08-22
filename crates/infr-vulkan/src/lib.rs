@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use ash::vk;
 use gpu_allocator::vulkan::{
@@ -1048,6 +1048,12 @@ pub struct VulkanBackend {
     /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
     /// device-leaking reference cycle.
     unified_pool: Arc<Mutex<Option<Arc<crate::unified::UnifiedVramPool>>>>,
+    /// Allocation resize gate shared by the LLM and auxiliary backend forks. Ordinary graph
+    /// execution takes a read lease; borrowing/removing expert slots takes the rare write lease.
+    unified_exec: Arc<RwLock<()>>,
+    /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
+    /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
+    unified_client: Option<UnifiedClient>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
     /// R4/R6).
@@ -1059,6 +1065,11 @@ pub struct VulkanBackend {
     /// point remains for this crate's own GPU tests and for external library callers.
     cfg: Arc<Config>,
     shared: Arc<VulkanShared>,
+}
+
+#[derive(Clone, Copy)]
+enum UnifiedClient {
+    Embedding,
 }
 
 /// Device memory info for a backend's shared state — the body of [`VulkanBackend::vram`],
@@ -2503,6 +2514,8 @@ impl VulkanBackend {
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::new(Mutex::new(None)),
+            unified_exec: Arc::new(RwLock::new(())),
+            unified_client: None,
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -3243,6 +3256,26 @@ impl VulkanBackend {
         self.unified_pool.lock().unwrap().clone()
     }
 
+    /// Derive a second execution backend over the same Vulkan device, queue, MoE pager and elastic
+    /// arena. It owns independent graph/weight allocator cursors but no second device or VRAM pool.
+    pub fn fork_embedding_client(&self) -> Result<Self> {
+        if self.unified_vram().is_none() {
+            return Err(be(
+                "cannot fork a unified Embedding backend before the MoE arena is initialized",
+            ));
+        }
+        Ok(Self {
+            moe_pager: Arc::clone(&self.moe_pager),
+            dense_pager: Mutex::new(None),
+            bda_weight_arena: Mutex::new(None),
+            unified_pool: Arc::clone(&self.unified_pool),
+            unified_exec: Arc::clone(&self.unified_exec),
+            unified_client: Some(UnifiedClient::Embedding),
+            cfg: Arc::clone(&self.cfg),
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
     fn unified_sub_buffer(
         &self,
         handle: Arc<crate::unified::UnifiedAllocationHandle>,
@@ -3266,17 +3299,21 @@ impl VulkanBackend {
         })
     }
 
-    pub(crate) fn alloc_unified(
+    fn alloc_unified_buffer(
         &self,
         size: usize,
         class: crate::unified::UnifiedVramClass,
-    ) -> Result<Box<dyn Buffer>> {
+    ) -> Result<VkBuffer> {
         let pool = self
             .unified_vram()
             .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
         let handle = match pool.allocate(size, class) {
             Some(handle) => handle,
             None if class != crate::unified::UnifiedVramClass::Expert => {
+                let _exclusive = self.unified_exec.write().unwrap();
+                if let Some(handle) = pool.allocate(size, class) {
+                    return self.unified_sub_buffer(handle, size);
+                }
                 let loaned = self
                     .moe_pager
                     .lock()
@@ -3302,7 +3339,15 @@ impl VulkanBackend {
                 )));
             }
         };
-        Ok(Box::new(self.unified_sub_buffer(handle, size)?) as Box<dyn Buffer>)
+        self.unified_sub_buffer(handle, size)
+    }
+
+    pub(crate) fn alloc_unified(
+        &self,
+        size: usize,
+        class: crate::unified::UnifiedVramClass,
+    ) -> Result<Box<dyn Buffer>> {
+        Ok(Box::new(self.alloc_unified_buffer(size, class)?) as Box<dyn Buffer>)
     }
 
     /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
@@ -3654,6 +3699,27 @@ impl VulkanBackend {
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        if let Some(UnifiedClient::Embedding) = self.unified_client {
+            let class = match usage {
+                BufferUsage::Weights => Some(crate::unified::UnifiedVramClass::EmbeddingWeights),
+                BufferUsage::Activations => {
+                    Some(crate::unified::UnifiedVramClass::EmbeddingRuntime)
+                }
+                BufferUsage::KvCache
+                | BufferUsage::Staging
+                | BufferUsage::Readback
+                | BufferUsage::HostWeights => None,
+            };
+            if let Some(class) = class {
+                let buf = self.alloc_unified_buffer(bytes, class)?;
+                if usage == BufferUsage::Weights {
+                    if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                        pb.inc(bytes as u64);
+                    }
+                }
+                return Ok(buf);
+            }
+        }
         // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
         // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
         // other `BufferUsage` takes the gpu-allocator path in `make_buf` below.
@@ -4141,6 +4207,7 @@ impl Backend for VulkanBackend {
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        let _arena_lease = self.unified_exec.read().unwrap();
         adapter::execute(self, plan, bindings)
     }
 
@@ -4164,6 +4231,7 @@ impl Backend for VulkanBackend {
         bindings: &Bindings,
         n: usize,
     ) -> Result<Option<Vec<u32>>> {
+        let _arena_lease = self.unified_exec.read().unwrap();
         adapter::execute_chain(self, plan, bindings, n)
     }
 
@@ -4996,12 +5064,13 @@ mod tests {
                 .class_bytes(crate::unified::UnifiedVramClass::Expert),
             SLOT * SLOTS,
         );
-        let embedding = be
-            .alloc_unified(
-                SLOT * 2 + SLOT / 2,
-                crate::unified::UnifiedVramClass::EmbeddingWeights,
-            )
-            .expect("loan expert slots");
+        let embedding_backend = be.fork_embedding_client().expect("embedding fork");
+        let embedding = embedding_backend
+            .alloc_uninit(SLOT * 2 + SLOT / 2, BufferUsage::Weights)
+            .expect("loan expert slots for embedding weights");
+        let runtime = embedding_backend
+            .alloc_uninit(SLOT / 2, BufferUsage::Activations)
+            .expect("use remaining loaned range for embedding runtime");
         let during = pool.stats();
         assert_eq!(
             during.class_bytes(crate::unified::UnifiedVramClass::EmbeddingWeights),
@@ -5011,7 +5080,12 @@ mod tests {
             during.class_bytes(crate::unified::UnifiedVramClass::Expert),
             SLOT * (SLOTS - 3),
         );
+        assert_eq!(
+            during.class_bytes(crate::unified::UnifiedVramClass::EmbeddingRuntime),
+            SLOT / 2,
+        );
         drop(embedding);
+        drop(runtime);
         be.moe_pager
             .lock()
             .unwrap()
