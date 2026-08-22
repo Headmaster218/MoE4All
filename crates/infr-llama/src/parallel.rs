@@ -203,6 +203,10 @@ impl ParallelSeam {
             .map_err(|error| anyhow!("derive unified Embedding backend: {error}"))
     }
 
+    pub fn unified_vram_stats(&self) -> Option<infr_vulkan::unified::UnifiedVramStats> {
+        self.vk.unified_vram().map(|pool| pool.stats())
+    }
+
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {

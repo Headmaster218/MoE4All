@@ -4117,6 +4117,20 @@ fn cmd_serve(
                 }
             })
             .transpose()?;
+        if embedding.is_some() {
+            if let Some(stats) = engine.unified_vram_stats() {
+                use infr_vulkan::unified::UnifiedVramClass;
+                tracing::info!(
+                    arena_bytes = stats.capacity_bytes,
+                    expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                    embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
+                    embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
+                    free_bytes = stats.free_bytes,
+                    largest_free_bytes = stats.largest_free_bytes,
+                    "unified VRAM ready"
+                );
+            }
+        }
         tracing::info!(
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()

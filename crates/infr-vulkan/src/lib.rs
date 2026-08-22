@@ -4207,7 +4207,16 @@ impl Backend for VulkanBackend {
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
-        let _arena_lease = self.unified_exec.read().unwrap();
+        // The primary LLM holds the shared lease while its commands can read expert slots, so an
+        // auxiliary client's rare allocation/loan cannot invalidate them.  The auxiliary client
+        // itself must not take this lease around `adapter::execute`: static recording lazily
+        // allocates transient buffers, and a full arena then needs the write side in
+        // `alloc_unified_buffer` to loan cold expert slots. Taking read here would self-deadlock on
+        // that read -> write upgrade before any command was submitted.
+        let _arena_lease = self
+            .unified_client
+            .is_none()
+            .then(|| self.unified_exec.read().unwrap());
         adapter::execute(self, plan, bindings)
     }
 
@@ -4231,7 +4240,10 @@ impl Backend for VulkanBackend {
         bindings: &Bindings,
         n: usize,
     ) -> Result<Option<Vec<u32>>> {
-        let _arena_lease = self.unified_exec.read().unwrap();
+        let _arena_lease = self
+            .unified_client
+            .is_none()
+            .then(|| self.unified_exec.read().unwrap());
         adapter::execute_chain(self, plan, bindings, n)
     }
 
