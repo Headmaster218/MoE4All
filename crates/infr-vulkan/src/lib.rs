@@ -24,6 +24,7 @@ mod recorder;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
+pub mod unified;
 mod vkext;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
