@@ -5,6 +5,8 @@
 //! while the whole embedding model is registered as one independently evictable resource for the
 //! future unified VRAM/RAM/SSD policy.
 
+mod tokenizer;
+
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::{MemoryTier, ResourceKind, ResourceSnapshot, ResourceTracker, WeightSource};
 use infr_gguf::Gguf;
