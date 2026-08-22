@@ -307,7 +307,7 @@ fn estimate_embedding(
         .as_deref()
         .and_then(|arch| metadata_usize(gguf, arch, "context_length"));
     let mut notes = vec![
-        "Embedding 推理由 INFR 托管的 llama.cpp worker 执行；当前按整模型驻留估算。".into(),
+        "Embedding 默认由 INFR 原生 CPU/Vulkan 图执行；当前按整模型驻留估算。".into(),
         "Embedding 没有生成式 KV cache；运行时预留按 512 MiB 保守估计。".into(),
     ];
     if profile.backend.eq_ignore_ascii_case("cpu") {

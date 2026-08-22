@@ -362,10 +362,10 @@ enum Cmd {
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
-        /// Optional GGUF embedding model hosted at /v1/embeddings through a managed llama.cpp worker.
+        /// Optional GGUF embedding model hosted natively at /v1/embeddings.
         #[arg(long, value_name = "MODEL")]
         embedding_model: Option<String>,
-        /// llama-server executable used for --embedding-model (auto-detected when omitted).
+        /// Use a llama-server compatibility worker instead of native embedding execution.
         #[arg(long, value_name = "PATH")]
         embedding_runner: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -397,10 +397,10 @@ enum Cmd {
         #[command(flatten)]
         sampling: SamplingOpts,
     },
-    /// Start an embedding-only OpenAI-compatible HTTP API (llama.cpp GGUF, CPU or Vulkan).
+    /// Start a native embedding-only OpenAI-compatible HTTP API (GGUF, CPU or Vulkan).
     ServeEmbedding {
         model: String,
-        /// llama-server executable (auto-detected when omitted).
+        /// Use a llama-server compatibility worker instead of native embedding execution.
         #[arg(long, value_name = "PATH")]
         embedding_runner: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -1815,11 +1815,11 @@ struct ParallelGenerator {
     watch: infr_llama::WeightWatch,
 }
 
-struct NativeEmbeddingGenerator {
-    model: infr_embedding::EmbeddingModel,
+struct EmbeddingGeneratorAdapter {
+    model: Box<dyn infr_embedding::EmbeddingEngine>,
 }
 
-impl infr_server::EmbeddingGenerator for NativeEmbeddingGenerator {
+impl infr_server::EmbeddingGenerator for EmbeddingGeneratorAdapter {
     fn embed(&self, inputs: &[String]) -> anyhow::Result<infr_server::EmbeddingOutcome> {
         let outcome = self.model.embed(inputs)?;
         Ok(infr_server::EmbeddingOutcome {
@@ -4202,24 +4202,40 @@ fn load_embedding_generator(
         .and_then(|s| s.to_str())
         .unwrap_or("embedding-model")
         .to_owned();
-    let model = match selected_backend(cfg)? {
-        Backend::Cpu => infr_embedding::EmbeddingModel::load_cpu_with_runner(
-            &gguf,
-            cfg.clone(),
-            runner,
-            parallel,
-        )?,
-        Backend::Vulkan(device) => infr_embedding::EmbeddingModel::load_vulkan_on(
-            &gguf,
-            cfg.clone(),
-            device,
-            runner,
-            parallel,
-        )?,
-        Backend::Metal => anyhow::bail!(
+    let compatibility_runner = runner.or(cfg.serve.embedding_runner.as_deref());
+    let model: Box<dyn infr_embedding::EmbeddingEngine> =
+        match (compatibility_runner, selected_backend(cfg)?) {
+            (Some(runner), Backend::Cpu) => Box::new(
+                infr_embedding::LlamaCppEmbeddingEngine::load_cpu_with_runner(
+                    &gguf,
+                    cfg.clone(),
+                    Some(runner),
+                    parallel,
+                )?,
+            ),
+            (Some(runner), Backend::Vulkan(device)) => {
+                Box::new(infr_embedding::LlamaCppEmbeddingEngine::load_vulkan_on(
+                    &gguf,
+                    cfg.clone(),
+                    device,
+                    Some(runner),
+                    parallel,
+                )?)
+            }
+            (Some(_), Backend::Metal) => anyhow::bail!(
+                "llama.cpp embedding compatibility mode supports --dev cpu and Vulkan only"
+            ),
+            (None, Backend::Cpu) => Box::new(infr_embedding::NativeEmbeddingEngine::load_cpu(
+                &gguf,
+                cfg.clone(),
+            )?),
+            (None, Backend::Vulkan(_)) => Box::new(
+                infr_embedding::NativeEmbeddingEngine::load_vulkan(&gguf, cfg.clone())?,
+            ),
+            (None, Backend::Metal) => anyhow::bail!(
             "native embedding currently supports --dev cpu and Vulkan; Metal is not implemented"
         ),
-    };
+        };
     let snapshot = model.resource_snapshot();
     tracing::info!(
         resource = %snapshot.id,
@@ -4227,7 +4243,7 @@ fn load_embedding_generator(
         tier = ?snapshot.tier,
         "embedding resource registered"
     );
-    Ok((model_id, Arc::new(NativeEmbeddingGenerator { model })))
+    Ok((model_id, Arc::new(EmbeddingGeneratorAdapter { model })))
 }
 
 fn cmd_serve_embedding(

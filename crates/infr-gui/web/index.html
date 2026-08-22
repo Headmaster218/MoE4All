@@ -77,7 +77,7 @@
           <label>任务类型<select id="task"><option value="chat">Chat / Completion</option><option value="embedding">Embedding</option><option value="rerank">Rerank（预留）</option></select></label>
         </div>
         <label>模型路径<input id="model-path" placeholder="选择左侧模型，或输入服务器上的 GGUF 路径"></label>
-        <label id="embedding-runner-wrap" class="hidden">Embedding runner<input id="embedding-runner" placeholder="留空自动查找 llama-server.exe，或填写完整路径"></label>
+        <label id="embedding-runner-wrap" class="hidden">兼容模式 runner（可选）<input id="embedding-runner" placeholder="留空使用 INFR 原生引擎；填写 llama-server.exe 路径则切换兼容模式"></label>
         <div class="grid three">
           <label>计算设备<select id="backend"></select></label>
           <label>服务地址<input id="service-addr" value="0.0.0.0:8080"></label>
@@ -132,7 +132,7 @@
 
       <section class="panel future">
         <h2>已预留能力</h2>
-        <div class="chips"><span>Embedding API</span><span>视觉编码器 / mmproj</span><span>VRAM → RAM → SSD</span><span>多 worker 路由</span></div>
+        <div class="chips"><span>视觉编码器 / mmproj</span><span>VRAM → RAM → SSD</span><span>多 worker 路由</span></div>
       </section>
     </div>
   </main>
