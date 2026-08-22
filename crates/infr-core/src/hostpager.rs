@@ -212,6 +212,289 @@ pub struct HostPager {
     streamed: AtomicU64,
 }
 
+/// Activity of the exclusive RAM tier used underneath the discrete-GPU MoE cache. Unlike
+/// [`HostPagerStats`], these counters describe promotions and demotions rather than independent
+/// cache fills: an Expert exists in VRAM OR in this arena, never both after an exchange settles.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExclusiveHostStats {
+    pub ram_hits: u64,
+    pub ssd_reads: u64,
+    pub ram_evictions: u64,
+    pub demotions: u64,
+    pub bytes_read: u64,
+    pub bytes_promoted: u64,
+    pub bytes_demoted: u64,
+}
+
+struct ExclusiveInner {
+    pager: Option<Pager>,
+    state: HashMap<BlockId, SlotState>,
+    descs: HashMap<BlockId, BlockDesc>,
+    /// One per-size-class read buffer. It is transient working memory, not a weight mirror: an
+    /// SSD miss is read here, pushed upward, and immediately reusable.
+    scratch: Box<[u8]>,
+}
+
+/// Fixed-budget, EXCLUSIVE RAM victim cache beneath a faster cache of the same uniform blocks.
+///
+/// A promotion always happens before the old upper-tier victim is copied down. On a RAM hit the
+/// victim takes the promoted block's exact slot; on an SSD hit it takes a free slot or replaces
+/// the RAM LRU. The resulting two physical lists are therefore exactly the two contiguous
+/// segments of one logical LRU: hot VRAM entries followed by warm RAM entries.
+pub struct ExclusiveHostCache {
+    inner: Mutex<ExclusiveInner>,
+    ready: Condvar,
+    arena: Arena,
+    io: Arc<dyn BlockIo>,
+    slot_bytes: usize,
+    ram_hits: AtomicU64,
+    ssd_reads: AtomicU64,
+    ram_evictions: AtomicU64,
+    demotions: AtomicU64,
+    bytes_read: AtomicU64,
+    bytes_promoted: AtomicU64,
+    bytes_demoted: AtomicU64,
+}
+
+/// Deferred second half of one exclusive promotion. The requested bytes have already reached
+/// the upper-tier exchange slot; executing this job copies the old upper-tier victim into the RAM
+/// slot reserved for it and marks that block ready. Raw addresses are stable because both arenas
+/// are fixed-size allocations owned for longer than the worker that executes the job.
+pub struct ExclusiveDemotion {
+    cache: Arc<ExclusiveHostCache>,
+    id: BlockId,
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+// SAFETY: the job owns no Rust references. `src` is an upper-tier slot kept reserved until the
+// worker completes; `dst` is a RAM slot in `Loading` state and cannot be read or evicted. The
+// cache and its arena stay alive through the Arc.
+unsafe impl Send for ExclusiveDemotion {}
+
+impl ExclusiveDemotion {
+    pub fn execute(self) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.src as *const u8, self.dst as *mut u8, self.len);
+        }
+        self.cache.finish_demotion(self.id, self.len);
+    }
+}
+
+impl ExclusiveHostCache {
+    /// Build one RAM size class. `n_slots == 0` is a valid SSD-through mode; the one-block
+    /// scratch still lets a miss be read before its VRAM victim is released.
+    pub fn new(n_slots: usize, slot_bytes: usize, io: Arc<dyn BlockIo>) -> Result<Self> {
+        if slot_bytes == 0 {
+            return Err(Error::backend(
+                "exclusive host cache needs a non-zero block stride".to_string(),
+            ));
+        }
+        Ok(Self {
+            inner: Mutex::new(ExclusiveInner {
+                pager: (n_slots > 0).then(|| Pager::new(n_slots)),
+                state: HashMap::new(),
+                descs: HashMap::new(),
+                scratch: vec![0u8; slot_bytes].into_boxed_slice(),
+            }),
+            ready: Condvar::new(),
+            arena: Arena::new(n_slots, slot_bytes),
+            io,
+            slot_bytes,
+            ram_hits: AtomicU64::new(0),
+            ssd_reads: AtomicU64::new(0),
+            ram_evictions: AtomicU64::new(0),
+            demotions: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            bytes_promoted: AtomicU64::new(0),
+            bytes_demoted: AtomicU64::new(0),
+        })
+    }
+
+    pub fn register(&self, desc: BlockDesc) -> Result<()> {
+        let n = desc.nbytes();
+        if n > self.slot_bytes {
+            return Err(Error::backend(format!(
+                "exclusive host cache: block {} is {n} bytes, slot stride is {}",
+                desc.id, self.slot_bytes
+            )));
+        }
+        self.inner.lock().unwrap().descs.insert(desc.id, desc);
+        Ok(())
+    }
+
+    pub fn block_bytes(&self, id: BlockId) -> Option<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .descs
+            .get(&id)
+            .map(BlockDesc::nbytes)
+    }
+
+    pub fn arena_bytes(&self) -> usize {
+        self.arena.total
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.arena.total / self.slot_bytes
+    }
+
+    pub fn stats(&self) -> ExclusiveHostStats {
+        ExclusiveHostStats {
+            ram_hits: self.ram_hits.load(Ordering::Relaxed),
+            ssd_reads: self.ssd_reads.load(Ordering::Relaxed),
+            ram_evictions: self.ram_evictions.load(Ordering::Relaxed),
+            demotions: self.demotions.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            bytes_promoted: self.bytes_promoted.load(Ordering::Relaxed),
+            bytes_demoted: self.bytes_demoted.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Promote `requested` through `upload`, then reserve a RAM slot for `demoted` and return the
+    /// deferred VRAM->RAM copy. This order is deliberate: the upper tier writes into its spare
+    /// slot first, so the old victim remains intact until its new RAM destination is available.
+    ///
+    /// `demoted` is `(block id, mapped upper-tier source address)`. `None` is the warm-up case
+    /// where the upper tier still had a genuinely free ordinary slot.
+    pub fn promote<U>(
+        self: &Arc<Self>,
+        requested: BlockId,
+        demoted: Option<(BlockId, usize)>,
+        upload: U,
+    ) -> Result<Option<ExclusiveDemotion>>
+    where
+        U: FnOnce(&[u8]) -> Result<()>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        while inner.state.get(&requested) == Some(&SlotState::Loading) {
+            inner = self.ready.wait(inner).unwrap();
+        }
+        let desc = inner.descs.get(&requested).cloned().ok_or_else(|| {
+            Error::backend(format!(
+                "exclusive host cache: block {requested} was never registered"
+            ))
+        })?;
+        let len = desc.nbytes();
+
+        let ram_slot = inner
+            .state
+            .get(&requested)
+            .filter(|&&state| state == SlotState::Ready)
+            .and_then(|_| inner.pager.as_ref()?.slot_of(requested));
+        if let Some(slot) = ram_slot {
+            let src = unsafe { self.arena.slot_ref(slot, len) };
+            upload(src)?;
+            self.ram_hits.fetch_add(1, Ordering::Relaxed);
+            self.bytes_promoted.fetch_add(len as u64, Ordering::Relaxed);
+
+            inner.state.remove(&requested);
+            if let Some((victim, victim_src)) = demoted {
+                let victim_len =
+                    inner
+                        .descs
+                        .get(&victim)
+                        .map(BlockDesc::nbytes)
+                        .ok_or_else(|| {
+                            Error::backend(format!(
+                                "exclusive host cache: demoted block {victim} was never registered"
+                            ))
+                        })?;
+                if victim_len != len {
+                    return Err(Error::backend(format!(
+                        "exclusive host cache: cannot exchange {len}-byte block {requested} with \
+                         {victim_len}-byte block {victim}"
+                    )));
+                }
+                let pager = inner.pager.as_mut().expect("RAM hit requires an arena");
+                let replaced = pager.replace_resident(requested, victim, Insert::Mru);
+                debug_assert_eq!(replaced, Some(slot));
+                inner.state.insert(victim, SlotState::Loading);
+                self.demotions.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(ExclusiveDemotion {
+                    cache: Arc::clone(self),
+                    id: victim,
+                    src: victim_src,
+                    dst: self.arena.slot_ptr(slot, victim_len) as usize,
+                    len: victim_len,
+                }));
+            }
+            let removed = inner
+                .pager
+                .as_mut()
+                .expect("RAM hit requires an arena")
+                .evict(requested);
+            debug_assert_eq!(removed, Some(slot));
+            return Ok(None);
+        }
+
+        // SSD miss: finish the read and upward copy before reserving/overwriting any RAM slot.
+        self.io.read_block(&desc, &mut inner.scratch[..len])?;
+        upload(&inner.scratch[..len])?;
+        self.ssd_reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
+        self.bytes_promoted.fetch_add(len as u64, Ordering::Relaxed);
+
+        let Some((victim, victim_src)) = demoted else {
+            return Ok(None);
+        };
+        let victim_len = inner
+            .descs
+            .get(&victim)
+            .map(BlockDesc::nbytes)
+            .ok_or_else(|| {
+                Error::backend(format!(
+                    "exclusive host cache: demoted block {victim} was never registered"
+                ))
+            })?;
+        if victim_len != len {
+            return Err(Error::backend(format!(
+                "exclusive host cache: size-class mismatch {len} vs {victim_len}"
+            )));
+        }
+        let Some(pager) = inner.pager.as_mut() else {
+            return Ok(None); // zero-RAM direct SSD -> VRAM mode
+        };
+        let (slot, evicted) = match pager.touch(victim) {
+            Resolution::Miss { slot, evicted } => (slot, evicted),
+            Resolution::Hit { .. } => {
+                return Err(Error::backend(format!(
+                    "exclusive host cache: VRAM victim {victim} was already in RAM"
+                )))
+            }
+        };
+        if let Some(old) = evicted {
+            inner.state.remove(&old);
+            self.ram_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        inner.state.insert(victim, SlotState::Loading);
+        self.demotions.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(ExclusiveDemotion {
+            cache: Arc::clone(self),
+            id: victim,
+            src: victim_src,
+            dst: self.arena.slot_ptr(slot, victim_len) as usize,
+            len: victim_len,
+        }))
+    }
+
+    fn finish_demotion(&self, id: BlockId, len: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        debug_assert_eq!(inner.state.get(&id), Some(&SlotState::Loading));
+        inner.state.insert(id, SlotState::Ready);
+        self.bytes_demoted.fetch_add(len as u64, Ordering::Relaxed);
+        drop(inner);
+        self.ready.notify_all();
+    }
+
+    /// Read a whole Prefill bank without admitting its individual Experts into the Decode LRU.
+    pub fn read_stream(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+        self.io.read_block(desc, dst)
+    }
+}
+
 impl HostPager {
     /// `n_slots` slots of `slot_bytes` each — the tier's whole budget, allocated up front so a
     /// budget that does not fit fails here rather than part-way through a generation.
@@ -779,6 +1062,151 @@ mod tests {
             p.register(desc(id, len)).expect("register");
         }
         p
+    }
+
+    #[test]
+    fn exclusive_cache_promotes_first_and_reuses_the_freed_ram_slot() {
+        let io = Arc::new(FakeIo::new());
+        let cache = Arc::new(ExclusiveHostCache::new(1, 16, io.clone()).expect("cache"));
+        for id in 1..=3 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+
+        // Cold block 1 goes SSD -> VRAM. There was no VRAM victim yet, so RAM remains empty.
+        let mut promoted = [0u8; 16];
+        assert!(cache
+            .promote(1, None, |bytes| {
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("promote 1")
+            .is_none());
+        assert_eq!(promoted, [1u8; 16]);
+
+        // Block 2 is read and promoted BEFORE block 1 is copied down into the sole RAM slot.
+        let vram_one = [1u8; 16];
+        let mut promoted = [0u8; 16];
+        let demotion = cache
+            .promote(2, Some((1, vram_one.as_ptr() as usize)), |bytes| {
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("promote 2")
+            .expect("victim demotion");
+        assert_eq!(promoted, [2u8; 16]);
+        demotion.execute();
+
+        // Promoting 1 now hits RAM (no third disk read), and block 2 takes the same RAM slot.
+        let vram_two = [2u8; 16];
+        let demotion = cache
+            .promote(1, Some((2, vram_two.as_ptr() as usize)), |bytes| {
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("promote 1 from RAM")
+            .expect("second victim demotion");
+        assert_eq!(promoted, [1u8; 16]);
+        demotion.execute();
+
+        let stats = cache.stats();
+        assert_eq!(stats.ssd_reads, 2);
+        assert_eq!(stats.ram_hits, 1);
+        assert_eq!(stats.demotions, 2);
+        assert_eq!(stats.ram_evictions, 0);
+        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn exclusive_cache_evicts_ram_lru_only_after_an_ssd_promotion() {
+        let io = Arc::new(FakeIo::new());
+        let cache = Arc::new(ExclusiveHostCache::new(1, 16, io.clone()).expect("cache"));
+        for id in 1..=3 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+
+        let mut promoted = [0u8; 16];
+        cache
+            .promote(1, None, |bytes| {
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("SSD -> VRAM 1");
+        let vram_one = [1u8; 16];
+        cache
+            .promote(2, Some((1, vram_one.as_ptr() as usize)), |bytes| {
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("SSD -> VRAM 2")
+            .expect("demote 1")
+            .execute();
+
+        // RAM currently holds 1. The SSD read of 3 must complete before 1 is evicted and before
+        // the old VRAM block 2 is installed in that slot.
+        let vram_two = [2u8; 16];
+        cache
+            .promote(3, Some((2, vram_two.as_ptr() as usize)), |bytes| {
+                assert_eq!(bytes, &[3u8; 16]);
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("SSD -> VRAM 3")
+            .expect("demote 2")
+            .execute();
+
+        // The newly demoted block is now the RAM resident. Bringing it back is a hit, not a
+        // fourth file read, and the former VRAM block takes precisely the slot it releases.
+        let vram_three = [3u8; 16];
+        cache
+            .promote(2, Some((3, vram_three.as_ptr() as usize)), |bytes| {
+                assert_eq!(bytes, &[2u8; 16]);
+                Ok(())
+            })
+            .expect("RAM -> VRAM 2")
+            .expect("demote 3")
+            .execute();
+
+        let stats = cache.stats();
+        assert_eq!(stats.ssd_reads, 3);
+        assert_eq!(stats.ram_hits, 1);
+        assert_eq!(stats.ram_evictions, 1);
+        assert_eq!(stats.demotions, 3);
+        assert_eq!(io.reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn exclusive_zero_ram_mode_reads_first_and_discards_the_victim() {
+        let io = Arc::new(FakeIo::new());
+        let cache = Arc::new(ExclusiveHostCache::new(0, 16, io.clone()).expect("cache"));
+        for id in 1..=2 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+
+        let mut promoted = [0u8; 16];
+        for (requested, victim) in [(1, None), (2, Some(1)), (1, Some(2))] {
+            let old = victim.map(|id| (id, [id as u8; 16]));
+            let demotion = cache
+                .promote(
+                    requested,
+                    old.as_ref()
+                        .map(|(id, bytes)| (*id, bytes.as_ptr() as usize)),
+                    |bytes| {
+                        assert_eq!(bytes, &[requested as u8; 16]);
+                        promoted.copy_from_slice(bytes);
+                        Ok(())
+                    },
+                )
+                .expect("direct SSD promotion");
+            assert!(demotion.is_none(), "zero RAM must not retain the victim");
+        }
+        assert_eq!(promoted, [1u8; 16]);
+        let stats = cache.stats();
+        assert_eq!(stats.ssd_reads, 3);
+        assert_eq!(stats.ram_hits, 0);
+        assert_eq!(stats.demotions, 0);
+        assert_eq!(stats.ram_evictions, 0);
+        assert_eq!(cache.arena_bytes(), 0);
+        assert_eq!(io.reads.load(Ordering::SeqCst), 3);
     }
 
     /// The property every other test rests on: a pin's bytes are the block's OWN bytes, before and

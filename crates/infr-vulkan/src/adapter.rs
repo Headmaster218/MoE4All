@@ -5507,9 +5507,8 @@ impl PrefillUploader {
                     let result = command
                         .after
                         .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
-                    if result.is_ok() {
-                        command.job.execute();
-                    }
+                    let result =
+                        result.and_then(|()| command.job.execute().map_err(|e| e.to_string()));
                     if done
                         .send(PrefillUploadCompletion { buf_id, result })
                         .is_err()
@@ -5962,7 +5961,7 @@ fn stage_layer_and_window<'a>(
 
 fn run_prefill_job_sync(be_: &VulkanBackend, job: crate::pager::PrefillCopyJob) -> Result<()> {
     let buf_id = job.buf_id();
-    job.execute();
+    job.execute()?;
     be_.moe_pager()
         .lock()
         .unwrap()

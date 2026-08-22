@@ -37,16 +37,15 @@ use std::sync::Arc;
 use ash::vk;
 
 use infr_core::backend::{Buffer, BufferUsage};
+use infr_core::blockio::BlockDesc;
 use infr_core::error::Result;
-use infr_core::hostpager::HostPager;
+use infr_core::hostpager::{ExclusiveDemotion, ExclusiveHostCache, HostPager};
 use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::pager_profile;
 use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
-use crate::unified::{
-    UnifiedAllocationHandle, UnifiedRange, UnifiedVramClass, UnifiedVramPool,
-};
+use crate::unified::{UnifiedAllocationHandle, UnifiedRange, UnifiedVramClass, UnifiedVramPool};
 
 /// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
 /// bad seam budget (0 slots) or sizing bug (misaligned stride) returns `Err` before any allocation.
@@ -127,6 +126,11 @@ pub struct GpuPager {
 struct CpuPushPlan {
     dst: usize,
     evicted: Option<BlockId>,
+}
+
+struct ExclusiveCpuPushPlan {
+    dst: usize,
+    demoted: Option<(BlockId, usize)>,
 }
 
 impl GpuPager {
@@ -289,6 +293,10 @@ impl GpuPager {
         self.pager.n_slots()
     }
 
+    pub fn enabled_slots(&self) -> usize {
+        self.pager.enabled_slots()
+    }
+
     pub fn slot_bytes(&self) -> usize {
         self.slot_bytes
     }
@@ -402,10 +410,14 @@ impl GpuPager {
             .iter()
             .enumerate()
             .filter_map(|(slot, backing)| {
-                backing
-                    .allocation
-                    .as_ref()
-                    .map(|_| (slot, backing.range, heat[slot]))
+                (self.pager.slot_enabled(slot as u32))
+                    .then(|| {
+                        backing
+                            .allocation
+                            .as_ref()
+                            .map(|_| (slot, backing.range, heat[slot]))
+                    })
+                    .flatten()
             })
             .collect()
     }
@@ -656,6 +668,75 @@ impl GpuPager {
                 Ok(Some(CpuPushPlan {
                     dst: self.slot_mapped_ptr(slot)?,
                     evicted,
+                }))
+            }
+        }
+    }
+
+    /// Permanently reserve one physical slot as this size class's exchange destination. The slot
+    /// stays allocated in the unified arena but is disabled in the ordinary VRAM LRU until a
+    /// promotion rotates into it; the evicted slot then becomes the next disabled spare.
+    fn reserve_exchange_slot(&mut self) -> Result<u32> {
+        if self.pager.n_slots() < 2 {
+            return Err(be("exclusive MoE cache needs at least two physical slots"));
+        }
+        let slot = (self.pager.n_slots() - 1) as u32;
+        let resident = self.pager.disable_slot(slot);
+        debug_assert!(
+            resident.is_none(),
+            "exchange slot reserved before first touch"
+        );
+        Ok(slot)
+    }
+
+    /// Resolve one exclusive VRAM/RAM promotion. A full-cache miss is written into the currently
+    /// disabled exchange slot; the old LRU slot remains byte-for-byte intact and is returned as
+    /// the demotion source. Only after the caller has copied the requested bytes upward may that
+    /// old slot be copied down and recycled as the next exchange slot.
+    fn plan_exclusive_cpu_push(
+        &mut self,
+        id: BlockId,
+        exchange_slot: &mut u32,
+        scan: bool,
+    ) -> Result<Option<ExclusiveCpuPushPlan>> {
+        let prof = pager_profile::active();
+        let lookup_t0 = prof.then(std::time::Instant::now);
+        let resolution = if scan {
+            self.pager.touch_cold(id)
+        } else {
+            self.pager.touch(id)
+        };
+        if let Some(t0) = lookup_t0 {
+            let (hit, evicted) = match resolution {
+                Resolution::Hit { .. } => (true, false),
+                Resolution::Miss { evicted, .. } => (false, evicted.is_some()),
+            };
+            pager_profile::record_gpu_cache_lookup(hit, evicted, t0.elapsed());
+        }
+        match resolution {
+            Resolution::Hit { .. } => Ok(None),
+            Resolution::Miss {
+                slot,
+                evicted: None,
+            } => {
+                self.record_placement(id, slot, None);
+                Ok(Some(ExclusiveCpuPushPlan {
+                    dst: self.slot_mapped_ptr(slot)?,
+                    demoted: None,
+                }))
+            }
+            Resolution::Miss {
+                slot,
+                evicted: Some(victim),
+            } => {
+                let promoted_slot = *exchange_slot;
+                let old_slot = self.pager.rotate_resident_to_spare(id, promoted_slot);
+                debug_assert_eq!(old_slot, slot);
+                *exchange_slot = old_slot;
+                self.record_placement(id, promoted_slot, Some(victim));
+                Ok(Some(ExclusiveCpuPushPlan {
+                    dst: self.slot_mapped_ptr(promoted_slot)?,
+                    demoted: Some((victim, self.slot_mapped_ptr(old_slot)?)),
                 }))
             }
         }
@@ -1118,19 +1199,23 @@ pub struct ExpertSource {
     pub layer_base: u32,
     /// Byte offset assigned by the seam's layer-major permanent host-store plan.
     pub host_offset: usize,
+    /// Exact file descriptor of this whole role bank. Present in bounded-RAM mode, where the bank
+    /// is not copied into the permanent Host Store and Prefill streams it directly from SSD.
+    pub file: Option<BlockDesc>,
 }
 
 /// Runtime metadata for one bank after [`ExpertSource::bank`] has been copied into the permanent
 /// host store. Keeping this separate is the ownership guarantee behind the single-copy design:
 /// the session cannot accidentally retain the model mapping as a second runtime weight source.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RegisteredExpertSource {
     stride_bytes: usize,
     layer_base: u32,
     block_base: u32,
-    host_chunk: usize,
+    host_chunk: Option<usize>,
     host_offset: usize,
     bank_bytes: usize,
+    file: Option<BlockDesc>,
 }
 
 struct HostStoreChunk {
@@ -1146,6 +1231,86 @@ struct HostStoreChunk {
 struct Pool {
     slot_bytes: usize,
     pager: GpuPager,
+    /// Present only in bounded-RAM / SSD mode. Together with `pager`, this is one logical LRU
+    /// split at the VRAM/RAM boundary; neither tier retains a duplicate of the other.
+    host: Option<Arc<ExclusiveHostCache>>,
+    /// Disabled physical VRAM slot used as the next promotion destination. It rotates with the
+    /// evicted slot after every full-cache miss.
+    exchange_slot: Option<u32>,
+    demoter: Option<DemotionWorker>,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // `ExclusiveDemotion::src` points into `pager`'s mapped VRAM. Struct fields are dropped
+        // after this hook, so drain the worker here while that mapping is guaranteed to be alive.
+        // The worker's own Drop still closes and joins its thread afterwards.
+        if let Some(worker) = &mut self.demoter {
+            let _ = worker.wait();
+        }
+    }
+}
+
+struct DemotionWorker {
+    tx: Option<std::sync::mpsc::SyncSender<ExclusiveDemotion>>,
+    done: std::sync::mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pending: bool,
+}
+
+impl DemotionWorker {
+    fn new(name: String) -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ExclusiveDemotion>(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job.execute();
+                    if done_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| be(format!("cannot spawn MoE demotion worker: {e}")))?;
+        Ok(Self {
+            tx: Some(tx),
+            done,
+            thread: Some(thread),
+            pending: false,
+        })
+    }
+
+    fn wait(&mut self) -> Result<()> {
+        if self.pending {
+            self.done
+                .recv()
+                .map_err(|_| be("MoE demotion worker stopped unexpectedly"))?;
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, job: ExclusiveDemotion) -> Result<()> {
+        self.wait()?;
+        self.tx
+            .as_ref()
+            .ok_or_else(|| be("MoE demotion worker is closed"))?
+            .send(job)
+            .map_err(|_| be("MoE demotion worker stopped unexpectedly"))?;
+        self.pending = true;
+        Ok(())
+    }
+}
+
+impl Drop for DemotionWorker {
+    fn drop(&mut self) {
+        let _ = self.wait();
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1179,8 +1344,17 @@ struct PrefillLayerPlacement {
 /// until the adapter joins that worker at the end of the forward.
 pub(crate) struct PrefillCopyJob {
     buf_id: usize,
-    copies: Vec<StagingCopy>,
+    copies: Vec<PrefillCopy>,
     bytes: usize,
+}
+
+enum PrefillCopy {
+    Memory(StagingCopy),
+    Disk {
+        host: Arc<ExclusiveHostCache>,
+        desc: BlockDesc,
+        dst: usize,
+    },
 }
 
 impl PrefillCopyJob {
@@ -1188,15 +1362,26 @@ impl PrefillCopyJob {
         self.buf_id
     }
 
-    pub(crate) fn execute(self) {
+    pub(crate) fn execute(self) -> Result<()> {
         let copy_t0 = pager_profile::active().then(std::time::Instant::now);
         for copy in self.copies {
-            let src = unsafe { std::slice::from_raw_parts(copy.src as *const u8, copy.len) };
-            par_copy_to_mapped(src, copy.dst as *mut u8);
+            match copy {
+                PrefillCopy::Memory(copy) => {
+                    let src =
+                        unsafe { std::slice::from_raw_parts(copy.src as *const u8, copy.len) };
+                    par_copy_to_mapped(src, copy.dst as *mut u8);
+                }
+                PrefillCopy::Disk { host, desc, dst } => {
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, desc.nbytes()) };
+                    host.read_stream(&desc, bytes)?;
+                }
+            }
         }
         if let Some(t0) = copy_t0 {
             pager_profile::record_memcpy(self.bytes, t0.elapsed());
         }
+        Ok(())
     }
 }
 
@@ -1291,6 +1476,9 @@ pub struct MoePagerSession {
 pub struct MoePoolSpec {
     pub slot_bytes: usize,
     pub n_slots: usize,
+    /// Bounded exclusive RAM cache below this VRAM size class. `None` selects the permanent
+    /// full-Host-Store fast path.
+    pub host: Option<Arc<ExclusiveHostCache>>,
 }
 
 /// One chunk of the unique permanent CPU store. Chunks are split only at complete layer boundaries
@@ -1342,8 +1530,14 @@ fn ring_region_bytes(total: usize, slots: usize, min_slot_bytes: usize) -> usize
 
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
-        if layout.host_chunks.is_empty() {
+        let tiered = layout.pools.iter().any(|pool| pool.host.is_some());
+        if !tiered && layout.host_chunks.is_empty() {
             return Err(be("moe pager: permanent host-store plan has no chunks"));
+        }
+        if tiered && layout.pools.iter().any(|pool| pool.host.is_none()) {
+            return Err(be(
+                "moe pager: bounded-RAM mode requires a host tier for every size class",
+            ));
         }
         let mut host_store = Vec::with_capacity(layout.host_chunks.len());
         let mut previous_end = 0usize;
@@ -1370,11 +1564,24 @@ impl MoePagerSession {
             previous_end = end;
         }
         let host_payload_bytes: usize = host_store.iter().map(|chunk| chunk.bytes.len()).sum();
-        tracing::info!(
-            "[infr] paged-MoE host store: {} bytes in {} CPU-only layer chunks; GPU-visible host payload = 0 bytes",
-            host_payload_bytes,
-            host_store.len(),
-        );
+        if tiered {
+            let cache_bytes: usize = layout
+                .pools
+                .iter()
+                .filter_map(|pool| pool.host.as_ref())
+                .map(|host| host.arena_bytes())
+                .sum();
+            tracing::info!(
+                "[infr] paged-MoE host tier: exclusive bounded cache={} bytes; permanent full Host Store=0 bytes",
+                cache_bytes,
+            );
+        } else {
+            tracing::info!(
+                "[infr] paged-MoE host store: {} bytes in {} CPU-only layer chunks; GPU-visible host payload = 0 bytes",
+                host_payload_bytes,
+                host_store.len(),
+            );
+        }
         let unified_specs: Vec<_> = layout
             .pools
             .iter()
@@ -1382,16 +1589,29 @@ impl MoePagerSession {
             .collect();
         let unified_pool = vk.init_unified_vram_for_expert_slots(&unified_specs)?;
         let mut pools = Vec::with_capacity(layout.pools.len());
-        for spec in &layout.pools {
+        for (pool_idx, spec) in layout.pools.iter().enumerate() {
+            let mut pager = GpuPager::new_unified(
+                vk,
+                Arc::clone(&unified_pool),
+                layout.n_blocks.saturating_mul(3),
+                spec.n_slots,
+                spec.slot_bytes,
+            )?;
+            let exchange_slot = if spec.host.is_some() {
+                Some(pager.reserve_exchange_slot()?)
+            } else {
+                None
+            };
             pools.push(Pool {
                 slot_bytes: spec.slot_bytes,
-                pager: GpuPager::new_unified(
-                    vk,
-                    Arc::clone(&unified_pool),
-                    layout.n_blocks.saturating_mul(3),
-                    spec.n_slots,
-                    spec.slot_bytes,
-                )?,
+                pager,
+                host: spec.host.clone(),
+                exchange_slot,
+                demoter: spec
+                    .host
+                    .as_ref()
+                    .map(|_| DemotionWorker::new(format!("infr-moe-demote-{pool_idx}")))
+                    .transpose()?,
             });
         }
         // One graph's windows = paged layers x roles x n_expert addresses. 64k entries (512 KiB)
@@ -1457,30 +1677,56 @@ impl MoePagerSession {
                 source.stride_bytes,
             )));
         }
-        let end = source
-            .host_offset
-            .checked_add(bank.len())
-            .ok_or_else(|| be("moe pager: host-store offset overflow"))?;
-        let (host_chunk, chunk) = self
-            .host_store
-            .iter_mut()
-            .enumerate()
-            .find(|(_, chunk)| {
-                source.host_offset >= chunk.base_offset
-                    && end <= chunk.base_offset + chunk.bytes.len()
-            })
-            .ok_or_else(|| {
-                be(format!(
-                    "moe pager: host-store bank range {}..{end} crosses or exceeds a chunk",
-                    source.host_offset,
-                ))
-            })?;
-        let chunk_offset = source.host_offset - chunk.base_offset;
-        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
-        chunk.bytes[chunk_offset..chunk_offset + bank.len()].copy_from_slice(bank);
-        if let Some(t0) = copy_t0 {
-            pager_profile::record_memcpy(bank.len(), t0.elapsed());
-        }
+        let block_base = (role.index() * self.role_stride) as u32 + source.layer_base;
+        let (host_chunk, chunk_offset, file) = if let Some(host) = &self.pools[pool].host {
+            let file = source
+                .file
+                .clone()
+                .ok_or_else(|| be("moe pager: bounded-RAM expert bank has no file descriptor"))?;
+            if file.nbytes() != bank.len() {
+                return Err(be(format!(
+                    "moe pager: bank file descriptor is {} bytes, expected {}",
+                    file.nbytes(),
+                    bank.len(),
+                )));
+            }
+            for expert in 0..n_expert as u32 {
+                let id = block_base + expert;
+                if host.block_bytes(id) != Some(source.stride_bytes) {
+                    return Err(be(format!(
+                        "moe pager: bounded-RAM block {id} is not registered as {} bytes",
+                        source.stride_bytes,
+                    )));
+                }
+            }
+            (None, 0, Some(file))
+        } else {
+            let end = source
+                .host_offset
+                .checked_add(bank.len())
+                .ok_or_else(|| be("moe pager: host-store offset overflow"))?;
+            let (host_chunk, chunk) = self
+                .host_store
+                .iter_mut()
+                .enumerate()
+                .find(|(_, chunk)| {
+                    source.host_offset >= chunk.base_offset
+                        && end <= chunk.base_offset + chunk.bytes.len()
+                })
+                .ok_or_else(|| {
+                    be(format!(
+                        "moe pager: host-store bank range {}..{end} crosses or exceeds a chunk",
+                        source.host_offset,
+                    ))
+                })?;
+            let chunk_offset = source.host_offset - chunk.base_offset;
+            let copy_t0 = pager_profile::active().then(std::time::Instant::now);
+            chunk.bytes[chunk_offset..chunk_offset + bank.len()].copy_from_slice(bank);
+            if let Some(t0) = copy_t0 {
+                pager_profile::record_memcpy(bank.len(), t0.elapsed());
+            }
+            (Some(host_chunk), chunk_offset, None)
+        };
         self.sources.insert(
             buf_id,
             (
@@ -1489,10 +1735,11 @@ impl MoePagerSession {
                 RegisteredExpertSource {
                     stride_bytes: source.stride_bytes,
                     layer_base: source.layer_base,
-                    block_base: (role.index() * self.role_stride) as u32 + source.layer_base,
+                    block_base,
                     host_chunk,
                     host_offset: chunk_offset,
                     bank_bytes: bank.len(),
+                    file,
                 },
             ),
         );
@@ -1671,7 +1918,7 @@ impl MoePagerSession {
         if !self.prefill_placement.is_empty() {
             return Ok(());
         }
-        let mut grouped: BTreeMap<u32, Vec<(u8, usize, usize, usize, usize, usize)>> =
+        let mut grouped: BTreeMap<u32, Vec<(u8, usize, usize, usize, Option<usize>, usize)>> =
             BTreeMap::new();
         for (&buf_id, (role, pool, src)) in &self.sources {
             let role_order = match role {
@@ -1705,19 +1952,21 @@ impl MoePagerSession {
                 .ok_or_else(|| be("moe pager: empty expert layer in host-store plan"))?;
             for (_, buf_id, pool, bytes, host_chunk, host_offset) in banks {
                 offset = prefill_align(offset);
-                if host_chunk != layer_host_chunk {
-                    return Err(be(format!(
-                        "moe pager: layer {layer_base} crosses permanent host-store chunks"
-                    )));
-                }
-                let expected = layer_host_offset
-                    .checked_add(offset)
-                    .ok_or_else(|| be("moe pager: prefill layer host-store offset overflow"))?;
-                if host_offset != expected {
-                    return Err(be(format!(
-                        "moe pager: layer {layer_base} bank host offset {host_offset} is not \
-                         contiguous (expected {expected})"
-                    )));
+                if let Some(layer_host_chunk) = layer_host_chunk {
+                    if host_chunk != Some(layer_host_chunk) {
+                        return Err(be(format!(
+                            "moe pager: layer {layer_base} crosses permanent host-store chunks"
+                        )));
+                    }
+                    let expected = layer_host_offset
+                        .checked_add(offset)
+                        .ok_or_else(|| be("moe pager: prefill layer host-store offset overflow"))?;
+                    if host_offset != expected {
+                        return Err(be(format!(
+                            "moe pager: layer {layer_base} bank host offset {host_offset} is not \
+                             contiguous (expected {expected})"
+                        )));
+                    }
                 }
                 packed.push((buf_id, pool, offset, bytes));
                 offset = offset
@@ -1895,6 +2144,11 @@ impl MoePagerSession {
     /// invalidated. Everything outside the borrowed lanes survives the phase transition.
     pub fn enter_prefill_layer(&mut self) -> Result<()> {
         if self.mode != MoeArenaMode::PrefillLayer {
+            for pool in &mut self.pools {
+                if let Some(worker) = &mut pool.demoter {
+                    worker.wait()?;
+                }
+            }
             self.build_prefill_layout()?;
             let mut evicted = 0usize;
             let mut borrowed = 0usize;
@@ -1968,19 +2222,35 @@ impl MoePagerSession {
                 .sources
                 .get(&bank_id)
                 .ok_or_else(|| be("moe pager: async layer bank source disappeared"))?;
-            let src = self.host_store[source.host_chunk]
-                .bytes
-                .get(source.host_offset..source.host_offset + source.bank_bytes)
-                .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
             let dst = self.pools[bank_placement.pool]
                 .pager
-                .virtual_mapped_ptr(bank_placement.byte_offset, src.len())?;
-            copies.push(StagingCopy {
-                src: src.as_ptr() as usize,
-                dst,
-                len: src.len(),
-            });
-            bytes = bytes.saturating_add(src.len());
+                .virtual_mapped_ptr(bank_placement.byte_offset, source.bank_bytes)?;
+            if let Some(host_chunk) = source.host_chunk {
+                let src = self.host_store[host_chunk]
+                    .bytes
+                    .get(source.host_offset..source.host_offset + source.bank_bytes)
+                    .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
+                copies.push(PrefillCopy::Memory(StagingCopy {
+                    src: src.as_ptr() as usize,
+                    dst,
+                    len: src.len(),
+                }));
+            } else {
+                let host = self.pools[bank_placement.pool]
+                    .host
+                    .as_ref()
+                    .ok_or_else(|| be("moe pager: disk-backed Prefill bank has no host reader"))?;
+                let desc = source
+                    .file
+                    .clone()
+                    .ok_or_else(|| be("moe pager: disk-backed Prefill bank has no descriptor"))?;
+                copies.push(PrefillCopy::Disk {
+                    host: Arc::clone(host),
+                    desc,
+                    dst,
+                });
+            }
+            bytes = bytes.saturating_add(source.bank_bytes);
         }
 
         let lane = placement.lane;
@@ -2196,16 +2466,58 @@ impl MoePagerSession {
         let mut copied = 0usize;
         for &lid in local_ids {
             let local = lid as usize;
-            let src = host_base
-                .checked_add(local.saturating_mul(stride))
-                .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
-            if let Some(plan) = pool.pager.plan_cpu_push(block_base + lid, scan)? {
-                let bytes = host_store[host_chunk]
-                    .bytes
-                    .get(src..src + stride)
-                    .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
-                par_copy_to_mapped(bytes, plan.dst as *mut u8);
-                copied += bytes.len();
+            let id = block_base + lid;
+            if let Some(host) = pool.host.as_ref().cloned() {
+                if pool.pager.is_resident(id) {
+                    let plan = pool.pager.plan_exclusive_cpu_push(
+                        id,
+                        pool.exchange_slot
+                            .as_mut()
+                            .expect("tiered pool has an exchange slot"),
+                        scan,
+                    )?;
+                    debug_assert!(plan.is_none());
+                    continue;
+                }
+                pool.demoter
+                    .as_mut()
+                    .expect("tiered pool has a demotion worker")
+                    .wait()?;
+                let plan = pool
+                    .pager
+                    .plan_exclusive_cpu_push(
+                        id,
+                        pool.exchange_slot
+                            .as_mut()
+                            .expect("tiered pool has an exchange slot"),
+                        scan,
+                    )?
+                    .expect("a nonresident block must produce an upload plan");
+                let job = host.promote(id, plan.demoted, |bytes| {
+                    par_copy_to_mapped(bytes, plan.dst as *mut u8);
+                    Ok(())
+                })?;
+                copied = copied.saturating_add(stride);
+                if let Some(job) = job {
+                    pool.demoter
+                        .as_mut()
+                        .expect("tiered pool has a demotion worker")
+                        .submit(job)?;
+                }
+            } else {
+                let host_chunk = host_chunk
+                    .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
+                let src = host_base
+                    .checked_add(local.saturating_mul(stride))
+                    .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
+                if let Some(plan) = pool.pager.plan_cpu_push(id, scan)? {
+                    let bytes = host_store[host_chunk]
+                        .bytes
+                        .get(src..src + stride)
+                        .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
+                    par_copy_to_mapped(bytes, plan.dst as *mut u8);
+                    copied += bytes.len();
+                }
             }
         }
         if let Some(t0) = copy_t0 {
@@ -2230,7 +2542,7 @@ impl MoePagerSession {
         let job = self
             .prepare_prefill_layer_cpu(buf_id)?
             .ok_or_else(|| be("moe pager: failed to prepare synchronous Prefill layer"))?;
-        job.execute();
+        job.execute()?;
         self.complete_prefill_layer_cpu(buf_id)?;
         Ok(true)
     }
@@ -2391,8 +2703,23 @@ impl MoePagerSession {
                 "[moe pager] shared/{:.1}MB: {} slots={}",
                 p.slot_bytes as f64 / 1e6,
                 stats_suffix(&s),
-                p.pager.n_slots(),
+                p.pager.enabled_slots(),
             );
+            if let Some(host) = &p.host {
+                let hs = host.stats();
+                tracing::info!(
+                    "[moe pager]   exclusive RAM: slots={} hits={} ssd_reads={} ram_evictions={} \
+                     demotions={} promoted={:.3}GB demoted={:.3}GB disk={:.3}GB",
+                    host.n_slots(),
+                    hs.ram_hits,
+                    hs.ssd_reads,
+                    hs.ram_evictions,
+                    hs.demotions,
+                    hs.bytes_promoted as f64 / 1e9,
+                    hs.bytes_demoted as f64 / 1e9,
+                    hs.bytes_read as f64 / 1e9,
+                );
+            }
         }
     }
 }

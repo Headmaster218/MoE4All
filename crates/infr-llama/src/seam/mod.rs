@@ -2049,6 +2049,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // `MoePagerSession::register` does.
     let mut moe_host_offsets =
         std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
+    let mut moe_host_by_size = std::collections::BTreeMap::<
+        usize,
+        std::sync::Arc<infr_core::hostpager::ExclusiveHostCache>,
+    >::new();
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
@@ -2130,7 +2134,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 _ => chunk_ranges.push((start, end)),
             }
         }
-        let host_chunks: Vec<infr_vulkan::pager::MoeHostChunkSpec> = chunk_ranges
+        let mut host_chunks: Vec<infr_vulkan::pager::MoeHostChunkSpec> = chunk_ranges
             .into_iter()
             .map(|(base_offset, end)| infr_vulkan::pager::MoeHostChunkSpec {
                 base_offset,
@@ -2198,6 +2202,55 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     pager_budget_bytes as f64 / 2f64.powi(20),
                 )
             })?;
+            // The Host tier has two honest modes. If the configured/automatic RAM budget covers
+            // the whole expert payload, retain the existing layer-contiguous store (fastest
+            // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
+            // caches and leave the remaining Experts on SSD. VRAM and those RAM caches are
+            // exclusive: a promotion consumes its RAM slot and the displaced VRAM block takes it.
+            let requested = infr_core::hostmem::Requested::from_config(
+                ec.paging.dram.map(|s| s.resolve(0)),
+                ec.paging.dram_bypass,
+            );
+            let ram_budget = match requested {
+                infr_core::hostmem::Requested::Fixed(bytes) => bytes.min(host_bytes as u64),
+                infr_core::hostmem::Requested::Off | infr_core::hostmem::Requested::Bypass => 0,
+                infr_core::hostmem::Requested::Auto => infr_core::hostmem::available_bytes()
+                    .map_or(host_bytes as u64, |available| {
+                        infr_core::hostmem::auto_arena_bytes(available, 0, host_bytes as u64)
+                    }),
+            } as usize;
+            let bounded_host = ram_budget < host_bytes;
+            if bounded_host {
+                let classes: Vec<(usize, usize)> = logical_pools
+                    .iter()
+                    .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
+                    .collect();
+                let ram_slots = infr_core::hostpager::plan_slots(ram_budget, &classes);
+                let io = std::sync::Arc::new(
+                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                for (&(slot_bytes, _, _), &slots) in logical_pools.iter().zip(&ram_slots) {
+                    let cache = infr_core::hostpager::ExclusiveHostCache::new(
+                        slots,
+                        slot_bytes,
+                        io.clone(),
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                    moe_host_by_size.insert(slot_bytes, std::sync::Arc::new(cache));
+                }
+                host_chunks.clear();
+                tracing::info!(
+                    "MoE host plan: bounded exclusive RAM cache {:.2} GB / {:.2} GB expert payload; remaining Experts stream from SSD",
+                    ram_budget as f64 / 1e9,
+                    host_bytes as f64 / 1e9,
+                );
+            } else {
+                tracing::info!(
+                    "MoE host plan: full layer-contiguous RAM store {:.2} GB",
+                    host_bytes as f64 / 1e9,
+                );
+            }
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
             // pointer, so it is NOT capped by one SSBO binding's maxStorageBufferRange (~4 GiB on
             // RADV) the way it was when the arena was a bound SSBO. A pool now holds as many experts
@@ -2229,6 +2282,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     infr_vulkan::pager::MoePoolSpec {
                         slot_bytes: sb,
                         n_slots: budget_slots,
+                        host: moe_host_by_size.get(&sb).cloned(),
                     }
                 })
                 .collect();
@@ -2244,12 +2298,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
              {:.2} GB mapped ReBAR pool budget; Decode size bias {size_cache_bias:+.2} \
-             ({size_cache_bias_source}); {:.2} GB CPU-only host store in {host_chunk_count} \
-             layer-boundary chunks; ctx={want_ctx})",
+             ({size_cache_bias_source}); host={} {:.2} GB in {host_chunk_count} chunks; \
+             ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),
                 pager_budget_bytes as f64 / 1e9,
-                host_bytes as f64 / 1e9,
+                if bounded_host {
+                    "exclusive-RAM/SSD"
+                } else {
+                    "full-RAM"
+                },
+                if bounded_host { ram_budget } else { host_bytes } as f64 / 1e9,
             );
             // Prefill streams every whole MoE layer through a topology-sized ring. Qwen3.6's
             // full-attention interval includes three DeltaNet layers, so current + one complete
@@ -2758,11 +2817,43 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let host_offset = *moe_host_offsets.get(&(l, role)).ok_or_else(|| {
                     anyhow!("MoE permanent host-store plan has no offset for {name}")
                 })?;
+                let file = if let Some(host) = moe_host_by_size.get(&stride_bytes) {
+                    let (base, len) = bytes.file_range();
+                    if len != stride_bytes * n_expert {
+                        return Err(anyhow!(
+                            "MoE bounded Host tier: {name}'s file range is {len} bytes, expected \
+                             {n_expert} x {stride_bytes}"
+                        ));
+                    }
+                    let role_idx = match role {
+                        infr_vulkan::pager::Role::Gate => 0usize,
+                        infr_vulkan::pager::Role::Up => 1,
+                        infr_vulkan::pager::Role::Down => 2,
+                    };
+                    let block_base = (role_idx * n_paged * n_expert + l * n_expert) as u32;
+                    for expert in 0..n_expert {
+                        host.register(infr_core::blockio::BlockDesc {
+                            id: block_base + expert as u32,
+                            extents: vec![infr_core::blockio::BlockExtent {
+                                offset: base + (expert * stride_bytes) as u64,
+                                len: stride_bytes,
+                            }],
+                        })
+                        .map_err(|e| anyhow!("{e}"))?;
+                    }
+                    Some(infr_core::blockio::BlockDesc {
+                        id: block_base,
+                        extents: vec![infr_core::blockio::BlockExtent { offset: base, len }],
+                    })
+                } else {
+                    None
+                };
                 let source = infr_vulkan::pager::ExpertSource {
                     bank,
                     stride_bytes,
                     layer_base,
                     host_offset,
+                    file,
                 };
                 vk.register_paged_expert(role, buf_id, source, n_expert)
                     .map_err(|e| anyhow!("{e}"))?;

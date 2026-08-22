@@ -5062,6 +5062,7 @@ mod tests {
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: SLOT,
                 n_slots: SLOTS,
+                host: None,
             }],
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
                 base_offset: 0,
@@ -5198,6 +5199,7 @@ mod tests {
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: 4096,
                 n_slots: 2,
+                host: None,
             }],
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
                 base_offset: 0,

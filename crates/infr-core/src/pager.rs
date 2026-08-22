@@ -542,6 +542,91 @@ impl Pager {
         Some(slot)
     }
 
+    /// Replace one resident block with another in the SAME physical slot and put the replacement
+    /// at the requested end of the LRU. This is the bookkeeping primitive used by an exclusive
+    /// upper/lower cache swap: the promoted block leaves its RAM slot only after its bytes have
+    /// reached VRAM, then the demoted VRAM block takes that exact RAM slot.
+    ///
+    /// No hit/miss counter is changed here. The access that caused the swap was already counted
+    /// by the tier that served it; this operation only changes ownership of an existing slot.
+    pub fn replace_resident(&mut self, old: BlockId, new: BlockId, insert: Insert) -> Option<u32> {
+        assert!(
+            !self.pinned.contains_key(&old),
+            "pager: replacement of pinned block {old}"
+        );
+        assert!(
+            !self.resident.contains_key(&new),
+            "pager: replacement block {new} is already resident"
+        );
+        let slot = self.resident.remove(&old)?;
+        let removed = self.unlink_lru(slot);
+        debug_assert_eq!(removed, Some(old));
+        self.epoch.remove(&old);
+        self.resident.insert(new, slot);
+        self.epoch.insert(new, self.cur_epoch);
+        match insert {
+            Insert::Mru => self.push_back_lru(slot, new),
+            Insert::Cold => self.push_front_lru(slot, new),
+        }
+        Some(slot)
+    }
+
+    /// Move a resident block from its current enabled slot into one disabled spare slot, making
+    /// the old slot the next spare. The bytes are NOT moved here; a backend first writes the
+    /// promoted block into `spare`, then copies the evicted block out of the returned old slot.
+    ///
+    /// The LRU position is preserved exactly. In the tiered MoE path this follows [`Self::touch`]
+    /// on a miss, so the moved block is already MRU and remains there while the physical exchange
+    /// slot rotates underneath it.
+    pub fn rotate_resident_to_spare(&mut self, id: BlockId, spare: u32) -> u32 {
+        let spare_idx = self.slot_idx(spare);
+        assert!(
+            self.disabled[spare_idx],
+            "pager: exchange slot {spare} is not disabled"
+        );
+        assert!(
+            self.lru[spare_idx].id.is_none(),
+            "pager: disabled exchange slot {spare} is occupied"
+        );
+        let old = *self
+            .resident
+            .get(&id)
+            .expect("pager: only a resident block can rotate into a spare");
+        let old_idx = self.slot_idx(old);
+        assert!(
+            !self.disabled[old_idx],
+            "pager: resident block {id} is in disabled slot {old}"
+        );
+
+        let node = self.lru[old_idx];
+        debug_assert_eq!(node.id, Some(id));
+        if let Some(prev) = node.prev {
+            let prev_idx = self.slot_idx(prev);
+            self.lru[prev_idx].next = Some(spare);
+        } else {
+            self.lru_head = Some(spare);
+        }
+        if let Some(next) = node.next {
+            let next_idx = self.slot_idx(next);
+            self.lru[next_idx].prev = Some(spare);
+        } else {
+            self.lru_tail = Some(spare);
+        }
+        if self.cold_victim_cursor == Some(old) {
+            self.cold_victim_cursor = Some(spare);
+        }
+        self.lru[spare_idx] = LruNode {
+            id: Some(id),
+            prev: node.prev,
+            next: node.next,
+        };
+        self.lru[old_idx] = LruNode::default();
+        self.resident.insert(id, spare);
+        self.disabled[spare_idx] = false;
+        self.disabled[old_idx] = true;
+        old
+    }
+
     /// Schedule-driven residency for a DETERMINISTIC cyclic sweep — the dense layer-streaming
     /// policy the module doc names (`BlockId = layer`, every forward pass visits blocks in the
     /// same fixed order). This is NOT demand/LRU: under a cyclic sweep the block whose next use
@@ -1469,5 +1554,28 @@ mod tests {
         p.touch(1);
         p.touch(1);
         assert!((p.stats().hit_rate() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exchange_slot_rotates_without_changing_lru_capacity() {
+        let mut p = Pager::new(3);
+        assert_eq!(p.disable_slot(2), None);
+        p.touch(10);
+        p.touch(11);
+        p.begin_batch();
+        let Resolution::Miss {
+            slot,
+            evicted: Some(10),
+        } = p.touch(12)
+        else {
+            panic!("full active set must evict its LRU")
+        };
+        let old = p.rotate_resident_to_spare(12, 2);
+        assert_eq!(old, slot);
+        assert_eq!(p.slot_of(12), Some(2));
+        assert!(!p.slot_enabled(old));
+        assert!(p.slot_enabled(2));
+        assert_eq!(p.enabled_slots(), 2);
+        assert_eq!(p.lru_order(), vec![11, 12]);
     }
 }
