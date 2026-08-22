@@ -370,10 +370,7 @@ impl UnifiedVramPool {
         Self::new_with_shards(vk, &shard_sizes)
     }
 
-    pub(crate) fn new_with_shards(
-        vk: &VulkanBackend,
-        shard_sizes: &[usize],
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new_with_shards(vk: &VulkanBackend, shard_sizes: &[usize]) -> Result<Arc<Self>> {
         if shard_sizes.is_empty() || shard_sizes.contains(&0) {
             return Err(be("unified VRAM arena needs non-empty physical shards"));
         }

@@ -1,0 +1,117 @@
+#version 460
+// Ling KDA recurrent delta-rule attention. One workgroup owns 32 V columns of one head and keeps
+// the [head_dim, 32] state tile in LDS across the token scan. Ling uses head_dim=128.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define COL_BLOCK 32u
+#define MAX_HD 128u
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint n_head;
+    uint head_dim;
+    float eps;
+    float lower_bound;
+    float qscale;
+} pc;
+
+layout(binding = 0) readonly buffer QB { float qkv[]; };       // [rows, 3*n_head*head_dim]
+layout(binding = 1) readonly buffer FB { float forget[]; };    // [rows, n_head*head_dim]
+layout(binding = 2) readonly buffer BB { float beta[]; };      // [rows, n_head]
+layout(binding = 3) readonly buffer AB { float a[]; };         // [n_head], already exp(A_log)
+layout(binding = 4) readonly buffer DB { float dt_bias[]; };   // [n_head*head_dim]
+layout(binding = 5) buffer SB { float state[]; };              // [n_head, head_dim, head_dim]
+layout(binding = 6) writeonly buffer OB { float outp[]; };     // [rows, n_head*head_dim]
+
+shared float ss[MAX_HD * COL_BLOCK];
+shared float qn[MAX_HD];
+shared float kn[MAX_HD];
+shared float decay[MAX_HD];
+shared float red[32];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint nblk = (pc.head_dim + COL_BLOCK - 1u) / COL_BLOCK;
+    uint h = gl_WorkGroupID.x / nblk;
+    uint blk = gl_WorkGroupID.x % nblk;
+    uint d = blk * COL_BLOCK + lane;
+    bool live = d < pc.head_dim;
+    uint inner = pc.n_head * pc.head_dim;
+    uint hbase = h * pc.head_dim;
+    uint sbase = h * pc.head_dim * pc.head_dim;
+
+    if (live) {
+        for (uint k = 0u; k < pc.head_dim; k++) {
+            ss[k * COL_BLOCK + lane] = state[sbase + k * pc.head_dim + d];
+        }
+    }
+    barrier();
+
+    for (uint tok = 0u; tok < pc.rows; tok++) {
+        uint row = tok * 3u * inner;
+        uint qbase = row + hbase;
+        uint kbase = row + inner + hbase;
+        uint vbase = row + 2u * inner + hbase;
+        uint fbase = tok * inner + hbase;
+
+        float qs = 0.0;
+        float ks = 0.0;
+        for (uint k = lane; k < pc.head_dim; k += 32u) {
+            float qv = qkv[qbase + k];
+            float kv = qkv[kbase + k];
+            qn[k] = qv;
+            kn[k] = kv;
+            qs += qv * qv;
+            ks += kv * kv;
+            float z = a[h] * (forget[fbase + k] + dt_bias[hbase + k]);
+            float log_decay = pc.lower_bound / (1.0 + exp(-z));
+            decay[k] = exp(log_decay);
+        }
+        red[lane] = qs;
+        barrier();
+        for (uint step = 16u; step > 0u; step >>= 1) {
+            if (lane < step) { red[lane] += red[lane + step]; }
+            barrier();
+        }
+        float qnorm = sqrt(red[0] + pc.eps);
+        barrier();
+        red[lane] = ks;
+        barrier();
+        for (uint step = 16u; step > 0u; step >>= 1) {
+            if (lane < step) { red[lane] += red[lane + step]; }
+            barrier();
+        }
+        float knorm = sqrt(red[0] + pc.eps);
+        barrier();
+        for (uint k = lane; k < pc.head_dim; k += 32u) {
+            qn[k] = qn[k] / qnorm * pc.qscale;
+            kn[k] = kn[k] / knorm;
+        }
+        barrier();
+
+        float b = 1.0 / (1.0 + exp(-beta[tok * pc.n_head + h]));
+        if (live) {
+            float pred = 0.0;
+            for (uint k = 0u; k < pc.head_dim; k++) {
+                float sval = ss[k * COL_BLOCK + lane] * decay[k];
+                ss[k * COL_BLOCK + lane] = sval;
+                pred += kn[k] * sval;
+            }
+            float delta = (qkv[vbase + d] - pred) * b;
+            float o = 0.0;
+            for (uint k = 0u; k < pc.head_dim; k++) {
+                float sval = ss[k * COL_BLOCK + lane] + kn[k] * delta;
+                ss[k * COL_BLOCK + lane] = sval;
+                o += qn[k] * sval;
+            }
+            outp[tok * inner + hbase + d] = o;
+        }
+        barrier();
+    }
+
+    if (live) {
+        for (uint k = 0u; k < pc.head_dim; k++) {
+            state[sbase + k * pc.head_dim + d] = ss[k * COL_BLOCK + lane];
+        }
+    }
+}

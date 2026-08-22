@@ -47,6 +47,10 @@ pub const QWEN35: &str = "qwen35";
 /// per-token sigmoid). Shares every `qwen35` field (`Config::from_gguf`'s `qwen35` gate,
 /// `MixerW::DeltaNet`); only the FFN differs (`FfnW::Moe`'s `shexp` branch — see `seam::weights`).
 pub const QWEN35_MOE: &str = "qwen35moe";
+/// Ling 3.0 Flash: a 42-layer hybrid with per-layer KDA or MLA token mixers and a DeepSeek-style
+/// routed MoE after two dense lead layers. KDA is a distinct recurrent operator; the MLA and MoE
+/// portions reuse the existing DeepSeek machinery where their tensor layouts match.
+pub const BAILINGMOE3: &str = "bailingmoe3";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
 /// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See
@@ -159,4 +163,5 @@ pub const ALL: &[&str] = &[
     DEEPSEEK4,
     QWEN35,
     QWEN35_MOE,
+    BAILINGMOE3,
 ];

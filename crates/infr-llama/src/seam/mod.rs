@@ -565,12 +565,22 @@ pub(crate) fn generate_dense_vulkan_session(
         warm_binder
     } else {
         let _gp = req.and_then(|r| r.gate_pass());
-        vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx)?
+        match vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx) {
+            Ok(bind) => bind,
+            Err(error) => {
+                vk.release_moe_load_reservation();
+                return Err(error);
+            }
+        }
     };
     let out = generate_dense_backend(
         vk, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
         constraint, None, None, None, None, None, req,
-    )?;
+    );
+    if out.is_err() {
+        vk.release_moe_load_reservation();
+    }
+    let out = out?;
     // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
     // (persists across calls on the same session — see `MoePagerSession`). A no-op when no paged
     // model is loaded. Printed every call rather than gated to "last call only" since neither the
@@ -1084,8 +1094,11 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 /// refuses any non-zero ratio before a graph is built, so nothing reads a geometry that does not
 /// exist yet.
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
-    if cfg.deepseek2 {
+    if cfg.is_mla_layer(l) {
         return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
+    }
+    if cfg.is_recurrent_layer(l) {
+        return (0, 0);
     }
     if cfg.deepseek4 {
         // Read straight off `head_dim` rather than through `layer_head_dim`/`layer_n_kv`: those
@@ -1150,14 +1163,14 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
 /// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
 /// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    !cfg.deepseek2 && kv_row_align_ok(cfg)
+    !cfg.deepseek2 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
 }
 
 /// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
 /// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
 /// priced exactly instead of the MoE planner treating every non-auto choice as f16.
 fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
-    if cfg.deepseek2 {
+    if cfg.deepseek2 || cfg.bailingmoe3 {
         return DType::F16;
     }
     let block_aligned = kv_row_align_ok(cfg);
@@ -1195,13 +1208,13 @@ pub(crate) fn mla_kv_fmt(
     k_fmt: DType,
     v_fmt: DType,
 ) -> AResult<(DType, DType)> {
-    if !cfg.deepseek2 || backend == "cpu" {
+    if (!cfg.deepseek2 && !cfg.bailingmoe3) || backend == "cpu" {
         return Ok((k_fmt, v_fmt));
     }
     let named = |dt: Option<DType>| matches!(dt, Some(dt) if dt != DType::F16);
     if named(ec.kv.type_k) || named(ec.kv.type_v) || ec.kv.force_q8 {
         return Err(anyhow!(
-            "deepseek2 (MLA) KV cache is f16-only on the {backend} backend: its attention kernel \
+            "MLA KV cache is f16-only on the {backend} backend: its attention kernel \
              reads the compressed KV row as f16 and would reinterpret any other dtype. Requested \
              k={:?} (INFR_KV_TYPE_K), v={:?} (INFR_KV_TYPE_V), force_q8={} (INFR_KV_Q8) — unset \
              them, ask for f16, or run this model on the CPU backend, which dequantizes every KV \
@@ -1245,10 +1258,9 @@ pub(crate) fn layer_state_bytes(
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
-    if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
-        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-        let state_elems =
-            cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+    if cfg.is_recurrent_layer(l) {
+        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
+        let state_elems = cfg.recurrent_state_elems();
         return (conv_elems * 4, state_elems * 4);
     }
 
@@ -1524,6 +1536,8 @@ pub struct ModelMemoryPlan {
     pub fixed_weight_bytes: u64,
     pub persistent_state_bytes: u64,
     pub runtime_reserve_bytes: u64,
+    pub weight_packing_margin_bytes: u64,
+    pub post_load_reserve_bytes: u64,
     pub expert_cache_bytes: u64,
 }
 
@@ -1534,15 +1548,53 @@ impl ModelMemoryPlan {
         persistent_state_bytes: u64,
         runtime_reserve_bytes: u64,
     ) -> Option<Self> {
+        Self::new_with_packing_margin(
+            total_room_bytes,
+            fixed_weight_bytes,
+            persistent_state_bytes,
+            runtime_reserve_bytes,
+            0,
+        )
+    }
+
+    pub fn new_with_packing_margin(
+        total_room_bytes: u64,
+        fixed_weight_bytes: u64,
+        persistent_state_bytes: u64,
+        runtime_reserve_bytes: u64,
+        weight_packing_margin_bytes: u64,
+    ) -> Option<Self> {
+        Self::new_with_reserves(
+            total_room_bytes,
+            fixed_weight_bytes,
+            persistent_state_bytes,
+            runtime_reserve_bytes,
+            weight_packing_margin_bytes,
+            0,
+        )
+    }
+
+    pub fn new_with_reserves(
+        total_room_bytes: u64,
+        fixed_weight_bytes: u64,
+        persistent_state_bytes: u64,
+        runtime_reserve_bytes: u64,
+        weight_packing_margin_bytes: u64,
+        post_load_reserve_bytes: u64,
+    ) -> Option<Self> {
         let persistent = fixed_weight_bytes.saturating_add(persistent_state_bytes);
         (persistent <= total_room_bytes).then(|| Self {
             total_room_bytes,
             fixed_weight_bytes,
             persistent_state_bytes,
             runtime_reserve_bytes,
+            weight_packing_margin_bytes,
+            post_load_reserve_bytes,
             expert_cache_bytes: total_room_bytes
                 .saturating_sub(persistent)
-                .saturating_sub(runtime_reserve_bytes),
+                .saturating_sub(runtime_reserve_bytes)
+                .saturating_sub(weight_packing_margin_bytes)
+                .saturating_sub(post_load_reserve_bytes),
         })
     }
 
@@ -1550,7 +1602,23 @@ impl ModelMemoryPlan {
         self.fixed_weight_bytes
             .saturating_add(self.persistent_state_bytes)
             .saturating_add(self.runtime_reserve_bytes)
+            .saturating_add(self.weight_packing_margin_bytes)
+            .saturating_add(self.post_load_reserve_bytes)
     }
+}
+
+/// Resident BDA weights are packed into 64 MiB blocks, so summing logical tensor bytes understates
+/// the committed allocation by the unused block tails. Measurements across supported model
+/// families put that delta at 1.16%-2.43%; 3%, rounded to a block and floored at 256 MiB, protects
+/// new architectures without changing the allocator or carrying a second copy of its state.
+fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
+    const BLOCK: u64 = 64 * 1024 * 1024;
+    const MIN: u64 = 256 * 1024 * 1024;
+    dense_weight_bytes
+        .saturating_mul(3)
+        .div_ceil(100)
+        .max(MIN)
+        .next_multiple_of(BLOCK)
 }
 
 /// Conservative load-time runtime reserve for control planes that do not own a live backend yet.
@@ -1917,6 +1985,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut pager_budget_bytes = 0u64;
+    let mut load_reserve_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -1958,7 +2027,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
         // borrows only cold Decode arena ranges and returns them on `enter_decode`.
         let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, ubatch_rows(ec));
-        let Some(plan) = ModelMemoryPlan::new(room, fp.dense, kv_bytes, runtime_reserve) else {
+        let packing_margin = resident_weight_packing_margin(fp.dense);
+        let Some(plan) = ModelMemoryPlan::new_with_reserves(
+            room,
+            fp.dense,
+            kv_bytes,
+            runtime_reserve,
+            packing_margin,
+            POST_KV_DEVICE_RESERVE,
+        ) else {
             return Err(anyhow!(
                 "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed the unified \
                  VRAM room ({:.2} GB after guard/reserve/configured cap) — dense layer streaming \
@@ -1996,13 +2073,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
             None => {}
         }
+        if n_paged > 0 {
+            load_reserve_bytes = plan.runtime_reserve_bytes;
+        }
         tracing::info!(
             "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime={:.2} GB \
+             packing_margin={:.2} GB post_load={:.2} GB \
              expert_cache={:.2} GB (k={k_fmt:?}, v={v_fmt:?}, ctx={want_ctx})",
             room as f64 / 1e9,
             plan.fixed_weight_bytes as f64 / 1e9,
             plan.persistent_state_bytes as f64 / 1e9,
             plan.runtime_reserve_bytes as f64 / 1e9,
+            plan.weight_packing_margin_bytes as f64 / 1e9,
+            plan.post_load_reserve_bytes as f64 / 1e9,
             (if n_paged > 0 {
                 pager_budget_bytes
             } else {
@@ -2113,34 +2196,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if current_layer.is_some() {
             host_layers.push((layer_start, host_bytes));
         }
-        // Windows' AMD Vulkan driver rejects one ~20+ GiB host-visible allocation. Preserve one
-        // logical layer-major store while splitting its VkDeviceMemory only BETWEEN layers. A
-        // layer therefore always remains one contiguous transfer source and one Prefill DMA.
-        const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
-        let mut chunk_ranges = Vec::<(usize, usize)>::new();
-        for (start, end) in host_layers {
-            if end - start > HOST_CHUNK_MAX {
-                return Err(anyhow!(
-                    "MoE expert layer requires {:.2} GiB, above the {:.2} GiB permanent \
-                     host-store chunk limit",
-                    (end - start) as f64 / 2f64.powi(30),
-                    HOST_CHUNK_MAX as f64 / 2f64.powi(30),
-                ));
-            }
-            match chunk_ranges.last_mut() {
-                Some((chunk_start, chunk_end)) if end - *chunk_start <= HOST_CHUNK_MAX => {
-                    *chunk_end = end;
-                }
-                _ => chunk_ranges.push((start, end)),
-            }
-        }
-        let mut host_chunks: Vec<infr_vulkan::pager::MoeHostChunkSpec> = chunk_ranges
-            .into_iter()
-            .map(|(base_offset, end)| infr_vulkan::pager::MoeHostChunkSpec {
-                base_offset,
-                bytes: end - base_offset,
-            })
-            .collect();
+        let mut host_chunks = Vec::<infr_vulkan::pager::MoeHostChunkSpec>::new();
         if pool_blocks.is_empty() {
             // Defensive: an MoE config with NO pageable `_exps` weight banks (no arch this crate
             // loads ships that). Nothing to page — stay fully resident and let the alloc-time
@@ -2239,13 +2295,40 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map_err(|e| anyhow!("{e}"))?;
                     moe_host_by_size.insert(slot_bytes, std::sync::Arc::new(cache));
                 }
-                host_chunks.clear();
                 tracing::info!(
                     "MoE host plan: bounded exclusive RAM cache {:.2} GB / {:.2} GB expert payload; remaining Experts stream from SSD",
                     ram_budget as f64 / 1e9,
                     host_bytes as f64 / 1e9,
                 );
             } else {
+                // Keep the complete payload in one logical layer-major store, split only BETWEEN
+                // layers so each layer remains a contiguous Prefill source. Bounded-RAM mode does
+                // not allocate this store and therefore must not inherit its per-chunk limit.
+                const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
+                let mut chunk_ranges = Vec::<(usize, usize)>::new();
+                for &(start, end) in &host_layers {
+                    if end - start > HOST_CHUNK_MAX {
+                        return Err(anyhow!(
+                            "MoE expert layer requires {:.2} GiB, above the {:.2} GiB permanent \
+                             host-store chunk limit",
+                            (end - start) as f64 / 2f64.powi(30),
+                            HOST_CHUNK_MAX as f64 / 2f64.powi(30),
+                        ));
+                    }
+                    match chunk_ranges.last_mut() {
+                        Some((chunk_start, chunk_end)) if end - *chunk_start <= HOST_CHUNK_MAX => {
+                            *chunk_end = end;
+                        }
+                        _ => chunk_ranges.push((start, end)),
+                    }
+                }
+                host_chunks = chunk_ranges
+                    .into_iter()
+                    .map(|(base_offset, end)| infr_vulkan::pager::MoeHostChunkSpec {
+                        base_offset,
+                        bytes: end - base_offset,
+                    })
+                    .collect();
                 tracing::info!(
                     "MoE host plan: full layer-contiguous RAM store {:.2} GB",
                     host_bytes as f64 / 1e9,
@@ -2321,6 +2404,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 n_paged
             };
             vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
+                load_reserve_bytes,
                 n_blocks,
                 pools,
                 host_chunks,
@@ -4226,11 +4310,9 @@ mod seam_helper_tests {
         // context length or the session KV dtype.
         let delta_q8 =
             super::layer_state_bytes(&cfg, 0, ctx, false, ubatch, DType::Q8_0, DType::Q8_0);
-        let delta_f16 =
-            super::layer_state_bytes(&cfg, 0, 1, false, ubatch, DType::F16, DType::F16);
+        let delta_f16 = super::layer_state_bytes(&cfg, 0, 1, false, ubatch, DType::F16, DType::F16);
         let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-        let state_elems =
-            cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+        let state_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
         assert_eq!(delta_q8, (conv_elems * 4, state_elems * 4));
         assert_eq!(delta_q8, delta_f16);
 
@@ -4254,8 +4336,7 @@ mod seam_helper_tests {
         let ctx = 200_000;
         let ubatch = 4096;
         let fmt = DType::Q8_0;
-        let estimate =
-            super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, fmt, fmt);
+        let estimate = super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, fmt, fmt);
         let attention = super::layer_state_bytes(&cfg, 3, ctx, false, ubatch, fmt, fmt);
         let delta = super::layer_state_bytes(&cfg, 0, ctx, false, ubatch, fmt, fmt);
         let attention_bytes = attention.0 as u64 + attention.1 as u64;
@@ -4279,10 +4360,9 @@ mod seam_helper_tests {
         let (ctx, ubatch) = (4096usize, super::ubatch_rows(&ec));
         let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, DType::F16, DType::F16);
         // 27 layers × exact K allocation plus the bindable V placeholder.
-        let per_layer = super::kv_side_bytes(
-            DType::F16,
-            ctx * (cfg.kv_lora_rank + cfg.qk_rope_dim),
-        ) + super::kv_side_bytes(DType::F16, 0);
+        let per_layer =
+            super::kv_side_bytes(DType::F16, ctx * (cfg.kv_lora_rank + cfg.qk_rope_dim))
+                + super::kv_side_bytes(DType::F16, 0);
         let want = (cfg.n_layer * per_layer) as u64;
         assert_eq!(est, want);
         // The pre-fix pricing, spelled out: K+V at the head-dim product.
@@ -4897,8 +4977,7 @@ mod seam_helper_tests {
 
         // MoE expert placement: same ceiling, minus the model/shape-derived phase workspace.
         let workspace = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ub);
-        let empty =
-            super::ModelMemoryPlan::new(XTX_ROOM, 0, 0, workspace).expect("empty plan");
+        let empty = super::ModelMemoryPlan::new(XTX_ROOM, 0, 0, workspace).expect("empty plan");
         assert_eq!(empty.expert_cache_bytes, XTX_ROOM - workspace);
         assert_eq!(empty.minimum_required_bytes(), workspace);
         let full = super::ModelMemoryPlan::new(XTX_ROOM, XTX_ROOM, 0, 0).expect("full plan");
@@ -4912,6 +4991,26 @@ mod seam_helper_tests {
             XTX_ROOM < vram.available,
             "…again a case the raw free figure would have waved through"
         );
+    }
+
+    #[test]
+    fn moe_weight_packing_margin_is_block_rounded_and_budgeted() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        assert_eq!(super::resident_weight_packing_margin(1), 256 * MIB);
+        assert_eq!(super::resident_weight_packing_margin(16 * GIB), 512 * MIB);
+
+        let plan = super::ModelMemoryPlan::new_with_reserves(
+            20 * GIB,
+            4 * GIB,
+            2 * GIB,
+            1 * GIB,
+            512 * MIB,
+            256 * MIB,
+        )
+        .expect("plan");
+        assert_eq!(plan.expert_cache_bytes, 12 * GIB + 256 * MIB);
+        assert_eq!(plan.minimum_required_bytes(), 7 * GIB + 768 * MIB);
     }
 
     #[test]

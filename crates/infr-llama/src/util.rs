@@ -11,6 +11,11 @@ use tokenizers::Tokenizer;
 /// which is what made a naive ByteLevel produce different token ids.
 pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Bailing/Ling pre-tokenizer (`tokenizer.ggml.pre == "bailingmoe2"`). The contractions are
+/// intentionally case-sensitive by spelling out both cases, matching llama.cpp's BAILINGMOE
+/// pre-type rather than Qwen2's case-insensitive contraction group.
+pub(crate) const BAILINGMOE_PRE_RE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+
 /// DeepSeek-LLM (V1) pre-tokenizer patterns — 6 successive splits applied in order
 /// (llama.cpp's `DEEPSEEK_LLM` pre-type, `src/llama-vocab.cpp`). See docs/deepseek.md §0.2.
 pub(crate) const DEEPSEEK_LLM_PRE_RES: [&str; 6] = [

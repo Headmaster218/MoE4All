@@ -2765,6 +2765,45 @@ impl VulkanBackend {
         Ok(())
     }
 
+    /// Allocate device-local dedicated buffers used only as a physical load-time reservation.
+    /// Chunking avoids both the device's single-allocation limit and one multi-GiB allocation.
+    pub(crate) fn alloc_load_vram_reservation(&self, bytes: u64) -> Result<Vec<Box<dyn Buffer>>> {
+        const CHUNK: u64 = 256 * 1024 * 1024;
+        let mut remaining = bytes;
+        let mut buffers = Vec::with_capacity(remaining.div_ceil(CHUNK) as usize);
+        while remaining > 0 {
+            let chunk = remaining.min(CHUNK);
+            let size = usize::try_from(chunk)
+                .map_err(|_| be("load-time VRAM reservation exceeds addressable size"))?;
+            let buffer = self.make_buf_ex(
+                size,
+                MemoryLocation::GpuOnly,
+                "session-runtime-reserve",
+                true,
+                false,
+            )?;
+            buffers.push(Box::new(buffer) as Box<dyn Buffer>);
+            remaining -= chunk;
+        }
+        Ok(buffers)
+    }
+
+    /// Error-path twin of `Backend::finish_weight_load`; harmless when no reservation is live.
+    pub fn release_moe_load_reservation(&self) {
+        let bytes = self
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_or(0, crate::pager::MoePagerSession::release_load_reservation);
+        if bytes > 0 {
+            tracing::info!(
+                "[infr] released {:.2} GiB of load-time VRAM for runtime workspace",
+                bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
+    }
+
     /// Register one paged layer's role tensor with the session `init_moe_pager` already installed
     /// — called from the seam's weight-load closure instead of uploading the tensor's full bytes.
     /// Panics if no session is installed (a caller bug: `init_moe_pager` must run first); errors
@@ -3181,10 +3220,7 @@ impl VulkanBackend {
 
     /// Create the one elastic VRAM arena shared by this backend's paged experts and auxiliary
     /// engines. Repeated calls return the same pool and reject contradictory capacities.
-    pub fn init_unified_vram(
-        &self,
-        bytes: usize,
-    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+    pub fn init_unified_vram(&self, bytes: usize) -> Result<Arc<crate::unified::UnifiedVramPool>> {
         let mut cell = self.unified_pool.lock().unwrap();
         if let Some(pool) = cell.as_ref() {
             if pool.stats().capacity_bytes != bytes {
@@ -4256,6 +4292,10 @@ impl Backend for VulkanBackend {
         self.moe_pager.lock().unwrap().is_some()
     }
 
+    fn finish_weight_load(&self) {
+        self.release_moe_load_reservation();
+    }
+
     fn dense_paged(&self) -> bool {
         self.dense_pager.lock().unwrap().is_some()
     }
@@ -5016,13 +5056,12 @@ mod tests {
             .alloc_unified(1000, crate::unified::UnifiedVramClass::Expert)
             .expect("expert view");
         let b = be
-            .alloc_unified(
-                300_000,
-                crate::unified::UnifiedVramClass::EmbeddingWeights,
-            )
+            .alloc_unified(300_000, crate::unified::UnifiedVramClass::EmbeddingWeights)
             .expect("embedding view");
         assert_ne!(a.device_addr(), b.device_addr());
-        let bytes: Vec<u8> = (0..b.len_bytes()).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let bytes: Vec<u8> = (0..b.len_bytes())
+            .map(|i| (i as u8).wrapping_mul(31))
+            .collect();
         be.upload(b.as_ref(), &bytes).expect("unified upload");
         let mut back = vec![0; bytes.len()];
         be.download(b.as_ref(), &mut back)
@@ -5058,6 +5097,7 @@ mod tests {
         const SLOT: usize = 1024 * 1024;
         const SLOTS: usize = 16;
         be.init_moe_pager(crate::pager::MoePagerLayout {
+            load_reserve_bytes: 0,
             n_blocks: 32,
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: SLOT,
@@ -5195,6 +5235,7 @@ mod tests {
             }
         };
         be.init_moe_pager(crate::pager::MoePagerLayout {
+            load_reserve_bytes: 0,
             n_blocks: 4,
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: 4096,

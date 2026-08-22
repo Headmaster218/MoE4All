@@ -785,6 +785,17 @@ pub enum Op {
         rows: u32,
         n: u32,
     },
+    /// Head-wise sigmoid gate: `dst[r,h,d] = x[r,h,d] * sigmoid(gate[r,h])`. Ling's gated MLA
+    /// produces one scalar per attention head, then broadcasts it over that head's V width before
+    /// the output projection. In place when `dst == x`.
+    HeadwiseSigmoidMul {
+        x: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+    },
     /// `dst[i] = cap * tanh(x[i] / cap)` (Gemma final-logit softcap).
     Softcap {
         x: TensorId,
@@ -1056,6 +1067,27 @@ pub enum Op {
         /// Eliminates 3 CopyStrided dispatches per DeltaNet layer (qwen35).
         src_stride: u32,
     },
+    /// Ling KDA recurrent delta-rule attention. `qkv` is `[rows, 3*n_head*head_dim]` with packed
+    /// Q, K, V blocks per row after projection + causal conv + SiLU. `forget` is
+    /// `[rows, n_head*head_dim]`, `beta` is `[rows, n_head]`, `a` is the converted `exp(A_log)`
+    /// weight `[n_head]`, and `dt_bias` is `[n_head*head_dim]`. Per token/head, Q and K are L2
+    /// normalized, Q is scaled by `1/sqrt(head_dim)`, and each state row receives its own decay:
+    /// `decay[k] = exp(lower_bound * sigmoid(a[h] * (forget[k] + dt_bias[k])))`. Then
+    /// `delta = (v - k^T S) * sigmoid(beta)`, `S += outer(k, delta)`, `dst = q^T S`.
+    Kda {
+        qkv: TensorId,
+        forget: TensorId,
+        beta: TensorId,
+        a: TensorId,
+        dt_bias: TensorId,
+        state: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        eps: f32,
+        lower_bound: f32,
+    },
     /// qwen35moe Qwen2-MoE-style shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
     /// shexp[r,c]` for `rows` rows of `n` elements. `moe` is the routed-MoE branch's output
     /// (`Op::MoeFfn`'s `dst`); `shexp` is the shared expert's own dense SwiGLU FFN output (a
@@ -1102,6 +1134,7 @@ impl Op {
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::MulVec { .. } => "MulVec",
+            Op::HeadwiseSigmoidMul { .. } => "HeadwiseSigmoidMul",
             Op::Softcap { .. } => "Softcap",
             Op::Argmax { .. } => "Argmax",
             Op::ArgmaxProb { .. } => "ArgmaxProb",
@@ -1113,6 +1146,7 @@ impl Op {
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
             Op::DeltaNet { .. } => "DeltaNet",
+            Op::Kda { .. } => "Kda",
             Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
         }
     }
@@ -1245,6 +1279,7 @@ impl Op {
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
             Op::MulVec { x, vec: v, dst, .. } => (vec![x, v], vec![dst]),
+            Op::HeadwiseSigmoidMul { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::Softcap { x, dst, .. } => (vec![x], vec![dst]),
             Op::Argmax { x, dst, .. } => (vec![x], vec![dst]),
             Op::ArgmaxProb {
@@ -1301,6 +1336,16 @@ impl Op {
                 vec![q, k, v, b, a, a_coef, dt_bias, state],
                 vec![state, dst],
             ),
+            Op::Kda {
+                qkv,
+                forget,
+                beta,
+                a,
+                dt_bias,
+                state,
+                dst,
+                ..
+            } => (vec![qkv, forget, beta, a, dt_bias, state], vec![state, dst]),
             Op::MoeSharedExpertAdd {
                 moe,
                 shexp,

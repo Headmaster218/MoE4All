@@ -4108,7 +4108,8 @@ fn cmd_serve(
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
         let embedding = embedding_model
             .map(|model| {
-                let compatibility_runner = embedding_runner.or(cfg.serve.embedding_runner.as_deref());
+                let compatibility_runner =
+                    embedding_runner.or(cfg.serve.embedding_runner.as_deref());
                 if compatibility_runner.is_some() {
                     load_embedding_generator(model, embedding_runner, 1, cfg)
                 } else {
@@ -4289,9 +4290,8 @@ fn load_native_embedding_generator_on(
         .and_then(|s| s.to_str())
         .unwrap_or("embedding-model")
         .to_owned();
-    let model: Box<dyn infr_embedding::EmbeddingEngine> = Box::new(
-        infr_embedding::NativeEmbeddingEngine::load_vulkan_with_backend(&gguf, backend)?,
-    );
+    let model: Box<dyn infr_embedding::EmbeddingEngine> =
+        Box::new(infr_embedding::NativeEmbeddingEngine::load_vulkan_with_backend(&gguf, backend)?);
     let snapshot = model.resource_snapshot();
     tracing::info!(
         resource = %snapshot.id,

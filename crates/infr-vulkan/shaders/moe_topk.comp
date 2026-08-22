@@ -53,8 +53,8 @@ layout(binding = 4) writeonly buffer WB { float wts[]; };
 shared float sval[128];
 shared uint sidx[128];
 // Per-expert score adjustment: bias (if has_bias) + group mask. Thread 0 pre-fills.
-// 256 experts → 1 KB shared — well within limits.
-shared float ssel_adj[256];
+// Keep this aligned with MAX_CHUNKS: 128 lanes * 8 chunks = 1024 experts (4 KiB shared).
+shared float ssel_adj[1024];
 
 // n_expert headroom: 128 lanes * 8 chunks = 1024 experts.
 #define MAX_CHUNKS 8u

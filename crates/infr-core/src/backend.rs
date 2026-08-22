@@ -609,6 +609,12 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Notify the backend that a cold session has finished allocating resident weights and is
+    /// about to size/allocate KV and recurrent state. Backends may use this boundary to release a
+    /// runtime reservation that protected those bytes from weight-arena packing tails. Default
+    /// no-op.
+    fn finish_weight_load(&self) {}
+
     /// Whether the currently loaded DENSE model streams per-layer weight blocks through a paged
     /// VRAM cache (dense layer streaming — the `crate::pager::Pager::schedule` policy; see
     /// `infr_vulkan::pager`'s dense session). Unlike [`Backend::moe_paged`] no host readback is

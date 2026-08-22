@@ -128,6 +128,20 @@ pub(super) struct DeltaW {
     pub(super) out: TensorId,
 }
 
+/// Ling KDA mixer weights. Q/K/V projection and causal-conv banks are concatenated once at load,
+/// matching the packed activation consumed by [`infr_core::Op::Kda`].
+pub(super) struct KdaW {
+    pub(super) qkv: TensorId,
+    pub(super) conv: TensorId,
+    pub(super) forget: TensorId,
+    pub(super) beta: TensorId,
+    pub(super) a: TensorId,
+    pub(super) dt_bias: TensorId,
+    pub(super) norm: TensorId,
+    pub(super) gate: TensorId,
+    pub(super) out: TensorId,
+}
+
 /// DeepSeek V2+ MLA (Multi-head Latent Attention) mixer weights — absorbed form. The KV cache holds
 /// ONE compressed row per token (`key_length = kv_lora_rank + qk_rope_dim`); V is an aliased prefix —
 /// no separate V cache. See `docs/deepseek.md` § Stage 2.
@@ -151,6 +165,8 @@ pub(super) struct MlaW {
     pub(super) wv_b: TensorId,
     /// Output projection `[n_head * v_head_dim, n_embd]`.
     pub(super) wo: TensorId,
+    /// Ling's one-scalar-per-head sigmoid output gate; absent on DeepSeek MLA.
+    pub(super) gate: Option<TensorId>,
     /// deepseek32's lightning indexer. `Some` exactly when `Config::deepseek32`; `None` for every
     /// `deepseek2` model, which attends every causally-eligible key. The emit arm reads this
     /// `Option` rather than the config flag, so a `deepseek32` model whose indexer weights were not
@@ -235,6 +251,7 @@ pub(super) struct LayerHcW {
 pub(super) enum MixerW {
     Attn(AttnW),
     DeltaNet(DeltaW),
+    Kda(KdaW),
     Mla(MlaW),
     Dsv4(Dsv4W),
 }
@@ -438,13 +455,13 @@ impl SeamKv {
                 self.max_ctx
             ));
         }
-        if cfg.qwen35 {
-            let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-            let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+        if cfg.qwen35 || cfg.bailingmoe3 {
+            let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
+            let s_elems = cfg.recurrent_state_elems();
             let conv_zero = vec![0f32; conv_elems];
             let s_zero = vec![0f32; s_elems];
             for l in 0..cfg.n_layer {
-                if !cfg.is_qwen35_attn_layer(l) {
+                if cfg.is_recurrent_layer(l) {
                     be.upload(self.kbufs[l].as_ref(), bytemuck::cast_slice(&conv_zero))
                         .map_err(|e| anyhow!("{e}"))?;
                     be.upload(self.vbufs[l].as_ref(), bytemuck::cast_slice(&s_zero))
@@ -561,11 +578,11 @@ impl SeamKv {
             );
             kbufs.push(
                 be.alloc(k_bytes, BufferUsage::KvCache)
-                .map_err(|e| anyhow!("{e}"))?,
+                    .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
                 be.alloc(v_bytes, BufferUsage::KvCache)
-                .map_err(|e| anyhow!("{e}"))?,
+                    .map_err(|e| anyhow!("{e}"))?,
             );
         }
         // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
@@ -649,7 +666,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.qwen35 {
+        if cfg.qwen35 || cfg.bailingmoe3 {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);

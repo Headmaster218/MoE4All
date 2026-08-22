@@ -2053,6 +2053,29 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::HeadwiseSigmoidMul {
+                    x,
+                    gate,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                } => {
+                    let (rr, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
+                    let xs = vals[x.0 as usize].clone();
+                    let gs = vals[gate.0 as usize].clone();
+                    let mut out = vec![0.0f32; rr * nh * hd];
+                    for r in 0..rr {
+                        for h in 0..nh {
+                            let sig = 1.0 / (1.0 + (-gs[r * nh + h]).exp());
+                            let base = (r * nh + h) * hd;
+                            for d in 0..hd {
+                                out[base + d] = xs[base + d] * sig;
+                            }
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 // qwen35moe shared-expert combine: `moe` (routed-MoE output) + sigmoid(`gate[r]`) *
                 // `shexp` (the shared expert's own dense FFN output), row-broadcast — see the
                 // `Op::MoeSharedExpertAdd` doc. Rows independent — spin-pool over rows, mirrors
@@ -3127,6 +3150,73 @@ impl Backend for CpuBackend {
                     );
                     vals[dst.0 as usize] = out;
                 }
+                Op::Kda {
+                    qkv,
+                    forget,
+                    beta,
+                    a,
+                    dt_bias,
+                    state,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    eps,
+                    lower_bound,
+                } => {
+                    let (rr, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
+                    let inner = nh * hd;
+                    let qkv = vals[qkv.0 as usize].clone();
+                    let forget = vals[forget.0 as usize].clone();
+                    let beta = vals[beta.0 as usize].clone();
+                    let a = weight(a);
+                    let dt_bias = weight(dt_bias);
+                    let st = &mut vals[state.0 as usize];
+                    let mut out = vec![0.0f32; rr * inner];
+                    let qscale = 1.0 / (hd as f32).sqrt();
+
+                    for t in 0..rr {
+                        let row = t * 3 * inner;
+                        for h in 0..nh {
+                            let hv = h * hd;
+                            let qbase = row + hv;
+                            let kbase = row + inner + hv;
+                            let vbase = row + 2 * inner + hv;
+                            let mut qn = 0.0f32;
+                            let mut kn = 0.0f32;
+                            for k in 0..hd {
+                                qn += qkv[qbase + k] * qkv[qbase + k];
+                                kn += qkv[kbase + k] * qkv[kbase + k];
+                            }
+                            let qinv = qscale / (qn + eps).sqrt();
+                            let kinv = 1.0 / (kn + eps).sqrt();
+                            let b = 1.0 / (1.0 + (-beta[t * nh + h]).exp());
+                            let sbase = h * hd * hd;
+
+                            for v in 0..hd {
+                                let mut pred = 0.0f32;
+                                for k in 0..hd {
+                                    let gate =
+                                        a[h] * (forget[t * inner + hv + k] + dt_bias[hv + k]);
+                                    let log_decay = lower_bound / (1.0 + (-gate).exp());
+                                    let si = sbase + k * hd + v;
+                                    st[si] *= log_decay.exp();
+                                    pred += st[si] * (qkv[kbase + k] * kinv);
+                                }
+                                let delta = (qkv[vbase + v] - pred) * b;
+                                let mut o = 0.0f32;
+                                for k in 0..hd {
+                                    let kval = qkv[kbase + k] * kinv;
+                                    let si = sbase + k * hd + v;
+                                    st[si] += kval * delta;
+                                    o += st[si] * (qkv[qbase + k] * qinv);
+                                }
+                                out[t * inner + hv + v] = o;
+                            }
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Mla {
                     q,
                     k_cache,
@@ -3740,6 +3830,71 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kda_one_step_updates_state_and_scales_query() {
+        use infr_core::tensor::TensorDesc;
+
+        let mut graph = Graph::new();
+        let qkv = graph.input(TensorDesc::new(vec![6], DType::F32));
+        let forget = graph.input(TensorDesc::new(vec![2], DType::F32));
+        let beta = graph.input(TensorDesc::new(vec![1], DType::F32));
+        let state = graph.input(TensorDesc::new(vec![4], DType::F32));
+        let a = graph.weight(TensorDesc::new(vec![1], DType::F32));
+        let dt_bias = graph.weight(TensorDesc::new(vec![2], DType::F32));
+        let out = graph.output(TensorDesc::new(vec![2], DType::F32));
+        graph.push(Op::Kda {
+            qkv,
+            forget,
+            beta,
+            a,
+            dt_bias,
+            state,
+            dst: out,
+            rows: 1,
+            n_head: 1,
+            head_dim: 2,
+            eps: 0.0,
+            lower_bound: -5.0,
+        });
+
+        let be = CpuBackend::new();
+        let upload = |v: &[f32], usage| {
+            let b = be.alloc(v.len() * 4, usage).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let qkv_b = upload(&[1.0, 0.0, 1.0, 0.0, 2.0, 4.0], BufferUsage::Activations);
+        let forget_b = upload(&[0.0, 0.0], BufferUsage::Activations);
+        let beta_b = upload(&[0.0], BufferUsage::Activations);
+        let state_b = upload(&[0.0; 4], BufferUsage::KvCache);
+        let a_b = upload(&[1.0], BufferUsage::Weights);
+        let dt_b = upload(&[0.0, 0.0], BufferUsage::Weights);
+        let out_b = be.alloc(8, BufferUsage::Readback).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qkv, qkv_b.as_ref())
+            .bind(forget, forget_b.as_ref())
+            .bind(beta, beta_b.as_ref())
+            .bind(state, state_b.as_ref())
+            .bind(a, a_b.as_ref())
+            .bind(dt_bias, dt_b.as_ref())
+            .bind(out, out_b.as_ref());
+        let plan = be.compile(&graph).unwrap();
+        be.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut out_bytes = vec![0u8; 8];
+        be.download(out_b.as_ref(), &mut out_bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&out_bytes);
+        let s = 1.0 / 2.0f32.sqrt();
+        assert!((got[0] - s).abs() < 1e-6, "{got:?}");
+        assert!((got[1] - 2.0 * s).abs() < 1e-6, "{got:?}");
+
+        let mut state_bytes = vec![0u8; 16];
+        be.download(state_b.as_ref(), &mut state_bytes).unwrap();
+        let got_state: &[f32] = bytemuck::cast_slice(&state_bytes);
+        assert_eq!(got_state, &[1.0, 2.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn attention_reads_graph_internal_kv() {

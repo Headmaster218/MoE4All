@@ -277,7 +277,9 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::GatedRmsNorm { .. }
             | Op::Softcap { .. }
             | Op::Conv1dSilu { .. }
-            | Op::DeltaNet { .. } => {}
+            | Op::DeltaNet { .. }
+            | Op::Kda { .. }
+            | Op::HeadwiseSigmoidMul { .. } => {}
             _ => {}
         }
     }
@@ -1997,6 +1999,21 @@ fn lower_op(
             rows,
             n,
         } => rec.mul_vec(r(*x)?, r(*vec)?, r(*dst)?, *rows as usize, *n as usize),
+        Op::HeadwiseSigmoidMul {
+            x,
+            gate,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+        } => rec.headwise_sigmoid_mul(
+            r(*x)?,
+            r(*gate)?,
+            r(*dst)?,
+            *rows as usize,
+            *n_head as usize,
+            *head_dim as usize,
+        ),
         Op::MoeSharedExpertAdd {
             moe,
             shexp,
@@ -3795,6 +3812,33 @@ fn lower_op(
                 } // if *src_stride > 0
             }
         }
+        Op::Kda {
+            qkv,
+            forget,
+            beta,
+            a,
+            dt_bias,
+            state,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+            eps,
+            lower_bound,
+        } => rec.kda(
+            r(*qkv)?,
+            r(*forget)?,
+            r(*beta)?,
+            r(*a)?,
+            r(*dt_bias)?,
+            r(*state)?,
+            r(*dst)?,
+            *rows as usize,
+            *n_head as usize,
+            *head_dim as usize,
+            *eps,
+            *lower_bound,
+        ),
         // Elementwise gemma logit softcap `y = cap·tanh(x/cap)` (in-place safe).
         Op::Softcap { x, dst, cap, n } => {
             rec.softcap(r(*x)?, r(*dst)?, *cap, *n as usize);
@@ -7640,13 +7684,8 @@ mod tests {
             let wf16 = infr_testkit::f16_bytes(&stacked);
             let wq = infr_testkit::dequant_oracle(DType::F16, &wf16);
             let w_off = out_f * in_f;
-            let want = infr_testkit::ref_linear(
-                &x,
-                &wq[w_off..w_off + out_f * in_f],
-                rows,
-                in_f,
-                out_f,
-            );
+            let want =
+                infr_testkit::ref_linear(&x, &wq[w_off..w_off + out_f * in_f], rows, in_f, out_f);
             let mut g = Graph::new();
             let xi = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
             let wi = g.weight(TensorDesc::new(vec![3 * out_f, in_f], DType::F16));

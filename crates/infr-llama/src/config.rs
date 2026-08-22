@@ -115,6 +115,13 @@ pub struct Config {
     /// field below plus the `MixerW::DeltaNet` mixer branch in `seam`'s layer loop — the same
     /// shared transformer skeleton every other architecture runs through.
     pub qwen35: bool,
+    /// Ling 3.0 Flash (`bailingmoe3`): hybrid KDA/MLA mixer and DeepSeek-style MoE.
+    pub bailingmoe3: bool,
+    /// Per-layer mixer selector for `bailingmoe3`: true is MLA, false is KDA. Empty elsewhere.
+    pub bailing_mla_layers: Vec<bool>,
+    /// Ling KDA per-head Q/K/V width and lower bound used by its log-decay gate.
+    pub kda_head_dim: usize,
+    pub kda_gate_lower_bound: f32,
     /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
     /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
     pub full_attn_interval: usize,
@@ -484,7 +491,7 @@ impl Config {
     /// and rides the every-layer branch. `false` for dense models (`self.moe` is `None`).
     pub fn is_moe_layer(&self, il: usize) -> bool {
         self.moe.is_some()
-            && if self.deepseek || self.deepseek2 {
+            && if self.deepseek || self.deepseek2 || self.bailingmoe3 {
                 il >= self.n_layer_dense_lead
             } else if self.moe_interleave_step > 0 {
                 (il + 1).is_multiple_of(self.moe_interleave_step)
@@ -505,6 +512,36 @@ impl Config {
         self.qwen35
             && self.full_attn_interval > 0
             && (il + 1).is_multiple_of(self.full_attn_interval)
+    }
+
+    /// Whether Ling layer `il` uses MLA rather than KDA.
+    pub fn is_bailing_mla_layer(&self, il: usize) -> bool {
+        self.bailingmoe3 && self.bailing_mla_layers.get(il).copied().unwrap_or(false)
+    }
+
+    pub fn is_mla_layer(&self, il: usize) -> bool {
+        self.deepseek2 || self.is_bailing_mla_layer(il)
+    }
+
+    pub fn is_recurrent_layer(&self, il: usize) -> bool {
+        (self.qwen35 && !self.is_qwen35_attn_layer(il))
+            || (self.bailingmoe3 && !self.is_bailing_mla_layer(il))
+    }
+
+    pub fn recurrent_conv_channels(&self) -> usize {
+        if self.bailingmoe3 {
+            3 * self.n_head * self.kda_head_dim
+        } else {
+            self.q35_conv_channels()
+        }
+    }
+
+    pub fn recurrent_state_elems(&self) -> usize {
+        if self.bailingmoe3 {
+            self.n_head * self.kda_head_dim * self.kda_head_dim
+        } else {
+            self.q35_num_v_heads() * self.q35_head_k_dim() * self.q35_head_v_dim()
+        }
     }
     /// qwen35 gated-DeltaNet derived dims (see `docs/qwen35.md`) — ports of the old seam's `Cfg`
     /// helpers of the same name, now living on the shared `Config`.
@@ -546,6 +583,7 @@ impl Config {
             | crate::arch::DEEPSEEK2
             | crate::arch::DEEPSEEK32
             | crate::arch::DEEPSEEK4
+            | crate::arch::BAILINGMOE3
             | crate::arch::BITNET
             | crate::arch::BITNET_B158 => false,
             crate::arch::QWEN3
@@ -623,92 +661,94 @@ impl Config {
         // shape (routed-expert bank + shared expert vs plain dense).
         let qwen35_moe = arch == crate::arch::QWEN35_MOE;
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
+        let bailingmoe3 = arch == crate::arch::BAILINGMOE3;
+        let mla_arch = deepseek2 || bailingmoe3;
         let mk = |k: &str| format!("{arch}.{k}");
         // DeepSeek2-specific metadata: MLA dims, MoE gating function, YaRN (everything EXCEPT
         // "lite" detection, which needs n_layer — added after `n_layer` below).
-        let (q_lora_rank, kv_lora_rank, key_length_mla, value_length_mla, qk_rope_dim) =
-            if deepseek2 {
-                if deepseek32 {
-                    // `deepseek32.cpp::load_arch_tensors` opens with
-                    // `if (!hparams.is_mla()) throw "DEEPSEEK32 architecture requires MLA"`, and
-                    // `llama_hparams::is_mla()` is "both MLA head-length keys are non-zero" (they
-                    // default to 0 when absent). V3.2 has NO unabsorbed fallback at all, so say
-                    // that, rather than letting the generic deepseek2 message below describe a
-                    // derivation this arch never had.
-                    for key in ["attention.key_length_mla", "attention.value_length_mla"] {
-                        if meta_u64(g, &mk(key)).unwrap_or(0) == 0 {
-                            bail!(
-                                "deepseek32 architecture requires MLA: {} is missing or zero",
-                                mk(key)
-                            );
-                        }
+        let (q_lora_rank, kv_lora_rank, key_length_mla, value_length_mla, qk_rope_dim) = if mla_arch
+        {
+            if deepseek32 {
+                // `deepseek32.cpp::load_arch_tensors` opens with
+                // `if (!hparams.is_mla()) throw "DEEPSEEK32 architecture requires MLA"`, and
+                // `llama_hparams::is_mla()` is "both MLA head-length keys are non-zero" (they
+                // default to 0 when absent). V3.2 has NO unabsorbed fallback at all, so say
+                // that, rather than letting the generic deepseek2 message below describe a
+                // derivation this arch never had.
+                for key in ["attention.key_length_mla", "attention.value_length_mla"] {
+                    if meta_u64(g, &mk(key)).unwrap_or(0) == 0 {
+                        bail!(
+                            "deepseek32 architecture requires MLA: {} is missing or zero",
+                            mk(key)
+                        );
                     }
                 }
-                // `deepseek32.cpp` reads `q_lora_rank` unconditionally — V3.2 has no "lite"
-                // variant carrying a direct `wq`, so a file without the key is not a lite model,
-                // it is a broken one.
-                let qlr = if deepseek32 {
-                    meta_u64(g, &mk("attention.q_lora_rank"))
-                        .context("deepseek32.attention.q_lora_rank")? as usize
-                } else {
-                    meta_u64(g, &mk("attention.q_lora_rank")).unwrap_or(0) as usize
-                };
-                let kvlr = meta_u64(g, &mk("attention.kv_lora_rank"))
-                    .context("deepseek2.attention.kv_lora_rank")?
-                    as usize;
-                // No default for either MLA length: `head_k_mla`/`v_head_dim` below are derived
-                // from them and nothing downstream can detect a wrong guess — the attention is
-                // simply mis-shaped. llama.cpp routes a GGUF that carries neither key through
-                // `is_mla() == false` (`llama_hparams::is_mla`), the unabsorbed `wkv_b` path,
-                // which infr does not implement; refuse the file instead.
-                let key_mla = mk("attention.key_length_mla");
-                let Some(klen) = meta_u64(g, &key_mla) else {
-                    bail!("{key_mla} missing: deepseek2 MLA head dims cannot be derived");
-                };
-                let value_mla = mk("attention.value_length_mla");
-                let Some(vlen) = meta_u64(g, &value_mla) else {
-                    bail!("{value_mla} missing: deepseek2 MLA head dims cannot be derived");
-                };
-                let qkr = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(64) as usize;
-                (qlr, kvlr, klen as usize, vlen as usize, qkr)
-            } else {
-                (0, 0, 0, 0, 0)
-            };
-        let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) = if deepseek2 || deepseek4
-        {
-            // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
-            // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
-            // with no such fallback, and neither arch's real value is softmax — defaulting it would
-            // silently re-route.
-            let gf = if deepseek32 || deepseek4 {
-                let key = mk("expert_gating_func");
-                meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8
-            } else {
-                meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8
-            };
-            let norm = g
-                .metadata()
-                .get(&mk("expert_weights_norm"))
-                .and_then(|v| match v {
-                    MetaValue::Bool(b) => Some(*b),
-                    _ => None,
-                })
-                .unwrap_or(false);
-            // `yarn_log_multiplier` is the input to deepseek2's MLA score mscale. V4's three
-            // attention call sites all use a plain `1/√head_dim` — none of stage 2's mscale² games
-            // — so the key stays unread there rather than feeding an arithmetic V4 does not have.
-            let mut ylm = if deepseek2 {
-                meta_f64(g, &mk("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0) as f32
-            } else {
-                0.0
-            };
-            if ylm != 0.0 {
-                ylm /= 0.1_f32; // convert-script fix
             }
-            (gf, norm, ylm)
+            // `deepseek32.cpp` reads `q_lora_rank` unconditionally — V3.2 has no "lite"
+            // variant carrying a direct `wq`, so a file without the key is not a lite model,
+            // it is a broken one.
+            let qlr = if deepseek32 {
+                meta_u64(g, &mk("attention.q_lora_rank"))
+                    .context("deepseek32.attention.q_lora_rank")? as usize
+            } else {
+                meta_u64(g, &mk("attention.q_lora_rank")).unwrap_or(0) as usize
+            };
+            let kvlr = meta_u64(g, &mk("attention.kv_lora_rank"))
+                .with_context(|| format!("{}.attention.kv_lora_rank", arch))?
+                as usize;
+            // No default for either MLA length: `head_k_mla`/`v_head_dim` below are derived
+            // from them and nothing downstream can detect a wrong guess — the attention is
+            // simply mis-shaped. llama.cpp routes a GGUF that carries neither key through
+            // `is_mla() == false` (`llama_hparams::is_mla`), the unabsorbed `wkv_b` path,
+            // which infr does not implement; refuse the file instead.
+            let key_mla = mk("attention.key_length_mla");
+            let Some(klen) = meta_u64(g, &key_mla) else {
+                bail!("{key_mla} missing: deepseek2 MLA head dims cannot be derived");
+            };
+            let value_mla = mk("attention.value_length_mla");
+            let Some(vlen) = meta_u64(g, &value_mla) else {
+                bail!("{value_mla} missing: deepseek2 MLA head dims cannot be derived");
+            };
+            let qkr = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(64) as usize;
+            (qlr, kvlr, klen as usize, vlen as usize, qkr)
         } else {
-            (0, false, 0.0)
+            (0, 0, 0, 0, 0)
         };
+        let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) =
+            if deepseek2 || deepseek4 || bailingmoe3 {
+                // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
+                // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
+                // with no such fallback, and neither arch's real value is softmax — defaulting it would
+                // silently re-route.
+                let gf = if deepseek32 || deepseek4 {
+                    let key = mk("expert_gating_func");
+                    meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8
+                } else {
+                    meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8
+                };
+                let norm = g
+                    .metadata()
+                    .get(&mk("expert_weights_norm"))
+                    .and_then(|v| match v {
+                        MetaValue::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                // `yarn_log_multiplier` is the input to deepseek2's MLA score mscale. V4's three
+                // attention call sites all use a plain `1/√head_dim` — none of stage 2's mscale² games
+                // — so the key stays unread there rather than feeding an arithmetic V4 does not have.
+                let mut ylm = if deepseek2 {
+                    meta_f64(g, &mk("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0) as f32
+                } else {
+                    0.0
+                };
+                if ylm != 0.0 {
+                    ylm /= 0.1_f32; // convert-script fix
+                }
+                (gf, norm, ylm)
+            } else {
+                (0, false, 0.0)
+            };
         // DeepSeek V2+ YaRN: `rope.scaling.type` (string; `"yarn"` enables the full frequency
         // ramp), `rope.scaling.factor` (the interpolate factor; llama.cpp defaults it to 1.0 when
         // the GGUF omits it), and `rope.scaling.original_context_length` (the corr_dim ramp's
@@ -743,7 +783,7 @@ impl Config {
         // MLA per-head dims, derived exactly as the reference does (`src/models/deepseek2.cpp`
         // and `llama_hparams::n_embd_head_v_mla`): the NOPE width is the full per-head key width
         // minus the rotary part, and the V width is the GGUF key verbatim.
-        let (head_k_mla, v_head_dim) = if deepseek2 {
+        let (head_k_mla, v_head_dim) = if mla_arch {
             // Mirrors `GGML_ASSERT(n_embd_head_qk_nope >= 1)`. Clamping instead would hand the
             // MLA kernels a one-wide NOPE dim and produce garbage with no error.
             let Some(qk_nope) = key_length_mla
@@ -762,12 +802,12 @@ impl Config {
         } else {
             (0, 0)
         };
-        let n_expert_groups = if deepseek2 {
+        let n_expert_groups = if deepseek2 || bailingmoe3 {
             meta_u64(g, &mk("expert_group_count")).unwrap_or(0) as usize
         } else {
             0
         };
-        let n_expert_groups_used = if deepseek2 {
+        let n_expert_groups_used = if deepseek2 || bailingmoe3 {
             meta_u64(g, &mk("expert_group_used_count")).unwrap_or(0) as usize
         } else {
             0
@@ -805,7 +845,18 @@ impl Config {
         // MTP head — without this split, `n_layer` below would include it and the trunk layer
         // loop (`seam.rs`'s `wload`) would misclassify `blk.32` as a gated-DeltaNet layer
         // (`(32+1) % full_attn_interval != 0`) and fail on missing `ssm_*` tensors.
-        let n_layer_nextn = meta_u64(g, &mk("nextn_predict_layers")).unwrap_or(0) as usize;
+        let declared_nextn = meta_u64(g, &mk("nextn_predict_layers")).unwrap_or(0) as usize;
+        // The public Ling GGUF declares one NextN layer but contains no NextN/MTP tensors: all 42
+        // `blk.*` entries are ordinary KDA/MLA trunk layers. Treat the metadata as stale. Should a
+        // future file actually carry an MTP tensor set, fail explicitly until that head is wired.
+        let bailing_has_nextn_tensors = bailingmoe3
+            && g.tensors()
+                .iter()
+                .any(|t| t.name.starts_with("nextn.") || t.name.contains(".nextn."));
+        if bailing_has_nextn_tensors {
+            bail!("bailingmoe3 NextN/MTP tensors are not supported yet");
+        }
+        let n_layer_nextn = if bailingmoe3 { 0 } else { declared_nextn };
         // The bail exists because a NextN block that is NOT split off the trunk gets fed to the
         // per-layer loop as if it were an ordinary block, and then either fails on missing tensors
         // or (worse) misreads the ones it finds. It is not "MTP is unimplemented": qwen35 splits
@@ -932,7 +983,7 @@ impl Config {
                 other => other.as_f64().map(|f| vec![f as f32; n_layer]),
             }
         };
-        let (swiglu_clamp_exp, swiglu_clamp_shexp) = if deepseek4 {
+        let (swiglu_clamp_exp, swiglu_clamp_shexp) = if deepseek4 || bailingmoe3 {
             let key = mk("swiglu_clamp_exp");
             let exp = clamp_arr("swiglu_clamp_exp").with_context(|| format!("{key} missing"))?;
             if exp.len() < n_layer {
@@ -999,14 +1050,14 @@ impl Config {
         // this a V3.2 file that happened to carry a `blk.0.attn_q.weight` would drop the whole
         // wq_a/q_a_norm/wq_b path the model actually has.
         let is_lite =
-            deepseek2 && !deepseek32 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
+            mla_arch && !deepseek32 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = positive_model_dimension(
             &mk("attention.head_count"),
             meta_u64(g, &mk("attention.head_count")).context("head_count")?,
         )?;
         // DeepSeek2 MLA: n_kv is always 1 (single key head shared by all query heads).
-        let n_kv = if deepseek2 {
+        let n_kv = if mla_arch {
             1
         } else {
             match meta_u64(g, &mk("attention.head_count_kv")) {
@@ -1065,6 +1116,7 @@ impl Config {
             || deepseek
             || deepseek2
             || deepseek4
+            || bailingmoe3
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
@@ -1087,7 +1139,7 @@ impl Config {
                     true,
                     meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
                 )
-            } else if deepseek2 || deepseek4 {
+            } else if deepseek2 || deepseek4 || bailingmoe3 {
                 let gating = match expert_gating_func {
                     // 0 = the key is absent, which llama.cpp documents as softmax for the old
                     // V2/V2.5 GGUFs written before `expert_gating_func` existed
@@ -1132,12 +1184,12 @@ impl Config {
         };
         // The model's trained context length (its default max context). Default 8192 if absent.
         let n_ctx_train = meta_u64(g, &mk("context_length")).unwrap_or(8192) as usize;
-        let head_dim = if deepseek2 {
+        let head_dim = if mla_arch {
             key_length_mla
         } else {
             meta_u64(g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize
         };
-        let rope_dim = if deepseek2 {
+        let rope_dim = if mla_arch {
             qk_rope_dim
         } else {
             meta_u64(g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize
@@ -1262,6 +1314,15 @@ impl Config {
         } else {
             0
         };
+        let (kda_head_dim, kda_gate_lower_bound) = if bailingmoe3 {
+            (
+                meta_u64(g, &mk("kda.head_dim")).context("bailingmoe3.kda.head_dim")? as usize,
+                meta_f64(g, &mk("kda.gate_lower_bound"))
+                    .context("bailingmoe3.kda.gate_lower_bound")? as f32,
+            )
+        } else {
+            (0, 0.0)
+        };
         let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 {
             (
                 meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")? as usize,
@@ -1270,6 +1331,15 @@ impl Config {
                 meta_u64(g, &mk("ssm.group_count")).context("qwen35 ssm.group_count")? as usize,
                 meta_u64(g, &mk("ssm.time_step_rank")).context("qwen35 ssm.time_step_rank")?
                     as usize,
+            )
+        } else if bailingmoe3 {
+            (
+                meta_u64(g, &mk("ssm.conv_kernel")).context("bailingmoe3.ssm.conv_kernel")?
+                    as usize,
+                kda_head_dim,
+                n_head * kda_head_dim,
+                n_head,
+                n_head,
             )
         } else {
             (0, 0, 0, 0, 0)
@@ -1291,7 +1361,7 @@ impl Config {
         };
         let attn_out_gate = qwen35;
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
-        let n_layer_dense_lead = if deepseek || deepseek2 {
+        let n_layer_dense_lead = if deepseek || deepseek2 || bailingmoe3 {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
         } else {
             0
@@ -1305,7 +1375,7 @@ impl Config {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
-        } else if deepseek || deepseek2 || deepseek4 {
+        } else if deepseek || deepseek2 || deepseek4 || bailingmoe3 {
             let n_shared = meta_u64(g, &mk("expert_shared_count")).unwrap_or(0) as usize;
             moe.map(|m| m.n_ff_exp * n_shared).unwrap_or(0)
         } else {
@@ -1373,6 +1443,28 @@ impl Config {
         } else {
             (0, 0.0, 0.0, 0.0, 0, 0.0)
         };
+        let bailing_mla_layers = if bailingmoe3 {
+            let key = mk("attention.head_count_kv");
+            let values = g
+                .metadata()
+                .get(&key)
+                .and_then(MetaValue::as_arr)
+                .with_context(|| format!("{key} missing (or not an array)"))?;
+            if values.len() < n_layer {
+                bail!("{key} has {} entries for {n_layer} layers", values.len());
+            }
+            values[..n_layer]
+                .iter()
+                .enumerate()
+                .map(|(il, v)| match v.as_u64() {
+                    Some(0) => Ok(false),
+                    Some(1) => Ok(true),
+                    other => bail!("{key}[{il}] must be 0 (KDA) or 1 (MLA), got {other:?}"),
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Ok(Config {
             n_layer,
             n_head,
@@ -1414,6 +1506,10 @@ impl Config {
             moe,
             n_ctx_train,
             qwen35,
+            bailingmoe3,
+            bailing_mla_layers,
+            kda_head_dim,
+            kda_gate_lower_bound,
             full_attn_interval,
             ssm_d_conv,
             ssm_d_state,

@@ -7904,6 +7904,51 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Ling KDA recurrence. The persistent state is `[n_head, head_dim, head_dim]`; Q/K/V arrive
+    /// packed in one projection+conv buffer and the forget gate carries one value per key dim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kda(
+        &self,
+        qkv: &dyn Buffer,
+        forget: &dyn Buffer,
+        beta: &dyn Buffer,
+        a: &dyn Buffer,
+        dt_bias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        n_head: usize,
+        head_dim: usize,
+        eps: f32,
+        lower_bound: f32,
+    ) {
+        debug_assert!(head_dim <= 128, "kda shader assumes head_dim <= 128");
+        let kern = self.be.kernel("kda", crate::gemm::kda_spv(), 7, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_head as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        push[16..20].copy_from_slice(&lower_bound.to_ne_bytes());
+        push[20..24].copy_from_slice(&(1.0f32 / (head_dim as f32).sqrt()).to_ne_bytes());
+        let n_blk = head_dim.div_ceil(32);
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(forget),
+                Self::vkb(beta),
+                Self::vkb(a),
+                Self::vkb(dt_bias),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2,
+            &push,
+            (n_head * n_blk) as u32,
+        );
+    }
+
     /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
     /// Selected for Vulkan single-token decode unless disabled. Push constants 32B (adds
     /// src_stride to standard).
@@ -9909,6 +9954,35 @@ impl<'a> Recorder<'a> {
             1,
             &pc,
             total.div_ceil(64),
+        );
+    }
+
+    /// Per-head sigmoid broadcast used by Ling's gated MLA.
+    pub fn headwise_sigmoid_mul(
+        &self,
+        x: &dyn Buffer,
+        gate: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) {
+        let k = self.be.kernel(
+            "headwise_sigmoid_mul",
+            crate::gemm::headwise_sigmoid_mul_spv(),
+            3,
+            12,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_head as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(gate), Self::vkb(y)],
+            1,
+            &push,
+            (rows * n_head * head_dim).div_ceil(64) as u32,
         );
     }
 

@@ -3027,6 +3027,13 @@ pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
 }
+/// SPIR-V for Ling KDA recurrent attention.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn kda_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kda.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for DeltaNet reading q/k/v from a single strided source buffer (env-gated).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_strided_spv() -> &'static [u32] {
@@ -3118,6 +3125,13 @@ pub(crate) fn copy_strided_spv() -> &'static [u32] {
 pub(crate) fn mul_sigmoid_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(MUL_SIGMOID_SPV_BYTES))
+}
+/// SPIR-V for Ling MLA's one-scalar-per-head sigmoid output gate.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn headwise_sigmoid_mul_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/headwise_sigmoid_mul.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the GeGLU activation with separate gate/up buffers (`y=gelu(gate)*up`). gemma4's
 /// per-layer-embd gate.

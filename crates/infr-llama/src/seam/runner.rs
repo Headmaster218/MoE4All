@@ -6,8 +6,8 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, DeltaW, Dsv4W, FfnW, HcTriple, IndexerW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
-    SeamKv, SeamWeights, SessionStable,
+    AttnW, DeltaW, Dsv4W, FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
+    MoeSharedW, SeamKv, SeamWeights, SessionStable,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
@@ -424,12 +424,12 @@ pub(crate) fn generate_dense_backend(
     let max_qrow = nh * max_hd;
     // DeepSeek2 MLA: per-layer dims are uniform (no SWA/full variation), but the max calc is for
     // uniform models anyway.
-    let mla_key_len = if c.deepseek2 {
+    let mla_key_len = if c.deepseek2 || c.bailingmoe3 {
         c.kv_lora_rank + c.qk_rope_dim
     } else {
         0
     };
-    let mla_qhead = if c.deepseek2 {
+    let mla_qhead = if c.deepseek2 || c.bailingmoe3 {
         c.head_k_mla + c.qk_rope_dim
     } else {
         0
@@ -717,7 +717,7 @@ pub(crate) fn generate_dense_backend(
                 // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
                 // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
                 // quantized buffer → OOB GPU fault → device lost.
-                if c.deepseek2
+                if (c.deepseek2 || c.bailingmoe3)
                     && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight"))
                 {
                     let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
@@ -785,7 +785,8 @@ pub(crate) fn generate_dense_backend(
             // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
-            let is_mla = c.deepseek2;
+            let is_mla = c.is_mla_layer(l);
+            let is_kda = c.bailingmoe3 && !is_mla;
             // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
             // output projection, attention sinks, hyper-connections and up to two compressor blocks
             // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
@@ -806,6 +807,9 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("attn_kv_a_norm.weight")])?;
                 wload(&[&p("attn_k_b.weight")])?;
                 wload(&[&p("attn_v_b.weight")])?;
+                if c.bailingmoe3 {
+                    wload(&[&p("attn_gate.weight")])?;
+                }
                 wload(&[&p("attn_output.weight")])?;
                 if c.deepseek32 {
                     // DeepSeek V3.2 lightning indexer (docs/deepseek.md § Stage 3), on EVERY
@@ -877,6 +881,24 @@ pub(crate) fn generate_dense_backend(
                         wload(&[&p(name)])?;
                     }
                 }
+            } else if is_kda {
+                wload(&[
+                    &p("attn_q.weight"),
+                    &p("attn_k.weight"),
+                    &p("attn_v.weight"),
+                ])?;
+                wload(&[
+                    &p("ssm_conv1d_q.weight"),
+                    &p("ssm_conv1d_k.weight"),
+                    &p("ssm_conv1d_v.weight"),
+                ])?;
+                wload(&[&p("ssm_f.weight")])?;
+                wload(&[&p("ssm_beta.weight")])?;
+                wload(&[&p("ssm_a")])?;
+                wload(&[&p("ssm_dt.bias")])?;
+                wload(&[&p("ssm_norm.weight")])?;
+                wload(&[&p("ssm_g.weight")])?;
+                wload(&[&p("attn_output.weight")])?;
             } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
                 wload(&[&p("attn_gate.weight")])?;
@@ -907,13 +929,13 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("attn_k.bias")])?;
                 wload(&[&p("attn_v.bias")])?;
             }
-            if qk_norm && !is_delta && !is_mla {
+            if qk_norm && !is_delta && !is_mla && !is_kda {
                 wload(&[&p("attn_q_norm.weight")])?;
                 wload(&[&p("attn_k_norm.weight")])?;
             }
             // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
             // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
-            if !is_delta && !is_mla && !is_dsv4 {
+            if !is_delta && !is_mla && !is_kda && !is_dsv4 {
                 wload(&[&p("attn_output.weight")])?;
             }
             // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
@@ -962,7 +984,7 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_gate_exps.weight")])?;
                 wload(&[&p("ffn_up_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 {
+                if c.deepseek2 || c.bailingmoe3 {
                     let ep_name = p("exp_probs_b.bias");
                     if g.tensors().iter().any(|t| t.name == ep_name) {
                         wload(&[&ep_name])?;
@@ -1128,6 +1150,11 @@ pub(crate) fn generate_dense_backend(
         }
 
         // ── re-decide the context against what the device says is LEFT ───────────────────────
+        // Every weight this session will hold is resident by now. Paged Vulkan sessions physically
+        // escrow their predicted runtime workspace while those allocations land; release it before
+        // the measured-room context clamp and exact KV/state allocations below. Other backends keep
+        // the default no-op.
+        be.finish_weight_load();
         // Every weight this session will hold is resident by now — including the arena block tails
         // and the driver's own memory that no pre-load footprint prices — so the budget query here
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
@@ -1173,11 +1200,11 @@ pub(crate) fn generate_dense_backend(
             );
             kbufs.push(
                 be.alloc(k_bytes, BufferUsage::KvCache)
-                .map_err(|e| anyhow!("{e}"))?,
+                    .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
                 be.alloc(v_bytes, BufferUsage::KvCache)
-                .map_err(|e| anyhow!("{e}"))?,
+                    .map_err(|e| anyhow!("{e}"))?,
             );
         }
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
@@ -1326,7 +1353,7 @@ pub(crate) fn generate_dense_backend(
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
         cached.len()
-    } else if c.qwen35 {
+    } else if c.qwen35 || c.bailingmoe3 {
         let pfx = common_prefix_len(cached, prompt);
         if pfx == cached.len() && pfx < prompt.len() {
             pfx
@@ -1337,10 +1364,10 @@ pub(crate) fn generate_dense_backend(
             // generation (CPU is a no-op, but Vulkan/Metal run a throwaway "Hi") dirties these
             // persistent buffers while leaving `cached` empty, so an `is_empty` guard here would
             // wrongly skip the reset and the first real prompt would inherit the warmup's state.
-            let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
-            let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
+            let conv_elems = (c.ssm_d_conv - 1) * c.recurrent_conv_channels();
+            let s_elems = c.recurrent_state_elems();
             for l in 0..c.n_layer {
-                if !c.is_qwen35_attn_layer(l) {
+                if c.is_recurrent_layer(l) {
                     be.upload(
                         kbufs[l].as_ref(),
                         bytemuck::cast_slice(&vec![0f32; conv_elems]),
@@ -1707,9 +1734,9 @@ pub(crate) fn generate_dense_backend(
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
-            if c.qwen35 && !c.is_qwen35_attn_layer(l) {
-                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
-                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
+            if c.is_recurrent_layer(l) {
+                let conv_elems = (c.ssm_d_conv - 1) * c.recurrent_conv_channels();
+                let s_elems = c.recurrent_state_elems();
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
                 continue;
@@ -1742,7 +1769,8 @@ pub(crate) fn generate_dense_backend(
             // qwen35 gated-DeltaNet layer: 9 mixer weights, no q/k/v/qk_norm/bias/wo at all (mirrors
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
-            let is_mla = c.deepseek2;
+            let is_mla = c.is_mla_layer(l);
+            let is_kda = c.bailingmoe3 && !is_mla;
             let mixer = if c.deepseek4 {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
@@ -1772,6 +1800,7 @@ pub(crate) fn generate_dense_backend(
                 let kv_a_norm = wpush(&mut g, &mut weights);
                 let wk_b = wpush(&mut g, &mut weights);
                 let wv_b = wpush(&mut g, &mut weights);
+                let gate = c.bailingmoe3.then(|| wpush(&mut g, &mut weights));
                 let wo = wpush(&mut g, &mut weights);
                 // DeepSeek V3.2's five lightning-indexer slots, in the SAME order as the `wload`
                 // arm above — `wpush` consumes `wspecs` SEQUENTIALLY, so a missing or reordered
@@ -1793,7 +1822,20 @@ pub(crate) fn generate_dense_backend(
                     wk_b,
                     wv_b,
                     wo,
+                    gate,
                     indexer,
+                })
+            } else if is_kda {
+                MixerW::Kda(KdaW {
+                    qkv: wpush(&mut g, &mut weights),
+                    conv: wpush(&mut g, &mut weights),
+                    forget: wpush(&mut g, &mut weights),
+                    beta: wpush(&mut g, &mut weights),
+                    a: wpush(&mut g, &mut weights),
+                    dt_bias: wpush(&mut g, &mut weights),
+                    norm: wpush(&mut g, &mut weights),
+                    gate: wpush(&mut g, &mut weights),
+                    out: wpush(&mut g, &mut weights),
                 })
             } else if is_delta {
                 let qkv = wpush(&mut g, &mut weights);
@@ -2126,12 +2168,12 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        let mla_kv_cmpr = if c.deepseek2 {
+        let mla_kv_cmpr = if c.deepseek2 || c.bailingmoe3 {
             Some(g.internal(f32d(batch * c.kv_lora_rank)))
         } else {
             None
         };
-        let mla_rope = if c.deepseek2 {
+        let mla_rope = if c.deepseek2 || c.bailingmoe3 {
             Some(g.internal(f32d(batch * c.qk_rope_dim)))
         } else {
             None
@@ -2265,6 +2307,10 @@ pub(crate) fn generate_dense_backend(
         let dn_bbuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_abuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+        // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
+        // head. Both are shared scratch across mutually-exclusive layer mixer arms.
+        let kda_forget = g.internal(f32d(batch * c.ssm_d_inner.max(1)));
+        let mla_gate = g.internal(f32d(batch * c.n_head.max(1)));
 
         let eps = c.rms_eps;
 
@@ -2606,7 +2652,7 @@ pub(crate) fn generate_dense_backend(
             // two can differ within a layer. `infr_core::graph::swiglu_clamp` owns the
             // `limit > 1e-6` disabled gate; passing a non-clamping layer's raw 0.0 through as
             // `Some(0.0)` would clamp that whole FFN to zero. `None` for every other arch.
-            let (clamp_exp, clamp_shexp) = if c.deepseek4 {
+            let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 {
                 (
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l]),
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_shexp[l]),
@@ -2796,6 +2842,100 @@ pub(crate) fn generate_dense_backend(
                 });
                 // DeltaNet's residual contribution is already in `sub` — skip the attention-only
                 // code below (query/key/value projections, RoPE, Attention, o-proj) entirely.
+            } else if let MixerW::Kda(kw) = &lw.mixer {
+                let inner = c.n_head * c.kda_head_dim;
+                let packed = 3 * inner;
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: kw.qkv,
+                    dst: dn_qkvbuf,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: packed as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Conv1dSilu {
+                    x: dn_qkvbuf,
+                    weight: kw.conv,
+                    state: k_cache[l],
+                    dst: dn_convout,
+                    rows: batch as u32,
+                    channels: packed as u32,
+                    kernel: c.ssm_d_conv as u32,
+                });
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: kw.forget,
+                    dst: kda_forget,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: inner as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: kw.beta,
+                    dst: dn_bbuf,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: c.n_head as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Kda {
+                    qkv: dn_convout,
+                    forget: kda_forget,
+                    beta: dn_bbuf,
+                    a: kw.a,
+                    dt_bias: kw.dt_bias,
+                    state: v_cache[l],
+                    dst: dn_out,
+                    rows: batch as u32,
+                    n_head: c.n_head as u32,
+                    head_dim: c.kda_head_dim as u32,
+                    eps,
+                    lower_bound: c.kda_gate_lower_bound,
+                });
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: kw.gate,
+                    dst: dn_zbuf,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: inner as u32,
+                    w_off: 0,
+                });
+                g.push(Op::QkNorm {
+                    x: dn_out,
+                    weight: Some(kw.norm),
+                    dst: dn_out,
+                    rows: batch as u32,
+                    n_head: c.n_head as u32,
+                    head_dim: c.kda_head_dim as u32,
+                    eps,
+                    x_stride: 0,
+                });
+                g.push(Op::GatedAct {
+                    gate: dn_zbuf,
+                    up: dn_out,
+                    dst: dn_out,
+                    rows: batch as u32,
+                    nff: inner as u32,
+                    act: Activation::Sigmoid,
+                    up_off: 0,
+                    up_stride: 0,
+                    gate_stride: 0,
+                    gate_block_width: 0,
+                    swiglu_clamp: None,
+                });
+                g.push(Op::Linear {
+                    x: dn_out,
+                    weight: kw.out,
+                    dst: sub,
+                    m: batch as u32,
+                    in_f: inner as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
             } else if let MixerW::Dsv4(mw) = &lw.mixer {
                 // ── DeepSeek V4 attention, `compress_ratio == 0` (pure sliding window) ─────────
                 // `docs/deepseek.md` § Stage 4. Every non-zero ratio was refused before the graph
@@ -3377,6 +3517,25 @@ pub(crate) fn generate_dense_backend(
                     freq_factors: yarn_ff,
                     key_bias: key_mask,
                 });
+                if let Some(gate_w) = mw.gate {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: gate_w,
+                        dst: mla_gate,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: c.n_head as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::HeadwiseSigmoidMul {
+                        x: attn,
+                        gate: mla_gate,
+                        dst: attn,
+                        rows: batch as u32,
+                        n_head: c.n_head as u32,
+                        head_dim: v_hd,
+                    });
+                }
                 // wo projection into `sub`. The residual add is NOT emitted here: every mixer arm
                 // leaves its sublayer output in `sub` and the shared tail below closes the wrap
                 // (`hidden += sub`, or the hyper-connection POST for V4). Pushing one here too
@@ -5507,6 +5666,7 @@ pub(crate) fn generate_dense_backend(
         // writing each token's K to row 0 (rows 1.. never populated, attention sees a one-row
         // cache). Keeps the "strict subset" promise the gate's doc states.
         && !c.deepseek2
+        && !c.bailingmoe3
         // DeepSeek V4: the same trap, from four ops at once. `Op::Attention { sinks }`,
         // `Op::HyperConnectMix`/`Pre`/`Post`, `Op::Rope { backward }` and `Op::QkNorm { weight:
         // None }` each have no record-once dyn twin, so the adapter's `decode_eligible` is false —

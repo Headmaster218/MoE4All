@@ -356,8 +356,7 @@ impl GpuPager {
                 let logical_end = logical_start + self.slot_bytes;
                 match current {
                     Some((start, _, shard, physical_end))
-                        if shard == backing.range.shard
-                            && physical_end == backing.range.offset =>
+                        if shard == backing.range.shard && physical_end == backing.range.offset =>
                     {
                         current = Some((
                             start,
@@ -1419,6 +1418,10 @@ fn prefill_range_cost(
 /// paged model lives (`VulkanBackend::init_moe_pager`); `None` for every non-paged model — zero
 /// cost, zero behavior change on the common (fits-in-VRAM) path.
 pub struct MoePagerSession {
+    /// Device-local buffers held only while weights, KV and recurrent state are allocated. The
+    /// cache plan excludes these bytes, so physically reserving them prevents weight-arena packing
+    /// tails from consuming the runtime workspace before the first forward.
+    load_reservation: Vec<Box<dyn Buffer>>,
     pools: Vec<Pool>,
     unified_pool: Arc<UnifiedVramPool>,
     /// Last topology observed by the cheap Decode restoration check. A matching generation is
@@ -1495,6 +1498,9 @@ pub struct MoeHostChunkSpec {
 /// time the adapter executes a graph, not just after the whole model is loaded) — see
 /// `infr-llama`'s `generate_dense_vulkan_session` for the call order this enables.
 pub struct MoePagerLayout {
+    /// Runtime workspace to hold physically until cold session initialization has completed. The
+    /// separate weight-packing margin must remain free for the real BDA block tails to consume.
+    pub load_reserve_bytes: u64,
     /// Total distinct experts nameable per pool's LUT = `n_paged_layers * n_expert` — the GLOBAL
     /// id space every pool shares (a pool only ever resolves ids of the layers registered into
     /// it; other layers' entries stay `NOT_RESIDENT`).
@@ -1530,6 +1536,13 @@ fn ring_region_bytes(total: usize, slots: usize, min_slot_bytes: usize) -> usize
 
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
+        let load_reservation = vk.alloc_load_vram_reservation(layout.load_reserve_bytes)?;
+        if layout.load_reserve_bytes > 0 {
+            tracing::info!(
+                "[infr] reserved {:.2} GiB of device VRAM through cold session initialization",
+                layout.load_reserve_bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
         let tiered = layout.pools.iter().any(|pool| pool.host.is_some());
         if !tiered && layout.host_chunks.is_empty() {
             return Err(be("moe pager: permanent host-store plan has no chunks"));
@@ -1620,6 +1633,7 @@ impl MoePagerSession {
         let tape_words = 64 * 1024;
         let tape = vk.alloc_uninit(tape_words * 8, BufferUsage::Staging)?;
         Ok(Self {
+            load_reservation,
             pools,
             unified_generation: unified_pool.generation(),
             unified_pool,
@@ -1637,6 +1651,18 @@ impl MoePagerSession {
             prefill_loaded: HashSet::new(),
             prefill_reserved_ranges: vec![Vec::new(); layout.pools.len()],
         })
+    }
+
+    /// Release the load-time runtime escrow immediately before the first forward. The returned bytes
+    /// become ordinary allocator room for activation and adapter scratch allocations.
+    pub fn release_load_reservation(&mut self) -> usize {
+        let bytes = self
+            .load_reservation
+            .iter()
+            .map(|buffer| buffer.len_bytes())
+            .sum();
+        self.load_reservation.clear();
+        bytes
     }
 
     /// Register one paged layer's `role` tensor — called from the seam's weight-load closure

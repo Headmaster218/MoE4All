@@ -196,14 +196,8 @@ pub fn estimate(
     let v = parse_kv_dtype(&profile.kv_type_v);
     let kv_bytes = match (context, k, v) {
         (Some(ctx), Some(k), Some(v)) => Some(
-            infr_llama::seam::estimate_kv_bytes(
-                &cfg,
-                ctx as usize,
-                true,
-                planning_ubatch,
-                k,
-                v,
-            ) * profile.parallel.max(1) as u64,
+            infr_llama::seam::estimate_kv_bytes(&cfg, ctx as usize, true, planning_ubatch, k, v)
+                * profile.parallel.max(1) as u64,
         ),
         _ => None,
     };
