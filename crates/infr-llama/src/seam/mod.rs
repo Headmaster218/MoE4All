@@ -638,13 +638,22 @@ pub(crate) fn dense_act_reserve_at(
 ) -> u64 {
     // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
     let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
+    // Only Op::Attention uses the pooled score/PV scratch below. Op::Mla scans compressed KV and
+    // accumulates softmax/value inside its dedicated kernel, while recurrent mixers have no
+    // context attention at all. Keep n_layer == 0 conservative for geometry-only configs/tests.
+    let ordinary_attention = |l: usize| !cfg.is_mla_layer(l) && !cfg.is_recurrent_layer(l);
+    let has_ordinary_attention = cfg.n_layer == 0 || (0..cfg.n_layer).any(ordinary_attention);
     // Attention pv accumulators: one pool per distinct (n_head, head_dim) shape.
     let hd_shapes = if cfg.swa_window > 0 && cfg.head_dim_swa != cfg.head_dim {
         cfg.head_dim + cfg.head_dim_swa
     } else {
         cfg.head_dim
     };
-    let attn_pv = 32 * cfg.n_head * hd_shapes;
+    let attn_pv = if has_ordinary_attention {
+        32 * cfg.n_head * hd_shapes
+    } else {
+        0
+    };
     // Non-flash score tiles (see the doc above). Keep hd128's established reservation behavior;
     // hd256 is scoreless only when the device can actually take M2's dedicated shader. This must
     // mirror the adapter's `flash_hd` gate rather than infer support from model geometry alone:
@@ -657,8 +666,9 @@ pub(crate) fn dense_act_reserve_at(
     };
     // `n_layer == 0` appears in geometry-only tests/config fragments; preserve the historical
     // conservative assumption that such a shape represents at least one full-attention layer.
-    let has_full = cfg.n_layer == 0 || (0..cfg.n_layer).any(|l| !cfg.is_swa_layer(l));
-    let has_swa = (0..cfg.n_layer).any(|l| cfg.is_swa_layer(l));
+    let has_full =
+        cfg.n_layer == 0 || (0..cfg.n_layer).any(|l| ordinary_attention(l) && !cfg.is_swa_layer(l));
+    let has_swa = (0..cfg.n_layer).any(|l| ordinary_attention(l) && cfg.is_swa_layer(l));
     let full_needs_scores = has_full && !flash_scoreless(cfg.head_dim);
     let kv_span = if full_needs_scores {
         want_ctx
@@ -4742,6 +4752,62 @@ mod seam_helper_tests {
         // No fixed term: halving the rows must halve the reserve, which a constant would floor.
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, 64);
         assert_eq!(half * 2, got, "the reserve is purely per-row");
+    }
+
+    /// Ling's KDA/MLA hybrid never emits Op::Attention. Its dedicated MLA kernel scans the
+    /// compressed cache and accumulates softmax/value internally, so charging the ordinary
+    /// nonfa_s/nonfa_pv pools strands most of the expert arena at long context.
+    #[test]
+    fn ling_mla_reserve_omits_ordinary_attention_pools() {
+        let mut mla_layers = vec![false; 42];
+        for il in [5, 11, 17, 23, 29, 35, 41] {
+            mla_layers[il] = true;
+        }
+        let cfg = Config {
+            n_layer: 42,
+            n_head: 32,
+            head_dim: 192,
+            n_embd: 2560,
+            n_ff: 6144,
+            bailingmoe3: true,
+            bailing_mla_layers: mla_layers,
+            kda_head_dim: 128,
+            ssm_d_conv: 4,
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 8,
+                n_ff_exp: 768,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 16,
+                n_expert_groups_used: 4,
+            }),
+            ..Default::default()
+        };
+        let (ctx, ubatch) = (65_681usize, 1024usize);
+        let got = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
+        let m = cfg.moe.expect("Ling is MoE");
+        let per_pair = 3 * m.n_ff_exp * 4 + cfg.n_embd * 4 + m.n_ff_exp + cfg.n_embd;
+        let moe = m.n_used * per_pair + 48 * cfg.n_embd;
+        let per_row = 12 * cfg.n_ff + 96 * cfg.n_embd + moe;
+        let expected =
+            ubatch as u64 * per_row as u64 * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1;
+        assert_eq!(got, expected);
+        assert_eq!(got, 959_447_040);
+
+        let mut ordinary = cfg.clone();
+        ordinary.bailingmoe3 = false;
+        ordinary.bailing_mla_layers.clear();
+        let ordinary_got =
+            super::dense_act_reserve_at(&ordinary, &conservative_caps(), ctx, ubatch);
+        let attn_pv = 32 * cfg.n_head * cfg.head_dim;
+        let attn_s = 2 * cfg.n_head * ctx.next_multiple_of(256);
+        let ordinary_pools = ubatch as u64 * (attn_pv + attn_s) as u64 * super::ACT_RESERVE_PAD.0
+            / super::ACT_RESERVE_PAD.1;
+        assert_eq!(ordinary_got - got, ordinary_pools);
+        assert_eq!(ordinary_pools, 6_769_606_656);
     }
 
     /// M4: M2's hd256 FlashAttention no longer materializes `nonfa_s`, so the placement/context
