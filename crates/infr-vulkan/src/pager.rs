@@ -1410,6 +1410,47 @@ fn prefill_range_cost(
         })
 }
 
+/// Choose the same resident fraction from every registered expert layer. The midpoint samples
+/// span each layer's full block-id range, so a partial budget is neither a prefix of layers nor a
+/// prefix of experts/roles within every layer.
+fn proportional_layer_preload(layers: &BTreeMap<u32, Vec<BlockId>>, limit: usize) -> Vec<BlockId> {
+    let ordered: Vec<_> = layers
+        .iter()
+        .filter(|(_, blocks)| !blocks.is_empty())
+        .collect();
+    let total: usize = ordered.iter().map(|(_, blocks)| blocks.len()).sum();
+    let target = limit.min(total);
+    if target == 0 {
+        return Vec::new();
+    }
+
+    let mut quotas = Vec::with_capacity(ordered.len());
+    let mut assigned = 0usize;
+    for (layer, blocks) in &ordered {
+        let scaled = target as u128 * blocks.len() as u128;
+        let quota = (scaled / total as u128) as usize;
+        let remainder = (scaled % total as u128) as usize;
+        quotas.push((**layer, quota, remainder));
+        assigned += quota;
+    }
+    let mut by_remainder: Vec<usize> = (0..quotas.len()).collect();
+    by_remainder.sort_unstable_by_key(|&i| (std::cmp::Reverse(quotas[i].2), quotas[i].0));
+    for &i in by_remainder.iter().take(target - assigned) {
+        quotas[i].1 += 1;
+    }
+
+    let mut out = Vec::with_capacity(target);
+    for ((_, blocks), (_, take, _)) in ordered.into_iter().zip(quotas) {
+        for sample in 0..take {
+            let idx =
+                (((2 * sample + 1) as u128 * blocks.len() as u128) / (2 * take) as u128) as usize;
+            out.push(blocks[idx]);
+        }
+    }
+    debug_assert_eq!(out.len(), target);
+    out
+}
+
 /// One model's whole paged-MoE session: uniform-size logical arena pools plus the permanent
 /// CPU-only layer-major source. Lives on the `VulkanBackend` HANDLE
 /// (NOT `VulkanShared` — the session's buffers hold `Arc<VulkanShared>` clones, and parking it on
@@ -1663,6 +1704,53 @@ impl MoePagerSession {
             .sum();
         self.load_reservation.clear();
         bytes
+    }
+
+    /// Seed every bounded exclusive RAM pool after all expert banks have been registered. Runtime
+    /// promotion, demotion and replacement are untouched; this only gives the existing lower-tier
+    /// LRU a balanced initial resident set before the first Decode miss.
+    pub fn preload_host_tier(&self) -> Result<(usize, usize)> {
+        let mut total_blocks = 0usize;
+        let mut total_bytes = 0usize;
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
+            let Some(host) = &pool.host else {
+                continue;
+            };
+            let mut layers = BTreeMap::<u32, Vec<BlockId>>::new();
+            for (_, source_pool, source) in self.sources.values() {
+                if *source_pool != pool_idx {
+                    continue;
+                }
+                let blocks = source.bank_bytes / source.stride_bytes;
+                let ids = layers.entry(source.layer_base).or_default();
+                ids.extend((0..blocks as u32).map(|expert| source.block_base + expert));
+            }
+            for ids in layers.values_mut() {
+                ids.sort_unstable();
+                ids.dedup();
+            }
+            let ids = proportional_layer_preload(&layers, host.n_slots());
+            if ids.len() != host.n_slots() {
+                return Err(be(format!(
+                    "moe pager: host pool {pool_idx} has {} slots but only {} registered expert blocks",
+                    host.n_slots(),
+                    ids.len()
+                )));
+            }
+            let started = std::time::Instant::now();
+            let (blocks, bytes) = host.preload(&ids)?;
+            let elapsed = started.elapsed();
+            tracing::info!(
+                "[infr] preloaded bounded MoE RAM pool {pool_idx}: {blocks} blocks / {:.2} GB across {} layers in {:.2}s ({:.2} GB/s)",
+                bytes as f64 / 1e9,
+                layers.len(),
+                elapsed.as_secs_f64(),
+                bytes as f64 / 1e9 / elapsed.as_secs_f64().max(f64::EPSILON),
+            );
+            total_blocks += blocks;
+            total_bytes += bytes;
+        }
+        Ok((total_blocks, total_bytes))
     }
 
     /// Register one paged layer's `role` tensor — called from the seam's weight-load closure
@@ -2734,9 +2822,12 @@ impl MoePagerSession {
             if let Some(host) = &p.host {
                 let hs = host.stats();
                 tracing::info!(
-                    "[moe pager]   exclusive RAM: slots={} hits={} ssd_reads={} ram_evictions={} \
-                     demotions={} promoted={:.3}GB demoted={:.3}GB disk={:.3}GB",
+                    "[moe pager]   exclusive RAM: slots={} preload={} ({:.3}GB) hits={} \
+                     ssd_reads={} ram_evictions={} demotions={} promoted={:.3}GB \
+                     demoted={:.3}GB disk={:.3}GB",
                     host.n_slots(),
+                    hs.preload_reads,
+                    hs.bytes_preloaded as f64 / 1e9,
                     hs.ram_hits,
                     hs.ssd_reads,
                     hs.ram_evictions,
@@ -3097,6 +3188,33 @@ mod tests {
     fn prefill_range_cost_counts_every_partially_overlapped_slot() {
         let heat = [Some(1), Some(2), Some(3)];
         assert_eq!(prefill_range_cost(&heat, 1024, 768, 1024), (2, 3));
+    }
+
+    #[test]
+    fn host_preload_samples_the_same_fraction_across_every_layer() {
+        let layers = BTreeMap::from([
+            (0, (0..8).collect::<Vec<_>>()),
+            (8, (100..108).collect::<Vec<_>>()),
+            (16, (200..208).collect::<Vec<_>>()),
+        ]);
+        let selected = proportional_layer_preload(&layers, 12);
+
+        assert_eq!(&selected[0..4], &[1, 3, 5, 7]);
+        assert_eq!(&selected[4..8], &[101, 103, 105, 107]);
+        assert_eq!(&selected[8..12], &[201, 203, 205, 207]);
+    }
+
+    #[test]
+    fn host_preload_uses_proportional_quotas_for_unequal_layers() {
+        let layers = BTreeMap::from([
+            (0, (0..4).collect::<Vec<_>>()),
+            (4, (100..108).collect::<Vec<_>>()),
+        ]);
+        let selected = proportional_layer_preload(&layers, 6);
+
+        assert_eq!(selected.len(), 6);
+        assert_eq!(selected.iter().filter(|&&id| id < 100).count(), 2);
+        assert_eq!(selected.iter().filter(|&&id| id >= 100).count(), 4);
     }
 
     #[test]

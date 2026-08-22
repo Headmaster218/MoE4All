@@ -4292,8 +4292,21 @@ impl Backend for VulkanBackend {
         self.moe_pager.lock().unwrap().is_some()
     }
 
-    fn finish_weight_load(&self) {
+    fn finish_weight_load(&self) -> Result<()> {
         self.release_moe_load_reservation();
+        let (blocks, bytes) = self
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(Ok((0, 0)), crate::pager::MoePagerSession::preload_host_tier)?;
+        if blocks > 0 {
+            tracing::info!(
+                "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GB",
+                bytes as f64 / 1e9,
+            );
+        }
+        Ok(())
     }
 
     fn dense_paged(&self) -> bool {

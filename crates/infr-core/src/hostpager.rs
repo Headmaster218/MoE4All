@@ -127,6 +127,15 @@ impl Arena {
         debug_assert!(self.offset(slot) + len <= self.total);
         std::slice::from_raw_parts(self.ptr.add(self.offset(slot)), len)
     }
+
+    /// # Safety
+    /// The caller must have exclusively reserved `slot` in `Loading` state, and no reader may
+    /// hold a reference to it; `len <= slot_bytes`.
+    unsafe fn slot_mut(&self, slot: u32, len: usize) -> &mut [u8] {
+        debug_assert!(len <= self.slot_bytes);
+        debug_assert!(self.offset(slot) + len <= self.total);
+        std::slice::from_raw_parts_mut(self.ptr.add(self.offset(slot)), len)
+    }
 }
 
 impl Drop for Arena {
@@ -217,6 +226,8 @@ pub struct HostPager {
 /// cache fills: an Expert exists in VRAM OR in this arena, never both after an exchange settles.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExclusiveHostStats {
+    pub preload_reads: u64,
+    pub bytes_preloaded: u64,
     pub ram_hits: u64,
     pub ssd_reads: u64,
     pub ram_evictions: u64,
@@ -247,6 +258,8 @@ pub struct ExclusiveHostCache {
     arena: Arena,
     io: Arc<dyn BlockIo>,
     slot_bytes: usize,
+    preload_reads: AtomicU64,
+    bytes_preloaded: AtomicU64,
     ram_hits: AtomicU64,
     ssd_reads: AtomicU64,
     ram_evictions: AtomicU64,
@@ -302,6 +315,8 @@ impl ExclusiveHostCache {
             arena: Arena::new(n_slots, slot_bytes),
             io,
             slot_bytes,
+            preload_reads: AtomicU64::new(0),
+            bytes_preloaded: AtomicU64::new(0),
             ram_hits: AtomicU64::new(0),
             ssd_reads: AtomicU64::new(0),
             ram_evictions: AtomicU64::new(0),
@@ -343,6 +358,8 @@ impl ExclusiveHostCache {
 
     pub fn stats(&self) -> ExclusiveHostStats {
         ExclusiveHostStats {
+            preload_reads: self.preload_reads.load(Ordering::Relaxed),
+            bytes_preloaded: self.bytes_preloaded.load(Ordering::Relaxed),
             ram_hits: self.ram_hits.load(Ordering::Relaxed),
             ssd_reads: self.ssd_reads.load(Ordering::Relaxed),
             ram_evictions: self.ram_evictions.load(Ordering::Relaxed),
@@ -351,6 +368,77 @@ impl ExclusiveHostCache {
             bytes_promoted: self.bytes_promoted.load(Ordering::Relaxed),
             bytes_demoted: self.bytes_demoted.load(Ordering::Relaxed),
         }
+    }
+
+    /// Fill empty RAM slots from registered blocks before the first upper-tier access.
+    ///
+    /// This is a cold-load operation: callers choose the block set and invoke it after all model
+    /// banks are registered but before execution starts. It seeds the same Pager/LRU used by
+    /// [`Self::promote`], so a later request is an ordinary RAM hit and the existing exclusive
+    /// exchange semantics take over unchanged. Already-ready ids are harmless and skipped.
+    pub fn preload(&self, ids: &[BlockId]) -> Result<(usize, usize)> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.pager.is_none() || ids.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut loaded = 0usize;
+        let mut bytes = 0usize;
+        for &id in ids {
+            while inner.state.get(&id) == Some(&SlotState::Loading) {
+                inner = self.ready.wait(inner).unwrap();
+            }
+            if inner.state.get(&id) == Some(&SlotState::Ready) {
+                continue;
+            }
+            let desc = inner.descs.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!(
+                    "exclusive host cache: preload block {id} was never registered"
+                ))
+            })?;
+            let len = desc.nbytes();
+            let pager = inner.pager.as_mut().expect("preload checked the arena");
+            if pager.resident_count() >= self.n_slots() {
+                return Err(Error::backend(format!(
+                    "exclusive host cache: preload selected more than {} RAM slots",
+                    self.n_slots()
+                )));
+            }
+            let slot = match pager.touch(id) {
+                Resolution::Miss { slot, evicted } => {
+                    debug_assert!(evicted.is_none(), "preload only fills empty RAM slots");
+                    slot
+                }
+                Resolution::Hit { .. } => {
+                    return Err(Error::backend(format!(
+                        "exclusive host cache: preload block {id} is resident without ready bytes"
+                    )));
+                }
+            };
+            inner.state.insert(id, SlotState::Loading);
+            let dst = unsafe { self.arena.slot_mut(slot, len) };
+            if let Err(err) = self.io.read_block(&desc, dst) {
+                inner.state.remove(&id);
+                let removed = inner
+                    .pager
+                    .as_mut()
+                    .expect("preload checked the arena")
+                    .evict(id);
+                debug_assert_eq!(removed, Some(slot));
+                drop(inner);
+                self.ready.notify_all();
+                return Err(err);
+            }
+            inner.state.insert(id, SlotState::Ready);
+            loaded += 1;
+            bytes += len;
+            self.preload_reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_preloaded
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
+        drop(inner);
+        self.ready.notify_all();
+        Ok((loaded, bytes))
     }
 
     /// Promote `requested` through `upload`, then reserve a RAM slot for `demoted` and return the
@@ -1114,6 +1202,35 @@ mod tests {
         assert_eq!(stats.demotions, 2);
         assert_eq!(stats.ram_evictions, 0);
         assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn exclusive_cache_preload_seeds_real_ram_hits_without_runtime_ssd_reads() {
+        let io = Arc::new(FakeIo::new());
+        let cache = Arc::new(ExclusiveHostCache::new(2, 16, io.clone()).expect("cache"));
+        for id in 1..=3 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+
+        assert_eq!(cache.preload(&[1, 3]).expect("preload"), (2, 32));
+        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+
+        let mut promoted = [0u8; 16];
+        assert!(cache
+            .promote(3, None, |bytes| {
+                promoted.copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("preloaded RAM promotion")
+            .is_none());
+        assert_eq!(promoted, [3u8; 16]);
+        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+
+        let stats = cache.stats();
+        assert_eq!(stats.preload_reads, 2);
+        assert_eq!(stats.bytes_preloaded, 32);
+        assert_eq!(stats.ram_hits, 1);
+        assert_eq!(stats.ssd_reads, 0);
     }
 
     #[test]

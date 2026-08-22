@@ -1154,7 +1154,7 @@ pub(crate) fn generate_dense_backend(
         // escrow their predicted runtime workspace while those allocations land; release it before
         // the measured-room context clamp and exact KV/state allocations below. Other backends keep
         // the default no-op.
-        be.finish_weight_load();
+        be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
         // Every weight this session will hold is resident by now — including the arena block tails
         // and the driver's own memory that no pre-load footprint prices — so the budget query here
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
