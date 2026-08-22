@@ -1546,14 +1546,18 @@ impl<'a> Recorder<'a> {
 
     fn vkb(b: &dyn Buffer) -> vk::DescriptorBufferInfo {
         let vb = Self::vk_of(b);
-        let Backing::BdaSub(block) = &vb.backing else {
-            return vk::DescriptorBufferInfo {
-                buffer: vb.buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            };
+        let backing_len = match &vb.backing {
+            Backing::BdaSub(block) => block.buf.size,
+            Backing::UnifiedSub(handle) => handle.shard_bytes(),
+            _ => {
+                return vk::DescriptorBufferInfo {
+                    buffer: vb.buffer,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
+                };
+            }
         };
-        let block_len = block.buf.size as u64;
+        let block_len = backing_len as u64;
         let range = (vb.size as u64)
             .next_multiple_of(256)
             .min(block_len - vb.sub_offset as u64);
@@ -1587,7 +1591,7 @@ impl<'a> Recorder<'a> {
     fn vkb_off(b: &dyn Buffer, elem_off: usize) -> vk::DescriptorBufferInfo {
         let vb = Self::vk_of(b);
         debug_assert!(
-            !matches!(vb.backing, Backing::BdaSub(_)),
+            !matches!(vb.backing, Backing::BdaSub(_) | Backing::UnifiedSub(_)),
             "vkb_off is for ordinary activation buffers, not resident-BDA weight sub-tensors"
         );
         vk::DescriptorBufferInfo {

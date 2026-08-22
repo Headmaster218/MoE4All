@@ -7,6 +7,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use infr_core::backend::Buffer;
+use infr_core::error::Result;
+
+use super::{as_vk_buf, be, VulkanBackend};
+
 /// Owner of a live range in the unified elastic arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnifiedVramClass {
@@ -265,6 +270,133 @@ impl UnifiedRangePool {
             live_allocations: state.live.len(),
             bytes_by_class: state.bytes_by_class,
         }
+    }
+}
+
+/// One physical mapped-ReBAR shard. The shard owns the Vulkan allocation while logical leases
+/// merely name byte ranges inside it.
+struct UnifiedVramShard {
+    buffer: Arc<dyn Buffer>,
+    base_addr: u64,
+    mapped_ptr: usize,
+    bytes: usize,
+}
+
+/// A Vulkan-backed range lease. Keeping the physical shard and logical lease in the same handle
+/// lets a `VkBuffer` view outlive the backend handle without forming a cycle through
+/// `VulkanShared`.
+pub(crate) struct UnifiedAllocationHandle {
+    lease: Arc<UnifiedAllocation>,
+    shard: Arc<UnifiedVramShard>,
+}
+
+impl UnifiedAllocationHandle {
+    pub(crate) fn range(&self) -> UnifiedRange {
+        self.lease.range()
+    }
+
+    pub(crate) fn buffer(&self) -> &dyn Buffer {
+        self.shard.buffer.as_ref()
+    }
+
+    pub(crate) fn base_addr(&self) -> u64 {
+        self.shard.base_addr
+    }
+
+    pub(crate) fn mapped_ptr(&self) -> *mut u8 {
+        self.shard.mapped_ptr as *mut u8
+    }
+
+    pub(crate) fn shard_bytes(&self) -> usize {
+        self.shard.bytes
+    }
+}
+
+/// Physical elastic VRAM arena. Shards work around Windows/driver single-allocation limits while
+/// `ranges` exposes one allocation policy and one accounting surface across all of them.
+pub struct UnifiedVramPool {
+    ranges: UnifiedRangePool,
+    shards: Vec<Arc<UnifiedVramShard>>,
+}
+
+impl UnifiedVramPool {
+    pub(crate) fn new(vk: &VulkanBackend, capacity: usize) -> Result<Arc<Self>> {
+        if capacity == 0 {
+            return Err(be("unified VRAM arena cannot have zero capacity"));
+        }
+        const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
+        let driver_max = usize::try_from(vk.shared.max_mem_alloc_size)
+            .unwrap_or(usize::MAX)
+            .max(256);
+        let platform_max = if cfg!(target_os = "windows") {
+            WINDOWS_MAX_SHARD
+        } else {
+            driver_max
+        };
+        let max_shard = platform_max.min(driver_max) / 256 * 256;
+        let mut remaining = capacity;
+        let mut shards = Vec::new();
+        while remaining != 0 {
+            let bytes = remaining.min(max_shard);
+            let (buffer, base_addr) = vk.alloc_mapped_arena_bda(bytes)?;
+            let buffer: Arc<dyn Buffer> = Arc::from(buffer);
+            let mapped_ptr = as_vk_buf(buffer.as_ref())?
+                .mapped_ptr()
+                .ok_or_else(|| be("unified VRAM shard is not persistently mapped"))?
+                as usize;
+            shards.push(Arc::new(UnifiedVramShard {
+                buffer,
+                base_addr,
+                mapped_ptr,
+                bytes,
+            }));
+            remaining -= bytes;
+        }
+        let ranges = UnifiedRangePool::new(shards.iter().map(|shard| shard.bytes))
+            .ok_or_else(|| be("unified VRAM arena has no physical shards"))?;
+        tracing::info!(
+            "[infr] unified VRAM arena: {} bytes across {} mapped ReBAR shard(s)",
+            capacity,
+            shards.len(),
+        );
+        Ok(Arc::new(Self { ranges, shards }))
+    }
+
+    pub(crate) fn allocate(
+        &self,
+        bytes: usize,
+        class: UnifiedVramClass,
+    ) -> Option<Arc<UnifiedAllocationHandle>> {
+        let lease = self.ranges.allocate(bytes, 256, class)?;
+        let shard = Arc::clone(self.shards.get(lease.range().shard)?);
+        Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
+    }
+
+    pub(crate) fn try_claim_exact(
+        &self,
+        shard: usize,
+        offset: usize,
+        bytes: usize,
+        class: UnifiedVramClass,
+    ) -> Option<Arc<UnifiedAllocationHandle>> {
+        let lease = self.ranges.try_claim_exact(shard, offset, bytes, class)?;
+        let physical = Arc::clone(self.shards.get(shard)?);
+        Some(Arc::new(UnifiedAllocationHandle {
+            lease,
+            shard: physical,
+        }))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.ranges.generation()
+    }
+
+    pub fn stats(&self) -> UnifiedVramStats {
+        self.ranges.stats()
+    }
+
+    pub fn allocations(&self) -> Vec<UnifiedRange> {
+        self.ranges.allocations()
     }
 }
 

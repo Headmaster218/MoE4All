@@ -510,6 +510,10 @@ enum Backing {
     /// `device_addr()` by a `-DSTREAMED` shader twin, required once the range would exceed
     /// `maxStorageBufferRange`/4 GiB and preferred for the big matmul families regardless.
     BdaSub(Arc<BdaBlockHandle>),
+    /// A releasable byte range inside the service-level mapped ReBAR arena. The allocation handle
+    /// owns neither a Vulkan buffer nor memory; it keeps the physical shard alive and returns the
+    /// range to the unified allocator when its final reference drops.
+    UnifiedSub(Arc<crate::unified::UnifiedAllocationHandle>),
     /// A DEDICATED `VkDeviceMemory` allocated with an EXTERNAL handle type (dma-buf / opaque-fd) —
     /// the cross-device P2P path (see `p2p.rs`). Two flavours share this variant. On the EXPORT
     /// side (device A) the memory is allocated with `VkExportMemoryAllocateInfo` and its fd handed
@@ -575,6 +579,9 @@ impl VkBuffer {
                 .buf
                 .mapped_ptr()
                 .map(|p| unsafe { p.add(self.sub_offset) }),
+            Backing::UnifiedSub(handle) => {
+                Some(unsafe { handle.mapped_ptr().add(self.sub_offset) })
+            }
             // External P2P memory is never host-mapped — reads/writes route through the staging
             // copy path (device A owns the pages; device B aliases them over PCIe).
             Backing::External { .. } => None,
@@ -625,7 +632,7 @@ impl Drop for VkBuffer {
                 // `self.backing` itself drops) is the whole of this handle's cleanup; the actual
                 // `destroy_buffer`/memory-free happens once, inside `BdaBlockHandle::buf`'s own
                 // `VkBuffer::drop`, when the last clone goes away.
-                Backing::BdaSub(_) => {}
+                Backing::BdaSub(_) | Backing::UnifiedSub(_) => {}
                 // A dedicated external-memory allocation (P2P export or import). Never host-mapped,
                 // so no unmap — just free the memory. On the export side this releases device A's
                 // pages once no importer still references the underlying dma-buf/fd (each side owns
@@ -638,7 +645,7 @@ impl Drop for VkBuffer {
             // handle's `buffer` is an alias of the block's — destroying it here would destroy the
             // block out from under every other sub-tensor still referencing it (and double-free when
             // the block's own `VkBuffer` later drops), so it is the one variant that skips this.
-            if !matches!(self.backing, Backing::BdaSub(_)) {
+            if !matches!(self.backing, Backing::BdaSub(_) | Backing::UnifiedSub(_)) {
                 self.shared.device.destroy_buffer(self.buffer, None);
             }
         }
@@ -662,6 +669,7 @@ impl Buffer for VkBuffer {
         }
         match &self.backing {
             Backing::BdaSub(block) => Some(block.base_addr + self.sub_offset as u64),
+            Backing::UnifiedSub(handle) => Some(handle.base_addr() + self.sub_offset as u64),
             _ => None,
         }
     }
@@ -1020,7 +1028,7 @@ pub struct VulkanBackend {
     /// The session still lives exactly as long as a loaded paged model can be generated with:
     /// `infr-llama`'s sessions own the `VulkanBackend`, and a new backend is a new device whose
     /// buffers couldn't read the old session anyway.
-    moe_pager: crate::pager::MoePagerCell,
+    moe_pager: Arc<crate::pager::MoePagerCell>,
     /// Dense layer-streaming cache (see `pager::DensePagerSession`) — `Some` only when the loaded
     /// DENSE model's per-layer weights don't fit VRAM and the seam's placement chose streaming.
     /// Same drop-ordering/ownership story as `moe_pager` (declared before `shared` so its
@@ -1036,6 +1044,10 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    /// Service-level elastic VRAM arena. Kept on backend handles rather than `VulkanShared`
+    /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
+    /// device-leaking reference cycle.
+    unified_pool: Arc<Mutex<Option<Arc<crate::unified::UnifiedVramPool>>>>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
     /// R4/R6).
@@ -2487,9 +2499,10 @@ impl VulkanBackend {
         cleanup.armed = false;
 
         let backend = Self {
-            moe_pager: Mutex::new(None),
+            moe_pager: Arc::new(Mutex::new(None)),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
+            unified_pool: Arc::new(Mutex::new(None)),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -3151,6 +3164,72 @@ impl VulkanBackend {
             fmt_bytes(requirements.size),
         );
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
+    }
+
+    /// Create the one elastic VRAM arena shared by this backend's paged experts and auxiliary
+    /// engines. Repeated calls return the same pool and reject contradictory capacities.
+    pub fn init_unified_vram(
+        &self,
+        bytes: usize,
+    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+        let mut cell = self.unified_pool.lock().unwrap();
+        if let Some(pool) = cell.as_ref() {
+            if pool.stats().capacity_bytes != bytes {
+                return Err(be(format!(
+                    "unified VRAM arena is already {} bytes; cannot reinitialize it as {bytes} bytes",
+                    pool.stats().capacity_bytes,
+                )));
+            }
+            return Ok(Arc::clone(pool));
+        }
+        let pool = crate::unified::UnifiedVramPool::new(self, bytes)?;
+        *cell = Some(Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    pub fn unified_vram(&self) -> Option<Arc<crate::unified::UnifiedVramPool>> {
+        self.unified_pool.lock().unwrap().clone()
+    }
+
+    fn unified_sub_buffer(
+        &self,
+        handle: Arc<crate::unified::UnifiedAllocationHandle>,
+        size: usize,
+    ) -> Result<VkBuffer> {
+        let range = handle.range();
+        if size > range.len || range.offset.saturating_add(range.len) > handle.shard_bytes() {
+            return Err(be("unified VRAM allocation is outside its physical shard"));
+        }
+        let physical = as_vk_buf(handle.buffer())?;
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer: physical.buffer,
+            backing: Backing::UnifiedSub(handle),
+            size,
+            mem_size: 0,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: range.offset,
+            own_addr: None,
+            act_bytes: 0,
+        })
+    }
+
+    pub(crate) fn alloc_unified(
+        &self,
+        size: usize,
+        class: crate::unified::UnifiedVramClass,
+    ) -> Result<Box<dyn Buffer>> {
+        let pool = self
+            .unified_vram()
+            .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
+        let handle = pool.allocate(size, class).ok_or_else(|| {
+            let stats = pool.stats();
+            be(format!(
+                "unified VRAM arena cannot fit {size} contiguous bytes ({} free, largest range {})",
+                stats.free_bytes, stats.largest_free_bytes,
+            ))
+        })?;
+        Ok(Box::new(self.unified_sub_buffer(handle, size)?) as Box<dyn Buffer>)
     }
 
     /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
@@ -4763,6 +4842,52 @@ mod tests {
             act.device_addr().is_none(),
             "an ordinary Activations buffer must not report a device_addr"
         );
+    }
+
+    /// Unified arena views share one physical mapped-ReBAR shard, retain independent offsets and
+    /// return their ranges when the final buffer handle drops.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn unified_vram_suballocation_roundtrip_and_release() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let pool = be
+            .init_unified_vram(8 * 1024 * 1024)
+            .expect("init unified VRAM");
+        let a = be
+            .alloc_unified(1000, crate::unified::UnifiedVramClass::Expert)
+            .expect("expert view");
+        let b = be
+            .alloc_unified(
+                300_000,
+                crate::unified::UnifiedVramClass::EmbeddingWeights,
+            )
+            .expect("embedding view");
+        assert_ne!(a.device_addr(), b.device_addr());
+        let bytes: Vec<u8> = (0..b.len_bytes()).map(|i| (i as u8).wrapping_mul(31)).collect();
+        be.upload(b.as_ref(), &bytes).expect("unified upload");
+        let mut back = vec![0; bytes.len()];
+        be.download(b.as_ref(), &mut back)
+            .expect("unified download");
+        assert_eq!(back, bytes);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::Expert),
+            1024,
+        );
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::EmbeddingWeights),
+            300_032,
+        );
+        drop(a);
+        drop(b);
+        assert_eq!(pool.stats().allocated_bytes, 0);
     }
 
     /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a
