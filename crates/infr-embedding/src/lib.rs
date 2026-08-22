@@ -66,6 +66,16 @@ pub struct EmbeddingBatch {
     pub prompt_tokens: u32,
 }
 
+/// Common execution boundary for embedding implementations.
+///
+/// The current llama.cpp process adapter remains the compatibility/oracle implementation. A
+/// native INFR graph can implement the same contract without changing the HTTP server or GUI.
+pub trait EmbeddingEngine: Send + Sync {
+    fn config(&self) -> &EmbeddingConfig;
+    fn resource_snapshot(&self) -> ResourceSnapshot;
+    fn embed(&self, inputs: &[String]) -> Result<EmbeddingBatch>;
+}
+
 #[derive(Clone, Debug)]
 enum EmbeddingDevice {
     Cpu,
@@ -83,7 +93,7 @@ impl EmbeddingDevice {
 /// The worker binds an ephemeral loopback-only port. It is never exposed to clients: INFR's own
 /// `/v1/embeddings` route remains the public endpoint and applies the same auth/admission policy as
 /// chat. Dropping this object terminates the worker and releases all of its RAM/VRAM allocations.
-pub struct EmbeddingModel {
+pub struct LlamaCppEmbeddingEngine {
     cfg: EmbeddingConfig,
     model_id: String,
     endpoint: String,
@@ -94,7 +104,7 @@ pub struct EmbeddingModel {
     resource: Arc<ResourceTracker>,
 }
 
-impl EmbeddingModel {
+impl LlamaCppEmbeddingEngine {
     pub fn load_cpu(path: &Path, cfg: Arc<infr_core::config::Config>) -> Result<Self> {
         Self::load_cpu_with_runner(path, cfg, None, 1)
     }
@@ -348,12 +358,31 @@ impl EmbeddingModel {
     }
 }
 
-impl Drop for EmbeddingModel {
+impl EmbeddingEngine for LlamaCppEmbeddingEngine {
+    fn config(&self) -> &EmbeddingConfig {
+        LlamaCppEmbeddingEngine::config(self)
+    }
+
+    fn resource_snapshot(&self) -> ResourceSnapshot {
+        LlamaCppEmbeddingEngine::resource_snapshot(self)
+    }
+
+    fn embed(&self, inputs: &[String]) -> Result<EmbeddingBatch> {
+        LlamaCppEmbeddingEngine::embed(self, inputs)
+    }
+}
+
+impl Drop for LlamaCppEmbeddingEngine {
     fn drop(&mut self) {
         self.stop_child();
         let _ = fs::remove_file(&self.log_path);
     }
 }
+
+/// Backward-compatible name for the external llama.cpp implementation.
+///
+/// New code should depend on [`EmbeddingEngine`] and select an implementation explicitly.
+pub type EmbeddingModel = LlamaCppEmbeddingEngine;
 
 #[derive(Serialize)]
 struct LlamaEmbeddingRequest<'a> {
