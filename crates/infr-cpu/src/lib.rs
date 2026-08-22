@@ -23,7 +23,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, G
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
-use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -1766,10 +1766,6 @@ impl Backend for CpuBackend {
                     let qs = &vals[q.0 as usize];
                     // K/V live in their persistent buffers (f32); borrow them — attention reads only
                     // the first `kv_len` rows, never the whole `max_ctx` cache.
-                    let kbuf = bindings.get(k_cache).expect("cpu backend: unbound k_cache");
-                    let vbuf = bindings.get(v_cache).expect("cpu backend: unbound v_cache");
-                    let kguard = cpu_buf(kbuf).read();
-                    let vguard = cpu_buf(vbuf).read();
                     // Materialize the valid KV rows as f32. K and V pick their cache dtype
                     // INDEPENDENTLY (f16 matches the GPU's f16 KV; Q8_0 blocks dequant via
                     // y = d*q) — the inner dot then runs in f32 either way.
@@ -1808,8 +1804,26 @@ impl Backend for CpuBackend {
                             _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
                         }
                     };
-                    let ks = deq(&kguard, g.desc(k_cache).dtype);
-                    let vs = deq(&vguard, g.desc(v_cache).dtype);
+                    // Decoder graphs bind persistent K/V caches as Inputs. Encoder-only models
+                    // instead produce complete K/V matrices as Internal tensors in this graph.
+                    let cache = |id: TensorId| -> Vec<f32> {
+                        match g.kind(id) {
+                            TensorKind::Internal | TensorKind::Output => {
+                                vals[id.0 as usize][..need].to_vec()
+                            }
+                            TensorKind::Input => {
+                                let buf = bindings
+                                    .get(id)
+                                    .expect("cpu backend: unbound attention cache");
+                                deq(&cpu_buf(buf).read(), g.desc(id).dtype)
+                            }
+                            TensorKind::Weight => {
+                                panic!("cpu backend: attention cache cannot be a Weight")
+                            }
+                        }
+                    };
+                    let ks = cache(k_cache);
+                    let vs = cache(v_cache);
                     // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
                     // extra logit per head in the max AND the denominator, never in the numerator.
                     // See `Op::Attention::sinks`.
@@ -3726,6 +3740,86 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_reads_graph_internal_kv() {
+        use infr_core::tensor::TensorDesc;
+
+        let mut graph = Graph::new();
+        let q_src = graph.input(TensorDesc::new(vec![4], DType::F32));
+        let k_src = graph.input(TensorDesc::new(vec![4], DType::F32));
+        let v_src = graph.input(TensorDesc::new(vec![4], DType::F32));
+        let q = graph.internal(TensorDesc::new(vec![4], DType::F16));
+        let k = graph.internal(TensorDesc::new(vec![4], DType::F16));
+        let v = graph.internal(TensorDesc::new(vec![4], DType::F16));
+        let out = graph.output(TensorDesc::new(vec![4], DType::F32));
+        for (src, dst) in [(q_src, q), (k_src, k), (v_src, v)] {
+            graph.push(Op::Copy {
+                src,
+                src_off: 0,
+                dst,
+                dst_off: 0,
+                n: 4,
+            });
+        }
+        graph.push(Op::Attention {
+            q,
+            k_cache: k,
+            v_cache: v,
+            dst: out,
+            rows: 2,
+            kv_len: 2,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 2,
+            scale: 1.0,
+            mask: AttnMask::Canvas { lo: 0 },
+            pos: 0,
+            sinks: None,
+        });
+
+        let backend = CpuBackend::new();
+        let q_buf = backend.alloc(16, BufferUsage::Activations).unwrap();
+        let k_buf = backend.alloc(16, BufferUsage::Activations).unwrap();
+        let v_buf = backend.alloc(16, BufferUsage::Activations).unwrap();
+        let out_buf = backend.alloc(16, BufferUsage::Readback).unwrap();
+        backend
+            .upload(
+                q_buf.as_ref(),
+                bytemuck::cast_slice(&[1.0f32, 0.0, 1.0, 0.0]),
+            )
+            .unwrap();
+        backend
+            .upload(
+                k_buf.as_ref(),
+                bytemuck::cast_slice(&[1.0f32, 0.0, 0.0, 1.0]),
+            )
+            .unwrap();
+        backend
+            .upload(
+                v_buf.as_ref(),
+                bytemuck::cast_slice(&[10.0f32, 0.0, 0.0, 20.0]),
+            )
+            .unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(q_src, q_buf.as_ref())
+            .bind(k_src, k_buf.as_ref())
+            .bind(v_src, v_buf.as_ref())
+            .bind(out, out_buf.as_ref());
+        let plan = backend.compile(&graph).unwrap();
+        backend.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut bytes = vec![0u8; 16];
+        backend.download(out_buf.as_ref(), &mut bytes).unwrap();
+        let got = bytemuck::cast_slice::<u8, f32>(&bytes);
+        let p0 = std::f32::consts::E / (std::f32::consts::E + 1.0);
+        let expected = [10.0 * p0, 20.0 * (1.0 - p0)];
+        for row in got.chunks_exact(2) {
+            assert!((row[0] - expected[0]).abs() < 1e-5, "{row:?}");
+            assert!((row[1] - expected[1]).abs() < 1e-5, "{row:?}");
+        }
+    }
 
     // Naive serial reference: a byte-for-byte copy of the ORIGINAL shift-register conv loop. The
     // parallel `conv1d_silu` reformulation must reproduce both `out` and the rebuilt `state` exactly.
