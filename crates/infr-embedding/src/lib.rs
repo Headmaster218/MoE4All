@@ -1,11 +1,14 @@
 //! Embedding-model integration for INFR.
 //!
-//! Embedding architectures are delegated to the mature `llama.cpp` implementation instead of
-//! being reimplemented as an INFR graph. INFR owns the process lifecycle and OpenAI-facing API,
-//! while the whole embedding model is registered as one independently evictable resource for the
-//! future unified VRAM/RAM/SSD policy.
+//! Supported encoder architectures run directly on INFR's CPU/Vulkan graph backends. The
+//! `llama.cpp` process adapter remains available as a compatibility path and numeric oracle. Both
+//! implementations share one engine boundary and resource-accounting contract so embedding
+//! weights can join the future unified VRAM/RAM/SSD policy without changing the HTTP API.
 
+mod native;
 mod tokenizer;
+
+pub use native::NativeEmbeddingEngine;
 
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::{MemoryTier, ResourceKind, ResourceSnapshot, ResourceTracker, WeightSource};

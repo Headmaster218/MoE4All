@@ -1199,8 +1199,11 @@ name = "infr-embedding"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "infr-core",
+ "infr-cpu",
  "infr-gguf",
+ "infr-vulkan",
  "reqwest",
  "serde",
  "serde_json",

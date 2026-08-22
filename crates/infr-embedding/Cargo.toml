@@ -8,7 +8,10 @@ repository.workspace = true
 [dependencies]
 infr-core.workspace = true
 infr-gguf.workspace = true
+infr-cpu.workspace = true
+infr-vulkan.workspace = true
 anyhow.workspace = true
+bytemuck.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
