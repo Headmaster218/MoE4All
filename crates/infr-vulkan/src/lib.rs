@@ -3187,6 +3187,58 @@ impl VulkanBackend {
         Ok(pool)
     }
 
+    /// Expert-aware initializer: physical shard boundaries are placed between slots so the
+    /// driver allocation cap never strands an unusable tail smaller than the next slot.
+    pub(crate) fn init_unified_vram_for_expert_slots(
+        &self,
+        specs: &[(usize, usize)],
+    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+        const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
+        let driver_max = usize::try_from(self.shared.max_mem_alloc_size)
+            .unwrap_or(usize::MAX)
+            .max(256);
+        let platform_max = if cfg!(target_os = "windows") {
+            WINDOWS_MAX_SHARD.min(driver_max)
+        } else {
+            driver_max
+        };
+        let mut shard_sizes = Vec::new();
+        let mut current = 0usize;
+        for &(slot_bytes, n_slots) in specs {
+            if slot_bytes == 0 || slot_bytes > platform_max {
+                return Err(be(format!(
+                    "expert slot size {slot_bytes} cannot fit unified VRAM shard limit {platform_max}"
+                )));
+            }
+            for _ in 0..n_slots {
+                if current != 0 && current.saturating_add(slot_bytes) > platform_max {
+                    shard_sizes.push(current);
+                    current = 0;
+                }
+                current = current
+                    .checked_add(slot_bytes)
+                    .ok_or_else(|| be("unified expert shard plan overflow"))?;
+            }
+        }
+        if current != 0 {
+            shard_sizes.push(current);
+        }
+        let expected: usize = shard_sizes.iter().sum();
+        let mut cell = self.unified_pool.lock().unwrap();
+        if let Some(pool) = cell.as_ref() {
+            if pool.stats().capacity_bytes != expected {
+                return Err(be(format!(
+                    "unified VRAM arena is already {} bytes; expert plan requires {expected} bytes",
+                    pool.stats().capacity_bytes,
+                )));
+            }
+            return Ok(Arc::clone(pool));
+        }
+        let pool = crate::unified::UnifiedVramPool::new_with_shards(self, &shard_sizes)?;
+        *cell = Some(Arc::clone(&pool));
+        Ok(pool)
+    }
+
     pub fn unified_vram(&self) -> Option<Arc<crate::unified::UnifiedVramPool>> {
         self.unified_pool.lock().unwrap().clone()
     }
@@ -3222,13 +3274,34 @@ impl VulkanBackend {
         let pool = self
             .unified_vram()
             .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
-        let handle = pool.allocate(size, class).ok_or_else(|| {
-            let stats = pool.stats();
-            be(format!(
-                "unified VRAM arena cannot fit {size} contiguous bytes ({} free, largest range {})",
-                stats.free_bytes, stats.largest_free_bytes,
-            ))
-        })?;
+        let handle = match pool.allocate(size, class) {
+            Some(handle) => handle,
+            None if class != crate::unified::UnifiedVramClass::Expert => {
+                let loaned = self
+                    .moe_pager
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .ok_or_else(|| be("unified VRAM is full and no MoE pager can loan slots"))?
+                    .loan_unified_bytes(size)?;
+                let handle = pool.allocate(size, class).ok_or_else(|| {
+                    be(format!(
+                        "unified VRAM loaned {loaned} expert slots but still cannot fit {size} contiguous bytes"
+                    ))
+                })?;
+                tracing::info!(
+                    "[infr] unified VRAM: loaned {loaned} cold expert slots for {class:?} ({size} bytes)"
+                );
+                handle
+            }
+            None => {
+                let stats = pool.stats();
+                return Err(be(format!(
+                    "unified VRAM arena cannot fit {size} expert bytes ({} free, largest range {})",
+                    stats.free_bytes, stats.largest_free_bytes,
+                )));
+            }
+        };
         Ok(Box::new(self.unified_sub_buffer(handle, size)?) as Box<dyn Buffer>)
     }
 
@@ -4888,6 +4961,69 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    /// A module allocation may evict cold expert slots, then exact-slot restoration returns every
+    /// byte to the expert cache after the module buffer is released.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn unified_vram_loans_and_restores_expert_slots() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        const SLOT: usize = 1024 * 1024;
+        const SLOTS: usize = 16;
+        be.init_moe_pager(crate::pager::MoePagerLayout {
+            n_blocks: 32,
+            pools: vec![crate::pager::MoePoolSpec {
+                slot_bytes: SLOT,
+                n_slots: SLOTS,
+            }],
+            host_chunks: vec![crate::pager::MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: SLOT,
+            }],
+            prefill_target_lanes: 1,
+        })
+        .expect("init pager");
+        let pool = be.unified_vram().expect("unified pool");
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * SLOTS,
+        );
+        let embedding = be
+            .alloc_unified(
+                SLOT * 2 + SLOT / 2,
+                crate::unified::UnifiedVramClass::EmbeddingWeights,
+            )
+            .expect("loan expert slots");
+        let during = pool.stats();
+        assert_eq!(
+            during.class_bytes(crate::unified::UnifiedVramClass::EmbeddingWeights),
+            SLOT * 2 + SLOT / 2,
+        );
+        assert_eq!(
+            during.class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * (SLOTS - 3),
+        );
+        drop(embedding);
+        be.moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("pager")
+            .enter_decode();
+        let restored = pool.stats();
+        assert_eq!(
+            restored.class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * SLOTS,
+        );
+        assert_eq!(restored.free_bytes, 0);
     }
 
     /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a

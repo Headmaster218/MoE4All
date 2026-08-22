@@ -171,13 +171,32 @@ impl UnifiedRangePool {
         align: usize,
         class: UnifiedVramClass,
     ) -> Option<Arc<UnifiedAllocation>> {
+        self.allocate_with_policy(requested_len, align, class, true)
+    }
+
+    fn allocate_first_fit(
+        &self,
+        requested_len: usize,
+        align: usize,
+        class: UnifiedVramClass,
+    ) -> Option<Arc<UnifiedAllocation>> {
+        self.allocate_with_policy(requested_len, align, class, false)
+    }
+
+    fn allocate_with_policy(
+        &self,
+        requested_len: usize,
+        align: usize,
+        class: UnifiedVramClass,
+        best_fit: bool,
+    ) -> Option<Arc<UnifiedAllocation>> {
         if requested_len == 0 || align == 0 || !align.is_power_of_two() {
             return None;
         }
         let len = align_up(requested_len, align)?;
         let mut state = self.inner.state.lock().unwrap();
         let mut best: Option<(usize, usize, usize, usize)> = None;
-        for (shard_idx, shard) in state.shards.iter().enumerate() {
+        'shards: for (shard_idx, shard) in state.shards.iter().enumerate() {
             for (&start, &span) in &shard.free {
                 let aligned = align_up(start, align)?;
                 let end = aligned.checked_add(len)?;
@@ -189,6 +208,9 @@ impl UnifiedRangePool {
                 let candidate = (waste, shard_idx, start, aligned);
                 if best.is_none_or(|old| candidate < old) {
                     best = Some(candidate);
+                }
+                if !best_fit {
+                    break 'shards;
                 }
             }
         }
@@ -299,6 +321,10 @@ impl UnifiedAllocationHandle {
         self.shard.buffer.as_ref()
     }
 
+    pub(crate) fn buffer_arc(&self) -> Arc<dyn Buffer> {
+        Arc::clone(&self.shard.buffer)
+    }
+
     pub(crate) fn base_addr(&self) -> u64 {
         self.shard.base_addr
     }
@@ -335,9 +361,24 @@ impl UnifiedVramPool {
         };
         let max_shard = platform_max.min(driver_max) / 256 * 256;
         let mut remaining = capacity;
-        let mut shards = Vec::new();
+        let mut shard_sizes = Vec::new();
         while remaining != 0 {
             let bytes = remaining.min(max_shard);
+            shard_sizes.push(bytes);
+            remaining -= bytes;
+        }
+        Self::new_with_shards(vk, &shard_sizes)
+    }
+
+    pub(crate) fn new_with_shards(
+        vk: &VulkanBackend,
+        shard_sizes: &[usize],
+    ) -> Result<Arc<Self>> {
+        if shard_sizes.is_empty() || shard_sizes.contains(&0) {
+            return Err(be("unified VRAM arena needs non-empty physical shards"));
+        }
+        let mut shards = Vec::new();
+        for &bytes in shard_sizes {
             let (buffer, base_addr) = vk.alloc_mapped_arena_bda(bytes)?;
             let buffer: Arc<dyn Buffer> = Arc::from(buffer);
             let mapped_ptr = as_vk_buf(buffer.as_ref())?
@@ -350,13 +391,12 @@ impl UnifiedVramPool {
                 mapped_ptr,
                 bytes,
             }));
-            remaining -= bytes;
         }
         let ranges = UnifiedRangePool::new(shards.iter().map(|shard| shard.bytes))
             .ok_or_else(|| be("unified VRAM arena has no physical shards"))?;
         tracing::info!(
             "[infr] unified VRAM arena: {} bytes across {} mapped ReBAR shard(s)",
-            capacity,
+            shard_sizes.iter().sum::<usize>(),
             shards.len(),
         );
         Ok(Arc::new(Self { ranges, shards }))
@@ -367,7 +407,11 @@ impl UnifiedVramPool {
         bytes: usize,
         class: UnifiedVramClass,
     ) -> Option<Arc<UnifiedAllocationHandle>> {
-        let lease = self.ranges.allocate(bytes, 256, class)?;
+        let lease = if class == UnifiedVramClass::Expert {
+            self.ranges.allocate_first_fit(bytes, 256, class)?
+        } else {
+            self.ranges.allocate(bytes, 256, class)?
+        };
         let shard = Arc::clone(self.shards.get(lease.range().shard)?);
         Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
     }
@@ -397,6 +441,10 @@ impl UnifiedVramPool {
 
     pub fn allocations(&self) -> Vec<UnifiedRange> {
         self.ranges.allocations()
+    }
+
+    pub fn shard_sizes(&self) -> Vec<usize> {
+        self.shards.iter().map(|shard| shard.bytes).collect()
     }
 }
 

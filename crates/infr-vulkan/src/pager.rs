@@ -44,6 +44,9 @@ use infr_core::pager_profile;
 use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
+use crate::unified::{
+    UnifiedAllocationHandle, UnifiedRange, UnifiedVramClass, UnifiedVramPool,
+};
 
 /// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
 /// bad seam budget (0 slots) or sizing bug (misaligned stride) returns `Err` before any allocation.
@@ -81,8 +84,21 @@ fn apply_placement(lut_host: &mut [u32], id: BlockId, slot: u32, evicted: Option
 struct ArenaShard {
     buffer: Arc<dyn Buffer>,
     addr: u64,
+    /// Byte offset of `first_slot` in `buffer`. Legacy arenas start at zero; unified pager runs
+    /// may begin in the middle of a service-level physical shard.
+    buffer_offset: usize,
     first_slot: u32,
     n_slots: u32,
+}
+
+struct UnifiedSlot {
+    range: UnifiedRange,
+    allocation: Option<Arc<UnifiedAllocationHandle>>,
+}
+
+struct UnifiedPagerBacking {
+    pool: Arc<UnifiedVramPool>,
+    slots: Vec<UnifiedSlot>,
 }
 
 pub struct GpuPager {
@@ -91,6 +107,9 @@ pub struct GpuPager {
     /// One GLOBAL Pager owns every slot; these are only physical backing segments. A slot can be
     /// assigned to any layer/role regardless of which arena contains it.
     arenas: Vec<ArenaShard>,
+    /// Present only for MoE pools participating in the service-level elastic VRAM arena. Dense
+    /// streaming and standalone pager tests keep their established dedicated arena path.
+    unified: Option<UnifiedPagerBacking>,
     /// Host-visible LUT mirror (mutated in place, re-uploaded on change) + the device buffer it's
     /// pushed to. `n_blocks` entries, each the resident block's SLOT INDEX
     /// (`infr_core::pager::NOT_RESIDENT` for an absent block). The paged MoE kernels read this slot
@@ -143,6 +162,7 @@ impl GpuPager {
             vec![ArenaShard {
                 buffer: Arc::from(arena),
                 addr: arena_addr,
+                buffer_offset: 0,
                 first_slot: 0,
                 n_slots: n_slots as u32,
             }],
@@ -173,6 +193,7 @@ impl GpuPager {
             arenas.push(ArenaShard {
                 buffer: Arc::from(arena),
                 addr,
+                buffer_offset: 0,
                 first_slot: first_slot as u32,
                 n_slots: shard_slots as u32,
             });
@@ -208,16 +229,60 @@ impl GpuPager {
             pager: Pager::new(n_slots),
             slot_bytes,
             arenas,
+            unified: None,
             lut_host,
             lut_dev,
             lut_dirty: false,
         })
     }
 
+    fn new_unified(
+        vk: &VulkanBackend,
+        pool: Arc<UnifiedVramPool>,
+        n_blocks: usize,
+        n_slots: usize,
+        slot_bytes: usize,
+    ) -> Result<Self> {
+        validate_pager_dims(n_slots, slot_bytes)?;
+        let mut slots: Vec<UnifiedSlot> = Vec::with_capacity(n_slots);
+        let mut arenas: Vec<ArenaShard> = Vec::new();
+        let mut previous_shard = None;
+        for slot in 0..n_slots {
+            let allocation = pool
+                .allocate(slot_bytes, UnifiedVramClass::Expert)
+                .ok_or_else(|| be("unified VRAM arena cannot fit all planned expert slots"))?;
+            let range = allocation.range();
+            let continues = previous_shard == Some(range.shard)
+                && arenas.last().is_some_and(|arena| {
+                    arena.first_slot as usize + arena.n_slots as usize == slot
+                        && arena.buffer_offset + arena.n_slots as usize * slot_bytes == range.offset
+                });
+            if continues {
+                arenas.last_mut().expect("checked above").n_slots += 1;
+            } else {
+                arenas.push(ArenaShard {
+                    buffer: allocation.buffer_arc(),
+                    addr: allocation.base_addr(),
+                    buffer_offset: range.offset,
+                    first_slot: slot as u32,
+                    n_slots: 1,
+                });
+            }
+            previous_shard = Some(range.shard);
+            slots.push(UnifiedSlot {
+                range,
+                allocation: Some(allocation),
+            });
+        }
+        let mut pager = Self::new_in_arenas(vk, n_blocks, n_slots, slot_bytes, arenas)?;
+        pager.unified = Some(UnifiedPagerBacking { pool, slots });
+        Ok(pager)
+    }
+
     /// The arena's 64-bit `VkDeviceAddress`. The paged kernels take this as a push constant and
     /// add `lut_slot * slot_bytes` to reach an expert.
     pub fn arena_addr(&self) -> u64 {
-        self.arenas[0].addr
+        self.arenas[0].addr + self.arenas[0].buffer_offset as u64
     }
 
     pub fn n_slots(&self) -> usize {
@@ -245,7 +310,7 @@ impl GpuPager {
             .ok_or_else(|| be(format!("global pager slot {slot} has no physical arena")))?;
         Ok((
             arena_idx,
-            (slot - arena.first_slot) as usize * self.slot_bytes,
+            arena.buffer_offset + (slot - arena.first_slot) as usize * self.slot_bytes,
         ))
     }
 
@@ -264,6 +329,136 @@ impl GpuPager {
 
     fn total_arena_bytes(&self) -> usize {
         self.pager.n_slots().saturating_mul(self.slot_bytes)
+    }
+
+    /// Logical ranges usable by Prefill. Unified borrowers may punch holes in the fixed slot
+    /// numbering, so only enabled, physically contiguous runs are returned.
+    fn available_virtual_ranges(&self) -> Vec<(usize, usize)> {
+        if let Some(unified) = &self.unified {
+            let mut ranges = Vec::new();
+            let mut current: Option<(usize, usize, usize, usize)> = None;
+            for (slot, backing) in unified.slots.iter().enumerate() {
+                if backing.allocation.is_none() || !self.pager.slot_enabled(slot as u32) {
+                    if let Some((start, end, _, _)) = current.take() {
+                        ranges.push((start, end));
+                    }
+                    continue;
+                }
+                let logical_start = slot * self.slot_bytes;
+                let logical_end = logical_start + self.slot_bytes;
+                match current {
+                    Some((start, _, shard, physical_end))
+                        if shard == backing.range.shard
+                            && physical_end == backing.range.offset =>
+                    {
+                        current = Some((
+                            start,
+                            logical_end,
+                            shard,
+                            backing.range.offset + backing.range.len,
+                        ));
+                    }
+                    Some((start, end, _, _)) => {
+                        ranges.push((start, end));
+                        current = Some((
+                            logical_start,
+                            logical_end,
+                            backing.range.shard,
+                            backing.range.offset + backing.range.len,
+                        ));
+                    }
+                    None => {
+                        current = Some((
+                            logical_start,
+                            logical_end,
+                            backing.range.shard,
+                            backing.range.offset + backing.range.len,
+                        ));
+                    }
+                }
+            }
+            if let Some((start, end, _, _)) = current {
+                ranges.push((start, end));
+            }
+            ranges
+        } else {
+            self.arenas
+                .iter()
+                .map(|arena| {
+                    let start = arena.first_slot as usize * self.slot_bytes;
+                    (start, start + arena.n_slots as usize * self.slot_bytes)
+                })
+                .collect()
+        }
+    }
+
+    fn unified_slot_allocations(&self) -> Vec<(usize, UnifiedRange, Option<usize>)> {
+        let Some(unified) = &self.unified else {
+            return Vec::new();
+        };
+        let heat = self.slot_heat();
+        unified
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, backing)| {
+                backing
+                    .allocation
+                    .as_ref()
+                    .map(|_| (slot, backing.range, heat[slot]))
+            })
+            .collect()
+    }
+
+    fn loan_slots(&mut self, slots: &[usize]) -> Result<()> {
+        let unified = self
+            .unified
+            .as_mut()
+            .ok_or_else(|| be("cannot loan a slot from a legacy pager arena"))?;
+        for &slot in slots {
+            if unified.slots[slot].allocation.is_none() {
+                continue;
+            }
+            if self.pager.enabled_slots() <= 8 {
+                return Err(be(
+                    "unified VRAM loan would shrink an expert pool below 8 slots",
+                ));
+            }
+            if let Some(evicted) = self.pager.disable_slot(slot as u32) {
+                if let Some(entry) = self.lut_host.get_mut(evicted as usize) {
+                    *entry = NOT_RESIDENT;
+                }
+                self.lut_dirty = true;
+            }
+            unified.slots[slot].allocation.take();
+        }
+        Ok(())
+    }
+
+    fn try_restore_loaned_slots(&mut self) -> usize {
+        let Some(unified) = self.unified.as_mut() else {
+            return 0;
+        };
+        let mut restored = 0;
+        for (slot, backing) in unified.slots.iter_mut().enumerate() {
+            if backing.allocation.is_some() {
+                continue;
+            }
+            let range = backing.range;
+            let Some(allocation) = unified.pool.try_claim_exact(
+                range.shard,
+                range.offset,
+                range.len,
+                UnifiedVramClass::Expert,
+            ) else {
+                continue;
+            };
+            backing.range = allocation.range();
+            backing.allocation = Some(allocation);
+            self.pager.enable_slot(slot as u32);
+            restored += 1;
+        }
+        restored
     }
 
     /// Per-slot Decode heat: `None` is free, `Some(1)` is the coldest resident and larger values
@@ -318,7 +513,7 @@ impl GpuPager {
             let start = arena.first_slot as usize * self.slot_bytes;
             let end = start + arena.n_slots as usize * self.slot_bytes;
             if offset >= start && offset.saturating_add(bytes) <= end {
-                return Ok((idx, offset - start));
+                return Ok((idx, arena.buffer_offset + offset - start));
             }
         }
         Err(be(format!(
@@ -1040,6 +1235,10 @@ fn prefill_range_cost(
 /// cost, zero behavior change on the common (fits-in-VRAM) path.
 pub struct MoePagerSession {
     pools: Vec<Pool>,
+    unified_pool: Arc<UnifiedVramPool>,
+    /// Last topology observed by the cheap Decode restoration check. A matching generation is
+    /// one atomic load and no scan; module allocation/drop changes it.
+    unified_generation: u64,
     role_stride: usize,
     /// The only owned host copy of all paged MoE weights. Plain CPU memory, deliberately not a
     /// Vulkan buffer: the full payload cannot be counted or accessed as shared/virtual VRAM.
@@ -1176,12 +1375,19 @@ impl MoePagerSession {
             host_payload_bytes,
             host_store.len(),
         );
+        let unified_specs: Vec<_> = layout
+            .pools
+            .iter()
+            .map(|spec| (spec.slot_bytes, spec.n_slots))
+            .collect();
+        let unified_pool = vk.init_unified_vram_for_expert_slots(&unified_specs)?;
         let mut pools = Vec::with_capacity(layout.pools.len());
         for spec in &layout.pools {
             pools.push(Pool {
                 slot_bytes: spec.slot_bytes,
-                pager: GpuPager::new_mapped(
+                pager: GpuPager::new_unified(
                     vk,
+                    Arc::clone(&unified_pool),
                     layout.n_blocks.saturating_mul(3),
                     spec.n_slots,
                     spec.slot_bytes,
@@ -1195,6 +1401,8 @@ impl MoePagerSession {
         let tape = vk.alloc_uninit(tape_words * 8, BufferUsage::Staging)?;
         Ok(Self {
             pools,
+            unified_generation: unified_pool.generation(),
+            unified_pool,
             role_stride: layout.n_blocks,
             host_store,
             sources: HashMap::new(),
@@ -1315,13 +1523,138 @@ impl MoePagerSession {
         Ok(src.bank_bytes)
     }
 
+    /// Release the coldest physically contiguous expert-slot window large enough for an
+    /// auxiliary allocation. Non-expert allocations are hard barriers and every expert pool
+    /// retains at least eight enabled slots (one routed Top-K working set).
+    pub(crate) fn loan_unified_bytes(&mut self, bytes: usize) -> Result<usize> {
+        if bytes == 0 {
+            return Ok(0);
+        }
+        if self.mode == MoeArenaMode::PrefillLayer {
+            self.enter_decode();
+        }
+        let allocations = self.unified_pool.allocations();
+        let shard_sizes = self.unified_pool.shard_sizes();
+        let mut expert_slots: HashMap<u64, (usize, usize, Option<usize>)> = HashMap::new();
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
+            for (slot, range, heat) in pool.pager.unified_slot_allocations() {
+                expert_slots.insert(range.id, (pool_idx, slot, heat));
+            }
+        }
+        let want = prefill_align(bytes);
+        let mut best: Option<((usize, u128, usize, usize), Vec<(usize, usize)>)> = None;
+        for (shard, &capacity) in shard_sizes.iter().enumerate() {
+            if want > capacity {
+                continue;
+            }
+            let shard_allocs: Vec<_> = allocations
+                .iter()
+                .filter(|range| range.shard == shard)
+                .copied()
+                .collect();
+            let mut starts = vec![0usize];
+            for range in &shard_allocs {
+                starts.push(range.offset);
+                starts.push(range.offset.saturating_add(range.len));
+            }
+            starts.sort_unstable();
+            starts.dedup();
+            for start in starts {
+                let start = prefill_align(start);
+                let Some(end) = start.checked_add(want) else {
+                    continue;
+                };
+                if end > capacity {
+                    continue;
+                }
+                let mut victims = Vec::new();
+                let mut per_pool = vec![0usize; self.pools.len()];
+                let mut resident = 0usize;
+                let mut heat_sum = 0u128;
+                let mut released = 0usize;
+                let mut blocked = false;
+                for range in shard_allocs.iter().filter(|range| {
+                    range.offset < end && range.offset.saturating_add(range.len) > start
+                }) {
+                    if range.class != UnifiedVramClass::Expert {
+                        blocked = true;
+                        break;
+                    }
+                    let Some(&(pool, slot, heat)) = expert_slots.get(&range.id) else {
+                        blocked = true;
+                        break;
+                    };
+                    victims.push((pool, slot));
+                    per_pool[pool] += 1;
+                    released = released.saturating_add(range.len);
+                    if let Some(rank) = heat {
+                        resident += 1;
+                        heat_sum += rank as u128;
+                    }
+                }
+                if blocked
+                    || victims.is_empty()
+                    || per_pool.iter().enumerate().any(|(pool, &count)| {
+                        self.pools[pool]
+                            .pager
+                            .pager
+                            .enabled_slots()
+                            .saturating_sub(count)
+                            < 8
+                    })
+                {
+                    continue;
+                }
+                let score = (
+                    resident,
+                    heat_sum,
+                    victims.len(),
+                    released.saturating_sub(want),
+                );
+                if best.as_ref().is_none_or(|(old, _)| score < *old) {
+                    best = Some((score, victims));
+                }
+            }
+        }
+        let Some((_, victims)) = best else {
+            return Err(be(format!(
+                "unified VRAM cannot create a {want}-byte contiguous window without crossing a permanent allocation or the expert minimum working set"
+            )));
+        };
+        let mut by_pool: Vec<Vec<usize>> = vec![Vec::new(); self.pools.len()];
+        for (pool, slot) in victims {
+            by_pool[pool].push(slot);
+        }
+        let mut loaned = 0usize;
+        for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
+            loaned = loaned.saturating_add(slots.len());
+            pool.pager.loan_slots(&slots)?;
+        }
+        self.unified_generation = self.unified_pool.generation();
+        Ok(loaned)
+    }
+
+    fn restore_unified_slots_if_changed(&mut self) -> usize {
+        if self.unified_pool.generation() == self.unified_generation {
+            return 0;
+        }
+        let restored = self
+            .pools
+            .iter_mut()
+            .map(|pool| pool.pager.try_restore_loaned_slots())
+            .sum();
+        self.unified_generation = self.unified_pool.generation();
+        restored
+    }
+
     /// Switch the shared arenas back to expert-LRU interpretation. Entering Prefill already
     /// invalidated exactly the Decode slots its temporary ring borrowed, so every mapping outside
     /// those ranges remains valid and hot. The borrowed slots are already on each pager's free
     /// list; Decode naturally repopulates only those misses.
     pub fn enter_decode(&mut self) -> bool {
+        let restored = self.restore_unified_slots_if_changed();
         if self.mode == MoeArenaMode::DecodeLru {
-            return false;
+            return restored != 0;
         }
         self.prefill_lane_layer.fill(None);
         self.prefill_loaded.clear();
@@ -1423,11 +1756,10 @@ impl MoePagerSession {
                 .iter()
                 .enumerate()
                 .flat_map(|(pool, item)| {
-                    item.pager.arenas.iter().map(move |arena| {
-                        let start = arena.first_slot as usize * item.slot_bytes;
-                        let end = start + arena.n_slots as usize * item.slot_bytes;
-                        (pool, start, end)
-                    })
+                    item.pager
+                        .available_virtual_ranges()
+                        .into_iter()
+                        .map(move |(start, end)| (pool, start, end))
                 })
                 .collect();
             let mut candidate_bases: Vec<Vec<Option<(usize, usize)>>> = lane_bank_bytes
