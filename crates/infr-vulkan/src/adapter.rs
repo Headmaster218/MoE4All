@@ -1199,16 +1199,45 @@ fn lower_op(
             // output projection is the caller (`w_off = g * o_lora_rank * in_f`); an f32 `wo_a` is
             // what the synthetic V4 fixture writes, and what the CPU-vs-Vulkan parity test runs.
             //
-            // F16 is NOT, and is refused rather than approximated: its m>1 path is the coopmat
-            // `matmul_proj` and its m=1 path is `linear`/`linear_f16_noext`, three more shifted-
-            // address call sites plus a 4-byte alignment obligation on the two that read the
-            // weight as packed u32 words — and nothing in the tree produces an f16 `w_off` today,
-            // so every line of it would be untested. A real (quantized) V4 GGUF takes the native
-            // path above and never reaches here.
-            if w_off != 0 && !native_dense_supported(dt) && dt != infr_core::DType::F32 {
+            // F16 now follows the same shifted-address design. Nomic-BERT's fused QKV projection
+            // exercises both its m=1 GEMV and m>1 coopmat GEMM paths; the parity test below pins
+            // both against a host reference.
+            // F16 kernels do not carry an element-offset field. Convert a row-aligned offset to a
+            // shifted BDA once and feed the existing arena-addressed entry points. Four-byte
+            // alignment covers the packed-u32 readers used by coopmat and the no-f16 fallback.
+            let f16_w_addr = if w_off != 0 && dt == infr_core::DType::F16 {
+                if w_off % in_f != 0 {
+                    return Err(be(format!(
+                        "vulkan adapter: F16 Linear w_off {w_off} is not a whole multiple of \
+                         in_f {in_f}"
+                    )));
+                }
+                let byte_off = w_off
+                    .checked_mul(2)
+                    .ok_or_else(|| be("vulkan adapter: F16 Linear byte offset overflow"))?;
+                if byte_off % 4 != 0 {
+                    return Err(be(format!(
+                        "vulkan adapter: F16 Linear byte offset {byte_off} is not u32 aligned"
+                    )));
+                }
+                let base = w.device_addr().ok_or_else(|| {
+                    be("vulkan adapter: F16 Linear with w_off needs a BDA weight address")
+                })?;
+                Some(
+                    base.checked_add(byte_off as u64)
+                        .ok_or_else(|| be("vulkan adapter: F16 Linear device address overflow"))?,
+                )
+            } else {
+                None
+            };
+            if w_off != 0
+                && !native_dense_supported(dt)
+                && dt != infr_core::DType::F32
+                && dt != infr_core::DType::F16
+            {
                 return Err(be(format!(
                     "vulkan adapter: Linear w_off on a {dt:?} weight — only the native (quant / \
-                     bf16) kernels and the f32 GEMV take a weight offset"
+                     bf16) kernels and the f16/f32 paths take a weight offset"
                 )));
             }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
@@ -1753,6 +1782,8 @@ fn lower_op(
                                 splits,
                                 false,
                             );
+                        } else if let Some(w_addr) = f16_w_addr {
+                            rec.matmul_proj_at(xb, w_addr, out, m, in_f, out_f);
                         } else {
                             // f16 coopmat GEMM. `matmul_proj` internally forks on `wq.device_addr()`
                             // (see its recorder doc) — no threading needed here.
@@ -1933,14 +1964,22 @@ fn lower_op(
                     rec.linear_f32_at(base + (w_off * 4) as u64, xb, y, m, in_f, out_f);
                 }
             } else if be_.caps().f16 {
-                rec.linear(w, xb, y, m, in_f, out_f);
+                if let Some(w_addr) = f16_w_addr {
+                    rec.linear_at(w_addr, xb, y, m, in_f, out_f);
+                } else {
+                    rec.linear(w, xb, y, m, in_f, out_f);
+                }
             } else {
                 // No shaderFloat16 (implies no coopmat too — f16 is a coopmat prerequisite):
                 // linear_f16.comp's `float16_t` SSBO read needs the Float16 SPIR-V capability the
                 // device lacks. linear_f16_noext.comp is the same dispatch shape reading the f16
                 // weight buffer as packed u32 words and unpacking via the CORE `unpackHalf2x16`
                 // builtin instead — correctness-first, not perf-tuned (no row-tiling).
-                rec.linear_f16_noext(w, xb, y, m, in_f, out_f);
+                if let Some(w_addr) = f16_w_addr {
+                    rec.linear_f16_noext_at(w_addr, xb, y, m, in_f, out_f);
+                } else {
+                    rec.linear_f16_noext(w, xb, y, m, in_f, out_f);
+                }
             }
         }
         Op::Add { a, b, dst, n } => rec.add(r(*a)?, r(*b)?, r(*dst)?, *n as usize),
@@ -7583,9 +7622,62 @@ mod tests {
         }
     }
 
-    /// A one-op `GatedAct` (SwiGLU: silu(gate)·up) graph through the seam must match a host loop.
-    ///
-    /// On the SHARED harness (`infr_testkit::run_graph`) — see `linear_graph_matches_host`.
+    /// A fused F16 weight can expose a row-aligned projection through `Linear::w_off` without
+    /// copying the slice into a second buffer. Cover both scalar GEMV and tiled GEMM dispatch.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn f16_linear_offset_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (in_f, out_f) = (32usize, 64usize);
+        for rows in [1usize, 17] {
+            let x: Vec<f32> = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.071).sin() * 0.25)
+                .collect();
+            let stacked: Vec<f32> = (0..3 * out_f * in_f)
+                .map(|i| (i as f32 * 0.013 + 0.3).cos() * 0.2)
+                .collect();
+            let wf16 = infr_testkit::f16_bytes(&stacked);
+            let wq = infr_testkit::dequant_oracle(DType::F16, &wf16);
+            let w_off = out_f * in_f;
+            let want = infr_testkit::ref_linear(
+                &x,
+                &wq[w_off..w_off + out_f * in_f],
+                rows,
+                in_f,
+                out_f,
+            );
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+            let wi = g.weight(TensorDesc::new(vec![3 * out_f, in_f], DType::F16));
+            let yi = g.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            g.push(Op::Linear {
+                x: xi,
+                weight: wi,
+                dst: yi,
+                m: rows as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+                w_off: w_off as u32,
+            });
+            let got = infr_testkit::run_graph(
+                &be_,
+                &g,
+                &[(xi, infr_testkit::f32_bytes(&x)), (wi, wf16)],
+                yi,
+                rows * out_f,
+            );
+            for (i, (&got, &want)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (got - want).abs() < 2e-2,
+                    "rows={rows} offset linear mismatch at {i}: got {got} want {want}"
+                );
+            }
+        }
+    }
+
+    /// A one-op `GatedAct` (SwiGLU) graph through the seam must match a host loop.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_act_silu_matches_host() {
