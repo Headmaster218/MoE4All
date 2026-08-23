@@ -8,7 +8,7 @@ use crate::recorder::Recorder;
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
-use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
+use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind};
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::HashMap;
@@ -201,7 +201,12 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // bakes its causal bound from the `pos` push constant at record time (there is no
             // params-driven `_dyn` twin), so a replayed tape would select keys for the position it
             // was recorded at.
-            Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
+            Op::Mla { .. }
+            | Op::LightningIndexer { .. }
+            | Op::Dsv4Compress { .. }
+            | Op::Dsv4CacheWrite { .. }
+            | Op::Dsv4Indexer { .. }
+            | Op::Dsv4Gather { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -2312,6 +2317,133 @@ fn lower_op(
                     },
                 },
             }
+        }
+        Op::Dsv4Compress {
+            values,
+            scores,
+            ape,
+            norm,
+            freq_factors,
+            state,
+            dst,
+            state_values_off,
+            state_scores_off,
+            pos,
+            ratio,
+            dim,
+            rope_dim,
+            theta,
+            eps,
+            overlap,
+        } => {
+            let ff = match freq_factors {
+                Some(id) => Some(r(*id)?),
+                None => None,
+            };
+            rec.dsv4_compress(
+                r(*values)?,
+                r(*scores)?,
+                r(*ape)?,
+                r(*norm)?,
+                ff,
+                r(*state)?,
+                r(*dst)?,
+                *state_values_off,
+                *state_scores_off,
+                *pos,
+                *ratio,
+                *dim,
+                *rope_dim,
+                *theta,
+                *eps,
+                *overlap,
+            );
+        }
+        Op::Dsv4CacheWrite {
+            src,
+            cache,
+            rows,
+            row,
+            cache_off,
+            format,
+        } => {
+            rec.dsv4_cache_write(
+                r(*src)?,
+                r(*cache)?,
+                *rows,
+                *row,
+                *cache_off,
+                matches!(format, Dsv4CacheFormat::Mxfp4),
+            );
+        }
+        Op::Dsv4Indexer {
+            q,
+            k_cache,
+            weights,
+            dst,
+            cache_off,
+            kv_len,
+            n_head,
+            head_dim,
+            top_k,
+            scale,
+        } => {
+            if *head_dim != 128 || *n_head > 64 || *top_k == 0 || *top_k > *kv_len {
+                return Err(be(format!(
+                    "vulkan Op::Dsv4Indexer requires head_dim=128, n_head<=64 and 0<top_k<=kv_len; \
+                     got head_dim={head_dim} n_head={n_head} top_k={top_k} kv_len={kv_len}"
+                )));
+            }
+            let sk = pooled(pool, be_, "dsv4_indexer_scores", *kv_len as usize * 4)?;
+            rec.dsv4_indexer(
+                r(*q)?,
+                r(*k_cache)?,
+                r(*weights)?,
+                pool[&sk].as_ref(),
+                r(*dst)?,
+                *cache_off,
+                *kv_len,
+                *n_head,
+                *head_dim,
+                *top_k,
+                *scale,
+            );
+        }
+        Op::Dsv4Gather {
+            raw_cache,
+            comp_cache,
+            indices,
+            dst,
+            comp_off,
+            pos,
+            selected,
+            head_dim,
+            raw_window,
+            ..
+        } => {
+            if *head_dim != 512 || *raw_window == 0 {
+                return Err(be(format!(
+                    "vulkan Op::Dsv4Gather requires head_dim=512 and a nonzero raw ring; got \
+                     head_dim={head_dim} raw_window={raw_window}"
+                )));
+            }
+            let dummy = pooled(pool, be_, "dsv4_gather_indices_dummy", 4)?;
+            let ib = match indices {
+                Some(id) => r(*id)?,
+                None => pool[&dummy].as_ref(),
+            };
+            rec.dsv4_gather(
+                r(*raw_cache)?,
+                r(*comp_cache)?,
+                ib,
+                r(*dst)?,
+                *comp_off,
+                *pos,
+                *selected,
+                *head_dim,
+                *raw_window,
+                indices.is_some(),
+            );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst
         // feeds an immediately-following WriteKv is redirected to write the KV cache directly at row
@@ -6202,16 +6334,15 @@ fn execute_paged_moe<'a>(
         &*be_.alloc_uninit(4, BufferUsage::Weights)?
     };
     let has_bias = exp_probs_b.is_some();
-    // Hash routing through the PAGER is unreached: the pager serves an expert bank too big for
-    // VRAM (Llama-4-Scout), and DeepSeek V4's hash layers are not that model. Rather than carry a
-    // second untested hash path here, bind the dummy and refuse — the resident arms above are
-    // where hash routing is implemented and tested.
-    let hash_buf: &dyn Buffer = &*be_.alloc_uninit(4, BufferUsage::Activations)?;
-    if expert_ids.is_some() {
-        return Err(be(
-            "vulkan adapter: paged MoeFfn does not implement hash routing (expert_ids)",
-        ));
-    }
+    // Hash routing changes only expert selection; the paged executor consumes the resulting IDs
+    // through the same residency and arena path as router top-k. Reuse the resident moe_topk hash
+    // mode so V4's early hash layers remain pageable without a second routing implementation.
+    let hash_dummy = be_.alloc_uninit(4, BufferUsage::Activations)?;
+    let hash_buf: &dyn Buffer = match expert_ids {
+        Some(id) => r(*id)?,
+        None => hash_dummy.as_ref(),
+    };
+    let hash = expert_ids.is_some();
     if swiglu_clamp.is_some() && (matches!(act, Activation::Sigmoid) || *weight_before) {
         return Err(be(
             "vulkan adapter: paged MoeFfn swiglu_clamp needs a gated SiLU/GELU with \
@@ -6259,7 +6390,7 @@ fn execute_paged_moe<'a>(
             *n_expert_groups,
             *n_expert_groups_used,
             hash_buf,
-            false,
+            hash,
         );
     }
 

@@ -106,6 +106,15 @@ pub struct HyperGates {
     pub comb: TensorId,
 }
 
+/// Persistent cache encodings used by DeepSeek V4's specialized cache writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dsv4CacheFormat {
+    /// 512 values: 448 OCP E4M3 bytes, 64 BF16 values, and 8 UE8M0 scale bytes.
+    Fp8Kv,
+    /// 128 values: 64 packed E2M1 bytes and 4 UE8M0 scale bytes.
+    Mxfp4,
+}
+
 /// How a tensor handle is provisioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorKind {
@@ -346,6 +355,69 @@ pub enum Op {
         rows: u32,
         row_stride: u32,
         pos: u32,
+    },
+    /// DeepSeek V4 compressor state update and, on a block boundary, per-channel softmax pooling.
+    /// `state` is an opaque byte-addressed cache buffer; the two offsets name its f32 value and
+    /// score rings. The projected rows are f32 and have width `dim` (HCA) or `2*dim` (overlapping
+    /// CSA/LID). The op always persists the current row and writes `dst[dim]` only when
+    /// `(pos + 1) % ratio == 0`.
+    Dsv4Compress {
+        values: TensorId,
+        scores: TensorId,
+        ape: TensorId,
+        norm: TensorId,
+        freq_factors: Option<TensorId>,
+        state: TensorId,
+        dst: TensorId,
+        state_values_off: u32,
+        state_scores_off: u32,
+        pos: u32,
+        ratio: u32,
+        dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        overlap: bool,
+    },
+    /// Quantize f32 rows into one of DeepSeek V4's two cache formats. `Fp8Kv` is the official
+    /// 512-wide mixed row (448 E4M3 + 64 BF16 + eight UE8M0 scale bytes); `Mxfp4` is the
+    /// indexer's 128-wide E2M1 cache (64 packed bytes + four UE8M0 scales).
+    Dsv4CacheWrite {
+        src: TensorId,
+        cache: TensorId,
+        rows: u32,
+        row: u32,
+        cache_off: u32,
+        format: Dsv4CacheFormat,
+    },
+    /// DeepSeek V4's ratio-4 block indexer over MXFP4 query/key rows. `q` holds `n_head` rows and
+    /// `k_cache` holds `kv_len` rows at `cache_off`; both use the 68-byte official indexer row.
+    Dsv4Indexer {
+        q: TensorId,
+        k_cache: TensorId,
+        weights: TensorId,
+        dst: TensorId,
+        cache_off: u32,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_k: u32,
+        scale: f32,
+    },
+    /// Gather the live V4 raw-SWA rows plus compressed rows into one packed f16 K=V scratch.
+    /// `indices` selects compressed rows for CSA; `None` gathers the complete visible prefix.
+    /// The following ordinary `Op::Attention` owns the shared softmax and attention sink.
+    Dsv4Gather {
+        raw_cache: TensorId,
+        comp_cache: TensorId,
+        indices: Option<TensorId>,
+        dst: TensorId,
+        comp_off: u32,
+        pos: u32,
+        visible: u32,
+        selected: u32,
+        head_dim: u32,
+        raw_window: u32,
     },
     /// Scaled-dot-product attention. `q` is `rows × n_head × head_dim`; `k_cache`/`v_cache` hold
     /// `kv_len` rows of `n_kv × head_dim`. GQA when `n_head > n_kv`. `dst` is `rows × n_head ×
@@ -1121,6 +1193,10 @@ impl Op {
             Op::Rope { .. } => "Rope",
             Op::QkNormRope { .. } => "QkNormRope",
             Op::WriteKv { .. } => "WriteKv",
+            Op::Dsv4Compress { .. } => "Dsv4Compress",
+            Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
+            Op::Dsv4Indexer { .. } => "Dsv4Indexer",
+            Op::Dsv4Gather { .. } => "Dsv4Gather",
             Op::Attention { .. } => "Attention",
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
@@ -1214,6 +1290,39 @@ impl Op {
                 (r, vec![dst])
             }
             Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
+            Op::Dsv4Compress {
+                values,
+                scores,
+                ape,
+                norm,
+                freq_factors,
+                state,
+                dst,
+                ..
+            } => {
+                let mut r = vec![values, scores, ape, norm, state];
+                r.extend(freq_factors);
+                (r, vec![state, dst])
+            }
+            Op::Dsv4CacheWrite { src, cache, .. } => (vec![src, cache], vec![cache]),
+            Op::Dsv4Indexer {
+                q,
+                k_cache,
+                weights,
+                dst,
+                ..
+            } => (vec![q, k_cache, weights], vec![dst]),
+            Op::Dsv4Gather {
+                raw_cache,
+                comp_cache,
+                indices,
+                dst,
+                ..
+            } => {
+                let mut r = vec![raw_cache, comp_cache];
+                r.extend(indices);
+                (r, vec![dst])
+            }
             Op::Attention {
                 q,
                 k_cache,
@@ -1427,6 +1536,23 @@ impl Graph {
                 match op {
                     Op::WriteKv { cache, .. } => {
                         set.insert(*cache);
+                    }
+                    Op::Dsv4Compress { state, .. } => {
+                        set.insert(*state);
+                    }
+                    Op::Dsv4CacheWrite { cache, .. } => {
+                        set.insert(*cache);
+                    }
+                    Op::Dsv4Indexer { k_cache, .. } => {
+                        set.insert(*k_cache);
+                    }
+                    Op::Dsv4Gather {
+                        raw_cache,
+                        comp_cache,
+                        ..
+                    } => {
+                        set.insert(*raw_cache);
+                        set.insert(*comp_cache);
                     }
                     Op::Attention {
                         k_cache, v_cache, ..

@@ -195,17 +195,14 @@ pub(super) struct IndexerW {
     pub(super) attn_q_b: TensorId,
 }
 
-/// DeepSeek V4's attention-mixer weights — the `compress_ratio == 0` (pure sliding-window) tier.
+/// DeepSeek V4's attention-mixer weights shared by all three compression tiers.
 /// See `docs/deepseek.md` § Stage 4.
 ///
 /// V4 is NOT MLA: there is no `kv_lora_rank`, no `wk_b`/`wv_b`, and one MQA KV head serves every
 /// query head. What it keeps from deepseek2 is the Q-LoRA triple; everything after it is its own.
 ///
-/// The compressor / lightning-indexer tensors a ratio-4 or ratio-128 layer additionally carries
-/// (`attn_compressor_*`, `indexer*`) have NO handles here: `generate_dense_backend` refuses a model
-/// with any non-zero ratio before the graph is built, so a layer that owns them never reaches the
-/// emit. Adding them means adding the compressed-KV state machine at the same time — see
-/// `docs/backlog.md` § B-DSV4-WIRING slice B.
+/// Ratio-4 and ratio-128 layers additionally carry [`Dsv4CompressedW`]; ratio-0 leaves that field
+/// empty and uses only the sliding-window cache.
 pub(super) struct Dsv4W {
     /// `attn_sinks.weight` `[n_head]` — one learned logit per query head, joining the softmax MAX
     /// and DENOMINATOR and never the numerator (`Op::Attention::sinks`).
@@ -228,6 +225,27 @@ pub(super) struct Dsv4W {
     /// `attn_output_b` `[o_group_count*o_lora_rank, n_embd]`.
     pub(super) wo_a: TensorId,
     pub(super) wo_b: TensorId,
+}
+
+/// One DeepSeek V4 softmax-pooling compressor. Ratio-4 layers own two of these (attention CSA and
+/// LID); ratio-128 layers own only the attention HCA compressor.
+pub(super) struct Dsv4CompressorW {
+    pub(super) wkv: TensorId,
+    pub(super) wgate: TensorId,
+    pub(super) ape: TensorId,
+    pub(super) norm: TensorId,
+}
+
+/// Ratio-4-only lightning indexer weights and its independent compressor.
+pub(super) struct Dsv4IndexerW {
+    pub(super) proj: TensorId,
+    pub(super) q_b: TensorId,
+    pub(super) compressor: Dsv4CompressorW,
+}
+
+pub(super) struct Dsv4CompressedW {
+    pub(super) attention: Dsv4CompressorW,
+    pub(super) indexer: Option<Dsv4IndexerW>,
 }
 
 /// One hyper-connection block's `(fn, base, scale)` triple. `w_fn` is the mixing matmul's weight
@@ -265,6 +283,9 @@ pub(super) struct LayerW {
     /// [`MixerW::Dsv4`]; `None` for every other arch. They are NOT mixer weights — one of them
     /// wraps the FFN sublayer — which is why they sit on `LayerW` beside the norms.
     pub(super) hc: Option<LayerHcW>,
+    /// V4 ratio-4/128 compressor handles, declared after the layer's HC weights to mirror GGUF
+    /// upload order. `None` for ratio-0 and every non-V4 layer.
+    pub(super) dsv4_compressed: Option<Dsv4CompressedW>,
     /// bitnet (BitNet b1.58) SubLN: RMSNorm on the concatenated-heads attention output BEFORE the
     /// o-projection (`AttnW::wo`). `Some` only when `Config::sub_norm` (bitnet); `None` elsewhere.
     pub(super) attn_sub_norm: Option<TensorId>,
@@ -468,6 +489,23 @@ impl SeamKv {
                         .map_err(|e| anyhow!("{e}"))?;
                 }
             }
+        } else if cfg.deepseek4 {
+            // Synthetic depth represents deterministic zero history. V4's compressor rings and
+            // compressed caches survive ordinary token resets, so clear both packed state buffers
+            // explicitly between benchmark reps; otherwise a prior rep's partial block would feed
+            // the first new block at the manufactured depth.
+            let max_bytes = self
+                .kbufs
+                .iter()
+                .chain(self.vbufs.iter())
+                .map(|b| b.len_bytes())
+                .max()
+                .unwrap_or(4);
+            let zeros = vec![0u8; max_bytes];
+            for b in self.kbufs.iter().chain(self.vbufs.iter()) {
+                be.upload(b.as_ref(), &zeros[..b.len_bytes()])
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
         }
         self.cached = tokens;
         Ok(())
@@ -666,7 +704,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.qwen35 || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);

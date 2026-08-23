@@ -7949,6 +7949,184 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_compress(
+        &self,
+        values: &dyn Buffer,
+        scores: &dyn Buffer,
+        ape: &dyn Buffer,
+        norm: &dyn Buffer,
+        freq_factors: Option<&dyn Buffer>,
+        state: &dyn Buffer,
+        dst: &dyn Buffer,
+        values_off: u32,
+        scores_off: u32,
+        pos: u32,
+        ratio: u32,
+        dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        overlap: bool,
+    ) {
+        let k = self.be.kernel(
+            if freq_factors.is_some() {
+                "dsv4_compress_ff"
+            } else {
+                "dsv4_compress"
+            },
+            crate::gemm::dsv4_compress_spv(freq_factors.is_some()),
+            if freq_factors.is_some() { 7 } else { 6 },
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(values_off / 4).to_ne_bytes());
+        push[4..8].copy_from_slice(&(scores_off / 4).to_ne_bytes());
+        push[8..12].copy_from_slice(&pos.to_ne_bytes());
+        push[12..16].copy_from_slice(&ratio.to_ne_bytes());
+        push[16..20].copy_from_slice(&dim.to_ne_bytes());
+        push[20..24].copy_from_slice(&rope_dim.to_ne_bytes());
+        push[24..28].copy_from_slice(&theta.to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&u32::from(overlap).to_ne_bytes());
+        let mut bufs = vec![
+            Self::vkb(values),
+            Self::vkb(scores),
+            Self::vkb(ape),
+            Self::vkb(norm),
+        ];
+        if let Some(ff) = freq_factors {
+            bufs.push(Self::vkb(ff));
+        }
+        bufs.extend([Self::vkb(state), Self::vkb(dst)]);
+        self.dispatch(k, &bufs, 2, &push, 1);
+    }
+
+    pub fn dsv4_cache_write(
+        &self,
+        src: &dyn Buffer,
+        cache: &dyn Buffer,
+        rows: u32,
+        row: u32,
+        cache_off: u32,
+        mxfp4: bool,
+    ) {
+        let k = self.be.kernel(
+            if mxfp4 {
+                "dsv4_cache_write_mxfp4"
+            } else {
+                "dsv4_cache_write_fp8"
+            },
+            crate::gemm::dsv4_cache_write_spv(mxfp4),
+            2,
+            12,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&row.to_ne_bytes());
+        push[8..12].copy_from_slice(&cache_off.to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(src), Self::vkb(cache)], 1, &push, rows);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_indexer(
+        &self,
+        q: &dyn Buffer,
+        k_cache: &dyn Buffer,
+        weights: &dyn Buffer,
+        scores: &dyn Buffer,
+        dst: &dyn Buffer,
+        cache_off: u32,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_k: u32,
+        scale: f32,
+    ) {
+        let score_k = self.be.kernel(
+            "dsv4_indexer_score",
+            crate::gemm::dsv4_indexer_score_spv(),
+            4,
+            20,
+        );
+        let mut score_push = [0u8; 20];
+        score_push[0..4].copy_from_slice(&cache_off.to_ne_bytes());
+        score_push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
+        score_push[8..12].copy_from_slice(&n_head.to_ne_bytes());
+        score_push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
+        score_push[16..20].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch_wide(
+            score_k,
+            &[
+                Self::vkb(q),
+                Self::vkb(k_cache),
+                Self::vkb(weights),
+                Self::vkb(scores),
+            ],
+            1,
+            &score_push,
+            kv_len,
+        );
+
+        let topk_k = self.be.kernel(
+            "dsv4_indexer_topk",
+            crate::gemm::dsv4_indexer_topk_spv(),
+            2,
+            8,
+        );
+        let mut topk_push = [0u8; 8];
+        topk_push[0..4].copy_from_slice(&kv_len.to_ne_bytes());
+        topk_push[4..8].copy_from_slice(&top_k.to_ne_bytes());
+        self.dispatch(
+            topk_k,
+            &[Self::vkb(scores), Self::vkb(dst)],
+            1,
+            &topk_push,
+            1,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_gather(
+        &self,
+        raw: &dyn Buffer,
+        comp: &dyn Buffer,
+        indices: &dyn Buffer,
+        dst: &dyn Buffer,
+        comp_off: u32,
+        pos: u32,
+        selected: u32,
+        head_dim: u32,
+        raw_window: u32,
+        has_indices: bool,
+    ) {
+        let raw_live = (pos + 1).min(raw_window);
+        let total_pairs = (raw_live + selected) * head_dim / 2;
+        let k = self
+            .be
+            .kernel("dsv4_gather", crate::gemm::dsv4_gather_spv(), 4, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&comp_off.to_ne_bytes());
+        push[4..8].copy_from_slice(&pos.to_ne_bytes());
+        push[8..12].copy_from_slice(&selected.to_ne_bytes());
+        push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&raw_window.to_ne_bytes());
+        push[20..24].copy_from_slice(&u32::from(has_indices).to_ne_bytes());
+        push[24..28].copy_from_slice(&total_pairs.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(raw),
+                Self::vkb(comp),
+                Self::vkb(indices),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            total_pairs.div_ceil(256),
+        );
+    }
+
     /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
     /// Selected for Vulkan single-token decode unless disabled. Push constants 32B (adds
     /// src_stride to standard).

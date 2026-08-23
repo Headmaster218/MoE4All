@@ -214,8 +214,8 @@ pub struct Config {
     /// is_swa_layer`] special-cases this arch for that reason: `swa_pattern` encodes "every p-th
     /// layer is FULL", and V4 has no full layers to point at.
     ///
-    /// Nothing emits a V4 graph yet: `seam::runner::generate_dense_backend` loads every tensor and
-    /// then refuses by name.
+    /// The seam emits all three V4 attention tiers and keeps their compressed caches in the
+    /// architecture-specific mixed-FP8/MXFP4 layout.
     pub deepseek4: bool,
     /// DeepSeek V4 (`{arch}.attention.compress_ratios`): the per-layer compression ratio, and the
     /// MASTER per-layer switch — which caches a layer keeps and which tensors it carries both hang
@@ -763,7 +763,7 @@ impl Config {
             rope_attn_factor,
             rope_yarn_beta_fast,
             rope_yarn_beta_slow,
-        ) = if deepseek2 {
+        ) = if deepseek2 || deepseek4 {
             let yarn = g
                 .metadata()
                 .get(&mk("rope.scaling.type"))

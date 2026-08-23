@@ -23,7 +23,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, G
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
-use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op, TensorKind};
+use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, MoeGating, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -456,6 +456,157 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
             .collect(),
         // F16 / Bf16 / all quant + codebook types go through the shared host dequant.
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
+    }
+}
+
+const DSV4_FP8_PAGE_ROWS: usize = 64;
+const DSV4_FP8_DATA_BYTES: usize = 576;
+const DSV4_FP8_SCALE_BYTES: usize = 8;
+const DSV4_FP8_PAGE_BYTES: usize =
+    DSV4_FP8_PAGE_ROWS * (DSV4_FP8_DATA_BYTES + DSV4_FP8_SCALE_BYTES);
+const DSV4_MXFP4_ROW_BYTES: usize = 68;
+
+fn dsv4_e4m3(code: u8) -> f32 {
+    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+    let mag = code & 0x7f;
+    let exp = (mag >> 3) as i32;
+    let mant = (mag & 7) as f32;
+    let v = if exp == 0 {
+        mant * 2f32.powi(-9)
+    } else if mag == 0x7f {
+        f32::NAN
+    } else {
+        (1.0 + mant / 8.0) * 2f32.powi(exp - 7)
+    };
+    sign * v
+}
+
+fn dsv4_e4m3_quantize(x: f32) -> u8 {
+    if x == 0.0 || !x.is_finite() {
+        return if x.is_sign_negative() { 0x80 } else { 0 };
+    }
+    let sign = if x.is_sign_negative() { 0x80 } else { 0 };
+    let ax = x.abs().min(448.0);
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for code in 0u8..=0x7e {
+        let err = (dsv4_e4m3(code) - ax).abs();
+        if err < best_err || (err == best_err && code & 1 == 0) {
+            best = code;
+            best_err = err;
+        }
+    }
+    sign | best
+}
+
+fn dsv4_ue8m0_scale(xs: &[f32], max_quant: f32) -> (u8, f32) {
+    let amax = xs.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    let exponent = if amax > 0.0 {
+        (amax / max_quant).log2().ceil() as i32
+    } else {
+        -127
+    }
+    .clamp(-127, 128);
+    ((exponent + 127) as u8, 2f32.powi(exponent))
+}
+
+fn dsv4_encode_fp8_row(src: &[f32], dst: &mut [u8], row: usize) {
+    debug_assert!(src.len() >= 512);
+    let page = row / DSV4_FP8_PAGE_ROWS;
+    let in_page = row % DSV4_FP8_PAGE_ROWS;
+    let base = page * DSV4_FP8_PAGE_BYTES;
+    let data = base + in_page * DSV4_FP8_DATA_BYTES;
+    let scales = base + DSV4_FP8_PAGE_ROWS * DSV4_FP8_DATA_BYTES + in_page * 8;
+    for block in 0..7 {
+        let s = &src[block * 64..block * 64 + 64];
+        let (encoded, scale) = dsv4_ue8m0_scale(s, 448.0);
+        dst[scales + block] = encoded;
+        for (i, &x) in s.iter().enumerate() {
+            dst[data + block * 64 + i] = dsv4_e4m3_quantize(x / scale);
+        }
+    }
+    dst[scales + 7] = 0;
+    for i in 0..64 {
+        let bits = half::bf16::from_f32(src[448 + i]).to_bits().to_le_bytes();
+        let off = data + 448 + 2 * i;
+        dst[off..off + 2].copy_from_slice(&bits);
+    }
+}
+
+fn dsv4_decode_fp8_row(src: &[u8], cache_off: usize, row: usize, dst: &mut [f32]) {
+    let page = row / DSV4_FP8_PAGE_ROWS;
+    let in_page = row % DSV4_FP8_PAGE_ROWS;
+    let base = cache_off + page * DSV4_FP8_PAGE_BYTES;
+    let data = base + in_page * DSV4_FP8_DATA_BYTES;
+    let scales = base + DSV4_FP8_PAGE_ROWS * DSV4_FP8_DATA_BYTES + in_page * 8;
+    for block in 0..7 {
+        let scale = 2f32.powi(src[scales + block] as i32 - 127);
+        for i in 0..64 {
+            dst[block * 64 + i] = dsv4_e4m3(src[data + block * 64 + i]) * scale;
+        }
+    }
+    for i in 0..64 {
+        let off = data + 448 + 2 * i;
+        dst[448 + i] = half::bf16::from_le_bytes([src[off], src[off + 1]]).to_f32();
+    }
+}
+
+const DSV4_E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+fn dsv4_e2m1_quantize(x: f32) -> u8 {
+    let sign = if x.is_sign_negative() { 8 } else { 0 };
+    let ax = x.abs();
+    let mut best = 0usize;
+    for i in 1..DSV4_E2M1.len() {
+        let err = (DSV4_E2M1[i] - ax).abs();
+        let best_err = (DSV4_E2M1[best] - ax).abs();
+        if err < best_err || (err == best_err && i & 1 == 0) {
+            best = i;
+        }
+    }
+    sign | best as u8
+}
+
+fn dsv4_encode_mxfp4_row(src: &[f32], dst: &mut [u8]) {
+    let mut rotated = [0.0f32; 128];
+    rotated.copy_from_slice(&src[..128]);
+    let mut stride = 1;
+    while stride < 128 {
+        for base in (0..128).step_by(2 * stride) {
+            for lane in 0..stride {
+                let a = rotated[base + lane];
+                let b = rotated[base + lane + stride];
+                rotated[base + lane] = a + b;
+                rotated[base + lane + stride] = a - b;
+            }
+        }
+        stride *= 2;
+    }
+    for x in &mut rotated {
+        *x *= 1.0 / (128.0f32).sqrt();
+    }
+    for block in 0..4 {
+        let s = &rotated[block * 32..block * 32 + 32];
+        let (encoded, scale) = dsv4_ue8m0_scale(s, 6.0);
+        dst[64 + block] = encoded;
+        for pair in 0..16 {
+            let lo = dsv4_e2m1_quantize(s[2 * pair] / scale);
+            let hi = dsv4_e2m1_quantize(s[2 * pair + 1] / scale);
+            dst[block * 16 + pair] = lo | (hi << 4);
+        }
+    }
+}
+
+fn dsv4_decode_mxfp4_row(src: &[u8], dst: &mut [f32]) {
+    for block in 0..4 {
+        let scale = 2f32.powi(src[64 + block] as i32 - 127);
+        for pair in 0..16 {
+            let packed = src[block * 16 + pair];
+            for (lane, code) in [(0usize, packed & 15), (1, packed >> 4)] {
+                let sign = if code & 8 != 0 { -1.0 } else { 1.0 };
+                dst[block * 32 + 2 * pair + lane] = sign * DSV4_E2M1[(code & 7) as usize] * scale;
+            }
+        }
     }
 }
 
@@ -1740,6 +1891,262 @@ impl Backend for CpuBackend {
                             }
                         }
                     }
+                }
+                Op::Dsv4Compress {
+                    values,
+                    scores,
+                    ape,
+                    norm,
+                    freq_factors,
+                    state,
+                    dst,
+                    state_values_off,
+                    state_scores_off,
+                    pos,
+                    ratio,
+                    dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    overlap,
+                } => {
+                    let (pos, ratio, dim, rd) = (
+                        pos as usize,
+                        ratio as usize,
+                        dim as usize,
+                        rope_dim as usize,
+                    );
+                    let width = if overlap { 2 * dim } else { dim };
+                    let state_rows = if overlap { 2 * ratio } else { ratio };
+                    let value = &vals[values.0 as usize];
+                    let score = &vals[scores.0 as usize];
+                    let ape = weight(ape);
+                    let norm = weight(norm);
+                    let ff = freq_factors.map(|id| &vals[id.0 as usize]);
+                    let buf = bindings
+                        .get(state)
+                        .expect("cpu backend: unbound DSV4 compressor state");
+                    let mut bytes = cpu_buf(buf).owned();
+                    let sf: &mut [f32] = bytemuck::cast_slice_mut(&mut bytes);
+                    let vo = state_values_off as usize / 4;
+                    let so = state_scores_off as usize / 4;
+                    let state_row = pos % state_rows;
+                    let ape_row = (pos % ratio) * width;
+                    sf[vo + state_row * width..vo + (state_row + 1) * width]
+                        .copy_from_slice(&value[..width]);
+                    for i in 0..width {
+                        sf[so + state_row * width + i] = score[i] + ape[ape_row + i];
+                    }
+
+                    let mut out = vec![0.0f32; dim];
+                    if (pos + 1).is_multiple_of(ratio) {
+                        let count = if overlap { 2 * ratio } else { ratio };
+                        for d in 0..dim {
+                            let mut mx = f32::NEG_INFINITY;
+                            for j in 0..count {
+                                let abs = pos as isize + 1 - count as isize + j as isize;
+                                if abs < 0 {
+                                    continue;
+                                }
+                                let half = usize::from(overlap && j >= ratio);
+                                let ix = (abs as usize % state_rows) * width + half * dim + d;
+                                mx = mx.max(sf[so + ix]);
+                            }
+                            let mut den = 0.0f32;
+                            let mut acc = 0.0f32;
+                            for j in 0..count {
+                                let abs = pos as isize + 1 - count as isize + j as isize;
+                                if abs < 0 {
+                                    continue;
+                                }
+                                let half = usize::from(overlap && j >= ratio);
+                                let ix = (abs as usize % state_rows) * width + half * dim + d;
+                                let w = (sf[so + ix] - mx).exp();
+                                den += w;
+                                acc += w * sf[vo + ix];
+                            }
+                            out[d] = acc / den;
+                        }
+                        let rms = (out.iter().map(|x| x * x).sum::<f32>() / dim as f32 + eps)
+                            .sqrt()
+                            .recip();
+                        for d in 0..dim {
+                            out[d] *= rms * norm[d];
+                        }
+                        let nope = dim - rd;
+                        let rope_pos = (pos + 1 - ratio) as f32;
+                        for p in 0..rd / 2 {
+                            let i0 = nope + 2 * p;
+                            let i1 = i0 + 1;
+                            let mut ang = rope_pos * theta.powf(-2.0 * p as f32 / rd as f32);
+                            if let Some(ff) = ff {
+                                ang /= ff[p];
+                            }
+                            let (sn, cs) = ang.sin_cos();
+                            let a = out[i0];
+                            let b = out[i1];
+                            out[i0] = a * cs - b * sn;
+                            out[i1] = a * sn + b * cs;
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::Dsv4CacheWrite {
+                    src,
+                    cache,
+                    rows,
+                    row,
+                    cache_off,
+                    format,
+                } => {
+                    let rows = rows as usize;
+                    let row = row as usize;
+                    let cache_off = cache_off as usize;
+                    let source = vals[src.0 as usize].clone();
+                    let encode = |bytes: &mut [u8]| {
+                        for r in 0..rows {
+                            match format {
+                                Dsv4CacheFormat::Fp8Kv => dsv4_encode_fp8_row(
+                                    &source[r * 512..r * 512 + 512],
+                                    &mut bytes[cache_off..],
+                                    row + r,
+                                ),
+                                Dsv4CacheFormat::Mxfp4 => {
+                                    let off = cache_off + (row + r) * DSV4_MXFP4_ROW_BYTES;
+                                    dsv4_encode_mxfp4_row(
+                                        &source[r * 128..r * 128 + 128],
+                                        &mut bytes[off..off + DSV4_MXFP4_ROW_BYTES],
+                                    );
+                                }
+                            }
+                        }
+                    };
+                    if matches!(g.kind(cache), TensorKind::Input) {
+                        let buf = bindings
+                            .get(cache)
+                            .expect("cpu backend: unbound DSV4 cache");
+                        encode(&mut cpu_buf(buf).owned());
+                    } else {
+                        let words = vals[cache.0 as usize].clone();
+                        let mut bytes = Vec::with_capacity(words.len() * 4);
+                        for word in words {
+                            bytes.extend_from_slice(&word.to_bits().to_le_bytes());
+                        }
+                        encode(&mut bytes);
+                        vals[cache.0 as usize] = bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_bits(u32::from_le_bytes(b.try_into().unwrap())))
+                            .collect();
+                    }
+                }
+                Op::Dsv4Indexer {
+                    q,
+                    k_cache,
+                    weights,
+                    dst,
+                    cache_off,
+                    kv_len,
+                    n_head,
+                    head_dim,
+                    top_k,
+                    scale,
+                } => {
+                    let (kv_len, nh, hd, top_k) = (
+                        kv_len as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        top_k as usize,
+                    );
+                    debug_assert_eq!(hd, 128);
+                    let q_words = &vals[q.0 as usize];
+                    let mut q_bytes = Vec::with_capacity(q_words.len() * 4);
+                    for &word in q_words {
+                        q_bytes.extend_from_slice(&word.to_bits().to_le_bytes());
+                    }
+                    let kb = bindings
+                        .get(k_cache)
+                        .expect("cpu backend: unbound DSV4 index cache");
+                    let k_bytes = cpu_buf(kb).read();
+                    let ws = &vals[weights.0 as usize];
+                    let mut qrow = vec![0.0f32; hd];
+                    let mut krow = vec![0.0f32; hd];
+                    let mut scores = vec![0.0f32; kv_len];
+                    for j in 0..kv_len {
+                        let ko = cache_off as usize + j * DSV4_MXFP4_ROW_BYTES;
+                        dsv4_decode_mxfp4_row(&k_bytes[ko..ko + DSV4_MXFP4_ROW_BYTES], &mut krow);
+                        let mut acc = 0.0f32;
+                        for h in 0..nh {
+                            let qo = h * DSV4_MXFP4_ROW_BYTES;
+                            dsv4_decode_mxfp4_row(
+                                &q_bytes[qo..qo + DSV4_MXFP4_ROW_BYTES],
+                                &mut qrow,
+                            );
+                            acc += ws[h] * scale * dot(&qrow, &krow).max(0.0);
+                        }
+                        scores[j] = acc;
+                    }
+                    let mut order: Vec<usize> = (0..kv_len).collect();
+                    order.select_nth_unstable_by(top_k.min(kv_len).saturating_sub(1), |&a, &b| {
+                        scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b))
+                    });
+                    order.truncate(top_k.min(kv_len));
+                    order.sort_unstable_by(|&a, &b| {
+                        scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b))
+                    });
+                    vals[dst.0 as usize] = order.into_iter().map(|i| i as f32).collect();
+                }
+                Op::Dsv4Gather {
+                    raw_cache,
+                    comp_cache,
+                    indices,
+                    dst,
+                    comp_off,
+                    pos,
+                    selected,
+                    head_dim,
+                    raw_window,
+                    ..
+                } => {
+                    let (pos, selected, hd, raw_window) = (
+                        pos as usize,
+                        selected as usize,
+                        head_dim as usize,
+                        raw_window as usize,
+                    );
+                    debug_assert_eq!(hd, 512);
+                    let raw = cpu_buf(
+                        bindings
+                            .get(raw_cache)
+                            .expect("cpu backend: unbound DSV4 raw cache"),
+                    )
+                    .read();
+                    let comp = cpu_buf(
+                        bindings
+                            .get(comp_cache)
+                            .expect("cpu backend: unbound DSV4 compressed cache"),
+                    )
+                    .read();
+                    let raw_live = (pos + 1).min(raw_window);
+                    let mut out = vec![0.0f32; (raw_live + selected) * hd];
+                    for i in 0..raw_live {
+                        let abs = pos + 1 - raw_live + i;
+                        dsv4_decode_fp8_row(
+                            &raw,
+                            0,
+                            abs % raw_window,
+                            &mut out[i * hd..(i + 1) * hd],
+                        );
+                    }
+                    for i in 0..selected {
+                        let row = indices.map_or(i, |ids| vals[ids.0 as usize][i] as usize);
+                        dsv4_decode_fp8_row(
+                            &comp,
+                            comp_off as usize,
+                            row,
+                            &mut out[(raw_live + i) * hd..(raw_live + i + 1) * hd],
+                        );
+                    }
+                    vals[dst.0 as usize] = out;
                 }
                 Op::Attention {
                     q,
@@ -3830,6 +4237,65 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsv4_mixed_fp8_row_roundtrips_and_uses_official_page_offsets() {
+        let src: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 - 255.5) * 0.013).sin() * 7.0)
+            .collect();
+        let mut cache = vec![0u8; DSV4_FP8_PAGE_BYTES];
+        dsv4_encode_fp8_row(&src, &mut cache, 17);
+        let mut out = vec![0.0f32; 512];
+        dsv4_decode_fp8_row(&cache, 0, 17, &mut out);
+        let fp8_err = src[..448]
+            .iter()
+            .zip(&out[..448])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let bf16_err = src[448..]
+            .iter()
+            .zip(&out[448..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(fp8_err < 0.3, "mixed-FP8 max error {fp8_err}");
+        assert!(bf16_err < 0.03, "BF16 tail max error {bf16_err}");
+        let scale_off = 64 * DSV4_FP8_DATA_BYTES + 17 * DSV4_FP8_SCALE_BYTES;
+        assert_eq!(cache[scale_off + 7], 0, "the eighth scale byte is padding");
+    }
+
+    #[test]
+    fn dsv4_mxfp4_row_roundtrips_in_hadamard_domain() {
+        let src: Vec<f32> = (0..128)
+            .map(|i| ((i as f32 + 0.5) * 0.17).cos() * 3.0)
+            .collect();
+        let mut encoded = [0u8; DSV4_MXFP4_ROW_BYTES];
+        dsv4_encode_mxfp4_row(&src, &mut encoded);
+        let mut decoded = [0.0f32; 128];
+        dsv4_decode_mxfp4_row(&encoded, &mut decoded);
+
+        let mut rotated = src.clone();
+        let mut stride = 1;
+        while stride < 128 {
+            for base in (0..128).step_by(2 * stride) {
+                for lane in 0..stride {
+                    let a = rotated[base + lane];
+                    let b = rotated[base + lane + stride];
+                    rotated[base + lane] = a + b;
+                    rotated[base + lane + stride] = a - b;
+                }
+            }
+            stride *= 2;
+        }
+        for x in &mut rotated {
+            *x /= (128.0f32).sqrt();
+        }
+        let max_err = rotated
+            .iter()
+            .zip(decoded)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 2.0, "MXFP4 Hadamard-domain max error {max_err}");
+    }
 
     #[test]
     fn kda_one_step_updates_state_and_scales_query() {

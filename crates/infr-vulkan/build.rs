@@ -653,6 +653,17 @@ fn main() {
         // expansion of its indices into the additive score mask `Op::Mla` adds (Op::TopkMask).
         ("lightning_indexer", "lightning_indexer", &[]),
         ("topk_mask", "topk_mask", &[]),
+        ("dsv4_compress", "dsv4_compress", &[]),
+        ("dsv4_compress", "dsv4_compress_ff", &["-DFREQ_FACTORS"]),
+        ("dsv4_cache_write", "dsv4_cache_write_fp8", &["-DDSV4_FP8"]),
+        (
+            "dsv4_cache_write",
+            "dsv4_cache_write_mxfp4",
+            &["-DDSV4_MXFP4"],
+        ),
+        ("dsv4_indexer_score", "dsv4_indexer_score", &[]),
+        ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
+        ("dsv4_gather", "dsv4_gather", &[]),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
         // pre-only form, whose `mixes` is the pre chunk alone.

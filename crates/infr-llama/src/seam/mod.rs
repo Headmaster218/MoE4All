@@ -1173,14 +1173,14 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
 /// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
 /// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    !cfg.deepseek2 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
+    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
 }
 
 /// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
 /// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
 /// priced exactly instead of the MoE planner treating every non-auto choice as f16.
 fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
-    if cfg.deepseek2 || cfg.bailingmoe3 {
+    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 {
         return DType::F16;
     }
     let block_aligned = kv_row_align_ok(cfg);
@@ -1253,6 +1253,103 @@ pub(crate) fn kv_rows_at(
     }
 }
 
+/// DeepSeek V4's official mixed-FP8 cache is paged in groups of 64 rows. Each page stores all
+/// 576 data bytes per row first (448 E4M3 bytes + 64 BF16 values), followed by eight UE8M0 scale
+/// bytes per row. The page is therefore exactly `64 * 584` bytes.
+pub(crate) const DSV4_FP8_PAGE_ROWS: usize = 64;
+pub(crate) const DSV4_FP8_DATA_BYTES: usize = 576;
+pub(crate) const DSV4_FP8_SCALE_BYTES: usize = 8;
+pub(crate) const DSV4_FP8_PAGE_BYTES: usize =
+    DSV4_FP8_PAGE_ROWS * (DSV4_FP8_DATA_BYTES + DSV4_FP8_SCALE_BYTES);
+pub(crate) const DSV4_MXFP4_ROW_BYTES: usize = 68;
+
+pub(crate) fn dsv4_fp8_cache_bytes(rows: usize) -> usize {
+    rows.max(1).div_ceil(DSV4_FP8_PAGE_ROWS) * DSV4_FP8_PAGE_BYTES
+}
+
+/// Byte layout of a DeepSeek V4 layer's two persistent buffers. `kbuf` is only the mixed-FP8 raw
+/// SWA ring. `vbuf` owns the compressed cache and its recurrent compressor state; ratio-4 adds the
+/// MXFP4 indexer cache and its second overlapping state. Packing these into the existing K/V pair
+/// keeps allocation, binding, fork geometry and unified-budget accounting on one established path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Dsv4LayerLayout {
+    pub raw_rows: usize,
+    pub raw_bytes: usize,
+    pub comp_rows: usize,
+    pub comp_off: usize,
+    pub comp_bytes: usize,
+    pub state_values_off: usize,
+    pub state_scores_off: usize,
+    pub lid_off: usize,
+    pub lid_bytes: usize,
+    pub lid_state_values_off: usize,
+    pub lid_state_scores_off: usize,
+    pub state_bytes: usize,
+}
+
+pub(crate) fn dsv4_layer_layout(cfg: &Config, l: usize, want_ctx: usize) -> Dsv4LayerLayout {
+    debug_assert!(cfg.deepseek4);
+    let raw_rows = want_ctx.min(cfg.swa_window.max(1)).max(1);
+    let raw_bytes = dsv4_fp8_cache_bytes(raw_rows);
+    let ratio = cfg.layer_compress_ratio(l);
+    if ratio == 0 {
+        return Dsv4LayerLayout {
+            raw_rows,
+            raw_bytes,
+            state_bytes: KV_MIN_SIDE_BYTES,
+            ..Dsv4LayerLayout::default()
+        };
+    }
+
+    let comp_rows = want_ctx.div_ceil(ratio).max(1);
+    let comp_off = 0usize;
+    let comp_bytes = dsv4_fp8_cache_bytes(comp_rows);
+    let overlap = ratio == 4;
+    let state_rows = if overlap { 2 * ratio } else { ratio };
+    let state_width = if overlap {
+        2 * cfg.head_dim
+    } else {
+        cfg.head_dim
+    };
+    let state_one = state_rows * state_width * 4;
+    let state_values_off = comp_off + comp_bytes;
+    let state_scores_off = state_values_off + state_one;
+    let mut end = state_scores_off + state_one;
+
+    let (lid_off, lid_bytes, lid_state_values_off, lid_state_scores_off) = if overlap {
+        let lid_off = end;
+        let lid_bytes = comp_rows * DSV4_MXFP4_ROW_BYTES;
+        let lid_width = 2 * cfg.indexer_head_size;
+        let lid_state_one = state_rows * lid_width * 4;
+        let lid_state_values_off = lid_off + lid_bytes;
+        let lid_state_scores_off = lid_state_values_off + lid_state_one;
+        end = lid_state_scores_off + lid_state_one;
+        (
+            lid_off,
+            lid_bytes,
+            lid_state_values_off,
+            lid_state_scores_off,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    Dsv4LayerLayout {
+        raw_rows,
+        raw_bytes,
+        comp_rows,
+        comp_off,
+        comp_bytes,
+        state_values_off,
+        state_scores_off,
+        lid_off,
+        lid_bytes,
+        lid_state_values_off,
+        lid_state_scores_off,
+        state_bytes: end.max(KV_MIN_SIDE_BYTES),
+    }
+}
+
 /// Exact bytes allocated for the two persistent state buffers owned by one layer.
 ///
 /// Most layers store context-scaled K/V rows. Qwen3.5/3.6 DeltaNet layers instead reuse the same
@@ -1268,6 +1365,10 @@ pub(crate) fn layer_state_bytes(
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
+    if cfg.deepseek4 {
+        let d = dsv4_layer_layout(cfg, l, want_ctx);
+        return (d.raw_bytes, d.state_bytes);
+    }
     if cfg.is_recurrent_layer(l) {
         let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
         let state_elems = cfg.recurrent_state_elems();
@@ -2086,10 +2187,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if n_paged > 0 {
             load_reserve_bytes = plan.runtime_reserve_bytes;
         }
+        let cache_layout = if cfg.deepseek4 {
+            "fp8-kv+mxfp4-index".to_string()
+        } else {
+            format!("k={k_fmt:?}, v={v_fmt:?}")
+        };
         tracing::info!(
             "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime={:.2} GB \
              packing_margin={:.2} GB post_load={:.2} GB \
-             expert_cache={:.2} GB (k={k_fmt:?}, v={v_fmt:?}, ctx={want_ctx})",
+             expert_cache={:.2} GB ({cache_layout}, ctx={want_ctx})",
             room as f64 / 1e9,
             plan.fixed_weight_bytes as f64 / 1e9,
             plan.persistent_state_bytes as f64 / 1e9,
@@ -4308,6 +4414,48 @@ mod seam_helper_tests {
             ssm_dt_rank: 16,
             ..Default::default()
         }
+    }
+
+    fn deepseek4_cache_config() -> Config {
+        Config {
+            deepseek4: true,
+            n_layer: 3,
+            head_dim: 512,
+            rope_dim: 64,
+            swa_window: 128,
+            indexer_head_size: 128,
+            compress_ratios: vec![0, 4, 128],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deepseek4_128k_cache_layout_prices_fp8_and_mxfp4_exactly() {
+        let cfg = deepseek4_cache_config();
+        let ctx = 131_072;
+        let raw = 2 * super::DSV4_FP8_PAGE_BYTES;
+
+        let r0 = super::dsv4_layer_layout(&cfg, 0, ctx);
+        assert_eq!(r0.raw_rows, 128);
+        assert_eq!(r0.raw_bytes, raw);
+        assert_eq!(r0.state_bytes, super::KV_MIN_SIDE_BYTES);
+
+        let r4 = super::dsv4_layer_layout(&cfg, 1, ctx);
+        assert_eq!(r4.comp_rows, 32_768);
+        assert_eq!(r4.comp_bytes, 512 * super::DSV4_FP8_PAGE_BYTES);
+        assert_eq!(r4.lid_bytes, 32_768 * super::DSV4_MXFP4_ROW_BYTES);
+        assert_eq!(r4.state_bytes, 21_446_656);
+        assert_eq!(
+            super::layer_state_bytes(&cfg, 1, ctx, false, 1024, DType::F16, DType::F16),
+            (raw, 21_446_656)
+        );
+
+        let r128 = super::dsv4_layer_layout(&cfg, 2, ctx);
+        assert_eq!(r128.comp_rows, 1024);
+        assert_eq!(r128.comp_bytes, 16 * super::DSV4_FP8_PAGE_BYTES);
+        assert_eq!(r128.lid_bytes, 0);
+        assert_eq!(r128.state_bytes, 1_122_304);
+        assert!(!super::kv_q8_layout_ok(&cfg));
     }
 
     #[test]

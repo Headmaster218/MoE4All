@@ -1,0 +1,103 @@
+#version 460
+// DeepSeek V4 scalar compressor state update and boundary pooling. The persistent f32 state is
+// packed into the layer's opaque state buffer; ratio-4 reads the first projection half from the
+// previous block and the second half from the current block, while ratio-128 reads one block.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint values_off;
+    uint scores_off;
+    uint pos;
+    uint ratio;
+    uint dim;
+    uint rope_dim;
+    float theta;
+    float eps;
+    uint overlap;
+} pc;
+
+layout(binding = 0) readonly buffer VB { float values[]; };
+layout(binding = 1) readonly buffer GB { float scores[]; };
+layout(binding = 2) readonly buffer AB { float ape[]; };
+layout(binding = 3) readonly buffer NB { float norm[]; };
+#ifdef FREQ_FACTORS
+layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) buffer SB { float state[]; };
+layout(binding = 6) writeonly buffer DB { float dst[]; };
+#else
+layout(binding = 4) buffer SB { float state[]; };
+layout(binding = 5) writeonly buffer DB { float dst[]; };
+#endif
+
+shared float pooled[512];
+shared float sums[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint width = pc.overlap != 0u ? 2u * pc.dim : pc.dim;
+    uint state_rows = pc.overlap != 0u ? 2u * pc.ratio : pc.ratio;
+    uint state_row = pc.pos % state_rows;
+    uint ape_row = (pc.pos % pc.ratio) * width;
+    for (uint i = t; i < width; i += 256u) {
+        state[pc.values_off + state_row * width + i] = values[i];
+        state[pc.scores_off + state_row * width + i] = scores[i] + ape[ape_row + i];
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    if ((pc.pos + 1u) % pc.ratio != 0u) { return; }
+    uint count = pc.overlap != 0u ? 2u * pc.ratio : pc.ratio;
+    for (uint d = t; d < pc.dim; d += 256u) {
+        float mx = -1.0 / 0.0;
+        for (uint j = 0u; j < count; ++j) {
+            int abs_pos = int(pc.pos + 1u) - int(count) + int(j);
+            if (abs_pos < 0) { continue; }
+            uint projection_part = (pc.overlap != 0u && j >= pc.ratio) ? 1u : 0u;
+            uint ix = (uint(abs_pos) % state_rows) * width + projection_part * pc.dim + d;
+            mx = max(mx, state[pc.scores_off + ix]);
+        }
+        float den = 0.0;
+        float acc = 0.0;
+        for (uint j = 0u; j < count; ++j) {
+            int abs_pos = int(pc.pos + 1u) - int(count) + int(j);
+            if (abs_pos < 0) { continue; }
+            uint projection_part = (pc.overlap != 0u && j >= pc.ratio) ? 1u : 0u;
+            uint ix = (uint(abs_pos) % state_rows) * width + projection_part * pc.dim + d;
+            float w = exp(state[pc.scores_off + ix] - mx);
+            den += w;
+            acc += w * state[pc.values_off + ix];
+        }
+        pooled[d] = acc / den;
+    }
+    barrier();
+
+    float ss = 0.0;
+    for (uint d = t; d < pc.dim; d += 256u) { ss += pooled[d] * pooled[d]; }
+    sums[t] = ss;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (t < stride) { sums[t] += sums[t + stride]; }
+        barrier();
+    }
+    float inv_rms = inversesqrt(sums[0] / float(pc.dim) + pc.eps);
+    for (uint d = t; d < pc.dim; d += 256u) { pooled[d] *= inv_rms * norm[d]; }
+    barrier();
+
+    uint nope = pc.dim - pc.rope_dim;
+    for (uint d = t; d < nope; d += 256u) { dst[d] = pooled[d]; }
+    uint rope_pos = pc.pos + 1u - pc.ratio;
+    for (uint p = t; p < pc.rope_dim / 2u; p += 256u) {
+        uint i0 = nope + 2u * p;
+        uint i1 = i0 + 1u;
+        float angle = float(rope_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.rope_dim));
+#ifdef FREQ_FACTORS
+        angle /= ff[p];
+#endif
+        float sn = sin(angle);
+        float cs = cos(angle);
+        float a = pooled[i0];
+        float b = pooled[i1];
+        dst[i0] = a * cs - b * sn;
+        dst[i1] = a * sn + b * cs;
+    }
+}

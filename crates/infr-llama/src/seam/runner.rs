@@ -6,15 +6,15 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, DeltaW, Dsv4W, FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
-    MoeSharedW, SeamKv, SeamWeights, SessionStable,
+    AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW,
+    KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
-use infr_core::graph::{Activation, AttnMask, Graph, HyperGates, Op};
+use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
@@ -216,13 +216,23 @@ fn session_stable(
     // is `rope.scaling.original_context_length` (4096 for V2-Lite) — NOT `n_ctx_train`, which
     // this GGUF inflates to 163840. Bound as a per-step f32 Input exactly like `rope_freqs`.
     // `None` = plain rope (non-yarn models).
-    let yarn_ff: Option<Vec<f32>> = if c.rope_scaling_yarn && c.qk_rope_dim > 0 {
-        let n_rot = c.qk_rope_dim as f32;
+    let yarn_dim = if c.deepseek4 {
+        c.rope_dim
+    } else {
+        c.qk_rope_dim
+    };
+    let yarn_theta = if c.deepseek4 {
+        c.compress_rope_theta
+    } else {
+        c.rope_theta
+    };
+    let yarn_ff: Option<Vec<f32>> = if c.rope_scaling_yarn && yarn_dim > 0 {
+        let n_rot = yarn_dim as f32;
         let n_ctx_orig = c.rope_scaling_orig_ctx as f32;
         let freq_scale = 1.0 / c.rope_scaling_factor;
         // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
         let corr = |nr: f32| {
-            n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * c.rope_theta.ln())
+            n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * yarn_theta.ln())
         };
         // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), read
         // from the GGUF — V2-Lite happens to carry llama.cpp's own defaults.
@@ -717,8 +727,11 @@ pub(crate) fn generate_dense_backend(
                 // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
                 // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
                 // quantized buffer → OOB GPU fault → device lost.
-                if (c.deepseek2 || c.bailingmoe3)
-                    && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight"))
+                if ((c.deepseek2 || c.bailingmoe3)
+                    && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
+                    || (c.deepseek4
+                        && (name.contains("_compressor_ape.weight")
+                            || name.contains("_compressor_norm.weight")))
                 {
                     let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                     let numel = i.shape.iter().product();
@@ -1479,33 +1492,15 @@ pub(crate) fn generate_dense_backend(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
-    // DeepSeek V4: the `compress_ratio == 0` tier emits (hyper-connections, MQA attention with
-    // sinks and the grouped output projection, MoE with the per-layer SwiGLU clamp under EITHER
-    // routing — the router bias, or the `ffn_gate_tid2eid` hash table). What is left below is the
-    // compressed tiers, refused by name rather than approximated because they would otherwise run
-    // and produce plausible wrong numbers, plus the shape facts the emit assumes. Placed after the
-    // weight upload on purpose, exactly as the deepseek32 slice was: a `deepseek4` GGUF still gets
-    // every tensor it declares validated end to end. See docs/deepseek.md § Stage 4.
+    // DeepSeek V4 shape facts that the graph emit assumes. Keep them after weight upload so every
+    // tensor declared by a V4 GGUF is validated before graph construction.
     if c.deepseek4 {
-        // Ratios 4 and 128. Their compressed caches, the three compressor states, the per-channel
-        // softmax pooling op and the block-counting lightning indexer are all still missing — see
-        // docs/backlog.md § B-DSV4-WIRING slice B. Naming the layer AND its ratio, because a real
-        // V4 file mixes tiers and "which layer" is the first thing to know.
-        if let Some((l, r)) = (0..c.n_layer)
-            .map(|l| (l, c.layer_compress_ratio(l)))
-            .find(|&(_, r)| r != 0)
-        {
+        if c.head_dim != 512 || c.indexer_head_size != 128 {
             return Err(anyhow!(
-                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio {r}: only the ratio-0 \
-                 tier (pure sliding window) generates. A compressed layer needs the {} compressor \
-                 over blocks of {r} tokens, its persistent compressor state, the CSA/HCA block \
-                 cache{} — none of which is implemented. See docs/deepseek.md § Stage 4.",
-                if r == 4 { "CSA" } else { "HCA" },
-                if r == 4 {
-                    " and the lightning indexer with its own compressor + LID cache"
-                } else {
-                    ""
-                },
+                "arch=deepseek4 cache kernels require key_length=512 and \
+                 attention.indexer.key_length=128; got {} and {}",
+                c.head_dim,
+                c.indexer_head_size
             ));
         }
         // Hash-routed layers: `Op::GatherI32` reads the token's row of `ffn_gate_tid2eid` and
@@ -1622,17 +1617,6 @@ pub(crate) fn generate_dense_backend(
             l_first == 0 || !e2b,
             "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
         );
-        // Backstop for the `c.deepseek4` refusals above. `wpush` below declares V4's handles in
-        // lockstep with the upload loop, and a compressed (ratio 4/128) layer uploads FOUR to TEN
-        // more tensors than the ratio-0 arm declares — so reaching the builder with one would bind
-        // every later weight in the layer, and every weight of every later layer, one buffer off.
-        // Silently. Fail at the seam instead of somewhere inside a kernel.
-        assert!(
-            !c.deepseek4 || (0..c.n_layer).all(|l| c.layer_compress_ratio(l) == 0),
-            "deepseek4 reached the graph builder with a non-zero compress_ratio: `wpush`'s Dsv4 arm \
-             declares the ratio-0 tensor set only, so the refusal in `generate_dense_backend` must \
-             not be removed until the compressed tiers have handles of their own"
-        );
         // The widened `[batch, hc_mult, n_embd]` residual stream lives in graph scratch and is
         // collapsed back to `[batch, n_embd]` only by the model head. A partial layer span carries
         // its residual in the caller's `hidden` buffer, which is `n_embd` wide — there is nowhere
@@ -1739,6 +1723,18 @@ pub(crate) fn generate_dense_backend(
                 let s_elems = c.recurrent_state_elems();
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
+                continue;
+            }
+            if c.deepseek4 {
+                let layout = crate::seam::dsv4_layer_layout(c, l, max_ctx);
+                k_cache.push(g.input(TensorDesc::new(
+                    vec![layout.raw_bytes.div_ceil(4)],
+                    DType::U32,
+                )));
+                v_cache.push(g.input(TensorDesc::new(
+                    vec![layout.state_bytes.div_ceil(4)],
+                    DType::U32,
+                )));
                 continue;
             }
             // Declared rows MUST equal the allocation above — same widths from the same helper
@@ -1921,6 +1917,27 @@ pub(crate) fn generate_dense_backend(
                     scale: wpush(&mut g, &mut weights),
                 },
             });
+            let dsv4_compressed = if c.deepseek4 && c.layer_compress_ratio(l) != 0 {
+                let attention = Dsv4CompressorW {
+                    wkv: wpush(&mut g, &mut weights),
+                    wgate: wpush(&mut g, &mut weights),
+                    ape: wpush(&mut g, &mut weights),
+                    norm: wpush(&mut g, &mut weights),
+                };
+                let indexer = (c.layer_compress_ratio(l) == 4).then(|| Dsv4IndexerW {
+                    proj: wpush(&mut g, &mut weights),
+                    q_b: wpush(&mut g, &mut weights),
+                    compressor: Dsv4CompressorW {
+                        wkv: wpush(&mut g, &mut weights),
+                        wgate: wpush(&mut g, &mut weights),
+                        ape: wpush(&mut g, &mut weights),
+                        norm: wpush(&mut g, &mut weights),
+                    },
+                });
+                Some(Dsv4CompressedW { attention, indexer })
+            } else {
+                None
+            };
             // bitnet SubLN attention-output norm — mirrors the `wload` push right after
             // `attn_output.weight` (loaded under the same `c.sub_norm && !is_delta` gate; bitnet
             // has no DeltaNet layers, so `is_delta` is always false there).
@@ -2033,6 +2050,7 @@ pub(crate) fn generate_dense_backend(
                 attn_norm,
                 mixer,
                 hc,
+                dsv4_compressed,
                 attn_sub_norm,
                 post_attn,
                 ffn_norm,
@@ -2205,14 +2223,14 @@ pub(crate) fn generate_dense_backend(
         let hc_comb = g.internal(f32d(batch * (c.hc_mult * c.hc_mult).max(1)));
         //   d4_qa      [batch, q_lora_rank]     the normed low-rank query intermediate
         //   d4_kv      [batch, head_dim]        the single MQA key/value row
-        //   d4_rq      [batch, n_head*rope_dim] the rope TAIL of every q head, packed
+        //   d4_rq      [batch, max(n_head,indexer_n_head)*rope_dim] shared rope-tail scratch
         //   d4_rkv     [batch, rope_dim]        the rope tail of the kv row
         //   d4_xg      [batch, hd_g]            one output-projection group's slice of `attn`
         //   d4_og      [batch, o_lora_rank]     that group's low-rank output
         //   d4_oa      [batch, o_group_count*o_lora_rank]  all groups' outputs, concatenated
         let d4_qa = g.internal(f32d(batch * c.q_lora_rank.max(1)));
         let d4_kv = g.internal(f32d(batch * c.head_dim.max(1)));
-        let d4_rq = g.internal(f32d(batch * (nh * c.rope_dim).max(1)));
+        let d4_rq = g.internal(f32d(batch * (nh.max(c.indexer_n_head) * c.rope_dim).max(1)));
         let d4_rkv = g.internal(f32d(batch * c.rope_dim.max(1)));
         // `o_group_count` is 0 on every non-V4 model (and refused as 0 on a V4 one), so this is
         // the harmless-allocation guard the rest of this block uses, not a real division.
@@ -2220,6 +2238,32 @@ pub(crate) fn generate_dense_backend(
         let d4_xg = g.internal(f32d(batch * d4_hdg.max(1)));
         let d4_og = g.internal(f32d(batch * c.o_lora_rank.max(1)));
         let d4_oa = g.internal(f32d(batch * (c.o_group_count * c.o_lora_rank).max(1)));
+        // Compressed-tier scratch. V4 remains on the deliberately scalar (batch==1) path, so one
+        // set is reused serially by all 43 layers. HCA can expose ctx/128 rows; CSA is capped by
+        // the block indexer's top-k. The gathered f16 K=V list feeds the existing sink-aware
+        // attention op, preserving one shared softmax across raw and compressed rows.
+        let d4_comp_values = g.internal(f32d((2 * c.head_dim).max(1)));
+        let d4_comp_scores = g.internal(f32d((2 * c.head_dim).max(1)));
+        let d4_comp = g.internal(f32d(c.head_dim.max(1)));
+        let d4_lid_values = g.internal(f32d((2 * c.indexer_head_size).max(1)));
+        let d4_lid_scores = g.internal(f32d((2 * c.indexer_head_size).max(1)));
+        let d4_lid = g.internal(f32d(c.indexer_head_size.max(1)));
+        let d4_ix_q = g.internal(f32d((c.indexer_n_head * c.indexer_head_size).max(1)));
+        let d4_ix_q4 = g.internal(TensorDesc::new(
+            vec![(c.indexer_n_head * crate::seam::DSV4_MXFP4_ROW_BYTES)
+                .max(4)
+                .div_ceil(4)],
+            DType::U32,
+        ));
+        let d4_ix_w = g.internal(f32d(c.indexer_n_head.max(1)));
+        let d4_visible4 = (start_pos + batch) / 4;
+        let d4_top_k = c.indexer_top_k.min(d4_visible4);
+        let d4_ix_topk = g.internal(TensorDesc::new(vec![d4_top_k.max(1)], DType::I32));
+        let d4_raw_rows = (start_pos + batch).min(c.swa_window.max(1));
+        let d4_hca_rows = (start_pos + batch) / 128;
+        let d4_comp_selected = d4_hca_rows.max(d4_top_k);
+        let d4_gather_rows = d4_raw_rows + d4_comp_selected;
+        let d4_gather = g.internal(f16d((d4_gather_rows * c.head_dim).max(1)));
         // deepseek32 lightning-indexer scratch. All f32: the k row is LayerNormed (so it never
         // leaves f16 range) but staying f32 also keeps the `Rope → WriteKv` peephole off it —
         // that fusion only fires on an f16 rope dst, and its fused kernels have no NEOX build.
@@ -2937,24 +2981,28 @@ pub(crate) fn generate_dense_backend(
                     w_off: 0,
                 });
             } else if let MixerW::Dsv4(mw) = &lw.mixer {
-                // ── DeepSeek V4 attention, `compress_ratio == 0` (pure sliding window) ─────────
-                // `docs/deepseek.md` § Stage 4. Every non-zero ratio was refused before the graph
-                // was built, so this arm is the WHOLE of V4's attention today.
+                // DeepSeek V4 raw SWA plus optional ratio-4 CSA/indexer or ratio-128 HCA tier.
                 let hd4 = c.head_dim as u32; // MQA: one KV head of this width serves every q head
                 let rd = c.rope_dim as u32;
-                let nope4 = hd4 - rd; // the head is [nope | rope]; the ROPED dims are LAST
                 let qrow4 = (nh as u32) * hd4;
                 let qlr = c.q_lora_rank as u32;
                 let ogc = c.o_group_count as u32;
                 let olr = c.o_lora_rank as u32;
                 let hdg = qrow4 / ogc;
+                let ratio4 = c.layer_compress_ratio(l) as u32;
+                let layout4 = crate::seam::dsv4_layer_layout(c, l, max_ctx);
                 // Ratio-0 layers rope PLAIN: `deepseek4.cpp` passes `freq_scale = 1`,
                 // `ext_factor = 0` and both betas 0 there, so there is no YaRN ramp and no mscale
                 // — only the compressed tiers use `compress_rope_theta` with YaRN. That is also
                 // what makes the `backward` de-rope below an exact inverse of the forward rope
                 // (`Op::Rope::backward`'s doc: ggml's forward-then-back scales by mscale², and V4
                 // cancels mscale to 1 at every one of its rope call sites).
-                let theta4 = c.rope_theta;
+                let theta4 = if ratio4 == 0 {
+                    c.rope_theta
+                } else {
+                    c.compress_rope_theta
+                };
+                let ff4 = (ratio4 != 0).then_some(yarn_ff).flatten();
 
                 // Q: wq_a → q_a_norm → wq_b, then a WEIGHTLESS per-head RMS norm (bare
                 // `ggml_rms_norm` after the reshape to [head_dim, n_head, n_tokens] — there is no
@@ -3001,16 +3049,25 @@ pub(crate) fn generate_dense_backend(
                 // `rows = batch*n_head` and `src_stride = head_dim`, row `b*n_head+h` is exactly
                 // head `h` of token `b`, and `src_off = nope` lands on its rope tail. The packed
                 // `[batch, n_head, rope_dim]` result is then a plain `n_head`-head rope row.
-                let rope_tail = |g: &mut Graph, x: TensorId, pack: TensorId, heads: u32, back| {
+                let rope_tail = |g: &mut Graph,
+                                 x: TensorId,
+                                 pack: TensorId,
+                                 heads: u32,
+                                 head_dim: u32,
+                                 rope_dim: u32,
+                                 theta: f32,
+                                 freq_factors: Option<TensorId>,
+                                 back| {
+                    let nope = head_dim - rope_dim;
                     g.push(Op::CopyStrided {
                         src: x,
-                        src_off: nope4,
-                        src_stride: hd4,
+                        src_off: nope,
+                        src_stride: head_dim,
                         dst: pack,
                         dst_off: 0,
-                        dst_stride: rd,
+                        dst_stride: rope_dim,
                         rows: (batch as u32) * heads,
-                        n: rd,
+                        n: rope_dim,
                     });
                     g.push(Op::Rope {
                         x: pack,
@@ -3018,10 +3075,10 @@ pub(crate) fn generate_dense_backend(
                         dst: pack,
                         rows: batch as u32,
                         n_head: heads,
-                        head_dim: rd,
-                        rope_dim: rd,
-                        theta: theta4,
-                        freq_factors: None,
+                        head_dim: rope_dim,
+                        rope_dim,
+                        theta,
+                        freq_factors,
                         x_stride: 0,
                         // NORM (interleaved pairs) — `llama_model::rope_type` puts DEEPSEEK4 in
                         // the NORM group, and V4's indexer does NOT inherit V3.2's NEOX override
@@ -3032,16 +3089,16 @@ pub(crate) fn generate_dense_backend(
                     g.push(Op::CopyStrided {
                         src: pack,
                         src_off: 0,
-                        src_stride: rd,
+                        src_stride: rope_dim,
                         dst: x,
-                        dst_off: nope4,
-                        dst_stride: hd4,
+                        dst_off: nope,
+                        dst_stride: head_dim,
                         rows: (batch as u32) * heads,
-                        n: rd,
+                        n: rope_dim,
                     });
                 };
                 if rd > 0 {
-                    rope_tail(&mut g, q, d4_rq, nh as u32, false);
+                    rope_tail(&mut g, q, d4_rq, nh as u32, hd4, rd, theta4, ff4, false);
                 }
 
                 // KV: ONE head for the whole layer (`attn_kv` is `[n_embd, head_dim]`), RMS-normed
@@ -3066,17 +3123,203 @@ pub(crate) fn generate_dense_backend(
                     eps,
                 });
                 if rd > 0 {
-                    rope_tail(&mut g, d4_kv, d4_rkv, 1, false);
+                    rope_tail(&mut g, d4_kv, d4_rkv, 1, hd4, rd, theta4, ff4, false);
                 }
-                for cache in [k_cache[l], v_cache[l]] {
-                    g.push(Op::WriteKv {
-                        src: d4_kv,
-                        cache,
-                        rows: batch as u32,
-                        row_stride: hd4,
-                        pos: start_pos as u32,
+                debug_assert_eq!(batch, 1, "DeepSeek V4 currently builds scalar forwards");
+                g.push(Op::Dsv4CacheWrite {
+                    src: d4_kv,
+                    cache: k_cache[l],
+                    rows: 1,
+                    row: (start_pos % layout4.raw_rows) as u32,
+                    cache_off: 0,
+                    format: Dsv4CacheFormat::Fp8Kv,
+                });
+
+                let mut compressed_indices = None;
+                let mut compressed_selected = 0usize;
+                if ratio4 != 0 {
+                    let cw = lw
+                        .dsv4_compressed
+                        .as_ref()
+                        .expect("compressed V4 layer without compressor weights");
+                    let overlap = ratio4 == 4;
+                    let comp_width = if overlap { 2 * hd4 } else { hd4 };
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: cw.attention.wkv,
+                        dst: d4_comp_values,
+                        m: 1,
+                        in_f: ne as u32,
+                        out_f: comp_width,
+                        w_off: 0,
                     });
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: cw.attention.wgate,
+                        dst: d4_comp_scores,
+                        m: 1,
+                        in_f: ne as u32,
+                        out_f: comp_width,
+                        w_off: 0,
+                    });
+                    g.push(Op::Dsv4Compress {
+                        values: d4_comp_values,
+                        scores: d4_comp_scores,
+                        ape: cw.attention.ape,
+                        norm: cw.attention.norm,
+                        freq_factors: yarn_ff,
+                        state: v_cache[l],
+                        dst: d4_comp,
+                        state_values_off: layout4.state_values_off as u32,
+                        state_scores_off: layout4.state_scores_off as u32,
+                        pos: start_pos as u32,
+                        ratio: ratio4,
+                        dim: hd4,
+                        rope_dim: rd,
+                        theta: c.compress_rope_theta,
+                        eps,
+                        overlap,
+                    });
+                    if (start_pos + 1).is_multiple_of(ratio4 as usize) {
+                        g.push(Op::Dsv4CacheWrite {
+                            src: d4_comp,
+                            cache: v_cache[l],
+                            rows: 1,
+                            row: (start_pos / ratio4 as usize) as u32,
+                            cache_off: layout4.comp_off as u32,
+                            format: Dsv4CacheFormat::Fp8Kv,
+                        });
+                    }
+
+                    let visible = (start_pos + 1) / ratio4 as usize;
+                    if ratio4 == 4 {
+                        let iw = cw
+                            .indexer
+                            .as_ref()
+                            .expect("ratio-4 V4 layer without indexer weights");
+                        let ix_hd = c.indexer_head_size as u32;
+                        let ix_width = 2 * ix_hd;
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: iw.compressor.wkv,
+                            dst: d4_lid_values,
+                            m: 1,
+                            in_f: ne as u32,
+                            out_f: ix_width,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: iw.compressor.wgate,
+                            dst: d4_lid_scores,
+                            m: 1,
+                            in_f: ne as u32,
+                            out_f: ix_width,
+                            w_off: 0,
+                        });
+                        g.push(Op::Dsv4Compress {
+                            values: d4_lid_values,
+                            scores: d4_lid_scores,
+                            ape: iw.compressor.ape,
+                            norm: iw.compressor.norm,
+                            freq_factors: yarn_ff,
+                            state: v_cache[l],
+                            dst: d4_lid,
+                            state_values_off: layout4.lid_state_values_off as u32,
+                            state_scores_off: layout4.lid_state_scores_off as u32,
+                            pos: start_pos as u32,
+                            ratio: ratio4,
+                            dim: ix_hd,
+                            rope_dim: rd,
+                            theta: c.compress_rope_theta,
+                            eps,
+                            overlap: true,
+                        });
+                        if (start_pos + 1).is_multiple_of(ratio4 as usize) {
+                            g.push(Op::Dsv4CacheWrite {
+                                src: d4_lid,
+                                cache: v_cache[l],
+                                rows: 1,
+                                row: (start_pos / ratio4 as usize) as u32,
+                                cache_off: layout4.lid_off as u32,
+                                format: Dsv4CacheFormat::Mxfp4,
+                            });
+                        }
+                        compressed_selected = visible.min(c.indexer_top_k);
+                        if visible > c.indexer_top_k {
+                            g.push(Op::Linear {
+                                x: d4_qa,
+                                weight: iw.q_b,
+                                dst: d4_ix_q,
+                                m: 1,
+                                in_f: qlr,
+                                out_f: (c.indexer_n_head * c.indexer_head_size) as u32,
+                                w_off: 0,
+                            });
+                            if rd > 0 {
+                                rope_tail(
+                                    &mut g,
+                                    d4_ix_q,
+                                    d4_rq,
+                                    c.indexer_n_head as u32,
+                                    ix_hd,
+                                    rd,
+                                    c.compress_rope_theta,
+                                    yarn_ff,
+                                    false,
+                                );
+                            }
+                            g.push(Op::Dsv4CacheWrite {
+                                src: d4_ix_q,
+                                cache: d4_ix_q4,
+                                rows: c.indexer_n_head as u32,
+                                row: 0,
+                                cache_off: 0,
+                                format: Dsv4CacheFormat::Mxfp4,
+                            });
+                            g.push(Op::Linear {
+                                x: hn,
+                                weight: iw.proj,
+                                dst: d4_ix_w,
+                                m: 1,
+                                in_f: ne as u32,
+                                out_f: c.indexer_n_head as u32,
+                                w_off: 0,
+                            });
+                            g.push(Op::Dsv4Indexer {
+                                q: d4_ix_q4,
+                                k_cache: v_cache[l],
+                                weights: d4_ix_w,
+                                dst: d4_ix_topk,
+                                cache_off: layout4.lid_off as u32,
+                                kv_len: visible as u32,
+                                n_head: c.indexer_n_head as u32,
+                                head_dim: ix_hd,
+                                top_k: compressed_selected as u32,
+                                scale: 1.0
+                                    / ((c.indexer_n_head * c.indexer_head_size) as f32).sqrt(),
+                            });
+                            compressed_indices = Some(d4_ix_topk);
+                        }
+                    } else {
+                        compressed_selected = visible;
+                    }
                 }
+
+                let raw_live = (start_pos + 1).min(layout4.raw_rows);
+                let gathered = raw_live + compressed_selected;
+                g.push(Op::Dsv4Gather {
+                    raw_cache: k_cache[l],
+                    comp_cache: v_cache[l],
+                    indices: compressed_indices,
+                    dst: d4_gather,
+                    comp_off: layout4.comp_off as u32,
+                    pos: start_pos as u32,
+                    visible: ((start_pos + 1) / (ratio4 as usize).max(1)) as u32,
+                    selected: compressed_selected as u32,
+                    head_dim: hd4,
+                    raw_window: layout4.raw_rows as u32,
+                });
                 // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
                 // cast into it exactly as llama4's NoPE layer casts its unroped one — `Op::Copy`,
                 // whose lowering does the f32→f16 conversion. The rope itself has to stay on the
@@ -3091,26 +3334,26 @@ pub(crate) fn generate_dense_backend(
                 });
                 g.push(Op::Attention {
                     q: q16,
-                    k_cache: k_cache[l],
-                    v_cache: v_cache[l],
+                    k_cache: d4_gather,
+                    v_cache: d4_gather,
                     dst: attn,
                     rows: batch as u32,
-                    kv_len: (start_pos + batch) as u32,
+                    kv_len: gathered as u32,
                     n_head: nh as u32,
                     n_kv: 1,
                     head_dim: hd4,
                     // Plain 1/√head_dim at all three of V4's attention call sites — none of
                     // stage 2's mscale² games.
                     scale: 1.0 / (c.head_dim as f32).sqrt(),
-                    mask,
-                    pos: start_pos as u32,
+                    mask: AttnMask::Causal,
+                    pos: gathered.saturating_sub(1) as u32,
                     sinks: Some(mw.sinks),
                 });
                 // DE-ROPE the attention output's rope slice, per head, by the QUERY position —
                 // `ggml_rope_ext_back` at the same theta and layout as the forward q rope. Nothing
                 // else in the DeepSeek family rotates backwards.
                 if rd > 0 {
-                    rope_tail(&mut g, attn, d4_rq, nh as u32, true);
+                    rope_tail(&mut g, attn, d4_rq, nh as u32, hd4, rd, theta4, ff4, true);
                 }
                 // Grouped low-rank output projection. `wo_a` read as `{hd_g, o_lora_rank,
                 // o_group_count}`: group `g` takes input columns `[g*hd_g, (g+1)*hd_g)` of the

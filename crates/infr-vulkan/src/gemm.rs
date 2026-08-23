@@ -3027,6 +3027,71 @@ pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dsv4_compress_spv(freq_factors: bool) -> &'static [u32] {
+    static BASE: OnceLock<Vec<u32>> = OnceLock::new();
+    static FF: OnceLock<Vec<u32>> = OnceLock::new();
+    if freq_factors {
+        FF.get_or_init(|| {
+            spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/dsv4_compress_ff.spv"
+            )))
+        })
+    } else {
+        BASE.get_or_init(|| {
+            spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/dsv4_compress.spv"
+            )))
+        })
+    }
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dsv4_cache_write_spv(mxfp4: bool) -> &'static [u32] {
+    static FP8: OnceLock<Vec<u32>> = OnceLock::new();
+    static FP4: OnceLock<Vec<u32>> = OnceLock::new();
+    if mxfp4 {
+        FP4.get_or_init(|| {
+            spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/dsv4_cache_write_mxfp4.spv"
+            )))
+        })
+    } else {
+        FP8.get_or_init(|| {
+            spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/dsv4_cache_write_fp8.spv"
+            )))
+        })
+    }
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dsv4_indexer_score_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/dsv4_indexer_score.spv"
+        )))
+    })
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dsv4_indexer_topk_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/dsv4_indexer_topk.spv"
+        )))
+    })
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dsv4_gather_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/dsv4_gather.spv"))))
+}
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

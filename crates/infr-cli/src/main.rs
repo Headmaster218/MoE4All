@@ -2458,8 +2458,8 @@ fn bench_json_line(
     };
     let place = match placement {
         Some(p) => format!(
-            ", \"ubatch\": {}, \"ubatch_pinned\": {}, \"kv_q8\": {}, \"submit_cap\": {}",
-            p.ubatch, p.ubatch_pinned, p.kv_q8, p.submit_cap
+            ", \"ubatch\": {}, \"ubatch_pinned\": {}, \"kv_q8\": {}, \"kv_layout\": \"{}\", \"submit_cap\": {}",
+            p.ubatch, p.ubatch_pinned, p.kv_q8, p.kv_layout, p.submit_cap
         ),
         None => String::new(),
     };
@@ -2499,7 +2499,7 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
         " [ubatch {}{}, kv {}, submit {}]",
         p.ubatch,
         if p.ubatch_pinned { " pinned" } else { "" },
-        if p.kv_q8 { "q8_0" } else { "f16" },
+        p.kv_layout,
         if p.submit_cap == 0 {
             "unlimited".to_string()
         } else {
@@ -5019,6 +5019,7 @@ mod tests {
             ubatch: 256,
             ubatch_pinned: true,
             kv_q8: true,
+            kv_layout: "q8_0",
             submit_cap: 112,
         };
         for (name, line) in [
@@ -5049,6 +5050,7 @@ mod tests {
         assert_eq!(v[0]["ubatch"].as_u64(), Some(256));
         assert_eq!(v[0]["ubatch_pinned"].as_bool(), Some(true));
         assert_eq!(v[0]["kv_q8"].as_bool(), Some(true));
+        assert_eq!(v[0]["kv_layout"].as_str(), Some("q8_0"));
         assert_eq!(v[0]["submit_cap"].as_u64(), Some(112));
         assert_eq!(v[0]["mtp_ts"].as_f64(), Some(150.0));
         // The CPU/Metal arms have no Vulkan placement: those keys must be ABSENT, not zeroed —
@@ -5079,6 +5081,7 @@ mod tests {
             ubatch: 1024,
             ubatch_pinned: false,
             kv_q8: false,
+            kv_layout: "f16",
             submit_cap: 0,
         };
         let s = placement_note(Some(&base));
@@ -5087,11 +5090,20 @@ mod tests {
             ubatch: 256,
             ubatch_pinned: true,
             kv_q8: true,
+            kv_layout: "q8_0",
             submit_cap: 112,
         };
         assert_eq!(
             placement_note(Some(&split)),
             " [ubatch 256 pinned, kv q8_0, submit split/112]"
+        );
+        let dsv4 = infr_llama::BenchPlacement {
+            kv_layout: "fp8-kv+mxfp4-index",
+            ..base
+        };
+        assert_eq!(
+            placement_note(Some(&dsv4)),
+            " [ubatch 1024, kv fp8-kv+mxfp4-index, submit unlimited]"
         );
         assert_eq!(placement_note(None), "");
     }

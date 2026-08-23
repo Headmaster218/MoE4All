@@ -30,6 +30,9 @@ pub struct BenchPlacement {
     pub ubatch_pinned: bool,
     /// The benchmark session actually allocated coupled q8_0 KV caches.
     pub kv_q8: bool,
+    /// Human-readable cache layout. DeepSeek V4 owns a mixed-FP8 attention cache plus an
+    /// MXFP4 indexer cache rather than either generic coupled-KV layout.
+    pub kv_layout: &'static str,
     /// Dispatches per submit; `0` = unlimited, one command buffer per forward (every healthy
     /// discrete GPU). Anything else means the submit splitter armed during this run.
     pub submit_cap: usize,
@@ -1381,12 +1384,20 @@ impl SeamModel {
         // Read the placement AFTER the reps: the pins are set by the binder on the first load, and
         // the submit cap can only have moved during the runs. `bench_vulkan` holds no
         // `PlacementScope`, so these read the process-wide fallback pins this session wrote.
+        let kv_q8 = state.as_ref().is_some_and(crate::seam::SeamKv::kv_q8);
         Ok((
             samples,
             BenchPlacement {
                 ubatch: crate::seam::ubatch_rows(&self.ecfg),
                 ubatch_pinned: self.ecfg.device.ubatch_specified,
-                kv_q8: state.as_ref().is_some_and(crate::seam::SeamKv::kv_q8),
+                kv_q8,
+                kv_layout: if self.cfg.deepseek4 {
+                    "fp8-kv+mxfp4-index"
+                } else if kv_q8 {
+                    "q8_0"
+                } else {
+                    "f16"
+                },
                 submit_cap: vk.submit_cap_now(),
             },
         ))
