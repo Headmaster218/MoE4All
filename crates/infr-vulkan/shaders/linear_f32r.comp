@@ -115,6 +115,32 @@ void main() {
         }
     }
 }
+#elif defined(VEC4)
+// Decode-sized vec4 GEMV: one workgroup per output just like the scalar arm, but each lane issues
+// 16-byte weight/activation loads and keeps four independent FMA chains. The final pairwise add is
+// reassociation-tolerant (the same contract as the existing MROW+VEC4 variants).
+shared float red[64];
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint nv = pc.in_f / 4u;
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo);
+    uint wbase = o * nv;
+    uint xbase = r * nv;
+    vec4 acc = vec4(0.0);
+    for (uint i = t; i < nv; i += 64u) { acc += WV(wbase + i) * x[xbase + i]; }
+    red[t] = (acc.x + acc.y) + (acc.z + acc.w);
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}
 #else
 shared float red[64];
 

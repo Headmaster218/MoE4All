@@ -830,6 +830,7 @@ fn main() {
         // `linear_f32`'s builds were dead — same as `e2b_proj` below, just not called out in the
         // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
+        ("linear_f32r", "linear_f32r_v4", &["-DVEC4"]),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
             "linear_f32r",

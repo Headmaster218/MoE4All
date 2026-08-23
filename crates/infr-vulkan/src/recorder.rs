@@ -1889,8 +1889,14 @@ impl<'a> Recorder<'a> {
     ) {
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
         let use_mrow = rows > 1 && self.vk().f32_mrow;
-        let use_v4 = use_mrow && in_f.is_multiple_of(4) && self.vk().f32_v4;
-        let (name, spv, groups) = if use_v4 && rows <= 4 {
+        let use_v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
+        let (name, spv, groups) = if use_v4 && rows == 1 {
+            (
+                "linear_f32r_v4",
+                crate::gemm::linear_f32r_v4_spv(),
+                out_f as u32,
+            )
+        } else if use_v4 && rows <= 4 {
             (
                 "linear_f32r_mrow4_v4",
                 crate::gemm::linear_f32r_mrow4_v4_spv(),

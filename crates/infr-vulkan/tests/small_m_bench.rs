@@ -298,7 +298,7 @@ fn mmv_mrow_matches_single_row_mmv() {
 /// The vec4 f32 prefill GEMV variants (`linear_f32r_mrow4_v4` rows<=4 / `linear_f32r_mrow8_v4`)
 /// must match a host f64 reference to f32 reassociation tolerance (vec4-lane accumulation +
 /// pairwise horizontal add reorders the K sum vs the scalar kernels — tolerance-level only).
-/// rows=1 (scalar 1-row kernel) and an in_f % 4 != 0 shape (scalar mrow8 fallback) ride along
+/// rows=1 (vec4 decode kernel) and an in_f % 4 != 0 shape (scalar mrow8 fallback) ride along
 /// to pin the whole dispatch table.
 #[test]
 fn linear_f32_v4_matches_host() {
@@ -310,7 +310,7 @@ fn linear_f32_v4_matches_host() {
         (4usize, 1536usize, 256usize), // mrow4_v4 (the E2B per-layer proj shape)
         (2, 256, 1536),                // mrow4_v4, transposed direction
         (6, 1536, 256),                // mrow8_v4
-        (1, 1536, 256),                // 1-row scalar kernel
+        (1, 1536, 256),                // 1-row vec4 decode kernel
         (4, 252, 64),                  // in_f % 4 != 0 → scalar mrow8 fallback
     ] {
         let ws: Vec<f32> = (0..out_f * in_f)
