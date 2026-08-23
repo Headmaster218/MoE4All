@@ -17,6 +17,7 @@ toml.workspace = true
 # seeded a cached kernel binary is still alive (see `kernel_cache.rs`).
 libc.workspace = true
 tracing.workspace = true
+rayon.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_System_SystemInformation"] }

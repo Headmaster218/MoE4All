@@ -2500,10 +2500,12 @@ impl MoePagerSession {
         let pool = &mut pools[pool_idx];
         let copy_t0 = pager_profile::active().then(std::time::Instant::now);
         let mut copied = 0usize;
-        for &lid in local_ids {
-            let local = lid as usize;
-            let id = block_base + lid;
-            if let Some(host) = pool.host.as_ref().cloned() {
+        if let Some(host) = pool.host.as_ref().cloned() {
+            // Resolve in the original order first: this preserves exact GPU-LRU victim selection
+            // and LUT contents. Only the resulting independent byte moves run in parallel.
+            let mut promotions = Vec::with_capacity(local_ids.len());
+            for &lid in local_ids {
+                let id = block_base + lid;
                 if pool.pager.is_resident(id) {
                     let plan = pool.pager.plan_inclusive_cpu_push(
                         id,
@@ -2525,12 +2527,26 @@ impl MoePagerSession {
                         scan,
                     )?
                     .expect("a nonresident block must produce an upload plan");
-                host.promote(id, plan.evicted, |bytes| {
-                    par_copy_to_mapped(bytes, plan.dst as *mut u8);
+                promotions.push((id, plan.evicted, plan.dst));
+            }
+            copied = promotions.len().saturating_mul(stride);
+            if promotions.len() > 1 {
+                host.promote_batch(&promotions, |bytes, dst| {
+                    par_copy_to_mapped(bytes, dst as *mut u8);
                     Ok(())
                 })?;
-                copied = copied.saturating_add(stride);
             } else {
+                for (id, evicted, dst) in promotions {
+                    host.promote(id, evicted, |bytes| {
+                        par_copy_to_mapped(bytes, dst as *mut u8);
+                        Ok(())
+                    })?;
+                }
+            }
+        } else {
+            for &lid in local_ids {
+                let local = lid as usize;
+                let id = block_base + lid;
                 let host_chunk = host_chunk
                     .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
                 let src = host_base

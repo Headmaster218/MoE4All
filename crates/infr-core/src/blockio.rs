@@ -112,6 +112,11 @@ struct ShardIo {
     /// Unix positioned reads do not need this: one descriptor already permits concurrent pread.
     #[cfg(windows)]
     fanout_files: Vec<File>,
+    /// Round-robin cursor shared by concurrent block reads. Without it, every block's first piece
+    /// lands on the primary handle and every second piece on handle one, serializing same-lane
+    /// work even though the remaining handles are idle.
+    #[cfg(windows)]
+    next_file: std::sync::atomic::AtomicUsize,
     stamp: FileStamp,
     /// Path kept for error messages only — every read and every re-stat goes through `file`.
     path: String,
@@ -171,16 +176,8 @@ impl FileBlockIo {
         }
         #[cfg(windows)]
         let fanout_files = {
-            // One is the exact legacy path and is useful for repeatable A/B runs. Values above the
-            // compile-time fanout cannot create more simultaneous work, so cap rather than keeping
-            // idle descriptors around. Read once at model open; there is no hot-path env lookup.
-            let handles = std::env::var("INFR_WINDOWS_FILE_FANOUT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(IO_FANOUT)
-                .clamp(1, IO_FANOUT);
-            let mut out = Vec::with_capacity(handles.saturating_sub(1));
-            for _ in 1..handles {
+            let mut out = Vec::with_capacity(IO_FANOUT.saturating_sub(1));
+            for _ in 1..IO_FANOUT {
                 let extra = File::open(path)?;
                 let extra_stamp = FileStamp::of(&extra)?;
                 if extra_stamp != stamp {
@@ -197,6 +194,8 @@ impl FileBlockIo {
             file,
             #[cfg(windows)]
             fanout_files,
+            #[cfg(windows)]
+            next_file: std::sync::atomic::AtomicUsize::new(0),
             stamp,
             path: path.display().to_string(),
             base,
@@ -273,10 +272,16 @@ impl ShardIo {
     fn read_file(&self, lane: usize) -> &File {
         #[cfg(windows)]
         {
-            if lane == 0 || self.fanout_files.is_empty() {
+            let _ = lane;
+            let n_files = self.fanout_files.len() + 1;
+            let selected = self
+                .next_file
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % n_files;
+            if selected == 0 {
                 &self.file
             } else {
-                &self.fanout_files[(lane - 1) % self.fanout_files.len()]
+                &self.fanout_files[selected - 1]
             }
         }
         #[cfg(not(windows))]

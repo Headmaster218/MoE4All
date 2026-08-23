@@ -560,6 +560,259 @@ impl InclusiveHostCache {
         Ok(())
     }
 
+    /// Promote several independent upper-tier misses as one I/O batch.
+    ///
+    /// Residency and victim selection stay serial and in caller order under `inner`, exactly like
+    /// repeated [`Self::promote`] calls. Only the expensive portion after those decisions is
+    /// parallel: SSD fills and the caller's uploads. Holding the residency lock until every job
+    /// completes keeps the same safety contract as `promote` (no external shadow release can make
+    /// an arena slot reusable while a worker still reads or writes it).
+    ///
+    /// `requests` must contain unique block ids and independent upload destinations. `context` is
+    /// opaque caller data, typically a mapped-device destination address.
+    pub fn promote_batch<T, U>(
+        &self,
+        requests: &[(BlockId, Option<BlockId>, T)],
+        upload: U,
+    ) -> Result<()>
+    where
+        T: Copy + Send + Sync,
+        U: Fn(&[u8], T) -> Result<()> + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        enum Source {
+            Hit {
+                slot: u32,
+            },
+            Fill {
+                slot: u32,
+                desc: BlockDesc,
+                host_evicted: bool,
+            },
+            Stream {
+                desc: BlockDesc,
+            },
+        }
+        struct Work<T> {
+            requested: BlockId,
+            context: T,
+            len: usize,
+            source: Source,
+        }
+
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let prof = pager_profile::active();
+        let mut inner = self.inner.lock().unwrap();
+        let mut unique = HashSet::with_capacity(requests.len());
+        for &(requested, _, _) in requests {
+            if !unique.insert(requested) {
+                return Err(Error::backend(format!(
+                    "inclusive host cache batch contains duplicate block {requested}"
+                )));
+            }
+            if !inner.descs.contains_key(&requested) {
+                return Err(Error::backend(format!(
+                    "inclusive host cache: block {requested} was never registered"
+                )));
+            }
+        }
+
+        let mut work = Vec::with_capacity(requests.len());
+        for &(requested, upper_evicted, context) in requests {
+            while inner.state.get(&requested) == Some(&SlotState::Loading) {
+                let wait_t0 = prof.then(std::time::Instant::now);
+                inner = self.ready.wait(inner).unwrap();
+                if let Some(t0) = wait_t0 {
+                    pager_profile::record_host_wait(t0.elapsed());
+                }
+            }
+            let desc = inner.descs[&requested].clone();
+            let len = desc.nbytes();
+
+            if let Some(victim) = upper_evicted {
+                self.gpu_evictions.fetch_add(1, Ordering::Relaxed);
+                if Self::release_shadow_locked(&mut inner, victim) {
+                    self.shadow_releases.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            let ram_slot = inner
+                .state
+                .get(&requested)
+                .filter(|&&state| state == SlotState::Ready)
+                .and_then(|_| inner.pager.as_ref()?.slot_of(requested));
+            if let Some(slot) = ram_slot {
+                let pinned_slot = inner
+                    .pager
+                    .as_mut()
+                    .and_then(|pager| pager.pin_if_resident(requested))
+                    .expect("ready RAM resident must still have a pager slot");
+                debug_assert_eq!(pinned_slot, slot);
+                let inserted = inner.shadows.insert(requested);
+                debug_assert!(inserted, "GPU miss requested an existing host shadow");
+                work.push(Work {
+                    requested,
+                    context,
+                    len,
+                    source: Source::Hit { slot },
+                });
+                continue;
+            }
+
+            let admission = inner
+                .pager
+                .as_mut()
+                .and_then(|pager| pager.resolve_and_pin(requested, Insert::Mru));
+            match admission {
+                Some(Resolution::Miss { slot, evicted }) => {
+                    let host_evicted = evicted.is_some();
+                    if let Some(old) = evicted {
+                        let removed = inner.state.remove(&old);
+                        debug_assert_eq!(removed, Some(SlotState::Ready));
+                        self.ram_evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    inner.state.insert(requested, SlotState::Loading);
+                    work.push(Work {
+                        requested,
+                        context,
+                        len,
+                        source: Source::Fill {
+                            slot,
+                            desc,
+                            host_evicted,
+                        },
+                    });
+                }
+                None => work.push(Work {
+                    requested,
+                    context,
+                    len,
+                    source: Source::Stream { desc },
+                }),
+                Some(Resolution::Hit { .. }) => {
+                    return Err(Error::backend(format!(
+                        "inclusive host cache: block {requested} became resident without ready bytes"
+                    )));
+                }
+            }
+        }
+
+        // SAFETY of the arena slices below: every Hit is pinned as a shadow before later planning;
+        // every Fill owns a distinct Loading+pin slot. `inner` remains locked until all workers
+        // join, so no external release can remove those pins or recycle a slot in the meantime.
+        let outcomes: Vec<Result<Option<std::time::Duration>>> = work
+            .par_iter()
+            .map(|job| match &job.source {
+                Source::Hit { slot } => {
+                    let src = unsafe { self.arena.slot_ref(*slot, job.len) };
+                    upload(src, job.context)?;
+                    Ok(None)
+                }
+                Source::Fill { slot, desc, .. } => {
+                    let dst = unsafe { self.arena.slot_mut(*slot, job.len) };
+                    let started = prof.then(std::time::Instant::now);
+                    self.io.read_block(desc, dst)?;
+                    let elapsed = started.map(|t| t.elapsed());
+                    upload(dst, job.context)?;
+                    Ok(elapsed)
+                }
+                Source::Stream { desc } => {
+                    // This is only reachable when every RAM slot is a GPU shadow (including the
+                    // zero-RAM mode). One temporary per in-flight miss lets the batch stay parallel
+                    // without creating a persistent second weight store.
+                    let mut bytes = vec![0u8; job.len];
+                    let started = prof.then(std::time::Instant::now);
+                    self.io.read_block(desc, &mut bytes)?;
+                    let elapsed = started.map(|t| t.elapsed());
+                    upload(&bytes, job.context)?;
+                    Ok(elapsed)
+                }
+            })
+            .collect();
+
+        let mut first_error = None;
+        let mut notify = false;
+        for (job, outcome) in work.iter().zip(outcomes) {
+            match outcome {
+                Ok(read_elapsed) => {
+                    match &job.source {
+                        Source::Hit { .. } => {
+                            self.ram_hits.fetch_add(1, Ordering::Relaxed);
+                            self.shadow_promotions.fetch_add(1, Ordering::Relaxed);
+                            if prof {
+                                pager_profile::record_host_hit(job.len);
+                            }
+                        }
+                        Source::Fill { host_evicted, .. } => {
+                            inner.state.insert(job.requested, SlotState::Ready);
+                            let inserted = inner.shadows.insert(job.requested);
+                            debug_assert!(inserted);
+                            self.shadow_promotions.fetch_add(1, Ordering::Relaxed);
+                            self.ssd_reads.fetch_add(1, Ordering::Relaxed);
+                            self.bytes_read.fetch_add(job.len as u64, Ordering::Relaxed);
+                            if prof {
+                                pager_profile::record_host_miss(job.len, *host_evicted);
+                            }
+                            notify = true;
+                        }
+                        Source::Stream { .. } => {
+                            self.ssd_reads.fetch_add(1, Ordering::Relaxed);
+                            self.bytes_read.fetch_add(job.len as u64, Ordering::Relaxed);
+                            if prof {
+                                pager_profile::record_host_miss(job.len, false);
+                            }
+                        }
+                    }
+                    if let Some(elapsed) = read_elapsed {
+                        pager_profile::record_host_read(
+                            job.len,
+                            elapsed,
+                            matches!(&job.source, Source::Stream { .. }),
+                        );
+                    }
+                    self.bytes_promoted
+                        .fetch_add(job.len as u64, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    match &job.source {
+                        Source::Hit { .. } => {
+                            if inner.shadows.remove(&job.requested) {
+                                inner
+                                    .pager
+                                    .as_mut()
+                                    .expect("RAM hit requires an arena")
+                                    .unpin(job.requested);
+                            }
+                        }
+                        Source::Fill { slot, .. } => {
+                            inner.state.remove(&job.requested);
+                            let pager = inner.pager.as_mut().expect("admission requires an arena");
+                            pager.unpin(job.requested);
+                            let removed = pager.evict(job.requested);
+                            debug_assert_eq!(removed, Some(*slot));
+                            notify = true;
+                        }
+                        Source::Stream { .. } => {}
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        drop(inner);
+        if notify {
+            self.ready.notify_all();
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     /// Notify the host tier that GPU residency ended outside ordinary decode replacement, such as
     /// unified-arena borrowing or a Prefill lane overwriting Decode slots.
     pub fn release_gpu_blocks(&self, ids: &[BlockId]) {
@@ -1146,6 +1399,22 @@ mod tests {
         }
     }
 
+    struct ConcurrentIo {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl BlockIo for ConcurrentIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     fn desc(id: BlockId, len: usize) -> BlockDesc {
         BlockDesc {
             id,
@@ -1162,6 +1431,35 @@ mod tests {
             p.register(desc(id, len)).expect("register");
         }
         p
+    }
+
+    #[test]
+    fn inclusive_batch_reads_distinct_misses_concurrently() {
+        let io = Arc::new(ConcurrentIo {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let cache = InclusiveHostCache::new(2, 16, io.clone()).expect("cache");
+        cache.register(desc(1, 16)).expect("register 1");
+        cache.register(desc(2, 16)).expect("register 2");
+        let uploaded = std::sync::Mutex::new([[0u8; 16]; 2]);
+
+        cache
+            .promote_batch(&[(1, None, 0usize), (2, None, 1usize)], |bytes, dst| {
+                uploaded.lock().unwrap()[dst].copy_from_slice(bytes);
+                Ok(())
+            })
+            .expect("batch promotion");
+
+        assert_eq!(*uploaded.lock().unwrap(), [[1u8; 16], [2u8; 16]]);
+        assert_eq!(
+            io.max_active.load(Ordering::SeqCst),
+            2,
+            "the two SSD misses were serialized"
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.ssd_reads, 2);
+        assert_eq!(stats.shadow_resident, 2);
     }
 
     #[test]
