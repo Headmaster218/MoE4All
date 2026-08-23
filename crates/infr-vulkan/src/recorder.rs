@@ -4274,7 +4274,12 @@ impl<'a> Recorder<'a> {
             }
             None => hc,
         };
+        let decode_hc4 = gates.is_some() && rows == 1 && hc == 4;
         let (name, spv) = match gates {
+            Some(_) if decode_hc4 => (
+                "hyper_mix_gates_decode",
+                crate::gemm::hyper_mix_gates_decode_spv(),
+            ),
             Some(_) => ("hyper_mix_gates", crate::gemm::hyper_mix_gates_spv()),
             None => ("hyper_mix", crate::gemm::hyper_mix_spv()),
         };
@@ -4287,7 +4292,8 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&n_iter.to_ne_bytes());
         // `pre` and (with gates) `post` + `comb` are the writes — the trailing bindings.
         let n_out = if gates.is_some() { 3 } else { 1 };
-        self.dispatch(k, &bufs, n_out, &push, rows.div_ceil(64));
+        let groups = if decode_hc4 { rows } else { rows.div_ceil(64) };
+        self.dispatch(k, &bufs, n_out, &push, groups);
     }
 
     /// DeepSeek V4 hyper-connection stream collapse (`hyper_pre.comp`, `Op::HyperConnectPre`):

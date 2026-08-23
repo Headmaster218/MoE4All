@@ -3570,6 +3570,17 @@ fn hc_cases() -> Vec<(&'static str, HcDims)> {
     let e = 1e-6f32;
     vec![
         (
+            "decode hc=4 n_iter=3, 1 token",
+            HcDims {
+                rows: 1,
+                hc: 4,
+                n_embd: 5,
+                eps: e,
+                n_iter: 3,
+                head: false,
+            },
+        ),
+        (
             "production hc=4 n_iter=3, 7 tokens",
             HcDims {
                 rows: 7,

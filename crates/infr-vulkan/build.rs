@@ -669,6 +669,11 @@ fn main() {
         // pre-only form, whose `mixes` is the pre chunk alone.
         ("hyper_mix", "hyper_mix", &[]),
         ("hyper_mix", "hyper_mix_gates", &["-DGATES"]),
+        (
+            "hyper_mix_gates_decode",
+            "hyper_mix_gates_decode",
+            &[],
+        ),
         ("hyper_pre", "hyper_pre", &[]),
         ("hyper_post", "hyper_post", &[]),
         ("softmax", "softmax", &[]),

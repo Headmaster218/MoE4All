@@ -1,0 +1,74 @@
+#version 460
+// Decode-specialized DeepSeek V4 hyper-connection gates for the production hc=4 shape.
+// One 32-lane workgroup owns one token. Four lanes perform each row/column normalization in
+// parallel while preserving the reference's ascending four-element reduction order inside a
+// lane. The generic kernel remains the fallback for batches and every other hc.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint  rows;
+    uint  hc;
+    uint  mix_dim;
+    float eps;
+    uint  n_iter;
+} pc;
+
+layout(binding = 0) readonly buffer MB { float mixes[]; };
+layout(binding = 1) readonly buffer SB { float scl[]; };
+layout(binding = 2) readonly buffer BB { float bse[]; };
+layout(binding = 3) writeonly buffer PB { float pre[]; };
+layout(binding = 4) writeonly buffer OB { float post[]; };
+layout(binding = 5) writeonly buffer CB { float comb[]; };
+
+shared float m[16];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.rows) { return; }
+    uint lane = gl_LocalInvocationID.x;
+    uint mb = t * pc.mix_dim;
+
+    if (lane < 4u) {
+        float zp = mixes[mb + lane] * scl[0] + bse[lane];
+        float zo = mixes[mb + 4u + lane] * scl[1] + bse[4u + lane];
+        pre[t*4u + lane] = 1.0 / (1.0 + exp(-zp)) + pc.eps;
+        post[t*4u + lane] = 2.0 / (1.0 + exp(-zo));
+    }
+    if (lane < 16u) {
+        m[lane] = mixes[mb + 8u + lane] * scl[2] + bse[8u + lane];
+    }
+    barrier();
+
+    if (lane < 4u) {
+        uint o = lane * 4u;
+        float mx = m[o];
+        for (uint d = 1u; d < 4u; ++d) { mx = max(mx, m[o + d]); }
+        float sum = 0.0;
+        for (uint d = 0u; d < 4u; ++d) {
+            m[o + d] = exp(m[o + d] - mx);
+            sum += m[o + d];
+        }
+        for (uint d = 0u; d < 4u; ++d) { m[o + d] = m[o + d] / sum + pc.eps; }
+    }
+    barrier();
+
+    for (uint it = 0u; it < pc.n_iter; ++it) {
+        if (it > 0u && lane < 4u) {
+            uint o = lane * 4u;
+            float sum = 0.0;
+            for (uint d = 0u; d < 4u; ++d) { sum += m[o + d]; }
+            sum += pc.eps;
+            for (uint d = 0u; d < 4u; ++d) { m[o + d] /= sum; }
+        }
+        barrier();
+        if (lane < 4u) {
+            float sum = 0.0;
+            for (uint src = 0u; src < 4u; ++src) { sum += m[lane + 4u*src]; }
+            sum += pc.eps;
+            for (uint src = 0u; src < 4u; ++src) { m[lane + 4u*src] /= sum; }
+        }
+        barrier();
+    }
+
+    if (lane < 16u) { comb[t*16u + lane] = m[lane]; }
+}

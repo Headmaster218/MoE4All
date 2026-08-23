@@ -2440,6 +2440,18 @@ pub(crate) fn hyper_mix_gates_spv() -> &'static [u32] {
         )))
     })
 }
+/// Decode-specialized production `hc=4` hyper-connection gates: one workgroup per token, with
+/// independent Sinkhorn rows/columns evaluated by four lanes instead of one serial lane.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_mix_gates_decode_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/hyper_mix_gates_decode.spv"
+        )))
+    })
+}
 /// SPIR-V for the hyper-connection stream collapse (`hyper_pre.comp`, `Op::HyperConnectPre`).
 /// Used by the recorder's `hyper_pre`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
