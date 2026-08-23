@@ -2486,8 +2486,8 @@ impl MoePagerSession {
 
     /// Resolve several roles from one shared size pool in caller order, then move all resulting
     /// host-tier misses concurrently. This preserves the exact LRU/LUT decisions of repeated
-    /// [`Self::push_role_cpu`] calls while allowing split Gate+Up banks to share one deeper SSD /
-    /// RAM-to-ReBAR batch. The caller must have opened one shared pager epoch first.
+    /// [`Self::push_role_cpu`] calls while allowing split Gate/Up/Down banks to share one deeper
+    /// SSD / RAM-to-ReBAR batch. The caller must have opened one shared pager epoch first.
     pub fn push_roles_cpu(&mut self, roles: &[(usize, &[u32])], scan: bool) -> Result<usize> {
         if roles.is_empty() {
             return Ok(0);

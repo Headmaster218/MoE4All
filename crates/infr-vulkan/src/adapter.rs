@@ -6484,8 +6484,11 @@ fn execute_paged_moe<'a>(
     } else {
         false
     };
-    let gate_up_batched = shared_batch && !stage_ids.is_empty();
-    if gate_up_batched {
+    // On one shared size pool, resolving all three roles before moving bytes gives the host tier
+    // enough independent work to saturate SSD/RAM/ReBAR. It is measurably faster than preserving
+    // the smaller Down-only overlap window on large-expert Decode.
+    let roles_batched = shared_batch && !stage_ids.is_empty();
+    if roles_batched {
         let mut guard = be_.moe_pager().lock().unwrap();
         guard
             .as_mut()
@@ -6494,11 +6497,12 @@ fn execute_paged_moe<'a>(
                 &[
                     (gate_id, stage_ids.as_slice()),
                     (up_id, stage_ids.as_slice()),
+                    (down_id, stage_ids.as_slice()),
                 ],
                 touch_all,
             )?;
     }
-    let gate_up_stage_ids = if gate_up_batched {
+    let role_stage_ids = if roles_batched {
         &[][..]
     } else {
         stage_ids.as_slice()
@@ -6511,7 +6515,7 @@ fn execute_paged_moe<'a>(
             rec,
             ps,
             gate_id,
-            gate_up_stage_ids,
+            role_stage_ids,
             n_expert,
             touch_all,
             shared_batch,
@@ -6527,13 +6531,15 @@ fn execute_paged_moe<'a>(
             rec,
             ps,
             up_id,
-            gate_up_stage_ids,
+            role_stage_ids,
             n_expert,
             touch_all,
             shared_batch,
         )?
     };
-    let down_has_miss = if !layer_stream && !stage_ids.is_empty() {
+    let down_has_miss = if roles_batched {
+        false
+    } else if !layer_stream && !stage_ids.is_empty() {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("paged execution requires a session");
         !sess.routed_all_resident(down_id, &stage_ids)?
@@ -6555,7 +6561,7 @@ fn execute_paged_moe<'a>(
             rec,
             ps,
             down_id,
-            &stage_ids,
+            role_stage_ids,
             n_expert,
             touch_all,
             shared_batch,
