@@ -106,6 +106,12 @@ impl FileStamp {
 /// One file of the model, and where its bytes sit in the address space the extents are written in.
 struct ShardIo {
     file: File,
+    /// Windows synchronous `ReadFile` calls issued through one file handle are serialized by the
+    /// kernel even when their byte ranges are independent. Keep additional handles opened on the
+    /// same file object generation so `read_pieces` can actually put several requests in flight.
+    /// Unix positioned reads do not need this: one descriptor already permits concurrent pread.
+    #[cfg(windows)]
+    fanout_files: Vec<File>,
     stamp: FileStamp,
     /// Path kept for error messages only — every read and every re-stat goes through `file`.
     path: String,
@@ -163,8 +169,34 @@ impl FileBlockIo {
                 )));
             }
         }
+        #[cfg(windows)]
+        let fanout_files = {
+            // One is the exact legacy path and is useful for repeatable A/B runs. Values above the
+            // compile-time fanout cannot create more simultaneous work, so cap rather than keeping
+            // idle descriptors around. Read once at model open; there is no hot-path env lookup.
+            let handles = std::env::var("INFR_WINDOWS_FILE_FANOUT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(IO_FANOUT)
+                .clamp(1, IO_FANOUT);
+            let mut out = Vec::with_capacity(handles.saturating_sub(1));
+            for _ in 1..handles {
+                let extra = File::open(path)?;
+                let extra_stamp = FileStamp::of(&extra)?;
+                if extra_stamp != stamp {
+                    return Err(Error::Loader(format!(
+                        "model file changed while opening parallel readers: {}",
+                        path.display()
+                    )));
+                }
+                out.push(extra);
+            }
+            out
+        };
         Ok(ShardIo {
             file,
+            #[cfg(windows)]
+            fanout_files,
             stamp,
             path: path.display().to_string(),
             base,
@@ -231,6 +263,27 @@ impl FileBlockIo {
             )));
         }
         Ok((shard, local))
+    }
+}
+
+impl ShardIo {
+    /// Pick an independent Windows handle for one concurrent piece. The primary descriptor is
+    /// lane zero and remains the identity/mtime authority; every extra descriptor was opened and
+    /// stamp-checked alongside it. On Unix every lane intentionally shares the positioned-read fd.
+    fn read_file(&self, lane: usize) -> &File {
+        #[cfg(windows)]
+        {
+            if lane == 0 || self.fanout_files.is_empty() {
+                &self.file
+            } else {
+                &self.fanout_files[(lane - 1) % self.fanout_files.len()]
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = lane;
+            &self.file
+        }
     }
 }
 
@@ -339,30 +392,32 @@ fn read_pieces<'a>(
         "dst must be exactly the pieces' total"
     );
     let mut rest = dst;
-    let mut placed: Vec<(&ShardIo, BlockExtent, &mut [u8])> = Vec::with_capacity(pieces.len());
-    for (shard, e) in pieces {
+    let mut placed: Vec<(usize, &ShardIo, BlockExtent, &mut [u8])> =
+        Vec::with_capacity(pieces.len());
+    for (lane, (shard, e)) in pieces.into_iter().enumerate() {
         let (mine, tail) = rest.split_at_mut(e.len);
         rest = tail;
-        placed.push((shard, e, mine));
+        placed.push((lane, shard, e, mine));
     }
     debug_assert!(rest.is_empty(), "the pieces must cover dst exactly");
 
     // The calling thread takes the last piece rather than parking on a join, so a single-piece
     // block spawns nothing at all and the common case costs no threads.
-    let Some((last_shard, last, last_dst)) = placed.pop() else {
+    let Some((last_lane, last_shard, last, last_dst)) = placed.pop() else {
         return Ok(());
     };
     let mut first_err = None;
     std::thread::scope(|s| {
         let handles: Vec<_> = placed
             .into_iter()
-            .map(|(shard, e, buf)| {
+            .map(|(lane, shard, e, buf)| {
                 s.spawn(move || {
-                    read_exact_at(&shard.file, e.offset, buf).map_err(|err| (shard, e, err))
+                    read_exact_at(shard.read_file(lane), e.offset, buf)
+                        .map_err(|err| (shard, e, err))
                 })
             })
             .collect();
-        first_err = read_exact_at(&last_shard.file, last.offset, last_dst)
+        first_err = read_exact_at(last_shard.read_file(last_lane), last.offset, last_dst)
             .map_err(|err| (last_shard, last, err))
             .err();
         for h in handles {
