@@ -16,6 +16,7 @@ use super::{as_vk_buf, be, VulkanBackend};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnifiedVramClass {
     Expert,
+    LlmRuntime,
     EmbeddingWeights,
     EmbeddingRuntime,
     VisionWeights,
@@ -25,17 +26,18 @@ pub enum UnifiedVramClass {
 }
 
 impl UnifiedVramClass {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         match self {
             Self::Expert => 0,
-            Self::EmbeddingWeights => 1,
-            Self::EmbeddingRuntime => 2,
-            Self::VisionWeights => 3,
-            Self::VisionRuntime => 4,
-            Self::DraftWeights => 5,
-            Self::DraftRuntime => 6,
+            Self::LlmRuntime => 1,
+            Self::EmbeddingWeights => 2,
+            Self::EmbeddingRuntime => 3,
+            Self::VisionWeights => 4,
+            Self::VisionRuntime => 5,
+            Self::DraftWeights => 6,
+            Self::DraftRuntime => 7,
         }
     }
 }
@@ -181,6 +183,48 @@ impl UnifiedRangePool {
         class: UnifiedVramClass,
     ) -> Option<Arc<UnifiedAllocation>> {
         self.allocate_with_policy(requested_len, align, class, false)
+    }
+
+    /// Allocate from the highest fitting address. Variable-sized auxiliary weights and runtime
+    /// workspaces grow down from the opposite end of each shard to the fixed-size Expert slots,
+    /// so releasing them exposes a coalesced suffix instead of leaving holes throughout the LRU.
+    fn allocate_high(
+        &self,
+        requested_len: usize,
+        align: usize,
+        class: UnifiedVramClass,
+    ) -> Option<Arc<UnifiedAllocation>> {
+        if requested_len == 0 || align == 0 || !align.is_power_of_two() {
+            return None;
+        }
+        let len = align_up(requested_len, align)?;
+        let mut state = self.inner.state.lock().unwrap();
+        let mut selected = None;
+        'shards: for shard_idx in (0..state.shards.len()).rev() {
+            let shard = &state.shards[shard_idx];
+            for (&free_start, &span) in shard.free.iter().rev() {
+                let range_end = free_start.checked_add(span)?;
+                let Some(latest) = range_end.checked_sub(len) else {
+                    continue;
+                };
+                let offset = latest & !(align - 1);
+                if offset >= free_start {
+                    selected = Some((shard_idx, free_start, offset));
+                    break 'shards;
+                }
+            }
+        }
+        let (shard, free_start, offset) = selected?;
+        take_range(&mut state.shards[shard].free, free_start, offset, len);
+        Some(make_allocation(
+            &self.inner,
+            &mut state,
+            shard,
+            offset,
+            len,
+            requested_len,
+            class,
+        ))
     }
 
     fn allocate_with_policy(
@@ -407,7 +451,7 @@ impl UnifiedVramPool {
         let lease = if class == UnifiedVramClass::Expert {
             self.ranges.allocate_first_fit(bytes, 256, class)?
         } else {
-            self.ranges.allocate(bytes, 256, class)?
+            self.ranges.allocate_high(bytes, 256, class)?
         };
         let shard = Arc::clone(self.shards.get(lease.range().shard)?);
         Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
@@ -594,5 +638,36 @@ mod tests {
         assert!(allocated > before);
         drop(allocation);
         assert!(pool.generation() > allocated);
+    }
+
+    #[test]
+    fn experts_grow_low_and_variable_objects_grow_high() {
+        let pool = UnifiedRangePool::new([4096]).unwrap();
+        let expert = pool
+            .allocate_first_fit(512, 256, UnifiedVramClass::Expert)
+            .unwrap();
+        let weights = pool
+            .allocate_high(768, 256, UnifiedVramClass::EmbeddingWeights)
+            .unwrap();
+        let runtime = pool
+            .allocate_high(256, 256, UnifiedVramClass::EmbeddingRuntime)
+            .unwrap();
+        assert_eq!(expert.range().offset, 0);
+        assert_eq!(weights.range().offset, 4096 - 768);
+        assert_eq!(runtime.range().offset, 4096 - 768 - 256);
+    }
+
+    #[test]
+    fn high_allocation_skips_an_undersized_higher_range() {
+        let pool = UnifiedRangePool::new([1024]).unwrap();
+        let barrier = pool
+            .try_claim_exact(0, 512, 256, UnifiedVramClass::Expert)
+            .unwrap();
+        let allocation = pool
+            .allocate_high(512, 256, UnifiedVramClass::EmbeddingWeights)
+            .unwrap();
+        assert_eq!(allocation.range().offset, 0);
+        assert_eq!(allocation.range().len, 512);
+        drop(barrier);
     }
 }

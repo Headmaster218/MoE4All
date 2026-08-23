@@ -524,6 +524,12 @@ pub trait Backend: Send + Sync {
     fn device_alloc_room(&self) -> Option<u64> {
         None
     }
+    /// Bytes already committed to an elastic device arena that an activation allocation may
+    /// reclaim without consuming [`Self::device_alloc_room`]. Persistent allocations such as KV
+    /// must not spend this allowance. Backends without such an arena return `None`.
+    fn device_elastic_activation_room(&self) -> Option<u64> {
+        None
+    }
     /// High-water mark of concurrently-live [`BufferUsage::Activations`] bytes since this backend
     /// was created, and `None` from a backend that does not track it. The oracle for the seam's
     /// activation reserve: the reserve is a PREDICTION of this number, so a session that ends with

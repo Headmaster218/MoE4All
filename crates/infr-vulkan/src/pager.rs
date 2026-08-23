@@ -1929,6 +1929,19 @@ impl MoePagerSession {
             .map(|pool| pool.pager.try_restore_loaned_slots())
             .sum();
         self.unified_generation = self.unified_pool.generation();
+        if restored != 0 {
+            let stats = self.unified_pool.stats();
+            tracing::info!(
+                restored_slots = restored,
+                expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
+                embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
+                embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
+                free_bytes = stats.free_bytes,
+                largest_free_bytes = stats.largest_free_bytes,
+                "restored released unified VRAM to the Expert cache"
+            );
+        }
         restored
     }
 

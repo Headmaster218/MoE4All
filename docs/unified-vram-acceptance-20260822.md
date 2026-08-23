@@ -1,5 +1,9 @@
 # Unified VRAM acceptance — 2026-08-22
 
+> Historical first-stage result. The persistent-Embedding and separate-runtime-reserve behavior
+> described below was superseded by the fully elastic design accepted on 2026-08-24; see
+> [`unified-vram-elastic-acceptance-20260824.md`](unified-vram-elastic-acceptance-20260824.md).
+
 ## Result
 
 The native LLM and native Embedding engine now share one logical VRAM arena. The arena may span

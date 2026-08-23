@@ -1722,6 +1722,13 @@ impl ModelMemoryPlan {
             .saturating_add(self.load_driver_reserve_bytes)
             .saturating_add(self.post_load_reserve_bytes)
     }
+
+    /// Physical size of the elastic Expert/runtime arena. Runtime is deducted while calculating
+    /// the target Expert occupancy, then added back here because it borrows the same bytes only
+    /// while a graph is active instead of living in a separate permanently idle reservation.
+    pub fn elastic_pool_bytes(self, expert_cache_target_bytes: u64) -> u64 {
+        expert_cache_target_bytes.saturating_add(self.runtime_reserve_bytes)
+    }
 }
 
 /// Resident BDA weights are packed into adaptive 64/128/256 MiB blocks, so summing logical tensor
@@ -1891,6 +1898,23 @@ pub(crate) fn kv_fit_ctx_in_budget(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
+    kv_fit_ctx_in_budgets(cfg, caps, ec, budget, None, cands, k_fmt, v_fmt)
+}
+
+/// Context fit with separate placement domains. `persistent_budget` is ordinary device room and
+/// must contain KV/recurrent state. `elastic_activation_budget`, when present, is an already-
+/// committed arena that only activation scratch may borrow; keeping the two tests separate avoids
+/// pretending that persistent KV can consume Expert slots.
+fn kv_fit_ctx_in_budgets(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    persistent_budget: u64,
+    elastic_activation_budget: Option<u64>,
+    cands: &[usize],
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
     if (0..cfg.n_layer).all(|l| kv_row_elems(cfg, l) == (0, 0)) {
         return None;
     }
@@ -1900,7 +1924,10 @@ pub(crate) fn kv_fit_ctx_in_budget(
         cands.iter().any(|&ubatch| {
             let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
             let reserve = dense_act_reserve_at(cfg, caps, ctx, ubatch);
-            kv.saturating_add(reserve) <= budget
+            elastic_activation_budget.map_or_else(
+                || kv.saturating_add(reserve) <= persistent_budget,
+                |activation_budget| kv <= persistent_budget && reserve <= activation_budget,
+            )
         })
     };
     // Monotone in ctx (both terms grow with it), so double-then-bisect finds the exact boundary.
@@ -1979,6 +2006,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     let caps = be.capabilities();
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
+    let elastic_activation = be.device_elastic_activation_room();
     // Walk the chunk ladder HERE too, and price each rung on its own: a shorter chunk shrinks both
     // the activation reserve and the SWA ring, so it buys context, and the rung the pre-load sweep
     // pinned was chosen against weight bytes that turned out to be ~2% light. Pricing only the
@@ -1989,7 +2017,18 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
-    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, &caps, ec, budget, &[ub], k_fmt, v_fmt);
+    let at = |ub: usize| {
+        kv_fit_ctx_in_budgets(
+            cfg,
+            &caps,
+            ec,
+            budget,
+            elastic_activation,
+            &[ub],
+            k_fmt,
+            v_fmt,
+        )
+    };
     let Some(_) = at(cands[0]) else {
         return want_ctx; // pure recurrent-state arch: no per-token KV to size.
     };
@@ -2103,9 +2142,10 @@ fn moe_host_backing(
     let budget = match requested {
         infr_core::hostmem::Requested::Fixed(bytes) => bytes.min(payload_bytes as u64),
         infr_core::hostmem::Requested::Off | infr_core::hostmem::Requested::Bypass => 0,
-        infr_core::hostmem::Requested::Auto => available.map_or(payload_bytes as u64, |available| {
-            infr_core::hostmem::auto_arena_bytes(available, 0, payload_bytes as u64)
-        }),
+        infr_core::hostmem::Requested::Auto => available
+            .map_or(payload_bytes as u64, |available| {
+                infr_core::hostmem::auto_arena_bytes(available, 0, payload_bytes as u64)
+            }),
     } as usize;
     if budget >= payload_bytes {
         MoeHostBacking::Full
@@ -2153,8 +2193,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let caps = vk.capabilities();
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
+    let mut expert_cache_target_bytes = 0u64;
     let mut pager_budget_bytes = 0u64;
-    let mut load_reserve_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -2225,7 +2265,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // total-process budget or the physical allocator ceiling. Percent keeps its old
                 // AVAILABLE-VRAM base for compatibility.
                 let requested = spec.resolve(vram.available);
-                pager_budget_bytes = requested.min(auto_budget);
+                expert_cache_target_bytes = requested.min(auto_budget);
                 if requested > auto_budget {
                     tracing::warn!(
                         "INFR_CACHE requested {:.2} GB of expert arena but the unified VRAM plan \
@@ -2240,12 +2280,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // experts from every layer and is strictly more flexible than pinning a prefix of
                 // complete layers.
                 n_paged = cfg.n_layer;
-                pager_budget_bytes = auto_budget;
+                expert_cache_target_bytes = auto_budget;
             }
             None => {}
         }
         if n_paged > 0 {
-            load_reserve_bytes = plan.runtime_reserve_bytes;
+            // Runtime scratch and Experts now share one physical elastic arena. The planner still
+            // subtracts the worst-case runtime peak to preserve the hard total-VRAM ceiling, but
+            // those bytes are no longer stranded outside the cache while Decode uses only a tiny
+            // workspace: they begin life as ordinary expert slots and graph execution borrows
+            // exactly the ranges it actually allocates. Initializing the arena first also serves
+            // the old load-time escrow purpose, so a second dedicated reservation would both
+            // waste VRAM and double-charge the same bytes.
+            pager_budget_bytes = plan.elastic_pool_bytes(expert_cache_target_bytes);
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
@@ -2253,9 +2300,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             format!("k={k_fmt:?}, v={v_fmt:?}")
         };
         tracing::info!(
-            "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime={:.2} GB \
+            "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime_elastic={:.2} GB \
              packing_margin={:.2} GB load_driver={:.2} GB post_load={:.2} GB \
-             expert_cache={:.2} GB ({cache_layout}, ctx={want_ctx})",
+             expert_cache_target={:.2} GB elastic_pool={:.2} GB ({cache_layout}, ctx={want_ctx})",
             room as f64 / 1e9,
             plan.fixed_weight_bytes as f64 / 1e9,
             plan.persistent_state_bytes as f64 / 1e9,
@@ -2264,11 +2311,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
             plan.load_driver_reserve_bytes as f64 / 1e9,
             plan.post_load_reserve_bytes as f64 / 1e9,
             (if n_paged > 0 {
-                pager_budget_bytes
+                expert_cache_target_bytes
             } else {
                 fp.expert
             }) as f64
                 / 1e9,
+            pager_budget_bytes as f64 / 1e9,
         );
     }
     // The layer index of a `blk.{l}.…_exps…` tensor name.
@@ -2444,11 +2492,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 ec.paging.dram.map(|s| s.resolve(0)),
                 ec.paging.dram_bypass,
             );
-            let host_backing = moe_host_backing(
-                requested,
-                infr_core::hostmem::available_bytes(),
-                host_bytes,
-            );
+            let host_backing =
+                moe_host_backing(requested, infr_core::hostmem::available_bytes(), host_bytes);
             let (host_kind, host_resident_bytes) = match host_backing {
                 MoeHostBacking::Full => ("full-RAM", host_bytes),
                 MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
@@ -2578,7 +2623,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 n_paged
             };
             vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
-                load_reserve_bytes,
+                // The runtime reserve is part of `pager_budget_bytes` and therefore physically
+                // escrowed by the unified arena itself. No second load-only allocation.
+                load_reserve_bytes: 0,
                 n_blocks,
                 pools,
                 host_chunks,
@@ -5331,6 +5378,21 @@ mod seam_helper_tests {
         .expect("plan");
         assert_eq!(plan.expert_cache_bytes, 12 * GIB + 256 * MIB);
         assert_eq!(plan.minimum_required_bytes(), 7 * GIB + 768 * MIB);
+        assert_eq!(
+            plan.elastic_pool_bytes(plan.expert_cache_bytes),
+            13 * GIB + 256 * MIB
+        );
+        assert_eq!(plan.elastic_pool_bytes(4 * GIB), 5 * GIB);
+        assert_eq!(
+            plan.elastic_pool_bytes(plan.expert_cache_bytes)
+                .saturating_add(plan.fixed_weight_bytes)
+                .saturating_add(plan.persistent_state_bytes)
+                .saturating_add(plan.weight_packing_margin_bytes)
+                .saturating_add(plan.load_driver_reserve_bytes)
+                .saturating_add(plan.post_load_reserve_bytes),
+            plan.total_room_bytes,
+            "the shared runtime reserve must be returned to the physical elastic arena exactly once"
+        );
 
         let dsv4_plan = super::ModelMemoryPlan::new_with_reserves(
             20 * GIB,
@@ -5531,7 +5593,7 @@ mod seam_helper_tests {
     /// A `Backend` that reports nothing but a live allocation budget — enough to drive
     /// [`super::reclamp_ctx_to_live_room`], which touches no other method. `room: None` stands in
     /// for the CPU/Metal backends, which have no budget to report.
-    struct RoomOnly(Option<u64>);
+    struct RoomOnly(Option<u64>, Option<u64>);
 
     impl infr_core::backend::Backend for RoomOnly {
         fn name(&self) -> &str {
@@ -5580,6 +5642,9 @@ mod seam_helper_tests {
         fn device_alloc_room(&self) -> Option<u64> {
             self.0
         }
+        fn device_elastic_activation_room(&self) -> Option<u64> {
+            self.1
+        }
     }
 
     /// The post-load re-clamp only ever SHRINKS, and only a context the session chose. Each arm is
@@ -5599,18 +5664,18 @@ mod seam_helper_tests {
         };
 
         // No budget to report: the caller's window survives untouched.
-        assert_eq!(call(&RoomOnly(None), &ec), want);
+        assert_eq!(call(&RoomOnly(None, None), &ec), want);
 
         // Roomy: the fit is past `want`, so the window is kept rather than raised.
         let roomy = super::kv_bytes_estimate_fmt(&cfg, want, true, 1024, k, v)
             + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, 1024)
             + super::POST_KV_DEVICE_RESERVE
             + (1 << 30);
-        assert_eq!(call(&RoomOnly(Some(roomy)), &ec), want);
+        assert_eq!(call(&RoomOnly(Some(roomy), None), &ec), want);
 
         // Tight: cut, and cut to a window that really fits the budget it was given.
         let tight = roomy / 3;
-        let got = call(&RoomOnly(Some(tight)), &ec);
+        let got = call(&RoomOnly(Some(tight), None), &ec);
         assert!(got < want, "a tight device must shrink the window: {got}");
         let ub = super::ubatch_rows(&ec);
         let need = super::kv_bytes_estimate_fmt(&cfg, got, true, ub, k, v)
@@ -5628,7 +5693,47 @@ mod seam_helper_tests {
             },
             ..Default::default()
         };
-        assert_eq!(call(&RoomOnly(Some(tight)), &pinned), want);
+        assert_eq!(call(&RoomOnly(Some(tight), None), &pinned), want);
+    }
+
+    #[test]
+    fn reclamp_accounts_elastic_activation_separately_from_kv_room() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        let caps = infr_core::backend::Capabilities::default();
+        let (k, v) = (DType::F16, DType::F16);
+        let want = 32768;
+        let ubatch = super::ubatch_rows(&ec);
+        let kv = super::kv_bytes_estimate_fmt(&cfg, want, true, ubatch, k, v);
+        let activation = super::dense_act_reserve_at(&cfg, &caps, want, ubatch);
+        let physical_room = kv + super::POST_KV_DEVICE_RESERVE;
+
+        let without_elastic = super::reclamp_ctx_to_live_room(
+            &RoomOnly(Some(physical_room), None),
+            &cfg,
+            &ec,
+            want,
+            k,
+            v,
+        );
+        assert!(
+            without_elastic < want,
+            "ordinary room cannot be spent twice on KV and activation"
+        );
+
+        let with_elastic = super::reclamp_ctx_to_live_room(
+            &RoomOnly(Some(physical_room), Some(activation)),
+            &cfg,
+            &ec,
+            want,
+            k,
+            v,
+        );
+        assert_eq!(
+            with_elastic, want,
+            "an already-committed elastic arena must cover activation without hiding KV room"
+        );
     }
 
     #[test]

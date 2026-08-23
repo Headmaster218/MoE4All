@@ -12,7 +12,7 @@ use infr_core::{
 use infr_gguf::Gguf;
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -91,6 +91,9 @@ impl NomicConfig {
 #[derive(Clone)]
 struct WeightSpec {
     label: String,
+    source: String,
+    source_offset: usize,
+    nbytes: usize,
     desc: TensorDesc,
 }
 
@@ -128,11 +131,18 @@ struct NativePlan {
 
 /// Nomic-BERT embedding inference executed directly by INFR's CPU or Vulkan graph backend.
 pub struct NativeEmbeddingEngine {
+    model_path: PathBuf,
     cfg: NomicConfig,
     tokenizer: BertWordPiece,
     backend: Box<dyn Backend>,
     specs: Vec<WeightSpec>,
-    weights: Vec<Box<dyn Buffer>>,
+    weights: Mutex<Option<Vec<Box<dyn Buffer>>>>,
+    weight_bytes: u64,
+    /// A backend fork sharing the LLM elastic arena loads weights only for an active request and
+    /// drops them after the final GPU fence. Standalone CPU/Vulkan embedding keeps the established
+    /// eager-resident behavior because it has no Expert cache to return capacity to.
+    evict_after_request: bool,
+    unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
     layout: WeightLayout,
     plans: Mutex<HashMap<usize, NativePlan>>,
     resource: Arc<ResourceTracker>,
@@ -144,13 +154,15 @@ impl NativeEmbeddingEngine {
             path,
             Box::new(infr_cpu::CpuBackend::new_with(engine_cfg)),
             MemoryTier::Ram,
+            false,
+            None,
         )
     }
 
     pub fn load_vulkan(path: &Path, engine_cfg: Arc<infr_core::config::Config>) -> Result<Self> {
         let backend = infr_vulkan::VulkanBackend::new_with(engine_cfg)
             .map_err(|error| anyhow!("initialize Vulkan embedding backend: {error}"))?;
-        Self::load(path, Box::new(backend), MemoryTier::Vram)
+        Self::load(path, Box::new(backend), MemoryTier::Vram, false, None)
     }
 
     /// Load on a Vulkan client derived from an already-warm LLM backend. The client shares the
@@ -159,17 +171,41 @@ impl NativeEmbeddingEngine {
         path: &Path,
         backend: infr_vulkan::VulkanBackend,
     ) -> Result<Self> {
-        Self::load(path, Box::new(backend), MemoryTier::Vram)
+        let unified_pool = backend.unified_vram();
+        Self::load(
+            path,
+            Box::new(backend),
+            MemoryTier::Vram,
+            true,
+            unified_pool,
+        )
     }
 
-    fn load(path: &Path, backend: Box<dyn Backend>, tier: MemoryTier) -> Result<Self> {
+    fn load(
+        path: &Path,
+        backend: Box<dyn Backend>,
+        tier: MemoryTier,
+        evict_after_request: bool,
+        unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
+    ) -> Result<Self> {
         if !path.is_file() {
             bail!("embedding model does not exist: {}", path.display());
         }
         let gguf = Gguf::open(path).map_err(|error| anyhow!(error.to_string()))?;
         let cfg = NomicConfig::from_gguf(&gguf)?;
         let tokenizer = BertWordPiece::from_metadata(gguf.metadata(), cfg.public.max_context)?;
-        let (specs, weights, layout, resident_bytes) = load_weights(&gguf, &cfg, backend.as_ref())?;
+        let (specs, layout, weight_bytes) = build_weight_catalog(&gguf, &cfg)?;
+        let weights = if evict_after_request {
+            None
+        } else {
+            Some(load_weight_buffers(&gguf, &specs, backend.as_ref())?)
+        };
+        let resident_bytes = weights.as_ref().map_or(0, |_| weight_bytes);
+        let resident_tier = if weights.is_some() {
+            tier
+        } else {
+            MemoryTier::Ssd
+        };
         let model_id = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -180,24 +216,30 @@ impl NativeEmbeddingEngine {
             architecture = %cfg.public.architecture,
             backend = backend.name(),
             tier = ?tier,
-            weights_mib = resident_bytes as f64 / 1048576.0,
+            weights_mib = weight_bytes as f64 / 1048576.0,
+            resident_mib = resident_bytes as f64 / 1048576.0,
+            dynamic_weights = evict_after_request,
             "native embedding model ready"
         );
         Ok(Self {
+            model_path: path.to_owned(),
             cfg,
             tokenizer,
             backend,
             specs,
-            weights,
+            weights: Mutex::new(weights),
+            weight_bytes,
+            evict_after_request,
+            unified_pool,
             layout,
             plans: Mutex::new(HashMap::new()),
             resource: Arc::new(ResourceTracker::new(
                 format!("embedding:{model_id}"),
                 ResourceKind::EmbeddingWeights,
+                weight_bytes,
                 resident_bytes,
-                resident_bytes,
-                tier,
-                resident_bytes,
+                resident_tier,
+                weight_bytes,
             )),
         })
     }
@@ -223,20 +265,80 @@ impl NativeEmbeddingEngine {
                 .context("embedding prompt-token count overflow")
         })?;
         let _lease = self.resource.acquire();
-        let mut plans = self.plans.lock().unwrap_or_else(|error| error.into_inner());
-        let mut embeddings = Vec::with_capacity(encoded.len());
-        for ids in encoded {
-            if !plans.contains_key(&ids.len()) {
-                let plan = self.build_plan(ids.len())?;
-                plans.insert(ids.len(), plan);
-            }
-            let plan = plans.get_mut(&ids.len()).expect("plan inserted above");
-            embeddings.push(self.execute_plan(plan, &ids)?);
+        let mut weights = self
+            .weights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if weights.is_none() {
+            let gguf = Gguf::open(&self.model_path).map_err(|error| anyhow!(error.to_string()))?;
+            let loaded = load_weight_buffers(&gguf, &self.specs, self.backend.as_ref())?;
+            *weights = Some(loaded);
+            self.resource
+                .set_residency(MemoryTier::Vram, self.weight_bytes);
+            tracing::info!(
+                weights_mib = self.weight_bytes as f64 / 1048576.0,
+                "embedding weights admitted to unified VRAM"
+            );
         }
-        Ok(EmbeddingBatch {
-            embeddings,
-            prompt_tokens,
-        })
+        let result = (|| {
+            let resident = weights.as_ref().expect("weights loaded above");
+            let mut plans = self.plans.lock().unwrap_or_else(|error| error.into_inner());
+            let mut embeddings = Vec::with_capacity(encoded.len());
+            for ids in encoded {
+                if !plans.contains_key(&ids.len()) {
+                    let plan = self.build_plan(ids.len())?;
+                    plans.insert(ids.len(), plan);
+                }
+                let plan = plans.get_mut(&ids.len()).expect("plan inserted above");
+                embeddings.push(self.execute_plan(plan, &ids, resident)?);
+            }
+            Ok(EmbeddingBatch {
+                embeddings,
+                prompt_tokens,
+            })
+        })();
+        if self.evict_after_request {
+            if let Some(pool) = &self.unified_pool {
+                use infr_vulkan::unified::UnifiedVramClass;
+                let stats = pool.stats();
+                tracing::info!(
+                    arena_bytes = stats.capacity_bytes,
+                    expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                    llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
+                    embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
+                    embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
+                    free_bytes = stats.free_bytes,
+                    largest_free_bytes = stats.largest_free_bytes,
+                    "embedding request post-execution unified VRAM residency"
+                );
+            }
+            // `Backend::execute` and the output download are synchronous: no command can still
+            // reference the transient activation ranges (which have already dropped). Dropping the
+            // weight buffers returns their ranges to the unified pool; the length-specific plan
+            // itself retains only tiny host-visible input/readback buffers and can be reused. The
+            // next LLM pager entry restores every now-free exact Expert slot.
+            weights.take();
+            self.resource.set_residency(MemoryTier::Ssd, 0);
+            if let Some(pool) = &self.unified_pool {
+                use infr_vulkan::unified::UnifiedVramClass;
+                let stats = pool.stats();
+                tracing::info!(
+                    arena_bytes = stats.capacity_bytes,
+                    expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                    llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
+                    embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
+                    embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
+                    free_bytes = stats.free_bytes,
+                    largest_free_bytes = stats.largest_free_bytes,
+                    "embedding request released unified VRAM"
+                );
+            }
+            tracing::info!(
+                weights_mib = self.weight_bytes as f64 / 1048576.0,
+                "embedding weights released from unified VRAM"
+            );
+        }
+        result
     }
 
     fn build_plan(&self, rows: usize) -> Result<NativePlan> {
@@ -466,7 +568,12 @@ impl NativeEmbeddingEngine {
         })
     }
 
-    fn execute_plan(&self, plan: &mut NativePlan, ids: &[u32]) -> Result<Vec<f32>> {
+    fn execute_plan(
+        &self,
+        plan: &mut NativePlan,
+        ids: &[u32],
+        weights: &[Box<dyn Buffer>],
+    ) -> Result<Vec<f32>> {
         self.backend
             .upload(plan.ids_buffer.as_ref(), bytemuck::cast_slice(ids))
             .map_err(|error| anyhow!("upload embedding token ids: {error}"))?;
@@ -482,7 +589,7 @@ impl NativeEmbeddingEngine {
             .bind(plan.ids, plan.ids_buffer.as_ref())
             .bind(plan.positions, plan.positions_buffer.as_ref())
             .bind(plan.output, plan.output_buffer.as_ref());
-        for ((id, buffer), spec) in plan.weight_ids.iter().zip(&self.weights).zip(&self.specs) {
+        for ((id, buffer), spec) in plan.weight_ids.iter().zip(weights).zip(&self.specs) {
             debug_assert_eq!(
                 buffer.len_bytes(),
                 spec.desc
@@ -540,22 +647,18 @@ impl EmbeddingEngine for NativeEmbeddingEngine {
     }
 }
 
-struct WeightLoader<'a> {
+struct WeightCatalogBuilder<'a> {
     gguf: &'a Gguf,
-    backend: &'a dyn Backend,
     specs: Vec<WeightSpec>,
-    buffers: Vec<Box<dyn Buffer>>,
-    resident_bytes: u64,
+    weight_bytes: u64,
 }
 
-impl<'a> WeightLoader<'a> {
-    fn new(gguf: &'a Gguf, backend: &'a dyn Backend) -> Self {
+impl<'a> WeightCatalogBuilder<'a> {
+    fn new(gguf: &'a Gguf) -> Self {
         Self {
             gguf,
-            backend,
             specs: Vec::new(),
-            buffers: Vec::new(),
-            resident_bytes: 0,
+            weight_bytes: 0,
         }
     }
 
@@ -579,34 +682,24 @@ impl<'a> WeightLoader<'a> {
         let info = self.tensor(name, shape)?;
         let desc = TensorDesc::new(info.shape.clone(), info.dtype);
         let nbytes = info.nbytes;
-        let bytes = self
-            .gguf
-            .tensor_bytes(name)
-            .map_err(|error| anyhow!("read GGUF tensor {name}: {error}"))?;
-        let buffer = self
-            .backend
-            .alloc_uninit(nbytes, BufferUsage::Weights)
-            .map_err(|error| anyhow!("allocate embedding weight {name}: {error}"))?;
-        self.backend
-            .upload(buffer.as_ref(), bytes)
-            .map_err(|error| anyhow!("upload embedding weight {name}: {error}"))?;
         let index = self.specs.len();
         self.specs.push(WeightSpec {
             label: name.to_owned(),
+            source: name.to_owned(),
+            source_offset: 0,
+            nbytes,
             desc,
         });
-        self.buffers.push(buffer);
-        self.resident_bytes += nbytes as u64;
+        self.weight_bytes += nbytes as u64;
         Ok(index)
     }
 }
 
-fn load_weights(
+fn build_weight_catalog(
     gguf: &Gguf,
     cfg: &NomicConfig,
-    backend: &dyn Backend,
-) -> Result<(Vec<WeightSpec>, Vec<Box<dyn Buffer>>, WeightLayout, u64)> {
-    let mut loader = WeightLoader::new(gguf, backend);
+) -> Result<(Vec<WeightSpec>, WeightLayout, u64)> {
+    let mut loader = WeightCatalogBuilder::new(gguf);
     let token_embedding = loader.push("token_embd.weight", &[cfg.hidden, cfg.vocab])?;
     let token_type_dtype = loader.tensor("token_types.weight", &[cfg.hidden, 2])?.dtype;
     if token_type_dtype != DType::F32 {
@@ -615,25 +708,16 @@ fn load_weights(
             token_type_dtype
         );
     }
-    let token_type_bytes = gguf
-        .tensor_bytes("token_types.weight")
-        .map_err(|error| anyhow!("read GGUF tensor token_types.weight: {error}"))?;
     let row_bytes = cfg.hidden * 4;
-    let token_type_buffer = loader
-        .backend
-        .alloc_uninit(row_bytes, BufferUsage::Weights)
-        .map_err(|error| anyhow!("allocate token type row: {error}"))?;
-    loader
-        .backend
-        .upload(token_type_buffer.as_ref(), &token_type_bytes[..row_bytes])
-        .map_err(|error| anyhow!("upload token type row: {error}"))?;
     let token_type_zero = loader.specs.len();
     loader.specs.push(WeightSpec {
         label: "token_types.weight[row=0]".into(),
+        source: "token_types.weight".into(),
+        source_offset: 0,
+        nbytes: row_bytes,
         desc: TensorDesc::new(vec![cfg.hidden], DType::F32),
     });
-    loader.buffers.push(token_type_buffer);
-    loader.resident_bytes += row_bytes as u64;
+    loader.weight_bytes += row_bytes as u64;
     let embedding_norm_weight = loader.push("token_embd_norm.weight", &[cfg.hidden])?;
     let embedding_norm_bias = loader.push("token_embd_norm.bias", &[cfg.hidden])?;
 
@@ -652,15 +736,13 @@ fn load_weights(
             output_norm_bias: loader.push(&name("layer_output_norm.bias"), &[cfg.hidden])?,
         });
     }
-    let WeightLoader {
+    let WeightCatalogBuilder {
         specs,
-        buffers,
-        resident_bytes,
+        weight_bytes,
         ..
     } = loader;
     Ok((
         specs,
-        buffers,
         WeightLayout {
             token_embedding,
             token_type_zero,
@@ -668,8 +750,41 @@ fn load_weights(
             embedding_norm_bias,
             layers,
         },
-        resident_bytes,
+        weight_bytes,
     ))
+}
+
+fn load_weight_buffers(
+    gguf: &Gguf,
+    specs: &[WeightSpec],
+    backend: &dyn Backend,
+) -> Result<Vec<Box<dyn Buffer>>> {
+    let mut buffers = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let source = gguf
+            .tensor_bytes(&spec.source)
+            .map_err(|error| anyhow!("read GGUF tensor {}: {error}", spec.source))?;
+        let end = spec
+            .source_offset
+            .checked_add(spec.nbytes)
+            .context("embedding weight source range overflow")?;
+        let bytes = source.get(spec.source_offset..end).with_context(|| {
+            format!(
+                "embedding weight {} source range {}..{end} exceeds {} bytes",
+                spec.label,
+                spec.source_offset,
+                source.len()
+            )
+        })?;
+        let buffer = backend
+            .alloc_uninit(spec.nbytes, BufferUsage::Weights)
+            .map_err(|error| anyhow!("allocate embedding weight {}: {error}", spec.label))?;
+        backend
+            .upload(buffer.as_ref(), bytes)
+            .map_err(|error| anyhow!("upload embedding weight {}: {error}", spec.label))?;
+        buffers.push(buffer);
+    }
+    Ok(buffers)
 }
 
 #[cfg(test)]

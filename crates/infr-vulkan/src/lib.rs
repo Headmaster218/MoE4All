@@ -50,6 +50,7 @@ pub const FLASH_HD256_BM16_SHARED: u32 = 30_912;
 pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
 
 use rayon::prelude::*;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
@@ -75,6 +76,30 @@ use infr_core::{
 
 /// Terse local shorthand for the shared [`infr_core::error::backend`] constructor.
 use infr_core::error::backend as be;
+
+thread_local! {
+    /// Address of the unified execution gate held exclusively by this thread. Vulkan graph
+    /// lowering allocates scratch lazily, so those nested allocations must reuse the outer gate
+    /// instead of trying to acquire the same non-reentrant `RwLock` again.
+    static UNIFIED_EXEC_OWNER: Cell<usize> = const { Cell::new(0) };
+}
+
+struct UnifiedExecScope {
+    previous: usize,
+}
+
+impl UnifiedExecScope {
+    fn enter(owner: usize) -> Self {
+        let previous = UNIFIED_EXEC_OWNER.with(|current| current.replace(owner));
+        Self { previous }
+    }
+}
+
+impl Drop for UnifiedExecScope {
+    fn drop(&mut self) {
+        UNIFIED_EXEC_OWNER.with(|current| current.set(self.previous));
+    }
+}
 
 /// Resolve an `INFR_DEV` value to a Vulkan physical-device index (`None` = "use the discrete
 /// default"). `INFR_DEV` is the SINGLE device-selection env, sharing the CLI's `--dev` grammar, so
@@ -1071,8 +1096,9 @@ pub struct VulkanBackend {
     /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
     /// device-leaking reference cycle.
     unified_pool: Arc<Mutex<Option<Arc<crate::unified::UnifiedVramPool>>>>,
-    /// Allocation resize gate shared by the LLM and auxiliary backend forks. Ordinary graph
-    /// execution takes a read lease; borrowing/removing expert slots takes the rare write lease.
+    /// Allocation/execution gate shared by the LLM and auxiliary backend forks. An execution owns
+    /// the write side because both primary and auxiliary graphs allocate elastic scratch lazily;
+    /// the thread-local owner lets those nested allocations reuse the non-reentrant lease.
     unified_exec: Arc<RwLock<()>>,
     /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
     /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
@@ -3363,16 +3389,20 @@ impl VulkanBackend {
         size: usize,
         class: crate::unified::UnifiedVramClass,
     ) -> Result<VkBuffer> {
+        self.with_unified_exclusive(|| self.alloc_unified_buffer_locked(size, class))
+    }
+
+    fn alloc_unified_buffer_locked(
+        &self,
+        size: usize,
+        class: crate::unified::UnifiedVramClass,
+    ) -> Result<VkBuffer> {
         let pool = self
             .unified_vram()
             .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
         let handle = match pool.allocate(size, class) {
             Some(handle) => handle,
             None if class != crate::unified::UnifiedVramClass::Expert => {
-                let _exclusive = self.unified_exec.write().unwrap();
-                if let Some(handle) = pool.allocate(size, class) {
-                    return self.unified_sub_buffer(handle, size);
-                }
                 let loaned = self
                     .moe_pager
                     .lock()
@@ -3385,9 +3415,21 @@ impl VulkanBackend {
                         "unified VRAM loaned {loaned} expert slots but still cannot fit {size} contiguous bytes"
                     ))
                 })?;
-                tracing::info!(
-                    "[infr] unified VRAM: loaned {loaned} cold expert slots for {class:?} ({size} bytes)"
-                );
+                if matches!(
+                    class,
+                    crate::unified::UnifiedVramClass::EmbeddingWeights
+                        | crate::unified::UnifiedVramClass::VisionWeights
+                        | crate::unified::UnifiedVramClass::DraftWeights
+                        | crate::unified::UnifiedVramClass::LlmRuntime
+                ) {
+                    tracing::debug!(
+                        "[infr] unified VRAM: loaned {loaned} cold expert slots for {class:?} ({size} bytes)"
+                    );
+                } else {
+                    tracing::info!(
+                        "[infr] unified VRAM: loaned {loaned} cold expert slots for {class:?} ({size} bytes)"
+                    );
+                }
                 handle
             }
             None => {
@@ -3399,6 +3441,28 @@ impl VulkanBackend {
             }
         };
         self.unified_sub_buffer(handle, size)
+    }
+
+    /// Run `f` while no other graph can submit commands that reference the elastic arena. Calls
+    /// nested from graph lowering reuse the outer lease; calls made by model loading or another
+    /// request acquire it normally. This is deliberately exclusive rather than an upgradable read
+    /// lock: scratch allocation may have to evict cold expert slots before recording can proceed.
+    fn with_unified_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.unified_vram().is_none() {
+            return f();
+        }
+        let owner = Arc::as_ptr(&self.unified_exec) as usize;
+        let current = UNIFIED_EXEC_OWNER.with(Cell::get);
+        if current == owner {
+            return f();
+        }
+        assert_eq!(
+            current, 0,
+            "one thread cannot enter two unrelated unified VRAM execution gates"
+        );
+        let _exclusive = self.unified_exec.write().unwrap();
+        let _scope = UnifiedExecScope::enter(owner);
+        f()
     }
 
     pub(crate) fn alloc_unified(
@@ -3701,7 +3765,10 @@ impl VulkanBackend {
     /// shares its block's ONE big handle, so the fill must start at `buf.sub_offset` or it would
     /// clobber whatever tensor happens to sit at the block's byte 0.
     fn fill_buf(&self, buf: &VkBuffer, byte: u8) -> Result<()> {
-        if let Some(ptr) = buf.mapped_ptr() {
+        if let Some(ptr) = buf
+            .mapped_ptr()
+            .filter(|_| !matches!(&buf.backing, Backing::UnifiedSub(_)))
+        {
             unsafe { std::ptr::write_bytes(ptr, byte, buf.size) };
         } else {
             let word = u32::from_ne_bytes([byte; 4]);
@@ -3735,7 +3802,10 @@ impl VulkanBackend {
             .collect::<Result<_>>()?;
         let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
         for buf in &bufs {
-            if let Some(ptr) = buf.mapped_ptr() {
+            if let Some(ptr) = buf
+                .mapped_ptr()
+                .filter(|_| !matches!(&buf.backing, Backing::UnifiedSub(_)))
+            {
                 unsafe { std::ptr::write_bytes(ptr, 0u8, buf.size) };
             } else {
                 let size = fill_span(buf.size); // round UP to a 4-byte multiple: cover the whole extent
@@ -3761,26 +3831,36 @@ impl VulkanBackend {
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
-        if let Some(UnifiedClient::Embedding) = self.unified_client {
-            let class = match usage {
-                BufferUsage::Weights => Some(crate::unified::UnifiedVramClass::EmbeddingWeights),
-                BufferUsage::Activations => {
-                    Some(crate::unified::UnifiedVramClass::EmbeddingRuntime)
-                }
-                BufferUsage::KvCache
-                | BufferUsage::Staging
-                | BufferUsage::Readback
-                | BufferUsage::HostWeights => None,
-            };
-            if let Some(class) = class {
-                let buf = self.alloc_unified_buffer(bytes, class)?;
-                if usage == BufferUsage::Weights {
-                    if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
-                        pb.inc(bytes as u64);
-                    }
-                }
-                return Ok(buf);
+        let unified_class = match (self.unified_client, usage) {
+            (Some(UnifiedClient::Embedding), BufferUsage::Weights) => {
+                Some(crate::unified::UnifiedVramClass::EmbeddingWeights)
             }
+            (Some(UnifiedClient::Embedding), BufferUsage::Activations) => {
+                Some(crate::unified::UnifiedVramClass::EmbeddingRuntime)
+            }
+            (None, BufferUsage::Activations) if self.unified_vram().is_some() => {
+                Some(crate::unified::UnifiedVramClass::LlmRuntime)
+            }
+            _ => None,
+        };
+        if let Some(class) = unified_class {
+            let mut buf = self.alloc_unified_buffer(bytes, class)?;
+            if usage == BufferUsage::Weights {
+                if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                    pb.inc(bytes as u64);
+                }
+            } else if class == crate::unified::UnifiedVramClass::LlmRuntime {
+                // Preserve the primary LLM activation high-water signal after moving those bytes
+                // into the mapped elastic arena. Auxiliary runtime must not contaminate it.
+                buf.act_bytes = bytes as u64;
+                let live = self
+                    .shared
+                    .act_live
+                    .fetch_add(bytes as u64, Ordering::Relaxed)
+                    + bytes as u64;
+                self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
+            }
+            return Ok(buf);
         }
         // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
         // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
@@ -4260,6 +4340,17 @@ impl Backend for VulkanBackend {
         Some(self.alloc_room())
     }
 
+    fn device_elastic_activation_room(&self) -> Option<u64> {
+        self.unified_vram().map(|pool| {
+            let stats = pool.stats();
+            stats
+                .free_bytes
+                .saturating_add(stats.class_bytes(crate::unified::UnifiedVramClass::Expert))
+                .saturating_add(stats.class_bytes(crate::unified::UnifiedVramClass::LlmRuntime))
+                as u64
+        })
+    }
+
     fn activation_peak(&self) -> Option<u64> {
         Some(self.shared.act_peak.load(Ordering::Relaxed))
     }
@@ -4269,17 +4360,7 @@ impl Backend for VulkanBackend {
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
-        // The primary LLM holds the shared lease while its commands can read expert slots, so an
-        // auxiliary client's rare allocation/loan cannot invalidate them.  The auxiliary client
-        // itself must not take this lease around `adapter::execute`: static recording lazily
-        // allocates transient buffers, and a full arena then needs the write side in
-        // `alloc_unified_buffer` to loan cold expert slots. Taking read here would self-deadlock on
-        // that read -> write upgrade before any command was submitted.
-        let _arena_lease = self
-            .unified_client
-            .is_none()
-            .then(|| self.unified_exec.read().unwrap());
-        adapter::execute(self, plan, bindings)
+        self.with_unified_exclusive(|| adapter::execute(self, plan, bindings))
     }
 
     /// See `Backend::max_decode_chain`. A device that needs its FORWARD split into several
@@ -4302,11 +4383,7 @@ impl Backend for VulkanBackend {
         bindings: &Bindings,
         n: usize,
     ) -> Result<Option<Vec<u32>>> {
-        let _arena_lease = self
-            .unified_client
-            .is_none()
-            .then(|| self.unified_exec.read().unwrap());
-        adapter::execute_chain(self, plan, bindings, n)
+        self.with_unified_exclusive(|| adapter::execute_chain(self, plan, bindings, n))
     }
 
     fn sync(&self) -> Result<()> {

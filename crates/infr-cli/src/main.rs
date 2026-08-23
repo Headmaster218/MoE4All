@@ -4124,6 +4124,7 @@ fn cmd_serve(
                 tracing::info!(
                     arena_bytes = stats.capacity_bytes,
                     expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                    llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
                     embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
                     embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
                     free_bytes = stats.free_bytes,
