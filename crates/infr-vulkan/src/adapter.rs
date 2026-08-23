@@ -6475,19 +6475,25 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
-    let shared_batch = if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
+    let (shared_batch, bounded_host_batch) = if !layer_stream
+        && !stage_ids.is_empty()
+        && !*fused_gate_up
+    {
         let mut guard = be_.moe_pager().lock().unwrap();
-        guard
+        let sess = guard
             .as_mut()
-            .expect("paged execution requires a session")
-            .begin_shared_batch(&[gate_id, up_id, down_id])?
+            .expect("paged execution requires a session");
+        let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
+        let bounded = shared && sess.role_uses_bounded_host_tier(gate_id)?;
+        (shared, bounded)
     } else {
-        false
+        (false, false)
     };
     // On one shared size pool, resolving all three roles before moving bytes gives the host tier
-    // enough independent work to saturate SSD/RAM/ReBAR. It is measurably faster than preserving
-    // the smaller Down-only overlap window on large-expert Decode.
-    let roles_batched = shared_batch && !stage_ids.is_empty();
+    // enough independent work to saturate SSD/RAM/ReBAR. Keep it restricted to the bounded tier:
+    // the complete Host Store has no parallel promotion work here, so batching Down would only
+    // discard its useful overlap with Gate/Up compute on Qwen/Ling-style models.
+    let roles_batched = bounded_host_batch;
     if roles_batched {
         let mut guard = be_.moe_pager().lock().unwrap();
         guard

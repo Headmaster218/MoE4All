@@ -2477,6 +2477,17 @@ impl MoePagerSession {
         Ok(true)
     }
 
+    /// Whether this role is backed by the bounded inclusive RAM/SSD tier rather than the complete
+    /// permanent Host Store. Cross-role promotion parallelism only pays on the bounded tier; the
+    /// full-store path copies serially and should retain Decode's Down-copy/Up+Gate overlap.
+    pub fn role_uses_bounded_host_tier(&self, buf_id: usize) -> Result<bool> {
+        let (_, pool, _) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("moe pager: host-tier query on an unregistered buffer"))?;
+        Ok(self.pools[*pool].host.is_some())
+    }
+
     /// Runtime Decode upload path backed by the unique CPU expert store. Every miss is copied
     /// directly into its final mapped-ReBAR LRU slot. The caller must have drained earlier arena
     /// readers before invoking this method; small-m Decode already does so before reading route ids.
