@@ -713,6 +713,24 @@ float dq(uint g) {
     uint idx = (j < 16u) ? (rb(bd + 1u + j) & 0xFu) : (rb(bd + 1u + j - 16u) >> 4u);
     return float(KV_MXFP4[idx]) * d;
 }
+#define HAVE_DQBLK
+// One 32-element group is one complete MXFP4 block. Decode the shared E8M0 scale once and fetch
+// the 16 packed code bytes as four unaligned words instead of repeating the address/scale path for
+// every element. The 17-byte block stride makes aligned vector loads impossible, so `ru32u` keeps
+// the same safe two-word funnel convention used by the other odd-stride formats.
+void dqblk(uint gstart, out float v[32]) {
+    uint bd = (gstart / 32u) * 17u;
+    float d = e8m0_half(rb(bd));
+    for (uint w4 = 0u; w4 < 4u; w4++) {
+        uint q = ru32u(bd + 1u + w4 * 4u);
+        for (uint b = 0u; b < 4u; b++) {
+            uint packed = (q >> (8u * b)) & 0xFFu;
+            uint j = w4 * 4u + b;
+            v[j] = float(KV_MXFP4[packed & 0xFu]) * d;
+            v[j + 16u] = float(KV_MXFP4[packed >> 4u]) * d;
+        }
+    }
+}
 #endif
 
 #if defined(FMT_NVFP4)
