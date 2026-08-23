@@ -1,9 +1,10 @@
 # DeepSeek support plan (V1 → V2/V3 → V3.2 → V4)
 
-Status: **Stage 3 done.** A `deepseek32` (V3.2) model loads, builds a graph with
-the lightning indexer wired in, and generates on CPU and Vulkan — see § Stage 3
-for what that is verified against and what cannot be verified without a real
-671B file.
+Status: **Stage 4 runs end to end.** DeepSeek V4 Flash loads and generates on Vulkan with its
+compressed-attention state machine, FP8 KV, MXFP4 indexer and paged MXFP4 experts. DSpark remains
+out of scope. The implementation/performance campaign and its trace-based cache conclusions are
+recorded in
+[perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md](perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md).
 
 Stage 2: CPU path works end-to-end on V2-Lite; Vulkan and Metal MLA kernels are
 implemented, wired, and executed on their real devices (Vulkan on the GPU box,
@@ -734,13 +735,10 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: a V4 model whose `compress_ratios` are ALL ZERO generates, under
-either routing.** The ratio-0 tier is emitted end to end and runs on CPU and
-Vulkan; ratios 4 and 128 are refused by name. See "Slice A — ratio 0" below for
-what that covers, "Slice A2 — hash routing" for the `ffn_gate_tid2eid` gather,
-and `docs/backlog.md` § B-DSV4-WIRING for what slice B owes. Note that no layer
-of the SHIPPED V4-Flash file is both ratio-0 and bias-routed — see
-`docs/backlog.md` § B-DSV4-REAL.
+**Progress: the shipped V4 Flash topology now generates end to end on Vulkan.** Ratio-0, CSA
+(ratio 4), HCA (ratio 128), compressed cache persistence, FP8 KV, the MXFP4 indexer and both routing
+forms are wired. The historical slices below remain useful as the implementation rationale; the
+final performance state and commit-by-commit audit are in the closeout document linked above.
 
 The 2026-08-10 read slice that preceded it was a read, not a port:
 `llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
@@ -1311,5 +1309,5 @@ Ordered by how much damage a wrong assumption does.
   V4's last three layers and does not appear in the graph builder at all. `infr`
   has MTP machinery (`docs/mtp.md`) that may host it; not investigated.
 - V3.2's **NextN** tensors — loaded but skipped by llama.cpp.
-- Performance. This plan is about correctness only. Nothing here is measured,
-  and no throughput claim is made.
+- The detailed performance history is intentionally kept in the RX 7900 XTX closeout document
+  rather than this architecture/correctness plan.

@@ -26,6 +26,9 @@ headline.
 - **[vulkan-review.md](vulkan-review.md)** — multi-vendor review of the Vulkan
   backend: what is RDNA3-tuned versus genuinely portable, and the per-vendor
   gaps (Intel Arc, NVIDIA) that follow from it.
+- **[deepseek-v4-flash-rx7900xtx-closeout-20260824.md](deepseek-v4-flash-rx7900xtx-closeout-20260824.md)**
+  — DeepSeek V4 Flash bring-up and performance closeout: commit impact audit, retained and rejected
+  optimizations, cache trace provenance, full-shadow decision and capacity simulations.
 
 ## Reading the numbers
 
