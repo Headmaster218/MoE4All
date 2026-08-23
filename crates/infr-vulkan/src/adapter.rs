@@ -6484,6 +6484,25 @@ fn execute_paged_moe<'a>(
     } else {
         false
     };
+    let gate_up_batched = shared_batch && !stage_ids.is_empty();
+    if gate_up_batched {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        guard
+            .as_mut()
+            .expect("paged execution requires a session")
+            .push_roles_cpu(
+                &[
+                    (gate_id, stage_ids.as_slice()),
+                    (up_id, stage_ids.as_slice()),
+                ],
+                touch_all,
+            )?;
+    }
+    let gate_up_stage_ids = if gate_up_batched {
+        &[][..]
+    } else {
+        stage_ids.as_slice()
+    };
     let gate_w = if layer_stream {
         stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
     } else {
@@ -6492,7 +6511,7 @@ fn execute_paged_moe<'a>(
             rec,
             ps,
             gate_id,
-            &stage_ids,
+            gate_up_stage_ids,
             n_expert,
             touch_all,
             shared_batch,
@@ -6508,7 +6527,7 @@ fn execute_paged_moe<'a>(
             rec,
             ps,
             up_id,
-            &stage_ids,
+            gate_up_stage_ids,
             n_expert,
             touch_all,
             shared_batch,

@@ -2481,19 +2481,39 @@ impl MoePagerSession {
     /// directly into its final mapped-ReBAR LRU slot. The caller must have drained earlier arena
     /// readers before invoking this method; small-m Decode already does so before reading route ids.
     pub fn push_role_cpu(&mut self, buf_id: usize, local_ids: &[u32], scan: bool) -> Result<usize> {
-        let (pool_idx, stride, block_base, host_chunk, host_base) = {
+        self.push_roles_cpu(&[(buf_id, local_ids)], scan)
+    }
+
+    /// Resolve several roles from one shared size pool in caller order, then move all resulting
+    /// host-tier misses concurrently. This preserves the exact LRU/LUT decisions of repeated
+    /// [`Self::push_role_cpu`] calls while allowing split Gate+Up banks to share one deeper SSD /
+    /// RAM-to-ReBAR batch. The caller must have opened one shared pager epoch first.
+    pub fn push_roles_cpu(&mut self, roles: &[(usize, &[u32])], scan: bool) -> Result<usize> {
+        if roles.is_empty() {
+            return Ok(0);
+        }
+        let mut resolved = Vec::with_capacity(roles.len());
+        for &(buf_id, local_ids) in roles {
             let (_, pool, src) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: DMA stage on an unregistered buffer"))?;
-            (
+            resolved.push((
                 *pool,
                 src.stride_bytes,
                 src.block_base,
                 src.host_chunk,
                 src.host_offset,
-            )
-        };
+                local_ids,
+            ));
+        }
+        let pool_idx = resolved[0].0;
+        if resolved.iter().any(|entry| entry.0 != pool_idx) {
+            return Err(be(
+                "moe pager: cross-role CPU push spans multiple size pools",
+            ));
+        }
+        let requested = resolved.iter().map(|entry| entry.5.len()).sum();
         let Self {
             pools, host_store, ..
         } = self;
@@ -2503,33 +2523,35 @@ impl MoePagerSession {
         if let Some(host) = pool.host.as_ref().cloned() {
             // Resolve in the original order first: this preserves exact GPU-LRU victim selection
             // and LUT contents. Only the resulting independent byte moves run in parallel.
-            let mut promotions = Vec::with_capacity(local_ids.len());
-            for &lid in local_ids {
-                let id = block_base + lid;
-                if pool.pager.is_resident(id) {
-                    let plan = pool.pager.plan_inclusive_cpu_push(
-                        id,
-                        pool.exchange_slot
-                            .as_mut()
-                            .expect("tiered pool has an exchange slot"),
-                        scan,
-                    )?;
-                    debug_assert!(plan.is_none());
-                    continue;
+            let mut promotions = Vec::with_capacity(requested);
+            for &(_, stride, block_base, _, _, local_ids) in &resolved {
+                for &lid in local_ids {
+                    let id = block_base + lid;
+                    if pool.pager.is_resident(id) {
+                        let plan = pool.pager.plan_inclusive_cpu_push(
+                            id,
+                            pool.exchange_slot
+                                .as_mut()
+                                .expect("tiered pool has an exchange slot"),
+                            scan,
+                        )?;
+                        debug_assert!(plan.is_none());
+                        continue;
+                    }
+                    let plan = pool
+                        .pager
+                        .plan_inclusive_cpu_push(
+                            id,
+                            pool.exchange_slot
+                                .as_mut()
+                                .expect("tiered pool has an exchange slot"),
+                            scan,
+                        )?
+                        .expect("a nonresident block must produce an upload plan");
+                    promotions.push((id, plan.evicted, plan.dst));
+                    copied = copied.saturating_add(stride);
                 }
-                let plan = pool
-                    .pager
-                    .plan_inclusive_cpu_push(
-                        id,
-                        pool.exchange_slot
-                            .as_mut()
-                            .expect("tiered pool has an exchange slot"),
-                        scan,
-                    )?
-                    .expect("a nonresident block must produce an upload plan");
-                promotions.push((id, plan.evicted, plan.dst));
             }
-            copied = promotions.len().saturating_mul(stride);
             if promotions.len() > 1 {
                 host.promote_batch(&promotions, |bytes, dst| {
                     par_copy_to_mapped(bytes, dst as *mut u8);
@@ -2544,28 +2566,30 @@ impl MoePagerSession {
                 }
             }
         } else {
-            for &lid in local_ids {
-                let local = lid as usize;
-                let id = block_base + lid;
-                let host_chunk = host_chunk
-                    .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
-                let src = host_base
-                    .checked_add(local.saturating_mul(stride))
-                    .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
-                if let Some(plan) = pool.pager.plan_cpu_push(id, scan)? {
-                    let bytes = host_store[host_chunk]
-                        .bytes
-                        .get(src..src + stride)
-                        .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
-                    par_copy_to_mapped(bytes, plan.dst as *mut u8);
-                    copied += bytes.len();
+            for &(_, stride, block_base, host_chunk, host_base, local_ids) in &resolved {
+                for &lid in local_ids {
+                    let local = lid as usize;
+                    let id = block_base + lid;
+                    let host_chunk = host_chunk
+                        .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
+                    let src = host_base
+                        .checked_add(local.saturating_mul(stride))
+                        .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
+                    if let Some(plan) = pool.pager.plan_cpu_push(id, scan)? {
+                        let bytes = host_store[host_chunk]
+                            .bytes
+                            .get(src..src + stride)
+                            .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
+                        par_copy_to_mapped(bytes, plan.dst as *mut u8);
+                        copied += bytes.len();
+                    }
                 }
             }
         }
         if let Some(t0) = copy_t0 {
             pager_profile::record_memcpy(copied, t0.elapsed());
         }
-        Ok(local_ids.len())
+        Ok(requested)
     }
 
     /// CPU-push one whole layer from the unique host store straight into its dynamic-ring
