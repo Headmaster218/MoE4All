@@ -939,12 +939,23 @@ const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 /// widest today is a 16-byte vec4 load) with headroom to spare for future wider kernels.
 const BDA_WEIGHT_ALIGN: u64 = 256;
 
-/// Minimum size for a resident-BDA arena block (see [`VulkanBackend::bda_weight_alloc`]). Blocks
-/// are opened ON DEMAND — one per call that outgrows the current block's remainder — so without a
-/// floor a run of small tensors would each pay for a separate dedicated `vkAllocateMemory`. Reuses
-/// [`ARENA_OVERFLOW_BLOCK`]'s size: the same "big enough to amortize, small enough not to waste"
-/// reasoning applies unchanged.
-const BDA_BLOCK_MIN: u64 = ARENA_OVERFLOW_BLOCK;
+/// Initial and maximum size floors for resident-BDA arena blocks (see
+/// [`VulkanBackend::bda_weight_alloc`]). The first small-tensor block stays at 64 MiB so compact
+/// models retain their old footprint. Each time a small allocation outgrows the available tails,
+/// the next floor doubles through 128 MiB to 256 MiB. Large individual tensors are still allocated
+/// at their exact aligned size: they neither inherit the floor's slack nor advance it.
+const BDA_BLOCK_MIN: u64 = 64 * 1024 * 1024;
+const BDA_BLOCK_MAX: u64 = 256 * 1024 * 1024;
+
+fn bda_block_geometry(want: u64, floor: u64, max_alloc: u64) -> (u64, u64) {
+    let block_bytes = want.max(floor).min(max_alloc);
+    let next_floor = if want <= floor && block_bytes == floor {
+        floor.saturating_mul(2).min(BDA_BLOCK_MAX)
+    } else {
+        floor
+    };
+    (block_bytes, next_floor)
+}
 
 /// Upper bound on ONE resident-BDA addressing unit's byte size (see [`BdaWeightArena`]'s addressing
 /// invariant). The 64-bit promotion protects the arena/expert BASE, but a tensor's (or a per-expert
@@ -1002,9 +1013,21 @@ struct BdaArenaBlock {
 /// offsets remain u32 — each addressing unit (one dense tensor / one per-expert slice) must stay
 /// < 4 Gi elements and < 4 GiB bytes; enforced today by model reality, revisit for >4 GiB single
 /// tensors.
-#[derive(Default)]
 struct BdaWeightArena {
     blocks: Vec<BdaArenaBlock>,
+    /// Floor for the next block opened for a small tensor. Adaptive growth avoids the many
+    /// partially-used 64 MiB tails seen on tensor-rich models without charging a 256 MiB minimum
+    /// to every small model.
+    next_block_floor: u64,
+}
+
+impl Default for BdaWeightArena {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            next_block_floor: BDA_BLOCK_MIN,
+        }
+    }
 }
 
 // ── VulkanBackend ─────────────────────────────────────────────────────────────
@@ -3438,12 +3461,14 @@ impl VulkanBackend {
             }
         }
 
-        // The current block (if any) has no room: open a fresh dedicated block sized to the
-        // request, floored at `BDA_BLOCK_MIN` and capped at `max_mem_alloc_size` — a whole
-        // multi-GiB model can't be one `vkAllocateMemory`, same reasoning as `WeightArena`'s block
-        // cap. A single tensor bigger than the cap can't be placed at all; report it rather than
-        // silently truncating.
-        let block_bytes = want.max(BDA_BLOCK_MIN).min(self.shared.max_mem_alloc_size);
+        // No existing tail fits. Small-tensor blocks grow 64 -> 128 -> 256 MiB as the model fills
+        // the arena, which sharply reduces block-tail fragmentation on tensor-rich models. A
+        // tensor larger than the current floor still gets an exact-size block and does not advance
+        // the floor. Every block remains capped at `max_mem_alloc_size`; a tensor bigger than that
+        // cap cannot be split and is rejected below.
+        let floor = arena.next_block_floor;
+        let (block_bytes, next_floor) =
+            bda_block_geometry(want, floor, self.shared.max_mem_alloc_size);
         if want > block_bytes {
             return Err(be(format!(
                 "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({} bytes) \
@@ -3464,6 +3489,7 @@ impl VulkanBackend {
         let base_addr = block_buf
             .own_addr
             .expect("resident-bda block built with device_address=true carries an own_addr");
+        arena.next_block_floor = next_floor;
         let handle = Arc::new(BdaBlockHandle {
             buf: block_buf,
             base_addr,
@@ -4974,6 +5000,27 @@ mod tests {
         let disabled = build(Some(0));
         disabled.observe_forward(std::time::Duration::from_secs(2), 1_000);
         assert_eq!(disabled.submit_dispatch_cap(), 0, "0 = no split");
+    }
+
+    #[test]
+    fn resident_bda_block_floor_grows_only_for_small_tensor_blocks() {
+        const MIB: u64 = 1024 * 1024;
+        let max = 4 * 1024 * MIB;
+
+        let (first, floor) = bda_block_geometry(1 * MIB, BDA_BLOCK_MIN, max);
+        assert_eq!((first, floor), (64 * MIB, 128 * MIB));
+        let (second, floor) = bda_block_geometry(1 * MIB, floor, max);
+        assert_eq!((second, floor), (128 * MIB, 256 * MIB));
+        let (third, floor) = bda_block_geometry(1 * MIB, floor, max);
+        assert_eq!((third, floor), (256 * MIB, 256 * MIB));
+
+        let (large, unchanged) = bda_block_geometry(300 * MIB, 128 * MIB, max);
+        assert_eq!(large, 300 * MIB, "large tensors keep exact-size blocks");
+        assert_eq!(
+            unchanged,
+            128 * MIB,
+            "large tensors do not advance the floor"
+        );
     }
 
     /// Resident-BDA weight arena: sub-allocate three odd-sized weight buffers directly from

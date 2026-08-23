@@ -1648,6 +1648,7 @@ pub struct ModelMemoryPlan {
     pub persistent_state_bytes: u64,
     pub runtime_reserve_bytes: u64,
     pub weight_packing_margin_bytes: u64,
+    pub load_driver_reserve_bytes: u64,
     pub post_load_reserve_bytes: u64,
     pub expert_cache_bytes: u64,
 }
@@ -1682,6 +1683,7 @@ impl ModelMemoryPlan {
             runtime_reserve_bytes,
             weight_packing_margin_bytes,
             0,
+            0,
         )
     }
 
@@ -1691,6 +1693,7 @@ impl ModelMemoryPlan {
         persistent_state_bytes: u64,
         runtime_reserve_bytes: u64,
         weight_packing_margin_bytes: u64,
+        load_driver_reserve_bytes: u64,
         post_load_reserve_bytes: u64,
     ) -> Option<Self> {
         let persistent = fixed_weight_bytes.saturating_add(persistent_state_bytes);
@@ -1700,11 +1703,13 @@ impl ModelMemoryPlan {
             persistent_state_bytes,
             runtime_reserve_bytes,
             weight_packing_margin_bytes,
+            load_driver_reserve_bytes,
             post_load_reserve_bytes,
             expert_cache_bytes: total_room_bytes
                 .saturating_sub(persistent)
                 .saturating_sub(runtime_reserve_bytes)
                 .saturating_sub(weight_packing_margin_bytes)
+                .saturating_sub(load_driver_reserve_bytes)
                 .saturating_sub(post_load_reserve_bytes),
         })
     }
@@ -1714,14 +1719,16 @@ impl ModelMemoryPlan {
             .saturating_add(self.persistent_state_bytes)
             .saturating_add(self.runtime_reserve_bytes)
             .saturating_add(self.weight_packing_margin_bytes)
+            .saturating_add(self.load_driver_reserve_bytes)
             .saturating_add(self.post_load_reserve_bytes)
     }
 }
 
-/// Resident BDA weights are packed into 64 MiB blocks, so summing logical tensor bytes understates
-/// the committed allocation by the unused block tails. Measurements across supported model
-/// families put that delta at 1.16%-2.43%; 3%, rounded to a block and floored at 256 MiB, protects
-/// new architectures without changing the allocator or carrying a second copy of its state.
+/// Resident BDA weights are packed into adaptive 64/128/256 MiB blocks, so summing logical tensor
+/// bytes understates the committed allocation by the unused block tails. Measurements across
+/// supported model families put that delta at 1.16%-2.43%; 3%, rounded to the initial block unit
+/// and floored at 256 MiB, protects new architectures without carrying a second copy of allocator
+/// state into the planner.
 fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
     const BLOCK: u64 = 64 * 1024 * 1024;
     const MIN: u64 = 256 * 1024 * 1024;
@@ -1730,6 +1737,25 @@ fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
         .div_ceil(100)
         .max(MIN)
         .next_multiple_of(BLOCK)
+}
+
+/// Extra room withheld from the expert arena while a DeepSeek V4 model is still loading. V4's
+/// unusually large resident dense set and tensor/pipeline count leave substantially more live
+/// device/driver memory than the logical tensor footprint describes. On the 24 GiB Windows AMD
+/// target, 13.5 GiB of expert cache loads reliably while 14 GiB fails near the final 414 MiB weight
+/// allocation; 1.5 GiB brings the automatic plan to the measured safe side of that boundary.
+///
+/// This is deliberately separate from [`POST_KV_DEVICE_RESERVE`]. Once weights are resident,
+/// [`reclamp_ctx_to_live_room`] observes this load-time overhead in the driver's live heap usage;
+/// subtracting it there again would double-charge it and can collapse the selected context.
+const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
+
+fn load_driver_reserve(cfg: &Config) -> u64 {
+    if cfg.deepseek4 {
+        DEEPSEEK4_LOAD_DRIVER_RESERVE
+    } else {
+        0
+    }
 }
 
 /// Conservative load-time runtime reserve for control planes that do not own a live backend yet.
@@ -2139,12 +2165,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // borrows only cold Decode arena ranges and returns them on `enter_decode`.
         let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, ubatch_rows(ec));
         let packing_margin = resident_weight_packing_margin(fp.dense);
+        let load_driver_reserve = load_driver_reserve(cfg);
         let Some(plan) = ModelMemoryPlan::new_with_reserves(
             room,
             fp.dense,
             kv_bytes,
             runtime_reserve,
             packing_margin,
+            load_driver_reserve,
             POST_KV_DEVICE_RESERVE,
         ) else {
             return Err(anyhow!(
@@ -2194,13 +2222,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         };
         tracing::info!(
             "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime={:.2} GB \
-             packing_margin={:.2} GB post_load={:.2} GB \
+             packing_margin={:.2} GB load_driver={:.2} GB post_load={:.2} GB \
              expert_cache={:.2} GB ({cache_layout}, ctx={want_ctx})",
             room as f64 / 1e9,
             plan.fixed_weight_bytes as f64 / 1e9,
             plan.persistent_state_bytes as f64 / 1e9,
             plan.runtime_reserve_bytes as f64 / 1e9,
             plan.weight_packing_margin_bytes as f64 / 1e9,
+            plan.load_driver_reserve_bytes as f64 / 1e9,
             plan.post_load_reserve_bytes as f64 / 1e9,
             (if n_paged > 0 {
                 pager_budget_bytes
@@ -5220,11 +5249,30 @@ mod seam_helper_tests {
             2 * GIB,
             1 * GIB,
             512 * MIB,
+            0,
             256 * MIB,
         )
         .expect("plan");
         assert_eq!(plan.expert_cache_bytes, 12 * GIB + 256 * MIB);
         assert_eq!(plan.minimum_required_bytes(), 7 * GIB + 768 * MIB);
+
+        let dsv4_plan = super::ModelMemoryPlan::new_with_reserves(
+            20 * GIB,
+            4 * GIB,
+            2 * GIB,
+            1 * GIB,
+            512 * MIB,
+            1536 * MIB,
+            256 * MIB,
+        )
+        .expect("DeepSeek V4 plan");
+        assert_eq!(dsv4_plan.expert_cache_bytes, 10 * GIB + 768 * MIB);
+        assert_eq!(dsv4_plan.minimum_required_bytes(), 9 * GIB + 256 * MIB);
+
+        let mut cfg = Config::default();
+        assert_eq!(super::load_driver_reserve(&cfg), 0);
+        cfg.deepseek4 = true;
+        assert_eq!(super::load_driver_reserve(&cfg), 1536 * MIB);
     }
 
     #[test]
