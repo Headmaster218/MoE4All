@@ -2082,6 +2082,38 @@ fn chunk_covered_dense_tensor(name: &str) -> bool {
     )
 }
 
+/// Select the backing store for routed experts after their exact load-time layout is known.
+///
+/// `payload_bytes` includes the alignment of the layer-contiguous DMA layout, so `Full` means the
+/// configured/automatic RAM budget can hold every byte Decode or Prefill can request. In that mode
+/// the Vulkan pager never constructs a `FileBlockIo`: SSD is a
+/// load-time source only, and runtime misses stop at RAM. A smaller budget selects the bounded
+/// inclusive RAM/SSD tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoeHostBacking {
+    Full,
+    Bounded { bytes: usize },
+}
+
+fn moe_host_backing(
+    requested: infr_core::hostmem::Requested,
+    available: Option<u64>,
+    payload_bytes: usize,
+) -> MoeHostBacking {
+    let budget = match requested {
+        infr_core::hostmem::Requested::Fixed(bytes) => bytes.min(payload_bytes as u64),
+        infr_core::hostmem::Requested::Off | infr_core::hostmem::Requested::Bypass => 0,
+        infr_core::hostmem::Requested::Auto => available.map_or(payload_bytes as u64, |available| {
+            infr_core::hostmem::auto_arena_bytes(available, 0, payload_bytes as u64)
+        }),
+    } as usize;
+    if budget >= payload_bytes {
+        MoeHostBacking::Full
+    } else {
+        MoeHostBacking::Bounded { bytes: budget }
+    }
+}
+
 /// Decide this model's MoE expert placement, install the pager session when the decision pages
 /// (FIRST load only), and return the Vulkan weight binder that implements it. Shared by every
 /// Vulkan weight-uploading session — [`generate_dense_vulkan_session`] and the DiffusionGemma
@@ -2412,16 +2444,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 ec.paging.dram.map(|s| s.resolve(0)),
                 ec.paging.dram_bypass,
             );
-            let ram_budget = match requested {
-                infr_core::hostmem::Requested::Fixed(bytes) => bytes.min(host_bytes as u64),
-                infr_core::hostmem::Requested::Off | infr_core::hostmem::Requested::Bypass => 0,
-                infr_core::hostmem::Requested::Auto => infr_core::hostmem::available_bytes()
-                    .map_or(host_bytes as u64, |available| {
-                        infr_core::hostmem::auto_arena_bytes(available, 0, host_bytes as u64)
-                    }),
-            } as usize;
-            let bounded_host = ram_budget < host_bytes;
-            if bounded_host {
+            let host_backing = moe_host_backing(
+                requested,
+                infr_core::hostmem::available_bytes(),
+                host_bytes,
+            );
+            let (host_kind, host_resident_bytes) = match host_backing {
+                MoeHostBacking::Full => ("full-RAM", host_bytes),
+                MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
+            };
+            if let MoeHostBacking::Bounded { bytes: ram_budget } = host_backing {
                 let classes: Vec<(usize, usize)> = logical_pools
                     .iter()
                     .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
@@ -2475,7 +2507,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     })
                     .collect();
                 tracing::info!(
-                    "MoE host plan: full layer-contiguous RAM store {:.2} GB",
+                    "MoE host plan: full layer-contiguous RAM store {:.2} GB; RAM budget covers \
+                     every routed expert, runtime SSD tier disabled",
                     host_bytes as f64 / 1e9,
                 );
             }
@@ -2531,12 +2564,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 cfg.n_layer,
                 pool_desc.join(", "),
                 pager_budget_bytes as f64 / 1e9,
-                if bounded_host {
-                    "inclusive-RAM/SSD"
-                } else {
-                    "full-RAM"
-                },
-                if bounded_host { ram_budget } else { host_bytes } as f64 / 1e9,
+                host_kind,
+                host_resident_bytes as f64 / 1e9,
             );
             // Prefill streams every whole MoE layer through a topology-sized ring. Qwen3.6's
             // full-attention interval includes three DeltaNet layers, so current + one complete
@@ -4250,6 +4279,53 @@ mod bda_cap_tests {
 mod seam_helper_tests {
     use super::{Config, DType, EngineConfig, PlacementPins, PlacementScope};
     use infr_core::backend::{Capabilities, COOPMAT_TILE_16};
+
+    const GIB: usize = 1 << 30;
+
+    #[test]
+    fn moe_host_backing_disables_ssd_when_routed_payload_fits() {
+        use infr_core::hostmem::Requested;
+
+        let payload = 24 * GIB;
+        assert_eq!(
+            super::moe_host_backing(Requested::Fixed(payload as u64), None, payload),
+            super::MoeHostBacking::Full,
+            "an exact explicit fit must disable the runtime SSD tier"
+        );
+        assert_eq!(
+            super::moe_host_backing(Requested::Fixed((40 * GIB) as u64), None, payload),
+            super::MoeHostBacking::Full,
+            "budget above the routed payload must not create a bounded SSD cache"
+        );
+        assert_eq!(
+            super::moe_host_backing(Requested::Auto, Some((64 * GIB) as u64), payload),
+            super::MoeHostBacking::Full,
+            "automatic sizing must select the full store when its post-headroom budget fits"
+        );
+    }
+
+    #[test]
+    fn moe_host_backing_keeps_ssd_only_below_routed_payload() {
+        use infr_core::hostmem::Requested;
+
+        let payload = 24 * GIB;
+        assert_eq!(
+            super::moe_host_backing(Requested::Fixed((23 * GIB) as u64), None, payload),
+            super::MoeHostBacking::Bounded { bytes: 23 * GIB }
+        );
+        assert!(matches!(
+            super::moe_host_backing(Requested::Auto, Some((25 * GIB) as u64), payload),
+            super::MoeHostBacking::Bounded { bytes } if bytes < payload
+        ));
+        assert_eq!(
+            super::moe_host_backing(Requested::Off, Some((64 * GIB) as u64), payload),
+            super::MoeHostBacking::Bounded { bytes: 0 }
+        );
+        assert_eq!(
+            super::moe_host_backing(Requested::Bypass, Some((64 * GIB) as u64), payload),
+            super::MoeHostBacking::Bounded { bytes: 0 }
+        );
+    }
 
     /// Arithmetic tests that predate capability-aware hd256 flash use the conservative device:
     /// it preserves their old non-FA reserve exactly. Dedicated M4 cases opt into the XTX tier.

@@ -172,11 +172,12 @@ cfg_struct! {
         stats: bool = false,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
         /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
-        /// leaving residency to the OS page cache.
+        /// leaving residency to the OS page cache. For paged MoE, a budget covering the complete
+        /// routed-expert payload automatically becomes the permanent layer-contiguous Host Store
+        /// and disables runtime SSD reads; a smaller budget becomes the inclusive RAM/SSD cache.
         ///
-        /// `None` (the default) keeps the zero-copy mmap path, which costs nothing and is right
-        /// whenever the weights fit. This budget is anonymous, non-evictable memory, so it is only
-        /// ever what the user asked for — never a fraction picked on their behalf.
+        /// `None` (the default) sizes itself from currently available host memory while preserving
+        /// headroom. An explicit size pins the budget; zero disables the DRAM cache.
         dram: Option<SizeSpec> = None,
         /// `INFR_DRAM_BYPASS`: read paged blocks straight from disk into GPU memory, with NO host
         /// cache in between — the shape a unified-memory device takes automatically, because there

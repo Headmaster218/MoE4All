@@ -116,6 +116,12 @@ overflow = false
 # Upload staging ring. Default: unset = budget/8, clamped to [256 MiB, 2 GiB].
 # ring = "1g"
 
+# Host weight-cache budget. Default: unset = size automatically from available RAM while leaving
+# headroom. For paged MoE, a budget large enough for every routed expert selects one permanent
+# layer-contiguous Host Store and disables runtime SSD reads; smaller budgets use RAM as an
+# inclusive cache above SSD. Set to "0" to disable the RAM cache.
+# dram = "40g"
+
 # Print per-pool hit/miss/eviction counts at exit.
 stats = false
 
