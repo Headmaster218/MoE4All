@@ -1783,19 +1783,16 @@ impl MoePagerSession {
             previous_end = end;
         }
         let host_payload_bytes: usize = host_store.iter().map(HostStoreChunk::len).sum();
-        let mut host_imports = Vec::new();
+        let mut host_import_requests = Vec::new();
         for chunk in &host_store {
-            if let Some(imported) = vk.import_host_allocation(Arc::clone(&chunk.bytes)) {
-                host_imports.push(imported);
-            }
+            host_import_requests.push((Arc::clone(&chunk.bytes), 1));
         }
         for pool in &layout.pools {
             if let Some(host) = &pool.host {
-                if let Some(imported) = vk.import_host_allocation(host.arena_allocation()) {
-                    host_imports.push(imported);
-                }
+                host_import_requests.push((host.arena_allocation(), pool.slot_bytes));
             }
         }
+        let host_imports = vk.import_host_allocations(host_import_requests);
         if !host_imports.is_empty() {
             tracing::info!(
                 "[infr] paged-MoE host DMA: imported {} RAM arena(s) in place",

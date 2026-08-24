@@ -722,7 +722,7 @@ impl ImportedHostAllocation {
         };
         offset
             .checked_add(len)
-            .is_some_and(|end| end <= self.logical_len)
+            .is_some_and(|end| end <= self.imported_len)
     }
 
     pub(crate) fn ranges(&self, ptr: *const u8, len: usize) -> Option<Vec<ImportedHostRange>> {
@@ -748,6 +748,33 @@ impl ImportedHostAllocation {
         }
         Some(out)
     }
+}
+
+fn proportional_import_index(progress: &[(usize, usize)]) -> Option<usize> {
+    let mut best = None;
+    for (index, &(imported, total)) in progress.iter().enumerate() {
+        if total == 0 || imported >= total {
+            continue;
+        }
+        let Some(previous) = best else {
+            best = Some(index);
+            continue;
+        };
+        let (best_imported, best_total) = progress[previous];
+        let order =
+            (imported as u128 * best_total as u128).cmp(&(best_imported as u128 * total as u128));
+        if order.is_lt() || (order.is_eq() && total > best_total) {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+fn gcd_usize(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 unsafe impl Send for VkBuffer {}
@@ -2700,181 +2727,295 @@ impl VulkanBackend {
         Ok(backend)
     }
 
-    /// Alias one existing host-pager allocation as transfer buffers. Failure is an optimization
-    /// fallback, not a model-load failure: the caller keeps the established CPU-to-ReBAR path.
-    pub(crate) fn import_host_allocation(
+    /// Alias existing host-pager allocations as transfer buffers. Import shards are assigned to
+    /// the arena with the lowest imported-block fraction, so a finite WDDM host-import budget is
+    /// shared proportionally instead of being exhausted by the first size class. Failure remains
+    /// an optimization fallback: ranges without an alias keep the established CPU-to-ReBAR path.
+    pub(crate) fn import_host_allocations(
         &self,
-        owner: Arc<AlignedHostBuffer>,
-    ) -> Option<ImportedHostAllocation> {
+        allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
+    ) -> Vec<ImportedHostAllocation> {
         if !self.cfg().paging.host_dma {
-            return None;
+            return Vec::new();
         }
         let Some(ext) = self.shared.external_memory_host.as_ref() else {
-            return None;
+            return Vec::new();
         };
         let alignment = self.shared.host_import_alignment.max(1);
-        if owner.is_empty()
-            || alignment > AlignedHostBuffer::ALIGNMENT
-            || !(owner.as_ptr() as usize).is_multiple_of(alignment)
-            || !owner.allocated_len().is_multiple_of(alignment)
-        {
+        if alignment > AlignedHostBuffer::ALIGNMENT {
             tracing::warn!(
-                "[infr] host DMA disabled for one arena: ptr/size does not meet Vulkan import alignment {}",
+                "[infr] host DMA disabled: Vulkan import alignment {} exceeds arena alignment {}",
                 alignment,
+                AlignedHostBuffer::ALIGNMENT,
             );
-            return None;
+            return Vec::new();
         }
 
-        match self.try_import_host_allocation(ext, owner, alignment) {
-            Ok(imported) => {
-                tracing::info!(
-                    "[infr] host DMA import: {:.2}/{:.2} GiB in {} shard(s)",
-                    imported.imported_len as f64 / (1u64 << 30) as f64,
-                    imported.logical_len as f64 / (1u64 << 30) as f64,
-                    imported.shards.len(),
-                );
-                Some(imported)
-            }
-            Err(err) => {
-                tracing::warn!("[infr] host DMA import unavailable; using CPU ReBAR copy: {err}");
-                None
-            }
-        }
+        self.try_import_host_allocations(ext, allocations, alignment)
     }
 
-    fn try_import_host_allocation(
+    fn try_import_host_allocations(
         &self,
         ext: &ash::ext::external_memory_host::Device,
-        owner: Arc<AlignedHostBuffer>,
+        allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
         alignment: usize,
-    ) -> Result<ImportedHostAllocation> {
+    ) -> Vec<ImportedHostAllocation> {
         const IMPORT_SHARD_MAX: usize = 2 * 1024 * 1024 * 1024;
-        let device = &self.shared.device;
         let max_shard =
             IMPORT_SHARD_MAX.min(self.shared.max_mem_alloc_size as usize) / alignment * alignment;
         if max_shard == 0 {
-            return Err(be(
-                "Vulkan host-import shard limit is smaller than its alignment",
-            ));
+            tracing::warn!(
+                "[infr] host DMA disabled: Vulkan host-import shard limit is smaller than its alignment"
+            );
+            return Vec::new();
         }
+
+        struct PendingImport {
+            owner: Arc<AlignedHostBuffer>,
+            logical_len: usize,
+            offset: usize,
+            quantum: usize,
+            block_bytes: usize,
+            shards: Vec<ImportedHostShard>,
+        }
+
+        let mut pending = Vec::new();
+        for (owner, block_bytes) in allocations {
+            if owner.is_empty() {
+                continue;
+            }
+            if !(owner.as_ptr() as usize).is_multiple_of(alignment)
+                || !owner.allocated_len().is_multiple_of(alignment)
+            {
+                tracing::warn!(
+                    "[infr] host DMA skipped one arena: ptr/size does not meet Vulkan import alignment {}",
+                    alignment,
+                );
+                continue;
+            }
+            let block_bytes = block_bytes.max(alignment);
+            let gcd = gcd_usize(block_bytes, alignment);
+            let quantum = block_bytes
+                .checked_div(gcd)
+                .and_then(|n| n.checked_mul(alignment))
+                .filter(|&n| n <= max_shard)
+                .unwrap_or(alignment);
+            pending.push(PendingImport {
+                logical_len: owner.len(),
+                owner,
+                offset: 0,
+                quantum,
+                block_bytes,
+                shards: Vec::new(),
+            });
+        }
+
+        let arena_count = pending.len();
+        let mut limit_error = None;
+        while let Some(index) = proportional_import_index(
+            &pending
+                .iter()
+                .map(|state| (state.offset.min(state.logical_len), state.logical_len))
+                .collect::<Vec<_>>(),
+        ) {
+            let state = &pending[index];
+            let remaining = state.owner.allocated_len() - state.offset;
+            let mut len = remaining.min(max_shard);
+            if len < remaining {
+                len = len / state.quantum * state.quantum;
+            }
+            if len == 0 {
+                len = remaining.min(max_shard);
+            }
+            let minimum = state.quantum.min(len);
+            let mut reduced = false;
+
+            loop {
+                let state = &pending[index];
+                match self.try_import_host_shard(ext, Arc::clone(&state.owner), state.offset, len) {
+                    Ok(shard) => {
+                        let state = &mut pending[index];
+                        state.shards.push(shard);
+                        state.offset += len;
+                        if reduced {
+                            // The first large allocation failure marks the WDDM capacity edge.
+                            // Keep the recovered tail but do not create a long run of tiny external
+                            // allocations trying to consume the final few pages.
+                            limit_error = Some(
+                                "driver capacity reached after a reduced tail shard".to_string(),
+                            );
+                        }
+                        break;
+                    }
+                    Err(err) => {
+                        let state = &pending[index];
+                        let half = (len / 2) / state.quantum * state.quantum;
+                        let smaller = if half >= minimum && half < len {
+                            Some(half)
+                        } else if minimum < len {
+                            Some(minimum)
+                        } else {
+                            None
+                        };
+                        if let Some(smaller) = smaller {
+                            len = smaller;
+                            reduced = true;
+                            continue;
+                        }
+                        limit_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            if limit_error.is_some() {
+                break;
+            }
+        }
+
+        let total_logical: usize = pending.iter().map(|state| state.logical_len).sum();
+        let total_imported: usize = pending
+            .iter()
+            .map(|state| state.offset.min(state.logical_len))
+            .sum();
+        if let Some(err) = limit_error {
+            tracing::warn!(
+                "[infr] host DMA import reached the driver limit at {:.2}/{:.2} GiB ({err}); remaining RAM uses CPU ReBAR copy",
+                total_imported as f64 / (1u64 << 30) as f64,
+                total_logical as f64 / (1u64 << 30) as f64,
+            );
+        }
+
+        let mut imported = Vec::new();
+        for (index, state) in pending.into_iter().enumerate() {
+            let imported_len = state.offset.min(state.logical_len);
+            let imported_blocks = imported_len / state.block_bytes;
+            let total_blocks = state.logical_len / state.block_bytes;
+            tracing::info!(
+                "[infr] host DMA arena {index}: {:.2}/{:.2} GiB, {imported_blocks}/{total_blocks} blocks ({:.1}%)",
+                imported_len as f64 / (1u64 << 30) as f64,
+                state.logical_len as f64 / (1u64 << 30) as f64,
+                imported_len as f64 * 100.0 / state.logical_len as f64,
+            );
+            if state.shards.is_empty() {
+                continue;
+            }
+            imported.push(ImportedHostAllocation {
+                base: state.owner.as_ptr() as usize,
+                logical_len: state.logical_len,
+                imported_len,
+                shards: state.shards,
+            });
+        }
+        tracing::info!(
+            "[infr] host DMA import total: {:.2}/{:.2} GiB across {}/{} arena(s)",
+            total_imported as f64 / (1u64 << 30) as f64,
+            total_logical as f64 / (1u64 << 30) as f64,
+            imported.len(),
+            arena_count,
+        );
+        imported
+    }
+
+    fn try_import_host_shard(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        owner: Arc<AlignedHostBuffer>,
+        offset: usize,
+        len: usize,
+    ) -> Result<ImportedHostShard> {
+        let device = &self.shared.device;
         let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+        let info = vk::BufferCreateInfo::default()
+            .push_next(&mut external)
+            .size(len as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.create_buffer(&info, None) }
+            .map_err(|e| be(format!("create imported-host buffer: {e}")))?;
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        if requirements.size > len as u64 {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(be(format!(
+                "imported-host shard is {len} bytes but Vulkan requires {}",
+                requirements.size,
+            )));
+        }
+        let host_ptr = unsafe { owner.as_ptr().add(offset) };
+        let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let result = unsafe {
+            (ext.fp().get_memory_host_pointer_properties_ext)(
+                device.handle(),
+                handle_type,
+                host_ptr.cast(),
+                &mut host_properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(be(format!(
+                "get imported-host pointer properties at offset {offset}: {result}"
+            )));
+        }
         let memory_properties = unsafe {
             self.shared
                 .instance
                 .get_physical_device_memory_properties(self.shared.physical_device)
         };
-        let mut shards = Vec::new();
-        let mut offset = 0usize;
-        while offset < owner.allocated_len() {
-            let len = (owner.allocated_len() - offset).min(max_shard);
-            let mut external =
-                vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
-            let info = vk::BufferCreateInfo::default()
-                .push_next(&mut external)
-                .size(len as u64)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let buffer = unsafe { device.create_buffer(&info, None) }
-                .map_err(|e| be(format!("create imported-host buffer: {e}")))?;
-            let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-            if requirements.size > len as u64 {
+        let compatible = requirements.memory_type_bits & host_properties.memory_type_bits;
+        let memory_type_index = (0..memory_properties.memory_type_count)
+            .find(|&index| {
+                compatible & (1u32 << index) != 0
+                    && memory_properties.memory_types[index as usize]
+                        .property_flags
+                        .contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+            })
+            .ok_or_else(|| {
                 unsafe { device.destroy_buffer(buffer, None) };
-                return Err(be(format!(
-                    "imported-host shard is {len} bytes but Vulkan requires {}",
-                    requirements.size,
-                )));
+                be(format!(
+                    "no coherent memory type for imported host pointer at offset {offset}"
+                ))
+            })?;
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle_type)
+            .host_pointer(host_ptr.cast());
+        let allocation = vk::MemoryAllocateInfo::default()
+            .push_next(&mut import)
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index);
+        let memory = unsafe { device.allocate_memory(&allocation, None) }.map_err(|e| {
+            unsafe { device.destroy_buffer(buffer, None) };
+            be(format!("import host shard {offset}..{}: {e}", offset + len,))
+        })?;
+        if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
             }
-            let host_ptr = unsafe { owner.as_ptr().add(offset) };
-            let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
-            let result = unsafe {
-                (ext.fp().get_memory_host_pointer_properties_ext)(
-                    device.handle(),
-                    handle_type,
-                    host_ptr.cast(),
-                    &mut host_properties,
-                )
-            };
-            if result != vk::Result::SUCCESS {
-                unsafe { device.destroy_buffer(buffer, None) };
-                return Err(be(format!(
-                    "get imported-host pointer properties at offset {offset}: {result}"
-                )));
-            }
-            let compatible = requirements.memory_type_bits & host_properties.memory_type_bits;
-            let memory_type_index = (0..memory_properties.memory_type_count)
-                .find(|&index| {
-                    compatible & (1u32 << index) != 0
-                        && memory_properties.memory_types[index as usize]
-                            .property_flags
-                            .contains(
-                                vk::MemoryPropertyFlags::HOST_VISIBLE
-                                    | vk::MemoryPropertyFlags::HOST_COHERENT,
-                            )
-                })
-                .ok_or_else(|| {
-                    unsafe { device.destroy_buffer(buffer, None) };
-                    be(format!(
-                        "no coherent memory type for imported host pointer at offset {offset}"
-                    ))
-                })?;
-            let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
-                .handle_type(handle_type)
-                .host_pointer(host_ptr.cast());
-            let allocation = vk::MemoryAllocateInfo::default()
-                .push_next(&mut import)
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type_index);
-            let memory = match unsafe { device.allocate_memory(&allocation, None) } {
-                Ok(memory) => memory,
-                Err(e) => {
-                    unsafe { device.destroy_buffer(buffer, None) };
-                    if !shards.is_empty() {
-                        tracing::warn!(
-                            "[infr] host DMA import reached the driver limit at {:.2} GiB ({e}); remaining RAM uses CPU ReBAR copy",
-                            offset as f64 / (1u64 << 30) as f64,
-                        );
-                        break;
-                    }
-                    return Err(be(format!(
-                        "import host shard {offset}..{}: {e}",
-                        offset + len,
-                    )));
-                }
-            };
-            if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-                unsafe {
-                    device.free_memory(memory, None);
-                    device.destroy_buffer(buffer, None);
-                }
-                return Err(be(format!("bind imported-host shard at {offset}: {e}")));
-            }
-            let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
-                shared: Arc::clone(&self.shared),
-                buffer,
-                backing: Backing::ImportedHost {
-                    memory,
-                    owner: Arc::clone(&owner),
-                    host_ptr,
-                },
-                size: len,
-                mem_size: requirements.size,
-                location: MemoryLocation::CpuToGpu,
-                sub_offset: 0,
-                own_addr: None,
-                act_bytes: 0,
-            });
-            shards.push(ImportedHostShard {
-                offset,
-                len,
-                buffer: imported,
-            });
-            offset += len;
+            return Err(be(format!("bind imported-host shard at {offset}: {e}")));
         }
-        Ok(ImportedHostAllocation {
-            base: owner.as_ptr() as usize,
-            logical_len: owner.len(),
-            imported_len: offset.min(owner.len()),
-            shards,
+        let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::ImportedHost {
+                memory,
+                owner,
+                host_ptr,
+            },
+            size: len,
+            mem_size: requirements.size,
+            location: MemoryLocation::CpuToGpu,
+            sub_offset: 0,
+            own_addr: None,
+            act_bytes: 0,
+        });
+        Ok(ImportedHostShard {
+            offset,
+            len,
+            buffer: imported,
         })
     }
 
@@ -4992,6 +5133,43 @@ fn probe_device_facts(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    #[test]
+    fn host_import_selector_spreads_a_finite_budget_proportionally() {
+        const GIB: usize = 1 << 30;
+        let totals = [23 * GIB, 12 * GIB, 10 * GIB];
+        let mut imported = [0usize; 3];
+
+        // Fourteen ordinary 2-GiB shards plus the recovered 1-GiB tail model the measured
+        // 29-GiB Windows limit. The old arena-at-a-time order produced [23, 6, 0].
+        for shard in (0..15).map(|index| if index == 14 { GIB } else { 2 * GIB }) {
+            let progress: Vec<_> = imported.into_iter().zip(totals).collect();
+            let index = proportional_import_index(&progress).expect("an arena still needs import");
+            imported[index] += shard.min(totals[index] - imported[index]);
+        }
+
+        assert_eq!(imported.iter().sum::<usize>(), 29 * GIB);
+        for (&got, &total) in imported.iter().zip(&totals) {
+            let fraction = got as f64 / total as f64;
+            assert!(
+                (0.55..=0.75).contains(&fraction),
+                "arena coverage {got}/{total} is not proportional: {imported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_import_selector_breaks_equal_fraction_ties_by_arena_size() {
+        assert_eq!(
+            proportional_import_index(&[(0, 10), (0, 30), (0, 20)]),
+            Some(1)
+        );
+        assert_eq!(
+            proportional_import_index(&[(5, 10), (15, 30), (10, 20)]),
+            Some(1)
+        );
+        assert_eq!(proportional_import_index(&[(10, 10), (30, 30)]), None);
+    }
 
     /// A `Buffer` impl that is NOT a `VkBuffer` — stands in for what the multi-backend paths can
     /// actually hand a Vulkan op (another backend's buffer, or a `TpBuffer`/`EpBuffer` wrapper).
