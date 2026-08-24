@@ -32,6 +32,9 @@
 //! issue #20757's SLRU-with-admission remains the documented upgrade if these thrash on an
 //! adversarial pattern.
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ash::vk;
@@ -1151,6 +1154,89 @@ impl Role {
             Role::Down => 2,
         }
     }
+
+    fn trace_name(self) -> &'static str {
+        match self {
+            Role::Gate => "gate",
+            Role::Up => "up",
+            Role::Down => "down",
+        }
+    }
+}
+
+const TRACE_NO_EVICTION: u32 = u32::MAX;
+
+/// One compact hot-path record. Human-readable CSV formatting is deliberately deferred until the
+/// request completes: a 2K Decode is millions of expert touches, so synchronous text output here
+/// would measure the filesystem rather than the pager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PagerTraceRecord {
+    call: u32,
+    pool: u32,
+    layer: u32,
+    expert: u32,
+    block_id: u32,
+    bytes: u32,
+    evicted: u32,
+    role: Role,
+    gpu_hit: bool,
+}
+
+struct PagerTrace {
+    path: PathBuf,
+    calls: u32,
+    records: Vec<PagerTraceRecord>,
+}
+
+impl PagerTrace {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            calls: 0,
+            records: Vec::with_capacity(1 << 20),
+        }
+    }
+
+    fn begin_call(&mut self) -> u32 {
+        let call = self.calls;
+        self.calls = self.calls.saturating_add(1);
+        call
+    }
+
+    fn write_csv(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(
+            out,
+            "seq,call,pool,role,layer,expert,block_id,bytes,gpu_hit,evicted"
+        )?;
+        for (seq, record) in self.records.iter().enumerate() {
+            write!(
+                out,
+                "{seq},{},{},{},{},{},{},{},{}",
+                record.call,
+                record.pool,
+                record.role.trace_name(),
+                record.layer,
+                record.expert,
+                record.block_id,
+                record.bytes,
+                u8::from(record.gpu_hit),
+            )?;
+            if record.evicted != TRACE_NO_EVICTION {
+                write!(out, ",{}", record.evicted)?;
+            } else {
+                write!(out, ",")?;
+            }
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        let file = File::create(&self.path)?;
+        let mut out = BufWriter::with_capacity(4 << 20, file);
+        self.write_csv(&mut out)?;
+        out.flush()
+    }
 }
 
 /// Stable identity of a bound `&dyn Buffer` — a thin-pointer cast of the trait object's data
@@ -1415,6 +1501,7 @@ pub struct MoePagerSession {
     tape: Box<dyn Buffer>,
     tape_words: usize,
     print_stats: bool,
+    trace: Option<PagerTrace>,
     /// Physical interpretation of every pool arena. Prefill owns slot 0..n_expert as one
     /// contiguous layer bank; decode restores the ordinary expert-LRU interpretation.
     mode: MoeArenaMode,
@@ -1606,6 +1693,7 @@ impl MoePagerSession {
             tape,
             tape_words,
             print_stats: vk.cfg().paging.stats,
+            trace: vk.cfg().paging.trace.clone().map(PagerTrace::new),
             mode: MoeArenaMode::DecodeLru,
             prefill_lane_layer: Vec::new(),
             prefill_target_lanes: layout.prefill_target_lanes.max(1),
@@ -2518,28 +2606,42 @@ impl MoePagerSession {
         }
         let mut resolved = Vec::with_capacity(roles.len());
         for &(buf_id, local_ids) in roles {
-            let (_, pool, src) = self
+            let (role, pool, src) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: DMA stage on an unregistered buffer"))?;
+            if src.stride_bytes == 0 || !src.bank_bytes.is_multiple_of(src.stride_bytes) {
+                return Err(be("moe pager: invalid registered expert bank geometry"));
+            }
+            let n_expert = u32::try_from(src.bank_bytes / src.stride_bytes)
+                .map_err(|_| be("moe pager: expert count exceeds u32"))?;
+            if n_expert == 0 {
+                return Err(be("moe pager: registered expert bank is empty"));
+            }
             resolved.push((
+                *role,
                 *pool,
                 src.stride_bytes,
                 src.block_base,
+                src.layer_base / n_expert,
                 src.host_chunk,
                 src.host_offset,
                 local_ids,
             ));
         }
-        let pool_idx = resolved[0].0;
-        if resolved.iter().any(|entry| entry.0 != pool_idx) {
+        let pool_idx = resolved[0].1;
+        if resolved.iter().any(|entry| entry.1 != pool_idx) {
             return Err(be(
                 "moe pager: cross-role CPU push spans multiple size pools",
             ));
         }
-        let requested = resolved.iter().map(|entry| entry.5.len()).sum();
+        let requested = resolved.iter().map(|entry| entry.7.len()).sum();
+        let trace_call = self.trace.as_mut().map(PagerTrace::begin_call);
         let Self {
-            pools, host_store, ..
+            pools,
+            host_store,
+            trace,
+            ..
         } = self;
         let pool = &mut pools[pool_idx];
         let copy_t0 = pager_profile::active().then(std::time::Instant::now);
@@ -2548,30 +2650,35 @@ impl MoePagerSession {
             // Resolve in the original order first: this preserves exact GPU-LRU victim selection
             // and LUT contents. Only the resulting independent byte moves run in parallel.
             let mut promotions = Vec::with_capacity(requested);
-            for &(_, stride, block_base, _, _, local_ids) in &resolved {
+            for &(role, _, stride, block_base, layer, _, _, local_ids) in &resolved {
                 for &lid in local_ids {
                     let id = block_base + lid;
-                    if pool.pager.is_resident(id) {
-                        let plan = pool.pager.plan_inclusive_cpu_push(
-                            id,
-                            pool.exchange_slot
-                                .as_mut()
-                                .expect("tiered pool has an exchange slot"),
-                            scan,
-                        )?;
-                        debug_assert!(plan.is_none());
-                        continue;
+                    let plan = pool.pager.plan_inclusive_cpu_push(
+                        id,
+                        pool.exchange_slot
+                            .as_mut()
+                            .expect("tiered pool has an exchange slot"),
+                        scan,
+                    )?;
+                    if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
+                        trace.records.push(PagerTraceRecord {
+                            call,
+                            pool: pool_idx as u32,
+                            layer,
+                            expert: lid,
+                            block_id: id,
+                            bytes: stride.min(u32::MAX as usize) as u32,
+                            evicted: plan
+                                .as_ref()
+                                .and_then(|plan| plan.evicted)
+                                .unwrap_or(TRACE_NO_EVICTION),
+                            role,
+                            gpu_hit: plan.is_none(),
+                        });
                     }
-                    let plan = pool
-                        .pager
-                        .plan_inclusive_cpu_push(
-                            id,
-                            pool.exchange_slot
-                                .as_mut()
-                                .expect("tiered pool has an exchange slot"),
-                            scan,
-                        )?
-                        .expect("a nonresident block must produce an upload plan");
+                    let Some(plan) = plan else {
+                        continue;
+                    };
                     promotions.push((id, plan.evicted, plan.dst));
                     copied = copied.saturating_add(stride);
                 }
@@ -2590,7 +2697,8 @@ impl MoePagerSession {
                 }
             }
         } else {
-            for &(_, stride, block_base, host_chunk, host_base, local_ids) in &resolved {
+            for &(role, _, stride, block_base, layer, host_chunk, host_base, local_ids) in &resolved
+            {
                 for &lid in local_ids {
                     let local = lid as usize;
                     let id = block_base + lid;
@@ -2599,7 +2707,24 @@ impl MoePagerSession {
                     let src = host_base
                         .checked_add(local.saturating_mul(stride))
                         .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
-                    if let Some(plan) = pool.pager.plan_cpu_push(id, scan)? {
+                    let plan = pool.pager.plan_cpu_push(id, scan)?;
+                    if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
+                        trace.records.push(PagerTraceRecord {
+                            call,
+                            pool: pool_idx as u32,
+                            layer,
+                            expert: lid,
+                            block_id: id,
+                            bytes: stride.min(u32::MAX as usize) as u32,
+                            evicted: plan
+                                .as_ref()
+                                .and_then(|plan| plan.evicted)
+                                .unwrap_or(TRACE_NO_EVICTION),
+                            role,
+                            gpu_hit: plan.is_none(),
+                        });
+                    }
+                    if let Some(plan) = plan {
                         let bytes = host_store[host_chunk]
                             .bytes
                             .get(src..src + stride)
@@ -2784,6 +2909,20 @@ impl MoePagerSession {
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
     pub fn print_stats_if_enabled(&self) {
+        if let Some(trace) = &self.trace {
+            match trace.flush() {
+                Ok(()) => tracing::info!(
+                    "[moe pager] trace: path={} records={} calls={}",
+                    trace.path.display(),
+                    trace.records.len(),
+                    trace.calls,
+                ),
+                Err(error) => tracing::error!(
+                    "[moe pager] cannot write trace {}: {error}",
+                    trace.path.display(),
+                ),
+            }
+        }
         if !self.print_stats {
             return;
         }
@@ -3149,6 +3288,44 @@ mod tests {
     fn validate_pager_dims_accepts_valid() {
         assert!(validate_pager_dims(1, 4).is_ok());
         assert!(validate_pager_dims(238, 13 << 20).is_ok());
+    }
+
+    #[test]
+    fn pager_trace_csv_preserves_order_hits_and_evictions() {
+        let mut trace = PagerTrace::new(PathBuf::from("unused.csv"));
+        trace.calls = 2;
+        trace.records = vec![
+            PagerTraceRecord {
+                call: 0,
+                pool: 1,
+                role: Role::Gate,
+                layer: 3,
+                expert: 7,
+                block_id: 103,
+                bytes: 4096,
+                gpu_hit: true,
+                evicted: TRACE_NO_EVICTION,
+            },
+            PagerTraceRecord {
+                call: 1,
+                pool: 1,
+                role: Role::Down,
+                layer: 3,
+                expert: 2,
+                block_id: 302,
+                bytes: 4096,
+                gpu_hit: false,
+                evicted: 81,
+            },
+        ];
+        let mut csv = Vec::new();
+        trace.write_csv(&mut csv).unwrap();
+        assert_eq!(
+            String::from_utf8(csv).unwrap(),
+            "seq,call,pool,role,layer,expert,block_id,bytes,gpu_hit,evicted\n\
+             0,0,1,gate,3,7,103,4096,1,\n\
+             1,1,1,down,3,2,302,4096,0,81\n"
+        );
     }
 
     #[test]

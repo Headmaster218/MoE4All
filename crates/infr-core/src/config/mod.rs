@@ -170,6 +170,10 @@ cfg_struct! {
         moe_size_cache_bias: Option<f32> = None,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
+        /// `INFR_PAGER_TRACE`: optional ordered Decode pager-access CSV. Records are buffered in
+        /// memory and written after generation so tracing does not add per-expert file I/O to the
+        /// critical path.
+        trace: Option<PathBuf> = None,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
         /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
         /// leaving residency to the OS page cache. For paged MoE, a budget covering the complete

@@ -80,6 +80,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kv.slots, 4);
     assert!(d.kv.ring);
     assert!(!d.kv.force_q8);
+    assert_eq!(d.paging.trace, None);
 
     // §6.5 / §10.2: the mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
     assert!(d.kernels.vulkan.mmv);
@@ -137,6 +138,18 @@ fn env_overrides_file() {
         env_layer(&[("INFR_FLASH_SPLITS", "4")]),
     ]);
     assert_eq!(cfg.kernels.vulkan.flash_splits, Some(4));
+}
+
+#[test]
+fn pager_trace_path_is_config_backed() {
+    let cfg = Config::load_from_layers(&[
+        file_layer("[paging]\ntrace = 'file.csv'\n"),
+        env_layer(&[("INFR_PAGER_TRACE", "env.csv")]),
+    ]);
+    assert_eq!(cfg.paging.trace.as_deref(), Some(Path::new("env.csv")));
+
+    let cfg = Config::load_from_layers(&[cli_layer(&["paging.trace=cli.csv"])]);
+    assert_eq!(cfg.paging.trace.as_deref(), Some(Path::new("cli.csv")));
 }
 
 /// A CLI flag beats the environment.
@@ -1367,6 +1380,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MLA_SG",
         "INFR_NO_Q8_DECODE_CHUNK1024",
         "INFR_NO_MOE_LAYER_STREAM",
+        "INFR_PAGER_TRACE",
         "INFR_SHUTDOWN_FILE",
         "INFR_EMBEDDING_RUNNER",
     ];
