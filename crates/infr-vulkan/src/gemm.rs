@@ -388,6 +388,32 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
     })
 }
 
+/// Hybrid paged-Qwen decode GEMV: routed slots use `dtype`, while the final slot reads a fixed
+/// dense Q8_0 shared-expert matrix. Kept separate from the ordinary paged table so unsupported
+/// graphs cannot accidentally select the larger push-constant ABI.
+pub(crate) fn native_idm_paged_shared_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q5K => v!("native_idm_q5k_paged_shexp"),
+        Q6K => v!("native_idm_q6k_paged_shexp"),
+        Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
+        _ => None,
+    }
+}
+
 /// The single-slot id-indexed native GEMV (kernel-cache name + SPIR-V) — the stacked expert
 /// tensor read from a `bufferDeviceAddress` arena; `stride` becomes the per-expert BYTE stride
 /// applied on the 64-bit pointer (no LUT); the sole weight build. Dispatched via
@@ -573,6 +599,42 @@ pub(crate) fn native_idm_sg_paged_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_sg16"),
+        _ => None,
+    }
+}
+
+/// Subgroup+NR twin of [`native_idm_paged_shared_build_spv`]. Only Q5_K/Q6_K have an enrolled
+/// subgroup down-projection path; IQ4_XS stays on the tree kernel.
+pub(crate) fn native_idm_sg_paged_shared_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+    sg16: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr, sg16) {
+        (Q6K, 2, false) => v!("native_idm_q6k_sg2_paged_shexp"),
+        (Q6K, 4, false) => v!("native_idm_q6k_sg4_paged_shexp"),
+        (Q6K, 8, false) => v!("native_idm_q6k_sg8_paged_shexp"),
+        (Q6K, 2, true) => v!("native_idm_q6k_sg2_paged_shexp_sg16"),
+        (Q6K, 4, true) => v!("native_idm_q6k_sg4_paged_shexp_sg16"),
+        (Q6K, 8, true) => v!("native_idm_q6k_sg8_paged_shexp_sg16"),
+        (Q5K, 2, false) => v!("native_idm_q5k_sg2_paged_shexp"),
+        (Q5K, 4, false) => v!("native_idm_q5k_sg4_paged_shexp"),
+        (Q5K, 8, false) => v!("native_idm_q5k_sg8_paged_shexp"),
+        (Q5K, 2, true) => v!("native_idm_q5k_sg2_paged_shexp_sg16"),
+        (Q5K, 4, true) => v!("native_idm_q5k_sg4_paged_shexp_sg16"),
+        (Q5K, 8, true) => v!("native_idm_q5k_sg8_paged_shexp_sg16"),
         _ => None,
     }
 }
@@ -1275,6 +1337,12 @@ pub(crate) fn native_gemm_i8cm_q8_0_rowscale_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the fused eight-routed-plus-one-shared Qwen decode reduction.
+pub(crate) fn moe_accumulate_shared_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate_shared.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

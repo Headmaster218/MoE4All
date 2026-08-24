@@ -1,0 +1,26 @@
+#version 460
+// Qwen35MoE decode combine for eight routed slots plus one always-resident shared expert.
+// Slot order deliberately matches the original two-op path: routed slots accumulate first, then
+// the sigmoid-gated shared output is added last, preserving the trained graph's arithmetic order.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint ne; uint routed_used; uint rows; } pc;
+layout(binding = 0) readonly buffer DB { float down[]; };
+layout(binding = 1) readonly buffer WB { float wts[]; };
+layout(binding = 2) readonly buffer GB { float gate[]; };
+layout(binding = 3) buffer HB { float hidden[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.ne) return;
+    uint row = gl_WorkGroupID.y;
+    uint physical_used = pc.routed_used + 1u;
+    uint routed_base = row * pc.routed_used;
+    uint down_base = row * physical_used;
+    float acc = 0.0;
+    for (uint slot = 0u; slot < pc.routed_used; slot++) {
+        acc += wts[routed_base + slot] * down[(down_base + slot) * pc.ne + i];
+    }
+    float g = 1.0 / (1.0 + exp(-gate[row]));
+    hidden[row * pc.ne + i] =
+        acc + g * down[(down_base + pc.routed_used) * pc.ne + i];
+}

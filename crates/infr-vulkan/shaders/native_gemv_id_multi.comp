@@ -29,6 +29,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
     uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask;
+#ifdef SHARED_Q8
+    uint shared_lo; uint shared_hi; uint routed_used;
+#endif
 } pc;
 #elif defined(STREAMED)
 // -DSTREAMED (resident-BDA): the stacked role tensor lives in a resident BDA arena at the 64-bit
@@ -77,6 +80,48 @@ shared float part[8];   // one partial per subgroup (64 threads / min 8-wide sub
 
 #include "native_decode.glsl"
 
+#ifdef SHARED_Q8
+// The optional last slot is a fixed, dense Q8_0 shared expert while slots before it use the
+// paged routed format selected by FMT_*. Keep the Q8 decoder local instead of defining FMT_Q8_0
+// alongside the routed format: native_decode.glsl deliberately exposes one dqblk implementation
+// per build. The branch selecting this decoder is workgroup-uniform (one slot per workgroup).
+void dqblk_shared_q8(uint gstart, out float v[32]) {
+    uint bd = (gstart / 32u) * 34u;
+    float d = f16tof32(ru16(bd));
+    uint qoff = bd + 2u;
+    uint qwb = qoff >> 2u;
+    uint qsh = (qoff & 3u) << 3u;
+    uvec4 qA = NW4(qwb); uvec4 qB = NW4(qwb + 4u);
+    if (qsh == 0u) {
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            int q4 = int((w8 < 4u) ? qA[w8] : qB[w8 - 4u]);
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    } else {
+        uint qtail = NW(qwb + 8u);
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            uint qcur = (w8 < 4u) ? qA[w8] : qB[w8 - 4u];
+            uint w1 = w8 + 1u;
+            uint qnxt = (w1 < 4u) ? qA[w1] : ((w1 < 8u) ? qB[w1 - 4u] : qtail);
+            int q4 = int((qcur >> qsh) | (qnxt << (32u - qsh)));
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    }
+}
+
+float dqsub_shared_q8(uint gstart, uint xoff) {
+    float v[32];
+    dqblk_shared_q8(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+#endif
+
 float dqsub(uint gstart, uint xoff) {
     float v[32];
     dqblk(gstart, v);
@@ -95,6 +140,7 @@ void main() {
     uint slot_global = unit / pc.out_f; // (row, slot) flattened — see the small-batch note above
     uint o = unit - slot_global * pc.out_f;
     uint row = slot_global / pc.n_used;
+    uint slot = slot_global - row * pc.n_used;
 #ifdef PAGED
     if ((pc.active_mask & (1u << (slot_global % pc.n_used))) == 0u) { return; }
 #endif
@@ -107,7 +153,18 @@ void main() {
     // indices for exactly this layer — a write-once window in the session's LUT tape (see
     // `MoePagerSession::lut_window` for why in-flight segments must read a frozen copy, not the
     // live pool LUT).
+#ifdef SHARED_Q8
+    bool is_shared = slot == pc.routed_used;
+    if (is_shared) {
+        w_addr = arena_base(pc.shared_lo, pc.shared_hi);
+    } else {
+        uint routed_slot = row * pc.routed_used + slot;
+        w_addr = arena_base(lut[pc.stride + ids[routed_slot]].x,
+                            lut[pc.stride + ids[routed_slot]].y);
+    }
+#else
     w_addr = arena_base(lut[pc.stride + ids[slot_global]].x, lut[pc.stride + ids[slot_global]].y);
+#endif
     uint wbase = o * pc.in_f;
 #elif defined(STREAMED)
     // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE
@@ -122,7 +179,13 @@ void main() {
     uint nsub = pc.in_f / 32u;
     float acc = 0.0;
     for (uint s = t; s < nsub; s += 64u) {
+#ifdef SHARED_Q8
+        acc += is_shared
+            ? dqsub_shared_q8(wbase + s * 32u, xbase + s * 32u)
+            : dqsub(wbase + s * 32u, xbase + s * 32u);
+#else
         acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+#endif
     }
     float sg = subgroupAdd(acc);
     if (subgroupElect()) { part[gl_SubgroupID] = sg; }

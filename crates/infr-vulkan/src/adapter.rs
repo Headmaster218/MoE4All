@@ -5405,7 +5405,30 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
-    let skip_op = plan.skip;
+    let mut skip_op = plan.skip;
+    // Strict decode-only Qwen peephole. Only suppress the six dense shared-expert ops when the
+    // routed bank is actually backed by the Vulkan pager; resident/CPU/other-model graphs keep the
+    // original op stream. `PagedMoeShared` is Copy and contains only graph handles.
+    let mut paged_moe_shared = HashMap::<usize, PagedMoeShared>::new();
+    for op_idx in 0..graph.ops.len() {
+        let Some(shared) = paged_moe_shared_at(graph, op_idx) else {
+            continue;
+        };
+        let Op::MoeFfn { gate_exps, .. } = &graph.ops[op_idx] else {
+            unreachable!();
+        };
+        let gbuf = resolve(&scratch, bindings, *gate_exps)?;
+        let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
+            s.is_paged(
+                crate::pager::Role::Gate,
+                crate::pager::buffer_identity(gbuf),
+            )
+        });
+        if paged {
+            paged_moe_shared.insert(op_idx, shared);
+            skip_op.extend(op_idx + 1..op_idx + 7);
+        }
+    }
 
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
     // recorder — hold them here so they drop only after `rec.finish()` submits.
@@ -5530,6 +5553,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     &mut pool,
                     &mut rec,
                     &mut pstream,
+                    paged_moe_shared.get(&op_idx).copied(),
                 )?;
                 continue;
             }
@@ -6261,6 +6285,229 @@ fn prefetch_next_moe_layer<'a>(
 /// arena+window hop with `out_f = 2*nff` and the activation splits gate|up per row exactly like
 /// the resident fused arms. `rows`/`n_used` are general (not hardcoded to llama4's rows=1/
 /// n_used=1).
+#[derive(Clone, Copy)]
+struct PagedMoeShared {
+    gate_inp: TensorId,
+    gate: TensorId,
+    wgate: TensorId,
+    wup: TensorId,
+    wdown: TensorId,
+    dst: TensorId,
+}
+
+/// Recognize the exact Qwen sigmoid-gated shared-expert tail emitted by `seam::runner`. This is a
+/// backend peephole rather than a graph semantic change: other backends and prefill retain the
+/// ordinary dense chain, while Vulkan decode can place the shared expert in routed slot 8.
+fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
+    // Validation/escape hatch: permits same-binary A/B and an immediate fallback if a future
+    // model reuses the exact graph shape but violates an unstated packing invariant.
+    if std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some() {
+        return None;
+    }
+    let Op::MoeFfn {
+        x,
+        gate_exps,
+        up_exps,
+        down_exps,
+        down_scale: None,
+        fused_gate_up: false,
+        dst: moe_dst,
+        ne,
+        n_used,
+        n_ff_exp,
+        act: Activation::Silu,
+        weight_before: false,
+        swiglu_clamp: None,
+        ..
+    } = graph.ops.get(op_idx)?
+    else {
+        return None;
+    };
+    if graph.desc(*x).numel() != *ne as usize || *n_used >= 31 {
+        return None;
+    }
+    let supported_routed = |id: TensorId| {
+        matches!(
+            graph.desc(id).dtype,
+            infr_core::DType::Q5K | infr_core::DType::Q6K | infr_core::DType::Iq4Xs
+        )
+    };
+    if !supported_routed(*gate_exps) || !supported_routed(*up_exps) || !supported_routed(*down_exps)
+    {
+        return None;
+    }
+    let [gate_op, g_op, u_op, act_op, d_op, add_op] = graph.ops.get(op_idx + 1..op_idx + 7)? else {
+        return None;
+    };
+    let Op::Linear {
+        x: gate_x,
+        weight: gate_inp,
+        dst: gate,
+        m: 1,
+        in_f: gate_in,
+        out_f: 1,
+        w_off: 0,
+    } = gate_op
+    else {
+        return None;
+    };
+    let Op::Linear {
+        x: gx,
+        weight: wgate,
+        dst: gbuf,
+        m: 1,
+        in_f: gin,
+        out_f: gout,
+        w_off: 0,
+    } = g_op
+    else {
+        return None;
+    };
+    let Op::Linear {
+        x: ux,
+        weight: wup,
+        dst: ubuf,
+        m: 1,
+        in_f: uin,
+        out_f: uout,
+        w_off: 0,
+    } = u_op
+    else {
+        return None;
+    };
+    let Op::GatedAct {
+        gate: ag,
+        up: au,
+        dst: abuf,
+        rows: 1,
+        nff,
+        act: Activation::Silu,
+        up_off: 0,
+        up_stride: 0,
+        gate_stride: 0,
+        gate_block_width: 0,
+        swiglu_clamp: None,
+    } = act_op
+    else {
+        return None;
+    };
+    let Op::Linear {
+        x: dx,
+        weight: wdown,
+        dst: d_out,
+        m: 1,
+        in_f: din,
+        out_f: dout,
+        w_off: 0,
+    } = d_op
+    else {
+        return None;
+    };
+    let Op::MoeSharedExpertAdd {
+        moe,
+        shexp,
+        gate: add_gate,
+        dst,
+        rows: 1,
+        n,
+    } = add_op
+    else {
+        return None;
+    };
+    let ne = *ne;
+    let nff_exp = *n_ff_exp;
+    if *gate_x != *x
+        || *gx != *x
+        || *ux != *x
+        || *gate_in != ne
+        || *gin != ne
+        || *uin != ne
+        || *gout != nff_exp
+        || *uout != nff_exp
+        || *ag != *gbuf
+        || *au != *ubuf
+        || *nff != nff_exp
+        || *dx != *abuf
+        || *din != nff_exp
+        || *dout != ne
+        || *moe != *moe_dst
+        || *shexp != *d_out
+        || *add_gate != *gate
+        || *n != ne
+        || graph.desc(*gate_inp).dtype != infr_core::DType::F32
+        || graph.desc(*wgate).dtype != infr_core::DType::Q8_0
+        || graph.desc(*wup).dtype != infr_core::DType::Q8_0
+        || graph.desc(*wdown).dtype != infr_core::DType::Q8_0
+    {
+        return None;
+    }
+    Some(PagedMoeShared {
+        gate_inp: *gate_inp,
+        gate: *gate,
+        wgate: *wgate,
+        wup: *wup,
+        wdown: *wdown,
+        dst: *dst,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_paged_maybe_shared(
+    rec: &Recorder<'_>,
+    dtype: infr_core::DType,
+    arena_addr: u64,
+    slot_bytes: u32,
+    lut: &dyn Buffer,
+    ids: &dyn Buffer,
+    n_used: usize,
+    lut_base: usize,
+    shared: Option<&dyn Buffer>,
+    x: &dyn Buffer,
+    x_per_slot: bool,
+    y: &dyn Buffer,
+    in_f: usize,
+    out_f: usize,
+    rows: usize,
+    active_mask: u32,
+) {
+    if let Some(shared) = shared {
+        debug_assert_eq!(rows, 1);
+        rec.linear_native_id_multi_paged_shared(
+            dtype,
+            arena_addr,
+            slot_bytes,
+            lut,
+            ids,
+            n_used,
+            lut_base,
+            shared,
+            x,
+            x_per_slot,
+            y,
+            in_f,
+            out_f,
+            active_mask,
+        );
+    } else {
+        rec.linear_native_id_multi_paged(
+            dtype,
+            arena_addr,
+            slot_bytes,
+            lut,
+            ids,
+            n_used,
+            lut_base,
+            x,
+            x_per_slot,
+            y,
+            in_f,
+            out_f,
+            rows,
+            active_mask,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_paged_moe<'a>(
@@ -6272,6 +6519,7 @@ fn execute_paged_moe<'a>(
     pool: &mut ScratchPool,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    shared: Option<PagedMoeShared>,
 ) -> Result<()> {
     use crate::pager::buffer_identity;
     let Op::MoeFfn {
@@ -6325,7 +6573,19 @@ fn execute_paged_moe<'a>(
     );
     let rows = graph.desc(*x).numel() / ne;
     let n_slots = rows * n_used;
+    let physical_used = n_used + usize::from(shared.is_some());
+    let physical_slots = rows * physical_used;
+    let routed_mask = if n_used == u32::BITS as usize {
+        u32::MAX
+    } else {
+        (1u32 << n_used) - 1
+    };
+    let shared_mask = shared.map_or(0, |_| 1u32 << n_used);
+    let all_active_mask = routed_mask | shared_mask;
     let r = |id: TensorId| resolve(scratch, bindings, id);
+    let shared_wgate = shared.map(|s| r(s.wgate)).transpose()?;
+    let shared_wup = shared.map(|s| r(s.wup)).transpose()?;
+    let shared_wdown = shared.map(|s| r(s.wdown)).transpose()?;
 
     // Dummy bias buffer when exp_probs_b is absent (the shader ignores it when has_bias==0).
     let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
@@ -6392,6 +6652,11 @@ fn execute_paged_moe<'a>(
             hash_buf,
             hash,
         );
+        if let Some(shared) = shared {
+            // One scalar raw gate logit per row. It is independent of top-k and remains a tiny
+            // dense F32 projection; only the three large shared matrices join the routed slots.
+            rc.linear_f32(r(shared.gate_inp)?, r(*x)?, r(shared.gate)?, rows, ne, 1);
+        }
     }
 
     let gate_buf = r(*gate_exps)?;
@@ -6467,7 +6732,7 @@ fn execute_paged_moe<'a>(
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
         sync_stream(be_, rec, ps)?;
     }
-    let mut active_mask = u32::MAX;
+    let mut active_mask = all_active_mask;
     let mut shared_batch_preopened = false;
     // Decode-only hit-first trial: when some complete Gate/Up/Down triplets are already resident,
     // launch those slots before blocking on the remaining host promotions. The original slot
@@ -6481,11 +6746,6 @@ fn execute_paged_moe<'a>(
         && stage_ids.len() == n_used
         && n_used <= u32::BITS as usize
     {
-        let all_mask = if n_used == u32::BITS as usize {
-            u32::MAX
-        } else {
-            (1u32 << n_used) - 1
-        };
         let (hit_mask, bounded) = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_ref().expect("paged execution requires a session");
@@ -6494,7 +6754,9 @@ fn execute_paged_moe<'a>(
                 sess.role_uses_bounded_host_tier(gate_id)?,
             )
         };
-        if bounded && hit_mask != 0 && hit_mask != all_mask {
+        // Without a shared expert, an empty hit set still has no useful first-stage work. With
+        // one, shared-only is useful work and overlaps the all-miss host promotion as requested.
+        if bounded && hit_mask != routed_mask && (hit_mask != 0 || shared.is_some()) {
             let mut hit_ids = Vec::with_capacity(n_used);
             let mut miss_ids = Vec::with_capacity(n_used);
             for (slot, &expert) in stage_ids.iter().enumerate() {
@@ -6508,7 +6770,7 @@ fn execute_paged_moe<'a>(
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
                 let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
-                if shared {
+                if shared && !hit_ids.is_empty() {
                     sess.push_roles_cpu(
                         &[
                             (gate_id, hit_ids.as_slice()),
@@ -6526,20 +6788,22 @@ fn execute_paged_moe<'a>(
                 let up_hit_w = stage_and_window(be_, rec, ps, up_id, &[], n_expert, false, true)?;
                 let down_hit_w =
                     stage_and_window(be_, rec, ps, down_id, &[], n_expert, false, true)?;
-                let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * gu_width * 4)?;
-                let ubuf = pooled(pool, be_, "moe_paged_u", n_slots * nff * 4)?;
-                let abuf = pooled(pool, be_, "moe_paged_a", n_slots * nff * 4)?;
-                let ybuf = pooled(pool, be_, "moe_paged_y", n_slots * ne * 4)?;
+                let gbuf = pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?;
+                let ubuf = pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?;
+                let abuf = pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?;
+                let ybuf = pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?;
                 let rec2 = rec.as_ref().expect("segment always Some between ops");
-                rec2.zero(pool[&gbuf].as_ref(), n_slots * gu_width);
-                rec2.zero(pool[&ubuf].as_ref(), n_slots * nff);
-                rec2.zero(pool[&ybuf].as_ref(), n_slots * ne);
+                rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
+                rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
+                rec2.zero(pool[&ybuf].as_ref(), physical_slots * ne);
                 rec2.arena_stream_barrier();
                 let xb = r(*x)?;
+                let first_mask = hit_mask | shared_mask;
                 {
                     let guard = be_.moe_pager().lock().unwrap();
                     let sess = guard.as_ref().expect("checked above");
-                    rec2.linear_native_id_multi_paged(
+                    linear_paged_maybe_shared(
+                        rec2,
                         gdt,
                         sess.arena_addr(gate_id)?,
                         sess.slot_bytes(gate_id)? as u32,
@@ -6547,15 +6811,17 @@ fn execute_paged_moe<'a>(
                         pool[&ids_key].as_ref(),
                         n_used,
                         gate_hit_w as usize,
+                        shared_wgate,
                         xb,
                         false,
                         pool[&gbuf].as_ref(),
                         ne,
                         gu_width,
                         rows,
-                        hit_mask,
+                        first_mask,
                     );
-                    rec2.linear_native_id_multi_paged(
+                    linear_paged_maybe_shared(
+                        rec2,
                         udt,
                         sess.arena_addr(up_id)?,
                         sess.slot_bytes(up_id)? as u32,
@@ -6563,16 +6829,17 @@ fn execute_paged_moe<'a>(
                         pool[&ids_key].as_ref(),
                         n_used,
                         up_hit_w as usize,
+                        shared_wup,
                         xb,
                         false,
                         pool[&ubuf].as_ref(),
                         ne,
                         nff,
                         rows,
-                        hit_mask,
+                        first_mask,
                     );
                 }
-                let n_act = n_slots * nff;
+                let n_act = physical_slots * nff;
                 match act {
                     Activation::Silu => rec2.silu_mul(
                         pool[&gbuf].as_ref(),
@@ -6606,7 +6873,8 @@ fn execute_paged_moe<'a>(
                 {
                     let guard = be_.moe_pager().lock().unwrap();
                     let sess = guard.as_ref().expect("checked above");
-                    rec2.linear_native_id_multi_paged(
+                    linear_paged_maybe_shared(
+                        rec2,
                         ddt,
                         sess.arena_addr(down_id)?,
                         sess.slot_bytes(down_id)? as u32,
@@ -6614,13 +6882,14 @@ fn execute_paged_moe<'a>(
                         pool[&ids_key].as_ref(),
                         n_used,
                         down_hit_w as usize,
+                        shared_wdown,
                         pool[&abuf].as_ref(),
                         true,
                         pool[&ybuf].as_ref(),
                         nff,
                         ne,
                         rows,
-                        hit_mask,
+                        first_mask,
                     );
                 }
                 submit_prefill_compute(rec, ps)?;
@@ -6629,7 +6898,7 @@ fn execute_paged_moe<'a>(
                 fresh.arena_stream_barrier();
                 *rec = Some(fresh);
                 stage_ids = miss_ids;
-                active_mask = all_mask ^ hit_mask;
+                active_mask = routed_mask ^ hit_mask;
                 shared_batch_preopened = true;
             }
         }
@@ -6981,21 +7250,22 @@ fn execute_paged_moe<'a>(
     // exactly mirroring the non-paged small-m arm (including its fused-gate_up shape: one
     // double-width GEMV into a gate|up buffer, split by the fused activation kernel). Recorded
     // inline into the ambient segment like the batched arm above.
-    let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * gu_width * 4)?;
+    let gbuf = pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?;
     let ubuf = if *fused_gate_up {
         None
     } else {
-        Some(pooled(pool, be_, "moe_paged_u", n_slots * nff * 4)?)
+        Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
     };
-    let abuf = pooled(pool, be_, "moe_paged_a", n_slots * nff * 4)?;
-    let ybuf = pooled(pool, be_, "moe_paged_y", n_slots * ne * 4)?;
-    let n_act = n_slots * nff;
+    let abuf = pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?;
+    let ybuf = pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?;
+    let n_act = physical_slots * nff;
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     let xb = r(*x)?;
     {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
-        rec2.linear_native_id_multi_paged(
+        linear_paged_maybe_shared(
+            rec2,
             gdt,
             sess.arena_addr(gate_id)?,
             sess.slot_bytes(gate_id)? as u32,
@@ -7003,6 +7273,7 @@ fn execute_paged_moe<'a>(
             pool[&ids_key].as_ref(),
             n_used,
             gate_w as usize,
+            shared_wgate,
             xb,
             false,
             pool[&gbuf].as_ref(),
@@ -7012,7 +7283,8 @@ fn execute_paged_moe<'a>(
             active_mask,
         );
         if let Some(ubuf) = &ubuf {
-            rec2.linear_native_id_multi_paged(
+            linear_paged_maybe_shared(
+                rec2,
                 udt,
                 sess.arena_addr(up_id)?,
                 sess.slot_bytes(up_id)? as u32,
@@ -7020,6 +7292,7 @@ fn execute_paged_moe<'a>(
                 pool[&ids_key].as_ref(),
                 n_used,
                 up_w as usize,
+                shared_wup,
                 xb,
                 false,
                 pool[ubuf].as_ref(),
@@ -7128,7 +7401,8 @@ fn execute_paged_moe<'a>(
     {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
-        rec2.linear_native_id_multi_paged(
+        linear_paged_maybe_shared(
+            rec2,
             ddt,
             sess.arena_addr(down_id)?,
             sess.slot_bytes(down_id)? as u32,
@@ -7136,6 +7410,7 @@ fn execute_paged_moe<'a>(
             pool[&ids_key].as_ref(),
             n_used,
             down_w as usize,
+            shared_wdown,
             pool[&abuf].as_ref(),
             true,
             pool[&ybuf].as_ref(),
@@ -7145,30 +7420,45 @@ fn execute_paged_moe<'a>(
             active_mask,
         );
     }
-    let dstb = r(*dst)?;
-    rec2.zero(dstb, rows * ne);
-    match down_scale {
-        Some(ds) => rec2.moe_accumulate_scaled(
+    let dstb = match shared {
+        Some(shared) => r(shared.dst)?,
+        None => r(*dst)?,
+    };
+    if let Some(shared) = shared {
+        rec2.moe_accumulate_shared(
             pool[&ybuf].as_ref(),
             pool[&wts].as_ref(),
-            // `down_scale[expert_id]` indexes by the LOCAL id (the layer's own [n_expert] scale
-            // array) — the same local-ids buffer the windowed GEMVs read.
-            pool[&ids_key].as_ref(),
-            r(*ds)?,
+            r(shared.gate)?,
             dstb,
             ne,
             n_used,
             rows,
-        ),
-        None => rec2.moe_accumulate(
-            pool[&ybuf].as_ref(),
-            pool[&wts].as_ref(),
-            dstb,
-            ne,
-            n_used,
-            rows,
-            *weight_before,
-        ),
+        );
+    } else {
+        rec2.zero(dstb, rows * ne);
+        match down_scale {
+            Some(ds) => rec2.moe_accumulate_scaled(
+                pool[&ybuf].as_ref(),
+                pool[&wts].as_ref(),
+                // `down_scale[expert_id]` indexes by the LOCAL id (the layer's own [n_expert] scale
+                // array) — the same local-ids buffer the windowed GEMVs read.
+                pool[&ids_key].as_ref(),
+                r(*ds)?,
+                dstb,
+                ne,
+                n_used,
+                rows,
+            ),
+            None => rec2.moe_accumulate(
+                pool[&ybuf].as_ref(),
+                pool[&wts].as_ref(),
+                dstb,
+                ne,
+                n_used,
+                rows,
+                *weight_before,
+            ),
+        }
     }
     Ok(()) // recorded inline — the ambient segment stays open
 }
