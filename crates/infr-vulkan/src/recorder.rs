@@ -7745,6 +7745,47 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Record several disjoint ranges between one pair of buffers as one Vulkan copy command.
+    /// Pager host DMA uses this to amortize submission/command overhead across all U/G/D misses in
+    /// the already-unified promotion batch.
+    pub(crate) fn copy_regions(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        regions: &[vk::BufferCopy],
+    ) {
+        if regions.is_empty() {
+            return;
+        }
+        self.stamp("copy_buffer");
+        let src_h = Self::vk_handle(src);
+        let dst_h = Self::vk_handle(dst);
+        let src_sub = Self::vk_of(src).sub_offset as u64;
+        let dst_sub = Self::vk_of(dst).sub_offset as u64;
+        let adjusted;
+        let regions = if src_sub == 0 && dst_sub == 0 {
+            regions
+        } else {
+            adjusted = regions
+                .iter()
+                .map(|region| vk::BufferCopy {
+                    src_offset: region.src_offset + src_sub,
+                    dst_offset: region.dst_offset + dst_sub,
+                    size: region.size,
+                })
+                .collect::<Vec<_>>();
+            adjusted.as_slice()
+        };
+        self.sync(&[src_h], &[dst_h], true);
+        self.dirty_transfer.set(true);
+        unsafe {
+            self.be
+                .shared
+                .device
+                .cmd_copy_buffer(self.cmd, src_h, dst_h, regions);
+        }
+    }
+
     pub fn attention(
         &self,
         q: &dyn Buffer,
@@ -8981,6 +9022,7 @@ impl<'a> Recorder<'a> {
             .dst_access_mask(
                 vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
                     | vk::AccessFlags::TRANSFER_WRITE,
             );
         unsafe {
@@ -8990,6 +9032,27 @@ impl<'a> Recorder<'a> {
                     | vk::PipelineStageFlags::TRANSFER
                     | vk::PipelineStageFlags::HOST,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+    }
+
+    /// Make writes through an imported coherent host pointer visible to transfer reads. This is
+    /// separate from ordinary buffer hazard tracking because the CPU write has no recorded Vulkan
+    /// producer command for `sync` to observe.
+    pub(crate) fn host_transfer_barrier(&self) {
+        let mb = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[mb],
                 &[],

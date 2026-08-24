@@ -1383,6 +1383,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PAGER_TRACE",
         "INFR_SHUTDOWN_FILE",
         "INFR_EMBEDDING_RUNNER",
+        "INFR_NO_HOST_DMA",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

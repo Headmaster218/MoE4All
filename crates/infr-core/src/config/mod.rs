@@ -192,6 +192,9 @@ cfg_struct! {
         /// only hardware most of this is developed and tested on. Also the honest choice on a
         /// machine whose RAM is better spent elsewhere.
         dram_bypass: bool = false,
+        /// Alias eligible DRAM pager arenas through `VK_EXT_external_memory_host` so Vulkan can
+        /// DMA promotions into VRAM. Unsupported devices transparently keep CPU ReBAR copies.
+        host_dma: bool = true,
         /// `INFR_LAYER_MAJOR`, TRI-state: `None` = decide from the placement (layer-major whenever
         /// the model's weights STREAM, chunk-major when they are resident), `Some(true)` = force it
         /// on, `Some(false)` = force it off.

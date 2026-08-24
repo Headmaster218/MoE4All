@@ -69,6 +69,7 @@ use infr_core::{
     config::Config,
     error::Result,
     graph::Graph,
+    hostpager::AlignedHostBuffer,
     Backend,
 };
 
@@ -334,6 +335,10 @@ struct VulkanShared {
     /// True when this device enabled `VK_EXT_external_memory_dma_buf`, so the P2P export/import may
     /// use the dma-buf handle type (the cross-GPU-portable one on Linux) in addition to opaque-fd.
     has_dma_buf: bool,
+    /// Optional import of ordinary process RAM as a Vulkan transfer buffer. This aliases the host
+    /// pager's one existing allocation; it does not create a GTT mirror or consume the VRAM budget.
+    external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    host_import_alignment: usize,
     /// `VK_KHR_external_semaphore_fd` loader — exports/imports a semaphore fd so a tensor-parallel
     /// all-reduce can order a peer's read after this device's GPU-side signal with no host round-trip
     /// (`AllReduceMode::P2pSemaphore`). `None` = the all-reduce uses the host fence (`queue_wait_idle`)
@@ -552,6 +557,14 @@ enum Backing {
     /// accounting: this is a gated probe/transport capability, not wired into any model path, and
     /// the import side aliases memory already owned by the exporting backend.
     External { memory: vk::DeviceMemory },
+    /// Ordinary process RAM imported through `VK_EXT_external_memory_host`. Vulkan owns only the
+    /// aliasing `VkDeviceMemory`; the `Arc` keeps the original allocation alive until after the
+    /// buffer and import are destroyed.
+    ImportedHost {
+        memory: vk::DeviceMemory,
+        owner: Arc<AlignedHostBuffer>,
+        host_ptr: *mut u8,
+    },
 }
 
 struct VkBuffer {
@@ -610,6 +623,7 @@ impl VkBuffer {
             // External P2P memory is never host-mapped — reads/writes route through the staging
             // copy path (device A owns the pages; device B aliases them over PCIe).
             Backing::External { .. } => None,
+            Backing::ImportedHost { host_ptr, .. } => Some(*host_ptr),
         }
     }
 }
@@ -665,6 +679,9 @@ impl Drop for VkBuffer {
                 Backing::External { memory } => {
                     self.shared.device.free_memory(*memory, None);
                 }
+                Backing::ImportedHost { memory, .. } => {
+                    self.shared.device.free_memory(*memory, None);
+                }
             }
             // Every OTHER variant owns `self.buffer` outright and must destroy it here. A `BdaSub`
             // handle's `buffer` is an alias of the block's — destroying it here would destroy the
@@ -674,6 +691,62 @@ impl Drop for VkBuffer {
                 self.shared.device.destroy_buffer(self.buffer, None);
             }
         }
+    }
+}
+
+struct ImportedHostShard {
+    offset: usize,
+    len: usize,
+    buffer: Arc<dyn Buffer>,
+}
+
+/// Vulkan aliases over one existing host allocation. A requested byte range may cross a 2-GiB
+/// import shard, so callers iterate the returned pieces rather than assuming one source buffer.
+pub(crate) struct ImportedHostAllocation {
+    base: usize,
+    logical_len: usize,
+    imported_len: usize,
+    shards: Vec<ImportedHostShard>,
+}
+
+pub(crate) struct ImportedHostRange {
+    pub buffer: Arc<dyn Buffer>,
+    pub offset: usize,
+    pub len: usize,
+}
+
+impl ImportedHostAllocation {
+    pub(crate) fn contains(&self, ptr: *const u8, len: usize) -> bool {
+        let Some(offset) = (ptr as usize).checked_sub(self.base) else {
+            return false;
+        };
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.logical_len)
+    }
+
+    pub(crate) fn ranges(&self, ptr: *const u8, len: usize) -> Option<Vec<ImportedHostRange>> {
+        let start = (ptr as usize).checked_sub(self.base)?;
+        let end = start.checked_add(len)?;
+        if end > self.logical_len {
+            return None;
+        }
+        let mut cursor = start;
+        let mut out = Vec::new();
+        while cursor < end {
+            let shard = self
+                .shards
+                .iter()
+                .find(|shard| cursor >= shard.offset && cursor < shard.offset + shard.len)?;
+            let n = (shard.offset + shard.len).min(end) - cursor;
+            out.push(ImportedHostRange {
+                buffer: Arc::clone(&shard.buffer),
+                offset: cursor - shard.offset,
+                len: n,
+            });
+            cursor += n;
+        }
+        Some(out)
     }
 }
 
@@ -1703,6 +1776,15 @@ impl VulkanBackend {
         // default single-device path is untouched, and no P2P handle type is offered.
         let has_ext_mem_fd = has_ext(c"VK_KHR_external_memory_fd");
         let has_ext_mem_dma_buf = has_ext(c"VK_EXT_external_memory_dma_buf");
+        let has_ext_mem_host = has_ext(c"VK_EXT_external_memory_host");
+        let host_import_alignment = if has_ext_mem_host {
+            let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props) };
+            host_props.min_imported_host_pointer_alignment as usize
+        } else {
+            0
+        };
         // External SEMAPHORE fd — the tensor-parallel all-reduce orders a peer's cross-device read
         // after this device's GPU-side signal with NO host round-trip: export a timeline semaphore as
         // an fd here, import it on the peer, signal a value on this device's submit and wait it on the
@@ -2131,6 +2213,9 @@ impl VulkanBackend {
         if has_ext_mem_dma_buf {
             ext_ptrs.push(c"VK_EXT_external_memory_dma_buf".as_ptr());
         }
+        if has_ext_mem_host {
+            ext_ptrs.push(c"VK_EXT_external_memory_host".as_ptr());
+        }
         // External-semaphore fd ops for the tensor-parallel all-reduce's GPU-side cross-device sync
         // (gated). `VK_KHR_external_semaphore` is core in 1.1 (no enable); the timeline-semaphore
         // feature is enabled via `timeline_sem_ci` chained into `device_ci` below.
@@ -2537,6 +2622,8 @@ impl VulkanBackend {
         // checks (`p2p.rs`); `None` = this backend offers no host-less cross-device transport.
         let external_memory_fd =
             has_ext_mem_fd.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+        let external_memory_host = has_ext_mem_host
+            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         // External-semaphore fd loader (`vkGetSemaphoreFdKHR`/`vkImportSemaphoreFdKHR`) — the gate for
         // the tensor-parallel GPU-side all-reduce sync. `Some` only when the fd ext AND the timeline
         // feature are both present (both enabled above); else the all-reduce uses the host fence.
@@ -2587,6 +2674,8 @@ impl VulkanBackend {
                 push_descriptor,
                 external_memory_fd,
                 has_dma_buf: has_ext_mem_dma_buf,
+                external_memory_host,
+                host_import_alignment,
                 external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
@@ -2609,6 +2698,184 @@ impl VulkanBackend {
         backend.verify_i8_coopmat_layout();
 
         Ok(backend)
+    }
+
+    /// Alias one existing host-pager allocation as transfer buffers. Failure is an optimization
+    /// fallback, not a model-load failure: the caller keeps the established CPU-to-ReBAR path.
+    pub(crate) fn import_host_allocation(
+        &self,
+        owner: Arc<AlignedHostBuffer>,
+    ) -> Option<ImportedHostAllocation> {
+        if !self.cfg().paging.host_dma {
+            return None;
+        }
+        let Some(ext) = self.shared.external_memory_host.as_ref() else {
+            return None;
+        };
+        let alignment = self.shared.host_import_alignment.max(1);
+        if owner.is_empty()
+            || alignment > AlignedHostBuffer::ALIGNMENT
+            || !(owner.as_ptr() as usize).is_multiple_of(alignment)
+            || !owner.allocated_len().is_multiple_of(alignment)
+        {
+            tracing::warn!(
+                "[infr] host DMA disabled for one arena: ptr/size does not meet Vulkan import alignment {}",
+                alignment,
+            );
+            return None;
+        }
+
+        match self.try_import_host_allocation(ext, owner, alignment) {
+            Ok(imported) => {
+                tracing::info!(
+                    "[infr] host DMA import: {:.2}/{:.2} GiB in {} shard(s)",
+                    imported.imported_len as f64 / (1u64 << 30) as f64,
+                    imported.logical_len as f64 / (1u64 << 30) as f64,
+                    imported.shards.len(),
+                );
+                Some(imported)
+            }
+            Err(err) => {
+                tracing::warn!("[infr] host DMA import unavailable; using CPU ReBAR copy: {err}");
+                None
+            }
+        }
+    }
+
+    fn try_import_host_allocation(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        owner: Arc<AlignedHostBuffer>,
+        alignment: usize,
+    ) -> Result<ImportedHostAllocation> {
+        const IMPORT_SHARD_MAX: usize = 2 * 1024 * 1024 * 1024;
+        let device = &self.shared.device;
+        let max_shard =
+            IMPORT_SHARD_MAX.min(self.shared.max_mem_alloc_size as usize) / alignment * alignment;
+        if max_shard == 0 {
+            return Err(be(
+                "Vulkan host-import shard limit is smaller than its alignment",
+            ));
+        }
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let memory_properties = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        let mut shards = Vec::new();
+        let mut offset = 0usize;
+        while offset < owner.allocated_len() {
+            let len = (owner.allocated_len() - offset).min(max_shard);
+            let mut external =
+                vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+            let info = vk::BufferCreateInfo::default()
+                .push_next(&mut external)
+                .size(len as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { device.create_buffer(&info, None) }
+                .map_err(|e| be(format!("create imported-host buffer: {e}")))?;
+            let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+            if requirements.size > len as u64 {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(be(format!(
+                    "imported-host shard is {len} bytes but Vulkan requires {}",
+                    requirements.size,
+                )));
+            }
+            let host_ptr = unsafe { owner.as_ptr().add(offset) };
+            let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
+            let result = unsafe {
+                (ext.fp().get_memory_host_pointer_properties_ext)(
+                    device.handle(),
+                    handle_type,
+                    host_ptr.cast(),
+                    &mut host_properties,
+                )
+            };
+            if result != vk::Result::SUCCESS {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(be(format!(
+                    "get imported-host pointer properties at offset {offset}: {result}"
+                )));
+            }
+            let compatible = requirements.memory_type_bits & host_properties.memory_type_bits;
+            let memory_type_index = (0..memory_properties.memory_type_count)
+                .find(|&index| {
+                    compatible & (1u32 << index) != 0
+                        && memory_properties.memory_types[index as usize]
+                            .property_flags
+                            .contains(
+                                vk::MemoryPropertyFlags::HOST_VISIBLE
+                                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+                            )
+                })
+                .ok_or_else(|| {
+                    unsafe { device.destroy_buffer(buffer, None) };
+                    be(format!(
+                        "no coherent memory type for imported host pointer at offset {offset}"
+                    ))
+                })?;
+            let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(handle_type)
+                .host_pointer(host_ptr.cast());
+            let allocation = vk::MemoryAllocateInfo::default()
+                .push_next(&mut import)
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type_index);
+            let memory = match unsafe { device.allocate_memory(&allocation, None) } {
+                Ok(memory) => memory,
+                Err(e) => {
+                    unsafe { device.destroy_buffer(buffer, None) };
+                    if !shards.is_empty() {
+                        tracing::warn!(
+                            "[infr] host DMA import reached the driver limit at {:.2} GiB ({e}); remaining RAM uses CPU ReBAR copy",
+                            offset as f64 / (1u64 << 30) as f64,
+                        );
+                        break;
+                    }
+                    return Err(be(format!(
+                        "import host shard {offset}..{}: {e}",
+                        offset + len,
+                    )));
+                }
+            };
+            if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+                unsafe {
+                    device.free_memory(memory, None);
+                    device.destroy_buffer(buffer, None);
+                }
+                return Err(be(format!("bind imported-host shard at {offset}: {e}")));
+            }
+            let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
+                shared: Arc::clone(&self.shared),
+                buffer,
+                backing: Backing::ImportedHost {
+                    memory,
+                    owner: Arc::clone(&owner),
+                    host_ptr,
+                },
+                size: len,
+                mem_size: requirements.size,
+                location: MemoryLocation::CpuToGpu,
+                sub_offset: 0,
+                own_addr: None,
+                act_bytes: 0,
+            });
+            shards.push(ImportedHostShard {
+                offset,
+                len,
+                buffer: imported,
+            });
+            offset += len;
+        }
+        Ok(ImportedHostAllocation {
+            base: owner.as_ptr() as usize,
+            logical_len: owner.len(),
+            imported_len: offset.min(owner.len()),
+            shards,
+        })
     }
 
     /// The int8 cooperative-matrix GEMM tier is usable on this device: the hardware enumerates the

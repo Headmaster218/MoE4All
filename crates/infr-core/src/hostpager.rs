@@ -27,8 +27,166 @@ use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
 use crate::pager_profile;
 use std::collections::{HashMap, HashSet};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Stable, page-aligned host storage suitable for optional
+/// `VK_EXT_external_memory_host` import. The logical byte count remains the pager budget; only the
+/// final allocation page is rounded up. Allocation is lazy-zeroed by the operating system on the
+/// native targets, matching the old zero-filled arena without eagerly touching a multi-GiB cache.
+pub struct AlignedHostBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    allocated_len: usize,
+}
+
+// SAFETY: the allocation is plain bytes with a stable address. Users establish non-overlap and
+// lifetime at the slot/cache layer; this owner neither creates references nor mutates metadata.
+unsafe impl Send for AlignedHostBuffer {}
+unsafe impl Sync for AlignedHostBuffer {}
+
+impl AlignedHostBuffer {
+    /// 64 KiB covers Windows allocation granularity and the 4 KiB import requirement reported by
+    /// current AMD drivers. A Vulkan backend with a stricter runtime requirement simply declines
+    /// the optional import and keeps the CPU-copy path.
+    pub const ALIGNMENT: usize = 64 * 1024;
+
+    pub fn new(len: usize) -> Result<Arc<Self>> {
+        if len == 0 {
+            return Ok(Arc::new(Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                allocated_len: 0,
+            }));
+        }
+        let allocated_len = len
+            .checked_add(Self::ALIGNMENT - 1)
+            .map(|n| n / Self::ALIGNMENT * Self::ALIGNMENT)
+            .ok_or_else(|| Error::backend("aligned host allocation size overflow".to_string()))?;
+
+        #[cfg(windows)]
+        let ptr = {
+            use windows::Win32::System::Memory::{
+                VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+            };
+            let raw = unsafe {
+                VirtualAlloc(
+                    None,
+                    allocated_len,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            NonNull::new(raw.cast::<u8>()).ok_or_else(|| {
+                Error::backend(format!(
+                    "VirtualAlloc could not reserve {allocated_len} bytes for the host pager"
+                ))
+            })?
+        };
+
+        #[cfg(unix)]
+        let ptr = {
+            let raw = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    allocated_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if raw == libc::MAP_FAILED {
+                return Err(Error::backend(format!(
+                    "mmap could not reserve {allocated_len} bytes for the host pager"
+                )));
+            }
+            NonNull::new(raw.cast::<u8>()).expect("mmap success returned null")
+        };
+
+        #[cfg(not(any(windows, unix)))]
+        let ptr = {
+            let layout = std::alloc::Layout::from_size_align(allocated_len, Self::ALIGNMENT)
+                .map_err(|e| {
+                    Error::backend(format!("invalid host pager allocation layout: {e}"))
+                })?;
+            NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).ok_or_else(|| {
+                Error::backend(format!(
+                    "allocator could not reserve {allocated_len} bytes for the host pager"
+                ))
+            })?
+        };
+
+        Ok(Arc::new(Self {
+            ptr,
+            len,
+            allocated_len,
+        }))
+    }
+
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn allocated_len(&self) -> usize {
+        self.allocated_len
+    }
+
+    /// Return the byte offset of a range that lies wholly inside the logical allocation.
+    pub fn offset_of(&self, ptr: *const u8, len: usize) -> Option<usize> {
+        let base = self.ptr.as_ptr() as usize;
+        let start = ptr as usize;
+        let offset = start.checked_sub(base)?;
+        (offset.checked_add(len)? <= self.len).then_some(offset)
+    }
+
+    /// # Safety
+    /// The caller must guarantee exclusive access to this range for the duration of the returned
+    /// slice. Pager slot state and model-load sequencing provide that guarantee at current uses.
+    pub unsafe fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
+        debug_assert!(offset.saturating_add(len) <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) }
+    }
+
+    /// # Safety
+    /// No writer may overlap the returned range for its lifetime.
+    pub unsafe fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        debug_assert!(offset.saturating_add(len) <= self.len);
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
+    }
+}
+
+impl Drop for AlignedHostBuffer {
+    fn drop(&mut self) {
+        if self.allocated_len == 0 {
+            return;
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            let _ = VirtualFree(self.ptr.as_ptr().cast(), 0, MEM_RELEASE);
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::munmap(self.ptr.as_ptr().cast(), self.allocated_len);
+        }
+        #[cfg(not(any(windows, unix)))]
+        unsafe {
+            let layout =
+                std::alloc::Layout::from_size_align_unchecked(self.allocated_len, Self::ALIGNMENT);
+            std::alloc::dealloc(self.ptr.as_ptr(), layout);
+        }
+    }
+}
 
 /// Split an arena budget across uniform size classes, in slots per class.
 ///
@@ -78,7 +236,7 @@ pub fn plan_slots(budget_bytes: usize, classes: &[(usize, usize)]) -> Vec<usize>
 /// never alias (see the module doc's soundness rules). Zero-initialized, matching the calloc
 /// contract every backend allocation in this workspace follows.
 struct Arena {
-    ptr: *mut u8,
+    allocation: Arc<AlignedHostBuffer>,
     total: usize,
     slot_bytes: usize,
 }
@@ -91,18 +249,13 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-    fn new(n_slots: usize, slot_bytes: usize) -> Self {
+    fn new(n_slots: usize, slot_bytes: usize) -> Result<Self> {
         let total = n_slots * slot_bytes;
-        let buf = vec![0u8; total].into_boxed_slice();
-        // Leak the box and keep only the pointer: holding both a `Box` and a raw pointer would
-        // mean every access aliases the box's own reference, which is exactly the aliasing this
-        // arena has to avoid. `Drop` reconstitutes it.
-        let ptr = Box::into_raw(buf) as *mut u8;
-        Self {
-            ptr,
+        Ok(Self {
+            allocation: AlignedHostBuffer::new(total)?,
             total,
             slot_bytes,
-        }
+        })
     }
 
     fn offset(&self, slot: u32) -> usize {
@@ -116,7 +269,7 @@ impl Arena {
         debug_assert!(len <= self.slot_bytes);
         debug_assert!(self.offset(slot) + len <= self.total);
         // SAFETY: the offset is within the single allocation this arena owns, per the asserts.
-        unsafe { self.ptr.add(self.offset(slot)) }
+        unsafe { self.allocation.as_ptr().add(self.offset(slot)) }
     }
 
     /// # Safety
@@ -125,7 +278,7 @@ impl Arena {
     unsafe fn slot_ref(&self, slot: u32, len: usize) -> &[u8] {
         debug_assert!(len <= self.slot_bytes);
         debug_assert!(self.offset(slot) + len <= self.total);
-        std::slice::from_raw_parts(self.ptr.add(self.offset(slot)), len)
+        std::slice::from_raw_parts(self.allocation.as_ptr().add(self.offset(slot)), len)
     }
 
     /// # Safety
@@ -134,19 +287,7 @@ impl Arena {
     unsafe fn slot_mut(&self, slot: u32, len: usize) -> &mut [u8] {
         debug_assert!(len <= self.slot_bytes);
         debug_assert!(self.offset(slot) + len <= self.total);
-        std::slice::from_raw_parts_mut(self.ptr.add(self.offset(slot)), len)
-    }
-}
-
-impl Drop for Arena {
-    fn drop(&mut self) {
-        // SAFETY: `ptr` came from `Box::into_raw` of a `[u8]` of exactly `total` bytes, and no
-        // `Pin` can outlive the `HostPager` that owns this arena (their lifetimes are tied).
-        unsafe {
-            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                self.ptr, self.total,
-            )));
-        }
+        std::slice::from_raw_parts_mut(self.allocation.as_ptr().add(self.offset(slot)), len)
     }
 }
 
@@ -294,7 +435,7 @@ impl InclusiveHostCache {
                 scratch: vec![0u8; slot_bytes].into_boxed_slice(),
             }),
             ready: Condvar::new(),
-            arena: Arena::new(n_slots, slot_bytes),
+            arena: Arena::new(n_slots, slot_bytes)?,
             io,
             slot_bytes,
             preload_reads: AtomicU64::new(0),
@@ -333,6 +474,10 @@ impl InclusiveHostCache {
 
     pub fn arena_bytes(&self) -> usize {
         self.arena.total
+    }
+
+    pub fn arena_allocation(&self) -> Arc<AlignedHostBuffer> {
+        Arc::clone(&self.arena.allocation)
     }
 
     pub fn n_slots(&self) -> usize {
@@ -869,7 +1014,7 @@ impl HostPager {
                 missed_once: HashSet::new(),
             }),
             ready: Condvar::new(),
-            arena: Arena::new(n_slots, slot_bytes),
+            arena: Arena::new(n_slots, slot_bytes)?,
             io,
             slot_bytes,
             max_resident: n_slots,
@@ -914,7 +1059,7 @@ impl HostPager {
                 missed_once: HashSet::new(),
             }),
             ready: Condvar::new(),
-            arena: Arena::new(0, slot_bytes),
+            arena: Arena::new(0, slot_bytes)?,
             io,
             slot_bytes,
             max_resident: 0,
@@ -1317,6 +1462,29 @@ mod tests {
     use super::*;
     use crate::blockio::BlockExtent;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn aligned_host_buffer_is_zeroed_aligned_and_range_checked() {
+        let logical = AlignedHostBuffer::ALIGNMENT + 17;
+        let buffer = AlignedHostBuffer::new(logical).expect("allocate aligned host buffer");
+        assert_eq!((buffer.as_ptr() as usize) % AlignedHostBuffer::ALIGNMENT, 0);
+        assert_eq!(buffer.len(), logical);
+        assert!(buffer.allocated_len() >= logical);
+        assert!(buffer
+            .allocated_len()
+            .is_multiple_of(AlignedHostBuffer::ALIGNMENT));
+        assert!(unsafe { buffer.slice(0, logical) }
+            .iter()
+            .all(|&byte| byte == 0));
+        assert_eq!(
+            buffer.offset_of(unsafe { buffer.as_ptr().add(9) }, 8),
+            Some(9)
+        );
+        assert_eq!(
+            buffer.offset_of(unsafe { buffer.as_ptr().add(logical - 1) }, 2),
+            None,
+        );
+    }
 
     /// `plan_slots` returns one entry per input class, POSITIONALLY. Both callers index the result
     /// against their own class list — the Vulkan session pairs entry `i` with VRAM pool `i` — so a

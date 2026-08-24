@@ -6111,7 +6111,7 @@ fn stage_dense_linear<'a>(
 /// slots, then freeze the layer's LUT window. `ids` empty means residency is already guaranteed.
 fn stage_and_window<'a>(
     be_: &'a VulkanBackend,
-    _rec: &mut Option<Recorder<'a>>,
+    rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     buf_id: usize,
     ids: &[u32],
@@ -6127,9 +6127,19 @@ fn stage_and_window<'a>(
         sess.begin_batch(buf_id)?;
     }
     if !ids.is_empty() {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.push_role_cpu(buf_id, ids, scan)?;
+        let push = {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().expect("paged execution requires a session");
+            sess.push_role_cpu(buf_id, ids, scan)?
+        };
+        if let Some(recorder) = rec.as_ref() {
+            push.record(recorder)?;
+        } else {
+            // Full-Host-Store Down overlap intentionally has no open recorder here: Gate/Up is
+            // already executing while the host writes Down. Dropping preserves that established
+            // CPU-copy window instead of serializing Down DMA behind the submitted compute.
+            drop(push);
+        }
     }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
@@ -6928,18 +6938,21 @@ fn execute_paged_moe<'a>(
     // discard its useful overlap with Gate/Up compute on Qwen/Ling-style models.
     let roles_batched = bounded_host_batch;
     if roles_batched {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        guard
-            .as_mut()
-            .expect("paged execution requires a session")
-            .push_roles_cpu(
-                &[
-                    (gate_id, stage_ids.as_slice()),
-                    (up_id, stage_ids.as_slice()),
-                    (down_id, stage_ids.as_slice()),
-                ],
-                touch_all,
-            )?;
+        let push = {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            guard
+                .as_mut()
+                .expect("paged execution requires a session")
+                .push_roles_cpu(
+                    &[
+                        (gate_id, stage_ids.as_slice()),
+                        (up_id, stage_ids.as_slice()),
+                        (down_id, stage_ids.as_slice()),
+                    ],
+                    touch_all,
+                )?
+        };
+        push.record(rec.as_ref().expect("segment always Some between ops"))?;
     }
     let role_stage_ids = if roles_batched {
         &[][..]

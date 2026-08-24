@@ -42,12 +42,12 @@ use ash::vk;
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::blockio::BlockDesc;
 use infr_core::error::Result;
-use infr_core::hostpager::{HostPager, InclusiveHostCache};
+use infr_core::hostpager::{AlignedHostBuffer, HostPager, InclusiveHostCache};
 use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::pager_profile;
 use infr_core::Backend;
 
-use super::{as_vk_buf, be, VulkanBackend};
+use super::{as_vk_buf, be, ImportedHostAllocation, VulkanBackend};
 use crate::unified::{UnifiedAllocationHandle, UnifiedRange, UnifiedVramClass, UnifiedVramPool};
 
 /// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
@@ -127,13 +127,20 @@ pub struct GpuPager {
 }
 
 struct CpuPushPlan {
-    dst: usize,
+    target: GpuCopyTarget,
     evicted: Option<BlockId>,
 }
 
 struct InclusiveCpuPushPlan {
-    dst: usize,
+    target: GpuCopyTarget,
     evicted: Option<BlockId>,
+}
+
+#[derive(Clone)]
+struct GpuCopyTarget {
+    buffer: Arc<dyn Buffer>,
+    offset: usize,
+    mapped_ptr: usize,
 }
 
 impl GpuPager {
@@ -336,6 +343,19 @@ impl GpuPager {
             .mapped_ptr()
             .ok_or_else(|| be("pager ReBAR arena shard is not mapped"))?;
         Ok(unsafe { base.add(offset) } as usize)
+    }
+
+    fn slot_copy_target(&self, slot: u32) -> Result<GpuCopyTarget> {
+        let (arena, offset) = self.slot_location(slot)?;
+        let buffer = Arc::clone(&self.arenas[arena].buffer);
+        let base = as_vk_buf(buffer.as_ref())?
+            .mapped_ptr()
+            .ok_or_else(|| be("pager ReBAR arena shard is not mapped"))?;
+        Ok(GpuCopyTarget {
+            buffer,
+            offset,
+            mapped_ptr: unsafe { base.add(offset) } as usize,
+        })
     }
 
     fn total_arena_bytes(&self) -> usize {
@@ -670,7 +690,7 @@ impl GpuPager {
             Resolution::Miss { slot, evicted } => {
                 self.record_placement(id, slot, evicted);
                 Ok(Some(CpuPushPlan {
-                    dst: self.slot_mapped_ptr(slot)?,
+                    target: self.slot_copy_target(slot)?,
                     evicted,
                 }))
             }
@@ -724,7 +744,7 @@ impl GpuPager {
             } => {
                 self.record_placement(id, slot, None);
                 Ok(Some(InclusiveCpuPushPlan {
-                    dst: self.slot_mapped_ptr(slot)?,
+                    target: self.slot_copy_target(slot)?,
                     evicted: None,
                 }))
             }
@@ -738,7 +758,7 @@ impl GpuPager {
                 *exchange_slot = old_slot;
                 self.record_placement(id, promoted_slot, Some(victim));
                 Ok(Some(InclusiveCpuPushPlan {
-                    dst: self.slot_mapped_ptr(promoted_slot)?,
+                    target: self.slot_copy_target(promoted_slot)?,
                     evicted: Some(victim),
                 }))
             }
@@ -1309,7 +1329,143 @@ struct HostStoreChunk {
     /// Ordinary CPU-owned memory. It has no VkBuffer, device address, GPU VA, shared-VRAM
     /// accounting, or second staging allocation. Chunks only avoid one enormous virtual address
     /// reservation; together they are the sole owned copy of the complete expert payload.
-    bytes: Box<[u8]>,
+    bytes: Arc<AlignedHostBuffer>,
+}
+
+impl HostStoreChunk {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn range(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        (offset.checked_add(len)? <= self.bytes.len())
+            .then(|| unsafe { self.bytes.slice(offset, len) })
+    }
+
+    fn copy_from_slice(&self, offset: usize, src: &[u8]) -> Result<()> {
+        let dst = offset
+            .checked_add(src.len())
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| be("host-store copy range out of bounds"))?;
+        let len = dst - offset;
+        unsafe { self.bytes.slice_mut(offset, len) }.copy_from_slice(src);
+        Ok(())
+    }
+}
+
+struct HostDmaCopy {
+    src_buffer: Arc<dyn Buffer>,
+    src_offset: usize,
+    src_ptr: usize,
+    dst_buffer: Arc<dyn Buffer>,
+    dst_offset: usize,
+    dst_ptr: usize,
+    len: usize,
+}
+
+/// One already-resolved pager promotion batch. LRU/LUT state is committed before this is returned;
+/// consuming it records GPU copies, while dropping it preserves the old immediate CPU-copy
+/// behavior for standalone pager tests and legacy callers.
+pub struct PreparedHostPush {
+    requested: usize,
+    copies: Vec<HostDmaCopy>,
+}
+
+impl PreparedHostPush {
+    pub(crate) fn record(mut self, rec: &crate::Recorder<'_>) -> Result<usize> {
+        struct Group {
+            src: Arc<dyn Buffer>,
+            dst: Arc<dyn Buffer>,
+            regions: Vec<vk::BufferCopy>,
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        for copy in &self.copies {
+            let src_handle = as_vk_buf(copy.src_buffer.as_ref())?.buffer;
+            let dst_handle = as_vk_buf(copy.dst_buffer.as_ref())?.buffer;
+            let group = match groups.iter_mut().find(|group| {
+                as_vk_buf(group.src.as_ref()).is_ok_and(|buf| buf.buffer == src_handle)
+                    && as_vk_buf(group.dst.as_ref()).is_ok_and(|buf| buf.buffer == dst_handle)
+            }) {
+                Some(group) => group,
+                None => {
+                    groups.push(Group {
+                        src: Arc::clone(&copy.src_buffer),
+                        dst: Arc::clone(&copy.dst_buffer),
+                        regions: Vec::new(),
+                    });
+                    groups.last_mut().expect("group was just appended")
+                }
+            };
+            group.regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(copy.src_offset as u64)
+                    .dst_offset(copy.dst_offset as u64)
+                    .size(copy.len as u64),
+            );
+        }
+        if !groups.is_empty() {
+            rec.host_transfer_barrier();
+            for group in &groups {
+                rec.copy_regions(group.src.as_ref(), group.dst.as_ref(), &group.regions);
+            }
+            if pager_profile::active() {
+                for copy in &self.copies {
+                    pager_profile::record_gpu_copy(copy.len);
+                }
+            }
+        }
+        self.copies.clear();
+        Ok(self.requested)
+    }
+}
+
+impl Drop for PreparedHostPush {
+    fn drop(&mut self) {
+        if self.copies.is_empty() {
+            return;
+        }
+        let started = pager_profile::active().then(std::time::Instant::now);
+        let mut bytes = 0usize;
+        for copy in &self.copies {
+            let src = unsafe { std::slice::from_raw_parts(copy.src_ptr as *const u8, copy.len) };
+            par_copy_to_mapped(src, copy.dst_ptr as *mut u8);
+            bytes = bytes.saturating_add(copy.len);
+        }
+        if let Some(t0) = started {
+            pager_profile::record_memcpy(bytes, t0.elapsed());
+        }
+    }
+}
+
+fn append_imported_copy(
+    imports: &[ImportedHostAllocation],
+    bytes: &[u8],
+    target: &GpuCopyTarget,
+    copies: &mut Vec<HostDmaCopy>,
+) -> bool {
+    let Some(ranges) = imports
+        .iter()
+        .find(|import| import.contains(bytes.as_ptr(), bytes.len()))
+        .and_then(|import| import.ranges(bytes.as_ptr(), bytes.len()))
+    else {
+        return false;
+    };
+    let mut advanced = 0usize;
+    for range in ranges {
+        copies.push(HostDmaCopy {
+            src_buffer: range.buffer,
+            src_offset: range.offset,
+            src_ptr: unsafe { bytes.as_ptr().add(advanced) } as usize,
+            dst_buffer: Arc::clone(&target.buffer),
+            dst_offset: target.offset + advanced,
+            dst_ptr: target.mapped_ptr + advanced,
+            len: range.len,
+        });
+        advanced += range.len;
+    }
+    debug_assert_eq!(advanced, bytes.len());
+    true
 }
 
 /// One logical arena pool: every block in it shares `slot_bytes`. Compatible Gate/Up/Down banks
@@ -1485,6 +1641,9 @@ pub struct MoePagerSession {
     /// The only owned host copy of all paged MoE weights. Plain CPU memory, deliberately not a
     /// Vulkan buffer: the full payload cannot be counted or accessed as shared/virtual VRAM.
     host_store: Vec<HostStoreChunk>,
+    /// Vulkan aliases over the exact RAM allocations above. Empty when the extension is absent or
+    /// import fails, in which case the established CPU ReBAR copy remains live.
+    host_imports: Vec<ImportedHostAllocation>,
     /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
     /// every PAGED `_exps` tensor. A non-paged layer's gate/up/down buffer is never registered
     /// here — the adapter's lookup simply misses and falls through to the ordinary
@@ -1617,21 +1776,32 @@ impl MoePagerSession {
                 .base_offset
                 .checked_add(spec.bytes)
                 .ok_or_else(|| be("moe pager: host-store chunk range overflow"))?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(spec.bytes).map_err(|e| {
-                be(format!(
-                    "moe pager: cannot reserve {} bytes for the unique CPU expert store: {e}",
-                    spec.bytes,
-                ))
-            })?;
-            bytes.resize(spec.bytes, 0);
             host_store.push(HostStoreChunk {
                 base_offset: spec.base_offset,
-                bytes: bytes.into_boxed_slice(),
+                bytes: AlignedHostBuffer::new(spec.bytes)?,
             });
             previous_end = end;
         }
-        let host_payload_bytes: usize = host_store.iter().map(|chunk| chunk.bytes.len()).sum();
+        let host_payload_bytes: usize = host_store.iter().map(HostStoreChunk::len).sum();
+        let mut host_imports = Vec::new();
+        for chunk in &host_store {
+            if let Some(imported) = vk.import_host_allocation(Arc::clone(&chunk.bytes)) {
+                host_imports.push(imported);
+            }
+        }
+        for pool in &layout.pools {
+            if let Some(host) = &pool.host {
+                if let Some(imported) = vk.import_host_allocation(host.arena_allocation()) {
+                    host_imports.push(imported);
+                }
+            }
+        }
+        if !host_imports.is_empty() {
+            tracing::info!(
+                "[infr] paged-MoE host DMA: imported {} RAM arena(s) in place",
+                host_imports.len(),
+            );
+        }
         if tiered {
             let cache_bytes: usize = layout
                 .pools
@@ -1689,6 +1859,7 @@ impl MoePagerSession {
             unified_pool,
             role_stride: layout.n_blocks,
             host_store,
+            host_imports,
             sources: HashMap::new(),
             tape,
             tape_words,
@@ -1834,7 +2005,7 @@ impl MoePagerSession {
                 .enumerate()
                 .find(|(_, chunk)| {
                     source.host_offset >= chunk.base_offset
-                        && end <= chunk.base_offset + chunk.bytes.len()
+                        && end <= chunk.base_offset + chunk.len()
                 })
                 .ok_or_else(|| {
                     be(format!(
@@ -1844,7 +2015,7 @@ impl MoePagerSession {
                 })?;
             let chunk_offset = source.host_offset - chunk.base_offset;
             let copy_t0 = pager_profile::active().then(std::time::Instant::now);
-            chunk.bytes[chunk_offset..chunk_offset + bank.len()].copy_from_slice(bank);
+            chunk.copy_from_slice(chunk_offset, bank)?;
             if let Some(t0) = copy_t0 {
                 pager_profile::record_memcpy(bank.len(), t0.elapsed());
             }
@@ -2364,8 +2535,7 @@ impl MoePagerSession {
                 .virtual_mapped_ptr(bank_placement.byte_offset, source.bank_bytes)?;
             if let Some(host_chunk) = source.host_chunk {
                 let src = self.host_store[host_chunk]
-                    .bytes
-                    .get(source.host_offset..source.host_offset + source.bank_bytes)
+                    .range(source.host_offset, source.bank_bytes)
                     .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
                 copies.push(PrefillCopy::Memory(StagingCopy {
                     src: src.as_ptr() as usize,
@@ -2626,7 +2796,12 @@ impl MoePagerSession {
     /// Runtime Decode upload path backed by the unique CPU expert store. Every miss is copied
     /// directly into its final mapped-ReBAR LRU slot. The caller must have drained earlier arena
     /// readers before invoking this method; small-m Decode already does so before reading route ids.
-    pub fn push_role_cpu(&mut self, buf_id: usize, local_ids: &[u32], scan: bool) -> Result<usize> {
+    pub(crate) fn push_role_cpu(
+        &mut self,
+        buf_id: usize,
+        local_ids: &[u32],
+        scan: bool,
+    ) -> Result<PreparedHostPush> {
         self.push_roles_cpu(&[(buf_id, local_ids)], scan)
     }
 
@@ -2634,9 +2809,16 @@ impl MoePagerSession {
     /// host-tier misses concurrently. This preserves the exact LRU/LUT decisions of repeated
     /// [`Self::push_role_cpu`] calls while allowing split Gate/Up/Down banks to share one deeper
     /// SSD / RAM-to-ReBAR batch. The caller must have opened one shared pager epoch first.
-    pub fn push_roles_cpu(&mut self, roles: &[(usize, &[u32])], scan: bool) -> Result<usize> {
+    pub fn push_roles_cpu(
+        &mut self,
+        roles: &[(usize, &[u32])],
+        scan: bool,
+    ) -> Result<PreparedHostPush> {
         if roles.is_empty() {
-            return Ok(0);
+            return Ok(PreparedHostPush {
+                requested: 0,
+                copies: Vec::new(),
+            });
         }
         let mut resolved = Vec::with_capacity(roles.len());
         for &(buf_id, local_ids) in roles {
@@ -2674,16 +2856,17 @@ impl MoePagerSession {
         let Self {
             pools,
             host_store,
+            host_imports,
             trace,
             ..
         } = self;
         let pool = &mut pools[pool_idx];
-        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
-        let mut copied = 0usize;
+        let mut dma_copies = Vec::new();
         if let Some(host) = pool.host.as_ref().cloned() {
             // Resolve in the original order first: this preserves exact GPU-LRU victim selection
             // and LUT contents. Only the resulting independent byte moves run in parallel.
             let mut promotions = Vec::with_capacity(requested);
+            let mut targets = Vec::with_capacity(requested);
             for &(role, _, stride, block_base, layer, _, _, local_ids) in &resolved {
                 for &lid in local_ids {
                     let id = block_base + lid;
@@ -2713,23 +2896,26 @@ impl MoePagerSession {
                     let Some(plan) = plan else {
                         continue;
                     };
-                    promotions.push((id, plan.evicted, plan.dst));
-                    copied = copied.saturating_add(stride);
+                    let target = targets.len();
+                    targets.push(plan.target);
+                    promotions.push((id, plan.evicted, target));
                 }
             }
-            if promotions.len() > 1 {
-                host.promote_batch(&promotions, |bytes, dst| {
-                    par_copy_to_mapped(bytes, dst as *mut u8);
-                    Ok(())
-                })?;
-            } else {
-                for (id, evicted, dst) in promotions {
-                    host.promote(id, evicted, |bytes| {
-                        par_copy_to_mapped(bytes, dst as *mut u8);
-                        Ok(())
-                    })?;
+            let collected = std::sync::Mutex::new(Vec::with_capacity(promotions.len()));
+            host.promote_batch(&promotions, |bytes, target| {
+                let mut local = Vec::new();
+                if append_imported_copy(host_imports, bytes, &targets[target], &mut local) {
+                    collected.lock().unwrap().extend(local);
+                } else {
+                    let started = pager_profile::active().then(std::time::Instant::now);
+                    par_copy_to_mapped(bytes, targets[target].mapped_ptr as *mut u8);
+                    if let Some(t0) = started {
+                        pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+                    }
                 }
-            }
+                Ok(())
+            })?;
+            dma_copies.extend(collected.into_inner().unwrap());
         } else {
             for &(role, _, stride, block_base, layer, host_chunk, host_base, local_ids) in &resolved
             {
@@ -2760,19 +2946,24 @@ impl MoePagerSession {
                     }
                     if let Some(plan) = plan {
                         let bytes = host_store[host_chunk]
-                            .bytes
-                            .get(src..src + stride)
+                            .range(src, stride)
                             .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
-                        par_copy_to_mapped(bytes, plan.dst as *mut u8);
-                        copied += bytes.len();
+                        if !append_imported_copy(host_imports, bytes, &plan.target, &mut dma_copies)
+                        {
+                            let started = pager_profile::active().then(std::time::Instant::now);
+                            par_copy_to_mapped(bytes, plan.target.mapped_ptr as *mut u8);
+                            if let Some(t0) = started {
+                                pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+                            }
+                        }
                     }
                 }
             }
         }
-        if let Some(t0) = copy_t0 {
-            pager_profile::record_memcpy(copied, t0.elapsed());
-        }
-        Ok(requested)
+        Ok(PreparedHostPush {
+            requested,
+            copies: dma_copies,
+        })
     }
 
     /// CPU-push one whole layer from the unique host store straight into its dynamic-ring
