@@ -1,322 +1,191 @@
-# INFR — AMD/Vulkan MoE Optimization Fork
+# INFR — AMD/Vulkan Large-MoE Research Fork
 
-> **Experimental fork of [kryptic-sh/infr](https://github.com/kryptic-sh/infr) focused on large-MoE inference, expert caching/paging, long-context performance, and heterogeneous memory execution on consumer AMD GPUs.**
+> Experimental fork of [kryptic-sh/infr](https://github.com/kryptic-sh/infr),
+> focused on large-MoE paging, heterogeneous memory, and long-context inference
+> on consumer AMD GPUs.
 
-This branch explores how far large Mixture-of-Experts models can be pushed on a relatively constrained consumer system:
+The primary development machine is deliberately modest relative to the models
+being tested:
 
-* **GPU:** AMD Radeon RX 7900 XTX, 24 GB VRAM
-* **Backend:** Vulkan / RDNA3
-* **Host memory:** 64 GB DDR4
-* **CPU:** Ryzen 5 5600X
-* **Storage:** SSD-backed model/expert storage for models exceeding RAM capacity
+| Component | Test system |
+|---|---|
+| GPU | AMD Radeon RX 7900 XTX, 24 GiB VRAM |
+| Backend | Native Windows 11, Vulkan, RDNA3 |
+| CPU | AMD Ryzen 5 5600X |
+| Host memory | 64 GiB DDR4 |
+| Storage | Local SSDs; expert weights may remain SSD-backed |
 
-The current snapshot is:
+The milestone tag [`v0.1-moe-snapshot`](https://github.com/Headmaster218/infr/tree/v0.1-moe-snapshot)
+marks the first bounded-RAM-to-VRAM DMA snapshot. `main` may contain newer,
+measured changes after that tag.
 
-**`v0.1-moe-snapshot`**
+## Scope
 
-This is a work in progress. The current code is being frozen and benchmarked before further architectural changes.
-
----
-
-## Why this fork exists
-
-Large MoE models have a very different memory behavior from conventional dense models: total model size can be far larger than available VRAM, while only a small subset of experts is active for each token.
-
-The main focus of this fork is therefore not simply kernel throughput, but the complete expert-serving path:
+A large MoE model can be much larger than VRAM while activating only a small
+fraction of its experts for each token. For the largest models here, even host
+RAM cannot hold every expert. This fork therefore treats inference as a
+three-tier execution problem:
 
 ```text
-SSD
- │
- ▼
-Host expert store / RAM cache
- │
- ▼
-GPU expert residency / LRU cache
- │
- ▼
+SSD-backed expert weights
+          ↓
+full Host store or bounded RAM cache
+          ↓
+elastic GPU expert cache
+          ↓
 Vulkan execution
 ```
 
-The work has focused on reducing the cost of moving, caching, selecting, and executing experts while overlapping as much data movement as possible with GPU computation.
-
-A particular goal is to make large MoE inference practical on systems where **neither VRAM nor system RAM is large enough to hold the complete model comfortably**.
-
----
-
-## Current results
-
-These numbers are representative of the current `v0.1-moe-snapshot` on a single RX 7900 XTX.
-
-They should be treated as **preliminary engineering results**, not yet as a fully standardized cross-runtime benchmark. A reproducible benchmark suite with exact model quantization, context length, cache size, command line, and repeated-run statistics is being prepared.
-
-| Model                 |        Decode |                                                                      Prefill | Status                                                     |
-| --------------------- | ------------: | ---------------------------------------------------------------------------: | ---------------------------------------------------------- |
-| **Qwen3.6-35B-A3B**   | **~40 tok/s** | **~400+ tok/s at very deep context; up to ~3,000+ tok/s at shallow context** | Decode and prefill extensively optimized                   |
-| **Qwen3.5-122B-A10B** | **~23 tok/s** |                                                                          WIP | Decode optimized; SSD-aware prefill pipeline pending       |
-| **Ling 3.0 Flash**    | **~36 tok/s** |                                                                          WIP | Decode path working well                                   |
-| **DeepSeek V4 Flash** |  **~4 tok/s** |                                                                          WIP | Early large-model result; substantial optimization remains |
-
-For Qwen3.6-35B-A3B, one repeatable deep-context configuration reaches approximately:
-
-* **~39 tok/s decode around 200K context**
-* **~409–437 tok/s prefill around 250K synthetic KV depth**, depending on microbatch
-* **~3,000–3,700 tok/s shallow-context prefill**, depending on batch/configuration
-
-The purpose of the upcoming benchmark pass is to make these results directly reproducible instead of relying on isolated optimization measurements.
-
----
-
-## Main optimization work
-
-### 1. GPU expert residency and LRU caching
-
-The decode path uses expert-level GPU residency rather than requiring complete MoE layers to remain permanently resident.
-
-Work in this area includes:
-
-* expert-level LRU caching
-* O(1) hit promotion
-* cache victim-selection optimization
-* role / expert-size-aware cache pools
-* reduced cache-management overhead
-* profiling of hit, miss, upload, wait, and eviction behavior
-
-The same GPU memory arena can be reused differently between prefill and decode rather than maintaining completely independent large allocations.
-
----
-
-### 2. Host expert store
-
-Expert weights are organized in a host-side representation designed around the access patterns of MoE inference.
-
-This allows the runtime to separate:
-
-* permanent GPU residency
-* streamed experts/layers
-* host-resident experts
-* models that ultimately require SSD-backed storage
-
-This becomes increasingly important for 100B+ and DeepSeek-class models where a 64 GB host cannot simply pin the complete expert bank.
-
----
-
-### 3. Prefill layer streaming
-
-For Qwen3.6-35B-A3B, prefill uses a different strategy from decode.
-
-GPU memory is divided between:
-
-* fixed resident layers
-* **A/B whole-layer streaming lanes**
-
-The next MoE layer can be transferred while the GPU is still executing the current layer.
-
-On a representative 200K-context configuration:
-
-* 8 / 40 MoE layers are resident
-* 32 layers are streamed
-* roughly 17.6 GiB is moved during the measured path
-* transfers begin concurrently with live GPU work
-
-This pipeline is one of the main reasons Qwen3.6-35B prefill performs substantially better than the current 100B+ model path.
-
----
-
-### 4. Direct CPU → GPU-visible memory path
-
-On Windows/RDNA3, this fork experiments with persistently mapped GPU-visible memory / ReBAR-backed pools.
-
-For supported paths, expert or layer data can be written directly by the CPU into its final GPU-visible location instead of always using a conventional:
-
-```text
-CPU buffer
-    ↓
-staging buffer
-    ↓
-GPU copy
-    ↓
-final expert allocation
-```
-
-The goal is to reduce small-transfer and synchronization overhead in latency-sensitive expert paging.
-
-Windows AMD allocation constraints require the logical cache to be divided into multiple physical mapped pools rather than using one very large mapped allocation.
-
----
-
-### 5. Long-context attention and Q8 KV work
-
-The fork also contains substantial long-context work independent of MoE paging itself, including:
-
-* specialized FlashAttention prefill paths
-* long-context attention tuning
-* dedicated Q8 KV decode handling
-* reduced transient Vulkan resource allocation
-* command submission / synchronization optimization
-
-At sufficiently long context lengths, attention increasingly dominates total runtime, so expert paging alone no longer determines throughput.
-
----
-
-### 6. Large-model decode
-
-The current snapshot can already run substantially larger models than the 35B-class configuration on the same 24 GB GPU / 64 GB host system.
-
-Current experimental targets include:
-
-* Qwen 122B-class MoE
-* Ling 3.0 Flash
-* DeepSeek V4 Flash
-
-Decode has received significantly more optimization than prefill for these models.
-
-**Large-model prefill is currently limited by SSD → RAM expert loading.**
-
-A deeper SSD-aware prefetch / streaming pipeline is one of the next major pieces of work.
-
----
-
-## Current limitations / open problems
-
-This snapshot intentionally freezes several unresolved problems so that later improvements can be measured against a stable baseline.
-
-### SSD-aware large-model prefill
-
-The 35B model can keep enough of its working set in RAM for an efficient layer-streaming pipeline.
-
-For significantly larger models this is no longer true.
-
-The next step is a hierarchical prefetch system closer to:
-
-```text
-SSD
- ↓
-RAM working-set cache
- ↓
-GPU expert/layer cache
- ↓
-Compute
-```
-
-with asynchronous prediction and transfer across all three storage tiers.
-
-### Miss rate is not the whole story
-
-Current work is also investigating whether aggregate expert-cache hit rate is sufficient to predict performance.
-
-Two workloads with the same average miss rate may behave very differently if one produces:
-
-* evenly distributed misses
-
-while another produces:
-
-* per-layer miss bursts
-* consecutive-token miss clusters
-* synchronized cache pressure
-
-The effect of this miss topology on decode critical-path latency is still being investigated.
-
-### Vulkan scheduling overhead
-
-Without CUDA Graph-style execution capture, dynamic MoE residency and heterogeneous execution can expose host-side command submission and synchronization overhead.
-
-Reducing this overhead further on Vulkan is another active area of work.
-
----
-
-## Relation to FreeToken
-
-This work was developed independently while investigating large-MoE inference on AMD RDNA3/Vulkan.
-
-After the initial architecture and optimization work was already underway, I came across **[FreeToken](https://github.com/FlashML-org/FreeToken)**, whose authors independently explore several closely related system ideas for edge MoE serving, including:
-
-* GPU expert caching
-* CPU/GPU heterogeneous execution
-* expert movement across the PCIe boundary
-* prefill streaming
-* memory-aware MoE scheduling
-
-The two projects currently operate in substantially different environments.
-
-**FreeToken:**
-
-```text
-NVIDIA
-CUDA
-large host-memory configurations
-```
-
-**This fork:**
-
-```text
-AMD RDNA3
-Vulkan
-24 GB VRAM
-64 GB DDR4
-SSD-backed large-model experiments
-```
-
-I am particularly interested in comparing how expert-cache behavior, miss handling, host-memory limitations, and dynamic scheduling differ between the CUDA/NVIDIA and Vulkan/AMD stacks.
-
-This repository is **not a fork of FreeToken** and does not use its implementation.
-
----
-
-## Development methodology
-
-Development of this experimental branch is **heavily AI-assisted**.
-
-My primary work on the project is:
-
-* system architecture
-* bottleneck identification
-* profiling and measurement
-* optimization strategy
-* experimental design
-* implementation direction
-* correctness/performance validation
-* iterative architectural decisions
-
-Coding agents are used extensively for Rust/Vulkan implementation and code modification.
-
-This distinction is stated explicitly because the purpose of this project is primarily to explore **system architecture and AI-assisted systems engineering**, rather than to present the repository as a hand-written kernel/runtime implementation by a single developer.
-
----
-
-## Benchmarking roadmap
-
-The next benchmark snapshot will standardize:
-
-* exact model files and quantization
-* context / synthetic KV depth
-* KV-cache format
-* expert-cache capacity
-* RAM / VRAM utilization
-* warm-up procedure
-* repeated runs
-* median throughput
-* expert hit/miss statistics
-* raw logs
-* reproduction commands
-
-Planned benchmark models:
-
-1. Qwen3.6-35B-A3B
-2. Qwen3.5-122B-A10B
-3. Ling 3.0 Flash
-4. DeepSeek V4 Flash
-
-Where practical, workload-compatible measurements with FreeToken will also be reported, with hardware and precision differences made explicit.
-
----
+The objective is not just a faster kernel. It is to keep the GPU supplied while
+preserving useful expert residency, controlling RAM and VRAM explicitly, and
+avoiding unnecessary copies or write-back stalls.
+
+## Representative results
+
+These are engineering measurements from one RX 7900 XTX, not cross-runtime
+claims. Rows use different workloads and are not directly comparable.
+
+| Model and workload | Key settings | Result |
+|---|---|---:|
+| Qwen3.6-35B-A3B APEX-I-Balanced, decode at synthetic depth 250K | Q8 K/V, 8 GiB expert-cache setting, 1,000 decode tokens | **41.2 tok/s** |
+| Qwen3.6-35B-A3B APEX-I-Balanced, prefill 4,096 at synthetic depth 250K | Q8 K/V, 8 GiB expert-cache setting | **477.9 tok/s** |
+| Qwen3.6-35B-A3B APEX-I-Balanced, prefill 4,096 at depth 0 | Q8 K/V, 8 GiB expert-cache setting | **2,855.6 tok/s** |
+| Qwen3.5-122B-A10B APEX-I-Quality, decode 128 at depth 0 | F16 K/V, 13.97 GiB GPU expert arena, 45 GiB bounded RAM, host DMA, submit splitting disabled, 3 reps | **23.2 tok/s** (22.7–23.5) |
+
+The Qwen3.6 results are recorded in
+[`docs/unified-vram-acceptance-20260822.md`](docs/unified-vram-acceptance-20260822.md).
+The 122B result is the proportional-host-DMA measurement at `497460a`. In that run,
+the Windows driver imported 28.99 of 45.00 GiB of host cache and distributed it
+across the three expert arenas at 62.6%, 67.7%, and 64.9% coverage. The previous
+first-come allocation reached 22.4 tok/s; proportional coverage reached 23.2
+tok/s under the same command, a 3.6% gain.
+
+`--synthetic-depth` allocates and initializes the real KV buffers and advances
+the runner/allocator state so attention reads the requested history length. It
+does not spend hours computing the preceding tokens, and its deterministic KV
+contents are intended for performance testing rather than quality evaluation.
+
+## Architecture in this fork
+
+### Unified elastic VRAM
+
+Paged experts, LLM activation scratch, and native Embedding weights/runtime
+share one logical Vulkan arena. The arena can span multiple physical mapped
+ReBAR allocations. Fixed dense weights and persistent KV/recurrent state remain
+outside it.
+
+Expert slots grow from low addresses; variable runtime allocations grow from
+high addresses. When a variable allocation needs room, the pager can release a
+cold contiguous expert window and restore the affected slots after the loan is
+returned. Prefill and decode reuse the same physical arena with different
+layouts instead of reserving two full caches.
+
+See
+[`docs/unified-vram-elastic-acceptance-20260824.md`](docs/unified-vram-elastic-acceptance-20260824.md)
+for memory accounting and real-GPU acceptance.
+
+### GPU expert pager
+
+Decode keeps expert-level GPU residency with an intrusive O(1) LRU. Hits promote
+to MRU; eviction retains the existing epoch/protection and scan-resistant cold
+touch semantics. Host promotions are batched across the routed expert roles,
+and shared/resident expert work is scheduled before work that depends on misses.
+
+The opt-in pager profiler aggregates cache lookup, victim selection, host-tier,
+copy, submit, synchronization, and LRU-work counters without per-expert logging.
+It is disabled in throughput measurements unless stated otherwise.
+
+For the full-RAM Qwen3.6 path, prefill uses layer-major host storage plus
+resident layers and A/B whole-layer streaming lanes. Decode reinterprets the
+same GPU memory as expert LRU slots.
+
+### Full-RAM and bounded RAM/SSD host tiers
+
+Two host modes are explicit:
+
+* If the expert payload fits the RAM budget, a layer-major full Host store serves
+  both prefill and decode.
+* If it does not fit, a bounded inclusive RAM cache sits in front of SSD. Startup
+  preloads the same fraction of every expert layer rather than filling early
+  layers first. GPU-resident blocks retain clean RAM shadows when capacity
+  permits, so those blocks can be evicted without a synchronous VRAM-to-RAM
+  write-back on the decode critical path.
+
+SSD misses read directly into reusable aligned RAM slots. The bounded path is
+what allows Ling 3.0 Flash, DeepSeek V4 Flash, and Qwen3.5-122B-A10B experiments
+to run on a 64 GiB host.
+
+### RAM-to-VRAM transfer
+
+On the tested Windows AMD driver, aligned host-cache allocations can be imported
+in place with `VK_EXT_external_memory_host`. Batched `vkCmdCopyBuffer` regions
+then move RAM-resident expert blocks into the mapped GPU arena without creating
+a second RAM cache.
+
+The measured import ceiling is about 29 GiB on this machine. A microbenchmark
+still reached that amount after preallocating 16 GiB of ReBAR memory, so the
+observed cap is not a shared 32 GiB VRAM-plus-RAM aperture. Import capacity is
+distributed proportionally across host arenas; blocks outside the imported
+prefixes retain the established parallel CPU copy into mapped ReBAR memory.
+Import failure is therefore a performance fallback, not a model-load failure.
+
+### Long-context execution
+
+The Qwen3.6 path includes hd256 FlashAttention prefill, a dedicated Q8 KV decode
+path, synthetic context-depth initialization, reusable Vulkan recorder
+resources, and explicit submit/synchronization controls. At deep context,
+attention increasingly dominates wall time; expert hit rate alone no longer
+predicts throughput.
+
+## Additional model work
+
+| Model | Fork status |
+|---|---|
+| Ling 3.0 Flash (`bailingmoe3`) | Runs end to end on Vulkan with KDA, gated MLA, and bounded RAM/SSD experts. It served as the first proof that an expert payload larger than both VRAM and RAM can remain usable; performance work is paused. |
+| DeepSeek V4 Flash | Runs end to end with the model's FP8 KV cache and MXFP4 indexer cache. The performance campaign is closed for now; the implementation remains in the tree and documented. |
+| Qwen3.5-122B-A10B | Current large-model decode target and the main user of the bounded RAM/SSD plus host-DMA path. |
+
+DeepSeek details and closeout measurements are in
+[`docs/deepseek.md`](docs/deepseek.md) and
+[`docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md`](docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md).
+The Qwen3.6 optimization history is in
+[`docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md`](docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md).
+
+## Current limits
+
+* Large-model prefill still lacks a complete asynchronous SSD-to-RAM lookahead
+  pipeline. SSD misses are much more expensive than RAM hits.
+* Host-DMA copies currently use the main compute queue. A separate asynchronous
+  transfer/compute queue and background VRAM write-back are not implemented.
+* Only the imported prefix of bounded RAM receives Vulkan DMA on the tested
+  Windows driver; the remainder uses the CPU-to-ReBAR fallback.
+* Synthetic depth reproduces KV allocation and attention work, not meaningful
+  language history.
+* Results are local, workload-specific measurements. Exact model quantization,
+  KV format, context, cache budgets, warm-up, and repetition count must match
+  before treating two numbers as an A/B.
+
+## Related work and development method
+
+This work was developed independently of
+[FreeToken](https://github.com/FlashML-org/FreeToken). The projects explore some
+related expert-caching and heterogeneous-execution ideas, but this repository is
+not a FreeToken fork and does not use its implementation.
+
+Development is heavily AI-assisted. The repository owner directs architecture,
+bottleneck analysis, profiling, experiments, implementation priorities, and
+correctness/performance acceptance; coding agents are used extensively for Rust
+and Vulkan implementation. This is stated explicitly because the project is an
+experiment in both inference systems and AI-assisted systems engineering.
 
 ## Upstream
 
-This repository is based on **[kryptic-sh/infr](https://github.com/kryptic-sh/infr)**, a Pure-Rust, Vulkan-first LLM inference engine.
+This repository is based on [kryptic-sh/infr](https://github.com/kryptic-sh/infr),
+a Pure-Rust, Vulkan-first LLM inference engine. The upstream project provides
+the runtime, model support, Vulkan backend, and much of the infrastructure on
+which this work is built.
 
-The original project provides the fundamental runtime, model support, Vulkan backend, and much of the infrastructure on which this experimental branch is built.
-
-**The original INFR README and usage documentation continue below.**
+The original INFR README and usage documentation continue below.
 
 ---
 
