@@ -107,6 +107,18 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
     }
 }
 
+/// Return the cached-prefix length only when a recurrent model can safely continue from its
+/// existing state. An empty token cache is deliberately NOT reusable: `SeamKv::reset()` clears
+/// the token bookkeeping but cannot synchronously clear device-side DeltaNet conv/S buffers, so
+/// startup warmup or an explicit session reset may leave dirty recurrent state behind it.
+fn recurrent_extension_start(cached: &[u32], prompt: &[u32]) -> Option<usize> {
+    if cached.is_empty() {
+        return None;
+    }
+    let pfx = common_prefix_len(cached, prompt);
+    (pfx == cached.len() && pfx < prompt.len()).then_some(pfx)
+}
+
 /// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
 /// gemma4 `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
 /// (declaration == upload order). Extracted so the four bind sites (denoise, verify, record-once,
@@ -1367,8 +1379,7 @@ pub(crate) fn generate_dense_backend(
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
         cached.len()
     } else if c.qwen35 || c.bailingmoe3 {
-        let pfx = common_prefix_len(cached, prompt);
-        if pfx == cached.len() && pfx < prompt.len() {
+        if let Some(pfx) = recurrent_extension_start(cached, prompt) {
             pfx
         } else {
             // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
@@ -6452,7 +6463,22 @@ pub(crate) fn generate_dense_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::{resident_after_gen, validate_token_ids};
+    use super::{recurrent_extension_start, resident_after_gen, validate_token_ids};
+
+    #[test]
+    fn recurrent_empty_cache_never_reuses_device_state() {
+        assert_eq!(recurrent_extension_start(&[], &[10, 20, 30]), None);
+    }
+
+    #[test]
+    fn recurrent_state_reuses_only_a_nonempty_exact_extension() {
+        assert_eq!(
+            recurrent_extension_start(&[10, 20], &[10, 20, 30]),
+            Some(2)
+        );
+        assert_eq!(recurrent_extension_start(&[10, 20], &[10, 20]), None);
+        assert_eq!(recurrent_extension_start(&[10, 20], &[10, 99, 30]), None);
+    }
 
     // ── resident_after_gen: which tokens' KV rows are recorded as materialized ────────────────
     //
