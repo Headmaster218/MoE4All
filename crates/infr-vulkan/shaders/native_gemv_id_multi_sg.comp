@@ -34,7 +34,7 @@ layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
 #ifdef PAGED
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
-    uint arena_lo; uint arena_hi; uint slot_bytes;
+    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask;
 } pc;
 #else
 layout(push_constant) uniform PC {
@@ -92,6 +92,9 @@ void main() {
     uint slot_global = unit / og;                    // (row, slot) flattened — see native_gemv_id_multi
     uint o0 = (unit - slot_global * og) * uint(NR);  // first output row this workgroup owns
     uint row = slot_global / pc.n_used;
+#ifdef PAGED
+    if ((pc.active_mask & (1u << (slot_global % pc.n_used))) == 0u) { return; }
+#endif
     // wexp keeps only the small within-expert element offset (0 — the pointer IS the expert base).
 #ifdef PAGED
     // Layer-local expert id -> frozen LUT-window slot -> 64-bit arena byte address. This is the

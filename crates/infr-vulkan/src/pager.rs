@@ -2508,6 +2508,40 @@ impl MoePagerSession {
             .all(|&expert| pager.is_resident(src.block_base + expert)))
     }
 
+    /// Return one bit per routed slot whose expert is resident in every supplied role. This is a
+    /// read-only Decode scheduling query used to launch complete hit triplets while the remaining
+    /// experts are promoted. All roles must share one physical size pool so a single pager epoch
+    /// can protect the in-flight hit slots from the later miss insertions.
+    pub fn routed_roles_resident_mask(&self, buf_ids: &[usize], ids: &[u32]) -> Result<u32> {
+        if ids.len() > u32::BITS as usize {
+            return Err(be("moe pager: routed residency mask exceeds 32 slots"));
+        }
+        let mut resolved = Vec::with_capacity(buf_ids.len());
+        let mut common_pool = None;
+        for &buf_id in buf_ids {
+            let (_, pool, src) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: residency mask queried an unregistered buffer"))?;
+            match common_pool {
+                Some(existing) if existing != *pool => return Ok(0),
+                None => common_pool = Some(*pool),
+                _ => {}
+            }
+            resolved.push((*pool, src.block_base));
+        }
+        let mut mask = 0u32;
+        for (slot, &expert) in ids.iter().enumerate() {
+            if resolved
+                .iter()
+                .all(|&(pool, block_base)| self.pools[pool].pager.is_resident(block_base + expert))
+            {
+                mask |= 1u32 << slot;
+            }
+        }
+        Ok(mask)
+    }
+
     /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
     /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
     /// mutation (the property that makes inline recording safe while earlier segments are still

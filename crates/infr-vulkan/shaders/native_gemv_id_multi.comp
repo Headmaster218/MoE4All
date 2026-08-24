@@ -28,7 +28,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #ifdef PAGED
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
-    uint arena_lo; uint arena_hi; uint slot_bytes;
+    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask;
 } pc;
 #elif defined(STREAMED)
 // -DSTREAMED (resident-BDA): the stacked role tensor lives in a resident BDA arena at the 64-bit
@@ -95,6 +95,9 @@ void main() {
     uint slot_global = unit / pc.out_f; // (row, slot) flattened — see the small-batch note above
     uint o = unit - slot_global * pc.out_f;
     uint row = slot_global / pc.n_used;
+#ifdef PAGED
+    if ((pc.active_mask & (1u << (slot_global % pc.n_used))) == 0u) { return; }
+#endif
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED
     // Slot base BYTE address from the LUT slot index (see native_weight_addr.glsl); wbase keeps

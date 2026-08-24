@@ -344,6 +344,7 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
                 in_f,
                 out_f,
                 1,
+                u32::MAX,
             );
             rec.finish().unwrap();
 
@@ -430,6 +431,7 @@ fn paged_sg_id_gemv_matches_host() {
             in_f,
             out_f,
             1,
+            u32::MAX,
         );
         rec.finish().unwrap();
 
@@ -444,6 +446,47 @@ fn paged_sg_id_gemv_matches_host() {
                 &got[slot * out_f..(slot + 1) * out_f],
                 &want,
             );
+        }
+        let sentinel = vec![-17.0f32; ids.len() * out_f];
+        be.upload(y.as_ref(), bytemuck::cast_slice(&sentinel))
+            .unwrap();
+        let active_mask = 0b101u32;
+        let rec = be.recorder().unwrap();
+        rec.linear_native_id_multi_paged(
+            dt,
+            pager.arena_addr(),
+            pager.slot_bytes() as u32,
+            pager.lut_buffer(),
+            ids_buf.as_ref(),
+            ids.len(),
+            0,
+            x_buf.as_ref(),
+            false,
+            y.as_ref(),
+            in_f,
+            out_f,
+            1,
+            active_mask,
+        );
+        rec.finish().unwrap();
+        be.download(y.as_ref(), &mut out).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&out);
+        for (slot, &eid) in ids.iter().enumerate() {
+            let slot_out = &got[slot * out_f..(slot + 1) * out_f];
+            if active_mask & (1 << slot) == 0 {
+                assert!(
+                    slot_out.iter().all(|&v| v == -17.0),
+                    "{dt:?}: masked slot {slot} was unexpectedly overwritten"
+                );
+            } else {
+                let want = host_gemv(&host[eid as usize], &x, in_f, out_f);
+                assert_close(
+                    dt,
+                    &format!("paged masked SG expert {eid}"),
+                    slot_out,
+                    &want,
+                );
+            }
         }
         println!("{dt:?}: paged SG idm OK");
     }

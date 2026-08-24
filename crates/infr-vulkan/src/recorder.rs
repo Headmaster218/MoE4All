@@ -9834,9 +9834,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
         rows: usize,
+        active_mask: u32,
     ) {
         assert_native_k("linear_native_id_multi_paged", in_f);
-        let mut push = [0u8; 36];
+        let mut push = [0u8; 40];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
@@ -9847,6 +9848,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&slot_bytes.to_ne_bytes());
+        push[36..40].copy_from_slice(&active_mask.to_ne_bytes());
         // `y` last — see `linear_native_id_paged`'s doc on why binding order matters for
         // `dispatch3`'s hazard tracking. Binding 0 (old arena SSBO) is unread; `lut` fills it.
         let bufs = [
@@ -9861,7 +9863,7 @@ impl<'a> Recorder<'a> {
                 if let Some((name, spv)) =
                     crate::gemm::native_idm_sg_paged_build_spv(dtype, nr, self.sg16())
                 {
-                    let k = self.be.kernel_sg(name, spv, 5, 36, self.sgp());
+                    let k = self.be.kernel_sg(name, spv, 5, 40, self.sgp());
                     let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
                     self.dispatch_wide(k, &bufs, 1, &push, groups);
                     return;
@@ -9871,7 +9873,7 @@ impl<'a> Recorder<'a> {
         let name =
             crate::linear::native_idm_paged_kernel_name(dtype).expect("native idm paged kernel");
         let spv = crate::gemm::native_idm_paged_build_spv(dtype).expect("native idm paged spv");
-        let k = self.be.kernel(name, spv, 5, 36);
+        let k = self.be.kernel(name, spv, 5, 40);
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 

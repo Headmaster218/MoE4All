@@ -138,6 +138,7 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
         in_f,
         out_f,
         1,
+        u32::MAX,
     );
     rec.linear_native_id_multi_paged(
         DType::Q8_0,
@@ -153,6 +154,7 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
         in_f,
         out_f,
         1,
+        u32::MAX,
     );
     rec.silu_mul(
         gbuf.as_ref(),

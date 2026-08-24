@@ -6467,6 +6467,173 @@ fn execute_paged_moe<'a>(
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
         sync_stream(be_, rec, ps)?;
     }
+    let mut active_mask = u32::MAX;
+    let mut shared_batch_preopened = false;
+    // Decode-only hit-first trial: when some complete Gate/Up/Down triplets are already resident,
+    // launch those slots before blocking on the remaining host promotions. The original slot
+    // order is retained through a kernel mask, so router weights and the final accumulation stay
+    // byte-for-byte in their ordinary layout. Keep the pager epoch open across both halves: miss
+    // insertion may then use any cold slot except the hit weights still being read by the GPU.
+    if !layer_stream
+        && rows == 1
+        && !*fused_gate_up
+        && !*weight_before
+        && stage_ids.len() == n_used
+        && n_used <= u32::BITS as usize
+    {
+        let all_mask = if n_used == u32::BITS as usize {
+            u32::MAX
+        } else {
+            (1u32 << n_used) - 1
+        };
+        let (hit_mask, bounded) = {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("paged execution requires a session");
+            (
+                sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?,
+                sess.role_uses_bounded_host_tier(gate_id)?,
+            )
+        };
+        if bounded && hit_mask != 0 && hit_mask != all_mask {
+            let mut hit_ids = Vec::with_capacity(n_used);
+            let mut miss_ids = Vec::with_capacity(n_used);
+            for (slot, &expert) in stage_ids.iter().enumerate() {
+                if hit_mask & (1u32 << slot) != 0 {
+                    hit_ids.push(expert);
+                } else {
+                    miss_ids.push(expert);
+                }
+            }
+            let shared = {
+                let mut guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_mut().expect("paged execution requires a session");
+                let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
+                if shared {
+                    sess.push_roles_cpu(
+                        &[
+                            (gate_id, hit_ids.as_slice()),
+                            (up_id, hit_ids.as_slice()),
+                            (down_id, hit_ids.as_slice()),
+                        ],
+                        false,
+                    )?;
+                }
+                shared
+            };
+            if shared {
+                let gate_hit_w =
+                    stage_and_window(be_, rec, ps, gate_id, &[], n_expert, false, true)?;
+                let up_hit_w = stage_and_window(be_, rec, ps, up_id, &[], n_expert, false, true)?;
+                let down_hit_w =
+                    stage_and_window(be_, rec, ps, down_id, &[], n_expert, false, true)?;
+                let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * gu_width * 4)?;
+                let ubuf = pooled(pool, be_, "moe_paged_u", n_slots * nff * 4)?;
+                let abuf = pooled(pool, be_, "moe_paged_a", n_slots * nff * 4)?;
+                let ybuf = pooled(pool, be_, "moe_paged_y", n_slots * ne * 4)?;
+                let rec2 = rec.as_ref().expect("segment always Some between ops");
+                rec2.zero(pool[&gbuf].as_ref(), n_slots * gu_width);
+                rec2.zero(pool[&ubuf].as_ref(), n_slots * nff);
+                rec2.zero(pool[&ybuf].as_ref(), n_slots * ne);
+                rec2.arena_stream_barrier();
+                let xb = r(*x)?;
+                {
+                    let guard = be_.moe_pager().lock().unwrap();
+                    let sess = guard.as_ref().expect("checked above");
+                    rec2.linear_native_id_multi_paged(
+                        gdt,
+                        sess.arena_addr(gate_id)?,
+                        sess.slot_bytes(gate_id)? as u32,
+                        sess.tape(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        gate_hit_w as usize,
+                        xb,
+                        false,
+                        pool[&gbuf].as_ref(),
+                        ne,
+                        gu_width,
+                        rows,
+                        hit_mask,
+                    );
+                    rec2.linear_native_id_multi_paged(
+                        udt,
+                        sess.arena_addr(up_id)?,
+                        sess.slot_bytes(up_id)? as u32,
+                        sess.tape(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        up_hit_w as usize,
+                        xb,
+                        false,
+                        pool[&ubuf].as_ref(),
+                        ne,
+                        nff,
+                        rows,
+                        hit_mask,
+                    );
+                }
+                let n_act = n_slots * nff;
+                match act {
+                    Activation::Silu => rec2.silu_mul(
+                        pool[&gbuf].as_ref(),
+                        pool[&ubuf].as_ref(),
+                        pool[&abuf].as_ref(),
+                        n_act,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Sigmoid => rec2.mul_sigmoid(
+                        pool[&gbuf].as_ref(),
+                        pool[&ubuf].as_ref(),
+                        pool[&abuf].as_ref(),
+                        n_act,
+                        0,
+                        0,
+                        0,
+                    ),
+                    Activation::Gelu => rec2.gelu_mul_off(
+                        pool[&gbuf].as_ref(),
+                        pool[&ubuf].as_ref(),
+                        0,
+                        0,
+                        nff,
+                        0,
+                        nff,
+                        0,
+                        pool[&abuf].as_ref(),
+                        n_act,
+                    ),
+                }
+                {
+                    let guard = be_.moe_pager().lock().unwrap();
+                    let sess = guard.as_ref().expect("checked above");
+                    rec2.linear_native_id_multi_paged(
+                        ddt,
+                        sess.arena_addr(down_id)?,
+                        sess.slot_bytes(down_id)? as u32,
+                        sess.tape(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        down_hit_w as usize,
+                        pool[&abuf].as_ref(),
+                        true,
+                        pool[&ybuf].as_ref(),
+                        nff,
+                        ne,
+                        rows,
+                        hit_mask,
+                    );
+                }
+                submit_prefill_compute(rec, ps)?;
+                let fresh = be_.recorder()?;
+                fresh.seed_barrier();
+                fresh.arena_stream_barrier();
+                *rec = Some(fresh);
+                stage_ids = miss_ids;
+                active_mask = all_mask ^ hit_mask;
+                shared_batch_preopened = true;
+            }
+        }
+    }
     // WAR: order every arena read recorded so far (this layer's prior roles, or an earlier
     // layer's dispatch still in the ambient segment — a raw pointer deref, invisible to the buffer
     // hazard tracker) before this op's direct copies below, which may overwrite a slot that read
@@ -6475,14 +6642,11 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
-    let (shared_batch, bounded_host_batch) = if !layer_stream
-        && !stage_ids.is_empty()
-        && !*fused_gate_up
-    {
+    let (shared_batch, bounded_host_batch) = if shared_batch_preopened {
+        (true, true)
+    } else if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
         let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard
-            .as_mut()
-            .expect("paged execution requires a session");
+        let sess = guard.as_mut().expect("paged execution requires a session");
         let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
         let bounded = shared && sess.role_uses_bounded_host_tier(gate_id)?;
         (shared, bounded)
@@ -6845,6 +7009,7 @@ fn execute_paged_moe<'a>(
             ne,
             gu_width,
             rows,
+            active_mask,
         );
         if let Some(ubuf) = &ubuf {
             rec2.linear_native_id_multi_paged(
@@ -6861,6 +7026,7 @@ fn execute_paged_moe<'a>(
                 ne,
                 nff,
                 rows,
+                active_mask,
             );
         }
     }
@@ -6976,6 +7142,7 @@ fn execute_paged_moe<'a>(
             nff,
             ne,
             rows,
+            active_mask,
         );
     }
     let dstb = r(*dst)?;
