@@ -35,14 +35,17 @@ The launcher does not modify firewall rules.
 - Select a GGUF. Split GGUFs are grouped by their first shard; `mmproj` files are detected but not
   treated as language models.
 - Save one or more profiles. Favorites sort first, followed by recently used models.
-- Select **重新估算** before loading. The KV estimate uses INFR's actual model layout calculation;
-  runtime and available expert-cache figures are conservative pre-load estimates.
+- Select **重新估算** before loading. KV, weight-packing margin, architecture-specific driver
+  reserve, post-load reserve, Expert target and elastic-pool figures use the same accounting as the
+  Vulkan loader. Host-cache auto sizing is sampled from currently available system memory.
 - Select **启动 / 切换**. A switch requests graceful shutdown, waits up to 660 seconds for active GPU
   work to drain, and then starts the replacement worker.
 - Use **强制停止** only when graceful draining is stuck. It terminates the worker process directly.
 
-The GUI shows worker phase, PID, address, recent logs, and the latest reported Prefill/Decode rates.
-Only one worker and one background download are managed at a time.
+The GUI shows worker phase, PID, address, recent logs, the latest reported Prefill/Decode rates, and
+the memory plan reported by the running worker: KV layout/context, Expert target, elastic/unified
+arena, host-cache mode/coverage, and host-DMA import coverage. Only one worker and one background
+download are managed at a time.
 
 ## Downloads
 
@@ -69,19 +72,24 @@ public Internet. Profiles, including a configured worker API key, are stored in
 `gui-data\state.json`; restrict that directory to the server account if other local users are not
 trusted.
 
-## Current and reserved capabilities
+## Current capabilities
 
-Chat/completion and Embedding GGUF workers are active now. The catalog and profile model keep task,
-modality, projector, memory-tier and advanced-config concepts separate so the remaining engines can
-be added without replacing the GUI:
-
-- Embedding profiles start INFR's managed `llama.cpp` worker and expose it through INFR's own
-  authenticated `/v1/embeddings` endpoint. The runner is auto-discovered, or can be selected per
-  profile. CPU and Vulkan are supported; closing/switching the worker unloads its model.
-- Rerank remains a reserved task and is rejected until its endpoint exists.
+- Chat/completion profiles run `infr serve`. They can attach one native Embedding GGUF to the same
+  OpenAI-compatible service. On Vulkan, the LLM initializes first and Embedding requests borrow
+  cold ranges from the unified elastic VRAM arena; the weights are released after each request and
+  Expert slots are restored. Setting an Embedding runner explicitly keeps the `llama.cpp`
+  compatibility path.
+- Standalone Embedding profiles use INFR's native CPU/Vulkan engine by default. An explicit runner
+  selects compatibility mode.
+- Paged MoE models use the current VRAM/RAM/SSD hierarchy. A RAM budget covering the complete Expert
+  payload selects the full layer-major host store; a smaller budget selects the bounded inclusive
+  RAM/SSD cache, preloaded proportionally across layers. `paging.dram_bypass` is also exposed.
+- Host DMA is enabled by default. Supported Vulkan drivers import aligned RAM arenas through
+  `VK_EXT_external_memory_host`; unsupported ranges fall back to the CPU/ReBAR path. The GUI reports
+  actual imported bytes from worker startup logs.
+- Pager stats and CSV tracing are available per profile. Additional config paths remain available
+  through the advanced editor generated from INFR's config manifest.
 - Vision/mmproj files are discovered and shown, but are not yet passed into an inference worker.
-- VRAM and RAM budgets are active. SSD is currently the existing model/mmap storage tier; explicit
-  VRAM -> RAM -> SSD policy controls are reserved for the later three-level pager.
 
 Persistent state lives only under `gui-data`, which is ignored by Git. Removing that directory
 resets the GUI catalog, profiles, favorites, recents, and generated management key; it does not

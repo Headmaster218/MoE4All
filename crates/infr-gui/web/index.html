@@ -74,9 +74,11 @@
         <input id="profile-id" type="hidden">
         <div class="grid two">
           <label>配置名称<input id="profile-name" value="Default"></label>
-          <label>任务类型<select id="task"><option value="chat">Chat / Completion</option><option value="embedding">Embedding</option><option value="rerank">Rerank（预留）</option></select></label>
+          <label>任务类型<select id="task"><option value="chat">Chat / Completion</option><option value="embedding">Embedding</option></select></label>
         </div>
         <label>模型路径<input id="model-path" placeholder="选择左侧模型，或输入服务器上的 GGUF 路径"></label>
+        <label id="embedding-model-wrap">联合 Embedding GGUF（可选）<input id="embedding-model" list="embedding-models" placeholder="与 Chat 共用服务和统一显存 arena"></label>
+        <datalist id="embedding-models"></datalist>
         <label id="embedding-runner-wrap" class="hidden">兼容模式 runner（可选）<input id="embedding-runner" placeholder="留空使用 INFR 原生引擎；填写 llama-server.exe 路径则切换兼容模式"></label>
         <div class="grid three">
           <label>计算设备<select id="backend"></select></label>
@@ -91,7 +93,7 @@
         <div class="grid three">
           <label>总 VRAM Budget<input id="vram-budget" value="23g" placeholder="23g / 90%"></label>
           <label>VRAM Reserve<input id="vram-reserve" value="512m" placeholder="512m"></label>
-          <label>RAM 权重缓存<input id="ram-budget" placeholder="留空走 mmap / 例如 64g"></label>
+          <label>RAM Expert Cache<input id="ram-budget" placeholder="留空自动，例如 45g；0 表示关闭"></label>
           <label>上下文<input id="context" value="200k"></label>
           <label>KV K<select id="kv-k"><option>q8_0</option><option>f16</option><option>auto</option></select></label>
           <label>KV V<select id="kv-v"><option>q8_0</option><option>f16</option><option>auto</option></select></label>
@@ -99,8 +101,14 @@
           <label>Expert cache 覆盖<input id="expert-cache" placeholder="留空自动分配"></label>
           <label>单请求最大输出<input id="max-tokens" type="number" value="131072"></label>
         </div>
+        <div id="pager-controls" class="toggle-strip">
+          <label class="toggle"><input id="host-dma" type="checkbox" checked><span>Host DMA</span></label>
+          <label class="toggle"><input id="dram-bypass" type="checkbox"><span>绕过 RAM cache</span></label>
+          <label class="toggle"><input id="pager-stats" type="checkbox"><span>Pager stats</span></label>
+          <label class="trace-field">Pager trace<input id="pager-trace" placeholder="可选 CSV 路径"></label>
+        </div>
         <div id="memory-estimate" class="memory-grid"><div class="subtle">选择本地模型后显示加载前估算</div></div>
-        <p class="hint">统一 VRAM Budget 是主控项；Expert cache 留空时由引擎在权重、KV、运行时和 Prefill 空间之间自动分配。</p>
+        <p class="hint">Expert cache 留空时使用统一弹性 VRAM 余量；RAM 留空时按当前可用内存自动选择 full 或 bounded RAM/SSD tier。</p>
       </section>
 
       <section class="panel">
@@ -127,12 +135,8 @@
 
       <section class="panel">
         <div class="section-title"><h2>运行日志</h2><span id="pid" class="subtle"></span></div>
+        <div id="runtime-memory" class="runtime-memory hidden"></div>
         <pre id="logs">等待 worker…</pre>
-      </section>
-
-      <section class="panel future">
-        <h2>已预留能力</h2>
-        <div class="chips"><span>视觉编码器 / mmproj</span><span>VRAM → RAM → SSD</span><span>多 worker 路由</span></div>
       </section>
     </div>
   </main>

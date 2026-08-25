@@ -1731,6 +1731,29 @@ impl ModelMemoryPlan {
     }
 }
 
+/// Build the same conservative pre-load memory account used by the Vulkan MoE loader.
+///
+/// Control planes use this instead of duplicating the resident-weight packing margin and
+/// architecture-specific driver reserves. `persistent_state_bytes` is the already-selected KV /
+/// recurrent-state layout, and `runtime_reserve_bytes` is the peak elastic activation estimate.
+pub fn estimate_model_memory_plan(
+    cfg: &Config,
+    dense_weight_bytes: u64,
+    total_room_bytes: u64,
+    persistent_state_bytes: u64,
+    runtime_reserve_bytes: u64,
+) -> Option<ModelMemoryPlan> {
+    ModelMemoryPlan::new_with_reserves(
+        total_room_bytes,
+        dense_weight_bytes,
+        persistent_state_bytes,
+        runtime_reserve_bytes,
+        resident_weight_packing_margin(dense_weight_bytes),
+        load_driver_reserve(cfg),
+        POST_KV_DEVICE_RESERVE,
+    )
+}
+
 /// Resident BDA weights are packed into adaptive 64/128/256 MiB blocks, so summing logical tensor
 /// bytes understates the committed allocation by the unused block tails. Measurements across
 /// supported model families put that delta at 1.16%-2.43%; 3%, rounded to the initial block unit
@@ -5409,8 +5432,17 @@ mod seam_helper_tests {
 
         let mut cfg = Config::default();
         assert_eq!(super::load_driver_reserve(&cfg), 0);
+        let estimated =
+            super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, 1 * GIB)
+                .expect("control-plane estimate");
+        assert_eq!(estimated.weight_packing_margin_bytes, 256 * MIB);
+        assert_eq!(estimated.post_load_reserve_bytes, 256 * MIB);
         cfg.deepseek4 = true;
         assert_eq!(super::load_driver_reserve(&cfg), 1536 * MIB);
+        let estimated =
+            super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, 1 * GIB)
+                .expect("DeepSeek control-plane estimate");
+        assert_eq!(estimated.load_driver_reserve_bytes, 1536 * MIB);
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub struct GuiState {
 impl Default for GuiState {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             directories: Vec::new(),
             downloaded_models: Vec::new(),
             favorites: Vec::new(),
@@ -37,9 +37,11 @@ pub struct ModelProfile {
     pub id: String,
     pub name: String,
     pub model_path: String,
-    /// Workload hosted by the worker. Rerank remains reserved for a later backend.
+    /// Optional native Embedding GGUF hosted beside a chat model in the same server.
+    pub embedding_model_path: String,
+    /// Workload hosted by the worker.
     pub task: String,
-    /// Optional llama-server executable for embedding profiles. Empty means auto-discovery.
+    /// Optional llama-server compatibility executable. Empty selects native Embedding.
     pub embedding_runner: String,
     pub backend: String,
     pub context: String,
@@ -50,6 +52,10 @@ pub struct ModelProfile {
     pub vram_reserve: String,
     pub ram_budget: String,
     pub expert_cache: String,
+    pub host_dma: bool,
+    pub dram_bypass: bool,
+    pub pager_stats: bool,
+    pub pager_trace: String,
     pub parallel: usize,
     pub service_addr: String,
     pub service_api_key: String,
@@ -63,6 +69,7 @@ impl Default for ModelProfile {
             id: String::new(),
             name: "Default".into(),
             model_path: String::new(),
+            embedding_model_path: String::new(),
             task: "chat".into(),
             embedding_runner: String::new(),
             backend: "Vulkan0".into(),
@@ -74,6 +81,10 @@ impl Default for ModelProfile {
             vram_reserve: "512m".into(),
             ram_budget: String::new(),
             expert_cache: String::new(),
+            host_dma: true,
+            dram_bypass: false,
+            pager_stats: false,
+            pager_trace: String::new(),
             parallel: 1,
             service_addr: "0.0.0.0:8080".into(),
             service_api_key: String::new(),
@@ -131,6 +142,7 @@ pub struct RuntimeStatus {
     pub prefill_tps: Option<f64>,
     pub decode_tps: Option<f64>,
     pub last_error: Option<String>,
+    pub memory: RuntimeMemoryStatus,
     pub logs: Vec<String>,
 }
 
@@ -146,9 +158,25 @@ impl Default for RuntimeStatus {
             prefill_tps: None,
             decode_tps: None,
             last_error: None,
+            memory: RuntimeMemoryStatus::default(),
             logs: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeMemoryStatus {
+    pub kv_layout: Option<String>,
+    pub context_tokens: Option<u64>,
+    pub expert_cache_target_bytes: Option<u64>,
+    pub elastic_pool_bytes: Option<u64>,
+    pub unified_arena_bytes: Option<u64>,
+    pub host_mode: Option<String>,
+    pub host_cache_bytes: Option<u64>,
+    pub expert_payload_bytes: Option<u64>,
+    pub host_dma_imported_bytes: Option<u64>,
+    pub host_dma_total_bytes: Option<u64>,
+    pub host_dma_arenas: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,14 +228,23 @@ pub struct StatusSnapshot {
 pub struct MemoryEstimate {
     pub model_bytes: u64,
     pub fixed_vram_bytes: Option<u64>,
+    pub expert_payload_bytes: Option<u64>,
     pub requested_ram_budget_bytes: Option<u64>,
+    pub effective_ram_cache_bytes: Option<u64>,
+    pub host_cache_mode: Option<String>,
+    pub host_cache_coverage: Option<f64>,
     pub fits_ram_budget: Option<bool>,
     pub kv_bytes: Option<u64>,
     pub runtime_reserve_bytes: u64,
+    pub weight_packing_margin_bytes: u64,
+    pub load_driver_reserve_bytes: u64,
+    pub post_load_reserve_bytes: u64,
     pub total_vram_bytes: Option<u64>,
     pub requested_vram_budget_bytes: Option<u64>,
     pub effective_vram_budget_bytes: Option<u64>,
     pub estimated_cache_room_bytes: Option<u64>,
+    pub elastic_pool_bytes: Option<u64>,
+    pub embedding_model_bytes: Option<u64>,
     pub trained_context: Option<usize>,
     pub architecture: Option<String>,
     pub is_moe: bool,
@@ -270,7 +307,40 @@ pub fn load_state(path: &Path) -> anyhow::Result<GuiState> {
         return Ok(GuiState::default());
     }
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+    let mut state: GuiState =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    if state.version < 2 {
+        for profile in &mut state.profiles {
+            migrate_pager_controls(profile);
+        }
+    }
+    state.version = GuiState::default().version;
+    Ok(state)
+}
+
+fn migrate_pager_controls(profile: &mut ModelProfile) {
+    if let Some(value) = profile.extra.remove("paging.host_dma") {
+        profile.host_dma = parse_saved_bool(&value).unwrap_or(profile.host_dma);
+    }
+    if let Some(value) = profile.extra.remove("paging.dram_bypass") {
+        profile.dram_bypass = parse_saved_bool(&value).unwrap_or(profile.dram_bypass);
+    }
+    if let Some(value) = profile.extra.remove("paging.stats") {
+        profile.pager_stats = parse_saved_bool(&value).unwrap_or(profile.pager_stats);
+    }
+    if let Some(value) = profile.extra.remove("paging.trace") {
+        if profile.pager_trace.is_empty() {
+            profile.pager_trace = value;
+        }
+    }
+}
+
+fn parse_saved_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 pub fn save_state(path: &Path, state: &GuiState) -> anyhow::Result<()> {
@@ -290,8 +360,7 @@ pub fn save_state(path: &Path, state: &GuiState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn state_round_trips_without_losing_profiles() {
+    fn temp_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "infr-gui-state-{}-{}",
             std::process::id(),
@@ -301,6 +370,12 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn state_round_trips_without_losing_profiles() {
+        let root = temp_root();
         let path = root.join("state.json");
         let mut state = GuiState::default();
         state.directories.push(PathBuf::from(r"D:\Models"));
@@ -319,6 +394,57 @@ mod tests {
         assert_eq!(loaded.favorites, state.favorites);
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].id, "balanced-q8");
+        assert!(loaded.profiles[0].host_dma);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_one_profiles_gain_current_pager_defaults() {
+        let state: GuiState = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "profiles": [{"id":"old","name":"Old","model_path":"model.gguf"}]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.profiles.len(), 1);
+        assert!(state.profiles[0].host_dma);
+        assert!(!state.profiles[0].dram_bypass);
+        assert!(state.profiles[0].embedding_model_path.is_empty());
+    }
+
+    #[test]
+    fn load_migrates_legacy_advanced_pager_controls() {
+        let root = temp_root();
+        let path = root.join("state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "profiles": [{
+                    "id":"old",
+                    "name":"Old",
+                    "model_path":"model.gguf",
+                    "extra": {
+                        "paging.host_dma":"false",
+                        "paging.dram_bypass":"1",
+                        "paging.stats":"true",
+                        "paging.trace":"old-pager.csv"
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let state = load_state(&path).unwrap();
+        let profile = &state.profiles[0];
+        assert_eq!(state.version, 2);
+        assert!(!profile.host_dma);
+        assert!(profile.dram_bypass);
+        assert!(profile.pager_stats);
+        assert_eq!(profile.pager_trace, "old-pager.csv");
+        assert!(profile.extra.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }

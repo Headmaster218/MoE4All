@@ -32,7 +32,7 @@ async function refresh(full = false) {
     renderRuntime();
     renderDownload();
     if (full) {
-      renderDirectories(); renderModels(); renderProfiles(); renderDevices(); renderSchema();
+      renderDirectories(); renderModels(); renderEmbeddingModels(); renderProfiles(); renderDevices(); renderSchema();
     }
   } catch (e) {
     if (String(e.message).includes('management key')) {
@@ -53,8 +53,36 @@ function renderRuntime() {
   $('prefill').textContent = r.prefill_tps == null ? '—' : r.prefill_tps.toFixed(1);
   $('decode').textContent = r.decode_tps == null ? '—' : r.decode_tps.toFixed(1);
   $('pid').textContent = r.pid ? `PID ${r.pid} · ${r.service_addr}` : '';
+  renderRuntimeMemory(r.memory || {});
   $('logs').textContent = r.logs.length ? r.logs.join('\n') : '等待 worker…';
   $('logs').scrollTop = $('logs').scrollHeight;
+}
+
+function hostMode(mode) {
+  return ({full:'Full RAM',bounded:'Bounded RAM/SSD',bypass:'SSD 直读',disabled:'已关闭',unknown:'启动时确定'})[mode] || mode || '—';
+}
+
+function renderRuntimeMemory(memory) {
+  const items = [];
+  if (memory.expert_cache_target_bytes != null) items.push(['Expert target', bytes(memory.expert_cache_target_bytes)]);
+  if (memory.elastic_pool_bytes != null) items.push(['Elastic pool', bytes(memory.elastic_pool_bytes)]);
+  if (memory.unified_arena_bytes != null) items.push(['Unified arena', bytes(memory.unified_arena_bytes)]);
+  if (memory.host_mode) {
+    const coverage = memory.host_cache_bytes != null && memory.expert_payload_bytes
+      ? ` · ${(memory.host_cache_bytes / memory.expert_payload_bytes * 100).toFixed(1)}%`
+      : '';
+    items.push(['Host tier', `${hostMode(memory.host_mode)} · ${bytes(memory.host_cache_bytes)}${coverage}`]);
+  }
+  if (memory.host_dma_imported_bytes != null) {
+    const total = memory.host_dma_total_bytes == null ? '' : ` / ${bytes(memory.host_dma_total_bytes)}`;
+    const arenas = memory.host_dma_arenas ? ` · ${memory.host_dma_arenas} arenas` : '';
+    items.push(['Host DMA', `${bytes(memory.host_dma_imported_bytes)}${total}${arenas}`]);
+  }
+  if (memory.kv_layout || memory.context_tokens != null) {
+    items.push(['KV / Context', `${esc(memory.kv_layout || '—')} · ${memory.context_tokens ?? '—'} tokens`]);
+  }
+  $('runtime-memory').classList.toggle('hidden', !items.length);
+  $('runtime-memory').innerHTML = items.map(([name,value]) => `<div><span>${esc(name)}</span><b>${value}</b></div>`).join('');
 }
 
 function renderDownload() {
@@ -114,6 +142,13 @@ function renderProfiles() {
   if (data.saved.profiles.some(p => p.id === current)) $('profile-select').value = current;
 }
 
+function renderEmbeddingModels() {
+  $('embedding-models').innerHTML = data.catalog
+    .filter(model => model.tasks.includes('embedding'))
+    .map(model => `<option value="${esc(model.path)}">${esc(model.name)}</option>`)
+    .join('');
+}
+
 function renderDevices() {
   const current = $('backend').value;
   const base = ['<option value="cpu">CPU</option>','<option value="metal">Metal</option>'];
@@ -127,7 +162,12 @@ function renderSchema() {
 }
 
 function syncTaskFields() {
-  $('embedding-runner-wrap').classList.toggle('hidden', $('task').value !== 'embedding');
+  const embeddingTask = $('task').value === 'embedding';
+  const attachedEmbedding = $('embedding-model').value.trim() !== '';
+  $('embedding-model-wrap').classList.toggle('hidden', embeddingTask);
+  $('embedding-runner-wrap').classList.toggle('hidden', !embeddingTask && !attachedEmbedding);
+  $('pager-controls').classList.toggle('hidden', embeddingTask);
+  $('ram-budget').disabled = embeddingTask || $('dram-bypass').checked;
 }
 
 function readProfile() {
@@ -139,10 +179,13 @@ function readProfile() {
   return {
     id: $('profile-id').value || `profile-${Date.now()}`,
     name: $('profile-name').value.trim() || 'Default', model_path:$('model-path').value.trim(), task:$('task').value,
+    embedding_model_path:$('embedding-model').value.trim(),
     embedding_runner:$('embedding-runner').value.trim(),
     backend:$('backend').value, context:$('context').value.trim(), ubatch:$('ubatch').value?Number($('ubatch').value):null,
     kv_type_k:$('kv-k').value, kv_type_v:$('kv-v').value, vram_budget:$('vram-budget').value.trim(),
     vram_reserve:$('vram-reserve').value.trim(), ram_budget:$('ram-budget').value.trim(), expert_cache:$('expert-cache').value.trim(),
+    host_dma:$('host-dma').checked, dram_bypass:$('dram-bypass').checked, pager_stats:$('pager-stats').checked,
+    pager_trace:$('pager-trace').value.trim(),
     parallel:Number($('parallel').value), service_addr:$('service-addr').value.trim(), service_api_key:$('service-key').value,
     max_tokens_cap:Number($('max-tokens').value), extra
   };
@@ -150,9 +193,10 @@ function readProfile() {
 
 function fillProfile(p) {
   $('profile-id').value=p.id||''; $('profile-name').value=p.name||'Default'; $('model-path').value=p.model_path||''; selectedModel=p.model_path||'';
-  $('task').value=p.task||'chat'; $('embedding-runner').value=p.embedding_runner||''; $('backend').value=p.backend||'Vulkan0'; $('context').value=p.context||''; $('ubatch').value=p.ubatch||'';
+  $('task').value=p.task||'chat'; $('embedding-model').value=p.embedding_model_path||''; $('embedding-runner').value=p.embedding_runner||''; $('backend').value=p.backend||'Vulkan0'; $('context').value=p.context||''; $('ubatch').value=p.ubatch||'';
   $('kv-k').value=p.kv_type_k||'auto'; $('kv-v').value=p.kv_type_v||'auto'; $('vram-budget').value=p.vram_budget||'';
   $('vram-reserve').value=p.vram_reserve||''; $('ram-budget').value=p.ram_budget||''; $('expert-cache').value=p.expert_cache||'';
+  $('host-dma').checked=p.host_dma!==false; $('dram-bypass').checked=Boolean(p.dram_bypass); $('pager-stats').checked=Boolean(p.pager_stats); $('pager-trace').value=p.pager_trace||'';
   $('parallel').value=p.parallel||1; $('service-addr').value=p.service_addr||'0.0.0.0:8080'; $('service-key').value=p.service_api_key||'';
   $('max-tokens').value=p.max_tokens_cap||131072; $('advanced').value=Object.entries(p.extra||{}).map(([k,v])=>`${k}=${v}`).join('\n');
   formDirty=false; syncTaskFields(); renderModels();
@@ -160,9 +204,17 @@ function fillProfile(p) {
 
 async function estimateProfile(profile) {
   const e = await api('/api/estimate',{method:'POST',body:JSON.stringify(profile)});
-  const cards = [['Host 权重上限',e.model_bytes],['固定 VRAM 权重',e.fixed_vram_bytes],['RAM 权重预算',e.requested_ram_budget_bytes],['KV / 持久状态',e.kv_bytes],['运行时预留',e.runtime_reserve_bytes],['有效 VRAM 预算',e.effective_vram_budget_bytes],['Expert Cache',e.estimated_cache_room_bytes]];
-  const ramState = e.fits_ram_budget === false ? ' · RAM 预算偏小' : '';
-  $('memory-estimate').innerHTML = cards.map(([n,v])=>`<div class="memory-card"><b>${bytes(v)}</b><span>${n}</span></div>`).join('') + `<div class="memory-card"><b>${e.fits_minimum===false?'可能不足':'可规划'}</b><span>${esc(e.architecture||'未知')} · ${e.confidence}${ramState}</span></div>`;
+  const cards = [
+    ['GGUF 文件',e.model_bytes],['固定 VRAM 权重',e.fixed_vram_bytes],['Expert payload',e.expert_payload_bytes],
+    ['KV / 持久状态',e.kv_bytes],['运行时弹性峰值',e.runtime_reserve_bytes],['Packing margin',e.weight_packing_margin_bytes],
+    ['驱动 / Post-load 预留',(e.load_driver_reserve_bytes || 0) + (e.post_load_reserve_bytes || 0)],
+    ['有效 VRAM 预算',e.effective_vram_budget_bytes],['Expert target',e.estimated_cache_room_bytes],['Elastic pool',e.elastic_pool_bytes],
+    ['联合 Embedding 权重',e.embedding_model_bytes]
+  ].filter(([,value]) => value !== null && value !== undefined);
+  const coverage = e.host_cache_coverage == null ? '' : ` · ${(e.host_cache_coverage * 100).toFixed(1)}%`;
+  if (e.host_cache_mode) cards.push([`Host tier · ${hostMode(e.host_cache_mode)}${coverage}`,e.effective_ram_cache_bytes]);
+  const ramState = e.fits_ram_budget === false ? ' · SSD 参与运行时 miss' : '';
+  $('memory-estimate').innerHTML = cards.map(([n,v])=>`<div class="memory-card"><b>${bytes(v)}</b><span>${esc(n)}</span></div>`).join('') + `<div class="memory-card"><b>${e.fits_minimum===false?'可能不足':'可规划'}</b><span>${esc(e.architecture||'未知')} · ${e.confidence}${ramState}</span></div>`;
   msg(e.notes.join(' '));
   return e;
 }
@@ -185,6 +237,8 @@ $('download-source').onchange = () => $('download-custom').classList.toggle('hid
 $('download').onclick = () => { const source=$('download-source').value; post('/api/downloads/start',{model_ref:$('download-ref').value,endpoint:source==='custom'?$('download-custom').value:source,jobs:Number($('download-jobs').value)},false); };
 $('profile-select').onchange = () => { const p=data.saved.profiles.find(p=>p.id===$('profile-select').value); if(p) fillProfile(p); else fillProfile({}); };
 $('task').onchange = () => { syncTaskFields(); formDirty = true; };
+$('embedding-model').oninput = () => { syncTaskFields(); formDirty = true; };
+$('dram-bypass').onchange = () => { syncTaskFields(); formDirty = true; };
 $('save').onclick = async () => { try{const p=readProfile(); await post('/api/profiles/save',p,true); $('profile-id').value=p.id; $('profile-select').value=p.id;}catch(e){} };
 $('delete-profile').onclick = async () => {
   const id = $('profile-id').value;

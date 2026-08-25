@@ -169,7 +169,6 @@ pub fn estimate(
     let gguf = Gguf::open(path).map_err(|e| e.to_string())?;
     let model_bytes = gguf.shards().iter().map(|(_, n)| *n).sum::<u64>();
     let requested_ram_budget_bytes = parse_absolute(&profile.ram_budget);
-    let fits_ram_budget = requested_ram_budget_bytes.map(|budget| model_bytes <= budget);
     let architecture = gguf
         .metadata()
         .str("general.architecture")
@@ -181,7 +180,6 @@ pub fn estimate(
             &gguf,
             model_bytes,
             requested_ram_budget_bytes,
-            fits_ram_budget,
             architecture,
         );
     }
@@ -214,38 +212,75 @@ pub fn estimate(
     });
     let runtime_reserve_bytes =
         infr_llama::seam::estimate_runtime_reserve_bytes(&cfg, planning_context, planning_ubatch);
+    let reserve_plan = infr_llama::seam::estimate_model_memory_plan(
+        &cfg,
+        fixed_vram_bytes,
+        u64::MAX,
+        kv_bytes.unwrap_or(0),
+        runtime_reserve_bytes,
+    )
+    .expect("an unbounded control-plane plan must fit");
     let memory_plan = effective_vram_budget_bytes
         .zip(kv_bytes)
         .and_then(|(budget, state)| {
-            infr_llama::seam::ModelMemoryPlan::new(
-                budget,
+            infr_llama::seam::estimate_model_memory_plan(
+                &cfg,
                 fixed_vram_bytes,
+                budget,
                 state,
                 runtime_reserve_bytes,
             )
         });
-    let estimated_cache_room_bytes = memory_plan.map(|plan| plan.expert_cache_bytes);
+    let cache_override = parse_budget(&profile.expert_cache, total_vram_bytes);
+    let estimated_cache_room_bytes = memory_plan.map(|plan| match cache_override {
+        Some(requested) => requested.min(plan.expert_cache_bytes),
+        None => plan.expert_cache_bytes.min(footprint.expert),
+    });
+    let pages_experts = is_moe
+        && memory_plan.is_some_and(|plan| {
+            cache_override.is_some() || plan.expert_cache_bytes < footprint.expert
+        });
+    let elastic_pool_bytes = memory_plan
+        .zip(estimated_cache_room_bytes)
+        .filter(|_| pages_experts)
+        .map(|(plan, target)| plan.elastic_pool_bytes(target));
     let fits_minimum = effective_vram_budget_bytes
         .zip(kv_bytes)
-        .map(|(budget, state)| {
-            infr_llama::seam::ModelMemoryPlan::new(
-                budget,
-                fixed_vram_bytes,
-                state,
-                runtime_reserve_bytes,
-            )
-            .is_some_and(|plan| plan.minimum_required_bytes() <= budget)
-        });
+        .map(|(budget, _)| memory_plan.is_some_and(|plan| plan.minimum_required_bytes() <= budget));
+    let host = estimate_host_cache(profile, is_moe, footprint.expert);
+    let embedding_model_bytes = attached_embedding_bytes(profile)?;
 
     let mut notes = vec![
         "KV 按当前引擎的实际布局公式估算，并已乘以并发槽数。".into(),
-        "运行时预留是加载前保守值；最终分配仍由 Vulkan budget guard 决定。".into(),
+        "固定权重、packing margin、架构驱动预留和 post-load 余量与 Vulkan 加载器使用同一套公式。"
+            .into(),
     ];
     if is_moe {
-        notes.push("MoE 文件大小主要代表 RAM/磁盘权重，不等于必须全部常驻显存。".into());
+        notes.push(match host.mode.as_deref() {
+            Some("full") => "Host tier 可覆盖完整 expert payload；SSD 仅参与加载。".into(),
+            Some("bounded") => {
+                "Host tier 是 bounded inclusive RAM/SSD cache；启动时按层等比例预热，未命中专家从 SSD 读取。".into()
+            }
+            Some("bypass") => "Host RAM cache 已旁路；expert miss 直接从 SSD 进入上层。".into(),
+            Some("disabled") => {
+                "Host RAM cache 已禁用；expert miss 使用无独立 arena 的后备读取路径。".into()
+            }
+            _ => "MoE expert payload 由 VRAM/RAM/SSD 分层管理，不等于必须全部常驻显存或内存。".into(),
+        });
     }
-    if fits_ram_budget == Some(false) {
-        notes.push("RAM 权重预算小于模型文件总量；未驻留部分将依赖 mmap/系统文件缓存。".into());
+    if profile.host_dma && host.effective_bytes.unwrap_or(0) > 0 {
+        notes.push(
+            "Host DMA 会尝试将对齐 RAM arena 原地导入 Vulkan；实际覆盖范围以启动日志为准。".into(),
+        );
+    }
+    if embedding_model_bytes.is_some() {
+        if profile.embedding_runner.trim().is_empty() {
+            notes.push("附加的原生 Embedding 权重在请求期间借用统一弹性 VRAM，完成后释放并恢复 expert slots。".into());
+        } else {
+            notes.push(
+                "附加 Embedding 使用兼容 runner，其独立进程内存不计入此统一 VRAM 估算。".into(),
+            );
+        }
     }
     if context.is_none() {
         notes.push("百分比或无效上下文无法离线换算，KV 预算将在加载时确定。".into());
@@ -253,14 +288,23 @@ pub fn estimate(
     Ok(MemoryEstimate {
         model_bytes,
         fixed_vram_bytes: Some(fixed_vram_bytes),
+        expert_payload_bytes: is_moe.then_some(footprint.expert),
         requested_ram_budget_bytes,
-        fits_ram_budget,
+        effective_ram_cache_bytes: host.effective_bytes,
+        host_cache_mode: host.mode,
+        host_cache_coverage: host.coverage,
+        fits_ram_budget: host.fits_payload,
         kv_bytes,
         runtime_reserve_bytes,
+        weight_packing_margin_bytes: reserve_plan.weight_packing_margin_bytes,
+        load_driver_reserve_bytes: reserve_plan.load_driver_reserve_bytes,
+        post_load_reserve_bytes: reserve_plan.post_load_reserve_bytes,
         total_vram_bytes,
         requested_vram_budget_bytes,
         effective_vram_budget_bytes,
         estimated_cache_room_bytes,
+        elastic_pool_bytes,
+        embedding_model_bytes,
         trained_context: Some(cfg.n_ctx_train),
         architecture,
         is_moe,
@@ -281,7 +325,6 @@ fn estimate_embedding(
     gguf: &Gguf,
     model_bytes: u64,
     requested_ram_budget_bytes: Option<u64>,
-    fits_ram_budget: Option<bool>,
     architecture: Option<String>,
 ) -> Result<MemoryEstimate, String> {
     let total_vram_bytes = devices
@@ -307,16 +350,20 @@ fn estimate_embedding(
     if profile.backend.eq_ignore_ascii_case("cpu") {
         notes.push("CPU 模式不占用 Vulkan 显存，VRAM 适配结果不适用。".into());
     }
-    if fits_ram_budget == Some(false) {
-        notes.push("RAM 权重预算小于模型文件总量。".into());
-    }
     Ok(MemoryEstimate {
         model_bytes,
         fixed_vram_bytes: (!profile.backend.eq_ignore_ascii_case("cpu")).then_some(model_bytes),
+        expert_payload_bytes: None,
         requested_ram_budget_bytes,
-        fits_ram_budget,
+        effective_ram_cache_bytes: None,
+        host_cache_mode: None,
+        host_cache_coverage: None,
+        fits_ram_budget: None,
         kv_bytes: None,
         runtime_reserve_bytes: EMBEDDING_RUNTIME_RESERVE,
+        weight_packing_margin_bytes: 0,
+        load_driver_reserve_bytes: 0,
+        post_load_reserve_bytes: 0,
         total_vram_bytes,
         requested_vram_budget_bytes,
         effective_vram_budget_bytes,
@@ -325,6 +372,8 @@ fn estimate_embedding(
                 .saturating_sub(model_bytes)
                 .saturating_sub(EMBEDDING_RUNTIME_RESERVE)
         }),
+        elastic_pool_bytes: None,
+        embedding_model_bytes: None,
         trained_context,
         architecture,
         is_moe: false,
@@ -332,6 +381,73 @@ fn estimate_embedding(
         confidence: "medium".into(),
         notes,
     })
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct HostCacheEstimate {
+    effective_bytes: Option<u64>,
+    mode: Option<String>,
+    coverage: Option<f64>,
+    fits_payload: Option<bool>,
+}
+
+fn estimate_host_cache(
+    profile: &ModelProfile,
+    is_moe: bool,
+    expert_payload_bytes: u64,
+) -> HostCacheEstimate {
+    if !is_moe || expert_payload_bytes == 0 {
+        return HostCacheEstimate::default();
+    }
+    let (effective_bytes, mode) = if profile.dram_bypass {
+        (Some(0), "bypass")
+    } else if profile.ram_budget.trim().is_empty() {
+        let bytes = infr_core::hostmem::available_bytes()
+            .map_or(expert_payload_bytes, |available| {
+                infr_core::hostmem::auto_arena_bytes(available, 0, expert_payload_bytes)
+            });
+        (
+            Some(bytes),
+            if bytes >= expert_payload_bytes {
+                "full"
+            } else {
+                "bounded"
+            },
+        )
+    } else if let Some(bytes) = parse_absolute(&profile.ram_budget) {
+        let bytes = bytes.min(expert_payload_bytes);
+        let mode = if bytes == 0 {
+            "disabled"
+        } else if bytes >= expert_payload_bytes {
+            "full"
+        } else {
+            "bounded"
+        };
+        (Some(bytes), mode)
+    } else {
+        return HostCacheEstimate {
+            mode: Some("unknown".into()),
+            ..HostCacheEstimate::default()
+        };
+    };
+    HostCacheEstimate {
+        effective_bytes,
+        mode: Some(mode.into()),
+        coverage: effective_bytes.map(|bytes| bytes as f64 / expert_payload_bytes as f64),
+        fits_payload: effective_bytes.map(|bytes| bytes >= expert_payload_bytes),
+    }
+}
+
+fn attached_embedding_bytes(profile: &ModelProfile) -> Result<Option<u64>, String> {
+    if profile.embedding_model_path.trim().is_empty() || profile.task == "embedding" {
+        return Ok(None);
+    }
+    let path = Path::new(profile.embedding_model_path.trim());
+    if !path.is_file() {
+        return Err("附加 Embedding 模型尚未下载到本地，无法估算统一 VRAM 借用量".into());
+    }
+    let gguf = Gguf::open(path).map_err(|e| e.to_string())?;
+    Ok(Some(infr_llama::weight_footprint(&gguf).total()))
 }
 
 fn parse_absolute(raw: &str) -> Option<u64> {
@@ -368,6 +484,33 @@ mod tests {
         assert!(is_embedding_architecture("nomic-bert"));
         assert!(is_embedding_architecture("BERT"));
         assert!(!is_embedding_architecture("qwen3moe"));
+    }
+
+    #[test]
+    fn host_cache_modes_match_the_moe_backing_contract() {
+        let payload = 8 * 1024 * 1024 * 1024;
+        let fixed = ModelProfile {
+            ram_budget: "3g".into(),
+            ..ModelProfile::default()
+        };
+        let estimated = estimate_host_cache(&fixed, true, payload);
+        assert_eq!(estimated.mode.as_deref(), Some("bounded"));
+        assert_eq!(estimated.effective_bytes, Some(3 * 1024 * 1024 * 1024));
+        assert_eq!(estimated.fits_payload, Some(false));
+
+        let bypass = ModelProfile {
+            dram_bypass: true,
+            ram_budget: "16g".into(),
+            ..ModelProfile::default()
+        };
+        let estimated = estimate_host_cache(&bypass, true, payload);
+        assert_eq!(estimated.mode.as_deref(), Some("bypass"));
+        assert_eq!(estimated.effective_bytes, Some(0));
+
+        assert_eq!(
+            estimate_host_cache(&fixed, false, 0),
+            HostCacheEstimate::default()
+        );
     }
 
     #[test]

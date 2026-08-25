@@ -114,6 +114,16 @@ impl WorkerManager {
             }
             _ => {
                 command.arg("serve").arg(&profile.model_path);
+                if !profile.embedding_model_path.trim().is_empty() {
+                    command
+                        .arg("--embedding-model")
+                        .arg(profile.embedding_model_path.trim());
+                    if !profile.embedding_runner.trim().is_empty() {
+                        command
+                            .arg("--embedding-runner")
+                            .arg(profile.embedding_runner.trim());
+                    }
+                }
             }
         }
         command
@@ -144,6 +154,7 @@ impl WorkerManager {
                 prefill_tps: None,
                 decode_tps: None,
                 last_error: None,
+                memory: Default::default(),
                 logs: Vec::new(),
             };
         }
@@ -444,10 +455,12 @@ pub fn validate_profile(profile: &ModelProfile) -> Result<(), String> {
         return Err("请选择模型".into());
     }
     if profile.model_path.contains(['\r', '\n'])
+        || profile.embedding_model_path.contains(['\r', '\n'])
         || profile.embedding_runner.contains(['\r', '\n'])
         || profile.service_api_key.contains(['\r', '\n'])
+        || profile.pager_trace.contains(['\r', '\n'])
     {
-        return Err("模型路径、Embedding runner 和 API Key 不能包含换行".into());
+        return Err("模型路径、Pager trace、Embedding runner 和 API Key 不能包含换行".into());
     }
     if !matches!(profile.task.as_str(), "chat" | "completion" | "embedding") {
         return Err(format!(
@@ -506,6 +519,10 @@ fn profile_settings(
         }
         insert_nonempty(&mut values, "paging.dram", &profile.ram_budget);
         insert_nonempty(&mut values, "paging.cache", &profile.expert_cache);
+        values.insert("paging.host_dma".into(), profile.host_dma.to_string());
+        values.insert("paging.dram_bypass".into(), profile.dram_bypass.to_string());
+        values.insert("paging.stats".into(), profile.pager_stats.to_string());
+        insert_nonempty(&mut values, "paging.trace", &profile.pager_trace);
         values.insert(
             "serve.max_tokens_cap".into(),
             profile.max_tokens_cap.max(1).to_string(),
@@ -569,7 +586,78 @@ async fn record_worker_log(status: &RwLock<RuntimeStatus>, line: String) {
     if line.to_ascii_lowercase().contains("error") {
         state.last_error = Some(line.clone());
     }
+    update_memory_status(&mut state, &line);
     push_log(&mut state.logs, line);
+}
+
+fn update_memory_status(state: &mut RuntimeStatus, line: &str) {
+    if line.contains("VRAM plan:") {
+        state.memory.expert_cache_target_bytes =
+            metric(line, "expert_cache_target=").map(decimal_gb_bytes);
+        state.memory.elastic_pool_bytes = metric(line, "elastic_pool=").map(decimal_gb_bytes);
+        state.memory.context_tokens = metric(line, "ctx=").map(|value| value as u64);
+        state.memory.kv_layout = line
+            .split_once('(')
+            .and_then(|(_, tail)| tail.rsplit_once(')').map(|(inside, _)| inside))
+            .and_then(|inside| {
+                inside
+                    .rsplit_once(", ctx=")
+                    .map(|(layout, _)| layout.trim())
+            })
+            .map(str::to_string);
+    }
+    if line.contains("MoE host plan: bounded inclusive RAM cache") {
+        state.memory.host_mode = Some("bounded".into());
+        state.memory.host_cache_bytes =
+            metric(line, "bounded inclusive RAM cache ").map(decimal_gb_bytes);
+        state.memory.expert_payload_bytes = metric(line, " GB / ").map(decimal_gb_bytes);
+    } else if line.contains("MoE host plan: full layer-contiguous RAM store") {
+        state.memory.host_mode = Some("full".into());
+        state.memory.host_cache_bytes =
+            metric(line, "full layer-contiguous RAM store ").map(decimal_gb_bytes);
+        state.memory.expert_payload_bytes = state.memory.host_cache_bytes;
+    }
+    if line.contains("host DMA import total:") {
+        if let Some((imported, total)) = ratio_after(line, "host DMA import total:") {
+            state.memory.host_dma_imported_bytes = Some(gib_bytes(imported));
+            state.memory.host_dma_total_bytes = Some(gib_bytes(total));
+        }
+        state.memory.host_dma_arenas = line
+            .split_once(" across ")
+            .and_then(|(_, tail)| tail.split_once(" arena(s)").map(|(value, _)| value.trim()))
+            .map(str::to_string);
+    } else if line.contains("host DMA import unavailable") || line.contains("host DMA disabled") {
+        state.memory.host_dma_imported_bytes = Some(0);
+    }
+    if let Some(bytes) = integer_after(line, "unified VRAM arena: ") {
+        state.memory.unified_arena_bytes = Some(bytes);
+    }
+    if line.contains("unified VRAM ready") {
+        if let Some(bytes) = integer_after(line, "arena_bytes=") {
+            state.memory.unified_arena_bytes = Some(bytes);
+        }
+    }
+}
+
+fn decimal_gb_bytes(value: f64) -> u64 {
+    (value * 1_000_000_000.0).round() as u64
+}
+
+fn gib_bytes(value: f64) -> u64 {
+    (value * (1u64 << 30) as f64).round() as u64
+}
+
+fn ratio_after(line: &str, marker: &str) -> Option<(f64, f64)> {
+    let tail = line.split_once(marker)?.1.trim_start();
+    let token = tail.split_whitespace().next()?;
+    let (left, right) = token.split_once('/')?;
+    Some((left.parse().ok()?, right.parse().ok()?))
+}
+
+fn integer_after(line: &str, marker: &str) -> Option<u64> {
+    let tail = line.split_once(marker)?.1.trim_start();
+    let number: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    number.parse().ok()
 }
 
 fn normalize_worker_log(bytes: &[u8]) -> String {
@@ -776,6 +864,74 @@ mod tests {
         assert!(!settings.contains_key("kv.type_k"));
         assert!(!settings.contains_key("paging.cache"));
         assert!(!settings.contains_key("serve.max_tokens_cap"));
+    }
+
+    #[test]
+    fn chat_profile_carries_the_current_host_pager_controls() {
+        let p = ModelProfile {
+            id: "large-moe".into(),
+            model_path: "model.gguf".into(),
+            host_dma: false,
+            dram_bypass: true,
+            pager_stats: true,
+            pager_trace: "pager.csv".into(),
+            ..ModelProfile::default()
+        };
+        let settings = profile_settings(&p, Path::new("worker.stop")).unwrap();
+
+        assert_eq!(
+            settings.get("paging.host_dma").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            settings.get("paging.dram_bypass").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            settings.get("paging.stats").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            settings.get("paging.trace").map(String::as_str),
+            Some("pager.csv")
+        );
+    }
+
+    #[test]
+    fn startup_logs_populate_the_runtime_memory_summary() {
+        let mut status = RuntimeStatus::default();
+        update_memory_status(
+            &mut status,
+            "VRAM plan: total_room=19.86 GB fixed=5.20 GB state=0.16 GB \
+             runtime_elastic=0.36 GB packing_margin=0.27 GB load_driver=0.00 GB \
+             post_load=0.27 GB expert_cache_target=13.61 GB elastic_pool=13.97 GB \
+             (k=F16, v=F16, ctx=145)",
+        );
+        update_memory_status(
+            &mut status,
+            "MoE host plan: bounded inclusive RAM cache 48.32 GB / 72.36 GB expert payload",
+        );
+        update_memory_status(
+            &mut status,
+            "[infr] host DMA import total: 28.99/45.00 GiB across 3/3 arena(s)",
+        );
+        update_memory_status(
+            &mut status,
+            "[infr] unified VRAM arena: 13966884864 bytes across 7 mapped ReBAR shard(s)",
+        );
+
+        assert_eq!(status.memory.kv_layout.as_deref(), Some("k=F16, v=F16"));
+        assert_eq!(status.memory.context_tokens, Some(145));
+        assert_eq!(
+            status.memory.expert_cache_target_bytes,
+            Some(13_610_000_000)
+        );
+        assert_eq!(status.memory.elastic_pool_bytes, Some(13_970_000_000));
+        assert_eq!(status.memory.host_mode.as_deref(), Some("bounded"));
+        assert_eq!(status.memory.host_cache_bytes, Some(48_320_000_000));
+        assert_eq!(status.memory.expert_payload_bytes, Some(72_360_000_000));
+        assert_eq!(status.memory.host_dma_arenas.as_deref(), Some("3/3"));
+        assert_eq!(status.memory.unified_arena_bytes, Some(13_966_884_864));
     }
 
     #[test]
