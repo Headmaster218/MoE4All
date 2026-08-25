@@ -1177,6 +1177,10 @@ pub struct VulkanBackend {
     /// `infr-llama`'s sessions own the `VulkanBackend`, and a new backend is a new device whose
     /// buffers couldn't read the old session anyway.
     moe_pager: Arc<crate::pager::MoePagerCell>,
+    /// `ParallelSeam` eagerly creates every KV slot after its warmup forward. While that startup
+    /// batch is in progress, the runner must not admit optional Host DMA aliases after slot 0 and
+    /// consume driver capacity needed by the remaining persistent slots.
+    session_finalization_deferred: Arc<std::sync::atomic::AtomicBool>,
     /// Dense layer-streaming cache (see `pager::DensePagerSession`) — `Some` only when the loaded
     /// DENSE model's per-layer weights don't fit VRAM and the seam's placement chose streaming.
     /// Same drop-ordering/ownership story as `moe_pager` (declared before `shared` so its
@@ -2674,6 +2678,7 @@ impl VulkanBackend {
 
         let backend = Self {
             moe_pager: Arc::new(Mutex::new(None)),
+            session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::new(Mutex::new(None)),
@@ -3759,6 +3764,7 @@ impl VulkanBackend {
         }
         Ok(Self {
             moe_pager: Arc::clone(&self.moe_pager),
+            session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::clone(&self.unified_pool),
@@ -3767,6 +3773,19 @@ impl VulkanBackend {
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
+    }
+
+    /// Hold optional Host DMA imports until a caller has materialized a batch of persistent KV
+    /// slots. The ordinary one-session path never enables this gate.
+    pub fn defer_session_finalization(&self, deferred: bool) {
+        self.session_finalization_deferred
+            .store(deferred, Ordering::Release);
+    }
+
+    /// Complete a previously deferred session-finalization boundary.
+    pub fn finish_deferred_session_allocations(&self) -> Result<()> {
+        self.defer_session_finalization(false);
+        <Self as Backend>::finish_session_allocations(self)
     }
 
     fn unified_sub_buffer(
@@ -4816,6 +4835,16 @@ impl Backend for VulkanBackend {
                 "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GB",
                 bytes as f64 / 1e9,
             );
+        }
+        Ok(())
+    }
+
+    fn finish_session_allocations(&self) -> Result<()> {
+        if self.session_finalization_deferred.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+            session.finish_host_dma_import(self);
         }
         Ok(())
     }

@@ -1644,6 +1644,10 @@ pub struct MoePagerSession {
     /// Vulkan aliases over the exact RAM allocations above. Empty when the extension is absent or
     /// import fails, in which case the established CPU ReBAR copy remains live.
     host_imports: Vec<ImportedHostAllocation>,
+    /// Host allocations eligible for DMA import once the unified arena and fixed weights have
+    /// claimed their device-visible address space. Importing them earlier can exhaust WDDM's
+    /// combined allocation ceiling and make the model's later VRAM allocations fail.
+    pending_host_imports: Vec<(Arc<AlignedHostBuffer>, usize)>,
     /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
     /// every PAGED `_exps` tensor. A non-paged layer's gate/up/down buffer is never registered
     /// here — the adapter's lookup simply misses and falls through to the ordinary
@@ -1792,13 +1796,6 @@ impl MoePagerSession {
                 host_import_requests.push((host.arena_allocation(), pool.slot_bytes));
             }
         }
-        let host_imports = vk.import_host_allocations(host_import_requests);
-        if !host_imports.is_empty() {
-            tracing::info!(
-                "[infr] paged-MoE host DMA: imported {} RAM arena(s) in place",
-                host_imports.len(),
-            );
-        }
         if tiered {
             let cache_bytes: usize = layout
                 .pools
@@ -1856,7 +1853,8 @@ impl MoePagerSession {
             unified_pool,
             role_stride: layout.n_blocks,
             host_store,
-            host_imports,
+            host_imports: Vec::new(),
+            pending_host_imports: host_import_requests,
             sources: HashMap::new(),
             tape,
             tape_words,
@@ -1870,6 +1868,23 @@ impl MoePagerSession {
             prefill_loaded: HashSet::new(),
             prefill_reserved_ranges: vec![Vec::new(); layout.pools.len()],
         })
+    }
+
+    /// Import RAM only after the unified arena, fixed weights, KV/recurrent state and permanent IO
+    /// buffers are resident, so WDDM's import ceiling cannot make a later model allocation fail.
+    pub fn finish_host_dma_import(&mut self, vk: &VulkanBackend) -> usize {
+        if self.pending_host_imports.is_empty() {
+            return self.host_imports.len();
+        }
+        let requests = std::mem::take(&mut self.pending_host_imports);
+        self.host_imports = vk.import_host_allocations(requests);
+        if !self.host_imports.is_empty() {
+            tracing::info!(
+                "[infr] paged-MoE host DMA: imported {} RAM arena(s) in place after VRAM placement",
+                self.host_imports.len(),
+            );
+        }
+        self.host_imports.len()
     }
 
     /// Release the load-time runtime escrow immediately before the first forward. The returned bytes

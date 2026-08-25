@@ -623,6 +623,14 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Notify the backend that every cold-session persistent allocation is resident: weights,
+    /// KV/recurrent state and permanent IO buffers. A backend may now admit optional lower-tier
+    /// aliases without risking that they consume resources required by the model itself. Default
+    /// no-op.
+    fn finish_session_allocations(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether the currently loaded DENSE model streams per-layer weight blocks through a paged
     /// VRAM cache (dense layer streaming — the `crate::pager::Pager::schedule` policy; see
     /// `infr_vulkan::pager`'s dense session). Unlike [`Backend::moe_paged`] no host readback is

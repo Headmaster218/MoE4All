@@ -1278,6 +1278,11 @@ pub(crate) fn generate_dense_backend(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
+        // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
+        // capacity with real model buffers. Admit them only after the complete persistent session
+        // shape exists; backends without such a lower tier keep the default no-op.
+        be.finish_session_allocations()
+            .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
             weights: std::sync::Arc::new(SeamWeights {
                 wbufs,

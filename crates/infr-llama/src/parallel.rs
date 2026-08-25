@@ -210,6 +210,20 @@ impl ParallelSeam {
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
+        self.vk.defer_session_finalization(true);
+        let initialized = self.init_slots_before_host_import(n_slots);
+        if let Err(error) = initialized {
+            self.vk.defer_session_finalization(false);
+            return Err(error);
+        }
+        self.vk
+            .finish_deferred_session_allocations()
+            .map_err(|error| anyhow!("finalize Vulkan session allocations: {error}"))
+    }
+
+    /// Build every persistent slot before optional WDDM Host DMA aliases are admitted. The warmup
+    /// still sees the proportionally preloaded RAM tier; only its faster Vulkan alias is deferred.
+    fn init_slots_before_host_import(&mut self, n_slots: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
         // The warmup generation both uploads the weights and compiles every lazily-built pipeline,
         // so the first REAL request pays neither. INFR_PROF_OPS is suppressed for it (recorders read
