@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -92,6 +93,9 @@ impl WorkerManager {
         drop(port_guard);
         let stamp = unix_ms();
         let stop_file = data_dir.join(format!("worker-{stamp}.stop"));
+        let log_file = std::fs::File::create(data_dir.join(format!("worker-{stamp}.log")))
+            .map_err(|e| format!("创建 worker 日志失败：{e}"))?;
+        let log_file = Arc::new(std::sync::Mutex::new(log_file));
         let _ = std::fs::remove_file(&stop_file);
 
         let mut command = Command::new(infr);
@@ -166,10 +170,10 @@ impl WorkerManager {
         });
 
         if let Some(stdout) = stdout {
-            spawn_worker_log_reader(self.status.clone(), stdout);
+            spawn_worker_log_reader(self.status.clone(), stdout, Arc::clone(&log_file));
         }
         if let Some(stderr) = stderr {
-            spawn_worker_log_reader(self.status.clone(), stderr);
+            spawn_worker_log_reader(self.status.clone(), stderr, log_file);
         }
         spawn_ready_probe(app.clone(), service_addr, pid);
         Ok(())
@@ -294,7 +298,11 @@ impl WorkerManager {
             }
             Ok(code) => {
                 status.phase = "failed".into();
-                status.last_error = Some(format!("worker exited unexpectedly: {code}"));
+                let exit = format!("worker exited unexpectedly: {code}");
+                if status.last_error.is_none() {
+                    status.last_error = Some(exit.clone());
+                }
+                push_log(&mut status.logs, exit);
             }
             Err(e) => {
                 status.phase = "failed".into();
@@ -554,7 +562,11 @@ fn insert_nonempty(values: &mut BTreeMap<String, String>, key: &str, value: &str
     }
 }
 
-fn spawn_worker_log_reader<R>(status: Arc<RwLock<RuntimeStatus>>, stream: R)
+fn spawn_worker_log_reader<R>(
+    status: Arc<RwLock<RuntimeStatus>>,
+    stream: R,
+    log_file: Arc<std::sync::Mutex<std::fs::File>>,
+)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -565,7 +577,13 @@ where
             bytes.clear();
             match reader.read_until(b'\n', &mut bytes).await {
                 Ok(0) => break,
-                Ok(_) => record_worker_log(&status, normalize_worker_log(&bytes)).await,
+                Ok(_) => {
+                    let line = normalize_worker_log(&bytes);
+                    if let Ok(mut file) = log_file.lock() {
+                        let _ = writeln!(file, "{line}");
+                    }
+                    record_worker_log(&status, line).await;
+                }
                 Err(e) => {
                     record_worker_log(&status, format!("worker log read failed: {e}")).await;
                     break;
