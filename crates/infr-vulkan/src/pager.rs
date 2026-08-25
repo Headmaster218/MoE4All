@@ -1560,6 +1560,15 @@ fn prefill_align(bytes: usize) -> usize {
     bytes.next_multiple_of(PREFILL_BANK_ALIGN)
 }
 
+fn slot_overlaps_prefill_ring(slot: usize, slot_bytes: usize, ranges: &[(usize, usize)]) -> bool {
+    let start = slot.saturating_mul(slot_bytes);
+    let end = start.saturating_add(slot_bytes);
+    ranges.iter().any(|&(offset, bytes)| {
+        let range_end = offset.saturating_add(bytes);
+        start < range_end && end > offset
+    })
+}
+
 /// Lexicographic cost of borrowing a contiguous arena range for Prefill. Fewer live Decode
 /// entries wins first; among equal counts, the lowest LRU-rank sum wins, so cold entries are
 /// displaced before hot ones. Free slots contribute neither count nor heat.
@@ -2078,19 +2087,28 @@ impl MoePagerSession {
 
     /// Release the coldest physically contiguous expert-slot window large enough for an
     /// auxiliary allocation. Non-expert allocations are hard barriers and every expert pool
-    /// retains at least eight enabled slots (one routed Top-K working set).
+    /// retains at least eight enabled slots (one routed Top-K working set). During whole-layer
+    /// Prefill, slots covered by the active streaming ring are barriers too: async uploads and GPU
+    /// segments still address those lanes, so runtime borrowing must leave them in place.
     pub(crate) fn loan_unified_bytes(&mut self, bytes: usize) -> Result<usize> {
         if bytes == 0 {
             return Ok(0);
         }
-        if self.mode == MoeArenaMode::PrefillLayer {
-            self.enter_decode();
-        }
+        let protect_prefill_ring = self.mode == MoeArenaMode::PrefillLayer;
         let allocations = self.unified_pool.allocations();
         let shard_sizes = self.unified_pool.shard_sizes();
         let mut expert_slots: HashMap<u64, (usize, usize, Option<usize>)> = HashMap::new();
         for (pool_idx, pool) in self.pools.iter().enumerate() {
             for (slot, range, heat) in pool.pager.unified_slot_allocations() {
+                if protect_prefill_ring
+                    && slot_overlaps_prefill_ring(
+                        slot,
+                        pool.slot_bytes,
+                        &self.prefill_reserved_ranges[pool_idx],
+                    )
+                {
+                    continue;
+                }
                 expert_slots.insert(range.id, (pool_idx, slot, heat));
             }
         }
@@ -2592,7 +2610,12 @@ impl MoePagerSession {
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: completed layer has no Prefill placement"))?;
         if self.prefill_lane_layer[placement.lane] != Some(placement.layer_base) {
-            return Err(be("moe pager: stale async Prefill completion"));
+            return Err(be(format!(
+                "moe pager: stale async Prefill completion (buf={buf_id}, lane={}, expected_layer={}, current_layer={:?})",
+                placement.lane,
+                placement.layer_base,
+                self.prefill_lane_layer[placement.lane],
+            )));
         }
         self.mark_layer_bank_current(buf_id)
     }
@@ -3580,6 +3603,16 @@ mod tests {
     fn prefill_range_cost_counts_every_partially_overlapped_slot() {
         let heat = [Some(1), Some(2), Some(3)];
         assert_eq!(prefill_range_cost(&heat, 1024, 768, 1024), (2, 3));
+    }
+
+    #[test]
+    fn runtime_loans_protect_only_slots_overlapped_by_the_prefill_ring() {
+        let ring = [(1536, 2048)];
+        assert!(!slot_overlaps_prefill_ring(0, 1024, &ring));
+        assert!(slot_overlaps_prefill_ring(1, 1024, &ring));
+        assert!(slot_overlaps_prefill_ring(2, 1024, &ring));
+        assert!(slot_overlaps_prefill_ring(3, 1024, &ring));
+        assert!(!slot_overlaps_prefill_ring(4, 1024, &ring));
     }
 
     #[test]
