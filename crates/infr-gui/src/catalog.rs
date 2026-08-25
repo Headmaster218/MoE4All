@@ -199,10 +199,10 @@ pub fn estimate(
         ),
         _ => None,
     };
-    let total_vram_bytes = devices
+    let selected_device = devices
         .iter()
-        .find(|d| format!("Vulkan{}", d.index).eq_ignore_ascii_case(&profile.backend))
-        .map(|d| d.vram_bytes);
+        .find(|d| format!("Vulkan{}", d.index).eq_ignore_ascii_case(&profile.backend));
+    let total_vram_bytes = selected_device.map(|d| d.vram_bytes);
     let requested_vram_budget_bytes = parse_budget(&profile.vram_budget, total_vram_bytes);
     let reserve = parse_budget(&profile.vram_reserve, total_vram_bytes).unwrap_or(0);
     let effective_vram_budget_bytes = total_vram_bytes.map(|total| {
@@ -210,8 +210,12 @@ pub fn estimate(
             .unwrap_or(total)
             .min(total.saturating_sub(reserve).saturating_sub(VULKAN_GUARD))
     });
-    let runtime_reserve_bytes =
-        infr_llama::seam::estimate_runtime_reserve_bytes(&cfg, planning_context, planning_ubatch);
+    let runtime_reserve_bytes = infr_llama::seam::estimate_runtime_reserve_bytes_for_device(
+        &cfg,
+        planning_context,
+        planning_ubatch,
+        selected_device.is_some_and(|device| device.flash_attention_hd256),
+    );
     let reserve_plan = infr_llama::seam::estimate_model_memory_plan(
         &cfg,
         fixed_vram_bytes,

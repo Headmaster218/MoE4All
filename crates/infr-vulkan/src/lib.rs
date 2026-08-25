@@ -997,6 +997,10 @@ pub struct DeviceInfo {
     pub external_memory: bool,
     pub external_memory_fd: bool,
     pub external_memory_dma_buf: bool,
+    /// The selected device/config can run the dedicated head-dim-256 FlashAttention prefill
+    /// kernel. Control planes use this to avoid reserving a full-context score tile that the
+    /// runtime will never allocate.
+    pub flash_attention_hd256: bool,
 }
 
 /// Copy `src` into a persistently-mapped destination, in PARALLEL for large buffers.
@@ -1522,6 +1526,14 @@ impl VulkanBackend {
                     exts.iter()
                         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
                 };
+                let flash_attention_hd256 = probe_flash_attention_hd256(
+                    &entry,
+                    &instance,
+                    pd,
+                    &has,
+                    cfg.kernels.vulkan.f16,
+                    cfg.kernels.vulkan.coopmat,
+                );
                 out.push(DeviceInfo {
                     index,
                     name,
@@ -1532,6 +1544,7 @@ impl VulkanBackend {
                     external_memory: has(c"VK_KHR_external_memory"),
                     external_memory_fd: has(c"VK_KHR_external_memory_fd"),
                     external_memory_dma_buf: has(c"VK_EXT_external_memory_dma_buf"),
+                    flash_attention_hd256,
                 });
             }
             Ok(out)
@@ -5154,6 +5167,57 @@ fn probe_device_facts(
         warps_per_sm: nv_sm.shader_warps_per_sm,
         sm_count: nv_sm.shader_sm_count,
     }
+}
+
+/// Probe exactly the capability gate used by the hd256 FlashAttention path without constructing a
+/// logical device. Device enumeration is already a cold control-plane operation, so querying the
+/// feature bit and cooperative-matrix table here keeps offline memory planning honest without
+/// creating a second Vulkan backend.
+fn probe_flash_attention_hd256(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    has_ext: &dyn Fn(&CStr) -> bool,
+    f16_enabled: bool,
+    coopmat_enabled: bool,
+) -> bool {
+    if !f16_enabled
+        || !coopmat_enabled
+        || !has_ext(c"VK_KHR_cooperative_matrix")
+        || unsafe { instance.get_physical_device_properties(physical_device) }
+            .limits
+            .max_compute_shared_memory_size
+            < FLASH_HD256_BM16_SHARED
+    {
+        return false;
+    }
+
+    let mut f16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+    let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut f16)
+        .push_next(&mut coopmat);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    if f16.shader_float16 == 0 || coopmat.cooperative_matrix == 0 {
+        return false;
+    }
+
+    let loader = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+    let Ok(configs) =
+        (unsafe { loader.get_physical_device_cooperative_matrix_properties(physical_device) })
+    else {
+        return false;
+    };
+    let probe = probe_device_facts(instance, physical_device, has_ext);
+    let trust = crate::caps::coopmat_trust(&probe, crate::caps::device_architecture(&probe));
+    let f16_component = vk::ComponentTypeKHR::FLOAT16;
+    configs.iter().any(|cfg| {
+        let shape = (cfg.m_size, cfg.n_size, cfg.k_size);
+        shape == infr_core::COOPMAT_TILE_16
+            && cfg.a_type == f16_component
+            && cfg.b_type == f16_component
+            && crate::caps::coopmat_shape_trusted(trust, shape)
+    })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

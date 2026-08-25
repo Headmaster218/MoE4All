@@ -1794,6 +1794,23 @@ pub fn estimate_runtime_reserve_bytes(cfg: &Config, want_ctx: usize, ubatch: usi
     dense_act_reserve_at(cfg, &Capabilities::default(), want_ctx, ubatch)
 }
 
+/// Device-aware form of [`estimate_runtime_reserve_bytes`] for control planes that have probed
+/// whether the selected Vulkan device can run the dedicated hd256 FlashAttention kernel.
+pub fn estimate_runtime_reserve_bytes_for_device(
+    cfg: &Config,
+    want_ctx: usize,
+    ubatch: usize,
+    flash_attention_hd256: bool,
+) -> u64 {
+    let mut caps = Capabilities::default();
+    if flash_attention_hd256 {
+        caps.f16 = true;
+        caps.coopmat_f16 = Some(infr_core::COOPMAT_TILE_16);
+        caps.max_shared_memory_bytes = infr_vulkan::FLASH_HD256_BM16_SHARED;
+    }
+    dense_act_reserve_at(cfg, &caps, want_ctx, ubatch)
+}
+
 /// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
 /// receives enough slots for one worst-case Prefill layer; the remaining bytes are then assigned
 /// in weighted-fair order. Reserving the floors up front avoids the old `clamp(floor, nb)` corner
@@ -5152,6 +5169,14 @@ mod seam_helper_tests {
         let (ctx, ubatch) = (200_000usize, 1024usize);
         let conservative = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
         let flash = super::dense_act_reserve_at(&cfg, &hd256_flash_caps(), ctx, ubatch);
+        assert_eq!(
+            super::estimate_runtime_reserve_bytes_for_device(&cfg, ctx, ubatch, false),
+            conservative,
+        );
+        assert_eq!(
+            super::estimate_runtime_reserve_bytes_for_device(&cfg, ctx, ubatch, true),
+            flash,
+        );
         let rows = ubatch as u64;
         let score_per_row = (2 * cfg.n_head * ctx.next_multiple_of(256)) as u64;
         let expected_score =
