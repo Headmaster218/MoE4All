@@ -1780,9 +1780,19 @@ fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
 /// subtracting it there again would double-charge it and can collapse the selected context.
 const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 
+/// WDDM charges large mapped ReBAR arenas more aggressively than the logical Vulkan allocation
+/// tally while they are being committed. On the Windows 7900 XTX target, Qwen35-family sessions
+/// can lose more than 1 GiB of the initially reported heap budget between committing a large
+/// mapped arena and allocating the full Q8 KV set. Keep that load-only movement out of the expert
+/// arena; Linux uses the live heap budget without this WDDM allowance and remains byte-for-byte
+/// unchanged.
+const WINDOWS_QWEN35_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
         DEEPSEEK4_LOAD_DRIVER_RESERVE
+    } else if cfg!(windows) && cfg.qwen35 {
+        WINDOWS_QWEN35_LOAD_DRIVER_RESERVE
     } else {
         0
     }
@@ -5468,6 +5478,13 @@ mod seam_helper_tests {
             super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, 1 * GIB)
                 .expect("DeepSeek control-plane estimate");
         assert_eq!(estimated.load_driver_reserve_bytes, 1536 * MIB);
+
+        cfg.deepseek4 = false;
+        cfg.qwen35 = true;
+        assert_eq!(
+            super::load_driver_reserve(&cfg),
+            if cfg!(windows) { 2 * GIB } else { 0 }
+        );
     }
 
     #[test]
