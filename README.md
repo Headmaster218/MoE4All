@@ -459,4 +459,5 @@ configuration reference), [`docs/metal.md`](docs/metal.md) and
 
 ## License
 
-[MIT](LICENSE)
+Licensed under the [Apache License 2.0](LICENSE). The original MIT notice for
+upstream code is retained in [LICENSE-MIT](LICENSE-MIT).

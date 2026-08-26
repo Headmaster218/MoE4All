@@ -22,8 +22,8 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/kryptic-sh/infr"
+license = "Apache-2.0"
+repository = "https://github.com/Headmaster218/infr"
 
 [workspace.dependencies]
 # internal
