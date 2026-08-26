@@ -243,6 +243,7 @@ impl ParallelSeam {
                 |_| {},
                 &mut slot0,
                 self.max_ctx,
+                Some(crate::seam::TurnCheckpoint::Enable),
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
             )
@@ -352,12 +353,11 @@ impl ParallelSeam {
             //    those the prompt extends (or equals) — not merely the first such slot (which would
             //    re-prefill more suffix). Pure decision, unit-tested via `pick_continuation`.
             let cont = pick_continuation(
-                free.iter().map(|&i| {
-                    let (sc, cached) = p.slots[i]
-                        .kv
-                        .as_ref()
-                        .map_or((0, 0), |k| (k.prefix_score(prompt), k.cached_len()));
-                    (i, sc, cached)
+                free.iter().filter_map(|&i| {
+                    p.slots[i].kv.as_ref().and_then(|k| {
+                        k.continuation_prefix_len(prompt)
+                            .map(|prefix| (i, prefix, prefix))
+                    })
                 }),
                 prompt.len(),
             );
@@ -445,9 +445,24 @@ impl ParallelSeam {
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: &RequestCtx,
+        on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_turn(prompt, None, max_new, constraint, req, on_piece)
+    }
+
+    /// [`generate`](Self::generate) with a stable rendered-history prefix for recurrent state
+    /// checkpointing. Attention-only models ignore the resulting boundary in the runner.
+    pub fn generate_turn(
+        &self,
+        prompt: &str,
+        stable_prefix: Option<&str>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
         let prompt_tokens = self.model.encode(prompt)?;
+        let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
         let mut guard = self.checkout(&prompt_tokens, req)?;
         // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
         // the model's trained window under `-np N`), mirroring the sequential session path: a
@@ -479,6 +494,7 @@ impl ParallelSeam {
             },
             &mut guard.kv,
             self.max_ctx,
+            turn_checkpoint,
             constraint,
             Some(req),
         )?;

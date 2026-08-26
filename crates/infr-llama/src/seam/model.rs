@@ -269,7 +269,7 @@ impl SlotPool {
             (0..self.slots.len()).filter_map(|i| {
                 self.slots[i]
                     .as_ref()
-                    .map(|s| (i, s.prefix_score(prompt), s.cached_len()))
+                    .and_then(|s| s.continuation_prefix_len(prompt).map(|p| (i, p, p)))
             }),
             prompt.len(),
         );
@@ -713,7 +713,32 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        self.generate_vulkan_session_constrained(session, prompt, max_new, None, req, on_piece)
+        self.generate_vulkan_session_turn_constrained(
+            session, prompt, max_new, None, None, req, on_piece,
+        )
+    }
+
+    /// Stateful-chat variant of [`generate_vulkan_session`](Self::generate_vulkan_session).
+    /// `stable_prefix` is the same history rendered without an assistant generation prompt; only
+    /// recurrent models consume it, while all other architectures follow the existing path.
+    pub fn generate_vulkan_session_turn(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt: &str,
+        stable_prefix: Option<&str>,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_vulkan_session_turn_constrained(
+            session,
+            prompt,
+            max_new,
+            stable_prefix,
+            None,
+            req,
+            on_piece,
+        )
     }
 
     /// [`generate_vulkan_session`](Self::generate_vulkan_session) with an optional llguidance
@@ -725,9 +750,26 @@ impl SeamModel {
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_vulkan_session_turn_constrained(
+            session, prompt, max_new, None, constraint, req, on_piece,
+        )
+    }
+
+    /// Constrained counterpart of [`generate_vulkan_session_turn`](Self::generate_vulkan_session_turn).
+    pub fn generate_vulkan_session_turn_constrained(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt: &str,
+        max_new: usize,
+        stable_prefix: Option<&str>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let turn_checkpoint = self.turn_checkpoint(&prompt_tokens, stable_prefix)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session
@@ -756,6 +798,7 @@ impl SeamModel {
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.pool.slots[slot],
             max_ctx,
+            turn_checkpoint,
             constraint,
             req,
         )?;
@@ -767,6 +810,25 @@ impl SeamModel {
             session.max_ctx = kv.max_ctx();
         }
         Ok(stats)
+    }
+
+    pub(crate) fn turn_checkpoint(
+        &self,
+        prompt_tokens: &[u32],
+        stable_prefix: Option<&str>,
+    ) -> Result<Option<crate::seam::TurnCheckpoint>> {
+        let Some(stable_prefix) = stable_prefix else {
+            return Ok(None);
+        };
+        let stable_tokens = self.encode(stable_prefix)?;
+        let boundary = (!stable_tokens.is_empty()
+            && stable_tokens.len() < prompt_tokens.len()
+            && prompt_tokens.starts_with(&stable_tokens))
+        .then_some(stable_tokens.len());
+        Ok(Some(boundary.map_or(
+            crate::seam::TurnCheckpoint::Enable,
+            crate::seam::TurnCheckpoint::Boundary,
+        )))
     }
 
     pub fn config(&self) -> &Config {
@@ -1274,6 +1336,7 @@ impl SeamModel {
                 |_| {},
                 state,
                 want,
+                None, // turn checkpoint boundary
                 None, // constraint
                 None, // req: bench is a sole sequence — env sampling, no gate
             )?;
@@ -1768,12 +1831,26 @@ impl SeamModel {
     /// shared [`crate::chat::Chat`] can drive a history-based REPL. Same template + error contract as
     /// [`render_chat`](Self::render_chat), generalized past a single user turn.
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.render_chat_messages_with_generation_prompt(messages, true)
+    }
+
+    /// Render the same history without opening a new assistant turn. Stateful recurrent chat uses
+    /// this exact token prefix as its rolling checkpoint boundary.
+    pub fn render_chat_messages_stable(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.render_chat_messages_with_generation_prompt(messages, false)
+    }
+
+    fn render_chat_messages_with_generation_prompt(
+        &self,
+        messages: &[(&str, &str)],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
         render_chat_jinja(
             &self.gguf,
             &self.tokenizer,
             self.cfg.eos,
             messages,
-            true,
+            add_generation_prompt,
             &self.ecfg,
         )
         .ok_or_else(no_template_err)
@@ -1923,6 +2000,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -1972,6 +2050,7 @@ impl DiffusionGemmaCpuSession {
                 reduced: &mut reduced,
             }),
             None,
+            None,
         )?;
         Ok(out_logits)
     }
@@ -2007,6 +2086,7 @@ impl DiffusionGemmaVulkanSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -2081,6 +2161,7 @@ impl DiffusionGemmaVulkanSession {
                 sample_temp_inv,
                 reduced: &mut reduced,
             }),
+            None,
             None,
         )?;
         Ok(match reduced {

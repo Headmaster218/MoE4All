@@ -55,6 +55,13 @@ pub trait ChatModel {
         self.render_model().render_chat_messages(messages)
     }
 
+    /// Optional stable history prefix for stateful recurrent backends. Stateless backends and
+    /// test doubles keep `None`; Vulkan seam chat renders the same messages without opening the
+    /// assistant generation turn.
+    fn render_stable_prefix(&self, _messages: &[(&str, &str)]) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Generate a completion for the already-rendered `prompt`, streaming decoded text to `on_piece`.
     ///
     /// `req` is the in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its
@@ -86,6 +93,33 @@ pub trait ChatModel {
         _on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
         self.generate(prompt, max_new, req, on_piece)
+    }
+
+    /// Turn-aware generation hook carrying the stable rendered-history prefix. The default keeps
+    /// every stateless/non-recurrent backend byte-identical by ignoring it.
+    fn generate_turn_with_step_hook(
+        &mut self,
+        prompt: &str,
+        _stable_prefix: Option<&str>,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+        on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+    ) -> Result<GenStats> {
+        self.generate_with_step_hook(prompt, max_new, req, on_piece, on_step)
+    }
+
+    /// Constrained turn-aware counterpart used by OpenAI forced tool calls.
+    fn generate_constrained_turn(
+        &mut self,
+        prompt: &str,
+        _stable_prefix: Option<&str>,
+        max_new: usize,
+        constraint: &mut crate::grammar::Constraint,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_constrained(prompt, max_new, constraint, req, on_piece)
     }
 
     /// Optional REPL status (e.g. dense returns `ctx N/MAX`); `None` for stateless backends.
@@ -227,14 +261,18 @@ impl<'a> Chat<'a> {
         on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
         self.history.push(("user".into(), message.to_string()));
-        let prompt = {
+        let (prompt, stable_prefix) = {
             let refs: Vec<(&str, &str)> = self
                 .history
                 .iter()
                 .map(|(r, c)| (r.as_str(), c.as_str()))
                 .collect();
-            match self.model.render(&refs) {
-                Ok(p) => p,
+            match self.model.render(&refs).and_then(|prompt| {
+                self.model
+                    .render_stable_prefix(&refs)
+                    .map(|stable| (prompt, stable))
+            }) {
+                Ok(rendered) => rendered,
                 Err(e) => {
                     self.history.pop();
                     return Err(e);
@@ -259,10 +297,14 @@ impl<'a> Chat<'a> {
         // failure above: leaving it in `history` with no assistant reply would make the NEXT turn
         // push a second consecutive `user` message, permanently corrupting the alternating-role
         // conversation state (the model re-renders with two user turns and no assistant between).
-        let stats = match self
-            .model
-            .generate_with_step_hook(&prompt, max_new, None, &mut emit, on_step)
-        {
+        let stats = match self.model.generate_turn_with_step_hook(
+            &prompt,
+            stable_prefix.as_deref(),
+            max_new,
+            None,
+            &mut emit,
+            on_step,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 self.history.pop();
@@ -328,13 +370,35 @@ impl OaiRenderer {
         messages: &[infr_chat::ChatMessage],
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
+        self.render_mode(messages, tools, true)
+    }
+
+    /// Render both the generation prompt and its stable no-generation history prefix. The two are
+    /// produced by the same embedded template with only `add_generation_prompt` changed.
+    pub fn render_turn(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<(String, String)> {
+        Ok((
+            self.render_mode(messages, tools, true)?,
+            self.render_mode(messages, tools, false)?,
+        ))
+    }
+
+    fn render_mode(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        add_generation_prompt: bool,
+    ) -> Result<String> {
         infr_chat::render_chat_oai(
             &self.gguf,
             &self.tokenizer,
             self.eos,
             messages,
             tools,
-            true,
+            add_generation_prompt,
             &self.ecfg,
         )
         .map_err(|e| match e {
@@ -435,6 +499,58 @@ mod tests {
             "prior think must be excluded: {second}"
         );
         assert!(second.contains("user: and of Italy?"), "{second}");
+    }
+
+    #[test]
+    fn shared_chat_passes_the_stable_history_prefix_to_generation() {
+        struct TurnAware {
+            seen: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+        }
+
+        impl ChatModel for TurnAware {
+            fn render(&self, _messages: &[(&str, &str)]) -> Result<String> {
+                Ok("stable-prefix<assistant>".into())
+            }
+
+            fn render_stable_prefix(&self, _messages: &[(&str, &str)]) -> Result<Option<String>> {
+                Ok(Some("stable-prefix".into()))
+            }
+
+            fn generate(
+                &mut self,
+                _prompt: &str,
+                _max_new: usize,
+                _req: Option<&crate::sampling::RequestCtx>,
+                _on_piece: &mut dyn FnMut(&str),
+            ) -> Result<GenStats> {
+                unreachable!("Chat must use the turn-aware hook")
+            }
+
+            fn generate_turn_with_step_hook(
+                &mut self,
+                prompt: &str,
+                stable_prefix: Option<&str>,
+                _max_new: usize,
+                _req: Option<&crate::sampling::RequestCtx>,
+                on_piece: &mut dyn FnMut(&str),
+                _on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+            ) -> Result<GenStats> {
+                *self.seen.borrow_mut() = Some((
+                    prompt.to_string(),
+                    stable_prefix.expect("stable prefix").to_string(),
+                ));
+                on_piece("ok");
+                Ok(GenStats::default())
+            }
+        }
+
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut chat = Chat::new(Box::new(TurnAware { seen: seen.clone() }));
+        chat.turn("hello", 8, &mut |_| {}).unwrap();
+        assert_eq!(
+            seen.borrow().as_ref(),
+            Some(&("stable-prefix<assistant>".into(), "stable-prefix".into()))
+        );
     }
 
     /// A mock whose FIRST `generate` fails and whose later ones succeed — proves a failed generate

@@ -466,6 +466,7 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // logits_out
         None, // h_out
         None, // denoise_req
+        None, // turn checkpoint boundary
         req,
     );
     if let Some(store) = store.filter(|_| ec.paging.stats) {
@@ -525,6 +526,7 @@ pub(crate) fn generate_dense_vulkan(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
+        None, // turn checkpoint boundary
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
     )
@@ -533,6 +535,15 @@ pub(crate) fn generate_dense_vulkan(
 /// [`generate_dense_vulkan`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
+#[derive(Clone, Copy)]
+pub(crate) enum TurnCheckpoint {
+    /// Allocate the rolling recurrent snapshot before session allocation finalization, without
+    /// taking a snapshot during this warmup call.
+    Enable,
+    /// Allocate if needed and capture state after this many prompt tokens.
+    Boundary(usize),
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_session(
@@ -547,6 +558,7 @@ pub(crate) fn generate_dense_vulkan_session(
     on_token: impl FnMut(u32),
     state: &mut Option<SeamKv>,
     want_ctx: usize,
+    turn_checkpoint: Option<TurnCheckpoint>,
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
@@ -574,8 +586,26 @@ pub(crate) fn generate_dense_vulkan_session(
         }
     };
     let out = generate_dense_backend(
-        vk, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
-        constraint, None, None, None, None, None, req,
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        None,
+        None,
+        None,
+        None,
+        None,
+        turn_checkpoint,
+        req,
     );
     if out.is_err() {
         vk.release_moe_load_reservation();
@@ -1405,9 +1435,10 @@ pub(crate) fn kv_rows(
 }
 
 /// Persistent KV/recurrent-state footprint summed over all layers at chunk height `ubatch` and
-/// side format. Qwen3.5/3.6 DeltaNet layers contribute their fixed f32 conv/S state instead of a
-/// fictional context-scaled KV cache. The ONE pricing helper the dense placement sweep and MoE
-/// expert-placement budget share, so both price exactly what the runner allocates.
+/// side format, including one rolling copy of append-only recurrent state. Qwen3.5/3.6 DeltaNet
+/// layers contribute their fixed f32 conv/S state instead of a fictional context-scaled KV cache.
+/// The ONE pricing helper the dense placement sweep and MoE expert-placement budget share, so both
+/// price exactly what stateful chat may allocate.
 pub(crate) fn kv_bytes_estimate(
     cfg: &Config,
     want_ctx: usize,
@@ -1431,10 +1462,24 @@ pub(crate) fn kv_bytes_estimate_fmt(
     k_fmt: DType,
     v_fmt: DType,
 ) -> u64 {
-    (0..cfg.n_layer)
+    let primary: u64 = (0..cfg.n_layer)
         .map(|l| {
             let (k_bytes, v_bytes) =
                 layer_state_bytes(cfg, l, want_ctx, ring, ubatch, k_fmt, v_fmt);
+            (k_bytes + v_bytes) as u64
+        })
+        .sum();
+    primary.saturating_add(recurrent_checkpoint_bytes(cfg))
+}
+
+/// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
+/// allocates this lazily at the first stable conversation boundary, but placement must reserve it
+/// up front so the allocation cannot unexpectedly consume the last expert/activation bytes.
+pub(crate) fn recurrent_checkpoint_bytes(cfg: &Config) -> u64 {
+    (0..cfg.n_layer)
+        .filter(|&l| cfg.is_recurrent_layer(l))
+        .map(|l| {
+            let (k_bytes, v_bytes) = layer_state_bytes(cfg, l, 1, false, 1, DType::F16, DType::F16);
             (k_bytes + v_bytes) as u64
         })
         .sum()
@@ -3338,6 +3383,7 @@ fn run_dense_oneshot(
         None, // logits_out
         None, // h_out
         None, // denoise_req
+        None, // turn checkpoint boundary
         None, // req
     )
 }
@@ -3912,6 +3958,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         None,
+        None,
         req,
     )
 }
@@ -3951,6 +3998,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,
@@ -3996,6 +4044,7 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         None,
+        None,
     )?;
     Ok(logits)
 }
@@ -4035,6 +4084,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         None,
         Some(&mut logits),
         Some(&mut h),
+        None,
         None,
         None,
     )?;
@@ -4078,6 +4128,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         None,
         Some(&mut h),
+        None,
         None,
         None,
     )?;
@@ -4124,6 +4175,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,
@@ -4701,8 +4753,13 @@ mod seam_helper_tests {
         let delta = super::layer_state_bytes(&cfg, 0, ctx, false, ubatch, fmt, fmt);
         let attention_bytes = attention.0 as u64 + attention.1 as u64;
         let delta_bytes = delta.0 as u64 + delta.1 as u64;
+        let checkpoint = super::recurrent_checkpoint_bytes(&cfg);
 
-        assert_eq!(estimate, 10 * attention_bytes + 30 * delta_bytes);
+        assert_eq!(checkpoint, 30 * delta_bytes);
+        assert_eq!(
+            estimate,
+            10 * attention_bytes + 30 * delta_bytes + checkpoint
+        );
         assert!(
             estimate < 40 * attention_bytes,
             "DeltaNet layers must not be priced as full-context KV"

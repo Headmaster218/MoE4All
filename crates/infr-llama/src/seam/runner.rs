@@ -8,8 +8,11 @@ use super::sc::{
 use super::weights::{
     AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW,
     KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
+    TurnRecurrentCkpt,
 };
-use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
+use super::{
+    common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
+};
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
@@ -422,6 +425,9 @@ pub(crate) fn generate_dense_backend(
     mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
     denoise_req: Option<DenoiseReq>,
+    // Stable rendered-history boundary for the rolling recurrent conversation checkpoint.
+    // `None` on bench, one-shot, MTP, diffusion, and every caller that does not own chat history.
+    turn_checkpoint: Option<TurnCheckpoint>,
     // The in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its stop-sequence
     // abort latch, and its turn on the GPU baton.
     //
@@ -1278,6 +1284,10 @@ pub(crate) fn generate_dense_backend(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
+        let mut turn_recurrent_ckpt = None;
+        if turn_checkpoint.is_some() && (c.qwen35 || c.bailingmoe3) {
+            TurnRecurrentCkpt::begin(&mut turn_recurrent_ckpt, be, c, &kbufs[..], &vbufs[..], &[])?;
+        }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
         // capacity with real model buffers. Admit them only after the complete persistent session
         // shape exists; backends without such a lower tier keep the default no-op.
@@ -1310,8 +1320,26 @@ pub(crate) fn generate_dense_backend(
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
+            turn_recurrent_ckpt,
         });
     }
+    // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
+    // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
+    // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
+    let restored_turn_start = if denoise_req.is_none()
+        && (c.qwen35 || c.bailingmoe3)
+        && state
+            .as_ref()
+            .is_some_and(|kv| recurrent_extension_start(&kv.cached, prompt).is_none())
+    {
+        let _gp = req.and_then(|r| r.gate_pass());
+        state
+            .as_mut()
+            .expect("seam state just initialized")
+            .restore_turn_recurrent(be, prompt)?
+    } else {
+        None
+    };
     let SeamKv {
         weights,
         // The session-stable derivations are already read via the `stable` local above (cloned
@@ -1334,6 +1362,7 @@ pub(crate) fn generate_dense_backend(
         sc_ping_write,
         sc_temp_inv_buf,
         mtp_delta_ckpt: _,
+        turn_recurrent_ckpt,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
@@ -1386,6 +1415,8 @@ pub(crate) fn generate_dense_backend(
     } else if c.qwen35 || c.bailingmoe3 {
         if let Some(pfx) = recurrent_extension_start(cached, prompt) {
             pfx
+        } else if let Some(pfx) = restored_turn_start {
+            pfx
         } else {
             // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
             // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
@@ -1418,6 +1449,30 @@ pub(crate) fn generate_dense_backend(
         // plain `prompt.len() - 1` (leave ≥1 prompt token to sample the first logits from).
         common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
     };
+    // Only a strict, newly processed prefix can become a checkpoint. If the hint is malformed,
+    // tokenization did not preserve the rendered string prefix, or the state already lies past it,
+    // leave the previous checkpoint intact and use the ordinary generation path.
+    let turn_checkpoint_boundary = turn_checkpoint
+        .and_then(|checkpoint| match checkpoint {
+            TurnCheckpoint::Enable => None,
+            TurnCheckpoint::Boundary(boundary) => Some(boundary),
+        })
+        .filter(|&boundary| {
+            (c.qwen35 || c.bailingmoe3)
+                && boundary > start
+                && boundary < prompt.len()
+                && boundary <= max_ctx
+        });
+    if let Some(boundary) = turn_checkpoint_boundary {
+        TurnRecurrentCkpt::begin(
+            turn_recurrent_ckpt,
+            be,
+            c,
+            &kbufs[..],
+            &vbufs[..],
+            &prompt[..boundary],
+        )?;
+    }
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
     // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
     // from `start` attends positions `[start - window, start)` on window layers, so a rewind
@@ -5681,7 +5736,12 @@ pub(crate) fn generate_dense_backend(
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let ce = (cs + ubatch).min(pf_end);
+                let mut ce = (cs + ubatch).min(pf_end);
+                if let Some(boundary) = turn_checkpoint_boundary {
+                    if cs < boundary && boundary < ce {
+                        ce = boundary;
+                    }
+                }
                 v.push((cs, ce));
                 cs = ce;
             }
@@ -5855,6 +5915,15 @@ pub(crate) fn generate_dense_backend(
                 );
                 be.execute(pf_plan.as_ref(), &pf_b)
                     .map_err(|e| anyhow!("{e}"))?;
+                if Some(cend) == turn_checkpoint_boundary {
+                    if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+                        if layer_major {
+                            ck.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                        } else {
+                            ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                        }
+                    }
+                }
                 // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
                 // build, plan compile, and execute (record + submit + GPU) — where a small-batch
                 // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
@@ -6274,6 +6343,11 @@ pub(crate) fn generate_dense_backend(
         // excluded from `last_written` — the fix for the `max_new==0` frontier and the
         // constrained-break unfed-forced-token cache-corruption cases.
         last_written = Some(pos);
+        if Some(pos + 1) == turn_checkpoint_boundary {
+            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+                ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+            }
+        }
         if prof_dec && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;
@@ -6477,10 +6551,7 @@ mod tests {
 
     #[test]
     fn recurrent_state_reuses_only_a_nonempty_exact_extension() {
-        assert_eq!(
-            recurrent_extension_start(&[10, 20], &[10, 20, 30]),
-            Some(2)
-        );
+        assert_eq!(recurrent_extension_start(&[10, 20], &[10, 20, 30]), Some(2));
         assert_eq!(recurrent_extension_start(&[10, 20], &[10, 20]), None);
         assert_eq!(recurrent_extension_start(&[10, 20], &[10, 99, 30]), None);
     }

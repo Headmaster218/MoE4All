@@ -1873,6 +1873,7 @@ trait GenBackend: Send + Sync {
     fn generate(
         &self,
         prompt: &str,
+        stable_prefix: Option<&str>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
@@ -1907,6 +1908,7 @@ impl GenBackend for SeamGenerator {
     fn generate(
         &self,
         prompt: &str,
+        stable_prefix: Option<&str>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
@@ -1914,8 +1916,22 @@ impl GenBackend for SeamGenerator {
     ) -> anyhow::Result<infr_llama::GenStats> {
         let mut model = self.model.lock().expect("serve generator poisoned");
         match constraint {
-            Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
-            None => model.generate(prompt, max_new, Some(req), on_piece),
+            Some(c) => model.generate_constrained_turn(
+                prompt,
+                stable_prefix,
+                max_new,
+                c,
+                Some(req),
+                on_piece,
+            ),
+            None => model.generate_turn_with_step_hook(
+                prompt,
+                stable_prefix,
+                max_new,
+                Some(req),
+                on_piece,
+                None,
+            ),
         }
     }
 
@@ -1946,13 +1962,16 @@ impl GenBackend for ParallelGenerator {
     fn generate(
         &self,
         prompt: &str,
+        stable_prefix: Option<&str>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
         self.engine
-            .generate(prompt, max_new, constraint, req, |p| on_piece(p))
+            .generate_turn(prompt, stable_prefix, max_new, constraint, req, |p| {
+                on_piece(p)
+            })
     }
 }
 
@@ -2034,7 +2053,7 @@ fn run_chat(
         // `infr_gguf::watch` for what this can and cannot see.
         be.weights().check()?;
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
-        let prompt = be.renderer().render(messages, tools)?;
+        let (prompt, stable_prefix) = be.renderer().render_turn(messages, tools)?;
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params
@@ -2055,6 +2074,7 @@ fn run_chat(
             let mut tokens = (0u32, 0u32);
             let emitted = match be.generate(
                 &primed,
+                Some(&stable_prefix),
                 max_new,
                 Some(&mut constraint),
                 &req,
@@ -2123,17 +2143,24 @@ fn run_chat(
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
-                let safe = stops.push(piece);
-                if !safe.is_empty() {
-                    stream.push(&safe, &mut *od);
-                }
-                // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
-                // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
-                if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    req.abort();
-                }
-            })?;
+            let stats = be.generate(
+                &prompt,
+                Some(&stable_prefix),
+                max_new,
+                None,
+                &req,
+                &mut |piece: &str| {
+                    let safe = stops.push(piece);
+                    if !safe.is_empty() {
+                        stream.push(&safe, &mut *od);
+                    }
+                    // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
+                    // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
+                    if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        req.abort();
+                    }
+                },
+            )?;
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
             if !tail.is_empty() {

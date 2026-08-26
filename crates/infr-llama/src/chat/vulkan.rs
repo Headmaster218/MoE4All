@@ -125,27 +125,11 @@ impl DenseSeamChat {
         }
         Ok(())
     }
-}
 
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-impl ChatModel for DenseSeamChat {
-    fn render_model(&self) -> &SeamModel {
-        &self.model
-    }
-
-    fn reset_kv(&mut self) {
-        super::reset_session(&mut self.session);
-    }
-
-    fn warmup(&mut self) -> Result<()> {
-        // The shared session warmup (throwaway generate + reset so the first real prompt prefills
-        // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
-        crate::with_profiling_suppressed(|| self.warmup_session())
-    }
-
-    fn generate(
+    fn generate_turn_impl(
         &mut self,
         prompt: &str,
+        stable_prefix: Option<&str>,
         max_new: usize,
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
@@ -165,10 +149,79 @@ impl ChatModel for DenseSeamChat {
             .map(|(stats, _)| stats);
         }
         self.ensure_session()?;
-        self.model.generate_vulkan_session(
+        self.model.generate_vulkan_session_turn(
+            self.session.as_mut().unwrap(),
+            prompt,
+            stable_prefix,
+            max_new,
+            req,
+            |p| on_piece(p),
+        )
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl ChatModel for DenseSeamChat {
+    fn render_model(&self) -> &SeamModel {
+        &self.model
+    }
+
+    fn render_stable_prefix(&self, messages: &[(&str, &str)]) -> Result<Option<String>> {
+        self.model.render_chat_messages_stable(messages).map(Some)
+    }
+
+    fn reset_kv(&mut self) {
+        super::reset_session(&mut self.session);
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        // The shared session warmup (throwaway generate + reset so the first real prompt prefills
+        // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
+        crate::with_profiling_suppressed(|| {
+            self.generate_turn_impl("Hi", Some(""), 2, None, &mut |_| {})?;
+            self.reset_kv();
+            Ok(())
+        })
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_turn_impl(prompt, None, max_new, req, on_piece)
+    }
+
+    fn generate_turn_with_step_hook(
+        &mut self,
+        prompt: &str,
+        stable_prefix: Option<&str>,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+        _on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+    ) -> Result<GenStats> {
+        self.generate_turn_impl(prompt, stable_prefix, max_new, req, on_piece)
+    }
+
+    fn generate_constrained_turn(
+        &mut self,
+        prompt: &str,
+        stable_prefix: Option<&str>,
+        max_new: usize,
+        constraint: &mut crate::grammar::Constraint,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        self.ensure_session()?;
+        self.model.generate_vulkan_session_turn_constrained(
             self.session.as_mut().unwrap(),
             prompt,
             max_new,
+            stable_prefix,
+            Some(constraint),
             req,
             |p| on_piece(p),
         )
@@ -182,14 +235,6 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        self.ensure_session()?;
-        self.model.generate_vulkan_session_constrained(
-            self.session.as_mut().unwrap(),
-            prompt,
-            max_new,
-            Some(constraint),
-            req,
-            |p| on_piece(p),
-        )
+        self.generate_constrained_turn(prompt, None, max_new, constraint, req, on_piece)
     }
 }

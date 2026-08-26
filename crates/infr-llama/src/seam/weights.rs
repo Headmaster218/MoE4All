@@ -392,6 +392,12 @@ pub(crate) struct SeamKv {
     /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
     /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
+    /// Rolling conversation checkpoint for append-only recurrent mixers. Unlike the MTP rollback
+    /// checkpoint above, this snapshot is taken at the stable rendered-history boundary BEFORE
+    /// the assistant generation prompt. The next turn can therefore restore that exact state and
+    /// prefill only the prior visible answer plus the new user turn, even when chat-history
+    /// normalization makes the newly rendered prompt diverge from `cached`.
+    pub(super) turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
 }
 
 /// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
@@ -403,6 +409,127 @@ pub(super) struct MtpDeltaCkpt {
     /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
     layers: Vec<usize>,
     cached_len: usize,
+}
+
+/// Device-resident recurrent state at one stable rendered conversation boundary. Buffers are
+/// allocated once per slot and reused; `copied` lets layer-major prefill capture each recurrent
+/// layer exactly when that layer reaches the boundary without any per-operation allocation.
+pub(super) struct TurnRecurrentCkpt {
+    kbufs: Vec<Box<dyn Buffer>>,
+    vbufs: Vec<Box<dyn Buffer>>,
+    layers: Vec<usize>,
+    tokens: Vec<u32>,
+    copied: Vec<bool>,
+    valid: bool,
+}
+
+fn checkpoint_extension_start(checkpoint: &[u32], prompt: &[u32]) -> Option<usize> {
+    (!checkpoint.is_empty() && checkpoint.len() < prompt.len() && prompt.starts_with(checkpoint))
+        .then_some(checkpoint.len())
+}
+
+impl TurnRecurrentCkpt {
+    /// Start replacing the rolling checkpoint with `tokens`. The existing device buffers are
+    /// retained; validity is published only after every recurrent layer has been copied.
+    pub(super) fn begin(
+        slot: &mut Option<Self>,
+        be: &dyn Backend,
+        cfg: &Config,
+        src_k: &[Box<dyn Buffer>],
+        src_v: &[Box<dyn Buffer>],
+        tokens: &[u32],
+    ) -> AResult<()> {
+        if slot.is_none() {
+            let layers: Vec<usize> = (0..cfg.n_layer)
+                .filter(|&l| cfg.is_recurrent_layer(l))
+                .collect();
+            if layers.is_empty() {
+                return Ok(());
+            }
+            let mut kbufs = Vec::with_capacity(layers.len());
+            let mut vbufs = Vec::with_capacity(layers.len());
+            for &l in &layers {
+                kbufs.push(
+                    be.alloc(src_k[l].len_bytes().max(1), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                vbufs.push(
+                    be.alloc(src_v[l].len_bytes().max(1), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+            }
+            let copied = vec![false; layers.len()];
+            *slot = Some(Self {
+                kbufs,
+                vbufs,
+                layers,
+                tokens: Vec::new(),
+                copied,
+                valid: false,
+            });
+        }
+        let ck = slot.as_mut().expect("checkpoint was just allocated");
+        ck.tokens.clear();
+        ck.tokens.extend_from_slice(tokens);
+        ck.copied.fill(false);
+        ck.valid = false;
+        Ok(())
+    }
+
+    /// Capture one recurrent layer. Used by layer-major prefill at the precise boundary.
+    pub(super) fn snapshot_layer(
+        &mut self,
+        be: &dyn Backend,
+        src_k: &[Box<dyn Buffer>],
+        src_v: &[Box<dyn Buffer>],
+        layer: usize,
+    ) -> AResult<()> {
+        let Some(i) = self.layers.iter().position(|&l| l == layer) else {
+            return Ok(());
+        };
+        self.snapshot_index(be, src_k, src_v, i)
+    }
+
+    fn snapshot_index(
+        &mut self,
+        be: &dyn Backend,
+        src_k: &[Box<dyn Buffer>],
+        src_v: &[Box<dyn Buffer>],
+        i: usize,
+    ) -> AResult<()> {
+        if self.copied[i] {
+            return Ok(());
+        }
+        let layer = self.layers[i];
+        be.copy_buffer(
+            src_k[layer].as_ref(),
+            self.kbufs[i].as_ref(),
+            src_k[layer].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.copy_buffer(
+            src_v[layer].as_ref(),
+            self.vbufs[i].as_ref(),
+            src_v[layer].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        self.copied[i] = true;
+        self.valid = !self.tokens.is_empty() && self.copied.iter().all(|&done| done);
+        Ok(())
+    }
+
+    /// Capture every recurrent layer. Used by chunk-major prefill and the per-token path.
+    pub(super) fn snapshot_all(
+        &mut self,
+        be: &dyn Backend,
+        src_k: &[Box<dyn Buffer>],
+        src_v: &[Box<dyn Buffer>],
+    ) -> AResult<()> {
+        for i in 0..self.layers.len() {
+            self.snapshot_index(be, src_k, src_v, i)?;
+        }
+        Ok(())
+    }
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -439,6 +566,22 @@ impl SeamKv {
         common_prefix_len(&self.cached, prompt)
     }
 
+    /// Longest state this slot can continue for `prompt`: either its live materialized state or
+    /// the rolling recurrent checkpoint. The live-state rule remains exactly the existing one;
+    /// a checkpoint is usable only for a strict extension of its complete token prefix.
+    pub(crate) fn continuation_prefix_len(&self, prompt: &[u32]) -> Option<usize> {
+        let live_score = self.prefix_score(prompt);
+        let live = (live_score > 0
+            && (live_score == self.cached.len() || live_score == prompt.len()))
+        .then_some(live_score);
+        let checkpoint = self.turn_recurrent_ckpt.as_ref().and_then(|ck| {
+            ck.valid
+                .then(|| checkpoint_extension_start(&ck.tokens, prompt))
+                .flatten()
+        });
+        live.into_iter().chain(checkpoint).max()
+    }
+
     /// Forget the materialized tokens WITHOUT dropping weights or buffers: the next call
     /// re-prefills from position 0 into the same session. Bench reps use this so each rep
     /// measures a full prefill while weights/pipelines/repack caches stay warm.
@@ -446,6 +589,7 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        self.invalidate_turn_checkpoint();
     }
 
     /// Number of token ids materialized in this slot's KV cache.
@@ -457,6 +601,7 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        self.invalidate_turn_checkpoint();
     }
 
     /// Benchmark-only synthetic context: mark the first `tokens.len()` positions as resident without
@@ -508,7 +653,52 @@ impl SeamKv {
             }
         }
         self.cached = tokens;
+        self.invalidate_turn_checkpoint();
         Ok(())
+    }
+
+    fn invalidate_turn_checkpoint(&mut self) {
+        if let Some(ck) = self.turn_recurrent_ckpt.as_mut() {
+            ck.valid = false;
+            ck.tokens.clear();
+            ck.copied.fill(false);
+        }
+    }
+
+    /// Restore a rolling recurrent checkpoint when `prompt` strictly extends it. A mismatch is
+    /// the ordinary `Option` fallback, not an error: the runner then performs its unchanged zero
+    /// reset + full prefill. Copies stay entirely on the backend/device.
+    pub(crate) fn restore_turn_recurrent(
+        &mut self,
+        be: &dyn Backend,
+        prompt: &[u32],
+    ) -> AResult<Option<usize>> {
+        let Some(ck) = self.turn_recurrent_ckpt.as_ref() else {
+            return Ok(None);
+        };
+        let Some(len) = ck
+            .valid
+            .then(|| checkpoint_extension_start(&ck.tokens, prompt))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        for (i, &l) in ck.layers.iter().enumerate() {
+            be.copy_buffer(
+                ck.kbufs[i].as_ref(),
+                self.kbufs[l].as_ref(),
+                ck.kbufs[i].len_bytes(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            be.copy_buffer(
+                ck.vbufs[i].as_ref(),
+                self.vbufs[l].as_ref(),
+                ck.vbufs[i].len_bytes(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+        self.cached.clone_from(&ck.tokens);
+        Ok(Some(len))
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
@@ -683,6 +873,7 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
+            turn_recurrent_ckpt: None,
         })
     }
 
@@ -751,5 +942,21 @@ impl SeamKv {
         }
         self.cached = src.cached[..p].to_vec();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoint_extension_start;
+
+    #[test]
+    fn recurrent_checkpoint_requires_a_nonempty_strict_extension() {
+        assert_eq!(
+            checkpoint_extension_start(&[10, 20], &[10, 20, 30]),
+            Some(2)
+        );
+        assert_eq!(checkpoint_extension_start(&[], &[10]), None);
+        assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 20]), None);
+        assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 99, 30]), None);
     }
 }
