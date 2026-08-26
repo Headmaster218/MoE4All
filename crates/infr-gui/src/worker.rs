@@ -566,8 +566,7 @@ fn spawn_worker_log_reader<R>(
     status: Arc<RwLock<RuntimeStatus>>,
     stream: R,
     log_file: Arc<std::sync::Mutex<std::fs::File>>,
-)
-where
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
