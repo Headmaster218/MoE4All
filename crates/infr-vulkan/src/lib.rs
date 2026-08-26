@@ -4276,6 +4276,39 @@ impl VulkanBackend {
             .collect())
     }
 
+    /// Restore the calloc contract for a retained set of buffers with at most one device submit.
+    /// This mirrors the initialization performed by [`Self::alloc_zeroed_batch`] without
+    /// reallocating the buffers or changing their unified-arena generation.
+    pub(crate) fn zero_buffers_batch<'a>(
+        &self,
+        bufs: impl IntoIterator<Item = &'a dyn Buffer>,
+    ) -> Result<()> {
+        let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
+        for buf in bufs {
+            let buf = as_vk_buf(buf)?;
+            if let Some(ptr) = buf
+                .mapped_ptr()
+                .filter(|_| !matches!(&buf.backing, Backing::UnifiedSub(_)))
+            {
+                unsafe { std::ptr::write_bytes(ptr, 0u8, buf.size) };
+            } else {
+                let size = fill_span(buf.size);
+                if size > 0 {
+                    dev.push((buf.buffer, buf.sub_offset as u64, size));
+                }
+            }
+        }
+        if !dev.is_empty() {
+            let shared = Arc::clone(&self.shared);
+            self.one_shot(move |cmd| unsafe {
+                for (b, off, size) in dev {
+                    shared.device.cmd_fill_buffer(cmd, b, off, size, 0);
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {

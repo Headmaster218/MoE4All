@@ -333,18 +333,17 @@ fn resolve<'a>(
 /// ops touch only the real `rows`, and row-major layout keeps element (r<rows, c) at the same index).
 /// [`alloc_scratch`]'s result: the per-tensor `Internal` scratch, indexed by `TensorId`.
 type ScratchSet = Vec<Option<Box<dyn Buffer>>>;
+type ScratchLayout = Vec<Option<usize>>;
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
-    let mut scratch: Vec<Option<Box<dyn Buffer>>> =
-        (0..graph.tensors.len()).map(|_| None).collect();
-    // Batch the whole scratch set into ONE zero-init submit (`alloc_zeroed_batch`): the naive
-    // per-tensor `alloc` pays a one-shot submit + queue_wait_idle per Internal (~70 x ~35us =
-    // ~2.5ms per execute on a 7900 XTX) — the dominant HOST cost of a small-m prefill step.
-    let mut idx: Vec<usize> = Vec::new();
-    let mut sizes: Vec<usize> = Vec::new();
-    for (i, decl) in graph.tensors.iter().enumerate() {
-        if matches!(decl.kind, TensorKind::Internal) {
+fn scratch_layout(graph: &Graph) -> Result<ScratchLayout> {
+    graph
+        .tensors
+        .iter()
+        .map(|decl| {
+            if !matches!(decl.kind, TensorKind::Internal) {
+                return Ok(None);
+            }
             let numel = decl.desc.numel();
             let padded = match decl.desc.shape.first() {
                 Some(&rows) if rows > 0 => rows.div_ceil(64) * 64 * (numel / rows),
@@ -355,15 +354,33 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
                 .dtype
                 .dense_bytes(padded)
                 .ok_or_else(|| be("vulkan adapter: internal tensor must be a dense dtype"))?;
-            idx.push(i);
-            sizes.push(bytes.max(4));
-        }
-    }
+            Ok(Some(bytes.max(4)))
+        })
+        .collect()
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn alloc_scratch_layout(be_: &VulkanBackend, layout: &ScratchLayout) -> Result<ScratchSet> {
+    let mut scratch: ScratchSet = (0..layout.len()).map(|_| None).collect();
+    // Batch the whole scratch set into ONE zero-init submit (`alloc_zeroed_batch`): the naive
+    // per-tensor `alloc` pays a one-shot submit + queue_wait_idle per Internal (~70 x ~35us =
+    // ~2.5ms per execute on a 7900 XTX) — the dominant HOST cost of a small-m prefill step.
+    let idx: Vec<usize> = layout
+        .iter()
+        .enumerate()
+        .filter_map(|(i, bytes)| bytes.map(|_| i))
+        .collect();
+    let sizes: Vec<usize> = idx.iter().map(|&i| layout[i].unwrap()).collect();
     let bufs = be_.alloc_zeroed_batch(&sizes, BufferUsage::Activations)?;
     for (i, buf) in idx.into_iter().zip(bufs) {
         scratch[i] = Some(buf);
     }
     Ok(scratch)
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
+    alloc_scratch_layout(be_, &scratch_layout(graph)?)
 }
 
 /// Peephole: fuse `QkNormRope(k → k16)` + `WriteKv(k16 → cache, pos)` into a single Qk-norm+RoPE that
@@ -395,12 +412,16 @@ enum StaticScratchPhase {
 #[derive(Default)]
 pub(crate) struct StaticScratchCache {
     phase: Option<StaticScratchPhase>,
+    scratch_layout: ScratchLayout,
+    scratch: ScratchSet,
     pool: ScratchPool,
 }
 
 impl StaticScratchCache {
     fn enter(&mut self, phase: StaticScratchPhase) {
         if self.phase != Some(phase) {
+            self.scratch.clear();
+            self.scratch_layout.clear();
             self.pool.clear();
             self.phase = Some(phase);
         }
@@ -5431,9 +5452,9 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
     }
 }
 
-/// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
-/// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Used for prefill
-/// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
+/// Per-execute static recording: prepare zeroed `Internal` scratch, record every op via `lower_op`
+/// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
+/// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
     // Paged decode plans are rebuilt per token, but their pooled workspace is shape-stable across
@@ -5450,7 +5471,44 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     } else {
         None
     };
-    let scratch = alloc_scratch(be_, graph)?;
+    let layout = scratch_layout(graph)?;
+    let mut local_scratch = None;
+    let mut scratch_reused = false;
+    if let Some(cache) = cached_pool.as_mut() {
+        if cache.scratch_layout == layout && cache.scratch.len() == layout.len() {
+            scratch_reused = true;
+        } else {
+            // Release the old layout before allocating the new one so a phase-local shape change
+            // cannot temporarily require both scratch sets from the unified arena.
+            cache.scratch.clear();
+            cache.scratch_layout.clear();
+            cache.scratch = alloc_scratch_layout(be_, &layout)?;
+            cache.scratch_layout.clone_from(&layout);
+        }
+    } else {
+        local_scratch = Some(alloc_scratch_layout(be_, &layout)?);
+    }
+    if scratch_reused {
+        let cache = cached_pool
+            .as_ref()
+            .expect("reused scratch requires a cache");
+        be_.zero_buffers_batch(cache.scratch.iter().filter_map(|buf| buf.as_deref()))?;
+    }
+
+    let using_cached = cached_pool.is_some();
+    let mut local_pool: ScratchPool = HashMap::new();
+    let (scratch, pool): (&ScratchSet, &mut ScratchPool) = match cached_pool.as_mut() {
+        Some(cache) => {
+            let cache = &mut **cache;
+            (&cache.scratch, &mut cache.pool)
+        }
+        None => (
+            local_scratch
+                .as_ref()
+                .expect("non-paged static execution owns local scratch"),
+            &mut local_pool,
+        ),
+    };
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
@@ -5465,7 +5523,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         };
         if let Some(pid) = pid {
             if let std::collections::hash_map::Entry::Vacant(e) = rope_pos.entry(pid.0) {
-                e.insert(read_pos0(be_, resolve(&scratch, bindings, pid)?)? as usize);
+                e.insert(read_pos0(be_, resolve(scratch, bindings, pid)?)? as usize);
             }
         }
     }
@@ -5480,7 +5538,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             let mut unfuse: Vec<usize> = Vec::new();
             for &idx in plan.linear_add.keys() {
                 if let Op::Linear { weight, .. } = &graph.ops[idx] {
-                    let w = resolve(&scratch, bindings, *weight)?;
+                    let w = resolve(scratch, bindings, *weight)?;
                     if sess.is_streamed(crate::pager::buffer_identity(w)) {
                         unfuse.push(idx);
                     }
@@ -5506,7 +5564,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         let Op::MoeFfn { gate_exps, .. } = &graph.ops[op_idx] else {
             unreachable!();
         };
-        let gbuf = resolve(&scratch, bindings, *gate_exps)?;
+        let gbuf = resolve(scratch, bindings, *gate_exps)?;
         let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
             s.is_paged(
                 crate::pager::Role::Gate,
@@ -5532,11 +5590,6 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
-    let mut local_pool: ScratchPool = HashMap::new();
-    let pool = match cached_pool.as_mut() {
-        Some(cache) => &mut cache.pool,
-        None => &mut local_pool,
-    };
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     let mut pstream = PagedStream::default();
 
@@ -5629,7 +5682,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             rec = Some(fresh);
         }
         if let Op::MoeFfn { gate_exps, .. } = op {
-            let gbuf = resolve(&scratch, bindings, *gate_exps)?;
+            let gbuf = resolve(scratch, bindings, *gate_exps)?;
             let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
                 s.is_paged(
                     crate::pager::Role::Gate,
@@ -5641,7 +5694,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     be_,
                     graph,
                     op,
-                    &scratch,
+                    scratch,
                     bindings,
                     pool,
                     &mut rec,
@@ -5660,7 +5713,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // so every miss is known the moment the op is reached.
         if be_.dense_paged() {
             if let Op::Linear { weight, .. } = op {
-                let wid = crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
+                let wid = crate::pager::buffer_identity(resolve(scratch, bindings, *weight)?);
                 let streamed = be_
                     .dense_pager()
                     .lock()
@@ -5675,7 +5728,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         op_idx,
                         op,
                         rec.as_ref().expect("segment always Some between ops"),
-                        &scratch,
+                        scratch,
                         bindings,
                         &fused_kv_write,
                         &fused_add,
@@ -5698,7 +5751,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             op_idx,
             op,
             rec.as_ref().expect("segment always Some between ops"),
-            &scratch,
+            scratch,
             bindings,
             &fused_kv_write,
             &fused_add,
@@ -5718,7 +5771,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
     // the other transient allocations until the final submit drains. Paged buffers remain in the
     // backend cache and are dropped only on a decode/prefill transition or model teardown.
-    if cached_pool.is_none() {
+    if !using_cached {
         transient.extend(local_pool.into_values());
     }
     let last = rec.take().expect("segment always Some at loop end");
@@ -7599,11 +7652,15 @@ mod tests {
     fn paged_static_scratch_lives_until_phase_transition() {
         let mut cache = StaticScratchCache::default();
         cache.enter(StaticScratchPhase::Decode);
+        cache.scratch_layout = vec![Some(4)];
+        cache.scratch = vec![Some(Box::new(TestBuffer(4)))];
         cache
             .pool
             .insert(("test_decode", 4), Box::new(TestBuffer(4)));
 
         cache.enter(StaticScratchPhase::Decode);
+        assert_eq!(cache.scratch_layout, vec![Some(4)]);
+        assert!(cache.scratch[0].is_some());
         assert_eq!(
             cache.pool.len(),
             1,
@@ -7615,11 +7672,17 @@ mod tests {
             cache.pool.is_empty(),
             "decode scratch must drop on the decode-to-prefill transition"
         );
+        assert!(cache.scratch_layout.is_empty());
+        assert!(cache.scratch.is_empty());
+        cache.scratch_layout = vec![Some(8)];
+        cache.scratch = vec![Some(Box::new(TestBuffer(8)))];
         cache
             .pool
             .insert(("test_prefill", 8), Box::new(TestBuffer(8)));
 
         cache.enter(StaticScratchPhase::Prefill);
+        assert_eq!(cache.scratch_layout, vec![Some(8)]);
+        assert!(cache.scratch[0].is_some());
         assert_eq!(
             cache.pool.len(),
             1,
@@ -7631,6 +7694,8 @@ mod tests {
             cache.pool.is_empty(),
             "prefill scratch must drop on the prefill-to-decode transition"
         );
+        assert!(cache.scratch_layout.is_empty());
+        assert!(cache.scratch.is_empty());
     }
 
     #[test]
