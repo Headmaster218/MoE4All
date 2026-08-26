@@ -599,12 +599,14 @@ pub(crate) fn native_idm_sg_paged_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_sg16"),
+        (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged"),
+        (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_sg16"),
         _ => None,
     }
 }
 
-/// Subgroup+NR twin of [`native_idm_paged_shared_build_spv`]. Only Q5_K/Q6_K have an enrolled
-/// subgroup down-projection path; IQ4_XS stays on the tree kernel.
+/// Subgroup+NR twin of [`native_idm_paged_shared_build_spv`]. Q5_K/Q6_K cover the established
+/// down-projection band; IQ2_XS covers Qwen3.8's measured gate/up shape. IQ4_XS stays on tree.
 pub(crate) fn native_idm_sg_paged_shared_build_spv(
     dtype: infr_core::DType,
     nr: u32,
@@ -635,6 +637,8 @@ pub(crate) fn native_idm_sg_paged_shared_build_spv(
         (Q5K, 2, true) => v!("native_idm_q5k_sg2_paged_shexp_sg16"),
         (Q5K, 4, true) => v!("native_idm_q5k_sg4_paged_shexp_sg16"),
         (Q5K, 8, true) => v!("native_idm_q5k_sg8_paged_shexp_sg16"),
+        (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged_shexp"),
+        (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_shexp_sg16"),
         _ => None,
     }
 }

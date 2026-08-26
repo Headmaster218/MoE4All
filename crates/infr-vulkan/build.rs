@@ -1788,6 +1788,25 @@ fn main() {
             "native_idm_iq3s_sg8_paged",
             &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
         ),
+        // Qwen3.8's paged 2560x640 IQ2_XS gate/up banks: NR=8 stages the 4 KiB codebook once
+        // for eight output rows. Both routed-only and routed+fixed-Q8-shared variants are kept;
+        // the exact shape gate lives in `native_id_sg_choice`.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq2xs_sg8_paged",
+            &["-DFMT_IQ2XS", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq2xs_sg8_paged_shexp",
+            &[
+                "-DFMT_IQ2XS",
+                "-DUSE_GRID",
+                "-DNR=8",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
+        ),
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("moe_accumulate_shared", "moe_accumulate_shared", &[]),

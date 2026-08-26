@@ -245,6 +245,12 @@ fn native_id_sg_choice(
     // (codebook in an L2-resident BUFFER instead of per-workgroup LDS) is the real fix for the
     // gate/up shape and is NOT what this tier does; ablating grid_init() outright measured
     // native_idm_iq2s 49.8 → 23.3ms, i.e. ~50ms of a 505ms decode still on the table.
+    // Qwen3.8's 2560x640 IQ2_XS gate/up shape wins with NR=8: its 4 KiB codebook is staged once
+    // for eight output rows instead of once per row. Keep the enrollment exact; IQ2_S's similar
+    // low-output shape regresses on this tier, and no other IQ2_XS geometry has been measured.
+    if dtype == Iq2Xs {
+        return (in_f == 2560 && out_f == 640).then_some(8);
+    }
     if !matches!(dtype, Q6K | Q5K | Iq3S) {
         return None;
     }
@@ -11476,6 +11482,9 @@ mod tests {
         for dt in [D::Q5K, D::Q6K, D::Iq3S] {
             assert_eq!(native_id_sg_choice(dt, 512, 2048, k), Some(2), "{dt:?}");
         }
+        assert_eq!(native_id_sg_choice(D::Iq2Xs, 2560, 640, k), Some(8));
+        assert_eq!(native_id_sg_choice(D::Iq2Xs, 2560, 641, k), None);
+        assert_eq!(native_id_sg_choice(D::Iq2Xs, 2048, 640, k), None);
         for dt in [D::Q4K, D::Iq4Nl, D::Iq2S] {
             assert_eq!(native_id_sg_choice(dt, 512, 2048, k), None, "{dt:?}");
         }
