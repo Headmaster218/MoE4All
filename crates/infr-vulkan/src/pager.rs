@@ -1292,9 +1292,9 @@ fn stats_suffix(s: &PagerStats) -> String {
     )
 }
 
-/// Load-time description of one paged layer's per-role expert bank. `register` copies this bank
-/// once into the session's CPU-only layer-major store, then drops the `Arc`; runtime paths retain
-/// only offsets and never pin, repack, or reread the GGUF mapping.
+/// Load-time description of one paged layer's per-role expert bank. In full-RAM mode `register`
+/// copies it once into the session's CPU-only layer-major store. In bounded-RAM mode the
+/// individual block descriptors have already been registered with the inclusive host cache.
 pub struct ExpertSource {
     pub bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
     pub stride_bytes: usize,
@@ -1305,14 +1305,13 @@ pub struct ExpertSource {
     pub layer_base: u32,
     /// Byte offset assigned by the seam's layer-major permanent host-store plan.
     pub host_offset: usize,
-    /// Exact file descriptor of this whole role bank. Present in bounded-RAM mode, where the bank
-    /// is not copied into the permanent Host Store and Prefill streams it directly from SSD.
+    /// Exact file descriptor of this whole role bank. Present in bounded-RAM mode and validated
+    /// against the per-expert descriptors used to assemble Prefill banks from RAM plus SSD misses.
     pub file: Option<BlockDesc>,
 }
 
-/// Runtime metadata for one bank after [`ExpertSource::bank`] has been copied into the permanent
-/// host store. Keeping this separate is the ownership guarantee behind the single-copy design:
-/// the session cannot accidentally retain the model mapping as a second runtime weight source.
+/// Runtime metadata for one registered bank. `host_chunk` names the permanent full-RAM source;
+/// `None` selects the bounded inclusive RAM/SSD tier through `block_base` and `stride_bytes`.
 #[derive(Clone, Debug)]
 struct RegisteredExpertSource {
     stride_bytes: usize,
@@ -1321,7 +1320,6 @@ struct RegisteredExpertSource {
     host_chunk: Option<usize>,
     host_offset: usize,
     bank_bytes: usize,
-    file: Option<BlockDesc>,
 }
 
 struct HostStoreChunk {
@@ -1507,20 +1505,22 @@ struct PrefillLayerPlacement {
     banks: Vec<usize>,
 }
 
-/// Fully resolved direct-copy job for one Prefill layer. Raw addresses are safe to move to the
-/// dedicated uploader because the session owns both the unique Host store and mapped ReBAR arenas
-/// until the adapter joins that worker at the end of the forward.
+/// Fully resolved copy job for one Prefill layer. Raw destination addresses are safe to move to the
+/// dedicated uploader because the session owns the mapped ReBAR arenas until the adapter joins
+/// that worker at the end of the forward. Full-RAM source addresses have the same lifetime;
+/// bounded sources retain their host cache with an `Arc`.
 pub(crate) struct PrefillCopyJob {
     buf_id: usize,
     copies: Vec<PrefillCopy>,
-    bytes: usize,
 }
 
 enum PrefillCopy {
     Memory(StagingCopy),
-    Disk {
+    Tiered {
         host: Arc<InclusiveHostCache>,
-        desc: BlockDesc,
+        block_base: BlockId,
+        n_blocks: usize,
+        block_bytes: usize,
         dst: usize,
     },
 }
@@ -1531,23 +1531,31 @@ impl PrefillCopyJob {
     }
 
     pub(crate) fn execute(self) -> Result<()> {
-        let copy_t0 = pager_profile::active().then(std::time::Instant::now);
         for copy in self.copies {
             match copy {
                 PrefillCopy::Memory(copy) => {
+                    let copy_t0 = pager_profile::active().then(std::time::Instant::now);
                     let src =
                         unsafe { std::slice::from_raw_parts(copy.src as *const u8, copy.len) };
                     par_copy_to_mapped(src, copy.dst as *mut u8);
+                    if let Some(t0) = copy_t0 {
+                        pager_profile::record_memcpy(copy.len, t0.elapsed());
+                    }
                 }
-                PrefillCopy::Disk { host, desc, dst } => {
-                    let bytes =
-                        unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, desc.nbytes()) };
-                    host.read_stream(&desc, bytes)?;
+                PrefillCopy::Tiered {
+                    host,
+                    block_base,
+                    n_blocks,
+                    block_bytes,
+                    dst,
+                } => {
+                    let len = n_blocks
+                        .checked_mul(block_bytes)
+                        .ok_or_else(|| be("moe pager: tiered Prefill bank byte size overflow"))?;
+                    let bytes = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                    host.materialize_stream(block_base, n_blocks, block_bytes, bytes)?;
                 }
             }
-        }
-        if let Some(t0) = copy_t0 {
-            pager_profile::record_memcpy(self.bytes, t0.elapsed());
         }
         Ok(())
     }
@@ -1993,7 +2001,7 @@ impl MoePagerSession {
             )));
         }
         let block_base = (role.index() * self.role_stride) as u32 + source.layer_base;
-        let (host_chunk, chunk_offset, file) = if let Some(host) = &self.pools[pool].host {
+        let (host_chunk, chunk_offset) = if let Some(host) = &self.pools[pool].host {
             let file = source
                 .file
                 .clone()
@@ -2014,7 +2022,7 @@ impl MoePagerSession {
                     )));
                 }
             }
-            (None, 0, Some(file))
+            (None, 0)
         } else {
             let end = source
                 .host_offset
@@ -2040,7 +2048,7 @@ impl MoePagerSession {
             if let Some(t0) = copy_t0 {
                 pager_profile::record_memcpy(bank.len(), t0.elapsed());
             }
-            (Some(host_chunk), chunk_offset, None)
+            (Some(host_chunk), chunk_offset)
         };
         self.sources.insert(
             buf_id,
@@ -2054,7 +2062,6 @@ impl MoePagerSession {
                     host_chunk,
                     host_offset: chunk_offset,
                     bank_bytes: bank.len(),
-                    file,
                 },
             ),
         );
@@ -2553,7 +2560,6 @@ impl MoePagerSession {
             .map(|layer| layer.banks.clone())
             .ok_or_else(|| be("moe pager: async layer missing from prefill layout"))?;
         let mut copies = Vec::with_capacity(banks.len());
-        let mut bytes = 0usize;
         for bank_id in banks {
             let bank_placement = *self
                 .prefill_placement
@@ -2579,18 +2585,16 @@ impl MoePagerSession {
                 let host = self.pools[bank_placement.pool]
                     .host
                     .as_ref()
-                    .ok_or_else(|| be("moe pager: disk-backed Prefill bank has no host reader"))?;
-                let desc = source
-                    .file
-                    .clone()
-                    .ok_or_else(|| be("moe pager: disk-backed Prefill bank has no descriptor"))?;
-                copies.push(PrefillCopy::Disk {
+                    .ok_or_else(|| be("moe pager: tiered Prefill bank has no host reader"))?;
+                let n_blocks = source.bank_bytes / source.stride_bytes;
+                copies.push(PrefillCopy::Tiered {
                     host: Arc::clone(host),
-                    desc,
+                    block_base: source.block_base,
+                    n_blocks,
+                    block_bytes: source.stride_bytes,
                     dst,
                 });
             }
-            bytes = bytes.saturating_add(source.bank_bytes);
         }
 
         let lane = placement.lane;
@@ -2600,11 +2604,7 @@ impl MoePagerSession {
                 .is_none_or(|p| p.lane != lane)
         });
         self.prefill_lane_layer[lane] = Some(placement.layer_base);
-        Ok(Some(PrefillCopyJob {
-            buf_id,
-            copies,
-            bytes,
-        }))
+        Ok(Some(PrefillCopyJob { buf_id, copies }))
     }
 
     pub(crate) fn complete_prefill_layer_cpu(&mut self, buf_id: usize) -> Result<()> {

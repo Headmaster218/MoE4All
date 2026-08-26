@@ -392,6 +392,30 @@ struct InclusiveInner {
     scratch: Box<[u8]>,
 }
 
+/// Temporary, non-touching borrows held while a Prefill bank is assembled from the inclusive
+/// cache. `Pager::repin` leaves Decode's LRU/epoch/stats untouched; dropping the set releases only
+/// these additional borrows, including when a parallel SSD read returns an error.
+struct InclusiveReadPins<'a> {
+    cache: &'a InclusiveHostCache,
+    ids: Vec<BlockId>,
+}
+
+impl Drop for InclusiveReadPins<'_> {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let mut inner = self.cache.inner.lock().unwrap();
+        let pager = inner
+            .pager
+            .as_mut()
+            .expect("resident inclusive blocks require a RAM arena");
+        for &id in &self.ids {
+            pager.unpin(id);
+        }
+    }
+}
+
 /// Fixed-budget, inclusive RAM cache beneath a faster cache of the same uniform blocks.
 ///
 /// A promoted block stays in RAM and is pinned while it remains in GPU cache. When the GPU evicts
@@ -987,9 +1011,202 @@ impl InclusiveHostCache {
         true
     }
 
-    /// Read a whole Prefill bank without admitting its individual Experts into the Decode LRU.
-    pub fn read_stream(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
-        self.io.read_block(desc, dst)
+    /// Assemble one contiguous Prefill bank from the existing inclusive RAM cache plus SSD misses.
+    ///
+    /// Ready blocks are borrowed with [`Pager::repin`], so this sequential whole-model sweep does
+    /// not perturb Decode's LRU order, epoch protection, or residency counters. Missing blocks read
+    /// directly into their final `dst` offsets and are deliberately not admitted: filling a bounded
+    /// cache with a one-use Prefill sweep would evict the routed working set Decode is about to use.
+    pub fn materialize_stream(
+        &self,
+        block_base: BlockId,
+        n_blocks: usize,
+        block_bytes: usize,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        use rayon::prelude::*;
+
+        enum Source {
+            Ram { slot: u32 },
+            Ssd { desc: BlockDesc },
+        }
+
+        struct Work {
+            id: BlockId,
+            offset: usize,
+            len: usize,
+            source: Source,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Ram,
+            Ssd,
+        }
+
+        struct Outcome {
+            kind: Kind,
+            len: usize,
+            elapsed: std::time::Duration,
+        }
+
+        if block_bytes == 0 {
+            return Err(Error::backend(
+                "inclusive host cache: Prefill block stride is zero".to_string(),
+            ));
+        }
+        let need = n_blocks.checked_mul(block_bytes).ok_or_else(|| {
+            Error::backend("inclusive host cache: Prefill bank size overflow".to_string())
+        })?;
+        if dst.len() < need {
+            return Err(Error::backend(format!(
+                "inclusive host cache: Prefill bank needs {need} bytes, destination holds {}",
+                dst.len()
+            )));
+        }
+
+        let mut ids = Vec::with_capacity(n_blocks);
+        for block in 0..n_blocks {
+            let local = u32::try_from(block).map_err(|_| {
+                Error::backend("inclusive host cache: Prefill block count exceeds u32".to_string())
+            })?;
+            ids.push(block_base.checked_add(local).ok_or_else(|| {
+                Error::backend("inclusive host cache: Prefill block id overflow".to_string())
+            })?);
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        for &id in &ids {
+            let desc = inner.descs.get(&id).ok_or_else(|| {
+                Error::backend(format!(
+                    "inclusive host cache: Prefill block {id} was never registered"
+                ))
+            })?;
+            if desc.nbytes() != block_bytes {
+                return Err(Error::backend(format!(
+                    "inclusive host cache: Prefill block {id} is {} bytes, expected {block_bytes}",
+                    desc.nbytes()
+                )));
+            }
+        }
+
+        let mut work = Vec::with_capacity(n_blocks);
+        let mut pinned = Vec::new();
+        for (block, &id) in ids.iter().enumerate() {
+            loop {
+                if inner.state.get(&id) == Some(&SlotState::Ready) {
+                    let slot = inner
+                        .pager
+                        .as_mut()
+                        .and_then(|pager| pager.repin(id))
+                        .expect("ready inclusive block must remain resident");
+                    pinned.push(id);
+                    work.push(Work {
+                        id,
+                        offset: block * block_bytes,
+                        len: block_bytes,
+                        source: Source::Ram { slot },
+                    });
+                    break;
+                }
+                if inner.state.get(&id) == Some(&SlotState::Loading) {
+                    inner = self.ready.wait(inner).unwrap();
+                    continue;
+                }
+                work.push(Work {
+                    id,
+                    offset: block * block_bytes,
+                    len: block_bytes,
+                    source: Source::Ssd {
+                        desc: inner.descs[&id].clone(),
+                    },
+                });
+                break;
+            }
+        }
+        let pins = InclusiveReadPins {
+            cache: self,
+            ids: pinned,
+        };
+        drop(inner);
+
+        let prof = pager_profile::active();
+        let dst_addr = dst.as_mut_ptr() as usize;
+        let outcomes: Vec<Result<Outcome>> = work
+            .par_iter()
+            .map(|job| {
+                let started = std::time::Instant::now();
+                // SAFETY: every job owns one distinct `[offset, offset + len)` block range in
+                // `dst`. RAM sources remain Ready and un-evictable through `pins`; SSD jobs only
+                // write their private destination range. All workers join before `dst` is reused.
+                let out = unsafe {
+                    std::slice::from_raw_parts_mut((dst_addr + job.offset) as *mut u8, job.len)
+                };
+                let kind = match &job.source {
+                    Source::Ram { slot } => {
+                        let src = unsafe { self.arena.slot_ref(*slot, job.len) };
+                        out.copy_from_slice(src);
+                        Kind::Ram
+                    }
+                    Source::Ssd { desc } => {
+                        self.io.read_block(desc, out)?;
+                        Kind::Ssd
+                    }
+                };
+                Ok(Outcome {
+                    kind,
+                    len: job.len,
+                    elapsed: started.elapsed(),
+                })
+            })
+            .collect();
+
+        let mut first_error = None;
+        let mut ram_blocks = 0u64;
+        let mut ram_bytes = 0u64;
+        let mut ssd_blocks = 0u64;
+        let mut ssd_bytes = 0u64;
+        for (job, outcome) in work.iter().zip(outcomes) {
+            match outcome {
+                Ok(outcome) => match outcome.kind {
+                    Kind::Ram => {
+                        ram_blocks += 1;
+                        ram_bytes += outcome.len as u64;
+                        if prof {
+                            pager_profile::record_host_hit(outcome.len);
+                            pager_profile::record_memcpy(outcome.len, outcome.elapsed);
+                        }
+                    }
+                    Kind::Ssd => {
+                        ssd_blocks += 1;
+                        ssd_bytes += outcome.len as u64;
+                        if prof {
+                            pager_profile::record_host_miss(outcome.len, false);
+                            pager_profile::record_host_read(outcome.len, outcome.elapsed, true);
+                        }
+                    }
+                },
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(Error::backend(format!(
+                            "inclusive host cache: Prefill block {} failed: {err}",
+                            job.id
+                        )));
+                    }
+                }
+            }
+        }
+        self.ram_hits.fetch_add(ram_blocks, Ordering::Relaxed);
+        self.ssd_reads.fetch_add(ssd_blocks, Ordering::Relaxed);
+        self.bytes_read.fetch_add(ssd_bytes, Ordering::Relaxed);
+        self.bytes_promoted
+            .fetch_add(ram_bytes.saturating_add(ssd_bytes), Ordering::Relaxed);
+        drop(pins);
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1628,6 +1845,83 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.ssd_reads, 2);
         assert_eq!(stats.shadow_resident, 2);
+    }
+
+    #[test]
+    fn inclusive_prefill_stream_reuses_ram_without_polluting_decode_lru() {
+        let io = Arc::new(FakeIo::new());
+        let cache = InclusiveHostCache::new(2, 16, io.clone()).expect("cache");
+        for id in 1..=4 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+        // Deliberate cold-to-hot order: if the Prefill scan touched its hits, block 3 would move
+        // behind block 1 and the later Decode admission would evict the wrong block.
+        cache.preload(&[3, 1]).expect("preload");
+
+        let mut bank = [0u8; 64];
+        cache
+            .materialize_stream(1, 4, 16, &mut bank)
+            .expect("materialize Prefill bank");
+        for (block, bytes) in bank.chunks_exact(16).enumerate() {
+            assert_eq!(bytes, &[(block + 1) as u8; 16]);
+        }
+        assert_eq!(
+            io.reads.load(Ordering::SeqCst),
+            4,
+            "two preloaded blocks must replace two SSD reads"
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.ram_hits, 2);
+        assert_eq!(stats.ssd_reads, 2);
+        assert_eq!(stats.bytes_read, 32);
+        assert_eq!(stats.bytes_promoted, 64);
+        assert_eq!(
+            stats.ram_evictions, 0,
+            "Prefill misses must not be admitted"
+        );
+
+        cache
+            .promote(2, None, |bytes| {
+                assert_eq!(bytes, &[2u8; 16]);
+                Ok(())
+            })
+            .expect("Decode promotion 2");
+        cache
+            .promote(3, Some(2), |bytes| {
+                assert_eq!(bytes, &[3u8; 16]);
+                Ok(())
+            })
+            .expect("Decode promotion 3");
+        assert_eq!(
+            cache.stats().ssd_reads,
+            4,
+            "block 3 must remain the LRU victim; the Prefill scan may not promote it"
+        );
+    }
+
+    #[test]
+    fn inclusive_prefill_stream_reads_distinct_ssd_misses_concurrently() {
+        let io = Arc::new(ConcurrentIo {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let cache = InclusiveHostCache::new(1, 16, io.clone()).expect("cache");
+        for id in 1..=3 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+        cache.preload(&[1]).expect("preload");
+        io.max_active.store(0, Ordering::SeqCst);
+
+        let mut bank = [0u8; 48];
+        cache
+            .materialize_stream(1, 3, 16, &mut bank)
+            .expect("materialize Prefill bank");
+        assert!(
+            io.max_active.load(Ordering::SeqCst) >= 2,
+            "the two SSD-only blocks were serialized"
+        );
+        assert_eq!(cache.stats().ram_hits, 1);
+        assert_eq!(cache.stats().ssd_reads, 2);
     }
 
     #[test]
