@@ -1,4 +1,21 @@
-# INFR — AMD/Vulkan Large-MoE Research Fork
+# INFR - AMD/Vulkan Large-MoE Research Fork
+
+[**Download the latest portable Windows release**](https://github.com/Headmaster218/infr/releases/latest)
+
+For native Windows 11, download the `infr-windows-x86_64-*.zip` archive,
+extract it, and double-click `Start-INFR-Wizard.cmd`. The package includes the
+CLI and bilingual launch wizard; bring your own supported GGUF model. No Rust,
+Visual Studio, or Vulkan SDK installation is required to run the packaged
+binary. A working 64-bit GPU driver with Vulkan support is still required.
+
+需要直接使用的 Windows 11 用户，请从
+[最新 Release](https://github.com/Headmaster218/infr/releases/latest)
+下载 `infr-windows-x86_64-*.zip`，解压后双击
+`Start-INFR-Wizard.cmd`。发布包不包含模型，请自行准备受支持的 GGUF；运行
+发布版不需要安装 Rust、Visual Studio 或 Vulkan SDK，只需安装支持 Vulkan
+的正常 64 位显卡驱动。
+
+
 
 > Experimental fork of [kryptic-sh/infr](https://github.com/kryptic-sh/infr),
 > focused on large-MoE paging, heterogeneous memory, and long-context inference
