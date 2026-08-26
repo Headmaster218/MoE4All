@@ -127,17 +127,21 @@ fn parse_mem_available(text: &str) -> Option<u64> {
     Some(kb * 1024)
 }
 
-/// Never take the last of the machine's memory: the larger of this and [`HEADROOM_FRACTION`] of
-/// what is available is left alone.
+/// Never take the last of the machine's memory: the larger of this and the bounded
+/// [`HEADROOM_FRACTION`] of what is available is left alone.
 ///
 /// The arena is not the only thing the run needs host memory for — the pinned staging ring, the
 /// CPU backend's activations, the tokenizer, and whatever else shares the box. A fixed floor
 /// matters on small hosts where a fraction rounds to nothing.
-const HEADROOM_MIN: u64 = 1 << 30;
+const HEADROOM_MIN: u64 = 10 << 30;
 
-/// The share of available memory left unclaimed on a large host, where a 1 GiB floor would be
-/// negligible. Reciprocal — `available / HEADROOM_FRACTION`.
-const HEADROOM_FRACTION: u64 = 8;
+/// The share of available memory left unclaimed on a large host, where the fixed floor would be
+/// too aggressive. Reciprocal — `available / HEADROOM_FRACTION`.
+const HEADROOM_FRACTION: u64 = 4;
+
+/// Keep the proportional reserve useful without permanently stranding excessive RAM on very
+/// large hosts.
+const HEADROOM_FRACTION_MAX: u64 = 32 << 30;
 
 /// Below this an arena is not worth building: the tier costs a copy per streamed block, and a
 /// budget this small holds so little of a model that the hit rate cannot pay for it.
@@ -155,7 +159,8 @@ const MIN_USEFUL: u64 = 256 << 20;
 ///
 /// Returns `0` when nothing worth having is left, which callers treat as "stay on the mmap path".
 pub fn auto_arena_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
-    let headroom = HEADROOM_MIN.max(available / HEADROOM_FRACTION);
+    let proportional = (available / HEADROOM_FRACTION).min(HEADROOM_FRACTION_MAX);
+    let headroom = HEADROOM_MIN.max(proportional);
     let usable = available
         .saturating_sub(committed)
         .saturating_sub(headroom)
@@ -356,7 +361,7 @@ mod tests {
             let got = auto_arena_bytes(avail, 0, u64::MAX);
             assert!(got < avail, "took all {avail} bytes");
             assert!(
-                avail - got >= HEADROOM_MIN,
+                avail < HEADROOM_MIN || avail - got >= HEADROOM_MIN,
                 "left less than the floor at {avail}: took {got}"
             );
         }
@@ -366,7 +371,17 @@ mod tests {
     #[test]
     fn a_large_host_leaves_the_fraction() {
         let avail = 64 * GIB;
-        assert_eq!(auto_arena_bytes(avail, 0, u64::MAX), avail - avail / 8);
+        assert_eq!(auto_arena_bytes(avail, 0, u64::MAX), 48 * GIB);
+    }
+
+    #[test]
+    fn a_workstation_keeps_a_quarter_available() {
+        assert_eq!(auto_arena_bytes(52 * GIB, 0, u64::MAX), 39 * GIB);
+    }
+
+    #[test]
+    fn a_huge_host_caps_the_proportional_reserve() {
+        assert_eq!(auto_arena_bytes(512 * GIB, 0, u64::MAX), 480 * GIB);
     }
 
     /// Unified memory: the VRAM budget comes out of the same RAM, so it must reduce the arena
