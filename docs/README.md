@@ -6,6 +6,9 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 ## Using infr
 
+- [../GETTING_STARTED.md](../GETTING_STARTED.md) — clean-clone installation,
+  native Windows 11 prerequisites, release build, Vulkan verification,
+  small-model smoke test, launch wizard, GUI, server, and troubleshooting.
 - [config.md](config.md) — the configuration reference: the four layers
   (defaults < config file < `INFR_*` env < CLI flags) and their precedence, the
   TOML file format and lookup order, `--set`, and a per-section walkthrough of

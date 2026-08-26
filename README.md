@@ -19,6 +19,10 @@ The milestone tag [`v0.1-moe-snapshot`](https://github.com/Headmaster218/infr/tr
 marks the first bounded-RAM-to-VRAM DMA snapshot. `main` may contain newer,
 measured changes after that tag.
 
+For a clean clone, follow the tested native Windows setup, build, GPU check,
+small-model smoke test, GUI, and server flow in
+[`GETTING_STARTED.md`](GETTING_STARTED.md).
+
 ## Scope
 
 A large MoE model can be much larger than VRAM while activating only a small
