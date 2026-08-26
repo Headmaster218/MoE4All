@@ -2218,9 +2218,12 @@ impl MoePagerSession {
             .map(|pool| pool.pager.try_restore_loaned_slots())
             .sum();
         self.unified_generation = self.unified_pool.generation();
-        if restored != 0 {
+        // Phase changes and auxiliary clients may release elastic runtime ranges and make their
+        // loaned expert slots reclaimable. This is allocator topology detail, not a per-request
+        // status event, so keep it out of streamed terminal output unless debug tracing is enabled.
+        if restored != 0 && tracing::enabled!(tracing::Level::DEBUG) {
             let stats = self.unified_pool.stats();
-            tracing::info!(
+            tracing::debug!(
                 restored_slots = restored,
                 expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
                 llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),

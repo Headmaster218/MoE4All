@@ -1191,6 +1191,12 @@ pub struct VulkanBackend {
     /// arena/ring buffers free first; owned by the backend HANDLE, never `VulkanShared` — the Arc
     /// cycle lesson on `moe_pager`'s doc applies unchanged).
     dense_pager: crate::pager::DensePagerCell,
+    /// Pooled workspace retained across consecutive paged-MoE static executes. Paged decode plans
+    /// are intentionally rebuilt per token for router readback, so plan-owned scratch would be
+    /// dropped every token and make the unified arena restore then immediately re-loan an expert
+    /// slot. The adapter clears this cache only when execution switches between decode and
+    /// prefill; declaring it before `shared` also guarantees its Vulkan buffers drop first.
+    static_scratch: Mutex<adapter::StaticScratchCache>,
     /// Resident-weight sub-allocator (see [`BdaWeightArena`]) — `None` until the first weight alloc;
     /// `make_alloc` routes every `BufferUsage::Weights` here (the sole weight path).
     ///
@@ -2693,6 +2699,7 @@ impl VulkanBackend {
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
+            static_scratch: Mutex::new(adapter::StaticScratchCache::default()),
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
@@ -3779,6 +3786,7 @@ impl VulkanBackend {
             moe_pager: Arc::clone(&self.moe_pager),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
+            static_scratch: Mutex::new(adapter::StaticScratchCache::default()),
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),

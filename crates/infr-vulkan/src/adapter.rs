@@ -381,6 +381,68 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
 /// flash-attention partials (≈38 GB) and took the device down.
 type ScratchPool = HashMap<(&'static str, usize), Box<dyn Buffer>>;
 
+/// Lifetime of the pooled scratch used by paged static execution. Paged models rebuild their
+/// graph plan for every token, so this cache belongs to the model backend rather than the plan.
+/// A phase transition drops the old pool before the new phase allocates its differently-sized
+/// workspace; repeated executes in one phase keep the same buffers and therefore keep any expert
+/// slots loaned to LLM runtime stable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaticScratchPhase {
+    Decode,
+    Prefill,
+}
+
+#[derive(Default)]
+pub(crate) struct StaticScratchCache {
+    phase: Option<StaticScratchPhase>,
+    pool: ScratchPool,
+}
+
+impl StaticScratchCache {
+    fn enter(&mut self, phase: StaticScratchPhase) {
+        if self.phase != Some(phase) {
+            self.pool.clear();
+            self.phase = Some(phase);
+        }
+    }
+}
+
+fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> StaticScratchPhase {
+    if rows.saturating_mul(n_used) >= 3usize.saturating_mul(n_expert) {
+        StaticScratchPhase::Prefill
+    } else {
+        StaticScratchPhase::Decode
+    }
+}
+
+/// Classify the paged-MoE work represented by one static graph using the same `touch_all` boundary
+/// as [`execute_paged_moe`]. This keeps rows=1 prompt feeding and small speculative/MTP batches in
+/// Decode while selecting Prefill for the wide batches that switch residency strategy. `None`
+/// keeps graphs with no MoE work on the established local-pool path even when their backend also
+/// happens to own a pager.
+fn paged_static_phase(graph: &Graph) -> Option<StaticScratchPhase> {
+    let mut phase = None;
+    for op in &graph.ops {
+        let Op::MoeFfn {
+            x,
+            ne,
+            n_expert,
+            n_used,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let rows = graph.desc(*x).numel() / *ne as usize;
+        let op_phase = moe_static_phase(rows, *n_used as usize, *n_expert as usize);
+        phase = Some(op_phase);
+        if op_phase == StaticScratchPhase::Prefill {
+            return Some(StaticScratchPhase::Prefill);
+        }
+    }
+    phase
+}
+
 /// mmv (int8 dp4a decode GEMV) size gate for the m≥3 small-m PREFILL mrow path: below this
 /// weight-element count the dequant GEMV is already so short (<~10us) that the extra quant_q8
 /// dispatch's fixed bubble (~2-3us on a 7900 XTX) eats the kernel saving. Probe data
@@ -5361,6 +5423,20 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    // Paged decode plans are rebuilt per token, but their pooled workspace is shape-stable across
+    // the whole decode phase. Retain that pool on the model backend so freeing one token's scratch
+    // cannot restore an expert slot that the next token immediately has to borrow again. The
+    // existing unified execution gate serializes this model's executes, so the mutex is only a
+    // lifetime container rather than a hot-path contention point.
+    let mut cached_pool = if be_.moe_paged() {
+        paged_static_phase(graph).map(|phase| {
+            let mut cache = be_.static_scratch.lock().unwrap();
+            cache.enter(phase);
+            cache
+        })
+    } else {
+        None
+    };
     let scratch = alloc_scratch(be_, graph)?;
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
@@ -5443,7 +5519,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
-    let mut pool: ScratchPool = HashMap::new();
+    let mut local_pool: ScratchPool = HashMap::new();
+    let pool = match cached_pool.as_mut() {
+        Some(cache) => &mut cache.pool,
+        None => &mut local_pool,
+    };
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     let mut pstream = PagedStream::default();
 
@@ -5550,7 +5630,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     op,
                     &scratch,
                     bindings,
-                    &mut pool,
+                    pool,
                     &mut rec,
                     &mut pstream,
                     paged_moe_shared.get(&op_idx).copied(),
@@ -5589,7 +5669,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         &mode,
                         &mut transient,
                         &mut dyn_args,
-                        &mut pool,
+                        pool,
                         &mut mmv_memo,
                         Some(arena_addr),
                     ) {
@@ -5612,7 +5692,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mode,
             &mut transient,
             &mut dyn_args,
-            &mut pool,
+            pool,
             &mut mmv_memo,
             None,
         ) {
@@ -5622,7 +5702,12 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     for c in dyn_args.drain(..) {
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
-    transient.extend(pool.into_values());
+    // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
+    // the other transient allocations until the final submit drains. Paged buffers remain in the
+    // backend cache and are dropped only on a decode/prefill transition or model teardown.
+    if cached_pool.is_none() {
+        transient.extend(local_pool.into_values());
+    }
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
     last.finish().map_err(|e| be(e.to_string()))?;
@@ -7482,6 +7567,64 @@ mod tests {
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
+
+    struct TestBuffer(usize);
+
+    impl Buffer for TestBuffer {
+        fn len_bytes(&self) -> usize {
+            self.0
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn paged_static_scratch_lives_until_phase_transition() {
+        let mut cache = StaticScratchCache::default();
+        cache.enter(StaticScratchPhase::Decode);
+        cache
+            .pool
+            .insert(("test_decode", 4), Box::new(TestBuffer(4)));
+
+        cache.enter(StaticScratchPhase::Decode);
+        assert_eq!(
+            cache.pool.len(),
+            1,
+            "same-phase execute must retain scratch"
+        );
+
+        cache.enter(StaticScratchPhase::Prefill);
+        assert!(
+            cache.pool.is_empty(),
+            "decode scratch must drop on the decode-to-prefill transition"
+        );
+        cache
+            .pool
+            .insert(("test_prefill", 8), Box::new(TestBuffer(8)));
+
+        cache.enter(StaticScratchPhase::Prefill);
+        assert_eq!(
+            cache.pool.len(),
+            1,
+            "same-phase prefill must retain scratch"
+        );
+
+        cache.enter(StaticScratchPhase::Decode);
+        assert!(
+            cache.pool.is_empty(),
+            "prefill scratch must drop on the prefill-to-decode transition"
+        );
+    }
+
+    #[test]
+    fn paged_static_phase_matches_touch_all_boundary() {
+        assert_eq!(moe_static_phase(1, 8, 512), StaticScratchPhase::Decode);
+        assert_eq!(moe_static_phase(16, 8, 512), StaticScratchPhase::Decode);
+        assert_eq!(moe_static_phase(191, 8, 512), StaticScratchPhase::Decode);
+        assert_eq!(moe_static_phase(192, 8, 512), StaticScratchPhase::Prefill);
+    }
 
     /// Read a `#define <name> <integer>` back out of GLSL source. Panics when the define is gone —
     /// a shader that no longer states its bound is exactly the drift this guards.
