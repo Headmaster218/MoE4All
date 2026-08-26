@@ -20,17 +20,23 @@ bilingual wizard, and choose automatic configuration.
 > development and validation platform. Other Vulkan GPUs may work, but they do
 > not currently receive the same compatibility and performance coverage.
 
-## Latest milestone: Qwen3.8-Flash-Next first boot
+## Latest milestone: full Qwen3.8-Flash-Next support
 
 Qwen3.8-Flash-Next now generates stable, coherent output through MoE4All on a
 consumer **AMD Radeon RX 7900 XTX**, including correct answers to simple math
 and reasoning questions. The first run used Windows 11, a Q2 quantization, and
 approximately **40 GB of system memory**.
 
-This is an early, short-context **first boot**. QSA is not integrated yet, so
-the current context is temporarily limited to roughly 2K tokens. The following
-are representative results and ranges from three early runs, not final
-long-context or fully optimized performance.
+The `qwen4exp` text path now covers the released model's four-stream
+hyper-connections, gated DeltaNet/full-attention layer mix, SSD-backed PLE,
+paged MoE, and **QSA sparse attention**. QSA maintains a separate F16 index-key
+cache, selects complete history blocks, and preserves the incomplete causal
+tail, removing the first implementation's temporary roughly 2K context limit.
+
+The first four rows below are representative values from three short runs. The
+last two are the newly completed QSA path checks. Their `tg1` workload verifies
+that both real and synthetic KV cross the QSA activation boundary; it is not a
+final long-context throughput measurement.
 
 | Test | Representative result | Three-run range |
 |---|---:|---:|
@@ -38,9 +44,13 @@ long-context or fully optimized performance.
 | Prefill at context 0, pp32 | **46.6 tok/s** | 46.2-47.1 tok/s |
 | Decode at context 1024, tg16 | **41.9 tok/s** | 41.4-42.7 tok/s |
 | Incremental prefill at context 1024, pp32 | **42.6 tok/s** | 42.1-43.3 tok/s |
+| QSA decode after real prefill to depth 2052, tg1 | **32.9 tok/s** | One path-validation run |
+| QSA decode after synthetic depth 4096, tg1 | **22.9 tok/s** | One path-validation run |
 
-The next priority is QSA correctness and long-context support, followed by
-kernel and end-to-end performance optimization.
+QSA currently uses a correctness-first exact block-selection implementation.
+Long-context kernels and end-to-end throughput still have room to improve, but
+the model architecture, cache allocation, and sparse-attention data path are
+now complete.
 
 ## Start in three steps
 
@@ -119,6 +129,8 @@ capabilities; rows use different workloads and are not directly comparable.
 | Qwen3.6-35B-A3B prefill 4,096 after 250K synthetic depth | Q8 K/V | **477.9 tok/s** |
 | Qwen3.6-35B-A3B prefill 4,096 at depth 0 | Q8 K/V | **2,855.6 tok/s** |
 | Qwen3.5-122B-A10B decode at depth 0 | F16 K/V, 45 GiB bounded RAM, 3 repetitions | **23.2 tok/s** |
+| Qwen3.8-Flash-Next QSA decode after real depth 2052 | Q2, F16 K/V, 40 GiB bounded RAM, tg1 path check | **32.9 tok/s** |
+| Qwen3.8-Flash-Next QSA decode after synthetic depth 4096 | Q2, F16 K/V, 40 GiB bounded RAM, tg1 path check | **22.9 tok/s** |
 
 Full conditions and engineering history:
 
@@ -133,7 +145,7 @@ Full conditions and engineering history:
 | Llama and Llama 4 | `llama`, `llama4` | Dense and MoE Vulkan inference |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`, `qwen3`, `qwen3moe` | Dense and Qwen3 MoE |
 | Qwen3.5 / Qwen3.6 | `qwen35`, `qwen35moe` | Gated DeltaNet, attention, and paged MoE |
-| Qwen3.8 Flash Next | `qwen4exp` | Early short-context Vulkan support; QSA and long context are in progress |
+| Qwen3.8 Flash Next | `qwen4exp` | Vulkan text inference with hyper-connections, gated DeltaNet, PLE, QSA, and paged MoE |
 | Gemma 3 / Gemma 4 | `gemma3`, `gemma4` | Dense, MoE, and E2B variants |
 | Ling 3.0 Flash | `bailingmoe3` | KDA, gated MLA, 512 experts, and RAM/SSD paging |
 | DeepSeek V4 Flash | `deepseek4` | FP8 KV, MXFP4 indexer cache, and paged MoE |

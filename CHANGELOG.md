@@ -6,6 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-27
+
+### Highlights
+
+- **Qwen3.8-Flash-Next (`qwen4exp`) text inference is fully wired on Vulkan.**
+  The implementation covers the released model's four-stream hyper-connections,
+  gated DeltaNet/full-attention layer mix, SSD-backed PLE lookup, paged MoE
+  experts, tokenizer/config plumbing, and model-specific thinking/non-thinking
+  sampling defaults. The released UD-Q2_K_XL GGUF has generated coherent chat
+  and passed short-context decode/prefill smoke tests on an RX 7900 XTX.
+- **QSA sparse attention and its index-key cache are implemented end to end.**
+  Full-attention layers cache raw index keys, pool and score complete blocks,
+  select the exact top blocks, preserve the incomplete causal tail, gather the
+  corresponding F16 K/V rows, and run the existing attention kernel over the
+  chronological sparse view. CPU reference code and Vulkan parity coverage
+  verify index selection and byte-exact K/V gathering. Real-cache depth 2052
+  and synthetic depth 4096 runs both crossed the old approximately 2K boundary
+  without a device loss.
+- **Large-model host caching keeps adaptive RAM headroom.** Automatic host-cache
+  sizing now leaves enough memory for runtime allocations and avoids driving
+  Windows into system paging while a bounded SSD/RAM expert tier is active.
+- **The Windows release workflow is more complete.** The bilingual wizard now
+  accepts a pasted model path directly from its history prompt, and portable
+  archives include both Chinese and English README files.
+
 ### Changed
 
 - **`infr serve --parallel` (`-n`, `--np`) defaults to 1 slot, was 4.** Each
