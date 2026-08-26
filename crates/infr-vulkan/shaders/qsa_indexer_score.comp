@@ -1,0 +1,85 @@
+#version 460
+// Qwen3.8 QSA: score one complete compressed block per workgroup. Raw index keys are cached
+// before norm/RoPE; a block is mean-pooled, RMS-normalised and roped at its first token position.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint kv_len;
+    uint n_head;
+    uint head_dim;
+    uint ratio;
+    uint rope_dim;
+    float theta;
+    float eps;
+    float scale;
+} pc;
+layout(binding = 0) readonly buffer QB { uint q[]; };
+layout(binding = 1) readonly buffer KB { uint k[]; };
+layout(binding = 2) readonly buffer NB { float norm[]; };
+layout(binding = 3) writeonly buffer SB { float scores[]; };
+
+shared float keyv[128];
+shared float rmsv[128];
+shared float part[4][128];
+
+float qread(uint i) {
+    uint w = q[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+}
+float kread(uint i) {
+    uint w = k[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint blocks = pc.kv_len / pc.ratio;
+    if (block >= blocks) { return; }
+    uint d = gl_LocalInvocationID.x;
+
+    float v = 0.0;
+    for (uint r = 0u; r < pc.ratio; ++r) {
+        v += kread((block * pc.ratio + r) * pc.head_dim + d);
+    }
+    v /= float(pc.ratio);
+    v = unpackHalf2x16(packHalf2x16(vec2(v, 0.0))).x;
+    keyv[d] = v;
+    rmsv[d] = v * v;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (d < stride) { rmsv[d] += rmsv[d + stride]; }
+        barrier();
+    }
+    float kn = v * inversesqrt(rmsv[0] / float(pc.head_dim) + pc.eps) * norm[d];
+    keyv[d] = kn;
+    barrier();
+
+    if (d < pc.rope_dim) {
+        uint pair = d >> 1u;
+        uint base = pair << 1u;
+        float angle = float(block * pc.ratio) * pow(pc.theta, -2.0 * float(pair) / float(pc.rope_dim));
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = keyv[base];
+        float b = keyv[base + 1u];
+        kn = (d & 1u) == 0u ? a * c - b * s : a * s + b * c;
+    }
+
+    for (uint h = 0u; h < 4u; ++h) {
+        part[h][d] = h < pc.n_head ? qread(h * pc.head_dim + d) * kn : 0.0;
+    }
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (d < stride) {
+            for (uint h = 0u; h < 4u; ++h) { part[h][d] += part[h][d + stride]; }
+        }
+        barrier();
+    }
+    if (d == 0u) {
+        float score = 0.0;
+        for (uint h = 0u; h < pc.n_head; ++h) { score += max(part[h][0], 0.0); }
+        scores[block] = score * pc.scale;
+    }
+}

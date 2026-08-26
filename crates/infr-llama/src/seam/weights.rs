@@ -113,6 +113,16 @@ pub(super) struct AttnW {
     pub(super) q_norm: Option<TensorId>,
     pub(super) k_norm: Option<TensorId>,
     pub(super) wo: TensorId,
+    /// Qwen3.8 QSA block-indexer weights. Present only on its full-attention layers.
+    pub(super) qsa: Option<QsaW>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct QsaW {
+    pub(super) k_norm: TensorId,
+    pub(super) k_proj: TensorId,
+    pub(super) q_norm: TensorId,
+    pub(super) q_proj: TensorId,
 }
 
 /// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/qwen35.md`). Unlike `AttnW` this
@@ -364,6 +374,9 @@ pub(crate) struct SeamKv {
     pub(super) stable: std::sync::Arc<SessionStable>,
     pub(super) kbufs: Vec<Box<dyn Buffer>>,
     pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    /// Qwen3.8 QSA raw index-key cache. Full-attention layers own one F16 row per token;
+    /// recurrent layers have no entry.
+    pub(super) qsa_kbufs: Vec<Option<Box<dyn Buffer>>>,
     /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
     /// forked slot sizes + copies its buffers to match this slot's layout.
     pub(super) k_fmt: DType,
@@ -677,6 +690,13 @@ impl SeamKv {
                 be.upload(state.as_ref(), &zeros)
                     .map_err(|e| anyhow!("{e}"))?;
             }
+            if cfg.qwen4exp {
+                for cache in self.qsa_kbufs.iter().flatten() {
+                    let zeros = vec![0u8; cache.len_bytes()];
+                    be.upload(cache.as_ref(), &zeros)
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
+            }
         } else if cfg.deepseek4 {
             // Synthetic depth represents deterministic zero history. V4's compressor rings and
             // compressed caches survive ordinary token resets, so clear both packed state buffers
@@ -837,6 +857,7 @@ impl SeamKv {
         let npl = cfg.n_embd_per_layer.max(1);
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for l in 0..cfg.n_layer {
             let (k_bytes, v_bytes) = crate::seam::layer_state_bytes(
                 cfg,
@@ -855,6 +876,15 @@ impl SeamKv {
                 be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
+            let qsa_bytes = crate::seam::qsa_cache_bytes(cfg, l, self.max_ctx);
+            qsa_kbufs.push(if qsa_bytes > 0 {
+                Some(
+                    be.alloc(qsa_bytes, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            });
         }
         // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
         // and the source's own sizes are right here — so check them instead of trusting two call
@@ -873,12 +903,24 @@ impl SeamKv {
                     ));
                 }
             }
+            match (&qsa_kbufs[l], &self.qsa_kbufs[l]) {
+                (Some(forked), Some(src)) if forked.len_bytes() == src.len_bytes() => {}
+                (None, None) => {}
+                (forked, src) => {
+                    return Err(anyhow!(
+                        "forked QSA cache geometry differs from its source at layer {l}: {:?} vs {:?}",
+                        forked.as_ref().map(|b| b.len_bytes()),
+                        src.as_ref().map(|b| b.len_bytes())
+                    ));
+                }
+            }
         }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             stable: std::sync::Arc::clone(&self.stable),
             kbufs,
             vbufs,
+            qsa_kbufs,
             k_fmt: self.k_fmt,
             v_fmt: self.v_fmt,
             hidden_buf: be

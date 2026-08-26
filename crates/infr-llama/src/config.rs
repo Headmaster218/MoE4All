@@ -1682,7 +1682,15 @@ impl Config {
                 if recurrent && ratio != 0 {
                     bail!(
                         "qwen4exp attention.compress_ratios[{il}] is {ratio} on a recurrent \
-                         layer; recurrent layers must use ratio 0"
+                        layer; recurrent layers must use ratio 0"
+                    );
+                }
+                if !recurrent
+                    && (ratio == 0 || indexer_top_k == 0 || !indexer_top_k.is_multiple_of(ratio))
+                {
+                    bail!(
+                        "qwen4exp full-attention layer {il} requires a nonzero compression ratio \
+                         that divides indexer top_k; got ratio {ratio}, top_k {indexer_top_k}"
                     );
                 }
             }

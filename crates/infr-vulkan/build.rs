@@ -664,6 +664,9 @@ fn main() {
         ("dsv4_indexer_score", "dsv4_indexer_score", &[]),
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
+        ("qsa_indexer_score", "qsa_indexer_score", &[]),
+        ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
+        ("qsa_gather", "qsa_gather", &[]),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
         // pre-only form, whose `mixes` is the pre chunk alone.

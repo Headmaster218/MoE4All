@@ -419,6 +419,39 @@ pub enum Op {
         head_dim: u32,
         raw_window: u32,
     },
+    /// Qwen3.8 QSA block selector. `k_cache` stores one raw (unnormalised, unroped) F16 index-key
+    /// row per token. Complete `ratio`-token blocks are mean-pooled, RMS-normalised and roped at
+    /// their first token position before scoring against the already normalised/roped query heads.
+    /// `dst` contains the selected block indices in chronological order.
+    QsaIndexer {
+        q: TensorId,
+        k_cache: TensorId,
+        k_norm: TensorId,
+        dst: TensorId,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        scale: f32,
+    },
+    /// Gather QSA-selected complete blocks plus the always-visible incomplete tail from the
+    /// ordinary full-attention K/V caches into packed F16 scratch consumed by `Op::Attention`.
+    QsaGather {
+        k_cache: TensorId,
+        v_cache: TensorId,
+        indices: TensorId,
+        k_dst: TensorId,
+        v_dst: TensorId,
+        selected_blocks: u32,
+        complete_blocks: u32,
+        tail: u32,
+        ratio: u32,
+        row_elems: u32,
+    },
     /// Scaled-dot-product attention. `q` is `rows × n_head × head_dim`; `k_cache`/`v_cache` hold
     /// `kv_len` rows of `n_kv × head_dim`. GQA when `n_head > n_kv`. `dst` is `rows × n_head ×
     /// head_dim`. `pos` is the absolute position of the first query row (for masking).
@@ -1241,6 +1274,8 @@ impl Op {
             Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
             Op::Dsv4Indexer { .. } => "Dsv4Indexer",
             Op::Dsv4Gather { .. } => "Dsv4Gather",
+            Op::QsaIndexer { .. } => "QsaIndexer",
+            Op::QsaGather { .. } => "QsaGather",
             Op::Attention { .. } => "Attention",
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
@@ -1371,6 +1406,21 @@ impl Op {
                 r.extend(indices);
                 (r, vec![dst])
             }
+            Op::QsaIndexer {
+                q,
+                k_cache,
+                k_norm,
+                dst,
+                ..
+            } => (vec![q, k_cache, k_norm], vec![dst]),
+            Op::QsaGather {
+                k_cache,
+                v_cache,
+                indices,
+                k_dst,
+                v_dst,
+                ..
+            } => (vec![k_cache, v_cache, indices], vec![k_dst, v_dst]),
             Op::Attention {
                 q,
                 k_cache,
@@ -1617,6 +1667,15 @@ impl Graph {
                     } => {
                         set.insert(*raw_cache);
                         set.insert(*comp_cache);
+                    }
+                    Op::QsaIndexer { k_cache, .. } => {
+                        set.insert(*k_cache);
+                    }
+                    Op::QsaGather {
+                        k_cache, v_cache, ..
+                    } => {
+                        set.insert(*k_cache);
+                        set.insert(*v_cache);
                     }
                     Op::Attention {
                         k_cache, v_cache, ..

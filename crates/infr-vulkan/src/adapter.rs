@@ -206,7 +206,9 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4Compress { .. }
             | Op::Dsv4CacheWrite { .. }
             | Op::Dsv4Indexer { .. }
-            | Op::Dsv4Gather { .. } => return false,
+            | Op::Dsv4Gather { .. }
+            | Op::QsaIndexer { .. }
+            | Op::QsaGather { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -2569,6 +2571,93 @@ fn lower_op(
                 *head_dim,
                 *raw_window,
                 indices.is_some(),
+            );
+        }
+        Op::QsaIndexer {
+            q,
+            k_cache,
+            k_norm,
+            dst,
+            kv_len,
+            n_head,
+            head_dim,
+            top_blocks,
+            ratio,
+            rope_dim,
+            theta,
+            eps,
+            scale,
+        } => {
+            let blocks = *kv_len / *ratio.max(&1);
+            if *head_dim != 128
+                || *n_head == 0
+                || *n_head > 4
+                || *ratio == 0
+                || *rope_dim > *head_dim
+                || !rope_dim.is_multiple_of(2)
+                || *top_blocks == 0
+                || *top_blocks > blocks
+                || *top_blocks > 512
+            {
+                return Err(be(format!(
+                    "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
+                     ratio>0 and 0<top_blocks<=min(blocks,512); got head_dim={head_dim} \
+                     n_head={n_head} rope_dim={rope_dim} ratio={ratio} top_blocks={top_blocks} \
+                     kv_len={kv_len}"
+                )));
+            }
+            let sk = pooled(pool, be_, "qsa_indexer_scores", blocks as usize * 4)?;
+            rec.qsa_indexer(
+                r(*q)?,
+                r(*k_cache)?,
+                r(*k_norm)?,
+                pool[&sk].as_ref(),
+                r(*dst)?,
+                *kv_len,
+                *n_head,
+                *head_dim,
+                *top_blocks,
+                *ratio,
+                *rope_dim,
+                *theta,
+                *eps,
+                *scale,
+            );
+        }
+        Op::QsaGather {
+            k_cache,
+            v_cache,
+            indices,
+            k_dst,
+            v_dst,
+            selected_blocks,
+            complete_blocks,
+            tail,
+            ratio,
+            row_elems,
+        } => {
+            if *ratio == 0
+                || *tail >= *ratio
+                || *selected_blocks > *complete_blocks
+                || *row_elems == 0
+                || !row_elems.is_multiple_of(2)
+            {
+                return Err(be(format!(
+                    "vulkan Op::QsaGather invalid geometry: selected={selected_blocks} \
+                     complete={complete_blocks} tail={tail} ratio={ratio} row_elems={row_elems}"
+                )));
+            }
+            rec.qsa_gather(
+                r(*k_cache)?,
+                r(*v_cache)?,
+                r(*indices)?,
+                r(*k_dst)?,
+                r(*v_dst)?,
+                *selected_blocks,
+                *complete_blocks,
+                *tail,
+                *ratio,
+                *row_elems,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst

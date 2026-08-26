@@ -8282,6 +8282,112 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_indexer(
+        &self,
+        q: &dyn Buffer,
+        k_cache: &dyn Buffer,
+        k_norm: &dyn Buffer,
+        scores: &dyn Buffer,
+        dst: &dyn Buffer,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        scale: f32,
+    ) {
+        let blocks = kv_len / ratio;
+        let score_k = self.be.kernel(
+            "qsa_indexer_score",
+            crate::gemm::qsa_indexer_score_spv(),
+            4,
+            32,
+        );
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&kv_len.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_head.to_ne_bytes());
+        push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
+        push[12..16].copy_from_slice(&ratio.to_ne_bytes());
+        push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
+        push[20..24].copy_from_slice(&theta.to_ne_bytes());
+        push[24..28].copy_from_slice(&eps.to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch_wide(
+            score_k,
+            &[
+                Self::vkb(q),
+                Self::vkb(k_cache),
+                Self::vkb(k_norm),
+                Self::vkb(scores),
+            ],
+            1,
+            &push,
+            blocks,
+        );
+
+        let topk_k = self.be.kernel(
+            "qsa_indexer_topk",
+            crate::gemm::qsa_indexer_topk_spv(),
+            2,
+            8,
+        );
+        let mut topk_push = [0u8; 8];
+        topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+        topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+        self.dispatch(
+            topk_k,
+            &[Self::vkb(scores), Self::vkb(dst)],
+            1,
+            &topk_push,
+            1,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_gather(
+        &self,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        indices: &dyn Buffer,
+        kd: &dyn Buffer,
+        vd: &dyn Buffer,
+        selected: u32,
+        complete: u32,
+        tail: u32,
+        ratio: u32,
+        row_elems: u32,
+    ) {
+        let row_pairs = row_elems / 2;
+        let total_pairs = (selected * ratio + tail) * row_pairs;
+        let kernel = self
+            .be
+            .kernel("qsa_gather", crate::gemm::qsa_gather_spv(), 5, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&selected.to_ne_bytes());
+        push[4..8].copy_from_slice(&complete.to_ne_bytes());
+        push[8..12].copy_from_slice(&tail.to_ne_bytes());
+        push[12..16].copy_from_slice(&ratio.to_ne_bytes());
+        push[16..20].copy_from_slice(&row_pairs.to_ne_bytes());
+        push[20..24].copy_from_slice(&total_pairs.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(indices),
+                Self::vkb(kd),
+                Self::vkb(vd),
+            ],
+            2,
+            &push,
+            total_pairs.div_ceil(256),
+        );
+    }
+
     /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
     /// Selected for Vulkan single-token decode unless disabled. Push constants 32B (adds
     /// src_stride to standard).

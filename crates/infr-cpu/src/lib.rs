@@ -2148,6 +2148,137 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::QsaIndexer {
+                    q,
+                    k_cache,
+                    k_norm,
+                    dst,
+                    kv_len,
+                    n_head,
+                    head_dim,
+                    top_blocks,
+                    ratio,
+                    rope_dim,
+                    theta,
+                    eps,
+                    scale,
+                } => {
+                    let (kv_len, nh, hd, top_blocks, ratio, rope_dim) = (
+                        kv_len as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        top_blocks as usize,
+                        ratio as usize,
+                        rope_dim as usize,
+                    );
+                    let blocks = kv_len / ratio;
+                    let q = &vals[q.0 as usize];
+                    let norm = &vals[k_norm.0 as usize];
+                    let cache = cpu_buf(
+                        bindings
+                            .get(k_cache)
+                            .expect("cpu backend: unbound QSA index-key cache"),
+                    )
+                    .read();
+                    let raw = dequant_cache_prefix(&cache, DType::F16, blocks * ratio * hd);
+                    let mut scores = vec![0.0f32; blocks];
+                    let mut key = vec![0.0f32; hd];
+                    for block in 0..blocks {
+                        key.fill(0.0);
+                        for r in 0..ratio {
+                            let src = (block * ratio + r) * hd;
+                            for d in 0..hd {
+                                key[d] += raw[src + d] / ratio as f32;
+                            }
+                        }
+                        for v in &mut key {
+                            *v = half::f16::from_f32(*v).to_f32();
+                        }
+                        let inv = (key.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
+                            .sqrt()
+                            .recip();
+                        for d in 0..hd {
+                            key[d] *= inv * norm[d];
+                        }
+                        let pos = (block * ratio) as f32;
+                        for pair in 0..rope_dim / 2 {
+                            let d = pair * 2;
+                            let angle = pos * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
+                            let (sin, cos) = angle.sin_cos();
+                            let (a, b) = (key[d], key[d + 1]);
+                            key[d] = a * cos - b * sin;
+                            key[d + 1] = a * sin + b * cos;
+                        }
+                        let mut score = 0.0f32;
+                        for h in 0..nh {
+                            score += dot(&q[h * hd..(h + 1) * hd], &key).max(0.0) * scale;
+                        }
+                        scores[block] = score;
+                    }
+                    let selected = top_blocks.min(blocks);
+                    let mut order: Vec<usize> = (0..blocks).collect();
+                    if selected > 0 {
+                        order.select_nth_unstable_by(selected - 1, |&a, &b| {
+                            scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b))
+                        });
+                    }
+                    order.truncate(selected);
+                    order.sort_unstable();
+                    vals[dst.0 as usize] = order.into_iter().map(|i| i as f32).collect();
+                }
+                Op::QsaGather {
+                    k_cache,
+                    v_cache,
+                    indices,
+                    k_dst,
+                    v_dst,
+                    selected_blocks,
+                    complete_blocks,
+                    tail,
+                    ratio,
+                    row_elems,
+                } => {
+                    let (selected, complete, tail, ratio, row) = (
+                        selected_blocks as usize,
+                        complete_blocks as usize,
+                        tail as usize,
+                        ratio as usize,
+                        row_elems as usize,
+                    );
+                    let visible = complete * ratio + tail;
+                    let read_cache = |id: TensorId| {
+                        let b = bindings
+                            .get(id)
+                            .expect("cpu backend: unbound QSA K/V cache");
+                        dequant_cache_prefix(&cpu_buf(b).read(), g.desc(id).dtype, visible * row)
+                    };
+                    let ks = read_cache(k_cache);
+                    let vs = read_cache(v_cache);
+                    let out_rows = selected * ratio + tail;
+                    let mut ko = vec![0.0f32; out_rows * row];
+                    let mut vo = vec![0.0f32; out_rows * row];
+                    let ids = &vals[indices.0 as usize];
+                    let mut dst_row = 0usize;
+                    for &id in ids.iter().take(selected) {
+                        let block = id as usize;
+                        for r in 0..ratio {
+                            let src = (block * ratio + r) * row;
+                            let dst = dst_row * row;
+                            ko[dst..dst + row].copy_from_slice(&ks[src..src + row]);
+                            vo[dst..dst + row].copy_from_slice(&vs[src..src + row]);
+                            dst_row += 1;
+                        }
+                    }
+                    for r in 0..tail {
+                        let src = (complete * ratio + r) * row;
+                        let dst = dst_row * row;
+                        ko[dst..dst + row].copy_from_slice(&ks[src..src + row]);
+                        vo[dst..dst + row].copy_from_slice(&vs[src..src + row]);
+                        dst_row += 1;
+                    }
+                    vals[k_dst.0 as usize] = ko;
+                    vals[v_dst.0 as usize] = vo;
+                }
                 Op::Attention {
                     q,
                     k_cache,

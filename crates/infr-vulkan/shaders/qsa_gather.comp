@@ -1,0 +1,35 @@
+#version 460
+// Gather selected complete QSA blocks and the incomplete causal tail from ordinary packed-F16 KV.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint selected;
+    uint complete;
+    uint tail;
+    uint ratio;
+    uint row_pairs;
+    uint total_pairs;
+} pc;
+layout(binding = 0) readonly buffer KB { uint k[]; };
+layout(binding = 1) readonly buffer VB { uint v[]; };
+layout(binding = 2) readonly buffer IB { uint indices[]; };
+layout(binding = 3) writeonly buffer KDB { uint kd[]; };
+layout(binding = 4) writeonly buffer VDB { uint vd[]; };
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= pc.total_pairs) { return; }
+    uint out_row = pair / pc.row_pairs;
+    uint in_row = pair % pc.row_pairs;
+    uint selected_rows = pc.selected * pc.ratio;
+    uint src_row;
+    if (out_row < selected_rows) {
+        uint slot = out_row / pc.ratio;
+        src_row = indices[slot] * pc.ratio + out_row % pc.ratio;
+    } else {
+        src_row = pc.complete * pc.ratio + out_row - selected_rows;
+    }
+    uint src = src_row * pc.row_pairs + in_row;
+    kd[pair] = k[src];
+    vd[pair] = v[src];
+}

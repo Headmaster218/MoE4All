@@ -1494,16 +1494,31 @@ pub(crate) fn kv_bytes_estimate_fmt(
             .ple_head_dim
             .saturating_mul(cfg.ple_ngram_size.saturating_sub(1))
             .saturating_mul(cfg.ple_heads_per_ngram);
-        hc_dim
+        let qsa: u64 = (0..cfg.n_layer)
+            .map(|l| qsa_cache_bytes(cfg, l, want_ctx) as u64)
+            .sum();
+        (hc_dim
             .saturating_add(ple_hist)
             .saturating_add(ple_in)
-            .saturating_mul(4) as u64
+            .saturating_mul(4) as u64)
+            .saturating_add(qsa)
     } else {
         0
     };
     primary
         .saturating_add(recurrent_checkpoint_bytes(cfg))
         .saturating_add(qwen4_extra)
+}
+
+/// Qwen3.8 QSA stores the unnormalised, unroped single index-key head for every token on each
+/// full-attention layer. The official cache dtype is BF16; infr's v1 QSA path keeps the same
+/// two-byte footprint in F16, matching the currently supported Qwen3.8 KV path.
+pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+    if cfg.qwen4exp && cfg.is_qwen_hybrid_attn_layer(layer) {
+        ctx.saturating_mul(cfg.indexer_head_size).saturating_mul(2)
+    } else {
+        0
+    }
 }
 
 /// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
@@ -4813,6 +4828,24 @@ mod seam_helper_tests {
             ssm_dt_rank: 16,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn qwen38_qsa_cache_prices_one_f16_index_key_row_per_full_layer() {
+        let cfg = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            full_attn_interval: 4,
+            indexer_head_size: 128,
+            ..Default::default()
+        };
+        let ctx = 262_144usize;
+        assert_eq!(super::qsa_cache_bytes(&cfg, 0, ctx), 0);
+        assert_eq!(super::qsa_cache_bytes(&cfg, 3, ctx), ctx * 128 * 2);
+        let total: usize = (0..cfg.n_layer)
+            .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
+            .sum();
+        assert_eq!(total, 768 * 1024 * 1024);
     }
 
     fn deepseek4_cache_config() -> Config {

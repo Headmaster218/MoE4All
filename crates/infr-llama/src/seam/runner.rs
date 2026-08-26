@@ -7,8 +7,8 @@ use super::sc::{
 };
 use super::weights::{
     AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW,
-    KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QwenHcW, QwenLayerHcW, QwenPleW, SeamKv,
-    SeamWeights, SessionStable, TurnRecurrentCkpt,
+    KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QsaW, QwenHcW, QwenLayerHcW, QwenPleW,
+    SeamKv, SeamWeights, SessionStable, TurnRecurrentCkpt,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
@@ -137,6 +137,7 @@ fn bind_layer_io<'a>(
     yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
     kbufs: &'a [Box<dyn Buffer>],
     vbufs: &'a [Box<dyn Buffer>],
+    qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
     wbufs: &'a [Box<dyn Buffer>],
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
@@ -151,6 +152,9 @@ fn bind_layer_io<'a>(
     for l in 0..n_layer {
         b.bind(h.k_cache[l], kbufs[l].as_ref());
         b.bind(h.v_cache[l], vbufs[l].as_ref());
+        if let (Some(id), Some(buf)) = (h.qsa_k_cache[l], &qsa_kbufs[l]) {
+            b.bind(id, buf.as_ref());
+        }
     }
     for (i, wid) in h.weights.iter().enumerate() {
         b.bind(*wid, wbufs[i].as_ref());
@@ -394,6 +398,7 @@ pub(super) struct DecodeHandles {
     ple_state: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
+    qsa_k_cache: Vec<Option<TensorId>>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
@@ -459,19 +464,6 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
-    if c.qwen4exp {
-        let ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
-        let exact_ctx = c.indexer_top_k.saturating_add(ratio - 1);
-        if want_ctx > exact_ctx {
-            return Err(anyhow!(
-                "qwen4exp v1 runs full attention exactly only through {exact_ctx} tokens (QSA \
-                 budget {} + at most {} tail tokens); requested context {want_ctx}. Use --ctx \
-                 {exact_ctx} or smaller until the QSA indexer is implemented",
-                c.indexer_top_k,
-                ratio - 1,
-            ));
-        }
-    }
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -1050,6 +1042,16 @@ pub(crate) fn generate_dense_backend(
             if !is_delta && !is_mla && !is_kda && !is_dsv4 {
                 wload(&[&p("attn_output.weight")])?;
             }
+            if c.qwen4exp && c.is_qwen_hybrid_attn_layer(l) {
+                for name in [
+                    "indexer.k_norm.weight",
+                    "indexer.k_proj.weight",
+                    "indexer.q_norm.weight",
+                    "indexer.q_proj.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+            }
             if c.is_ple_layer(l) {
                 for name in [
                     "ple_key.weight",
@@ -1330,6 +1332,7 @@ pub(crate) fn generate_dense_backend(
         // token; V is an aliased prefix view — no separate v_cache.
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for l in 0..c.n_layer {
             // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally
             // only, so position 0 stays eligible for every query row and a ring that had wrapped
@@ -1365,6 +1368,15 @@ pub(crate) fn generate_dense_backend(
                 be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
+            let qsa_bytes = crate::seam::qsa_cache_bytes(c, l, want_ctx);
+            qsa_kbufs.push(if qsa_bytes > 0 {
+                Some(
+                    be.alloc(qsa_bytes, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            });
         }
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
         // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
@@ -1463,6 +1475,7 @@ pub(crate) fn generate_dense_backend(
             stable: std::sync::Arc::clone(&stable),
             kbufs,
             vbufs,
+            qsa_kbufs,
             k_fmt,
             v_fmt,
             hidden_buf,
@@ -1509,6 +1522,7 @@ pub(crate) fn generate_dense_backend(
         stable: _,
         kbufs,
         vbufs,
+        qsa_kbufs,
         k_fmt: _,
         v_fmt: _,
         hidden_buf,
@@ -1970,12 +1984,14 @@ pub(crate) fn generate_dense_backend(
         // `generate_dense_backend` and `MixerW::DeltaNet`'s use of them below).
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
+        let mut qsa_k_cache = Vec::new();
         for l in 0..c.n_layer {
             if c.is_recurrent_layer(l) {
                 let conv_elems = (c.ssm_d_conv - 1) * c.recurrent_conv_channels();
                 let s_elems = c.recurrent_state_elems();
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
+                qsa_k_cache.push(None);
                 continue;
             }
             if c.deepseek4 {
@@ -1988,6 +2004,7 @@ pub(crate) fn generate_dense_backend(
                     vec![layout.state_bytes.div_ceil(4)],
                     DType::U32,
                 )));
+                qsa_k_cache.push(None);
                 continue;
             }
             // Declared rows MUST equal the allocation above — same widths from the same helper
@@ -1998,6 +2015,10 @@ pub(crate) fn generate_dense_backend(
             let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
             k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
             v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
+            qsa_k_cache.push(
+                (crate::seam::qsa_cache_bytes(c, l, max_ctx) > 0)
+                    .then(|| g.input(f16d(max_ctx * c.indexer_head_size))),
+            );
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
@@ -2165,6 +2186,12 @@ pub(crate) fn generate_dense_backend(
                     (None, None)
                 };
                 let wo = wpush(&mut g, &mut weights);
+                let qsa = (c.qwen4exp && c.is_qwen_hybrid_attn_layer(l)).then(|| QsaW {
+                    k_norm: wpush(&mut g, &mut weights),
+                    k_proj: wpush(&mut g, &mut weights),
+                    q_norm: wpush(&mut g, &mut weights),
+                    q_proj: wpush(&mut g, &mut weights),
+                });
                 MixerW::Attn(AttnW {
                     wq,
                     wk,
@@ -2175,6 +2202,7 @@ pub(crate) fn generate_dense_backend(
                     q_norm,
                     k_norm,
                     wo,
+                    qsa,
                 })
             };
             // DeepSeek V4's two hyper-connection triples, in `wload`'s order: attn `(fn, base,
@@ -2486,6 +2514,32 @@ pub(crate) fn generate_dense_backend(
         let q16 = g.internal(f16d(batch * max_qrow));
         let k16 = g.internal(f16d(batch * max_kvrow));
         let attn = g.internal(f32d(batch * max_qrow));
+        // Qwen3.8 QSA scratch. The model runs one token at a time, so one projected query and raw
+        // key row are reused across all full-attention layers. Packed K/V holds at most the fixed
+        // token budget plus an incomplete compression block.
+        let qsa_ratio = if c.qwen4exp {
+            c.compress_ratios.iter().copied().max().unwrap_or(4).max(1)
+        } else {
+            1
+        };
+        let (qsa_raw_k, qsa_q, qsa_q16, qsa_indices, qsa_gather_k, qsa_gather_v) = if c.qwen4exp {
+            let max_rows = c.indexer_top_k.saturating_add(qsa_ratio - 1);
+            (
+                g.internal(f32d(batch * c.indexer_head_size)),
+                g.internal(f32d(batch * c.indexer_n_head * c.indexer_head_size)),
+                g.internal(f16d(batch * c.indexer_n_head * c.indexer_head_size)),
+                g.internal(TensorDesc::new(
+                    vec![(c.indexer_top_k / qsa_ratio).max(1)],
+                    DType::I32,
+                )),
+                g.internal(f16d(max_rows * max_kvrow.max(1))),
+                g.internal(f16d(max_rows * max_kvrow.max(1))),
+            )
+        } else {
+            // These aliases are never read on another architecture. Keeping them out of the
+            // graph entirely preserves every pre-QSA graph's tensor and allocation layout.
+            (k, q, q16, positions, k16, k16)
+        };
         // DeepSeek2 MLA scratch: mla_q (f32 query with [nope|rope] per head, roped by the kernel),
         // mla_k16 (f32 K row staging; cast to f16 only at WriteKv — raw wkv_a_mqa outputs exceed f16 max before RMSNorm), mla_kv_cmpr (f32 latent for norm), mla_rope (f32 k_pe).
         let mla_q = if mla_qrow > 0 {
@@ -4629,19 +4683,105 @@ pub(crate) fn generate_dense_backend(
                         q16
                     }
                 };
+                let qsa_query = if let Some(qw) = aw.qsa {
+                    let cache = qsa_k_cache[l]
+                        .expect("a qwen4exp full-attention layer declares a QSA key cache");
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: qw.k_proj,
+                        dst: qsa_raw_k,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: c.indexer_head_size as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::WriteKv {
+                        src: qsa_raw_k,
+                        cache,
+                        rows: batch as u32,
+                        row_stride: c.indexer_head_size as u32,
+                        pos: start_pos as u32,
+                    });
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: qw.q_proj,
+                        dst: qsa_q,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: (c.indexer_n_head * c.indexer_head_size) as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::QkNormRope {
+                        x: qsa_q,
+                        weight: qw.q_norm,
+                        positions,
+                        dst: qsa_q16,
+                        rows: batch as u32,
+                        n_head: c.indexer_n_head as u32,
+                        head_dim: c.indexer_head_size as u32,
+                        rope_dim: c.rope_dim as u32,
+                        theta,
+                        eps,
+                        freq_factors: layer_ff,
+                        x_stride: 0,
+                    });
+                    Some((qsa_q16, cache, qw.k_norm))
+                } else {
+                    None
+                };
+                let visible = start_pos + batch;
+                let (attn_k, attn_v, attn_len, attn_pos) = if let Some((ix_q, ix_k, ix_norm)) =
+                    qsa_query.filter(|_| visible > c.indexer_top_k + qsa_ratio - 1)
+                {
+                    assert_eq!(batch, 1, "QSA sparse attention currently requires batch=1");
+                    let complete = visible / qsa_ratio;
+                    let tail = visible % qsa_ratio;
+                    let selected = (c.indexer_top_k / qsa_ratio).min(complete);
+                    g.push(Op::QsaIndexer {
+                        q: ix_q,
+                        k_cache: ix_k,
+                        k_norm: ix_norm,
+                        dst: qsa_indices,
+                        kv_len: visible as u32,
+                        n_head: c.indexer_n_head as u32,
+                        head_dim: c.indexer_head_size as u32,
+                        top_blocks: selected as u32,
+                        ratio: qsa_ratio as u32,
+                        rope_dim: c.rope_dim as u32,
+                        theta,
+                        eps,
+                        scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                    });
+                    g.push(Op::QsaGather {
+                        k_cache: k_cache[kv_src],
+                        v_cache: v_cache[kv_src],
+                        indices: qsa_indices,
+                        k_dst: qsa_gather_k,
+                        v_dst: qsa_gather_v,
+                        selected_blocks: selected as u32,
+                        complete_blocks: complete as u32,
+                        tail: tail as u32,
+                        ratio: qsa_ratio as u32,
+                        row_elems: kvrow as u32,
+                    });
+                    let gathered = selected * qsa_ratio + tail;
+                    (qsa_gather_k, qsa_gather_v, gathered, gathered - 1)
+                } else {
+                    (k_cache[kv_src], v_cache[kv_src], visible, start_pos)
+                };
                 g.push(Op::Attention {
                     q: q_attn,
-                    k_cache: k_cache[kv_src],
-                    v_cache: v_cache[kv_src],
+                    k_cache: attn_k,
+                    v_cache: attn_v,
                     dst: attn,
                     rows: batch as u32,
-                    kv_len: (start_pos + batch) as u32,
+                    kv_len: attn_len as u32,
                     n_head: nh as u32,
                     n_kv: nkv as u32,
                     head_dim: hd as u32,
                     scale,
                     mask,
-                    pos: start_pos as u32,
+                    pos: attn_pos as u32,
                     sinks: None,
                 });
                 // qwen35: per-head SIGMOID output gate applied to the attention output BEFORE the
@@ -5447,6 +5587,7 @@ pub(crate) fn generate_dense_backend(
                 ple_state,
                 k_cache,
                 v_cache,
+                qsa_k_cache,
                 weights,
             },
         )
@@ -5726,6 +5867,7 @@ pub(crate) fn generate_dense_backend(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &qsa_kbufs[..],
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -5979,6 +6121,7 @@ pub(crate) fn generate_dense_backend(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &qsa_kbufs[..],
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6390,6 +6533,7 @@ pub(crate) fn generate_dense_backend(
                     yff_buf,
                     &kbufs[..],
                     &vbufs[..],
+                    &qsa_kbufs[..],
                     &wbufs[..],
                     qwen_wide_buf,
                     ple_embd_buf,
@@ -6542,6 +6686,7 @@ pub(crate) fn generate_dense_backend(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &qsa_kbufs[..],
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6821,6 +6966,7 @@ pub(crate) fn generate_dense_backend(
                 yff_buf,
                 &kbufs[..],
                 &vbufs[..],
+                &qsa_kbufs[..],
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -6873,6 +7019,7 @@ pub(crate) fn generate_dense_backend(
                 yff_buf,
                 &kbufs[..],
                 &vbufs[..],
+                &qsa_kbufs[..],
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -6924,6 +7071,7 @@ pub(crate) fn generate_dense_backend(
                 yff_buf,
                 &kbufs[..],
                 &vbufs[..],
+                &qsa_kbufs[..],
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,

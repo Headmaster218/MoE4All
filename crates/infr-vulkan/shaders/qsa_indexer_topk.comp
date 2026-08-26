@@ -1,0 +1,76 @@
+#version 460
+// Exact score-desc/index-asc top-k, followed by an index-ascending bitonic sort. The latter
+// reproduces scatter-to-mask attention order: selected tokens are consumed chronologically.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint blocks; uint top_k; } pc;
+layout(binding = 0) readonly buffer SB { float scores[]; };
+layout(binding = 1) writeonly buffer DB { uint dst[]; };
+
+#define INVALID 0xffffffffu
+shared float sval[256];
+shared uint sidx[256];
+shared float prev_val;
+shared uint prev_idx;
+shared uint chosen[512];
+
+bool above(uint ai, float av, uint bi, float bv) {
+    if (ai == INVALID) { return false; }
+    if (bi == INVALID) { return true; }
+    return av != bv ? av > bv : ai < bi;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    for (uint rank = 0u; rank < pc.top_k; ++rank) {
+        uint bi = INVALID;
+        float bv = 0.0;
+        for (uint j = t; j < pc.blocks; j += 256u) {
+            float s = scores[j];
+            if (rank > 0u && !above(prev_idx, prev_val, j, s)) { continue; }
+            if (above(j, s, bi, bv)) { bi = j; bv = s; }
+        }
+        sidx[t] = bi;
+        sval[t] = bv;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (t < stride && above(sidx[t + stride], sval[t + stride], sidx[t], sval[t])) {
+                sidx[t] = sidx[t + stride];
+                sval[t] = sval[t + stride];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            chosen[rank] = sidx[0];
+            prev_idx = sidx[0];
+            prev_val = sval[0];
+        }
+        barrier();
+    }
+
+    uint i0 = t;
+    uint i1 = t + 256u;
+    if (i0 >= pc.top_k) { chosen[i0] = INVALID; }
+    if (i1 >= pc.top_k) { chosen[i1] = INVALID; }
+    barrier();
+    for (uint width = 2u; width <= 512u; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint pass = 0u; pass < 2u; ++pass) {
+                uint i = t + pass * 256u;
+                uint j = i ^ stride;
+                if (j > i) {
+                    bool ascending = (i & width) == 0u;
+                    uint a = chosen[i];
+                    uint b = chosen[j];
+                    if ((ascending && a > b) || (!ascending && a < b)) {
+                        chosen[i] = b;
+                        chosen[j] = a;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    if (i0 < pc.top_k) { dst[i0] = chosen[i0]; }
+    if (i1 < pc.top_k) { dst[i1] = chosen[i1]; }
+}
