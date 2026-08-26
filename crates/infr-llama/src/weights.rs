@@ -55,7 +55,14 @@ pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbyte
 pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
     let mut dense = 0u64;
     let mut expert = 0u64;
+    let qwen4exp = g.metadata().str("general.architecture") == Some(crate::arch::QWEN4EXP);
     for t in g.tensors() {
+        // Qwen3.8's PLE table is deliberately an SSD/mmap tier: one inference token gathers only
+        // 16 short rows. Pricing the multi-hundred-GiB table as an always-resident GPU weight would
+        // reject the model before the loader can establish that tier.
+        if qwen4exp && t.name == "per_layer_token_embd.weight" {
+            continue;
+        }
         let numel: usize = t.shape.iter().product();
         let bytes = tensor_resident_bytes(t.dtype, numel, t.nbytes);
         if t.name.contains("_exps") {

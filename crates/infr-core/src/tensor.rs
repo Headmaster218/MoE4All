@@ -163,12 +163,13 @@ impl DType {
 ///     shared-memory grid-LUT staging fix (grid_init(); see build.rs::gen_grids) and the shipped
 ///     `Iq2S`/`Iq3S` mmq kernels (one shared gather serves four staged int8 bytes, reused BM
 ///     times by the dp4a loop — same ~20% staging overhead Q3_K carries, near-Q3_K throughput
-///     measured). These five stay out only because no audited MoE GGUF quantizes expert banks
-///     with them (unsloth UD mixes use IQ2_S/IQ3_S/IQ4_XS + K-quants); each maps to the same
-///     recipe (IQ2_XS/IQ2_XXS ≙ IQ2_S with KSIGNS-packed signs at BLK=16; IQ3_XXS ≙ IQ3_S with
-///     KSIGNS at BLK=32; IQ1_S/IQ1_M add the ±0.125 delta as a per-sub-block `sact`-style
-///     correction since Σ±delta·x needs the activation sum). They keep the idm fallback until a
-///     real model ships them.
+///     measured). Qwen3.8-Flash-Next UD-Q2_K_XL now ships IQ2_XS gate/up banks (plus one IQ3_XXS
+///     pair), but qwen4exp v1 deliberately keeps prefill on the per-token path; its decode and
+///     prefill therefore use the fully covered paged id/idm-GEMV floor. These five stay out of the
+///     *batched* family until a caller can use that path. Each maps to the same recipe (IQ2_XS/
+///     IQ2_XXS ≙ IQ2_S with KSIGNS-packed signs at BLK=16; IQ3_XXS ≙ IQ3_S with KSIGNS at
+///     BLK=32; IQ1_S/IQ1_M add the ±0.125 delta as a per-sub-block `sact`-style correction since
+///     Σ±delta·x needs the activation sum).
 ///   * `Bf16`/`F16`/`F32` (float weights): not dp4a material at all — no integer codes to feed
 ///     the packed int8 dot; they ride the float GEMM/GEMV routes.
 pub const MOE_MMQ_DTYPES: &[DType] = &[

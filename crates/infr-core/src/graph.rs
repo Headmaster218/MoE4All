@@ -846,6 +846,50 @@ pub enum Op {
         s: f32,
         n: u32,
     },
+    /// Elementwise `dst[i] = silu(x[i] * scale)`. Qwen3.8's low-rank gated-residual bottleneck
+    /// divides by the number of residual streams before SiLU.
+    Silu {
+        x: TensorId,
+        dst: TensorId,
+        n: u32,
+        scale: f32,
+    },
+    /// Qwen3.8 stream collapse after its low-rank gate projection. `x` and `gate` are
+    /// `[rows, hc, n_embd]`; gate contains raw logits. The output is
+    /// `mean_h(x[r,h,d] * sigmoid(gate[r,h,d]))`.
+    QwenHcMix {
+        x: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    },
+    /// Qwen3.8 residual injection. `residual`/`dst` are `[rows,hc,n_embd]`, `block` is
+    /// `[rows,n_embd]`, and `gate` is `[rows,hc]` raw logits. Per element:
+    /// `dst = residual + block * 2*sigmoid(gate/hc)`.
+    QwenHcInject {
+        residual: TensorId,
+        block: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    },
+    /// Qwen3.8 PLE query-dependent value gate. `key` and `query` are grouped-normalized
+    /// `[rows,hc,n_embd]`; `value` is `[rows,n_embd]`. For each stream, reduce
+    /// `dot(key,query)/sqrt(n_embd)`, apply signed sqrt then sigmoid, and broadcast-multiply the
+    /// value into `dst[rows,hc,n_embd]`.
+    QwenPleGate {
+        key: TensorId,
+        query: TensorId,
+        value: TensorId,
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    },
     /// Broadcast elementwise multiply: `dst[r*n+c] = x[r*n+c] * vec[c]` for `r` in `0..rows`, `c`
     /// in `0..n` — the multiplicative twin of [`Op::AddBias`]. `vec` is a length-`n` weight
     /// (diffusion-gemma's router input scale `ffn_gate_inp.scale`, applied to the router's
@@ -1209,6 +1253,10 @@ impl Op {
             Op::Add { .. } => "Add",
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
+            Op::Silu { .. } => "Silu",
+            Op::QwenHcMix { .. } => "QwenHcMix",
+            Op::QwenHcInject { .. } => "QwenHcInject",
+            Op::QwenPleGate { .. } => "QwenPleGate",
             Op::MulVec { .. } => "MulVec",
             Op::HeadwiseSigmoidMul { .. } => "HeadwiseSigmoidMul",
             Op::Softcap { .. } => "Softcap",
@@ -1387,6 +1435,22 @@ impl Op {
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
+            Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
+            Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
+            Op::QwenHcInject {
+                residual,
+                block,
+                gate,
+                dst,
+                ..
+            } => (vec![residual, block, gate], vec![dst]),
+            Op::QwenPleGate {
+                key,
+                query,
+                value,
+                dst,
+                ..
+            } => (vec![key, query, value], vec![dst]),
             Op::MulVec { x, vec: v, dst, .. } => (vec![x, v], vec![dst]),
             Op::HeadwiseSigmoidMul { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::Softcap { x, dst, .. } => (vec![x], vec![dst]),

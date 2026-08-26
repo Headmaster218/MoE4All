@@ -2,7 +2,7 @@
 //! Mechanically split out of `lib.rs` (no logic change).
 use crate::{
     BAILINGMOE_PRE_RE, DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES,
-    LLAMA4_PRE_RE, QWEN2_PRE_RE,
+    LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
@@ -151,9 +151,11 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
             let seq = build_multi_split_seq(DEEPSEEK_V3_PRE_RES.as_slice())?;
             tok.with_pre_tokenizer(Some(seq));
         }
-        "qwen2" | "llama4" | "bailingmoe2" => {
+        "qwen2" | "qwen35" | "llama4" | "bailingmoe2" => {
             let re = if pre == "qwen2" {
                 QWEN2_PRE_RE
+            } else if pre == "qwen35" {
+                QWEN35_PRE_RE
             } else if pre == "bailingmoe2" {
                 BAILINGMOE_PRE_RE
             } else {

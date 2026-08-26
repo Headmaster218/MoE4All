@@ -47,6 +47,10 @@ pub const QWEN35: &str = "qwen35";
 /// per-token sigmoid). Shares every `qwen35` field (`Config::from_gguf`'s `qwen35` gate,
 /// `MixerW::DeltaNet`); only the FFN differs (`FfnW::Moe`'s `shexp` branch — see `seam::weights`).
 pub const QWEN35_MOE: &str = "qwen35moe";
+/// Qwen3.8 Flash Next. The official GGUF converter names the architecture `qwen4exp`: a
+/// gated-DeltaNet/full-attention hybrid with four low-rank gated residual streams, a 512-expert
+/// MoE, and one SSD-sized PLE n-gram embedding table.
+pub const QWEN4EXP: &str = "qwen4exp";
 /// Ling 3.0 Flash: a 42-layer hybrid with per-layer KDA or MLA token mixers and a DeepSeek-style
 /// routed MoE after two dense lead layers. KDA is a distinct recurrent operator; the MLA and MoE
 /// portions reuse the existing DeepSeek machinery where their tensor layouts match.
@@ -163,5 +167,6 @@ pub const ALL: &[&str] = &[
     DEEPSEEK4,
     QWEN35,
     QWEN35_MOE,
+    QWEN4EXP,
     BAILINGMOE3,
 ];

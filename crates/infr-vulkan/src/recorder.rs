@@ -4368,6 +4368,108 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    pub fn silu_scale(&self, x: &dyn Buffer, dst: &dyn Buffer, n: u32, scale: f32) {
+        let k = self
+            .be
+            .kernel("silu_scale", crate::gemm::silu_scale_spv(), 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&n.to_ne_bytes());
+        push[4..8].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(x), Self::vkb(dst)], 1, &push, n.div_ceil(64));
+    }
+
+    pub fn qwen_hc_mix(
+        &self,
+        x: &dyn Buffer,
+        gate: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let total = rows * n_embd;
+        let k = self
+            .be
+            .kernel("qwen_hc_mix", crate::gemm::qwen_hc_mix_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(gate), Self::vkb(dst)],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_inject(
+        &self,
+        residual: &dyn Buffer,
+        block: &dyn Buffer,
+        gate: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let total = rows * hc * n_embd;
+        let k = self
+            .be
+            .kernel("qwen_hc_inject", crate::gemm::qwen_hc_inject_spv(), 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(residual),
+                Self::vkb(block),
+                Self::vkb(gate),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_ple_gate(
+        &self,
+        key: &dyn Buffer,
+        query: &dyn Buffer,
+        value: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let groups = rows * hc;
+        let k = self
+            .be
+            .kernel("qwen_ple_gate", crate::gemm::qwen_ple_gate_spv(), 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&groups.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(key),
+                Self::vkb(query),
+                Self::vkb(value),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
     /// every cached key against the row's indexer heads and writes the top-`top_k` key indices.
     /// One workgroup per query row — the dispatch below is `rows` groups, and each group's 256

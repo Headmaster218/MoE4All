@@ -7,8 +7,8 @@ use super::sc::{
 };
 use super::weights::{
     AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW,
-    KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
-    TurnRecurrentCkpt,
+    KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QwenHcW, QwenLayerHcW, QwenPleW, SeamKv,
+    SeamWeights, SessionStable, TurnRecurrentCkpt,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
@@ -138,6 +138,9 @@ fn bind_layer_io<'a>(
     kbufs: &'a [Box<dyn Buffer>],
     vbufs: &'a [Box<dyn Buffer>],
     wbufs: &'a [Box<dyn Buffer>],
+    qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
+    ple_embd_buf: &'a Option<Box<dyn Buffer>>,
+    ple_state_buf: &'a Option<Box<dyn Buffer>>,
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
@@ -151,6 +154,15 @@ fn bind_layer_io<'a>(
     }
     for (i, wid) in h.weights.iter().enumerate() {
         b.bind(*wid, wbufs[i].as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.qwen_wide, qwen_wide_buf) {
+        b.bind(id, buf.as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.ple_embd, ple_embd_buf) {
+        b.bind(id, buf.as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.ple_state, ple_state_buf) {
+        b.bind(id, buf.as_ref());
     }
 }
 
@@ -375,6 +387,11 @@ pub(super) struct DecodeHandles {
     // the `[vocab]` logits. `None` when the build didn't append the op (sampling temp > 0, a
     // grammar constraint, or a multi-row logits build).
     tok_id: Option<TensorId>,
+    // Qwen3.8's caller-owned four-stream residual and PLE inputs. The wide residual is shared by
+    // the layer-0 and layer-1..end plans; PLE inputs exist only on a span containing the PLE layer.
+    qwen_wide: Option<TensorId>,
+    ple_embd: Option<TensorId>,
+    ple_state: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
@@ -442,6 +459,19 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
+    if c.qwen4exp {
+        let ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
+        let exact_ctx = c.indexer_top_k.saturating_add(ratio - 1);
+        if want_ctx > exact_ctx {
+            return Err(anyhow!(
+                "qwen4exp v1 runs full attention exactly only through {exact_ctx} tokens (QSA \
+                 budget {} + at most {} tail tokens); requested context {want_ctx}. Use --ctx \
+                 {exact_ctx} or smaller until the QSA indexer is implemented",
+                c.indexer_top_k,
+                ratio - 1,
+            ));
+        }
+    }
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -611,6 +641,21 @@ pub(crate) fn generate_dense_backend(
     // unconditionally, so the pair is forced to f16 — and a NAMED non-f16 format is refused here
     // rather than silently downgraded. `crate::seam::mla_kv_fmt` owns the rule and its argument.
     (k_fmt, v_fmt) = crate::seam::mla_kv_fmt(c, be.name(), ec, k_fmt, v_fmt)?;
+    if c.qwen4exp {
+        let named_non_f16 =
+            |specified: bool, dt: Option<DType>| specified && !matches!(dt, Some(DType::F16));
+        if named_non_f16(ec.kv.type_k_specified, ec.kv.type_k)
+            || named_non_f16(ec.kv.type_v_specified, ec.kv.type_v)
+            || ec.kv.force_q8
+        {
+            return Err(anyhow!(
+                "qwen4exp v1 supports F16 KV only; remove the KV override or set both \
+                 kv.type_k=f16 and kv.type_v=f16"
+            ));
+        }
+        k_fmt = DType::F16;
+        v_fmt = DType::F16;
+    }
 
     // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
     // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows` for the sizing and
@@ -645,6 +690,7 @@ pub(crate) fn generate_dense_backend(
         let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut wspecs: Vec<(DType, usize)> = Vec::new();
         let mut layer_has_epb = vec![false; c.n_layer];
+        let mut layer_fused_experts = vec![false; c.n_layer];
         // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
         // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
         // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
@@ -745,7 +791,27 @@ pub(crate) fn generate_dense_backend(
                 // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
                 // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
                 // quantized buffer → OOB GPU fault → device lost.
-                if ((c.deepseek2 || c.bailingmoe3)
+                if c.qwen4exp && name.ends_with("ple_conv1d.weight") {
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let src = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let channels = c.hc_mult * c.n_embd;
+                    let src_k = c.ple_conv_kernel;
+                    let dst_k = (src_k - 1) * c.ple_ngram_size + 1;
+                    if src.len() != channels * src_k {
+                        return Err(anyhow!(
+                            "{name}: {} values do not match {channels} channels x {src_k} taps",
+                            src.len()
+                        ));
+                    }
+                    let mut expanded = vec![0.0f32; channels * dst_k];
+                    for ch in 0..channels {
+                        for tap in 0..src_k {
+                            expanded[ch * dst_k + tap * c.ple_ngram_size] = src[ch * src_k + tap];
+                        }
+                    }
+                    let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                    (WBytes::Owned(bytes), DType::F32, expanded.len())
+                } else if ((c.deepseek2 || c.bailingmoe3)
                     && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
                     || (c.deepseek4
                         && (name.contains("_compressor_ape.weight")
@@ -815,14 +881,29 @@ pub(crate) fn generate_dense_backend(
             let p = |s: &str| format!("blk.{l}.{s}");
             // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
-            let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+            let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
             let is_kda = c.bailingmoe3 && !is_mla;
             // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
             // output projection, attention sinks, hyper-connections and up to two compressor blocks
             // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
             let is_dsv4 = c.deepseek4;
-            wload(&[&p("attn_norm.weight")])?;
+            if c.qwen4exp {
+                for name in [
+                    "hc_attn_norm.weight",
+                    "hc_attn_down.weight",
+                    "hc_attn_up.weight",
+                    "hc_attn_inject.weight",
+                    "hc_ffn_norm.weight",
+                    "hc_ffn_down.weight",
+                    "hc_ffn_up.weight",
+                    "hc_ffn_inject.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+            } else {
+                wload(&[&p("attn_norm.weight")])?;
+            }
             if is_mla {
                 // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
                 if !c.is_lite {
@@ -969,6 +1050,18 @@ pub(crate) fn generate_dense_backend(
             if !is_delta && !is_mla && !is_kda && !is_dsv4 {
                 wload(&[&p("attn_output.weight")])?;
             }
+            if c.is_ple_layer(l) {
+                for name in [
+                    "ple_key.weight",
+                    "ple_value.weight",
+                    "ple_norm_key.weight",
+                    "ple_norm_query.weight",
+                    "ple_norm_conv.weight",
+                    "ple_conv1d.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+            }
             // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
             // the graph, but load order is arbitrary as long as `wpush` mirrors it — kept right
             // after `attn_output` (its logical neighbor). `[n_embd]`, resident (small f32 norm).
@@ -985,7 +1078,9 @@ pub(crate) fn generate_dense_backend(
             } else {
                 "ffn_norm.weight"
             };
-            wload(&[&p(ffn_norm_name)])?;
+            if !c.qwen4exp {
+                wload(&[&p(ffn_norm_name)])?;
+            }
             if c.dual_moe() {
                 // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
                 // per-expert down scale), summed — see docs/diffusion-gemma.md's FFN wiring. Shared
@@ -1012,8 +1107,17 @@ pub(crate) fn generate_dense_backend(
                 // down banks. (llama4 interleaves dense layers on `moe_interleave_step`; those fall
                 // through to the dense branches below — Scout's step==1 makes every layer MoE.)
                 wload(&[&p("ffn_gate_inp.weight")])?;
-                wload(&[&p("ffn_gate_exps.weight")])?;
-                wload(&[&p("ffn_up_exps.weight")])?;
+                let fused = g
+                    .tensors()
+                    .iter()
+                    .any(|t| t.name == p("ffn_gate_up_exps.weight"));
+                layer_fused_experts[l] = fused;
+                if fused {
+                    wload(&[&p("ffn_gate_up_exps.weight")])?;
+                } else {
+                    wload(&[&p("ffn_gate_exps.weight")])?;
+                    wload(&[&p("ffn_up_exps.weight")])?;
+                }
                 wload(&[&p("ffn_down_exps.weight")])?;
                 if c.deepseek2 || c.bailingmoe3 {
                     let ep_name = p("exp_probs_b.bias");
@@ -1070,10 +1174,21 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("post_norm.weight")])?;
             }
         }
-        // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
-        // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
-        // values as the host `token_embd`, but zero-copy.
-        wload(&["output_norm.weight"])?;
+        // Qwen3.8's final grouped HC mixer replaces output_norm and is stored before the LM head.
+        // Every other architecture keeps the original output_norm-first order exactly.
+        if c.qwen4exp {
+            for name in [
+                "output_hc_norm.weight",
+                "output_hc_down.weight",
+                "output_hc_up.weight",
+            ] {
+                wload(&[name])?;
+            }
+        } else {
+            wload(&["output_norm.weight"])?;
+        }
+        // LM head = `output.weight`, or (tied) the quantized `token_embd.weight` mapped from the
+        // mmap and dequantized per-row by `Op::Linear` — same f32 values as the host embedding.
         if g.tensors().iter().any(|t| t.name == "output.weight") {
             wload(&["output.weight"])?;
         } else {
@@ -1178,6 +1293,19 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
             wbufs.push(b);
             wspecs.push((DType::F32, c.hc_mult * ne));
+        }
+        // Qwen3.8 grouped RMSNorm reduces each n_embd-wide stream independently before applying
+        // its full hc*n_embd affine. One n_embd-wide unit vector supplies the weightless first
+        // half of that operation at every HC and PLE site.
+        if c.qwen4exp {
+            let ones = vec![1.0f32; ne];
+            let b = be
+                .alloc(ones.len() * 4, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                .map_err(|e| anyhow!("{e}"))?;
+            wbufs.push(b);
+            wspecs.push((DType::F32, ne));
         }
 
         // ── re-decide the context against what the device says is LEFT ───────────────────────
@@ -1284,6 +1412,35 @@ pub(crate) fn generate_dense_backend(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
+        let qwen_wide_buf = if c.qwen4exp {
+            Some(
+                be.alloc(c.hc_mult * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        let ple_embd_buf = if c.qwen4exp {
+            let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+            Some(
+                be.alloc(heads * c.ple_head_dim * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        let ple_state_buf = if c.qwen4exp {
+            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+            let b = be
+                .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
+                .map_err(|e| anyhow!("{e}"))?;
+            let zeros = vec![0u8; b.len_bytes()];
+            be.upload(b.as_ref(), &zeros).map_err(|e| anyhow!("{e}"))?;
+            Some(b)
+        } else {
+            None
+        };
+        let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
         let mut turn_recurrent_ckpt = None;
         if turn_checkpoint.is_some() && (c.qwen35 || c.bailingmoe3) {
             TurnRecurrentCkpt::begin(&mut turn_recurrent_ckpt, be, c, &kbufs[..], &vbufs[..], &[])?;
@@ -1300,6 +1457,8 @@ pub(crate) fn generate_dense_backend(
                 rf_buf,
                 yff_buf,
                 layer_has_epb,
+                layer_fused_experts,
+                ple_worker,
             }),
             stable: std::sync::Arc::clone(&stable),
             kbufs,
@@ -1310,6 +1469,9 @@ pub(crate) fn generate_dense_backend(
             pos_buf,
             ipl_buf,
             logits_buf,
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
@@ -1353,6 +1515,9 @@ pub(crate) fn generate_dense_backend(
         pos_buf,
         ipl_buf,
         logits_buf,
+        qwen_wide_buf,
+        ple_embd_buf,
+        ple_state_buf,
         max_ctx,
         cached,
         denoise_cache,
@@ -1373,6 +1538,8 @@ pub(crate) fn generate_dense_backend(
         rf_buf,
         yff_buf,
         layer_has_epb,
+        layer_fused_experts,
+        ple_worker,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
     if prompt.len() + max_new + 1 > max_ctx {
@@ -1412,7 +1579,7 @@ pub(crate) fn generate_dense_backend(
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
         cached.len()
-    } else if c.qwen35 || c.bailingmoe3 {
+    } else if c.qwen35 || c.qwen4exp || c.bailingmoe3 {
         if let Some(pfx) = recurrent_extension_start(cached, prompt) {
             pfx
         } else if let Some(pfx) = restored_turn_start {
@@ -1439,6 +1606,11 @@ pub(crate) fn generate_dense_backend(
                     )
                     .map_err(|e| anyhow!("{e}"))?;
                 }
+            }
+            if let Some(state) = ple_state_buf.as_ref() {
+                let zeros = vec![0u8; state.len_bytes()];
+                be.upload(state.as_ref(), &zeros)
+                    .map_err(|e| anyhow!("{e}"))?;
             }
             cached.clear();
             0
@@ -1710,7 +1882,7 @@ pub(crate) fn generate_dense_backend(
         // graph is ever replay-eligible anyway (batched prefill/denoise are rows>1), and DG has
         // no autoregressive decode loop — its per-prefill decode is exactly one token — so this
         // costs nothing while making both modes bit-identical.
-        g.no_decode_replay = c.diffusion_gemma;
+        g.no_decode_replay = c.diffusion_gemma || c.qwen4exp;
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
         // per-side when the runner enabled it (see `k_fmt`/`v_fmt` at the cache alloc). ONLY the
@@ -1745,6 +1917,16 @@ pub(crate) fn generate_dense_backend(
             g.input(f32d(batch * ne))
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
+        let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
+        let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
+        let ple_embd = span_has_ple.then(|| {
+            let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+            g.input(f32d(batch * heads * c.ple_head_dim))
+        });
+        let ple_state = span_has_ple.then(|| {
+            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+            g.input(f32d(hist * c.hc_mult * ne))
+        });
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats) — a per-step f32
         // Input like `rope_freqs` (uploaded once into `yff_buf`, rebound every execute).
@@ -1832,10 +2014,31 @@ pub(crate) fn generate_dense_backend(
         };
         let mut lw: Vec<LayerW> = Vec::new();
         for l in 0..c.n_layer {
-            let attn_norm = wpush(&mut g, &mut weights);
+            // Qwen3.8 stores both gated-residual mixers before the layer's token-mixer weights.
+            // Their norm tensors also serve as harmless placeholders for LayerW's generic norm
+            // fields; the qwen4 graph branch performs grouped normalization itself.
+            let qwen_hc = c.qwen4exp.then(|| QwenLayerHcW {
+                attn: QwenHcW {
+                    norm: wpush(&mut g, &mut weights),
+                    down: wpush(&mut g, &mut weights),
+                    up: wpush(&mut g, &mut weights),
+                    inject: Some(wpush(&mut g, &mut weights)),
+                },
+                ffn: QwenHcW {
+                    norm: wpush(&mut g, &mut weights),
+                    down: wpush(&mut g, &mut weights),
+                    up: wpush(&mut g, &mut weights),
+                    inject: Some(wpush(&mut g, &mut weights)),
+                },
+            });
+            let attn_norm = if let Some(hc) = &qwen_hc {
+                hc.attn.norm
+            } else {
+                wpush(&mut g, &mut weights)
+            };
             // qwen35 gated-DeltaNet layer: 9 mixer weights, no q/k/v/qk_norm/bias/wo at all (mirrors
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
-            let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+            let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
             let is_kda = c.bailingmoe3 && !is_mla;
             let mixer = if c.deepseek4 {
@@ -2009,6 +2212,14 @@ pub(crate) fn generate_dense_backend(
             } else {
                 None
             };
+            let ple = c.is_ple_layer(l).then(|| QwenPleW {
+                key: wpush(&mut g, &mut weights),
+                value: wpush(&mut g, &mut weights),
+                norm_key: wpush(&mut g, &mut weights),
+                norm_query: wpush(&mut g, &mut weights),
+                norm_conv: wpush(&mut g, &mut weights),
+                conv: wpush(&mut g, &mut weights),
+            });
             // bitnet SubLN attention-output norm — mirrors the `wload` push right after
             // `attn_output.weight` (loaded under the same `c.sub_norm && !is_delta` gate; bitnet
             // has no DeltaNet layers, so `is_delta` is always false there).
@@ -2022,7 +2233,11 @@ pub(crate) fn generate_dense_backend(
             } else {
                 None
             };
-            let ffn_norm = wpush(&mut g, &mut weights);
+            let ffn_norm = if let Some(hc) = &qwen_hc {
+                hc.ffn.norm
+            } else {
+                wpush(&mut g, &mut weights)
+            };
             let ffn = if c.dual_moe() {
                 let d_gate = wpush(&mut g, &mut weights);
                 // fused: `d_up` is the SAME handle as `d_gate` (one concatenated upload, see the
@@ -2048,11 +2263,20 @@ pub(crate) fn generate_dense_backend(
                     m_post_norm: wpush(&mut g, &mut weights),
                 }
             } else if c.moe.is_some() && c.is_moe_layer(l) {
+                let router = wpush(&mut g, &mut weights);
+                let gate_exps = wpush(&mut g, &mut weights);
+                let fused_gate_up = layer_fused_experts[l];
+                let up_exps = if fused_gate_up {
+                    gate_exps
+                } else {
+                    wpush(&mut g, &mut weights)
+                };
                 FfnW::Moe {
-                    router: wpush(&mut g, &mut weights),
-                    gate_exps: wpush(&mut g, &mut weights),
-                    up_exps: wpush(&mut g, &mut weights),
+                    router,
+                    gate_exps,
+                    up_exps,
                     down_exps: wpush(&mut g, &mut weights),
+                    fused_gate_up,
                     // ONE slot, two possible tensors: `wload`'s deepseek4 arm uploads
                     // `ffn_gate_tid2eid.weight` on a hash-routed layer and `exp_probs_b.bias` on
                     // every other, exclusively — so exactly one handle is pushed here, in that
@@ -2121,6 +2345,8 @@ pub(crate) fn generate_dense_backend(
                 attn_norm,
                 mixer,
                 hc,
+                qwen_hc,
+                ple,
                 dsv4_compressed,
                 attn_sub_norm,
                 post_attn,
@@ -2133,7 +2359,17 @@ pub(crate) fn generate_dense_backend(
                 pl_post_norm,
             });
         }
-        let w_out_norm = wpush(&mut g, &mut weights);
+        let qwen_hc_head = c.qwen4exp.then(|| QwenHcW {
+            norm: wpush(&mut g, &mut weights),
+            down: wpush(&mut g, &mut weights),
+            up: wpush(&mut g, &mut weights),
+            inject: None,
+        });
+        let w_out_norm = if let Some(hc) = &qwen_hc_head {
+            hc.norm
+        } else {
+            wpush(&mut g, &mut weights)
+        };
         let w_lm = wpush(&mut g, &mut weights);
         // DeepSeek V4's hyper-connection HEAD triple (`output_hc_fn/base/scale`) — model-level, and
         // uploaded right after the lm_head, so declared right after it too. `output_hc_fn` is
@@ -2222,6 +2458,11 @@ pub(crate) fn generate_dense_backend(
         // every hyper-connection mixing matmul — upload order matches the `if c.deepseek4` block
         // at the end of the weight loop above.
         let hc_ones = if c.deepseek4 {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
+        };
+        let qwen_hc_ones = if c.qwen4exp {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -2427,6 +2668,18 @@ pub(crate) fn generate_dense_backend(
         let kda_forget = g.internal(f32d(batch * c.ssm_d_inner.max(1)));
         let mla_gate = g.internal(f32d(batch * c.n_head.max(1)));
 
+        // Qwen3.8 HC/PLE scratch. The wide residual itself is caller-owned (`qwen_wide`); these
+        // buffers are reused serially by each layer and by both HC modules in that layer.
+        let qwen_alt = g.internal(f32d(batch * hcw.max(1)));
+        let qwen_normed = g.internal(f32d(batch * hcw.max(1)));
+        let qwen_low = g.internal(f32d(batch * c.hc_low_rank.max(1)));
+        let qwen_gate = g.internal(f32d(batch * hcw.max(1)));
+        let qwen_inject = g.internal(f32d(batch * c.hc_mult.max(1)));
+        let ple_key = g.internal(f32d(batch * hcw.max(1)));
+        let ple_query = g.internal(f32d(batch * hcw.max(1)));
+        let ple_gated = g.internal(f32d(batch * hcw.max(1)));
+        let ple_conv = g.internal(f32d(batch * hcw.max(1)));
+
         let eps = c.rms_eps;
 
         // DeepSeek V4 hyper-connection WRAP-PRE: everything between the widened residual `res` and
@@ -2481,6 +2734,67 @@ pub(crate) fn generate_dense_backend(
                 hc: c.hc_mult as u32,
                 n_embd: ne as u32,
             });
+        };
+        let qwen_hc_mix = |g: &mut Graph, t: &QwenHcW, res: TensorId, dst: TensorId| {
+            let ones = qwen_hc_ones.expect("qwen4exp build always declares qwen_hc_ones");
+            g.push(Op::RmsNorm {
+                x: res,
+                weight: ones,
+                dst: qwen_normed,
+                rows: (batch * c.hc_mult) as u32,
+                dim: ne as u32,
+                eps,
+            });
+            g.push(Op::MulVec {
+                x: qwen_normed,
+                vec: t.norm,
+                dst: qwen_normed,
+                rows: batch as u32,
+                n: hcw as u32,
+            });
+            g.push(Op::Linear {
+                x: qwen_normed,
+                weight: t.down,
+                dst: qwen_low,
+                m: batch as u32,
+                in_f: hcw as u32,
+                out_f: c.hc_low_rank as u32,
+                w_off: 0,
+            });
+            g.push(Op::Silu {
+                x: qwen_low,
+                dst: qwen_low,
+                n: (batch * c.hc_low_rank) as u32,
+                scale: 1.0 / c.hc_mult as f32,
+            });
+            g.push(Op::Linear {
+                x: qwen_low,
+                weight: t.up,
+                dst: qwen_gate,
+                m: batch as u32,
+                in_f: c.hc_low_rank as u32,
+                out_f: hcw as u32,
+                w_off: 0,
+            });
+            g.push(Op::QwenHcMix {
+                x: qwen_normed,
+                gate: qwen_gate,
+                dst,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                n_embd: ne as u32,
+            });
+            if let Some(inject) = t.inject {
+                g.push(Op::Linear {
+                    x: qwen_normed,
+                    weight: inject,
+                    dst: qwen_inject,
+                    m: batch as u32,
+                    in_f: hcw as u32,
+                    out_f: c.hc_mult as u32,
+                    w_off: 0,
+                });
+            }
         };
 
         // Everything from here to the layer loop is the PROLOGUE: it produces the layer stack's
@@ -2719,8 +3033,125 @@ pub(crate) fn generate_dense_backend(
                 });
             }
         }
+        if c.qwen4exp && prologue {
+            let wide = qwen_wide.expect("qwen4exp build always declares qwen_wide");
+            for h in 0..c.hc_mult {
+                g.push(Op::CopyStrided {
+                    src: hidden,
+                    src_off: 0,
+                    src_stride: ne as u32,
+                    dst: wide,
+                    dst_off: (h * ne) as u32,
+                    dst_stride: hcw as u32,
+                    rows: batch as u32,
+                    n: ne as u32,
+                });
+            }
+        }
 
         for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
+            if let Some(pw) = &lw.ple {
+                let wide = qwen_wide.expect("a qwen4exp PLE layer needs qwen_wide");
+                let embd = ple_embd.expect("a qwen4exp PLE layer needs ple_embd");
+                let state = ple_state.expect("a qwen4exp PLE layer needs ple_state");
+                let ones = qwen_hc_ones.expect("qwen4exp build always declares qwen_hc_ones");
+                let ple_in = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+                g.push(Op::Linear {
+                    x: embd,
+                    weight: pw.key,
+                    dst: ple_key,
+                    m: batch as u32,
+                    in_f: ple_in as u32,
+                    out_f: hcw as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Linear {
+                    x: embd,
+                    weight: pw.value,
+                    dst: hn,
+                    m: batch as u32,
+                    in_f: ple_in as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                g.push(Op::RmsNorm {
+                    x: ple_key,
+                    weight: ones,
+                    dst: ple_key,
+                    rows: (batch * c.hc_mult) as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+                g.push(Op::MulVec {
+                    x: ple_key,
+                    vec: pw.norm_key,
+                    dst: ple_key,
+                    rows: batch as u32,
+                    n: hcw as u32,
+                });
+                g.push(Op::RmsNorm {
+                    x: wide,
+                    weight: ones,
+                    dst: ple_query,
+                    rows: (batch * c.hc_mult) as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+                g.push(Op::MulVec {
+                    x: ple_query,
+                    vec: pw.norm_query,
+                    dst: ple_query,
+                    rows: batch as u32,
+                    n: hcw as u32,
+                });
+                g.push(Op::QwenPleGate {
+                    key: ple_key,
+                    query: ple_query,
+                    value: hn,
+                    dst: ple_gated,
+                    rows: batch as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                });
+                // Preserve the unnormalised gated value for the residual add; ple_key is dead
+                // after the gate reduction and can hold the convolution input.
+                g.push(Op::RmsNorm {
+                    x: ple_gated,
+                    weight: ones,
+                    dst: ple_key,
+                    rows: (batch * c.hc_mult) as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+                g.push(Op::MulVec {
+                    x: ple_key,
+                    vec: pw.norm_conv,
+                    dst: ple_key,
+                    rows: batch as u32,
+                    n: hcw as u32,
+                });
+                g.push(Op::Conv1dSilu {
+                    x: ple_key,
+                    weight: pw.conv,
+                    state,
+                    dst: ple_conv,
+                    rows: batch as u32,
+                    channels: hcw as u32,
+                    kernel: ((c.ple_conv_kernel - 1) * c.ple_ngram_size + 1) as u32,
+                });
+                g.push(Op::Add {
+                    a: wide,
+                    b: ple_gated,
+                    dst: qwen_alt,
+                    n: (batch * hcw) as u32,
+                });
+                g.push(Op::Add {
+                    a: qwen_alt,
+                    b: ple_conv,
+                    dst: wide,
+                    n: (batch * hcw) as u32,
+                });
+            }
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
             let nkv = c.layer_n_kv(l);
@@ -2778,20 +3209,26 @@ pub(crate) fn generate_dense_backend(
             // attn input norm. DeepSeek V4 reads the widened residual through its attention
             // hyper-connection wrap instead of reading `hidden` directly: the wrap collapses the
             // `hc_mult` streams into `hn`, and `attn_norm` then normalises that.
-            let attn_in = if let Some(hcl) = &lw.hc {
+            let attn_in = if let Some(hcl) = &lw.qwen_hc {
+                let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
+                qwen_hc_mix(&mut g, &hcl.attn, wide, hn);
+                hn
+            } else if let Some(hcl) = &lw.hc {
                 hc_wrap_pre(&mut g, &hcl.attn, hcr[0], hn);
                 hn
             } else {
                 hidden
             };
-            g.push(Op::RmsNorm {
-                x: attn_in,
-                weight: lw.attn_norm,
-                dst: hn,
-                rows: batch as u32,
-                dim: ne as u32,
-                eps,
-            });
+            if lw.qwen_hc.is_none() {
+                g.push(Op::RmsNorm {
+                    x: attn_in,
+                    weight: lw.attn_norm,
+                    dst: hn,
+                    rows: batch as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+            }
             // gemma4 E2B KV-layer sharing: shared layers compute Q only and attend to an earlier
             // layer's cache. `own_kv`/`kv_src` are `true`/`l` for every layer of a non-sharing model.
             let own_kv = c.has_own_kv(l);
@@ -2910,7 +3347,7 @@ pub(crate) fn generate_dense_backend(
                 // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
                 // split form's GatedAct reads QkNorm's freshly-written `dn_out`, a real
                 // read-after-write hazard the fusion removes.
-                if fuse_gated_rmsnorm {
+                if fuse_gated_rmsnorm && !c.qwen4exp {
                     g.push(Op::GatedRmsNorm {
                         x: dn_out,
                         weight: dw.ssm_norm,
@@ -2938,7 +3375,11 @@ pub(crate) fn generate_dense_backend(
                         dst: dn_out,
                         rows: batch as u32,
                         nff: (q35_nv * q35_vd) as u32,
-                        act: Activation::Silu,
+                        act: if c.qwen4exp {
+                            Activation::Sigmoid
+                        } else {
+                            Activation::Silu
+                        },
                         up_off: 0,
                         up_stride: 0,
                         gate_stride: 0,
@@ -4260,7 +4701,19 @@ pub(crate) fn generate_dense_backend(
             // `residual` — so the widened stream ping-pongs `hcr[0] -> hcr[1]` here and
             // `hcr[1] -> hcr[0]` at the FFN tail below, returning to `hcr[0]` at each layer
             // boundary. The FFN's own wrap then collapses the NEW stream into `hn`.
-            if let Some(hcl) = &lw.hc {
+            if let Some(hcl) = &lw.qwen_hc {
+                let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
+                g.push(Op::QwenHcInject {
+                    residual: wide,
+                    block: sub,
+                    gate: qwen_inject,
+                    dst: qwen_alt,
+                    rows: batch as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                });
+                qwen_hc_mix(&mut g, &hcl.ffn, qwen_alt, hn);
+            } else if let Some(hcl) = &lw.hc {
                 g.push(Op::HyperConnectPost {
                     x: sub,
                     residual: hcr[0],
@@ -4397,6 +4850,7 @@ pub(crate) fn generate_dense_backend(
                     gate_exps,
                     up_exps,
                     down_exps,
+                    fused_gate_up,
                     exp_probs_b,
                     tid2eid,
                     shexp,
@@ -4436,7 +4890,7 @@ pub(crate) fn generate_dense_backend(
                         up_exps,
                         down_exps,
                         down_scale: None,
-                        fused_gate_up: false,
+                        fused_gate_up,
                         dst: moe_dst,
                         ne: ne as u32,
                         n_expert: mc.n_expert as u32,
@@ -4724,7 +5178,18 @@ pub(crate) fn generate_dense_backend(
                     eps,
                 });
             }
-            if lw.hc.is_some() {
+            if lw.qwen_hc.is_some() {
+                let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
+                g.push(Op::QwenHcInject {
+                    residual: qwen_alt,
+                    block: sub,
+                    gate: qwen_inject,
+                    dst: wide,
+                    rows: batch as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                });
+            } else if lw.hc.is_some() {
                 // Close the FFN wrap, ping-ponging back to `hcr[0]` — the stream the NEXT layer's
                 // attention wrap (and, after the last layer, the model head) reads.
                 g.push(Op::HyperConnectPost {
@@ -4856,17 +5321,25 @@ pub(crate) fn generate_dense_backend(
                 n_embd: ne as u32,
             });
         }
+        if l_end == c.n_layer {
+            if let Some(t) = &qwen_hc_head {
+                let wide = qwen_wide.expect("qwen4exp model head needs qwen_wide");
+                qwen_hc_mix(&mut g, t, wide, hn);
+            }
+        }
         // LM-head tail — skipped entirely for headless builds (`logits_rows == 0`, the batched
         // prefill chunks: see `logits`' declaration above).
         let (h_out, tok_id, u_in) = if let Some(logits) = logits {
-            g.push(Op::RmsNorm {
-                x: hidden,
-                weight: w_out_norm,
-                dst: hn,
-                rows: batch as u32,
-                dim: ne as u32,
-                eps,
-            });
+            if !c.qwen4exp {
+                g.push(Op::RmsNorm {
+                    x: hidden,
+                    weight: w_out_norm,
+                    dst: hn,
+                    rows: batch as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+            }
             // For batch > 1 with logits_rows == 1: the LM head runs only on the LAST token's
             // hidden state — extract it via Op::Copy before the projection so the logits output is
             // [vocab]. Speculative verify passes logits_rows == batch and runs the head over every
@@ -4969,6 +5442,9 @@ pub(crate) fn generate_dense_backend(
                 tok_ids,
                 u_in,
                 tok_id,
+                qwen_wide,
+                ple_embd,
+                ple_state,
                 k_cache,
                 v_cache,
                 weights,
@@ -5251,6 +5727,9 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
         );
         if plan_sc {
             if dyn_sc {
@@ -5501,6 +5980,9 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -5662,9 +6144,10 @@ pub(crate) fn generate_dense_backend(
     // unsloth-dynamic Qwen3.6-MoE (UD) quants mix Q5_K/Q6_K/IQ4_XS into gate/up/down banks across
     // layers; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down (Q3_K); IQ2_S/IQ3_S is
     // the UD-IQ3_S file's expert pair (grid-codebook mmq via shared-LUT staging). The remaining
-    // codebook quants (IQ1_*/IQ2_XXS/IQ2_XS/IQ3_XXS/TQ*) have no dp4a-mmq kernel (no shipped MoE
-    // GGUF uses them for expert banks — see MOE_MMQ_DTYPES's EXCLUSIONS) and keep the per-token
-    // loop.
+    // codebook quants (IQ1_*/IQ2_XXS/IQ2_XS/IQ3_XXS/TQ*) have no dp4a-mmq kernel. Qwen3.8 Flash
+    // Next's UD-Q2_K_XL does ship IQ2_XS/IQ3_XXS expert banks, but qwen4exp is deliberately kept
+    // on this per-token prefill loop in v1; its paged id/idm-GEMV floor covers those dtypes. See
+    // MOE_MMQ_DTYPES's exclusions for the batched-kernel boundary.
     // `MOE_MMQ_DTYPES` is the SINGLE SOURCE OF TRUTH this closure and the Vulkan adapter's batched
     // `Op::MoeFfn` gate (its `mmq_ok`) both derive from — a mismatch either silently falls back to
     // per-token prefill or compiles a graph the adapter rejects; `moe_mmq_drift_test` (in
@@ -5686,7 +6169,7 @@ pub(crate) fn generate_dense_backend(
     // `build`), and no `batch > 1` V4 graph has ever been EXECUTED — the only V4 fixture that
     // exists writes f32 expert banks, so `moe_batched_ok` is false for it and nothing here could
     // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
-    let batched_prefill_ok = (c.moe.is_none() || moe_batched_ok) && !c.deepseek4;
+    let batched_prefill_ok = (c.moe.is_none() || moe_batched_ok) && !c.deepseek4 && !c.qwen4exp;
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
@@ -5908,6 +6391,9 @@ pub(crate) fn generate_dense_backend(
                     &kbufs[..],
                     &vbufs[..],
                     &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
                 );
                 debug_assert!(
                     pf_h.logits.is_none(),
@@ -6005,6 +6491,9 @@ pub(crate) fn generate_dense_backend(
         // `sliding_window = 1` model — where attending only your own row IS the right answer —
         // stayed exact and hid it.
         && !c.deepseek4
+        // Qwen3.8 is intentionally two submissions in v1: layer 0 overlaps the host PLE gather,
+        // then layer 1..end consumes its result. A one-plan replay cannot represent that handoff.
+        && !c.qwen4exp
         && (qk_norm || stable.rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
@@ -6054,6 +6543,9 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -6290,6 +6782,121 @@ pub(crate) fn generate_dense_backend(
             let t_exec = std::time::Instant::now();
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
+        } else if c.qwen4exp {
+            // Start the mmap/SSD PLE gather before layer 0. The first GPU plan initializes the
+            // four-stream residual and executes layer 0 while this CPU worker hashes/dequants the
+            // 16 selected rows; the second plan starts at the PLE-bearing layer 1.
+            let ticket = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                .submit(&cur, pos, c.ple_ngram_size)?;
+
+            let (g0, h0) = build(
+                1,
+                pos,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                gpu_embed,
+                false,
+                Some(0..1),
+            );
+            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+            let mut b0 = Bindings::new();
+            if let Some(ids) = h0.tok_ids {
+                b0.bind(ids, dec_ids_buf.as_ref());
+            }
+            // A partial span exposes hidden as an Input even when EmbedGather writes it.
+            b0.bind(h0.hidden, hidden_buf.as_ref());
+            b0.bind(h0.positions, pos_buf.as_ref());
+            bind_layer_io(
+                &mut b0,
+                &h0,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+            );
+            let mut setup_total = t_setup.elapsed();
+            let t_exec0 = std::time::Instant::now();
+            be.execute(plan0.as_ref(), &b0)
+                .map_err(|e| anyhow!("{e}"))?;
+            let exec0 = t_exec0.elapsed();
+
+            let t_setup1 = std::time::Instant::now();
+            let ple_rows = ticket.wait()?;
+            let ple_buf = ple_embd_buf
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE staging buffer"))?;
+            if ple_rows.len() * 4 != ple_buf.len_bytes() {
+                return Err(anyhow!(
+                    "qwen4exp PLE worker produced {} bytes, staging buffer has {}",
+                    ple_rows.len() * 4,
+                    ple_buf.len_bytes()
+                ));
+            }
+            be.upload(ple_buf.as_ref(), bytemuck::cast_slice(&ple_rows))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let (g1, h1) = build(
+                1,
+                pos,
+                1,
+                false,
+                None,
+                false,
+                want_h,
+                gpu_argmax,
+                gpu_sample,
+                false,
+                false,
+                Some(1..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            let mut b1 = Bindings::new();
+            b1.bind(h1.hidden, hidden_buf.as_ref());
+            b1.bind(h1.positions, pos_buf.as_ref());
+            bind_layer_io(
+                &mut b1,
+                &h1,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+            );
+            b1.bind(
+                h1.logits.expect("qwen4exp tail build has logits"),
+                logits_buf.as_ref(),
+            );
+            if let Some(tid) = h1.tok_id {
+                b1.bind(tid, id_out);
+            }
+            if let Some(uin) = h1.u_in {
+                b1.bind(uin, u_buf.as_ref());
+            }
+            if let (Some(ho), Some(hb)) = (h1.h_out, &h_tap_buf) {
+                b1.bind(ho, hb.as_ref());
+            }
+            setup_total += t_setup1.elapsed();
+            let t_exec1 = std::time::Instant::now();
+            be.execute(plan1.as_ref(), &b1)
+                .map_err(|e| anyhow!("{e}"))?;
+            setup_el = setup_total;
+            exec_el = exec0 + t_exec1.elapsed();
         } else {
             let (g, h) = build(
                 1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
@@ -6318,6 +6925,9 @@ pub(crate) fn generate_dense_backend(
                 &kbufs[..],
                 &vbufs[..],
                 &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
             );
             b.bind(
                 h.logits.expect("decode build has logits"),

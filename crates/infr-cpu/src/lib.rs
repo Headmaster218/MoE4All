@@ -2439,6 +2439,104 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::Silu { x, dst, n, scale } => {
+                    let xs = &vals[x.0 as usize];
+                    let mut out = vec![0f32; n as usize];
+                    self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
+                        let base = c * 4096;
+                        for (i, o) in oc.iter_mut().enumerate() {
+                            let v = xs[base + i] * scale;
+                            *o = v / (1.0 + (-v).exp());
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::QwenHcMix {
+                    x,
+                    gate,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let xs = &vals[x.0 as usize];
+                    let gs = &vals[gate.0 as usize];
+                    let mut out = vec![0f32; rr * ne];
+                    self.pool().for_chunks_mut(&mut out, ne, 1, &|r, row| {
+                        for d in 0..ne {
+                            let mut sum = 0.0f32;
+                            for h in 0..hc {
+                                let i = (r * hc + h) * ne + d;
+                                let sig = 1.0 / (1.0 + (-gs[i]).exp());
+                                sum += xs[i] * sig;
+                            }
+                            row[d] = sum / hc as f32;
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::QwenHcInject {
+                    residual,
+                    block,
+                    gate,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let rs = &vals[residual.0 as usize];
+                    let bs = &vals[block.0 as usize];
+                    let gs = &vals[gate.0 as usize];
+                    let mut out = vec![0f32; rr * hc * ne];
+                    self.pool().for_chunks_mut(&mut out, ne, 1, &|rh, row| {
+                        let r = rh / hc;
+                        let h = rh % hc;
+                        let scale = 2.0 / (1.0 + (-(gs[r * hc + h] / hc as f32)).exp());
+                        let base = rh * ne;
+                        for d in 0..ne {
+                            row[d] = rs[base + d] + bs[r * ne + d] * scale;
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::QwenPleGate {
+                    key,
+                    query,
+                    value,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let ks = &vals[key.0 as usize];
+                    let qs = &vals[query.0 as usize];
+                    let vs = &vals[value.0 as usize];
+                    let mut out = vec![0f32; rr * hc * ne];
+                    self.pool().for_chunks_mut(&mut out, ne, 1, &|rh, row| {
+                        let r = rh / hc;
+                        let base = rh * ne;
+                        let mut dot = 0.0f32;
+                        for d in 0..ne {
+                            dot += ks[base + d] * qs[base + d];
+                        }
+                        let score = dot / (ne as f32).sqrt();
+                        let signed = if score > 0.0 {
+                            score.abs().max(1e-6).sqrt()
+                        } else if score < 0.0 {
+                            -score.abs().max(1e-6).sqrt()
+                        } else {
+                            0.0
+                        };
+                        let scale = 1.0 / (1.0 + (-signed).exp());
+                        for d in 0..ne {
+                            row[d] = vs[r * ne + d] * scale;
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
                 // Broadcast multiply: the length-`n` `vec` scales every one of `rows` rows
                 // (diffusion-gemma's router input scale — the multiplicative twin of `AddBias`).
                 Op::MulVec {

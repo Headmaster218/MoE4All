@@ -2126,6 +2126,49 @@ fn lower_op(
             }
             rec.scale(r(*dst)?, *s, n);
         }
+        Op::Silu { x, dst, n, scale } => rec.silu_scale(r(*x)?, r(*dst)?, *n, *scale),
+        Op::QwenHcMix {
+            x,
+            gate,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => rec.qwen_hc_mix(r(*x)?, r(*gate)?, r(*dst)?, *rows, *hc, *n_embd),
+        Op::QwenHcInject {
+            residual,
+            block,
+            gate,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => rec.qwen_hc_inject(
+            r(*residual)?,
+            r(*block)?,
+            r(*gate)?,
+            r(*dst)?,
+            *rows,
+            *hc,
+            *n_embd,
+        ),
+        Op::QwenPleGate {
+            key,
+            query,
+            value,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => rec.qwen_ple_gate(
+            r(*key)?,
+            r(*query)?,
+            r(*value)?,
+            r(*dst)?,
+            *rows,
+            *hc,
+            *n_embd,
+        ),
         Op::Copy {
             src,
             src_off,

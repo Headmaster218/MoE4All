@@ -16,6 +16,10 @@ pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}
 /// pre-type rather than Qwen2's case-insensitive contraction group.
 pub(crate) const BAILINGMOE_PRE_RE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
 
+/// Qwen3.5/3.8 pre-tokenizer. `\p{M}` is significant for combining marks; this is the exact
+/// pattern published in Qwen3.8's tokenizer.json and selected by llama.cpp's `qwen35` pre-type.
+pub(crate) const QWEN35_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// DeepSeek-LLM (V1) pre-tokenizer patterns — 6 successive splits applied in order
 /// (llama.cpp's `DEEPSEEK_LLM` pre-type, `src/llama-vocab.cpp`). See docs/deepseek.md §0.2.
 pub(crate) const DEEPSEEK_LLM_PRE_RES: [&str; 6] = [

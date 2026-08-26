@@ -366,6 +366,39 @@ mod tests {
         }
     }
 
+    /// Unsloth's Qwen3.8-Flash-Next UD-Q2_K_XL is a mixed recipe rather than a new GGUF dtype:
+    /// most expert gate/up banks are IQ2_XS, one pair is IQ3_XXS, and down banks are IQ4_NL.
+    /// qwen4exp v1 uses the small-m path for both decode and its intentionally per-token prefill,
+    /// so all three must retain resident and paged single-/multi-id coverage. The remaining fixed
+    /// quantized/BF16 fixed weights in that file use the dense-native formats listed below (its
+    /// small F32 tensors keep the established loader conversion/specialized paths).
+    #[test]
+    fn qwen38_q2_k_xl_recipe_has_complete_decode_coverage() {
+        use infr_core::DType::{Bf16, Iq2Xs, Iq3Xxs, Iq4Nl, Q4K, Q5K, Q6K, Q8_0};
+
+        for dtype in [Iq2Xs, Iq3Xxs, Iq4Nl] {
+            assert!(
+                moe_expert_dtype_ok(dtype),
+                "{dtype:?} lacks resident id/idm coverage"
+            );
+            assert!(
+                native_id_paged_kernel_name(dtype).is_some(),
+                "{dtype:?} lacks paged id coverage"
+            );
+            assert!(
+                native_idm_paged_kernel_name(dtype).is_some(),
+                "{dtype:?} lacks paged idm coverage"
+            );
+        }
+
+        for dtype in [Bf16, Q4K, Q5K, Q6K, Q8_0, Iq4Nl] {
+            assert!(
+                native_dense_supported(dtype),
+                "Q2_K_XL fixed-weight dtype {dtype:?} lacks a native dense path"
+            );
+        }
+    }
+
     /// Canonical enumeration of every `DType` variant, used by the drift guards below to mean
     /// literally "for EVERY dtype". [`all_dtypes_is_exhaustive`] pins it exhaustive: adding a variant
     /// to the enum breaks that test's compile until it's listed here, so this can't silently omit a

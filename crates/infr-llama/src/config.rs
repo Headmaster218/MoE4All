@@ -115,6 +115,9 @@ pub struct Config {
     /// field below plus the `MixerW::DeltaNet` mixer branch in `seam`'s layer loop — the same
     /// shared transformer skeleton every other architecture runs through.
     pub qwen35: bool,
+    /// Qwen3.8 Flash Next (`qwen4exp`): Qwen-style recurrent/full attention wrapped in four
+    /// low-rank gated residual streams, plus PLE and a routed/shared-expert MoE.
+    pub qwen4exp: bool,
     /// Ling 3.0 Flash (`bailingmoe3`): hybrid KDA/MLA mixer and DeepSeek-style MoE.
     pub bailingmoe3: bool,
     /// Per-layer mixer selector for `bailingmoe3`: true is MLA, false is KDA. Empty elsewhere.
@@ -125,6 +128,8 @@ pub struct Config {
     /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
     /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
     pub full_attn_interval: usize,
+    /// Explicit per-layer recurrent selector used by qwen4exp GGUFs. Empty on other arches.
+    pub recurrent_layers: Vec<bool>,
     /// qwen35 SSM (gated-DeltaNet) dims — see `docs/qwen35.md`. `0` for non-qwen35 models.
     pub ssm_d_conv: usize,
     pub ssm_d_state: usize,
@@ -254,6 +259,9 @@ pub struct Config {
     /// hyper-connection block carries. Every per-layer `hc_*` tensor and the model-level
     /// `output_hc_*` triple are shaped by it. `0` for every non-`deepseek4` model.
     pub hc_mult: usize,
+    /// Qwen3.8's low-rank gated-residual bottleneck. DeepSeek V4 uses full-rank Sinkhorn HC and
+    /// leaves this zero.
+    pub hc_low_rank: usize,
     /// DeepSeek V4 (`{arch}.hyper_connection.sinkhorn_iterations`): how many Sinkhorn normalisation
     /// rounds make the stream-mixing matrix approximately doubly stochastic. `0` for every
     /// non-`deepseek4` model.
@@ -261,6 +269,17 @@ pub struct Config {
     /// DeepSeek V4 (`{arch}.hyper_connection.epsilon`): the epsilon added inside that Sinkhorn
     /// normalisation. `0.0` for every non-`deepseek4` model.
     pub hc_eps: f32,
+    /// Qwen3.8 PLE metadata. The enormous `per_layer_token_embd` tensor remains mmap-backed;
+    /// these fields are enough to hash and fetch its rows without materializing the table.
+    pub ple_layers: Vec<bool>,
+    pub ple_ngram_size: usize,
+    pub ple_heads_per_ngram: usize,
+    pub ple_head_dim: usize,
+    pub ple_conv_kernel: usize,
+    pub ple_eos: u32,
+    pub ple_layer_multipliers: Vec<u64>,
+    pub ple_head_offsets: Vec<u64>,
+    pub ple_head_vocab_sizes: Vec<u64>,
     /// DeepSeek lightning indexer: number of indexer QUERY heads
     /// (`{arch}.attention.indexer.head_count`). One KEY head is shared by all of them (MQA) on V3.2;
     /// on V4 the keys come from the compressor instead. `0` for every model that is neither
@@ -514,6 +533,20 @@ impl Config {
             && (il + 1).is_multiple_of(self.full_attn_interval)
     }
 
+    /// Whether a Qwen hybrid layer is full attention rather than recurrent. The qwen35 helper is
+    /// retained for its existing callers; qwen4exp uses an explicit per-layer vector when present.
+    pub fn is_qwen_hybrid_attn_layer(&self, il: usize) -> bool {
+        self.is_qwen35_attn_layer(il)
+            || (self.qwen4exp
+                && !self.recurrent_layers.get(il).copied().unwrap_or_else(|| {
+                    self.full_attn_interval > 0 && !(il + 1).is_multiple_of(self.full_attn_interval)
+                }))
+    }
+
+    pub fn is_ple_layer(&self, il: usize) -> bool {
+        self.qwen4exp && self.ple_layers.get(il).copied().unwrap_or(false)
+    }
+
     /// Whether Ling layer `il` uses MLA rather than KDA.
     pub fn is_bailing_mla_layer(&self, il: usize) -> bool {
         self.bailingmoe3 && self.bailing_mla_layers.get(il).copied().unwrap_or(false)
@@ -525,6 +558,7 @@ impl Config {
 
     pub fn is_recurrent_layer(&self, il: usize) -> bool {
         (self.qwen35 && !self.is_qwen35_attn_layer(il))
+            || (self.qwen4exp && self.recurrent_layers.get(il).copied().unwrap_or(false))
             || (self.bailingmoe3 && !self.is_bailing_mla_layer(il))
     }
 
@@ -597,12 +631,13 @@ impl Config {
             // both lists so the supported set can't drift from the match arms above. `QWEN35_MOE`
             // (Qwen3.6 MoE) shares the exact same attention/qk-norm shape as dense `QWEN35` — only
             // its FFN differs (see the `moe`/`shexp_ff` parses below).
-            crate::arch::QWEN35 | crate::arch::QWEN35_MOE => true,
+            crate::arch::QWEN35 | crate::arch::QWEN35_MOE | crate::arch::QWEN4EXP => true,
             other => bail!(
-                "infr-llama supports architecture={} (plus {}|{}), got {other:?}",
+                "infr-llama supports architecture={} (plus {}|{}|{}), got {other:?}",
                 crate::arch::TRANSFORMER.join("|"),
                 crate::arch::QWEN35,
                 crate::arch::QWEN35_MOE,
+                crate::arch::QWEN4EXP,
             ),
         };
         // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
@@ -661,6 +696,7 @@ impl Config {
         // shape (routed-expert bank + shared expert vs plain dense).
         let qwen35_moe = arch == crate::arch::QWEN35_MOE;
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
+        let qwen4exp = arch == crate::arch::QWEN4EXP;
         let bailingmoe3 = arch == crate::arch::BAILINGMOE3;
         let mla_arch = deepseek2 || bailingmoe3;
         let mk = |k: &str| format!("{arch}.{k}");
@@ -818,20 +854,21 @@ impl Config {
         // downstream able to notice. V4's indexer differs structurally (no `indexer.attn_k`, no
         // `indexer.k_norm` — its keys come from the compressor) but is described by the same three
         // numbers.
-        let (indexer_n_head, indexer_head_size, indexer_top_k) = if deepseek32 || deepseek4 {
-            let ix = |k: &str| -> Result<usize> {
-                let key = mk(k);
-                let v = meta_u64(g, &key).with_context(|| format!("{key} missing"))?;
-                positive_model_dimension(&key, v)
+        let (indexer_n_head, indexer_head_size, indexer_top_k) =
+            if deepseek32 || deepseek4 || qwen4exp {
+                let ix = |k: &str| -> Result<usize> {
+                    let key = mk(k);
+                    let v = meta_u64(g, &key).with_context(|| format!("{key} missing"))?;
+                    positive_model_dimension(&key, v)
+                };
+                (
+                    ix("attention.indexer.head_count")?,
+                    ix("attention.indexer.key_length")?,
+                    ix("attention.indexer.top_k")?,
+                )
+            } else {
+                (0, 0, 0)
             };
-            (
-                ix("attention.indexer.head_count")?,
-                ix("attention.indexer.key_length")?,
-                ix("attention.indexer.top_k")?,
-            )
-        } else {
-            (0, 0, 0)
-        };
         // The indexer's `k_norm` is a real (mean-centred) LayerNorm and `deepseek32.cpp` hardcodes
         // `hparams.f_norm_eps = 1e-6` for it — a SEPARATE epsilon from `f_norm_rms_eps` (`rms_eps`
         // below), which stays whatever the GGUF declares.
@@ -912,17 +949,27 @@ impl Config {
         // `o_groups * o_lora_rank` input) are held to positive; a zero would divide by zero or
         // silently collapse a dimension. The remaining three are counts and an epsilon, where zero
         // is a legal — if degenerate — value, so they are only required to be PRESENT.
-        let (o_group_count, o_lora_rank, hc_mult, hc_sinkhorn_iters, hash_layer_count) =
+        let (o_group_count, o_lora_rank, hc_mult, hc_low_rank, hc_sinkhorn_iters, hash_layer_count) =
             if deepseek4 {
                 (
                     req_dim("attention.output_group_count")?,
                     req_dim("attention.output_lora_rank")?,
                     req_dim("hyper_connection.count")?,
+                    0,
                     req_u64("hyper_connection.sinkhorn_iterations")? as usize,
                     req_u64("hash_layer_count")? as usize,
                 )
+            } else if qwen4exp {
+                (
+                    0,
+                    0,
+                    req_dim("hyper_connection.count")?,
+                    req_dim("hyper_connection.low_rank")?,
+                    0,
+                    0,
+                )
             } else {
-                (0, 0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0)
             };
         let (compress_rope_theta, hc_eps) = if deepseek4 {
             (
@@ -937,7 +984,7 @@ impl Config {
         // because `load_arch_tensors` then indexes `[il]` for every layer; the extra entries a
         // longer array carries are simply unused, which is why this takes a prefix rather than
         // demanding an exact length.
-        let compress_ratios: Vec<usize> = if deepseek4 {
+        let compress_ratios: Vec<usize> = if deepseek4 || qwen4exp {
             let key = mk("attention.compress_ratios");
             let arr = g
                 .metadata()
@@ -959,8 +1006,16 @@ impl Config {
                     // compression ratios 0, 4, and 128". An unknown ratio is not a wider variant of
                     // a known one — it decides which tensors the layer HAS — so refuse rather than
                     // round it to the nearest tier.
-                    if !matches!(r, 0 | 4 | 128) {
-                        bail!("{key}[{il}] = {v:?} is not one of 0, 4, 128");
+                    let valid = if deepseek4 {
+                        matches!(r, 0 | 4 | 128)
+                    } else {
+                        matches!(r, 0 | 4)
+                    };
+                    if !valid {
+                        if deepseek4 {
+                            bail!("{key}[{il}] = {v:?} is not one of 0, 4, 128");
+                        }
+                        bail!("{key}[{il}] = {v:?} is not one of 0, 4");
                     }
                     Ok(r)
                 })
@@ -1076,7 +1131,7 @@ impl Config {
                 .collect()
         } else if let Some(ff) = meta_u64(g, &mk("feed_forward_length")) {
             vec![ff as usize; n_layer]
-        } else if qwen35_moe {
+        } else if qwen35_moe || qwen4exp {
             // qwen35moe (Qwen3.6 MoE, routed-expert FFN on every layer) carries NO top-level
             // `feed_forward_length` — there's no dense `ffn_*` tensor anywhere in the GGUF, only
             // the routed bank (`ffn_*_exps`, sized by `expert_feed_forward_length` — parsed into
@@ -1111,6 +1166,7 @@ impl Config {
         let moe = if arch == crate::arch::QWEN3_MOE
             || diffusion_gemma
             || qwen35_moe
+            || qwen4exp
             || gemma4_moe
             || llama4
             || deepseek
@@ -1203,7 +1259,7 @@ impl Config {
                 _ => None,
             })
             // qwen35's GGUF sets this explicitly (1e7); the fallback only matters if it's absent.
-            .unwrap_or(if qwen35 { 1e7 } else { 10000.0 });
+            .unwrap_or(if qwen35 || qwen4exp { 1e7 } else { 10000.0 });
         let rms_eps = g
             .metadata()
             .get(&mk("attention.layer_norm_rms_epsilon"))
@@ -1212,7 +1268,7 @@ impl Config {
                 _ => None,
             })
             // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
-            .unwrap_or(if qwen35 { 1e-6 } else { 1e-5 });
+            .unwrap_or(if qwen35 || qwen4exp { 1e-6 } else { 1e-5 });
         // deepseek4 reads `attention.sliding_window` with a plain `get_key` — its raw attention is
         // sliding-window on EVERY layer, so the window is not optional decoration there.
         let swa_window = if deepseek4 {
@@ -1309,10 +1365,35 @@ impl Config {
         // qwen35 (gated-DeltaNet hybrid) extras — ports of the old seam's `qwen35::Cfg::from_gguf`.
         // These metadata keys sit directly under `qwen35.*` (NOT `qwen35.attention.*`), matching the
         // old seam's parser exactly.
-        let full_attn_interval = if qwen35 {
+        let full_attn_interval = if qwen35 || qwen4exp {
             meta_u64(g, &mk("full_attention_interval")).unwrap_or(4) as usize
         } else {
             0
+        };
+        let recurrent_layers = if qwen4exp {
+            let key = mk("attention.recurrent_layers");
+            if let Some(values) = g.metadata().get(&key).and_then(MetaValue::as_arr) {
+                if values.len() < n_layer {
+                    bail!("{key} has {} entries for {n_layer} layers", values.len());
+                }
+                values[..n_layer]
+                    .iter()
+                    .enumerate()
+                    .map(|(il, v)| match v {
+                        MetaValue::Bool(b) => Ok(*b),
+                        _ => v
+                            .as_u64()
+                            .map(|n| n != 0)
+                            .with_context(|| format!("{key}[{il}] is not bool/integer")),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                (0..n_layer)
+                    .map(|il| !(il + 1).is_multiple_of(full_attn_interval.max(1)))
+                    .collect()
+            }
+        } else {
+            Vec::new()
         };
         let (kda_head_dim, kda_gate_lower_bound) = if bailingmoe3 {
             (
@@ -1323,13 +1404,19 @@ impl Config {
         } else {
             (0, 0.0)
         };
-        let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 {
+        let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 || qwen4exp
+        {
             (
-                meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")? as usize,
-                meta_u64(g, &mk("ssm.state_size")).context("qwen35 ssm.state_size")? as usize,
-                meta_u64(g, &mk("ssm.inner_size")).context("qwen35 ssm.inner_size")? as usize,
-                meta_u64(g, &mk("ssm.group_count")).context("qwen35 ssm.group_count")? as usize,
-                meta_u64(g, &mk("ssm.time_step_rank")).context("qwen35 ssm.time_step_rank")?
+                meta_u64(g, &mk("ssm.conv_kernel"))
+                    .with_context(|| format!("{arch} ssm.conv_kernel"))? as usize,
+                meta_u64(g, &mk("ssm.state_size"))
+                    .with_context(|| format!("{arch} ssm.state_size"))? as usize,
+                meta_u64(g, &mk("ssm.inner_size"))
+                    .with_context(|| format!("{arch} ssm.inner_size"))? as usize,
+                meta_u64(g, &mk("ssm.group_count"))
+                    .with_context(|| format!("{arch} ssm.group_count"))? as usize,
+                meta_u64(g, &mk("ssm.time_step_rank"))
+                    .with_context(|| format!("{arch} ssm.time_step_rank"))?
                     as usize,
             )
         } else if bailingmoe3 {
@@ -1344,7 +1431,7 @@ impl Config {
         } else {
             (0, 0, 0, 0, 0)
         };
-        let rope_sections: [u32; 4] = if qwen35 {
+        let rope_sections: [u32; 4] = if qwen35 || qwen4exp {
             let mut s = [0u32; 4];
             if let Some(arr) = g
                 .metadata()
@@ -1359,7 +1446,7 @@ impl Config {
         } else {
             [0u32; 4]
         };
-        let attn_out_gate = qwen35;
+        let attn_out_gate = qwen35 || qwen4exp;
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
         let n_layer_dense_lead = if deepseek || deepseek2 || bailingmoe3 {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
@@ -1371,7 +1458,7 @@ impl Config {
         // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). DeepSeek's shared expert is
         // `n_ff_exp * n_expert_shared` wide (llama.cpp fuses `n_expert_shared` experts into one
         // wider branch — see docs/deepseek.md § Stage 1). `0` = no shared expert.
-        let shexp_ff = if qwen35_moe {
+        let shexp_ff = if qwen35_moe || qwen4exp {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
@@ -1383,7 +1470,7 @@ impl Config {
         };
         // llama4 shared expert is summed in PLAIN (no per-token gate); qwen35moe gates by sigmoid.
         // DeepSeek's shared expert is also plain-summed (no gate).
-        let shexp_gated = qwen35_moe;
+        let shexp_gated = qwen35_moe || qwen4exp;
         // llama4 iRoPE + MoE interleave. `interleave_moe_layer_step` defaults to 1 (every layer MoE,
         // as on Scout). The NoPE step: the reference forces the chunked-attention branch whenever
         // `attention.sliding_window` is absent or nonzero, in which case `n_no_rope_layer_step`
@@ -1465,6 +1552,166 @@ impl Config {
         } else {
             Vec::new()
         };
+        let (
+            ple_layers,
+            ple_ngram_size,
+            ple_heads_per_ngram,
+            ple_head_dim,
+            ple_conv_kernel,
+            ple_eos,
+            ple_layer_multipliers,
+            ple_head_offsets,
+            ple_head_vocab_sizes,
+        ) = if qwen4exp {
+            let arr_u64 = |suffix: &str| -> Result<Vec<u64>> {
+                let key = mk(suffix);
+                g.metadata()
+                    .get(&key)
+                    .and_then(MetaValue::as_arr)
+                    .with_context(|| format!("{key} missing (or not an array)"))?
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        v.as_u64()
+                            .with_context(|| format!("{key}[{i}] is not a non-negative integer"))
+                    })
+                    .collect()
+            };
+            let mut layers = vec![false; n_layer];
+            for il in arr_u64("ple.layers")? {
+                let il = usize::try_from(il).context("qwen4exp.ple.layers index overflow")?;
+                if il >= n_layer {
+                    bail!(
+                        "{}.ple.layers contains {il}, but block_count is {n_layer}",
+                        arch
+                    );
+                }
+                layers[il] = true;
+            }
+            let ng = req_dim("ple.ngram_size")?;
+            let hpg = req_dim("ple.heads_per_ngram")?;
+            let row = req_dim("embedding_length_per_layer_input")?;
+            let kernel = req_dim("ple.conv_kernel")?;
+            let eos = req_u64("ple.eos_token_id")? as u32;
+            let multipliers = arr_u64("ple.layer_multipliers")?;
+            let offsets = arr_u64("ple.head_offsets")?;
+            let sizes = arr_u64("ple.head_vocab_sizes")?;
+            let n_heads = ng.saturating_sub(1).saturating_mul(hpg);
+            if ng < 2 || multipliers.len() < ng {
+                bail!(
+                    "qwen4exp PLE needs ngram_size >= 2 and one multiplier per position; got \
+                     ngram_size={ng}, multipliers={}",
+                    multipliers.len()
+                );
+            }
+            if offsets.len() != n_heads || sizes.len() != n_heads || sizes.contains(&0) {
+                bail!(
+                    "qwen4exp PLE head metadata mismatch: expected {n_heads} non-zero heads, got \
+                     offsets={} sizes={}",
+                    offsets.len(),
+                    sizes.len()
+                );
+            }
+            (
+                layers,
+                ng,
+                hpg,
+                row,
+                kernel,
+                eos,
+                multipliers,
+                offsets,
+                sizes,
+            )
+        } else {
+            (
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        if qwen4exp {
+            for (name, value) in [
+                ("ssm.conv_kernel", ssm_d_conv),
+                ("ssm.state_size", ssm_d_state),
+                ("ssm.inner_size", ssm_d_inner),
+                ("ssm.group_count", ssm_n_group),
+                ("ssm.time_step_rank", ssm_dt_rank),
+            ] {
+                if value == 0 {
+                    bail!("{}.{} must be positive", arch, name);
+                }
+            }
+            if recurrent_layers.len() != n_layer {
+                bail!(
+                    "qwen4exp recurrent-layer map has {} entries for {n_layer} layers",
+                    recurrent_layers.len()
+                );
+            }
+            if !recurrent_layers.iter().any(|&v| v) || !recurrent_layers.iter().any(|&v| !v) {
+                bail!("qwen4exp requires both recurrent and full-attention layers");
+            }
+            if !ssm_dt_rank.is_multiple_of(ssm_n_group) {
+                bail!(
+                    "qwen4exp ssm.time_step_rank ({ssm_dt_rank}) must be divisible by \
+                     ssm.group_count ({ssm_n_group})"
+                );
+            }
+            if !ssm_d_inner.is_multiple_of(ssm_dt_rank) {
+                bail!(
+                    "qwen4exp ssm.inner_size ({ssm_d_inner}) must be divisible by \
+                     ssm.time_step_rank ({ssm_dt_rank})"
+                );
+            }
+            let head_v_dim = ssm_d_inner / ssm_dt_rank;
+            if head_v_dim != ssm_d_state {
+                bail!(
+                    "qwen4exp gated-DeltaNet requires equal K/V head dimensions; state_size is \
+                     {ssm_d_state}, but inner_size/time_step_rank is {head_v_dim}"
+                );
+            }
+            for (il, (&recurrent, &ratio)) in
+                recurrent_layers.iter().zip(&compress_ratios).enumerate()
+            {
+                if recurrent && ratio != 0 {
+                    bail!(
+                        "qwen4exp attention.compress_ratios[{il}] is {ratio} on a recurrent \
+                         layer; recurrent layers must use ratio 0"
+                    );
+                }
+            }
+            let ple_impl: Vec<_> = ple_layers
+                .iter()
+                .enumerate()
+                .filter_map(|(il, &enabled)| enabled.then_some(il))
+                .collect();
+            if ple_impl.as_slice() != [1] {
+                bail!(
+                    "qwen4exp v1 expects the released model's single PLE implementation at \
+                     zero-based layer 1; got {ple_impl:?}"
+                );
+            }
+            let ple_width = ple_ngram_size
+                .checked_sub(1)
+                .and_then(|n| n.checked_mul(ple_heads_per_ngram))
+                .and_then(|n| n.checked_mul(ple_head_dim))
+                .context("qwen4exp PLE flattened width overflow")?;
+            if ple_width != n_embd {
+                bail!(
+                    "qwen4exp PLE flattened width is {ple_width}, but embedding_length is \
+                     {n_embd}"
+                );
+            }
+            hc_mult
+                .checked_mul(n_embd)
+                .context("qwen4exp hyper-connection width overflow")?;
+        }
         Ok(Config {
             n_layer,
             n_head,
@@ -1506,11 +1753,13 @@ impl Config {
             moe,
             n_ctx_train,
             qwen35,
+            qwen4exp,
             bailingmoe3,
             bailing_mla_layers,
             kda_head_dim,
             kda_gate_lower_bound,
             full_attn_interval,
+            recurrent_layers,
             ssm_d_conv,
             ssm_d_state,
             ssm_d_inner,
@@ -1539,8 +1788,18 @@ impl Config {
             o_lora_rank,
             compress_rope_theta,
             hc_mult,
+            hc_low_rank,
             hc_sinkhorn_iters,
             hc_eps,
+            ple_layers,
+            ple_ngram_size,
+            ple_heads_per_ngram,
+            ple_head_dim,
+            ple_conv_kernel,
+            ple_eos,
+            ple_layer_multipliers,
+            ple_head_offsets,
+            ple_head_vocab_sizes,
             indexer_n_head,
             indexer_head_size,
             indexer_top_k,
@@ -1587,6 +1846,26 @@ mod tests {
         push_str(bytes, key);
         push_u32(bytes, 4); // GGUF_TYPE_UINT32
         push_u32(bytes, value);
+    }
+
+    fn push_u32_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[u32]) {
+        push_str(bytes, key);
+        push_u32(bytes, 9); // GGUF_TYPE_ARRAY
+        push_u32(bytes, 4); // GGUF_TYPE_UINT32
+        push_u64(bytes, values.len() as u64);
+        for &value in values {
+            push_u32(bytes, value);
+        }
+    }
+
+    fn push_u64_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[u64]) {
+        push_str(bytes, key);
+        push_u32(bytes, 9); // GGUF_TYPE_ARRAY
+        push_u32(bytes, 10); // GGUF_TYPE_UINT64
+        push_u64(bytes, values.len() as u64);
+        for &value in values {
+            push_u64(bytes, value);
+        }
     }
 
     /// Minimal `deepseek2` GGUF carrying exactly `keys` (each prefixed with `deepseek2.`) plus a
@@ -1663,10 +1942,111 @@ mod tests {
         bytes
     }
 
+    /// Four-layer scale model of the released Qwen3.8 layout. It deliberately omits
+    /// `attention.recurrent_layers`, as the current converter does, to exercise the 3 GDN + 1
+    /// full-attention interval fallback.
+    fn qwen4exp_fixture(ple_row_dim: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, 1); // tensor count
+        push_u64(&mut bytes, 34); // metadata count
+
+        push_str(&mut bytes, "general.architecture");
+        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
+        push_str(&mut bytes, "qwen4exp");
+        for (key, value) in [
+            ("block_count", 4),
+            ("embedding_length", 32),
+            ("attention.head_count", 4),
+            ("attention.head_count_kv", 2),
+            ("attention.key_length", 8),
+            ("rope.dimension_count", 2),
+            ("context_length", 64),
+            ("expert_count", 8),
+            ("expert_used_count", 2),
+            ("expert_feed_forward_length", 16),
+            ("expert_shared_feed_forward_length", 16),
+            ("full_attention_interval", 4),
+            ("ssm.conv_kernel", 4),
+            ("ssm.state_size", 4),
+            ("ssm.inner_size", 16),
+            ("ssm.group_count", 2),
+            ("ssm.time_step_rank", 4),
+            ("hyper_connection.count", 4),
+            ("hyper_connection.low_rank", 8),
+            ("attention.indexer.head_count", 2),
+            ("attention.indexer.key_length", 8),
+            ("attention.indexer.top_k", 16),
+            ("ple.ngram_size", 3),
+            ("ple.heads_per_ngram", 2),
+            ("embedding_length_per_layer_input", ple_row_dim),
+            ("ple.conv_kernel", 4),
+            ("ple.eos_token_id", 2),
+        ] {
+            push_u32_metadata(&mut bytes, &format!("qwen4exp.{key}"), value);
+        }
+        push_u32_array_metadata(
+            &mut bytes,
+            "qwen4exp.attention.compress_ratios",
+            &[0, 0, 0, 4],
+        );
+        push_u32_array_metadata(
+            &mut bytes,
+            "qwen4exp.rope.dimension_sections",
+            &[1, 1, 0, 0],
+        );
+        push_u32_array_metadata(&mut bytes, "qwen4exp.ple.layers", &[1]);
+        push_u64_array_metadata(
+            &mut bytes,
+            "qwen4exp.ple.layer_multipliers",
+            &[u32::MAX as u64 + 17, 11, 13],
+        );
+        push_u64_array_metadata(&mut bytes, "qwen4exp.ple.head_offsets", &[0, 100, 200, 300]);
+        push_u64_array_metadata(
+            &mut bytes,
+            "qwen4exp.ple.head_vocab_sizes",
+            &[97, 89, 83, 79],
+        );
+
+        push_str(&mut bytes, "token_embd.weight");
+        push_u32(&mut bytes, 2);
+        push_u64(&mut bytes, 32);
+        push_u64(&mut bytes, 8);
+        push_u32(&mut bytes, 0); // F32
+        push_u64(&mut bytes, 0);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&[0; 32 * 8 * 4]);
+        bytes
+    }
+
     #[test]
     fn model_dimensions_must_be_positive() {
         assert!(positive_model_dimension("test.head_count", 0).is_err());
         assert_eq!(positive_model_dimension("test.head_count", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn qwen4exp_interval_and_ple_geometry_match_the_released_layout() {
+        let cfg = config_from_fixture("qwen4exp", &qwen4exp_fixture(8))
+            .expect("scaled qwen4exp fixture must parse");
+        assert!(cfg.qwen4exp);
+        assert_eq!(cfg.recurrent_layers, [true, true, true, false]);
+        assert_eq!(cfg.compress_ratios, [0, 0, 0, 4]);
+        assert_eq!(cfg.ple_layers, [false, true, false, false]);
+        assert_eq!(cfg.ple_layer_multipliers[0], u32::MAX as u64 + 17);
+        assert_eq!(cfg.q35_head_k_dim(), 4);
+        assert_eq!(cfg.q35_head_v_dim(), 4);
+    }
+
+    #[test]
+    fn qwen4exp_refuses_a_ple_width_that_does_not_flatten_to_hidden_size() {
+        let Err(err) = config_from_fixture("qwen4exp-bad-ple", &qwen4exp_fixture(7)) else {
+            panic!("mismatched qwen4exp PLE width parsed successfully");
+        };
+        assert!(err.to_string().contains("PLE flattened width"));
     }
 
     #[test]

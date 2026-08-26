@@ -1410,6 +1410,10 @@ fn op_name(op: &Op) -> &'static str {
         Op::Add { .. } => "Add",
         Op::AddBias { .. } => "AddBias",
         Op::Scale { .. } => "Scale",
+        Op::Silu { .. } => "Silu",
+        Op::QwenHcMix { .. } => "QwenHcMix",
+        Op::QwenHcInject { .. } => "QwenHcInject",
+        Op::QwenPleGate { .. } => "QwenPleGate",
         Op::MulVec { .. } => "MulVec",
         Op::Softcap { .. } => "Softcap",
         Op::Argmax { .. } => "Argmax",
@@ -5795,6 +5799,16 @@ impl MetalBackend {
                 // silent wrong-output run rather than pretending to support it blind.
                 return Err(Error::Unsupported(
                     "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
+                        .into(),
+                ));
+            }
+            Op::Silu { .. }
+            | Op::QwenHcMix { .. }
+            | Op::QwenHcInject { .. }
+            | Op::QwenPleGate { .. } => {
+                return Err(Error::Unsupported(
+                    "Metal Qwen3.8 hyper-connection/PLE primitives are not implemented; use \
+                     Vulkan or CPU"
                         .into(),
                 ));
             }

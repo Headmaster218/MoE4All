@@ -22,6 +22,9 @@ pub(super) enum FfnW {
         gate_exps: TensorId,
         up_exps: TensorId,
         down_exps: TensorId,
+        /// `true` when `gate_exps` is the fused `[2*n_ff_exp, n_embd]` bank and `up_exps` aliases
+        /// it. Qwen3.8 uses the same layout already supported by the pager's MoE op.
+        fused_gate_up: bool,
         /// Shared expert (qwen35moe / llama4): `Some` when `Config::shexp_ff > 0` — a dense SwiGLU
         /// branch run on the SAME input as the routed bank and summed with its output. qwen35moe
         /// gates it by a per-token sigmoid (`Op::MoeSharedExpertAdd`, `gate_inp = Some`); llama4
@@ -265,6 +268,31 @@ pub(super) struct LayerHcW {
     pub(super) ffn: HcTriple,
 }
 
+/// Qwen3.8's low-rank gated residual module. Unlike DeepSeek V4 HC, this is grouped RMSNorm,
+/// down/SiLU/up elementwise gates, and an optional per-stream injection projection.
+#[derive(Clone, Copy)]
+pub(super) struct QwenHcW {
+    pub(super) norm: TensorId,
+    pub(super) down: TensorId,
+    pub(super) up: TensorId,
+    pub(super) inject: Option<TensorId>,
+}
+
+pub(super) struct QwenLayerHcW {
+    pub(super) attn: QwenHcW,
+    pub(super) ffn: QwenHcW,
+}
+
+pub(super) struct QwenPleW {
+    pub(super) key: TensorId,
+    pub(super) value: TensorId,
+    pub(super) norm_key: TensorId,
+    pub(super) norm_query: TensorId,
+    pub(super) norm_conv: TensorId,
+    /// Dilation-expanded depthwise kernel (`ple_conv_kernel=4`, ngram dilation 3 -> kernel 10).
+    pub(super) conv: TensorId,
+}
+
 /// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, DeepSeek MLA, or DeepSeek V4.
 pub(super) enum MixerW {
     Attn(AttnW),
@@ -283,6 +311,8 @@ pub(super) struct LayerW {
     /// [`MixerW::Dsv4`]; `None` for every other arch. They are NOT mixer weights — one of them
     /// wraps the FFN sublayer — which is why they sit on `LayerW` beside the norms.
     pub(super) hc: Option<LayerHcW>,
+    pub(super) qwen_hc: Option<QwenLayerHcW>,
+    pub(super) ple: Option<QwenPleW>,
     /// V4 ratio-4/128 compressor handles, declared after the layer's HC weights to mirror GGUF
     /// upload order. `None` for ratio-0 and every non-V4 layer.
     pub(super) dsv4_compressed: Option<Dsv4CompressedW>,
@@ -342,6 +372,12 @@ pub(crate) struct SeamKv {
     pub(super) pos_buf: Box<dyn Buffer>,
     pub(super) ipl_buf: Option<Box<dyn Buffer>>,
     pub(super) logits_buf: Box<dyn Buffer>,
+    /// Qwen3.8's four-stream residual carried across the layer-0/PLE split execution.
+    pub(super) qwen_wide_buf: Option<Box<dyn Buffer>>,
+    /// Host-gathered PLE rows uploaded after layer 0 finishes.
+    pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
+    /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
+    pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
     /// The context this slot's KV cache was ACTUALLY allocated for. Usually the `want_ctx` the
     /// caller asked for; smaller when the cold init's live-room re-clamp shrank it (see
     /// `crate::seam::reclamp_ctx_to_live_room`), which is why callers holding a `want_ctx` of
@@ -542,6 +578,8 @@ pub(crate) struct SeamWeights {
     pub(super) yff_buf: Option<(Box<dyn Buffer>, usize)>,
     /// Per-layer: whether `ffn_exp_probs_b.weight` was loaded (DeepSeek V3+ router bias).
     pub(super) layer_has_epb: Vec<bool>,
+    pub(super) layer_fused_experts: Vec<bool>,
+    pub(super) ple_worker: Option<std::sync::Arc<super::ple::PleWorker>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -621,7 +659,7 @@ impl SeamKv {
                 self.max_ctx
             ));
         }
-        if cfg.qwen35 || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
             let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
             let s_elems = cfg.recurrent_state_elems();
             let conv_zero = vec![0f32; conv_elems];
@@ -633,6 +671,11 @@ impl SeamKv {
                     be.upload(self.vbufs[l].as_ref(), bytemuck::cast_slice(&s_zero))
                         .map_err(|e| anyhow!("{e}"))?;
                 }
+            }
+            if let Some(state) = &self.ple_state_buf {
+                let zeros = vec![0u8; state.len_bytes()];
+                be.upload(state.as_ref(), &zeros)
+                    .map_err(|e| anyhow!("{e}"))?;
             }
         } else if cfg.deepseek4 {
             // Synthetic depth represents deterministic zero history. V4's compressor rings and
@@ -855,6 +898,32 @@ impl SeamKv {
             logits_buf: be
                 .alloc(cfg.vocab * 4, BufferUsage::Readback)
                 .map_err(|e| anyhow!("{e}"))?,
+            qwen_wide_buf: if cfg.qwen4exp {
+                Some(
+                    be.alloc(cfg.hc_mult * cfg.n_embd * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            },
+            ple_embd_buf: if cfg.qwen4exp {
+                let heads = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram;
+                Some(
+                    be.alloc(cfg.ple_head_dim * heads * 4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            },
+            ple_state_buf: if cfg.qwen4exp {
+                let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
+                Some(
+                    be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            },
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
@@ -895,7 +964,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.deepseek4 {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);

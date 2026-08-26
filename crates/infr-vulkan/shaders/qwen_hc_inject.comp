@@ -1,0 +1,18 @@
+#version 460
+// Qwen3.8 per-stream residual injection.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint hc; uint n_embd; uint total; } pc;
+layout(binding = 0) readonly buffer RB { float residual[]; };
+layout(binding = 1) readonly buffer BB { float block_out[]; };
+layout(binding = 2) readonly buffer GB { float gate[]; };
+layout(binding = 3) writeonly buffer DB { float dst[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) { return; }
+    uint rh = i / pc.n_embd;
+    uint d = i - rh * pc.n_embd;
+    uint r = rh / pc.hc;
+    uint h = rh - r * pc.hc;
+    float s = 2.0 / (1.0 + exp(-(gate[r * pc.hc + h] / float(pc.hc))));
+    dst[i] = residual[i] + block_out[r * pc.n_embd + d] * s;
+}

@@ -18,6 +18,7 @@ use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
 
 pub mod model;
+mod ple;
 mod runner;
 mod sc;
 mod weights;
@@ -667,7 +668,14 @@ pub(crate) fn dense_act_reserve_at(
     ubatch: usize,
 ) -> u64 {
     // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
-    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
+    // Qwen3.8 v1 deliberately executes one token at a time: the PLE host gather is overlapped
+    // with layer 0 and the four-stream residual is carried across that split. Pricing a 1024-row
+    // graph that is never built would withhold many GiB from its expert cache.
+    let rows = if cfg.qwen4exp {
+        1
+    } else {
+        ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64
+    };
     // Only Op::Attention uses the pooled score/PV scratch below. Op::Mla scans compressed KV and
     // accumulates softmax/value inside its dedicated kernel, while recurrent mixers have no
     // context attention at all. Keep n_layer == 0 conservative for geometry-only configs/tests.
@@ -733,7 +741,7 @@ pub(crate) fn dense_act_reserve_at(
     // Plus its attention out-gate pair (`qg` + `gate_a`), which every arch declares but only this
     // one makes big: qwen35 interleaves q and gate in one projection, so `qg` is DOUBLE the q
     // width and the umbrella's n_embd term no longer covers the three of them.
-    let deltanet = if cfg.qwen35 {
+    let deltanet = if cfg.qwen35 || cfg.qwen4exp {
         4 * (2 * cfg.q35_conv_channels()
             + cfg.ssm_d_inner
             + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
@@ -743,7 +751,15 @@ pub(crate) fn dense_act_reserve_at(
     } else {
         0
     };
-    let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet) as u64;
+    // Qwen3.8's two wide ping-pong residuals, grouped-norm/gate scratch and PLE key/query/gated/
+    // conv rows. The generic n_embd umbrella does not cover hc*n_embd tensors.
+    let qwen4_hc = if cfg.qwen4exp {
+        8 * cfg.hc_mult * cfg.n_embd + 3 * cfg.hc_low_rank
+    } else {
+        0
+    };
+    let per_row =
+        (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
     rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
 }
 
@@ -1203,14 +1219,14 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
 /// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
 /// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
+    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && !cfg.qwen4exp && kv_row_align_ok(cfg)
 }
 
 /// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
 /// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
 /// priced exactly instead of the MoE planner treating every non-auto choice as f16.
 fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
-    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 {
+    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 || cfg.qwen4exp {
         return DType::F16;
     }
     let block_aligned = kv_row_align_ok(cfg);
@@ -1469,7 +1485,25 @@ pub(crate) fn kv_bytes_estimate_fmt(
             (k_bytes + v_bytes) as u64
         })
         .sum();
-    primary.saturating_add(recurrent_checkpoint_bytes(cfg))
+    let qwen4_extra = if cfg.qwen4exp {
+        let hc_dim = cfg.hc_mult.saturating_mul(cfg.n_embd);
+        let ple_hist = (cfg.ple_conv_kernel.saturating_sub(1))
+            .saturating_mul(cfg.ple_ngram_size)
+            .saturating_mul(hc_dim);
+        let ple_in = cfg
+            .ple_head_dim
+            .saturating_mul(cfg.ple_ngram_size.saturating_sub(1))
+            .saturating_mul(cfg.ple_heads_per_ngram);
+        hc_dim
+            .saturating_add(ple_hist)
+            .saturating_add(ple_in)
+            .saturating_mul(4) as u64
+    } else {
+        0
+    };
+    primary
+        .saturating_add(recurrent_checkpoint_bytes(cfg))
+        .saturating_add(qwen4_extra)
 }
 
 /// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
@@ -1841,7 +1875,7 @@ const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
         DEEPSEEK4_LOAD_DRIVER_RESERVE
-    } else if cfg!(windows) && (cfg.qwen35 || cfg.bailingmoe3) {
+    } else if cfg!(windows) && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
         WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE
     } else {
         0
@@ -1850,7 +1884,7 @@ fn load_driver_reserve(cfg: &Config) -> u64 {
 
 fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
     let automatic = if cfg!(windows)
-        && (cfg.qwen35 || cfg.bailingmoe3)
+        && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3)
         && ec.device.vram_budget.is_none()
         && ec.device.vram_reserve.is_none()
     {

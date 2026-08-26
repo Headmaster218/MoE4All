@@ -1,0 +1,37 @@
+#version 460
+// Qwen3.8 PLE query-dependent value gate. One 256-lane workgroup owns one (row, HC stream).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint hc; uint n_embd; uint groups; } pc;
+layout(binding = 0) readonly buffer KB { float key[]; };
+layout(binding = 1) readonly buffer QB { float query[]; };
+layout(binding = 2) readonly buffer VB { float value[]; };
+layout(binding = 3) writeonly buffer DB { float dst[]; };
+shared float sums[256];
+void main() {
+    uint group = gl_WorkGroupID.x;
+    if (group >= pc.groups) { return; }
+    uint lane = gl_LocalInvocationID.x;
+    uint r = group / pc.hc;
+    uint base = group * pc.n_embd;
+    float acc = 0.0;
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        acc += key[base + d] * query[base + d];
+    }
+    sums[lane] = acc;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) { sums[lane] += sums[lane + stride]; }
+        barrier();
+    }
+    if (lane == 0u) {
+        float score = sums[0] / sqrt(float(pc.n_embd));
+        float signed_root = score > 0.0 ? sqrt(max(abs(score), 1e-6))
+                           : score < 0.0 ? -sqrt(max(abs(score), 1e-6)) : 0.0;
+        sums[0] = 1.0 / (1.0 + exp(-signed_root));
+    }
+    barrier();
+    float scale = sums[0];
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        dst[base + d] = value[r * pc.n_embd + d] * scale;
+    }
+}

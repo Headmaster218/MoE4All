@@ -140,6 +140,210 @@ fn gen(n: usize, salt: usize) -> Vec<f32> {
 }
 
 #[test]
+fn qwen4_primitives_match_reference() {
+    let cpu = infr_cpu::CpuBackend::new();
+
+    let n = 37usize;
+    let mut silu_graph = Graph::new();
+    let silu_x = silu_graph.input(f32d(n));
+    let silu_dst = silu_graph.output(f32d(n));
+    let silu_scale = 0.25f32;
+    silu_graph.push(Op::Silu {
+        x: silu_x,
+        dst: silu_dst,
+        n: n as u32,
+        scale: silu_scale,
+    });
+    let silu_in = gen(n, 31);
+    let silu_ref: Vec<f32> = silu_in
+        .iter()
+        .map(|&x| {
+            let v = x * silu_scale;
+            v / (1.0 + (-v).exp())
+        })
+        .collect();
+    let silu_cpu = run(&cpu, &silu_graph, &[(silu_x, &silu_in)], &[], silu_dst, n);
+    assert!(maxerr(&silu_cpu, &silu_ref) < 1e-6);
+
+    let (rows, hc, ne) = (2usize, 4usize, 320usize);
+    let wide_n = rows * hc * ne;
+    let mut mix_graph = Graph::new();
+    let mix_x = mix_graph.input(f32d(wide_n));
+    let mix_gate = mix_graph.input(f32d(wide_n));
+    let mix_dst = mix_graph.output(f32d(rows * ne));
+    mix_graph.push(Op::QwenHcMix {
+        x: mix_x,
+        gate: mix_gate,
+        dst: mix_dst,
+        rows: rows as u32,
+        hc: hc as u32,
+        n_embd: ne as u32,
+    });
+    let mix_in = gen(wide_n, 32);
+    let mix_gate_in = gen(wide_n, 33);
+    let mut mix_ref = vec![0.0f32; rows * ne];
+    for r in 0..rows {
+        for d in 0..ne {
+            for h in 0..hc {
+                let i = (r * hc + h) * ne + d;
+                mix_ref[r * ne + d] += mix_in[i] / (1.0 + (-mix_gate_in[i]).exp()) / hc as f32;
+            }
+        }
+    }
+    let mix_cpu = run(
+        &cpu,
+        &mix_graph,
+        &[(mix_x, &mix_in), (mix_gate, &mix_gate_in)],
+        &[],
+        mix_dst,
+        rows * ne,
+    );
+    assert!(maxerr(&mix_cpu, &mix_ref) < 1e-6);
+
+    let mut inject_graph = Graph::new();
+    let inject_residual = inject_graph.input(f32d(wide_n));
+    let inject_block = inject_graph.input(f32d(rows * ne));
+    let inject_gate = inject_graph.input(f32d(rows * hc));
+    let inject_dst = inject_graph.output(f32d(wide_n));
+    inject_graph.push(Op::QwenHcInject {
+        residual: inject_residual,
+        block: inject_block,
+        gate: inject_gate,
+        dst: inject_dst,
+        rows: rows as u32,
+        hc: hc as u32,
+        n_embd: ne as u32,
+    });
+    let residual_in = gen(wide_n, 34);
+    let block_in = gen(rows * ne, 35);
+    let inject_gate_in = gen(rows * hc, 36);
+    let mut inject_ref = vec![0.0f32; wide_n];
+    for r in 0..rows {
+        for h in 0..hc {
+            let scale = 2.0 / (1.0 + (-(inject_gate_in[r * hc + h] / hc as f32)).exp());
+            for d in 0..ne {
+                let i = (r * hc + h) * ne + d;
+                inject_ref[i] = residual_in[i] + block_in[r * ne + d] * scale;
+            }
+        }
+    }
+    let inject_cpu = run(
+        &cpu,
+        &inject_graph,
+        &[
+            (inject_residual, &residual_in),
+            (inject_block, &block_in),
+            (inject_gate, &inject_gate_in),
+        ],
+        &[],
+        inject_dst,
+        wide_n,
+    );
+    assert!(maxerr(&inject_cpu, &inject_ref) < 1e-6);
+
+    let mut ple_graph = Graph::new();
+    let ple_key = ple_graph.input(f32d(wide_n));
+    let ple_query = ple_graph.input(f32d(wide_n));
+    let ple_value = ple_graph.input(f32d(rows * ne));
+    let ple_dst = ple_graph.output(f32d(wide_n));
+    ple_graph.push(Op::QwenPleGate {
+        key: ple_key,
+        query: ple_query,
+        value: ple_value,
+        dst: ple_dst,
+        rows: rows as u32,
+        hc: hc as u32,
+        n_embd: ne as u32,
+    });
+    let key_in = gen(wide_n, 37);
+    let query_in = gen(wide_n, 38);
+    let value_in = gen(rows * ne, 39);
+    let mut ple_ref = vec![0.0f32; wide_n];
+    for r in 0..rows {
+        for h in 0..hc {
+            let base = (r * hc + h) * ne;
+            let dot: f32 = key_in[base..base + ne]
+                .iter()
+                .zip(&query_in[base..base + ne])
+                .map(|(k, q)| k * q)
+                .sum();
+            let score = dot / (ne as f32).sqrt();
+            let signed_root = if score > 0.0 {
+                score.abs().max(1e-6).sqrt()
+            } else if score < 0.0 {
+                -score.abs().max(1e-6).sqrt()
+            } else {
+                0.0
+            };
+            let scale = 1.0 / (1.0 + (-signed_root).exp());
+            for d in 0..ne {
+                ple_ref[base + d] = value_in[r * ne + d] * scale;
+            }
+        }
+    }
+    let ple_cpu = run(
+        &cpu,
+        &ple_graph,
+        &[
+            (ple_key, &key_in),
+            (ple_query, &query_in),
+            (ple_value, &value_in),
+        ],
+        &[],
+        ple_dst,
+        wide_n,
+    );
+    assert!(maxerr(&ple_cpu, &ple_ref) < 1e-6);
+
+    if let Some(vk) = gpu() {
+        let silu_vk = run(&vk, &silu_graph, &[(silu_x, &silu_in)], &[], silu_dst, n);
+        let mix_vk = run(
+            &vk,
+            &mix_graph,
+            &[(mix_x, &mix_in), (mix_gate, &mix_gate_in)],
+            &[],
+            mix_dst,
+            rows * ne,
+        );
+        let inject_vk = run(
+            &vk,
+            &inject_graph,
+            &[
+                (inject_residual, &residual_in),
+                (inject_block, &block_in),
+                (inject_gate, &inject_gate_in),
+            ],
+            &[],
+            inject_dst,
+            wide_n,
+        );
+        let ple_vk = run(
+            &vk,
+            &ple_graph,
+            &[
+                (ple_key, &key_in),
+                (ple_query, &query_in),
+                (ple_value, &value_in),
+            ],
+            &[],
+            ple_dst,
+            wide_n,
+        );
+        println!(
+            "qwen4 primitive Vulkan errors: silu={:e} mix={:e} inject={:e} ple={:e}",
+            maxerr(&silu_vk, &silu_ref),
+            maxerr(&mix_vk, &mix_ref),
+            maxerr(&inject_vk, &inject_ref),
+            maxerr(&ple_vk, &ple_ref),
+        );
+        assert!(maxerr(&silu_vk, &silu_ref) < 1e-5);
+        assert!(maxerr(&mix_vk, &mix_ref) < 1e-5);
+        assert!(maxerr(&inject_vk, &inject_ref) < 1e-5);
+        assert!(maxerr(&ple_vk, &ple_ref) < 1e-4);
+    }
+}
+
+#[test]
 #[ignore = "requires a Vulkan GPU"]
 fn copystrided_parity() {
     let Some(vk) = gpu() else {
