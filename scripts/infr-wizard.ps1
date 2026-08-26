@@ -188,7 +188,7 @@ function Select-ModelPath {
         for ($i = 0; $i -lt $models.Count; $i++) {
             Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
         }
-        Write-Host ' [N] 输入新路径 / Enter a new path'
+        Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
         while ($true) {
             $choice = (Read-Host '选择模型 [1] / Select model [1]').Trim()
             if ([string]::IsNullOrWhiteSpace($choice)) { return $models[0] }
@@ -197,7 +197,15 @@ function Select-ModelPath {
                 return $models[$index - 1]
             }
             if ($choice -match '^(n|new|新)$') { break }
-            Write-Host '选择无效。Invalid selection.' -ForegroundColor Yellow
+            try {
+                $modelPath = ConvertTo-FullPath $choice
+                if (Test-Path -LiteralPath $modelPath -PathType Leaf) {
+                    return $modelPath
+                }
+            } catch {
+                # Keep prompting with the common, actionable error below.
+            }
+            Write-Host '选择无效或找不到该模型文件。Invalid selection or model file not found.' -ForegroundColor Yellow
         }
     }
 
