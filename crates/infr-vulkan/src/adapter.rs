@@ -4182,25 +4182,20 @@ fn lower_op(
                 infr_core::graph::MoeGating::Sigmoid => 1u32,
                 infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
             };
-            // exp_probs_b: resolve if present, else bind a dummy zero buffer (the shader ignores
-            // it when `has_bias == 0`). One float is enough — the shader reads only indices
-            // < n_expert, which push constants clamp before the bias buffer is touched.
-            let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
-                r(*epb)?
-            } else {
-                &*be_.alloc_uninit(4, BufferUsage::Weights)?
-            };
             let has_bias = exp_probs_b.is_some();
             // DeepSeek V4 hash routing: the selection arrives pre-gathered, so `moe_topk` copies
-            // it in and skips its whole selection phase (see `moe_topk.comp`). Same dummy-bind
-            // shape as `bias_buf` when absent. The two SELECTION-only inputs have nothing left to
-            // select on a hash layer, so refuse rather than ignore them.
-            let hash_buf: &dyn Buffer = if let Some(hid) = expert_ids {
-                r(*hid)?
-            } else {
-                &*be_.alloc_uninit(4, BufferUsage::Activations)?
-            };
+            // it in and skips its whole selection phase (see `moe_topk.comp`). Bias/hash are
+            // ignored by the shader when their flags are false, but Vulkan still requires their
+            // descriptor to remain live through submission. Keep one shared 4-byte binding in the
+            // scratch pool instead of allocating one per layer: a `Weights` dummy permanently
+            // advanced the monotonic BDA arena, while an Activation dummy could die before the
+            // recorded command was submitted.
             let hash = expert_ids.is_some();
+            let dummy_key = if !has_bias || !hash {
+                Some(pooled(pool, be_, "moe_dummy", 4)?)
+            } else {
+                None
+            };
             if hash && (has_bias || *n_expert_groups > 1) {
                 return Err(be(
                     "vulkan adapter: MoeFfn expert_ids (hash routing) supplies the selection — \
@@ -4386,6 +4381,16 @@ fn lower_op(
                 } else {
                     rec.linear(rw, rxb, logits.as_ref(), rows, ne, n_expert);
                 }
+                let bias_buf: &dyn Buffer = match exp_probs_b {
+                    Some(epb) => r(*epb)?,
+                    None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
+                };
+                let hash_buf: &dyn Buffer = match expert_ids {
+                    Some(hid) => r(*hid)?,
+                    None => {
+                        pool[dummy_key.as_ref().expect("absent hash ids allocated dummy")].as_ref()
+                    }
+                };
                 rec.moe_topk(
                     logits.as_ref(),
                     ids.as_ref(),
@@ -4683,6 +4688,14 @@ fn lower_op(
             } else {
                 rec.linear(rw, rxb, logits.get(pool), rows, ne, n_expert);
             }
+            let bias_buf: &dyn Buffer = match exp_probs_b {
+                Some(epb) => r(*epb)?,
+                None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
+            };
+            let hash_buf: &dyn Buffer = match expert_ids {
+                Some(hid) => r(*hid)?,
+                None => pool[dummy_key.as_ref().expect("absent hash ids allocated dummy")].as_ref(),
+            };
             // Top-`n_used` per token (gating-dependent weighting), weights pre-scaled by `scale`.
             rec.moe_topk(
                 logits.get(pool),
@@ -6682,22 +6695,16 @@ fn execute_paged_moe<'a>(
     let shared_wup = shared.map(|s| r(s.wup)).transpose()?;
     let shared_wdown = shared.map(|s| r(s.wdown)).transpose()?;
 
-    // Dummy bias buffer when exp_probs_b is absent (the shader ignores it when has_bias==0).
-    let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
-        r(*epb)?
-    } else {
-        &*be_.alloc_uninit(4, BufferUsage::Weights)?
-    };
+    // Bias/hash descriptors are ignored when their flags are false, but the binding still has to
+    // outlive the recorded command. One pooled dummy serves both absent inputs across every layer
+    // and every execute in the current phase.
     let has_bias = exp_probs_b.is_some();
-    // Hash routing changes only expert selection; the paged executor consumes the resulting IDs
-    // through the same residency and arena path as router top-k. Reuse the resident moe_topk hash
-    // mode so V4's early hash layers remain pageable without a second routing implementation.
-    let hash_dummy = be_.alloc_uninit(4, BufferUsage::Activations)?;
-    let hash_buf: &dyn Buffer = match expert_ids {
-        Some(id) => r(*id)?,
-        None => hash_dummy.as_ref(),
-    };
     let hash = expert_ids.is_some();
+    let dummy_key = if !has_bias || !hash {
+        Some(pooled(pool, be_, "moe_dummy", 4)?)
+    } else {
+        None
+    };
     if swiglu_clamp.is_some() && (matches!(act, Activation::Sigmoid) || *weight_before) {
         return Err(be(
             "vulkan adapter: paged MoeFfn swiglu_clamp needs a gated SiLU/GELU with \
@@ -6730,6 +6737,14 @@ fn execute_paged_moe<'a>(
         } else {
             rc.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
         }
+        let bias_buf: &dyn Buffer = match exp_probs_b {
+            Some(epb) => r(*epb)?,
+            None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
+        };
+        let hash_buf: &dyn Buffer = match expert_ids {
+            Some(id) => r(*id)?,
+            None => pool[dummy_key.as_ref().expect("absent hash ids allocated dummy")].as_ref(),
+        };
         rc.moe_topk(
             pool[&logits].as_ref(),
             pool[&ids_key].as_ref(),
