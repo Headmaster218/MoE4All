@@ -18,6 +18,24 @@ MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此�
 > 当前主要开发和实测平台是原生 Windows 11、AMD Radeon RX 7900 XTX 和
 > Vulkan。其他 Vulkan GPU 可能可用，但不是 MoE4All 当前的重点验证平台。
 
+## 最新进展：Qwen3.8-Flash-Next 首次运行成功
+
+Qwen3.8-Flash-Next 已经通过 MoE4All 在消费级 **AMD Radeon RX 7900 XTX**
+上稳定生成正常内容，简单数学和推理问题也能够正确回答。首跑使用 Windows 11、
+Q2 量化，实际系统内存占用约 **40 GB**。
+
+这是短上下文阶段的 **First Boot**：QSA 尚未接入，因此当前上下文暂时限制在
+约 2K 以内。下表为三次早期测试的代表值和范围，尚不代表长上下文或最终优化性能。
+
+| 测试 | 代表值 | 三次范围 |
+|---|---:|---:|
+| 0 context decode，tg16 | **43.5 tok/s** | 42.6-44.9 tok/s |
+| 0 context prefill，pp32 | **46.6 tok/s** | 46.2-47.1 tok/s |
+| 1024 context decode，tg16 | **41.9 tok/s** | 41.4-42.7 tok/s |
+| 1024 context incremental prefill，pp32 | **42.6 tok/s** | 42.1-43.3 tok/s |
+
+下一步将优先完成 QSA 正确性和长上下文支持，再继续优化 kernel 与整体性能。
+
 ## 三步开始
 
 ### 1. 下载
@@ -101,6 +119,7 @@ Windows 11 主机。它们用于说明项目已经达到的能力，不同模型
 | Llama、Llama 4 | `llama`、`llama4` | Dense 与 MoE Vulkan 推理 |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`、`qwen3`、`qwen3moe` | Dense 与 Qwen3 MoE |
 | Qwen3.5 / Qwen3.6 | `qwen35`、`qwen35moe` | Gated DeltaNet、Attention 与分页 MoE |
+| Qwen3.8 Flash Next | `qwen4exp` | 早期短上下文 Vulkan；QSA 与长上下文支持进行中 |
 | Gemma 3 / Gemma 4 | `gemma3`、`gemma4` | Dense、MoE 与 E2B 变体 |
 | Ling 3.0 Flash | `bailingmoe3` | KDA、gated MLA、512 experts 与 RAM/SSD 分页 |
 | DeepSeek V4 Flash | `deepseek4` | FP8 KV、MXFP4 indexer cache 与分页 MoE |

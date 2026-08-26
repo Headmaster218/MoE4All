@@ -20,6 +20,28 @@ bilingual wizard, and choose automatic configuration.
 > development and validation platform. Other Vulkan GPUs may work, but they do
 > not currently receive the same compatibility and performance coverage.
 
+## Latest milestone: Qwen3.8-Flash-Next first boot
+
+Qwen3.8-Flash-Next now generates stable, coherent output through MoE4All on a
+consumer **AMD Radeon RX 7900 XTX**, including correct answers to simple math
+and reasoning questions. The first run used Windows 11, a Q2 quantization, and
+approximately **40 GB of system memory**.
+
+This is an early, short-context **first boot**. QSA is not integrated yet, so
+the current context is temporarily limited to roughly 2K tokens. The following
+are representative results and ranges from three early runs, not final
+long-context or fully optimized performance.
+
+| Test | Representative result | Three-run range |
+|---|---:|---:|
+| Decode at context 0, tg16 | **43.5 tok/s** | 42.6-44.9 tok/s |
+| Prefill at context 0, pp32 | **46.6 tok/s** | 46.2-47.1 tok/s |
+| Decode at context 1024, tg16 | **41.9 tok/s** | 41.4-42.7 tok/s |
+| Incremental prefill at context 1024, pp32 | **42.6 tok/s** | 42.1-43.3 tok/s |
+
+The next priority is QSA correctness and long-context support, followed by
+kernel and end-to-end performance optimization.
+
 ## Start in three steps
 
 ### 1. Download
@@ -111,6 +133,7 @@ Full conditions and engineering history:
 | Llama and Llama 4 | `llama`, `llama4` | Dense and MoE Vulkan inference |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`, `qwen3`, `qwen3moe` | Dense and Qwen3 MoE |
 | Qwen3.5 / Qwen3.6 | `qwen35`, `qwen35moe` | Gated DeltaNet, attention, and paged MoE |
+| Qwen3.8 Flash Next | `qwen4exp` | Early short-context Vulkan support; QSA and long context are in progress |
 | Gemma 3 / Gemma 4 | `gemma3`, `gemma4` | Dense, MoE, and E2B variants |
 | Ling 3.0 Flash | `bailingmoe3` | KDA, gated MLA, 512 experts, and RAM/SSD paging |
 | DeepSeek V4 Flash | `deepseek4` | FP8 KV, MXFP4 indexer cache, and paged MoE |
