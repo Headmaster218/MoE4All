@@ -1,0 +1,128 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Override .cargo/config.toml's developer-only target-cpu=native setting.
+  RUSTFLAGS: '-C target-cpu=x86-64 -C target-feature=+crt-static'
+  VULKAN_SDK_VERSION: '1.4.357.0'
+
+jobs:
+  package:
+    name: Build Windows release package
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release-x86-64
+
+      - name: Resolve and validate release version
+        id: release
+        shell: pwsh
+        run: |
+          $metadata = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $package = $metadata.packages | Where-Object { $_.name -eq 'infr-cli' } | Select-Object -First 1
+          if ($null -eq $package) { throw 'infr-cli is missing from cargo metadata.' }
+          $version = [string]$package.version
+          $expectedTag = "release-$version"
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -ne $expectedTag) {
+            throw "Tag '${{ github.ref_name }}' does not match Cargo version '$expectedTag'."
+          }
+          $packageName = "infr-windows-x86_64-$version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "archive_name=$packageName.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache Vulkan SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-windows-x64-${{ env.VULKAN_SDK_VERSION }}
+      - name: Install Vulkan shader compiler
+        shell: pwsh
+        run: .\scripts\install-vulkan-sdk-windows.ps1
+
+      - name: Test Windows platform code
+        shell: pwsh
+        run: |
+          cargo check --locked -p infr-hub --all-targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-hub model_ref::tests::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build portable infr.exe
+        run: cargo build --release --locked -p infr-cli
+
+      - name: Create release archive
+        shell: pwsh
+        run: .\scripts\package-windows.ps1 -Version '${{ steps.release.outputs.version }}'
+      - name: Smoke-test extracted CMD package
+        shell: pwsh
+        run: |
+          $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
+          Expand-Archive -LiteralPath '.\dist\${{ steps.release.outputs.archive_name }}' -DestinationPath $extractPath
+          $packageRoot = Join-Path $extractPath '${{ steps.release.outputs.package_name }}'
+          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}'
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.release.outputs.package_name }}
+          path: |
+            dist/${{ steps.release.outputs.archive_name }}
+            dist/${{ steps.release.outputs.archive_name }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest release archive
+        if: startsWith(github.ref, 'refs/tags/release-')
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ steps.release.outputs.archive_name }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/release-')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $assets = @(
+            '.\dist\${{ steps.release.outputs.archive_name }}'
+            '.\dist\${{ steps.release.outputs.archive_name }}.sha256'
+          )
+          & gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag @assets --clobber
+          } else {
+            & gh release create $tag @assets --verify-tag --title "INFR ${{ steps.release.outputs.version }}" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }

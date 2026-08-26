@@ -188,18 +188,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         args.addr
     };
-    println!("INFR GUI: http://{shown}");
-    println!("Worker binary: {}", app.inner.infr_path.display());
+    tracing::info!(address = %shown, "INFR GUI listening");
+    tracing::info!(worker = %app.inner.infr_path.display(), "worker binary selected");
     if !app.inner.admin_key.is_empty() {
-        println!("Management API is protected by INFR_GUI_KEY.");
+        tracing::info!("management API is protected by INFR_GUI_KEY");
     }
     let shutdown_app = app.clone();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                println!("Stopping INFR GUI and draining its worker...");
+                tracing::info!("stopping INFR GUI and draining its worker");
                 if let Err(error) = shutdown_app.inner.worker.stop_and_wait().await {
-                    eprintln!("worker shutdown warning: {error}");
+                    tracing::warn!(%error, "worker shutdown warning");
                 }
             }
         })

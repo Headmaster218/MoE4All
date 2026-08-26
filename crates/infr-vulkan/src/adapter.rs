@@ -6852,8 +6852,11 @@ fn execute_paged_moe<'a>(
                 .expect("paged execution requires a session")
                 .enter_decode();
             if changed && infr_core::pager_profile::active() {
-                eprintln!(
-                    "[moe-prefill] arena switched to decode-LRU: rows={rows} n_used={n_used} n_expert={n_expert}"
+                tracing::info!(
+                    rows,
+                    n_used,
+                    n_expert,
+                    "[moe-prefill] arena switched to decode-LRU"
                 );
             }
         }

@@ -143,6 +143,61 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace --locked
 
+  # Native Windows release guard. This builds the same portable package users
+  # download, then expands it and drives all three CMD wizard modes in DryRun.
+  # GitHub-hosted runners have no supported discrete GPU, so real Vulkan model
+  # execution remains a separate workstation/self-hosted smoke test.
+  windows-package:
+    name: Windows package smoke
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      # .cargo/config.toml intentionally stays native for local performance.
+      # Public binaries must run on CPUs other than the Actions runner's CPU.
+      RUSTFLAGS: '-C target-cpu=x86-64 -C target-feature=+crt-static'
+      VULKAN_SDK_VERSION: '1.4.357.0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release-x86-64
+      - name: Cache Vulkan SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-windows-x64-${{ env.VULKAN_SDK_VERSION }}
+      - name: Install Vulkan shader compiler
+        shell: pwsh
+        run: .\scripts\install-vulkan-sdk-windows.ps1
+      - name: Test Windows platform code
+        shell: pwsh
+        run: |
+          cargo check --locked -p infr-hub --all-targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-hub model_ref::tests::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build portable infr.exe
+        run: cargo build --release --locked -p infr-cli
+      - name: Package and smoke-test the CMD distribution
+        shell: pwsh
+        run: |
+          $metadata = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $version = [string](($metadata.packages | Where-Object { $_.name -eq 'infr-cli' } | Select-Object -First 1).version)
+          .\scripts\package-windows.ps1 -OutputDirectory 'target\ci-dist' -Version $version
+          $packageName = "infr-windows-x86_64-$version"
+          $archivePath = Join-Path 'target\ci-dist' "$packageName.zip"
+          $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $extractPath
+          .\scripts\smoke-windows-package.ps1 -PackageRoot (Join-Path $extractPath $packageName) -ExpectedVersion $version
+
   # Cheap Linux guard for the macOS-only `infr-metal` crate: `cargo check`
   # cross-compiled to aarch64-apple-darwin doesn't link, so no macOS SDK is
   # needed — it just typechecks the match arms/tests that the Linux clippy/test

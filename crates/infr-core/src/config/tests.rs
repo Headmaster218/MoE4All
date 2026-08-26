@@ -793,18 +793,25 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 ///
 /// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
 ///   when it is read (§5.3).
-/// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
-///   point at files on disk, deliberately left on the environment.
+/// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_EMBEDDING_TEST_*` /
+///   `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that point at files on disk, deliberately left
+///   on the environment.
+/// * `INFR_NO_MOE_SHARED_SLOT` — a backend-private same-binary validation escape hatch, explicitly
+///   accounted for in `manifest::NOT_MIGRATED`.
 ///
 /// `RAYON_NUM_THREADS` is not an `INFR_*` knob and is not in scope: `infr-cli` still PUBLISHES it,
 /// because rayon's global pool has no other input.
 #[test]
 fn no_infr_env_reads_outside_the_config_layer() {
     /// Keys any file may still read directly (§6.10).
-    const FIXTURE_KEYS: &[&str] = &[
+    const DIRECT_ENV_KEYS: &[&str] = &[
         "INFR_TEST_GGUF",
         "INFR_TEST_MODEL",
+        "INFR_EMBEDDING_TEST_MODEL",
+        "INFR_EMBEDDING_TEST_ORACLE",
+        "INFR_EMBEDDING_TEST_VULKAN",
         "INFR_LLAMA_DIFFUSION_CLI",
+        "INFR_NO_MOE_SHARED_SLOT",
     ];
 
     let Some(crates) = repo_crates_dir() else {
@@ -818,7 +825,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
     }
     offenders.retain(|hit| {
         let (path, key) = hit.rsplit_once(' ').expect("hit is `path KEY`");
-        if FIXTURE_KEYS.contains(&key) {
+        if DIRECT_ENV_KEYS.contains(&key) {
             return false;
         }
         // `INFR_PROFILE` is the build scripts' alone.

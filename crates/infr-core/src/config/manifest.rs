@@ -8,7 +8,7 @@
 //!   | grep -vE '_TEST_|^INFR_(TP|EP|CPU|METAL)$'
 //! ```
 //!
-//! which yields **177** keys at `2dd0c5a`: [`KEYS`]'s 174 plus [`NOT_MIGRATED`]'s 3. (A naive
+//! which yielded **177** keys at `2dd0c5a`: [`KEYS`]'s 174 plus [`NOT_MIGRATED`]'s 3. (A naive
 //! `grep 'env::var("INFR_'` found only 153 of them — 205 literal call sites — because ~27 reads
 //! went through a helper that took the key name as a `&str`: `budget::env_flag`/`env_mib`/
 //! `overflow_vram_reserve`, `pager::ring_bytes_policy`, `tier::EnvRows::get`, `fusion`'s
@@ -368,6 +368,12 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
         "CLI presentation only, NOT a Config field: since S7 it is `infr run --diffusion-visual`, \
          a plain clap flag whose `env =` fallback keeps the old spelling working. The literal that \
          remains in `cli/main.rs` is that clap attribute, not a `std::env::var` read.",
+    ),
+    (
+        "INFR_NO_MOE_SHARED_SLOT",
+        "Vulkan validation escape hatch for same-binary A/B of the shared-expert slot peephole. \
+         It is backend-private and deliberately remains a direct presence check rather than user \
+         configuration.",
     ),
 ];
 

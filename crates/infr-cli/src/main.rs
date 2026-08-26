@@ -4340,6 +4340,7 @@ fn cmd_serve_embedding(
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let (model_id, generator) = load_embedding_generator(model, runner, parallel, cfg)?;
     let parallel = parallel.max(1);
+    // print-ok: serve-embedding endpoint banner is stable CLI output.
     println!("infr serve-embedding: {model_id} on http://{sockaddr}  (OpenAI /v1/embeddings)");
     tokio::runtime::Runtime::new()?.block_on(infr_server::serve_embedding(
         generator,
