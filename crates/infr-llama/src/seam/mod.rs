@@ -1826,21 +1826,39 @@ fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
 const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 
 /// WDDM charges large mapped ReBAR arenas more aggressively than the logical Vulkan allocation
-/// tally while they are being committed. On the Windows 7900 XTX target, Qwen35-family sessions
-/// can lose more than 1 GiB of the initially reported heap budget between committing a large
-/// mapped arena and allocating the full Q8 KV set. Keep that load-only movement out of the expert
-/// arena; Linux uses the live heap budget without this WDDM allowance and remains byte-for-byte
-/// unchanged.
-const WINDOWS_QWEN35_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+/// tally while they are being committed. On the Windows 7900 XTX target, Qwen35 and Ling sessions
+/// gain about 2 GiB of untracked heap usage between committing a large mapped arena and allocating
+/// their fixed weights/state. Keep that load-only movement out of the expert arena; Linux uses the
+/// live heap budget without this WDDM allowance and remains byte-for-byte unchanged.
+const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Cold WDDM startup has a small amount of run-to-run heap-budget movement beyond the measured
+/// large-ReBAR load reserve above. Automatic placement should favor a reliable first launch over the
+/// last few Expert slots. An explicit total VRAM budget/reserve remains authoritative and opts out
+/// of this extra policy margin.
+const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
         DEEPSEEK4_LOAD_DRIVER_RESERVE
-    } else if cfg!(windows) && cfg.qwen35 {
-        WINDOWS_QWEN35_LOAD_DRIVER_RESERVE
+    } else if cfg!(windows) && (cfg.qwen35 || cfg.bailingmoe3) {
+        WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE
     } else {
         0
     }
+}
+
+fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
+    let automatic = if cfg!(windows)
+        && (cfg.qwen35 || cfg.bailingmoe3)
+        && ec.device.vram_budget.is_none()
+        && ec.device.vram_reserve.is_none()
+    {
+        WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
+    } else {
+        0
+    };
+    load_driver_reserve(cfg).saturating_add(automatic)
 }
 
 /// Conservative load-time runtime reserve for control planes that do not own a live backend yet.
@@ -1866,6 +1884,72 @@ pub fn estimate_runtime_reserve_bytes_for_device(
     dense_act_reserve_at(cfg, &caps, want_ctx, ubatch)
 }
 
+fn moe_expert_layer(name: &str) -> Option<usize> {
+    name.strip_prefix("blk.")
+        .and_then(|r| r.split('.').next())
+        .and_then(|l| l.parse::<usize>().ok())
+}
+
+fn moe_role_index(name: &str) -> Option<usize> {
+    if name.ends_with("ffn_gate_exps.weight") || name.ends_with("ffn_gate_up_exps.weight") {
+        Some(0)
+    } else if name.ends_with("ffn_up_exps.weight") {
+        Some(1)
+    } else if name.ends_with("ffn_down_exps.weight") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// The pager's physical size classes, derived from the same expert banks its binder diverts.
+/// Keeping this outside the binder lets the default-context preflight reserve the exact one-layer
+/// floor before any Vulkan allocation exists.
+fn moe_logical_pools(g: &Gguf, cfg: &Config, n_paged: usize) -> Vec<(usize, usize, [usize; 3])> {
+    let Some(moe) = cfg.moe.as_ref() else {
+        return Vec::new();
+    };
+    let n_expert = moe.n_expert.max(1);
+    let mut by_size = std::collections::BTreeMap::<usize, (usize, [usize; 3])>::new();
+    for t in g.tensors() {
+        let Some(_layer) = moe_expert_layer(&t.name).filter(|&l| l < n_paged) else {
+            continue;
+        };
+        let Some(role) = moe_role_index(&t.name) else {
+            continue;
+        };
+        let slot_bytes = (t.nbytes / n_expert).max(4);
+        let entry = by_size.entry(slot_bytes).or_insert((0, [0; 3]));
+        entry.0 += n_expert;
+        entry.1[role] += n_expert;
+    }
+    by_size
+        .into_iter()
+        .map(|(slot_bytes, (blocks, role_blocks))| (slot_bytes, blocks, role_blocks))
+        .collect()
+}
+
+fn moe_pool_floor_bytes(pools: &[(usize, usize, [usize; 3])], n_expert: usize) -> Option<u64> {
+    pools
+        .iter()
+        .try_fold(0u64, |sum, &(slot_bytes, n_blocks, role_blocks)| {
+            let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
+            let slots = n_expert
+                .saturating_mul(roles_per_layer)
+                .min(n_blocks)
+                .max(1);
+            sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
+        })
+}
+
+pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
+    let Some(moe) = cfg.moe.as_ref() else {
+        return 0;
+    };
+    let pools = moe_logical_pools(g, cfg, cfg.n_layer);
+    moe_pool_floor_bytes(&pools, moe.n_expert.max(1)).unwrap_or(u64::MAX)
+}
+
 /// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
 /// receives enough slots for one worst-case Prefill layer; the remaining bytes are then assigned
 /// in weighted-fair order. Reserving the floors up front avoids the old `clamp(floor, nb)` corner
@@ -1886,13 +1970,7 @@ fn moe_pool_slot_counts(
                 .max(1)
         })
         .collect();
-    let minimum =
-        pools
-            .iter()
-            .zip(&floors)
-            .try_fold(0u64, |sum, (&(slot_bytes, _, _), &slots)| {
-                sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
-            })?;
+    let minimum = moe_pool_floor_bytes(pools, n_expert)?;
     if minimum > budget {
         return None;
     }
@@ -1974,6 +2052,33 @@ pub(crate) fn kv_fit_ctx_for(
     )
 }
 
+/// MoE counterpart of [`kv_fit_ctx_for`]. `fixed_bytes` excludes pageable expert banks but
+/// includes their load-time fixed reserves. The remaining physical arena is shared by Expert
+/// slots and transient runtime allocations, so it must hold the larger of the one-layer Expert
+/// floor and the activation peak, not both at once.
+pub(crate) fn kv_fit_ctx_for_moe(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    fixed_bytes: u64,
+    minimum_elastic_bytes: u64,
+    vram: &infr_vulkan::VramInfo,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
+    kv_fit_ctx_in_budgets(
+        cfg,
+        caps,
+        ec,
+        planned_vram_room(vram, ec).saturating_sub(fixed_bytes),
+        None,
+        minimum_elastic_bytes,
+        &ubatch_candidates(ec),
+        k_fmt,
+        v_fmt,
+    )
+}
+
 /// The search half of [`kv_fit_ctx_for`], against a budget that is ALREADY net of the weights:
 /// the largest context whose KV cache plus its activation reserve fit `budget` bytes.
 ///
@@ -1993,19 +2098,21 @@ pub(crate) fn kv_fit_ctx_in_budget(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
-    kv_fit_ctx_in_budgets(cfg, caps, ec, budget, None, cands, k_fmt, v_fmt)
+    kv_fit_ctx_in_budgets(cfg, caps, ec, budget, None, 0, cands, k_fmt, v_fmt)
 }
 
 /// Context fit with separate placement domains. `persistent_budget` is ordinary device room and
 /// must contain KV/recurrent state. `elastic_activation_budget`, when present, is an already-
 /// committed arena that only activation scratch may borrow; keeping the two tests separate avoids
-/// pretending that persistent KV can consume Expert slots.
+/// pretending that persistent KV can consume Expert slots. `minimum_elastic_bytes` reserves a
+/// physical arena floor that can itself be reused by activation scratch.
 fn kv_fit_ctx_in_budgets(
     cfg: &Config,
     caps: &Capabilities,
     ec: &EngineConfig,
     persistent_budget: u64,
     elastic_activation_budget: Option<u64>,
+    minimum_elastic_bytes: u64,
     cands: &[usize],
     k_fmt: DType,
     v_fmt: DType,
@@ -2020,8 +2127,11 @@ fn kv_fit_ctx_in_budgets(
             let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
             let reserve = dense_act_reserve_at(cfg, caps, ctx, ubatch);
             elastic_activation_budget.map_or_else(
-                || kv.saturating_add(reserve) <= persistent_budget,
-                |activation_budget| kv <= persistent_budget && reserve <= activation_budget,
+                || kv.saturating_add(reserve.max(minimum_elastic_bytes)) <= persistent_budget,
+                |activation_budget| {
+                    kv <= persistent_budget
+                        && reserve.max(minimum_elastic_bytes) <= activation_budget
+                },
             )
         })
     };
@@ -2119,6 +2229,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
             ec,
             budget,
             elastic_activation,
+            0,
             &[ub],
             k_fmt,
             v_fmt,
@@ -2332,7 +2443,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // borrows only cold Decode arena ranges and returns them on `enter_decode`.
         let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, ubatch_rows(ec));
         let packing_margin = resident_weight_packing_margin(fp.dense);
-        let load_driver_reserve = load_driver_reserve(cfg);
+        let load_driver_reserve = session_load_driver_reserve(cfg, ec);
         let Some(plan) = ModelMemoryPlan::new_with_reserves(
             room,
             fp.dense,
@@ -5542,6 +5653,41 @@ mod seam_helper_tests {
             super::load_driver_reserve(&cfg),
             if cfg!(windows) { 2 * GIB } else { 0 }
         );
+
+        let automatic = EngineConfig::default();
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &automatic),
+            if cfg!(windows) {
+                2 * GIB + 512 * MIB
+            } else {
+                0
+            }
+        );
+        let mut explicit = EngineConfig::default();
+        explicit.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(512 * MIB));
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &explicit),
+            if cfg!(windows) { 2 * GIB } else { 0 }
+        );
+
+        cfg.qwen35 = false;
+        cfg.bailingmoe3 = true;
+        assert_eq!(
+            super::load_driver_reserve(&cfg),
+            if cfg!(windows) { 2 * GIB } else { 0 }
+        );
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &automatic),
+            if cfg!(windows) {
+                2 * GIB + 512 * MIB
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &explicit),
+            if cfg!(windows) { 2 * GIB } else { 0 }
+        );
     }
 
     #[test]
@@ -5567,6 +5713,52 @@ mod seam_helper_tests {
             .iter()
             .zip(&slots)
             .all(|(&(_, max_slots, _), &n)| n <= max_slots));
+    }
+
+    #[test]
+    fn moe_context_fit_reserves_fixed_bytes_not_the_pageable_payload() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = qwen3_14b();
+        let ec = EngineConfig::default();
+        let vram = xtx(XTX_FREE);
+        let (k, v) = (DType::F16, DType::F16);
+
+        let resident =
+            super::kv_fit_ctx_for(&cfg, &conservative_caps(), &ec, 30 * GIB, &vram, k, v)
+                .expect("has KV");
+        assert!(
+            resident < super::MIN_SESSION_CTX,
+            "an over-VRAM all-resident footprint must not pretend to fit"
+        );
+
+        let fixed = 5 * GIB;
+        let expert_floor = 2 * GIB;
+        let fit = super::kv_fit_ctx_for_moe(
+            &cfg,
+            &conservative_caps(),
+            &ec,
+            fixed,
+            expert_floor,
+            &vram,
+            k,
+            v,
+        )
+        .expect("has KV");
+        assert!(
+            fit >= super::MIN_SESSION_CTX,
+            "paged MoE must remain usable"
+        );
+
+        let ring = super::kv_ring_wanted(&cfg, &ec);
+        let need = |ctx: usize, ub: usize| {
+            let kv = super::kv_bytes_estimate_fmt(&cfg, ctx, ring, ub, k, v);
+            let runtime = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ub);
+            fixed + kv + runtime.max(expert_floor)
+        };
+        let cands = super::ubatch_candidates(&ec);
+        assert!(cands.iter().any(|&ub| need(fit, ub) <= XTX_ROOM));
+        assert!(cands.iter().all(|&ub| need(fit + 1, ub) > XTX_ROOM));
     }
 
     /// **Drift guard (backlog B11), the rung half.** The shared `ubatch_candidates` ladder exists so

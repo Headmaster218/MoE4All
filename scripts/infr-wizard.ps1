@@ -15,7 +15,13 @@ try {
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$infrPath = Join-Path $repoRoot 'target\release\infr.exe'
+$releaseInfrPath = Join-Path $repoRoot 'infr.exe'
+$sourceInfrPath = Join-Path $repoRoot 'target\release\infr.exe'
+$infrPath = if (Test-Path -LiteralPath $releaseInfrPath -PathType Leaf) {
+    $releaseInfrPath
+} else {
+    $sourceInfrPath
+}
 $dataDir = Join-Path $repoRoot 'gui-data'
 $statePath = Join-Path $dataDir 'wizard-state.json'
 $guiStatePath = Join-Path $dataDir 'state.json'
@@ -101,6 +107,23 @@ function Read-YesNo {
             return $false
         }
         Write-Host '请输入 Y 或 N。Please enter Y or N.' -ForegroundColor Yellow
+    }
+}
+
+function Read-SecretValue {
+    param([Parameter(Mandatory = $true)][string]$Label)
+    while ($true) {
+        $secureValue = Read-Host $Label -AsSecureString
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
+        try {
+            $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+        Write-Host '此项不能为空。This value is required.' -ForegroundColor Yellow
     }
 }
 
@@ -210,51 +233,127 @@ function Format-PowerShellArgument {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
+function Test-IsLoopbackAddress {
+    param([Parameter(Mandatory = $true)][string]$Address)
+    return $Address.Trim() -match '^(127(?:\.\d{1,3}){3}|\[::1\]):\d+$'
+}
+
+function Read-ListenAddress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Default
+    )
+    while ($true) {
+        $value = Read-TextValue -Label $Label -Default $Default -Required
+        $matched = if ($value -match '^\[([^\]]+)\]:(\d+)$') {
+            $hostText = $Matches[1]
+            $portText = $Matches[2]
+            $true
+        } elseif ($value -match '^([^:]+):(\d+)$') {
+            $hostText = $Matches[1]
+            $portText = $Matches[2]
+            $true
+        } else {
+            $false
+        }
+        $addressValue = $null
+        $port = 0
+        if ($matched -and
+            [System.Net.IPAddress]::TryParse($hostText, [ref]$addressValue) -and
+            [int]::TryParse($portText, [ref]$port) -and
+            $port -ge 1 -and $port -le 65535) {
+            return $value
+        }
+        Write-Host '请输入有效的 IP:端口，例如 127.0.0.1:8080 或 [::1]:8080。' -ForegroundColor Yellow
+        Write-Host 'Enter a valid IP:port, for example 127.0.0.1:8080 or [::1]:8080.' -ForegroundColor Yellow
+    }
+}
+
+function Get-ClientAddress {
+    param([Parameter(Mandatory = $true)][string]$ListenAddress)
+    $value = $ListenAddress.Trim()
+    if ($value -match '^0\.0\.0\.0:(\d+)$') {
+        return "127.0.0.1:$($Matches[1])"
+    }
+    if ($value -match '^\[::\]:(\d+)$') {
+        return "[::1]:$($Matches[1])"
+    }
+    return $value
+}
+
 Clear-Host
 Write-Host 'INFR 启动向导 / INFR Launch Wizard' -ForegroundColor Green
 Write-Host '上次设置会作为默认值；直接回车即可复用。Press Enter to reuse the previous value.'
+Write-Host "程序 / Executable: $infrPath" -ForegroundColor DarkGray
 
 if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf)) {
-    throw "找不到 infr.exe，请先运行 cargo build --release --locked -p infr-cli。`nExecutable not found: $infrPath"
+    throw "找不到 infr.exe。发布包请把 infr.exe 与 Start-INFR-Wizard.cmd 放在同一目录；源码构建请先运行 cargo build --release --locked -p infr-cli。`nExecutable not found beside the launcher or under target\release."
 }
 
-$launchMode = Read-Choice -Label '运行模式 / Launch mode' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'benchmark')) -Options @(
-    [pscustomobject]@{ Key = '1'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
-    [pscustomobject]@{ Key = '2'; Value = 'chat'; Label = '实时终端对话 / Interactive terminal chat' }
+$launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
+    [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
+    [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
+    [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
 )
 $modelPath = Select-ModelPath
 
-Write-Host "`n通用设置 / Common settings" -ForegroundColor Cyan
-$device = Read-TextValue -Label '设备 / Device' -Default ([string](Get-SavedValue 'device' 'Vulkan0')) -Required
-$context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default ([string](Get-SavedValue 'context' ''))
-$ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default ([string](Get-SavedValue 'ubatch' '512')) -Minimum 1 -AllowBlank
-$threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default ([string](Get-SavedValue 'threads' '')) -Minimum 1 -AllowBlank
-$configPath = Read-TextValue -Label '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup' -Default ([string](Get-SavedValue 'config_path' ''))
-if (-not [string]::IsNullOrWhiteSpace($configPath)) {
-    $configPath = ConvertTo-FullPath $configPath
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-        throw "找不到配置文件 / Config file not found: $configPath"
-    }
+$setupModeDefault = 'quick'
+if ($null -ne $script:Saved) {
+    $savedSetupMode = $script:Saved.PSObject.Properties['setup_mode']
+    # States written by the older all-advanced wizard keep their previous behavior after upgrade.
+    $setupModeDefault = if ($null -eq $savedSetupMode) { 'advanced' } else { [string]$savedSetupMode.Value }
 }
-
-$kvPreset = Read-Choice -Label 'KV Cache 类型 / KV cache type' -DefaultValue ([string](Get-SavedValue 'kv_preset' 'q8')) -Options @(
-    [pscustomobject]@{ Key = '1'; Value = 'q8'; Label = 'Q8_0 K + Q8_0 V' }
-    [pscustomobject]@{ Key = '2'; Value = 'f16'; Label = 'F16 K + F16 V' }
-    [pscustomobject]@{ Key = '3'; Value = 'auto'; Label = '引擎自动 / Engine default' }
-    [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '分别指定 / Custom K and V' }
+$setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $setupModeDefault -Options @(
+    [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动配置（推荐）/ Automatic setup (recommended)' }
+    [pscustomobject]@{ Key = '2'; Value = 'advanced'; Label = '高级设置 / Advanced settings' }
 )
+
+$device = [string](Get-SavedValue 'device' '')
+$context = [string](Get-SavedValue 'context' '')
+$ubatch = [string](Get-SavedValue 'ubatch' '')
+$threads = [string](Get-SavedValue 'threads' '')
+$configPath = [string](Get-SavedValue 'config_path' '')
+$kvPreset = [string](Get-SavedValue 'kv_preset' 'auto')
 $kvTypeK = [string](Get-SavedValue 'kv_type_k' 'q8_0')
 $kvTypeV = [string](Get-SavedValue 'kv_type_v' 'q8_0')
-switch ($kvPreset) {
-    'q8' { $kvTypeK = 'q8_0'; $kvTypeV = 'q8_0' }
-    'f16' { $kvTypeK = 'f16'; $kvTypeV = 'f16' }
-    'custom' {
-        $kvTypeK = Read-TextValue -Label 'K cache 类型 / K cache dtype' -Default $kvTypeK -Required
-        $kvTypeV = Read-TextValue -Label 'V cache 类型 / V cache dtype' -Default $kvTypeV -Required
+$configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
+
+if ($setupMode -eq 'advanced') {
+    Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
+    Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
+    $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $device
+    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+    $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
+    $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
+    $configPath = Read-TextValue -Label '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup' -Default $configPath
+    if (-not [string]::IsNullOrWhiteSpace($configPath)) {
+        $configPath = ConvertTo-FullPath $configPath
+        if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+            throw "找不到配置文件 / Config file not found: $configPath"
+        }
     }
+
+    $kvPreset = Read-Choice -Label 'KV Cache 类型 / KV cache type' -DefaultValue $kvPreset -Options @(
+        [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '引擎自动（推荐）/ Engine default (recommended)' }
+        [pscustomobject]@{ Key = '2'; Value = 'q8'; Label = 'Q8_0 K + Q8_0 V' }
+        [pscustomobject]@{ Key = '3'; Value = 'f16'; Label = 'F16 K + F16 V' }
+        [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '分别指定 / Custom K and V' }
+    )
+    switch ($kvPreset) {
+        'q8' { $kvTypeK = 'q8_0'; $kvTypeV = 'q8_0' }
+        'f16' { $kvTypeK = 'f16'; $kvTypeV = 'f16' }
+        'custom' {
+            $kvTypeK = Read-TextValue -Label 'K cache 类型 / K cache dtype' -Default $kvTypeK -Required
+            $kvTypeV = Read-TextValue -Label 'V cache 类型 / V cache dtype' -Default $kvTypeV -Required
+        }
+    }
+
+    $configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default $configureMemory
+} else {
+    Write-Host "`n将自动探测 GPU、上下文、显存和 RAM；不覆盖引擎默认值。" -ForegroundColor DarkGray
+    Write-Host 'GPU, context, VRAM and RAM will be detected automatically; engine defaults stay intact.' -ForegroundColor DarkGray
 }
 
-$configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default ([bool](Get-SavedValue 'configure_memory' $true))
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
 $vramReserve = [string](Get-SavedValue 'vram_reserve' '')
 $expertCache = [string](Get-SavedValue 'expert_cache' '')
@@ -265,7 +364,7 @@ $hostDma = [bool](Get-SavedValue 'host_dma' $true)
 $kvOverflow = [bool](Get-SavedValue 'kv_overflow' $false)
 $kvOverflowVram = [string](Get-SavedValue 'kv_overflow_vram_mb' '')
 $kvOverflowReserve = [string](Get-SavedValue 'kv_overflow_reserve_mb' '')
-if ($configureMemory) {
+if ($setupMode -eq 'advanced' -and $configureMemory) {
     Write-Host '大小可写 21g、512m、80%；留空表示自动。Sizes accept 21g, 512m or 80%; blank means auto.' -ForegroundColor DarkGray
     $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
     $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
@@ -281,22 +380,28 @@ if ($configureMemory) {
     }
 }
 
-$submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue ([string](Get-SavedValue 'submit_mode' 'auto')) -Options @(
-    [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
-    [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
-    [pscustomobject]@{ Key = '3'; Value = 'fixed'; Label = '固定 cap / Fixed cap' }
-)
+$submitMode = [string](Get-SavedValue 'submit_mode' 'auto')
 $submitCap = [string](Get-SavedValue 'submit_cap' '64')
-if ($submitMode -eq 'fixed') {
-    $submitCap = Read-IntegerValue -Label '固定 dispatch cap / Fixed dispatch cap' -Default $submitCap -Minimum 1
+if ($setupMode -eq 'advanced') {
+    $submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue $submitMode -Options @(
+        [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
+        [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
+        [pscustomobject]@{ Key = '3'; Value = 'fixed'; Label = '固定 cap / Fixed cap' }
+    )
+    if ($submitMode -eq 'fixed') {
+        $submitCap = Read-IntegerValue -Label '固定 dispatch cap / Fixed dispatch cap' -Default $submitCap -Minimum 1
+    }
 }
 
-$configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default ([bool](Get-SavedValue 'configure_diagnostics' $false))
+$configureDiagnostics = [bool](Get-SavedValue 'configure_diagnostics' $false)
 $pagerStats = [bool](Get-SavedValue 'pager_stats' $false)
 $pagerProfile = [bool](Get-SavedValue 'pager_profile' $false)
 $stageProfile = [bool](Get-SavedValue 'stage_profile' $false)
 $vramProfile = [bool](Get-SavedValue 'vram_profile' $false)
-if ($configureDiagnostics) {
+if ($setupMode -eq 'advanced') {
+    $configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default $configureDiagnostics
+}
+if ($setupMode -eq 'advanced' -and $configureDiagnostics) {
     $pagerStats = Read-YesNo -Label '输出 pager 命中统计？/ Print pager hit statistics?' -Default $pagerStats
     $pagerProfile = Read-YesNo -Label '启用聚合 pager profiler？/ Enable aggregate pager profiler?' -Default $pagerProfile
     $stageProfile = Read-YesNo -Label '启用阶段计时？/ Enable stage timings?' -Default $stageProfile
@@ -317,6 +422,10 @@ $temperature = [string](Get-SavedValue 'temperature' '')
 $topK = [string](Get-SavedValue 'top_k' '')
 $topP = [string](Get-SavedValue 'top_p' '')
 $seed = [string](Get-SavedValue 'seed' '')
+$serverAddr = [string](Get-SavedValue 'server_addr' '127.0.0.1:8080')
+$serverParallel = [string](Get-SavedValue 'server_parallel' '1')
+$serverAuth = [bool](Get-SavedValue 'server_auth' $false)
+$serverApiKey = ''
 
 if ($launchMode -eq 'benchmark') {
     $benchKind = Read-Choice -Label '测试类型 / Benchmark type' -DefaultValue $benchKind -Options @(
@@ -369,23 +478,50 @@ if ($launchMode -eq 'benchmark') {
         $topP = Read-TextValue -Label 'Top-P，留空为模型默认 / blank for model default' -Default $topP
         $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
     }
+
+    if ($launchMode -eq 'server') {
+        Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
+        Write-Host '本机使用 127.0.0.1；局域网访问可用 0.0.0.0，但应启用 API key。' -ForegroundColor DarkGray
+        Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
+        $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
+        $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
+        $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
+        if ($serverAuth) {
+            $serverApiKey = Read-SecretValue -Label 'API key（隐藏输入且不会保存）/ API key (hidden and not saved)'
+        } elseif (-not (Test-IsLoopbackAddress $serverAddr)) {
+            Write-Host '警告：该监听地址可能被其他设备访问，且当前未启用鉴权。' -ForegroundColor Yellow
+            Write-Host 'Warning: this address may be reachable by other devices and authentication is disabled.' -ForegroundColor Yellow
+            if (-not (Read-YesNo -Label '仍然继续？/ Continue anyway?' -Default $false)) {
+                exit 0
+            }
+        }
+    }
 }
 
-$customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default ([string](Get-SavedValue 'custom_sets' ''))
+$customSets = [string](Get-SavedValue 'custom_sets' '')
+if ($setupMode -eq 'advanced') {
+    $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
+}
 
 $nativeArgs = [System.Collections.Generic.List[string]]::new()
-[void]$nativeArgs.Add($(if ($launchMode -eq 'benchmark') { 'bench' } else { 'run' }))
-if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
-[void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device)
-if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
-if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
-if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
+[void]$nativeArgs.Add($(switch ($launchMode) {
+    'benchmark' { 'bench' }
+    'server' { 'serve' }
+    default { 'run' }
+}))
+if ($setupMode -eq 'advanced') {
+    if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
+    if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
+    if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
+    if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
+    if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
+}
 
-if ($kvPreset -ne 'auto') {
+if ($setupMode -eq 'advanced' -and $kvPreset -ne 'auto') {
     Add-SetArgument $nativeArgs 'kv.type_k' $kvTypeK
     Add-SetArgument $nativeArgs 'kv.type_v' $kvTypeV
 }
-if ($configureMemory) {
+if ($setupMode -eq 'advanced' -and $configureMemory) {
     if ($vramBudget) { Add-SetArgument $nativeArgs 'device.vram_budget' $vramBudget }
     if ($vramReserve) { Add-SetArgument $nativeArgs 'device.vram_reserve' $vramReserve }
     if ($expertCache) { Add-SetArgument $nativeArgs 'paging.cache' $expertCache }
@@ -397,17 +533,19 @@ if ($configureMemory) {
     if ($kvOverflow -and $kvOverflowVram) { Add-SetArgument $nativeArgs 'kv.overflow_vram_mb' $kvOverflowVram }
     if ($kvOverflow -and $kvOverflowReserve) { Add-SetArgument $nativeArgs 'kv.overflow_reserve_mb' $kvOverflowReserve }
 }
-switch ($submitMode) {
-    'disabled' { Add-SetArgument $nativeArgs 'device.submit_dispatches' '0' }
-    'fixed' { Add-SetArgument $nativeArgs 'device.submit_dispatches' $submitCap }
+if ($setupMode -eq 'advanced') {
+    switch ($submitMode) {
+        'disabled' { Add-SetArgument $nativeArgs 'device.submit_dispatches' '0' }
+        'fixed' { Add-SetArgument $nativeArgs 'device.submit_dispatches' $submitCap }
+    }
 }
-if ($configureDiagnostics) {
+if ($setupMode -eq 'advanced' -and $configureDiagnostics) {
     Add-SetArgument $nativeArgs 'paging.stats' $pagerStats.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.pager_profile' $pagerProfile.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.stages' $stageProfile.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.vram' $vramProfile.ToString().ToLowerInvariant()
 }
-if (-not [string]::IsNullOrWhiteSpace($customSets)) {
+if ($setupMode -eq 'advanced' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
     foreach ($entry in $customSets.Split(';')) {
         $entry = $entry.Trim()
         if (-not $entry) { continue }
@@ -415,7 +553,11 @@ if (-not [string]::IsNullOrWhiteSpace($customSets)) {
         if ($equals -le 0) {
             throw "额外配置缺少 path=value / Invalid extra setting: $entry"
         }
-        Add-SetArgument $nativeArgs $entry.Substring(0, $equals).Trim() $entry.Substring($equals + 1).Trim()
+        $settingPath = $entry.Substring(0, $equals).Trim()
+        if ($launchMode -eq 'server' -and $settingPath -eq 'serve.api_key') {
+            throw '服务器 API key 请使用专用提示输入，以免密钥出现在命令和历史记录中。Use the server API-key prompt so the secret is not exposed in commands or history.'
+        }
+        Add-SetArgument $nativeArgs $settingPath $entry.Substring($equals + 1).Trim()
     }
 }
 
@@ -445,11 +587,19 @@ if ($launchMode -eq 'benchmark') {
         if ($seed) { [void]$nativeArgs.Add('--seed'); [void]$nativeArgs.Add($seed) }
     }
 }
+if ($launchMode -eq 'server') {
+    if (-not $serverAuth) {
+        # The explicit empty CLI layer also disables a key inherited from infr.toml or INFR_API_KEY.
+        Add-SetArgument $nativeArgs 'serve.api_key' ''
+    }
+    [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
+    [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+}
 [void]$nativeArgs.Add($modelPath)
 
 $commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
 $state = [ordered]@{
-    launch_mode = $launchMode; model = $modelPath; device = $device; context = $context
+    launch_mode = $launchMode; setup_mode = $setupMode; model = $modelPath; device = $device; context = $context
     ubatch = $ubatch; threads = $threads; config_path = $configPath
     kv_preset = $kvPreset; kv_type_k = $kvTypeK; kv_type_v = $kvTypeV
     configure_memory = $configureMemory; vram_budget = $vramBudget; vram_reserve = $vramReserve
@@ -463,6 +613,7 @@ $state = [ordered]@{
     depth_mode = $depthMode; depth_tokens = $depthTokens; reps = $reps; json_output = $jsonOutput
     think_mode = $thinkMode; max_new = $maxNew; configure_sampling = $configureSampling
     temperature = $temperature; top_k = $topK; top_p = $topP; seed = $seed
+    server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
     custom_sets = $customSets; last_command = $commandText
 }
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
@@ -470,22 +621,48 @@ $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding
 
 Write-Host "`n最终命令 / Final command" -ForegroundColor Green
 Write-Host $commandText -ForegroundColor White
+if ($launchMode -eq 'server' -and $serverAuth) {
+    Write-Host 'API key 将通过当前子进程环境传入，未显示在命令中，也不会保存。' -ForegroundColor DarkGray
+    Write-Host 'The API key is passed through the child-process environment; it is hidden above and not saved.' -ForegroundColor DarkGray
+}
 Write-Host "`n设置已保存 / Settings saved: $statePath" -ForegroundColor DarkGray
 if ($DryRun) {
     Write-Host 'DryRun：未启动。DryRun: command was not started.' -ForegroundColor Yellow
     exit 0
 }
-if (-not (Read-YesNo -Label '现在启动？/ Start now?' -Default $true)) {
+$startLabel = if ($launchMode -eq 'server') { '现在启动服务器？/ Start the server now?' } else { '现在启动？/ Start now?' }
+if (-not (Read-YesNo -Label $startLabel -Default $true)) {
     exit 0
 }
 
+if ($launchMode -eq 'server') {
+    $clientAddress = Get-ClientAddress $serverAddr
+    Write-Host "`nAPI 地址 / API base URL: http://$clientAddress/v1" -ForegroundColor Cyan
+    Write-Host "健康检查 / Health check: http://$clientAddress/health"
+    Write-Host '兼容 OpenAI 客户端时，将 Base URL 设为上面的 /v1 地址。' -ForegroundColor DarkGray
+    Write-Host 'For OpenAI clients, use the /v1 address above as the Base URL.' -ForegroundColor DarkGray
+    Write-Host '按 Ctrl+C 停止服务器。Press Ctrl+C to stop the server.' -ForegroundColor Yellow
+} elseif ($launchMode -eq 'chat') {
+    Write-Host "`n模型加载完成后，在 > 提示符输入消息；输入 exit、quit 或 :q 退出。" -ForegroundColor Cyan
+    Write-Host 'After the model loads, type at the > prompt; use exit, quit or :q to leave.' -ForegroundColor DarkGray
+}
+
 Write-Host "`n启动中 / Starting..." -ForegroundColor Green
+$previousApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
+$hadApiKey = $null -ne $previousApiKey
+if ($launchMode -eq 'server' -and $serverAuth) {
+    [Environment]::SetEnvironmentVariable('INFR_API_KEY', $serverApiKey, 'Process')
+}
 Push-Location $repoRoot
 try {
     & $infrPath @nativeArgs
     $exitCode = $LASTEXITCODE
 } finally {
     Pop-Location
+    if ($launchMode -eq 'server' -and $serverAuth) {
+        $restoreApiKey = if ($hadApiKey) { $previousApiKey } else { $null }
+        [Environment]::SetEnvironmentVariable('INFR_API_KEY', $restoreApiKey, 'Process')
+    }
 }
 if ($null -eq $exitCode) { $exitCode = 0 }
 Write-Host "`nINFR 退出码 / exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { 'Green' } else { 'Red' })

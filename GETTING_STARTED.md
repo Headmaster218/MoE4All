@@ -135,13 +135,15 @@ $model = 'D:\Models\Qwen3-0.6B-Q4_K_M.gguf'
 
 ### 5.1 交互式终端向导
 
-先完成一次 CLI 构建，然后双击根目录的 `Start-INFR-Wizard.cmd`，或在 PowerShell 执行：
+源码目录中先完成一次 CLI 构建，然后双击根目录的 `Start-INFR-Wizard.cmd`，或在 PowerShell 执行：
 
 ```powershell
 .\Start-INFR-Wizard.cmd
 ```
 
-向导支持中英双语提示，可选择 benchmark 或实时对话，并配置设备、上下文、ubatch、KV、显存/RAM、分页、submit splitter 和 profiler。上次设置保存在被 Git 忽略的 `gui-data\wizard-state.json`。
+向导支持中英双语提示，默认进入实时终端对话，也可启动 OpenAI 兼容 API 服务器或运行 benchmark。自动配置模式会保留引擎的 GPU、上下文、VRAM/RAM 和 KV 自动探测；高级模式可设置设备、ubatch、分页、submit splitter 和 profiler。服务器模式会引导配置监听地址、并发会话数和可选 API key；API key 不写入设置文件。
+
+发布包可将 `infr.exe`、`Start-INFR-Wizard.cmd` 和 `scripts\infr-wizard.ps1` 按原目录关系放在一起，向导会优先使用 CMD 同目录的 `infr.exe`。源码目录中没有该文件时，则自动使用 `target\release\infr.exe`。上次非敏感设置保存在 `gui-data\wizard-state.json`。
 
 如果本机执行策略阻止 `.ps1`，可只为这次启动绕过：
 
