@@ -3963,12 +3963,17 @@ fn cmd_compare(
 }
 
 /// Architecture-family recommended sampling `(temp, top_k, top_p)` — the published per-family
-/// defaults (`top_k = 0` = keep-all, i.e. top_k disabled). infr enables `<think>` by default, so
-/// the Qwen3.x row uses its THINKING recommendation. An unknown arch falls back to the neutral
-/// chat default the whole engine used before this table existed.
-fn arch_sampling(arch: &str) -> (f32, usize, f32) {
+/// defaults (`top_k = 0` = keep-all, i.e. top_k disabled). Qwen3.8 publishes distinct thinking and
+/// non-thinking profiles; older Qwen families retain their established thinking recommendation.
+/// An unknown arch falls back to the neutral chat default the whole engine used before this table
+/// existed.
+fn arch_sampling(arch: &str, no_think: bool) -> (f32, usize, f32) {
     use infr_llama::arch::*;
     match arch {
+        // Qwen3.8 Flash Next official profiles. Its generation_config.json carries the thinking
+        // values; the model card separately specifies the non-thinking values.
+        QWEN4EXP if no_think => (0.7, 20, 0.8),
+        QWEN4EXP => (1.0, 20, 0.95),
         // Qwen3.x thinking rec (Qwen team): temp 0.6 / top_k 20 / top_p 0.95.
         QWEN3 | QWEN3_MOE | QWEN35 | QWEN35_MOE => (0.6, 20, 0.95),
         // Qwen2/2.5 rec: a touch hotter, tighter nucleus.
@@ -4012,14 +4017,25 @@ fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<us
 /// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, with any
 /// [`generation_config_sampling`] sibling override applied per field. Returns `(temp, top_k, top_p,
 /// source_label)` — the label is for the CLI banner so the effective sampler is never a mystery.
-fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) {
+fn model_sampling_defaults(gguf: &std::path::Path, no_think: bool) -> (f32, usize, f32, String) {
     let arch = infr_llama::arch::arch_of(gguf);
     let (mut t, mut k, mut p) = arch
         .as_deref()
-        .map(arch_sampling)
+        .map(|a| arch_sampling(a, no_think))
         .unwrap_or((0.6, 20, 0.95));
-    let mut src = arch.clone().unwrap_or_else(|| "default".to_string());
-    let (gt, gk, gp) = generation_config_sampling(gguf);
+    let qwen4_instruct = no_think && arch.as_deref() == Some(infr_llama::arch::QWEN4EXP);
+    let mut src = if qwen4_instruct {
+        "qwen4exp:no-think".to_string()
+    } else {
+        arch.clone().unwrap_or_else(|| "default".to_string())
+    };
+    // The released Qwen3.8 generation_config describes thinking mode. Do not let that sibling
+    // overwrite the model card's separate non-thinking profile when --no-think is active.
+    let (gt, gk, gp) = if qwen4_instruct {
+        (None, None, None)
+    } else {
+        generation_config_sampling(gguf)
+    };
     if gt.is_some() || gk.is_some() || gp.is_some() {
         src = format!("{}+generation_config", arch.as_deref().unwrap_or("default"));
     }
@@ -4061,7 +4077,7 @@ fn apply_model_sampling_defaults(
     specified: &PartialConfig,
     gguf: &std::path::Path,
 ) -> Arc<Config> {
-    let (t, k, p, src) = model_sampling_defaults(gguf);
+    let (t, k, p, src) = model_sampling_defaults(gguf, cfg.sampling.no_think);
     let mut out = (**cfg).clone();
     if !specified.is_path_set("sampling.temp") {
         out.sampling.temp = t;
@@ -5013,15 +5029,18 @@ mod tests {
     #[test]
     fn arch_sampling_table_is_family_specific() {
         // Qwen3.x thinking rec; also the fallback for any unknown arch.
-        assert_eq!(arch_sampling(QWEN3), (0.6, 20, 0.95));
-        assert_eq!(arch_sampling(QWEN35_MOE), (0.6, 20, 0.95));
-        assert_eq!(arch_sampling("some-future-arch"), (0.6, 20, 0.95));
+        assert_eq!(arch_sampling(QWEN3, false), (0.6, 20, 0.95));
+        assert_eq!(arch_sampling(QWEN35_MOE, false), (0.6, 20, 0.95));
+        assert_eq!(arch_sampling("some-future-arch", false), (0.6, 20, 0.95));
+        // Qwen3.8 publishes separate defaults for thinking and direct-answer modes.
+        assert_eq!(arch_sampling(QWEN4EXP, false), (1.0, 20, 0.95));
+        assert_eq!(arch_sampling(QWEN4EXP, true), (0.7, 20, 0.8));
         // Qwen2/2.5 runs hotter with a tighter nucleus.
-        assert_eq!(arch_sampling(QWEN2), (0.7, 20, 0.8));
+        assert_eq!(arch_sampling(QWEN2, false), (0.7, 20, 0.8));
         // Gemma: high temp, wide top_k.
-        assert_eq!(arch_sampling(GEMMA4), (1.0, 64, 0.95));
+        assert_eq!(arch_sampling(GEMMA4, false), (1.0, 64, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
-        assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
+        assert_eq!(arch_sampling(LLAMA, false), (0.6, 0, 0.9));
     }
 
     /// `infr bench --json` must emit PARSEABLE JSON whose first key is `avg_ts`, in every
