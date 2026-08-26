@@ -1,314 +1,495 @@
-# INFR 从零安装与启动
+# MoE4All 快速开始 / Getting Started
 
-本文面向刚刚 clone 本仓库、尚未安装构建环境的用户。主流程是本项目当前实际开发和验证的环境：**原生 Windows 11 + Vulkan**。Linux 和 macOS 的最短流程在文末。
+这份指南优先面向直接下载 Windows 发布包的用户。普通使用不需要安装 Rust、
+Visual Studio 或 Vulkan SDK。源码构建和开发环境放在后半部分。
 
-截至 2026-08-26，Windows 流程已在 AMD Radeon RX 7900 XTX 上用 Rust stable、Vulkan SDK 1.4.357.0（shaderc 2026.3）验证。版本不要求完全相同，但 Rust 和 Vulkan SDK 建议使用当前稳定版。
+[返回项目首页](README.md) |
+[下载最新版](https://github.com/Headmaster218/MoE4All/releases/latest) |
+[English quick start](#english-quick-start)
 
-## 1. 需要安装什么
+## 1. 使用前需要准备什么
 
-| 项目 | 是否必需 | 用途 |
+| 项目 | 是否必须 | 说明 |
 |---|---:|---|
-| 64 位 Windows 11 和最新稳定 GPU 驱动 | 是 | 驱动提供运行时 Vulkan 实现 |
-| [Git for Windows](https://git-scm.com/download/win) | 是 | clone 和更新仓库 |
-| [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) | 是 | Rust MSVC 目标所需的链接器和 Windows 库 |
-| [Rust stable（rustup）](https://www.rust-lang.org/tools/install) | 是 | 编译 Rust workspace |
-| [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows) | 是 | 构建时用 `glslc` 把大量 GLSL compute shader 编译为 SPIR-V |
-| Node.js、Python、CMake、Ninja | 否 | CLI 和内置 GUI 都不依赖这些工具 |
-| llama.cpp / llama-server | 否 | 仅 `compare` 或显式选择 Embedding 兼容 runner 时需要 |
+| 64 位 Windows 11 | 是 | 当前主要开发和验证环境 |
+| AMD 显卡驱动 | 是 | 驱动需要提供可用的 Vulkan 运行时 |
+| MoE4All Windows ZIP | 是 | 从 GitHub Release 下载并完整解压 |
+| GGUF 模型 | 是 | 模型自备；单文件或完整分片组 |
+| 足够的 SSD 空间 | 大模型需要 | 模型可大于显存和内存，但完整文件必须位于本地存储 |
+| Rust、VS、Vulkan SDK | 运行发布版不需要 | 只有从源码构建时才需要 |
 
-模型必须是本仓库支持架构的 **GGUF**。大模型还需要足够的 SSD 空间；分片 GGUF 的全部分片必须位于同一目录。建议使用本地 NVMe SSD，并让 Windows 页面文件保持启用。
+MoE4All 当前重点优化和实测 AMD Radeon。其他带 Vulkan 驱动的 GPU 可能能够
+运行上游支持的路径，但本项目不会对它们作同等程度的兼容和性能保证。
 
-## 2. Windows 11 安装
+大型 MoE 对内存和 SSD 的需求差异很大。24 GiB 显存不代表只能运行 24 GiB
+模型，但模型超出显存越多，就越依赖 RAM 容量、SSD 速度和专家命中率。
 
-### 2.1 安装驱动和工具链
+## 2. 下载和解压
 
-1. 从 AMD、NVIDIA 或 Intel 官网安装适合 GPU 的最新稳定驱动，完成后重启。
-2. 安装 Git for Windows。
-3. 安装 Visual Studio Build Tools（2022 或更新稳定版），选择 **Desktop development with C++ / 使用 C++ 的桌面开发**，并确认包含：
-   - MSVC x64/x86 C++ build tools；
-   - Windows 10 或 Windows 11 SDK。
-4. 通过 rustup 安装 64 位 MSVC Rust，然后选择 stable 工具链。
-5. 安装当前稳定版 LunarG Vulkan SDK。SDK 安装器应设置 `VULKAN_SDK`，并把其 `Bin` 目录加入 `PATH`。
-6. 关闭并重新打开 PowerShell，使新的环境变量生效。
+1. 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases/latest)。
+2. 下载 `infr-windows-x86_64-版本号.zip`。
+3. 将 ZIP 完整解压到一个普通目录，例如 `D:\MoE4All`。
+4. 不要直接在压缩包预览窗口中运行 CMD，也不要只单独取出 `infr.exe`。
 
-本项目的 shader 使用 Vulkan 1.3 和较新的 GLSL 扩展。旧版 `glslc`（例如 shaderc 2023.8）不够；请使用当前 Vulkan SDK，建议 shaderc 2025 或更新版本。
-
-### 2.2 检查环境
-
-在一个新的 **64 位 PowerShell** 中执行：
-
-```powershell
-git --version
-rustup default stable-x86_64-pc-windows-msvc
-rustup update stable
-rustc -vV
-cargo --version
-glslc --version
-$env:VULKAN_SDK
-```
-
-`rustc -vV` 的 `host` 应为 `x86_64-pc-windows-msvc`，`glslc --version` 必须成功。普通 PowerShell 中看不到 `cl.exe` 不一定有问题，Rust 可以通过 Visual Studio 的安装信息找到 MSVC；最终以 Cargo 能否链接为准。
-
-若 SDK 已安装但 `glslc` 仍找不到，可在当前 PowerShell 临时补上路径：
-
-```powershell
-$env:Path = (Join-Path $env:VULKAN_SDK 'Bin') + ';' + $env:Path
-glslc --version
-```
-
-### 2.3 Clone 和构建
-
-```powershell
-Set-Location 'D:\Projects'
-git clone https://github.com/Headmaster218/infr.git
-Set-Location '.\infr'
-cargo build --release --locked -p infr-cli
-```
-
-第一次构建会下载 crates，并编译数量很多的 Vulkan shader，耗时和 `target` 目录都可能明显大于普通 Rust 项目。后续构建会增量复用结果。
-
-仓库的 [`.cargo/config.toml`](.cargo/config.toml) 使用 `target-cpu=native`，因此 release 二进制针对**执行构建的这台 CPU**生成。请在目标机器上构建；不要把它随意复制到指令集更旧的电脑。
-
-构建成功后，程序位于：
+解压后至少应看到：
 
 ```text
-target\release\infr.exe
+infr.exe
+Start-INFR-Wizard.cmd
+GETTING_STARTED.md
+scripts\infr-wizard.ps1
+LICENSE
+LICENSE-MIT
+NOTICE
 ```
 
-## 3. 先验证 Vulkan，再加载模型
+发布包使用通用 x86-64 CPU 目标并静态链接 Visual C++ runtime。Vulkan 由显卡
+驱动在运行时提供，因此用户不需要安装用于编译 shader 的 Vulkan SDK。
+
+### Windows 安全提示
+
+当前发布版尚未进行商业 Authenticode 代码签名。Windows SmartScreen 可能显示
+“无法识别的应用”。请只从本项目 GitHub Release 下载，并可使用同一 Release
+提供的 `.sha256` 文件校验 ZIP。
+
+PowerShell 执行策略较严格的机器也可能拦截向导脚本。遇到这种情况先确认文件
+确实来自官方 Release，再参考[常见问题](#10-常见问题--troubleshooting)。
+
+## 3. 准备 GGUF 模型
+
+### 什么是 GGUF
+
+GGUF 是模型权重和运行 metadata 的文件格式。MoE4All 读取其中的架构、张量、
+tokenizer 和 chat template。仅有模型名称或普通 Transformers 权重目录不够，
+需要下载对应的 `.gguf` 文件。
+
+### 单文件和分片模型
+
+小模型通常只有一个文件：
+
+```text
+Qwen3-0.6B-Q4_K_M.gguf
+```
+
+大模型常被拆成多片：
+
+```text
+Model-Q5_K_M-00001-of-00004.gguf
+Model-Q5_K_M-00002-of-00004.gguf
+Model-Q5_K_M-00003-of-00004.gguf
+Model-Q5_K_M-00004-of-00004.gguf
+```
+
+所有分片必须属于同一量化、位于同一目录且下载完整。加载器支持从其中任意一片
+识别整个分片组；为了和其他工具的习惯一致，选择第一片最直观。
+
+### 量化名称怎么选
+
+模型名中的 `Q4`、`Q5`、`Q6`、`Q8`、`IQ4`、`MXFP4` 等通常表示权重量化。
+数字和格式会影响文件大小、精度、速度及 kernel 支持，不能只按“数字越大越好”
+判断。
+
+第一次使用建议：
+
+- 先选择项目已明确支持的 GGUF 架构和常见量化。
+- 小模型可从 `Q4_K_M` 或 `Q5_K_M` 开始。
+- 大型 MoE 优先参考项目实测模型所用的量化，不要只看总参数量。
+- 确认 SSD 还有足够空间保存全部分片。
+
+### 一个用于确认环境的小模型
+
+建议第一次先用 Qwen3 0.6B 验证驱动、GGUF、tokenizer 和生成链路：
+
+- [Hugging Face 直链](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf?download=true)
+- [ModelScope 国内直链](https://modelscope.cn/models/unsloth/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q4_K_M.gguf)
+
+推荐自行下载本地 GGUF。CLI 也支持 `org/repo:quant` 形式的自动下载，但网络、
+代理、鉴权和大文件断点环境差异很大，本地模型路径通常最容易排错。
+
+## 4. 第一次启动
+
+双击解压目录中的：
+
+```text
+Start-INFR-Wizard.cmd
+```
+
+向导会记住上一次的非敏感设置。看到带方括号的默认值时，直接按 Enter 就会
+复用它。
+
+### 选择模型
+
+向导会列出最近使用的模型。也可以选择输入新路径，然后：
+
+- 粘贴完整 GGUF 路径；或
+- 把 GGUF 文件拖进已经打开的终端窗口，再按 Enter。
+
+路径可以包含空格和中文。当前版本尚未把“直接将 GGUF 拖到 CMD 图标上启动”
+接入模型参数；请先打开向导，再将文件拖入模型路径提示处。
+
+### 自动配置
+
+普通用户请选择：
+
+```text
+[1] 自动配置（推荐）/ Automatic setup (recommended)
+```
+
+自动配置会让引擎探测 Vulkan GPU、可用显存、系统 RAM 和模型结构，并规划：
+
+- 固定模型权重；
+- KV Cache 和 recurrent state；
+- prefill/decode 运行时空间；
+- GPU expert cache；
+- full-RAM 或 bounded RAM/SSD 专家层。
+
+自动配置以“在当前机器上可靠启动”为优先目标，不保证一定是最高性能设置。
+第一次不要照抄其他电脑的 `12g`、`45g` 或 submit cap。
+
+### 启动前确认
+
+向导会打印最终命令并询问是否启动。模型加载期间可能出现大量显存、RAM 和分页
+规划日志。大型模型首次填充 RAM cache 时会读取 SSD，开头几轮可能明显慢于预热
+后的稳定速度。
+
+## 5. 三种运行模式
+
+### 5.1 实时终端对话
+
+这是默认和最适合首次使用的模式。模型加载完成后，在 `>` 提示符输入消息。
+
+```text
+exit
+quit
+:q
+```
+
+以上任意一个命令可以退出。`Ctrl+C` 会请求引擎排空当前 GPU 工作并退出。
+
+对话会保留当前会话的 KV 和 recurrent state，不应在每轮都重新计算完整历史。
+上下文超过窗口或切换进程后则需要重新建立状态。
+
+### 5.2 OpenAI 兼容 API
+
+服务器模式适合接入聊天前端、脚本或支持自定义 OpenAI Base URL 的应用。
+
+默认地址：
+
+```text
+http://127.0.0.1:8080/v1
+```
+
+`127.0.0.1` 仅供本机访问。使用 `0.0.0.0` 对局域网开放时应启用 API key，
+并配置 Windows 防火墙；不要将无鉴权服务暴露到公网。
+
+并发会话数不是免费的。每个并发 slot 都需要独立 KV Cache，增加 `parallel`
+可能缩小每个请求可用的自动上下文窗口。
+
+### 5.3 性能测试
+
+Benchmark 用于测量：
+
+- **Prefill / pp**：读取和处理输入 token 的速度；
+- **Decode / tg**：逐 token 生成的速度；
+- **Synthetic depth**：不真实计算前面几十万 token，但建立对应长度的 KV 与
+  allocator 状态，用于测量长上下文后的推理开销。
+
+Benchmark 不检查回答质量。Synthetic KV 是确定性测试数据，不包含有意义的
+语言历史。
+
+## 6. 常用参数是什么意思
+
+普通用户可以一直使用自动配置。下面这些解释主要用于看懂日志和高级设置。
+
+| 参数 | 通俗解释 | 建议 |
+|---|---|---|
+| Context / `--ctx` | 一次会话最多保留多少 token；越大通常需要越多 KV 内存 | 首次留空自动 |
+| Max new tokens | 每轮最多生成多少 token，不是上下文总长度 | 避免设置得远高于实际需要 |
+| Thinking | 是否向支持的模型请求思考模式 | 不确定时使用模型默认 |
+| KV Cache 类型 | 保存历史注意力状态的格式；Q8 通常比 F16 更省空间 | 留空让架构选择；确认支持后再固定 Q8 |
+| Ubatch | prefill 每次送入 GPU 的 token 块大小 | 大值可能更快，也需要更多运行时显存 |
+| VRAM budget | 引擎可使用的总显存，不只是专家缓存 | 不要把显卡标称容量全部填满 |
+| VRAM reserve | 给桌面、驱动波动和额外资源留下的显存 | Windows 主显示卡需要合理余量 |
+| GPU expert cache | 显存中可常驻多少专家权重 | 只是总显存预算的一部分 |
+| RAM expert cache | 用多少系统 RAM 缓存专家，剩余部分继续从 SSD 读取 | 太大可能挤压系统和页面文件 |
+| Host DMA | 让兼容驱动用 Vulkan DMA 从导入 RAM 搬到 VRAM | 默认开启；失败会回退 |
+| Submit splitter | 把长 GPU 工作切成多次提交，涉及性能和 Windows TDR | 普通用户保持自动 |
+| Parallel slots | API 同时生成的会话数，每个 slot 有独立 KV | 从 1 开始 |
+
+### 关于 Q8 KV
+
+Q8 KV 可以显著降低长上下文缓存空间，但不是所有架构都使用同一套 KV 路径。
+向导的“引擎自动”最稳妥。对已验证的 Qwen3.5/Qwen3.6 路径，可以在高级模式
+选择 Q8 K + Q8 V；若加载日志报告格式不可用，应退回自动或 F16，而不是只修改
+显示字符串。
+
+### 关于显存数字
+
+日志中的 Expert cache 不是整个显存占用。以下内容也会使用 VRAM：
+
+- 固定 Dense、Attention、Embedding 等权重；
+- KV Cache 和 recurrent state；
+- prefill/decode activation scratch；
+- staging、量化临时空间和驱动余量。
+
+因此“显卡还有 18 GiB”不等于可以手工设置 18 GiB expert cache。
+
+## 7. 直接使用命令行
+
+在发布包目录打开 PowerShell：
 
 ```powershell
-$infr = (Resolve-Path '.\target\release\infr.exe').Path
+$infr = (Resolve-Path '.\infr.exe').Path
 & $infr --version
 & $infr devices
 ```
 
-正常情况下会列出至少一个 `VulkanN`，例如 `Vulkan0: AMD Radeon RX 7900 XTX`。后续的 `--dev Vulkan0` 使用这里显示的编号。`external_memory_host` 等扩展会影响 Host DMA 等性能路径，但不是基本推理能否运行的前提；不支持时会回退到已有搬运路径。
+`devices` 应列出 AMD GPU、设备编号和显存。如果这里没有 Vulkan GPU，应先修复
+驱动，不要通过减小模型缓存参数绕过。
 
-如果 `devices` 看不到 GPU，先修复驱动/Vulkan 运行时，不要通过调模型缓存参数绕过。Vulkan SDK 提供的 `vulkaninfo --summary` 也可用于区分“SDK 已安装”和“GPU 驱动工作正常”。
-
-## 4. 用小模型做首次冒烟测试
-
-第一次不要直接从 80–160 GiB 的 MoE 开始。先用 Qwen3 0.6B 验证下载、GGUF、Vulkan、tokenizer 和生成全链路：
-
-```powershell
-$model = 'unsloth/Qwen3-0.6B-GGUF:Q4_K_M'
-& $infr run --dev Vulkan0 --ctx 8192 --max-new 64 $model '请用一句话介绍自己。'
-```
-
-`run` 支持自动下载缺失模型。也可以先显式下载：
-
-```powershell
-& $infr pull $model
-```
-
-网络环境不适合自动下载时，建议直接下载这个单文件模型，然后按下文的本地 GGUF 方式启动：
-
-- [Hugging Face 官方直链](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf?download=true)
-- [ModelScope 国内镜像直链](https://modelscope.cn/models/unsloth/Qwen3-0.6B-GGUF/resolve/master/Qwen3-0.6B-Q4_K_M.gguf)
-
-访问受限的 HuggingFace 仓库时，在当前会话设置 token：
-
-```powershell
-$env:HF_TOKEN = 'hf_...'
-```
-
-使用本地 GGUF 时，直接传绝对路径。PowerShell 变量和调用运算符 `&` 可以可靠处理空格：
+### 本地 GGUF 对话
 
 ```powershell
 $model = 'D:\Models\Qwen3-0.6B-Q4_K_M.gguf'
-& $infr run --dev Vulkan0 --ctx 8192 --max-new 64 $model 'Hello'
+& $infr run --max-new 256 $model
 ```
 
-分片模型应传第一片，例如 `model-00001-of-00004.gguf`；其余分片由加载器从同一目录发现。
-
-做一个短 benchmark 冒烟：
+也可以附带第一条消息：
 
 ```powershell
-& $infr bench --dev Vulkan0 --ctx 8192 -u 256 -p 256 -n 0 -r 1 $model
-& $infr bench --dev Vulkan0 --ctx 8192 -u 256 -p 0 -n 32 --synthetic-depth 4096 -r 1 $model
+& $infr run --max-new 256 $model '请用三句话介绍这个项目。'
 ```
 
-第二条命令会分配并初始化真实 KV 状态，但使用无语义的 synthetic context；它用于性能测试，不用于检查回答质量。
-
-## 5. 三种日常启动方式
-
-### 5.1 交互式终端向导
-
-源码目录中先完成一次 CLI 构建，然后双击根目录的 `Start-INFR-Wizard.cmd`，或在 PowerShell 执行：
+### 思考模式
 
 ```powershell
-.\Start-INFR-Wizard.cmd
+& $infr run --think $model
+& $infr run --no-think $model
 ```
 
-向导支持中英双语提示，默认进入实时终端对话，也可启动 OpenAI 兼容 API 服务器或运行 benchmark。自动配置模式会保留引擎的 GPU、上下文、VRAM/RAM 和 KV 自动探测；高级模式可设置设备、ubatch、分页、submit splitter 和 profiler。服务器模式会引导配置监听地址、并发会话数和可选 API key；API key 不写入设置文件。
+不传这两个参数时使用模型默认行为。
 
-发布包可将 `infr.exe`、`Start-INFR-Wizard.cmd` 和 `scripts\infr-wizard.ps1` 按原目录关系放在一起，向导会优先使用 CMD 同目录的 `infr.exe`。源码目录中没有该文件时，则自动使用 `target\release\infr.exe`。上次非敏感设置保存在 `gui-data\wizard-state.json`。
+### 可选的 Hugging Face model ref
 
-如果本机执行策略阻止 `.ps1`，可只为这次启动绕过：
+```powershell
+& $infr pull 'unsloth/Qwen3-0.6B-GGUF:Q4_K_M'
+& $infr run  'unsloth/Qwen3-0.6B-GGUF:Q4_K_M'
+```
+
+受限仓库可在当前 PowerShell 会话设置 `HF_TOKEN`。对于国内网络或数十 GB 的
+模型，仍建议通过熟悉的下载工具准备本地 GGUF。
+
+## 8. API 示例
+
+启动服务器：
+
+```powershell
+$env:INFR_API_KEY = 'change-me'
+& $infr serve --addr 127.0.0.1:8080 $model
+```
+
+测试健康状态：
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:8080/health'
+```
+
+发送聊天请求：
+
+```powershell
+$headers = @{ Authorization = 'Bearer change-me' }
+$body = @{
+    model = 'local-model'
+    messages = @(@{ role = 'user'; content = '你好，请简短介绍自己。' })
+    stream = $false
+} | ConvertTo-Json -Depth 6
+
+Invoke-RestMethod `
+    -Uri 'http://127.0.0.1:8080/v1/chat/completions' `
+    -Method Post `
+    -Headers $headers `
+    -ContentType 'application/json' `
+    -Body $body
+```
+
+不设置 API key 时默认无鉴权，只适合回环地址或受信网络。
+
+## 9. Benchmark 示例
+
+```powershell
+# Prefill 1024 token
+& $infr bench -p 1024 -n 0 -r 1 $model
+
+# Decode 128 token
+& $infr bench -p 0 -n 128 -r 1 $model
+
+# 模拟已有 100K 上下文后的 decode，不真实 prefill 前面的 100K
+& $infr bench --synthetic-depth 100000 -p 0 -n 128 --ctx 131072 -r 1 $model
+
+# 已有 100K context 后再 prefill 4096
+& $infr bench --synthetic-depth 100000 -p 4096 -n 0 --ctx 131072 -r 1 $model
+```
+
+真实 `-d N` 会实际运行 N token warmup；`--synthetic-depth N` 则直接初始化等效
+KV/context 状态。两者不可同时使用。
+
+性能比较时必须记录模型量化、上下文、KV 类型、ubatch、cache 设置、重复次数和
+是否已预热。只比较一个 `tok/s` 数字很容易得到错误结论。
+
+## 10. 常见问题 / Troubleshooting
+
+### 双击 CMD 后提示 PowerShell 脚本被禁止
+
+先确认 ZIP 来自项目 Release。然后在解压目录打开 PowerShell，只为本次进程运行：
 
 ```powershell
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File '.\scripts\infr-wizard.ps1'
 ```
 
-### 5.2 浏览器 GUI
+后续版本会改善双击入口对下载脚本执行策略的处理。
 
-首次仅在本机使用时，建议显式绑定回环地址：
+### `infr.exe devices` 看不到显卡
+
+安装或更新 AMD 官方驱动并重启。发布版不需要 Vulkan SDK，但必须有驱动提供的
+Vulkan runtime。先让 `devices` 正常，再加载模型。
+
+### 找不到模型或缺少分片
+
+确认路径指向 `.gguf`，所有 `-NNNNN-of-MMMMM` 文件位于同一目录，并且总分片
+数、量化名称和文件前缀一致。不要混用不同下载来源或不同量化的分片。
+
+### 模型加载时显存预算拒绝启动
+
+先关闭占用显存的程序，使用自动配置，减小 context，必要时在已确认支持的架构
+上使用 Q8 KV。不要先设置 `INFR_NO_VRAM_GUARD=1`，因为驱动过量提交可能表现为
+权重经总线回读、设备丢失或 Windows TDR，而不是干净的 OOM。
+
+### 大模型开头很慢
+
+当专家总量大于 RAM budget 时，MoE4All 使用 bounded RAM/SSD tier。首次加载会
+按层预热一部分专家，后续 SSD miss 仍可能逐步填充 RAM cache。首轮速度和稳定
+预热速度应分开观察。
+
+### 系统内存占用很高
+
+大型 MoE 会主动利用 RAM 缓存专家。不要把 RAM expert cache 设置到让 Windows、
+页面文件和其他程序没有余量。自动探测以可用内存为基础；手工预算应更保守。
+
+### 下载的 EXE 被 SmartScreen 提示
+
+当前二进制尚未购买商业代码签名证书。请核对下载域名、Release tag 和 SHA256。
+不要从聊天附件或不明网盘获取重打包版本。
+
+## 11. 从源码构建 / Build from source
+
+开发者和需要修改代码的用户才需要本节。
+
+### Windows 工具链
+
+安装：
+
+1. [Git for Windows](https://git-scm.com/download/win)
+2. [Rust stable](https://www.rust-lang.org/tools/install)
+3. Visual Studio Build Tools，选择“使用 C++ 的桌面开发”、MSVC x64/x86 和
+   Windows 10/11 SDK
+4. [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows)，用于构建时
+   的 `glslc`
+
+检查环境：
+
+```powershell
+git --version
+rustc -vV
+cargo --version
+glslc --version
+```
+
+构建：
+
+```powershell
+git clone https://github.com/Headmaster218/MoE4All.git
+Set-Location '.\MoE4All'
+cargo build --release --locked -p infr-cli
+.\target\release\infr.exe devices
+```
+
+仓库的 `.cargo/config.toml` 面向本机开发性能，可能使用 `target-cpu=native`。
+本地 release 二进制不应随意复制到指令集更旧的 CPU。GitHub Release 使用通用
+x86-64 和静态 CRT 配置，更适合作为公开分发版本。
+
+第一次构建会下载 Rust crates，并编译大量 Vulkan compute shader，耗时和
+`target` 目录体积都可能明显大于普通 Rust 项目。后续构建会复用增量产物。
+
+浏览器 GUI 当前是源码开发入口，可运行：
 
 ```powershell
 .\Start-INFR-GUI.cmd -ListenAddress 127.0.0.1:8180
 ```
 
-GUI 启动器会自动执行 release 增量构建，同时构建 `infr.exe` 和 `infr-gui.exe`；不需要 Node.js。浏览器打开 `http://127.0.0.1:8180`，输入控制台显示的 management key。GUI 可管理模型目录、配置、内存估算、下载和 `infr serve` worker。
+GUI 启动器会构建 `infr.exe` 和 `infr-gui.exe`，因此不包含在当前轻量 Windows
+用户发布包中。
 
-直接双击脚本时默认监听 `0.0.0.0:8180`，会对本机网络接口开放。除非已经配置好防火墙和可信内网，不要把 8180 暴露到公网。详细说明见 [`crates/infr-gui/README.md`](crates/infr-gui/README.md)。
+### Linux
 
-### 5.3 OpenAI 兼容 API
-
-```powershell
-$env:INFR_API_KEY = 'change-me'
-& $infr serve --dev Vulkan0 --ctx 8192 --addr 127.0.0.1:8080 $model
-```
-
-在另一个 PowerShell 中测试：
-
-```powershell
-$headers = @{ Authorization = 'Bearer change-me' }
-$request = @{
-    model = 'local'
-    messages = @(@{ role = 'user'; content = '你好，请回复一句话。' })
-    stream = $false
-} | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/chat/completions' `
-    -Method Post -Headers $headers -ContentType 'application/json' -Body $request
-```
-
-不设置 `INFR_API_KEY` 时默认无鉴权，只适合回环地址或受信网络。
-
-## 6. 配置和环境变量
-
-基本启动**不需要**设置任何 `INFR_*`：设备、上下文、VRAM 和可用主机内存都有自动探测。推荐的优先级是：先用默认值跑通，再通过 GUI 估算或日志决定是否固定预算。
-
-配置的覆盖顺序是：
-
-```text
-内置默认值 < infr.toml < INFR_* 环境变量 < CLI 参数/--set
-```
-
-要创建项目本地配置，可复制带完整注释的示例：
-
-```powershell
-Copy-Item '.\infr.example.toml' '.\infr.toml'
-```
-
-常用的当前会话变量示例：
-
-```powershell
-$env:INFR_DEV = 'Vulkan0'
-$env:INFR_CTX = '32k'
-$env:INFR_UBATCH = '512'
-$env:INFR_KV_TYPE_K = 'q8_0'
-$env:INFR_KV_TYPE_V = 'q8_0'
-```
-
-这些设置会影响从该 PowerShell 启动的后续进程。删除一个临时值：
-
-```powershell
-Remove-Item Env:INFR_CTX
-```
-
-长期配置优先写入 `infr.toml`，避免遗忘的全局环境变量悄悄改变 benchmark。完整字段、环境变量映射和 `--set` 语义见 [`docs/config.md`](docs/config.md)。
-
-## 7. 大 MoE 模型的首次启动
-
-1. 先确认小模型已经能生成，并保留完整启动日志。
-2. 让所有 GGUF 分片位于同一块高速 SSD 的同一目录，并传入第一片。
-3. 首次使用自动 VRAM/RAM 预算，或先在 GUI 中加入模型并执行“重新估算”。不要直接照抄另一台机器的 12g/45g 等实验值。
-4. 需要固定 Qwen 长上下文 KV 时，可显式使用 `--set kv.type_k=q8_0 --set kv.type_v=q8_0`；其他架构先确认其 KV 实现支持该格式。
-5. 显存预算是 INFR 的总设备内存上限，不是只给 Expert cache 的大小。固定权重、KV、运行时 scratch、staging 和 Expert arena 都要留在预算内。
-6. RAM 预算小于 Expert 总量时会启用 bounded RAM/SSD tier。SSD miss 会影响首轮 prefill/decode，因此“大模型能加载”与“已经预热后的稳定吞吐”要分开判断。
-7. Host DMA 默认开启；驱动支持并成功导入的 RAM 前缀使用 Vulkan DMA，其余范围自动回退，不需要手工设置环境变量。
-
-一个不固定内存预算的 Qwen 启动模板：
-
-```powershell
-$model = 'D:\Models\Qwen-MoE-00001-of-00004.gguf'
-& $infr run --dev Vulkan0 --ctx 32k -u 512 `
-    --set kv.type_k=q8_0 --set kv.type_v=q8_0 $model
-```
-
-如果出现显存预算 guard、设备丢失或 Windows 桌面同时占用大量显存，依次尝试减小 `--ctx`、`-u`，再设置保守的 `device.vram_budget` / `device.vram_reserve`；不要先关闭 guard。
-
-## 8. 常见问题
-
-### `failed to run glslc`
-
-Vulkan SDK 未安装或其 `Bin` 不在 `PATH`。重新打开终端，检查 `$env:VULKAN_SDK` 和 `glslc --version`。
-
-### shader 编译报扩展或语法错误
-
-通常是 shaderc 太旧。更新 LunarG Vulkan SDK；本项目不支持 Ubuntu 24.04 自带的 shaderc 2023.8。
-
-### Rust 链接报 `link.exe`、Windows SDK 或系统库错误
-
-通过 Visual Studio Installer 修改 Build Tools，安装“使用 C++ 的桌面开发”、MSVC x64/x86 tools 和 Windows SDK，然后重新打开 PowerShell。
-
-当前 Windows release 链接可能输出 `LNK4098: 默认库 LIBCMT 与其他库的使用冲突`。它目前是 warning；若 Cargo 最终显示 `Finished release profile`、退出码为 0，且 `infr.exe devices` 正常，就不属于构建失败。不要因为这条 warning 删除或替换 `Cargo.lock`。
-
-### `infr devices` 没有设备或加载 Vulkan 失败
-
-这是 GPU 驱动/Vulkan runtime 问题，不是 `glslc` 问题。更新厂商驱动，重启，并用 `vulkaninfo --summary` 复核。
-
-### 模型只加载到第一片后报缺文件
-
-确认文件名仍为标准 `00001-of-000NN` 形式，全部分片完整且在同一目录；启动参数传第一片。
-
-### 大模型 OOM 或预算 guard 拒绝启动
-
-先减小 context 和 ubatch；使用 GUI 的当前模型估算；为 Windows 桌面、驱动和运行时保留显存。只有看懂日志里的 fixed/KV/runtime/Expert 分项后，再固定 `paging.cache` 或 `paging.dram`。
-
-### 第一次构建很慢
-
-这是预期行为：Vulkan crate 会编译大量 shader 变体。不要删除 `target`；后续增量构建会快很多。`--locked` 应保留，以确保使用仓库提交的 `Cargo.lock`。
-
-## 9. Linux 和 macOS
-
-Linux CI 使用 Ubuntu 26.04，因为它提供足够新的 `glslc`。典型环境：
+Linux 保留上游 Vulkan 路径，但 MoE4All 当前主要在 Windows AMD 主机验证：
 
 ```bash
-sudo apt update
 sudo apt install -y git build-essential glslc libvulkan1 vulkan-tools
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustup update stable
-git clone https://github.com/Headmaster218/infr.git
-cd infr
+git clone https://github.com/Headmaster218/MoE4All.git
+cd MoE4All
 cargo build --release --locked -p infr-cli
 ./target/release/infr devices
 ```
 
-另行安装 GPU 厂商的 Vulkan 驱动。Ubuntu 24.04 用户需要从其他可信来源安装新版 shaderc，不能使用其旧版 `glslc` 包。
+发行版自带的 `glslc` 必须足够新，能够编译项目使用的 Vulkan 扩展。
 
-Apple Silicon/macOS 使用 Metal 运行，但当前 workspace 构建仍会编译 Vulkan crate 的 shader，因此也需要 `glslc`：
+### macOS
+
+Apple Silicon 使用 Metal backend，但 workspace 构建仍会编译 Vulkan shader：
 
 ```bash
 xcode-select --install
 brew install shaderc
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-git clone https://github.com/Headmaster218/infr.git
-cd infr
+git clone https://github.com/Headmaster218/MoE4All.git
+cd MoE4All
 cargo build --release --locked -p infr-cli
 ./target/release/infr run --dev metal MODEL.gguf
 ```
 
-## 10. 可交付检查单
+## 12. 配置来源
 
-一个新 clone 至少应完成以下检查，才算环境真正可用：
+基本启动不需要设置任何 `INFR_*` 环境变量。配置优先级为：
 
-- `cargo build --release --locked -p infr-cli` 成功；
-- `target\release\infr.exe devices` 能列出目标 Vulkan GPU；
-- 一个小 GGUF 能完成加载并生成可读文本；
-- 短 prefill 和 synthetic-depth decode benchmark 都能输出 tok/s；
-- 计划使用 GUI 时，`http://127.0.0.1:8180` 可打开并能启动/停止 worker；
-- 计划提供 API 时，`/v1/chat/completions` 能完成一次带鉴权请求。
+```text
+内置默认值 < infr.toml < INFR_* 环境变量 < CLI 参数 / --set
+```
+
+长期配置建议写入 `infr.toml`，临时实验使用 CLI。环境变量会被子进程继承，容易
+在几天后忘记并影响 benchmark。完整字段见 [配置参考](docs/config.md) 和
+[`infr.example.toml`](infr.example.toml)。
+
+## English quick start
+
+MoE4All's portable Windows package is the recommended path for end users:
+
+1. Install a current AMD GPU driver with Vulkan support.
+2. Download and fully extract the latest `infr-windows-x86_64-*.zip` from
+   [GitHub Releases](https://github.com/Headmaster218/MoE4All/releases/latest).
+3. Download a supported GGUF model. Keep all shards of a split model together.
+4. Double-click `Start-INFR-Wizard.cmd`.
+5. Choose interactive chat and automatic configuration, then paste or drag the
+   GGUF path into the open model-path prompt.
+
+The release package does not require Rust, Visual Studio, or the Vulkan SDK.
+Models are not bundled. Start with a small GGUF to validate the driver and
+generation path before loading a very large MoE model.
+
+The wizard can also start an OpenAI-compatible server or run prefill/decode
+benchmarks. Advanced memory, KV, paging, and submit controls are intended for
+users who understand the corresponding startup log. Automatic mode is the
+recommended baseline.
+
+For upstream engine documentation, see the original
+[kryptic-sh/infr README](https://github.com/kryptic-sh/infr#readme). MoE4All
+project documentation starts at [README.md](README.md) and
+[docs/README.md](docs/README.md).
