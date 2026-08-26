@@ -60,6 +60,7 @@ $rootFiles = @(
     'Start-INFR-Wizard.cmd'
     'GETTING_STARTED.md'
     'README.md'
+    'README_EN.md'
     'CHANGELOG.md'
     'infr.example.toml'
     'LICENSE'
