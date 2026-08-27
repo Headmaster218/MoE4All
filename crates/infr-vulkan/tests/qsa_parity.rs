@@ -160,6 +160,35 @@ fn qsa_index_and_gather_match_reference() {
     }
     assert_eq!(got_k, want_k);
     assert_eq!(got_v, want_v);
+
+    // Equal scores exercise the secondary key: the earliest block indices must win exactly as
+    // they did in the repeated-max implementation.
+    be.upload(q.as_ref(), &vec![0; qb.len()]).unwrap();
+    be.upload(raw.as_ref(), &vec![0; rawb.len()]).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.qsa_indexer(
+        q.as_ref(),
+        raw.as_ref(),
+        nw.as_ref(),
+        scores.as_ref(),
+        ids.as_ref(),
+        1,
+        kv_len as u32,
+        nh as u32,
+        hd as u32,
+        top as u32,
+        ratio as u32,
+        rope_dim as u32,
+        theta,
+        eps,
+        scale,
+    );
+    rec.finish().unwrap();
+    be.download(ids.as_ref(), &mut ib).unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, u32>(&ib),
+        &(0..top as u32).collect::<Vec<_>>()
+    );
 }
 
 #[test]

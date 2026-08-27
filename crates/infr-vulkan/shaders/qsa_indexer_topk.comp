@@ -1,6 +1,10 @@
 #version 460
 // Exact score-desc/index-asc top-k, followed by an index-ascending bitonic sort. The latter
 // reproduces scatter-to-mask attention order: selected tokens are consumed chronologically.
+//
+// Select the k-th key with a 4-bit radix pass over (ordered-score, ~index). This preserves the
+// original total order while scanning the score vector 16 times instead of top_k times. Qwen3.8
+// selects 512 of up to 65536 blocks, so the old repeated maximum reduction dominated decode.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -14,16 +18,15 @@ layout(binding = 0) readonly buffer SB { float scores[]; };
 layout(binding = 1) writeonly buffer DB { uint dst[]; };
 
 #define INVALID 0xffffffffu
-shared float sval[256];
-shared uint sidx[256];
-shared float prev_val;
-shared uint prev_idx;
+shared uint bucket[16];
+shared uint selected_digit;
+shared uint remaining_rank;
+shared uint selected_count;
 shared uint chosen[512];
 
-bool above(uint ai, float av, uint bi, float bv) {
-    if (ai == INVALID) { return false; }
-    if (bi == INVALID) { return true; }
-    return av != bv ? av > bv : ai < bi;
+uint ordered_float(float x) {
+    uint bits = floatBitsToUint(x);
+    return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
 }
 
 void main() {
@@ -33,31 +36,76 @@ void main() {
     uint blocks = (pc.kv_len - pc.rows + row + 1u) / pc.ratio;
     uint score_base = row * pc.max_blocks;
     uint dst_base = row * pc.top_k;
-    for (uint rank = 0u; rank < pc.top_k; ++rank) {
-        uint bi = INVALID;
-        float bv = 0.0;
-        for (uint j = t; j < blocks; j += 256u) {
-            float s = scores[score_base + j];
-            if (rank > 0u && !above(prev_idx, prev_val, j, s)) { continue; }
-            if (above(j, s, bi, bv)) { bi = j; bv = s; }
-        }
-        sidx[t] = bi;
-        sval[t] = bv;
+    uint prefix_score = 0u;
+    uint prefix_index = 0u;
+    uint rank = pc.top_k;
+
+    // A score contributes the high 32 bits. The complemented index contributes the low 32 bits,
+    // making a smaller source index rank above a larger one when scores tie.
+    for (uint level = 0u; level < 16u; ++level) {
+        if (t < 16u) { bucket[t] = 0u; }
         barrier();
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (t < stride && above(sidx[t + stride], sval[t + stride], sidx[t], sval[t])) {
-                sidx[t] = sidx[t + stride];
-                sval[t] = sval[t + stride];
+
+        for (uint j = t; j < blocks; j += 256u) {
+            uint score_key = ordered_float(scores[score_base + j]);
+            uint index_key = ~j;
+            uint digit;
+            if (level < 8u) {
+                uint done = level * 4u;
+                uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
+                if ((score_key & mask) != (prefix_score & mask)) { continue; }
+                digit = (score_key >> (28u - done)) & 0xfu;
+            } else {
+                if (score_key != prefix_score) { continue; }
+                uint done = (level - 8u) * 4u;
+                uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
+                if ((index_key & mask) != (prefix_index & mask)) { continue; }
+                digit = (index_key >> (28u - done)) & 0xfu;
             }
-            barrier();
+            atomicAdd(bucket[digit], 1u);
         }
+        barrier();
+
         if (t == 0u) {
-            chosen[rank] = sidx[0];
-            prev_idx = sidx[0];
-            prev_val = sval[0];
+            uint above = 0u;
+            uint digit = 0u;
+            uint next_rank = rank;
+            for (int b = 15; b >= 0; --b) {
+                uint count = bucket[uint(b)];
+                if (above + count >= rank) {
+                    digit = uint(b);
+                    next_rank = rank - above;
+                    break;
+                }
+                above += count;
+            }
+            selected_digit = digit;
+            remaining_rank = next_rank;
         }
+        barrier();
+
+        if (level < 8u) {
+            prefix_score |= selected_digit << (28u - level * 4u);
+        } else {
+            prefix_index |= selected_digit << (28u - (level - 8u) * 4u);
+        }
+        rank = remaining_rank;
         barrier();
     }
+
+    // The index component makes every key unique, so exactly top_k entries are >= the threshold.
+    if (t == 0u) { selected_count = 0u; }
+    barrier();
+    for (uint j = t; j < blocks; j += 256u) {
+        uint score_key = ordered_float(scores[score_base + j]);
+        uint index_key = ~j;
+        if (score_key > prefix_score ||
+            (score_key == prefix_score && index_key >= prefix_index)) {
+            uint slot = atomicAdd(selected_count, 1u);
+            if (slot < pc.top_k) { chosen[slot] = j; }
+        }
+    }
+    barrier();
 
     uint i0 = t;
     uint i1 = t + 256u;
