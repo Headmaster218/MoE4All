@@ -2,10 +2,10 @@
 // Exact score-desc/index-asc top-k, followed by an index-ascending bitonic sort. The latter
 // reproduces scatter-to-mask attention order: selected tokens are consumed chronologically.
 //
-// Select the k-th score with an 8-pass 4-bit radix search, then resolve the lower-index tie break
+// Select the k-th score with a 4-pass 8-bit radix search, then resolve the lower-index tie break
 // with one parallel count and one collection pass. This preserves the original total order while
-// scanning the score vector 10 times instead of 17 (16 radix + collection). Qwen3.8 selects 512
-// of up to 65536 blocks, so avoiding eight full index-radix scans matters at long context.
+// scanning the score vector 6 times instead of 17 (16 radix + collection). Qwen3.8 selects 512
+// of up to 65536 blocks, so avoiding twelve full index-radix scans matters at long context.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -19,7 +19,7 @@ layout(binding = 0) readonly buffer SB { float scores[]; };
 layout(binding = 1) writeonly buffer DB { uint dst[]; };
 
 #define INVALID 0xffffffffu
-shared uint bucket[16];
+shared uint bucket[256];
 shared uint selected_digit;
 shared uint remaining_rank;
 shared uint selected_count;
@@ -41,16 +41,16 @@ void main() {
     uint prefix_score = 0u;
     uint rank = pc.top_k;
 
-    for (uint level = 0u; level < 8u; ++level) {
-        if (t < 16u) { bucket[t] = 0u; }
+    for (uint level = 0u; level < 4u; ++level) {
+        bucket[t] = 0u;
         barrier();
 
         for (uint j = t; j < blocks; j += 256u) {
             uint score_key = ordered_float(scores[score_base + j]);
-            uint done = level * 4u;
+            uint done = level * 8u;
             uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
             if ((score_key & mask) != (prefix_score & mask)) { continue; }
-            uint digit = (score_key >> (28u - done)) & 0xfu;
+            uint digit = (score_key >> (24u - done)) & 0xffu;
             atomicAdd(bucket[digit], 1u);
         }
         barrier();
@@ -59,7 +59,7 @@ void main() {
             uint above = 0u;
             uint digit = 0u;
             uint next_rank = rank;
-            for (int b = 15; b >= 0; --b) {
+            for (int b = 255; b >= 0; --b) {
                 uint count = bucket[uint(b)];
                 if (above + count >= rank) {
                     digit = uint(b);
@@ -73,7 +73,7 @@ void main() {
         }
         barrier();
 
-        prefix_score |= selected_digit << (28u - level * 4u);
+        prefix_score |= selected_digit << (24u - level * 8u);
         rank = remaining_rank;
         barrier();
     }
