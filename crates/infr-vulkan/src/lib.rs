@@ -5825,6 +5825,7 @@ mod tests {
                 bytes: SLOT,
             }],
             prefill_target_lanes: 1,
+            prefill_cache_bytes: (SLOT * SLOTS) as u64,
         })
         .expect("init pager");
         let pool = be.unified_vram().expect("unified pool");
@@ -5963,6 +5964,7 @@ mod tests {
                 bytes: 4096,
             }],
             prefill_target_lanes: 2,
+            prefill_cache_bytes: 8192,
         })
         .expect("init_moe_pager");
         let weak = Arc::downgrade(&be.shared);

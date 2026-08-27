@@ -900,15 +900,24 @@ const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 /// carries the presence flag separately and every input — valid value, `0`, garbage, unset — keeps
 /// today's behaviour bit-for-bit (R1).
 pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
-    ec.device.ubatch.filter(|&v| v > 0).unwrap_or_else(|| {
-        with_placement_pins(
-            |p| match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
+    let configured = ec.device.ubatch.filter(|&v| v > 0);
+    let (placed, moe_cap) = with_placement_pins(|p| {
+        (
+            match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
                 0 => None, // nothing pinned
                 rows => Some(rows),
             },
+            match p.moe_ubatch_cap.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                rows => Some(rows),
+            },
         )
-        .unwrap_or_else(default_ubatch_rows)
-    })
+    });
+    let selected = configured.or(placed).unwrap_or_else(default_ubatch_rows);
+    match moe_cap {
+        Some(cap) => selected.min(cap),
+        None => selected,
+    }
 }
 
 /// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` (§6.12) — the dense
@@ -950,6 +959,18 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
         cands.extend(DENSE_UBATCH_LADDER.into_iter().filter(|&c| c < now));
     }
     cands
+}
+
+/// Emergency MoE-only shrink ladder. Unlike [`ubatch_candidates`], this remains available after
+/// an explicit `INFR_UBATCH`: the requested height is priced first and is lowered only when its
+/// activation reserve leaves less than one complete whole-layer Prefill lane. This is a viability
+/// fallback, not a throughput/residency policy sweep.
+fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
+    const FALLBACKS: [usize; 4] = [1024, 512, 256, 128];
+    let now = ubatch_rows(ec);
+    let mut candidates = vec![now];
+    candidates.extend(FALLBACKS.into_iter().filter(|&rows| rows < now));
+    candidates
 }
 
 /// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
@@ -1012,6 +1033,10 @@ pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
 #[derive(Default)]
 pub(crate) struct PlacementPins {
     ubatch: std::sync::atomic::AtomicUsize,
+    /// Emergency upper bound used only when the requested/current chunk leaves no complete MoE
+    /// Prefill lane. Kept separate so ordinary placement/re-clamp pins cannot override an explicit
+    /// `INFR_UBATCH`.
+    moe_ubatch_cap: std::sync::atomic::AtomicUsize,
     kv_q8: std::sync::OnceLock<()>,
     /// Has this session already reported an activation peak above what it reserved (the runner's
     /// `activation reserve too low` warning)? The condition persists for the session's whole life —
@@ -1090,6 +1115,16 @@ fn repin_ubatch_lower(rows: usize) {
         let cur = p.ubatch.load(std::sync::atomic::Ordering::Relaxed);
         if cur == 0 || rows < cur {
             p.ubatch.store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+fn cap_moe_ubatch(rows: usize) {
+    with_placement_pins(|p| {
+        let cur = p.moe_ubatch_cap.load(std::sync::atomic::Ordering::Relaxed);
+        if cur == 0 || rows < cur {
+            p.moe_ubatch_cap
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
         }
     });
 }
@@ -2054,6 +2089,28 @@ pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
     moe_pool_floor_bytes(&pools, moe.n_expert.max(1)).unwrap_or(u64::MAX)
 }
 
+/// Whole-layer Prefill ring depth from the model's actual mixer topology. A recurrent run gives
+/// the uploader that many fast layers in which to prepare the next slow Attention/MLA layer; the
+/// extra lane is the layer currently being consumed. Models without recurrent mixers keep the
+/// established all-layer target and let physical cache capacity cap it.
+fn moe_prefill_target_lanes(cfg: &Config, n_paged: usize) -> usize {
+    let mut current_run = 0usize;
+    let mut longest_run = 0usize;
+    for layer in 0..cfg.n_layer {
+        if cfg.is_recurrent_layer(layer) {
+            current_run = current_run.saturating_add(1);
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    if longest_run == 0 {
+        n_paged.max(1)
+    } else {
+        longest_run.saturating_add(1).min(n_paged.max(1))
+    }
+}
+
 /// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
 /// receives enough slots for one worst-case Prefill layer; the remaining bytes are then assigned
 /// in weighted-fair order. Reserving the floors up front avoids the old `clamp(floor, nb)` corner
@@ -2532,23 +2589,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let ring = kv_ring_wanted(cfg, ec);
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
-        let kv_bytes = match (k_fmt, v_fmt) {
-            (DType::Q8_0, DType::Q8_0) => {
-                kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), true)
-            }
-            (DType::F16, DType::F16) => {
-                kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), false)
-            }
-            _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch_rows(ec), k_fmt, v_fmt),
+        let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
+            (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
+            (DType::F16, DType::F16) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, false),
+            _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, k_fmt, v_fmt),
         };
+        let initial_ubatch = ubatch_rows(ec);
+        let mut selected_ubatch = initial_ubatch;
+        let kv_bytes = kv_bytes_at(selected_ubatch);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
         // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
         // borrows only cold Decode arena ranges and returns them on `enter_decode`.
-        let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, ubatch_rows(ec));
+        let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, selected_ubatch);
         let packing_margin = resident_weight_packing_margin(fp.dense);
         let load_driver_reserve = session_load_driver_reserve(cfg, ec);
-        let Some(plan) = ModelMemoryPlan::new_with_reserves(
+        let Some(mut plan) = ModelMemoryPlan::new_with_reserves(
             room,
             fp.dense,
             kv_bytes,
@@ -2567,6 +2623,55 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 room as f64 / 1e9,
             ));
         };
+        let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
+        let paged_target_at = |candidate: ModelMemoryPlan| match requested_cache {
+            Some(requested) => Some(requested.min(candidate.expert_cache_bytes)),
+            None if candidate.expert_cache_bytes < fp.expert => Some(candidate.expert_cache_bytes),
+            None => None,
+        };
+        let prefill_floor = moe_prefill_floor_bytes(g, cfg);
+        let mut paged_target = paged_target_at(plan);
+        if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
+            for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
+                let candidate_kv = kv_bytes_at(candidate);
+                let candidate_runtime = dense_act_reserve_at(cfg, &caps, want_ctx, candidate);
+                let Some(candidate_plan) = ModelMemoryPlan::new_with_reserves(
+                    room,
+                    fp.dense,
+                    candidate_kv,
+                    candidate_runtime,
+                    packing_margin,
+                    load_driver_reserve,
+                    POST_KV_DEVICE_RESERVE,
+                ) else {
+                    continue;
+                };
+                let candidate_target = paged_target_at(candidate_plan);
+                if candidate_target.is_none_or(|bytes| bytes >= prefill_floor) {
+                    selected_ubatch = candidate;
+                    plan = candidate_plan;
+                    paged_target = candidate_target;
+                    break;
+                }
+            }
+        }
+        if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
+            return Err(anyhow!(
+                "MoE expert cache leaves {:.2} MiB, but one complete Prefill layer needs {:.2} MiB; \
+                 increase INFR_VRAM_BUDGET/INFR_CACHE or reduce context/runtime memory",
+                paged_target.unwrap_or(0) as f64 / 2f64.powi(20),
+                prefill_floor as f64 / 2f64.powi(20),
+            ));
+        }
+        if selected_ubatch != initial_ubatch {
+            cap_moe_ubatch(selected_ubatch);
+            tracing::warn!(
+                "MoE placement: lowered the Prefill chunk from {initial_ubatch} to \
+                 {selected_ubatch} rows because the larger chunk's runtime reserve left less than \
+                 one complete Expert streaming lane"
+            );
+        }
+
         let auto_budget = plan.expert_cache_bytes;
         match cache_override {
             Some(spec) => {
@@ -2922,16 +3027,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 host_kind,
                 host_resident_bytes as f64 / 1e9,
             );
-            // Prefill streams every whole MoE layer through a topology-sized ring. Qwen3.6's
-            // full-attention interval includes three DeltaNet layers, so current + one complete
-            // interval gives five lanes and lets the long Attention cover all four successors.
-            // Other/all-Attention models request one lane per paged layer and let physical cache
-            // capacity be the sole cap; the Vulkan pager performs that exact fit per pool.
-            let prefill_target_lanes = if cfg.qwen35 && cfg.full_attn_interval > 0 {
-                cfg.full_attn_interval.saturating_add(1)
-            } else {
-                n_paged
-            };
+            // Recurrent hybrids use current + the longest consecutive recurrent run. The pager
+            // may lower that target to fit the Expert-cache share, but never spends the runtime
+            // reserve priced for the selected Prefill chunk. Pure Attention models retain their
+            // established all-layer target.
+            let prefill_target_lanes = moe_prefill_target_lanes(cfg, n_paged);
             vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
                 // The runtime reserve is part of `pager_budget_bytes` and therefore physically
                 // escrowed by the unified arena itself. No second load-only allocation.
@@ -2940,6 +3040,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 pools,
                 host_chunks,
                 prefill_target_lanes,
+                prefill_cache_bytes: expert_cache_target_bytes,
             })
             .map_err(|e| anyhow!("{e}"))?;
         }
@@ -4756,6 +4857,35 @@ mod seam_helper_tests {
         );
     }
 
+    #[test]
+    fn moe_viability_pin_may_lower_but_never_raise_explicit_ubatch() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let explicit = EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(2048),
+                ubatch_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(super::ubatch_rows(&explicit), 2048);
+        assert_eq!(
+            super::moe_ubatch_fallback_candidates(&explicit),
+            vec![2048, 1024, 512, 256, 128]
+        );
+
+        super::repin_ubatch_lower(512);
+        assert_eq!(
+            super::ubatch_rows(&explicit),
+            2048,
+            "ordinary placement pins must not override an explicit height"
+        );
+        super::cap_moe_ubatch(1024);
+        assert_eq!(super::ubatch_rows(&explicit), 1024);
+        super::cap_moe_ubatch(4096);
+        assert_eq!(super::ubatch_rows(&explicit), 1024);
+    }
+
     /// The `*_specified` rule (§11 decision 8): an UNRECOGNIZED KV format name still suppresses
     /// auto-q8 (it was supplied) while yielding no dtype, and it is not ring-capable either.
     #[test]
@@ -4883,6 +5013,40 @@ mod seam_helper_tests {
             ssm_dt_rank: 16,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn moe_prefill_lanes_use_current_plus_longest_recurrent_run() {
+        let qwen35 = qwen35_hybrid_state();
+        assert_eq!(super::moe_prefill_target_lanes(&qwen35, 40), 4);
+
+        let qwen38 = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            recurrent_layers: (0usize..48)
+                .map(|layer| !(layer + 1).is_multiple_of(4))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(super::moe_prefill_target_lanes(&qwen38, 48), 4);
+
+        let mut mla_layers = vec![false; 42];
+        for layer in [5, 11, 17, 23, 29, 35, 41] {
+            mla_layers[layer] = true;
+        }
+        let ling = Config {
+            bailingmoe3: true,
+            n_layer: 42,
+            bailing_mla_layers: mla_layers,
+            ..Default::default()
+        };
+        assert_eq!(super::moe_prefill_target_lanes(&ling, 42), 6);
+
+        let attention_only = Config {
+            n_layer: 24,
+            ..Default::default()
+        };
+        assert_eq!(super::moe_prefill_target_lanes(&attention_only, 24), 24);
     }
 
     #[test]
