@@ -3542,6 +3542,13 @@ pub(crate) fn attn_combine_spv() -> &'static [u32] {
     static ATTN_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ATTN_COMBINE_SPV.get_or_init(|| spv_words(ATTN_COMBINE_SPV_BYTES))
 }
+/// Wave32 reduction variant of [`attn_combine_spv`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_combine_sg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine_sg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for tiled online-softmax attention over an f16 KV cache.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attention_kv_spv() -> &'static [u32] {

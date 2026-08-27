@@ -6926,13 +6926,34 @@ impl<'a> Recorder<'a> {
         );
         // pass 2: combine — split each (row, head)'s hd outputs across `ntile` workgroups for
         // occupancy. The combine is row-agnostic: rows*nh independent [n_chunks] partial sets.
-        let k2 = self
-            .be
-            .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
-        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        let combine_sg = rows == 1
+            && hd == 256
+            && k_q8
+            && v_q8
+            && n_chunks >= 16
+            && self.vk().q8_decode_combine_sg;
+        let k2 = if combine_sg {
+            self.be.kernel_sg(
+                "attn_combine_sg",
+                crate::gemm::attn_combine_sg_spv(),
+                4,
+                16,
+                32,
+            )
+        } else {
+            self.be
+                .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16)
+        };
+        let ntile = if combine_sg {
+            16u32
+        } else if hd.is_multiple_of(4) {
+            4u32
+        } else {
+            1u32
+        };
         // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
-        // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
-        // always holds — this pins that invariant at the call site (never fires for shipped hd).
+        // hd-ntile*hdt dims (left uninitialized). The Q8 hd256 specialization uses 16; the general
+        // path uses 4 only when divisible, else 1, so this pins the invariant at the call site.
         debug_assert!(
             hd.is_multiple_of(ntile as usize),
             "attn_combine: hd ({hd}) must be a multiple of ntile ({ntile}); hdt=hd/ntile would drop dims"

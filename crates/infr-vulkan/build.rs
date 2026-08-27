@@ -867,6 +867,7 @@ fn main() {
         ("linear_res", "linear_res", &[]),
         ("attention", "attention", &[]),
         ("attn_combine", "attn_combine", &[]),
+        ("attn_combine", "attn_combine_sg", &["-DSUBGROUP_REDUCE"]),
         ("attn_combine", "attn_combine_live", &["-DUSE_LIVE"]),
         ("attn_live", "attn_live", &[]),
         ("attention_kv", "attention_kv", &[]),

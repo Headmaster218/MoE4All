@@ -1,4 +1,8 @@
 #version 460
+#ifdef SUBGROUP_REDUCE
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 // Flash-decode combine: one workgroup per (head, hd-tile). Merges n_chunks partial softmax results
 // (per-chunk max pm, sum pl, weighted-V pacc) via the online-softmax rule. o = [nh, hd].
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -32,12 +36,26 @@ void main() {
 #else
     uint nch = pc.n_chunks;
 #endif
+#ifdef SUBGROUP_REDUCE
+    float lane_m = -3.0e38;
+    for (uint c = t; c < nch; c += 32u) { lane_m = max(lane_m, pm[base + c]); }
+    float mm = subgroupMax(lane_m);
+    float lane_l = 0.0;
+    for (uint c = t; c < nch; c += 32u) {
+        float w = exp(pm[base + c] - mm);
+        wexp[c] = w;
+        lane_l += pl[base + c] * w;
+    }
+    float l = subgroupAdd(lane_l);
+    barrier();
+#else
     float mm = -3.0e38;
     for (uint c = 0u; c < nch; c++) { mm = max(mm, pm[base + c]); }
     for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
     barrier();
     float l = 0.0;
     for (uint c = 0u; c < nch; c++) { l += pl[base + c] * wexp[c]; }
+#endif
     float inv = 1.0 / l;
     for (uint d = d0 + t; d < d0 + hdt; d += 32u) {
         float acc = 0.0;
