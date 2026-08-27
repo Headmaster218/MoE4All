@@ -313,6 +313,8 @@ cfg_struct! {
         /// Wave32 two-level reduction for the GPU MoE router top-k. The scalar shared-memory tree
         /// remains available as an A/B and portability fallback.
         moe_topk_sg: bool = true,
+        /// Fill all eight wave32 subgroups when QSA scores a single decode row.
+        qsa_score_decode8: bool = true,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 

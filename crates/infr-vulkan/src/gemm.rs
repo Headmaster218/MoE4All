@@ -3277,6 +3277,16 @@ pub(crate) fn qsa_indexer_score_spv() -> &'static [u32] {
     })
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn qsa_indexer_score_decode8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qsa_indexer_score_decode8.spv"
+        )))
+    })
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn qsa_indexer_compress_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {

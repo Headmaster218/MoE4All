@@ -8401,13 +8401,23 @@ impl<'a> Recorder<'a> {
             );
         }
 
-        let score_k = self.be.kernel_sg(
-            "qsa_indexer_score",
-            crate::gemm::qsa_indexer_score_spv(),
-            3,
-            24,
-            32,
-        );
+        let decode8 = rows == 1 && self.vk().qsa_score_decode8;
+        let (score_name, score_spv, block_tile, query_tile) = if decode8 {
+            (
+                "qsa_indexer_score_decode8",
+                crate::gemm::qsa_indexer_score_decode8_spv(),
+                8,
+                1,
+            )
+        } else {
+            (
+                "qsa_indexer_score",
+                crate::gemm::qsa_indexer_score_spv(),
+                4,
+                2,
+            )
+        };
+        let score_k = self.be.kernel_sg(score_name, score_spv, 3, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
@@ -8420,8 +8430,8 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(q), Self::vkb(block_cache), Self::vkb(scores)],
             1,
             &push,
-            blocks.div_ceil(4),
-            rows.div_ceil(2),
+            blocks.div_ceil(block_tile),
+            rows.div_ceil(query_tile),
             1,
         );
 

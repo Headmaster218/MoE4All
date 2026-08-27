@@ -1,9 +1,10 @@
 #version 460
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-// Score a 2-query x 4-block tile. Final block keys are materialized once by
-// qsa_indexer_compress; this kernel only stages reusable Q/K data and computes the positive-head
-// dot sum. A fixed wave32 pipeline gives eight subgroups, one per query/block pair.
+// Score a query/block tile. Final block keys are materialized once by qsa_indexer_compress; this
+// kernel only stages reusable Q/K data and computes the positive-head dot sum. A fixed wave32
+// pipeline gives eight subgroups, one per query/block pair. Decode uses 1 query x 8 blocks so no
+// subgroup is idle; batched prefill keeps the established 2 queries x 4 blocks tile.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -18,8 +19,16 @@ layout(binding = 0) readonly buffer QB { uint q[]; };
 layout(binding = 1) readonly buffer KB { float block_k[]; };
 layout(binding = 2) writeonly buffer SB { float scores[]; };
 
-shared float qtile[2][4][128];
-shared float ktile[4][128];
+#ifdef QSA_SCORE_DECODE8
+#define QUERY_TILE 1u
+#define BLOCK_TILE 8u
+#else
+#define QUERY_TILE 2u
+#define BLOCK_TILE 4u
+#endif
+
+shared float qtile[QUERY_TILE][4][128];
+shared float ktile[BLOCK_TILE][128];
 
 float qread(uint i) {
     uint w = q[i >> 1u];
@@ -29,11 +38,11 @@ float qread(uint i) {
 
 void main() {
     uint t = gl_LocalInvocationID.x;
-    uint row_base = gl_WorkGroupID.y * 2u;
-    uint block_base = gl_WorkGroupID.x * 4u;
+    uint row_base = gl_WorkGroupID.y * QUERY_TILE;
+    uint block_base = gl_WorkGroupID.x * BLOCK_TILE;
     uint max_blocks = pc.kv_len / pc.ratio;
 
-    for (uint i = t; i < 2u * 4u * 128u; i += 256u) {
+    for (uint i = t; i < QUERY_TILE * 4u * 128u; i += 256u) {
         uint d = i & 127u;
         uint h = (i >> 7u) & 3u;
         uint qr = i >> 9u;
@@ -42,7 +51,7 @@ void main() {
             ? qread((row * pc.n_head + h) * pc.head_dim + d)
             : 0.0;
     }
-    for (uint i = t; i < 4u * 128u; i += 256u) {
+    for (uint i = t; i < BLOCK_TILE * 128u; i += 256u) {
         uint d = i & 127u;
         uint bs = i >> 7u;
         uint block = block_base + bs;
@@ -53,8 +62,8 @@ void main() {
     barrier();
 
     uint sg = gl_SubgroupID;
-    uint qr = sg >> 2u;
-    uint bs = sg & 3u;
+    uint qr = sg / BLOCK_TILE;
+    uint bs = sg % BLOCK_TILE;
     uint row = row_base + qr;
     uint block = block_base + bs;
     if (row >= pc.rows || block >= max_blocks) { return; }

@@ -666,6 +666,11 @@ fn main() {
         ("dsv4_gather", "dsv4_gather", &[]),
         ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode8",
+            &["-DQSA_SCORE_DECODE8"],
+        ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_gather", "qsa_gather", &[]),
         ("qsa_gather", "qsa_gather_kq8", &["-DKQ8"]),
