@@ -4,7 +4,7 @@
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
 use crate::linear::native_dense_supported;
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES};
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
@@ -2620,12 +2620,23 @@ fn lower_op(
                 "qsa_indexer_scores",
                 *rows as usize * blocks as usize * 4,
             )?;
+            let topk_work = if *rows == 1 && blocks >= QSA_TOPK_PARALLEL_MIN_BLOCKS {
+                Some(pooled(
+                    pool,
+                    be_,
+                    "qsa_indexer_topk_work",
+                    QSA_TOPK_PARALLEL_WORK_BYTES,
+                )?)
+            } else {
+                None
+            };
             rec.qsa_indexer(
                 r(*q)?,
                 r(*k_cache)?,
                 r(*block_cache)?,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
+                topk_work.map(|id| pool[&id].as_ref()),
                 r(*dst)?,
                 *rows,
                 *kv_len,

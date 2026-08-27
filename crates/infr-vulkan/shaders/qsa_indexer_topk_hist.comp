@@ -1,0 +1,40 @@
+#version 460
+// One exact score-radix pass, split across independent workgroups. Each workgroup writes its own
+// 256-bin histogram so the hot score scan scales across the GPU without global atomic contention.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint blocks;
+    uint top_k;
+    uint groups;
+    uint state_base;
+    uint level;
+} pc;
+layout(binding = 0) readonly buffer SB { float scores[]; };
+layout(binding = 1) buffer WB { uint work[]; };
+
+shared uint bucket[256];
+
+uint ordered_float(float x) {
+    uint bits = floatBitsToUint(x);
+    return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    bucket[t] = 0u;
+    barrier();
+
+    uint done = pc.level * 8u;
+    uint prefix = pc.level == 0u ? 0u : work[pc.state_base];
+    uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
+    for (uint j = group * 256u + t; j < pc.blocks; j += pc.groups * 256u) {
+        uint score_key = ordered_float(scores[j]);
+        if ((score_key & mask) != (prefix & mask)) { continue; }
+        uint digit = (score_key >> (24u - done)) & 0xffu;
+        atomicAdd(bucket[digit], 1u);
+    }
+    barrier();
+    work[group * 256u + t] = bucket[t];
+}

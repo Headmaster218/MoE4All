@@ -16,6 +16,10 @@ use infr_core::{backend::Buffer, error::Result, pager_profile};
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
+pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
+pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
+const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
+
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
 /// `Stage` (INFR_FLASH_STAGE) stages the f16 K/V tile into shmem and coopMatLoads from there.
@@ -8357,6 +8361,7 @@ impl<'a> Recorder<'a> {
         block_cache: &dyn Buffer,
         k_norm: &dyn Buffer,
         scores: &dyn Buffer,
+        topk_work: Option<&dyn Buffer>,
         dst: &dyn Buffer,
         rows: u32,
         kv_len: u32,
@@ -8435,25 +8440,76 @@ impl<'a> Recorder<'a> {
             1,
         );
 
-        let topk_k = self.be.kernel(
-            "qsa_indexer_topk",
-            crate::gemm::qsa_indexer_topk_spv(),
-            2,
-            20,
-        );
-        let mut topk_push = [0u8; 20];
-        topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
-        topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
-        topk_push[8..12].copy_from_slice(&rows.to_ne_bytes());
-        topk_push[12..16].copy_from_slice(&kv_len.to_ne_bytes());
-        topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
-        self.dispatch(
-            topk_k,
-            &[Self::vkb(scores), Self::vkb(dst)],
-            1,
-            &topk_push,
-            rows,
-        );
+        if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
+            let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
+            let state_base = groups * 256;
+            let hist_k = self.be.kernel(
+                "qsa_indexer_topk_hist",
+                crate::gemm::qsa_indexer_topk_hist_spv(),
+                2,
+                20,
+            );
+            let select_k = self.be.kernel(
+                "qsa_indexer_topk_select",
+                crate::gemm::qsa_indexer_topk_select_spv(),
+                1,
+                20,
+            );
+            let mut radix_push = [0u8; 20];
+            radix_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+            radix_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+            radix_push[8..12].copy_from_slice(&groups.to_ne_bytes());
+            radix_push[12..16].copy_from_slice(&state_base.to_ne_bytes());
+            for level in 0..4u32 {
+                radix_push[16..20].copy_from_slice(&level.to_ne_bytes());
+                self.dispatch(
+                    hist_k,
+                    &[Self::vkb(scores), Self::vkb(work)],
+                    1,
+                    &radix_push,
+                    groups,
+                );
+                self.dispatch(select_k, &[Self::vkb(work)], 1, &radix_push, 1);
+            }
+
+            let collect_k = self.be.kernel(
+                "qsa_indexer_topk_collect",
+                crate::gemm::qsa_indexer_topk_collect_spv(),
+                3,
+                12,
+            );
+            let mut collect_push = [0u8; 12];
+            collect_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+            collect_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+            collect_push[8..12].copy_from_slice(&state_base.to_ne_bytes());
+            self.dispatch(
+                collect_k,
+                &[Self::vkb(scores), Self::vkb(work), Self::vkb(dst)],
+                1,
+                &collect_push,
+                1,
+            );
+        } else {
+            let topk_k = self.be.kernel(
+                "qsa_indexer_topk",
+                crate::gemm::qsa_indexer_topk_spv(),
+                2,
+                20,
+            );
+            let mut topk_push = [0u8; 20];
+            topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+            topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+            topk_push[8..12].copy_from_slice(&rows.to_ne_bytes());
+            topk_push[12..16].copy_from_slice(&kv_len.to_ne_bytes());
+            topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
+            self.dispatch(
+                topk_k,
+                &[Self::vkb(scores), Self::vkb(dst)],
+                1,
+                &topk_push,
+                rows,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

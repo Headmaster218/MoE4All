@@ -3317,6 +3317,9 @@ macro_rules! qsa_spv {
         }
     };
 }
+qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
+qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
+qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
 qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");

@@ -315,6 +315,8 @@ cfg_struct! {
         moe_topk_sg: bool = true,
         /// Fill all eight wave32 subgroups when QSA scores a single decode row.
         qsa_score_decode8: bool = true,
+        /// Multi-workgroup exact radix selection for deep single-row QSA decode.
+        qsa_topk_parallel: bool = true,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 
