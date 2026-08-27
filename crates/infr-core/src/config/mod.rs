@@ -369,6 +369,8 @@ cfg_struct! {
         q8_pv_f16: bool = true,
         /// Reuse each Q8 K/V read across pairs of adjacent GQA query heads in hd256 decode.
         q8_decode_gqa2: bool = true,
+        /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
+        q8_decode_gqa4: bool = true,
         /// Wave32 max/sum reduction for the coupled Q8 hd256 decode combine pass.
         q8_decode_combine_sg: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the

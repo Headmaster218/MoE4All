@@ -6860,6 +6860,7 @@ impl<'a> Recorder<'a> {
                         self.vk().q8_pv_f16,
                         self.vk().q8_decode_chunk1024,
                         self.vk().q8_decode_gqa2 && nh / nkv >= 2 && (nh / nkv).is_multiple_of(2),
+                        self.vk().q8_decode_gqa4 && nh / nkv >= 4 && (nh / nkv).is_multiple_of(4),
                     )
                 } else {
                     None
@@ -6879,6 +6880,7 @@ impl<'a> Recorder<'a> {
         };
         let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
         let fused_gqa2 = p1name == "attn_decode_hd256_q8_gqa2";
+        let fused_gqa4 = p1name == "attn_decode_hd256_q8_gqa4";
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };
@@ -6926,7 +6928,13 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p1[..plen],
-            ((if fused_gqa2 { nh / 2 } else { nh }) * n_chunks) as u32,
+            ((if fused_gqa4 {
+                nh / 4
+            } else if fused_gqa2 {
+                nh / 2
+            } else {
+                nh
+            }) * n_chunks) as u32,
             gy as u32,
             1,
         );
