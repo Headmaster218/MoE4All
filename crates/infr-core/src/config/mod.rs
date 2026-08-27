@@ -367,6 +367,8 @@ cfg_struct! {
         /// `INFR_NO_Q8_PV_F16` (inverted) — use packed fp16 only for Q8 V dequantization before
         /// converting back to fp32; softmax weighting and P.V accumulation remain fp32.
         q8_pv_f16: bool = true,
+        /// Reuse each Q8 K/V read across pairs of adjacent GQA query heads in hd256 decode.
+        q8_decode_gqa2: bool = true,
         /// Wave32 max/sum reduction for the coupled Q8 hd256 decode combine pass.
         q8_decode_combine_sg: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the

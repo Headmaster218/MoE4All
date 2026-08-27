@@ -78,7 +78,9 @@ fn run_case_with_combine(
         chunk_max > 512,
         combine_sg,
     )?;
-    let (nh, nkv, hd) = (4usize, 2usize, 256usize);
+    // Qwen3.5/3.6 uses four query heads per KV head; this also exercises two fused pairs per KV
+    // head rather than only the first pair.
+    let (nh, nkv, hd) = (8usize, 2usize, 256usize);
     let n = kv_len * nkv * hd;
     let q: Vec<f32> = (0..nh * hd)
         .map(|i| sample(i, 0x1234_5678) * 0.37)
