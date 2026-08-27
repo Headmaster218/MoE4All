@@ -75,7 +75,7 @@ if ($dependencyOutput -match '(?i)\b(?:vcruntime|msvcp|concrt)[^\s]*\.dll\b|\bap
 $wizardSource = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
 [void][scriptblock]::Create($wizardSource)
 
-$modelPath = Join-Path $PackageRoot 'ci-smoke-model.gguf'
+$modelPath = Join-Path $PackageRoot 'ci smoke model.gguf'
 [System.IO.File]::WriteAllBytes($modelPath, [byte[]]::new(0))
 $dataDirectory = Join-Path $PackageRoot 'gui-data'
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
@@ -83,7 +83,8 @@ New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 function Invoke-WizardDryRun {
     param(
         [Parameter(Mandatory = $true)][string]$Mode,
-        [Parameter(Mandatory = $true)][string]$ExpectedCommand
+        [Parameter(Mandatory = $true)][string]$ExpectedCommand,
+        [string]$ModelSelection = ''
     )
 
     $state = [ordered]@{
@@ -120,7 +121,11 @@ function Invoke-WizardDryRun {
     $process = [System.Diagnostics.Process]::Start($processInfo)
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    for ($i = 0; $i -lt 32; $i++) {
+    # Keep the saved launch mode, then exercise the same Read-Host model prompt used for
+    # Explorer/terminal drag-and-drop. Remaining blank answers retain the saved quick settings.
+    $process.StandardInput.WriteLine('')
+    $process.StandardInput.WriteLine($ModelSelection)
+    for ($i = 0; $i -lt 30; $i++) {
         $process.StandardInput.WriteLine('')
     }
     $process.StandardInput.WriteLine('x')
@@ -143,8 +148,10 @@ function Invoke-WizardDryRun {
     }
 }
 
-Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run'
-Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve'
+$quotedModelPath = '"' + $modelPath + '"'
+$powerShellDrop = "& '$modelPath'"
+Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -ModelSelection $quotedModelPath
+Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop
 Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench'
 
 Remove-Item -LiteralPath $modelPath -Force

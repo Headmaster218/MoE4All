@@ -153,7 +153,30 @@ function Read-Choice {
 
 function ConvertTo-FullPath {
     param([Parameter(Mandatory = $true)][string]$Value)
-    $value = $Value.Trim().Trim('"').Trim("'")
+    $value = $Value.Trim()
+
+    # PowerShell-aware terminals may paste a dropped file as `& 'C:\path\model.gguf'`.
+    # Read-Host returns that as plain text, so remove the call operator and paired quotes before
+    # treating it as a path. Repeating the quote pass also accepts a copied quoted path wrapped by
+    # another pair of quotes.
+    if ($value -match '^&\s*(.+)$') {
+        $value = $Matches[1].Trim()
+    }
+    while ($value.Length -ge 2) {
+        $first = $value[0]
+        $last = $value[$value.Length - 1]
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $value = $value.Substring(1, $value.Length - 2).Trim()
+            continue
+        }
+        break
+    }
+
+    $uri = $null
+    if ($value.StartsWith('file:', [System.StringComparison]::OrdinalIgnoreCase) -and
+        [System.Uri]::TryCreate($value, [System.UriKind]::Absolute, [ref]$uri) -and $uri.IsFile) {
+        $value = $uri.LocalPath
+    }
     if ([System.IO.Path]::IsPathRooted($value)) {
         return [System.IO.Path]::GetFullPath($value)
     }
