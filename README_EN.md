@@ -24,33 +24,33 @@ bilingual wizard, and choose automatic configuration.
 
 Qwen3.8-Flash-Next now generates stable, coherent output through MoE4All on a
 consumer **AMD Radeon RX 7900 XTX**, including correct answers to simple math
-and reasoning questions. The first run used Windows 11, a Q2 quantization, and
-approximately **40 GB of system memory**.
+and reasoning questions. Both Q2_K_XL and IQ4_XS quantizations have been tested
+on Windows 11 with SSD paging under a **40 GiB bounded-RAM** budget.
 
 The `qwen4exp` text path now covers the released model's four-stream
 hyper-connections, gated DeltaNet/full-attention layer mix, SSD-backed PLE,
 paged MoE, and **QSA sparse attention**. QSA maintains a separate F16 index-key
 cache, selects complete history blocks, and preserves the incomplete causal
-tail, removing the first implementation's temporary roughly 2K context limit.
+tail for long-context inference. The main K/V cache supports Q8_0, while the
+QSA index-key cache remains F16 and is budgeted and allocated independently.
 
-The first four rows below are representative values from three short runs. The
-last two are the newly completed QSA path checks. Their `tg1` workload verifies
-that both real and synthetic KV cross the QSA activation boundary; it is not a
-final long-context throughput measurement.
+The table below was measured on an RX 7900 XTX with Vulkan0, Q8 K/V, and a
+40 GiB bounded-RAM budget. Decode uses `tg128`, prefill uses `pp1024`, and the
+ubatch is 1024. Depths 128K and 250K use synthetic depth to construct the real
+KV length. Every entry is a three-run average and reports `kv_q8=true` and
+`kv_layout=q8_0`.
 
-| Test | Representative result | Three-run range |
-|---|---:|---:|
-| Decode at context 0, tg16 | **43.5 tok/s** | 42.6-44.9 tok/s |
-| Prefill at context 0, pp32 | **46.6 tok/s** | 46.2-47.1 tok/s |
-| Decode at context 1024, tg16 | **41.9 tok/s** | 41.4-42.7 tok/s |
-| Incremental prefill at context 1024, pp32 | **42.6 tok/s** | 42.1-43.3 tok/s |
-| QSA decode after real prefill to depth 2052, tg1 | **32.9 tok/s** | One path-validation run |
-| QSA decode after synthetic depth 4096, tg1 | **22.9 tok/s** | One path-validation run |
+| Context depth | Q2_K_XL decode | Q2_K_XL prefill | IQ4_XS decode | IQ4_XS prefill |
+|---:|---:|---:|---:|---:|
+| 0 | **29.45 tok/s** | **155.16 tok/s** | **16.85 tok/s** | **244.68 tok/s** |
+| 128K | **26.23 tok/s** | **170.44 tok/s** | **14.15 tok/s** | **250.55 tok/s** |
+| 250K | **22.82 tok/s** | **152.27 tok/s** | **15.26 tok/s** | **239.00 tok/s** |
 
-QSA currently uses a correctness-first exact block-selection implementation.
-Long-context kernels and end-to-end throughput still have room to improve, but
-the model architecture, cache allocation, and sparse-attention data path are
-now complete.
+Q2 and IQ4_XS both passed three-round API conversations while preserving a
+verification code, completing cross-turn arithmetic, and summarizing prior
+content. QSA uses radix top-k with exact score/index ordering, and batched
+QSA/PLE prefill is enabled. Decode remains sensitive to expert RAM/SSD coverage
+and has further optimization headroom.
 
 ## Start in three steps
 
@@ -129,8 +129,10 @@ capabilities; rows use different workloads and are not directly comparable.
 | Qwen3.6-35B-A3B prefill 4,096 after 250K synthetic depth | Q8 K/V | **477.9 tok/s** |
 | Qwen3.6-35B-A3B prefill 4,096 at depth 0 | Q8 K/V | **2,855.6 tok/s** |
 | Qwen3.5-122B-A10B decode at depth 0 | F16 K/V, 45 GiB bounded RAM, 3 repetitions | **23.2 tok/s** |
-| Qwen3.8-Flash-Next QSA decode after real depth 2052 | Q2, F16 K/V, 40 GiB bounded RAM, tg1 path check | **32.9 tok/s** |
-| Qwen3.8-Flash-Next QSA decode after synthetic depth 4096 | Q2, F16 K/V, 40 GiB bounded RAM, tg1 path check | **22.9 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL decode after 250K synthetic depth | Q8 K/V, 40 GiB bounded RAM, tg128, 3-run average | **22.82 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL prefill 1,024 after 250K | Q8 K/V, 40 GiB bounded RAM, 3-run average | **152.27 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS decode after 250K synthetic depth | Q8 K/V, 40 GiB bounded RAM, tg128, 3-run average | **15.26 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS prefill 1,024 after 250K | Q8 K/V, 40 GiB bounded RAM, 3-run average | **239.00 tok/s** |
 
 Full conditions and engineering history:
 
