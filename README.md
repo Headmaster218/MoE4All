@@ -6,7 +6,7 @@
 [下载最新版 Windows 程序](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [快速开始](GETTING_STARTED.md) |
 [English](README_EN.md) |
-[技术文档](docs/README.md)
+[技术文档](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
 
 MoE4All 是一个面向 AMD 显卡和 Windows 11 的本地大模型运行项目。它让
 MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此模型不必全部塞进
@@ -52,7 +52,7 @@ Prefill。Decode 仍明显受专家 RAM/SSD 覆盖率影响，仍有继续优化
 ### 1. 下载
 
 打开 [最新 Release](https://github.com/Headmaster218/MoE4All/releases/latest)，
-下载 `infr-windows-x86_64-*.zip` 并完整解压。
+下载 `MoE4All-Windows-x86_64-v*.zip` 并完整解压。
 
 发布包已经包含 `infr.exe` 和中英双语启动向导。运行发布版不需要安装 Rust、
 Visual Studio 或 Vulkan SDK，只需要正常的 64 位 AMD 显卡驱动及其 Vulkan
@@ -77,6 +77,9 @@ Start-INFR-Wizard.cmd
 选择终端聊天、OpenAI 兼容 API 或性能测试，然后输入或拖入 GGUF 路径。
 普通用户建议使用“自动配置”：MoE4All 会探测 GPU、可用显存和系统内存，并
 自动规划 KV Cache、运行时空间和专家缓存。
+
+向导启动时会用很短的网络请求检查 GitHub Release；发现新版本时只显示下载
+链接，不会自动修改程序。断网不会阻止启动。
 
 ## 它能做什么
 
@@ -123,9 +126,9 @@ Windows 11 主机。它们用于说明项目已经达到的能力，不同模型
 
 完整条件和优化历史见：
 
-- [Qwen3.6 RX 7900 XTX 优化记录](docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
-- [统一显存验收记录](docs/unified-vram-elastic-acceptance-20260824.md)
-- [DeepSeek V4 Flash 收尾记录](docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
+- [Qwen3.6 RX 7900 XTX 优化记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
+- [统一显存验收记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/unified-vram-elastic-acceptance-20260824.md)
+- [DeepSeek V4 Flash 收尾记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
 
 ## 当前模型支持
 
@@ -195,8 +198,9 @@ AMD Vulkan 计算
 显存中的模型固定部分、KV Cache、运行时 scratch 和专家缓存由统一预算协调，
 prefill 与 decode 切换时可以重新分配弹性空间。
 
-更深入的实现说明在 [技术文档索引](docs/README.md) 和
-[MoE4All Wiki](infr-fork-wiki/README.md)。
+更深入的实现说明在
+[技术文档索引](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md) 和
+[MoE4All Wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md)。
 
 ## 当前限制
 

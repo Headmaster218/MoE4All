@@ -5,7 +5,7 @@
 [Latest Windows release](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [Getting started](GETTING_STARTED.md#english-quick-start) |
 [简体中文](README.md) |
-[Technical documentation](docs/README.md)
+[Technical documentation](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
 
 MoE4All is a local LLM inference project focused on AMD GPUs and native
 Windows 11. It moves MoE expert weights between VRAM, system RAM, and SSD on
@@ -57,7 +57,7 @@ and has further optimization headroom.
 ### 1. Download
 
 Open the [latest Release](https://github.com/Headmaster218/MoE4All/releases/latest),
-download `infr-windows-x86_64-*.zip`, and fully extract the archive.
+download `MoE4All-Windows-x86_64-v*.zip`, and fully extract the archive.
 
 The package includes `infr.exe` and the bilingual launch wizard. Running the
 packaged build does not require Rust, Visual Studio, or the Vulkan SDK. It does
@@ -86,6 +86,10 @@ Choose interactive terminal chat, the OpenAI-compatible API, or benchmark
 mode, then paste or drag the GGUF path into the open model prompt. Automatic
 configuration is recommended: MoE4All detects the GPU, available VRAM, system
 memory, model structure, KV requirements, runtime space, and expert cache.
+
+At startup, the wizard makes a short request to check the latest GitHub
+Release. It only displays a download link when an update exists and never
+modifies the installation automatically. Offline startup continues normally.
 
 ## What it does
 
@@ -136,9 +140,9 @@ capabilities; rows use different workloads and are not directly comparable.
 
 Full conditions and engineering history:
 
-- [Qwen3.6 RX 7900 XTX optimization history](docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
-- [Unified elastic VRAM acceptance](docs/unified-vram-elastic-acceptance-20260824.md)
-- [DeepSeek V4 Flash closeout](docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
+- [Qwen3.6 RX 7900 XTX optimization history](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
+- [Unified elastic VRAM acceptance](https://github.com/Headmaster218/MoE4All/blob/main/docs/unified-vram-elastic-acceptance-20260824.md)
+- [DeepSeek V4 Flash closeout](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
 
 ## Current model support
 
@@ -213,8 +217,10 @@ hot tier, and SSD supplies the rest. Fixed model weights, KV caches, runtime
 scratch, and expert residency share a coordinated VRAM budget. Elastic space
 can be reassigned when execution changes between prefill and decode.
 
-For implementation details, see the [documentation index](docs/README.md) and
-the [MoE4All wiki](infr-fork-wiki/README.md).
+For implementation details, see the
+[documentation index](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
+and the
+[MoE4All wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md).
 
 ## Current limitations
 
