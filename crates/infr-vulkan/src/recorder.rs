@@ -8374,15 +8374,31 @@ impl<'a> Recorder<'a> {
         top_blocks: u32,
         ratio: u32,
         scale: f32,
+        k_q8: bool,
+        v_q8: bool,
+        kcap: u32,
+        vcap: u32,
     ) {
-        let kernel = self.be.kernel_sg(
-            "qsa_attention_batch",
-            crate::gemm::qsa_attention_batch_spv(),
-            5,
-            32,
-            32,
-        );
-        let mut push = [0u8; 32];
+        let (name, spv) = match (k_q8, v_q8) {
+            (false, false) => (
+                "qsa_attention_batch",
+                crate::gemm::qsa_attention_batch_spv(),
+            ),
+            (true, false) => (
+                "qsa_attention_batch_kq8",
+                crate::gemm::qsa_attention_batch_kq8_spv(),
+            ),
+            (false, true) => (
+                "qsa_attention_batch_vq8",
+                crate::gemm::qsa_attention_batch_vq8_spv(),
+            ),
+            (true, true) => (
+                "qsa_attention_batch_q8",
+                crate::gemm::qsa_attention_batch_q8_spv(),
+            ),
+        };
+        let kernel = self.be.kernel_sg(name, spv, 5, 40, 32);
+        let mut push = [0u8; 40];
         for (i, value) in [
             rows,
             kv_len,
@@ -8392,6 +8408,8 @@ impl<'a> Recorder<'a> {
             top_blocks,
             ratio,
             scale.to_bits(),
+            kcap,
+            vcap,
         ]
         .into_iter()
         .enumerate()
@@ -8426,19 +8444,29 @@ impl<'a> Recorder<'a> {
         tail: u32,
         ratio: u32,
         row_elems: u32,
+        k_q8: bool,
+        v_q8: bool,
+        kcap: u32,
+        vcap: u32,
     ) {
         let row_pairs = row_elems / 2;
         let total_pairs = (selected * ratio + tail) * row_pairs;
-        let kernel = self
-            .be
-            .kernel("qsa_gather", crate::gemm::qsa_gather_spv(), 5, 24);
-        let mut push = [0u8; 24];
+        let (name, spv) = match (k_q8, v_q8) {
+            (false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
+            (true, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
+            (false, true) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
+            (true, true) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
+        };
+        let kernel = self.be.kernel(name, spv, 5, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&selected.to_ne_bytes());
         push[4..8].copy_from_slice(&complete.to_ne_bytes());
         push[8..12].copy_from_slice(&tail.to_ne_bytes());
         push[12..16].copy_from_slice(&ratio.to_ne_bytes());
         push[16..20].copy_from_slice(&row_pairs.to_ne_bytes());
         push[20..24].copy_from_slice(&total_pairs.to_ne_bytes());
+        push[24..28].copy_from_slice(&kcap.to_ne_bytes());
+        push[28..32].copy_from_slice(&vcap.to_ne_bytes());
         self.dispatch(
             kernel,
             &[

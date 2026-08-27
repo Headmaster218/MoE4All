@@ -1,6 +1,6 @@
 #version 460
 // Correctness-first batched Qwen3.8 QSA attention. One workgroup owns one (query row, attention
-// head), reads that row's selected complete blocks directly from F16 KV caches,
+// head), reads that row's selected complete blocks directly from F16 or planar-Q8 KV caches,
 // appends its incomplete causal tail, and performs an exact two-pass softmax. Each lane owns one
 // element of a 128-wide head or two elements of Qwen3.8's 256-wide attention head.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -14,6 +14,8 @@ layout(push_constant) uniform PC {
     uint top_blocks;
     uint ratio;
     float scale;
+    uint kcap;
+    uint vcap;
 } pc;
 layout(binding = 0) readonly buffer QB { uint q[]; };
 layout(binding = 1) readonly buffer KB { uint k[]; };
@@ -33,15 +35,31 @@ float qread(uint i) {
 }
 
 float kread(uint i) {
+#ifdef KQ8
+    int codes = int(k[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    float scale = unpackHalf2x16(k[(pc.kcap >> 2u) + (block >> 1u)])[block & 1u];
+    return scale * float(code);
+#else
     uint w = k[i >> 1u];
     uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
     return unpackHalf2x16(h).x;
+#endif
 }
 
 float vread(uint i) {
+#ifdef VQ8
+    int codes = int(v[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    float scale = unpackHalf2x16(v[(pc.vcap >> 2u) + (block >> 1u)])[block & 1u];
+    return scale * float(code);
+#else
     uint w = v[i >> 1u];
     uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
     return unpackHalf2x16(h).x;
+#endif
 }
 
 uint source_row(uint row, uint logical, uint selected, uint complete) {

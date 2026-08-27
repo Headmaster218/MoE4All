@@ -80,7 +80,7 @@ fn qsa_index_and_gather_match_reference() {
     be.upload(raw.as_ref(), &rawb).unwrap();
     be.upload(nw.as_ref(), bytemuck::cast_slice(&norm)).unwrap();
 
-    let row = 16usize;
+    let row = 32usize;
     let kvals: Vec<f32> = (0..kv_len * row).map(|i| i as f32 * 0.001).collect();
     let vvals: Vec<f32> = (0..kv_len * row).map(|i| -1.0 - i as f32 * 0.001).collect();
     let kb = f16_bytes(&kvals);
@@ -126,6 +126,10 @@ fn qsa_index_and_gather_match_reference() {
         2,
         ratio as u32,
         row as u32,
+        false,
+        false,
+        0,
+        0,
     );
     rec.finish().unwrap();
 
@@ -160,6 +164,39 @@ fn qsa_index_and_gather_match_reference() {
     }
     assert_eq!(got_k, want_k);
     assert_eq!(got_v, want_v);
+
+    let cap = kv_len * row;
+    let q8_bytes = (cap / 32 * 34).next_multiple_of(4);
+    let kq = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.store_q8(k.as_ref(), kq.as_ref(), cap, 0, cap, true, 0);
+    rec.store_q8(v.as_ref(), vq.as_ref(), cap, 0, cap, true, 0);
+    rec.qsa_gather(
+        kq.as_ref(),
+        vq.as_ref(),
+        ids.as_ref(),
+        kd.as_ref(),
+        vd.as_ref(),
+        top as u32,
+        blocks as u32,
+        2,
+        ratio as u32,
+        row as u32,
+        true,
+        true,
+        cap as u32,
+        cap as u32,
+    );
+    rec.finish().unwrap();
+    be.download(kd.as_ref(), &mut got_k).unwrap();
+    be.download(vd.as_ref(), &mut got_v).unwrap();
+    for (name, got, want) in [("K", &got_k, &want_k), ("V", &got_v, &want_v)] {
+        for i in 0..out_rows * row {
+            let err = (h(got, i) - h(want, i)).abs();
+            assert!(err < 0.03, "Q8 {name} gather elem {i}: err {err}");
+        }
+    }
 
     // Equal scores exercise the secondary key: the earliest block indices must win exactly as
     // they did in the repeated-max implementation.
@@ -363,6 +400,10 @@ fn qsa_batched_rows_match_causal_reference() {
         top as u32,
         ratio as u32,
         attn_scale,
+        false,
+        false,
+        0,
+        0,
     );
     rec.finish().unwrap();
 
@@ -379,6 +420,46 @@ fn qsa_batched_rows_match_causal_reference() {
         assert!(
             (got - want).abs() < 3e-3,
             "output {i}: got {got}, want {want}"
+        );
+    }
+
+    let cap = kv_len * n_kv * attn_hd;
+    let q8_bytes = (cap / 32 * 34).next_multiple_of(4);
+    let kq = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    let q8_out = be
+        .alloc(want_out.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.store_q8(k.as_ref(), kq.as_ref(), cap, 0, cap, true, 0);
+    rec.store_q8(v.as_ref(), vq.as_ref(), cap, 0, cap, true, 0);
+    rec.qsa_attention_batch(
+        attn_q.as_ref(),
+        kq.as_ref(),
+        vq.as_ref(),
+        ids.as_ref(),
+        q8_out.as_ref(),
+        rows as u32,
+        kv_len as u32,
+        n_head as u32,
+        n_kv as u32,
+        attn_hd as u32,
+        top as u32,
+        ratio as u32,
+        attn_scale,
+        true,
+        true,
+        cap as u32,
+        cap as u32,
+    );
+    rec.finish().unwrap();
+    let mut q8_out_bytes = vec![0u8; want_out.len() * 4];
+    be.download(q8_out.as_ref(), &mut q8_out_bytes).unwrap();
+    let q8_out = bytemuck::cast_slice::<u8, f32>(&q8_out_bytes);
+    for (i, (&got, &want)) in q8_out.iter().zip(&want_out).enumerate() {
+        assert!(
+            (got - want).abs() < 0.02,
+            "Q8 output {i}: got {got}, want {want}"
         );
     }
 }

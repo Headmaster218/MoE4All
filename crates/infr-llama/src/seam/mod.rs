@@ -1224,17 +1224,27 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
 /// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
 /// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && !cfg.qwen4exp && kv_row_align_ok(cfg)
+    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
 }
 
 /// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
 /// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
 /// priced exactly instead of the MoE planner treating every non-auto choice as f16.
 fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
-    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 || cfg.qwen4exp {
+    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 {
         return DType::F16;
     }
     let block_aligned = kv_row_align_ok(cfg);
+    // Qwen3.8's QSA gather/attention reads the ordinary K/V cache in F16 or planar Q8_0. Its
+    // separate raw index-key cache remains F16 and is priced by `qsa_cache_bytes` below.
+    if cfg.qwen4exp {
+        return match requested {
+            Some(DType::Q8_0) if block_aligned => DType::Q8_0,
+            Some(DType::F16) => DType::F16,
+            _ if (ec.kv.force_q8 || kv_auto_q8()) && block_aligned => DType::Q8_0,
+            _ => DType::F16,
+        };
+    }
     let turbo_aligned = (0..cfg.n_layer).all(|l| cfg.layer_head_dim(l).is_multiple_of(128));
     match requested {
         Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if turbo_aligned => dt,
@@ -4851,6 +4861,59 @@ mod seam_helper_tests {
             .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
             .sum();
         assert_eq!(total, 768 * 1024 * 1024);
+    }
+
+    #[test]
+    fn qwen38_q8_prices_only_the_main_kv_cache_as_q8() {
+        let recurrent_layers: Vec<bool> =
+            (0usize..48).map(|l| !(l + 1).is_multiple_of(4)).collect();
+        let cfg = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            full_attn_interval: 4,
+            recurrent_layers,
+            n_kv: 2,
+            head_dim: 256,
+            indexer_head_size: 128,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 2048,
+            ssm_n_group: 8,
+            ssm_dt_rank: 16,
+            ..Default::default()
+        };
+        let ec = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: Some(DType::Q8_0),
+                type_k_specified: true,
+                type_v: Some(DType::Q8_0),
+                type_v_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(super::kv_row_align_ok(&cfg));
+        assert!(super::kv_q8_layout_ok(&cfg));
+        assert_eq!(
+            super::vulkan_kv_fmt_for_budget(&cfg, &ec, ec.kv.type_k),
+            DType::Q8_0
+        );
+
+        let ctx = 262_144usize;
+        let f16 = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 1024, DType::F16, DType::F16);
+        let q8 = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 1024, DType::Q8_0, DType::Q8_0);
+        let elems_per_side = ctx * cfg.n_kv * cfg.head_dim;
+        let saved_per_full_layer = 2
+            * (super::kv_side_bytes(DType::F16, elems_per_side)
+                - super::kv_side_bytes(DType::Q8_0, elems_per_side));
+        assert_eq!(f16 - q8, (12 * saved_per_full_layer) as u64);
+        assert_eq!(
+            (0..cfg.n_layer)
+                .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
+                .sum::<usize>(),
+            768 * 1024 * 1024,
+            "the independent F16 QSA index cache is unchanged"
+        );
     }
 
     #[test]

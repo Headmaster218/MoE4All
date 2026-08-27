@@ -2648,15 +2648,24 @@ fn lower_op(
             ratio,
             row_elems,
         } => {
+            let kdt = graph.desc(*k_cache).dtype;
+            let vdt = graph.desc(*v_cache).dtype;
+            let k_q8 = kdt == infr_core::DType::Q8_0;
+            let v_q8 = vdt == infr_core::DType::Q8_0;
+            let supported = |dt| matches!(dt, infr_core::DType::F16 | infr_core::DType::Q8_0);
             if *ratio == 0
                 || *tail >= *ratio
                 || *selected_blocks > *complete_blocks
                 || *row_elems == 0
                 || !row_elems.is_multiple_of(2)
+                || ((k_q8 || v_q8) && !row_elems.is_multiple_of(32))
+                || !supported(kdt)
+                || !supported(vdt)
             {
                 return Err(be(format!(
                     "vulkan Op::QsaGather invalid geometry: selected={selected_blocks} \
-                     complete={complete_blocks} tail={tail} ratio={ratio} row_elems={row_elems}"
+                     complete={complete_blocks} tail={tail} ratio={ratio} row_elems={row_elems} \
+                     k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
             rec.qsa_gather(
@@ -2670,6 +2679,10 @@ fn lower_op(
                 *tail,
                 *ratio,
                 *row_elems,
+                k_q8,
+                v_q8,
+                graph.desc(*k_cache).numel() as u32,
+                graph.desc(*v_cache).numel() as u32,
             );
         }
         Op::QsaBatchAttention {
@@ -2691,6 +2704,7 @@ fn lower_op(
             let first_blocks = first_visible / *ratio.max(&1);
             let kdt = graph.desc(*k_cache).dtype;
             let vdt = graph.desc(*v_cache).dtype;
+            let supported = |dt| matches!(dt, infr_core::DType::F16 | infr_core::DType::Q8_0);
             if *rows == 0
                 || *rows > *kv_len
                 || *n_head == 0
@@ -2702,11 +2716,11 @@ fn lower_op(
                 || *top_blocks > first_blocks
                 || *top_blocks > 512
                 || graph.desc(*q).dtype != infr_core::DType::F16
-                || kdt != infr_core::DType::F16
-                || vdt != infr_core::DType::F16
+                || !supported(kdt)
+                || !supported(vdt)
             {
                 return Err(be(format!(
-                    "vulkan Op::QsaBatchAttention requires F16 q/k/v, rows<=kv_len, \
+                    "vulkan Op::QsaBatchAttention requires F16 q, F16/Q8_0 k/v, rows<=kv_len, \
                      head_dim=128/256, n_head divisible by n_kv, ratio>0 and \
                      0<top_blocks<=first complete blocks; \
                      got rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
@@ -2728,6 +2742,10 @@ fn lower_op(
                 *top_blocks,
                 *ratio,
                 *scale,
+                kdt == infr_core::DType::Q8_0,
+                vdt == infr_core::DType::Q8_0,
+                graph.desc(*k_cache).numel() as u32,
+                graph.desc(*v_cache).numel() as u32,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst

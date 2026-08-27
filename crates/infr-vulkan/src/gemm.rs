@@ -3256,7 +3256,13 @@ macro_rules! qsa_spv {
     };
 }
 qsa_spv!(qsa_gather_spv, "qsa_gather");
+qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
+qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");
+qsa_spv!(qsa_gather_q8_spv, "qsa_gather_q8");
 qsa_spv!(qsa_attention_batch_spv, "qsa_attention_batch");
+qsa_spv!(qsa_attention_batch_kq8_spv, "qsa_attention_batch_kq8");
+qsa_spv!(qsa_attention_batch_vq8_spv, "qsa_attention_batch_vq8");
+qsa_spv!(qsa_attention_batch_q8_spv, "qsa_attention_batch_q8");
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

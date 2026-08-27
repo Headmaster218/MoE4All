@@ -633,20 +633,13 @@ pub(crate) fn generate_dense_backend(
     // unconditionally, so the pair is forced to f16 — and a NAMED non-f16 format is refused here
     // rather than silently downgraded. `crate::seam::mla_kv_fmt` owns the rule and its argument.
     (k_fmt, v_fmt) = crate::seam::mla_kv_fmt(c, be.name(), ec, k_fmt, v_fmt)?;
-    if c.qwen4exp {
-        let named_non_f16 =
-            |specified: bool, dt: Option<DType>| specified && !matches!(dt, Some(DType::F16));
-        if named_non_f16(ec.kv.type_k_specified, ec.kv.type_k)
-            || named_non_f16(ec.kv.type_v_specified, ec.kv.type_v)
-            || ec.kv.force_q8
-        {
-            return Err(anyhow!(
-                "qwen4exp v1 supports F16 KV only; remove the KV override or set both \
-                 kv.type_k=f16 and kv.type_v=f16"
-            ));
-        }
-        k_fmt = DType::F16;
-        v_fmt = DType::F16;
+    if c.qwen4exp
+        && (!matches!(k_fmt, DType::F16 | DType::Q8_0)
+            || !matches!(v_fmt, DType::F16 | DType::Q8_0))
+    {
+        return Err(anyhow!(
+            "qwen4exp supports F16 and Q8_0 KV; got k={k_fmt:?}, v={v_fmt:?}"
+        ));
     }
 
     // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
@@ -6356,9 +6349,11 @@ pub(crate) fn generate_dense_backend(
     // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
     // Qwen3.8's correctness-first batched path may use the existing multi-row paged id-GEMV for
     // expert dtypes that do not yet have MMQ (IQ2_XS/IQ3_XXS). Its row-aware QSA kernel consumes
-    // F16 K/V in this first batched implementation.
+    // either F16 or planar-Q8 K/V.
     let batched_prefill_ok = if c.qwen4exp {
-        k_fmt == DType::F16 && v_fmt == DType::F16 && (be.moe_paged() || moe_batched_ok)
+        matches!(k_fmt, DType::F16 | DType::Q8_0)
+            && matches!(v_fmt, DType::F16 | DType::Q8_0)
+            && (be.moe_paged() || moe_batched_ok)
     } else {
         (c.moe.is_none() || moe_batched_ok) && !c.deepseek4
     };
