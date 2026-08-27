@@ -599,12 +599,14 @@ pub(crate) fn native_idm_sg_paged_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_sg16"),
+        (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged"),
+        (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_sg16"),
         _ => None,
     }
 }
 
-/// Subgroup+NR twin of [`native_idm_paged_shared_build_spv`]. Only Q5_K/Q6_K have an enrolled
-/// subgroup down-projection path; IQ4_XS stays on the tree kernel.
+/// Subgroup+NR twin of [`native_idm_paged_shared_build_spv`]. Q5_K/Q6_K cover the established
+/// down-projection band; IQ2_XS covers Qwen3.8's measured gate/up shape. IQ4_XS stays on tree.
 pub(crate) fn native_idm_sg_paged_shared_build_spv(
     dtype: infr_core::DType,
     nr: u32,
@@ -635,8 +637,20 @@ pub(crate) fn native_idm_sg_paged_shared_build_spv(
         (Q5K, 2, true) => v!("native_idm_q5k_sg2_paged_shexp_sg16"),
         (Q5K, 4, true) => v!("native_idm_q5k_sg4_paged_shexp_sg16"),
         (Q5K, 8, true) => v!("native_idm_q5k_sg8_paged_shexp_sg16"),
+        (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged_shexp"),
+        (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_shexp_sg16"),
         _ => None,
     }
+}
+
+/// Qwen3.8's fused paged IQ2_XS gate+up GEMV and SwiGLU decode kernel.
+pub(crate) fn native_id_swiglu_iq2xs_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_id_swiglu_iq2xs_sg8_paged.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// The id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant. Env-gated
 /// measurement entry ([`crate::recorder::Recorder::linear_mmv_id_multi_q4k`]) + parity tests.
@@ -3230,11 +3244,25 @@ pub(crate) fn qsa_indexer_topk_spv() -> &'static [u32] {
         )))
     })
 }
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn qsa_gather_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/qsa_gather.spv"))))
+macro_rules! qsa_spv {
+    ($f:ident, $name:literal) => {
+        #[cfg_attr(infr_profile, infr_prof::instrument)]
+        pub(crate) fn $f() -> &'static [u32] {
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+        }
+    };
 }
+qsa_spv!(qsa_gather_spv, "qsa_gather");
+qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
+qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");
+qsa_spv!(qsa_gather_q8_spv, "qsa_gather_q8");
+qsa_spv!(qsa_attention_batch_spv, "qsa_attention_batch");
+qsa_spv!(qsa_attention_batch_kq8_spv, "qsa_attention_batch_kq8");
+qsa_spv!(qsa_attention_batch_vq8_spv, "qsa_attention_batch_vq8");
+qsa_spv!(qsa_attention_batch_q8_spv, "qsa_attention_batch_q8");
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

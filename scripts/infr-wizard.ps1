@@ -1,6 +1,8 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$DryRun
+    [Parameter(Position = 0)][string]$InitialModelPath = '',
+    [switch]$DryRun,
+    [switch]$SkipUpdateCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,7 +155,30 @@ function Read-Choice {
 
 function ConvertTo-FullPath {
     param([Parameter(Mandatory = $true)][string]$Value)
-    $value = $Value.Trim().Trim('"').Trim("'")
+    $value = $Value.Trim()
+
+    # PowerShell-aware terminals may paste a dropped file as `& 'C:\path\model.gguf'`.
+    # Read-Host returns that as plain text, so remove the call operator and paired quotes before
+    # treating it as a path. Repeating the quote pass also accepts a copied quoted path wrapped by
+    # another pair of quotes.
+    if ($value -match '^&\s*(.+)$') {
+        $value = $Matches[1].Trim()
+    }
+    while ($value.Length -ge 2) {
+        $first = $value[0]
+        $last = $value[$value.Length - 1]
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $value = $value.Substring(1, $value.Length - 2).Trim()
+            continue
+        }
+        break
+    }
+
+    $uri = $null
+    if ($value.StartsWith('file:', [System.StringComparison]::OrdinalIgnoreCase) -and
+        [System.Uri]::TryCreate($value, [System.UriKind]::Absolute, [ref]$uri) -and $uri.IsFile) {
+        $value = $uri.LocalPath
+    }
     if ([System.IO.Path]::IsPathRooted($value)) {
         return [System.IO.Path]::GetFullPath($value)
     }
@@ -161,6 +186,25 @@ function ConvertTo-FullPath {
 }
 
 function Select-ModelPath {
+    param([AllowEmptyString()][string]$InitialPath = '')
+
+    if (-not [string]::IsNullOrWhiteSpace($InitialPath)) {
+        try {
+            $modelPath = ConvertTo-FullPath $InitialPath
+        } catch {
+            throw "启动参数中的模型路径无效 / Invalid model path passed to the launcher: $InitialPath"
+        }
+        if (-not (Test-Path -LiteralPath $modelPath -PathType Leaf)) {
+            throw "找不到启动参数中的模型文件 / Model file passed to the launcher was not found: $modelPath"
+        }
+        if ([System.IO.Path]::GetExtension($modelPath) -ne '.gguf') {
+            throw "启动参数必须指向 GGUF 文件 / The launcher argument must point to a GGUF file: $modelPath"
+        }
+        Write-Host "`n已从启动参数选择模型 / Model selected from launcher argument" -ForegroundColor Cyan
+        Write-Host " $modelPath"
+        return $modelPath
+    }
+
     $models = [System.Collections.Generic.List[string]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
@@ -289,21 +333,86 @@ function Get-ClientAddress {
     return $value
 }
 
-Clear-Host
-Write-Host 'INFR 启动向导 / INFR Launch Wizard' -ForegroundColor Green
-Write-Host '上次设置会作为默认值；直接回车即可复用。Press Enter to reuse the previous value.'
-Write-Host "程序 / Executable: $infrPath" -ForegroundColor DarkGray
+function Get-EngineVersion {
+    $output = (& $infrPath --version 2>$null | Out-String).Trim()
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0 -and $output -match '(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)') {
+        return $Matches[1]
+    }
+    return 'unknown'
+}
+
+function ConvertTo-ComparableVersion {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    if ($Value -match '(\d+)\.(\d+)\.(\d+)') {
+        return [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    }
+    return $null
+}
+
+function Show-UpdateStatus {
+    param([Parameter(Mandatory = $true)][string]$CurrentVersion)
+
+    $disabled = [Environment]::GetEnvironmentVariable('MOE4ALL_NO_UPDATE_CHECK', 'Process')
+    if ($SkipUpdateCheck -or $disabled -match '^(1|true|yes|on)$') {
+        return
+    }
+    $current = ConvertTo-ComparableVersion $CurrentVersion
+    if ($null -eq $current) {
+        return
+    }
+
+    try {
+        $headers = @{
+            Accept = 'application/vnd.github+json'
+            'User-Agent' = "MoE4All-Wizard/$CurrentVersion"
+        }
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Headmaster218/MoE4All/releases/latest' -Headers $headers -TimeoutSec 3 -ErrorAction Stop
+        $latestText = [string]$release.tag_name
+        $latest = ConvertTo-ComparableVersion $latestText
+        if ($null -ne $latest -and $latest -gt $current) {
+            Write-Host "发现新版本 / Update available: $latestText" -ForegroundColor Yellow
+            Write-Host ([string]$release.html_url) -ForegroundColor Cyan
+        } elseif ($null -ne $latest) {
+            Write-Host "更新检查 / Update check: v$CurrentVersion is current" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.' -ForegroundColor DarkGray
+    }
+}
 
 if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf)) {
     throw "找不到 infr.exe。发布包请把 infr.exe 与 Start-INFR-Wizard.cmd 放在同一目录；源码构建请先运行 cargo build --release --locked -p infr-cli。`nExecutable not found beside the launcher or under target\release."
 }
+
+$productVersion = Get-EngineVersion
+Clear-Host
+Write-Host '============================================================' -ForegroundColor Green
+$banner = @'
+ __  __       _____ _  _     _   _ _
+|  \/  | ___ | ____| || |   / \ | | |
+| |\/| |/ _ \|  _| | || |_ / _ \| | |
+| |  | | (_) | |___|__   _/ ___ \ | |___
+|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|
+'@
+
+Write-Host $banner -ForegroundColor Green
+Write-Host "  MoE4All v$productVersion" -ForegroundColor Green
+Write-Host '  Making huge MoE LLMs accessible to AMD users.'
+Write-Host '  让 A 卡用户也能在本地运行大型 MoE AI！'
+Write-Host '  John / Headmaster218  https://github.com/Headmaster218/MoE4All' -ForegroundColor DarkGray
+Write-Host '============================================================' -ForegroundColor Green
+Write-Host 'MoE4All 启动向导 / MoE4All Launch Wizard' -ForegroundColor Green
+Write-Host '上次设置会作为默认值；直接回车即可复用。Press Enter to reuse the previous value.'
+Write-Host "引擎 / Engine: $infrPath" -ForegroundColor DarkGray
+Show-UpdateStatus -CurrentVersion $productVersion
 
 $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
     [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
     [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
     [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
 )
-$modelPath = Select-ModelPath
+$modelPath = Select-ModelPath -InitialPath $InitialModelPath
 
 $setupModeDefault = 'quick'
 if ($null -ne $script:Saved) {
@@ -673,5 +782,5 @@ try {
     }
 }
 if ($null -eq $exitCode) { $exitCode = 0 }
-Write-Host "`nINFR 退出码 / exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { 'Green' } else { 'Red' })
+Write-Host "`nMoE4All / infr 退出码 / exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { 'Green' } else { 'Red' })
 exit $exitCode

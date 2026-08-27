@@ -1,5 +1,6 @@
 #version 460
-// Gather selected complete QSA blocks and the incomplete causal tail from ordinary packed-F16 KV.
+// Gather selected complete QSA blocks and the incomplete causal tail into packed-F16 scratch.
+// KQ8/VQ8 read infr's planar KV layout: int8 codes in [0, cap), then one f16 scale per 32 codes.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -9,12 +10,34 @@ layout(push_constant) uniform PC {
     uint ratio;
     uint row_pairs;
     uint total_pairs;
+    uint kcap;
+    uint vcap;
 } pc;
 layout(binding = 0) readonly buffer KB { uint k[]; };
 layout(binding = 1) readonly buffer VB { uint v[]; };
 layout(binding = 2) readonly buffer IB { uint indices[]; };
 layout(binding = 3) writeonly buffer KDB { uint kd[]; };
 layout(binding = 4) writeonly buffer VDB { uint vd[]; };
+
+#ifdef KQ8
+float kread(uint i) {
+    int codes = int(k[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    float scale = unpackHalf2x16(k[(pc.kcap >> 2u) + (block >> 1u)])[block & 1u];
+    return scale * float(code);
+}
+#endif
+
+#ifdef VQ8
+float vread(uint i) {
+    int codes = int(v[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    float scale = unpackHalf2x16(v[(pc.vcap >> 2u) + (block >> 1u)])[block & 1u];
+    return scale * float(code);
+}
+#endif
 
 void main() {
     uint pair = gl_GlobalInvocationID.x;
@@ -29,7 +52,17 @@ void main() {
     } else {
         src_row = pc.complete * pc.ratio + out_row - selected_rows;
     }
-    uint src = src_row * pc.row_pairs + in_row;
-    kd[pair] = k[src];
-    vd[pair] = v[src];
+    uint src_pair = src_row * pc.row_pairs + in_row;
+#ifdef KQ8
+    uint ke = src_pair * 2u;
+    kd[pair] = packHalf2x16(vec2(kread(ke), kread(ke + 1u)));
+#else
+    kd[pair] = k[src_pair];
+#endif
+#ifdef VQ8
+    uint ve = src_pair * 2u;
+    vd[pair] = packHalf2x16(vec2(vread(ve), vread(ve + 1u)));
+#else
+    vd[pair] = v[src_pair];
+#endif
 }

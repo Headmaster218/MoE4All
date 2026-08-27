@@ -734,11 +734,12 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         }
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
-            // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a
-            // model that emits EOS instantly on the dummy context would otherwise report fictional
-            // tok/s. `cmd_bench` used to `set_var("INFR_IGNORE_EOS", "1")` itself; as a flag-level
-            // override it wins over the file and the environment just as that overwrite did.
+            // Benchmarks decode a FIXED, deterministic token count (llama-bench semantics): greedy
+            // sampling with a fixed seed, and never stop at EOS. The four-prompt Vulkan harness
+            // relies on every A/B process taking the same generated-token path for each prompt.
             layer.sampling.ignore_eos = Some(true);
+            layer.sampling.temp = Some(0.0);
+            layer.sampling.seed = Some(Some(0x1_6e37));
         }
         Cmd::Pull { .. } | Cmd::Devices | Cmd::Multi { .. } | Cmd::Compare { .. } => {}
     }
@@ -2186,8 +2187,9 @@ fn run_chat(
 }
 
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
-/// `llama-bench`, so `infr bench` and `llama-bench` are directly comparable. Dummy tokens (timing
-/// is data-independent), `prefill_chunk` policy for the prefill batching (the engine's real path).
+/// `llama-bench`, so `infr bench` and `llama-bench` are directly comparable. Vulkan uses four
+/// stable math-prompt streams so exact-shape warmup does not preheat the identical MoE route;
+/// `prefill_chunk` policy remains the engine's real path.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
     model: &str,
@@ -2205,9 +2207,8 @@ fn cmd_bench(
     // (which `VulkanBackend::new_with` reads its device pick off since S5a), `-u` through
     // INFR_UBATCH, `-t` through RAYON_NUM_THREADS. So `--dev metal`/`--dev cpu` route here exactly
     // like a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
-    // Bench also pins `sampling.ignore_eos` (see `cli_flag_layer`): benchmarks decode a FIXED token
-    // count (llama-bench semantics) and never stop at EOS — a model that emits EOS instantly on the
-    // dummy context would otherwise report fictional tok/s.
+    // Bench pins greedy sampling, its seed and `sampling.ignore_eos` (see `cli_flag_layer`): each
+    // A/B process follows the same generated route and decodes a FIXED token count.
     // -pg "P,G": a coding-agent turn (ingest P then generate G); throughput = (P+G)/time.
     let synthetic_depth = synthetic_depth.filter(|&d| d > 0);
     if synthetic_depth.is_some() && depth != 0 {
@@ -4850,13 +4851,26 @@ mod tests {
     }
 
     #[test]
-    fn bench_pins_ignore_eos_through_the_cli_layer() {
-        // What `cmd_bench`'s `set_var("INFR_IGNORE_EOS", "1")` used to do: a flag-level override,
-        // so it wins over the environment exactly as that overwrite did.
+    fn bench_pins_deterministic_sampling_through_the_cli_layer() {
+        // Bench owns the sampling path: these flag-level overrides beat environment/config values
+        // so repeated A/B processes follow the same generated-token route.
         let layer = cli_flag_layer(&bench_cmd()).unwrap();
         assert!(layer.is_path_set("sampling.ignore_eos"));
-        assert!(resolve_cfg(&[], layer, &[]).sampling.ignore_eos);
-        // …and `run` does NOT pin it.
+        assert!(layer.is_path_set("sampling.temp"));
+        assert!(layer.is_path_set("sampling.seed"));
+        let cfg = resolve_cfg(
+            &[
+                ("INFR_IGNORE_EOS", "0"),
+                ("INFR_TEMP", "0.8"),
+                ("INFR_SEED", "9"),
+            ],
+            layer,
+            &[],
+        );
+        assert!(cfg.sampling.ignore_eos);
+        assert_eq!(cfg.sampling.temp, 0.0);
+        assert_eq!(cfg.sampling.seed, Some(0x1_6e37));
+        // `run` does NOT pin benchmark sampling.
         let layer = cli_flag_layer(&Cmd::Run {
             model: "m".to_string(),
             message: None,

@@ -208,7 +208,8 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4Indexer { .. }
             | Op::Dsv4Gather { .. }
             | Op::QsaIndexer { .. }
-            | Op::QsaGather { .. } => return false,
+            | Op::QsaGather { .. }
+            | Op::QsaBatchAttention { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -2578,6 +2579,7 @@ fn lower_op(
             k_cache,
             k_norm,
             dst,
+            rows,
             kv_len,
             n_head,
             head_dim,
@@ -2589,30 +2591,40 @@ fn lower_op(
             scale,
         } => {
             let blocks = *kv_len / *ratio.max(&1);
+            let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
+            let first_blocks = first_visible / *ratio.max(&1);
             if *head_dim != 128
+                || *rows == 0
+                || *rows > *kv_len
                 || *n_head == 0
                 || *n_head > 4
                 || *ratio == 0
                 || *rope_dim > *head_dim
                 || !rope_dim.is_multiple_of(2)
                 || *top_blocks == 0
-                || *top_blocks > blocks
+                || *top_blocks > first_blocks
                 || *top_blocks > 512
             {
                 return Err(be(format!(
                     "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
                      ratio>0 and 0<top_blocks<=min(blocks,512); got head_dim={head_dim} \
                      n_head={n_head} rope_dim={rope_dim} ratio={ratio} top_blocks={top_blocks} \
-                     kv_len={kv_len}"
+                     rows={rows} kv_len={kv_len}"
                 )));
             }
-            let sk = pooled(pool, be_, "qsa_indexer_scores", blocks as usize * 4)?;
+            let sk = pooled(
+                pool,
+                be_,
+                "qsa_indexer_scores",
+                *rows as usize * blocks as usize * 4,
+            )?;
             rec.qsa_indexer(
                 r(*q)?,
                 r(*k_cache)?,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
                 r(*dst)?,
+                *rows,
                 *kv_len,
                 *n_head,
                 *head_dim,
@@ -2636,15 +2648,24 @@ fn lower_op(
             ratio,
             row_elems,
         } => {
+            let kdt = graph.desc(*k_cache).dtype;
+            let vdt = graph.desc(*v_cache).dtype;
+            let k_q8 = kdt == infr_core::DType::Q8_0;
+            let v_q8 = vdt == infr_core::DType::Q8_0;
+            let supported = |dt| matches!(dt, infr_core::DType::F16 | infr_core::DType::Q8_0);
             if *ratio == 0
                 || *tail >= *ratio
                 || *selected_blocks > *complete_blocks
                 || *row_elems == 0
                 || !row_elems.is_multiple_of(2)
+                || ((k_q8 || v_q8) && !row_elems.is_multiple_of(32))
+                || !supported(kdt)
+                || !supported(vdt)
             {
                 return Err(be(format!(
                     "vulkan Op::QsaGather invalid geometry: selected={selected_blocks} \
-                     complete={complete_blocks} tail={tail} ratio={ratio} row_elems={row_elems}"
+                     complete={complete_blocks} tail={tail} ratio={ratio} row_elems={row_elems} \
+                     k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
             rec.qsa_gather(
@@ -2658,6 +2679,73 @@ fn lower_op(
                 *tail,
                 *ratio,
                 *row_elems,
+                k_q8,
+                v_q8,
+                graph.desc(*k_cache).numel() as u32,
+                graph.desc(*v_cache).numel() as u32,
+            );
+        }
+        Op::QsaBatchAttention {
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            top_blocks,
+            ratio,
+            scale,
+        } => {
+            let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
+            let first_blocks = first_visible / *ratio.max(&1);
+            let kdt = graph.desc(*k_cache).dtype;
+            let vdt = graph.desc(*v_cache).dtype;
+            let supported = |dt| matches!(dt, infr_core::DType::F16 | infr_core::DType::Q8_0);
+            if *rows == 0
+                || *rows > *kv_len
+                || *n_head == 0
+                || *n_kv == 0
+                || !n_head.is_multiple_of(*n_kv)
+                || !matches!(*head_dim, 128 | 256)
+                || *ratio == 0
+                || *top_blocks == 0
+                || *top_blocks > first_blocks
+                || *top_blocks > 512
+                || graph.desc(*q).dtype != infr_core::DType::F16
+                || !supported(kdt)
+                || !supported(vdt)
+            {
+                return Err(be(format!(
+                    "vulkan Op::QsaBatchAttention requires F16 q, F16/Q8_0 k/v, rows<=kv_len, \
+                     head_dim=128/256, n_head divisible by n_kv, ratio>0 and \
+                     0<top_blocks<=first complete blocks; \
+                     got rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
+                     head_dim={head_dim} ratio={ratio} top_blocks={top_blocks} \
+                     k_dtype={kdt:?} v_dtype={vdt:?}"
+                )));
+            }
+            rec.qsa_attention_batch(
+                r(*q)?,
+                r(*k_cache)?,
+                r(*v_cache)?,
+                r(*indices)?,
+                r(*dst)?,
+                *rows,
+                *kv_len,
+                *n_head,
+                *n_kv,
+                *head_dim,
+                *top_blocks,
+                *ratio,
+                *scale,
+                kdt == infr_core::DType::Q8_0,
+                vdt == infr_core::DType::Q8_0,
+                graph.desc(*k_cache).numel() as u32,
+                graph.desc(*v_cache).numel() as u32,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst
@@ -7562,109 +7650,138 @@ fn execute_paged_moe<'a>(
     let n_act = physical_slots * nff;
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     let xb = r(*x)?;
-    {
+    let fused_decode_swiglu = rows == 1
+        && shared.is_none()
+        && !*fused_gate_up
+        && !*weight_before
+        && swiglu_clamp.is_none()
+        && matches!(act, Activation::Silu)
+        && gdt == infr_core::DType::Iq2Xs
+        && udt == infr_core::DType::Iq2Xs
+        && ne == 2560
+        && nff == 640;
+    if fused_decode_swiglu {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
-        linear_paged_maybe_shared(
-            rec2,
-            gdt,
-            sess.arena_addr(gate_id)?,
-            sess.slot_bytes(gate_id)? as u32,
-            sess.tape(),
+        rec2.linear_native_id_swiglu_iq2xs_paged(
             pool[&ids_key].as_ref(),
             n_used,
+            sess.tape(),
             gate_w as usize,
-            shared_wgate,
+            sess.tape(),
+            up_w as usize,
             xb,
-            false,
-            pool[&gbuf].as_ref(),
+            pool[&abuf].as_ref(),
             ne,
-            gu_width,
+            nff,
             rows,
             active_mask,
         );
-        if let Some(ubuf) = &ubuf {
+    } else {
+        {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("checked above");
             linear_paged_maybe_shared(
                 rec2,
-                udt,
-                sess.arena_addr(up_id)?,
-                sess.slot_bytes(up_id)? as u32,
+                gdt,
+                sess.arena_addr(gate_id)?,
+                sess.slot_bytes(gate_id)? as u32,
                 sess.tape(),
                 pool[&ids_key].as_ref(),
                 n_used,
-                up_w as usize,
-                shared_wup,
+                gate_w as usize,
+                shared_wgate,
                 xb,
                 false,
-                pool[ubuf].as_ref(),
+                pool[&gbuf].as_ref(),
                 ne,
-                nff,
+                gu_width,
                 rows,
                 active_mask,
             );
-        }
-    }
-    if *weight_before {
-        rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, gu_width);
-        if let Some(ubuf) = &ubuf {
-            rec2.moe_weight_scale(pool[ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
-        }
-    }
-    match &ubuf {
-        Some(ubuf) => match act {
-            Activation::Silu => rec2.silu_mul(
-                pool[&gbuf].as_ref(),
-                pool[ubuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_act,
-                *swiglu_clamp,
-            ),
-            Activation::Sigmoid => rec2.mul_sigmoid(
-                pool[&gbuf].as_ref(),
-                pool[ubuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_act,
-                0,
-                0,
-                0,
-            ),
-            Activation::Gelu => rec2.gelu_mul_off(
-                pool[&gbuf].as_ref(),
-                pool[ubuf].as_ref(),
-                0,
-                0,
-                nff,
-                0,
-                nff,
-                0,
-                pool[&abuf].as_ref(),
-                n_act,
-            ),
-        },
-        // Fused: `gbuf` is [n_slots, 2*nff] gate|up rows; the fused activation kernels split it
-        // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
-        // like the resident small-m fused arm.
-        None => match act {
-            Activation::Silu => rec2.silu_mul_fused(
-                pool[&gbuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_slots,
-                nff,
-                *swiglu_clamp,
-            ),
-            Activation::Gelu => rec2.gelu_mul_fused(
-                pool[&gbuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_slots,
-                nff,
-                *swiglu_clamp,
-            ),
-            Activation::Sigmoid => {
-                return Err(be(
-                    "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
-                ))
+            if let Some(ubuf) = &ubuf {
+                linear_paged_maybe_shared(
+                    rec2,
+                    udt,
+                    sess.arena_addr(up_id)?,
+                    sess.slot_bytes(up_id)? as u32,
+                    sess.tape(),
+                    pool[&ids_key].as_ref(),
+                    n_used,
+                    up_w as usize,
+                    shared_wup,
+                    xb,
+                    false,
+                    pool[ubuf].as_ref(),
+                    ne,
+                    nff,
+                    rows,
+                    active_mask,
+                );
             }
-        },
+        }
+        if *weight_before {
+            rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, gu_width);
+            if let Some(ubuf) = &ubuf {
+                rec2.moe_weight_scale(pool[ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
+            }
+        }
+        match &ubuf {
+            Some(ubuf) => match act {
+                Activation::Silu => rec2.silu_mul(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_act,
+                    *swiglu_clamp,
+                ),
+                Activation::Sigmoid => rec2.mul_sigmoid(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_act,
+                    0,
+                    0,
+                    0,
+                ),
+                Activation::Gelu => rec2.gelu_mul_off(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    0,
+                    0,
+                    nff,
+                    0,
+                    nff,
+                    0,
+                    pool[&abuf].as_ref(),
+                    n_act,
+                ),
+            },
+            // Fused: `gbuf` is [n_slots, 2*nff] gate|up rows; the fused activation kernels split it
+            // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
+            // like the resident small-m fused arm.
+            None => match act {
+                Activation::Silu => rec2.silu_mul_fused(
+                    pool[&gbuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_slots,
+                    nff,
+                    *swiglu_clamp,
+                ),
+                Activation::Gelu => rec2.gelu_mul_fused(
+                    pool[&gbuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_slots,
+                    nff,
+                    *swiglu_clamp,
+                ),
+                Activation::Sigmoid => {
+                    return Err(be(
+                        "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
+                    ))
+                }
+            },
+        }
     }
     let down_w = if let Some(window) = down_w {
         window

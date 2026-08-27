@@ -183,7 +183,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build portable infr.exe
+      - name: Build portable MoE4All engine (infr.exe)
         run: cargo build --release --locked -p infr-cli
       - name: Package and smoke-test the CMD distribution
         shell: pwsh
@@ -192,7 +192,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
           $version = [string](($metadata.packages | Where-Object { $_.name -eq 'infr-cli' } | Select-Object -First 1).version)
           .\scripts\package-windows.ps1 -OutputDirectory 'target\ci-dist' -Version $version
-          $packageName = "infr-windows-x86_64-$version"
+          $packageName = "MoE4All-Windows-x86_64-v$version"
           $archivePath = Join-Path 'target\ci-dist' "$packageName.zip"
           $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
           Expand-Archive -LiteralPath $archivePath -DestinationPath $extractPath

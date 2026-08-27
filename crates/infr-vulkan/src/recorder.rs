@@ -245,6 +245,12 @@ fn native_id_sg_choice(
     // (codebook in an L2-resident BUFFER instead of per-workgroup LDS) is the real fix for the
     // gate/up shape and is NOT what this tier does; ablating grid_init() outright measured
     // native_idm_iq2s 49.8 → 23.3ms, i.e. ~50ms of a 505ms decode still on the table.
+    // Qwen3.8's 2560x640 IQ2_XS gate/up shape wins with NR=8: its 4 KiB codebook is staged once
+    // for eight output rows instead of once per row. Keep the enrollment exact; IQ2_S's similar
+    // low-output shape regresses on this tier, and no other IQ2_XS geometry has been measured.
+    if dtype == Iq2Xs {
+        return (in_f == 2560 && out_f == 640).then_some(8);
+    }
     if !matches!(dtype, Q6K | Q5K | Iq3S) {
         return None;
     }
@@ -8290,6 +8296,7 @@ impl<'a> Recorder<'a> {
         k_norm: &dyn Buffer,
         scores: &dyn Buffer,
         dst: &dyn Buffer,
+        rows: u32,
         kv_len: u32,
         n_head: u32,
         head_dim: u32,
@@ -8305,17 +8312,18 @@ impl<'a> Recorder<'a> {
             "qsa_indexer_score",
             crate::gemm::qsa_indexer_score_spv(),
             4,
-            32,
+            36,
         );
-        let mut push = [0u8; 32];
-        push[0..4].copy_from_slice(&kv_len.to_ne_bytes());
-        push[4..8].copy_from_slice(&n_head.to_ne_bytes());
-        push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
-        push[12..16].copy_from_slice(&ratio.to_ne_bytes());
-        push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
-        push[20..24].copy_from_slice(&theta.to_ne_bytes());
-        push[24..28].copy_from_slice(&eps.to_ne_bytes());
-        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
+        push[8..12].copy_from_slice(&n_head.to_ne_bytes());
+        push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&ratio.to_ne_bytes());
+        push[20..24].copy_from_slice(&rope_dim.to_ne_bytes());
+        push[24..28].copy_from_slice(&theta.to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch_wide(
             score_k,
             &[
@@ -8326,24 +8334,100 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push,
-            blocks,
+            rows.saturating_mul(blocks),
         );
 
         let topk_k = self.be.kernel(
             "qsa_indexer_topk",
             crate::gemm::qsa_indexer_topk_spv(),
             2,
-            8,
+            20,
         );
-        let mut topk_push = [0u8; 8];
+        let mut topk_push = [0u8; 20];
         topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
         topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+        topk_push[8..12].copy_from_slice(&rows.to_ne_bytes());
+        topk_push[12..16].copy_from_slice(&kv_len.to_ne_bytes());
+        topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
         self.dispatch(
             topk_k,
             &[Self::vkb(scores), Self::vkb(dst)],
             1,
             &topk_push,
+            rows,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_attention_batch(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        indices: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        n_kv: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        scale: f32,
+        k_q8: bool,
+        v_q8: bool,
+        kcap: u32,
+        vcap: u32,
+    ) {
+        let (name, spv) = match (k_q8, v_q8) {
+            (false, false) => (
+                "qsa_attention_batch",
+                crate::gemm::qsa_attention_batch_spv(),
+            ),
+            (true, false) => (
+                "qsa_attention_batch_kq8",
+                crate::gemm::qsa_attention_batch_kq8_spv(),
+            ),
+            (false, true) => (
+                "qsa_attention_batch_vq8",
+                crate::gemm::qsa_attention_batch_vq8_spv(),
+            ),
+            (true, true) => (
+                "qsa_attention_batch_q8",
+                crate::gemm::qsa_attention_batch_q8_spv(),
+            ),
+        };
+        let kernel = self.be.kernel_sg(name, spv, 5, 40, 32);
+        let mut push = [0u8; 40];
+        for (i, value) in [
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            top_blocks,
+            ratio,
+            scale.to_bits(),
+            kcap,
+            vcap,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(indices),
+                Self::vkb(dst),
+            ],
             1,
+            &push,
+            rows.saturating_mul(n_head),
         );
     }
 
@@ -8360,19 +8444,29 @@ impl<'a> Recorder<'a> {
         tail: u32,
         ratio: u32,
         row_elems: u32,
+        k_q8: bool,
+        v_q8: bool,
+        kcap: u32,
+        vcap: u32,
     ) {
         let row_pairs = row_elems / 2;
         let total_pairs = (selected * ratio + tail) * row_pairs;
-        let kernel = self
-            .be
-            .kernel("qsa_gather", crate::gemm::qsa_gather_spv(), 5, 24);
-        let mut push = [0u8; 24];
+        let (name, spv) = match (k_q8, v_q8) {
+            (false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
+            (true, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
+            (false, true) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
+            (true, true) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
+        };
+        let kernel = self.be.kernel(name, spv, 5, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&selected.to_ne_bytes());
         push[4..8].copy_from_slice(&complete.to_ne_bytes());
         push[8..12].copy_from_slice(&tail.to_ne_bytes());
         push[12..16].copy_from_slice(&ratio.to_ne_bytes());
         push[16..20].copy_from_slice(&row_pairs.to_ne_bytes());
         push[20..24].copy_from_slice(&total_pairs.to_ne_bytes());
+        push[24..28].copy_from_slice(&kcap.to_ne_bytes());
+        push[28..32].copy_from_slice(&vcap.to_ne_bytes());
         self.dispatch(
             kernel,
             &[
@@ -10211,6 +10305,61 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (n_used * out_f) as u32);
     }
 
+    /// Fused paged IQ2_XS gate+up GEMV and SwiGLU for Qwen3.8 decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_swiglu_iq2xs_paged(
+        &self,
+        ids: &dyn Buffer,
+        n_used: usize,
+        gate_lut: &dyn Buffer,
+        gate_lut_base: usize,
+        up_lut: &dyn Buffer,
+        up_lut_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rows: usize,
+        active_mask: u32,
+    ) {
+        let k = self.be.kernel_sg(
+            "native_id_swiglu_iq2xs_sg8_paged",
+            crate::gemm::native_id_swiglu_iq2xs_spv(),
+            5,
+            28,
+            32,
+        );
+        let mut push = [0u8; 28];
+        for (i, value) in [
+            in_f as u32,
+            out_f as u32,
+            n_used as u32,
+            gate_lut_base as u32,
+            up_lut_base as u32,
+            rows as u32,
+            active_mask,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        let groups = (rows * n_used * out_f.div_ceil(8)) as u32;
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(ids),
+                Self::vkb(gate_lut),
+                Self::vkb(up_lut),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`
     /// ([m, k/32]) for the dp4a mmq matmul. (Pass 1 of mmq, reusable standalone.)
     pub fn quant_q8(
@@ -11476,6 +11625,9 @@ mod tests {
         for dt in [D::Q5K, D::Q6K, D::Iq3S] {
             assert_eq!(native_id_sg_choice(dt, 512, 2048, k), Some(2), "{dt:?}");
         }
+        assert_eq!(native_id_sg_choice(D::Iq2Xs, 2560, 640, k), Some(8));
+        assert_eq!(native_id_sg_choice(D::Iq2Xs, 2560, 641, k), None);
+        assert_eq!(native_id_sg_choice(D::Iq2Xs, 2048, 640, k), None);
         for dt in [D::Q4K, D::Iq4Nl, D::Iq2S] {
             assert_eq!(native_id_sg_choice(dt, 512, 2048, k), None, "{dt:?}");
         }

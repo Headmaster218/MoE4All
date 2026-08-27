@@ -1,0 +1,136 @@
+#version 460
+// Correctness-first batched Qwen3.8 QSA attention. One workgroup owns one (query row, attention
+// head), reads that row's selected complete blocks directly from F16 or planar-Q8 KV caches,
+// appends its incomplete causal tail, and performs an exact two-pass softmax. Each lane owns one
+// element of a 128-wide head or two elements of Qwen3.8's 256-wide attention head.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint n_kv;
+    uint head_dim;
+    uint top_blocks;
+    uint ratio;
+    float scale;
+    uint kcap;
+    uint vcap;
+} pc;
+layout(binding = 0) readonly buffer QB { uint q[]; };
+layout(binding = 1) readonly buffer KB { uint k[]; };
+layout(binding = 2) readonly buffer VB { uint v[]; };
+layout(binding = 3) readonly buffer IB { uint indices[]; };
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+
+shared float partial[128];
+shared float row_max;
+shared float row_sum;
+shared float row_exp;
+
+float qread(uint i) {
+    uint w = q[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+}
+
+float kread(uint i) {
+#ifdef KQ8
+    int codes = int(k[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    float scale = unpackHalf2x16(k[(pc.kcap >> 2u) + (block >> 1u)])[block & 1u];
+    return scale * float(code);
+#else
+    uint w = k[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+#endif
+}
+
+float vread(uint i) {
+#ifdef VQ8
+    int codes = int(v[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    float scale = unpackHalf2x16(v[(pc.vcap >> 2u) + (block >> 1u)])[block & 1u];
+    return scale * float(code);
+#else
+    uint w = v[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+#endif
+}
+
+uint source_row(uint row, uint logical, uint selected, uint complete) {
+    uint selected_rows = selected * pc.ratio;
+    if (logical < selected_rows) {
+        uint slot = logical / pc.ratio;
+        uint block = indices[row * pc.top_blocks + slot];
+        return block * pc.ratio + logical % pc.ratio;
+    }
+    return complete * pc.ratio + logical - selected_rows;
+}
+
+float score_key(uint qbase, uint kbase, uint d) {
+    float sum = qread(qbase + d) * kread(kbase + d);
+    if (pc.head_dim == 256u) {
+        sum += qread(qbase + d + 128u) * kread(kbase + d + 128u);
+    }
+    partial[d] = sum;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (d < stride) { partial[d] += partial[d + stride]; }
+        barrier();
+    }
+    return partial[0] * pc.scale;
+}
+
+void main() {
+    uint job = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row = job / pc.n_head;
+    uint head = job - row * pc.n_head;
+    if (row >= pc.rows || (pc.head_dim != 128u && pc.head_dim != 256u)) { return; }
+    uint d = gl_LocalInvocationID.x;
+    uint group = pc.n_head / pc.n_kv;
+    uint kv_head = head / group;
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint complete = visible / pc.ratio;
+    uint tail = visible - complete * pc.ratio;
+    uint selected = min(pc.top_blocks, complete);
+    uint keys = selected * pc.ratio + tail;
+    uint qbase = (row * pc.n_head + head) * pc.head_dim;
+
+    if (d == 0u) { row_max = -3.402823466e+38; }
+    barrier();
+    for (uint logical = 0u; logical < keys; ++logical) {
+        uint src_row = source_row(row, logical, selected, complete);
+        uint kbase = (src_row * pc.n_kv + kv_head) * pc.head_dim;
+        float logit = score_key(qbase, kbase, d);
+        if (d == 0u) { row_max = max(row_max, logit); }
+        barrier();
+    }
+
+    if (d == 0u) { row_sum = 0.0; }
+    float accum0 = 0.0;
+    float accum1 = 0.0;
+    barrier();
+    for (uint logical = 0u; logical < keys; ++logical) {
+        uint src_row = source_row(row, logical, selected, complete);
+        uint base = (src_row * pc.n_kv + kv_head) * pc.head_dim;
+        float logit = score_key(qbase, base, d);
+        if (d == 0u) {
+            row_exp = exp(logit - row_max);
+            row_sum += row_exp;
+        }
+        barrier();
+        accum0 += row_exp * vread(base + d);
+        if (pc.head_dim == 256u) {
+            accum1 += row_exp * vread(base + d + 128u);
+        }
+        barrier();
+    }
+    uint out_base = (row * pc.n_head + head) * pc.head_dim + d;
+    dst[out_base] = accum0 / row_sum;
+    if (pc.head_dim == 256u) { dst[out_base + 128u] = accum1 / row_sum; }
+}

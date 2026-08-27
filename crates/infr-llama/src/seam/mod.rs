@@ -667,15 +667,10 @@ pub(crate) fn dense_act_reserve_at(
     want_ctx: usize,
     ubatch: usize,
 ) -> u64 {
-    // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
-    // Qwen3.8 v1 deliberately executes one token at a time: the PLE host gather is overlapped
-    // with layer 0 and the four-stream residual is carried across that split. Pricing a 1024-row
-    // graph that is never built would withhold many GiB from its expert cache.
-    let rows = if cfg.qwen4exp {
-        1
-    } else {
-        ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64
-    };
+    // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`). Qwen3.8 now
+    // builds the same ubatch-height graph as the other supported architectures, including its
+    // four-stream residual, PLE and row-aware QSA scratch, so it must reserve the real row count.
+    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
     // Only Op::Attention uses the pooled score/PV scratch below. Op::Mla scans compressed KV and
     // accumulates softmax/value inside its dedicated kernel, while recurrent mixers have no
     // context attention at all. Keep n_layer == 0 conservative for geometry-only configs/tests.
@@ -751,16 +746,27 @@ pub(crate) fn dense_act_reserve_at(
     } else {
         0
     };
-    // Qwen3.8's two wide ping-pong residuals, grouped-norm/gate scratch and PLE key/query/gated/
-    // conv rows. The generic n_embd umbrella does not cover hc*n_embd tensors.
+    // Qwen3.8's caller-owned wide residual; qwen_alt/normed/gate scratch; and PLE
+    // key/query/gated/conv rows are eight f32 `[rows, hc*n_embd]` buffers in total. The low-rank
+    // projection and per-stream injection are f32 too. The generic n_embd umbrella cannot absorb
+    // these hc-wide tensors.
     let qwen4_hc = if cfg.qwen4exp {
-        8 * cfg.hc_mult * cfg.n_embd + 3 * cfg.hc_low_rank
+        32 * cfg.hc_mult * cfg.n_embd + 4 * cfg.hc_low_rank + 4 * cfg.hc_mult
     } else {
         0
     };
     let per_row =
         (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
-    rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
+    let row_reserve = rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1;
+    // Qwen3.8 keeps its scalar decode graph live while a separately compiled batched-prefill
+    // graph owns the row-scaled pools above. Two real runs at d4096 measured the fixed intercept
+    // at 54.6 MiB (64 rows: 143.6 MiB peak; 128 rows: 232.7 MiB), so round it up to 64 MiB.
+    // This is a fixed plan-overlap cost, not another per-row multiplier.
+    row_reserve.saturating_add(if cfg.qwen4exp {
+        QWEN4_PLAN_OVERLAP_RESERVE
+    } else {
+        0
+    })
 }
 
 /// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]: the residual
@@ -853,6 +859,7 @@ pub(crate) fn layer_major_prefill(
 /// is still the largest — which is the argument for deriving these bytes from the graph the runner
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
+const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
@@ -1219,17 +1226,27 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
 /// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
 /// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && !cfg.qwen4exp && kv_row_align_ok(cfg)
+    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
 }
 
 /// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
 /// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
 /// priced exactly instead of the MoE planner treating every non-auto choice as f16.
 fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
-    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 || cfg.qwen4exp {
+    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 {
         return DType::F16;
     }
     let block_aligned = kv_row_align_ok(cfg);
+    // Qwen3.8's QSA gather/attention reads the ordinary K/V cache in F16 or planar Q8_0. Its
+    // separate raw index-key cache remains F16 and is priced by `qsa_cache_bytes` below.
+    if cfg.qwen4exp {
+        return match requested {
+            Some(DType::Q8_0) if block_aligned => DType::Q8_0,
+            Some(DType::F16) => DType::F16,
+            _ if (ec.kv.force_q8 || kv_auto_q8()) && block_aligned => DType::Q8_0,
+            _ => DType::F16,
+        };
+    }
     let turbo_aligned = (0..cfg.n_layer).all(|l| cfg.layer_head_dim(l).is_multiple_of(128));
     match requested {
         Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if turbo_aligned => dt,
@@ -4846,6 +4863,96 @@ mod seam_helper_tests {
             .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
             .sum();
         assert_eq!(total, 768 * 1024 * 1024);
+    }
+
+    #[test]
+    fn qwen38_q8_prices_only_the_main_kv_cache_as_q8() {
+        let recurrent_layers: Vec<bool> =
+            (0usize..48).map(|l| !(l + 1).is_multiple_of(4)).collect();
+        let cfg = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            full_attn_interval: 4,
+            recurrent_layers,
+            n_kv: 2,
+            head_dim: 256,
+            indexer_head_size: 128,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 2048,
+            ssm_n_group: 8,
+            ssm_dt_rank: 16,
+            ..Default::default()
+        };
+        let ec = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: Some(DType::Q8_0),
+                type_k_specified: true,
+                type_v: Some(DType::Q8_0),
+                type_v_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(super::kv_row_align_ok(&cfg));
+        assert!(super::kv_q8_layout_ok(&cfg));
+        assert_eq!(
+            super::vulkan_kv_fmt_for_budget(&cfg, &ec, ec.kv.type_k),
+            DType::Q8_0
+        );
+
+        let ctx = 262_144usize;
+        let f16 = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 1024, DType::F16, DType::F16);
+        let q8 = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 1024, DType::Q8_0, DType::Q8_0);
+        let elems_per_side = ctx * cfg.n_kv * cfg.head_dim;
+        let saved_per_full_layer = 2
+            * (super::kv_side_bytes(DType::F16, elems_per_side)
+                - super::kv_side_bytes(DType::Q8_0, elems_per_side));
+        assert_eq!(f16 - q8, (12 * saved_per_full_layer) as u64);
+        assert_eq!(
+            (0..cfg.n_layer)
+                .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
+                .sum::<usize>(),
+            768 * 1024 * 1024,
+            "the independent F16 QSA index cache is unchanged"
+        );
+    }
+
+    #[test]
+    fn qwen38_activation_reserve_tracks_the_real_prefill_batch() {
+        let cfg = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_head: 24,
+            n_embd: 2560,
+            n_ff: 640,
+            head_dim: 256,
+            hc_mult: 4,
+            hc_low_rank: 320,
+            ssm_d_inner: 6144,
+            ssm_n_group: 16,
+            ssm_dt_rank: 48,
+            ssm_d_state: 128,
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 512);
+        let full = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 1024);
+        assert_eq!(
+            full - super::QWEN4_PLAN_OVERLAP_RESERVE,
+            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
+            "only the row-scaled part doubles; the retained decode plan is fixed"
+        );
     }
 
     fn deepseek4_cache_config() -> Config {

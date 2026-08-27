@@ -27,7 +27,7 @@ MoE4All 当前重点优化和实测 AMD Radeon。其他带 Vulkan 驱动的 GPU 
 ## 2. 下载和解压
 
 1. 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases/latest)。
-2. 下载 `infr-windows-x86_64-版本号.zip`。
+2. 下载 `MoE4All-Windows-x86_64-v版本号.zip`。
 3. 将 ZIP 完整解压到一个普通目录，例如 `D:\MoE4All`。
 4. 不要直接在压缩包预览窗口中运行 CMD，也不要只单独取出 `infr.exe`。
 
@@ -123,9 +123,13 @@ Start-INFR-Wizard.cmd
 
 - 粘贴完整 GGUF 路径；或
 - 把 GGUF 文件拖进已经打开的终端窗口，再按 Enter。
+- 直接把 GGUF 拖到 `Start-INFR-Wizard.cmd` 上，以该模型打开向导。
 
-路径可以包含空格和中文。当前版本尚未把“直接将 GGUF 拖到 CMD 图标上启动”
-接入模型参数；请先打开向导，再将文件拖入模型路径提示处。
+路径可以包含空格和中文。分片模型只需拖入其中一片，建议选择第一片。
+
+向导启动时会检查 GitHub 上的最新 Release。请求超时很短，断网时会直接继续；
+它只提示下载地址，不会自动下载或替换程序。如需完全禁用，可在启动前设置
+`MOE4ALL_NO_UPDATE_CHECK=1`。
 
 ### 自动配置
 
@@ -465,7 +469,8 @@ cargo build --release --locked -p infr-cli
 ```
 
 长期配置建议写入 `infr.toml`，临时实验使用 CLI。环境变量会被子进程继承，容易
-在几天后忘记并影响 benchmark。完整字段见 [配置参考](docs/config.md) 和
+在几天后忘记并影响 benchmark。完整字段见
+[配置参考](https://github.com/Headmaster218/MoE4All/blob/main/docs/config.md) 和
 [`infr.example.toml`](infr.example.toml)。
 
 ## English quick start
@@ -473,12 +478,12 @@ cargo build --release --locked -p infr-cli
 MoE4All's portable Windows package is the recommended path for end users:
 
 1. Install a current AMD GPU driver with Vulkan support.
-2. Download and fully extract the latest `infr-windows-x86_64-*.zip` from
+2. Download and fully extract the latest `MoE4All-Windows-x86_64-v*.zip` from
    [GitHub Releases](https://github.com/Headmaster218/MoE4All/releases/latest).
 3. Download a supported GGUF model. Keep all shards of a split model together.
 4. Double-click `Start-INFR-Wizard.cmd`.
-5. Choose interactive chat and automatic configuration, then paste or drag the
-   GGUF path into the open model-path prompt.
+5. Choose interactive chat and automatic configuration, then paste a GGUF path,
+   drag it into the open prompt, or drop the file directly onto the CMD launcher.
 
 The release package does not require Rust, Visual Studio, or the Vulkan SDK.
 Models are not bundled. Start with a small GGUF to validate the driver and
@@ -492,4 +497,4 @@ recommended baseline.
 For upstream engine documentation, see the original
 [kryptic-sh/infr README](https://github.com/kryptic-sh/infr#readme). MoE4All
 project documentation starts at [README.md](README.md) and
-[docs/README.md](docs/README.md).
+[docs/README.md](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md).

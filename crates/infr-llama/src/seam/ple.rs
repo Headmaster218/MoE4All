@@ -11,7 +11,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 const TABLE_NAME: &str = "per_layer_token_embd.weight";
 
 struct Job {
-    context: Vec<u32>,
+    tokens: Vec<u32>,
+    start: usize,
+    rows: usize,
     reply: SyncSender<Result<Vec<f32>>>,
 }
 
@@ -105,7 +107,9 @@ impl PleWorker {
             .name("infr-qwen4-ple".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    let _ = job.reply.send(state.gather(&job.context));
+                    let _ = job
+                        .reply
+                        .send(state.gather_range(&job.tokens, job.start, job.rows));
                 }
             })
             .context("spawn qwen4exp PLE worker")?;
@@ -115,61 +119,96 @@ impl PleWorker {
     /// Start the SSD/mmap gather before layer 0 is submitted. Only the current token and at most
     /// `ngram-1` predecessors cross the channel.
     pub(super) fn submit(&self, tokens: &[u32], pos: usize, ngram: usize) -> Result<PleTicket> {
-        let begin = pos.saturating_sub(ngram.saturating_sub(1));
-        let context = tokens
-            .get(begin..=pos)
-            .with_context(|| {
-                format!(
-                    "PLE token position {pos} outside stream of {}",
-                    tokens.len()
-                )
-            })?
-            .to_vec();
+        self.submit_range(tokens, pos, 1, ngram)
+    }
+
+    /// Gather a consecutive known-prompt range in token order. Only the range and its at most
+    /// `ngram-1` predecessors cross the worker channel.
+    pub(super) fn submit_range(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        rows: usize,
+        ngram: usize,
+    ) -> Result<PleTicket> {
+        let (tokens, local_start) = ple_job_tokens(tokens, start, rows, ngram)?;
         let (reply, rx) = mpsc::sync_channel(1);
         self.tx
-            .send(Job { context, reply })
+            .send(Job {
+                tokens,
+                start: local_start,
+                rows,
+                reply,
+            })
             .map_err(|_| anyhow!("qwen4exp PLE worker is not running"))?;
         Ok(PleTicket(rx))
     }
 }
 
-impl WorkerState {
-    fn gather(&self, recent: &[u32]) -> Result<Vec<f32>> {
-        let ctx = ple_context(recent, self.ngram, self.eos)?;
+fn ple_job_tokens(
+    tokens: &[u32],
+    start: usize,
+    rows: usize,
+    ngram: usize,
+) -> Result<(Vec<u32>, usize)> {
+    let end = start
+        .checked_add(rows)
+        .context("PLE token range overflow")?;
+    let begin = start.saturating_sub(ngram.saturating_sub(1));
+    let context = tokens
+        .get(begin..end)
+        .with_context(|| {
+            format!(
+                "PLE token range {start}..{end} outside stream of {}",
+                tokens.len()
+            )
+        })?
+        .to_vec();
+    Ok((context, start - begin))
+}
 
-        let indices = ple_row_indices(
-            &ctx,
-            self.ngram,
-            self.heads_per_ngram,
-            &self.multipliers,
-            &self.offsets,
-            &self.vocab_sizes,
-        );
-        let mut out = Vec::with_capacity(indices.len() * self.row_dim);
-        for row in indices {
-            let row = usize::try_from(row).context("PLE row index overflow")?;
-            if row >= self.rows {
-                bail!(
-                    "qwen4exp PLE row {row} is outside table with {} rows",
-                    self.rows
-                );
+impl WorkerState {
+    fn gather_range(&self, tokens: &[u32], start: usize, rows: usize) -> Result<Vec<f32>> {
+        let heads = (self.ngram - 1) * self.heads_per_ngram;
+        let mut out = Vec::with_capacity(rows * heads * self.row_dim);
+        for pos in start..start + rows {
+            let recent = tokens
+                .get(..=pos)
+                .context("PLE local token range is inconsistent")?;
+            let ctx = ple_context(recent, self.ngram, self.eos)?;
+            let indices = ple_row_indices(
+                &ctx,
+                self.ngram,
+                self.heads_per_ngram,
+                &self.multipliers,
+                &self.offsets,
+                &self.vocab_sizes,
+            );
+            for row in indices {
+                let row = usize::try_from(row).context("PLE row index overflow")?;
+                if row >= self.rows {
+                    bail!(
+                        "qwen4exp PLE row {row} is outside table with {} rows",
+                        self.rows
+                    );
+                }
+                let off = row
+                    .checked_mul(self.row_bytes)
+                    .context("PLE byte offset overflow")?;
+                let end = off
+                    .checked_add(self.row_bytes)
+                    .context("PLE byte range overflow")?;
+                let values = infr_gguf::dequant::dequant_block(self.dtype, &self.table[off..end])
+                    .with_context(|| format!("dequant qwen4exp PLE row {row}"))?;
+                if values.len() != self.row_dim {
+                    bail!(
+                        "qwen4exp PLE row {row} dequantized to {} values, expected {}",
+                        values.len(),
+                        self.row_dim
+                    );
+                }
+                out.extend_from_slice(&values);
             }
-            let off = row
-                .checked_mul(self.row_bytes)
-                .context("PLE byte offset overflow")?;
-            let end = off
-                .checked_add(self.row_bytes)
-                .context("PLE byte range overflow")?;
-            let values = infr_gguf::dequant::dequant_block(self.dtype, &self.table[off..end])
-                .with_context(|| format!("dequant qwen4exp PLE row {row}"))?;
-            if values.len() != self.row_dim {
-                bail!(
-                    "qwen4exp PLE row {row} dequantized to {} values, expected {}",
-                    values.len(),
-                    self.row_dim
-                );
-            }
-            out.extend_from_slice(&values);
         }
         Ok(out)
     }
@@ -241,5 +280,16 @@ mod tests {
         assert_eq!(ctx, vec![7, 2, 2]);
         // The current token's own EOS does not hide its predecessors.
         assert_eq!(ple_context(&[9, 8, 2], 3, 2).unwrap(), vec![2, 8, 9]);
+    }
+
+    #[test]
+    fn batched_range_preserves_each_scalar_ngram_context() {
+        let tokens = [5, 7, 11, 13, 17, 19, 23, 29];
+        let (local, start) = ple_job_tokens(&tokens, 3, 4, 4).unwrap();
+        for row in 0..4 {
+            let batched = ple_context(&local[..=start + row], 4, 2).unwrap();
+            let scalar = ple_context(&tokens[..=3 + row], 4, 2).unwrap();
+            assert_eq!(batched, scalar);
+        }
     }
 }

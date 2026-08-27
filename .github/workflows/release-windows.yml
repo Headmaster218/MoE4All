@@ -23,7 +23,7 @@ env:
 
 jobs:
   package:
-    name: Build Windows release package
+    name: Build MoE4All Windows package
     runs-on: windows-2025
     timeout-minutes: 90
     permissions:
@@ -55,7 +55,7 @@ jobs:
           if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -ne $expectedTag) {
             throw "Tag '${{ github.ref_name }}' does not match Cargo version '$expectedTag'."
           }
-          $packageName = "infr-windows-x86_64-$version"
+          $packageName = "MoE4All-Windows-x86_64-v$version"
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "archive_name=$packageName.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -78,7 +78,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build portable infr.exe
+      - name: Build portable MoE4All engine (infr.exe)
         run: cargo build --release --locked -p infr-cli
 
       - name: Create release archive
@@ -122,7 +122,9 @@ jobs:
           & gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             & gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "GitHub Release upload failed with exit code $LASTEXITCODE" }
+            & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}"
           } else {
-            & gh release create $tag @assets --verify-tag --title "INFR ${{ steps.release.outputs.version }}" --generate-notes
+            & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes
           }
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }

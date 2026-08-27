@@ -43,7 +43,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
 $outputFullPath = Resolve-RepoPath $OutputDirectory
 New-Item -ItemType Directory -Path $outputFullPath -Force | Out-Null
 
-$packageName = "infr-windows-x86_64-$Version"
+$packageName = "MoE4All-Windows-x86_64-v$Version"
 $stagingPath = Join-Path $outputFullPath $packageName
 $outputPrefix = $outputFullPath.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
 if (-not $stagingPath.StartsWith($outputPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {

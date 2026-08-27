@@ -6,7 +6,7 @@
 [下载最新版 Windows 程序](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [快速开始](GETTING_STARTED.md) |
 [English](README_EN.md) |
-[技术文档](docs/README.md)
+[技术文档](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
 
 MoE4All 是一个面向 AMD 显卡和 Windows 11 的本地大模型运行项目。它让
 MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此模型不必全部塞进
@@ -21,35 +21,38 @@ MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此�
 ## 最新进展：完整支持 Qwen3.8-Flash-Next
 
 Qwen3.8-Flash-Next 已经通过 MoE4All 在消费级 **AMD Radeon RX 7900 XTX**
-上稳定生成正常内容，简单数学和推理问题也能够正确回答。首跑使用 Windows 11、
-Q2 量化，实际系统内存占用约 **40 GB**。
+上稳定生成正常内容，简单数学和推理问题也能够正确回答。Q2_K_XL 和 IQ4_XS
+量化均已完成 Windows 11 实测，并可在 **40 GiB bounded RAM** 下从 SSD 分页运行。
 
 当前 `qwen4exp` 文本路径已经完整接入发布模型所需的四流 Hyper-Connection、
 Gated DeltaNet/全注意力混合层、SSD 支持的 PLE、分页 MoE，以及 **QSA 稀疏注意力**。
 QSA 会维护独立的 F16 index-key cache，选择完整历史块并保留未完成的 causal tail，
-因此推理不再受首版约 2K 上下文的临时限制。
+以覆盖长上下文。主 K/V Cache 支持 Q8_0；QSA index-key cache 保持 F16，并独立
+计价和分配。
 
-下表前四项是三次短测的代表值；最后两项是刚完成的 QSA 路径验证。`tg1` 只用于
-确认真实和 synthetic KV 都跨过 QSA 启用边界，不应视为最终长上下文吞吐成绩。
+下表来自 RX 7900 XTX、Vulkan0、Q8 K/V、40 GiB bounded RAM。Decode 使用
+`tg128`，Prefill 使用 `pp1024`，ubatch 为 1024；128K/250K 通过 synthetic depth
+构造真实 KV 长度。表内是三次平均值，所有 12 项均报告 `kv_q8=true`、
+`kv_layout=q8_0`。
 
-| 测试 | 代表值 | 三次范围 |
-|---|---:|---:|
-| 0 context decode，tg16 | **43.5 tok/s** | 42.6-44.9 tok/s |
-| 0 context prefill，pp32 | **46.6 tok/s** | 46.2-47.1 tok/s |
-| 1024 context decode，tg16 | **41.9 tok/s** | 41.4-42.7 tok/s |
-| 1024 context incremental prefill，pp32 | **42.6 tok/s** | 42.1-43.3 tok/s |
-| 真实 prefill 至 depth 2052 后 QSA decode，tg1 | **32.9 tok/s** | 单次路径验证 |
-| synthetic depth 4096 后 QSA decode，tg1 | **22.9 tok/s** | 单次路径验证 |
+| Context depth | Q2_K_XL decode | Q2_K_XL prefill | IQ4_XS decode | IQ4_XS prefill |
+|---:|---:|---:|---:|---:|
+| 0 | **29.45 tok/s** | **155.16 tok/s** | **16.85 tok/s** | **244.68 tok/s** |
+| 128K | **26.23 tok/s** | **170.44 tok/s** | **14.15 tok/s** | **250.55 tok/s** |
+| 250K | **22.82 tok/s** | **152.27 tok/s** | **15.26 tok/s** | **239.00 tok/s** |
 
-QSA 当前采用 correctness-first 的精确选块实现；长上下文 kernel 与端到端性能仍有
-优化空间，但模型架构、缓存分配和实际稀疏注意力数据路径已经贯通。
+Q2 与 IQ4_XS 都通过了三轮真实 API 对话，能够保持校验码、完成跨轮算术并总结
+先前内容。
+
+QSA 当前使用保持 score/index 精确顺序的 radix top-k，并已接入 batched QSA/PLE
+Prefill。Decode 仍明显受专家 RAM/SSD 覆盖率影响，仍有继续优化空间。
 
 ## 三步开始
 
 ### 1. 下载
 
 打开 [最新 Release](https://github.com/Headmaster218/MoE4All/releases/latest)，
-下载 `infr-windows-x86_64-*.zip` 并完整解压。
+下载 `MoE4All-Windows-x86_64-v*.zip` 并完整解压。
 
 发布包已经包含 `infr.exe` 和中英双语启动向导。运行发布版不需要安装 Rust、
 Visual Studio 或 Vulkan SDK，只需要正常的 64 位 AMD 显卡驱动及其 Vulkan
@@ -74,6 +77,9 @@ Start-INFR-Wizard.cmd
 选择终端聊天、OpenAI 兼容 API 或性能测试，然后输入或拖入 GGUF 路径。
 普通用户建议使用“自动配置”：MoE4All 会探测 GPU、可用显存和系统内存，并
 自动规划 KV Cache、运行时空间和专家缓存。
+
+向导启动时会用很短的网络请求检查 GitHub Release；发现新版本时只显示下载
+链接，不会自动修改程序。断网不会阻止启动。
 
 ## 它能做什么
 
@@ -113,14 +119,16 @@ Windows 11 主机。它们用于说明项目已经达到的能力，不同模型
 | Qwen3.6-35B-A3B，250K synthetic depth 后 prefill 4,096 | Q8 K/V | **477.9 tok/s** |
 | Qwen3.6-35B-A3B，depth 0 prefill 4,096 | Q8 K/V | **2,855.6 tok/s** |
 | Qwen3.5-122B-A10B，depth 0 decode | F16 K/V，45 GiB bounded RAM，3 次重复 | **23.2 tok/s** |
-| Qwen3.8-Flash-Next，真实 depth 2052 后 QSA decode | Q2，F16 K/V，40 GiB bounded RAM，tg1 路径验证 | **32.9 tok/s** |
-| Qwen3.8-Flash-Next，synthetic depth 4096 后 QSA decode | Q2，F16 K/V，40 GiB bounded RAM，tg1 路径验证 | **22.9 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL，250K synthetic depth 后 decode | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 | **22.82 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均 | **152.27 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS，250K synthetic depth 后 decode | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 | **15.26 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均 | **239.00 tok/s** |
 
 完整条件和优化历史见：
 
-- [Qwen3.6 RX 7900 XTX 优化记录](docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
-- [统一显存验收记录](docs/unified-vram-elastic-acceptance-20260824.md)
-- [DeepSeek V4 Flash 收尾记录](docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
+- [Qwen3.6 RX 7900 XTX 优化记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
+- [统一显存验收记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/unified-vram-elastic-acceptance-20260824.md)
+- [DeepSeek V4 Flash 收尾记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
 
 ## 当前模型支持
 
@@ -190,8 +198,9 @@ AMD Vulkan 计算
 显存中的模型固定部分、KV Cache、运行时 scratch 和专家缓存由统一预算协调，
 prefill 与 decode 切换时可以重新分配弹性空间。
 
-更深入的实现说明在 [技术文档索引](docs/README.md) 和
-[MoE4All Wiki](infr-fork-wiki/README.md)。
+更深入的实现说明在
+[技术文档索引](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md) 和
+[MoE4All Wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md)。
 
 ## 当前限制
 

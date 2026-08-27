@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- The Windows launch wizard now shows the MoE4All version, project identity,
+  maintainer, and repository, and checks GitHub Releases for updates without
+  blocking offline startup.
+- A GGUF can be dropped directly onto `Start-INFR-Wizard.cmd` or passed as its
+  first argument. Existing history selection and in-terminal path pasting remain
+  available.
+
+### Changed
+
+- Windows archives and workflow artifacts are named
+  `MoE4All-Windows-x86_64-vVERSION.zip`; the engine remains `infr.exe` for CLI
+  and script compatibility.
+- GitHub Release titles use `MoE4All vVERSION`, and package smoke tests now cover
+  the bilingual documentation, version banner, all three wizard modes, and the
+  direct model-path argument.
+- Links from packaged documentation to repository-only technical material use
+  GitHub URLs, so they remain valid outside a source checkout.
+
 ## [0.2.0] - 2026-08-27
 
 ### Highlights

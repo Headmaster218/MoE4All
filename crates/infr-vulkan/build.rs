@@ -667,6 +667,17 @@ fn main() {
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_gather", "qsa_gather", &[]),
+        ("qsa_gather", "qsa_gather_kq8", &["-DKQ8"]),
+        ("qsa_gather", "qsa_gather_vq8", &["-DVQ8"]),
+        ("qsa_gather", "qsa_gather_q8", &["-DKQ8", "-DVQ8"]),
+        ("qsa_attention_batch", "qsa_attention_batch", &[]),
+        ("qsa_attention_batch", "qsa_attention_batch_kq8", &["-DKQ8"]),
+        ("qsa_attention_batch", "qsa_attention_batch_vq8", &["-DVQ8"]),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_q8",
+            &["-DKQ8", "-DVQ8"],
+        ),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
         // pre-only form, whose `mixes` is the pre chunk alone.
@@ -1787,6 +1798,30 @@ fn main() {
             "native_gemv_id_multi_sg",
             "native_idm_iq3s_sg8_paged",
             &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
+        ),
+        // Qwen3.8's paged 2560x640 IQ2_XS gate/up banks: NR=8 stages the 4 KiB codebook once
+        // for eight output rows. Both routed-only and routed+fixed-Q8-shared variants are kept;
+        // the exact shape gate lives in `native_id_sg_choice`.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq2xs_sg8_paged",
+            &["-DFMT_IQ2XS", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq2xs_sg8_paged_shexp",
+            &[
+                "-DFMT_IQ2XS",
+                "-DUSE_GRID",
+                "-DNR=8",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "native_gemv_id_swiglu_sg",
+            "native_id_swiglu_iq2xs_sg8_paged",
+            &["-DNR=8"],
         ),
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
