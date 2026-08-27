@@ -1760,6 +1760,11 @@ pub use infr_core::pager::ring_bytes;
 // whose byte count is not evenly divisible by its slot count from giving every later region a
 // pathologically misaligned base address.
 const RING_REGION_ALIGN: usize = 256;
+const MIN_LUT_TAPE_WORDS: usize = 64 * 1024;
+
+fn moe_lut_tape_words(n_blocks: usize) -> usize {
+    MIN_LUT_TAPE_WORDS.max(n_blocks.saturating_mul(3))
+}
 
 fn ring_region_bytes(total: usize, slots: usize, min_slot_bytes: usize) -> usize {
     debug_assert!(slots >= 2);
@@ -1858,10 +1863,10 @@ impl MoePagerSession {
                 exchange_slot,
             });
         }
-        // One graph's windows = paged layers x roles x n_expert addresses. 64k entries (512 KiB)
-        // leaves an order of magnitude of headroom; `lut_window` hard-errors
-        // on overflow rather than wrapping into a region an in-flight segment may still read.
-        let tape_words = 64 * 1024;
+        // One graph's windows can name every paged layer once for each of Gate/Up/Down. Keep the
+        // historical 64k floor for smaller models, while 512-expert models size to their actual
+        // global role space instead of overflowing at the 129th window.
+        let tape_words = moe_lut_tape_words(layout.n_blocks);
         let tape = vk.alloc_uninit(tape_words * 8, BufferUsage::Staging)?;
         Ok(Self {
             load_reservation,
@@ -2565,7 +2570,7 @@ impl MoePagerSession {
                 .prefill_placement
                 .get(&bank_id)
                 .ok_or_else(|| be("moe pager: async layer bank has no Prefill placement"))?;
-            let (_, _source_pool, source) = self
+            let (_, source_pool, source) = self
                 .sources
                 .get(&bank_id)
                 .ok_or_else(|| be("moe pager: async layer bank source disappeared"))?;
@@ -2582,7 +2587,9 @@ impl MoePagerSession {
                     len: src.len(),
                 }));
             } else {
-                let host = self.pools[bank_placement.pool]
+                // Prefill may pack this bank into a different GPU arena pool, but its block
+                // descriptors remain registered in the original size-class host pool.
+                let host = self.pools[*source_pool]
                     .host
                     .as_ref()
                     .ok_or_else(|| be("moe pager: tiered Prefill bank has no host reader"))?;
@@ -3551,6 +3558,12 @@ mod tests {
     fn validate_pager_dims_accepts_valid() {
         assert!(validate_pager_dims(1, 4).is_ok());
         assert!(validate_pager_dims(238, 13 << 20).is_ok());
+    }
+
+    #[test]
+    fn moe_lut_tape_covers_three_windows_per_global_expert_block() {
+        assert_eq!(moe_lut_tape_words(24 * 256), MIN_LUT_TAPE_WORDS);
+        assert_eq!(moe_lut_tape_words(48 * 512), 48 * 512 * 3);
     }
 
     #[test]

@@ -746,10 +746,12 @@ pub(crate) fn dense_act_reserve_at(
     } else {
         0
     };
-    // Qwen3.8's two wide ping-pong residuals, grouped-norm/gate scratch and PLE key/query/gated/
-    // conv rows. The generic n_embd umbrella does not cover hc*n_embd tensors.
+    // Qwen3.8's caller-owned wide residual; qwen_alt/normed/gate scratch; and PLE
+    // key/query/gated/conv rows are eight f32 `[rows, hc*n_embd]` buffers in total. The low-rank
+    // projection and per-stream injection are f32 too. The generic n_embd umbrella cannot absorb
+    // these hc-wide tensors.
     let qwen4_hc = if cfg.qwen4exp {
-        8 * cfg.hc_mult * cfg.n_embd + 3 * cfg.hc_low_rank
+        32 * cfg.hc_mult * cfg.n_embd + 4 * cfg.hc_low_rank + 4 * cfg.hc_mult
     } else {
         0
     };
