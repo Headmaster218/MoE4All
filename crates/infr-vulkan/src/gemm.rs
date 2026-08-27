@@ -3244,11 +3244,19 @@ pub(crate) fn qsa_indexer_topk_spv() -> &'static [u32] {
         )))
     })
 }
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn qsa_gather_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/qsa_gather.spv"))))
+macro_rules! qsa_spv {
+    ($f:ident, $name:literal) => {
+        #[cfg_attr(infr_profile, infr_prof::instrument)]
+        pub(crate) fn $f() -> &'static [u32] {
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+        }
+    };
 }
+qsa_spv!(qsa_gather_spv, "qsa_gather");
+qsa_spv!(qsa_attention_batch_spv, "qsa_attention_batch");
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

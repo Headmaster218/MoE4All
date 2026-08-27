@@ -2514,9 +2514,8 @@ pub(crate) fn generate_dense_backend(
         let q16 = g.internal(f16d(batch * max_qrow));
         let k16 = g.internal(f16d(batch * max_kvrow));
         let attn = g.internal(f32d(batch * max_qrow));
-        // Qwen3.8 QSA scratch. The model runs one token at a time, so one projected query and raw
-        // key row are reused across all full-attention layers. Packed K/V holds at most the fixed
-        // token budget plus an incomplete compression block.
+        // Qwen3.8 QSA scratch. Index rows are independent in batched Prefill; scalar decode keeps
+        // using the compact gathered K/V buffers below.
         let qsa_ratio = if c.qwen4exp {
             c.compress_ratios.iter().copied().max().unwrap_or(4).max(1)
         } else {
@@ -2529,7 +2528,7 @@ pub(crate) fn generate_dense_backend(
                 g.internal(f32d(batch * c.indexer_n_head * c.indexer_head_size)),
                 g.internal(f16d(batch * c.indexer_n_head * c.indexer_head_size)),
                 g.internal(TensorDesc::new(
-                    vec![(c.indexer_top_k / qsa_ratio).max(1)],
+                    vec![batch * (c.indexer_top_k / qsa_ratio).max(1)],
                     DType::I32,
                 )),
                 g.internal(f16d(max_rows * max_kvrow.max(1))),
@@ -4730,18 +4729,21 @@ pub(crate) fn generate_dense_backend(
                     None
                 };
                 let visible = start_pos + batch;
-                let (attn_k, attn_v, attn_len, attn_pos) = if let Some((ix_q, ix_k, ix_norm)) =
-                    qsa_query.filter(|_| visible > c.indexer_top_k + qsa_ratio - 1)
-                {
-                    assert_eq!(batch, 1, "QSA sparse attention currently requires batch=1");
-                    let complete = visible / qsa_ratio;
-                    let tail = visible % qsa_ratio;
-                    let selected = (c.indexer_top_k / qsa_ratio).min(complete);
+                let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
+                let batched_qsa = batch > 1 && qsa_query.is_some() && visible > qsa_threshold;
+                if batched_qsa {
+                    assert!(
+                        start_pos + 1 > qsa_threshold,
+                        "a batched QSA span must not cross the dense-to-sparse boundary"
+                    );
+                    let (ix_q, ix_k, ix_norm) = qsa_query.expect("batched QSA query");
+                    let selected = c.indexer_top_k / qsa_ratio;
                     g.push(Op::QsaIndexer {
                         q: ix_q,
                         k_cache: ix_k,
                         k_norm: ix_norm,
                         dst: qsa_indices,
+                        rows: batch as u32,
                         kv_len: visible as u32,
                         n_head: c.indexer_n_head as u32,
                         head_dim: c.indexer_head_size as u32,
@@ -4752,38 +4754,78 @@ pub(crate) fn generate_dense_backend(
                         eps,
                         scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
                     });
-                    g.push(Op::QsaGather {
+                    g.push(Op::QsaBatchAttention {
+                        q: q_attn,
                         k_cache: k_cache[kv_src],
                         v_cache: v_cache[kv_src],
                         indices: qsa_indices,
-                        k_dst: qsa_gather_k,
-                        v_dst: qsa_gather_v,
-                        selected_blocks: selected as u32,
-                        complete_blocks: complete as u32,
-                        tail: tail as u32,
+                        dst: attn,
+                        rows: batch as u32,
+                        kv_len: visible as u32,
+                        n_head: nh as u32,
+                        n_kv: nkv as u32,
+                        head_dim: hd as u32,
+                        top_blocks: selected as u32,
                         ratio: qsa_ratio as u32,
-                        row_elems: kvrow as u32,
+                        scale,
                     });
-                    let gathered = selected * qsa_ratio + tail;
-                    (qsa_gather_k, qsa_gather_v, gathered, gathered - 1)
                 } else {
-                    (k_cache[kv_src], v_cache[kv_src], visible, start_pos)
-                };
-                g.push(Op::Attention {
-                    q: q_attn,
-                    k_cache: attn_k,
-                    v_cache: attn_v,
-                    dst: attn,
-                    rows: batch as u32,
-                    kv_len: attn_len as u32,
-                    n_head: nh as u32,
-                    n_kv: nkv as u32,
-                    head_dim: hd as u32,
-                    scale,
-                    mask,
-                    pos: attn_pos as u32,
-                    sinks: None,
-                });
+                    let (attn_k, attn_v, attn_len, attn_pos) = if let Some((ix_q, ix_k, ix_norm)) =
+                        qsa_query.filter(|_| visible > qsa_threshold)
+                    {
+                        debug_assert_eq!(batch, 1);
+                        let complete = visible / qsa_ratio;
+                        let tail = visible % qsa_ratio;
+                        let selected = (c.indexer_top_k / qsa_ratio).min(complete);
+                        g.push(Op::QsaIndexer {
+                            q: ix_q,
+                            k_cache: ix_k,
+                            k_norm: ix_norm,
+                            dst: qsa_indices,
+                            rows: 1,
+                            kv_len: visible as u32,
+                            n_head: c.indexer_n_head as u32,
+                            head_dim: c.indexer_head_size as u32,
+                            top_blocks: selected as u32,
+                            ratio: qsa_ratio as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta,
+                            eps,
+                            scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                        });
+                        g.push(Op::QsaGather {
+                            k_cache: k_cache[kv_src],
+                            v_cache: v_cache[kv_src],
+                            indices: qsa_indices,
+                            k_dst: qsa_gather_k,
+                            v_dst: qsa_gather_v,
+                            selected_blocks: selected as u32,
+                            complete_blocks: complete as u32,
+                            tail: tail as u32,
+                            ratio: qsa_ratio as u32,
+                            row_elems: kvrow as u32,
+                        });
+                        let gathered = selected * qsa_ratio + tail;
+                        (qsa_gather_k, qsa_gather_v, gathered, gathered - 1)
+                    } else {
+                        (k_cache[kv_src], v_cache[kv_src], visible, start_pos)
+                    };
+                    g.push(Op::Attention {
+                        q: q_attn,
+                        k_cache: attn_k,
+                        v_cache: attn_v,
+                        dst: attn,
+                        rows: batch as u32,
+                        kv_len: attn_len as u32,
+                        n_head: nh as u32,
+                        n_kv: nkv as u32,
+                        head_dim: hd as u32,
+                        scale,
+                        mask,
+                        pos: attn_pos as u32,
+                        sinks: None,
+                    });
+                }
                 // qwen35: per-head SIGMOID output gate applied to the attention output BEFORE the
                 // o-projection (`gate_a` was split out of the interleaved `attn_q` projection above).
                 if c.attn_out_gate {
@@ -6288,9 +6330,9 @@ pub(crate) fn generate_dense_backend(
     // layers; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down (Q3_K); IQ2_S/IQ3_S is
     // the UD-IQ3_S file's expert pair (grid-codebook mmq via shared-LUT staging). The remaining
     // codebook quants (IQ1_*/IQ2_XXS/IQ2_XS/IQ3_XXS/TQ*) have no dp4a-mmq kernel. Qwen3.8 Flash
-    // Next's UD-Q2_K_XL does ship IQ2_XS/IQ3_XXS expert banks, but qwen4exp is deliberately kept
-    // on this per-token prefill loop in v1; its paged id/idm-GEMV floor covers those dtypes. See
-    // MOE_MMQ_DTYPES's exclusions for the batched-kernel boundary.
+    // Next's UD-Q2_K_XL does ship IQ2_XS/IQ3_XXS expert banks; when those banks are paged, its
+    // correctness-first batched path uses the existing shape-general paged id/idm-GEMV floor.
+    // A resident model still needs the ordinary MOE_MMQ_DTYPES eligibility below.
     // `MOE_MMQ_DTYPES` is the SINGLE SOURCE OF TRUTH this closure and the Vulkan adapter's batched
     // `Op::MoeFfn` gate (its `mmq_ok`) both derive from — a mismatch either silently falls back to
     // per-token prefill or compiles a graph the adapter rejects; `moe_mmq_drift_test` (in
@@ -6312,7 +6354,14 @@ pub(crate) fn generate_dense_backend(
     // `build`), and no `batch > 1` V4 graph has ever been EXECUTED — the only V4 fixture that
     // exists writes f32 expert banks, so `moe_batched_ok` is false for it and nothing here could
     // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
-    let batched_prefill_ok = (c.moe.is_none() || moe_batched_ok) && !c.deepseek4 && !c.qwen4exp;
+    // Qwen3.8's correctness-first batched path may use the existing multi-row paged id-GEMV for
+    // expert dtypes that do not yet have MMQ (IQ2_XS/IQ3_XXS). Its row-aware QSA kernel consumes
+    // F16 K/V in this first batched implementation.
+    let batched_prefill_ok = if c.qwen4exp {
+        k_fmt == DType::F16 && v_fmt == DType::F16 && (be.moe_paged() || moe_batched_ok)
+    } else {
+        (c.moe.is_none() || moe_batched_ok) && !c.deepseek4
+    };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
@@ -6361,9 +6410,18 @@ pub(crate) fn generate_dense_backend(
         let chunks: Vec<(usize, usize)> = {
             let mut v = Vec::new();
             let mut cs = start;
+            let qsa_boundary = c.qwen4exp.then(|| {
+                let ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
+                c.indexer_top_k + ratio - 1
+            });
             while cs < pf_end {
                 let mut ce = (cs + ubatch).min(pf_end);
                 if let Some(boundary) = turn_checkpoint_boundary {
+                    if cs < boundary && boundary < ce {
+                        ce = boundary;
+                    }
+                }
+                if let Some(boundary) = qsa_boundary {
                     if cs < boundary && boundary < ce {
                         ce = boundary;
                     }
@@ -6386,6 +6444,10 @@ pub(crate) fn generate_dense_backend(
             pos: Box<dyn Buffer>,
             /// gemma4-E2B per-layer token rows.
             ipl: Option<Box<dyn Buffer>>,
+            /// Qwen3.8 caller-owned four-stream residual for this batch.
+            qwen_wide: Option<Box<dyn Buffer>>,
+            /// Qwen3.8 PLE rows, flattened in prompt-token order.
+            ple_embd: Option<Box<dyn Buffer>>,
         }
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
         for (si, span) in spans.iter().enumerate() {
@@ -6469,12 +6531,45 @@ pub(crate) fn generate_dense_backend(
                     } else {
                         None
                     };
+                    let qwen_wide = if c.qwen4exp {
+                        Some(
+                            be.alloc(pf_m * c.hc_mult * ne * 4, BufferUsage::Activations)
+                                .map_err(|e| anyhow!("{e}"))?,
+                        )
+                    } else {
+                        None
+                    };
+                    let ple_embd = if c.qwen4exp {
+                        let rows = ple_worker
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                            .submit_range(prompt, cstart, pf_m, c.ple_ngram_size)?
+                            .wait()?;
+                        let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+                        let expected = pf_m * heads * c.ple_head_dim;
+                        if rows.len() != expected {
+                            return Err(anyhow!(
+                                "qwen4exp batched PLE produced {} values, expected {expected}",
+                                rows.len()
+                            ));
+                        }
+                        let b = be
+                            .alloc(rows.len() * 4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        Some(b)
+                    } else {
+                        None
+                    };
                     live[ci] = Some(PfChunk {
                         m: pf_m,
                         input,
                         resid,
                         pos,
                         ipl,
+                        qwen_wide,
+                        ple_embd,
                     });
                 }
                 let ch = live[ci]
@@ -6535,8 +6630,16 @@ pub(crate) fn generate_dense_backend(
                     &vbufs[..],
                     &qsa_kbufs[..],
                     &wbufs[..],
-                    qwen_wide_buf,
-                    ple_embd_buf,
+                    if c.qwen4exp {
+                        &ch.qwen_wide
+                    } else {
+                        qwen_wide_buf
+                    },
+                    if c.qwen4exp {
+                        &ch.ple_embd
+                    } else {
+                        ple_embd_buf
+                    },
                     ple_state_buf,
                 );
                 debug_assert!(

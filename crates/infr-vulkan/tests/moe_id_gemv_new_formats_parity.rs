@@ -373,6 +373,89 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
     }
 }
 
+/// Qwen3.8 Q2 batched Prefill falls back to this shape-general paged id-GEMV because IQ2_XS has
+/// no dp4a MMQ kernel. Distinct inputs and expert ids per row verify the `(row, slot)` flattening.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn paged_iq2xs_multirow_matches_host() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (rows, n_used, n_expert) = (3usize, 2usize, 4usize);
+    let (in_f, out_f) = (256usize, 8usize);
+    let stride = in_f * out_f;
+    let dt = DType::Iq2Xs;
+    let (epb, bpb) = block_geom(dt);
+    let stride_bytes = stride / epb * bpb;
+    let banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| synth_bank(dt, stride, 0x38ba_7c11 ^ ((e as u64) << 32)))
+        .collect();
+    let host: Vec<Vec<f32>> = banks
+        .iter()
+        .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+        .collect();
+    let x: Vec<f32> = (0..rows * in_f)
+        .map(|i| ((i * 17 + i / in_f * 23) % 61) as f32 * 0.0125 - 0.35)
+        .collect();
+    let ids = [0u32, 2, 3, 1, 2, 0];
+
+    let x_buf = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let mut pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes).unwrap();
+    let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
+    for eid in 0..n_expert as u32 {
+        pager
+            .ensure_resident(&be, staging.as_ref(), eid, &banks[eid as usize])
+            .unwrap();
+    }
+    pager.flush_lut(&be).unwrap();
+    let y = be
+        .alloc(rows * n_used * out_f * 4, BufferUsage::Activations)
+        .unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.linear_native_id_multi_paged(
+        dt,
+        pager.arena_addr(),
+        pager.slot_bytes() as u32,
+        pager.lut_buffer(),
+        ids_buf.as_ref(),
+        n_used,
+        0,
+        x_buf.as_ref(),
+        false,
+        y.as_ref(),
+        in_f,
+        out_f,
+        rows,
+        u32::MAX,
+    );
+    rec.finish().unwrap();
+
+    let mut out = vec![0u8; rows * n_used * out_f * 4];
+    be.download(y.as_ref(), &mut out).unwrap();
+    let got: &[f32] = bytemuck::cast_slice(&out);
+    for (pair, &eid) in ids.iter().enumerate() {
+        let row = pair / n_used;
+        let want = host_gemv(
+            &host[eid as usize],
+            &x[row * in_f..(row + 1) * in_f],
+            in_f,
+            out_f,
+        );
+        assert_close(
+            dt,
+            &format!("paged multirow row {row} expert {eid}"),
+            &got[pair * out_f..(pair + 1) * out_f],
+            &want,
+        );
+    }
+}
+
 /// The paged decode route must use the same reassociation-tolerant subgroup+NR kernels as the
 /// resident route for the three deliberately enrolled heavy formats. `out_f=2048` enters the
 /// default SG band; `rows=1` is decode. Scrambled ids and a nontrivial LUT placement prove the

@@ -4,6 +4,7 @@
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
+    uint rows;
     uint kv_len;
     uint n_head;
     uint head_dim;
@@ -34,8 +35,13 @@ float kread(uint i) {
 }
 
 void main() {
-    uint block = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    uint blocks = pc.kv_len / pc.ratio;
+    uint job = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint max_blocks = pc.kv_len / pc.ratio;
+    uint row = job / max_blocks;
+    uint block = job - row * max_blocks;
+    if (row >= pc.rows) { return; }
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint blocks = visible / pc.ratio;
     if (block >= blocks) { return; }
     uint d = gl_LocalInvocationID.x;
 
@@ -68,7 +74,8 @@ void main() {
     }
 
     for (uint h = 0u; h < 4u; ++h) {
-        part[h][d] = h < pc.n_head ? qread(h * pc.head_dim + d) * kn : 0.0;
+        uint qbase = row * pc.n_head * pc.head_dim;
+        part[h][d] = h < pc.n_head ? qread(qbase + h * pc.head_dim + d) * kn : 0.0;
     }
     barrier();
     for (uint stride = 64u; stride > 0u; stride >>= 1u) {
@@ -80,6 +87,6 @@ void main() {
     if (d == 0u) {
         float score = 0.0;
         for (uint h = 0u; h < pc.n_head; ++h) { score += max(part[h][0], 0.0); }
-        scores[block] = score * pc.scale;
+        scores[row * max_blocks + block] = score * pc.scale;
     }
 }

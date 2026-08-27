@@ -428,6 +428,9 @@ pub enum Op {
         k_cache: TensorId,
         k_norm: TensorId,
         dst: TensorId,
+        /// Number of consecutive query rows. Row `r` sees
+        /// `kv_len - rows + r + 1` cached tokens.
+        rows: u32,
         kv_len: u32,
         n_head: u32,
         head_dim: u32,
@@ -451,6 +454,26 @@ pub enum Op {
         tail: u32,
         ratio: u32,
         row_elems: u32,
+    },
+    /// Batched Qwen3.8 QSA attention over row-specific selected blocks. Unlike
+    /// [`Op::QsaGather`], which materializes one compact K/V prefix for one query, this op reads
+    /// each row's chronological block-index slice directly and applies attention to that row's
+    /// selected complete blocks plus its own incomplete causal tail. `kv_len` is the visible
+    /// length of the final row; row `r` sees `kv_len - rows + r + 1` tokens.
+    QsaBatchAttention {
+        q: TensorId,
+        k_cache: TensorId,
+        v_cache: TensorId,
+        indices: TensorId,
+        dst: TensorId,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        n_kv: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        scale: f32,
     },
     /// Scaled-dot-product attention. `q` is `rows × n_head × head_dim`; `k_cache`/`v_cache` hold
     /// `kv_len` rows of `n_kv × head_dim`. GQA when `n_head > n_kv`. `dst` is `rows × n_head ×
@@ -1276,6 +1299,7 @@ impl Op {
             Op::Dsv4Gather { .. } => "Dsv4Gather",
             Op::QsaIndexer { .. } => "QsaIndexer",
             Op::QsaGather { .. } => "QsaGather",
+            Op::QsaBatchAttention { .. } => "QsaBatchAttention",
             Op::Attention { .. } => "Attention",
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
@@ -1421,6 +1445,14 @@ impl Op {
                 v_dst,
                 ..
             } => (vec![k_cache, v_cache, indices], vec![k_dst, v_dst]),
+            Op::QsaBatchAttention {
+                q,
+                k_cache,
+                v_cache,
+                indices,
+                dst,
+                ..
+            } => (vec![q, k_cache, v_cache, indices], vec![dst]),
             Op::Attention {
                 q,
                 k_cache,
@@ -1672,6 +1704,12 @@ impl Graph {
                         set.insert(*k_cache);
                     }
                     Op::QsaGather {
+                        k_cache, v_cache, ..
+                    } => {
+                        set.insert(*k_cache);
+                        set.insert(*v_cache);
+                    }
+                    Op::QsaBatchAttention {
                         k_cache, v_cache, ..
                     } => {
                         set.insert(*k_cache);

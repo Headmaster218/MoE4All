@@ -208,7 +208,8 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4Indexer { .. }
             | Op::Dsv4Gather { .. }
             | Op::QsaIndexer { .. }
-            | Op::QsaGather { .. } => return false,
+            | Op::QsaGather { .. }
+            | Op::QsaBatchAttention { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -2578,6 +2579,7 @@ fn lower_op(
             k_cache,
             k_norm,
             dst,
+            rows,
             kv_len,
             n_head,
             head_dim,
@@ -2589,30 +2591,40 @@ fn lower_op(
             scale,
         } => {
             let blocks = *kv_len / *ratio.max(&1);
+            let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
+            let first_blocks = first_visible / *ratio.max(&1);
             if *head_dim != 128
+                || *rows == 0
+                || *rows > *kv_len
                 || *n_head == 0
                 || *n_head > 4
                 || *ratio == 0
                 || *rope_dim > *head_dim
                 || !rope_dim.is_multiple_of(2)
                 || *top_blocks == 0
-                || *top_blocks > blocks
+                || *top_blocks > first_blocks
                 || *top_blocks > 512
             {
                 return Err(be(format!(
                     "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
                      ratio>0 and 0<top_blocks<=min(blocks,512); got head_dim={head_dim} \
                      n_head={n_head} rope_dim={rope_dim} ratio={ratio} top_blocks={top_blocks} \
-                     kv_len={kv_len}"
+                     rows={rows} kv_len={kv_len}"
                 )));
             }
-            let sk = pooled(pool, be_, "qsa_indexer_scores", blocks as usize * 4)?;
+            let sk = pooled(
+                pool,
+                be_,
+                "qsa_indexer_scores",
+                *rows as usize * blocks as usize * 4,
+            )?;
             rec.qsa_indexer(
                 r(*q)?,
                 r(*k_cache)?,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
                 r(*dst)?,
+                *rows,
                 *kv_len,
                 *n_head,
                 *head_dim,
@@ -2658,6 +2670,64 @@ fn lower_op(
                 *tail,
                 *ratio,
                 *row_elems,
+            );
+        }
+        Op::QsaBatchAttention {
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            top_blocks,
+            ratio,
+            scale,
+        } => {
+            let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
+            let first_blocks = first_visible / *ratio.max(&1);
+            let kdt = graph.desc(*k_cache).dtype;
+            let vdt = graph.desc(*v_cache).dtype;
+            if *rows == 0
+                || *rows > *kv_len
+                || *n_head == 0
+                || *n_kv == 0
+                || !n_head.is_multiple_of(*n_kv)
+                || !matches!(*head_dim, 128 | 256)
+                || *ratio == 0
+                || *top_blocks == 0
+                || *top_blocks > first_blocks
+                || *top_blocks > 512
+                || graph.desc(*q).dtype != infr_core::DType::F16
+                || kdt != infr_core::DType::F16
+                || vdt != infr_core::DType::F16
+            {
+                return Err(be(format!(
+                    "vulkan Op::QsaBatchAttention requires F16 q/k/v, rows<=kv_len, \
+                     head_dim=128/256, n_head divisible by n_kv, ratio>0 and \
+                     0<top_blocks<=first complete blocks; \
+                     got rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
+                     head_dim={head_dim} ratio={ratio} top_blocks={top_blocks} \
+                     k_dtype={kdt:?} v_dtype={vdt:?}"
+                )));
+            }
+            rec.qsa_attention_batch(
+                r(*q)?,
+                r(*k_cache)?,
+                r(*v_cache)?,
+                r(*indices)?,
+                r(*dst)?,
+                *rows,
+                *kv_len,
+                *n_head,
+                *n_kv,
+                *head_dim,
+                *top_blocks,
+                *ratio,
+                *scale,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst

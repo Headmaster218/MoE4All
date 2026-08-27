@@ -104,6 +104,7 @@ fn qsa_index_and_gather_match_reference() {
         nw.as_ref(),
         scores.as_ref(),
         ids.as_ref(),
+        1,
         kv_len as u32,
         nh as u32,
         hd as u32,
@@ -159,4 +160,196 @@ fn qsa_index_and_gather_match_reference() {
     }
     assert_eq!(got_k, want_k);
     assert_eq!(got_v, want_v);
+}
+
+#[test]
+fn qsa_batched_rows_match_causal_reference() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (rows, ratio, index_hd, index_heads, rope_dim, top) =
+        (3usize, 4usize, 128usize, 4usize, 64usize, 3usize);
+    let (n_head, n_kv, attn_hd) = (4usize, 2usize, 256usize);
+    let kv_len = 26usize;
+    let max_blocks = kv_len / ratio;
+    let theta = 10_000.0f32;
+    let eps = 1e-6f32;
+    let index_scale = 1.0 / (index_hd as f32).sqrt();
+    let attn_scale = 1.0 / (attn_hd as f32).sqrt();
+
+    let index_qv: Vec<f32> = (0..rows * index_heads * index_hd)
+        .map(|i| ((i * 37 + 11) % 101) as f32 / 65.0 - 0.75)
+        .collect();
+    let rawv: Vec<f32> = (0..kv_len * index_hd)
+        .map(|i| ((i * 53 + 7) % 127) as f32 / 75.0 - 0.8)
+        .collect();
+    let norm: Vec<f32> = (0..index_hd)
+        .map(|i| 0.75 + (i % 17) as f32 * 0.01)
+        .collect();
+    let index_qb = f16_bytes(&index_qv);
+    let rawb = f16_bytes(&rawv);
+
+    let mut want_ids = Vec::with_capacity(rows * top);
+    let mut key = vec![0.0f32; index_hd];
+    for row in 0..rows {
+        let visible = kv_len - rows + row + 1;
+        let blocks = visible / ratio;
+        let mut scores = vec![0.0f32; blocks];
+        for (block, score) in scores.iter_mut().enumerate() {
+            for d in 0..index_hd {
+                key[d] = (0..ratio)
+                    .map(|r| h(&rawb, (block * ratio + r) * index_hd + d))
+                    .sum::<f32>()
+                    / ratio as f32;
+                key[d] = half::f16::from_f32(key[d]).to_f32();
+            }
+            let inv = (key.iter().map(|v| v * v).sum::<f32>() / index_hd as f32 + eps)
+                .sqrt()
+                .recip();
+            for d in 0..index_hd {
+                key[d] *= inv * norm[d];
+            }
+            for pair in 0..rope_dim / 2 {
+                let d = 2 * pair;
+                let angle =
+                    (block * ratio) as f32 * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
+                let (sin, cos) = angle.sin_cos();
+                let (a, b) = (key[d], key[d + 1]);
+                key[d] = a * cos - b * sin;
+                key[d + 1] = a * sin + b * cos;
+            }
+            let qbase = row * index_heads * index_hd;
+            for head in 0..index_heads {
+                let dot = (0..index_hd)
+                    .map(|d| h(&index_qb, qbase + head * index_hd + d) * key[d])
+                    .sum::<f32>();
+                *score += dot.max(0.0) * index_scale;
+            }
+        }
+        let mut rank: Vec<usize> = (0..blocks).collect();
+        rank.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b)));
+        rank.truncate(top);
+        rank.sort_unstable();
+        want_ids.extend(rank.into_iter().map(|i| i as u32));
+    }
+
+    let attn_qv: Vec<f32> = (0..rows * n_head * attn_hd)
+        .map(|i| ((i * 29 + 19) % 113) as f32 / 90.0 - 0.6)
+        .collect();
+    let kvals: Vec<f32> = (0..kv_len * n_kv * attn_hd)
+        .map(|i| ((i * 43 + 5) % 109) as f32 / 85.0 - 0.65)
+        .collect();
+    let vvals: Vec<f32> = (0..kv_len * n_kv * attn_hd)
+        .map(|i| ((i * 31 + 23) % 103) as f32 / 80.0 - 0.6)
+        .collect();
+    let attn_qb = f16_bytes(&attn_qv);
+    let kb = f16_bytes(&kvals);
+    let vb = f16_bytes(&vvals);
+
+    let mut want_out = vec![0.0f32; rows * n_head * attn_hd];
+    for row in 0..rows {
+        let visible = kv_len - rows + row + 1;
+        let complete = visible / ratio;
+        let tail = visible % ratio;
+        let mut source_rows = Vec::with_capacity(top * ratio + tail);
+        for &block in &want_ids[row * top..(row + 1) * top] {
+            source_rows.extend(block as usize * ratio..(block as usize + 1) * ratio);
+        }
+        source_rows.extend(complete * ratio..complete * ratio + tail);
+        for head in 0..n_head {
+            let kv_head = head / (n_head / n_kv);
+            let qbase = (row * n_head + head) * attn_hd;
+            let mut logits = Vec::with_capacity(source_rows.len());
+            for &src_row in &source_rows {
+                let kbase = (src_row * n_kv + kv_head) * attn_hd;
+                logits.push(
+                    (0..attn_hd)
+                        .map(|d| h(&attn_qb, qbase + d) * h(&kb, kbase + d))
+                        .sum::<f32>()
+                        * attn_scale,
+                );
+            }
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denom = logits.iter().map(|x| (x - max).exp()).sum::<f32>();
+            for (&src_row, logit) in source_rows.iter().zip(logits) {
+                let p = (logit - max).exp() / denom;
+                let vbase = (src_row * n_kv + kv_head) * attn_hd;
+                for d in 0..attn_hd {
+                    want_out[qbase + d] += p * h(&vb, vbase + d);
+                }
+            }
+        }
+    }
+
+    let index_q = be.alloc(index_qb.len(), BufferUsage::Activations).unwrap();
+    let raw = be.alloc(rawb.len(), BufferUsage::KvCache).unwrap();
+    let nw = be.alloc(norm.len() * 4, BufferUsage::Weights).unwrap();
+    let scores = be
+        .alloc(rows * max_blocks * 4, BufferUsage::Activations)
+        .unwrap();
+    let ids = be.alloc(rows * top * 4, BufferUsage::Activations).unwrap();
+    let attn_q = be.alloc(attn_qb.len(), BufferUsage::Activations).unwrap();
+    let k = be.alloc(kb.len(), BufferUsage::KvCache).unwrap();
+    let v = be.alloc(vb.len(), BufferUsage::KvCache).unwrap();
+    let out = be
+        .alloc(want_out.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(index_q.as_ref(), &index_qb).unwrap();
+    be.upload(raw.as_ref(), &rawb).unwrap();
+    be.upload(nw.as_ref(), bytemuck::cast_slice(&norm)).unwrap();
+    be.upload(attn_q.as_ref(), &attn_qb).unwrap();
+    be.upload(k.as_ref(), &kb).unwrap();
+    be.upload(v.as_ref(), &vb).unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.qsa_indexer(
+        index_q.as_ref(),
+        raw.as_ref(),
+        nw.as_ref(),
+        scores.as_ref(),
+        ids.as_ref(),
+        rows as u32,
+        kv_len as u32,
+        index_heads as u32,
+        index_hd as u32,
+        top as u32,
+        ratio as u32,
+        rope_dim as u32,
+        theta,
+        eps,
+        index_scale,
+    );
+    rec.qsa_attention_batch(
+        attn_q.as_ref(),
+        k.as_ref(),
+        v.as_ref(),
+        ids.as_ref(),
+        out.as_ref(),
+        rows as u32,
+        kv_len as u32,
+        n_head as u32,
+        n_kv as u32,
+        attn_hd as u32,
+        top as u32,
+        ratio as u32,
+        attn_scale,
+    );
+    rec.finish().unwrap();
+
+    let mut got_ids_bytes = vec![0u8; rows * top * 4];
+    be.download(ids.as_ref(), &mut got_ids_bytes).unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, u32>(&got_ids_bytes),
+        want_ids.as_slice()
+    );
+    let mut got_out_bytes = vec![0u8; want_out.len() * 4];
+    be.download(out.as_ref(), &mut got_out_bytes).unwrap();
+    let got_out = bytemuck::cast_slice::<u8, f32>(&got_out_bytes);
+    for (i, (&got, &want)) in got_out.iter().zip(&want_out).enumerate() {
+        assert!(
+            (got - want).abs() < 3e-3,
+            "output {i}: got {got}, want {want}"
+        );
+    }
 }

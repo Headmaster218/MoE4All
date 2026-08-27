@@ -667,15 +667,10 @@ pub(crate) fn dense_act_reserve_at(
     want_ctx: usize,
     ubatch: usize,
 ) -> u64 {
-    // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
-    // Qwen3.8 v1 deliberately executes one token at a time: the PLE host gather is overlapped
-    // with layer 0 and the four-stream residual is carried across that split. Pricing a 1024-row
-    // graph that is never built would withhold many GiB from its expert cache.
-    let rows = if cfg.qwen4exp {
-        1
-    } else {
-        ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64
-    };
+    // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`). Qwen3.8 now
+    // builds the same ubatch-height graph as the other supported architectures, including its
+    // four-stream residual, PLE and row-aware QSA scratch, so it must reserve the real row count.
+    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
     // Only Op::Attention uses the pooled score/PV scratch below. Op::Mla scans compressed KV and
     // accumulates softmax/value inside its dedicated kernel, while recurrent mixers have no
     // context attention at all. Keep n_layer == 0 conservative for geometry-only configs/tests.
@@ -760,7 +755,16 @@ pub(crate) fn dense_act_reserve_at(
     };
     let per_row =
         (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
-    rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
+    let row_reserve = rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1;
+    // Qwen3.8 keeps its scalar decode graph live while a separately compiled batched-prefill
+    // graph owns the row-scaled pools above. Two real runs at d4096 measured the fixed intercept
+    // at 54.6 MiB (64 rows: 143.6 MiB peak; 128 rows: 232.7 MiB), so round it up to 64 MiB.
+    // This is a fixed plan-overlap cost, not another per-row multiplier.
+    row_reserve.saturating_add(if cfg.qwen4exp {
+        QWEN4_PLAN_OVERLAP_RESERVE
+    } else {
+        0
+    })
 }
 
 /// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]: the residual
@@ -853,6 +857,7 @@ pub(crate) fn layer_major_prefill(
 /// is still the largest — which is the argument for deriving these bytes from the graph the runner
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
+const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
@@ -4846,6 +4851,43 @@ mod seam_helper_tests {
             .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
             .sum();
         assert_eq!(total, 768 * 1024 * 1024);
+    }
+
+    #[test]
+    fn qwen38_activation_reserve_tracks_the_real_prefill_batch() {
+        let cfg = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_head: 24,
+            n_embd: 2560,
+            n_ff: 640,
+            head_dim: 256,
+            hc_mult: 4,
+            hc_low_rank: 320,
+            ssm_d_inner: 6144,
+            ssm_n_group: 16,
+            ssm_dt_rank: 48,
+            ssm_d_state: 128,
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 512);
+        let full = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 1024);
+        assert_eq!(
+            full - super::QWEN4_PLAN_OVERLAP_RESERVE,
+            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
+            "only the row-scaled part doubles; the retained decode plan is fixed"
+        );
     }
 
     fn deepseek4_cache_config() -> Config {

@@ -8296,6 +8296,7 @@ impl<'a> Recorder<'a> {
         k_norm: &dyn Buffer,
         scores: &dyn Buffer,
         dst: &dyn Buffer,
+        rows: u32,
         kv_len: u32,
         n_head: u32,
         head_dim: u32,
@@ -8311,17 +8312,18 @@ impl<'a> Recorder<'a> {
             "qsa_indexer_score",
             crate::gemm::qsa_indexer_score_spv(),
             4,
-            32,
+            36,
         );
-        let mut push = [0u8; 32];
-        push[0..4].copy_from_slice(&kv_len.to_ne_bytes());
-        push[4..8].copy_from_slice(&n_head.to_ne_bytes());
-        push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
-        push[12..16].copy_from_slice(&ratio.to_ne_bytes());
-        push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
-        push[20..24].copy_from_slice(&theta.to_ne_bytes());
-        push[24..28].copy_from_slice(&eps.to_ne_bytes());
-        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
+        push[8..12].copy_from_slice(&n_head.to_ne_bytes());
+        push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&ratio.to_ne_bytes());
+        push[20..24].copy_from_slice(&rope_dim.to_ne_bytes());
+        push[24..28].copy_from_slice(&theta.to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch_wide(
             score_k,
             &[
@@ -8332,24 +8334,82 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push,
-            blocks,
+            rows.saturating_mul(blocks),
         );
 
         let topk_k = self.be.kernel(
             "qsa_indexer_topk",
             crate::gemm::qsa_indexer_topk_spv(),
             2,
-            8,
+            20,
         );
-        let mut topk_push = [0u8; 8];
+        let mut topk_push = [0u8; 20];
         topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
         topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+        topk_push[8..12].copy_from_slice(&rows.to_ne_bytes());
+        topk_push[12..16].copy_from_slice(&kv_len.to_ne_bytes());
+        topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
         self.dispatch(
             topk_k,
             &[Self::vkb(scores), Self::vkb(dst)],
             1,
             &topk_push,
+            rows,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_attention_batch(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        indices: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        n_kv: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        scale: f32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "qsa_attention_batch",
+            crate::gemm::qsa_attention_batch_spv(),
+            5,
+            32,
+            32,
+        );
+        let mut push = [0u8; 32];
+        for (i, value) in [
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            top_blocks,
+            ratio,
+            scale.to_bits(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(indices),
+                Self::vkb(dst),
+            ],
             1,
+            &push,
+            rows.saturating_mul(n_head),
         );
     }
 

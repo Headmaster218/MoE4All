@@ -2153,6 +2153,7 @@ impl Backend for CpuBackend {
                     k_cache,
                     k_norm,
                     dst,
+                    rows,
                     kv_len,
                     n_head,
                     head_dim,
@@ -2163,7 +2164,8 @@ impl Backend for CpuBackend {
                     eps,
                     scale,
                 } => {
-                    let (kv_len, nh, hd, top_blocks, ratio, rope_dim) = (
+                    let (rows, kv_len, nh, hd, top_blocks, ratio, rope_dim) = (
+                        rows as usize,
                         kv_len as usize,
                         n_head as usize,
                         head_dim as usize,
@@ -2171,7 +2173,7 @@ impl Backend for CpuBackend {
                         ratio as usize,
                         rope_dim as usize,
                     );
-                    let blocks = kv_len / ratio;
+                    let max_blocks = kv_len / ratio;
                     let q = &vals[q.0 as usize];
                     let norm = &vals[k_norm.0 as usize];
                     let cache = cpu_buf(
@@ -2180,51 +2182,65 @@ impl Backend for CpuBackend {
                             .expect("cpu backend: unbound QSA index-key cache"),
                     )
                     .read();
-                    let raw = dequant_cache_prefix(&cache, DType::F16, blocks * ratio * hd);
-                    let mut scores = vec![0.0f32; blocks];
+                    let raw = dequant_cache_prefix(&cache, DType::F16, max_blocks * ratio * hd);
+                    let mut scores = vec![0.0f32; rows * max_blocks];
+                    let mut selected_rows = vec![0.0f32; rows * top_blocks];
                     let mut key = vec![0.0f32; hd];
-                    for block in 0..blocks {
-                        key.fill(0.0);
-                        for r in 0..ratio {
-                            let src = (block * ratio + r) * hd;
-                            for d in 0..hd {
-                                key[d] += raw[src + d] / ratio as f32;
+                    for row in 0..rows {
+                        let visible = kv_len - rows + row + 1;
+                        let blocks = visible / ratio;
+                        for block in 0..blocks {
+                            key.fill(0.0);
+                            for rr in 0..ratio {
+                                let src = (block * ratio + rr) * hd;
+                                for d in 0..hd {
+                                    key[d] += raw[src + d] / ratio as f32;
+                                }
                             }
+                            for v in &mut key {
+                                *v = half::f16::from_f32(*v).to_f32();
+                            }
+                            let inv = (key.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
+                                .sqrt()
+                                .recip();
+                            for d in 0..hd {
+                                key[d] *= inv * norm[d];
+                            }
+                            let pos = (block * ratio) as f32;
+                            for pair in 0..rope_dim / 2 {
+                                let d = pair * 2;
+                                let angle =
+                                    pos * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
+                                let (sin, cos) = angle.sin_cos();
+                                let (a, b) = (key[d], key[d + 1]);
+                                key[d] = a * cos - b * sin;
+                                key[d + 1] = a * sin + b * cos;
+                            }
+                            let mut score = 0.0f32;
+                            let qb = row * nh * hd;
+                            for h in 0..nh {
+                                score +=
+                                    dot(&q[qb + h * hd..qb + (h + 1) * hd], &key).max(0.0) * scale;
+                            }
+                            scores[row * max_blocks + block] = score;
                         }
-                        for v in &mut key {
-                            *v = half::f16::from_f32(*v).to_f32();
+                        let selected = top_blocks.min(blocks);
+                        let row_scores = &scores[row * max_blocks..(row + 1) * max_blocks];
+                        let mut order: Vec<usize> = (0..blocks).collect();
+                        if selected > 0 {
+                            order.select_nth_unstable_by(selected - 1, |&a, &b| {
+                                row_scores[b]
+                                    .total_cmp(&row_scores[a])
+                                    .then_with(|| a.cmp(&b))
+                            });
                         }
-                        let inv = (key.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
-                            .sqrt()
-                            .recip();
-                        for d in 0..hd {
-                            key[d] *= inv * norm[d];
+                        order.truncate(selected);
+                        order.sort_unstable();
+                        for (slot, block) in order.into_iter().enumerate() {
+                            selected_rows[row * top_blocks + slot] = block as f32;
                         }
-                        let pos = (block * ratio) as f32;
-                        for pair in 0..rope_dim / 2 {
-                            let d = pair * 2;
-                            let angle = pos * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
-                            let (sin, cos) = angle.sin_cos();
-                            let (a, b) = (key[d], key[d + 1]);
-                            key[d] = a * cos - b * sin;
-                            key[d + 1] = a * sin + b * cos;
-                        }
-                        let mut score = 0.0f32;
-                        for h in 0..nh {
-                            score += dot(&q[h * hd..(h + 1) * hd], &key).max(0.0) * scale;
-                        }
-                        scores[block] = score;
                     }
-                    let selected = top_blocks.min(blocks);
-                    let mut order: Vec<usize> = (0..blocks).collect();
-                    if selected > 0 {
-                        order.select_nth_unstable_by(selected - 1, |&a, &b| {
-                            scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b))
-                        });
-                    }
-                    order.truncate(selected);
-                    order.sort_unstable();
-                    vals[dst.0 as usize] = order.into_iter().map(|i| i as f32).collect();
+                    vals[dst.0 as usize] = selected_rows;
                 }
                 Op::QsaGather {
                     k_cache,
@@ -2278,6 +2294,85 @@ impl Backend for CpuBackend {
                     }
                     vals[k_dst.0 as usize] = ko;
                     vals[v_dst.0 as usize] = vo;
+                }
+                Op::QsaBatchAttention {
+                    q,
+                    k_cache,
+                    v_cache,
+                    indices,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    n_kv,
+                    head_dim,
+                    top_blocks,
+                    ratio,
+                    scale,
+                } => {
+                    let (rows, kv_len, nh, nkv, hd, top_blocks, ratio) = (
+                        rows as usize,
+                        kv_len as usize,
+                        n_head as usize,
+                        n_kv as usize,
+                        head_dim as usize,
+                        top_blocks as usize,
+                        ratio as usize,
+                    );
+                    let qs = &vals[q.0 as usize];
+                    let ids = &vals[indices.0 as usize];
+                    let read_cache = |id: TensorId| {
+                        let b = bindings
+                            .get(id)
+                            .expect("cpu backend: unbound QSA K/V cache");
+                        dequant_cache_prefix(
+                            &cpu_buf(b).read(),
+                            g.desc(id).dtype,
+                            kv_len * nkv * hd,
+                        )
+                    };
+                    let ks = read_cache(k_cache);
+                    let vs = read_cache(v_cache);
+                    let group = nh / nkv;
+                    let mut out = vec![0.0f32; rows * nh * hd];
+                    self.pool().for_chunks_mut(&mut out, hd, 1, &|rh, out_row| {
+                        let row = rh / nh;
+                        let head = rh % nh;
+                        let kv_head = head / group;
+                        let visible = kv_len - rows + row + 1;
+                        let complete = visible / ratio;
+                        let tail = visible % ratio;
+                        let selected = top_blocks.min(complete);
+                        let qbase = (row * nh + head) * hd;
+                        let qrow = &qs[qbase..qbase + hd];
+                        let mut source_rows = Vec::with_capacity(selected * ratio + tail);
+                        for slot in 0..selected {
+                            let block = ids[row * top_blocks + slot] as usize;
+                            source_rows.extend(block * ratio..(block + 1) * ratio);
+                        }
+                        source_rows.extend(complete * ratio..complete * ratio + tail);
+
+                        let mut logits = Vec::with_capacity(source_rows.len());
+                        let mut max_logit = f32::NEG_INFINITY;
+                        for &src_row in &source_rows {
+                            let kb = (src_row * nkv + kv_head) * hd;
+                            let logit = dot(qrow, &ks[kb..kb + hd]) * scale;
+                            logits.push(logit);
+                            max_logit = max_logit.max(logit);
+                        }
+                        let denom = logits
+                            .iter()
+                            .map(|&logit| (logit - max_logit).exp())
+                            .sum::<f32>();
+                        for (&src_row, &logit) in source_rows.iter().zip(&logits) {
+                            let p = (logit - max_logit).exp() / denom;
+                            let vb = (src_row * nkv + kv_head) * hd;
+                            for (dst, &value) in out_row.iter_mut().zip(&vs[vb..vb + hd]) {
+                                *dst = value.mul_add(p, *dst);
+                            }
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
                 }
                 Op::Attention {
                     q,

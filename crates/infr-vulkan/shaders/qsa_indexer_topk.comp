@@ -3,7 +3,13 @@
 // reproduces scatter-to-mask attention order: selected tokens are consumed chronologically.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint blocks; uint top_k; } pc;
+layout(push_constant) uniform PC {
+    uint max_blocks;
+    uint top_k;
+    uint rows;
+    uint kv_len;
+    uint ratio;
+} pc;
 layout(binding = 0) readonly buffer SB { float scores[]; };
 layout(binding = 1) writeonly buffer DB { uint dst[]; };
 
@@ -22,11 +28,16 @@ bool above(uint ai, float av, uint bi, float bv) {
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) { return; }
+    uint blocks = (pc.kv_len - pc.rows + row + 1u) / pc.ratio;
+    uint score_base = row * pc.max_blocks;
+    uint dst_base = row * pc.top_k;
     for (uint rank = 0u; rank < pc.top_k; ++rank) {
         uint bi = INVALID;
         float bv = 0.0;
-        for (uint j = t; j < pc.blocks; j += 256u) {
-            float s = scores[j];
+        for (uint j = t; j < blocks; j += 256u) {
+            float s = scores[score_base + j];
             if (rank > 0u && !above(prev_idx, prev_val, j, s)) { continue; }
             if (above(j, s, bi, bv)) { bi = j; bv = s; }
         }
@@ -71,6 +82,6 @@ void main() {
             barrier();
         }
     }
-    if (i0 < pc.top_k) { dst[i0] = chosen[i0]; }
-    if (i1 < pc.top_k) { dst[i1] = chosen[i1]; }
+    if (i0 < pc.top_k) { dst[dst_base + i0] = chosen[i0]; }
+    if (i1 < pc.top_k) { dst[dst_base + i1] = chosen[i1]; }
 }
