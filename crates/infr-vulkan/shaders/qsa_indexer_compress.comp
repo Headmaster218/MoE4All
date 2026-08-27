@@ -1,0 +1,63 @@
+#version 460
+// Materialize each newly-complete QSA block once. This is bit-for-bit the old score shader's
+// key path: mean in f32, round to f16, RMSNorm, then RoPE at the block's first token position.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint first_block;
+    uint count;
+    uint head_dim;
+    uint ratio;
+    uint rope_dim;
+    float theta;
+    float eps;
+} pc;
+layout(binding = 0) readonly buffer KB { uint raw_k[]; };
+layout(binding = 1) readonly buffer NB { float norm[]; };
+layout(binding = 2) writeonly buffer CB { float block_k[]; };
+
+shared float keyv[128];
+shared float rmsv[128];
+
+float kread(uint i) {
+    uint w = raw_k[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+}
+
+void main() {
+    uint local_block = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (local_block >= pc.count) { return; }
+    uint block = pc.first_block + local_block;
+    uint d = gl_LocalInvocationID.x;
+
+    float v = 0.0;
+    for (uint r = 0u; r < pc.ratio; ++r) {
+        v += kread((block * pc.ratio + r) * pc.head_dim + d);
+    }
+    v /= float(pc.ratio);
+    v = unpackHalf2x16(packHalf2x16(vec2(v, 0.0))).x;
+    keyv[d] = v;
+    rmsv[d] = v * v;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (d < stride) { rmsv[d] += rmsv[d + stride]; }
+        barrier();
+    }
+    float kn = v * inversesqrt(rmsv[0] / float(pc.head_dim) + pc.eps) * norm[d];
+    keyv[d] = kn;
+    barrier();
+
+    if (d < pc.rope_dim) {
+        uint pair = d >> 1u;
+        uint base = pair << 1u;
+        float angle = float(block * pc.ratio) *
+            pow(pc.theta, -2.0 * float(pair) / float(pc.rope_dim));
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = keyv[base];
+        float b = keyv[base + 1u];
+        kn = (d & 1u) == 0u ? a * c - b * s : a * s + b * c;
+    }
+    block_k[block * pc.head_dim + d] = kn;
+}

@@ -664,6 +664,7 @@ fn main() {
         ("dsv4_indexer_score", "dsv4_indexer_score", &[]),
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
+        ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_gather", "qsa_gather", &[]),
@@ -2671,6 +2672,49 @@ fn main() {
             "native_gemm_mmq_iq3_s",
             "native_gemm_mmq_iq3_s_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        // Qwen3.8 Q2_K_XL: IQ2_XS gate/up plus the one IQ3_XXS gate/up pair. These are the
+        // All variants share the exact same bucket layout and paged arena/LUT ABI as the existing
+        // IQ2_S/IQ3_S family; no ordinary dense projection is opted into this expert-only tier.
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xp",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xp32",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xpg",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xpg32",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xp",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xp32",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xpg",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xpg32",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
         // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)

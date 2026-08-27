@@ -73,6 +73,7 @@ fn qsa_index_and_gather_match_reference() {
 
     let q = be.alloc(qb.len(), BufferUsage::Activations).unwrap();
     let raw = be.alloc(rawb.len(), BufferUsage::KvCache).unwrap();
+    let block_keys = be.alloc(blocks * hd * 4, BufferUsage::KvCache).unwrap();
     let nw = be.alloc(norm.len() * 4, BufferUsage::Weights).unwrap();
     let scores = be.alloc(blocks * 4, BufferUsage::Activations).unwrap();
     let ids = be.alloc(top * 4, BufferUsage::Activations).unwrap();
@@ -101,11 +102,13 @@ fn qsa_index_and_gather_match_reference() {
     rec.qsa_indexer(
         q.as_ref(),
         raw.as_ref(),
+        block_keys.as_ref(),
         nw.as_ref(),
         scores.as_ref(),
         ids.as_ref(),
         1,
         kv_len as u32,
+        0,
         nh as u32,
         hd as u32,
         top as u32,
@@ -206,11 +209,13 @@ fn qsa_index_and_gather_match_reference() {
     rec.qsa_indexer(
         q.as_ref(),
         raw.as_ref(),
+        block_keys.as_ref(),
         nw.as_ref(),
         scores.as_ref(),
         ids.as_ref(),
         1,
         kv_len as u32,
+        0,
         nh as u32,
         hd as u32,
         top as u32,
@@ -350,6 +355,9 @@ fn qsa_batched_rows_match_causal_reference() {
 
     let index_q = be.alloc(index_qb.len(), BufferUsage::Activations).unwrap();
     let raw = be.alloc(rawb.len(), BufferUsage::KvCache).unwrap();
+    let block_keys = be
+        .alloc(max_blocks * index_hd * 4, BufferUsage::KvCache)
+        .unwrap();
     let nw = be.alloc(norm.len() * 4, BufferUsage::Weights).unwrap();
     let scores = be
         .alloc(rows * max_blocks * 4, BufferUsage::Activations)
@@ -372,11 +380,13 @@ fn qsa_batched_rows_match_causal_reference() {
     rec.qsa_indexer(
         index_q.as_ref(),
         raw.as_ref(),
+        block_keys.as_ref(),
         nw.as_ref(),
         scores.as_ref(),
         ids.as_ref(),
         rows as u32,
         kv_len as u32,
+        0,
         index_heads as u32,
         index_hd as u32,
         top as u32,

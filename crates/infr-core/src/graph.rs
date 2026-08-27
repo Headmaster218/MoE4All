@@ -420,18 +420,22 @@ pub enum Op {
         raw_window: u32,
     },
     /// Qwen3.8 QSA block selector. `k_cache` stores one raw (unnormalised, unroped) F16 index-key
-    /// row per token. Complete `ratio`-token blocks are mean-pooled, RMS-normalised and roped at
-    /// their first token position before scoring against the already normalised/roped query heads.
+    /// row per token. Newly-complete `ratio`-token blocks are mean-pooled, RMS-normalised and
+    /// roped once into `block_cache`; all later queries score that persistent F32 block key.
     /// `dst` contains the selected block indices in chronological order.
     QsaIndexer {
         q: TensorId,
         k_cache: TensorId,
+        block_cache: TensorId,
         k_norm: TensorId,
         dst: TensorId,
         /// Number of consecutive query rows. Row `r` sees
         /// `kv_len - rows + r + 1` cached tokens.
         rows: u32,
         kv_len: u32,
+        /// First block whose final key must be (re)materialized. Zero on the first sparse call;
+        /// the prior complete-block count on an incremental call.
+        compress_from: u32,
         n_head: u32,
         head_dim: u32,
         top_blocks: u32,
@@ -1433,10 +1437,14 @@ impl Op {
             Op::QsaIndexer {
                 q,
                 k_cache,
+                block_cache,
                 k_norm,
                 dst,
                 ..
-            } => (vec![q, k_cache, k_norm], vec![dst]),
+            } => (
+                vec![q, k_cache, block_cache, k_norm],
+                vec![block_cache, dst],
+            ),
             Op::QsaGather {
                 k_cache,
                 v_cache,
@@ -1700,8 +1708,13 @@ impl Graph {
                         set.insert(*raw_cache);
                         set.insert(*comp_cache);
                     }
-                    Op::QsaIndexer { k_cache, .. } => {
+                    Op::QsaIndexer {
+                        k_cache,
+                        block_cache,
+                        ..
+                    } => {
                         set.insert(*k_cache);
+                        set.insert(*block_cache);
                     }
                     Op::QsaGather {
                         k_cache, v_cache, ..

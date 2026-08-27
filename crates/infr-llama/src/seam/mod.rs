@@ -769,9 +769,18 @@ pub(crate) fn dense_act_reserve_at(
     })
 }
 
-/// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]: the residual
-/// stream for the WHOLE prompt at once — one `[ubatch, n_embd]` f32 buffer per chunk, all live
-/// across the layer boundary — where chunk-major keeps only the chunk it is running.
+/// Number of ubatches in one Qwen3.8 layer-major prefill group. Eight leaves enough same-layer
+/// work to amortize/pipeline expert staging without retaining a long prompt's four residual
+/// streams all at once.
+pub(crate) const QWEN4_PREFILL_GROUP_CHUNKS: usize = 8;
+// RX 7900 XTX pp8192 measured the combined group + graph high-water mark 18 MiB above the
+// algebraic reserve. Keep a small fixed cushion so boundary placements do not depend on that
+// model-specific scratch residue.
+const QWEN4_PREFILL_GROUP_PAD: u64 = 32 * 1024 * 1024;
+
+/// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]. Ordinary
+/// streaming models retain the whole prompt's residual rows. Qwen3.8 retains one bounded group,
+/// including its caller-owned four-stream residual and PLE rows.
 ///
 /// Priced at the full context because that is the longest prompt the session can be handed, and
 /// these buffers are allocated mid-prefill out of whatever the arenas left: an under-reserve
@@ -783,7 +792,19 @@ pub(crate) fn dense_act_reserve_at(
 pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
     let ctx = want_ctx.max(1);
     let ub = ubatch.clamp(1, ctx);
-    ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
+    if cfg.qwen4exp {
+        let rows = ctx.min(ub.saturating_mul(QWEN4_PREFILL_GROUP_CHUNKS)) as u64;
+        let residual = cfg.n_embd.saturating_mul(1 + cfg.hc_mult);
+        let ple = cfg
+            .ple_ngram_size
+            .saturating_sub(1)
+            .saturating_mul(cfg.ple_heads_per_ngram)
+            .saturating_mul(cfg.ple_head_dim);
+        rows.saturating_mul(residual.saturating_add(ple).saturating_mul(4) as u64)
+            .saturating_add(QWEN4_PREFILL_GROUP_PAD)
+    } else {
+        ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
+    }
 }
 
 /// Does this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
@@ -793,9 +814,10 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 /// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
 /// prefill cost when they stream: measured on Qwen3-14B Q8_0 at ctx 4096, the 1024-row default read
 /// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
-/// one sweep regardless of chunk count, at the cost of holding every chunk's residual stream at once
-/// ([`layer_major_act_bytes`]) — a trade that only pays when there is I/O to save, hence the default
-/// of "on exactly when the weights stream".
+/// one sweep regardless of chunk count, at the cost of holding residual streams across layer
+/// boundaries ([`layer_major_act_bytes`]). Qwen3.8 bounds that lifetime to fixed groups; ordinary
+/// streaming models retain the whole prompt. The trade pays when there is I/O to save, hence the
+/// default of "on exactly when the weights stream".
 ///
 /// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
 /// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
@@ -1527,15 +1549,31 @@ pub(crate) fn kv_bytes_estimate_fmt(
         .saturating_add(qwen4_extra)
 }
 
-/// Qwen3.8 QSA stores the unnormalised, unroped single index-key head for every token on each
-/// full-attention layer. The official cache dtype is BF16; infr's v1 QSA path keeps the same
-/// two-byte footprint in F16, matching the currently supported Qwen3.8 KV path.
-pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+/// Raw Qwen3.8 QSA index keys: one unnormalised, unroped F16 row per token.
+pub(crate) fn qsa_raw_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
     if cfg.qwen4exp && cfg.is_qwen_hybrid_attn_layer(layer) {
         ctx.saturating_mul(cfg.indexer_head_size).saturating_mul(2)
     } else {
         0
     }
+}
+
+/// Persistent final QSA keys: one F32 RMS-normalised and roped row per complete compressed block.
+pub(crate) fn qsa_block_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+    if cfg.qwen4exp && cfg.is_qwen_hybrid_attn_layer(layer) {
+        let ratio = cfg.layer_compress_ratio(layer).max(1);
+        (ctx / ratio)
+            .max(1)
+            .saturating_mul(cfg.indexer_head_size)
+            .saturating_mul(4)
+    } else {
+        0
+    }
+}
+
+/// Total per-layer QSA state charged to context placement.
+pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+    qsa_raw_cache_bytes(cfg, layer, ctx).saturating_add(qsa_block_cache_bytes(cfg, layer, ctx))
 }
 
 /// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
@@ -4848,21 +4886,35 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn qwen38_qsa_cache_prices_one_f16_index_key_row_per_full_layer() {
+    fn qwen38_qsa_cache_prices_raw_rows_and_final_block_keys() {
+        let compress_ratios: Vec<usize> = (0usize..48)
+            .map(|l| if (l + 1).is_multiple_of(4) { 4 } else { 0 })
+            .collect();
         let cfg = Config {
             qwen4exp: true,
             n_layer: 48,
             full_attn_interval: 4,
             indexer_head_size: 128,
+            compress_ratios,
             ..Default::default()
         };
         let ctx = 262_144usize;
         assert_eq!(super::qsa_cache_bytes(&cfg, 0, ctx), 0);
-        assert_eq!(super::qsa_cache_bytes(&cfg, 3, ctx), ctx * 128 * 2);
+        assert_eq!(
+            super::qsa_block_cache_bytes(&cfg, 3, 1),
+            128 * 4,
+            "a sub-block context still needs a bindable cache placeholder"
+        );
+        assert_eq!(super::qsa_raw_cache_bytes(&cfg, 3, ctx), ctx * 128 * 2);
+        assert_eq!(
+            super::qsa_block_cache_bytes(&cfg, 3, ctx),
+            (ctx / 4) * 128 * 4
+        );
+        assert_eq!(super::qsa_cache_bytes(&cfg, 3, ctx), 96 * 1024 * 1024);
         let total: usize = (0..cfg.n_layer)
             .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
             .sum();
-        assert_eq!(total, 768 * 1024 * 1024);
+        assert_eq!(total, 1152 * 1024 * 1024);
     }
 
     #[test]
@@ -4874,6 +4926,9 @@ mod seam_helper_tests {
             n_layer: 48,
             full_attn_interval: 4,
             recurrent_layers,
+            compress_ratios: (0usize..48)
+                .map(|l| if (l + 1).is_multiple_of(4) { 4 } else { 0 })
+                .collect(),
             n_kv: 2,
             head_dim: 256,
             indexer_head_size: 128,
@@ -4913,8 +4968,8 @@ mod seam_helper_tests {
             (0..cfg.n_layer)
                 .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
                 .sum::<usize>(),
-            768 * 1024 * 1024,
-            "the independent F16 QSA index cache is unchanged"
+            1152 * 1024 * 1024,
+            "QSA raw rows and persistent final block keys are independent of main KV dtype"
         );
     }
 
@@ -4952,6 +5007,33 @@ mod seam_helper_tests {
             full - super::QWEN4_PLAN_OVERLAP_RESERVE,
             2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
             "only the row-scaled part doubles; the retained decode plan is fixed"
+        );
+    }
+
+    #[test]
+    fn qwen38_layer_major_reserve_is_bounded_to_one_prefill_group() {
+        let cfg = Config {
+            qwen4exp: true,
+            n_embd: 2560,
+            hc_mult: 4,
+            ple_ngram_size: 4,
+            ple_heads_per_ngram: 2,
+            ple_head_dim: 320,
+            ..Default::default()
+        };
+        let ubatch = 1024usize;
+        let rows = ubatch * super::QWEN4_PREFILL_GROUP_CHUNKS;
+        let row_elems = cfg.n_embd * (1 + cfg.hc_mult)
+            + (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram * cfg.ple_head_dim;
+        let expected = rows as u64 * row_elems as u64 * 4 + super::QWEN4_PREFILL_GROUP_PAD;
+        assert_eq!(
+            super::layer_major_act_bytes(&cfg, 262_144, ubatch),
+            expected
+        );
+        assert_eq!(
+            super::layer_major_act_bytes(&cfg, rows / 2, ubatch),
+            (expected - super::QWEN4_PREFILL_GROUP_PAD) / 2 + super::QWEN4_PREFILL_GROUP_PAD,
+            "short prompts reserve only their live rows"
         );
     }
 

@@ -35,7 +35,9 @@ impl Rng {
 fn block_geom(dt: DType) -> (usize, usize) {
     match dt {
         DType::Iq2S => (256, 82),
+        DType::Iq2Xs => (256, 74),
         DType::Iq3S => (256, 110),
+        DType::Iq3Xxs => (256, 98),
         other => panic!("no geometry for {other:?}"),
     }
 }
@@ -485,5 +487,154 @@ fn grid_mmq_paged_expert_gemm_matches_host_under_eviction() {
         let want_y = host_expert_gemm(&down_host, &gq, &counts_host, &offsets_host, n, k);
         assert_close(&format!("paged IQ3_S {label}"), &y_out[..rows * k], &want_y);
         println!("paged IQ2_S+IQ3_S {label}: parity under eviction churn OK ({rows} rows)");
+    }
+}
+
+/// Qwen3.8 Q2_K_XL uses IQ2_XS for almost every gate/up bank and IQ3_XXS for one pair. Exercise
+/// both resident and paged kernels at the BM=32 and BM=64 routing thresholds against the GGUF
+/// decoder. The paged copy is deliberately churned through fewer slots than experts.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn qwen38_xs_grid_mmq_all_variants_match_host() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (k, n, n_expert) = (256usize, 64usize, 5usize);
+    let stride = k * n;
+
+    for dt in [DType::Iq2Xs, DType::Iq3Xxs] {
+        let banks: Vec<Vec<u8>> = (0..n_expert)
+            .map(|e| synth_bank(dt, stride, 0x38f1a5 ^ (dt as u64) ^ ((e as u64) << 32)))
+            .collect();
+        let host: Vec<Vec<f32>> = banks
+            .iter()
+            .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+            .collect();
+        let joined = banks.concat();
+        let flat = pad_to_u32_align(&joined);
+        let resident = be.alloc(flat.len(), BufferUsage::Weights).unwrap();
+        be.upload(resident.as_ref(), &flat).unwrap();
+
+        let slot_bytes = banks[0].len();
+        let mut pager = GpuPager::new(&be, n_expert, 3, slot_bytes).unwrap();
+        let staging = be.alloc_uninit(slot_bytes, BufferUsage::Staging).unwrap();
+        for eid in [0u32, 1, 2, 3, 4] {
+            pager
+                .ensure_resident(&be, staging.as_ref(), eid, &banks[eid as usize])
+                .unwrap();
+        }
+        pager.flush_lut(&be).unwrap();
+        assert!(pager.stats().evictions > 0, "test must reuse pager slots");
+
+        for (counts_host, label) in [
+            (vec![0u32, 0, 4, 3, 2], "BM32"),
+            (vec![0u32, 0, 70, 65, 65], "BM64"),
+        ] {
+            let offsets_host: Vec<u32> = {
+                let mut acc = 0;
+                counts_host
+                    .iter()
+                    .map(|&count| {
+                        let offset = acc;
+                        acc += count;
+                        offset
+                    })
+                    .collect()
+            };
+            let rows = counts_host.iter().sum::<u32>() as usize;
+            let npad = rows.div_ceil(64) * 64 + 64;
+            let x: Vec<f32> = (0..rows * k)
+                .map(|i| (((i * 43 + 19) % 79) as f32 - 39.0) * 0.009)
+                .collect();
+            let xq = quant_act(&x);
+
+            let mk_u32 = |v: &[u32]| {
+                let b = be.alloc(v.len() * 4, BufferUsage::Activations).unwrap();
+                be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+                b
+            };
+            let counts = mk_u32(&counts_host);
+            let offsets = mk_u32(&offsets_host);
+            let xbuf = be.alloc(rows * k * 4, BufferUsage::Activations).unwrap();
+            be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let qa = be.alloc(npad * k, BufferUsage::Activations).unwrap();
+            let qda = be
+                .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
+                .unwrap();
+            let qsa = be
+                .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
+                .unwrap();
+            let y_res = be.alloc(npad * n * 4, BufferUsage::Activations).unwrap();
+            let y_paged = be.alloc(npad * n * 4, BufferUsage::Activations).unwrap();
+
+            let rec = be.recorder().unwrap();
+            rec.quant_q8(
+                xbuf.as_ref(),
+                qa.as_ref(),
+                qda.as_ref(),
+                qsa.as_ref(),
+                rows,
+                k,
+            );
+            rec.matmul_mmq_experts(
+                dt,
+                "expert_gateup",
+                qa.as_ref(),
+                qda.as_ref(),
+                None,
+                resident.as_ref(),
+                0,
+                stride,
+                counts.as_ref(),
+                offsets.as_ref(),
+                y_res.as_ref(),
+                rows,
+                k,
+                n,
+                n_expert,
+                1,
+            );
+            rec.matmul_mmq_experts_paged(
+                dt,
+                "expert_gateup",
+                qa.as_ref(),
+                qda.as_ref(),
+                None,
+                pager.arena_addr(),
+                pager.slot_bytes() as u32,
+                pager.lut_buffer(),
+                0,
+                counts.as_ref(),
+                offsets.as_ref(),
+                y_paged.as_ref(),
+                rows,
+                k,
+                n,
+                n_expert,
+                1,
+            );
+            rec.finish().unwrap();
+
+            let download = |buf: &dyn infr_core::backend::Buffer| {
+                let mut bytes = vec![0u8; npad * n * 4];
+                be.download(buf, &mut bytes).unwrap();
+                bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+            };
+            let got_res = download(y_res.as_ref());
+            let got_paged = download(y_paged.as_ref());
+            let want = host_expert_gemm(&host, &xq, &counts_host, &offsets_host, k, n);
+            assert_close(
+                &format!("resident {dt:?} {label}"),
+                &got_res[..rows * n],
+                &want,
+            );
+            assert_close(
+                &format!("paged {dt:?} {label}"),
+                &got_paged[..rows * n],
+                &want,
+            );
+            println!("{dt:?} {label}: resident+paged parity OK ({rows} rows)");
+        }
     }
 }

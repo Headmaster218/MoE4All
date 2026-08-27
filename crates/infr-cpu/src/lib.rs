@@ -2151,10 +2151,12 @@ impl Backend for CpuBackend {
                 Op::QsaIndexer {
                     q,
                     k_cache,
+                    block_cache,
                     k_norm,
                     dst,
                     rows,
                     kv_len,
+                    compress_from,
                     n_head,
                     head_dim,
                     top_blocks,
@@ -2186,19 +2188,23 @@ impl Backend for CpuBackend {
                     let mut scores = vec![0.0f32; rows * max_blocks];
                     let mut selected_rows = vec![0.0f32; rows * top_blocks];
                     let mut key = vec![0.0f32; hd];
-                    for row in 0..rows {
-                        let visible = kv_len - rows + row + 1;
-                        let blocks = visible / ratio;
-                        for block in 0..blocks {
+                    let first_new = (compress_from as usize).min(max_blocks);
+                    {
+                        let block_buf = bindings
+                            .get(block_cache)
+                            .expect("cpu backend: unbound QSA block-key cache");
+                        let mut bytes = cpu_buf(block_buf).owned();
+                        let blocks_f32: &mut [f32] = bytemuck::cast_slice_mut(&mut bytes);
+                        for block in first_new..max_blocks {
                             key.fill(0.0);
                             for rr in 0..ratio {
                                 let src = (block * ratio + rr) * hd;
                                 for d in 0..hd {
-                                    key[d] += raw[src + d] / ratio as f32;
+                                    key[d] += raw[src + d];
                                 }
                             }
                             for v in &mut key {
-                                *v = half::f16::from_f32(*v).to_f32();
+                                *v = half::f16::from_f32(*v / ratio as f32).to_f32();
                             }
                             let inv = (key.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
                                 .sqrt()
@@ -2216,11 +2222,24 @@ impl Backend for CpuBackend {
                                 key[d] = a * cos - b * sin;
                                 key[d + 1] = a * sin + b * cos;
                             }
+                            blocks_f32[block * hd..(block + 1) * hd].copy_from_slice(&key);
+                        }
+                    }
+                    let block_buf = bindings
+                        .get(block_cache)
+                        .expect("cpu backend: unbound QSA block-key cache");
+                    let block_bytes = cpu_buf(block_buf).read();
+                    let block_keys: &[f32] = bytemuck::cast_slice(&block_bytes);
+                    for row in 0..rows {
+                        let visible = kv_len - rows + row + 1;
+                        let blocks = visible / ratio;
+                        for block in 0..blocks {
                             let mut score = 0.0f32;
                             let qb = row * nh * hd;
+                            let key = &block_keys[block * hd..(block + 1) * hd];
                             for h in 0..nh {
                                 score +=
-                                    dot(&q[qb + h * hd..qb + (h + 1) * hd], &key).max(0.0) * scale;
+                                    dot(&q[qb + h * hd..qb + (h + 1) * hd], key).max(0.0) * scale;
                             }
                             scores[row * max_blocks + block] = score;
                         }

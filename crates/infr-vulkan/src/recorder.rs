@@ -590,6 +590,26 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq2_s_xpg32_spv(),
             ),
         },
+        D::Iq2Xs => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq2_xs_xp",
+                g::native_gemm_mmq_iq2_xs_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq2_xs_xp32",
+                g::native_gemm_mmq_iq2_xs_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq2_xs_xpg",
+                g::native_gemm_mmq_iq2_xs_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq2_xs_xpg32",
+                g::native_gemm_mmq_iq2_xs_xpg32_spv(),
+            ),
+        },
         D::Iq3S => MoeMmqDesc {
             resident_nb: 6,
             xp: (
@@ -608,6 +628,26 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
             xpg32: (
                 "native_gemm_mmq_iq3_s_xpg32",
                 g::native_gemm_mmq_iq3_s_xpg32_spv(),
+            ),
+        },
+        D::Iq3Xxs => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq3_xxs_xp",
+                g::native_gemm_mmq_iq3_xxs_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq3_xxs_xp32",
+                g::native_gemm_mmq_iq3_xxs_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq3_xxs_xpg",
+                g::native_gemm_mmq_iq3_xxs_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq3_xxs_xpg32",
+                g::native_gemm_mmq_iq3_xxs_xpg32_spv(),
             ),
         },
         D::Mxfp4 => MoeMmqDesc {
@@ -8293,11 +8333,13 @@ impl<'a> Recorder<'a> {
         &self,
         q: &dyn Buffer,
         k_cache: &dyn Buffer,
+        block_cache: &dyn Buffer,
         k_norm: &dyn Buffer,
         scores: &dyn Buffer,
         dst: &dyn Buffer,
         rows: u32,
         kv_len: u32,
+        compress_from: u32,
         n_head: u32,
         head_dim: u32,
         top_blocks: u32,
@@ -8308,33 +8350,58 @@ impl<'a> Recorder<'a> {
         scale: f32,
     ) {
         let blocks = kv_len / ratio;
-        let score_k = self.be.kernel(
+        let first_new = compress_from.min(blocks);
+        let new_blocks = blocks - first_new;
+        if new_blocks > 0 {
+            let compress_k = self.be.kernel(
+                "qsa_indexer_compress",
+                crate::gemm::qsa_indexer_compress_spv(),
+                3,
+                28,
+            );
+            let mut push = [0u8; 28];
+            push[0..4].copy_from_slice(&first_new.to_ne_bytes());
+            push[4..8].copy_from_slice(&new_blocks.to_ne_bytes());
+            push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
+            push[12..16].copy_from_slice(&ratio.to_ne_bytes());
+            push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
+            push[20..24].copy_from_slice(&theta.to_ne_bytes());
+            push[24..28].copy_from_slice(&eps.to_ne_bytes());
+            self.dispatch_wide(
+                compress_k,
+                &[
+                    Self::vkb(k_cache),
+                    Self::vkb(k_norm),
+                    Self::vkb(block_cache),
+                ],
+                1,
+                &push,
+                new_blocks,
+            );
+        }
+
+        let score_k = self.be.kernel_sg(
             "qsa_indexer_score",
             crate::gemm::qsa_indexer_score_spv(),
-            4,
-            36,
+            3,
+            24,
+            32,
         );
-        let mut push = [0u8; 36];
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
         push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
         push[16..20].copy_from_slice(&ratio.to_ne_bytes());
-        push[20..24].copy_from_slice(&rope_dim.to_ne_bytes());
-        push[24..28].copy_from_slice(&theta.to_ne_bytes());
-        push[28..32].copy_from_slice(&eps.to_ne_bytes());
-        push[32..36].copy_from_slice(&scale.to_ne_bytes());
-        self.dispatch_wide(
+        push[20..24].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch3(
             score_k,
-            &[
-                Self::vkb(q),
-                Self::vkb(k_cache),
-                Self::vkb(k_norm),
-                Self::vkb(scores),
-            ],
+            &[Self::vkb(q), Self::vkb(block_cache), Self::vkb(scores)],
             1,
             &push,
-            rows.saturating_mul(blocks),
+            blocks.div_ceil(4),
+            rows.div_ceil(2),
+            1,
         );
 
         let topk_k = self.be.kernel(
@@ -11658,7 +11725,9 @@ mod tests {
             (D::Iq4Nl, "iq4_nl", 6),
             (D::Iq4Xs, "iq4_xs", 6),
             (D::Iq2S, "iq2_s", 6),
+            (D::Iq2Xs, "iq2_xs", 6),
             (D::Iq3S, "iq3_s", 6),
+            (D::Iq3Xxs, "iq3_xxs", 6),
             (D::Mxfp4, "mxfp4", 6),
             (D::Nvfp4, "nvfp4", 6),
             (D::Q2_0, "q2_0", 6),

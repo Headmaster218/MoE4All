@@ -1071,6 +1071,41 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         _ => return None,
     })
 }
+
+macro_rules! iq_xs_mmq_spv {
+    ($fn_name:ident, $file:literal) => {
+        #[cfg_attr(infr_profile, infr_prof::instrument)]
+        pub(crate) fn $fn_name() -> &'static [u32] {
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| spv_words(BYTES))
+        }
+    };
+}
+
+iq_xs_mmq_spv!(native_gemm_mmq_iq2_xs_xp_spv, "native_gemm_mmq_iq2_xs_xp");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xs_xp32_spv,
+    "native_gemm_mmq_iq2_xs_xp32"
+);
+iq_xs_mmq_spv!(native_gemm_mmq_iq2_xs_xpg_spv, "native_gemm_mmq_iq2_xs_xpg");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xs_xpg32_spv,
+    "native_gemm_mmq_iq2_xs_xpg32"
+);
+iq_xs_mmq_spv!(native_gemm_mmq_iq3_xxs_xp_spv, "native_gemm_mmq_iq3_xxs_xp");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq3_xxs_xp32_spv,
+    "native_gemm_mmq_iq3_xxs_xp32"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq3_xxs_xpg_spv,
+    "native_gemm_mmq_iq3_xxs_xpg"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq3_xxs_xpg32_spv,
+    "native_gemm_mmq_iq3_xxs_xpg32"
+);
 /// The f16-weight decode GEMV (`linear_f16.comp`; weight read through a typed 64-bit
 /// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
 /// resident build died with the eager `VulkanBackend::linear_f16` caller, its sole consumer).
@@ -3231,6 +3266,16 @@ pub(crate) fn qsa_indexer_score_spv() -> &'static [u32] {
         spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/qsa_indexer_score.spv"
+        )))
+    })
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn qsa_indexer_compress_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qsa_indexer_compress.spv"
         )))
     })
 }

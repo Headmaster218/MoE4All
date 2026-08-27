@@ -138,6 +138,7 @@ fn bind_layer_io<'a>(
     kbufs: &'a [Box<dyn Buffer>],
     vbufs: &'a [Box<dyn Buffer>],
     qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
+    qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
     wbufs: &'a [Box<dyn Buffer>],
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
@@ -153,6 +154,9 @@ fn bind_layer_io<'a>(
         b.bind(h.k_cache[l], kbufs[l].as_ref());
         b.bind(h.v_cache[l], vbufs[l].as_ref());
         if let (Some(id), Some(buf)) = (h.qsa_k_cache[l], &qsa_kbufs[l]) {
+            b.bind(id, buf.as_ref());
+        }
+        if let (Some(id), Some(buf)) = (h.qsa_block_cache[l], &qsa_cbufs[l]) {
             b.bind(id, buf.as_ref());
         }
     }
@@ -335,6 +339,10 @@ fn session_stable(
                 })
             }
     };
+    let qwen_grid_experts = c.qwen4exp
+        && g.tensors().iter().any(|t| {
+            t.name.ends_with("_exps.weight") && matches!(t.dtype, DType::Iq2Xs | DType::Iq3Xxs)
+        });
     Ok(SessionStable {
         has_wv,
         out_scale,
@@ -344,6 +352,7 @@ fn session_stable(
         fuse_gu,
         fuse_qkv,
         moe_batched_ok,
+        qwen_grid_experts,
     })
 }
 
@@ -399,6 +408,7 @@ pub(super) struct DecodeHandles {
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     qsa_k_cache: Vec<Option<TensorId>>,
+    qsa_block_cache: Vec<Option<TensorId>>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
@@ -515,6 +525,7 @@ pub(crate) fn generate_dense_backend(
     let fuse_gu = stable.fuse_gu;
     let fuse_qkv = stable.fuse_qkv;
     let moe_batched_ok = stable.moe_batched_ok;
+    let qwen_grid_experts = stable.qwen_grid_experts;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -1326,6 +1337,7 @@ pub(crate) fn generate_dense_backend(
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut qsa_cbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for l in 0..c.n_layer {
             // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally
             // only, so position 0 stays eligible for every query row and a ring that had wrapped
@@ -1361,10 +1373,19 @@ pub(crate) fn generate_dense_backend(
                 be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
-            let qsa_bytes = crate::seam::qsa_cache_bytes(c, l, want_ctx);
+            let qsa_bytes = crate::seam::qsa_raw_cache_bytes(c, l, want_ctx);
             qsa_kbufs.push(if qsa_bytes > 0 {
                 Some(
                     be.alloc(qsa_bytes, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            });
+            let qsa_comp_bytes = crate::seam::qsa_block_cache_bytes(c, l, want_ctx);
+            qsa_cbufs.push(if qsa_comp_bytes > 0 {
+                Some(
+                    be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 )
             } else {
@@ -1469,6 +1490,7 @@ pub(crate) fn generate_dense_backend(
             kbufs,
             vbufs,
             qsa_kbufs,
+            qsa_cbufs,
             k_fmt,
             v_fmt,
             hidden_buf,
@@ -1516,6 +1538,7 @@ pub(crate) fn generate_dense_backend(
         kbufs,
         vbufs,
         qsa_kbufs,
+        qsa_cbufs,
         k_fmt: _,
         v_fmt: _,
         hidden_buf,
@@ -1978,6 +2001,7 @@ pub(crate) fn generate_dense_backend(
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
         let mut qsa_k_cache = Vec::new();
+        let mut qsa_block_cache = Vec::new();
         for l in 0..c.n_layer {
             if c.is_recurrent_layer(l) {
                 let conv_elems = (c.ssm_d_conv - 1) * c.recurrent_conv_channels();
@@ -1985,6 +2009,7 @@ pub(crate) fn generate_dense_backend(
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
                 qsa_k_cache.push(None);
+                qsa_block_cache.push(None);
                 continue;
             }
             if c.deepseek4 {
@@ -1998,6 +2023,7 @@ pub(crate) fn generate_dense_backend(
                     DType::U32,
                 )));
                 qsa_k_cache.push(None);
+                qsa_block_cache.push(None);
                 continue;
             }
             // Declared rows MUST equal the allocation above — same widths from the same helper
@@ -2009,8 +2035,14 @@ pub(crate) fn generate_dense_backend(
             k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
             v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
             qsa_k_cache.push(
-                (crate::seam::qsa_cache_bytes(c, l, max_ctx) > 0)
+                (crate::seam::qsa_raw_cache_bytes(c, l, max_ctx) > 0)
                     .then(|| g.input(f16d(max_ctx * c.indexer_head_size))),
+            );
+            qsa_block_cache.push(
+                (crate::seam::qsa_block_cache_bytes(c, l, max_ctx) > 0).then(|| {
+                    let ratio = c.layer_compress_ratio(l).max(1);
+                    g.input(f32d((max_ctx / ratio).max(1) * c.indexer_head_size))
+                }),
             );
         }
 
@@ -4678,6 +4710,8 @@ pub(crate) fn generate_dense_backend(
                 let qsa_query = if let Some(qw) = aw.qsa {
                     let cache = qsa_k_cache[l]
                         .expect("a qwen4exp full-attention layer declares a QSA key cache");
+                    let block_cache = qsa_block_cache[l]
+                        .expect("a qwen4exp full-attention layer declares a QSA block cache");
                     g.push(Op::Linear {
                         x: hn,
                         weight: qw.k_proj,
@@ -4717,7 +4751,7 @@ pub(crate) fn generate_dense_backend(
                         freq_factors: layer_ff,
                         x_stride: 0,
                     });
-                    Some((qsa_q16, cache, qw.k_norm))
+                    Some((qsa_q16, cache, block_cache, qw.k_norm))
                 } else {
                     None
                 };
@@ -4729,15 +4763,21 @@ pub(crate) fn generate_dense_backend(
                         start_pos + 1 > qsa_threshold,
                         "a batched QSA span must not cross the dense-to-sparse boundary"
                     );
-                    let (ix_q, ix_k, ix_norm) = qsa_query.expect("batched QSA query");
+                    let (ix_q, ix_k, ix_blocks, ix_norm) = qsa_query.expect("batched QSA query");
                     let selected = c.indexer_top_k / qsa_ratio;
                     g.push(Op::QsaIndexer {
                         q: ix_q,
                         k_cache: ix_k,
+                        block_cache: ix_blocks,
                         k_norm: ix_norm,
                         dst: qsa_indices,
                         rows: batch as u32,
                         kv_len: visible as u32,
+                        compress_from: if start_pos <= qsa_threshold {
+                            0
+                        } else {
+                            (start_pos / qsa_ratio) as u32
+                        },
                         n_head: c.indexer_n_head as u32,
                         head_dim: c.indexer_head_size as u32,
                         top_blocks: selected as u32,
@@ -4763,46 +4803,53 @@ pub(crate) fn generate_dense_backend(
                         scale,
                     });
                 } else {
-                    let (attn_k, attn_v, attn_len, attn_pos) = if let Some((ix_q, ix_k, ix_norm)) =
-                        qsa_query.filter(|_| visible > qsa_threshold)
-                    {
-                        debug_assert_eq!(batch, 1);
-                        let complete = visible / qsa_ratio;
-                        let tail = visible % qsa_ratio;
-                        let selected = (c.indexer_top_k / qsa_ratio).min(complete);
-                        g.push(Op::QsaIndexer {
-                            q: ix_q,
-                            k_cache: ix_k,
-                            k_norm: ix_norm,
-                            dst: qsa_indices,
-                            rows: 1,
-                            kv_len: visible as u32,
-                            n_head: c.indexer_n_head as u32,
-                            head_dim: c.indexer_head_size as u32,
-                            top_blocks: selected as u32,
-                            ratio: qsa_ratio as u32,
-                            rope_dim: c.rope_dim as u32,
-                            theta,
-                            eps,
-                            scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
-                        });
-                        g.push(Op::QsaGather {
-                            k_cache: k_cache[kv_src],
-                            v_cache: v_cache[kv_src],
-                            indices: qsa_indices,
-                            k_dst: qsa_gather_k,
-                            v_dst: qsa_gather_v,
-                            selected_blocks: selected as u32,
-                            complete_blocks: complete as u32,
-                            tail: tail as u32,
-                            ratio: qsa_ratio as u32,
-                            row_elems: kvrow as u32,
-                        });
-                        let gathered = selected * qsa_ratio + tail;
-                        (qsa_gather_k, qsa_gather_v, gathered, gathered - 1)
-                    } else {
-                        (k_cache[kv_src], v_cache[kv_src], visible, start_pos)
-                    };
+                    let (attn_k, attn_v, attn_len, attn_pos) =
+                        if let Some((ix_q, ix_k, ix_blocks, ix_norm)) =
+                            qsa_query.filter(|_| visible > qsa_threshold)
+                        {
+                            debug_assert_eq!(batch, 1);
+                            let complete = visible / qsa_ratio;
+                            let tail = visible % qsa_ratio;
+                            let selected = (c.indexer_top_k / qsa_ratio).min(complete);
+                            g.push(Op::QsaIndexer {
+                                q: ix_q,
+                                k_cache: ix_k,
+                                block_cache: ix_blocks,
+                                k_norm: ix_norm,
+                                dst: qsa_indices,
+                                rows: 1,
+                                kv_len: visible as u32,
+                                compress_from: if start_pos <= qsa_threshold {
+                                    0
+                                } else {
+                                    (start_pos / qsa_ratio) as u32
+                                },
+                                n_head: c.indexer_n_head as u32,
+                                head_dim: c.indexer_head_size as u32,
+                                top_blocks: selected as u32,
+                                ratio: qsa_ratio as u32,
+                                rope_dim: c.rope_dim as u32,
+                                theta,
+                                eps,
+                                scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                            });
+                            g.push(Op::QsaGather {
+                                k_cache: k_cache[kv_src],
+                                v_cache: v_cache[kv_src],
+                                indices: qsa_indices,
+                                k_dst: qsa_gather_k,
+                                v_dst: qsa_gather_v,
+                                selected_blocks: selected as u32,
+                                complete_blocks: complete as u32,
+                                tail: tail as u32,
+                                ratio: qsa_ratio as u32,
+                                row_elems: kvrow as u32,
+                            });
+                            let gathered = selected * qsa_ratio + tail;
+                            (qsa_gather_k, qsa_gather_v, gathered, gathered - 1)
+                        } else {
+                            (k_cache[kv_src], v_cache[kv_src], visible, start_pos)
+                        };
                     g.push(Op::Attention {
                         q: q_attn,
                         k_cache: attn_k,
@@ -5623,6 +5670,7 @@ pub(crate) fn generate_dense_backend(
                 k_cache,
                 v_cache,
                 qsa_k_cache,
+                qsa_block_cache,
                 weights,
             },
         )
@@ -5903,6 +5951,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &qsa_kbufs[..],
+            &qsa_cbufs[..],
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6157,6 +6206,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &qsa_kbufs[..],
+            &qsa_cbufs[..],
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6321,10 +6371,8 @@ pub(crate) fn generate_dense_backend(
     // use; Q5_1 is what the shipped gemma-4-26B-A4B-it-GGUF's down banks use (29/30 layers);
     // unsloth-dynamic Qwen3.6-MoE (UD) quants mix Q5_K/Q6_K/IQ4_XS into gate/up/down banks across
     // layers; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down (Q3_K); IQ2_S/IQ3_S is
-    // the UD-IQ3_S file's expert pair (grid-codebook mmq via shared-LUT staging). The remaining
-    // codebook quants (IQ1_*/IQ2_XXS/IQ2_XS/IQ3_XXS/TQ*) have no dp4a-mmq kernel. Qwen3.8 Flash
-    // Next's UD-Q2_K_XL does ship IQ2_XS/IQ3_XXS expert banks; when those banks are paged, its
-    // correctness-first batched path uses the existing shape-general paged id/idm-GEMV floor.
+    // the UD-IQ3_S file's expert pair (grid-codebook mmq via shared-LUT staging). Qwen3.8 Flash
+    // Next's UD-Q2_K_XL adds IQ2_XS/IQ3_XXS expert banks, covered by their paged MMQ variants.
     // A resident model still needs the ordinary MOE_MMQ_DTYPES eligibility below.
     // `MOE_MMQ_DTYPES` is the SINGLE SOURCE OF TRUTH this closure and the Vulkan adapter's batched
     // `Op::MoeFfn` gate (its `mmq_ok`) both derive from — a mismatch either silently falls back to
@@ -6347,9 +6395,7 @@ pub(crate) fn generate_dense_backend(
     // `build`), and no `batch > 1` V4 graph has ever been EXECUTED — the only V4 fixture that
     // exists writes f32 expert banks, so `moe_batched_ok` is false for it and nothing here could
     // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
-    // Qwen3.8's correctness-first batched path may use the existing multi-row paged id-GEMV for
-    // expert dtypes that do not yet have MMQ (IQ2_XS/IQ3_XXS). Its row-aware QSA kernel consumes
-    // either F16 or planar-Q8 K/V.
+    // Qwen3.8's row-aware QSA kernel consumes either F16 or planar-Q8 K/V.
     let batched_prefill_ok = if c.qwen4exp {
         matches!(k_fmt, DType::F16 | DType::Q8_0)
             && matches!(v_fmt, DType::F16 | DType::Q8_0)
@@ -6396,7 +6442,16 @@ pub(crate) fn generate_dense_backend(
         // SWA ring is untouched by the reorder — its bound is per layer and per dispatch
         // ("window + one chunk", see `kv_rows`), and each layer's ring still sees exactly the same
         // ascending sequence of writes it saw chunk-major.
-        let layer_major = crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b);
+        // A single Qwen3.8 chunk has no repeated expert sweep to amortize: splitting it into one
+        // execute per layer only inserts 48 queue-drain boundaries. Enable the MoE-driven
+        // layer-major order when there are multiple chunks; dense paging keeps its established
+        // behavior because it may need the order even for one chunk.
+        let qwen_moe_streaming = c.qwen4exp
+            && qwen_grid_experts
+            && be.moe_paged()
+            && pf_end.saturating_sub(start) > ubatch;
+        let streaming = be.dense_paged() || qwen_moe_streaming;
+        let layer_major = crate::seam::layer_major_prefill(ec, &caps, streaming, !e2b);
         let spans: Vec<std::ops::Range<usize>> = if layer_major {
             (0..c.n_layer).map(|l| l..l + 1).collect()
         } else {
@@ -6444,233 +6499,265 @@ pub(crate) fn generate_dense_backend(
             /// Qwen3.8 PLE rows, flattened in prompt-token order.
             ple_embd: Option<Box<dyn Buffer>>,
         }
+        let group_chunks = if layer_major && c.qwen4exp {
+            crate::seam::QWEN4_PREFILL_GROUP_CHUNKS
+        } else {
+            chunks.len().max(1)
+        };
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
-        for (si, span) in spans.iter().enumerate() {
-            for (ci, &(cstart, cend)) in chunks.iter().enumerate() {
-                // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
-                // The chunk that was already in flight is not cut off — the backend drains it and
-                // returns `Error::Aborted` from `be.execute` below, which lands here as the same
-                // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
-                // so this is an error and not a partial success; the CLI turns the latched signal
-                // into the conventional 130/143 exit status regardless of what this call returns.
-                if crate::sampling::abort_requested(req) {
-                    anyhow::bail!("aborted: shutdown requested");
-                }
-                // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
-                // the baton to whichever sequence has been waiting longest.
-                let _gp = req.and_then(|r| r.gate_pass());
-                let pf_m = cend - cstart;
-                if live[ci].is_none() {
-                    // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
-                    // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
-                    // the old f32 rows upload (4*n_embd*pf_m bytes).
-                    let input = if gpu_embed {
-                        let ids: Vec<i32> =
-                            prompt[cstart..cend].iter().map(|&t| t as i32).collect();
-                        let b = be
-                            .alloc(pf_m * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        b
-                    } else {
-                        let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-                        let token_embd = token_embd.get()?; // host embed gather → materialize
-                        for &tok in &prompt[cstart..cend] {
-                            let base = tok as usize * ne;
-                            pf_hidden.extend(
-                                token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
-                            );
+        for group_start in (0..chunks.len()).step_by(group_chunks) {
+            let group_end = (group_start + group_chunks).min(chunks.len());
+            let preallocate_group = layer_major && c.qwen4exp;
+            let passes = if preallocate_group { 2 } else { 1 };
+            for pass in 0..passes {
+                let materialize_only = preallocate_group && pass == 0;
+                for (si, span) in spans.iter().enumerate() {
+                    if materialize_only && si != 0 {
+                        break;
+                    }
+                    for (ci, &(cstart, cend)) in
+                        chunks.iter().enumerate().take(group_end).skip(group_start)
+                    {
+                        // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
+                        // The chunk that was already in flight is not cut off — the backend drains it and
+                        // returns `Error::Aborted` from `be.execute` below, which lands here as the same
+                        // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
+                        // so this is an error and not a partial success; the CLI turns the latched signal
+                        // into the conventional 130/143 exit status regardless of what this call returns.
+                        if crate::sampling::abort_requested(req) {
+                            anyhow::bail!("aborted: shutdown requested");
                         }
-                        let b = be
-                            .alloc(pf_m * ne * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        b
-                    };
-                    // The residual stream. A layer-span build carries `hidden` in a CALLER-owned
-                    // buffer rather than graph scratch, so the chunk owns one: on the host-embed
-                    // path the uploaded rows already ARE the layer stack's input and `input`
-                    // serves, while the gpu_embed path uploads ids there and the in-graph gather
-                    // needs somewhere to write. Sized EXACTLY like the `[batch, n_embd]` handle it
-                    // binds — the interpreters' write-back is a length-checked `copy_from_slice`
-                    // against the declared numel, and the host-embed path has always bound this
-                    // shape, so nothing writes past it.
-                    let resid = if gpu_embed {
-                        Some(
-                            be.alloc(pf_m * ne * 4, BufferUsage::Activations)
-                                .map_err(|e| anyhow!("{e}"))?,
-                        )
-                    } else {
-                        None
-                    };
-                    // Absolute positions [cstart, ..., cend-1].
-                    let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
-                    let pos = be
-                        .alloc(pf_m * 4, BufferUsage::Staging)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
-                        .map_err(|e| anyhow!("{e}"))?;
-                    // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
-                    // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
-                    // prologue).
-                    let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
-                        let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
-                        let b = be
-                            .alloc(rows.len() * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    let qwen_wide = if c.qwen4exp {
-                        Some(
-                            be.alloc(pf_m * c.hc_mult * ne * 4, BufferUsage::Activations)
-                                .map_err(|e| anyhow!("{e}"))?,
-                        )
-                    } else {
-                        None
-                    };
-                    let ple_embd = if c.qwen4exp {
-                        let rows = ple_worker
-                            .as_ref()
-                            .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                            .submit_range(prompt, cstart, pf_m, c.ple_ngram_size)?
-                            .wait()?;
-                        let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
-                        let expected = pf_m * heads * c.ple_head_dim;
-                        if rows.len() != expected {
-                            return Err(anyhow!(
-                                "qwen4exp batched PLE produced {} values, expected {expected}",
-                                rows.len()
-                            ));
-                        }
-                        let b = be
-                            .alloc(rows.len() * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    live[ci] = Some(PfChunk {
-                        m: pf_m,
-                        input,
-                        resid,
-                        pos,
-                        ipl,
-                        qwen_wide,
-                        ple_embd,
-                    });
-                }
-                let ch = live[ci]
-                    .as_ref()
-                    .expect("the chunk's buffers were just materialized");
-                let pf_t0 = std::time::Instant::now();
-                // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
-                // chunk's logits — the decode loop below feeds the LAST prompt token itself and
-                // samples from its own fresh logits — so the LM-head tail (whole-chunk
-                // output_norm, last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On
-                // a 262k-vocab model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm
-                // per chunk.
-                // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path
-                // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
-                // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
-                // will add alongside the actual head forward.
-                let (pf_g, pf_h) = build(
-                    ch.m,
-                    cstart,
-                    0,
-                    false,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    // The token-id input + in-graph gather belong to the span that STARTS the
-                    // stack; a later span reads the residual stream that one left behind.
-                    gpu_embed && span.start == 0,
-                    false, // mtp_verify: ordinary chunked prefill, not MTP verify
-                    Some(span.clone()),
-                );
-                let t_build = pf_t0.elapsed();
-                let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
-                let t_compile = pf_t0.elapsed();
-                let mut pf_b = Bindings::new();
-                if let Some(ids) = pf_h.tok_ids {
-                    pf_b.bind(ids, ch.input.as_ref());
-                }
-                pf_b.bind(
-                    pf_h.hidden,
-                    ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
-                );
-                pf_b.bind(pf_h.positions, ch.pos.as_ref());
-                if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
-                    pf_b.bind(pid, ib.as_ref());
-                }
-                // gemma4's proportional-RoPE divisors + the K/V caches + the weights
-                // (`bind_layer_io`): without the `rope_freqs` bind the batched graph has a live
-                // unbound Input and panics.
-                bind_layer_io(
-                    &mut pf_b,
-                    &pf_h,
-                    c.n_layer,
-                    rf_buf,
-                    yff_buf,
-                    &kbufs[..],
-                    &vbufs[..],
-                    &qsa_kbufs[..],
-                    &wbufs[..],
-                    if c.qwen4exp {
-                        &ch.qwen_wide
-                    } else {
-                        qwen_wide_buf
-                    },
-                    if c.qwen4exp {
-                        &ch.ple_embd
-                    } else {
-                        ple_embd_buf
-                    },
-                    ple_state_buf,
-                );
-                debug_assert!(
-                    pf_h.logits.is_none(),
-                    "headless prefill build has no logits"
-                );
-                be.execute(pf_plan.as_ref(), &pf_b)
-                    .map_err(|e| anyhow!("{e}"))?;
-                if Some(cend) == turn_checkpoint_boundary {
-                    if let Some(ck) = turn_recurrent_ckpt.as_mut() {
-                        if layer_major {
-                            ck.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                        // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
+                        // the baton to whichever sequence has been waiting longest.
+                        let _gp = if materialize_only {
+                            None
                         } else {
-                            ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                            req.and_then(|r| r.gate_pass())
+                        };
+                        let pf_m = cend - cstart;
+                        if live[ci].is_none() {
+                            // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
+                            // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
+                            // the old f32 rows upload (4*n_embd*pf_m bytes).
+                            let input = if gpu_embed {
+                                let ids: Vec<i32> =
+                                    prompt[cstart..cend].iter().map(|&t| t as i32).collect();
+                                let b = be
+                                    .alloc(pf_m * 4, BufferUsage::Staging)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                b
+                            } else {
+                                let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+                                let token_embd = token_embd.get()?; // host embed gather → materialize
+                                for &tok in &prompt[cstart..cend] {
+                                    let base = tok as usize * ne;
+                                    pf_hidden.extend(
+                                        token_embd[base..base + ne]
+                                            .iter()
+                                            .map(|&x| x * embed_scale),
+                                    );
+                                }
+                                let b = be
+                                    .alloc(pf_m * ne * 4, BufferUsage::Staging)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                b
+                            };
+                            // The residual stream. A layer-span build carries `hidden` in a CALLER-owned
+                            // buffer rather than graph scratch, so the chunk owns one: on the host-embed
+                            // path the uploaded rows already ARE the layer stack's input and `input`
+                            // serves, while the gpu_embed path uploads ids there and the in-graph gather
+                            // needs somewhere to write. Sized EXACTLY like the `[batch, n_embd]` handle it
+                            // binds — the interpreters' write-back is a length-checked `copy_from_slice`
+                            // against the declared numel, and the host-embed path has always bound this
+                            // shape, so nothing writes past it.
+                            let resid = if gpu_embed {
+                                Some(
+                                    be.alloc(pf_m * ne * 4, BufferUsage::Activations)
+                                        .map_err(|e| anyhow!("{e}"))?,
+                                )
+                            } else {
+                                None
+                            };
+                            // Absolute positions [cstart, ..., cend-1].
+                            let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
+                            let pos = be
+                                .alloc(pf_m * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
+                            // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
+                            // prologue).
+                            let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
+                                let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
+                                let b = be
+                                    .alloc(rows.len() * 4, BufferUsage::Staging)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                Some(b)
+                            } else {
+                                None
+                            };
+                            let qwen_wide = if c.qwen4exp {
+                                Some(
+                                    be.alloc(pf_m * c.hc_mult * ne * 4, BufferUsage::Activations)
+                                        .map_err(|e| anyhow!("{e}"))?,
+                                )
+                            } else {
+                                None
+                            };
+                            let ple_embd = if c.qwen4exp {
+                                let rows = ple_worker
+                                    .as_ref()
+                                    .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                                    .submit_range(prompt, cstart, pf_m, c.ple_ngram_size)?
+                                    .wait()?;
+                                let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+                                let expected = pf_m * heads * c.ple_head_dim;
+                                if rows.len() != expected {
+                                    return Err(anyhow!(
+                                    "qwen4exp batched PLE produced {} values, expected {expected}",
+                                    rows.len()
+                                ));
+                                }
+                                let b = be
+                                    .alloc(rows.len() * 4, BufferUsage::Staging)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                Some(b)
+                            } else {
+                                None
+                            };
+                            live[ci] = Some(PfChunk {
+                                m: pf_m,
+                                input,
+                                resid,
+                                pos,
+                                ipl,
+                                qwen_wide,
+                                ple_embd,
+                            });
+                        }
+                        // Claim every long-lived buffer in this group before the first execute lets
+                        // the expert pager lay its asynchronous Prefill ring over the elastic arena.
+                        // The buffers were already included in placement; this preserves a contiguous
+                        // home for them instead of asking for it after the ring fragmented the room.
+                        if materialize_only {
+                            continue;
+                        }
+                        let ch = live[ci]
+                            .as_ref()
+                            .expect("the chunk's buffers were just materialized");
+                        let pf_t0 = std::time::Instant::now();
+                        // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
+                        // chunk's logits — the decode loop below feeds the LAST prompt token itself and
+                        // samples from its own fresh logits — so the LM-head tail (whole-chunk
+                        // output_norm, last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On
+                        // a 262k-vocab model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm
+                        // per chunk.
+                        // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path
+                        // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
+                        // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
+                        // will add alongside the actual head forward.
+                        let (pf_g, pf_h) = build(
+                            ch.m,
+                            cstart,
+                            0,
+                            false,
+                            None,
+                            false,
+                            false,
+                            false,
+                            false,
+                            // The token-id input + in-graph gather belong to the span that STARTS the
+                            // stack; a later span reads the residual stream that one left behind.
+                            gpu_embed && span.start == 0,
+                            false, // mtp_verify: ordinary chunked prefill, not MTP verify
+                            Some(span.clone()),
+                        );
+                        let t_build = pf_t0.elapsed();
+                        let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
+                        let t_compile = pf_t0.elapsed();
+                        let mut pf_b = Bindings::new();
+                        if let Some(ids) = pf_h.tok_ids {
+                            pf_b.bind(ids, ch.input.as_ref());
+                        }
+                        pf_b.bind(
+                            pf_h.hidden,
+                            ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
+                        );
+                        pf_b.bind(pf_h.positions, ch.pos.as_ref());
+                        if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
+                            pf_b.bind(pid, ib.as_ref());
+                        }
+                        // gemma4's proportional-RoPE divisors + the K/V caches + the weights
+                        // (`bind_layer_io`): without the `rope_freqs` bind the batched graph has a live
+                        // unbound Input and panics.
+                        bind_layer_io(
+                            &mut pf_b,
+                            &pf_h,
+                            c.n_layer,
+                            rf_buf,
+                            yff_buf,
+                            &kbufs[..],
+                            &vbufs[..],
+                            &qsa_kbufs[..],
+                            &qsa_cbufs[..],
+                            &wbufs[..],
+                            if c.qwen4exp {
+                                &ch.qwen_wide
+                            } else {
+                                qwen_wide_buf
+                            },
+                            if c.qwen4exp {
+                                &ch.ple_embd
+                            } else {
+                                ple_embd_buf
+                            },
+                            ple_state_buf,
+                        );
+                        debug_assert!(
+                            pf_h.logits.is_none(),
+                            "headless prefill build has no logits"
+                        );
+                        be.execute(pf_plan.as_ref(), &pf_b)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        if Some(cend) == turn_checkpoint_boundary {
+                            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+                                if layer_major {
+                                    ck.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                                } else {
+                                    ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                                }
+                            }
+                        }
+                        // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
+                        // build, plan compile, and execute (record + submit + GPU) — where a small-batch
+                        // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
+                        // the layer span, the whole model unless this is a layer-major prefill.
+                        if ec.prof.stages {
+                            tracing::info!(
+                            "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
+                            ch.m,
+                            span.start,
+                            span.end,
+                            t_build.as_secs_f64() * 1e3,
+                            (t_compile - t_build).as_secs_f64() * 1e3,
+                            (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                        );
+                        }
+                        prompt_t += pf_t0.elapsed();
+                        // Last span for this chunk: its uploads and its residual stream are dead.
+                        if si + 1 == spans.len() {
+                            live[ci] = None;
                         }
                     }
-                }
-                // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
-                // build, plan compile, and execute (record + submit + GPU) — where a small-batch
-                // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
-                // the layer span, the whole model unless this is a layer-major prefill.
-                if ec.prof.stages {
-                    tracing::info!(
-                        "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
-                        ch.m,
-                        span.start,
-                        span.end,
-                        t_build.as_secs_f64() * 1e3,
-                        (t_compile - t_build).as_secs_f64() * 1e3,
-                        (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
-                    );
-                }
-                prompt_t += pf_t0.elapsed();
-                // Last span for this chunk: its uploads and its residual stream are dead.
-                if si + 1 == spans.len() {
-                    live[ci] = None;
                 }
             }
         }
@@ -6785,6 +6872,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &qsa_kbufs[..],
+            &qsa_cbufs[..],
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -7065,6 +7153,7 @@ pub(crate) fn generate_dense_backend(
                 &kbufs[..],
                 &vbufs[..],
                 &qsa_kbufs[..],
+                &qsa_cbufs[..],
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7118,6 +7207,7 @@ pub(crate) fn generate_dense_backend(
                 &kbufs[..],
                 &vbufs[..],
                 &qsa_kbufs[..],
+                &qsa_cbufs[..],
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7170,6 +7260,7 @@ pub(crate) fn generate_dense_backend(
                 &kbufs[..],
                 &vbufs[..],
                 &qsa_kbufs[..],
+                &qsa_cbufs[..],
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7351,11 +7442,15 @@ pub(crate) fn generate_dense_backend(
     // that does not hold.
     if let Some(peak) = be.activation_peak() {
         let rows = crate::seam::ubatch_rows(ec);
+        let qwen_grouped = c.qwen4exp
+            && qwen_grid_experts
+            && be.moe_paged()
+            && prompt.len().saturating_sub(1).saturating_sub(start) > rows;
         // Both halves of what a prefill holds live, so the comparison stays honest in either
-        // order: the per-chunk scratch, plus — layer-major only — the whole prompt's residual
-        // stream, which is exactly what the placement budgets were told to leave room for.
+        // order: per-chunk scratch plus the layer-major residual set (whole prompt normally,
+        // one bounded group on Qwen3.8), exactly as priced during placement.
         let reserved = crate::seam::dense_act_reserve_at(c, &caps, max_ctx, rows).saturating_add(
-            if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b) {
+            if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || qwen_grouped, !e2b) {
                 crate::seam::layer_major_act_bytes(c, max_ctx, rows)
             } else {
                 0

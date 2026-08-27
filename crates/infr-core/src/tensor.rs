@@ -158,18 +158,15 @@ impl DType {
 ///     staging loop would degenerate into the same scalar decode the idm fallback already does;
 ///     TQ2_0 would map, but no shipped MoE GGUF quantizes expert banks ternary, so neither earns
 ///     a kernel until one does.
-///   * `Iq1S`/`Iq1M`/`Iq2Xxs`/`Iq2Xs`/`Iq3Xxs` (remaining grid i-quants): NOT ALU-impossible —
+///   * `Iq1S`/`Iq1M`/`Iq2Xxs` (remaining grid i-quants): NOT ALU-impossible —
 ///     the original "grid gather + sign staging is ALU-bound" rationale was DISPROVEN by the
 ///     shared-memory grid-LUT staging fix (grid_init(); see build.rs::gen_grids) and the shipped
 ///     `Iq2S`/`Iq3S` mmq kernels (one shared gather serves four staged int8 bytes, reused BM
 ///     times by the dp4a loop — same ~20% staging overhead Q3_K carries, near-Q3_K throughput
-///     measured). Qwen3.8-Flash-Next UD-Q2_K_XL now ships IQ2_XS gate/up banks (plus one IQ3_XXS
-///     pair), but qwen4exp v1 deliberately keeps prefill on the per-token path; its decode and
-///     prefill therefore use the fully covered paged id/idm-GEMV floor. These five stay out of the
-///     *batched* family until a caller can use that path. Each maps to the same recipe (IQ2_XS/
-///     IQ2_XXS ≙ IQ2_S with KSIGNS-packed signs at BLK=16; IQ3_XXS ≙ IQ3_S with KSIGNS at
-///     BLK=32; IQ1_S/IQ1_M add the ±0.125 delta as a per-sub-block `sact`-style correction since
-///     Σ±delta·x needs the activation sum).
+///     measured). IQ2_XS and IQ3_XXS are now covered because Qwen3.8-Flash-Next UD-Q2_K_XL ships
+///     them in its gate/up banks. IQ2_XXS maps to the same IQ2 recipe but has no shipped MoE caller;
+///     IQ1_S/IQ1_M additionally need the ±0.125 delta as a per-sub-block `sact`-style correction
+///     since Σ±delta·x needs the activation sum, so those three remain on id-GEMV for now.
 ///   * `Bf16`/`F16`/`F32` (float weights): not dp4a material at all — no integer codes to feed
 ///     the packed int8 dot; they ride the float GEMM/GEMV routes.
 pub const MOE_MMQ_DTYPES: &[DType] = &[
@@ -186,7 +183,9 @@ pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Iq4Nl,
     DType::Iq4Xs,
     DType::Iq2S,
+    DType::Iq2Xs,
     DType::Iq3S,
+    DType::Iq3Xxs,
     DType::Mxfp4,
     DType::Nvfp4,
     // Q2_0 (Bonsai ternary): symmetric small-int — codes-1 = {-1,0,+1,+2} feed dp4a directly
@@ -238,7 +237,9 @@ pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
     DType::Iq4Nl,
     DType::Iq4Xs,
     DType::Iq2S,
+    DType::Iq2Xs,
     DType::Iq3S,
+    DType::Iq3Xxs,
     DType::Mxfp4,
     DType::Nvfp4,
     DType::Q2_0,

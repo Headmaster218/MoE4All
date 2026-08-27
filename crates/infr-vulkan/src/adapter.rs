@@ -2577,10 +2577,12 @@ fn lower_op(
         Op::QsaIndexer {
             q,
             k_cache,
+            block_cache,
             k_norm,
             dst,
             rows,
             kv_len,
+            compress_from,
             n_head,
             head_dim,
             top_blocks,
@@ -2621,11 +2623,13 @@ fn lower_op(
             rec.qsa_indexer(
                 r(*q)?,
                 r(*k_cache)?,
+                r(*block_cache)?,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
                 r(*dst)?,
                 *rows,
                 *kv_len,
+                *compress_from,
                 *n_head,
                 *head_dim,
                 *top_blocks,
@@ -7877,6 +7881,9 @@ fn execute_paged_moe<'a>(
                 *weight_before,
             ),
         }
+    }
+    if layer_stream {
+        prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
     }
     Ok(()) // recorded inline — the ambient segment stays open
 }

@@ -364,6 +364,8 @@ pub(crate) struct SessionStable {
     pub(super) fuse_qkv: bool,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
     pub(super) moe_batched_ok: bool,
+    /// Qwen3.8 expert banks whose large MMQ scratch requires bounded layer-major prompt groups.
+    pub(super) qwen_grid_experts: bool,
 }
 
 pub(crate) struct SeamKv {
@@ -377,6 +379,8 @@ pub(crate) struct SeamKv {
     /// Qwen3.8 QSA raw index-key cache. Full-attention layers own one F16 row per token;
     /// recurrent layers have no entry.
     pub(super) qsa_kbufs: Vec<Option<Box<dyn Buffer>>>,
+    /// Qwen3.8 QSA final block-key cache. Each complete compressed block owns one F32 row.
+    pub(super) qsa_cbufs: Vec<Option<Box<dyn Buffer>>>,
     /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
     /// forked slot sizes + copies its buffers to match this slot's layout.
     pub(super) k_fmt: DType,
@@ -691,7 +695,7 @@ impl SeamKv {
                     .map_err(|e| anyhow!("{e}"))?;
             }
             if cfg.qwen4exp {
-                for cache in self.qsa_kbufs.iter().flatten() {
+                for cache in self.qsa_kbufs.iter().chain(&self.qsa_cbufs).flatten() {
                     let zeros = vec![0u8; cache.len_bytes()];
                     be.upload(cache.as_ref(), &zeros)
                         .map_err(|e| anyhow!("{e}"))?;
@@ -858,6 +862,7 @@ impl SeamKv {
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut qsa_cbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for l in 0..cfg.n_layer {
             let (k_bytes, v_bytes) = crate::seam::layer_state_bytes(
                 cfg,
@@ -876,10 +881,19 @@ impl SeamKv {
                 be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
-            let qsa_bytes = crate::seam::qsa_cache_bytes(cfg, l, self.max_ctx);
+            let qsa_bytes = crate::seam::qsa_raw_cache_bytes(cfg, l, self.max_ctx);
             qsa_kbufs.push(if qsa_bytes > 0 {
                 Some(
                     be.alloc(qsa_bytes, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            });
+            let qsa_comp_bytes = crate::seam::qsa_block_cache_bytes(cfg, l, self.max_ctx);
+            qsa_cbufs.push(if qsa_comp_bytes > 0 {
+                Some(
+                    be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 )
             } else {
@@ -914,6 +928,17 @@ impl SeamKv {
                     ));
                 }
             }
+            match (&qsa_cbufs[l], &self.qsa_cbufs[l]) {
+                (Some(forked), Some(src)) if forked.len_bytes() == src.len_bytes() => {}
+                (None, None) => {}
+                (forked, src) => {
+                    return Err(anyhow!(
+                        "forked QSA block cache geometry differs from its source at layer {l}: {:?} vs {:?}",
+                        forked.as_ref().map(|b| b.len_bytes()),
+                        src.as_ref().map(|b| b.len_bytes())
+                    ));
+                }
+            }
         }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
@@ -921,6 +946,7 @@ impl SeamKv {
             kbufs,
             vbufs,
             qsa_kbufs,
+            qsa_cbufs,
             k_fmt: self.k_fmt,
             v_fmt: self.v_fmt,
             hidden_buf: be
