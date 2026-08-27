@@ -10217,6 +10217,61 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (n_used * out_f) as u32);
     }
 
+    /// Fused paged IQ2_XS gate+up GEMV and SwiGLU for Qwen3.8 decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_swiglu_iq2xs_paged(
+        &self,
+        ids: &dyn Buffer,
+        n_used: usize,
+        gate_lut: &dyn Buffer,
+        gate_lut_base: usize,
+        up_lut: &dyn Buffer,
+        up_lut_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rows: usize,
+        active_mask: u32,
+    ) {
+        let k = self.be.kernel_sg(
+            "native_id_swiglu_iq2xs_sg8_paged",
+            crate::gemm::native_id_swiglu_iq2xs_spv(),
+            5,
+            28,
+            32,
+        );
+        let mut push = [0u8; 28];
+        for (i, value) in [
+            in_f as u32,
+            out_f as u32,
+            n_used as u32,
+            gate_lut_base as u32,
+            up_lut_base as u32,
+            rows as u32,
+            active_mask,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        let groups = (rows * n_used * out_f.div_ceil(8)) as u32;
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(ids),
+                Self::vkb(gate_lut),
+                Self::vkb(up_lut),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`
     /// ([m, k/32]) for the dp4a mmq matmul. (Pass 1 of mmq, reusable standalone.)
     pub fn quant_q8(

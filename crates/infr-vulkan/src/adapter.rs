@@ -7562,109 +7562,138 @@ fn execute_paged_moe<'a>(
     let n_act = physical_slots * nff;
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     let xb = r(*x)?;
-    {
+    let fused_decode_swiglu = rows == 1
+        && shared.is_none()
+        && !*fused_gate_up
+        && !*weight_before
+        && swiglu_clamp.is_none()
+        && matches!(act, Activation::Silu)
+        && gdt == infr_core::DType::Iq2Xs
+        && udt == infr_core::DType::Iq2Xs
+        && ne == 2560
+        && nff == 640;
+    if fused_decode_swiglu {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
-        linear_paged_maybe_shared(
-            rec2,
-            gdt,
-            sess.arena_addr(gate_id)?,
-            sess.slot_bytes(gate_id)? as u32,
-            sess.tape(),
+        rec2.linear_native_id_swiglu_iq2xs_paged(
             pool[&ids_key].as_ref(),
             n_used,
+            sess.tape(),
             gate_w as usize,
-            shared_wgate,
+            sess.tape(),
+            up_w as usize,
             xb,
-            false,
-            pool[&gbuf].as_ref(),
+            pool[&abuf].as_ref(),
             ne,
-            gu_width,
+            nff,
             rows,
             active_mask,
         );
-        if let Some(ubuf) = &ubuf {
+    } else {
+        {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("checked above");
             linear_paged_maybe_shared(
                 rec2,
-                udt,
-                sess.arena_addr(up_id)?,
-                sess.slot_bytes(up_id)? as u32,
+                gdt,
+                sess.arena_addr(gate_id)?,
+                sess.slot_bytes(gate_id)? as u32,
                 sess.tape(),
                 pool[&ids_key].as_ref(),
                 n_used,
-                up_w as usize,
-                shared_wup,
+                gate_w as usize,
+                shared_wgate,
                 xb,
                 false,
-                pool[ubuf].as_ref(),
+                pool[&gbuf].as_ref(),
                 ne,
-                nff,
+                gu_width,
                 rows,
                 active_mask,
             );
-        }
-    }
-    if *weight_before {
-        rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, gu_width);
-        if let Some(ubuf) = &ubuf {
-            rec2.moe_weight_scale(pool[ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
-        }
-    }
-    match &ubuf {
-        Some(ubuf) => match act {
-            Activation::Silu => rec2.silu_mul(
-                pool[&gbuf].as_ref(),
-                pool[ubuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_act,
-                *swiglu_clamp,
-            ),
-            Activation::Sigmoid => rec2.mul_sigmoid(
-                pool[&gbuf].as_ref(),
-                pool[ubuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_act,
-                0,
-                0,
-                0,
-            ),
-            Activation::Gelu => rec2.gelu_mul_off(
-                pool[&gbuf].as_ref(),
-                pool[ubuf].as_ref(),
-                0,
-                0,
-                nff,
-                0,
-                nff,
-                0,
-                pool[&abuf].as_ref(),
-                n_act,
-            ),
-        },
-        // Fused: `gbuf` is [n_slots, 2*nff] gate|up rows; the fused activation kernels split it
-        // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
-        // like the resident small-m fused arm.
-        None => match act {
-            Activation::Silu => rec2.silu_mul_fused(
-                pool[&gbuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_slots,
-                nff,
-                *swiglu_clamp,
-            ),
-            Activation::Gelu => rec2.gelu_mul_fused(
-                pool[&gbuf].as_ref(),
-                pool[&abuf].as_ref(),
-                n_slots,
-                nff,
-                *swiglu_clamp,
-            ),
-            Activation::Sigmoid => {
-                return Err(be(
-                    "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
-                ))
+            if let Some(ubuf) = &ubuf {
+                linear_paged_maybe_shared(
+                    rec2,
+                    udt,
+                    sess.arena_addr(up_id)?,
+                    sess.slot_bytes(up_id)? as u32,
+                    sess.tape(),
+                    pool[&ids_key].as_ref(),
+                    n_used,
+                    up_w as usize,
+                    shared_wup,
+                    xb,
+                    false,
+                    pool[ubuf].as_ref(),
+                    ne,
+                    nff,
+                    rows,
+                    active_mask,
+                );
             }
-        },
+        }
+        if *weight_before {
+            rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, gu_width);
+            if let Some(ubuf) = &ubuf {
+                rec2.moe_weight_scale(pool[ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
+            }
+        }
+        match &ubuf {
+            Some(ubuf) => match act {
+                Activation::Silu => rec2.silu_mul(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_act,
+                    *swiglu_clamp,
+                ),
+                Activation::Sigmoid => rec2.mul_sigmoid(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_act,
+                    0,
+                    0,
+                    0,
+                ),
+                Activation::Gelu => rec2.gelu_mul_off(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    0,
+                    0,
+                    nff,
+                    0,
+                    nff,
+                    0,
+                    pool[&abuf].as_ref(),
+                    n_act,
+                ),
+            },
+            // Fused: `gbuf` is [n_slots, 2*nff] gate|up rows; the fused activation kernels split it
+            // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
+            // like the resident small-m fused arm.
+            None => match act {
+                Activation::Silu => rec2.silu_mul_fused(
+                    pool[&gbuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_slots,
+                    nff,
+                    *swiglu_clamp,
+                ),
+                Activation::Gelu => rec2.gelu_mul_fused(
+                    pool[&gbuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    n_slots,
+                    nff,
+                    *swiglu_clamp,
+                ),
+                Activation::Sigmoid => {
+                    return Err(be(
+                        "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
+                    ))
+                }
+            },
+        }
     }
     let down_w = if let Some(window) = down_w {
         window

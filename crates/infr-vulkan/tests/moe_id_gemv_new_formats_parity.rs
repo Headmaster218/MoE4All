@@ -492,6 +492,110 @@ fn paged_sg_id_gemv_matches_host() {
     }
 }
 
+/// Qwen3.8's decode fast path resolves two independent paged IQ2_XS banks, computes gate/up
+/// GEMVs, and writes SwiGLU directly. Keep a host reference here so LUT placement, activation,
+/// and masked routed slots stay covered independently of full-model generation tests.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn paged_iq2xs_fused_swiglu_matches_host() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let dt = DType::Iq2Xs;
+    let (in_f, out_f, n_expert) = (256usize, 16usize, 4usize);
+    let stride = in_f * out_f;
+    let (epb, bpb) = block_geom(dt);
+    let stride_bytes = stride / epb * bpb;
+    let gate_banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| synth_bank(dt, stride, 0x6a7e ^ ((e as u64) << 32)))
+        .collect();
+    let up_banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| synth_bank(dt, stride, 0x7570 ^ ((e as u64) << 32)))
+        .collect();
+    let host_gate: Vec<Vec<f32>> = gate_banks
+        .iter()
+        .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+        .collect();
+    let host_up: Vec<Vec<f32>> = up_banks
+        .iter()
+        .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+        .collect();
+
+    let ids = [3u32, 0, 2];
+    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let x: Vec<f32> = (0..in_f)
+        .map(|i| ((i % 19) as f32 - 9.0) * 0.0125)
+        .collect();
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let mut gate_pager = GpuPager::new(&be, n_expert, ids.len(), stride_bytes).unwrap();
+    let mut up_pager = GpuPager::new(&be, n_expert, ids.len(), stride_bytes).unwrap();
+    let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
+    // The load order deliberately differs from logical expert order.
+    for &eid in &[0u32, 2, 3] {
+        gate_pager
+            .ensure_resident(&be, staging.as_ref(), eid, &gate_banks[eid as usize])
+            .unwrap();
+        up_pager
+            .ensure_resident(&be, staging.as_ref(), eid, &up_banks[eid as usize])
+            .unwrap();
+    }
+    gate_pager.flush_lut(&be).unwrap();
+    up_pager.flush_lut(&be).unwrap();
+
+    let y = be
+        .alloc(ids.len() * out_f * 4, BufferUsage::Activations)
+        .unwrap();
+    let active_mask = 0b101u32;
+    let sentinel = vec![-17.0f32; ids.len() * out_f];
+    be.upload(y.as_ref(), bytemuck::cast_slice(&sentinel))
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.linear_native_id_swiglu_iq2xs_paged(
+        ids_buf.as_ref(),
+        ids.len(),
+        gate_pager.lut_buffer(),
+        0,
+        up_pager.lut_buffer(),
+        0,
+        x_buf.as_ref(),
+        y.as_ref(),
+        in_f,
+        out_f,
+        1,
+        active_mask,
+    );
+    rec.finish().unwrap();
+
+    let mut out = vec![0u8; ids.len() * out_f * 4];
+    be.download(y.as_ref(), &mut out).unwrap();
+    let got: &[f32] = bytemuck::cast_slice(&out);
+    for (slot, &eid) in ids.iter().enumerate() {
+        let slot_out = &got[slot * out_f..(slot + 1) * out_f];
+        if active_mask & (1 << slot) == 0 {
+            assert!(slot_out.iter().all(|&v| v == -17.0));
+            continue;
+        }
+        let gate = host_gemv(&host_gate[eid as usize], &x, in_f, out_f);
+        let up = host_gemv(&host_up[eid as usize], &x, in_f, out_f);
+        let want: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        assert_close(
+            dt,
+            &format!("paged fused SwiGLU expert {eid}"),
+            slot_out,
+            &want,
+        );
+    }
+}
+
 /// Backlog B39: the native-block kernels walk K as `nsub = in_f / 32` whole 32-element sub-blocks,
 /// so an expert bank narrower than 32 ran ZERO iterations — and since the GEMV writes its
 /// accumulator unconditionally, `linear_native_id_multi` completed cleanly and stored an exact

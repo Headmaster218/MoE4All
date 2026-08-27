@@ -1807,6 +1807,11 @@ fn main() {
                 "-DSHARED_Q8",
             ],
         ),
+        (
+            "native_gemv_id_swiglu_sg",
+            "native_id_swiglu_iq2xs_sg8_paged",
+            &["-DNR=8"],
+        ),
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("moe_accumulate_shared", "moe_accumulate_shared", &[]),

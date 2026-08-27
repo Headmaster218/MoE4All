@@ -642,6 +642,16 @@ pub(crate) fn native_idm_sg_paged_shared_build_spv(
         _ => None,
     }
 }
+
+/// Qwen3.8's fused paged IQ2_XS gate+up GEMV and SwiGLU decode kernel.
+pub(crate) fn native_id_swiglu_iq2xs_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_id_swiglu_iq2xs_sg8_paged.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// The id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant. Env-gated
 /// measurement entry ([`crate::recorder::Recorder::linear_mmv_id_multi_q4k`]) + parity tests.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
