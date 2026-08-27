@@ -310,6 +310,9 @@ cfg_struct! {
         /// `INFR_MOE_SMALL_M` (`tier::EnvRows`, clamped 0..=64 by the accessor — an unclamped
         /// override trips the amdgpu ring watchdog).
         moe_small_m: usize = 8,
+        /// Wave32 two-level reduction for the GPU MoE router top-k. The scalar shared-memory tree
+        /// remains available as an A/B and portability fallback.
+        moe_topk_sg: bool = true,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 

@@ -1,4 +1,8 @@
 #version 460
+#ifdef SUBGROUP_REDUCE
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 // MoE router top-k on the GPU (one workgroup, 128 lanes): top-`n_used` over `n_expert` logits →
 // selected expert ids + weights, all in VRAM. Mirrors the host `moe_topk` (max-shift, top-k by
 // logit, weight by gating function, optional renorm over the selected set, × routing scale) so an
@@ -207,6 +211,26 @@ void select_topk(uint t, uint lbase, uint obase) {
                 if (s > bv) { bv = s; be = e; }
             }
         }
+#ifdef SUBGROUP_REDUCE
+        // Four pinned wave32 subgroups reduce locally, then subgroup 0 reduces their four winners.
+        // Pairing max(score) with min(index among equal maxima) preserves the scalar tree's tie rule.
+        float wave_best = subgroupMax(bv);
+        uint wave_idx = subgroupMin(bv == wave_best ? be : 0xFFFFFFFFu);
+        if (subgroupElect()) {
+            sval[gl_SubgroupID] = wave_best;
+            sidx[gl_SubgroupID] = wave_idx;
+        }
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float group_input = t < gl_NumSubgroups ? sval[t] : -1e30;
+            float group_best = subgroupMax(group_input);
+            uint group_idx = subgroupMin(
+                group_input == group_best && t < gl_NumSubgroups ? sidx[t] : 0xFFFFFFFFu
+            );
+            if (t == 0u) { sidx[0] = group_idx; }
+        }
+        barrier();
+#else
         sval[t] = bv;
         sidx[t] = be;
         barrier();
@@ -221,6 +245,7 @@ void select_topk(uint t, uint lbase, uint obase) {
             }
             barrier();
         }
+#endif
         uint winner = sidx[0];
         // Clamp to the valid expert range. NaN logits make every `>` comparison false, so the
         // selection can end on the 0xFFFFFFFF sentinel (or any out-of-range slot); the downstream

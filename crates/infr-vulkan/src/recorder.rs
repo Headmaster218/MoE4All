@@ -9186,9 +9186,13 @@ impl<'a> Recorder<'a> {
         hash_ids: &dyn Buffer,
         hash: bool,
     ) {
-        let k = self
-            .be
-            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36);
+        let k = if self.vk().moe_topk_sg {
+            self.be
+                .kernel_sg("moe_topk_sg", crate::gemm::moe_topk_sg_spv(), 5, 36, 32)
+        } else {
+            self.be
+                .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36)
+        };
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
@@ -13957,6 +13961,55 @@ mod tests {
             (wts[1] - 1.0).abs() < 1e-6,
             "expected ~1 for the high-logit pick: {wts:?}"
         );
+    }
+
+    /// Exercise every wave in the 512-expert, top-10 sigmoid router shape used by Qwen3.5 MoE.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_512_experts_selects_exact_top10() {
+        let be = be_with(|_| {});
+        let (n_tokens, n_expert, n_used) = (1usize, 512usize, 10usize);
+        let logits: Vec<f32> = (0..n_expert).map(|i| i as f32 / 512.0).collect();
+        let dummy = vec![0.0f32; n_expert];
+        let blog = upf32(&be, &logits);
+        let bdummy = upf32(&be, &dummy);
+        let bids = be
+            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+            .unwrap();
+        let bwts = be
+            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.moe_topk(
+            blog.as_ref(),
+            bids.as_ref(),
+            bwts.as_ref(),
+            bdummy.as_ref(),
+            n_tokens,
+            n_expert,
+            n_used,
+            1.0,
+            1,    // sigmoid
+            true, // normalize selected weights
+            false,
+            0,
+            0,
+            bdummy.as_ref(),
+            false,
+        );
+        rec.finish().unwrap();
+
+        let mut idb = vec![0u8; n_tokens * n_used * 4];
+        be.download(bids.as_ref(), &mut idb).unwrap();
+        let ids: &[u32] = bytemuck::cast_slice(&idb);
+        let expected: Vec<u32> = (502..512).rev().collect();
+        assert_eq!(ids, expected, "512-expert top-10 selection changed");
+
+        let mut wb = vec![0u8; n_tokens * n_used * 4];
+        be.download(bwts.as_ref(), &mut wb).unwrap();
+        let wts: &[f32] = bytemuck::cast_slice(&wb);
+        assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
+        assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the
