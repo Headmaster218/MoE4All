@@ -990,10 +990,17 @@ fn native_warp_gemm(
         && out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
         && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some();
-    let use_ag = !use_direct
-        && out_f.is_multiple_of(128)
+    let use_n64_ag = !use_direct
+        && out_f.is_multiple_of(64)
+        && !out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
-        && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
+        && crate::gemm::native_gemm_warp_n64_ag_kernel_name(dt).is_some()
+        && be_.cfg().kernels.vulkan.gemm_warp;
+    let use_ag = !use_direct
+        && ((out_f.is_multiple_of(128)
+            && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some())
+            || use_n64_ag)
+        && in_f.is_multiple_of(32)
         && be_.cfg().kernels.vulkan.gemm_warp;
     let a16 = if use_ag {
         let mpad = m.div_ceil(64) * 64;

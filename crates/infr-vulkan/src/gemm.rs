@@ -1722,6 +1722,16 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
     })
 }
 
+/// BN=64/BK=64 A_GLOBAL warptile for Q8_0 output widths divisible by 64 but not 128.
+/// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n64_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
+    match dtype {
+        infr_core::DType::Q8_0 => Some("native_gemm_warp_q8_0_n64_ag"),
+        _ => None,
+    }
+}
+
 /// SPLIT_K (NARROW_N tile) + A_GLOBAL.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {

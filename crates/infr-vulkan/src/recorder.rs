@@ -2306,7 +2306,8 @@ impl<'a> Recorder<'a> {
     /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the
     /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
-    /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged.
+    /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged. The Q8_0
+    /// N64 variant also accepts `n%64==0 && n%128!=0`; all other variants still require n%128.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_f16a(
         &self,
@@ -2320,6 +2321,9 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        let n64 = (!n.is_multiple_of(128) && n.is_multiple_of(64))
+            .then(|| crate::gemm::native_gemm_warp_n64_ag_kernel_name(dtype))
+            .flatten();
         // The BN=128 (n128) ag tile beats the BN=256 (wide) ag tile on EVERY shape this decision
         // can reach, measured on RDNA3 (7900 XTX): the wide tile's WN=64 → 2×4 = 8 accumulator
         // coopmat frags per warp cost enough VGPRs to drop occupancy, and the wide-square n=4096
@@ -2360,7 +2364,9 @@ impl<'a> Recorder<'a> {
             .flatten();
         // Resident A_GLOBAL tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
         // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
-        let (name, bn, bm): (&str, usize, usize) = if use_wide {
+        let (name, bn, bm): (&str, usize, usize) = if let Some(name) = n64 {
+            (name, 64, 64)
+        } else if use_wide {
             (
                 crate::gemm::native_gemm_warp_ag_kernel_name(dtype).expect("ag name"),
                 256,
@@ -13614,6 +13620,69 @@ mod tests {
         }
         println!("native_gemm_mmq_q6k max_err={e:e}");
         assert!(e < 2e-2, "native_gemm_mmq_q6k mismatch: {e}"); // int8 activation quant tolerance
+    }
+
+    /// Q8_0 BN=64/BK=64 A_GLOBAL tile used by Qwen3.8's N=320 recurrent projections. The
+    /// non-multiple-of-64 row count exercises padded rows without changing the logical N stride.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn native_gemm_warp_q8_n64_ag_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n) = (70usize, 256usize, 320usize);
+        let mpad = m.div_ceil(64) * 64;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| half::f16::from_f32(((i % 23) as f32 - 11.0) * 0.02).to_f32())
+            .collect();
+        let nblk = n * k / 32;
+        let scales: Vec<half::f16> = (0..nblk)
+            .map(|b| half::f16::from_f32(0.002 + (b % 7) as f32 * 0.0005))
+            .collect();
+        let mut weights = vec![0u8; nblk * 34];
+        for b in 0..nblk {
+            weights[b * 34..b * 34 + 2].copy_from_slice(&scales[b].to_bits().to_le_bytes());
+            for j in 0..32 {
+                weights[b * 34 + 2 + j] = (((b * 13 + j * 7) % 31) as i8 - 15) as u8;
+            }
+        }
+
+        let ba = be.alloc(a.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(ba.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+        let bw = be.upload_weight_bytes(&weights).unwrap();
+        let a16 = be.alloc(mpad * k * 2, BufferUsage::Activations).unwrap();
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.store_f16(ba.as_ref(), a16.as_ref(), m * k, 0);
+        rec.matmul_native_f16a(
+            infr_core::DType::Q8_0,
+            a16.as_ref(),
+            bw.device_addr().unwrap(),
+            0,
+            bc.as_ref(),
+            m,
+            k,
+            n,
+        );
+        rec.finish().unwrap();
+
+        let mut bytes = vec![0u8; mpad * n * 4];
+        be.download(bc.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let mut max_err = 0.0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let want: f32 = (0..k)
+                    .map(|x| {
+                        let g = col * k + x;
+                        let b = g / 32;
+                        let q = weights[b * 34 + 2 + g % 32] as i8;
+                        a[r * k + x] * scales[b].to_f32() * q as f32
+                    })
+                    .sum();
+                max_err = max_err.max((got[r * n + col] - want).abs());
+            }
+        }
+        println!("native_gemm_warp_q8_n64_ag max_err={max_err:e}");
+        assert!(max_err < 2e-2, "Q8 N64 A_GLOBAL mismatch: {max_err}");
     }
 
     #[test]
