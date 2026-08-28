@@ -137,7 +137,8 @@ pub struct CpuBuffer {
 enum CpuStore {
     Owned(Mutex<Vec<u8>>),
     Mapped(TensorBytes),
-    /// Read from the model file into the host arena on demand (`paging.dram`). The bytes are only
+    /// Read from the model file into the host arena on demand (normally sized by
+    /// `device.ram_budget`). The bytes are only
     /// valid while pinned, which is why every op pins what it reads before running — see
     /// [`CpuBackend::pin_op_weights`].
     Paged {
@@ -942,7 +943,7 @@ impl Backend for CpuBackend {
             // it is here and not inside `CpuBuffer::read`: that returns a view, not a `Result`, so
             // an I/O failure there could only panic. The guards drop at the end of the iteration.
             // Empty (and free) for a model with no paged weights, which is every model until
-            // `paging.dram` is set.
+            // the host RAM planner selects a paged arena.
             let _pins = self.pin_op_weights(op, bindings)?;
             let __t0 = if prof_ops {
                 Some(std::time::Instant::now())

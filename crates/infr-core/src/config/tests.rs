@@ -72,6 +72,7 @@ fn default_config_matches_documented_defaults() {
     // §6.1: `Option` means "the user pinned it"; the 1024 / iGPU-adaptive chain stays at its site.
     assert_eq!(d.device.ubatch, None);
     assert_eq!(d.device.vram_budget, None);
+    assert_eq!(d.device.ram_budget, None);
     assert_eq!(d.device.vram_reserve, None);
     assert_eq!(d.device.ubatch_parallel, 256);
     assert_eq!(d.device.submit_dispatches, None);
@@ -354,6 +355,12 @@ fn mib_and_size_string_spellings() {
     }
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "1g")])]);
     assert_eq!(cfg.paging.ring, Some(super::SizeSpec::Bytes(1 << 30)));
+
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_RAM_BUDGET", "50g")])]);
+    assert_eq!(
+        cfg.device.ram_budget,
+        Some(super::SizeSpec::Bytes(50 << 30))
+    );
 
     assert_eq!(d.paging.ring_slots, 2);
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING_SLOTS", "8")])]);
@@ -1379,6 +1386,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// they were born reading `Config` (`docs/config-plan.md` R3), so they are `migrated` from
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
+        "INFR_RAM_BUDGET",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
         "INFR_HF_ENDPOINT",

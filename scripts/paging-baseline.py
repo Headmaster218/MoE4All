@@ -79,8 +79,10 @@ def bench(model, dev, limit, flags, dram=None, cache=None):
         # differ in where the weights live as well as in what backs the misses, and the comparison
         # says nothing about the host tier.
         cmd += ["--set", f"paging.cache={cache}"]
-    # The host weight cache (`paging.dram`): weights read from the file into our own arena under
-    # our own eviction policy, instead of mapped and left to the page cache.
+    # Compatibility-only raw host-cache control (`paging.dram`): weights read from the file into
+    # our own arena under our own eviction policy, instead of mapped and left to the page cache.
+    # This benchmark intentionally uses the deprecated cache-only knob because its two arms need
+    # exact arena sizes; normal runs should use the total-process `device.ram_budget` setting.
     #
     # `dram=None` is the MMAP arm and must say `0` — the OFF switch — not simply omit the flag.
     # An omitted flag now means "size it yourself", so the baseline would quietly become a second
@@ -106,7 +108,8 @@ def main():
     ap.add_argument("--gen", type=int, default=32, help="decode tokens (-n)")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--dram", default=None,
-                    help="also run each limit with this paging.dram budget (e.g. `1g`), or "
+                    help="also run each limit with the legacy exact-cache paging.dram budget "
+                         "(e.g. `1g`), or "
                          "`auto` to leave the budget unset and measure the engine's own sizing")
     ap.add_argument("--cache", default=None,
                     help="paging.cache (VRAM paging budget), applied to BOTH arms — how a GPU run "

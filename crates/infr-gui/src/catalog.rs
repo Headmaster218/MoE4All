@@ -168,7 +168,8 @@ pub fn estimate(
     }
     let gguf = Gguf::open(path).map_err(|e| e.to_string())?;
     let model_bytes = gguf.shards().iter().map(|(_, n)| *n).sum::<u64>();
-    let requested_ram_budget_bytes = parse_absolute(&profile.ram_budget);
+    let total_host_ram = infr_core::hostmem::total_bytes();
+    let requested_ram_budget_bytes = parse_budget(&profile.ram_budget, total_host_ram);
     let architecture = gguf
         .metadata()
         .str("general.architecture")
@@ -251,7 +252,16 @@ pub fn estimate(
     let fits_minimum = effective_vram_budget_bytes
         .zip(kv_bytes)
         .map(|(budget, _)| memory_plan.is_some_and(|plan| plan.minimum_required_bytes() <= budget));
-    let host = estimate_host_cache(profile, is_moe, footprint.expert);
+    let host_available = infr_core::hostmem::available_bytes();
+    let process_resident = infr_core::hostmem::process_resident_bytes();
+    let host = estimate_host_cache(
+        profile,
+        is_moe,
+        footprint.expert,
+        host_available,
+        process_resident,
+        total_host_ram,
+    );
     let embedding_model_bytes = attached_embedding_bytes(profile)?;
 
     let mut notes = vec![
@@ -259,6 +269,12 @@ pub fn estimate(
         "固定权重、packing margin、架构驱动预留和 post-load 余量与 Vulkan 加载器使用同一套公式。"
             .into(),
     ];
+    if requested_ram_budget_bytes.is_some() {
+        notes.push(
+            "显式 RAM 值是 infr 进程的总常驻内存预算；启动时会按工作进程的实际 Working Set 扣除非 cache 占用，当前页面只提供近似 cache 估算。"
+                .into(),
+        );
+    }
     if is_moe {
         notes.push(match host.mode.as_deref() {
             Some("full") => "Host tier 可覆盖完整 expert payload；SSD 仅参与加载。".into(),
@@ -399,6 +415,9 @@ fn estimate_host_cache(
     profile: &ModelProfile,
     is_moe: bool,
     expert_payload_bytes: u64,
+    available: Option<u64>,
+    process_resident: Option<u64>,
+    total_host_ram: Option<u64>,
 ) -> HostCacheEstimate {
     if !is_moe || expert_payload_bytes == 0 {
         return HostCacheEstimate::default();
@@ -406,10 +425,11 @@ fn estimate_host_cache(
     let (effective_bytes, mode) = if profile.dram_bypass {
         (Some(0), "bypass")
     } else if profile.ram_budget.trim().is_empty() {
-        let bytes = infr_core::hostmem::available_bytes()
-            .map_or(expert_payload_bytes, |available| {
-                infr_core::hostmem::auto_arena_bytes(available, 0, expert_payload_bytes)
-            });
+        let bytes = available
+            .map(|available| {
+                infr_core::hostmem::auto_cache_bytes(available, 0, expert_payload_bytes)
+            })
+            .unwrap_or(0);
         (
             Some(bytes),
             if bytes >= expert_payload_bytes {
@@ -418,8 +438,12 @@ fn estimate_host_cache(
                 "bounded"
             },
         )
-    } else if let Some(bytes) = parse_absolute(&profile.ram_budget) {
-        let bytes = bytes.min(expert_payload_bytes);
+    } else if let Some(total_process_budget) = parse_budget(&profile.ram_budget, total_host_ram) {
+        let bytes = infr_core::hostmem::cache_bytes_for_total_budget(
+            total_process_budget,
+            process_resident,
+            expert_payload_bytes,
+        );
         let mode = if bytes == 0 {
             "disabled"
         } else if bytes >= expert_payload_bytes {
@@ -497,7 +521,14 @@ mod tests {
             ram_budget: "3g".into(),
             ..ModelProfile::default()
         };
-        let estimated = estimate_host_cache(&fixed, true, payload);
+        let estimated = estimate_host_cache(
+            &fixed,
+            true,
+            payload,
+            Some(64 * 1024 * 1024 * 1024),
+            Some(0),
+            Some(64 * 1024 * 1024 * 1024),
+        );
         assert_eq!(estimated.mode.as_deref(), Some("bounded"));
         assert_eq!(estimated.effective_bytes, Some(3 * 1024 * 1024 * 1024));
         assert_eq!(estimated.fits_payload, Some(false));
@@ -507,13 +538,88 @@ mod tests {
             ram_budget: "16g".into(),
             ..ModelProfile::default()
         };
-        let estimated = estimate_host_cache(&bypass, true, payload);
+        let estimated = estimate_host_cache(
+            &bypass,
+            true,
+            payload,
+            Some(64 * 1024 * 1024 * 1024),
+            Some(0),
+            Some(64 * 1024 * 1024 * 1024),
+        );
         assert_eq!(estimated.mode.as_deref(), Some("bypass"));
         assert_eq!(estimated.effective_bytes, Some(0));
 
         assert_eq!(
-            estimate_host_cache(&fixed, false, 0),
+            estimate_host_cache(
+                &fixed,
+                false,
+                0,
+                Some(64 * 1024 * 1024 * 1024),
+                Some(0),
+                Some(64 * 1024 * 1024 * 1024),
+            ),
             HostCacheEstimate::default()
+        );
+    }
+
+    #[test]
+    fn host_cache_estimate_treats_an_explicit_50g_as_total_process_ram() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let profile = ModelProfile {
+            ram_budget: "50g".into(),
+            ..ModelProfile::default()
+        };
+        let estimated = estimate_host_cache(
+            &profile,
+            true,
+            80 * GIB,
+            Some(48 * GIB),
+            Some(2 * GIB),
+            Some(64 * GIB),
+        );
+        assert_eq!(estimated.mode.as_deref(), Some("bounded"));
+        assert_eq!(estimated.effective_bytes, Some(48 * GIB));
+        assert_eq!(estimated.fits_payload, Some(false));
+
+        let automatic = estimate_host_cache(
+            &ModelProfile::default(),
+            true,
+            80 * GIB,
+            Some(48 * GIB),
+            Some(2 * GIB),
+            Some(64 * GIB),
+        );
+        assert_eq!(automatic.effective_bytes, Some(36 * GIB));
+        assert_eq!(
+            estimate_host_cache(
+                &ModelProfile::default(),
+                true,
+                80 * GIB,
+                None,
+                Some(2 * GIB),
+                Some(64 * GIB),
+            )
+            .effective_bytes,
+            Some(0),
+            "auto mode must not assume that all host memory is available without a probe"
+        );
+
+        let percentage = ModelProfile {
+            ram_budget: "50%".into(),
+            ..ModelProfile::default()
+        };
+        assert_eq!(
+            estimate_host_cache(
+                &percentage,
+                true,
+                80 * GIB,
+                Some(48 * GIB),
+                Some(2 * GIB),
+                Some(64 * GIB),
+            )
+            .effective_bytes,
+            Some(30 * GIB),
+            "percentage budgets use total physical RAM before subtracting process residency"
         );
     }
 

@@ -76,6 +76,64 @@ impl<'a> TokenEmbd<'a> {
     }
 }
 
+fn host_ram_request(ec: &EngineConfig) -> infr_core::hostmem::RamRequest {
+    let total_host_ram = infr_core::hostmem::total_bytes();
+    let total_process_budget = ec.device.ram_budget.and_then(|size| match size {
+        infr_core::SizeSpec::Bytes(bytes) => Some(bytes),
+        infr_core::SizeSpec::Percent(_) => match total_host_ram {
+            Some(total) => Some(size.resolve(total)),
+            None => {
+                tracing::warn!(
+                    "device.ram_budget is a percentage, but total physical RAM could not be \
+                     detected; falling back to automatic host-memory sizing"
+                );
+                None
+            }
+        },
+    });
+    let legacy_cache_budget = ec.paging.dram.map(|size| size.resolve(0));
+    if total_process_budget.is_some() && legacy_cache_budget.is_some() {
+        tracing::warn!(
+            "both device.ram_budget and legacy paging.dram are set; using device.ram_budget"
+        );
+    }
+    infr_core::hostmem::RamRequest::from_config(
+        total_process_budget,
+        legacy_cache_budget,
+        ec.paging.dram_bypass,
+    )
+}
+
+fn log_host_ram_request(
+    what: &str,
+    request: infr_core::hostmem::RamRequest,
+    process_resident: Option<u64>,
+    cache_bytes: u64,
+) {
+    match (request, process_resident) {
+        (infr_core::hostmem::RamRequest::TotalProcessBudget(total), Some(resident)) => {
+            tracing::info!(
+                total_process_ram_budget_bytes = total,
+                observed_process_resident_bytes = resident,
+                host_cache_budget_bytes = cache_bytes,
+                "{what} host tier: resolved total-process RAM budget"
+            )
+        }
+        (infr_core::hostmem::RamRequest::TotalProcessBudget(total), None) => tracing::warn!(
+            total_process_ram_budget_bytes = total,
+            host_cache_budget_bytes = cache_bytes,
+            "{what} host tier: this platform could not measure process resident RAM; treating \
+             device.ram_budget as a best-effort host-cache ceiling"
+        ),
+        (infr_core::hostmem::RamRequest::LegacyCacheBudget(bytes), _) => tracing::warn!(
+            legacy_host_cache_bytes = bytes,
+            "{what} host tier: paging.dram / INFR_DRAM_CACHE is a deprecated raw cache override; \
+             use device.ram_budget / INFR_RAM_BUDGET for a total-process RAM budget"
+        ),
+        _ => {}
+    }
+}
+
 /// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
 /// copy: map an mmap slice zero-copy; alloc+upload owned bytes (the combined gate+up concat — never
 /// produced for CPU since `combined_gu` is false there, but stays correct if it ever is).
@@ -91,11 +149,10 @@ impl<'a> TokenEmbd<'a> {
 /// collapse: decode 23-33x slower once the weights stop fitting), and the arena's own policy is
 /// what fixes it.
 ///
-/// An explicit `paging.dram` always wins in BOTH directions — it forces the arena on a model that
-/// would have fit, and pins the size on one that would not. That is deliberate and must stay: a
-/// machine with enough RAM to hold the model is exactly the machine you want to exercise the
-/// streaming path on, so `INFR_DRAM_CACHE=<size>` is how a CPU run is put on it regardless of what
-/// the fit test would have decided.
+/// An explicit `device.ram_budget` always wins in BOTH directions — it forces the arena on a model
+/// that would have fit and sets the process's total resident-RAM target. The current working set is
+/// subtracted before this arena is planned. Legacy `paging.dram` remains an exact-cache diagnostic
+/// override only.
 ///
 /// Returns `None` — not an error — when nothing seats, so every degraded case falls back to
 /// today's behaviour rather than failing the load.
@@ -103,11 +160,8 @@ fn cpu_paged_store(
     ec: &EngineConfig,
     g: &Gguf,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
-    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(
-        ec.paging.dram.map(|s| s.resolve(0)),
-        ec.paging.dram_bypass,
-    );
+    // `0` is the explicit OFF switch, not "unset" — preserve it through request resolution.
+    let ram_request = host_ram_request(ec);
     // Only the weights this backend would actually page count toward "does it fit": the sub-floor
     // tensors stay mapped either way, so counting them could page a model that fits.
     let pageable: u64 = g
@@ -117,7 +171,15 @@ fn cpu_paged_store(
         .map(|t| t.nbytes as u64)
         .sum();
     let available = infr_core::hostmem::available_bytes();
-    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, pageable) {
+    let process_resident = infr_core::hostmem::process_resident_bytes();
+    let arena_plan =
+        infr_core::hostmem::cpu_arena_plan(ram_request, available, process_resident, pageable);
+    let cache_bytes = match arena_plan {
+        infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
+        _ => 0,
+    };
+    log_host_ram_request("CPU", ram_request, process_resident, cache_bytes);
+    let budget = match arena_plan {
         // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
         // on unified memory). For the CPU backend this arena is the only tier there is, so a
         // read-through with nothing behind it would be a pure regression on the mapping.
@@ -126,11 +188,11 @@ fn cpu_paged_store(
             return Ok(None);
         }
         infr_core::hostmem::ArenaPlan::Take(n) => {
-            if explicit == infr_core::hostmem::Requested::Auto {
+            if ram_request == infr_core::hostmem::RamRequest::Auto {
                 tracing::info!(
                     "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
                      available, so they stream from disk through a {:.2} GB arena instead of the \
-                     OS page cache (set INFR_DRAM_CACHE to override)",
+                     OS page cache (set INFR_RAM_BUDGET to override)",
                     pageable as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                     n as f64 / 1e9,
@@ -148,7 +210,7 @@ fn cpu_paged_store(
                     "host paging: {:.2} GB of weights do not fit the {:.2} GB of host memory \
                      available, but too little is free to seat a useful arena — falling back to \
                      the OS page cache, which thrashes on a forward pass's cyclic sweep. Free \
-                     memory, or set INFR_DRAM_CACHE explicitly",
+                     memory, or set INFR_RAM_BUDGET explicitly",
                     pageable as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                 );
@@ -160,7 +222,7 @@ fn cpu_paged_store(
     if plans.is_empty() {
         tracing::warn!(
             "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
-             mmap path (raise INFR_DRAM_CACHE past one tensor's size to page)",
+             mmap path (raise INFR_RAM_BUDGET enough to leave room for one tensor)",
             budget as f64 / 1e9,
         );
         return Ok(None);
@@ -191,8 +253,8 @@ fn cpu_paged_store(
 /// # Where the budget comes from
 /// **Both call sites are already past the point where the model did not fit VRAM** — dense
 /// streaming and the paged MoE cache are each only reached when residency was rejected — so
-/// reaching here IS the signal that this run has to stream. An explicit `paging.dram` still wins;
-/// otherwise the budget is sized from what the host can actually spare
+/// reaching here IS the signal that this run has to stream. An explicit `device.ram_budget` still
+/// wins; otherwise the budget is sized from what the host can actually spare
 /// ([`infr_core::hostmem`]), because a tier that is off by default helps nobody on the one run
 /// that needs it, and the alternative is a user guessing a number that is worth 1.6x
 /// (`docs/perf/results.md`).
@@ -201,9 +263,9 @@ fn cpu_paged_store(
 /// Auto-sizing never REPLACES the two knobs, because a machine big enough to hold the model
 /// resident is exactly the machine you want to test streaming on. `INFR_CACHE` (`paging.cache`)
 /// caps the VRAM paging budget, which is what forces residency to be rejected and this function to
-/// be reached at all; `INFR_DRAM_CACHE` (`paging.dram`) then pins this arena's size instead of
-/// letting it be measured. Both together are how every figure in `docs/perf/results.md` was taken
-/// on a card that would otherwise have kept the model resident — e.g. `--cache 2g --dram 3g`.
+/// be reached at all; `INFR_RAM_BUDGET` (`device.ram_budget`) then pins total process RAM instead
+/// of letting it be measured. Both together can force this path on a machine that would otherwise
+/// keep the model resident. Legacy `paging.dram` pins only the raw host-cache size.
 ///
 /// # Unified memory has only ONE host tier, and it is the arena above this one
 /// `unified` is `DeviceCaps::unified_memory` — an iGPU or APU whose "VRAM" IS system RAM. There the
@@ -211,8 +273,8 @@ fn cpu_paged_store(
 /// the same RAM that the GPU CANNOT read directly: every hit would still be copied through the
 /// staging ring, while the identical bytes spent on the arena above are read in place. It is not
 /// merely double-counted, it is strictly worse than making that arena bigger. So auto-sizing
-/// declines on unified memory and says why; an explicit `paging.dram` is still honoured, because a
-/// user asking for it by name may be working around something this does not model.
+/// declines on unified memory and says why; an explicit `device.ram_budget` is still honoured,
+/// because a user asking for it by name may be working around something this does not model.
 fn vulkan_host_tier(
     ec: &EngineConfig,
     g: &Gguf,
@@ -221,82 +283,91 @@ fn vulkan_host_tier(
     unified: bool,
 ) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
     let unpaged = || vec![None; classes.len()];
-    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(
-        ec.paging.dram.map(|s| s.resolve(0)),
-        ec.paging.dram_bypass,
-    );
+    // `0` is the explicit OFF switch, not "unset" — preserve it through request resolution.
+    let ram_request = host_ram_request(ec);
     let available = infr_core::hostmem::available_bytes();
+    let process_resident = infr_core::hostmem::process_resident_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
-    let budget =
-        match infr_core::hostmem::streaming_arena_plan(explicit, available, unified, pageable) {
-            // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
-            // to cache down here — but its misses still come from BLOCK reads instead of the
-            // mapping, which is what lets a big model run on these machines at all.
-            infr_core::hostmem::ArenaPlan::StreamOnly => {
-                let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                tracing::info!(
-                    "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
+    let arena_plan = infr_core::hostmem::streaming_arena_plan(
+        ram_request,
+        available,
+        process_resident,
+        unified,
+        pageable,
+    );
+    let cache_bytes = match arena_plan {
+        infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
+        _ => 0,
+    };
+    log_host_ram_request(what, ram_request, process_resident, cache_bytes);
+    let budget = match arena_plan {
+        // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
+        // to cache down here — but its misses still come from BLOCK reads instead of the
+        // mapping, which is what lets a big model run on these machines at all.
+        infr_core::hostmem::ArenaPlan::StreamOnly => {
+            let io = std::sync::Arc::new(
+                infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            tracing::info!(
+                "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
                      this device's memory IS host memory, so the {} pool(s) above are already the \
                      only useful cache and a second one would hold bytes the GPU cannot read in \
-                     place. Raise INFR_CACHE to cache more; INFR_DRAM_CACHE forces a host arena",
-                    classes.len(),
-                );
-                let mut out = Vec::with_capacity(classes.len());
-                for &(slot_bytes, _) in classes {
-                    let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
-                        .map_err(|e| anyhow!("{e}"))?;
-                    out.push(Some(std::sync::Arc::new(p)));
-                }
-                return Ok(out);
+                     place. Raise INFR_CACHE to cache more; INFR_RAM_BUDGET forces a host arena",
+                classes.len(),
+            );
+            let mut out = Vec::with_capacity(classes.len());
+            for &(slot_bytes, _) in classes {
+                let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
+                    .map_err(|e| anyhow!("{e}"))?;
+                out.push(Some(std::sync::Arc::new(p)));
             }
-            infr_core::hostmem::ArenaPlan::Take(n) => {
-                if explicit == infr_core::hostmem::Requested::Auto {
-                    tracing::info!(
+            return Ok(out);
+        }
+        infr_core::hostmem::ArenaPlan::Take(n) => {
+            if ram_request == infr_core::hostmem::RamRequest::Auto {
+                tracing::info!(
                     "{what} host tier: sized automatically to {:.2} GB of {:.2} GB available host \
-                     memory (set INFR_DRAM_CACHE to override)",
+                     memory (set INFR_RAM_BUDGET to override)",
                     n as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                 );
-                }
-                n as usize
             }
-            infr_core::hostmem::ArenaPlan::Skip(why) => {
-                use infr_core::hostmem::Skip;
-                match why {
-                    Skip::NoProbe => tracing::warn!(
+            n as usize
+        }
+        infr_core::hostmem::ArenaPlan::Skip(why) => {
+            use infr_core::hostmem::Skip;
+            match why {
+                Skip::NoProbe => tracing::warn!(
                     "{what} host tier: this model must stream, but there is no host-memory probe \
                      on this platform, so the arena cannot be sized automatically — set \
-                     INFR_DRAM_CACHE to page weights through DRAM instead of leaving them to the \
+                     INFR_RAM_BUDGET to page weights through DRAM instead of leaving them to the \
                      OS page cache"
                 ),
-                    Skip::TooLittle => tracing::warn!(
+                Skip::TooLittle => tracing::warn!(
                     "{what} host tier: this model must stream, but only {:.2} GB of host memory \
                      is available — too little to seat a useful arena, so the weights stay on the \
-                     OS page cache. Free memory, or set INFR_DRAM_CACHE explicitly",
+                     OS page cache. Free memory, or set INFR_RAM_BUDGET explicitly",
                     available.unwrap_or(0) as f64 / 1e9,
                 ),
-                    // Off by name: say so once, because a user who set it and then wonders why
-                    // streaming is slow should find the reason in the log.
-                    Skip::Disabled => tracing::info!(
-                        "{what} host tier: disabled by paging.dram=0 — weights stream from the OS \
-                     page cache instead of an arena"
-                    ),
-                    // Unreachable here by construction: `streaming_arena_plan` is for callers already
-                    // past the fit decision, so it never answers `Fits`.
-                    Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
-                }
-                return Ok(unpaged());
+                // Off by name: say so once, because a user who set it and then wonders why
+                // streaming is slow should find the reason in the log.
+                Skip::Disabled => tracing::info!(
+                    "{what} host tier: disabled by an explicit zero RAM setting — weights stream \
+                     from the OS page cache instead of an arena"
+                ),
+                // Unreachable here by construction: `streaming_arena_plan` is for callers already
+                // past the fit decision, so it never answers `Fits`.
+                Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
             }
-        };
+            return Ok(unpaged());
+        }
+    };
     let slots = infr_core::hostpager::plan_slots(budget, classes);
     if slots.iter().all(|&n| n == 0) {
         tracing::warn!(
             "{what} host tier: a {:.2} GB budget seats no block class of this model — keeping \
-             the mmap path (raise INFR_DRAM_CACHE past one block's size to page)",
+             the mmap path (raise INFR_RAM_BUDGET enough to leave room for one block)",
             budget as f64 / 1e9,
         );
         return Ok(unpaged());
@@ -444,7 +515,7 @@ pub(crate) fn generate_dense_cpu_mode(
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a weight binder that maps
-    // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when `paging.dram` asks
+    // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when the host RAM plan asks
     // for a host weight cache, registers the big ones to be read from the file on demand.
     let store = cpu_paged_store(ec, g)?;
     let bind = cpu_bind_with(&cpu_be, store.clone());
@@ -2525,17 +2596,26 @@ enum MoeHostBacking {
 }
 
 fn moe_host_backing(
-    requested: infr_core::hostmem::Requested,
+    ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
+    process_resident: Option<u64>,
     payload_bytes: usize,
 ) -> MoeHostBacking {
-    let budget = match requested {
-        infr_core::hostmem::Requested::Fixed(bytes) => bytes.min(payload_bytes as u64),
-        infr_core::hostmem::Requested::Off | infr_core::hostmem::Requested::Bypass => 0,
-        infr_core::hostmem::Requested::Auto => available
-            .map_or(payload_bytes as u64, |available| {
-                infr_core::hostmem::auto_arena_bytes(available, 0, payload_bytes as u64)
-            }),
+    let budget = match ram_request {
+        infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
+            infr_core::hostmem::cache_bytes_for_total_budget(
+                total,
+                process_resident,
+                payload_bytes as u64,
+            )
+        }
+        infr_core::hostmem::RamRequest::LegacyCacheBudget(bytes) => bytes.min(payload_bytes as u64),
+        infr_core::hostmem::RamRequest::Bypass => 0,
+        infr_core::hostmem::RamRequest::Auto => available
+            .map(|available| {
+                infr_core::hostmem::auto_cache_bytes(available, 0, payload_bytes as u64)
+            })
+            .unwrap_or(0),
     } as usize;
     if budget >= payload_bytes {
         MoeHostBacking::Full
@@ -3030,22 +3110,30 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
             // caches and leave the remaining Experts on SSD. GPU-resident Experts retain a pinned
             // RAM shadow when capacity permits, making GPU eviction metadata-only.
-            let requested = infr_core::hostmem::Requested::from_config(
-                ec.paging.dram.map(|s| s.resolve(0)),
-                ec.paging.dram_bypass,
-            );
+            let ram_request = host_ram_request(ec);
+            let host_available = infr_core::hostmem::available_bytes();
+            let process_resident = infr_core::hostmem::process_resident_bytes();
             let host_backing =
-                moe_host_backing(requested, infr_core::hostmem::available_bytes(), host_bytes);
+                moe_host_backing(ram_request, host_available, process_resident, host_bytes);
             let (host_kind, host_resident_bytes) = match host_backing {
                 MoeHostBacking::Full => ("full-RAM", host_bytes),
                 MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
             };
-            if let MoeHostBacking::Bounded { bytes: ram_budget } = host_backing {
+            log_host_ram_request(
+                "MoE",
+                ram_request,
+                process_resident,
+                host_resident_bytes as u64,
+            );
+            if let MoeHostBacking::Bounded {
+                bytes: host_cache_budget,
+            } = host_backing
+            {
                 let classes: Vec<(usize, usize)> = logical_pools
                     .iter()
                     .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
                     .collect();
-                let ram_slots = infr_core::hostpager::plan_slots(ram_budget, &classes);
+                let ram_slots = infr_core::hostpager::plan_slots(host_cache_budget, &classes);
                 let io = std::sync::Arc::new(
                     infr_core::blockio::FileBlockIo::open_shards(&g.shards())
                         .map_err(|e| anyhow!("{e}"))?,
@@ -3061,7 +3149,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
                 tracing::info!(
                     "MoE host plan: bounded inclusive RAM cache {:.2} GB / {:.2} GB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
-                    ram_budget as f64 / 1e9,
+                    host_cache_budget as f64 / 1e9,
                     host_bytes as f64 / 1e9,
                 );
             } else {
@@ -4875,22 +4963,60 @@ mod seam_helper_tests {
     const GIB: usize = 1 << 30;
 
     #[test]
+    fn host_ram_request_preserves_total_budget_and_legacy_cache_semantics() {
+        use infr_core::{hostmem::RamRequest, SizeSpec};
+
+        let mut config = EngineConfig::default();
+        config.device.ram_budget = Some(SizeSpec::Bytes((50 * GIB) as u64));
+        config.paging.dram = Some(SizeSpec::Bytes((7 * GIB) as u64));
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::TotalProcessBudget((50 * GIB) as u64),
+            "the canonical process-wide budget must win over the compatibility cache override"
+        );
+
+        config.device.ram_budget = None;
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::LegacyCacheBudget((7 * GIB) as u64),
+            "legacy paging.dram must retain its exact cache-only meaning"
+        );
+
+        config.device.ram_budget = Some(SizeSpec::Bytes(0));
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::TotalProcessBudget(0),
+            "zero must retain its canonical source so diagnostics cannot mislabel it"
+        );
+    }
+
+    #[test]
     fn moe_host_backing_disables_ssd_when_routed_payload_fits() {
-        use infr_core::hostmem::Requested;
+        use infr_core::hostmem::RamRequest;
 
         let payload = 24 * GIB;
         assert_eq!(
-            super::moe_host_backing(Requested::Fixed(payload as u64), None, payload),
+            super::moe_host_backing(
+                RamRequest::LegacyCacheBudget(payload as u64),
+                None,
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Full,
             "an exact explicit fit must disable the runtime SSD tier"
         );
         assert_eq!(
-            super::moe_host_backing(Requested::Fixed((40 * GIB) as u64), None, payload),
+            super::moe_host_backing(
+                RamRequest::LegacyCacheBudget((40 * GIB) as u64),
+                None,
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Full,
             "budget above the routed payload must not create a bounded SSD cache"
         );
         assert_eq!(
-            super::moe_host_backing(Requested::Auto, Some((64 * GIB) as u64), payload),
+            super::moe_host_backing(RamRequest::Auto, Some((64 * GIB) as u64), Some(0), payload,),
             super::MoeHostBacking::Full,
             "automatic sizing must select the full store when its post-headroom budget fits"
         );
@@ -4898,24 +5024,66 @@ mod seam_helper_tests {
 
     #[test]
     fn moe_host_backing_keeps_ssd_only_below_routed_payload() {
-        use infr_core::hostmem::Requested;
+        use infr_core::hostmem::RamRequest;
 
         let payload = 24 * GIB;
         assert_eq!(
-            super::moe_host_backing(Requested::Fixed((23 * GIB) as u64), None, payload),
+            super::moe_host_backing(
+                RamRequest::LegacyCacheBudget((23 * GIB) as u64),
+                None,
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 23 * GIB }
         );
         assert!(matches!(
-            super::moe_host_backing(Requested::Auto, Some((25 * GIB) as u64), payload),
+            super::moe_host_backing(
+                RamRequest::Auto,
+                Some((25 * GIB) as u64),
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
         ));
         assert_eq!(
-            super::moe_host_backing(Requested::Off, Some((64 * GIB) as u64), payload),
+            super::moe_host_backing(
+                RamRequest::TotalProcessBudget(0),
+                Some((64 * GIB) as u64),
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 0 }
         );
         assert_eq!(
-            super::moe_host_backing(Requested::Bypass, Some((64 * GIB) as u64), payload),
+            super::moe_host_backing(
+                RamRequest::Bypass,
+                Some((64 * GIB) as u64),
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 0 }
+        );
+    }
+
+    #[test]
+    fn moe_host_backing_resolves_total_ram_and_auto_requires_a_probe() {
+        use infr_core::hostmem::RamRequest;
+
+        let payload = 80 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                Some((48 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 48 * GIB },
+            "50 GiB is the total process target, leaving 48 GiB after its current working set"
+        );
+        assert_eq!(
+            super::moe_host_backing(RamRequest::Auto, None, Some(0), payload),
+            super::MoeHostBacking::Bounded { bytes: 0 },
+            "auto sizing without a probe must not assume the whole payload fits RAM"
         );
     }
 

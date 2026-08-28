@@ -525,7 +525,7 @@ fn profile_settings(
         if !profile.kv_type_v.eq_ignore_ascii_case("auto") {
             insert_nonempty(&mut values, "kv.type_v", &profile.kv_type_v);
         }
-        insert_nonempty(&mut values, "paging.dram", &profile.ram_budget);
+        insert_nonempty(&mut values, "device.ram_budget", &profile.ram_budget);
         insert_nonempty(&mut values, "paging.cache", &profile.expert_cache);
         values.insert("paging.host_dma".into(), profile.host_dma.to_string());
         values.insert("paging.dram_bypass".into(), profile.dram_bypass.to_string());
@@ -866,11 +866,11 @@ mod tests {
         for automatic in [
             "device.ctx",
             "device.vram_budget",
+            "device.ram_budget",
             "device.vram_reserve",
             "device.ubatch",
             "kv.type_k",
             "kv.type_v",
-            "paging.dram",
             "paging.cache",
         ] {
             assert!(
@@ -904,6 +904,7 @@ mod tests {
         let p = ModelProfile {
             id: "large-moe".into(),
             model_path: "model.gguf".into(),
+            ram_budget: "50g".into(),
             host_dma: false,
             dram_bypass: true,
             pager_stats: true,
@@ -912,6 +913,14 @@ mod tests {
         };
         let settings = profile_settings(&p, Path::new("worker.stop")).unwrap();
 
+        assert_eq!(
+            settings.get("device.ram_budget").map(String::as_str),
+            Some("50g")
+        );
+        assert!(
+            !settings.contains_key("paging.dram"),
+            "new GUI profiles must not emit the legacy cache-only parameter"
+        );
         assert_eq!(
             settings.get("paging.host_dma").map(String::as_str),
             Some("false")

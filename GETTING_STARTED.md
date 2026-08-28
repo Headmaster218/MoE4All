@@ -215,7 +215,7 @@ Benchmark 不检查回答质量。Synthetic KV 是确定性测试数据，不包
 | VRAM budget | 引擎可使用的总显存，不只是专家缓存 | 不要把显卡标称容量全部填满 |
 | VRAM reserve | 给桌面、驱动波动和额外资源留下的显存 | Windows 主显示卡需要合理余量 |
 | GPU expert cache | 显存中可常驻多少专家权重 | 只是总显存预算的一部分 |
-| RAM expert cache | 用多少系统 RAM 缓存专家，剩余部分继续从 SSD 读取 | 太大可能挤压系统和页面文件 |
+| 总 RAM budget (`device.ram_budget` / `INFR_RAM_BUDGET`) | infr 进程的总常驻内存目标；扣除现有工作集后，余量用于专家 cache | 留空自动；手动值可挤出系统冷页；百分比按物理 RAM 总量计算 |
 | Host DMA | 让兼容驱动用 Vulkan DMA 从导入 RAM 搬到 VRAM | 默认开启；失败会回退 |
 | Submit splitter | 把长 GPU 工作切成多次提交，涉及性能和 Windows TDR | 普通用户保持自动 |
 | Parallel slots | API 同时生成的会话数，每个 slot 有独立 KV | 从 1 开始 |
@@ -376,8 +376,11 @@ Vulkan runtime。先让 `devices` 正常，再加载模型。
 
 ### 系统内存占用很高
 
-大型 MoE 会主动利用 RAM 缓存专家。不要把 RAM expert cache 设置到让 Windows、
-页面文件和其他程序没有余量。自动探测以可用内存为基础；手工预算应更保守。
+大型 MoE 会主动利用 RAM 缓存专家。留空时，引擎按当前可用内存自动留出系统余量；
+手工 `device.ram_budget`（或 `INFR_RAM_BUDGET`）表示 infr 进程总常驻 RAM 预算，
+并允许 Windows 换出其他冷页。该值属于高级覆盖项，应按机器负载和页面文件容量
+谨慎设置。旧 `paging.dram` / `INFR_DRAM_CACHE` 只为复现历史基准保留，表示原始
+host cache 大小，不应写入新配置。
 
 ### 下载的 EXE 被 SmartScreen 提示
 

@@ -61,6 +61,11 @@ cfg_struct! {
         /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.
         /// Percentages resolve against total device-local memory.
         vram_budget: Option<SizeSpec> = None,
+        /// `INFR_RAM_BUDGET`: total resident host-memory target for this process. The host-tier
+        /// planner subtracts the live process working set and gives only the remainder to its
+        /// weight cache. Unset keeps automatic sizing with system headroom; zero disables the
+        /// host cache. Percentages resolve against total physical host RAM.
+        ram_budget: Option<SizeSpec> = None,
         /// `INFR_VRAM_RESERVE`: additional device memory kept outside the backend's allocation
         /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
         /// against total device-local memory.
@@ -174,14 +179,10 @@ cfg_struct! {
         /// memory and written after generation so tracing does not add per-expert file I/O to the
         /// critical path.
         trace: Option<PathBuf> = None,
-        /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
-        /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
-        /// leaving residency to the OS page cache. For paged MoE, a budget covering the complete
-        /// routed-expert payload automatically becomes the permanent layer-contiguous Host Store
-        /// and disables runtime SSD reads; a smaller budget becomes the inclusive RAM/SSD cache.
-        ///
-        /// `None` (the default) sizes itself from currently available host memory while preserving
-        /// headroom. An explicit size pins the budget; zero disables the DRAM cache.
+        /// Legacy raw host-cache override: `INFR_DRAM_CACHE` / `paging.dram`. New configurations
+        /// should use `device.ram_budget`, whose value covers the whole process. This field retains
+        /// its historical cache-only meaning so existing benchmark scripts remain reproducible.
+        /// It is used only when `device.ram_budget` is unset; zero disables the host cache.
         dram: Option<SizeSpec> = None,
         /// `INFR_DRAM_BYPASS`: read paged blocks straight from disk into GPU memory, with NO host
         /// cache in between — the shape a unified-memory device takes automatically, because there

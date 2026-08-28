@@ -1409,7 +1409,8 @@ impl HostPager {
                 None => {
                     return Err(Error::backend(format!(
                         "host pager: every slot of the {}-slot host cache is pinned, so block {id} \
-                         cannot be admitted. Raise the host paging budget (paging.dram) — it must \
+                         cannot be admitted. Raise the total process RAM budget \
+                         (device.ram_budget) — it must \
                          hold at least one working set per concurrent request.",
                         inner.pager.n_slots()
                     )))
@@ -2132,7 +2133,10 @@ mod tests {
         let _a = p.pin(1, Insert::Mru).expect("pin");
         let _b = p.pin(2, Insert::Mru).expect("pin");
         let err = p.pin(3, Insert::Mru).expect_err("must refuse");
-        assert!(err.to_string().contains("paging.dram"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("device.ram_budget"),
+            "unexpected: {err}"
+        );
         // Releasing one pin makes the same call succeed.
         drop(_a);
         assert_eq!(&p.pin(3, Insert::Mru).expect("pin")[..], &[3u8; 16][..]);

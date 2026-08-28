@@ -207,7 +207,7 @@ async function estimateProfile(profile) {
     ['GGUF 文件',e.model_bytes],['固定 VRAM 权重',e.fixed_vram_bytes],['Expert payload',e.expert_payload_bytes],
     ['KV / 持久状态',e.kv_bytes],['运行时弹性峰值',e.runtime_reserve_bytes],['Packing margin',e.weight_packing_margin_bytes],
     ['驱动 / Post-load 预留',(e.load_driver_reserve_bytes || 0) + (e.post_load_reserve_bytes || 0)],
-    ['有效 VRAM 预算',e.effective_vram_budget_bytes],['Expert target',e.estimated_cache_room_bytes],['Elastic pool',e.elastic_pool_bytes],
+    ['有效 VRAM 预算',e.effective_vram_budget_bytes],['总 RAM 预算',e.requested_ram_budget_bytes],['Expert target',e.estimated_cache_room_bytes],['Elastic pool',e.elastic_pool_bytes],
     ['联合 Embedding 权重',e.embedding_model_bytes]
   ].filter(([,value]) => value !== null && value !== undefined);
   const coverage = e.host_cache_coverage == null ? '' : ` · ${(e.host_cache_coverage * 100).toFixed(1)}%`;

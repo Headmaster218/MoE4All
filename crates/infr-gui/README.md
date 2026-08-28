@@ -81,9 +81,11 @@ trusted.
   compatibility path.
 - Standalone Embedding profiles use INFR's native CPU/Vulkan engine by default. An explicit runner
   selects compatibility mode.
-- Paged MoE models use the current VRAM/RAM/SSD hierarchy. A RAM budget covering the complete Expert
-  payload selects the full layer-major host store; a smaller budget selects the bounded inclusive
-  RAM/SSD cache, preloaded proportionally across layers. `paging.dram_bypass` is also exposed.
+- Paged MoE models use the current VRAM/RAM/SSD hierarchy. The GUI writes `device.ram_budget`; an
+  explicit value is the worker's total resident-memory target, and its live working set is
+  subtracted before the remaining bytes are
+  assigned to the full host store or bounded inclusive RAM/SSD cache. Automatic mode retains host
+  headroom. `paging.dram_bypass` is also exposed.
 - Host DMA is enabled by default. Supported Vulkan drivers import aligned RAM arenas through
   `VK_EXT_external_memory_host`; unsupported ranges fall back to the CPU/ReBAR path. The GUI reports
   actual imported bytes from worker startup logs.

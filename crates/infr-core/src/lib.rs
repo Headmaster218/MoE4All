@@ -48,8 +48,8 @@ pub use resource::{MemoryTier, ResourceKind, ResourceLease, ResourceSnapshot, Re
 pub use tensor::{DType, Shape, TensorDesc, TensorId};
 
 /// A parsed human size/count value: an absolute amount, or a percentage the CALLER resolves
-/// against the device-appropriate base (available VRAM for GPU-resident structures like the
-/// paged expert cache and the Vulkan KV budget; available system RAM on the CPU backend).
+/// against the knob-appropriate base (device-local VRAM for GPU budgets; total physical RAM for
+/// the process-wide `device.ram_budget`; available system RAM for automatic host-cache policy).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SizeSpec {
     /// Absolute amount in the knob's base unit (bytes for sizes, tokens for counts).
