@@ -130,7 +130,6 @@ function renderModels() {
     selectedModel = el.dataset.model; $('model-path').value = selectedModel; formDirty = true; renderModels();
     const model = data.catalog.find(m => m.path === selectedModel);
     if (model?.tasks?.length === 1 && model.tasks[0] === 'embedding') $('task').value = 'embedding';
-    if (model?.trained_context && !$('context').value) $('context').value = model.trained_context;
     syncTaskFields();
   });
   document.querySelectorAll('[data-star]').forEach(b => b.onclick = async (ev) => { ev.stopPropagation(); await post('/api/favorites/toggle',{path:b.dataset.star},true); });

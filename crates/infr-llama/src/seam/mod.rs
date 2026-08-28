@@ -2164,6 +2164,29 @@ fn moe_pool_slot_counts(
     Some(slots)
 }
 
+const AUTO_MOE_ARENA_SHRINK_MIN: u64 = 256 * 1024 * 1024;
+const AUTO_MOE_ARENA_MAX_ATTEMPTS: usize = 16;
+
+/// Next automatic mapped-arena probe. An allocation failure has no trustworthy byte shortfall,
+/// so retire 5% (at least 256 MiB); a successful allocation whose live budget is short can name
+/// the exact deficit and skips directly past it. Explicit cache budgets never call this helper.
+fn next_auto_moe_arena_budget(current: u64, minimum: u64, shortfall: u64) -> Option<u64> {
+    const STEP_ALIGN: u64 = 64 * 1024 * 1024;
+    let measured = shortfall.div_ceil(STEP_ALIGN).saturating_mul(STEP_ALIGN);
+    let step = (current / 20).max(AUTO_MOE_ARENA_SHRINK_MIN).max(measured);
+    let next = current.saturating_sub(step);
+    (next >= minimum && next < current).then_some(next)
+}
+
+fn moe_pool_capacity_bytes(pools: &[(usize, usize, [usize; 3])], slots: &[usize]) -> u64 {
+    pools
+        .iter()
+        .zip(slots)
+        .fold(0u64, |total, (&(slot_bytes, ..), &n_slots)| {
+            total.saturating_add((slot_bytes as u64).saturating_mul(n_slots as u64))
+        })
+}
+
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
 /// activation reserve both PLATEAU with context — every attention layer sliding-window (so the
 /// ring caps its rows) and head_dim 128 with no score tile. There the fit is bounded by nothing
@@ -2562,6 +2585,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut expert_cache_target_bytes = 0u64;
     let mut pager_budget_bytes = 0u64;
+    let mut pager_memory_plan = None;
+    let mut pager_prefill_floor_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -2708,6 +2733,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // the old load-time escrow purpose, so a second dedicated reservation would both
             // waste VRAM and double-charge the same bytes.
             pager_budget_bytes = plan.elastic_pool_bytes(expert_cache_target_bytes);
+            pager_memory_plan = Some(plan);
+            pager_prefill_floor_bytes = prefill_floor;
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
@@ -2885,19 +2912,119 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None if auto_size_bias_layout => (2.0, "auto"),
                 None => (0.0, "off"),
             };
-            let slot_counts = moe_pool_slot_counts(
-                &logical_pools,
-                pager_budget_bytes,
-                n_expert,
-                size_cache_bias,
-            )
-            .ok_or_else(|| {
-                anyhow!(
-                    "MoE expert arena budget ({:.2} MiB) cannot hold one complete Prefill layer; \
-                     increase INFR_VRAM_BUDGET/INFR_CACHE or reduce context/runtime memory",
-                    pager_budget_bytes as f64 / 2f64.powi(20),
-                )
-            })?;
+            // Commit the mapped arena before allocating host caches or loading weights, then ask
+            // the driver how much room is ACTUALLY left. `VK_EXT_memory_budget` accounting for a
+            // large ReBAR mapping is card/driver dependent: WDDM can charge more than the logical
+            // VkDeviceMemory size, so a plan that fits arithmetically on one GPU can leave too
+            // little room for the same fixed weights on another. Automatic placement shrinks and
+            // retries while the arena is still empty; an explicit `paging.cache` remains exact.
+            let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
+            let prefill_floor = pager_prefill_floor_bytes;
+            let planned_pager_budget = pager_budget_bytes;
+            let minimum_pager_budget = plan.runtime_reserve_bytes.saturating_add(prefill_floor);
+            let required_after_arena = plan
+                .minimum_required_bytes()
+                .saturating_sub(plan.runtime_reserve_bytes);
+            let adaptive_arena = cache_override.is_none();
+            let mut candidate_budget = pager_budget_bytes;
+            let mut attempts = 0usize;
+            let slot_counts = loop {
+                attempts += 1;
+                let Some(candidate_slots) = moe_pool_slot_counts(
+                    &logical_pools,
+                    candidate_budget,
+                    n_expert,
+                    size_cache_bias,
+                ) else {
+                    return Err(anyhow!(
+                        "MoE expert arena budget ({:.2} MiB) cannot hold one complete Prefill \
+                         layer plus runtime workspace; increase the VRAM budget or reduce context",
+                        candidate_budget as f64 / 2f64.powi(20),
+                    ));
+                };
+                let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
+                if physical_bytes.saturating_sub(plan.runtime_reserve_bytes) < prefill_floor {
+                    return Err(anyhow!(
+                        "MoE mapped arena cannot retain one complete Prefill layer after its \
+                         runtime reserve (arena {:.2} MiB, runtime {:.2} MiB, layer {:.2} MiB)",
+                        physical_bytes as f64 / 2f64.powi(20),
+                        plan.runtime_reserve_bytes as f64 / 2f64.powi(20),
+                        prefill_floor as f64 / 2f64.powi(20),
+                    ));
+                }
+                let specs: Vec<(usize, usize)> = logical_pools
+                    .iter()
+                    .zip(&candidate_slots)
+                    .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
+                    .collect();
+
+                let failure = match vk.prepare_moe_unified_vram(&specs) {
+                    Ok(committed) => {
+                        debug_assert_eq!(committed as u64, physical_bytes);
+                        let live_room = vk.alloc_room();
+                        if live_room >= required_after_arena {
+                            pager_budget_bytes = physical_bytes;
+                            expert_cache_target_bytes = expert_cache_target_bytes
+                                .min(physical_bytes.saturating_sub(plan.runtime_reserve_bytes));
+                            if attempts > 1 {
+                                tracing::warn!(
+                                    planned_bytes = planned_pager_budget,
+                                    actual_bytes = pager_budget_bytes,
+                                    attempts,
+                                    "automatic MoE arena reduced after live Vulkan allocation \
+                                     feedback; fixed weights, KV and runtime reserves remain intact"
+                                );
+                            }
+                            break candidate_slots;
+                        }
+                        let shortfall = required_after_arena - live_room;
+                        vk.discard_empty_moe_unified_vram()
+                            .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
+                        (
+                            shortfall,
+                            format!(
+                                "the mapped arena left {:.2} MiB live, {:.2} MiB short of fixed \
+                                 weights/KV/reserves",
+                                live_room as f64 / 2f64.powi(20),
+                                shortfall as f64 / 2f64.powi(20),
+                            ),
+                        )
+                    }
+                    Err(error) => (0, error.to_string()),
+                };
+
+                if !adaptive_arena {
+                    return Err(anyhow!(
+                        "explicit MoE expert arena {:.2} MiB did not fit this device: {}",
+                        physical_bytes as f64 / 2f64.powi(20),
+                        failure.1,
+                    ));
+                }
+                let next = (attempts < AUTO_MOE_ARENA_MAX_ATTEMPTS)
+                    .then(|| {
+                        next_auto_moe_arena_budget(
+                            candidate_budget,
+                            minimum_pager_budget,
+                            failure.0,
+                        )
+                    })
+                    .flatten()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "automatic MoE arena could not find a device-safe size after \
+                             {attempts} attempt(s): {}",
+                            failure.1,
+                        )
+                    })?;
+                tracing::warn!(
+                    attempt = attempts,
+                    old_bytes = candidate_budget,
+                    new_bytes = next,
+                    reason = %failure.1,
+                    "automatic MoE arena allocation retry"
+                );
+                candidate_budget = next;
+            };
             // The Host tier has two honest modes. If the configured/automatic RAM budget covers
             // the whole expert payload, retain the existing layer-contiguous store (fastest
             // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
@@ -6133,6 +6260,29 @@ mod seam_helper_tests {
             .iter()
             .zip(&slots)
             .all(|(&(_, max_slots, _), &n)| n <= max_slots));
+        assert_eq!(super::moe_pool_capacity_bytes(&pools, &slots), allocated);
+    }
+
+    #[test]
+    fn automatic_moe_arena_retry_is_bounded_and_honors_the_floor() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB64: u64 = 1024 * MIB;
+        let current = 16 * GIB64;
+        assert_eq!(
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, 0),
+            Some(current - current / 20),
+            "an unknown allocation failure retires five percent"
+        );
+        assert_eq!(
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, 1537 * MIB),
+            Some(current - 1600 * MIB),
+            "a measured deficit rounds up and skips directly past it"
+        );
+        assert_eq!(
+            super::next_auto_moe_arena_budget(2 * GIB64, 2 * GIB64, 0),
+            None,
+            "the runtime plus one-layer floor is never crossed"
+        );
     }
 
     #[test]

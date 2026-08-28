@@ -21,8 +21,11 @@
 /// a new allocation can have without swapping — it already accounts for reclaimable page cache, so
 /// it is exactly the figure this tier wants and not something derivable from `MemTotal`.
 ///
-/// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`. Every other platform answers
-/// `None` today; macOS would need `host_statistics64`'s free/inactive/purgeable split.
+/// **Windows** reads `GlobalMemoryStatusEx` and uses the smaller of `ullAvailPhys` and
+/// `ullAvailPageFile`. The arena needs both reusable physical pages and commit charge;
+/// `VirtualAlloc(MEM_COMMIT)` can fail even with free RAM when the process/system commit limit is
+/// tighter. Every other platform answers `None` today; macOS would need `host_statistics64`'s
+/// free/inactive/purgeable split.
 ///
 /// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
 /// limit a container or a `systemd-run --scope -p MemoryMax=` puts on this process — measured on
@@ -40,12 +43,21 @@ pub fn available_bytes() -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        Some(windows_memory_status()?.ullAvailPhys)
+        let status = windows_memory_status()?;
+        Some(windows_available_bytes(
+            status.ullAvailPhys,
+            status.ullAvailPageFile,
+        ))
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_available_bytes(available_phys: u64, available_commit: u64) -> u64 {
+    available_phys.min(available_commit)
 }
 
 #[cfg(windows)]
@@ -352,6 +364,17 @@ mod tests {
             "available {avail} exceeds total {}",
             status.ullTotalPhys
         );
+        assert!(
+            avail <= status.ullAvailPageFile,
+            "available {avail} exceeds commit headroom {}",
+            status.ullAvailPageFile
+        );
+    }
+
+    #[test]
+    fn windows_probe_is_bounded_by_physical_and_commit_headroom() {
+        assert_eq!(windows_available_bytes(48 * GIB, 20 * GIB), 20 * GIB);
+        assert_eq!(windows_available_bytes(12 * GIB, 40 * GIB), 12 * GIB);
     }
 
     /// Headroom is the point: the budget never equals what is available, however much there is.

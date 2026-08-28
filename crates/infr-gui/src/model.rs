@@ -21,7 +21,7 @@ pub struct GuiState {
 impl Default for GuiState {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             directories: Vec::new(),
             downloaded_models: Vec::new(),
             favorites: Vec::new(),
@@ -73,12 +73,12 @@ impl Default for ModelProfile {
             task: "chat".into(),
             embedding_runner: String::new(),
             backend: "Vulkan0".into(),
-            context: "200k".into(),
+            context: String::new(),
             ubatch: None,
-            kv_type_k: "q8_0".into(),
-            kv_type_v: "q8_0".into(),
-            vram_budget: "23g".into(),
-            vram_reserve: "512m".into(),
+            kv_type_k: "auto".into(),
+            kv_type_v: "auto".into(),
+            vram_budget: String::new(),
+            vram_reserve: String::new(),
             ram_budget: String::new(),
             expert_cache: String::new(),
             host_dma: true,
@@ -314,8 +314,34 @@ pub fn load_state(path: &Path) -> anyhow::Result<GuiState> {
             migrate_pager_controls(profile);
         }
     }
+    if state.version < 3 {
+        for profile in &mut state.profiles {
+            migrate_legacy_hardware_defaults(profile);
+        }
+    }
     state.version = GuiState::default().version;
     Ok(state)
+}
+
+/// Versions 1-2 populated every new profile with the development machine's 24 GiB tuning.
+/// Migrate only the complete untouched tuple: changing any one field is evidence that the user
+/// made an intentional hardware/profile choice and must remain authoritative.
+fn migrate_legacy_hardware_defaults(profile: &mut ModelProfile) {
+    let untouched = profile.context.eq_ignore_ascii_case("200k")
+        && profile.kv_type_k.eq_ignore_ascii_case("q8_0")
+        && profile.kv_type_v.eq_ignore_ascii_case("q8_0")
+        && profile.vram_budget.eq_ignore_ascii_case("23g")
+        && profile.vram_reserve.eq_ignore_ascii_case("512m")
+        && profile.ubatch.is_none()
+        && profile.ram_budget.trim().is_empty()
+        && profile.expert_cache.trim().is_empty();
+    if untouched {
+        profile.context.clear();
+        profile.kv_type_k = "auto".into();
+        profile.kv_type_v = "auto".into();
+        profile.vram_budget.clear();
+        profile.vram_reserve.clear();
+    }
 }
 
 fn migrate_pager_controls(profile: &mut ModelProfile) {
@@ -399,6 +425,18 @@ mod tests {
     }
 
     #[test]
+    fn new_profiles_leave_hardware_sizing_to_the_engine() {
+        let profile = ModelProfile::default();
+        assert!(profile.context.is_empty());
+        assert_eq!(profile.kv_type_k, "auto");
+        assert_eq!(profile.kv_type_v, "auto");
+        assert!(profile.vram_budget.is_empty());
+        assert!(profile.vram_reserve.is_empty());
+        assert!(profile.ram_budget.is_empty());
+        assert!(profile.expert_cache.is_empty());
+    }
+
+    #[test]
     fn version_one_profiles_gain_current_pager_defaults() {
         let state: GuiState = serde_json::from_str(
             r#"{
@@ -439,12 +477,61 @@ mod tests {
 
         let state = load_state(&path).unwrap();
         let profile = &state.profiles[0];
-        assert_eq!(state.version, 2);
+        assert_eq!(state.version, 3);
         assert!(!profile.host_dma);
         assert!(profile.dram_bypass);
         assert!(profile.pager_stats);
         assert_eq!(profile.pager_trace, "old-pager.csv");
         assert!(profile.extra.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_migrates_only_the_untouched_legacy_hardware_template() {
+        let root = temp_root();
+        let path = root.join("state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "profiles": [
+                    {
+                        "id":"legacy",
+                        "name":"Legacy default",
+                        "model_path":"model.gguf",
+                        "context":"200k",
+                        "kv_type_k":"q8_0",
+                        "kv_type_v":"q8_0",
+                        "vram_budget":"23g",
+                        "vram_reserve":"512m"
+                    },
+                    {
+                        "id":"custom",
+                        "name":"Intentional",
+                        "model_path":"model.gguf",
+                        "context":"128k",
+                        "kv_type_k":"q8_0",
+                        "kv_type_v":"q8_0",
+                        "vram_budget":"23g",
+                        "vram_reserve":"512m"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let state = load_state(&path).unwrap();
+        let legacy = state.profiles.iter().find(|p| p.id == "legacy").unwrap();
+        assert!(legacy.context.is_empty());
+        assert_eq!(legacy.kv_type_k, "auto");
+        assert_eq!(legacy.kv_type_v, "auto");
+        assert!(legacy.vram_budget.is_empty());
+        assert!(legacy.vram_reserve.is_empty());
+
+        let custom = state.profiles.iter().find(|p| p.id == "custom").unwrap();
+        assert_eq!(custom.context, "128k");
+        assert_eq!(custom.kv_type_k, "q8_0");
+        assert_eq!(custom.vram_budget, "23g");
         fs::remove_dir_all(root).unwrap();
     }
 }

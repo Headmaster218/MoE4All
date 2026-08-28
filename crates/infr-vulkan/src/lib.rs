@@ -278,6 +278,16 @@ impl VramInfo {
     }
 }
 
+fn backend_physical_alloc_room(vram: VramInfo, tracked_used: u64) -> u64 {
+    if vram.live {
+        vram.alloc_room()
+    } else {
+        // Without VK_EXT_memory_budget the snapshot is the whole heap, not live free memory.
+        // Keep the fallback honest with the backend's own balanced allocation tally.
+        vram.alloc_room().saturating_sub(tracked_used)
+    }
+}
+
 struct VulkanShared {
     // NOTE: field declaration order matters for drop.
     // Rust drops struct fields in *declaration order*.  We keep `allocator`
@@ -3388,10 +3398,11 @@ impl VulkanBackend {
     /// the room only before this backend has allocated — which is when placement runs.
     pub fn alloc_room(&self) -> u64 {
         let vram = self.vram();
+        let tracked_used = self.shared.device_used.load(Ordering::Relaxed);
         infr_core::budget::unified_vram_room(
             vram.total,
-            vram.alloc_room(),
-            self.shared.device_used.load(Ordering::Relaxed),
+            backend_physical_alloc_room(vram, tracked_used),
+            tracked_used,
             self.cfg.device.vram_budget,
             self.cfg.device.vram_reserve,
         )
@@ -3768,6 +3779,36 @@ impl VulkanBackend {
         let pool = crate::unified::UnifiedVramPool::new_with_shards(self, &shard_sizes)?;
         *cell = Some(Arc::clone(&pool));
         Ok(pool)
+    }
+
+    /// Materialize an otherwise-empty MoE unified arena before the pager session is installed.
+    /// The seam uses this as a real allocation probe: mapped ReBAR memory can consume a
+    /// driver-dependent amount of heap budget beyond its logical byte size, especially on WDDM.
+    /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
+    pub fn prepare_moe_unified_vram(&self, specs: &[(usize, usize)]) -> Result<usize> {
+        let pool = self.init_unified_vram_for_expert_slots(specs)?;
+        Ok(pool.stats().capacity_bytes)
+    }
+
+    /// Drop a prepared MoE arena after a placement probe found that it leaves too little live
+    /// room. This is deliberately valid only before the pager has leased a single range; once a
+    /// session exists, changing its physical slot space would invalidate every BDA/LUT address.
+    pub fn discard_empty_moe_unified_vram(&self) -> Result<usize> {
+        let mut cell = self.unified_pool.lock().unwrap();
+        let Some(pool) = cell.as_ref() else {
+            return Ok(0);
+        };
+        let stats = pool.stats();
+        if stats.free_bytes != stats.capacity_bytes || Arc::strong_count(pool) != 1 {
+            return Err(be(
+                "cannot resize unified VRAM after the pager has leased or retained its arena",
+            ));
+        }
+        let bytes = stats.capacity_bytes;
+        let pool = cell.take().expect("checked above");
+        drop(cell);
+        drop(pool);
+        Ok(bytes)
     }
 
     pub fn unified_vram(&self) -> Option<Arc<crate::unified::UnifiedVramPool>> {
@@ -5267,6 +5308,32 @@ fn probe_flash_attention_hd256(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    #[test]
+    fn fallback_vram_room_subtracts_tracked_allocations() {
+        const GIB: u64 = 1 << 30;
+        let fallback = VramInfo {
+            total: 16 * GIB,
+            available: 16 * GIB,
+            live: false,
+            uma: false,
+        };
+        assert_eq!(
+            backend_physical_alloc_room(fallback, 5 * GIB),
+            fallback.alloc_room() - 5 * GIB
+        );
+
+        let live = VramInfo {
+            available: 9 * GIB,
+            live: true,
+            ..fallback
+        };
+        assert_eq!(
+            backend_physical_alloc_room(live, 5 * GIB),
+            live.alloc_room(),
+            "a live heap budget already nets out tracked allocations"
+        );
+    }
 
     #[test]
     fn host_import_selector_spreads_a_finite_budget_proportionally() {

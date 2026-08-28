@@ -862,6 +862,22 @@ mod tests {
             ..ModelProfile::default()
         };
         validate_profile(&p).unwrap();
+        let settings = profile_settings(&p, Path::new("worker.stop")).unwrap();
+        for automatic in [
+            "device.ctx",
+            "device.vram_budget",
+            "device.vram_reserve",
+            "device.ubatch",
+            "kv.type_k",
+            "kv.type_v",
+            "paging.dram",
+            "paging.cache",
+        ] {
+            assert!(
+                !settings.contains_key(automatic),
+                "default GUI profile must leave {automatic} to engine auto sizing"
+            );
+        }
     }
 
     #[test]
