@@ -2252,6 +2252,7 @@ impl MoePagerSession {
             tracing::debug!(
                 restored_slots = restored,
                 expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                kv_cache_bytes = stats.class_bytes(UnifiedVramClass::KvCache),
                 llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
                 embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
                 embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),

@@ -16,6 +16,7 @@ use super::{as_vk_buf, be, VulkanBackend};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnifiedVramClass {
     Expert,
+    KvCache,
     LlmRuntime,
     EmbeddingWeights,
     EmbeddingRuntime,
@@ -26,18 +27,19 @@ pub enum UnifiedVramClass {
 }
 
 impl UnifiedVramClass {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 
     const fn index(self) -> usize {
         match self {
             Self::Expert => 0,
-            Self::LlmRuntime => 1,
-            Self::EmbeddingWeights => 2,
-            Self::EmbeddingRuntime => 3,
-            Self::VisionWeights => 4,
-            Self::VisionRuntime => 5,
-            Self::DraftWeights => 6,
-            Self::DraftRuntime => 7,
+            Self::KvCache => 1,
+            Self::LlmRuntime => 2,
+            Self::EmbeddingWeights => 3,
+            Self::EmbeddingRuntime => 4,
+            Self::VisionWeights => 5,
+            Self::VisionRuntime => 6,
+            Self::DraftWeights => 7,
+            Self::DraftRuntime => 8,
         }
     }
 }

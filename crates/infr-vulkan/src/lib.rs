@@ -64,7 +64,7 @@ use gpu_allocator::vulkan::{
 use gpu_allocator::MemoryLocation;
 
 use infr_core::{
-    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
+    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan, SegmentedKvSpec},
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
     error::Result,
@@ -808,6 +808,44 @@ impl Buffer for VkBuffer {
             _ => None,
         }
     }
+}
+
+/// A graph-visible full-context KV buffer backed by independently committed physical segments.
+/// The tiny host-visible table stores one device address per live segment; paged KV kernels bind
+/// that table while the ordinary graph continues to carry the original logical tensor extent.
+struct VkSegmentedKvBuffer {
+    shared: Arc<VulkanShared>,
+    spec: SegmentedKvSpec,
+    table: VkBuffer,
+    segments: Mutex<Vec<VkBuffer>>,
+}
+
+impl VkSegmentedKvBuffer {
+    fn committed(&self) -> usize {
+        self.segments.lock().unwrap().len()
+    }
+
+    pub(crate) fn table_buffer(&self) -> &VkBuffer {
+        &self.table
+    }
+
+    pub(crate) fn spec(&self) -> SegmentedKvSpec {
+        self.spec
+    }
+}
+
+impl Buffer for VkSegmentedKvBuffer {
+    fn len_bytes(&self) -> usize {
+        self.spec.logical_bytes
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+pub(crate) fn as_segmented_kv(b: &dyn Buffer) -> Option<&VkSegmentedKvBuffer> {
+    b.as_any().downcast_ref::<VkSegmentedKvBuffer>()
 }
 
 // ── weight arena ────────────────────────────────────────────────────────────────
@@ -3906,7 +3944,8 @@ impl VulkanBackend {
                 })?;
                 if matches!(
                     class,
-                    crate::unified::UnifiedVramClass::EmbeddingWeights
+                    crate::unified::UnifiedVramClass::KvCache
+                        | crate::unified::UnifiedVramClass::EmbeddingWeights
                         | crate::unified::UnifiedVramClass::VisionWeights
                         | crate::unified::UnifiedVramClass::DraftWeights
                         | crate::unified::UnifiedVramClass::LlmRuntime
@@ -3960,6 +3999,80 @@ impl VulkanBackend {
         class: crate::unified::UnifiedVramClass,
     ) -> Result<Box<dyn Buffer>> {
         Ok(Box::new(self.alloc_unified_buffer(size, class)?) as Box<dyn Buffer>)
+    }
+
+    fn make_segmented_kv(&self, spec: SegmentedKvSpec) -> Result<VkSegmentedKvBuffer> {
+        if spec.logical_bytes == 0
+            || spec.segment_bytes == 0
+            || spec.segment_elements == 0
+            || spec.max_segments == 0
+        {
+            return Err(be(format!(
+                "segmented KV needs non-zero logical bytes, segment bytes and segment count; got {spec:?}"
+            )));
+        }
+        let table_bytes = spec
+            .max_segments
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| be("segmented KV address-table size overflow"))?;
+        let table = self.make_buf(table_bytes, MemoryLocation::CpuToGpu, "kv-segment-table")?;
+        self.fill_buf(&table, 0)?;
+        Ok(VkSegmentedKvBuffer {
+            shared: Arc::clone(&self.shared),
+            spec,
+            table,
+            segments: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn ensure_segmented_kv_inner(&self, buffer: &VkSegmentedKvBuffer, wanted: usize) -> Result<()> {
+        if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+            return Err(be(
+                "segmented KV buffer belongs to a different Vulkan backend/device",
+            ));
+        }
+        if wanted > buffer.spec.max_segments {
+            return Err(be(format!(
+                "segmented KV requested {wanted} segments, but its logical extent allows only {}",
+                buffer.spec.max_segments
+            )));
+        }
+        self.with_unified_exclusive(|| {
+            let mut segments = buffer.segments.lock().unwrap();
+            while segments.len() < wanted {
+                let segment = if self.unified_vram().is_some() {
+                    self.alloc_unified_buffer_locked(
+                        buffer.spec.segment_bytes,
+                        crate::unified::UnifiedVramClass::KvCache,
+                    )?
+                } else {
+                    self.make_buf_ex(
+                        buffer.spec.segment_bytes,
+                        MemoryLocation::GpuOnly,
+                        "kv-segment",
+                        false,
+                        true,
+                    )?
+                };
+                let addr = segment
+                    .device_addr()
+                    .ok_or_else(|| be("segmented KV physical segment has no device address"))?;
+                let index = segments.len();
+                let table_ptr = buffer
+                    .table
+                    .mapped_ptr()
+                    .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        addr.to_ne_bytes().as_ptr(),
+                        table_ptr.add(index * std::mem::size_of::<u64>()),
+                        std::mem::size_of::<u64>(),
+                    );
+                }
+                segments.push(segment);
+            }
+            Ok(())
+        })
     }
 
     /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
@@ -4687,6 +4800,16 @@ impl Backend for VulkanBackend {
             self.fill_buf(&buf, 0xFF)?;
         }
         Ok(Box::new(buf))
+    }
+
+    fn alloc_segmented_kv(&self, spec: SegmentedKvSpec) -> Result<Option<Box<dyn Buffer>>> {
+        Ok(Some(Box::new(self.make_segmented_kv(spec)?)))
+    }
+
+    fn ensure_segmented_kv(&self, buffer: &dyn Buffer, segments: usize) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("ensure_segmented_kv received a flat or foreign buffer"))?;
+        self.ensure_segmented_kv_inner(segmented, segments)
     }
 
     /// Copy `src` (host slice) into `dst` (device buffer).
@@ -5863,6 +5986,60 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    /// Segmented KV keeps its graph-visible logical extent while committing only the requested
+    /// physical segments from the elastic arena. Address-table entries are populated once and all
+    /// KV-class bytes return to the arena with the virtual buffer.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn segmented_kv_commits_and_releases_elastic_ranges() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        const MIB: usize = 1024 * 1024;
+        let pool = be.init_unified_vram(8 * MIB).expect("init unified VRAM");
+        let virtual_kv = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 4 * MIB,
+                segment_bytes: MIB,
+                segment_elements: MIB / 2,
+                max_segments: 4,
+            })
+            .expect("allocate segmented KV")
+            .expect("Vulkan supports segmented KV");
+        assert_eq!(virtual_kv.len_bytes(), 4 * MIB);
+        let segmented = as_segmented_kv(virtual_kv.as_ref()).expect("segmented downcast");
+        assert_eq!(segmented.committed(), 0);
+
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 2)
+            .expect("commit two segments");
+        assert_eq!(segmented.committed(), 2);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            2 * MIB
+        );
+        let ptr = segmented
+            .table_buffer()
+            .mapped_ptr()
+            .expect("table mapping") as *const u64;
+        let addresses = unsafe { std::slice::from_raw_parts(ptr, 4) };
+        assert_ne!(addresses[0], 0);
+        assert_ne!(addresses[1], 0);
+        assert_ne!(addresses[0], addresses[1]);
+        assert_eq!(addresses[2], 0);
+
+        drop(virtual_kv);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            0
+        );
     }
 
     /// A module allocation may evict cold expert slots, then exact-slot restoration returns every
