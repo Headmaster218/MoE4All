@@ -21,6 +21,7 @@ pub mod model;
 mod ple;
 mod runner;
 mod sc;
+mod segmented_kv;
 mod weights;
 
 pub(crate) use runner::generate_dense_backend;
