@@ -3330,14 +3330,34 @@ macro_rules! qsa_spv {
 qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
+qsa_spv!(qsa_indexer_compress_seg_spv, "qsa_indexer_compress_seg");
+qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
+qsa_spv!(
+    qsa_indexer_score_decode8_seg_spv,
+    "qsa_indexer_score_decode8_seg"
+);
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
 qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");
 qsa_spv!(qsa_gather_q8_spv, "qsa_gather_q8");
+qsa_spv!(qsa_gather_seg_spv, "qsa_gather_seg");
+qsa_spv!(qsa_gather_kq8_seg_spv, "qsa_gather_kq8_seg");
+qsa_spv!(qsa_gather_vq8_seg_spv, "qsa_gather_vq8_seg");
+qsa_spv!(qsa_gather_q8_seg_spv, "qsa_gather_q8_seg");
 qsa_spv!(qsa_attention_batch_spv, "qsa_attention_batch");
 qsa_spv!(qsa_attention_batch_kq8_spv, "qsa_attention_batch_kq8");
 qsa_spv!(qsa_attention_batch_vq8_spv, "qsa_attention_batch_vq8");
 qsa_spv!(qsa_attention_batch_q8_spv, "qsa_attention_batch_q8");
+qsa_spv!(qsa_attention_batch_seg_spv, "qsa_attention_batch_seg");
+qsa_spv!(
+    qsa_attention_batch_kq8_seg_spv,
+    "qsa_attention_batch_kq8_seg"
+);
+qsa_spv!(
+    qsa_attention_batch_vq8_seg_spv,
+    "qsa_attention_batch_vq8_seg"
+);
+qsa_spv!(qsa_attention_batch_q8_seg_spv, "qsa_attention_batch_q8_seg");
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

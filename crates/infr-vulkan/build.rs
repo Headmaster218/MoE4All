@@ -720,11 +720,26 @@ fn main() {
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
         ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
+        (
+            "qsa_indexer_compress",
+            "qsa_indexer_compress_seg",
+            &["-DKV_SEGMENTED"],
+        ),
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_seg",
+            &["-DKV_SEGMENTED"],
+        ),
         (
             "qsa_indexer_score",
             "qsa_indexer_score_decode8",
             &["-DQSA_SCORE_DECODE8"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode8_seg",
+            &["-DQSA_SCORE_DECODE8", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_indexer_topk_hist", "qsa_indexer_topk_hist", &[]),
@@ -734,6 +749,22 @@ fn main() {
         ("qsa_gather", "qsa_gather_kq8", &["-DKQ8"]),
         ("qsa_gather", "qsa_gather_vq8", &["-DVQ8"]),
         ("qsa_gather", "qsa_gather_q8", &["-DKQ8", "-DVQ8"]),
+        ("qsa_gather", "qsa_gather_seg", &["-DKV_SEGMENTED"]),
+        (
+            "qsa_gather",
+            "qsa_gather_kq8_seg",
+            &["-DKQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_gather",
+            "qsa_gather_vq8_seg",
+            &["-DVQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_gather",
+            "qsa_gather_q8_seg",
+            &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
+        ),
         ("qsa_attention_batch", "qsa_attention_batch", &[]),
         ("qsa_attention_batch", "qsa_attention_batch_kq8", &["-DKQ8"]),
         ("qsa_attention_batch", "qsa_attention_batch_vq8", &["-DVQ8"]),
@@ -741,6 +772,26 @@ fn main() {
             "qsa_attention_batch",
             "qsa_attention_batch_q8",
             &["-DKQ8", "-DVQ8"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_seg",
+            &["-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_kq8_seg",
+            &["-DKQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_vq8_seg",
+            &["-DVQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_q8_seg",
+            &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
         ),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s

@@ -2730,14 +2730,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
         let dynamic_layout = (ec.kv.dynamic
-            && cfg.qwen35
+            && (cfg.qwen35 || cfg.qwen4exp)
             && !ring
             && !ec.kv.overflow
             && matches!(k_fmt, DType::F16 | DType::Q8_0)
             && matches!(v_fmt, DType::F16 | DType::Q8_0))
         .then(|| {
             segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
-                .expect("qwen35 has segmented KV geometry")
+                .expect("Qwen hybrid models have segmented KV geometry")
         });
         let dynamic_kv_reserve = dynamic_layout
             .as_ref()

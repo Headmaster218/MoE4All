@@ -1,6 +1,11 @@
 #version 460
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef KV_SEGMENTED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 // Score a query/block tile. Final block keys are materialized once by qsa_indexer_compress; this
 // kernel only stages reusable Q/K data and computes the positive-head dot sum. A fixed wave32
 // pipeline gives eight subgroups, one per query/block pair. Decode uses 1 query x 8 blocks so no
@@ -14,9 +19,15 @@ layout(push_constant) uniform PC {
     uint head_dim;
     uint ratio;
     float scale;
+    uint block_shift;
 } pc;
 layout(binding = 0) readonly buffer QB { uint q[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 1) readonly buffer KB { uvec2 block_segments[]; };
+#include "kv_addr.glsl"
+#else
 layout(binding = 1) readonly buffer KB { float block_k[]; };
+#endif
 layout(binding = 2) writeonly buffer SB { float scores[]; };
 
 #ifdef QSA_SCORE_DECODE8
@@ -34,6 +45,16 @@ float qread(uint i) {
     uint w = q[i >> 1u];
     uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
     return unpackHalf2x16(h).x;
+}
+
+float block_read(uint i) {
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.block_shift);
+    uint64_t base = kv_segment_base(block_segments[kv_segment(i, pc.block_shift)]);
+    return kv_f32(base, local);
+#else
+    return block_k[i];
+#endif
 }
 
 void main() {
@@ -56,7 +77,7 @@ void main() {
         uint bs = i >> 7u;
         uint block = block_base + bs;
         ktile[bs][d] = block < max_blocks
-            ? block_k[block * pc.head_dim + d]
+            ? block_read(block * pc.head_dim + d)
             : 0.0;
     }
     barrier();

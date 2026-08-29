@@ -50,6 +50,11 @@ float kv_half(uint64_t base, uint i) {
     return float(KvHalf(base + uint64_t(i << 1u)).v[0]);
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer KvF32 { float v[]; };
+float kv_f32(uint64_t base, uint i) {
+    return KvF32(base + uint64_t(i << 2u)).v[0];
+}
+
 // ── Cooperative-matrix tensor base (coopmat flash prefill, #74 slice 4 resurrection) ────────────
 // The coopmat flash-prefill QK/PV `coopMatLoad` reads the KV tensor straight from a buffer_reference
 // base: `coopMatLoad(M, KvMat(k_addr).v, elem_off, stride, layout)`. The pointer carries ONLY the

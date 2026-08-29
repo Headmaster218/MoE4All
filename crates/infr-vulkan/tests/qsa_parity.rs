@@ -121,6 +121,7 @@ fn qsa_index_and_gather_match_reference() {
         theta,
         eps,
         scale,
+        None,
     );
     rec.qsa_gather(
         k.as_ref(),
@@ -137,6 +138,7 @@ fn qsa_index_and_gather_match_reference() {
         false,
         0,
         0,
+        None,
     );
     rec.finish().unwrap();
 
@@ -194,6 +196,7 @@ fn qsa_index_and_gather_match_reference() {
         true,
         cap as u32,
         cap as u32,
+        None,
     );
     rec.finish().unwrap();
     be.download(kd.as_ref(), &mut got_k).unwrap();
@@ -229,6 +232,7 @@ fn qsa_index_and_gather_match_reference() {
         theta,
         eps,
         scale,
+        None,
     );
     rec.finish().unwrap();
     be.download(ids.as_ref(), &mut ib).unwrap();
@@ -401,6 +405,7 @@ fn qsa_batched_rows_match_causal_reference() {
         theta,
         eps,
         index_scale,
+        None,
     );
     rec.qsa_attention_batch(
         attn_q.as_ref(),
@@ -420,6 +425,7 @@ fn qsa_batched_rows_match_causal_reference() {
         false,
         0,
         0,
+        None,
     );
     rec.finish().unwrap();
 
@@ -467,6 +473,7 @@ fn qsa_batched_rows_match_causal_reference() {
         true,
         cap as u32,
         cap as u32,
+        None,
     );
     rec.finish().unwrap();
     let mut q8_out_bytes = vec![0u8; want_out.len() * 4];

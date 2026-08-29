@@ -1327,7 +1327,7 @@ pub(crate) fn generate_dense_backend(
         // segments on demand; applying the flat-buffer live-room clamp would price those bytes a
         // second time. Every other session retains the existing measured clamp unchanged.
         let segmented_kv = ec.kv.dynamic
-            && c.qwen35
+            && (c.qwen35 || c.qwen4exp)
             && !kv_ring
             && !ec.kv.overflow
             && matches!(k_fmt, DType::F16 | DType::Q8_0)
@@ -1340,7 +1340,7 @@ pub(crate) fn generate_dense_backend(
         };
         let segmented_layout = segmented_kv.then(|| {
             SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt)
-                .expect("qwen35 has segmented KV geometry")
+                .expect("Qwen hybrid models have segmented KV geometry")
         });
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and

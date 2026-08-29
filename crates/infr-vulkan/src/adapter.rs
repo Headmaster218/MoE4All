@@ -2665,10 +2665,26 @@ fn lower_op(
             } else {
                 None
             };
+            let raw_cache = r(*k_cache)?;
+            let block_cache = r(*block_cache)?;
+            let (raw_binding, block_binding, segment_shifts) = match (
+                segmented_kv_view(raw_cache),
+                segmented_kv_view(block_cache),
+            ) {
+                (Some((raw_table, raw_shift)), Some((block_table, block_shift))) => {
+                    (raw_table, block_table, Some((raw_shift, block_shift)))
+                }
+                (None, None) => (raw_cache, block_cache, None),
+                _ => {
+                    return Err(be(
+                            "vulkan Op::QsaIndexer raw and block caches must both be segmented or both be flat",
+                        ));
+                }
+            };
             rec.qsa_indexer(
                 r(*q)?,
-                r(*k_cache)?,
-                r(*block_cache)?,
+                raw_binding,
+                block_binding,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
                 topk_work.map(|id| pool[&id].as_ref()),
@@ -2684,6 +2700,7 @@ fn lower_op(
                 *theta,
                 *eps,
                 *scale,
+                segment_shifts,
             );
         }
         Op::QsaGather {
@@ -2718,9 +2735,28 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
+            let k_cache_buf = r(*k_cache)?;
+            let v_cache_buf = r(*v_cache)?;
+            let (k_binding, v_binding, segment_shift) = match (
+                segmented_kv_view(k_cache_buf),
+                segmented_kv_view(v_cache_buf),
+            ) {
+                (Some((k_table, k_shift)), Some((v_table, v_shift))) if k_shift == v_shift => {
+                    (k_table, v_table, Some(k_shift))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(be("vulkan Op::QsaGather K/V segment geometry differs"));
+                }
+                (None, None) => (k_cache_buf, v_cache_buf, None),
+                _ => {
+                    return Err(be(
+                        "vulkan Op::QsaGather K/V caches must both be segmented or both be flat",
+                    ));
+                }
+            };
             rec.qsa_gather(
-                r(*k_cache)?,
-                r(*v_cache)?,
+                k_binding,
+                v_binding,
                 r(*indices)?,
                 r(*k_dst)?,
                 r(*v_dst)?,
@@ -2733,6 +2769,7 @@ fn lower_op(
                 v_q8,
                 graph.desc(*k_cache).numel() as u32,
                 graph.desc(*v_cache).numel() as u32,
+                segment_shift,
             );
         }
         Op::QsaBatchAttention {
@@ -2778,10 +2815,31 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
+            let k_cache_buf = r(*k_cache)?;
+            let v_cache_buf = r(*v_cache)?;
+            let (k_binding, v_binding, segment_shift) = match (
+                segmented_kv_view(k_cache_buf),
+                segmented_kv_view(v_cache_buf),
+            ) {
+                (Some((k_table, k_shift)), Some((v_table, v_shift))) if k_shift == v_shift => {
+                    (k_table, v_table, Some(k_shift))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(be(
+                        "vulkan Op::QsaBatchAttention K/V segment geometry differs",
+                    ));
+                }
+                (None, None) => (k_cache_buf, v_cache_buf, None),
+                _ => {
+                    return Err(be(
+                            "vulkan Op::QsaBatchAttention K/V caches must both be segmented or both be flat",
+                        ));
+                }
+            };
             rec.qsa_attention_batch(
                 r(*q)?,
-                r(*k_cache)?,
-                r(*v_cache)?,
+                k_binding,
+                v_binding,
                 r(*indices)?,
                 r(*dst)?,
                 *rows,
@@ -2796,6 +2854,7 @@ fn lower_op(
                 vdt == infr_core::DType::Q8_0,
                 graph.desc(*k_cache).numel() as u32,
                 graph.desc(*v_cache).numel() as u32,
+                segment_shift,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst

@@ -1,4 +1,9 @@
 #version 460
+#ifdef KV_SEGMENTED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 // Materialize each newly-complete QSA block once. This is bit-for-bit the old score shader's
 // key path: mean in f32, round to f16, RMSNorm, then RoPE at the block's first token position.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -11,18 +16,35 @@ layout(push_constant) uniform PC {
     uint rope_dim;
     float theta;
     float eps;
+    uint raw_shift;
+    uint block_shift;
 } pc;
+#ifdef KV_SEGMENTED
+layout(binding = 0) readonly buffer KB { uvec2 raw_segments[]; };
+#else
 layout(binding = 0) readonly buffer KB { uint raw_k[]; };
+#endif
 layout(binding = 1) readonly buffer NB { float norm[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 2) readonly buffer CB { uvec2 block_segments[]; };
+#include "kv_addr.glsl"
+#else
 layout(binding = 2) writeonly buffer CB { float block_k[]; };
+#endif
 
 shared float keyv[128];
 shared float rmsv[128];
 
 float kread(uint i) {
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.raw_shift);
+    uint64_t base = kv_segment_base(raw_segments[kv_segment(i, pc.raw_shift)]);
+    return kv_half(base, local);
+#else
     uint w = raw_k[i >> 1u];
     uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
     return unpackHalf2x16(h).x;
+#endif
 }
 
 void main() {
@@ -59,5 +81,12 @@ void main() {
         float b = keyv[base + 1u];
         kn = (d & 1u) == 0u ? a * c - b * s : a * s + b * c;
     }
-    block_k[block * pc.head_dim + d] = kn;
+    uint out_elem = block * pc.head_dim + d;
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(out_elem, pc.block_shift);
+    uint64_t base = kv_segment_base(block_segments[kv_segment(out_elem, pc.block_shift)]);
+    kv_store_f32(base, local, kn);
+#else
+    block_k[out_elem] = kn;
+#endif
 }

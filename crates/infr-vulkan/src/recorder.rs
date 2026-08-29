@@ -8649,18 +8649,27 @@ impl<'a> Recorder<'a> {
         theta: f32,
         eps: f32,
         scale: f32,
+        segment_shifts: Option<(u32, u32)>,
     ) {
         let blocks = kv_len / ratio;
         let first_new = compress_from.min(blocks);
         let new_blocks = blocks - first_new;
         if new_blocks > 0 {
-            let compress_k = self.be.kernel(
-                "qsa_indexer_compress",
-                crate::gemm::qsa_indexer_compress_spv(),
-                3,
-                28,
-            );
-            let mut push = [0u8; 28];
+            let (name, spv, push_bytes) = if segment_shifts.is_some() {
+                (
+                    "qsa_indexer_compress_seg",
+                    crate::gemm::qsa_indexer_compress_seg_spv(),
+                    36,
+                )
+            } else {
+                (
+                    "qsa_indexer_compress",
+                    crate::gemm::qsa_indexer_compress_spv(),
+                    28,
+                )
+            };
+            let compress_k = self.be.kernel(name, spv, 3, push_bytes);
+            let mut push = [0u8; 36];
             push[0..4].copy_from_slice(&first_new.to_ne_bytes());
             push[4..8].copy_from_slice(&new_blocks.to_ne_bytes());
             push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
@@ -8668,6 +8677,10 @@ impl<'a> Recorder<'a> {
             push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
             push[20..24].copy_from_slice(&theta.to_ne_bytes());
             push[24..28].copy_from_slice(&eps.to_ne_bytes());
+            if let Some((raw_shift, block_shift)) = segment_shifts {
+                push[28..32].copy_from_slice(&raw_shift.to_ne_bytes());
+                push[32..36].copy_from_slice(&block_shift.to_ne_bytes());
+            }
             self.dispatch_wide(
                 compress_k,
                 &[
@@ -8676,18 +8689,33 @@ impl<'a> Recorder<'a> {
                     Self::vkb(block_cache),
                 ],
                 1,
-                &push,
+                &push[..push_bytes as usize],
                 new_blocks,
             );
         }
 
         let decode8 = rows == 1 && self.vk().qsa_score_decode8;
-        let (score_name, score_spv, block_tile, query_tile) = if decode8 {
+        let segmented = segment_shifts.is_some();
+        let (score_name, score_spv, block_tile, query_tile) = if decode8 && segmented {
+            (
+                "qsa_indexer_score_decode8_seg",
+                crate::gemm::qsa_indexer_score_decode8_seg_spv(),
+                8,
+                1,
+            )
+        } else if decode8 {
             (
                 "qsa_indexer_score_decode8",
                 crate::gemm::qsa_indexer_score_decode8_spv(),
                 8,
                 1,
+            )
+        } else if segmented {
+            (
+                "qsa_indexer_score_seg",
+                crate::gemm::qsa_indexer_score_seg_spv(),
+                4,
+                2,
             )
         } else {
             (
@@ -8697,19 +8725,25 @@ impl<'a> Recorder<'a> {
                 2,
             )
         };
-        let score_k = self.be.kernel_sg(score_name, score_spv, 3, 24, 32);
-        let mut push = [0u8; 24];
+        let score_push_bytes = if segmented { 28 } else { 24 };
+        let score_k = self
+            .be
+            .kernel_sg(score_name, score_spv, 3, score_push_bytes, 32);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
         push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
         push[16..20].copy_from_slice(&ratio.to_ne_bytes());
         push[20..24].copy_from_slice(&scale.to_ne_bytes());
+        if let Some((_, block_shift)) = segment_shifts {
+            push[24..28].copy_from_slice(&block_shift.to_ne_bytes());
+        }
         self.dispatch3(
             score_k,
             &[Self::vkb(q), Self::vkb(block_cache), Self::vkb(scores)],
             1,
-            &push,
+            &push[..score_push_bytes as usize],
             blocks.div_ceil(block_tile),
             rows.div_ceil(query_tile),
             1,
@@ -8807,27 +8841,46 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         kcap: u32,
         vcap: u32,
+        segment_shift: Option<u32>,
     ) {
-        let (name, spv) = match (k_q8, v_q8) {
-            (false, false) => (
+        let segmented = segment_shift.is_some();
+        let (name, spv) = match (k_q8, v_q8, segmented) {
+            (false, false, true) => (
+                "qsa_attention_batch_seg",
+                crate::gemm::qsa_attention_batch_seg_spv(),
+            ),
+            (true, false, true) => (
+                "qsa_attention_batch_kq8_seg",
+                crate::gemm::qsa_attention_batch_kq8_seg_spv(),
+            ),
+            (false, true, true) => (
+                "qsa_attention_batch_vq8_seg",
+                crate::gemm::qsa_attention_batch_vq8_seg_spv(),
+            ),
+            (true, true, true) => (
+                "qsa_attention_batch_q8_seg",
+                crate::gemm::qsa_attention_batch_q8_seg_spv(),
+            ),
+            (false, false, false) => (
                 "qsa_attention_batch",
                 crate::gemm::qsa_attention_batch_spv(),
             ),
-            (true, false) => (
+            (true, false, false) => (
                 "qsa_attention_batch_kq8",
                 crate::gemm::qsa_attention_batch_kq8_spv(),
             ),
-            (false, true) => (
+            (false, true, false) => (
                 "qsa_attention_batch_vq8",
                 crate::gemm::qsa_attention_batch_vq8_spv(),
             ),
-            (true, true) => (
+            (true, true, false) => (
                 "qsa_attention_batch_q8",
                 crate::gemm::qsa_attention_batch_q8_spv(),
             ),
         };
-        let kernel = self.be.kernel_sg(name, spv, 5, 40, 32);
-        let mut push = [0u8; 40];
+        let push_bytes = if segmented { 44 } else { 40 };
+        let kernel = self.be.kernel_sg(name, spv, 5, push_bytes, 32);
+        let mut push = [0u8; 44];
         for (i, value) in [
             rows,
             kv_len,
@@ -8845,6 +8898,9 @@ impl<'a> Recorder<'a> {
         {
             push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
+        if let Some(shift) = segment_shift {
+            push[40..44].copy_from_slice(&shift.to_ne_bytes());
+        }
         self.dispatch_wide(
             kernel,
             &[
@@ -8855,7 +8911,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(dst),
             ],
             1,
-            &push,
+            &push[..push_bytes as usize],
             rows.saturating_mul(n_head),
         );
     }
@@ -8877,17 +8933,24 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         kcap: u32,
         vcap: u32,
+        segment_shift: Option<u32>,
     ) {
         let row_pairs = row_elems / 2;
         let total_pairs = (selected * ratio + tail) * row_pairs;
-        let (name, spv) = match (k_q8, v_q8) {
-            (false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
-            (true, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
-            (false, true) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
-            (true, true) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
+        let segmented = segment_shift.is_some();
+        let (name, spv) = match (k_q8, v_q8, segmented) {
+            (false, false, true) => ("qsa_gather_seg", crate::gemm::qsa_gather_seg_spv()),
+            (true, false, true) => ("qsa_gather_kq8_seg", crate::gemm::qsa_gather_kq8_seg_spv()),
+            (false, true, true) => ("qsa_gather_vq8_seg", crate::gemm::qsa_gather_vq8_seg_spv()),
+            (true, true, true) => ("qsa_gather_q8_seg", crate::gemm::qsa_gather_q8_seg_spv()),
+            (false, false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
+            (true, false, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
+            (false, true, false) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
+            (true, true, false) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
         };
-        let kernel = self.be.kernel(name, spv, 5, 32);
-        let mut push = [0u8; 32];
+        let push_bytes = if segmented { 36 } else { 32 };
+        let kernel = self.be.kernel(name, spv, 5, push_bytes);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&selected.to_ne_bytes());
         push[4..8].copy_from_slice(&complete.to_ne_bytes());
         push[8..12].copy_from_slice(&tail.to_ne_bytes());
@@ -8896,6 +8959,9 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&total_pairs.to_ne_bytes());
         push[24..28].copy_from_slice(&kcap.to_ne_bytes());
         push[28..32].copy_from_slice(&vcap.to_ne_bytes());
+        if let Some(shift) = segment_shift {
+            push[32..36].copy_from_slice(&shift.to_ne_bytes());
+        }
         self.dispatch(
             kernel,
             &[
@@ -8906,7 +8972,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(vd),
             ],
             2,
-            &push,
+            &push[..push_bytes as usize],
             total_pairs.div_ceil(256),
         );
     }
