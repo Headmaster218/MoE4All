@@ -187,6 +187,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.force_q8 = presence(get, "INFR_KV_Q8");
     p.kv.slots = num_pos(get, "INFR_KV_SLOTS");
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
+    p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");
     p.kv.coopmat_bda = presence(get, "INFR_KV_COOPMAT_BDA");
     p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");

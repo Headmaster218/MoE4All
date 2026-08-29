@@ -523,9 +523,23 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    /// Whether segmented KV allocations can currently borrow from a pre-reserved elastic pool.
+    /// This is runtime state, not a static device capability: Vulkan returns true only after the
+    /// paged-MoE arena has been established.
+    fn segmented_kv_available(&self) -> bool {
+        false
+    }
+
     /// Ensure that `buffer` owns at least `segments` physical KV segments. Backends that returned
     /// `Some` from [`Backend::alloc_segmented_kv`] must accept that buffer here.
     fn ensure_segmented_kv(&self, _buffer: &dyn Buffer, _segments: usize) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV is not supported by this backend",
+        ))
+    }
+    /// Clear every committed physical segment. Used by synthetic-depth benchmarks, whose logical
+    /// history must be deterministic even though it was not produced by a real prefill.
+    fn clear_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
         Err(crate::error::Error::backend(
             "segmented KV is not supported by this backend",
         ))

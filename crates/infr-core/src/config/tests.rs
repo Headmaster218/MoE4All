@@ -80,6 +80,7 @@ fn default_config_matches_documented_defaults() {
     // §6.3 / §6.4.
     assert_eq!(d.kv.slots, 4);
     assert!(d.kv.ring);
+    assert!(d.kv.dynamic);
     assert!(!d.kv.force_q8);
     assert_eq!(d.paging.trace, None);
 
@@ -1168,6 +1169,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_TYPE_K",
         "INFR_KV_TYPE_V",
         "INFR_MTP",
+        "INFR_NO_DYNAMIC_KV",
         "INFR_NO_GATED_RMSNORM",
         "INFR_NO_GPU_ARGMAX",
         "INFR_NO_GPU_DRAFT_PROB",

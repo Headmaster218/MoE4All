@@ -139,6 +139,9 @@ cfg_struct! {
         slots: usize = 4,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
+        /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
+        /// segmented addressing retain their existing flat allocation.
+        dynamic: bool = true,
         /// `INFR_KV_INLINE`.
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.

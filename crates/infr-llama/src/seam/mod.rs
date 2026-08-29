@@ -1903,6 +1903,9 @@ pub struct ModelMemoryPlan {
     pub fixed_weight_bytes: u64,
     pub persistent_state_bytes: u64,
     pub runtime_reserve_bytes: u64,
+    /// Maximum lazily committed per-token state. It shares the unified arena with experts and
+    /// runtime scratch, but remains separately named so diagnostics never call KV "runtime".
+    pub dynamic_state_reserve_bytes: u64,
     pub weight_packing_margin_bytes: u64,
     pub load_driver_reserve_bytes: u64,
     pub post_load_reserve_bytes: u64,
@@ -1952,18 +1955,43 @@ impl ModelMemoryPlan {
         load_driver_reserve_bytes: u64,
         post_load_reserve_bytes: u64,
     ) -> Option<Self> {
+        Self::new_with_dynamic_reserve(
+            total_room_bytes,
+            fixed_weight_bytes,
+            persistent_state_bytes,
+            runtime_reserve_bytes,
+            0,
+            weight_packing_margin_bytes,
+            load_driver_reserve_bytes,
+            post_load_reserve_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dynamic_reserve(
+        total_room_bytes: u64,
+        fixed_weight_bytes: u64,
+        persistent_state_bytes: u64,
+        runtime_reserve_bytes: u64,
+        dynamic_state_reserve_bytes: u64,
+        weight_packing_margin_bytes: u64,
+        load_driver_reserve_bytes: u64,
+        post_load_reserve_bytes: u64,
+    ) -> Option<Self> {
         let persistent = fixed_weight_bytes.saturating_add(persistent_state_bytes);
         (persistent <= total_room_bytes).then(|| Self {
             total_room_bytes,
             fixed_weight_bytes,
             persistent_state_bytes,
             runtime_reserve_bytes,
+            dynamic_state_reserve_bytes,
             weight_packing_margin_bytes,
             load_driver_reserve_bytes,
             post_load_reserve_bytes,
             expert_cache_bytes: total_room_bytes
                 .saturating_sub(persistent)
                 .saturating_sub(runtime_reserve_bytes)
+                .saturating_sub(dynamic_state_reserve_bytes)
                 .saturating_sub(weight_packing_margin_bytes)
                 .saturating_sub(load_driver_reserve_bytes)
                 .saturating_sub(post_load_reserve_bytes),
@@ -1974,6 +2002,7 @@ impl ModelMemoryPlan {
         self.fixed_weight_bytes
             .saturating_add(self.persistent_state_bytes)
             .saturating_add(self.runtime_reserve_bytes)
+            .saturating_add(self.dynamic_state_reserve_bytes)
             .saturating_add(self.weight_packing_margin_bytes)
             .saturating_add(self.load_driver_reserve_bytes)
             .saturating_add(self.post_load_reserve_bytes)
@@ -1983,7 +2012,12 @@ impl ModelMemoryPlan {
     /// the target Expert occupancy, then added back here because it borrows the same bytes only
     /// while a graph is active instead of living in a separate permanently idle reservation.
     pub fn elastic_pool_bytes(self, expert_cache_target_bytes: u64) -> u64 {
-        expert_cache_target_bytes.saturating_add(self.runtime_reserve_bytes)
+        expert_cache_target_bytes.saturating_add(self.elastic_reserve_bytes())
+    }
+
+    pub fn elastic_reserve_bytes(self) -> u64 {
+        self.runtime_reserve_bytes
+            .saturating_add(self.dynamic_state_reserve_bytes)
     }
 }
 
@@ -2695,6 +2729,20 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let ring = kv_ring_wanted(cfg, ec);
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
+        let dynamic_layout = (ec.kv.dynamic
+            && cfg.qwen35
+            && !ring
+            && !ec.kv.overflow
+            && matches!(k_fmt, DType::F16 | DType::Q8_0)
+            && matches!(v_fmt, DType::F16 | DType::Q8_0))
+        .then(|| {
+            segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
+                .expect("qwen35 has segmented KV geometry")
+        });
+        let dynamic_kv_reserve = dynamic_layout
+            .as_ref()
+            .map(|layout| layout.committed_bytes(want_ctx))
+            .unwrap_or(0);
         let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
             (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
             (DType::F16, DType::F16) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, false),
@@ -2703,6 +2751,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let initial_ubatch = ubatch_rows(ec);
         let mut selected_ubatch = initial_ubatch;
         let kv_bytes = kv_bytes_at(selected_ubatch);
+        let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
         // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
@@ -2710,11 +2759,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, selected_ubatch);
         let packing_margin = resident_weight_packing_margin(fp.dense);
         let load_driver_reserve = session_load_driver_reserve(cfg, ec);
-        let Some(mut plan) = ModelMemoryPlan::new_with_reserves(
+        let Some(mut plan) = ModelMemoryPlan::new_with_dynamic_reserve(
             room,
             fp.dense,
-            kv_bytes,
+            persistent_state,
             runtime_reserve,
+            dynamic_kv_reserve,
             packing_margin,
             load_driver_reserve,
             POST_KV_DEVICE_RESERVE,
@@ -2740,12 +2790,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
             for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
                 let candidate_kv = kv_bytes_at(candidate);
+                let candidate_persistent = candidate_kv.saturating_sub(dynamic_kv_reserve);
                 let candidate_runtime = dense_act_reserve_at(cfg, &caps, want_ctx, candidate);
-                let Some(candidate_plan) = ModelMemoryPlan::new_with_reserves(
+                let Some(candidate_plan) = ModelMemoryPlan::new_with_dynamic_reserve(
                     room,
                     fp.dense,
-                    candidate_kv,
+                    candidate_persistent,
                     candidate_runtime,
+                    dynamic_kv_reserve,
                     packing_margin,
                     load_driver_reserve,
                     POST_KV_DEVICE_RESERVE,
@@ -2819,17 +2871,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
+        } else if dynamic_kv_reserve > 0 {
+            format!("dynamic-32k k={k_fmt:?}, v={v_fmt:?}")
         } else {
             format!("k={k_fmt:?}, v={v_fmt:?}")
         };
         tracing::info!(
             "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime_elastic={:.2} GB \
+             dynamic_state_elastic={:.2} GB \
              packing_margin={:.2} GB load_driver={:.2} GB post_load={:.2} GB \
              expert_cache_target={:.2} GB elastic_pool={:.2} GB ({cache_layout}, ctx={want_ctx})",
             room as f64 / 1e9,
             plan.fixed_weight_bytes as f64 / 1e9,
             plan.persistent_state_bytes as f64 / 1e9,
             plan.runtime_reserve_bytes as f64 / 1e9,
+            plan.dynamic_state_reserve_bytes as f64 / 1e9,
             plan.weight_packing_margin_bytes as f64 / 1e9,
             plan.load_driver_reserve_bytes as f64 / 1e9,
             plan.post_load_reserve_bytes as f64 / 1e9,
@@ -3002,10 +3058,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
             let prefill_floor = pager_prefill_floor_bytes;
             let planned_pager_budget = pager_budget_bytes;
-            let minimum_pager_budget = plan.runtime_reserve_bytes.saturating_add(prefill_floor);
+            let elastic_reserve = plan.elastic_reserve_bytes();
+            let minimum_pager_budget = elastic_reserve.saturating_add(prefill_floor);
             let required_after_arena = plan
                 .minimum_required_bytes()
-                .saturating_sub(plan.runtime_reserve_bytes);
+                .saturating_sub(elastic_reserve);
             let adaptive_arena = cache_override.is_none();
             let mut candidate_budget = pager_budget_bytes;
             let mut attempts = 0usize;
@@ -3024,12 +3081,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     ));
                 };
                 let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
-                if physical_bytes.saturating_sub(plan.runtime_reserve_bytes) < prefill_floor {
+                if physical_bytes.saturating_sub(elastic_reserve) < prefill_floor {
                     return Err(anyhow!(
                         "MoE mapped arena cannot retain one complete Prefill layer after its \
                          runtime reserve (arena {:.2} MiB, runtime {:.2} MiB, layer {:.2} MiB)",
                         physical_bytes as f64 / 2f64.powi(20),
-                        plan.runtime_reserve_bytes as f64 / 2f64.powi(20),
+                        elastic_reserve as f64 / 2f64.powi(20),
                         prefill_floor as f64 / 2f64.powi(20),
                     ));
                 }
@@ -3046,7 +3103,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         if live_room >= required_after_arena {
                             pager_budget_bytes = physical_bytes;
                             expert_cache_target_bytes = expert_cache_target_bytes
-                                .min(physical_bytes.saturating_sub(plan.runtime_reserve_bytes));
+                                .min(physical_bytes.saturating_sub(elastic_reserve));
                             if attempts > 1 {
                                 tracing::warn!(
                                     planned_bytes = planned_pager_budget,
@@ -6403,6 +6460,36 @@ mod seam_helper_tests {
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &explicit),
             if cfg!(windows) { 2 * GIB } else { 0 }
+        );
+    }
+
+    #[test]
+    fn dynamic_kv_reserve_borrows_the_expert_arena_without_double_counting() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let plan = super::ModelMemoryPlan::new_with_dynamic_reserve(
+            24 * GIB,
+            5 * GIB,
+            1 * GIB,
+            2 * GIB,
+            4 * GIB,
+            1 * GIB,
+            0,
+            1 * GIB,
+        )
+        .expect("dynamic KV plan");
+
+        assert_eq!(plan.expert_cache_bytes, 10 * GIB);
+        assert_eq!(plan.minimum_required_bytes(), 14 * GIB);
+        assert_eq!(plan.elastic_reserve_bytes(), 6 * GIB);
+        assert_eq!(plan.elastic_pool_bytes(plan.expert_cache_bytes), 16 * GIB);
+        assert_eq!(
+            plan.fixed_weight_bytes
+                + plan.persistent_state_bytes
+                + plan.weight_packing_margin_bytes
+                + plan.post_load_reserve_bytes
+                + plan.elastic_pool_bytes(plan.expert_cache_bytes),
+            plan.total_room_bytes,
+            "runtime and maximum KV return to the shared arena exactly once"
         );
     }
 

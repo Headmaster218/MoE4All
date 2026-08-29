@@ -4803,13 +4803,30 @@ impl Backend for VulkanBackend {
     }
 
     fn alloc_segmented_kv(&self, spec: SegmentedKvSpec) -> Result<Option<Box<dyn Buffer>>> {
+        if self.unified_vram().is_none() {
+            return Ok(None);
+        }
         Ok(Some(Box::new(self.make_segmented_kv(spec)?)))
+    }
+
+    fn segmented_kv_available(&self) -> bool {
+        self.unified_vram().is_some()
     }
 
     fn ensure_segmented_kv(&self, buffer: &dyn Buffer, segments: usize) -> Result<()> {
         let segmented = as_segmented_kv(buffer)
             .ok_or_else(|| be("ensure_segmented_kv received a flat or foreign buffer"))?;
         self.ensure_segmented_kv_inner(segmented, segments)
+    }
+
+    fn clear_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("clear_segmented_kv received a flat or foreign buffer"))?;
+        let segments = segmented.segments.lock().unwrap();
+        for segment in segments.iter() {
+            self.fill_buf(segment, 0)?;
+        }
+        Ok(())
     }
 
     /// Copy `src` (host slice) into `dst` (device buffer).

@@ -148,6 +148,7 @@ knobs! {
     "INFR_KV_Q8"                => "kv.force_q8",            Presence,    Ignored, "1",    migrated;
     "INFR_KV_SLOTS"             => "kv.slots",               Int,         Ignored, "8",    migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
+    "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;

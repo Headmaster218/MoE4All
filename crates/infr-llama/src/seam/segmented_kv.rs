@@ -5,11 +5,8 @@
 //! steps, while recurrent layers remain fixed-size state and attention/QSA planes commit only the
 //! segments their materialized token depth reaches.
 
-// This first commit fixes the geometry contract before the allocator consumes it. Remove this
-// allowance in the wiring commit, where every item below enters the production path.
-#![allow(dead_code)]
-
 use crate::Config;
+use infr_core::backend::SegmentedKvSpec;
 use infr_core::tensor::DType;
 
 use super::{kv_row_elems, kv_side_bytes};
@@ -44,6 +41,26 @@ impl PlaneLayout {
 
     pub(crate) fn segment_bytes(self) -> usize {
         kv_side_bytes(self.dtype, self.rows_per_segment() * self.row_elems)
+    }
+
+    pub(crate) fn segment_elements(self) -> usize {
+        self.rows_per_segment() * self.row_elems
+    }
+
+    pub(crate) fn logical_elements(self, max_ctx: usize) -> usize {
+        let rows = (max_ctx / self.tokens_per_row).max(1);
+        rows * self.row_elems
+    }
+
+    pub(crate) fn spec(self, max_ctx: usize) -> SegmentedKvSpec {
+        let segment_elements = self.segment_elements();
+        debug_assert!(segment_elements.is_power_of_two());
+        SegmentedKvSpec {
+            logical_bytes: kv_side_bytes(self.dtype, self.logical_elements(max_ctx)),
+            segment_bytes: self.segment_bytes(),
+            segment_elements,
+            max_segments: max_ctx.div_ceil(KV_GROW_ROWS),
+        }
     }
 }
 
@@ -113,6 +130,7 @@ impl SegmentedKvLayout {
         Some(Self { max_ctx, planes })
     }
 
+    #[cfg(test)]
     pub(crate) fn max_segments(&self) -> usize {
         self.max_ctx.div_ceil(KV_GROW_ROWS)
     }
@@ -127,6 +145,13 @@ impl SegmentedKvLayout {
             .iter()
             .map(|plane| plane.segment_bytes() as u64 * segments)
             .sum()
+    }
+
+    pub(crate) fn plane(&self, layer: usize, kind: PlaneKind) -> Option<PlaneLayout> {
+        self.planes
+            .iter()
+            .copied()
+            .find(|plane| plane.layer == layer && plane.kind == kind)
     }
 }
 
