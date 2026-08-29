@@ -1406,19 +1406,23 @@ pub(crate) fn generate_dense_backend(
             );
             let qsa_bytes = crate::seam::qsa_raw_cache_bytes(c, l, want_ctx);
             qsa_kbufs.push(if qsa_bytes > 0 {
-                Some(
+                Some(if let Some(layout) = segmented_layout.as_ref() {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?
+                } else {
                     be.alloc(qsa_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
+                        .map_err(|e| anyhow!("{e}"))?
+                })
             } else {
                 None
             });
             let qsa_comp_bytes = crate::seam::qsa_block_cache_bytes(c, l, want_ctx);
             qsa_cbufs.push(if qsa_comp_bytes > 0 {
-                Some(
+                Some(if let Some(layout) = segmented_layout.as_ref() {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?
+                } else {
                     be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
+                        .map_err(|e| anyhow!("{e}"))?
+                })
             } else {
                 None
             });
