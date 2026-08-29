@@ -3187,10 +3187,11 @@ fn synthetic_deepseek4_stream_mixing_is_load_bearing() {
 ///    different rotation, and they do.
 ///
 /// The tolerance in (2) is not float noise: the cancellation is exact in real arithmetic but the
-/// cache holds the ROPED row in f16, so what comes back is `R(-t)·round_f16(R(t)·kv)` and the
-/// rounding is itself position-dependent. Measured on this fixture: **1.5e-6** with an f32 KV
-/// cache, **1.6e-3** with the default f16 one, and **1.0e0** — the whole signal — with the de-rope
-/// deleted. The threshold sits between the second and the third.
+/// cache holds the roped row in FP8 E4M3, so what comes back is
+/// `R(-t) * round_fp8(R(t) * kv)` and the rounding is itself position-dependent. Measured on this
+/// fixture: `3.21e-2` absolute (`2.80%` of the logits RMS) with the production FP8 cache, versus
+/// approximately the whole signal with the de-rope deleted. A 5% relative threshold leaves ample
+/// room for FP8 rounding while retaining roughly 20x separation from the regression it detects.
 #[test]
 fn synthetic_deepseek4_derope_inverts_the_query_rope() {
     // (1) the forward rope is not a no-op.
@@ -3222,7 +3223,7 @@ fn synthetic_deepseek4_derope_inverts_the_query_rope() {
     let scale = rms(&short).max(rms(&long));
     println!("deepseek4 window-1 position independence: max|Δ| = {dv:e} (logit rms {scale:e})");
     assert!(
-        dv < 1e-2 * scale,
+        dv < 5e-2 * scale,
         "the last row's logits moved with the prompt LENGTH (max|Δ| = {dv:e}, logit rms {scale:e}) \
          on a repeated-token prompt at sliding_window=1 — the only position dependence left there \
          is the attention output's rope slice, so the backward de-rope is missing or is not the \

@@ -87,7 +87,15 @@ const uint WM = 16u;
 const uint BM = 64u;
 const uint WM = 32u;
 #endif
-#ifdef NARROW_N
+#ifdef N64
+// Four-wave narrow-output tile for shapes such as Qwen3.8's [M,10240] x
+// [320,10240]^T recurrent projection. The old BN=64 kernel restaged A and
+// synchronized every BK=32; this variant reads the caller's f16 A directly,
+// doubles BK, and keeps the same 64-column output granularity without padding N.
+const uint BN = 64u;
+const uint BK = 64u;
+const uint WN = 32u;
+#elif defined(NARROW_N)
 const uint BN = 128u;
 #ifdef BK32
 const uint BK = 32u;

@@ -4,7 +4,7 @@
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
 use crate::linear::native_dense_supported;
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES};
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
@@ -990,10 +990,17 @@ fn native_warp_gemm(
         && out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
         && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some();
-    let use_ag = !use_direct
-        && out_f.is_multiple_of(128)
+    let use_n64_ag = !use_direct
+        && out_f.is_multiple_of(64)
+        && !out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
-        && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
+        && crate::gemm::native_gemm_warp_n64_ag_kernel_name(dt).is_some()
+        && be_.cfg().kernels.vulkan.gemm_warp;
+    let use_ag = !use_direct
+        && ((out_f.is_multiple_of(128)
+            && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some())
+            || use_n64_ag)
+        && in_f.is_multiple_of(32)
         && be_.cfg().kernels.vulkan.gemm_warp;
     let a16 = if use_ag {
         let mpad = m.div_ceil(64) * 64;
@@ -2577,10 +2584,12 @@ fn lower_op(
         Op::QsaIndexer {
             q,
             k_cache,
+            block_cache,
             k_norm,
             dst,
             rows,
             kv_len,
+            compress_from,
             n_head,
             head_dim,
             top_blocks,
@@ -2618,14 +2627,27 @@ fn lower_op(
                 "qsa_indexer_scores",
                 *rows as usize * blocks as usize * 4,
             )?;
+            let topk_work = if *rows == 1 && blocks >= QSA_TOPK_PARALLEL_MIN_BLOCKS {
+                Some(pooled(
+                    pool,
+                    be_,
+                    "qsa_indexer_topk_work",
+                    QSA_TOPK_PARALLEL_WORK_BYTES,
+                )?)
+            } else {
+                None
+            };
             rec.qsa_indexer(
                 r(*q)?,
                 r(*k_cache)?,
+                r(*block_cache)?,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
+                topk_work.map(|id| pool[&id].as_ref()),
                 r(*dst)?,
                 *rows,
                 *kv_len,
+                *compress_from,
                 *n_head,
                 *head_dim,
                 *top_blocks,
@@ -7877,6 +7899,9 @@ fn execute_paged_moe<'a>(
                 *weight_before,
             ),
         }
+    }
+    if layer_stream {
+        prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
     }
     Ok(()) // recorded inline — the ambient segment stays open
 }

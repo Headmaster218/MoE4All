@@ -7,8 +7,10 @@
 //! - [`available_bytes`], a PLATFORM probe of what could be committed right now. It is deliberately
 //!   allowed to answer "I do not know" rather than estimate, because an over-estimate here is an
 //!   out-of-memory kill or a swap storm mid-generation, not a slow run.
-//! - [`auto_arena_bytes`], the PURE arithmetic that turns that answer into a budget. Separate so
+//! - [`auto_cache_bytes`], the PURE arithmetic that turns that answer into a budget. Separate so
 //!   the policy can be tested without a machine that happens to have the right amount of RAM free.
+//! - [`process_resident_bytes`], the current process working set used to resolve an explicit
+//!   total-process RAM budget into the part that can actually become a weight cache.
 
 /// Host memory that could be committed right now, or `None` where this platform has no probe.
 ///
@@ -21,8 +23,11 @@
 /// a new allocation can have without swapping — it already accounts for reclaimable page cache, so
 /// it is exactly the figure this tier wants and not something derivable from `MemTotal`.
 ///
-/// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`. Every other platform answers
-/// `None` today; macOS would need `host_statistics64`'s free/inactive/purgeable split.
+/// **Windows** reads `GlobalMemoryStatusEx` and uses the smaller of `ullAvailPhys` and
+/// `ullAvailPageFile`. The arena needs both reusable physical pages and commit charge;
+/// `VirtualAlloc(MEM_COMMIT)` can fail even with free RAM when the process/system commit limit is
+/// tighter. Every other platform answers `None` today; macOS would need `host_statistics64`'s
+/// free/inactive/purgeable split.
 ///
 /// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
 /// limit a container or a `systemd-run --scope -p MemoryMax=` puts on this process — measured on
@@ -40,12 +45,42 @@ pub fn available_bytes() -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        Some(windows_memory_status()?.ullAvailPhys)
+        let status = windows_memory_status()?;
+        Some(windows_available_bytes(
+            status.ullAvailPhys,
+            status.ullAvailPageFile,
+        ))
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
     }
+}
+
+/// Total physical host RAM, used only as the base for percentage-valued total-process budgets.
+///
+/// This is deliberately separate from [`available_bytes`]: `device.ram_budget=80%` means 80% of
+/// the machine's physical RAM as a process-wide target, while automatic cache sizing must continue
+/// to use memory available right now and retain its existing headroom policy.
+pub fn total_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        parse_mem_total(&text)
+    }
+    #[cfg(windows)]
+    {
+        Some(windows_memory_status()?.ullTotalPhys)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_available_bytes(available_phys: u64, available_commit: u64) -> u64 {
+    available_phys.min(available_commit)
 }
 
 #[cfg(windows)]
@@ -56,6 +91,49 @@ fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
     Some(status)
+}
+
+/// Physical RAM currently resident in this process, including file-backed mappings.
+///
+/// This is intentionally a working-set measurement, not committed/private virtual memory. An
+/// explicit `device.ram_budget` is a total physical-RAM target: cold pages may leave the working set,
+/// while a page-file-backed reservation that is not resident must not consume the target twice.
+/// Failure is reported as `None`; callers retain the historical fixed-cache fallback on platforms
+/// without a probe rather than panicking during model load.
+pub fn process_resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        parse_process_resident(&text)
+    }
+    #[cfg(windows)]
+    {
+        windows_process_resident_bytes()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_resident_bytes() -> Option<u64> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    unsafe {
+        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).ok()?;
+    }
+    Some(counters.WorkingSetSize as u64)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_resident(text: &str) -> Option<u64> {
+    let line = text.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// Memory this process may still commit before its cgroup kills it, or `None` when no ancestor
@@ -127,6 +205,13 @@ fn parse_mem_available(text: &str) -> Option<u64> {
     Some(kb * 1024)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_mem_total(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
 /// Never take the last of the machine's memory: the larger of this and the bounded
 /// [`HEADROOM_FRACTION`] of what is available is left alone.
 ///
@@ -158,7 +243,7 @@ const MIN_USEFUL: u64 = 256 << 20;
 ///   every block would already be resident.
 ///
 /// Returns `0` when nothing worth having is left, which callers treat as "stay on the mmap path".
-pub fn auto_arena_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
+pub fn auto_cache_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
     let proportional = (available / HEADROOM_FRACTION).min(HEADROOM_FRACTION_MAX);
     let headroom = HEADROOM_MIN.max(proportional);
     let usable = available
@@ -169,6 +254,16 @@ pub fn auto_arena_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
         return 0;
     }
     usable
+}
+
+/// Convert an explicit total-process RAM target into bytes available to this new host arena.
+///
+/// `resident` is sampled immediately before the arena is planned. It includes existing model
+/// mappings and earlier arenas, so repeated model/session loads share one process-wide ceiling.
+/// Where the platform probe fails, zero preserves the historical interpretation as a best-effort
+/// fallback; Windows and Linux have live probes and therefore enforce the total-budget meaning.
+pub fn cache_bytes_for_total_budget(total: u64, resident: Option<u64>, pageable: u64) -> u64 {
+    total.saturating_sub(resident.unwrap_or(0)).min(pageable)
 }
 
 /// What a caller should do about a host weight arena.
@@ -197,38 +292,43 @@ pub enum Skip {
     NoProbe,
     /// Streaming is needed but too little memory is free to seat a useful arena.
     TooLittle,
-    /// The user turned it off by name (`paging.dram = 0`).
+    /// The user supplied zero through either explicit host-RAM compatibility spelling.
     Disabled,
 }
 
-/// What the user's `paging.dram` asked for. A budget of ZERO is not "no budget" — it is the
-/// explicit OFF switch, and it has to be distinguishable from unset now that unset means "size it
-/// yourself". Without it there is no way to A/B the tier against the mmap path it replaces, and no
-/// way for a user to refuse an arena on a machine where the automatic answer is wrong.
+/// How host RAM should be assigned. A budget of ZERO is not "no budget" — it is the explicit OFF
+/// switch, and it has to be distinguishable from unset now that unset means automatic sizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Requested {
+pub enum RamRequest {
     /// Nothing set — size from what the host can spare.
     Auto,
-    /// `paging.dram = 0` — keep the mmap path whatever the fit test says.
-    Off,
-    /// A budget named by the user, which wins over every automatic rung.
-    Fixed(u64),
+    /// Canonical `device.ram_budget`: a total-process resident-RAM target.
+    TotalProcessBudget(u64),
+    /// Compatibility-only `paging.dram`: the old exact host-cache allocation.
+    LegacyCacheBudget(u64),
     /// `paging.dram_bypass` — no host cache at all: blocks are read from disk straight into the
     /// arena above. A size cannot express this, which is why it is its own state.
     Bypass,
 }
 
-impl Requested {
-    /// Read a resolved `paging.dram` / `paging.dram_bypass` pair: bypass wins (it says something a
-    /// size cannot), then `None` unset, `Some(0)` off, `Some(n)` fixed.
-    pub fn from_config(v: Option<u64>, bypass: bool) -> Self {
+impl RamRequest {
+    /// Resolve the canonical total-process budget and the legacy raw-cache override. Bypass wins,
+    /// then `device.ram_budget`, then compatibility-only `paging.dram`; zero remains the explicit
+    /// off switch in either spelling while retaining which spelling supplied it.
+    pub fn from_config(
+        total_process_budget: Option<u64>,
+        legacy_cache_budget: Option<u64>,
+        bypass: bool,
+    ) -> Self {
         if bypass {
             return Self::Bypass;
         }
-        match v {
-            None => Self::Auto,
-            Some(0) => Self::Off,
-            Some(n) => Self::Fixed(n),
+        match total_process_budget {
+            Some(n) => Self::TotalProcessBudget(n),
+            None => match legacy_cache_budget {
+                None => Self::Auto,
+                Some(n) => Self::LegacyCacheBudget(n),
+            },
         }
     }
 }
@@ -236,22 +336,34 @@ impl Requested {
 /// The arena plan for a run that has ALREADY been decided to stream — the Vulkan dense and MoE
 /// tiers, whose callers only reach them once residency was rejected.
 ///
-/// `explicit` (the user's `paging.dram`) always wins, including on unified memory: forcing this
-/// path on hardware that would not choose it is how it gets tested at all.
+/// A user request always wins, including on unified memory. `TotalProcessBudget` subtracts
+/// `process_resident`; `LegacyCacheBudget` preserves the old exact-cache benchmark control. The
+/// canonical total budget deliberately bypasses automatic headroom, so it may make the OS page out
+/// unrelated cold memory.
 pub fn streaming_arena_plan(
-    explicit: Requested,
+    request: RamRequest,
     available: Option<u64>,
+    process_resident: Option<u64>,
     unified: bool,
     pageable: u64,
 ) -> ArenaPlan {
-    match explicit {
+    match request {
         // `Bypass` outranks a size: it is the one that says "no host cache at all", which a
         // number cannot express. It exists so the unified-memory shape can be exercised on a
         // discrete GPU, which is the only hardware this is developed on.
-        Requested::Bypass => return ArenaPlan::StreamOnly,
-        Requested::Fixed(b) => return ArenaPlan::Take(b),
-        Requested::Off => return ArenaPlan::Skip(Skip::Disabled),
-        Requested::Auto => {}
+        RamRequest::Bypass => return ArenaPlan::StreamOnly,
+        RamRequest::TotalProcessBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
+        RamRequest::TotalProcessBudget(total) => {
+            let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
+            return if bytes == 0 {
+                ArenaPlan::Skip(Skip::TooLittle)
+            } else {
+                ArenaPlan::Take(bytes)
+            };
+        }
+        RamRequest::LegacyCacheBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
+        RamRequest::LegacyCacheBudget(bytes) => return ArenaPlan::Take(bytes),
+        RamRequest::Auto => {}
     }
     if unified {
         return ArenaPlan::StreamOnly;
@@ -259,7 +371,7 @@ pub fn streaming_arena_plan(
     let Some(available) = available else {
         return ArenaPlan::Skip(Skip::NoProbe);
     };
-    match auto_arena_bytes(available, 0, pageable) {
+    match auto_cache_bytes(available, 0, pageable) {
         0 => ArenaPlan::Skip(Skip::TooLittle),
         n => ArenaPlan::Take(n),
     }
@@ -270,16 +382,30 @@ pub fn streaming_arena_plan(
 ///
 /// The extra rung over [`streaming_arena_plan`] is [`Skip::Fits`]: when the weights fit, the mmap
 /// path is zero-copy and an arena could only add copies, so paging a model that fits would be a
-/// regression. `explicit` still wins over that test in both directions.
-pub fn cpu_arena_plan(explicit: Requested, available: Option<u64>, pageable: u64) -> ArenaPlan {
-    match explicit {
-        Requested::Fixed(b) => return ArenaPlan::Take(b),
-        Requested::Off => return ArenaPlan::Skip(Skip::Disabled),
+/// regression. An explicit request still wins over that test in both directions.
+pub fn cpu_arena_plan(
+    request: RamRequest,
+    available: Option<u64>,
+    process_resident: Option<u64>,
+    pageable: u64,
+) -> ArenaPlan {
+    match request {
+        RamRequest::TotalProcessBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
+        RamRequest::TotalProcessBudget(total) => {
+            let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
+            return if bytes == 0 {
+                ArenaPlan::Skip(Skip::TooLittle)
+            } else {
+                ArenaPlan::Take(bytes)
+            };
+        }
+        RamRequest::LegacyCacheBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
+        RamRequest::LegacyCacheBudget(bytes) => return ArenaPlan::Take(bytes),
         // Bypassing the host cache means "read straight into the tier above", and for the CPU
         // backend there IS no tier above — this arena is the only one. Reading through to nothing
         // would be a pure regression on the mapping, so the flag simply keeps the mmap path.
-        Requested::Bypass => return ArenaPlan::Skip(Skip::Disabled),
-        Requested::Auto => {}
+        RamRequest::Bypass => return ArenaPlan::Skip(Skip::Disabled),
+        RamRequest::Auto => {}
     }
     let Some(available) = available else {
         return ArenaPlan::Skip(Skip::NoProbe);
@@ -287,7 +413,7 @@ pub fn cpu_arena_plan(explicit: Requested, available: Option<u64>, pageable: u64
     if pageable <= available {
         return ArenaPlan::Skip(Skip::Fits);
     }
-    match auto_arena_bytes(available, 0, pageable) {
+    match auto_cache_bytes(available, 0, pageable) {
         0 => ArenaPlan::Skip(Skip::TooLittle),
         n => ArenaPlan::Take(n),
     }
@@ -304,6 +430,7 @@ mod tests {
         let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n\
                     MemAvailable:   43000000 kB\nBuffers:          100000 kB\n";
         assert_eq!(parse_mem_available(text), Some(43_000_000 * 1024));
+        assert_eq!(parse_mem_total(text), Some(65_780_000 * 1024));
     }
 
     /// A kernel too old to report `MemAvailable` must produce `None`, not a figure derived from
@@ -318,6 +445,14 @@ mod tests {
     fn a_malformed_field_is_unknown() {
         assert_eq!(parse_mem_available("MemAvailable:   plenty kB\n"), None);
         assert_eq!(parse_mem_available("MemAvailable:\n"), None);
+        assert_eq!(parse_mem_total("MemTotal:   plenty kB\n"), None);
+    }
+
+    #[test]
+    fn parses_process_resident_in_kb() {
+        let text = "Name:\tinfr\nVmSize:\t100000 kB\nVmRSS:\t12345 kB\nRssAnon:\t8000 kB\n";
+        assert_eq!(parse_process_resident(text), Some(12_345 * 1024));
+        assert_eq!(parse_process_resident("Name:\tinfr\n"), None);
     }
 
     /// The probe must agree with itself on the machine running the tests: a plausible, non-zero
@@ -326,16 +461,18 @@ mod tests {
     #[test]
     fn the_live_probe_is_plausible() {
         let avail = available_bytes().expect("linux always has /proc/meminfo");
-        let text = std::fs::read_to_string("/proc/meminfo").expect("meminfo");
-        let total: u64 = text
-            .lines()
-            .find(|l| l.starts_with("MemTotal:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<u64>().ok())
-            .expect("MemTotal")
-            * 1024;
+        let total = total_bytes().expect("linux always has MemTotal");
         assert!(avail > 0, "available must be non-zero");
         assert!(avail <= total, "available {avail} exceeds total {total}");
+        let resident = process_resident_bytes().expect("linux always has /proc/self/status");
+        assert!(
+            resident > 0,
+            "the running test process must have resident pages"
+        );
+        assert!(
+            resident <= total,
+            "process RSS {resident} exceeds RAM {total}"
+        );
     }
 
     #[cfg(windows)]
@@ -352,13 +489,35 @@ mod tests {
             "available {avail} exceeds total {}",
             status.ullTotalPhys
         );
+        assert_eq!(total_bytes(), Some(status.ullTotalPhys));
+        assert!(
+            avail <= status.ullAvailPageFile,
+            "available {avail} exceeds commit headroom {}",
+            status.ullAvailPageFile
+        );
+        let resident = process_resident_bytes().expect("GetProcessMemoryInfo should answer");
+        assert!(
+            resident > 0,
+            "the running test process must have resident pages"
+        );
+        assert!(
+            resident <= status.ullTotalPhys,
+            "process working set {resident} exceeds physical RAM {}",
+            status.ullTotalPhys
+        );
+    }
+
+    #[test]
+    fn windows_probe_is_bounded_by_physical_and_commit_headroom() {
+        assert_eq!(windows_available_bytes(48 * GIB, 20 * GIB), 20 * GIB);
+        assert_eq!(windows_available_bytes(12 * GIB, 40 * GIB), 12 * GIB);
     }
 
     /// Headroom is the point: the budget never equals what is available, however much there is.
     #[test]
     fn headroom_is_always_left() {
         for &avail in &[2 * GIB, 8 * GIB, 64 * GIB, 512 * GIB] {
-            let got = auto_arena_bytes(avail, 0, u64::MAX);
+            let got = auto_cache_bytes(avail, 0, u64::MAX);
             assert!(got < avail, "took all {avail} bytes");
             assert!(
                 avail < HEADROOM_MIN || avail - got >= HEADROOM_MIN,
@@ -371,17 +530,17 @@ mod tests {
     #[test]
     fn a_large_host_leaves_the_fraction() {
         let avail = 64 * GIB;
-        assert_eq!(auto_arena_bytes(avail, 0, u64::MAX), 48 * GIB);
+        assert_eq!(auto_cache_bytes(avail, 0, u64::MAX), 48 * GIB);
     }
 
     #[test]
     fn a_workstation_keeps_a_quarter_available() {
-        assert_eq!(auto_arena_bytes(52 * GIB, 0, u64::MAX), 39 * GIB);
+        assert_eq!(auto_cache_bytes(52 * GIB, 0, u64::MAX), 39 * GIB);
     }
 
     #[test]
     fn a_huge_host_caps_the_proportional_reserve() {
-        assert_eq!(auto_arena_bytes(512 * GIB, 0, u64::MAX), 480 * GIB);
+        assert_eq!(auto_cache_bytes(512 * GIB, 0, u64::MAX), 480 * GIB);
     }
 
     /// Unified memory: the VRAM budget comes out of the same RAM, so it must reduce the arena
@@ -389,8 +548,8 @@ mod tests {
     #[test]
     fn committed_bytes_reduce_the_budget_one_for_one() {
         let avail = 32 * GIB;
-        let free = auto_arena_bytes(avail, 0, u64::MAX);
-        let with = auto_arena_bytes(avail, 4 * GIB, u64::MAX);
+        let free = auto_cache_bytes(avail, 0, u64::MAX);
+        let with = auto_cache_bytes(avail, 4 * GIB, u64::MAX);
         assert_eq!(
             free - with,
             4 * GIB,
@@ -401,30 +560,52 @@ mod tests {
     /// Never budget past what could actually be paged.
     #[test]
     fn the_pageable_total_is_a_ceiling() {
-        assert_eq!(auto_arena_bytes(64 * GIB, 0, 3 * GIB), 3 * GIB);
+        assert_eq!(auto_cache_bytes(64 * GIB, 0, 3 * GIB), 3 * GIB);
+        assert_eq!(
+            cache_bytes_for_total_budget(50 * GIB, Some(2 * GIB), 3 * GIB),
+            3 * GIB
+        );
     }
 
     /// **The flags must keep working.** A machine big enough to hold the model resident is exactly
     /// the machine streaming has to be tested on, so an explicit budget wins over every automatic
     /// rung — including the fits-in-RAM test, the no-probe case and unified memory.
     #[test]
-    fn an_explicit_budget_always_wins() {
-        let forced = Requested::Fixed(3 * GIB);
-        // CPU: a model that comfortably fits is still paged when asked.
+    fn a_legacy_exact_cache_budget_always_wins() {
+        let forced = RamRequest::LegacyCacheBudget(3 * GIB);
+        // Compatibility mode does not reinterpret historical cache-size experiments as process
+        // totals, even when a process working-set measurement is available.
         assert_eq!(
-            cpu_arena_plan(forced, Some(64 * GIB), GIB),
+            cpu_arena_plan(forced, Some(64 * GIB), Some(GIB), 8 * GIB),
             ArenaPlan::Take(3 * GIB)
         );
-        // ...and with no probe at all.
-        assert_eq!(cpu_arena_plan(forced, None, GIB), ArenaPlan::Take(3 * GIB));
+        assert_eq!(
+            cpu_arena_plan(forced, None, None, 8 * GIB),
+            ArenaPlan::Take(3 * GIB)
+        );
         // Streaming tiers: honoured on unified memory, which auto-sizing declines.
         assert_eq!(
-            streaming_arena_plan(forced, Some(64 * GIB), true, 40 * GIB),
+            streaming_arena_plan(forced, Some(64 * GIB), Some(GIB), true, 40 * GIB),
             ArenaPlan::Take(3 * GIB)
         );
         assert_eq!(
-            streaming_arena_plan(forced, None, false, 40 * GIB),
+            streaming_arena_plan(forced, None, None, false, 40 * GIB),
             ArenaPlan::Take(3 * GIB)
+        );
+    }
+
+    #[test]
+    fn an_oversized_explicit_budget_bypasses_automatic_headroom() {
+        let forced = RamRequest::TotalProcessBudget(50 * GIB);
+        assert_eq!(
+            streaming_arena_plan(forced, Some(48 * GIB), Some(2 * GIB), false, 80 * GIB),
+            ArenaPlan::Take(48 * GIB),
+            "50 GiB is the process target, so its existing 2 GiB leaves 48 GiB for cache"
+        );
+        assert_eq!(
+            streaming_arena_plan(forced, Some(48 * GIB), Some(50 * GIB), false, 80 * GIB),
+            ArenaPlan::Skip(Skip::TooLittle),
+            "a process already at its explicit total budget must not allocate another arena"
         );
     }
 
@@ -433,28 +614,51 @@ mod tests {
     /// replaces once auto-sizing turns it on by itself, and `0` would otherwise read as "unset".
     #[test]
     fn a_zero_budget_is_the_off_switch() {
-        assert_eq!(Requested::from_config(Some(0), false), Requested::Off);
         assert_eq!(
-            cpu_arena_plan(Requested::Off, Some(GIB), 200 * GIB),
+            RamRequest::from_config(Some(0), None, false),
+            RamRequest::TotalProcessBudget(0)
+        );
+        assert_eq!(
+            cpu_arena_plan(
+                RamRequest::TotalProcessBudget(0),
+                Some(GIB),
+                Some(0),
+                200 * GIB
+            ),
             ArenaPlan::Skip(Skip::Disabled)
         );
         assert_eq!(
-            streaming_arena_plan(Requested::Off, Some(64 * GIB), false, 200 * GIB),
+            streaming_arena_plan(
+                RamRequest::LegacyCacheBudget(0),
+                Some(64 * GIB),
+                Some(0),
+                false,
+                200 * GIB
+            ),
             ArenaPlan::Skip(Skip::Disabled)
         );
         // ...and it is distinct from unset, which on that same host DOES build one.
         assert!(matches!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 200 * GIB),
+            streaming_arena_plan(RamRequest::Auto, Some(64 * GIB), Some(0), false, 200 * GIB),
             ArenaPlan::Take(_)
         ));
     }
 
     #[test]
     fn from_config_maps_unset_and_sizes() {
-        assert_eq!(Requested::from_config(None, false), Requested::Auto);
+        assert_eq!(RamRequest::from_config(None, None, false), RamRequest::Auto);
         assert_eq!(
-            Requested::from_config(Some(42), false),
-            Requested::Fixed(42)
+            RamRequest::from_config(Some(42), None, false),
+            RamRequest::TotalProcessBudget(42)
+        );
+        assert_eq!(
+            RamRequest::from_config(None, Some(42), false),
+            RamRequest::LegacyCacheBudget(42)
+        );
+        assert_eq!(
+            RamRequest::from_config(Some(42), Some(7), false),
+            RamRequest::TotalProcessBudget(42),
+            "the canonical total-process parameter wins over the legacy cache override"
         );
     }
 
@@ -463,12 +667,12 @@ mod tests {
     #[test]
     fn a_model_that_fits_is_not_paged() {
         assert_eq!(
-            cpu_arena_plan(Requested::Auto, Some(64 * GIB), 8 * GIB),
+            cpu_arena_plan(RamRequest::Auto, Some(64 * GIB), Some(0), 8 * GIB),
             ArenaPlan::Skip(Skip::Fits)
         );
         // Exactly fitting still counts as fitting.
         assert_eq!(
-            cpu_arena_plan(Requested::Auto, Some(8 * GIB), 8 * GIB),
+            cpu_arena_plan(RamRequest::Auto, Some(8 * GIB), Some(0), 8 * GIB),
             ArenaPlan::Skip(Skip::Fits)
         );
     }
@@ -476,7 +680,7 @@ mod tests {
     /// Requirement two: a model that does NOT fit streams, without being asked to.
     #[test]
     fn a_model_that_does_not_fit_streams() {
-        match cpu_arena_plan(Requested::Auto, Some(32 * GIB), 200 * GIB) {
+        match cpu_arena_plan(RamRequest::Auto, Some(32 * GIB), Some(0), 200 * GIB) {
             ArenaPlan::Take(n) => assert!(n > 0 && n < 32 * GIB, "implausible budget {n}"),
             other => panic!("an over-sized model must stream, got {other:?}"),
         }
@@ -489,24 +693,24 @@ mod tests {
     #[test]
     fn unified_memory_streams_without_caching() {
         assert_eq!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 40 * GIB),
+            streaming_arena_plan(RamRequest::Auto, Some(64 * GIB), Some(0), true, 40 * GIB),
             ArenaPlan::StreamOnly
         );
         // It must NOT collapse to "keep the mmap path" — that is the thing it replaces.
         assert_ne!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 40 * GIB),
+            streaming_arena_plan(RamRequest::Auto, Some(64 * GIB), Some(0), true, 40 * GIB),
             ArenaPlan::Skip(Skip::Fits)
         );
         // A host with no memory to spare still streams on unified memory, because the decision
         // does not depend on having any to give.
         assert_eq!(
-            streaming_arena_plan(Requested::Auto, Some(GIB), true, 40 * GIB),
+            streaming_arena_plan(RamRequest::Auto, Some(GIB), Some(0), true, 40 * GIB),
             ArenaPlan::StreamOnly
         );
         // The same host WITHOUT unified memory caches instead — otherwise this test would pass
         // for a version that simply never auto-sizes.
         assert!(matches!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 40 * GIB),
+            streaming_arena_plan(RamRequest::Auto, Some(64 * GIB), Some(0), false, 40 * GIB),
             ArenaPlan::Take(_)
         ));
     }
@@ -515,11 +719,11 @@ mod tests {
     #[test]
     fn no_probe_is_distinct_from_fitting() {
         assert_eq!(
-            cpu_arena_plan(Requested::Auto, None, 200 * GIB),
+            cpu_arena_plan(RamRequest::Auto, None, Some(0), 200 * GIB),
             ArenaPlan::Skip(Skip::NoProbe)
         );
         assert_eq!(
-            streaming_arena_plan(Requested::Auto, None, false, 200 * GIB),
+            streaming_arena_plan(RamRequest::Auto, None, Some(0), false, 200 * GIB),
             ArenaPlan::Skip(Skip::NoProbe)
         );
     }
@@ -527,9 +731,9 @@ mod tests {
     /// A host with nothing to spare declines rather than building a useless arena.
     #[test]
     fn a_squeezed_host_declines() {
-        assert_eq!(auto_arena_bytes(GIB, 0, u64::MAX), 0);
-        assert_eq!(auto_arena_bytes(64 * GIB, 63 * GIB, u64::MAX), 0);
+        assert_eq!(auto_cache_bytes(GIB, 0, u64::MAX), 0);
+        assert_eq!(auto_cache_bytes(64 * GIB, 63 * GIB, u64::MAX), 0);
         // Just under the useful floor, with headroom accounted for.
-        assert_eq!(auto_arena_bytes(2 * GIB, 0, MIN_USEFUL - 1), 0);
+        assert_eq!(auto_cache_bytes(2 * GIB, 0, MIN_USEFUL - 1), 0);
     }
 }

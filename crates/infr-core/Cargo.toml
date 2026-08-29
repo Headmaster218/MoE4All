@@ -20,7 +20,7 @@ tracing.workspace = true
 rayon.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }
+windows = { version = "0.58", features = ["Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

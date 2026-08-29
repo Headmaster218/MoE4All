@@ -2,9 +2,10 @@
 // Exact score-desc/index-asc top-k, followed by an index-ascending bitonic sort. The latter
 // reproduces scatter-to-mask attention order: selected tokens are consumed chronologically.
 //
-// Select the k-th key with a 4-bit radix pass over (ordered-score, ~index). This preserves the
-// original total order while scanning the score vector 16 times instead of top_k times. Qwen3.8
-// selects 512 of up to 65536 blocks, so the old repeated maximum reduction dominated decode.
+// Select the k-th score with a 4-pass 8-bit radix search, then resolve the lower-index tie break
+// with one parallel count and one collection pass. This preserves the original total order while
+// scanning the score vector 6 times instead of 17 (16 radix + collection). Qwen3.8 selects 512
+// of up to 65536 blocks, so avoiding twelve full index-radix scans matters at long context.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -18,10 +19,11 @@ layout(binding = 0) readonly buffer SB { float scores[]; };
 layout(binding = 1) writeonly buffer DB { uint dst[]; };
 
 #define INVALID 0xffffffffu
-shared uint bucket[16];
+shared uint bucket[256];
 shared uint selected_digit;
 shared uint remaining_rank;
 shared uint selected_count;
+shared uint tie_prefix[256];
 shared uint chosen[512];
 
 uint ordered_float(float x) {
@@ -37,31 +39,18 @@ void main() {
     uint score_base = row * pc.max_blocks;
     uint dst_base = row * pc.top_k;
     uint prefix_score = 0u;
-    uint prefix_index = 0u;
     uint rank = pc.top_k;
 
-    // A score contributes the high 32 bits. The complemented index contributes the low 32 bits,
-    // making a smaller source index rank above a larger one when scores tie.
-    for (uint level = 0u; level < 16u; ++level) {
-        if (t < 16u) { bucket[t] = 0u; }
+    for (uint level = 0u; level < 4u; ++level) {
+        bucket[t] = 0u;
         barrier();
 
         for (uint j = t; j < blocks; j += 256u) {
             uint score_key = ordered_float(scores[score_base + j]);
-            uint index_key = ~j;
-            uint digit;
-            if (level < 8u) {
-                uint done = level * 4u;
-                uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
-                if ((score_key & mask) != (prefix_score & mask)) { continue; }
-                digit = (score_key >> (28u - done)) & 0xfu;
-            } else {
-                if (score_key != prefix_score) { continue; }
-                uint done = (level - 8u) * 4u;
-                uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
-                if ((index_key & mask) != (prefix_index & mask)) { continue; }
-                digit = (index_key >> (28u - done)) & 0xfu;
-            }
+            uint done = level * 8u;
+            uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
+            if ((score_key & mask) != (prefix_score & mask)) { continue; }
+            uint digit = (score_key >> (24u - done)) & 0xffu;
             atomicAdd(bucket[digit], 1u);
         }
         barrier();
@@ -70,7 +59,7 @@ void main() {
             uint above = 0u;
             uint digit = 0u;
             uint next_rank = rank;
-            for (int b = 15; b >= 0; --b) {
+            for (int b = 255; b >= 0; --b) {
                 uint count = bucket[uint(b)];
                 if (above + count >= rank) {
                     digit = uint(b);
@@ -84,26 +73,44 @@ void main() {
         }
         barrier();
 
-        if (level < 8u) {
-            prefix_score |= selected_digit << (28u - level * 4u);
-        } else {
-            prefix_index |= selected_digit << (28u - (level - 8u) * 4u);
-        }
+        prefix_score |= selected_digit << (24u - level * 8u);
         rank = remaining_rank;
         barrier();
     }
 
-    // The index component makes every key unique, so exactly top_k entries are >= the threshold.
+    // `rank` is now the number of entries equal to the threshold score that must be retained.
+    // Give each lane a contiguous index range, count its ties, and have lane 0 prefix those 256
+    // tiny counts. A later lane can then decide locally whether each equal-score index is among
+    // the first `rank`, preserving the exact lower-index tie break without radix-scanning index.
+    uint begin = blocks * t / 256u;
+    uint end = blocks * (t + 1u) / 256u;
+    uint local_ties = 0u;
+    for (uint j = begin; j < end; ++j) {
+        local_ties += uint(ordered_float(scores[score_base + j]) == prefix_score);
+    }
+    tie_prefix[t] = local_ties;
+    barrier();
+    if (t == 0u) {
+        uint prefix = 0u;
+        for (uint lane = 0u; lane < 256u; ++lane) {
+            uint count = tie_prefix[lane];
+            tie_prefix[lane] = prefix;
+            prefix += count;
+        }
+    }
+    barrier();
+
     if (t == 0u) { selected_count = 0u; }
     barrier();
-    for (uint j = t; j < blocks; j += 256u) {
+    uint tie_ordinal = tie_prefix[t];
+    for (uint j = begin; j < end; ++j) {
         uint score_key = ordered_float(scores[score_base + j]);
-        uint index_key = ~j;
-        if (score_key > prefix_score ||
-            (score_key == prefix_score && index_key >= prefix_index)) {
+        bool equal = score_key == prefix_score;
+        if (score_key > prefix_score || (equal && tie_ordinal < rank)) {
             uint slot = atomicAdd(selected_count, 1u);
             if (slot < pc.top_k) { chosen[slot] = j; }
         }
+        tie_ordinal += uint(equal);
     }
     barrier();
 

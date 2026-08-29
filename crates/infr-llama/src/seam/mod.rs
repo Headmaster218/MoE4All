@@ -76,6 +76,64 @@ impl<'a> TokenEmbd<'a> {
     }
 }
 
+fn host_ram_request(ec: &EngineConfig) -> infr_core::hostmem::RamRequest {
+    let total_host_ram = infr_core::hostmem::total_bytes();
+    let total_process_budget = ec.device.ram_budget.and_then(|size| match size {
+        infr_core::SizeSpec::Bytes(bytes) => Some(bytes),
+        infr_core::SizeSpec::Percent(_) => match total_host_ram {
+            Some(total) => Some(size.resolve(total)),
+            None => {
+                tracing::warn!(
+                    "device.ram_budget is a percentage, but total physical RAM could not be \
+                     detected; falling back to automatic host-memory sizing"
+                );
+                None
+            }
+        },
+    });
+    let legacy_cache_budget = ec.paging.dram.map(|size| size.resolve(0));
+    if total_process_budget.is_some() && legacy_cache_budget.is_some() {
+        tracing::warn!(
+            "both device.ram_budget and legacy paging.dram are set; using device.ram_budget"
+        );
+    }
+    infr_core::hostmem::RamRequest::from_config(
+        total_process_budget,
+        legacy_cache_budget,
+        ec.paging.dram_bypass,
+    )
+}
+
+fn log_host_ram_request(
+    what: &str,
+    request: infr_core::hostmem::RamRequest,
+    process_resident: Option<u64>,
+    cache_bytes: u64,
+) {
+    match (request, process_resident) {
+        (infr_core::hostmem::RamRequest::TotalProcessBudget(total), Some(resident)) => {
+            tracing::info!(
+                total_process_ram_budget_bytes = total,
+                observed_process_resident_bytes = resident,
+                host_cache_budget_bytes = cache_bytes,
+                "{what} host tier: resolved total-process RAM budget"
+            )
+        }
+        (infr_core::hostmem::RamRequest::TotalProcessBudget(total), None) => tracing::warn!(
+            total_process_ram_budget_bytes = total,
+            host_cache_budget_bytes = cache_bytes,
+            "{what} host tier: this platform could not measure process resident RAM; treating \
+             device.ram_budget as a best-effort host-cache ceiling"
+        ),
+        (infr_core::hostmem::RamRequest::LegacyCacheBudget(bytes), _) => tracing::warn!(
+            legacy_host_cache_bytes = bytes,
+            "{what} host tier: paging.dram / INFR_DRAM_CACHE is a deprecated raw cache override; \
+             use device.ram_budget / INFR_RAM_BUDGET for a total-process RAM budget"
+        ),
+        _ => {}
+    }
+}
+
 /// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
 /// copy: map an mmap slice zero-copy; alloc+upload owned bytes (the combined gate+up concat — never
 /// produced for CPU since `combined_gu` is false there, but stays correct if it ever is).
@@ -91,11 +149,10 @@ impl<'a> TokenEmbd<'a> {
 /// collapse: decode 23-33x slower once the weights stop fitting), and the arena's own policy is
 /// what fixes it.
 ///
-/// An explicit `paging.dram` always wins in BOTH directions — it forces the arena on a model that
-/// would have fit, and pins the size on one that would not. That is deliberate and must stay: a
-/// machine with enough RAM to hold the model is exactly the machine you want to exercise the
-/// streaming path on, so `INFR_DRAM_CACHE=<size>` is how a CPU run is put on it regardless of what
-/// the fit test would have decided.
+/// An explicit `device.ram_budget` always wins in BOTH directions — it forces the arena on a model
+/// that would have fit and sets the process's total resident-RAM target. The current working set is
+/// subtracted before this arena is planned. Legacy `paging.dram` remains an exact-cache diagnostic
+/// override only.
 ///
 /// Returns `None` — not an error — when nothing seats, so every degraded case falls back to
 /// today's behaviour rather than failing the load.
@@ -103,11 +160,8 @@ fn cpu_paged_store(
     ec: &EngineConfig,
     g: &Gguf,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
-    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(
-        ec.paging.dram.map(|s| s.resolve(0)),
-        ec.paging.dram_bypass,
-    );
+    // `0` is the explicit OFF switch, not "unset" — preserve it through request resolution.
+    let ram_request = host_ram_request(ec);
     // Only the weights this backend would actually page count toward "does it fit": the sub-floor
     // tensors stay mapped either way, so counting them could page a model that fits.
     let pageable: u64 = g
@@ -117,7 +171,15 @@ fn cpu_paged_store(
         .map(|t| t.nbytes as u64)
         .sum();
     let available = infr_core::hostmem::available_bytes();
-    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, pageable) {
+    let process_resident = infr_core::hostmem::process_resident_bytes();
+    let arena_plan =
+        infr_core::hostmem::cpu_arena_plan(ram_request, available, process_resident, pageable);
+    let cache_bytes = match arena_plan {
+        infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
+        _ => 0,
+    };
+    log_host_ram_request("CPU", ram_request, process_resident, cache_bytes);
+    let budget = match arena_plan {
         // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
         // on unified memory). For the CPU backend this arena is the only tier there is, so a
         // read-through with nothing behind it would be a pure regression on the mapping.
@@ -126,11 +188,11 @@ fn cpu_paged_store(
             return Ok(None);
         }
         infr_core::hostmem::ArenaPlan::Take(n) => {
-            if explicit == infr_core::hostmem::Requested::Auto {
+            if ram_request == infr_core::hostmem::RamRequest::Auto {
                 tracing::info!(
                     "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
                      available, so they stream from disk through a {:.2} GB arena instead of the \
-                     OS page cache (set INFR_DRAM_CACHE to override)",
+                     OS page cache (set INFR_RAM_BUDGET to override)",
                     pageable as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                     n as f64 / 1e9,
@@ -148,7 +210,7 @@ fn cpu_paged_store(
                     "host paging: {:.2} GB of weights do not fit the {:.2} GB of host memory \
                      available, but too little is free to seat a useful arena — falling back to \
                      the OS page cache, which thrashes on a forward pass's cyclic sweep. Free \
-                     memory, or set INFR_DRAM_CACHE explicitly",
+                     memory, or set INFR_RAM_BUDGET explicitly",
                     pageable as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                 );
@@ -160,7 +222,7 @@ fn cpu_paged_store(
     if plans.is_empty() {
         tracing::warn!(
             "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
-             mmap path (raise INFR_DRAM_CACHE past one tensor's size to page)",
+             mmap path (raise INFR_RAM_BUDGET enough to leave room for one tensor)",
             budget as f64 / 1e9,
         );
         return Ok(None);
@@ -191,8 +253,8 @@ fn cpu_paged_store(
 /// # Where the budget comes from
 /// **Both call sites are already past the point where the model did not fit VRAM** — dense
 /// streaming and the paged MoE cache are each only reached when residency was rejected — so
-/// reaching here IS the signal that this run has to stream. An explicit `paging.dram` still wins;
-/// otherwise the budget is sized from what the host can actually spare
+/// reaching here IS the signal that this run has to stream. An explicit `device.ram_budget` still
+/// wins; otherwise the budget is sized from what the host can actually spare
 /// ([`infr_core::hostmem`]), because a tier that is off by default helps nobody on the one run
 /// that needs it, and the alternative is a user guessing a number that is worth 1.6x
 /// (`docs/perf/results.md`).
@@ -201,9 +263,9 @@ fn cpu_paged_store(
 /// Auto-sizing never REPLACES the two knobs, because a machine big enough to hold the model
 /// resident is exactly the machine you want to test streaming on. `INFR_CACHE` (`paging.cache`)
 /// caps the VRAM paging budget, which is what forces residency to be rejected and this function to
-/// be reached at all; `INFR_DRAM_CACHE` (`paging.dram`) then pins this arena's size instead of
-/// letting it be measured. Both together are how every figure in `docs/perf/results.md` was taken
-/// on a card that would otherwise have kept the model resident — e.g. `--cache 2g --dram 3g`.
+/// be reached at all; `INFR_RAM_BUDGET` (`device.ram_budget`) then pins total process RAM instead
+/// of letting it be measured. Both together can force this path on a machine that would otherwise
+/// keep the model resident. Legacy `paging.dram` pins only the raw host-cache size.
 ///
 /// # Unified memory has only ONE host tier, and it is the arena above this one
 /// `unified` is `DeviceCaps::unified_memory` — an iGPU or APU whose "VRAM" IS system RAM. There the
@@ -211,8 +273,8 @@ fn cpu_paged_store(
 /// the same RAM that the GPU CANNOT read directly: every hit would still be copied through the
 /// staging ring, while the identical bytes spent on the arena above are read in place. It is not
 /// merely double-counted, it is strictly worse than making that arena bigger. So auto-sizing
-/// declines on unified memory and says why; an explicit `paging.dram` is still honoured, because a
-/// user asking for it by name may be working around something this does not model.
+/// declines on unified memory and says why; an explicit `device.ram_budget` is still honoured,
+/// because a user asking for it by name may be working around something this does not model.
 fn vulkan_host_tier(
     ec: &EngineConfig,
     g: &Gguf,
@@ -221,82 +283,91 @@ fn vulkan_host_tier(
     unified: bool,
 ) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
     let unpaged = || vec![None; classes.len()];
-    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(
-        ec.paging.dram.map(|s| s.resolve(0)),
-        ec.paging.dram_bypass,
-    );
+    // `0` is the explicit OFF switch, not "unset" — preserve it through request resolution.
+    let ram_request = host_ram_request(ec);
     let available = infr_core::hostmem::available_bytes();
+    let process_resident = infr_core::hostmem::process_resident_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
-    let budget =
-        match infr_core::hostmem::streaming_arena_plan(explicit, available, unified, pageable) {
-            // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
-            // to cache down here — but its misses still come from BLOCK reads instead of the
-            // mapping, which is what lets a big model run on these machines at all.
-            infr_core::hostmem::ArenaPlan::StreamOnly => {
-                let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                tracing::info!(
-                    "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
+    let arena_plan = infr_core::hostmem::streaming_arena_plan(
+        ram_request,
+        available,
+        process_resident,
+        unified,
+        pageable,
+    );
+    let cache_bytes = match arena_plan {
+        infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
+        _ => 0,
+    };
+    log_host_ram_request(what, ram_request, process_resident, cache_bytes);
+    let budget = match arena_plan {
+        // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
+        // to cache down here — but its misses still come from BLOCK reads instead of the
+        // mapping, which is what lets a big model run on these machines at all.
+        infr_core::hostmem::ArenaPlan::StreamOnly => {
+            let io = std::sync::Arc::new(
+                infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            tracing::info!(
+                "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
                      this device's memory IS host memory, so the {} pool(s) above are already the \
                      only useful cache and a second one would hold bytes the GPU cannot read in \
-                     place. Raise INFR_CACHE to cache more; INFR_DRAM_CACHE forces a host arena",
-                    classes.len(),
-                );
-                let mut out = Vec::with_capacity(classes.len());
-                for &(slot_bytes, _) in classes {
-                    let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
-                        .map_err(|e| anyhow!("{e}"))?;
-                    out.push(Some(std::sync::Arc::new(p)));
-                }
-                return Ok(out);
+                     place. Raise INFR_CACHE to cache more; INFR_RAM_BUDGET forces a host arena",
+                classes.len(),
+            );
+            let mut out = Vec::with_capacity(classes.len());
+            for &(slot_bytes, _) in classes {
+                let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
+                    .map_err(|e| anyhow!("{e}"))?;
+                out.push(Some(std::sync::Arc::new(p)));
             }
-            infr_core::hostmem::ArenaPlan::Take(n) => {
-                if explicit == infr_core::hostmem::Requested::Auto {
-                    tracing::info!(
+            return Ok(out);
+        }
+        infr_core::hostmem::ArenaPlan::Take(n) => {
+            if ram_request == infr_core::hostmem::RamRequest::Auto {
+                tracing::info!(
                     "{what} host tier: sized automatically to {:.2} GB of {:.2} GB available host \
-                     memory (set INFR_DRAM_CACHE to override)",
+                     memory (set INFR_RAM_BUDGET to override)",
                     n as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                 );
-                }
-                n as usize
             }
-            infr_core::hostmem::ArenaPlan::Skip(why) => {
-                use infr_core::hostmem::Skip;
-                match why {
-                    Skip::NoProbe => tracing::warn!(
+            n as usize
+        }
+        infr_core::hostmem::ArenaPlan::Skip(why) => {
+            use infr_core::hostmem::Skip;
+            match why {
+                Skip::NoProbe => tracing::warn!(
                     "{what} host tier: this model must stream, but there is no host-memory probe \
                      on this platform, so the arena cannot be sized automatically — set \
-                     INFR_DRAM_CACHE to page weights through DRAM instead of leaving them to the \
+                     INFR_RAM_BUDGET to page weights through DRAM instead of leaving them to the \
                      OS page cache"
                 ),
-                    Skip::TooLittle => tracing::warn!(
+                Skip::TooLittle => tracing::warn!(
                     "{what} host tier: this model must stream, but only {:.2} GB of host memory \
                      is available — too little to seat a useful arena, so the weights stay on the \
-                     OS page cache. Free memory, or set INFR_DRAM_CACHE explicitly",
+                     OS page cache. Free memory, or set INFR_RAM_BUDGET explicitly",
                     available.unwrap_or(0) as f64 / 1e9,
                 ),
-                    // Off by name: say so once, because a user who set it and then wonders why
-                    // streaming is slow should find the reason in the log.
-                    Skip::Disabled => tracing::info!(
-                        "{what} host tier: disabled by paging.dram=0 — weights stream from the OS \
-                     page cache instead of an arena"
-                    ),
-                    // Unreachable here by construction: `streaming_arena_plan` is for callers already
-                    // past the fit decision, so it never answers `Fits`.
-                    Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
-                }
-                return Ok(unpaged());
+                // Off by name: say so once, because a user who set it and then wonders why
+                // streaming is slow should find the reason in the log.
+                Skip::Disabled => tracing::info!(
+                    "{what} host tier: disabled by an explicit zero RAM setting — weights stream \
+                     from the OS page cache instead of an arena"
+                ),
+                // Unreachable here by construction: `streaming_arena_plan` is for callers already
+                // past the fit decision, so it never answers `Fits`.
+                Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
             }
-        };
+            return Ok(unpaged());
+        }
+    };
     let slots = infr_core::hostpager::plan_slots(budget, classes);
     if slots.iter().all(|&n| n == 0) {
         tracing::warn!(
             "{what} host tier: a {:.2} GB budget seats no block class of this model — keeping \
-             the mmap path (raise INFR_DRAM_CACHE past one block's size to page)",
+             the mmap path (raise INFR_RAM_BUDGET enough to leave room for one block)",
             budget as f64 / 1e9,
         );
         return Ok(unpaged());
@@ -444,7 +515,7 @@ pub(crate) fn generate_dense_cpu_mode(
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a weight binder that maps
-    // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when `paging.dram` asks
+    // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when the host RAM plan asks
     // for a host weight cache, registers the big ones to be read from the file on demand.
     let store = cpu_paged_store(ec, g)?;
     let bind = cpu_bind_with(&cpu_be, store.clone());
@@ -769,9 +840,18 @@ pub(crate) fn dense_act_reserve_at(
     })
 }
 
-/// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]: the residual
-/// stream for the WHOLE prompt at once — one `[ubatch, n_embd]` f32 buffer per chunk, all live
-/// across the layer boundary — where chunk-major keeps only the chunk it is running.
+/// Number of ubatches in one Qwen3.8 layer-major prefill group. Eight leaves enough same-layer
+/// work to amortize/pipeline expert staging without retaining a long prompt's four residual
+/// streams all at once.
+pub(crate) const QWEN4_PREFILL_GROUP_CHUNKS: usize = 8;
+// RX 7900 XTX pp8192 measured the combined group + graph high-water mark 18 MiB above the
+// algebraic reserve. Keep a small fixed cushion so boundary placements do not depend on that
+// model-specific scratch residue.
+const QWEN4_PREFILL_GROUP_PAD: u64 = 32 * 1024 * 1024;
+
+/// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]. Ordinary
+/// streaming models retain the whole prompt's residual rows. Qwen3.8 retains one bounded group,
+/// including its caller-owned four-stream residual and PLE rows.
 ///
 /// Priced at the full context because that is the longest prompt the session can be handed, and
 /// these buffers are allocated mid-prefill out of whatever the arenas left: an under-reserve
@@ -783,7 +863,19 @@ pub(crate) fn dense_act_reserve_at(
 pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
     let ctx = want_ctx.max(1);
     let ub = ubatch.clamp(1, ctx);
-    ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
+    if cfg.qwen4exp {
+        let rows = ctx.min(ub.saturating_mul(QWEN4_PREFILL_GROUP_CHUNKS)) as u64;
+        let residual = cfg.n_embd.saturating_mul(1 + cfg.hc_mult);
+        let ple = cfg
+            .ple_ngram_size
+            .saturating_sub(1)
+            .saturating_mul(cfg.ple_heads_per_ngram)
+            .saturating_mul(cfg.ple_head_dim);
+        rows.saturating_mul(residual.saturating_add(ple).saturating_mul(4) as u64)
+            .saturating_add(QWEN4_PREFILL_GROUP_PAD)
+    } else {
+        ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
+    }
 }
 
 /// Does this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
@@ -793,9 +885,10 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 /// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
 /// prefill cost when they stream: measured on Qwen3-14B Q8_0 at ctx 4096, the 1024-row default read
 /// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
-/// one sweep regardless of chunk count, at the cost of holding every chunk's residual stream at once
-/// ([`layer_major_act_bytes`]) — a trade that only pays when there is I/O to save, hence the default
-/// of "on exactly when the weights stream".
+/// one sweep regardless of chunk count, at the cost of holding residual streams across layer
+/// boundaries ([`layer_major_act_bytes`]). Qwen3.8 bounds that lifetime to fixed groups; ordinary
+/// streaming models retain the whole prompt. The trade pays when there is I/O to save, hence the
+/// default of "on exactly when the weights stream".
 ///
 /// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
 /// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
@@ -878,15 +971,24 @@ const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 /// carries the presence flag separately and every input — valid value, `0`, garbage, unset — keeps
 /// today's behaviour bit-for-bit (R1).
 pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
-    ec.device.ubatch.filter(|&v| v > 0).unwrap_or_else(|| {
-        with_placement_pins(
-            |p| match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
+    let configured = ec.device.ubatch.filter(|&v| v > 0);
+    let (placed, moe_cap) = with_placement_pins(|p| {
+        (
+            match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
                 0 => None, // nothing pinned
                 rows => Some(rows),
             },
+            match p.moe_ubatch_cap.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                rows => Some(rows),
+            },
         )
-        .unwrap_or_else(default_ubatch_rows)
-    })
+    });
+    let selected = configured.or(placed).unwrap_or_else(default_ubatch_rows);
+    match moe_cap {
+        Some(cap) => selected.min(cap),
+        None => selected,
+    }
 }
 
 /// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` (§6.12) — the dense
@@ -928,6 +1030,18 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
         cands.extend(DENSE_UBATCH_LADDER.into_iter().filter(|&c| c < now));
     }
     cands
+}
+
+/// Emergency MoE-only shrink ladder. Unlike [`ubatch_candidates`], this remains available after
+/// an explicit `INFR_UBATCH`: the requested height is priced first and is lowered only when its
+/// activation reserve leaves less than one complete whole-layer Prefill lane. This is a viability
+/// fallback, not a throughput/residency policy sweep.
+fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
+    const FALLBACKS: [usize; 4] = [1024, 512, 256, 128];
+    let now = ubatch_rows(ec);
+    let mut candidates = vec![now];
+    candidates.extend(FALLBACKS.into_iter().filter(|&rows| rows < now));
+    candidates
 }
 
 /// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
@@ -990,6 +1104,10 @@ pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
 #[derive(Default)]
 pub(crate) struct PlacementPins {
     ubatch: std::sync::atomic::AtomicUsize,
+    /// Emergency upper bound used only when the requested/current chunk leaves no complete MoE
+    /// Prefill lane. Kept separate so ordinary placement/re-clamp pins cannot override an explicit
+    /// `INFR_UBATCH`.
+    moe_ubatch_cap: std::sync::atomic::AtomicUsize,
     kv_q8: std::sync::OnceLock<()>,
     /// Has this session already reported an activation peak above what it reserved (the runner's
     /// `activation reserve too low` warning)? The condition persists for the session's whole life —
@@ -1068,6 +1186,16 @@ fn repin_ubatch_lower(rows: usize) {
         let cur = p.ubatch.load(std::sync::atomic::Ordering::Relaxed);
         if cur == 0 || rows < cur {
             p.ubatch.store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+fn cap_moe_ubatch(rows: usize) {
+    with_placement_pins(|p| {
+        let cur = p.moe_ubatch_cap.load(std::sync::atomic::Ordering::Relaxed);
+        if cur == 0 || rows < cur {
+            p.moe_ubatch_cap
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
         }
     });
 }
@@ -1527,15 +1655,31 @@ pub(crate) fn kv_bytes_estimate_fmt(
         .saturating_add(qwen4_extra)
 }
 
-/// Qwen3.8 QSA stores the unnormalised, unroped single index-key head for every token on each
-/// full-attention layer. The official cache dtype is BF16; infr's v1 QSA path keeps the same
-/// two-byte footprint in F16, matching the currently supported Qwen3.8 KV path.
-pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+/// Raw Qwen3.8 QSA index keys: one unnormalised, unroped F16 row per token.
+pub(crate) fn qsa_raw_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
     if cfg.qwen4exp && cfg.is_qwen_hybrid_attn_layer(layer) {
         ctx.saturating_mul(cfg.indexer_head_size).saturating_mul(2)
     } else {
         0
     }
+}
+
+/// Persistent final QSA keys: one F32 RMS-normalised and roped row per complete compressed block.
+pub(crate) fn qsa_block_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+    if cfg.qwen4exp && cfg.is_qwen_hybrid_attn_layer(layer) {
+        let ratio = cfg.layer_compress_ratio(layer).max(1);
+        (ctx / ratio)
+            .max(1)
+            .saturating_mul(cfg.indexer_head_size)
+            .saturating_mul(4)
+    } else {
+        0
+    }
+}
+
+/// Total per-layer QSA state charged to context placement.
+pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
+    qsa_raw_cache_bytes(cfg, layer, ctx).saturating_add(qsa_block_cache_bytes(cfg, layer, ctx))
 }
 
 /// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
@@ -2016,6 +2160,28 @@ pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
     moe_pool_floor_bytes(&pools, moe.n_expert.max(1)).unwrap_or(u64::MAX)
 }
 
+/// Whole-layer Prefill ring depth from the model's actual mixer topology. A recurrent run gives
+/// the uploader that many fast layers in which to prepare the next slow Attention/MLA layer; the
+/// extra lane is the layer currently being consumed. Models without recurrent mixers keep the
+/// established all-layer target and let physical cache capacity cap it.
+fn moe_prefill_target_lanes(cfg: &Config, n_paged: usize) -> usize {
+    let mut current_run = 0usize;
+    let mut longest_run = 0usize;
+    for layer in 0..cfg.n_layer {
+        if cfg.is_recurrent_layer(layer) {
+            current_run = current_run.saturating_add(1);
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    if longest_run == 0 {
+        n_paged.max(1)
+    } else {
+        longest_run.saturating_add(1).min(n_paged.max(1))
+    }
+}
+
 /// Split the MoE arena budget across slot-size pools without ever exceeding it. Each pool first
 /// receives enough slots for one worst-case Prefill layer; the remaining bytes are then assigned
 /// in weighted-fair order. Reserving the floors up front avoids the old `clamp(floor, nb)` corner
@@ -2067,6 +2233,29 @@ fn moe_pool_slot_counts(
         remaining -= pools[i].0 as u64;
     }
     Some(slots)
+}
+
+const AUTO_MOE_ARENA_SHRINK_MIN: u64 = 256 * 1024 * 1024;
+const AUTO_MOE_ARENA_MAX_ATTEMPTS: usize = 16;
+
+/// Next automatic mapped-arena probe. An allocation failure has no trustworthy byte shortfall,
+/// so retire 5% (at least 256 MiB); a successful allocation whose live budget is short can name
+/// the exact deficit and skips directly past it. Explicit cache budgets never call this helper.
+fn next_auto_moe_arena_budget(current: u64, minimum: u64, shortfall: u64) -> Option<u64> {
+    const STEP_ALIGN: u64 = 64 * 1024 * 1024;
+    let measured = shortfall.div_ceil(STEP_ALIGN).saturating_mul(STEP_ALIGN);
+    let step = (current / 20).max(AUTO_MOE_ARENA_SHRINK_MIN).max(measured);
+    let next = current.saturating_sub(step);
+    (next >= minimum && next < current).then_some(next)
+}
+
+fn moe_pool_capacity_bytes(pools: &[(usize, usize, [usize; 3])], slots: &[usize]) -> u64 {
+    pools
+        .iter()
+        .zip(slots)
+        .fold(0u64, |total, (&(slot_bytes, ..), &n_slots)| {
+            total.saturating_add((slot_bytes as u64).saturating_mul(n_slots as u64))
+        })
 }
 
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
@@ -2407,17 +2596,26 @@ enum MoeHostBacking {
 }
 
 fn moe_host_backing(
-    requested: infr_core::hostmem::Requested,
+    ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
+    process_resident: Option<u64>,
     payload_bytes: usize,
 ) -> MoeHostBacking {
-    let budget = match requested {
-        infr_core::hostmem::Requested::Fixed(bytes) => bytes.min(payload_bytes as u64),
-        infr_core::hostmem::Requested::Off | infr_core::hostmem::Requested::Bypass => 0,
-        infr_core::hostmem::Requested::Auto => available
-            .map_or(payload_bytes as u64, |available| {
-                infr_core::hostmem::auto_arena_bytes(available, 0, payload_bytes as u64)
-            }),
+    let budget = match ram_request {
+        infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
+            infr_core::hostmem::cache_bytes_for_total_budget(
+                total,
+                process_resident,
+                payload_bytes as u64,
+            )
+        }
+        infr_core::hostmem::RamRequest::LegacyCacheBudget(bytes) => bytes.min(payload_bytes as u64),
+        infr_core::hostmem::RamRequest::Bypass => 0,
+        infr_core::hostmem::RamRequest::Auto => available
+            .map(|available| {
+                infr_core::hostmem::auto_cache_bytes(available, 0, payload_bytes as u64)
+            })
+            .unwrap_or(0),
     } as usize;
     if budget >= payload_bytes {
         MoeHostBacking::Full
@@ -2467,6 +2665,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut expert_cache_target_bytes = 0u64;
     let mut pager_budget_bytes = 0u64;
+    let mut pager_memory_plan = None;
+    let mut pager_prefill_floor_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -2494,23 +2694,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let ring = kv_ring_wanted(cfg, ec);
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
-        let kv_bytes = match (k_fmt, v_fmt) {
-            (DType::Q8_0, DType::Q8_0) => {
-                kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), true)
-            }
-            (DType::F16, DType::F16) => {
-                kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), false)
-            }
-            _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch_rows(ec), k_fmt, v_fmt),
+        let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
+            (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
+            (DType::F16, DType::F16) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, false),
+            _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, k_fmt, v_fmt),
         };
+        let initial_ubatch = ubatch_rows(ec);
+        let mut selected_ubatch = initial_ubatch;
+        let kv_bytes = kv_bytes_at(selected_ubatch);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
         // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
         // borrows only cold Decode arena ranges and returns them on `enter_decode`.
-        let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, ubatch_rows(ec));
+        let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, selected_ubatch);
         let packing_margin = resident_weight_packing_margin(fp.dense);
         let load_driver_reserve = session_load_driver_reserve(cfg, ec);
-        let Some(plan) = ModelMemoryPlan::new_with_reserves(
+        let Some(mut plan) = ModelMemoryPlan::new_with_reserves(
             room,
             fp.dense,
             kv_bytes,
@@ -2529,6 +2728,55 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 room as f64 / 1e9,
             ));
         };
+        let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
+        let paged_target_at = |candidate: ModelMemoryPlan| match requested_cache {
+            Some(requested) => Some(requested.min(candidate.expert_cache_bytes)),
+            None if candidate.expert_cache_bytes < fp.expert => Some(candidate.expert_cache_bytes),
+            None => None,
+        };
+        let prefill_floor = moe_prefill_floor_bytes(g, cfg);
+        let mut paged_target = paged_target_at(plan);
+        if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
+            for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
+                let candidate_kv = kv_bytes_at(candidate);
+                let candidate_runtime = dense_act_reserve_at(cfg, &caps, want_ctx, candidate);
+                let Some(candidate_plan) = ModelMemoryPlan::new_with_reserves(
+                    room,
+                    fp.dense,
+                    candidate_kv,
+                    candidate_runtime,
+                    packing_margin,
+                    load_driver_reserve,
+                    POST_KV_DEVICE_RESERVE,
+                ) else {
+                    continue;
+                };
+                let candidate_target = paged_target_at(candidate_plan);
+                if candidate_target.is_none_or(|bytes| bytes >= prefill_floor) {
+                    selected_ubatch = candidate;
+                    plan = candidate_plan;
+                    paged_target = candidate_target;
+                    break;
+                }
+            }
+        }
+        if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
+            return Err(anyhow!(
+                "MoE expert cache leaves {:.2} MiB, but one complete Prefill layer needs {:.2} MiB; \
+                 increase INFR_VRAM_BUDGET/INFR_CACHE or reduce context/runtime memory",
+                paged_target.unwrap_or(0) as f64 / 2f64.powi(20),
+                prefill_floor as f64 / 2f64.powi(20),
+            ));
+        }
+        if selected_ubatch != initial_ubatch {
+            cap_moe_ubatch(selected_ubatch);
+            tracing::warn!(
+                "MoE placement: lowered the Prefill chunk from {initial_ubatch} to \
+                 {selected_ubatch} rows because the larger chunk's runtime reserve left less than \
+                 one complete Expert streaming lane"
+            );
+        }
+
         let auto_budget = plan.expert_cache_bytes;
         match cache_override {
             Some(spec) => {
@@ -2565,6 +2813,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // the old load-time escrow purpose, so a second dedicated reservation would both
             // waste VRAM and double-charge the same bytes.
             pager_budget_bytes = plan.elastic_pool_bytes(expert_cache_target_bytes);
+            pager_memory_plan = Some(plan);
+            pager_prefill_floor_bytes = prefill_floor;
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
@@ -2742,40 +2992,148 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None if auto_size_bias_layout => (2.0, "auto"),
                 None => (0.0, "off"),
             };
-            let slot_counts = moe_pool_slot_counts(
-                &logical_pools,
-                pager_budget_bytes,
-                n_expert,
-                size_cache_bias,
-            )
-            .ok_or_else(|| {
-                anyhow!(
-                    "MoE expert arena budget ({:.2} MiB) cannot hold one complete Prefill layer; \
-                     increase INFR_VRAM_BUDGET/INFR_CACHE or reduce context/runtime memory",
-                    pager_budget_bytes as f64 / 2f64.powi(20),
-                )
-            })?;
+            // Commit the mapped arena before allocating host caches or loading weights, then ask
+            // the driver how much room is ACTUALLY left. `VK_EXT_memory_budget` accounting for a
+            // large ReBAR mapping is card/driver dependent: WDDM can charge more than the logical
+            // VkDeviceMemory size, so a plan that fits arithmetically on one GPU can leave too
+            // little room for the same fixed weights on another. Automatic placement shrinks and
+            // retries while the arena is still empty; an explicit `paging.cache` remains exact.
+            let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
+            let prefill_floor = pager_prefill_floor_bytes;
+            let planned_pager_budget = pager_budget_bytes;
+            let minimum_pager_budget = plan.runtime_reserve_bytes.saturating_add(prefill_floor);
+            let required_after_arena = plan
+                .minimum_required_bytes()
+                .saturating_sub(plan.runtime_reserve_bytes);
+            let adaptive_arena = cache_override.is_none();
+            let mut candidate_budget = pager_budget_bytes;
+            let mut attempts = 0usize;
+            let slot_counts = loop {
+                attempts += 1;
+                let Some(candidate_slots) = moe_pool_slot_counts(
+                    &logical_pools,
+                    candidate_budget,
+                    n_expert,
+                    size_cache_bias,
+                ) else {
+                    return Err(anyhow!(
+                        "MoE expert arena budget ({:.2} MiB) cannot hold one complete Prefill \
+                         layer plus runtime workspace; increase the VRAM budget or reduce context",
+                        candidate_budget as f64 / 2f64.powi(20),
+                    ));
+                };
+                let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
+                if physical_bytes.saturating_sub(plan.runtime_reserve_bytes) < prefill_floor {
+                    return Err(anyhow!(
+                        "MoE mapped arena cannot retain one complete Prefill layer after its \
+                         runtime reserve (arena {:.2} MiB, runtime {:.2} MiB, layer {:.2} MiB)",
+                        physical_bytes as f64 / 2f64.powi(20),
+                        plan.runtime_reserve_bytes as f64 / 2f64.powi(20),
+                        prefill_floor as f64 / 2f64.powi(20),
+                    ));
+                }
+                let specs: Vec<(usize, usize)> = logical_pools
+                    .iter()
+                    .zip(&candidate_slots)
+                    .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
+                    .collect();
+
+                let failure = match vk.prepare_moe_unified_vram(&specs) {
+                    Ok(committed) => {
+                        debug_assert_eq!(committed as u64, physical_bytes);
+                        let live_room = vk.alloc_room();
+                        if live_room >= required_after_arena {
+                            pager_budget_bytes = physical_bytes;
+                            expert_cache_target_bytes = expert_cache_target_bytes
+                                .min(physical_bytes.saturating_sub(plan.runtime_reserve_bytes));
+                            if attempts > 1 {
+                                tracing::warn!(
+                                    planned_bytes = planned_pager_budget,
+                                    actual_bytes = pager_budget_bytes,
+                                    attempts,
+                                    "automatic MoE arena reduced after live Vulkan allocation \
+                                     feedback; fixed weights, KV and runtime reserves remain intact"
+                                );
+                            }
+                            break candidate_slots;
+                        }
+                        let shortfall = required_after_arena - live_room;
+                        vk.discard_empty_moe_unified_vram()
+                            .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
+                        (
+                            shortfall,
+                            format!(
+                                "the mapped arena left {:.2} MiB live, {:.2} MiB short of fixed \
+                                 weights/KV/reserves",
+                                live_room as f64 / 2f64.powi(20),
+                                shortfall as f64 / 2f64.powi(20),
+                            ),
+                        )
+                    }
+                    Err(error) => (0, error.to_string()),
+                };
+
+                if !adaptive_arena {
+                    return Err(anyhow!(
+                        "explicit MoE expert arena {:.2} MiB did not fit this device: {}",
+                        physical_bytes as f64 / 2f64.powi(20),
+                        failure.1,
+                    ));
+                }
+                let next = (attempts < AUTO_MOE_ARENA_MAX_ATTEMPTS)
+                    .then(|| {
+                        next_auto_moe_arena_budget(
+                            candidate_budget,
+                            minimum_pager_budget,
+                            failure.0,
+                        )
+                    })
+                    .flatten()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "automatic MoE arena could not find a device-safe size after \
+                             {attempts} attempt(s): {}",
+                            failure.1,
+                        )
+                    })?;
+                tracing::warn!(
+                    attempt = attempts,
+                    old_bytes = candidate_budget,
+                    new_bytes = next,
+                    reason = %failure.1,
+                    "automatic MoE arena allocation retry"
+                );
+                candidate_budget = next;
+            };
             // The Host tier has two honest modes. If the configured/automatic RAM budget covers
             // the whole expert payload, retain the existing layer-contiguous store (fastest
             // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
             // caches and leave the remaining Experts on SSD. GPU-resident Experts retain a pinned
             // RAM shadow when capacity permits, making GPU eviction metadata-only.
-            let requested = infr_core::hostmem::Requested::from_config(
-                ec.paging.dram.map(|s| s.resolve(0)),
-                ec.paging.dram_bypass,
-            );
+            let ram_request = host_ram_request(ec);
+            let host_available = infr_core::hostmem::available_bytes();
+            let process_resident = infr_core::hostmem::process_resident_bytes();
             let host_backing =
-                moe_host_backing(requested, infr_core::hostmem::available_bytes(), host_bytes);
+                moe_host_backing(ram_request, host_available, process_resident, host_bytes);
             let (host_kind, host_resident_bytes) = match host_backing {
                 MoeHostBacking::Full => ("full-RAM", host_bytes),
                 MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
             };
-            if let MoeHostBacking::Bounded { bytes: ram_budget } = host_backing {
+            log_host_ram_request(
+                "MoE",
+                ram_request,
+                process_resident,
+                host_resident_bytes as u64,
+            );
+            if let MoeHostBacking::Bounded {
+                bytes: host_cache_budget,
+            } = host_backing
+            {
                 let classes: Vec<(usize, usize)> = logical_pools
                     .iter()
                     .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
                     .collect();
-                let ram_slots = infr_core::hostpager::plan_slots(ram_budget, &classes);
+                let ram_slots = infr_core::hostpager::plan_slots(host_cache_budget, &classes);
                 let io = std::sync::Arc::new(
                     infr_core::blockio::FileBlockIo::open_shards(&g.shards())
                         .map_err(|e| anyhow!("{e}"))?,
@@ -2791,7 +3149,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
                 tracing::info!(
                     "MoE host plan: bounded inclusive RAM cache {:.2} GB / {:.2} GB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
-                    ram_budget as f64 / 1e9,
+                    host_cache_budget as f64 / 1e9,
                     host_bytes as f64 / 1e9,
                 );
             } else {
@@ -2884,16 +3242,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 host_kind,
                 host_resident_bytes as f64 / 1e9,
             );
-            // Prefill streams every whole MoE layer through a topology-sized ring. Qwen3.6's
-            // full-attention interval includes three DeltaNet layers, so current + one complete
-            // interval gives five lanes and lets the long Attention cover all four successors.
-            // Other/all-Attention models request one lane per paged layer and let physical cache
-            // capacity be the sole cap; the Vulkan pager performs that exact fit per pool.
-            let prefill_target_lanes = if cfg.qwen35 && cfg.full_attn_interval > 0 {
-                cfg.full_attn_interval.saturating_add(1)
-            } else {
-                n_paged
-            };
+            // Recurrent hybrids use current + the longest consecutive recurrent run. The pager
+            // may lower that target to fit the Expert-cache share, but never spends the runtime
+            // reserve priced for the selected Prefill chunk. Pure Attention models retain their
+            // established all-layer target.
+            let prefill_target_lanes = moe_prefill_target_lanes(cfg, n_paged);
             vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
                 // The runtime reserve is part of `pager_budget_bytes` and therefore physically
                 // escrowed by the unified arena itself. No second load-only allocation.
@@ -2902,6 +3255,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 pools,
                 host_chunks,
                 prefill_target_lanes,
+                prefill_cache_bytes: expert_cache_target_bytes,
             })
             .map_err(|e| anyhow!("{e}"))?;
         }
@@ -4609,22 +4963,60 @@ mod seam_helper_tests {
     const GIB: usize = 1 << 30;
 
     #[test]
+    fn host_ram_request_preserves_total_budget_and_legacy_cache_semantics() {
+        use infr_core::{hostmem::RamRequest, SizeSpec};
+
+        let mut config = EngineConfig::default();
+        config.device.ram_budget = Some(SizeSpec::Bytes((50 * GIB) as u64));
+        config.paging.dram = Some(SizeSpec::Bytes((7 * GIB) as u64));
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::TotalProcessBudget((50 * GIB) as u64),
+            "the canonical process-wide budget must win over the compatibility cache override"
+        );
+
+        config.device.ram_budget = None;
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::LegacyCacheBudget((7 * GIB) as u64),
+            "legacy paging.dram must retain its exact cache-only meaning"
+        );
+
+        config.device.ram_budget = Some(SizeSpec::Bytes(0));
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::TotalProcessBudget(0),
+            "zero must retain its canonical source so diagnostics cannot mislabel it"
+        );
+    }
+
+    #[test]
     fn moe_host_backing_disables_ssd_when_routed_payload_fits() {
-        use infr_core::hostmem::Requested;
+        use infr_core::hostmem::RamRequest;
 
         let payload = 24 * GIB;
         assert_eq!(
-            super::moe_host_backing(Requested::Fixed(payload as u64), None, payload),
+            super::moe_host_backing(
+                RamRequest::LegacyCacheBudget(payload as u64),
+                None,
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Full,
             "an exact explicit fit must disable the runtime SSD tier"
         );
         assert_eq!(
-            super::moe_host_backing(Requested::Fixed((40 * GIB) as u64), None, payload),
+            super::moe_host_backing(
+                RamRequest::LegacyCacheBudget((40 * GIB) as u64),
+                None,
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Full,
             "budget above the routed payload must not create a bounded SSD cache"
         );
         assert_eq!(
-            super::moe_host_backing(Requested::Auto, Some((64 * GIB) as u64), payload),
+            super::moe_host_backing(RamRequest::Auto, Some((64 * GIB) as u64), Some(0), payload,),
             super::MoeHostBacking::Full,
             "automatic sizing must select the full store when its post-headroom budget fits"
         );
@@ -4632,24 +5024,66 @@ mod seam_helper_tests {
 
     #[test]
     fn moe_host_backing_keeps_ssd_only_below_routed_payload() {
-        use infr_core::hostmem::Requested;
+        use infr_core::hostmem::RamRequest;
 
         let payload = 24 * GIB;
         assert_eq!(
-            super::moe_host_backing(Requested::Fixed((23 * GIB) as u64), None, payload),
+            super::moe_host_backing(
+                RamRequest::LegacyCacheBudget((23 * GIB) as u64),
+                None,
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 23 * GIB }
         );
         assert!(matches!(
-            super::moe_host_backing(Requested::Auto, Some((25 * GIB) as u64), payload),
+            super::moe_host_backing(
+                RamRequest::Auto,
+                Some((25 * GIB) as u64),
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
         ));
         assert_eq!(
-            super::moe_host_backing(Requested::Off, Some((64 * GIB) as u64), payload),
+            super::moe_host_backing(
+                RamRequest::TotalProcessBudget(0),
+                Some((64 * GIB) as u64),
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 0 }
         );
         assert_eq!(
-            super::moe_host_backing(Requested::Bypass, Some((64 * GIB) as u64), payload),
+            super::moe_host_backing(
+                RamRequest::Bypass,
+                Some((64 * GIB) as u64),
+                Some(0),
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 0 }
+        );
+    }
+
+    #[test]
+    fn moe_host_backing_resolves_total_ram_and_auto_requires_a_probe() {
+        use infr_core::hostmem::RamRequest;
+
+        let payload = 80 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                Some((48 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 48 * GIB },
+            "50 GiB is the total process target, leaving 48 GiB after its current working set"
+        );
+        assert_eq!(
+            super::moe_host_backing(RamRequest::Auto, None, Some(0), payload),
+            super::MoeHostBacking::Bounded { bytes: 0 },
+            "auto sizing without a probe must not assume the whole payload fits RAM"
         );
     }
 
@@ -4716,6 +5150,35 @@ mod seam_helper_tests {
             1024,
             "…and the height falls back"
         );
+    }
+
+    #[test]
+    fn moe_viability_pin_may_lower_but_never_raise_explicit_ubatch() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let explicit = EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(2048),
+                ubatch_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(super::ubatch_rows(&explicit), 2048);
+        assert_eq!(
+            super::moe_ubatch_fallback_candidates(&explicit),
+            vec![2048, 1024, 512, 256, 128]
+        );
+
+        super::repin_ubatch_lower(512);
+        assert_eq!(
+            super::ubatch_rows(&explicit),
+            2048,
+            "ordinary placement pins must not override an explicit height"
+        );
+        super::cap_moe_ubatch(1024);
+        assert_eq!(super::ubatch_rows(&explicit), 1024);
+        super::cap_moe_ubatch(4096);
+        assert_eq!(super::ubatch_rows(&explicit), 1024);
     }
 
     /// The `*_specified` rule (§11 decision 8): an UNRECOGNIZED KV format name still suppresses
@@ -4848,21 +5311,69 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn qwen38_qsa_cache_prices_one_f16_index_key_row_per_full_layer() {
+    fn moe_prefill_lanes_use_current_plus_longest_recurrent_run() {
+        let qwen35 = qwen35_hybrid_state();
+        assert_eq!(super::moe_prefill_target_lanes(&qwen35, 40), 4);
+
+        let qwen38 = Config {
+            qwen4exp: true,
+            n_layer: 48,
+            recurrent_layers: (0usize..48)
+                .map(|layer| !(layer + 1).is_multiple_of(4))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(super::moe_prefill_target_lanes(&qwen38, 48), 4);
+
+        let mut mla_layers = vec![false; 42];
+        for layer in [5, 11, 17, 23, 29, 35, 41] {
+            mla_layers[layer] = true;
+        }
+        let ling = Config {
+            bailingmoe3: true,
+            n_layer: 42,
+            bailing_mla_layers: mla_layers,
+            ..Default::default()
+        };
+        assert_eq!(super::moe_prefill_target_lanes(&ling, 42), 6);
+
+        let attention_only = Config {
+            n_layer: 24,
+            ..Default::default()
+        };
+        assert_eq!(super::moe_prefill_target_lanes(&attention_only, 24), 24);
+    }
+
+    #[test]
+    fn qwen38_qsa_cache_prices_raw_rows_and_final_block_keys() {
+        let compress_ratios: Vec<usize> = (0usize..48)
+            .map(|l| if (l + 1).is_multiple_of(4) { 4 } else { 0 })
+            .collect();
         let cfg = Config {
             qwen4exp: true,
             n_layer: 48,
             full_attn_interval: 4,
             indexer_head_size: 128,
+            compress_ratios,
             ..Default::default()
         };
         let ctx = 262_144usize;
         assert_eq!(super::qsa_cache_bytes(&cfg, 0, ctx), 0);
-        assert_eq!(super::qsa_cache_bytes(&cfg, 3, ctx), ctx * 128 * 2);
+        assert_eq!(
+            super::qsa_block_cache_bytes(&cfg, 3, 1),
+            128 * 4,
+            "a sub-block context still needs a bindable cache placeholder"
+        );
+        assert_eq!(super::qsa_raw_cache_bytes(&cfg, 3, ctx), ctx * 128 * 2);
+        assert_eq!(
+            super::qsa_block_cache_bytes(&cfg, 3, ctx),
+            (ctx / 4) * 128 * 4
+        );
+        assert_eq!(super::qsa_cache_bytes(&cfg, 3, ctx), 96 * 1024 * 1024);
         let total: usize = (0..cfg.n_layer)
             .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
             .sum();
-        assert_eq!(total, 768 * 1024 * 1024);
+        assert_eq!(total, 1152 * 1024 * 1024);
     }
 
     #[test]
@@ -4874,6 +5385,9 @@ mod seam_helper_tests {
             n_layer: 48,
             full_attn_interval: 4,
             recurrent_layers,
+            compress_ratios: (0usize..48)
+                .map(|l| if (l + 1).is_multiple_of(4) { 4 } else { 0 })
+                .collect(),
             n_kv: 2,
             head_dim: 256,
             indexer_head_size: 128,
@@ -4913,8 +5427,8 @@ mod seam_helper_tests {
             (0..cfg.n_layer)
                 .map(|l| super::qsa_cache_bytes(&cfg, l, ctx))
                 .sum::<usize>(),
-            768 * 1024 * 1024,
-            "the independent F16 QSA index cache is unchanged"
+            1152 * 1024 * 1024,
+            "QSA raw rows and persistent final block keys are independent of main KV dtype"
         );
     }
 
@@ -4952,6 +5466,33 @@ mod seam_helper_tests {
             full - super::QWEN4_PLAN_OVERLAP_RESERVE,
             2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
             "only the row-scaled part doubles; the retained decode plan is fixed"
+        );
+    }
+
+    #[test]
+    fn qwen38_layer_major_reserve_is_bounded_to_one_prefill_group() {
+        let cfg = Config {
+            qwen4exp: true,
+            n_embd: 2560,
+            hc_mult: 4,
+            ple_ngram_size: 4,
+            ple_heads_per_ngram: 2,
+            ple_head_dim: 320,
+            ..Default::default()
+        };
+        let ubatch = 1024usize;
+        let rows = ubatch * super::QWEN4_PREFILL_GROUP_CHUNKS;
+        let row_elems = cfg.n_embd * (1 + cfg.hc_mult)
+            + (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram * cfg.ple_head_dim;
+        let expected = rows as u64 * row_elems as u64 * 4 + super::QWEN4_PREFILL_GROUP_PAD;
+        assert_eq!(
+            super::layer_major_act_bytes(&cfg, 262_144, ubatch),
+            expected
+        );
+        assert_eq!(
+            super::layer_major_act_bytes(&cfg, rows / 2, ubatch),
+            (expected - super::QWEN4_PREFILL_GROUP_PAD) / 2 + super::QWEN4_PREFILL_GROUP_PAD,
+            "short prompts reserve only their live rows"
         );
     }
 
@@ -5887,6 +6428,29 @@ mod seam_helper_tests {
             .iter()
             .zip(&slots)
             .all(|(&(_, max_slots, _), &n)| n <= max_slots));
+        assert_eq!(super::moe_pool_capacity_bytes(&pools, &slots), allocated);
+    }
+
+    #[test]
+    fn automatic_moe_arena_retry_is_bounded_and_honors_the_floor() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB64: u64 = 1024 * MIB;
+        let current = 16 * GIB64;
+        assert_eq!(
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, 0),
+            Some(current - current / 20),
+            "an unknown allocation failure retires five percent"
+        );
+        assert_eq!(
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, 1537 * MIB),
+            Some(current - 1600 * MIB),
+            "a measured deficit rounds up and skips directly past it"
+        );
+        assert_eq!(
+            super::next_auto_moe_arena_budget(2 * GIB64, 2 * GIB64, 0),
+            None,
+            "the runtime plus one-layer floor is never crossed"
+        );
     }
 
     #[test]

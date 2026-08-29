@@ -474,7 +474,11 @@ if ($setupMode -eq 'advanced') {
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
 $vramReserve = [string](Get-SavedValue 'vram_reserve' '')
 $expertCache = [string](Get-SavedValue 'expert_cache' '')
-$dramCache = [string](Get-SavedValue 'dram_cache' '')
+$ramBudget = [string](Get-SavedValue 'ram_budget' '')
+if (-not $ramBudget) {
+    # One-time compatibility with state written before the setting became a total-process budget.
+    $ramBudget = [string](Get-SavedValue 'dram_cache' '')
+}
 $pagerRing = [string](Get-SavedValue 'pager_ring' '')
 $pagerRingSlots = [string](Get-SavedValue 'pager_ring_slots' '')
 $hostDma = [bool](Get-SavedValue 'host_dma' $true)
@@ -486,7 +490,7 @@ if ($setupMode -eq 'advanced' -and $configureMemory) {
     $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
     $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
     $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
-    $dramCache = Read-TextValue -Label 'RAM 专家缓存，0 为禁用 / RAM expert cache, 0 disables' -Default $dramCache
+    $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
     $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
     $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
     $pagerRingSlots = Read-IntegerValue -Label 'Pager ring slots，留空为默认 / Pager ring slots, blank for default' -Default $pagerRingSlots -Minimum 2 -AllowBlank
@@ -642,7 +646,7 @@ if ($setupMode -eq 'advanced' -and $configureMemory) {
     if ($vramBudget) { Add-SetArgument $nativeArgs 'device.vram_budget' $vramBudget }
     if ($vramReserve) { Add-SetArgument $nativeArgs 'device.vram_reserve' $vramReserve }
     if ($expertCache) { Add-SetArgument $nativeArgs 'paging.cache' $expertCache }
-    if ($dramCache) { Add-SetArgument $nativeArgs 'paging.dram' $dramCache }
+    if ($ramBudget) { Add-SetArgument $nativeArgs 'device.ram_budget' $ramBudget }
     Add-SetArgument $nativeArgs 'paging.host_dma' $hostDma.ToString().ToLowerInvariant()
     if ($pagerRing) { Add-SetArgument $nativeArgs 'paging.ring' $pagerRing }
     if ($pagerRingSlots) { Add-SetArgument $nativeArgs 'paging.ring_slots' $pagerRingSlots }
@@ -720,7 +724,7 @@ $state = [ordered]@{
     ubatch = $ubatch; threads = $threads; config_path = $configPath
     kv_preset = $kvPreset; kv_type_k = $kvTypeK; kv_type_v = $kvTypeV
     configure_memory = $configureMemory; vram_budget = $vramBudget; vram_reserve = $vramReserve
-    expert_cache = $expertCache; dram_cache = $dramCache; host_dma = $hostDma
+    expert_cache = $expertCache; ram_budget = $ramBudget; host_dma = $hostDma
     pager_ring = $pagerRing; pager_ring_slots = $pagerRingSlots
     kv_overflow = $kvOverflow; kv_overflow_vram_mb = $kvOverflowVram; kv_overflow_reserve_mb = $kvOverflowReserve
     submit_mode = $submitMode; submit_cap = $submitCap

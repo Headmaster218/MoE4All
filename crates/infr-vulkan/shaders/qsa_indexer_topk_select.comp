@@ -1,0 +1,43 @@
+#version 460
+// Merge one byte-radix histogram and persist the selected prefix/rank for the next pass.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint blocks;
+    uint top_k;
+    uint groups;
+    uint state_base;
+    uint level;
+} pc;
+layout(binding = 0) buffer WB { uint work[]; };
+
+shared uint bucket[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint total = 0u;
+    for (uint group = 0u; group < pc.groups; ++group) {
+        total += work[group * 256u + t];
+    }
+    bucket[t] = total;
+    barrier();
+
+    if (t == 0u) {
+        uint rank = pc.level == 0u ? pc.top_k : work[pc.state_base + 1u];
+        uint above = 0u;
+        uint digit = 0u;
+        uint next_rank = rank;
+        for (int b = 255; b >= 0; --b) {
+            uint count = bucket[uint(b)];
+            if (above + count >= rank) {
+                digit = uint(b);
+                next_rank = rank - above;
+                break;
+            }
+            above += count;
+        }
+        uint prefix = pc.level == 0u ? 0u : work[pc.state_base];
+        work[pc.state_base] = prefix | (digit << (24u - pc.level * 8u));
+        work[pc.state_base + 1u] = next_rank;
+    }
+}

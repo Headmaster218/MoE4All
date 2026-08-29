@@ -61,6 +61,11 @@ cfg_struct! {
         /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.
         /// Percentages resolve against total device-local memory.
         vram_budget: Option<SizeSpec> = None,
+        /// `INFR_RAM_BUDGET`: total resident host-memory target for this process. The host-tier
+        /// planner subtracts the live process working set and gives only the remainder to its
+        /// weight cache. Unset keeps automatic sizing with system headroom; zero disables the
+        /// host cache. Percentages resolve against total physical host RAM.
+        ram_budget: Option<SizeSpec> = None,
         /// `INFR_VRAM_RESERVE`: additional device memory kept outside the backend's allocation
         /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
         /// against total device-local memory.
@@ -174,14 +179,10 @@ cfg_struct! {
         /// memory and written after generation so tracing does not add per-expert file I/O to the
         /// critical path.
         trace: Option<PathBuf> = None,
-        /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
-        /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
-        /// leaving residency to the OS page cache. For paged MoE, a budget covering the complete
-        /// routed-expert payload automatically becomes the permanent layer-contiguous Host Store
-        /// and disables runtime SSD reads; a smaller budget becomes the inclusive RAM/SSD cache.
-        ///
-        /// `None` (the default) sizes itself from currently available host memory while preserving
-        /// headroom. An explicit size pins the budget; zero disables the DRAM cache.
+        /// Legacy raw host-cache override: `INFR_DRAM_CACHE` / `paging.dram`. New configurations
+        /// should use `device.ram_budget`, whose value covers the whole process. This field retains
+        /// its historical cache-only meaning so existing benchmark scripts remain reproducible.
+        /// It is used only when `device.ram_budget` is unset; zero disables the host cache.
         dram: Option<SizeSpec> = None,
         /// `INFR_DRAM_BYPASS`: read paged blocks straight from disk into GPU memory, with NO host
         /// cache in between — the shape a unified-memory device takes automatically, because there
@@ -310,6 +311,13 @@ cfg_struct! {
         /// `INFR_MOE_SMALL_M` (`tier::EnvRows`, clamped 0..=64 by the accessor — an unclamped
         /// override trips the amdgpu ring watchdog).
         moe_small_m: usize = 8,
+        /// Wave32 two-level reduction for the GPU MoE router top-k. The scalar shared-memory tree
+        /// remains available as an A/B and portability fallback.
+        moe_topk_sg: bool = true,
+        /// Fill all eight wave32 subgroups when QSA scores a single decode row.
+        qsa_score_decode8: bool = true,
+        /// Multi-workgroup exact radix selection for deep single-row QSA decode.
+        qsa_topk_parallel: bool = true,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 
@@ -360,6 +368,12 @@ cfg_struct! {
         /// `INFR_NO_Q8_PV_F16` (inverted) — use packed fp16 only for Q8 V dequantization before
         /// converting back to fp32; softmax weighting and P.V accumulation remain fp32.
         q8_pv_f16: bool = true,
+        /// Reuse each Q8 K/V read across pairs of adjacent GQA query heads in hd256 decode.
+        q8_decode_gqa2: bool = true,
+        /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
+        q8_decode_gqa4: bool = true,
+        /// Wave32 max/sum reduction for the coupled Q8 hd256 decode combine pass.
+        q8_decode_combine_sg: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.

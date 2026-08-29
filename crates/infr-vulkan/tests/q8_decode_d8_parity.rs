@@ -25,6 +25,7 @@ fn backend(
     qk_f16: bool,
     pv_f16: bool,
     chunk1024: bool,
+    combine_sg: bool,
 ) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
     cfg.kernels.vulkan.q8_decode_d8 = d8;
@@ -33,6 +34,7 @@ fn backend(
     cfg.kernels.vulkan.q8_qk_f16 = qk_f16;
     cfg.kernels.vulkan.q8_pv_f16 = pv_f16;
     cfg.kernels.vulkan.q8_decode_chunk1024 = chunk1024;
+    cfg.kernels.vulkan.q8_decode_combine_sg = combine_sg;
     VulkanBackend::new_with(Arc::new(cfg)).ok()
 }
 
@@ -53,8 +55,32 @@ fn run_case(
     kv_len: usize,
     chunk_max: usize,
 ) -> Option<Vec<f32>> {
-    let be = backend(d8, ls128, ls256, qk_f16, pv_f16, chunk_max > 512)?;
-    let (nh, nkv, hd) = (4usize, 2usize, 256usize);
+    run_case_with_combine(d8, ls128, ls256, qk_f16, pv_f16, kv_len, chunk_max, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_case_with_combine(
+    d8: bool,
+    ls128: bool,
+    ls256: bool,
+    qk_f16: bool,
+    pv_f16: bool,
+    kv_len: usize,
+    chunk_max: usize,
+    combine_sg: bool,
+) -> Option<Vec<f32>> {
+    let be = backend(
+        d8,
+        ls128,
+        ls256,
+        qk_f16,
+        pv_f16,
+        chunk_max > 512,
+        combine_sg,
+    )?;
+    // Qwen3.5/3.6 uses four query heads per KV head; this also exercises two fused pairs per KV
+    // head rather than only the first pair.
+    let (nh, nkv, hd) = (8usize, 2usize, 256usize);
     let n = kv_len * nkv * hd;
     let q: Vec<f32> = (0..nh * hd)
         .map(|i| sample(i, 0x1234_5678) * 0.37)
@@ -200,4 +226,29 @@ fn q8_hd256_chunk1024_matches_chunk512() {
         );
     }
     eprintln!("Q8 hd256 chunk512/chunk1024 parity: kv_len={kv_len}, max_err={max_err}");
+}
+
+#[test]
+fn q8_hd256_wave_combine_matches_scalar() {
+    let kv_len = 32_769usize;
+    let Some(scalar) = run_case_with_combine(true, true, true, true, true, kv_len, 1024, false)
+    else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let Some(wave) = run_case_with_combine(true, true, true, true, true, kv_len, 1024, true) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let mut max_err = 0.0f32;
+    for (i, (&a, &b)) in scalar.iter().zip(&wave).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "out {i}: scalar={a}, wave={b}"
+        );
+        let err = (a - b).abs();
+        max_err = max_err.max(err);
+        assert!(err <= 5.0e-4, "out {i}: scalar={a}, wave={b}, err={err}");
+    }
+    eprintln!("Q8 hd256 scalar/wave combine parity: kv_len={kv_len}, max_err={max_err}");
 }

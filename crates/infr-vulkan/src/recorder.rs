@@ -16,6 +16,10 @@ use infr_core::{backend::Buffer, error::Result, pager_profile};
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
+pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
+pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
+const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
+
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
 /// `Stage` (INFR_FLASH_STAGE) stages the f16 K/V tile into shmem and coopMatLoads from there.
@@ -590,6 +594,26 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq2_s_xpg32_spv(),
             ),
         },
+        D::Iq2Xs => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq2_xs_xp",
+                g::native_gemm_mmq_iq2_xs_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq2_xs_xp32",
+                g::native_gemm_mmq_iq2_xs_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq2_xs_xpg",
+                g::native_gemm_mmq_iq2_xs_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq2_xs_xpg32",
+                g::native_gemm_mmq_iq2_xs_xpg32_spv(),
+            ),
+        },
         D::Iq3S => MoeMmqDesc {
             resident_nb: 6,
             xp: (
@@ -608,6 +632,26 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
             xpg32: (
                 "native_gemm_mmq_iq3_s_xpg32",
                 g::native_gemm_mmq_iq3_s_xpg32_spv(),
+            ),
+        },
+        D::Iq3Xxs => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq3_xxs_xp",
+                g::native_gemm_mmq_iq3_xxs_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq3_xxs_xp32",
+                g::native_gemm_mmq_iq3_xxs_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq3_xxs_xpg",
+                g::native_gemm_mmq_iq3_xxs_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq3_xxs_xpg32",
+                g::native_gemm_mmq_iq3_xxs_xpg32_spv(),
             ),
         },
         D::Mxfp4 => MoeMmqDesc {
@@ -2262,7 +2306,8 @@ impl<'a> Recorder<'a> {
     /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the
     /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
-    /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged.
+    /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged. The Q8_0
+    /// N64 variant also accepts `n%64==0 && n%128!=0`; all other variants still require n%128.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_f16a(
         &self,
@@ -2276,6 +2321,9 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        let n64 = (!n.is_multiple_of(128) && n.is_multiple_of(64))
+            .then(|| crate::gemm::native_gemm_warp_n64_ag_kernel_name(dtype))
+            .flatten();
         // The BN=128 (n128) ag tile beats the BN=256 (wide) ag tile on EVERY shape this decision
         // can reach, measured on RDNA3 (7900 XTX): the wide tile's WN=64 → 2×4 = 8 accumulator
         // coopmat frags per warp cost enough VGPRs to drop occupancy, and the wide-square n=4096
@@ -2316,7 +2364,9 @@ impl<'a> Recorder<'a> {
             .flatten();
         // Resident A_GLOBAL tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
         // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
-        let (name, bn, bm): (&str, usize, usize) = if use_wide {
+        let (name, bn, bm): (&str, usize, usize) = if let Some(name) = n64 {
+            (name, 64, 64)
+        } else if use_wide {
             (
                 crate::gemm::native_gemm_warp_ag_kernel_name(dtype).expect("ag name"),
                 256,
@@ -6815,6 +6865,8 @@ impl<'a> Recorder<'a> {
                         self.vk().q8_qk_f16,
                         self.vk().q8_pv_f16,
                         self.vk().q8_decode_chunk1024,
+                        self.vk().q8_decode_gqa2 && nh / nkv >= 2 && (nh / nkv).is_multiple_of(2),
+                        self.vk().q8_decode_gqa4 && nh / nkv >= 4 && (nh / nkv).is_multiple_of(4),
                     )
                 } else {
                     None
@@ -6833,6 +6885,8 @@ impl<'a> Recorder<'a> {
             None
         };
         let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
+        let fused_gqa2 = p1name == "attn_decode_hd256_q8_gqa2";
+        let fused_gqa4 = p1name == "attn_decode_hd256_q8_gqa4";
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };
@@ -6880,19 +6934,46 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p1[..plen],
-            (nh * n_chunks) as u32,
+            ((if fused_gqa4 {
+                nh / 4
+            } else if fused_gqa2 {
+                nh / 2
+            } else {
+                nh
+            }) * n_chunks) as u32,
             gy as u32,
             1,
         );
         // pass 2: combine — split each (row, head)'s hd outputs across `ntile` workgroups for
         // occupancy. The combine is row-agnostic: rows*nh independent [n_chunks] partial sets.
-        let k2 = self
-            .be
-            .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
-        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        let combine_sg = rows == 1
+            && hd == 256
+            && k_q8
+            && v_q8
+            && n_chunks >= 16
+            && self.vk().q8_decode_combine_sg;
+        let k2 = if combine_sg {
+            self.be.kernel_sg(
+                "attn_combine_sg",
+                crate::gemm::attn_combine_sg_spv(),
+                4,
+                16,
+                32,
+            )
+        } else {
+            self.be
+                .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16)
+        };
+        let ntile = if combine_sg {
+            16u32
+        } else if hd.is_multiple_of(4) {
+            4u32
+        } else {
+            1u32
+        };
         // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
-        // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
-        // always holds — this pins that invariant at the call site (never fires for shipped hd).
+        // hd-ntile*hdt dims (left uninitialized). The Q8 hd256 specialization uses 16; the general
+        // path uses 4 only when divisible, else 1, so this pins the invariant at the call site.
         debug_assert!(
             hd.is_multiple_of(ntile as usize),
             "attn_combine: hd ({hd}) must be a multiple of ntile ({ntile}); hdt=hd/ntile would drop dims"
@@ -8293,11 +8374,14 @@ impl<'a> Recorder<'a> {
         &self,
         q: &dyn Buffer,
         k_cache: &dyn Buffer,
+        block_cache: &dyn Buffer,
         k_norm: &dyn Buffer,
         scores: &dyn Buffer,
+        topk_work: Option<&dyn Buffer>,
         dst: &dyn Buffer,
         rows: u32,
         kv_len: u32,
+        compress_from: u32,
         n_head: u32,
         head_dim: u32,
         top_blocks: u32,
@@ -8308,54 +8392,140 @@ impl<'a> Recorder<'a> {
         scale: f32,
     ) {
         let blocks = kv_len / ratio;
-        let score_k = self.be.kernel(
-            "qsa_indexer_score",
-            crate::gemm::qsa_indexer_score_spv(),
-            4,
-            36,
-        );
-        let mut push = [0u8; 36];
+        let first_new = compress_from.min(blocks);
+        let new_blocks = blocks - first_new;
+        if new_blocks > 0 {
+            let compress_k = self.be.kernel(
+                "qsa_indexer_compress",
+                crate::gemm::qsa_indexer_compress_spv(),
+                3,
+                28,
+            );
+            let mut push = [0u8; 28];
+            push[0..4].copy_from_slice(&first_new.to_ne_bytes());
+            push[4..8].copy_from_slice(&new_blocks.to_ne_bytes());
+            push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
+            push[12..16].copy_from_slice(&ratio.to_ne_bytes());
+            push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
+            push[20..24].copy_from_slice(&theta.to_ne_bytes());
+            push[24..28].copy_from_slice(&eps.to_ne_bytes());
+            self.dispatch_wide(
+                compress_k,
+                &[
+                    Self::vkb(k_cache),
+                    Self::vkb(k_norm),
+                    Self::vkb(block_cache),
+                ],
+                1,
+                &push,
+                new_blocks,
+            );
+        }
+
+        let decode8 = rows == 1 && self.vk().qsa_score_decode8;
+        let (score_name, score_spv, block_tile, query_tile) = if decode8 {
+            (
+                "qsa_indexer_score_decode8",
+                crate::gemm::qsa_indexer_score_decode8_spv(),
+                8,
+                1,
+            )
+        } else {
+            (
+                "qsa_indexer_score",
+                crate::gemm::qsa_indexer_score_spv(),
+                4,
+                2,
+            )
+        };
+        let score_k = self.be.kernel_sg(score_name, score_spv, 3, 24, 32);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
         push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
         push[16..20].copy_from_slice(&ratio.to_ne_bytes());
-        push[20..24].copy_from_slice(&rope_dim.to_ne_bytes());
-        push[24..28].copy_from_slice(&theta.to_ne_bytes());
-        push[28..32].copy_from_slice(&eps.to_ne_bytes());
-        push[32..36].copy_from_slice(&scale.to_ne_bytes());
-        self.dispatch_wide(
+        push[20..24].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch3(
             score_k,
-            &[
-                Self::vkb(q),
-                Self::vkb(k_cache),
-                Self::vkb(k_norm),
-                Self::vkb(scores),
-            ],
+            &[Self::vkb(q), Self::vkb(block_cache), Self::vkb(scores)],
             1,
             &push,
-            rows.saturating_mul(blocks),
+            blocks.div_ceil(block_tile),
+            rows.div_ceil(query_tile),
+            1,
         );
 
-        let topk_k = self.be.kernel(
-            "qsa_indexer_topk",
-            crate::gemm::qsa_indexer_topk_spv(),
-            2,
-            20,
-        );
-        let mut topk_push = [0u8; 20];
-        topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
-        topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
-        topk_push[8..12].copy_from_slice(&rows.to_ne_bytes());
-        topk_push[12..16].copy_from_slice(&kv_len.to_ne_bytes());
-        topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
-        self.dispatch(
-            topk_k,
-            &[Self::vkb(scores), Self::vkb(dst)],
-            1,
-            &topk_push,
-            rows,
-        );
+        if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
+            let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
+            let state_base = groups * 256;
+            let hist_k = self.be.kernel(
+                "qsa_indexer_topk_hist",
+                crate::gemm::qsa_indexer_topk_hist_spv(),
+                2,
+                20,
+            );
+            let select_k = self.be.kernel(
+                "qsa_indexer_topk_select",
+                crate::gemm::qsa_indexer_topk_select_spv(),
+                1,
+                20,
+            );
+            let mut radix_push = [0u8; 20];
+            radix_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+            radix_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+            radix_push[8..12].copy_from_slice(&groups.to_ne_bytes());
+            radix_push[12..16].copy_from_slice(&state_base.to_ne_bytes());
+            for level in 0..4u32 {
+                radix_push[16..20].copy_from_slice(&level.to_ne_bytes());
+                self.dispatch(
+                    hist_k,
+                    &[Self::vkb(scores), Self::vkb(work)],
+                    1,
+                    &radix_push,
+                    groups,
+                );
+                self.dispatch(select_k, &[Self::vkb(work)], 1, &radix_push, 1);
+            }
+
+            let collect_k = self.be.kernel(
+                "qsa_indexer_topk_collect",
+                crate::gemm::qsa_indexer_topk_collect_spv(),
+                3,
+                12,
+            );
+            let mut collect_push = [0u8; 12];
+            collect_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+            collect_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+            collect_push[8..12].copy_from_slice(&state_base.to_ne_bytes());
+            self.dispatch(
+                collect_k,
+                &[Self::vkb(scores), Self::vkb(work), Self::vkb(dst)],
+                1,
+                &collect_push,
+                1,
+            );
+        } else {
+            let topk_k = self.be.kernel(
+                "qsa_indexer_topk",
+                crate::gemm::qsa_indexer_topk_spv(),
+                2,
+                20,
+            );
+            let mut topk_push = [0u8; 20];
+            topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
+            topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
+            topk_push[8..12].copy_from_slice(&rows.to_ne_bytes());
+            topk_push[12..16].copy_from_slice(&kv_len.to_ne_bytes());
+            topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
+            self.dispatch(
+                topk_k,
+                &[Self::vkb(scores), Self::vkb(dst)],
+                1,
+                &topk_push,
+                rows,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9119,9 +9289,13 @@ impl<'a> Recorder<'a> {
         hash_ids: &dyn Buffer,
         hash: bool,
     ) {
-        let k = self
-            .be
-            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36);
+        let k = if self.vk().moe_topk_sg {
+            self.be
+                .kernel_sg("moe_topk_sg", crate::gemm::moe_topk_sg_spv(), 5, 36, 32)
+        } else {
+            self.be
+                .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36)
+        };
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
@@ -11658,7 +11832,9 @@ mod tests {
             (D::Iq4Nl, "iq4_nl", 6),
             (D::Iq4Xs, "iq4_xs", 6),
             (D::Iq2S, "iq2_s", 6),
+            (D::Iq2Xs, "iq2_xs", 6),
             (D::Iq3S, "iq3_s", 6),
+            (D::Iq3Xxs, "iq3_xxs", 6),
             (D::Mxfp4, "mxfp4", 6),
             (D::Nvfp4, "nvfp4", 6),
             (D::Q2_0, "q2_0", 6),
@@ -13446,6 +13622,69 @@ mod tests {
         assert!(e < 2e-2, "native_gemm_mmq_q6k mismatch: {e}"); // int8 activation quant tolerance
     }
 
+    /// Q8_0 BN=64/BK=64 A_GLOBAL tile used by Qwen3.8's N=320 recurrent projections. The
+    /// non-multiple-of-64 row count exercises padded rows without changing the logical N stride.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn native_gemm_warp_q8_n64_ag_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n) = (70usize, 256usize, 320usize);
+        let mpad = m.div_ceil(64) * 64;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| half::f16::from_f32(((i % 23) as f32 - 11.0) * 0.02).to_f32())
+            .collect();
+        let nblk = n * k / 32;
+        let scales: Vec<half::f16> = (0..nblk)
+            .map(|b| half::f16::from_f32(0.002 + (b % 7) as f32 * 0.0005))
+            .collect();
+        let mut weights = vec![0u8; nblk * 34];
+        for b in 0..nblk {
+            weights[b * 34..b * 34 + 2].copy_from_slice(&scales[b].to_bits().to_le_bytes());
+            for j in 0..32 {
+                weights[b * 34 + 2 + j] = (((b * 13 + j * 7) % 31) as i8 - 15) as u8;
+            }
+        }
+
+        let ba = be.alloc(a.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(ba.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+        let bw = be.upload_weight_bytes(&weights).unwrap();
+        let a16 = be.alloc(mpad * k * 2, BufferUsage::Activations).unwrap();
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.store_f16(ba.as_ref(), a16.as_ref(), m * k, 0);
+        rec.matmul_native_f16a(
+            infr_core::DType::Q8_0,
+            a16.as_ref(),
+            bw.device_addr().unwrap(),
+            0,
+            bc.as_ref(),
+            m,
+            k,
+            n,
+        );
+        rec.finish().unwrap();
+
+        let mut bytes = vec![0u8; mpad * n * 4];
+        be.download(bc.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let mut max_err = 0.0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let want: f32 = (0..k)
+                    .map(|x| {
+                        let g = col * k + x;
+                        let b = g / 32;
+                        let q = weights[b * 34 + 2 + g % 32] as i8;
+                        a[r * k + x] * scales[b].to_f32() * q as f32
+                    })
+                    .sum();
+                max_err = max_err.max((got[r * n + col] - want).abs());
+            }
+        }
+        println!("native_gemm_warp_q8_n64_ag max_err={max_err:e}");
+        assert!(max_err < 2e-2, "Q8 N64 A_GLOBAL mismatch: {max_err}");
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_proj_matches_cpu() {
@@ -13888,6 +14127,55 @@ mod tests {
             (wts[1] - 1.0).abs() < 1e-6,
             "expected ~1 for the high-logit pick: {wts:?}"
         );
+    }
+
+    /// Exercise every wave in the 512-expert, top-10 sigmoid router shape used by Qwen3.5 MoE.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_512_experts_selects_exact_top10() {
+        let be = be_with(|_| {});
+        let (n_tokens, n_expert, n_used) = (1usize, 512usize, 10usize);
+        let logits: Vec<f32> = (0..n_expert).map(|i| i as f32 / 512.0).collect();
+        let dummy = vec![0.0f32; n_expert];
+        let blog = upf32(&be, &logits);
+        let bdummy = upf32(&be, &dummy);
+        let bids = be
+            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+            .unwrap();
+        let bwts = be
+            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.moe_topk(
+            blog.as_ref(),
+            bids.as_ref(),
+            bwts.as_ref(),
+            bdummy.as_ref(),
+            n_tokens,
+            n_expert,
+            n_used,
+            1.0,
+            1,    // sigmoid
+            true, // normalize selected weights
+            false,
+            0,
+            0,
+            bdummy.as_ref(),
+            false,
+        );
+        rec.finish().unwrap();
+
+        let mut idb = vec![0u8; n_tokens * n_used * 4];
+        be.download(bids.as_ref(), &mut idb).unwrap();
+        let ids: &[u32] = bytemuck::cast_slice(&idb);
+        let expected: Vec<u32> = (502..512).rev().collect();
+        assert_eq!(ids, expected, "512-expert top-10 selection changed");
+
+        let mut wb = vec![0u8; n_tokens * n_used * 4];
+        be.download(bwts.as_ref(), &mut wb).unwrap();
+        let wts: &[f32] = bytemuck::cast_slice(&wb);
+        assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
+        assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the

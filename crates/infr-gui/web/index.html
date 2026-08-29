@@ -91,12 +91,12 @@
       <section id="memory-plan" class="panel">
         <div class="section-title"><div><div class="eyebrow">MEMORY PLAN</div><h2>显存与内存预算</h2></div><button id="estimate" class="ghost">重新估算</button></div>
         <div class="grid three">
-          <label>总 VRAM Budget<input id="vram-budget" value="23g" placeholder="23g / 90%"></label>
-          <label>VRAM Reserve<input id="vram-reserve" value="512m" placeholder="512m"></label>
-          <label>RAM Expert Cache<input id="ram-budget" placeholder="留空自动，例如 45g；0 表示关闭"></label>
-          <label>上下文<input id="context" value="200k"></label>
-          <label>KV K<select id="kv-k"><option>q8_0</option><option>f16</option><option>auto</option></select></label>
-          <label>KV V<select id="kv-v"><option>q8_0</option><option>f16</option><option>auto</option></select></label>
+          <label>总 VRAM Budget<input id="vram-budget" placeholder="留空自动，例如 23g / 90%"></label>
+          <label>VRAM Reserve<input id="vram-reserve" placeholder="留空自动，例如 512m"></label>
+          <label>总 RAM Budget<input id="ram-budget" placeholder="留空自动，例如 50g；0 表示关闭 RAM tier"></label>
+          <label>上下文<input id="context" placeholder="留空自动"></label>
+          <label>KV K<select id="kv-k"><option>auto</option><option>q8_0</option><option>f16</option></select></label>
+          <label>KV V<select id="kv-v"><option>auto</option><option>q8_0</option><option>f16</option></select></label>
           <label>Prefill ubatch<input id="ubatch" type="number" placeholder="自动"></label>
           <label>Expert cache 覆盖<input id="expert-cache" placeholder="留空自动分配"></label>
           <label>单请求最大输出<input id="max-tokens" type="number" value="131072"></label>
@@ -108,7 +108,7 @@
           <label class="trace-field">Pager trace<input id="pager-trace" placeholder="可选 CSV 路径"></label>
         </div>
         <div id="memory-estimate" class="memory-grid"><div class="subtle">选择本地模型后显示加载前估算</div></div>
-        <p class="hint">Expert cache 留空时使用统一弹性 VRAM 余量；RAM 留空时按当前可用内存自动选择 full 或 bounded RAM/SSD tier。</p>
+        <p class="hint">Expert cache 留空时使用统一弹性 VRAM 余量；RAM 留空时自动保留系统余量，手动值表示 infr 进程总常驻内存预算。</p>
       </section>
 
       <section class="panel">

@@ -1568,6 +1568,13 @@ fn prefill_align(bytes: usize) -> usize {
     bytes.next_multiple_of(PREFILL_BANK_ALIGN)
 }
 
+fn prefill_lane_bytes(lanes: &[Vec<usize>]) -> Option<u64> {
+    lanes
+        .iter()
+        .flatten()
+        .try_fold(0u64, |sum, &bytes| sum.checked_add(bytes as u64))
+}
+
 fn slot_overlaps_prefill_ring(slot: usize, slot_bytes: usize, ranges: &[(usize, usize)]) -> bool {
     let start = slot.saturating_mul(slot_bytes);
     let end = start.saturating_add(slot_bytes);
@@ -1688,9 +1695,13 @@ pub struct MoePagerSession {
     /// Complete layer currently occupying each dynamic Prefill lane. Layer-major Prefill invokes
     /// the same layer once per microbatch chunk; those later chunks reuse the first upload.
     prefill_lane_layer: Vec<Option<u32>>,
-    /// Requested lane count from model topology (for example current + four lookahead layers for
-    /// Qwen3.6's 1:3 Attention/DeltaNet pattern). The physical pool geometry may cap it lower.
+    /// Requested lane count from model topology (current + its longest recurrent run). The
+    /// physical pool geometry and Expert-cache occupancy may cap it lower.
     prefill_target_lanes: usize,
+    /// Expert-cache occupancy selected after reserving the active Prefill chunk's runtime memory.
+    /// The physical pools also contain that runtime reserve so Decode can use it while idle, but a
+    /// whole-layer ring must not protect those bytes from runtime loans.
+    prefill_cache_bytes: u64,
     /// Per registered bank, its whole-layer placement inside the streaming ring. Decode ignores
     /// this map and restores every expert slot to the existing global LRU.
     prefill_placement: HashMap<usize, PrefillPlacement>,
@@ -1746,6 +1757,8 @@ pub struct MoePagerLayout {
     /// Model-topology target for the Prefill whole-layer streaming ring. Runtime construction
     /// caps it by the number of complete lanes that fit every physical pool.
     pub prefill_target_lanes: usize,
+    /// Maximum bytes the Prefill ring may retain from the shared Expert/runtime arena.
+    pub prefill_cache_bytes: u64,
 }
 
 /// Upload-ring sizing policy — pure budget arithmetic, so it lives in the shared seam
@@ -1885,6 +1898,7 @@ impl MoePagerSession {
             mode: MoeArenaMode::DecodeLru,
             prefill_lane_layer: Vec::new(),
             prefill_target_lanes: layout.prefill_target_lanes.max(1),
+            prefill_cache_bytes: layout.prefill_cache_bytes,
             prefill_placement: HashMap::new(),
             prefill_layers: Vec::new(),
             prefill_loaded: HashSet::new(),
@@ -2353,6 +2367,10 @@ impl MoePagerSession {
                 for (bank, &(_, _, _, bytes)) in banks.iter().enumerate() {
                     lane_bank_bytes[lane][bank] = lane_bank_bytes[lane][bank].max(bytes);
                 }
+            }
+            let candidate_bytes = prefill_lane_bytes(&lane_bank_bytes);
+            if candidate_bytes.is_none_or(|bytes| bytes > self.prefill_cache_bytes) {
+                continue;
             }
 
             let mut free_ranges: Vec<(usize, usize, usize)> = self
@@ -3629,6 +3647,17 @@ mod tests {
         assert!(slot_overlaps_prefill_ring(2, 1024, &ring));
         assert!(slot_overlaps_prefill_ring(3, 1024, &ring));
         assert!(!slot_overlaps_prefill_ring(4, 1024, &ring));
+    }
+
+    #[test]
+    fn prefill_lane_bytes_price_only_the_selected_expert_ring() {
+        let four_lanes = vec![vec![100, 200, 300]; 4];
+        assert_eq!(prefill_lane_bytes(&four_lanes), Some(2400));
+        assert!(prefill_lane_bytes(&four_lanes).unwrap() > 2000);
+
+        let three_lanes = &four_lanes[..3];
+        assert_eq!(prefill_lane_bytes(three_lanes), Some(1800));
+        assert!(prefill_lane_bytes(three_lanes).unwrap() <= 2000);
     }
 
     #[test]

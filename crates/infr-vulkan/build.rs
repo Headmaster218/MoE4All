@@ -229,6 +229,34 @@ fn main() {
         ),
         (
             "attn_decode",
+            "attn_decode_hd256_q8_gqa2",
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+                "-DQ8_CHUNK1024",
+                "-DGQA2",
+            ],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8_gqa4",
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+                "-DQ8_CHUNK1024",
+                "-DGQA4",
+            ],
+        ),
+        (
+            "attn_decode",
             "attn_decode_hd256_q8_c512",
             &[
                 "-DDHD4=64",
@@ -664,8 +692,17 @@ fn main() {
         ("dsv4_indexer_score", "dsv4_indexer_score", &[]),
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
+        ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode8",
+            &["-DQSA_SCORE_DECODE8"],
+        ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
+        ("qsa_indexer_topk_hist", "qsa_indexer_topk_hist", &[]),
+        ("qsa_indexer_topk_select", "qsa_indexer_topk_select", &[]),
+        ("qsa_indexer_topk_collect", "qsa_indexer_topk_collect", &[]),
         ("qsa_gather", "qsa_gather", &[]),
         ("qsa_gather", "qsa_gather_kq8", &["-DKQ8"]),
         ("qsa_gather", "qsa_gather_vq8", &["-DVQ8"]),
@@ -866,6 +903,7 @@ fn main() {
         ("linear_res", "linear_res", &[]),
         ("attention", "attention", &[]),
         ("attn_combine", "attn_combine", &[]),
+        ("attn_combine", "attn_combine_sg", &["-DSUBGROUP_REDUCE"]),
         ("attn_combine", "attn_combine_live", &["-DUSE_LIVE"]),
         ("attn_live", "attn_live", &[]),
         ("attention_kv", "attention_kv", &[]),
@@ -2672,6 +2710,49 @@ fn main() {
             "native_gemm_mmq_iq3_s_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
+        // Qwen3.8 Q2_K_XL: IQ2_XS gate/up plus the one IQ3_XXS gate/up pair. These are the
+        // All variants share the exact same bucket layout and paged arena/LUT ABI as the existing
+        // IQ2_S/IQ3_S family; no ordinary dense projection is opted into this expert-only tier.
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xp",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xp32",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xpg",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xs_xpg32",
+            &["-DFMT_IQ2XS", "-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xp",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xp32",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xpg",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq3_xxs_xpg32",
+            &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
         // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
         // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)
         // the default BM=64 tile is ~75% masked waste — a BM=32 tile halves that. Selected
@@ -2942,6 +3023,7 @@ fn main() {
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
+        ("moe_topk", "moe_topk_sg", &["-DSUBGROUP_REDUCE"]),
         // Embedding-row gather+dequant (Op::EmbedGather): one .spv per table format.
         ("embed_gather", "embed_gather_q8_0", &["-DFMT_Q8_0"]),
         ("embed_gather", "embed_gather_bf16", &["-DFMT_BF16"]),
@@ -3085,6 +3167,14 @@ fn main() {
             "native_gemm_warp",
             "native_gemm_warp_q8_0_n128_ag",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL"],
+        ),
+        (
+            // Qwen3.8 recurrent projection: N=320 is divisible by 64 but not 128, so it used to
+            // miss every warptile and fall back to the legacy BN=64/BK=32 kernel. Keep BN=64,
+            // but use the A_GLOBAL path, BK=64, and four wave32s per workgroup.
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n64_ag",
+            &["-DFMT_Q8_0", "-DN64", "-DA_GLOBAL", "-DWG_THREADS=128"],
         ),
         (
             "native_gemm_warp",

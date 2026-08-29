@@ -1071,6 +1071,41 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         _ => return None,
     })
 }
+
+macro_rules! iq_xs_mmq_spv {
+    ($fn_name:ident, $file:literal) => {
+        #[cfg_attr(infr_profile, infr_prof::instrument)]
+        pub(crate) fn $fn_name() -> &'static [u32] {
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| spv_words(BYTES))
+        }
+    };
+}
+
+iq_xs_mmq_spv!(native_gemm_mmq_iq2_xs_xp_spv, "native_gemm_mmq_iq2_xs_xp");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xs_xp32_spv,
+    "native_gemm_mmq_iq2_xs_xp32"
+);
+iq_xs_mmq_spv!(native_gemm_mmq_iq2_xs_xpg_spv, "native_gemm_mmq_iq2_xs_xpg");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xs_xpg32_spv,
+    "native_gemm_mmq_iq2_xs_xpg32"
+);
+iq_xs_mmq_spv!(native_gemm_mmq_iq3_xxs_xp_spv, "native_gemm_mmq_iq3_xxs_xp");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq3_xxs_xp32_spv,
+    "native_gemm_mmq_iq3_xxs_xp32"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq3_xxs_xpg_spv,
+    "native_gemm_mmq_iq3_xxs_xpg"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq3_xxs_xpg32_spv,
+    "native_gemm_mmq_iq3_xxs_xpg32"
+);
 /// The f16-weight decode GEMV (`linear_f16.comp`; weight read through a typed 64-bit
 /// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
 /// resident build died with the eager `VulkanBackend::linear_f16` caller, its sole consumer).
@@ -1372,6 +1407,13 @@ pub(crate) fn moe_accumulate_scaled_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_topk_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// Wave32 two-level reduction variant of [`moe_topk_spv`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn moe_topk_sg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk_sg.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -1678,6 +1720,16 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
         Q8_0 => "native_gemm_warp_q8_0_n128_ag",
         _ => return None,
     })
+}
+
+/// BN=64/BK=64 A_GLOBAL warptile for Q8_0 output widths divisible by 64 but not 128.
+/// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n64_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
+    match dtype {
+        infr_core::DType::Q8_0 => Some("native_gemm_warp_q8_0_n64_ag"),
+        _ => None,
+    }
 }
 
 /// SPLIT_K (NARROW_N tile) + A_GLOBAL.
@@ -3235,6 +3287,26 @@ pub(crate) fn qsa_indexer_score_spv() -> &'static [u32] {
     })
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn qsa_indexer_score_decode8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qsa_indexer_score_decode8.spv"
+        )))
+    })
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn qsa_indexer_compress_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qsa_indexer_compress.spv"
+        )))
+    })
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn qsa_indexer_topk_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -3255,6 +3327,9 @@ macro_rules! qsa_spv {
         }
     };
 }
+qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
+qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
+qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
 qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");
@@ -3489,6 +3564,13 @@ pub(crate) fn attention_spv() -> &'static [u32] {
 pub(crate) fn attn_combine_spv() -> &'static [u32] {
     static ATTN_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ATTN_COMBINE_SPV.get_or_init(|| spv_words(ATTN_COMBINE_SPV_BYTES))
+}
+/// Wave32 reduction variant of [`attn_combine_spv`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_combine_sg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine_sg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for tiled online-softmax attention over an f16 KV cache.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3754,6 +3836,8 @@ dyn_spv!(attn_decode_swa_spv, "attn_decode_swa");
 dyn_spv!(attn_decode_swa_dynac_spv, "attn_decode_swa_dynac");
 dyn_spv!(attn_decode_hd256_spv, "attn_decode_hd256");
 dyn_spv!(attn_decode_hd256_q8_spv, "attn_decode_hd256_q8");
+dyn_spv!(attn_decode_hd256_q8_gqa2_spv, "attn_decode_hd256_q8_gqa2");
+dyn_spv!(attn_decode_hd256_q8_gqa4_spv, "attn_decode_hd256_q8_gqa4");
 dyn_spv!(attn_decode_hd256_q8_c512_spv, "attn_decode_hd256_q8_c512");
 dyn_spv!(attn_decode_hd256_q8_ls64_spv, "attn_decode_hd256_q8_ls64");
 dyn_spv!(attn_decode_hd256_q8_ls128_spv, "attn_decode_hd256_q8_ls128");
@@ -3833,8 +3917,16 @@ pub(crate) fn attn_decode_q8_kernel(
     qk_f16: bool,
     pv_f16: bool,
     chunk1024: bool,
+    gqa2: bool,
+    gqa4: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     match (hd, swa, dynac) {
+        (256, false, false) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 && gqa4 => {
+            Some(("attn_decode_hd256_q8_gqa4", attn_decode_hd256_q8_gqa4_spv()))
+        }
+        (256, false, false) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 && gqa2 => {
+            Some(("attn_decode_hd256_q8_gqa2", attn_decode_hd256_q8_gqa2_spv()))
+        }
         (256, false, false) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 => {
             Some(("attn_decode_hd256_q8", attn_decode_hd256_q8_spv()))
         }

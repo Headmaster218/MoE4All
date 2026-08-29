@@ -1,0 +1,86 @@
+#version 460
+// Apply the exact score-desc/index-asc threshold produced by the parallel radix passes, then sort
+// the selected block indices chronologically for sparse attention.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint blocks;
+    uint top_k;
+    uint state_base;
+} pc;
+layout(binding = 0) readonly buffer SB { float scores[]; };
+layout(binding = 1) readonly buffer WB { uint work[]; };
+layout(binding = 2) writeonly buffer DB { uint dst[]; };
+
+#define INVALID 0xffffffffu
+shared uint selected_count;
+shared uint tie_prefix[256];
+shared uint chosen[512];
+
+uint ordered_float(float x) {
+    uint bits = floatBitsToUint(x);
+    return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint prefix_score = work[pc.state_base];
+    uint rank = work[pc.state_base + 1u];
+    uint begin = pc.blocks * t / 256u;
+    uint end = pc.blocks * (t + 1u) / 256u;
+
+    uint local_ties = 0u;
+    for (uint j = begin; j < end; ++j) {
+        local_ties += uint(ordered_float(scores[j]) == prefix_score);
+    }
+    tie_prefix[t] = local_ties;
+    barrier();
+    if (t == 0u) {
+        uint prefix = 0u;
+        for (uint lane = 0u; lane < 256u; ++lane) {
+            uint count = tie_prefix[lane];
+            tie_prefix[lane] = prefix;
+            prefix += count;
+        }
+        selected_count = 0u;
+    }
+    barrier();
+
+    uint tie_ordinal = tie_prefix[t];
+    for (uint j = begin; j < end; ++j) {
+        uint score_key = ordered_float(scores[j]);
+        bool equal = score_key == prefix_score;
+        if (score_key > prefix_score || (equal && tie_ordinal < rank)) {
+            uint slot = atomicAdd(selected_count, 1u);
+            if (slot < pc.top_k) { chosen[slot] = j; }
+        }
+        tie_ordinal += uint(equal);
+    }
+    barrier();
+
+    uint i0 = t;
+    uint i1 = t + 256u;
+    if (i0 >= pc.top_k) { chosen[i0] = INVALID; }
+    if (i1 >= pc.top_k) { chosen[i1] = INVALID; }
+    barrier();
+    for (uint width = 2u; width <= 512u; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint pass = 0u; pass < 2u; ++pass) {
+                uint i = t + pass * 256u;
+                uint j = i ^ stride;
+                if (j > i) {
+                    bool ascending = (i & width) == 0u;
+                    uint a = chosen[i];
+                    uint b = chosen[j];
+                    if ((ascending && a > b) || (!ascending && a < b)) {
+                        chosen[i] = b;
+                        chosen[j] = a;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    if (i0 < pc.top_k) { dst[i0] = chosen[i0]; }
+    if (i1 < pc.top_k) { dst[i1] = chosen[i1]; }
+}
