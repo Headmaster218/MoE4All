@@ -30,19 +30,18 @@ QSA 会维护独立的 F16 index-key cache，选择完整历史块并保留未�
 以覆盖长上下文。主 K/V Cache 支持 Q8_0；QSA index-key cache 保持 F16，并独立
 计价和分配。
 
-下表来自 2026-08-29 的 RX 7900 XTX、Vulkan0 实测，使用 20 GiB 显存预算、
-50 GiB 进程 RAM 总预算和 Q8 K/V。Decode 生成 64 token；Prefill 按显存余量选择
-实际 ubatch。每项先用一组固定数学提示词预热，再用三组固定提示词测量；128K/250K
-通过 synthetic depth 构造真实 KV 长度。
+下表来自 RX 7900 XTX、Vulkan0、Q8 K/V 和 40 GiB bounded RAM 下的历史稳定实测，
+未发生 Windows 系统分页。Decode 使用 `tg128`，Prefill 使用 `pp1024`，ubatch 为
+1024；128K/250K 通过 synthetic depth 构造真实 KV 长度。表内为三次平均值。
 
 | Context depth | Q2_K_XL decode | Q2_K_XL prefill | IQ4_XS decode | IQ4_XS prefill |
 |---:|---:|---:|---:|---:|
-| 0 | **17.3 tok/s** | **684.0 tok/s** | **15.6 tok/s** | **468.5 tok/s** |
-| 128K | **20.3 tok/s** | **513.9 tok/s** | **15.6 tok/s** | **294.1 tok/s** |
-| 250K | **23.0 tok/s** | **424.4 tok/s** | **16.5 tok/s** | **311.0 tok/s** |
+| 0 | **29.45 tok/s** | **155.16 tok/s** | **16.85 tok/s** | **244.68 tok/s** |
+| 128K | **26.23 tok/s** | **170.44 tok/s** | **14.15 tok/s** | **250.55 tok/s** |
+| 250K | **22.82 tok/s** | **152.27 tok/s** | **15.26 tok/s** | **239.00 tok/s** |
 
-五个本地大模型在两档显存与进程 RAM 预算下的完整矩阵、实际 ubatch 和容量边界见
-[2026-08-29 Windows 本地大模型性能矩阵](docs/perf/windows-local-model-matrix-20260829.md)。
+更多历史稳定成绩与测试条件见
+[Windows 本地大模型代表性性能记录](docs/perf/windows-local-model-matrix-20260829.md)。
 
 Q2 与 IQ4_XS 都通过了三轮真实 API 对话，能够保持校验码、完成跨轮算术并总结
 先前内容。
@@ -112,24 +111,24 @@ Start-INFR-Wizard.cmd
 
 ## 实测结果
 
-以下代表值来自 2026-08-29 的 RX 7900 XTX 24 GiB、Ryzen 5 5600X、
-64 GiB DDR4、Windows 11 主机。统一使用 20 GiB 显存预算与 50 GiB 进程 RAM
-总预算；Decode 生成 64 token，Prefill 使用表中模型可稳定运行的性能档 ubatch。
-每项均先预热再测三组固定提示词。不同架构、量化和上下文负载不能直接横向比较。
+以下代表值来自 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11
+主机的历史稳定测试。已排除进入系统分页的资源压力诊断结果；各行测试日期、模型量化、
+上下文和缓存条件不同，不能直接横向比较。
 
-| 模型与量化 | Context depth | KV | Decode | Prefill |
-|---|---:|---|---:|---:|
-| Qwen3.6-35B-A3B APEX-I-Balanced | 0 | Q8 K/V | **84.7 tok/s** | **3,208.8 tok/s** |
-| Qwen3.6-35B-A3B APEX-I-Balanced | 250K synthetic | Q8 K/V | **50.9 tok/s** | **460.1 tok/s** |
-| Qwen3.5-122B-A10B APEX-I-Quality | 128K synthetic | Q8 K/V | **9.9 tok/s** | **98.4 tok/s** |
-| Ling-3.0-Flash Q5_K_M | 0 | F16 K/V | **5.3 tok/s** | **105.8 tok/s** |
-| Ling-3.0-Flash Q5_K_M | 128K synthetic | F16 K/V | **0.7 tok/s** | **9.8 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL | 250K synthetic | Q8 K/V | **23.0 tok/s** | **424.4 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS | 250K synthetic | Q8 K/V | **16.5 tok/s** | **311.0 tok/s** |
+| 模型与负载 | 关键条件 | 结果 |
+|---|---|---:|
+| Qwen3.6-35B-A3B，250K synthetic depth 后 decode | Q8 K/V，生成 1,000 token | **41.2 tok/s** |
+| Qwen3.6-35B-A3B，250K 后 prefill 4,096 | Q8 K/V | **477.9 tok/s** |
+| Qwen3.6-35B-A3B，depth 0 prefill 4,096 | Q8 K/V | **2,855.6 tok/s** |
+| Qwen3.5-122B-A10B，depth 0 decode | F16 K/V，45 GiB bounded RAM，3 次重复 | **23.2 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL，250K 后 decode | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 | **22.82 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均 | **152.27 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS，250K 后 decode | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 | **15.26 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均 | **239.00 tok/s** |
 
 完整条件和优化历史见：
 
-- [2026-08-29 Windows 本地大模型性能矩阵](docs/perf/windows-local-model-matrix-20260829.md)
+- [Windows 本地大模型代表性性能记录](docs/perf/windows-local-model-matrix-20260829.md)
 - [Qwen3.6 RX 7900 XTX 优化记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
 - [统一显存验收记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/unified-vram-elastic-acceptance-20260824.md)
 - [DeepSeek V4 Flash 收尾记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)

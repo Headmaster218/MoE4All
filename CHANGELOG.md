@@ -6,6 +6,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
+### Highlights
+
+- **Automatic memory planning now follows the selected device and the live allocator ceiling.**
+  Fixed weights, persistent KV/QSA/recurrent state, peak runtime workspace, weight-packing
+  alignment, Windows driver headroom, and the elastic expert arena are priced in one plan. If a
+  Windows driver exposes slightly less allocatable VRAM than its initial budget snapshot, automatic
+  mode retries with a smaller expert arena while preserving fixed state and the minimum runnable
+  expert working set.
+- **Manual RAM budgets now mean total infr process memory.** The host expert arena subtracts the
+  process's existing resident footprint instead of treating `device.ram_budget` as extra cache.
+  Automatic mode continues to reserve system headroom, reducing the risk of Windows paging.
+- **Qwen3.8-Flash-Next decode and prefill received a focused Vulkan performance pass.** QSA scoring
+  and exact top-k selection use wider, parallel passes; Q8 attention reuses K/V data across GQA
+  heads; narrow Q8 prefill projections and Q2 expert prefill take faster paths.
+
+### Changed
+
+- MoE prefill lane counts are bounded by the runtime memory plan instead of assuming every device
+  can host the same concurrent working set.
+- Windows release artifacts are produced from version tags only.
+- Benchmark documentation now uses stable historical runs that did not enter system paging; the
+  resource-pressure diagnostic sweep is not presented as product performance.
+
+### Fixed
+
+- Automatic Qwen3.5/Qwen3.6/Qwen3.8 placement no longer plans against a generic 24 GiB GPU shape or
+  hands the Vulkan allocator bytes it has already reserved for model state and runtime work.
+- DeepSeek V4's de-rope regression test now accounts for the production FP8 E4M3 KV rounding error
+  while retaining wide separation from a missing de-rope implementation.
+
+### Performance
+
+- Removed full index radix scans from QSA top-k and parallelized deep-context QSA selection.
+- Added wave32 MoE top-k reduction on supported AMD Vulkan devices.
+- Parallelized deep Q8 attention combine and reused Q8 K/V blocks across GQA head pairs and groups.
+- Tiled narrow Q8 prefill projections and accelerated Q2 paged-expert prefill.
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
