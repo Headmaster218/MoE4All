@@ -14,17 +14,32 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint n; uint cap;
     uint s_lo; uint s_hi;
 } pc;
+#ifdef KV_SEGMENTED
+layout(binding = 0) readonly buffer SB { uvec2 segments[]; };
+#endif
 layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
 #include "kv_addr.glsl"
 #define SU(wi) kv_word(k_addr, (wi))
 
 void main() {
+#ifndef KV_SEGMENTED
     k_addr = kv_base(pc.s_lo, pc.s_hi);
+#endif
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.cap);
+    k_addr = kv_segment_base(segments[kv_segment(i, pc.cap)]);
+    uint seg_elems = 1u << pc.cap;
+    int cw = int(SU(local >> 2u));
+    int c = bitfieldExtract(cw, int((local & 3u) * 8u), 8);
+    uint bk = local >> 5u;
+    float d = unpackHalf2x16(SU((seg_elems >> 2u) + (bk >> 1u)))[bk & 1u];
+#else
     int cw = int(SU(i >> 2u));
     int c = bitfieldExtract(cw, int((i & 3u) * 8u), 8);
     uint bk = i >> 5u;
     float d = unpackHalf2x16(SU((pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+#endif
     dst[i] = float16_t(d * float(c));
 }

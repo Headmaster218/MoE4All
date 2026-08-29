@@ -32,9 +32,13 @@ layout(binding = 1) readonly buffer NB { float nw[]; };
 layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
 #ifdef FREQ_FACTORS
 layout(binding = 3) readonly buffer FF { float ff[]; };
-#ifndef KV_BDA
+#ifdef KV_SEGMENTED
+layout(binding = 4) readonly buffer YB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
 layout(binding = 4) buffer YB { float16_t y[]; };
 #endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 3) readonly buffer YB { uvec2 segments[]; };
 #elif !defined(KV_BDA)
 layout(binding = 3) buffer YB { float16_t y[]; };
 #endif
@@ -42,15 +46,28 @@ layout(binding = 3) buffer YB { float16_t y[]; };
 // gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
 // those dims are left unrotated). `ff` takes binding 2 (read), `y` shifts to binding 3 (write).
 layout(binding = 2) readonly buffer FF { float ff[]; };
-#ifndef KV_BDA
+#ifdef KV_SEGMENTED
+layout(binding = 3) readonly buffer YB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
 layout(binding = 3) buffer YB { float16_t y[]; };
 #endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 2) readonly buffer YB { uvec2 segments[]; };
 #elif !defined(KV_BDA)
 layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
 #ifdef KV_BDA
 #include "kv_addr.glsl"
+#ifdef KV_SEGMENTED
+void kvw(uint idx, float val) {
+    uint shift = uint(findMSB((pc.nheads * pc.hd) << 15u));
+    uint seg = kv_segment(idx, shift);
+    kv_store_half(kv_segment_base(segments[seg]), kv_segment_local(idx, shift), val);
+}
+#define KVW(idx, val) kvw((idx), (val))
+#else
 #define KVW(idx, val) kv_store_half(k_addr, (idx), (val))
+#endif
 #else
 #define KVW(idx, val) y[idx] = float16_t(val)
 #endif
@@ -59,7 +76,7 @@ shared float xs[512]; // hd up to 512 (gemma4 full layers); 64 threads each hand
 shared float red[64];
 
 void main() {
-#ifdef KV_BDA
+#if defined(KV_BDA) && !defined(KV_SEGMENTED)
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
     uint t = gl_LocalInvocationID.x;
