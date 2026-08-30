@@ -6106,6 +6106,7 @@ pub(crate) fn generate_dense_backend(
             Vec::new(),
             GenStats {
                 n_prompt: 0,
+                n_cached: 0,
                 prompt_secs: sc_secs + build_secs + exec_secs + dl_secs,
                 n_gen: 0,
                 decode_secs: 0.0,
@@ -6269,6 +6270,7 @@ pub(crate) fn generate_dense_backend(
             Vec::new(),
             GenStats {
                 n_prompt: m,
+                n_cached: start,
                 prompt_secs: t0.elapsed().as_secs_f64(),
                 n_gen: 0,
                 decode_secs: 0.0,
@@ -7484,6 +7486,7 @@ pub(crate) fn generate_dense_backend(
     let stats = GenStats {
         // The tokens actually PREFILLED this call (the un-cached suffix) — the TTFT-honest count.
         n_prompt: prompt.len() - start,
+        n_cached: start,
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,
         decode_secs: decode_t.as_secs_f64(),

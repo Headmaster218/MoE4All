@@ -14,7 +14,7 @@ mod stream;
 mod template;
 mod tools;
 
-pub use stream::{prompt_prefills_think, ChatStream, Delta};
+pub use stream::{partial_tool_name, prompt_prefills_think, ChatStream, Delta};
 pub use template::{
     render_chat_jinja, render_chat_oai, render_chat_user, render_template, TemplateError,
 };

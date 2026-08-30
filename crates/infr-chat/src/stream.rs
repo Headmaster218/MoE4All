@@ -18,7 +18,16 @@ pub fn prompt_prefills_think(prompt: &str) -> bool {
 pub enum Delta {
     Reasoning(String),
     Content(String),
-    ToolCall { name: String, arguments: String },
+    /// The model has begun a tool call and its function name is now known. This is emitted before
+    /// the complete JSON arguments so streaming clients can start their TTFT/decode clock at the
+    /// actual model boundary instead of attributing all tool-call tokens to one terminal frame.
+    ToolCallStart {
+        name: String,
+    },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
 }
 
 /// Incremental splitter for the streaming server path. Accumulates the raw decoded text and, on each
@@ -41,6 +50,7 @@ pub struct ChatStream {
     cur_tool: Cursor,  // Hermes/Qwen `<tool_call>`
     cur_pipe: Cursor,  // gemma4/E2B/DG `<|tool_call>`
     cur_final: Cursor, // channel-format `<channel|>`
+    tool_started: bool,
 }
 
 /// A forward-only search for a fixed `needle` in an append-only buffer: once the needle is found its
@@ -81,6 +91,7 @@ impl ChatStream {
             cur_tool: Cursor::default(),
             cur_pipe: Cursor::default(),
             cur_final: Cursor::default(),
+            tool_started: false,
         }
     }
 
@@ -163,6 +174,7 @@ impl ChatStream {
             emit_region(&self.raw, hm, r_end, hold, &mut self.sent_r, true, on_delta);
             if let Some(cs) = c_start {
                 let tool_open = self.tool_open_at(cs, final_flush);
+                self.emit_tool_start(tool_open, on_delta);
                 let (c_end, hold) = match tool_open {
                     Some(t) if t >= cs => (t, false),
                     _ => (self.raw.len(), !final_flush),
@@ -208,6 +220,7 @@ impl ChatStream {
         };
         if let Some(cs) = c_start {
             let tool_open = self.tool_open_at(cs, final_flush);
+            self.emit_tool_start(tool_open, on_delta);
             let (c_end, hold) = match tool_open {
                 Some(t) if t >= cs => (t, false),
                 _ => (self.raw.len(), !final_flush),
@@ -223,6 +236,48 @@ impl ChatStream {
             );
         }
     }
+
+    /// Emit the one-shot tool-start marker once the function name has appeared in the buffered
+    /// call. Waiting for the name (rather than the `<tool_call>` opener) avoids an empty function
+    /// name in Responses clients while still placing the marker many tokens before final JSON
+    /// parsing. If a dialect does not expose a name until its closing brace, no marker is emitted;
+    /// the final call remains correct and the legacy Chat Completions wire is unchanged.
+    fn emit_tool_start(&mut self, tool_open: Option<usize>, on_delta: &mut dyn FnMut(Delta)) {
+        if self.tool_started {
+            return;
+        }
+        let Some(open) = tool_open else { return };
+        let Some(name) = partial_tool_name(&self.raw[open..]) else {
+            return;
+        };
+        self.tool_started = true;
+        on_delta(Delta::ToolCallStart { name });
+    }
+}
+
+/// Extract a function name from a partially decoded tool-call JSON body. The name is generally
+/// available dozens of tokens before the arguments finish, which lets a Responses adapter emit its
+/// output-item start event at the true decode boundary.
+pub fn partial_tool_name(call: &str) -> Option<String> {
+    let key = call.find("\"name\"")?;
+    let tail = &call[key + 6..];
+    let colon = tail.find(':')?;
+    let after = tail[colon + 1..].trim_start();
+    let bytes = after.as_bytes();
+    if bytes.first().copied() != Some(b'\"') {
+        return None;
+    }
+    let mut escaped = false;
+    for i in 1..bytes.len() {
+        match (bytes[i], escaped) {
+            (b'\\', false) => escaped = true,
+            (b'\"', false) => {
+                return serde_json::from_str::<String>(&after[..=i]).ok();
+            }
+            (_, _) => escaped = false,
+        }
+    }
+    None
 }
 
 /// Emit the not-yet-sent slice of `raw[region_start .. region_end]` (past `*sent` bytes), holding back
@@ -285,6 +340,7 @@ mod chat_stream_tests {
             match d {
                 Delta::Reasoning(x) => r.push_str(x),
                 Delta::Content(x) => c.push_str(x),
+                Delta::ToolCallStart { .. } => {}
                 Delta::ToolCall { name, arguments } => t.push((name.clone(), arguments.clone())),
             }
         }
@@ -350,6 +406,21 @@ mod chat_stream_tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].0, "run_bash");
         assert!(t[0].1.contains("ls"));
+    }
+
+    #[test]
+    fn tool_call_start_is_emitted_when_name_arrives_before_arguments() {
+        let mut starts = Vec::new();
+        let mut s = ChatStream::new(true);
+        s.push(
+            "<tool_call>{\"name\":\"run_bash\",\"arguments\":",
+            &mut |d| {
+                if let Delta::ToolCallStart { name } = d {
+                    starts.push(name);
+                }
+            },
+        );
+        assert_eq!(starts, vec!["run_bash"]);
     }
 
     #[test]
