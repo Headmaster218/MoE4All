@@ -1832,6 +1832,7 @@ impl SeamModel {
         }
         Ok(crate::GenStats {
             n_prompt,
+            n_cached: 0,
             prompt_secs,
             n_gen: out.len(),
             decode_secs: t1.elapsed().as_secs_f64(),

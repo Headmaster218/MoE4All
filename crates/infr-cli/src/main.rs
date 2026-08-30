@@ -2073,6 +2073,7 @@ fn run_chat(
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
             let mut tokens = (0u32, 0u32);
+            let mut cached_tokens = 0u32;
             let emitted = match be.generate(
                 &primed,
                 Some(&stable_prefix),
@@ -2088,7 +2089,11 @@ fn run_chat(
                 },
             ) {
                 Ok(gstats) => {
-                    tokens = (gstats.n_prompt as u32, gstats.n_gen as u32);
+                    tokens = (
+                        gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
+                        gstats.n_gen as u32,
+                    );
+                    cached_tokens = gstats.n_cached as u32;
                     let body = body.trim().trim_end_matches("</tool_call>").trim();
                     match serde_json::from_str::<serde_json::Value>(body) {
                         Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
@@ -2115,6 +2120,7 @@ fn run_chat(
                 return Ok(infr_server::ChatOutcome {
                     finish: infr_server::Finish::ToolCalls,
                     prompt_tokens: tokens.0,
+                    cached_prompt_tokens: cached_tokens,
                     completion_tokens: tokens.1,
                 });
             }
@@ -2180,7 +2186,8 @@ fn run_chat(
         };
         Ok(infr_server::ChatOutcome {
             finish,
-            prompt_tokens: stats.n_prompt as u32,
+            prompt_tokens: stats.n_prompt.saturating_add(stats.n_cached) as u32,
+            cached_prompt_tokens: stats.n_cached as u32,
             completion_tokens: stats.n_gen as u32,
         })
     }
