@@ -123,7 +123,10 @@ pub struct EmbeddingOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatOutcome {
     pub finish: Finish,
+    /// Total prompt tokens presented to the model, including any prefix served from KV cache.
     pub prompt_tokens: u32,
+    /// Prompt tokens served from a reusable prefix cache and not recomputed for this request.
+    pub cached_prompt_tokens: u32,
     pub completion_tokens: u32,
 }
 
@@ -606,10 +609,31 @@ pub struct OAIFunction {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+impl UsageInfo {
+    fn from_outcome(outcome: ChatOutcome) -> Self {
+        Self {
+            prompt_tokens: outcome.prompt_tokens,
+            completion_tokens: outcome.completion_tokens,
+            total_tokens: outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens),
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: outcome.cached_prompt_tokens.min(outcome.prompt_tokens),
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,8 +754,10 @@ impl ServeStats {
     /// is new information about tokens nobody has counted yet, the same shape as `prompt_tokens`
     /// arriving at completion.
     fn fold_completion(&self, rec: &ReqRecord) {
-        self.interval_prompt_tokens
-            .fetch_add(u64::from(rec.prompt_tokens), Ordering::Relaxed);
+        self.interval_prompt_tokens.fetch_add(
+            u64::from(rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens)),
+            Ordering::Relaxed,
+        );
         let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
         if correction > 0 {
             self.bump_gen(correction);
@@ -931,6 +957,7 @@ impl ReqTally {
             .map_or(total, |t| t.saturating_duration_since(self.started));
         ReqRecord {
             prompt_tokens: outcome.prompt_tokens,
+            cached_prompt_tokens: outcome.cached_prompt_tokens.min(outcome.prompt_tokens),
             gen_tokens: outcome.completion_tokens,
             deltas: self.deltas,
             window: self.window,
@@ -947,6 +974,7 @@ impl ReqTally {
 #[derive(Debug, Clone, Copy)]
 struct ReqRecord {
     prompt_tokens: u32,
+    cached_prompt_tokens: u32,
     gen_tokens: u32,
     deltas: u64,
     /// The stats window this request's last deltas landed in — see [`ServeStats::fold_completion`].
@@ -965,7 +993,10 @@ impl ReqRecord {
     /// THIS request's prefill speed: prompt tokens over its time-to-first-delta. A per-request
     /// number, unlike [`StatsWindow::prefill_tps`].
     fn prefill_tps(&self) -> f64 {
-        per_second(u64::from(self.prompt_tokens), self.prefill)
+        per_second(
+            u64::from(self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)),
+            self.prefill,
+        )
     }
 
     /// THIS request's decode speed: generated tokens over the time after the first delta.
@@ -1825,13 +1856,7 @@ async fn non_streaming(
                     },
                     finish_reason: finish.as_str().into(),
                 }],
-                usage: UsageInfo {
-                    prompt_tokens: outcome.prompt_tokens,
-                    completion_tokens: outcome.completion_tokens,
-                    total_tokens: outcome
-                        .prompt_tokens
-                        .saturating_add(outcome.completion_tokens),
-                },
+                usage: UsageInfo::from_outcome(outcome),
             })
             .into_response()
         }
@@ -2489,6 +2514,7 @@ mod tests {
             Ok(ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
+                cached_prompt_tokens: 0,
                 completion_tokens: 2,
             })
         }
@@ -2791,6 +2817,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2824,6 +2851,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2863,6 +2891,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -3337,20 +3366,29 @@ mod tests {
         let outcome = ChatOutcome {
             finish: Finish::Stop,
             prompt_tokens: 17,
+            cached_prompt_tokens: 0,
             completion_tokens: 5,
         };
-        let usage = UsageInfo {
-            prompt_tokens: outcome.prompt_tokens,
-            completion_tokens: outcome.completion_tokens,
-            total_tokens: outcome
-                .prompt_tokens
-                .saturating_add(outcome.completion_tokens),
-        };
+        let usage = UsageInfo::from_outcome(outcome);
         assert_eq!(usage.total_tokens, 22);
+        assert_eq!(usage.prompt_tokens_details.cached_tokens, 0);
         assert_eq!(
             usage.total_tokens,
             usage.prompt_tokens + usage.completion_tokens
         );
+    }
+
+    #[test]
+    fn usage_reports_full_prompt_and_cached_share() {
+        let usage = UsageInfo::from_outcome(ChatOutcome {
+            finish: Finish::Stop,
+            prompt_tokens: 100,
+            cached_prompt_tokens: 76,
+            completion_tokens: 4,
+        });
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.prompt_tokens_details.cached_tokens, 76);
+        assert_eq!(usage.total_tokens, 104);
     }
 
     /// End-to-end: the non-streaming handler must surface the generator's REAL counts (EchoGen
@@ -3716,6 +3754,7 @@ mod tests {
             Ok(ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
+                cached_prompt_tokens: 0,
                 completion_tokens: 1,
             })
         }
@@ -4046,6 +4085,7 @@ mod tests {
     ) -> ReqRecord {
         ReqRecord {
             prompt_tokens: prompt,
+            cached_prompt_tokens: 0,
             gen_tokens: gen,
             deltas,
             window,
@@ -4055,6 +4095,17 @@ mod tests {
             total: Duration::from_millis(500),
             finish: Finish::Stop,
         }
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_excluded_from_prefill_rates() {
+        let stats = ServeStats::default();
+        let mut request = rec(100, 0, 0);
+        request.cached_prompt_tokens = 80;
+
+        assert_eq!(request.prefill_tps(), 200.0);
+        stats.fold_completion(&request);
+        assert_eq!(stats.drain(Duration::from_secs(1)).prompt_tokens, 20);
     }
 
     /// **The whole point of the periodic line.** Its numbers must describe the INTERVAL, so a drain
@@ -4159,6 +4210,7 @@ mod tests {
             ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
+                cached_prompt_tokens: 0,
                 completion_tokens: 1,
             },
             Finish::Stop,
@@ -4185,6 +4237,7 @@ mod tests {
             ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
+                cached_prompt_tokens: 0,
                 completion_tokens: 2,
             },
             Finish::Stop,
@@ -4203,6 +4256,7 @@ mod tests {
             ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 0,
+                cached_prompt_tokens: 0,
                 completion_tokens: 0,
             },
             Finish::Stop,
