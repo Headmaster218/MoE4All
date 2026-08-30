@@ -2823,6 +2823,7 @@ fn generate_mtp_spec_core(
     Ok((
         crate::GenStats {
             n_prompt: p,
+            n_cached: 0,
             prompt_secs: prime_verify_secs,
             n_gen: out.len(),
             decode_secs: t_decode.elapsed().as_secs_f64(),

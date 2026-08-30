@@ -64,7 +64,11 @@ pub fn is_llama4(path: &std::path::Path) -> bool {
 /// `ChatTurn` path). `prompt_secs` = prefill (time to first token), `decode_secs` = generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GenStats {
+    /// Prompt tokens that required a forward this turn. The remainder of the rendered prompt may
+    /// have been reused from a persistent KV-prefix slot and is reported separately in `n_cached`.
     pub n_prompt: usize,
+    /// Prompt tokens served from a reusable KV-prefix slot rather than prefilled this turn.
+    pub n_cached: usize,
     pub prompt_secs: f64,
     pub n_gen: usize,
     pub decode_secs: f64,

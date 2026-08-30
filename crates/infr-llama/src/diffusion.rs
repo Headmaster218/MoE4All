@@ -653,6 +653,7 @@ pub fn diffusion_generate(
         tokens: response,
         stats: GenStats {
             n_prompt: prompt_tokens.len(),
+            n_cached: 0,
             prompt_secs,
             n_gen,
             decode_secs,
