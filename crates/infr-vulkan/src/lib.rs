@@ -6059,8 +6059,8 @@ mod tests {
         );
     }
 
-    /// A module allocation may evict cold expert slots, then exact-slot restoration returns every
-    /// byte to the expert cache after the module buffer is released.
+    /// A module allocation may evict cold expert slots, then either execution-phase transition
+    /// returns every released byte to the expert cache before using its slot topology.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn unified_vram_loans_and_restores_expert_slots() {
@@ -6123,6 +6123,28 @@ mod tests {
             .as_mut()
             .expect("pager")
             .enter_decode();
+        let restored = pool.stats();
+        assert_eq!(
+            restored.class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * SLOTS,
+        );
+        assert_eq!(restored.free_bytes, 0);
+
+        let embedding = embedding_backend
+            .alloc_uninit(SLOT * 2 + SLOT / 2, BufferUsage::Weights)
+            .expect("loan expert slots before Prefill");
+        drop(embedding);
+        let error = be
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("pager")
+            .enter_prefill_layer()
+            .expect_err("the synthetic pager has no registered Prefill banks");
+        assert!(error
+            .to_string()
+            .contains("cannot build a prefill layout without expert banks"));
         let restored = pool.stats();
         assert_eq!(
             restored.class_bytes(crate::unified::UnifiedVramClass::Expert),
