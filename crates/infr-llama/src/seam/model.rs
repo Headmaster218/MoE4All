@@ -542,12 +542,10 @@ impl SeamModel {
     /// arena must fit the live free bytes. Paged MoE Experts contribute their one-layer arena
     /// floor rather than their full pageable payload. The rung ladder, in order:
     ///
-    ///  1. **f16 fits `want`** → use it, say nothing. (The overwhelmingly common case, and — since
-    ///     the fit now walks the same prefill-chunk ladder placement walks — the case gemma-3-12b
-    ///     at ctx 131072 belongs in and used to miss.)
-    ///  2. **f16 misses, q8_0 reaches `want`** → pin auto-q8 and `tracing::warn!`. Only a FULL
-    ///     rescue pins q8; a partial one keeps the predictable f16 cache, because auto-q8 exists
-    ///     to avoid losing capability, not to trade decode speed for a still-clamped window.
+    ///  1. **The selected KV format fits `want`** → use it, say nothing. Vulkan defaults an
+    ///     unset, compatible cache to Q8_0; an explicit format remains authoritative.
+    ///  2. **Legacy placement state can be rescued by q8_0** → retain the existing pin-and-warn
+    ///     compatibility rung before shrinking the context.
     ///  3. **`INFR_KV_OVERFLOW`** → keep `want` with the cache in system RAM.
     ///  4. **Nothing serves even [`MIN_SESSION_CTX`](crate::seam::MIN_SESSION_CTX)** → `Err`. The
     ///     weights leave no room for a usable cache on this device, so refusing with the numbers
@@ -575,6 +573,7 @@ impl SeamModel {
         // half the bytes per token. The fit math now prices MoE's pageable Experts separately, so
         // the same rescue is valid for dense and paged-MoE sessions.
         let may_auto_q8 = !crate::seam::kv_auto_q8()
+            && !crate::seam::kv_default_q8(&self.cfg, &self.ecfg)
             && crate::seam::kv_unset(&self.ecfg)
             && crate::seam::kv_q8_layout_ok(&self.cfg);
         let fit_q8 = may_auto_q8.then(|| self.kv_fit_ctx_fmt(vk, true)).flatten();
@@ -686,7 +685,7 @@ impl SeamModel {
     /// the backstop.
     fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
         // Price whatever the runner will actually allocate: the auto-q8 pin (if the placement
-        // ladder set it earlier in this process) or the plain env-driven formats.
+        // ladder set it earlier in this process) or the automatic/explicit formats.
         self.kv_fit_ctx_fmt(vk, crate::seam::kv_auto_q8())
     }
 
@@ -735,15 +734,16 @@ impl SeamModel {
     }
 
     /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit
-    /// `INFR_KV_TYPE_K`/`_V` when set, else the default ladder (legacy `INFR_KV_Q8`, then a
-    /// placement-pinned or candidate auto-q8, then f16) — the same ladder `parse_kv_fmt` walks in
-    /// the runner. ESTIMATE ONLY in one direction: the runner additionally gates each format on
+    /// `INFR_KV_TYPE_K`/`_V` when set, else the Vulkan default (Q8_0 on a compatible layout,
+    /// otherwise f16) — the same ladder `parse_kv_fmt` walks in the runner. ESTIMATE ONLY in one
+    /// direction: the runner additionally gates each format on
     /// backend/alignment and falls back to f16, so a gated-out low-bit request under-estimates
     /// here and the alloc-time VRAM guard backstops it.
     fn kv_fit_fmts(&self, auto_q8: bool) -> (DType, DType) {
+        let default_q8 = crate::seam::kv_default_q8(&self.cfg, &self.ecfg);
         let side = |want: Option<DType>| match want {
             Some(dt) => dt,
-            None if self.ecfg.kv.force_q8 || auto_q8 => DType::Q8_0,
+            None if self.ecfg.kv.force_q8 || auto_q8 || default_q8 => DType::Q8_0,
             None => DType::F16,
         };
         (side(self.ecfg.kv.type_k), side(self.ecfg.kv.type_v))

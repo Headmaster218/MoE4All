@@ -599,30 +599,26 @@ pub(crate) fn generate_dense_backend(
     // env/file/CLI layer). A name nothing recognizes yields `None` here AND leaves `*_specified`
     // true, which is exactly today's split (§11 decision 8): it falls through to the ladder below
     // while still having suppressed auto-q8 up in the placement.
-    let parse_kv_fmt = |want: Option<DType>| -> DType {
-        match want {
-            Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
-            Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
-            Some(dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl))
-                if blk_ok =>
-            {
-                dt
+    let automatic_q8 =
+        be.name() == "vulkan" && (crate::seam::kv_auto_q8() || crate::seam::kv_default_q8(c, ec));
+    let parse_kv_fmt =
+        |want: Option<DType>| -> DType {
+            match want {
+                Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
+                Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
+                Some(
+                    dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl),
+                ) if blk_ok => dt,
+                Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
+                Some(DType::F16) => DType::F16,
+                // unset/unknown/gated-out → legacy `kv.force_q8` alias (both sides q8) or f16.
+                _ if ec.kv.force_q8 && kv_align_ok && kv_q8_backend => DType::Q8_0,
+                // Vulkan's automatic Q8 choice. Backend and layout gates keep it out of CPU/Metal and
+                // out of models whose cache rows cannot carry Q8_0 blocks.
+                _ if automatic_q8 && kv_align_ok => DType::Q8_0,
+                _ => DType::F16,
             }
-            Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
-            Some(DType::F16) => DType::F16,
-            // unset/unknown/gated-out → legacy `kv.force_q8` alias (both sides q8) or f16.
-            _ if ec.kv.force_q8 && kv_align_ok && kv_q8_backend => DType::Q8_0,
-            // Placement-pinned auto-q8 (see `crate::seam::PlacementPins`): the Vulkan placement
-            // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin
-            // is a Vulkan placement decision and must not leak into a CPU/Metal session (e.g.
-            // the CPU oracle of a parity test) running in the same process. The pin is only ever
-            // set when `kv_env_unset()` and `kv_q8_layout_ok` held, so the alignment/backend
-            // gates here re-check what already passed; the env being unset means no earlier arm
-            // can shadow this one.
-            _ if crate::seam::kv_auto_q8() && be.name() == "vulkan" && kv_align_ok => DType::Q8_0,
-            _ => DType::F16,
-        }
-    };
+        };
     let mut k_fmt = parse_kv_fmt(ec.kv.type_k);
     let mut v_fmt = parse_kv_fmt(ec.kv.type_v);
     // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
@@ -1320,13 +1316,22 @@ pub(crate) fn generate_dense_backend(
         // arena. Its buffers therefore keep the requested logical extent and commit physical 32K
         // segments on demand; applying the flat-buffer live-room clamp would price those bytes a
         // second time. Every other session retains the existing measured clamp unchanged.
-        let segmented_kv = ec.kv.dynamic
+        let segmented_available = be.segmented_kv_available();
+        let segmented_kv =
+            crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
+        if ec.kv.dynamic
             && (c.qwen35 || c.qwen4exp)
             && !kv_ring
             && !ec.kv.overflow
-            && matches!(k_fmt, DType::F16 | DType::Q8_0)
-            && matches!(v_fmt, DType::F16 | DType::Q8_0)
-            && be.segmented_kv_available();
+            && segmented_available
+            && !segmented_kv
+        {
+            tracing::info!(
+                k_dtype = ?k_fmt,
+                v_dtype = ?v_fmt,
+                "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
+            );
+        }
         let want_ctx = if segmented_kv {
             want_ctx
         } else {
@@ -7495,13 +7500,13 @@ pub(crate) fn generate_dense_backend(
         // Both halves of what a prefill holds live, so the comparison stays honest in either
         // order: per-chunk scratch plus the layer-major residual set (whole prompt normally,
         // one bounded group on Qwen3.8), exactly as priced during placement.
-        let reserved = crate::seam::dense_act_reserve_at(c, &caps, max_ctx, rows).saturating_add(
-            if crate::seam::layer_major_prefill(ec, &caps, !e2b) {
-                crate::seam::layer_major_act_bytes(c, max_ctx, rows)
-            } else {
-                0
-            },
-        );
+        let reserved =
+            crate::seam::runtime_reserve_at(c, &caps, max_ctx, kv_ring, rows, k_fmt, v_fmt)
+                .saturating_add(if crate::seam::layer_major_prefill(ec, &caps, !e2b) {
+                    crate::seam::layer_major_act_bytes(c, max_ctx, rows)
+                } else {
+                    0
+                });
         // RUST_LOG=debug turns this into the measurement the reserve is re-fit against; the WARN
         // below is what a user sees when the prediction was wrong in the direction that hurts.
         tracing::debug!(
