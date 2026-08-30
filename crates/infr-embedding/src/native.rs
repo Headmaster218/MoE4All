@@ -285,11 +285,12 @@ impl NativeEmbeddingEngine {
             let mut plans = self.plans.lock().unwrap_or_else(|error| error.into_inner());
             let mut embeddings = Vec::with_capacity(encoded.len());
             for ids in encoded {
-                if !plans.contains_key(&ids.len()) {
-                    let plan = self.build_plan(ids.len())?;
-                    plans.insert(ids.len(), plan);
-                }
-                let plan = plans.get_mut(&ids.len()).expect("plan inserted above");
+                let plan = match plans.entry(ids.len()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(self.build_plan(ids.len())?)
+                    }
+                };
                 embeddings.push(self.execute_plan(plan, &ids, resident)?);
             }
             Ok(EmbeddingBatch {

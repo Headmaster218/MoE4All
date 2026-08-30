@@ -187,6 +187,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.force_q8 = presence(get, "INFR_KV_Q8");
     p.kv.slots = num_pos(get, "INFR_KV_SLOTS");
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
+    p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");
     p.kv.coopmat_bda = presence(get, "INFR_KV_COOPMAT_BDA");
     p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");
@@ -204,8 +205,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.host_dma = presence_inv(get, "INFR_NO_HOST_DMA");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
     p.paging.trace = opt_path(get, "INFR_PAGER_TRACE");
-    // Tri-state: "0" ⇒ force chunk-major, any other value ⇒ force layer-major, unset ⇒ decide
-    // from the placement (see `PagingCfg::layer_major`).
+    // Tri-state syntax retained for compatibility: "0" keeps chunk-major, any other value forces
+    // layer-major, and unset uses the chunk-major default (see `PagingCfg::layer_major`).
     p.paging.layer_major = get("INFR_LAYER_MAJOR").map(|s| Some(s != "0"));
 
     // ── kernels.vulkan ───────────────────────────────────────────────────────

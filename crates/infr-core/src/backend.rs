@@ -415,6 +415,19 @@ pub trait Buffer: Send + Sync {
     }
 }
 
+/// Geometry of a logically contiguous KV buffer whose physical storage is committed in fixed
+/// segments. `logical_bytes` preserves the graph-visible full-context extent; `segment_bytes`
+/// and `max_segments` describe the bounded physical backing grown on demand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentedKvSpec {
+    pub logical_bytes: usize,
+    pub segment_bytes: usize,
+    /// Logical tensor elements represented by one segment. This excludes format-local side data
+    /// such as the planar Q8 scale plane and is always a power of two for the 32K Qwen geometry.
+    pub segment_elements: usize,
+    pub max_segments: usize,
+}
+
 /// A compiled, ready-to-run graph (pipelines + command buffers for Vulkan, an op schedule for CPU).
 pub trait Plan: Send + Sync {
     /// Downcast hook so a backend can recover its concrete plan type from a `&dyn Plan`.
@@ -502,6 +515,34 @@ pub trait Backend: Send + Sync {
     /// the perf win.
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         self.alloc(bytes, usage)
+    }
+
+    /// Allocate a lazily committed KV buffer when this backend supports segmented device
+    /// addressing. `None` keeps the caller on its existing flat-buffer path.
+    fn alloc_segmented_kv(&self, _spec: SegmentedKvSpec) -> Result<Option<Box<dyn Buffer>>> {
+        Ok(None)
+    }
+
+    /// Whether segmented KV allocations can currently borrow from a pre-reserved elastic pool.
+    /// This is runtime state, not a static device capability: Vulkan returns true only after the
+    /// paged-MoE arena has been established.
+    fn segmented_kv_available(&self) -> bool {
+        false
+    }
+
+    /// Ensure that `buffer` owns at least `segments` physical KV segments. Backends that returned
+    /// `Some` from [`Backend::alloc_segmented_kv`] must accept that buffer here.
+    fn ensure_segmented_kv(&self, _buffer: &dyn Buffer, _segments: usize) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV is not supported by this backend",
+        ))
+    }
+    /// Clear every committed physical segment. Used by synthetic-depth benchmarks, whose logical
+    /// history must be deterministic even though it was not produced by a real prefill.
+    fn clear_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV is not supported by this backend",
+        ))
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;

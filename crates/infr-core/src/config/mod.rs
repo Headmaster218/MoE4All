@@ -139,6 +139,9 @@ cfg_struct! {
         slots: usize = 4,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
+        /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
+        /// segmented addressing retain their existing flat allocation.
+        dynamic: bool = true,
         /// `INFR_KV_INLINE`.
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.
@@ -196,15 +199,13 @@ cfg_struct! {
         /// Alias eligible DRAM pager arenas through `VK_EXT_external_memory_host` so Vulkan can
         /// DMA promotions into VRAM. Unsupported devices transparently keep CPU ReBAR copies.
         host_dma: bool = true,
-        /// `INFR_LAYER_MAJOR`, TRI-state: `None` = decide from the placement (layer-major whenever
-        /// the model's weights STREAM, chunk-major when they are resident), `Some(true)` = force it
-        /// on, `Some(false)` = force it off.
+        /// `INFR_LAYER_MAJOR`, TRI-state syntax: `None` and `Some(false)` use the chunk-major
+        /// default; `Some(true)` forces layer-major where the backend and architecture support it.
         ///
         /// Layer-major prefill runs the chunk loop INSIDE the layer loop, so a prompt sweeps the
-        /// weight set once instead of once per `device.ubatch` chunk. That is the whole prefill
-        /// cost of a streamed model and nothing at all when the weights are resident, where it
-        /// would only add activation residency — hence the auto rule. Both overrides exist for A/B:
-        /// forcing it ON is how a resident model can be diffed against the chunk-major order.
+        /// weight set once instead of once per `device.ubatch` chunk. It is an explicit diagnostic
+        /// mode: `None` and `Some(false)` use chunk-major, while `Some(true)` enables layer-major
+        /// on a backend and architecture that can carry graph inputs between layer spans.
         layer_major: Option<bool> = None,
     }
 }

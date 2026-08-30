@@ -3330,14 +3330,34 @@ macro_rules! qsa_spv {
 qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
+qsa_spv!(qsa_indexer_compress_seg_spv, "qsa_indexer_compress_seg");
+qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
+qsa_spv!(
+    qsa_indexer_score_decode8_seg_spv,
+    "qsa_indexer_score_decode8_seg"
+);
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
 qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");
 qsa_spv!(qsa_gather_q8_spv, "qsa_gather_q8");
+qsa_spv!(qsa_gather_seg_spv, "qsa_gather_seg");
+qsa_spv!(qsa_gather_kq8_seg_spv, "qsa_gather_kq8_seg");
+qsa_spv!(qsa_gather_vq8_seg_spv, "qsa_gather_vq8_seg");
+qsa_spv!(qsa_gather_q8_seg_spv, "qsa_gather_q8_seg");
 qsa_spv!(qsa_attention_batch_spv, "qsa_attention_batch");
 qsa_spv!(qsa_attention_batch_kq8_spv, "qsa_attention_batch_kq8");
 qsa_spv!(qsa_attention_batch_vq8_spv, "qsa_attention_batch_vq8");
 qsa_spv!(qsa_attention_batch_q8_spv, "qsa_attention_batch_q8");
+qsa_spv!(qsa_attention_batch_seg_spv, "qsa_attention_batch_seg");
+qsa_spv!(
+    qsa_attention_batch_kq8_seg_spv,
+    "qsa_attention_batch_kq8_seg"
+);
+qsa_spv!(
+    qsa_attention_batch_vq8_seg_spv,
+    "qsa_attention_batch_vq8_seg"
+);
+qsa_spv!(qsa_attention_batch_q8_seg_spv, "qsa_attention_batch_q8_seg");
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {
@@ -3603,6 +3623,11 @@ macro_rules! dyn_spv {
 }
 dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
 dyn_spv!(qk_norm_rope_dyn_ff_spv, "qk_norm_rope_dyn_ff");
+dyn_spv!(qk_norm_rope_seg_spv, "qk_norm_rope_seg");
+dyn_spv!(
+    qk_norm_rope_interleaved_seg_spv,
+    "qk_norm_rope_interleaved_seg"
+);
 // Same "read a scalar from a device buffer instead of a push constant" idea, but for
 // DiffusionGemma denoise self-conditioning's softmax scale (`-DUSE_SCALE_BUF`) rather than the
 // record-once decode replay's pos/kv_len — see `Op::Softmax::scale_buf`'s doc and `Recorder::
@@ -3611,8 +3636,15 @@ dyn_spv!(softmax_dyn_spv, "softmax_dyn");
 dyn_spv!(rope_f16_spv, "rope_f16");
 dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
+dyn_spv!(store_f16_seg_spv, "store_f16_seg");
+dyn_spv!(store_f16_f16_seg_spv, "store_f16_f16_seg");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
+dyn_spv!(attn_partial_seg_spv, "attn_partial_seg");
+dyn_spv!(attn_partial_seg_nohd_spv, "attn_partial_seg_nohd");
+dyn_spv!(attn_partial_seg_kq8_spv, "attn_partial_seg_kq8");
+dyn_spv!(attn_partial_seg_vq8_spv, "attn_partial_seg_vq8");
+dyn_spv!(attn_partial_seg_q8_spv, "attn_partial_seg_q8");
 // A/B escape for the hd=256/512 attn_partial fast paths (INFR_NO_ATTN_HD=1): the same three f16
 // form-factors compiled with -DNO_HD_SPEC, so a regression on those shapes is diagnosable
 // against the general per-key loops.
@@ -3652,6 +3684,8 @@ dyn_spv!(store_q8_spv, "store_q8");
 dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
 dyn_spv!(store_q8_f16_spv, "store_q8_f16");
 dyn_spv!(store_q8_f16_dyn_spv, "store_q8_f16_dyn");
+dyn_spv!(store_q8_seg_spv, "store_q8_seg");
+dyn_spv!(store_q8_f16_seg_spv, "store_q8_f16_seg");
 // Mainline low-bit KV quants: per-format quantize (f32 V / f16 K) + dequant→f16 prefix expander.
 dyn_spv!(quant_kv_q4_0_spv, "quant_kv_q4_0");
 dyn_spv!(quant_kv_q4_0_f16_spv, "quant_kv_q4_0_f16");
@@ -4034,6 +4068,7 @@ pub(crate) fn attn_partial_ml_kernel(
     }
 }
 dyn_spv!(dequant_q8_f16_spv, "dequant_q8_f16");
+dyn_spv!(dequant_q8_f16_seg_spv, "dequant_q8_f16_seg");
 /// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
 /// kv_len; workgroups past the live range early-exit with a zero-weight header).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

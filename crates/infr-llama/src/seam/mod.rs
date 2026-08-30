@@ -21,6 +21,7 @@ pub mod model;
 mod ple;
 mod runner;
 mod sc;
+mod segmented_kv;
 mod weights;
 
 pub(crate) use runner::generate_dense_backend;
@@ -840,6 +841,61 @@ pub(crate) fn dense_act_reserve_at(
     })
 }
 
+/// F16 expansion buffers held by Vulkan while a batched attention op reads a Q8_0 KV cache.
+///
+/// The adapter pools these as `(tag, bytes)` under separate `kvdeq_k` and `kvdeq_v` tags. A model
+/// with one attention geometry therefore keeps one buffer per Q8 side; mixed layer geometries keep
+/// one per distinct byte size. Mirror that exact lifetime here instead of charging once per layer.
+fn q8_prefill_scratch_bytes(
+    cfg: &Config,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    if ubatch.min(want_ctx) <= 1 {
+        return 0;
+    }
+
+    let mut k_sizes = std::collections::BTreeSet::new();
+    let mut v_sizes = std::collections::BTreeSet::new();
+    for l in 0..cfg.n_layer {
+        if cfg.is_mla_layer(l) || cfg.is_recurrent_layer(l) {
+            continue;
+        }
+        let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) as u64;
+        let (k_row, v_row) = kv_row_elems(cfg, l);
+        if k_fmt == DType::Q8_0 {
+            k_sizes.insert(rows.saturating_mul(k_row as u64).saturating_mul(2));
+        }
+        if v_fmt == DType::Q8_0 {
+            v_sizes.insert(rows.saturating_mul(v_row as u64).saturating_mul(2));
+        }
+    }
+
+    k_sizes
+        .into_iter()
+        .chain(v_sizes)
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Runtime workspace priced by placement and checked against Vulkan's measured activation peak.
+/// This includes the graph's ordinary activation pools plus format-specific KV read scratch.
+pub(crate) fn runtime_reserve_at(
+    cfg: &Config,
+    caps: &Capabilities,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    dense_act_reserve_at(cfg, caps, want_ctx, ubatch).saturating_add(q8_prefill_scratch_bytes(
+        cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
+    ))
+}
+
 /// Number of ubatches in one Qwen3.8 layer-major prefill group. Eight leaves enough same-layer
 /// work to amortize/pipeline expert staging without retaining a long prompt's four residual
 /// streams all at once.
@@ -882,25 +938,21 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 /// L+1 — instead of running the whole model per chunk?
 ///
 /// The two orders compute the same thing; they differ in what they re-read. Chunk-major sweeps the
-/// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
-/// prefill cost when they stream: measured on Qwen3-14B Q8_0 at ctx 4096, the 1024-row default read
-/// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
-/// one sweep regardless of chunk count, at the cost of holding residual streams across layer
-/// boundaries ([`layer_major_act_bytes`]). Qwen3.8 bounds that lifetime to fixed groups; ordinary
-/// streaming models retain the whole prompt. The trade pays when there is I/O to save, hence the
-/// default of "on exactly when the weights stream".
+/// entire weight set once PER CHUNK. Layer-major can reduce those reads, at the cost of retaining
+/// residual streams and introducing one execute boundary per layer/chunk pair
+/// ([`layer_major_act_bytes`]). That trade helped one streamed dense model, but regressed paged
+/// Qwen3.8 prefill by more than an order of magnitude, so chunk-major is the default everywhere.
 ///
-/// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
-/// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
-/// next, which is what threads the residual stream between two layers' dispatches, and an
-/// architecture whose layer stack can be entered past layer 0 at all (`spannable`).
+/// `paging.layer_major = true` is the only way onto this diagnostic path. It needs a backend that
+/// carries a bound `Input` from one execute to the next, which is what threads the residual stream
+/// between two layers' dispatches, and an architecture whose layer stack can be entered past layer
+/// 0 at all (`spannable`).
 pub(crate) fn layer_major_prefill(
     ec: &EngineConfig,
     caps: &infr_core::backend::Capabilities,
-    streaming: bool,
     spannable: bool,
 ) -> bool {
-    let want = ec.paging.layer_major.unwrap_or(streaming);
+    let want = ec.paging.layer_major == Some(true);
     if want && !spannable {
         // gemma4-E2B: its layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a
         // span starting past layer 0 would read an unbound tensor. This is the gate for it — the
@@ -1233,6 +1285,13 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
     !ec.kv.type_k_specified && !ec.kv.type_v_specified && !ec.kv.force_q8
 }
 
+/// The automatic Vulkan KV format when the user did not choose one explicitly. Keep this out of
+/// [`EngineConfig`]'s generic defaults: CPU/Metal sessions retain their backend-specific behavior,
+/// while every Vulkan placement estimate and allocation can ask the same model-layout gate.
+pub(crate) fn kv_default_q8(cfg: &Config, ec: &EngineConfig) -> bool {
+    kv_unset(ec) && kv_q8_layout_ok(cfg)
+}
+
 /// Per-token (K, V) ELEMENT counts for layer `l` — the one answer to "how wide is a row of this
 /// layer's KV cache", shared by the runner's allocation, the graph declaration, the fork/seed
 /// copies and every footprint estimate. Multiply by a row count for a whole cache side.
@@ -1371,7 +1430,9 @@ fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<D
         return match requested {
             Some(DType::Q8_0) if block_aligned => DType::Q8_0,
             Some(DType::F16) => DType::F16,
-            _ if (ec.kv.force_q8 || kv_auto_q8()) && block_aligned => DType::Q8_0,
+            _ if (ec.kv.force_q8 || kv_auto_q8() || kv_default_q8(cfg, ec)) && block_aligned => {
+                DType::Q8_0
+            }
             _ => DType::F16,
         };
     }
@@ -1385,7 +1446,9 @@ fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<D
             dt
         }
         Some(dt @ (DType::F16 | DType::Bf16 | DType::F32)) => dt,
-        _ if (ec.kv.force_q8 || kv_auto_q8()) && block_aligned => DType::Q8_0,
+        _ if (ec.kv.force_q8 || kv_auto_q8() || kv_default_q8(cfg, ec)) && block_aligned => {
+            DType::Q8_0
+        }
         _ => DType::F16,
     }
 }
@@ -1730,8 +1793,9 @@ pub fn estimate_kv_bytes(
 ///     never learned the ring split — they keep full-context caches, documented scope gate);
 ///   - `kv.ring = false` (`INFR_NO_KV_RING=1`, A/B and escape hatch).
 pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
-    // Not-supplied = the f16 default = ring-capable; otherwise the requested format must PARSE to
-    // f16 or q8 (a name the runner would not recognize either is not ring-capable — the
+    // Not supplied is ring-capable under either automatic Vulkan Q8 or another backend's F16
+    // default; otherwise the requested format must PARSE to f16 or q8 (a name the runner would
+    // not recognize either is not ring-capable — the
     // `specified && dtype.is_none()` case, §11 decision 8). The dtype comes from the ONE shared
     // spelling table (`budget::parse_kv_dtype`, now applied in the config's env layer), so adding
     // an alias cannot make this gate and the runner disagree.
@@ -1785,6 +1849,24 @@ pub(crate) fn placement_ring(cfg: &Config, ec: &EngineConfig, k_fmt: DType, v_fm
         && matches!(v_fmt, DType::F16 | DType::Q8_0)
 }
 
+/// Whether this session requests the segmented Qwen KV layout. The implementation currently
+/// relies on Q8_0's compact fixed-size segments; explicit F16 or a mixed pair keeps the established
+/// flat allocation path until segmented F16 has its own performance and allocation contract.
+pub(crate) fn segmented_kv_wanted(
+    cfg: &Config,
+    ec: &EngineConfig,
+    ring: bool,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> bool {
+    ec.kv.dynamic
+        && (cfg.qwen35 || cfg.qwen4exp)
+        && !ring
+        && !ec.kv.overflow
+        && k_fmt == DType::Q8_0
+        && v_fmt == DType::Q8_0
+}
+
 /// Bytes a FULLY-RESIDENT dense session needs at one EXPLICIT prefill chunk height and KV format
 /// pair: weights + the exact KV allocation ([`kv_bytes_estimate_fmt`]) + the activation reserve
 /// ([`dense_act_reserve_at`]). The arithmetic both the fit math and the placement sweep compare
@@ -1803,7 +1885,9 @@ pub(crate) fn dense_resident_need(
         .saturating_add(kv_bytes_estimate_fmt(
             cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
         ))
-        .saturating_add(dense_act_reserve_at(cfg, caps, want_ctx, ubatch))
+        .saturating_add(runtime_reserve_at(
+            cfg, caps, want_ctx, ring, ubatch, k_fmt, v_fmt,
+        ))
 }
 
 /// Does a fully-resident dense session at this chunk height fit the ALLOCATOR's ceiling?
@@ -1824,10 +1908,8 @@ pub(crate) fn dense_placement_fits(
     v_fmt: DType,
 ) -> bool {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    // A RESIDENT session prefills chunk-major unless the user forced the other order, so the
-    // whole-prompt residual stream is priced only for the forced case. `Some(true)` is the sole
-    // value that reaches here as layer-major: unset means "on iff streaming", and a session that
-    // fits does not stream.
+    // Every session prefills chunk-major unless the user forces the other order, so the
+    // whole-prompt residual stream is priced only for the explicit `Some(true)` case.
     let lm = if ec.paging.layer_major == Some(true) {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
     } else {
@@ -1871,13 +1953,12 @@ pub(crate) fn dense_stream_budget_at(
     v_fmt: DType,
 ) -> u64 {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    // A streamed session prefills LAYER-MAJOR by default, which holds every chunk's residual
-    // stream at once — those bytes come out of the same VRAM the arenas want, and they are
-    // allocated later, so the arena has to leave room for them (see `layer_major_act_bytes`).
-    let lm = if ec.paging.layer_major == Some(false) {
-        0
-    } else {
+    // Chunk-major is the default for streamed sessions too. Only an explicit layer-major request
+    // holds residual streams across layers, so only that mode reserves the extra bytes.
+    let lm = if ec.paging.layer_major == Some(true) {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
+    } else {
+        0
     };
     planned_vram_room(vram, ec)
         .saturating_sub(dense_resident_need(
@@ -1902,6 +1983,9 @@ pub struct ModelMemoryPlan {
     pub fixed_weight_bytes: u64,
     pub persistent_state_bytes: u64,
     pub runtime_reserve_bytes: u64,
+    /// Maximum lazily committed per-token state. It shares the unified arena with experts and
+    /// runtime scratch, but remains separately named so diagnostics never call KV "runtime".
+    pub dynamic_state_reserve_bytes: u64,
     pub weight_packing_margin_bytes: u64,
     pub load_driver_reserve_bytes: u64,
     pub post_load_reserve_bytes: u64,
@@ -1951,18 +2035,43 @@ impl ModelMemoryPlan {
         load_driver_reserve_bytes: u64,
         post_load_reserve_bytes: u64,
     ) -> Option<Self> {
+        Self::new_with_dynamic_reserve(
+            total_room_bytes,
+            fixed_weight_bytes,
+            persistent_state_bytes,
+            runtime_reserve_bytes,
+            0,
+            weight_packing_margin_bytes,
+            load_driver_reserve_bytes,
+            post_load_reserve_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dynamic_reserve(
+        total_room_bytes: u64,
+        fixed_weight_bytes: u64,
+        persistent_state_bytes: u64,
+        runtime_reserve_bytes: u64,
+        dynamic_state_reserve_bytes: u64,
+        weight_packing_margin_bytes: u64,
+        load_driver_reserve_bytes: u64,
+        post_load_reserve_bytes: u64,
+    ) -> Option<Self> {
         let persistent = fixed_weight_bytes.saturating_add(persistent_state_bytes);
         (persistent <= total_room_bytes).then(|| Self {
             total_room_bytes,
             fixed_weight_bytes,
             persistent_state_bytes,
             runtime_reserve_bytes,
+            dynamic_state_reserve_bytes,
             weight_packing_margin_bytes,
             load_driver_reserve_bytes,
             post_load_reserve_bytes,
             expert_cache_bytes: total_room_bytes
                 .saturating_sub(persistent)
                 .saturating_sub(runtime_reserve_bytes)
+                .saturating_sub(dynamic_state_reserve_bytes)
                 .saturating_sub(weight_packing_margin_bytes)
                 .saturating_sub(load_driver_reserve_bytes)
                 .saturating_sub(post_load_reserve_bytes),
@@ -1973,6 +2082,7 @@ impl ModelMemoryPlan {
         self.fixed_weight_bytes
             .saturating_add(self.persistent_state_bytes)
             .saturating_add(self.runtime_reserve_bytes)
+            .saturating_add(self.dynamic_state_reserve_bytes)
             .saturating_add(self.weight_packing_margin_bytes)
             .saturating_add(self.load_driver_reserve_bytes)
             .saturating_add(self.post_load_reserve_bytes)
@@ -1982,7 +2092,12 @@ impl ModelMemoryPlan {
     /// the target Expert occupancy, then added back here because it borrows the same bytes only
     /// while a graph is active instead of living in a separate permanently idle reservation.
     pub fn elastic_pool_bytes(self, expert_cache_target_bytes: u64) -> u64 {
-        expert_cache_target_bytes.saturating_add(self.runtime_reserve_bytes)
+        expert_cache_target_bytes.saturating_add(self.elastic_reserve_bytes())
+    }
+
+    pub fn elastic_reserve_bytes(self) -> u64 {
+        self.runtime_reserve_bytes
+            .saturating_add(self.dynamic_state_reserve_bytes)
     }
 }
 
@@ -2072,9 +2187,23 @@ fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
 }
 
 /// Conservative load-time runtime reserve for control planes that do not own a live backend yet.
-/// Placement calls the same activation formula with the selected device's real capabilities.
+/// Placement calls the same formula with the selected device's real capabilities. These helpers
+/// describe the automatic Vulkan format: Q8_0 on a compatible layout, otherwise F16.
 pub fn estimate_runtime_reserve_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
-    dense_act_reserve_at(cfg, &Capabilities::default(), want_ctx, ubatch)
+    let fmt = if kv_q8_layout_ok(cfg) {
+        DType::Q8_0
+    } else {
+        DType::F16
+    };
+    runtime_reserve_at(
+        cfg,
+        &Capabilities::default(),
+        want_ctx,
+        false,
+        ubatch,
+        fmt,
+        fmt,
+    )
 }
 
 /// Device-aware form of [`estimate_runtime_reserve_bytes`] for control planes that have probed
@@ -2091,7 +2220,12 @@ pub fn estimate_runtime_reserve_bytes_for_device(
         caps.coopmat_f16 = Some(infr_core::COOPMAT_TILE_16);
         caps.max_shared_memory_bytes = infr_vulkan::FLASH_HD256_BM16_SHARED;
     }
-    dense_act_reserve_at(cfg, &caps, want_ctx, ubatch)
+    let fmt = if kv_q8_layout_ok(cfg) {
+        DType::Q8_0
+    } else {
+        DType::F16
+    };
+    runtime_reserve_at(cfg, &caps, want_ctx, false, ubatch, fmt, fmt)
 }
 
 fn moe_expert_layer(name: &str) -> Option<usize> {
@@ -2380,7 +2514,7 @@ fn kv_fit_ctx_in_budgets(
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
             let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
-            let reserve = dense_act_reserve_at(cfg, caps, ctx, ubatch);
+            let reserve = runtime_reserve_at(cfg, caps, ctx, ring, ubatch, k_fmt, v_fmt);
             elastic_activation_budget.map_or_else(
                 || kv.saturating_add(reserve.max(minimum_elastic_bytes)) <= persistent_budget,
                 |activation_budget| {
@@ -2537,7 +2671,9 @@ pub(crate) fn reclamp_ctx_to_live_room(
          memory; set INFR_CTX to override",
         gib(room),
         gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)),
-        gib(dense_act_reserve_at(cfg, &caps, fit, ubatch)),
+        gib(runtime_reserve_at(
+            cfg, &caps, fit, ring, ubatch, k_fmt, v_fmt,
+        )),
         gib(POST_KV_DEVICE_RESERVE),
     );
     fit
@@ -2694,6 +2830,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let ring = kv_ring_wanted(cfg, ec);
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
+        let dynamic_layout = segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt).then(|| {
+            segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
+                .expect("Qwen hybrid models have segmented KV geometry")
+        });
+        let dynamic_kv_reserve = dynamic_layout
+            .as_ref()
+            .map(|layout| layout.committed_bytes(want_ctx))
+            .unwrap_or(0);
         let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
             (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
             (DType::F16, DType::F16) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, false),
@@ -2702,18 +2846,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let initial_ubatch = ubatch_rows(ec);
         let mut selected_ubatch = initial_ubatch;
         let kv_bytes = kv_bytes_at(selected_ubatch);
+        let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
         // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
         // borrows only cold Decode arena ranges and returns them on `enter_decode`.
-        let runtime_reserve = dense_act_reserve_at(cfg, &caps, want_ctx, selected_ubatch);
+        let runtime_reserve =
+            runtime_reserve_at(cfg, &caps, want_ctx, ring, selected_ubatch, k_fmt, v_fmt);
         let packing_margin = resident_weight_packing_margin(fp.dense);
         let load_driver_reserve = session_load_driver_reserve(cfg, ec);
-        let Some(mut plan) = ModelMemoryPlan::new_with_reserves(
+        let Some(mut plan) = ModelMemoryPlan::new_with_dynamic_reserve(
             room,
             fp.dense,
-            kv_bytes,
+            persistent_state,
             runtime_reserve,
+            dynamic_kv_reserve,
             packing_margin,
             load_driver_reserve,
             POST_KV_DEVICE_RESERVE,
@@ -2739,12 +2886,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
             for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
                 let candidate_kv = kv_bytes_at(candidate);
-                let candidate_runtime = dense_act_reserve_at(cfg, &caps, want_ctx, candidate);
-                let Some(candidate_plan) = ModelMemoryPlan::new_with_reserves(
+                let candidate_persistent = candidate_kv.saturating_sub(dynamic_kv_reserve);
+                let candidate_runtime =
+                    runtime_reserve_at(cfg, &caps, want_ctx, ring, candidate, k_fmt, v_fmt);
+                let Some(candidate_plan) = ModelMemoryPlan::new_with_dynamic_reserve(
                     room,
                     fp.dense,
-                    candidate_kv,
+                    candidate_persistent,
                     candidate_runtime,
+                    dynamic_kv_reserve,
                     packing_margin,
                     load_driver_reserve,
                     POST_KV_DEVICE_RESERVE,
@@ -2818,17 +2968,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
+        } else if dynamic_kv_reserve > 0 {
+            format!("dynamic-32k k={k_fmt:?}, v={v_fmt:?}")
         } else {
             format!("k={k_fmt:?}, v={v_fmt:?}")
         };
         tracing::info!(
             "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime_elastic={:.2} GB \
+             dynamic_state_elastic={:.2} GB \
              packing_margin={:.2} GB load_driver={:.2} GB post_load={:.2} GB \
              expert_cache_target={:.2} GB elastic_pool={:.2} GB ({cache_layout}, ctx={want_ctx})",
             room as f64 / 1e9,
             plan.fixed_weight_bytes as f64 / 1e9,
             plan.persistent_state_bytes as f64 / 1e9,
             plan.runtime_reserve_bytes as f64 / 1e9,
+            plan.dynamic_state_reserve_bytes as f64 / 1e9,
             plan.weight_packing_margin_bytes as f64 / 1e9,
             plan.load_driver_reserve_bytes as f64 / 1e9,
             plan.post_load_reserve_bytes as f64 / 1e9,
@@ -3001,10 +3155,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
             let prefill_floor = pager_prefill_floor_bytes;
             let planned_pager_budget = pager_budget_bytes;
-            let minimum_pager_budget = plan.runtime_reserve_bytes.saturating_add(prefill_floor);
+            let elastic_reserve = plan.elastic_reserve_bytes();
+            let minimum_pager_budget = elastic_reserve.saturating_add(prefill_floor);
             let required_after_arena = plan
                 .minimum_required_bytes()
-                .saturating_sub(plan.runtime_reserve_bytes);
+                .saturating_sub(elastic_reserve);
             let adaptive_arena = cache_override.is_none();
             let mut candidate_budget = pager_budget_bytes;
             let mut attempts = 0usize;
@@ -3023,12 +3178,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     ));
                 };
                 let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
-                if physical_bytes.saturating_sub(plan.runtime_reserve_bytes) < prefill_floor {
+                if physical_bytes.saturating_sub(elastic_reserve) < prefill_floor {
                     return Err(anyhow!(
                         "MoE mapped arena cannot retain one complete Prefill layer after its \
                          runtime reserve (arena {:.2} MiB, runtime {:.2} MiB, layer {:.2} MiB)",
                         physical_bytes as f64 / 2f64.powi(20),
-                        plan.runtime_reserve_bytes as f64 / 2f64.powi(20),
+                        elastic_reserve as f64 / 2f64.powi(20),
                         prefill_floor as f64 / 2f64.powi(20),
                     ));
                 }
@@ -3045,7 +3200,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         if live_room >= required_after_arena {
                             pager_budget_bytes = physical_bytes;
                             expert_cache_target_bytes = expert_cache_target_bytes
-                                .min(physical_bytes.saturating_sub(plan.runtime_reserve_bytes));
+                                .min(physical_bytes.saturating_sub(elastic_reserve));
                             if attempts > 1 {
                                 tracing::warn!(
                                     planned_bytes = planned_pager_budget,
@@ -3355,14 +3510,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // KV small enough to take the try-resident tier at real contexts instead of streaming.
         let configured_k = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let configured_v = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
-        let has_explicit_kv = ec.kv.type_k.is_some() || ec.kv.type_v.is_some() || ec.kv.force_q8;
         let kv_fmts = |try_auto_q8: bool| {
             if try_auto_q8 {
                 (DType::Q8_0, DType::Q8_0)
-            } else if has_explicit_kv {
-                (configured_k, configured_v)
             } else {
-                (DType::F16, DType::F16)
+                (configured_k, configured_v)
             }
         };
         // Does weights + KV + the honest activation reserve fit at this (chunk, fmt)? Through the
@@ -3434,6 +3586,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if !resident
             && cache_override.is_none()
             && !kv_auto_q8()
+            && !kv_default_q8(cfg, ec)
             && kv_unset(ec)
             && kv_q8_layout_ok(cfg)
         {
@@ -5217,6 +5370,125 @@ mod seam_helper_tests {
     }
 
     #[test]
+    fn vulkan_default_kv_is_q8_only_when_unset_and_compatible() {
+        let cfg = qwen3_14b();
+        let unset = EngineConfig::default();
+        assert!(super::kv_default_q8(&cfg, &unset));
+        assert_eq!(
+            super::vulkan_kv_fmt_for_budget(&cfg, &unset, None),
+            DType::Q8_0
+        );
+
+        let explicit_f16 = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: Some(DType::F16),
+                type_k_specified: true,
+                type_v: Some(DType::F16),
+                type_v_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!super::kv_default_q8(&cfg, &explicit_f16));
+        assert_eq!(
+            super::vulkan_kv_fmt_for_budget(&cfg, &explicit_f16, Some(DType::F16)),
+            DType::F16
+        );
+
+        let mla = deepseek_v2_lite_kv();
+        assert!(!super::kv_default_q8(&mla, &unset));
+        assert_eq!(
+            super::vulkan_kv_fmt_for_budget(&mla, &unset, None),
+            DType::F16
+        );
+    }
+
+    #[test]
+    fn segmented_kv_requires_q8_on_both_sides() {
+        let cfg = Config {
+            qwen35: true,
+            n_layer: 1,
+            n_kv: 2,
+            head_dim: 128,
+            full_attn_interval: 1,
+            ..Default::default()
+        };
+        let mut ec = EngineConfig::default();
+        ec.kv.dynamic = true;
+        assert!(super::segmented_kv_wanted(
+            &cfg,
+            &ec,
+            false,
+            DType::Q8_0,
+            DType::Q8_0
+        ));
+        assert!(!super::segmented_kv_wanted(
+            &cfg,
+            &ec,
+            false,
+            DType::F16,
+            DType::F16
+        ));
+        assert!(!super::segmented_kv_wanted(
+            &cfg,
+            &ec,
+            false,
+            DType::Q8_0,
+            DType::F16
+        ));
+
+        ec.kv.dynamic = false;
+        assert!(!super::segmented_kv_wanted(
+            &cfg,
+            &ec,
+            false,
+            DType::Q8_0,
+            DType::Q8_0
+        ));
+        ec.kv.dynamic = true;
+        ec.kv.overflow = true;
+        assert!(!super::segmented_kv_wanted(
+            &cfg,
+            &ec,
+            false,
+            DType::Q8_0,
+            DType::Q8_0
+        ));
+        ec.kv.overflow = false;
+        assert!(!super::segmented_kv_wanted(
+            &cfg,
+            &ec,
+            true,
+            DType::Q8_0,
+            DType::Q8_0
+        ));
+    }
+
+    #[test]
+    fn q8_runtime_reserve_includes_pooled_f16_kv_expansion() {
+        let cfg = qwen3_14b();
+        let (ctx, ubatch) = (250_000usize, 1024usize);
+        let caps = conservative_caps();
+        let f16 =
+            super::runtime_reserve_at(&cfg, &caps, ctx, false, ubatch, DType::F16, DType::F16);
+        let q8 =
+            super::runtime_reserve_at(&cfg, &caps, ctx, false, ubatch, DType::Q8_0, DType::Q8_0);
+        let one_side = ctx as u64 * (cfg.n_kv * cfg.head_dim) as u64 * 2;
+        assert_eq!(q8 - f16, 2 * one_side);
+        assert!(
+            super::runtime_reserve_at(
+                &cfg,
+                &caps,
+                ctx / 2,
+                false,
+                ubatch,
+                DType::Q8_0,
+                DType::Q8_0,
+            ) < q8
+        );
+    }
+
+    #[test]
     fn kv_side_bytes_prices_each_side_in_its_own_dtype() {
         // q8 prices K+V at ~half the f16 bytes (34 B / 32-elem block vs 2 B/elem, ×2 sides).
         let elems = 32_000usize;
@@ -5494,6 +5766,41 @@ mod seam_helper_tests {
             (expected - super::QWEN4_PREFILL_GROUP_PAD) / 2 + super::QWEN4_PREFILL_GROUP_PAD,
             "short prompts reserve only their live rows"
         );
+    }
+
+    #[test]
+    fn layer_major_prefill_is_explicit_only() {
+        let caps = Capabilities {
+            graph_input_inplace: true,
+            ..Default::default()
+        };
+        let default_cfg = EngineConfig::default();
+        assert!(
+            !super::layer_major_prefill(&default_cfg, &caps, true),
+            "an unset setting must keep the chunk-major production order"
+        );
+
+        let enabled = EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(super::layer_major_prefill(&enabled, &caps, true));
+        assert!(
+            !super::layer_major_prefill(&enabled, &caps, false),
+            "an architecture that cannot split its stack stays chunk-major"
+        );
+
+        let disabled = EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!super::layer_major_prefill(&disabled, &caps, true));
     }
 
     fn deepseek4_cache_config() -> Config {
@@ -5785,7 +6092,7 @@ mod seam_helper_tests {
         let need = |ctx: usize, ub: usize| {
             weights
                 + super::kv_bytes_estimate_fmt(cfg, ctx, ring, ub, k, v)
-                + super::dense_act_reserve_at(cfg, &conservative_caps(), ctx, ub)
+                + super::runtime_reserve_at(cfg, &conservative_caps(), ctx, ring, ub, k, v)
         };
         let cands = super::ubatch_candidates(ec);
         let best = |ctx: usize| cands.iter().map(|&ub| need(ctx, ub)).min().expect("ladder");
@@ -6062,13 +6369,31 @@ mod seam_helper_tests {
         let (ctx, ubatch) = (200_000usize, 1024usize);
         let conservative = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
         let flash = super::dense_act_reserve_at(&cfg, &hd256_flash_caps(), ctx, ubatch);
+        let automatic_conservative = super::runtime_reserve_at(
+            &cfg,
+            &conservative_caps(),
+            ctx,
+            false,
+            ubatch,
+            DType::Q8_0,
+            DType::Q8_0,
+        );
+        let automatic_flash = super::runtime_reserve_at(
+            &cfg,
+            &hd256_flash_caps(),
+            ctx,
+            false,
+            ubatch,
+            DType::Q8_0,
+            DType::Q8_0,
+        );
         assert_eq!(
             super::estimate_runtime_reserve_bytes_for_device(&cfg, ctx, ubatch, false),
-            conservative,
+            automatic_conservative,
         );
         assert_eq!(
             super::estimate_runtime_reserve_bytes_for_device(&cfg, ctx, ubatch, true),
-            flash,
+            automatic_flash,
         );
         let rows = ubatch as u64;
         let score_per_row = (2 * cfg.n_head * ctx.next_multiple_of(256)) as u64;
@@ -6227,8 +6552,7 @@ mod seam_helper_tests {
         );
 
         // Streaming budget: exhausted at the ceiling, and it never offers the guard's headroom.
-        // A streamed session also prefills layer-major, whose whole-prompt residual stream is
-        // allocated AFTER the arenas out of the same VRAM — so the budget holds that back too.
+        // Chunk-major is the default and needs no cross-layer residual reservation.
         let lm = super::layer_major_act_bytes(&cfg, ctx, ub);
         assert!(
             lm > 0,
@@ -6254,14 +6578,13 @@ mod seam_helper_tests {
         );
         assert_eq!(
             budget(exact - (1 << 30)),
-            (1 << 30) - lm,
-            "and it is exactly the room below the ceiling less the residual stream, not the free \
-             figure"
+            1 << 30,
+            "the default chunk-major order keeps the whole room below the ceiling"
         );
-        // Forcing chunk-major back on gives those bytes to the arena, which is the knob's point.
-        let chunk_major = EngineConfig {
+        // Explicit layer-major is the only mode that holds the cross-layer residual stream back.
+        let layer_major = EngineConfig {
             paging: infr_core::config::PagingCfg {
-                layer_major: Some(false),
+                layer_major: Some(true),
                 ..ec.paging.clone()
             },
             ..ec.clone()
@@ -6270,7 +6593,7 @@ mod seam_helper_tests {
             super::dense_stream_budget_at(
                 &cfg,
                 &conservative_caps(),
-                &chunk_major,
+                &layer_major,
                 exact - (1 << 30),
                 &vram,
                 ctx,
@@ -6278,8 +6601,8 @@ mod seam_helper_tests {
                 f16.0,
                 f16.1
             ),
-            1 << 30,
-            "paging.layer_major = false takes the residual-stream reserve back off the budget"
+            (1 << 30) - lm,
+            "paging.layer_major = true reserves the residual stream explicitly"
         );
 
         // MoE expert placement: same ceiling, minus the model/shape-derived phase workspace.
@@ -6311,7 +6634,7 @@ mod seam_helper_tests {
             20 * GIB,
             4 * GIB,
             2 * GIB,
-            1 * GIB,
+            GIB,
             512 * MIB,
             0,
             256 * MIB,
@@ -6339,7 +6662,7 @@ mod seam_helper_tests {
             20 * GIB,
             4 * GIB,
             2 * GIB,
-            1 * GIB,
+            GIB,
             512 * MIB,
             1536 * MIB,
             256 * MIB,
@@ -6350,16 +6673,14 @@ mod seam_helper_tests {
 
         let mut cfg = Config::default();
         assert_eq!(super::load_driver_reserve(&cfg), 0);
-        let estimated =
-            super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, 1 * GIB)
-                .expect("control-plane estimate");
+        let estimated = super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, GIB)
+            .expect("control-plane estimate");
         assert_eq!(estimated.weight_packing_margin_bytes, 256 * MIB);
         assert_eq!(estimated.post_load_reserve_bytes, 256 * MIB);
         cfg.deepseek4 = true;
         assert_eq!(super::load_driver_reserve(&cfg), 1536 * MIB);
-        let estimated =
-            super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, 1 * GIB)
-                .expect("DeepSeek control-plane estimate");
+        let estimated = super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, GIB)
+            .expect("DeepSeek control-plane estimate");
         assert_eq!(estimated.load_driver_reserve_bytes, 1536 * MIB);
 
         cfg.deepseek4 = false;
@@ -6402,6 +6723,36 @@ mod seam_helper_tests {
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &explicit),
             if cfg!(windows) { 2 * GIB } else { 0 }
+        );
+    }
+
+    #[test]
+    fn dynamic_kv_reserve_borrows_the_expert_arena_without_double_counting() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let plan = super::ModelMemoryPlan::new_with_dynamic_reserve(
+            24 * GIB,
+            5 * GIB,
+            GIB,
+            2 * GIB,
+            4 * GIB,
+            GIB,
+            0,
+            GIB,
+        )
+        .expect("dynamic KV plan");
+
+        assert_eq!(plan.expert_cache_bytes, 10 * GIB);
+        assert_eq!(plan.minimum_required_bytes(), 14 * GIB);
+        assert_eq!(plan.elastic_reserve_bytes(), 6 * GIB);
+        assert_eq!(plan.elastic_pool_bytes(plan.expert_cache_bytes), 16 * GIB);
+        assert_eq!(
+            plan.fixed_weight_bytes
+                + plan.persistent_state_bytes
+                + plan.weight_packing_margin_bytes
+                + plan.post_load_reserve_bytes
+                + plan.elastic_pool_bytes(plan.expert_cache_bytes),
+            plan.total_room_bytes,
+            "runtime and maximum KV return to the shared arena exactly once"
         );
     }
 

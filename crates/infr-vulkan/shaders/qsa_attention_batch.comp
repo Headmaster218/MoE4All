@@ -1,4 +1,9 @@
 #version 460
+#ifdef KV_SEGMENTED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 // Correctness-first batched Qwen3.8 QSA attention. One workgroup owns one (query row, attention
 // head), reads that row's selected complete blocks directly from F16 or planar-Q8 KV caches,
 // appends its incomplete causal tail, and performs an exact two-pass softmax. Each lane owns one
@@ -16,10 +21,17 @@ layout(push_constant) uniform PC {
     float scale;
     uint kcap;
     uint vcap;
+    uint segment_shift;
 } pc;
 layout(binding = 0) readonly buffer QB { uint q[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
+layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
+#include "kv_addr.glsl"
+#else
 layout(binding = 1) readonly buffer KB { uint k[]; };
 layout(binding = 2) readonly buffer VB { uint v[]; };
+#endif
 layout(binding = 3) readonly buffer IB { uint indices[]; };
 layout(binding = 4) writeonly buffer DB { float dst[]; };
 
@@ -35,6 +47,22 @@ float qread(uint i) {
 }
 
 float kread(uint i) {
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.segment_shift);
+    uint64_t base = kv_segment_base(k_segments[kv_segment(i, pc.segment_shift)]);
+#ifdef KQ8
+    int codes = int(kv_word(base, local >> 2u));
+    int code = bitfieldExtract(codes, int((local & 3u) * 8u), 8);
+    uint block = local >> 5u;
+    uint segment_elems = 1u << pc.segment_shift;
+    float scale = unpackHalf2x16(
+        kv_word(base, (segment_elems >> 2u) + (block >> 1u))
+    )[block & 1u];
+    return scale * float(code);
+#else
+    return kv_half(base, local);
+#endif
+#else
 #ifdef KQ8
     int codes = int(k[i >> 2u]);
     int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
@@ -46,9 +74,26 @@ float kread(uint i) {
     uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
     return unpackHalf2x16(h).x;
 #endif
+#endif
 }
 
 float vread(uint i) {
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.segment_shift);
+    uint64_t base = kv_segment_base(v_segments[kv_segment(i, pc.segment_shift)]);
+#ifdef VQ8
+    int codes = int(kv_word(base, local >> 2u));
+    int code = bitfieldExtract(codes, int((local & 3u) * 8u), 8);
+    uint block = local >> 5u;
+    uint segment_elems = 1u << pc.segment_shift;
+    float scale = unpackHalf2x16(
+        kv_word(base, (segment_elems >> 2u) + (block >> 1u))
+    )[block & 1u];
+    return scale * float(code);
+#else
+    return kv_half(base, local);
+#endif
+#else
 #ifdef VQ8
     int codes = int(v[i >> 2u]);
     int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
@@ -59,6 +104,7 @@ float vread(uint i) {
     uint w = v[i >> 1u];
     uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
     return unpackHalf2x16(h).x;
+#endif
 #endif
 }
 

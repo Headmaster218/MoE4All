@@ -32,12 +32,27 @@ uint64_t v_addr = 0ul; // V cache base byte address (set once in main from v_lo/
 
 uint64_t kv_base(uint lo, uint hi) { return (uint64_t(hi) << 32) | uint64_t(lo); }
 
+#ifdef KV_SEGMENTED
+// A segmented cache binds a tiny uvec2 address table in the descriptor slot formerly occupied by
+// the flat cache. `shift` is log2(logical elements per segment), so lookup is two integer ops and
+// one uniform table load; the physical segment itself is still read through the established BDA
+// helpers below. Qwen's 32K-row geometry guarantees a power-of-two element count per segment.
+uint kv_segment(uint elem, uint shift) { return elem >> shift; }
+uint kv_segment_local(uint elem, uint shift) { return elem & ((1u << shift) - 1u); }
+uint64_t kv_segment_base(uvec2 address) { return kv_base(address.x, address.y); }
+#endif
+
 // ── Scalar reads (used by attention_kv this slice) ─────────────────────────────────────────────
 // One f16 element `i` off `base` (the f16 KV cache read: `float(k[i])` / `float(v[i])`). Byte
 // offset `i<<1` is built in u32 and added before the cast; deref index is the constant 0 → saddr.
 layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer KvHalf { float16_t v[]; };
 float kv_half(uint64_t base, uint i) {
     return float(KvHalf(base + uint64_t(i << 1u)).v[0]);
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer KvF32 { float v[]; };
+float kv_f32(uint64_t base, uint i) {
+    return KvF32(base + uint64_t(i << 2u)).v[0];
 }
 
 // ── Cooperative-matrix tensor base (coopmat flash prefill, #74 slice 4 resurrection) ────────────

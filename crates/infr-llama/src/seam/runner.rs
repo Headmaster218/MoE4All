@@ -5,10 +5,12 @@
 use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
+use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::weights::{
-    AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW,
-    KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QsaW, QwenHcW, QwenLayerHcW, QwenPleW,
-    SeamKv, SeamWeights, SessionStable, TurnRecurrentCkpt,
+    alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
+    FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QsaW, QwenHcW,
+    QwenLayerHcW, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
+    TurnRecurrentCkpt,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
@@ -339,10 +341,6 @@ fn session_stable(
                 })
             }
     };
-    let qwen_grid_experts = c.qwen4exp
-        && g.tensors().iter().any(|t| {
-            t.name.ends_with("_exps.weight") && matches!(t.dtype, DType::Iq2Xs | DType::Iq3Xxs)
-        });
     Ok(SessionStable {
         has_wv,
         out_scale,
@@ -352,7 +350,6 @@ fn session_stable(
         fuse_gu,
         fuse_qkv,
         moe_batched_ok,
-        qwen_grid_experts,
     })
 }
 
@@ -525,7 +522,6 @@ pub(crate) fn generate_dense_backend(
     let fuse_gu = stable.fuse_gu;
     let fuse_qkv = stable.fuse_qkv;
     let moe_batched_ok = stable.moe_batched_ok;
-    let qwen_grid_experts = stable.qwen_grid_experts;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -603,30 +599,26 @@ pub(crate) fn generate_dense_backend(
     // env/file/CLI layer). A name nothing recognizes yields `None` here AND leaves `*_specified`
     // true, which is exactly today's split (§11 decision 8): it falls through to the ladder below
     // while still having suppressed auto-q8 up in the placement.
-    let parse_kv_fmt = |want: Option<DType>| -> DType {
-        match want {
-            Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
-            Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
-            Some(dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl))
-                if blk_ok =>
-            {
-                dt
+    let automatic_q8 =
+        be.name() == "vulkan" && (crate::seam::kv_auto_q8() || crate::seam::kv_default_q8(c, ec));
+    let parse_kv_fmt =
+        |want: Option<DType>| -> DType {
+            match want {
+                Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
+                Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
+                Some(
+                    dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl),
+                ) if blk_ok => dt,
+                Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
+                Some(DType::F16) => DType::F16,
+                // unset/unknown/gated-out → legacy `kv.force_q8` alias (both sides q8) or f16.
+                _ if ec.kv.force_q8 && kv_align_ok && kv_q8_backend => DType::Q8_0,
+                // Vulkan's automatic Q8 choice. Backend and layout gates keep it out of CPU/Metal and
+                // out of models whose cache rows cannot carry Q8_0 blocks.
+                _ if automatic_q8 && kv_align_ok => DType::Q8_0,
+                _ => DType::F16,
             }
-            Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
-            Some(DType::F16) => DType::F16,
-            // unset/unknown/gated-out → legacy `kv.force_q8` alias (both sides q8) or f16.
-            _ if ec.kv.force_q8 && kv_align_ok && kv_q8_backend => DType::Q8_0,
-            // Placement-pinned auto-q8 (see `crate::seam::PlacementPins`): the Vulkan placement
-            // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin
-            // is a Vulkan placement decision and must not leak into a CPU/Metal session (e.g.
-            // the CPU oracle of a parity test) running in the same process. The pin is only ever
-            // set when `kv_env_unset()` and `kv_q8_layout_ok` held, so the alignment/backend
-            // gates here re-check what already passed; the env being unset means no earlier arm
-            // can shadow this one.
-            _ if crate::seam::kv_auto_q8() && be.name() == "vulkan" && kv_align_ok => DType::Q8_0,
-            _ => DType::F16,
-        }
-    };
+        };
     let mut k_fmt = parse_kv_fmt(ec.kv.type_k);
     let mut v_fmt = parse_kv_fmt(ec.kv.type_v);
     // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
@@ -1320,11 +1312,35 @@ pub(crate) fn generate_dense_backend(
         // the measured-room context clamp and exact KV/state allocations below. Other backends keep
         // the default no-op.
         be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
-        // Every weight this session will hold is resident by now — including the arena block tails
-        // and the driver's own memory that no pre-load footprint prices — so the budget query here
-        // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
-        // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
-        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt);
+        // A paged Qwen session reserves its maximum per-token state inside the unified elastic
+        // arena. Its buffers therefore keep the requested logical extent and commit physical 32K
+        // segments on demand; applying the flat-buffer live-room clamp would price those bytes a
+        // second time. Every other session retains the existing measured clamp unchanged.
+        let segmented_available = be.segmented_kv_available();
+        let segmented_kv =
+            crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
+        if ec.kv.dynamic
+            && (c.qwen35 || c.qwen4exp)
+            && !kv_ring
+            && !ec.kv.overflow
+            && segmented_available
+            && !segmented_kv
+        {
+            tracing::info!(
+                k_dtype = ?k_fmt,
+                v_dtype = ?v_fmt,
+                "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
+            );
+        }
+        let want_ctx = if segmented_kv {
+            want_ctx
+        } else {
+            crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)
+        };
+        let segmented_layout = segmented_kv.then(|| {
+            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt)
+                .expect("Qwen hybrid models have segmented KV geometry")
+        });
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
@@ -1366,28 +1382,46 @@ pub(crate) fn generate_dense_backend(
                 v_fmt,
             );
             kbufs.push(
-                be.alloc(k_bytes, BufferUsage::KvCache)
-                    .map_err(|e| anyhow!("{e}"))?,
+                if let Some(layout) = segmented_layout
+                    .as_ref()
+                    .filter(|layout| layout.plane(l, PlaneKind::K).is_some())
+                {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::K)?
+                } else {
+                    be.alloc(k_bytes, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?
+                },
             );
             vbufs.push(
-                be.alloc(v_bytes, BufferUsage::KvCache)
-                    .map_err(|e| anyhow!("{e}"))?,
+                if let Some(layout) = segmented_layout
+                    .as_ref()
+                    .filter(|layout| layout.plane(l, PlaneKind::V).is_some())
+                {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::V)?
+                } else {
+                    be.alloc(v_bytes, BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))?
+                },
             );
             let qsa_bytes = crate::seam::qsa_raw_cache_bytes(c, l, want_ctx);
             qsa_kbufs.push(if qsa_bytes > 0 {
-                Some(
+                Some(if let Some(layout) = segmented_layout.as_ref() {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?
+                } else {
                     be.alloc(qsa_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
+                        .map_err(|e| anyhow!("{e}"))?
+                })
             } else {
                 None
             });
             let qsa_comp_bytes = crate::seam::qsa_block_cache_bytes(c, l, want_ctx);
             qsa_cbufs.push(if qsa_comp_bytes > 0 {
-                Some(
+                Some(if let Some(layout) = segmented_layout.as_ref() {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?
+                } else {
                     be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
+                        .map_err(|e| anyhow!("{e}"))?
+                })
             } else {
                 None
             });
@@ -1491,6 +1525,11 @@ pub(crate) fn generate_dense_backend(
             vbufs,
             qsa_kbufs,
             qsa_cbufs,
+            segmented_kv: if segmented_kv {
+                SegmentedKvState::enabled()
+            } else {
+                SegmentedKvState::default()
+            },
             k_fmt,
             v_fmt,
             hidden_buf,
@@ -1539,6 +1578,7 @@ pub(crate) fn generate_dense_backend(
         vbufs,
         qsa_kbufs,
         qsa_cbufs,
+        segmented_kv,
         k_fmt: _,
         v_fmt: _,
         hidden_buf,
@@ -1562,6 +1602,7 @@ pub(crate) fn generate_dense_backend(
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
     } = state.as_mut().expect("seam state just initialized");
+    let segmented_kv_enabled = segmented_kv.enabled;
     let SeamWeights {
         wbufs,
         wspecs,
@@ -1578,6 +1619,22 @@ pub(crate) fn generate_dense_backend(
             prompt.len(),
             max_new
         ));
+    }
+    macro_rules! ensure_kv_depth {
+        ($tokens:expr) => {
+            segmented_kv.ensure_depth(
+                be,
+                c,
+                max_ctx,
+                k_fmt,
+                v_fmt,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                $tokens,
+            )?
+        };
     }
     // Ordinary (non-denoise) generation needs a non-empty prompt (the `.min(prompt.len()-1)`
     // prefix-diff below would underflow on empty, and there'd be nothing to sample the first
@@ -1912,7 +1969,7 @@ pub(crate) fn generate_dense_backend(
         // graph is ever replay-eligible anyway (batched prefill/denoise are rows>1), and DG has
         // no autoregressive decode loop — its per-prefill decode is exactly one token — so this
         // costs nothing while making both modes bit-identical.
-        g.no_decode_replay = c.diffusion_gemma || c.qwen4exp;
+        g.no_decode_replay = c.diffusion_gemma || c.qwen4exp || segmented_kv_enabled;
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
         // per-side when the runner enabled it (see `k_fmt`/`v_fmt` at the cache alloc). ONLY the
@@ -6232,6 +6289,7 @@ pub(crate) fn generate_dense_backend(
         if let (Some(ho), Some(hb)) = (vh.h_out, &vf_h_buf) {
             vb.bind(ho, hb.as_ref());
         }
+        ensure_kv_depth!(start + m);
         let t0 = std::time::Instant::now();
         be.execute(vplan.as_ref(), &vb)
             .map_err(|e| anyhow!("{e}"))?;
@@ -6444,16 +6502,10 @@ pub(crate) fn generate_dense_backend(
         // SWA ring is untouched by the reorder — its bound is per layer and per dispatch
         // ("window + one chunk", see `kv_rows`), and each layer's ring still sees exactly the same
         // ascending sequence of writes it saw chunk-major.
-        // A single Qwen3.8 chunk has no repeated expert sweep to amortize: splitting it into one
-        // execute per layer only inserts 48 queue-drain boundaries. Enable the MoE-driven
-        // layer-major order when there are multiple chunks; dense paging keeps its established
-        // behavior because it may need the order even for one chunk.
-        let qwen_moe_streaming = c.qwen4exp
-            && qwen_grid_experts
-            && be.moe_paged()
-            && pf_end.saturating_sub(start) > ubatch;
-        let streaming = be.dense_paged() || qwen_moe_streaming;
-        let layer_major = crate::seam::layer_major_prefill(ec, &caps, streaming, !e2b);
+        // Chunk-major is the production default. Layer-major remains an explicit A/B mode: on
+        // paged Qwen3.8 it measured more than an order of magnitude slower because it turns one
+        // whole-model chunk into per-layer execute/queue-drain boundaries.
+        let layer_major = crate::seam::layer_major_prefill(ec, &caps, !e2b);
         let spans: Vec<std::ops::Range<usize>> = if layer_major {
             (0..c.n_layer).map(|l| l..l + 1).collect()
         } else {
@@ -6536,6 +6588,7 @@ pub(crate) fn generate_dense_backend(
                         } else {
                             req.and_then(|r| r.gate_pass())
                         };
+                        ensure_kv_depth!(cend);
                         let pf_m = cend - cstart;
                         if live[ci].is_none() {
                             // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
@@ -6798,6 +6851,7 @@ pub(crate) fn generate_dense_backend(
     let dyn_replay = caps.decode_replay
         && !be.moe_paged()
         && !be.dense_paged()
+        && !segmented_kv_enabled
         && !ec.kernels.vulkan.no_replay
         // DiffusionGemma graphs opt out of the replay tape entirely (`Graph::no_decode_replay`,
         // set in `build` above — the adapter's `decode_eligible` rejects them, this mirror just
@@ -6954,6 +7008,7 @@ pub(crate) fn generate_dense_backend(
         // can be head-of-line blocked behind another's whole generation, only behind one step of it.
         // `req` None (run/bench/tests) constructs nothing.
         let _gp = req.and_then(|r| r.gate_pass());
+        ensure_kv_depth!(pos + 1);
         if can_chain && pos + 1 >= prompt.len() && pos + 1 == cur.len() && logits_out.is_none() {
             // Clamped by the backend's watchdog budget too: a chain is one submit of `n` decode
             // steps, and on a slow device that submit has to stay short (see
@@ -7444,20 +7499,16 @@ pub(crate) fn generate_dense_backend(
     // that does not hold.
     if let Some(peak) = be.activation_peak() {
         let rows = crate::seam::ubatch_rows(ec);
-        let qwen_grouped = c.qwen4exp
-            && qwen_grid_experts
-            && be.moe_paged()
-            && prompt.len().saturating_sub(1).saturating_sub(start) > rows;
         // Both halves of what a prefill holds live, so the comparison stays honest in either
         // order: per-chunk scratch plus the layer-major residual set (whole prompt normally,
         // one bounded group on Qwen3.8), exactly as priced during placement.
-        let reserved = crate::seam::dense_act_reserve_at(c, &caps, max_ctx, rows).saturating_add(
-            if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || qwen_grouped, !e2b) {
-                crate::seam::layer_major_act_bytes(c, max_ctx, rows)
-            } else {
-                0
-            },
-        );
+        let reserved =
+            crate::seam::runtime_reserve_at(c, &caps, max_ctx, kv_ring, rows, k_fmt, v_fmt)
+                .saturating_add(if crate::seam::layer_major_prefill(ec, &caps, !e2b) {
+                    crate::seam::layer_major_act_bytes(c, max_ctx, rows)
+                } else {
+                    0
+                });
         // RUST_LOG=debug turns this into the measurement the reserve is re-fit against; the WARN
         // below is what a user sees when the prediction was wrong in the direction that hurts.
         tracing::debug!(

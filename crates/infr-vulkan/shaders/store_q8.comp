@@ -31,20 +31,29 @@ layout(binding = 0) readonly buffer SB { float src[]; };
 #endif
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifdef KV_SEGMENTED
+layout(binding = 2) readonly buffer CB { uvec2 segments[]; };
+#endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 1) readonly buffer CB { uvec2 segments[]; };
 #endif
 #define KV_STORE_BYTE
 #include "kv_addr.glsl"
 #define STB(bo, v) kv_store_byte(k_addr, (bo), (v))
 
 void main() {
-    k_addr = kv_base(pc.d_lo, pc.d_hi);
     uint blk = gl_WorkGroupID.x;         // 0 .. n/32-1  (source block)
     uint t = gl_LocalInvocationID.x;     // 0 .. 31      (element within block)
 #ifdef USE_PARAMS
     // SWA ring cache: row capacity = cap/n (total elements / row width; decode writes one row, so
     // n IS the row width here). The ring recycles rows the window mask already excludes, so the
     // write row is pos % rows — an identity on a full-context cache (pos < rows always).
-    uint rows = pc.cap / pc.n;
+    uint rows =
+#ifdef KV_SEGMENTED
+        0u;
+#else
+        pc.cap / pc.n;
+#endif
     uint row = (rows > 0u) ? (p_pos % rows) : p_pos;
     uint off = row * pc.n;
 #else
@@ -57,11 +66,25 @@ void main() {
     int q = clamp(int(round(v * inv)), -127, 127);
     // Planar: code byte = global element index (codes region [0,cap)); scale for this block sits in
     // the scales region at byte cap + block*2 (block = (off+blk*32)/32 = off/32 + blk).
+#ifdef KV_SEGMENTED
+    uint global_elem = off + blk * 32u + t;
+    uint seg = kv_segment(global_elem, pc.cap);
+    uint elem = kv_segment_local(global_elem, pc.cap);
+    uint seg_elems = 1u << pc.cap;
+    k_addr = kv_segment_base(segments[seg]);
+#else
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
     uint elem = off + blk * 32u + t;
+#endif
     STB(elem, uint(q) & 0xFFu);   // two's-complement byte; reader sign-extends
     if (t == 0u) {
+#ifdef KV_SEGMENTED
+        uint block = elem / 32u;
+        uint sb = seg_elems + block * 2u;
+#else
         uint block = off / 32u + blk;
         uint sb = pc.cap + block * 2u;
+#endif
         uint16_t s = float16BitsToUint16(float16_t(d));
         STB(sb, uint(s & uint16_t(0xFFu)));
         STB(sb + 1u, uint(s >> 8));

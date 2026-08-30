@@ -546,7 +546,7 @@ fn lock_file_exclusive(file: &fs::File) -> std::io::Result<()> {
     let mut overlapped = zero_overlapped();
     let ok = unsafe {
         LockFileEx(
-            file.as_raw_handle() as *mut std::ffi::c_void,
+            file.as_raw_handle(),
             LOCKFILE_EXCLUSIVE_LOCK,
             0,
             LOCK_LEN_LOW,
@@ -571,7 +571,7 @@ fn unlock_file(file: &fs::File) -> std::io::Result<()> {
     let mut overlapped = zero_overlapped();
     let ok = unsafe {
         UnlockFileEx(
-            file.as_raw_handle() as *mut std::ffi::c_void,
+            file.as_raw_handle(),
             0,
             LOCK_LEN_LOW,
             LOCK_LEN_HIGH,

@@ -573,7 +573,7 @@ mod tests {
             unified_vram_room(
                 24 * GIB,
                 12 * GIB,
-                1 * GIB,
+                GIB,
                 Some(SizeSpec::Percent(0.90)),
                 Some(SizeSpec::Bytes(2 * GIB)),
             ),

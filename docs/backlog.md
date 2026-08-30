@@ -879,15 +879,20 @@ residue worth tracking; what follows is that plus what was deliberately left.
   currently sizes it against HOST memory the way `paging.dram` now is. Needs an
   APU to answer. Metal is a separate question: it has no pager at all until
   phase 4, so it inherits none of this yet.
-- **Layer-major prefill LANDED; what is left is where it does not reach.** The
-  chunk loop now runs inside the layer loop for a streamed model
+- **Layer-major prefill is now explicit-only.** It originally made the chunk
+  loop run inside the layer loop for a streamed model
   (`seam::layer_major_prefill`, the `spans`/`chunks` walk in
   `generate_dense_backend`), so a prompt sweeps the weight set once instead of
   once per chunk. Re-measured on the B36 shape — Qwen3-14B Q8_0 / RX 7900 XTX,
   `MemoryMax=8G`, `paging.cache=2g`, `paging.dram=6g`, P=4096, three rounds with
   the arm order permuted and a cold page cache before every run — at the
   1024-row default chunk: 25.27 → 6.31 GB read and 341.9 → 779.9 pp t/s, the
-  read volume now exactly a single-chunk prefill's. The residue:
+  read volume now exactly a single-chunk prefill's. A later automatic Qwen3.8
+  paged-MoE extension did not generalize: on Q2 pp4096, chunk-major measured
+  169.44-205.00 tok/s at ubatch 1024-2048 against layer-major's 11.44-13.34.
+  Unset and `paging.layer_major=false` therefore use chunk-major everywhere;
+  `paging.layer_major=true` retains the implementation for explicit A/B. The
+  original dense experiment's residue remains useful context:
   - **The remaining gap to the single-chunk arm is HOST cost, not I/O.** Same
     6.31 GB, but 779.9 t/s against 1049.6: layer-major builds and compiles a
     graph per (layer, chunk) — 40 x 4 here — where the one-chunk arm builds one.

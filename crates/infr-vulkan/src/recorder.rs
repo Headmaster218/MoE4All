@@ -5851,6 +5851,39 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Write f32 activations into a lazily committed f16 KV cache. `dst` is the segment address
+    /// table and `segment_shift` is log2(elements per physical segment).
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_f16_off_segmented(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_off: usize,
+        segment_shift: u32,
+        src_f16: bool,
+    ) {
+        let (name, spv) = if src_f16 {
+            ("store_f16_f16_seg", crate::gemm::store_f16_f16_seg_spv())
+        } else {
+            ("store_f16_seg", crate::gemm::store_f16_seg_spv())
+        };
+        let k = self.be.kernel(name, spv, 2, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(src_off as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&segment_shift.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::store_f16_dyn`]: writes the f16 cache at `dst_addr` (row from
     /// `params`). `dst` stays bound at slot 2 (inert) for the store→read barrier.
     pub fn store_f16_dyn_at(
@@ -6026,6 +6059,47 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Fused QK-norm + RoPE write into a segmented f16 K cache. The segment size is derived from
+    /// the Qwen row width and the fixed 32K growth quantum in the shader.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_segmented(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_seg",
+            crate::gemm::qk_norm_rope_seg_spv(),
+            3,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::qk_norm_rope_interleaved`]: writes the fused K cache at `y_addr`.
     /// `y` stays bound at slot 2 (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
@@ -6063,6 +6137,48 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
+    /// Interleaved-source twin of [`Self::qk_norm_rope_segmented`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_interleaved_segmented(
+        &self,
+        qg: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_interleaved_seg",
+            crate::gemm::qk_norm_rope_interleaved_seg_spv(),
+            3,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
@@ -6237,6 +6353,39 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Quantize into a segmented planar-Q8 KV cache. Each physical segment owns its local code and
+    /// scale planes, avoiding any relocation when the logical context crosses a 32K boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_q8_segmented(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+        src_off: usize,
+        segment_shift: u32,
+    ) {
+        let (name, spv) = if src_f16 {
+            ("store_q8_f16_seg", crate::gemm::store_q8_f16_seg_spv())
+        } else {
+            ("store_q8_seg", crate::gemm::store_q8_seg_spv())
+        };
+        let k = self.be.kernel(name, spv, 2, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&segment_shift.to_ne_bytes());
+        push[12..16].copy_from_slice(&(src_off as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32) / 32,
+        );
+    }
+
     /// Record-once decode variant of [`Recorder::store_q8`]: the write offset is `p_pos*n` (one KV
     /// row at the token's position), `p_pos` read from the `params` SSBO so the buffer replays.
     pub fn store_q8_dyn(
@@ -6292,6 +6441,33 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(src_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// Expand a segmented planar-Q8 prefix into contiguous f16 scratch for the existing prefill
+    /// attention kernels.
+    pub fn dequant_q8_f16_segmented(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        segment_shift: u32,
+    ) {
+        let k = self.be.kernel(
+            "dequant_q8_f16_seg",
+            crate::gemm::dequant_q8_f16_seg_spv(),
+            2,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&segment_shift.to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -6624,7 +6800,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_impl(
             q, kc, vc, o, pm, pl, pacc, rows, pos, kv_len, nh, nkv, hd, chunk, n_chunks, scale,
-            window, canvas_lo, k_q8, v_q8, cap, batched, None, None,
+            window, canvas_lo, k_q8, v_q8, cap, batched, None, None, None,
         );
     }
 
@@ -6691,6 +6867,62 @@ impl<'a> Recorder<'a> {
             batched,
             Some((k_addr, v_addr)),
             kv_ml,
+            None,
+        );
+    }
+
+    /// Split-K attention over lazily committed KV segments. `kc`/`vc` are segment address tables;
+    /// `segment_shift` is log2(elements per physical segment) and is identical for K and V.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_segmented(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        rows: usize,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        k_q8: bool,
+        v_q8: bool,
+        segment_shift: u32,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            None,
+            k_q8,
+            v_q8,
+            segment_shift as usize,
+            false,
+            None,
+            None,
+            Some(segment_shift),
         );
     }
 
@@ -6743,11 +6975,36 @@ impl<'a> Recorder<'a> {
         // no dequant→f16 prepass). Only ever set with `kv_addr` Some (inline decode needs the BDA
         // base) and with `k_q8`/`v_q8`/`batched` false (mainline is a distinct read path).
         kv_ml: Option<infr_core::DType>,
+        // Lazily committed cache: bindings 1/2 are address tables and `cap` carries this shift.
+        // Kept separate from a zero BDA base so no existing flat-cache state changes meaning.
+        kv_segment_shift: Option<u32>,
     ) {
-        let bda = kv_addr.is_some();
+        let segmented = kv_segment_shift.is_some();
+        debug_assert!(!(segmented && (kv_addr.is_some() || kv_ml.is_some() || batched)));
+        let bda = kv_addr.is_some() || segmented;
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32). Each
         // f16 variant has a `_bda` twin selected when `kv_addr` is Some (device-address K/V reads).
-        let (p1name, p1spv) = if let Some(dt) = kv_ml {
+        let (p1name, p1spv) = if segmented {
+            match (k_q8, v_q8) {
+                (false, false) if crate::gemm::attn_hd_spec_disabled(self.vk()) => (
+                    "attn_partial_seg_nohd",
+                    crate::gemm::attn_partial_seg_nohd_spv(),
+                ),
+                (false, false) => ("attn_partial_seg", crate::gemm::attn_partial_seg_spv()),
+                (true, false) => (
+                    "attn_partial_seg_kq8",
+                    crate::gemm::attn_partial_seg_kq8_spv(),
+                ),
+                (false, true) => (
+                    "attn_partial_seg_vq8",
+                    crate::gemm::attn_partial_seg_vq8_spv(),
+                ),
+                (true, true) => (
+                    "attn_partial_seg_q8",
+                    crate::gemm::attn_partial_seg_q8_spv(),
+                ),
+            }
+        } else if let Some(dt) = kv_ml {
             // Lever 1: mainline low-bit KV decode reads the cache INLINE (per-format FMT build).
             debug_assert!(bda && !k_q8 && !v_q8 && !batched);
             crate::gemm::attn_partial_ml_kernel(dt, crate::gemm::attn_hd_spec_disabled(self.vk()))
@@ -6831,8 +7088,9 @@ impl<'a> Recorder<'a> {
         // but the row bound is checked rather than inferred, since a wrong answer here is silent
         // garbage rather than a crash. `window > 0` needs no such check: those builds carry the
         // modulo, which is the identity when the cache happens to be full-context.
-        let ring_safe = window > 0 || cap == 0 || pos < cap / (nkv * hd);
+        let ring_safe = segmented || window > 0 || cap == 0 || pos < cap / (nkv * hd);
         let fast = if !batched
+            && !segmented
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
             && kv_ml.is_none()
@@ -6900,7 +7158,8 @@ impl<'a> Recorder<'a> {
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
         p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
-        p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        let cap_field = kv_segment_shift.unwrap_or(cap as u32);
+        p1[32..36].copy_from_slice(&cap_field.to_ne_bytes());
         p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
         // `rows` is dead in `attn_partial.comp` (this slot carries `canvas_lo+1`, 0 = disabled,
         // instead — see `canvas_lo`'s doc above) but `attn_partial_mrows.comp` (the `batched`
@@ -8390,18 +8649,27 @@ impl<'a> Recorder<'a> {
         theta: f32,
         eps: f32,
         scale: f32,
+        segment_shifts: Option<(u32, u32)>,
     ) {
         let blocks = kv_len / ratio;
         let first_new = compress_from.min(blocks);
         let new_blocks = blocks - first_new;
         if new_blocks > 0 {
-            let compress_k = self.be.kernel(
-                "qsa_indexer_compress",
-                crate::gemm::qsa_indexer_compress_spv(),
-                3,
-                28,
-            );
-            let mut push = [0u8; 28];
+            let (name, spv, push_bytes) = if segment_shifts.is_some() {
+                (
+                    "qsa_indexer_compress_seg",
+                    crate::gemm::qsa_indexer_compress_seg_spv(),
+                    36,
+                )
+            } else {
+                (
+                    "qsa_indexer_compress",
+                    crate::gemm::qsa_indexer_compress_spv(),
+                    28,
+                )
+            };
+            let compress_k = self.be.kernel(name, spv, 3, push_bytes);
+            let mut push = [0u8; 36];
             push[0..4].copy_from_slice(&first_new.to_ne_bytes());
             push[4..8].copy_from_slice(&new_blocks.to_ne_bytes());
             push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
@@ -8409,6 +8677,10 @@ impl<'a> Recorder<'a> {
             push[16..20].copy_from_slice(&rope_dim.to_ne_bytes());
             push[20..24].copy_from_slice(&theta.to_ne_bytes());
             push[24..28].copy_from_slice(&eps.to_ne_bytes());
+            if let Some((raw_shift, block_shift)) = segment_shifts {
+                push[28..32].copy_from_slice(&raw_shift.to_ne_bytes());
+                push[32..36].copy_from_slice(&block_shift.to_ne_bytes());
+            }
             self.dispatch_wide(
                 compress_k,
                 &[
@@ -8417,18 +8689,33 @@ impl<'a> Recorder<'a> {
                     Self::vkb(block_cache),
                 ],
                 1,
-                &push,
+                &push[..push_bytes as usize],
                 new_blocks,
             );
         }
 
         let decode8 = rows == 1 && self.vk().qsa_score_decode8;
-        let (score_name, score_spv, block_tile, query_tile) = if decode8 {
+        let segmented = segment_shifts.is_some();
+        let (score_name, score_spv, block_tile, query_tile) = if decode8 && segmented {
+            (
+                "qsa_indexer_score_decode8_seg",
+                crate::gemm::qsa_indexer_score_decode8_seg_spv(),
+                8,
+                1,
+            )
+        } else if decode8 {
             (
                 "qsa_indexer_score_decode8",
                 crate::gemm::qsa_indexer_score_decode8_spv(),
                 8,
                 1,
+            )
+        } else if segmented {
+            (
+                "qsa_indexer_score_seg",
+                crate::gemm::qsa_indexer_score_seg_spv(),
+                4,
+                2,
             )
         } else {
             (
@@ -8438,19 +8725,25 @@ impl<'a> Recorder<'a> {
                 2,
             )
         };
-        let score_k = self.be.kernel_sg(score_name, score_spv, 3, 24, 32);
-        let mut push = [0u8; 24];
+        let score_push_bytes = if segmented { 28 } else { 24 };
+        let score_k = self
+            .be
+            .kernel_sg(score_name, score_spv, 3, score_push_bytes, 32);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
         push[12..16].copy_from_slice(&head_dim.to_ne_bytes());
         push[16..20].copy_from_slice(&ratio.to_ne_bytes());
         push[20..24].copy_from_slice(&scale.to_ne_bytes());
+        if let Some((_, block_shift)) = segment_shifts {
+            push[24..28].copy_from_slice(&block_shift.to_ne_bytes());
+        }
         self.dispatch3(
             score_k,
             &[Self::vkb(q), Self::vkb(block_cache), Self::vkb(scores)],
             1,
-            &push,
+            &push[..score_push_bytes as usize],
             blocks.div_ceil(block_tile),
             rows.div_ceil(query_tile),
             1,
@@ -8548,27 +8841,46 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         kcap: u32,
         vcap: u32,
+        segment_shift: Option<u32>,
     ) {
-        let (name, spv) = match (k_q8, v_q8) {
-            (false, false) => (
+        let segmented = segment_shift.is_some();
+        let (name, spv) = match (k_q8, v_q8, segmented) {
+            (false, false, true) => (
+                "qsa_attention_batch_seg",
+                crate::gemm::qsa_attention_batch_seg_spv(),
+            ),
+            (true, false, true) => (
+                "qsa_attention_batch_kq8_seg",
+                crate::gemm::qsa_attention_batch_kq8_seg_spv(),
+            ),
+            (false, true, true) => (
+                "qsa_attention_batch_vq8_seg",
+                crate::gemm::qsa_attention_batch_vq8_seg_spv(),
+            ),
+            (true, true, true) => (
+                "qsa_attention_batch_q8_seg",
+                crate::gemm::qsa_attention_batch_q8_seg_spv(),
+            ),
+            (false, false, false) => (
                 "qsa_attention_batch",
                 crate::gemm::qsa_attention_batch_spv(),
             ),
-            (true, false) => (
+            (true, false, false) => (
                 "qsa_attention_batch_kq8",
                 crate::gemm::qsa_attention_batch_kq8_spv(),
             ),
-            (false, true) => (
+            (false, true, false) => (
                 "qsa_attention_batch_vq8",
                 crate::gemm::qsa_attention_batch_vq8_spv(),
             ),
-            (true, true) => (
+            (true, true, false) => (
                 "qsa_attention_batch_q8",
                 crate::gemm::qsa_attention_batch_q8_spv(),
             ),
         };
-        let kernel = self.be.kernel_sg(name, spv, 5, 40, 32);
-        let mut push = [0u8; 40];
+        let push_bytes = if segmented { 44 } else { 40 };
+        let kernel = self.be.kernel_sg(name, spv, 5, push_bytes, 32);
+        let mut push = [0u8; 44];
         for (i, value) in [
             rows,
             kv_len,
@@ -8586,6 +8898,9 @@ impl<'a> Recorder<'a> {
         {
             push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
+        if let Some(shift) = segment_shift {
+            push[40..44].copy_from_slice(&shift.to_ne_bytes());
+        }
         self.dispatch_wide(
             kernel,
             &[
@@ -8596,7 +8911,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(dst),
             ],
             1,
-            &push,
+            &push[..push_bytes as usize],
             rows.saturating_mul(n_head),
         );
     }
@@ -8618,17 +8933,24 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         kcap: u32,
         vcap: u32,
+        segment_shift: Option<u32>,
     ) {
         let row_pairs = row_elems / 2;
         let total_pairs = (selected * ratio + tail) * row_pairs;
-        let (name, spv) = match (k_q8, v_q8) {
-            (false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
-            (true, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
-            (false, true) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
-            (true, true) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
+        let segmented = segment_shift.is_some();
+        let (name, spv) = match (k_q8, v_q8, segmented) {
+            (false, false, true) => ("qsa_gather_seg", crate::gemm::qsa_gather_seg_spv()),
+            (true, false, true) => ("qsa_gather_kq8_seg", crate::gemm::qsa_gather_kq8_seg_spv()),
+            (false, true, true) => ("qsa_gather_vq8_seg", crate::gemm::qsa_gather_vq8_seg_spv()),
+            (true, true, true) => ("qsa_gather_q8_seg", crate::gemm::qsa_gather_q8_seg_spv()),
+            (false, false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
+            (true, false, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
+            (false, true, false) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
+            (true, true, false) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
         };
-        let kernel = self.be.kernel(name, spv, 5, 32);
-        let mut push = [0u8; 32];
+        let push_bytes = if segmented { 36 } else { 32 };
+        let kernel = self.be.kernel(name, spv, 5, push_bytes);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&selected.to_ne_bytes());
         push[4..8].copy_from_slice(&complete.to_ne_bytes());
         push[8..12].copy_from_slice(&tail.to_ne_bytes());
@@ -8637,6 +8959,9 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&total_pairs.to_ne_bytes());
         push[24..28].copy_from_slice(&kcap.to_ne_bytes());
         push[28..32].copy_from_slice(&vcap.to_ne_bytes());
+        if let Some(shift) = segment_shift {
+            push[32..36].copy_from_slice(&shift.to_ne_bytes());
+        }
         self.dispatch(
             kernel,
             &[
@@ -8647,7 +8972,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(vd),
             ],
             2,
-            &push,
+            &push[..push_bytes as usize],
             total_pairs.div_ceil(256),
         );
     }

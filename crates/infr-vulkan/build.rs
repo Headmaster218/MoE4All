@@ -123,6 +123,33 @@ fn main() {
             "attn_partial_mrows_c256_bda",
             &["-DSC_MAX=256u", "-DKV_BDA"],
         ),
+        // Lazily committed 32K-row KV segments. Bindings 1/2 carry address tables while the
+        // physical segments retain the existing local f16 or planar-Q8 representation.
+        (
+            "attn_partial",
+            "attn_partial_seg",
+            &["-DKV_BDA", "-DKV_SEGMENTED"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_seg_nohd",
+            &["-DKV_BDA", "-DKV_SEGMENTED", "-DNO_HD_SPEC"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_seg_kq8",
+            &["-DKV_BDA", "-DKV_SEGMENTED", "-DKQ8"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_seg_vq8",
+            &["-DKV_BDA", "-DKV_SEGMENTED", "-DVQ8"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_seg_q8",
+            &["-DKV_BDA", "-DKV_SEGMENTED", "-DKQ8", "-DVQ8"],
+        ),
         // PROBE (B7 slice 1, tests/attn_ktile_probe.rs only — NOTHING in production dispatches
         // these): LDS-staged K-tile flash-decoding pass 1, one whole 128-dim dot per THREAD out of
         // shared memory, so attn_partial's per-key `subgroupAdd` disappears. Four configurations:
@@ -693,11 +720,26 @@ fn main() {
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
         ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
+        (
+            "qsa_indexer_compress",
+            "qsa_indexer_compress_seg",
+            &["-DKV_SEGMENTED"],
+        ),
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_seg",
+            &["-DKV_SEGMENTED"],
+        ),
         (
             "qsa_indexer_score",
             "qsa_indexer_score_decode8",
             &["-DQSA_SCORE_DECODE8"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode8_seg",
+            &["-DQSA_SCORE_DECODE8", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_indexer_topk_hist", "qsa_indexer_topk_hist", &[]),
@@ -707,6 +749,22 @@ fn main() {
         ("qsa_gather", "qsa_gather_kq8", &["-DKQ8"]),
         ("qsa_gather", "qsa_gather_vq8", &["-DVQ8"]),
         ("qsa_gather", "qsa_gather_q8", &["-DKQ8", "-DVQ8"]),
+        ("qsa_gather", "qsa_gather_seg", &["-DKV_SEGMENTED"]),
+        (
+            "qsa_gather",
+            "qsa_gather_kq8_seg",
+            &["-DKQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_gather",
+            "qsa_gather_vq8_seg",
+            &["-DVQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_gather",
+            "qsa_gather_q8_seg",
+            &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
+        ),
         ("qsa_attention_batch", "qsa_attention_batch", &[]),
         ("qsa_attention_batch", "qsa_attention_batch_kq8", &["-DKQ8"]),
         ("qsa_attention_batch", "qsa_attention_batch_vq8", &["-DVQ8"]),
@@ -714,6 +772,26 @@ fn main() {
             "qsa_attention_batch",
             "qsa_attention_batch_q8",
             &["-DKQ8", "-DVQ8"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_seg",
+            &["-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_kq8_seg",
+            &["-DKQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_vq8_seg",
+            &["-DVQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_q8_seg",
+            &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
         ),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
@@ -768,8 +846,15 @@ fn main() {
         ("store_q8", "store_q8", &[]),
         ("store_q8", "store_q8_dyn", &["-DUSE_PARAMS"]),
         ("store_q8", "store_q8_f16", &["-DSRC_F16"]),
+        ("store_q8", "store_q8_seg", &["-DKV_SEGMENTED"]),
+        (
+            "store_q8",
+            "store_q8_f16_seg",
+            &["-DSRC_F16", "-DKV_SEGMENTED"],
+        ),
         // Expand a Q8_0 KV prefix → f16 scratch so the f16 flash/non-FA prefill kernels can run.
         ("dequant_q8_f16", "dequant_q8_f16", &[]),
+        ("dequant_q8_f16", "dequant_q8_f16_seg", &["-DKV_SEGMENTED"]),
         (
             "store_q8",
             "store_q8_f16_dyn",
@@ -985,6 +1070,16 @@ fn main() {
         ("store_f16", "store_f16_bda", &["-DKV_BDA"]),
         (
             "store_f16",
+            "store_f16_seg",
+            &["-DKV_BDA", "-DKV_SEGMENTED"],
+        ),
+        (
+            "store_f16",
+            "store_f16_f16_seg",
+            &["-DSRC_F16", "-DKV_BDA", "-DKV_SEGMENTED"],
+        ),
+        (
+            "store_f16",
             "store_f16_dyn_bda",
             &["-DUSE_PARAMS", "-DKV_BDA"],
         ),
@@ -995,6 +1090,11 @@ fn main() {
             &["-DOUT_F16", "-DUSE_PARAMS", "-DKV_BDA"],
         ),
         ("qk_norm_rope", "qk_norm_rope_bda", &["-DKV_BDA"]),
+        (
+            "qk_norm_rope",
+            "qk_norm_rope_seg",
+            &["-DKV_BDA", "-DKV_SEGMENTED"],
+        ),
         (
             "qk_norm_rope",
             "qk_norm_rope_dyn_bda",
@@ -1014,6 +1114,11 @@ fn main() {
             "qk_norm_rope_interleaved",
             "qk_norm_rope_interleaved_bda",
             &["-DKV_BDA"],
+        ),
+        (
+            "qk_norm_rope_interleaved",
+            "qk_norm_rope_interleaved_seg",
+            &["-DKV_BDA", "-DKV_SEGMENTED"],
         ),
         (
             "qk_norm_rope_interleaved",

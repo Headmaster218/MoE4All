@@ -117,6 +117,16 @@ fn is_kv_prepass(dt: infr_core::DType) -> bool {
     is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
 
+/// Return the descriptor-visible address table and log2(elements per physical segment) for a
+/// lazily committed KV buffer. Flat caches deliberately return `None` and keep every established
+/// lowering path byte-for-byte unchanged.
+fn segmented_kv_view(buffer: &dyn Buffer) -> Option<(&dyn Buffer, u32)> {
+    let segmented = crate::as_segmented_kv(buffer)?;
+    let elements = segmented.spec().segment_elements;
+    debug_assert!(elements.is_power_of_two());
+    Some((segmented.table_buffer(), elements.trailing_zeros()))
+}
+
 /// Lever 1 (kv-decode-perf-levers #1): mainline low-bit block quants the DECODE split-K kernel can
 /// dequant INLINE via a coalesced block-amortized decoder (`attn_partial`'s `dqv4`,
 /// `attn_partial_ml_kernel`) — so decode reads the compact cache directly instead of a dequant→f16
@@ -2380,6 +2390,24 @@ fn lower_op(
             let cache_dt = graph.desc(*cache).dtype;
             let cache_q8 = matches!(cache_dt, infr_core::DType::Q8_0);
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
+            if let Some((table, segment_shift)) = segmented_kv_view(c) {
+                if !matches!(mode, RopeMode::Static(_)) {
+                    return Err(be(
+                        "vulkan adapter: segmented KV writes require the static recording path",
+                    ));
+                }
+                let off = pos * rs;
+                if cache_q8 {
+                    rec.store_q8_segmented(s, table, n, off, src_f16, 0, segment_shift);
+                } else if cache_dt == infr_core::DType::F16 {
+                    rec.store_f16_off_segmented(s, table, n, off, 0, segment_shift, src_f16);
+                } else {
+                    return Err(be(format!(
+                        "vulkan adapter: segmented KV cache dtype {cache_dt:?} is unsupported"
+                    )));
+                }
+                return Ok(());
+            }
             // Planar scales region begins at byte `cap` = total cache elements.
             let cap = graph.desc(*cache).numel();
             // SWA ring cache: the write for position p lands at row p % cap_rows — the ring only
@@ -2637,10 +2665,26 @@ fn lower_op(
             } else {
                 None
             };
+            let raw_cache = r(*k_cache)?;
+            let block_cache = r(*block_cache)?;
+            let (raw_binding, block_binding, segment_shifts) = match (
+                segmented_kv_view(raw_cache),
+                segmented_kv_view(block_cache),
+            ) {
+                (Some((raw_table, raw_shift)), Some((block_table, block_shift))) => {
+                    (raw_table, block_table, Some((raw_shift, block_shift)))
+                }
+                (None, None) => (raw_cache, block_cache, None),
+                _ => {
+                    return Err(be(
+                            "vulkan Op::QsaIndexer raw and block caches must both be segmented or both be flat",
+                        ));
+                }
+            };
             rec.qsa_indexer(
                 r(*q)?,
-                r(*k_cache)?,
-                r(*block_cache)?,
+                raw_binding,
+                block_binding,
                 r(*k_norm)?,
                 pool[&sk].as_ref(),
                 topk_work.map(|id| pool[&id].as_ref()),
@@ -2656,6 +2700,7 @@ fn lower_op(
                 *theta,
                 *eps,
                 *scale,
+                segment_shifts,
             );
         }
         Op::QsaGather {
@@ -2690,9 +2735,28 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
+            let k_cache_buf = r(*k_cache)?;
+            let v_cache_buf = r(*v_cache)?;
+            let (k_binding, v_binding, segment_shift) = match (
+                segmented_kv_view(k_cache_buf),
+                segmented_kv_view(v_cache_buf),
+            ) {
+                (Some((k_table, k_shift)), Some((v_table, v_shift))) if k_shift == v_shift => {
+                    (k_table, v_table, Some(k_shift))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(be("vulkan Op::QsaGather K/V segment geometry differs"));
+                }
+                (None, None) => (k_cache_buf, v_cache_buf, None),
+                _ => {
+                    return Err(be(
+                        "vulkan Op::QsaGather K/V caches must both be segmented or both be flat",
+                    ));
+                }
+            };
             rec.qsa_gather(
-                r(*k_cache)?,
-                r(*v_cache)?,
+                k_binding,
+                v_binding,
                 r(*indices)?,
                 r(*k_dst)?,
                 r(*v_dst)?,
@@ -2705,6 +2769,7 @@ fn lower_op(
                 v_q8,
                 graph.desc(*k_cache).numel() as u32,
                 graph.desc(*v_cache).numel() as u32,
+                segment_shift,
             );
         }
         Op::QsaBatchAttention {
@@ -2750,10 +2815,31 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
+            let k_cache_buf = r(*k_cache)?;
+            let v_cache_buf = r(*v_cache)?;
+            let (k_binding, v_binding, segment_shift) = match (
+                segmented_kv_view(k_cache_buf),
+                segmented_kv_view(v_cache_buf),
+            ) {
+                (Some((k_table, k_shift)), Some((v_table, v_shift))) if k_shift == v_shift => {
+                    (k_table, v_table, Some(k_shift))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(be(
+                        "vulkan Op::QsaBatchAttention K/V segment geometry differs",
+                    ));
+                }
+                (None, None) => (k_cache_buf, v_cache_buf, None),
+                _ => {
+                    return Err(be(
+                            "vulkan Op::QsaBatchAttention K/V caches must both be segmented or both be flat",
+                        ));
+                }
+            };
             rec.qsa_attention_batch(
                 r(*q)?,
-                r(*k_cache)?,
-                r(*v_cache)?,
+                k_binding,
+                v_binding,
                 r(*indices)?,
                 r(*dst)?,
                 *rows,
@@ -2768,6 +2854,7 @@ fn lower_op(
                 vdt == infr_core::DType::Q8_0,
                 graph.desc(*k_cache).numel() as u32,
                 graph.desc(*v_cache).numel() as u32,
+                segment_shift,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst
@@ -2804,12 +2891,51 @@ fn lower_op(
             // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
             // store→read barrier. Bit-identical to the bound dispatch.
             let y_addr = out_buf.device_addr();
+            let y_segmented = segmented_kv_view(out_buf);
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
                         Some(f) => Some(r(*f)?),
                         None => None,
                     };
+                    if let Some((table, _segment_shift)) = y_segmented {
+                        if ff.is_some() {
+                            return Err(be(
+                                "vulkan adapter: segmented QkNormRope does not support frequency factors",
+                            ));
+                        }
+                        if *x_stride > 0 {
+                            rec.qk_norm_rope_interleaved_segmented(
+                                r(*x)?,
+                                r(*weight)?,
+                                table,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                                *eps,
+                                *x_stride as usize,
+                            );
+                        } else {
+                            rec.qk_norm_rope_segmented(
+                                r(*x)?,
+                                r(*weight)?,
+                                table,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                                *eps,
+                            );
+                        }
+                        return Ok(());
+                    }
                     if *x_stride > 0 && ff.is_none() {
                         // Interleaved q+g buffer: read query with stride, skip CopyStrided per head.
                         match y_addr {
@@ -2878,6 +3004,11 @@ fn lower_op(
                     } // x_stride > 0
                 }
                 RopeMode::Dynamic(params) => {
+                    if y_segmented.is_some() {
+                        return Err(be(
+                            "vulkan adapter: segmented QkNormRope requires static recording",
+                        ));
+                    }
                     // gemma4 proportional RoPE (full-attention layers): the ff divisors bind via
                     // the `qk_norm_rope_dyn_ff` variant — pos still comes from `params`.
                     let ff = match freq_factors {
@@ -3128,6 +3259,22 @@ fn lower_op(
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
+            let k_segmented = segmented_kv_view(r(*k_cache)?);
+            let v_segmented = segmented_kv_view(r(*v_cache)?);
+            let segmented_cache = match (k_segmented, v_segmented) {
+                (None, None) => false,
+                (Some((_, ks)), Some((_, vs))) if ks == vs => true,
+                (Some(_), Some(_)) => {
+                    return Err(be(
+                        "vulkan adapter: K/V segmented caches use different segment geometry",
+                    ));
+                }
+                _ => {
+                    return Err(be(
+                        "vulkan adapter: K and V must both be segmented or both be flat",
+                    ));
+                }
+            };
             // Row capacity of the bound cache. An SWA layer's cache may be a RING of fewer rows
             // than the live kv_len (window + ubatch, see the runner's ring sizing): position j
             // then lives at row j % att_cap_rows — the scalar/split kernels derive the same
@@ -3144,6 +3291,11 @@ fn lower_op(
             // shapes that path cannot serve are refused here rather than silently mis-served.
             // `decode_eligible` already forces sinks graphs off the record-once replay tape.
             if let Some(sk) = sinks {
+                if segmented_cache {
+                    return Err(be(
+                        "vulkan adapter: segmented attention does not support attention sinks",
+                    ));
+                }
                 // The scalar sinks build reads `q` and both caches as f16 (the seam's own
                 // producer→consumer dtype flow). Every other KV dtype reaches the tier ladder
                 // through the dequant→f16 prepass below, which this early return skips — so
@@ -3186,6 +3338,11 @@ fn lower_op(
                 return Ok(());
             }
             if let RopeMode::Dynamic(params) = mode {
+                if segmented_cache {
+                    return Err(be(
+                        "vulkan adapter: segmented attention requires static recording",
+                    ));
+                }
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
                 // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
                 // partial kernel, so gemma-family decode replays too.
@@ -3461,7 +3618,11 @@ fn lower_op(
                     let sc = pool[&k].as_ref();
                     let src = r(*k_cache)?;
                     if k_q8 {
-                        rec.dequant_q8_f16(src, sc, ne, cap);
+                        if let Some((table, shift)) = segmented_kv_view(src) {
+                            rec.dequant_q8_f16_segmented(table, sc, ne, shift);
+                        } else {
+                            rec.dequant_q8_f16(src, sc, ne, cap);
+                        }
                     } else if matches!(kdt, infr_core::DType::F32) {
                         rec.store_f16(src, sc, ne, 0);
                     } else if is_turbo(kdt) {
@@ -3478,7 +3639,11 @@ fn lower_op(
                     let sc = pool[&k].as_ref();
                     let src = r(*v_cache)?;
                     if v_q8 {
-                        rec.dequant_q8_f16(src, sc, ne, cap);
+                        if let Some((table, shift)) = segmented_kv_view(src) {
+                            rec.dequant_q8_f16_segmented(table, sc, ne, shift);
+                        } else {
+                            rec.dequant_q8_f16(src, sc, ne, cap);
+                        }
                     } else if matches!(vdt, infr_core::DType::F32) {
                         rec.store_f16(src, sc, ne, 0);
                     } else if is_turbo(vdt) {
@@ -3495,6 +3660,10 @@ fn lower_op(
                 // planar read), so force q8-eff off — flash_ok then reduces to `flash_geom`.
                 let k_q8_eff = flash_deq_fmt.is_none() && k_q8 && !deq_k;
                 let v_q8_eff = flash_deq_fmt.is_none() && v_q8 && !deq_v;
+                // Q8 prefill expands both sides into ordinary flat f16 scratch, so it may retain
+                // the existing flash tiers. Any side still backed by an address table must use a
+                // segmented-aware reader.
+                let segmented_read = segmented_cache && (!deq_k || !deq_v);
                 // Prefill, causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
                 // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes
                 // 1/√hd and reads/writes ceil(rows/64)*64 q/dst rows, so guard the scale and
@@ -3513,7 +3682,7 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff);
+                let flash_ok = flash_geom && !segmented_read && !(k_q8_eff || v_q8_eff);
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
@@ -3547,6 +3716,7 @@ fn lower_op(
                     _ => None,
                 };
                 let nonfa_ok = !flash_ok
+                    && !segmented_read
                     && canvas_lo.is_none()
                     && rows >= 64
                     // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax) —
@@ -3576,6 +3746,7 @@ fn lower_op(
                 // against the scalar/split floor).
                 let nc_fa_ok = !flash_ok
                     && !nonfa_ok
+                    && !segmented_read
                     && !be_.caps().f16_coopmat()
                     && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && canvas_lo.is_none()
@@ -3607,6 +3778,7 @@ fn lower_op(
                 // decide. Reproduces the old `is_err()`/`is_ok()` pair exactly.
                 let mrows_attn = be_.cfg().kernels.vulkan.mrows_attn;
                 let batched_attn = rows >= 2
+                    && !segmented_read
                     && hd <= 128
                     && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
                     && canvas_lo.is_none()
@@ -3680,6 +3852,10 @@ fn lower_op(
                     kv_len.div_ceil(n).min(kv_len - 1).max(1)
                 } else if batched_attn {
                     256
+                } else if segmented_read && rows >= 64 {
+                    // `attn_partial`'s score slab holds at most 1024 keys. Use that ceiling to
+                    // minimize partial scratch until the segmented coopmat prefill tier lands.
+                    1024
                 } else if (ring_past || cap_short) && rows >= 64 {
                     // Large-rows ring/capacity-limited prefill: the pm/pl/pacc partials are [rows,
                     // nh, n_chunks, hd] — the ordinary ~32-chunk policy would balloon them (1024
@@ -3707,11 +3883,12 @@ fn lower_op(
                 let chunk = split_k_chunk_count_cap(span, chunk);
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
-                let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past || cap_short)
-                    && span > chunk
-                    && hd % 4 == 0
-                    && hd <= 512
-                    && (rows == 1 || !(k_q8_eff || v_q8_eff));
+                let split_ok =
+                    (rows < 64 || segmented_read || canvas_lo.is_some() || ring_past || cap_short)
+                        && (span > chunk || segmented_read)
+                        && hd % 4 == 0
+                        && hd <= 512
+                        && (rows == 1 || !(k_q8_eff || v_q8_eff));
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
@@ -3870,58 +4047,94 @@ fn lower_op(
                     // address → the `(Some, Some)` arm). `decode_inline` ⟹ `split_ok` here, so this
                     // is the arm that fires. None for f16/Q8/prefill.
                     let kv_ml = if decode_inline { Some(kdt) } else { None };
-                    match (kcb.device_addr(), vcb.device_addr()) {
-                        (Some(ka), Some(va)) => rec.attention_kv_split_at(
-                            r(*q)?,
-                            kcb,
-                            vcb,
-                            ka,
-                            va,
-                            r(*dst)?,
-                            pool[&pm].as_ref(),
-                            pool[&pl].as_ref(),
-                            pool[&pacc].as_ref(),
-                            rows,
-                            pos,
-                            kv_len,
-                            nh,
-                            nkv,
-                            hd,
-                            chunk,
-                            n_chunks,
-                            *scale,
-                            window,
-                            canvas_lo,
-                            k_q8_eff,
-                            v_q8_eff,
-                            cap,
-                            batched_attn,
-                            kv_ml,
-                        ),
-                        _ => rec.attention_kv_split(
-                            r(*q)?,
-                            kcb,
-                            vcb,
-                            r(*dst)?,
-                            pool[&pm].as_ref(),
-                            pool[&pl].as_ref(),
-                            pool[&pacc].as_ref(),
-                            rows,
-                            pos,
-                            kv_len,
-                            nh,
-                            nkv,
-                            hd,
-                            chunk,
-                            n_chunks,
-                            *scale,
-                            window,
-                            canvas_lo,
-                            k_q8_eff,
-                            v_q8_eff,
-                            cap,
-                            batched_attn,
-                        ),
+                    match (segmented_kv_view(kcb), segmented_kv_view(vcb)) {
+                        (Some((kt, ks)), Some((vt, vs))) if ks == vs => {
+                            rec.attention_kv_split_segmented(
+                                r(*q)?,
+                                kt,
+                                vt,
+                                r(*dst)?,
+                                pool[&pm].as_ref(),
+                                pool[&pl].as_ref(),
+                                pool[&pacc].as_ref(),
+                                rows,
+                                pos,
+                                kv_len,
+                                nh,
+                                nkv,
+                                hd,
+                                chunk,
+                                n_chunks,
+                                *scale,
+                                window,
+                                k_q8_eff,
+                                v_q8_eff,
+                                ks,
+                            );
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(be(
+                                "vulkan adapter: split attention K/V segment geometry differs",
+                            ));
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            return Err(be(
+                                "vulkan adapter: split attention cannot mix segmented and flat K/V",
+                            ));
+                        }
+                        (None, None) => match (kcb.device_addr(), vcb.device_addr()) {
+                            (Some(ka), Some(va)) => rec.attention_kv_split_at(
+                                r(*q)?,
+                                kcb,
+                                vcb,
+                                ka,
+                                va,
+                                r(*dst)?,
+                                pool[&pm].as_ref(),
+                                pool[&pl].as_ref(),
+                                pool[&pacc].as_ref(),
+                                rows,
+                                pos,
+                                kv_len,
+                                nh,
+                                nkv,
+                                hd,
+                                chunk,
+                                n_chunks,
+                                *scale,
+                                window,
+                                canvas_lo,
+                                k_q8_eff,
+                                v_q8_eff,
+                                cap,
+                                batched_attn,
+                                kv_ml,
+                            ),
+                            _ => rec.attention_kv_split(
+                                r(*q)?,
+                                kcb,
+                                vcb,
+                                r(*dst)?,
+                                pool[&pm].as_ref(),
+                                pool[&pl].as_ref(),
+                                pool[&pacc].as_ref(),
+                                rows,
+                                pos,
+                                kv_len,
+                                nh,
+                                nkv,
+                                hd,
+                                chunk,
+                                n_chunks,
+                                *scale,
+                                window,
+                                canvas_lo,
+                                k_q8_eff,
+                                v_q8_eff,
+                                cap,
+                                batched_attn,
+                            ),
+                        },
                     }
                 } else {
                     let window = match mask {

@@ -15,16 +15,24 @@ layout(push_constant) uniform PC { uint n; uint off; uint src_off; uint cap;
     uint d_lo; uint d_hi; // K/V cache dst base device address (uvec2-split)
 #endif
 } pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
 layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
 #ifdef USE_PARAMS
 // Record-once decode: the write offset is row*n (one KV row at position pos), pos from a host-updated
 // params SSBO instead of the `pc.off` push constant. `dst` moves to binding 2 (params takes 1).
 // `cap` is the cache's ROW capacity: an SWA ring cache recycles rows the window mask already
 // excludes, so the row is pos % cap (identity on a full-context cache, where pos < cap always).
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
-#ifndef KV_BDA
+#ifdef KV_SEGMENTED
+layout(binding = 2) readonly buffer DB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
 layout(binding = 2) buffer DB { float16_t dst[]; };
 #endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 1) readonly buffer DB { uvec2 segments[]; };
 #elif !defined(KV_BDA)
 layout(binding = 1) buffer DB { float16_t dst[]; };
 #endif
@@ -33,7 +41,7 @@ layout(binding = 1) buffer DB { float16_t dst[]; };
 #endif
 
 void main() {
-#ifdef KV_BDA
+#if defined(KV_BDA) && !defined(KV_SEGMENTED)
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
     uint i = gl_GlobalInvocationID.x;
@@ -44,7 +52,12 @@ void main() {
 #else
     uint off = pc.off;
 #endif
-#ifdef KV_BDA
+#ifdef KV_SEGMENTED
+    uint elem = off + i;
+    uint seg = kv_segment(elem, pc.cap);
+    uint local = kv_segment_local(elem, pc.cap);
+    kv_store_half(kv_segment_base(segments[seg]), local, src[pc.src_off + i]);
+#elif defined(KV_BDA)
     kv_store_half(k_addr, off + i, src[pc.src_off + i]);
 #else
     dst[off + i] = float16_t(src[pc.src_off + i]);
