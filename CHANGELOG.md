@@ -6,6 +6,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-30
+
+### Highlights
+
+- **Qwen KV state now grows in 32K-token segments on Vulkan.** Compatible Qwen3.5/Qwen3.6 and
+  Qwen3.8-Flash-Next sessions allocate Q8 K/V capacity as context crosses each segment boundary
+  instead of reserving the complete configured window at startup. Qwen3.8's QSA index-key state
+  follows the same elastic allocation model.
+- **Compatible Vulkan sessions now default to Q8_0 K/V.** Explicit `kv.type_k` and `kv.type_v`
+  choices remain authoritative; layouts that cannot use Q8_0 continue to fall back to F16.
+
+### Changed
+
+- Chunk-major prefill is again the production default for resident and streamed models.
+  Layer-major execution remains available only through the explicit `paging.layer_major=true`
+  diagnostic override.
+- Memory planning, runtime allocation, cache reporting, synthetic-depth setup, and session cloning
+  now resolve the same effective Vulkan K/V format and segmented layout.
+
+### Fixed
+
+- Qwen3.8 QSA planes are allocated from their segmented arena instead of retaining an unintended
+  flat context-sized allocation.
+- Automatic K/V budgeting no longer prices F16 while the Vulkan runner actually allocates Q8_0,
+  preventing inconsistent context limits and VRAM accounting.
+- Segmented K/V address lowering now handles reads, writes, Q8 dequantization, attention, and QSA
+  gather/index operations across 32K boundaries.
+
+### Known limitations
+
+- Elastic segmented growth currently applies to coupled Q8_0 K/V on supported Qwen Vulkan paths.
+  Explicit F16 or mixed K/V formats retain the established flat-allocation behavior.
+
 ## [0.4.0] - 2026-08-29
 
 ### Highlights
