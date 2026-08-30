@@ -7,7 +7,9 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!   POST /v1/responses          -> OpenAI Responses JSON | typed SSE event stream        (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
+//!   GET  /v1/metrics            -> live throughput + cumulative pager/cache counters      (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
@@ -19,8 +21,10 @@
 //!   `Delta::ToolCall`   -> `delta.tool_calls[]`  (finish_reason "tool_calls")
 
 use std::{
+    cell::Cell,
     convert::Infallible,
     net::SocketAddr,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc,
@@ -123,7 +127,10 @@ pub struct EmbeddingOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatOutcome {
     pub finish: Finish,
+    /// Total prompt tokens presented to the model, including any prefix served from KV cache.
     pub prompt_tokens: u32,
+    /// Prompt tokens served from a reusable prefix cache and therefore not recomputed this turn.
+    pub cached_prompt_tokens: u32,
     pub completion_tokens: u32,
 }
 
@@ -171,6 +178,301 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+}
+
+/// Compatibility subset of OpenAI's Responses request. Unknown fields are deliberately ignored:
+/// local inference cannot implement hosted tools or server-side conversation storage, but clients
+/// that send optional Responses fields should still work when their actual input is text/messages
+/// plus function tools.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesRequest {
+    pub model: String,
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub truncation: Option<String>,
+    #[serde(default)]
+    pub store: Option<bool>,
+}
+
+impl ResponsesRequest {
+    /// Convert Responses' item-oriented input and flat function schema to the chat-shaped request
+    /// already understood by the generator. This is intentionally stateless: callers replay prior
+    /// output items in `input`, just as `store=false` Responses clients do.
+    fn into_chat(self) -> Result<ChatRequest, ParamError> {
+        if matches!(self.store, Some(true)) {
+            return Err(ParamError {
+                param: "store",
+                message: "store=true is not supported by this stateless local server".into(),
+            });
+        }
+        if let Some(mode) = self.truncation.as_deref() {
+            if !matches!(mode, "disabled" | "auto") {
+                return Err(ParamError {
+                    param: "truncation",
+                    message: format!("unsupported truncation mode {mode:?}"),
+                });
+            }
+        }
+
+        let mut messages = Vec::new();
+        if let Some(instructions) = self.instructions.filter(|s| !s.is_empty()) {
+            messages.push(ChatMessageDto {
+                role: "developer".into(),
+                content: Some(serde_json::Value::String(instructions)),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        if let Some(input) = self.input {
+            responses_input_to_messages(input, &mut messages)?;
+        }
+        if messages.is_empty() {
+            return Err(ParamError {
+                param: "input",
+                message: "input must contain text or at least one supported message item".into(),
+            });
+        }
+
+        Ok(ChatRequest {
+            model: self.model,
+            messages,
+            stream: self.stream,
+            tools: responses_tools_to_chat(self.tools)?,
+            tool_choice: responses_tool_choice_to_chat(self.tool_choice)?,
+            max_tokens: None,
+            max_completion_tokens: self.max_output_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            seed: self.seed,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            repeat_penalty: None,
+        })
+    }
+}
+
+fn responses_input_to_messages(
+    input: serde_json::Value,
+    messages: &mut Vec<ChatMessageDto>,
+) -> Result<(), ParamError> {
+    match input {
+        serde_json::Value::String(text) => {
+            messages.push(simple_message("user", text));
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let kind = match item.get("type").and_then(|v| v.as_str()) {
+                    Some(kind) => kind,
+                    // OpenAI's easy-input message shape permits `{role, content}` without an
+                    // explicit discriminator. Treat it exactly like a `type:"message"` item.
+                    None if item.get("role").and_then(|v| v.as_str()).is_some() => "message",
+                    None => {
+                        return Err(ParamError {
+                            param: "input",
+                            message: "every Responses input item must have a string `type` or a message `role`".into(),
+                        })
+                    }
+                };
+                match kind {
+                    "message" => {
+                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                        let content = responses_content_text(item.get("content"));
+                        messages.push(simple_message(role, content));
+                    }
+                    "function_call" => {
+                        let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                            ParamError {
+                                param: "input",
+                                message: "function_call input item requires `name`".into(),
+                            }
+                        })?;
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                            .unwrap_or("call_local");
+                        messages.push(ChatMessageDto {
+                            role: "assistant".into(),
+                            content: None,
+                            tool_calls: Some(serde_json::json!([{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments}
+                            }])),
+                            tool_call_id: None,
+                            name: None,
+                        });
+                    }
+                    "function_call_output" => {
+                        let call_id =
+                            item.get("call_id")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| ParamError {
+                                    param: "input",
+                                    message: "function_call_output requires `call_id`".into(),
+                                })?;
+                        let output = item
+                            .get("output")
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        messages.push(ChatMessageDto {
+                            role: "tool".into(),
+                            content: Some(serde_json::Value::String(output)),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.to_owned()),
+                            name: None,
+                        });
+                    }
+                    // Stateless clients may replay reasoning items. The local model has no opaque
+                    // encrypted reasoning state to restore, so these carry no prompt content.
+                    "reasoning" => {}
+                    other => {
+                        return Err(ParamError {
+                            param: "input",
+                            message: format!("unsupported Responses input item type {other:?}"),
+                        })
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(ParamError {
+            param: "input",
+            message: "input must be a string or an array of Responses input items".into(),
+        }),
+    }
+}
+
+fn simple_message(role: &str, content: String) -> ChatMessageDto {
+    ChatMessageDto {
+        role: role.to_owned(),
+        content: Some(serde_json::Value::String(content)),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }
+}
+
+fn responses_content_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(|v| v.as_str()) {
+                Some("input_text" | "output_text" | "text") => {
+                    part.get("text").and_then(|v| v.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn responses_tools_to_chat(
+    tools: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ParamError> {
+    let Some(tools) = tools else { return Ok(None) };
+    let arr = tools.as_array().ok_or_else(|| ParamError {
+        param: "tools",
+        message: "tools must be an array".into(),
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for tool in arr {
+        let kind = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "function" {
+            return Err(ParamError {
+                param: "tools",
+                message: format!(
+                    "tool type {kind:?} is not available locally; only custom function tools are supported"
+                ),
+            });
+        }
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ParamError {
+                param: "tools",
+                message: "function tool requires a string `name`".into(),
+            })?;
+        out.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description").cloned().unwrap_or(serde_json::Value::Null),
+                "parameters": tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
+                "strict": tool.get("strict").cloned().unwrap_or(serde_json::Value::Bool(false))
+            }
+        }));
+    }
+    Ok(Some(serde_json::Value::Array(out)))
+}
+
+fn responses_tool_choice_to_chat(
+    choice: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ParamError> {
+    let Some(choice) = choice else {
+        return Ok(None);
+    };
+    match choice {
+        serde_json::Value::Object(mut obj) => {
+            if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
+                let name = obj
+                    .remove("name")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .ok_or_else(|| ParamError {
+                        param: "tool_choice",
+                        message: "function tool_choice requires `name`".into(),
+                    })?;
+                Ok(Some(serde_json::json!({
+                    "type":"function", "function":{"name":name}
+                })))
+            } else {
+                Err(ParamError {
+                    param: "tool_choice",
+                    message: "only function tool_choice objects are supported".into(),
+                })
+            }
+        }
+        serde_json::Value::String(s) => Ok(Some(serde_json::Value::String(s))),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ParamError {
+            param: "tool_choice",
+            message: "tool_choice must be a string or function choice object".into(),
+        }),
+    }
 }
 
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
@@ -606,10 +908,34 @@ pub struct OAIFunction {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+impl UsageInfo {
+    /// Build the OpenAI usage block from the generator's authoritative counts. `prompt_tokens`
+    /// INCLUDES any KV-prefix-cache hits; the cached share is reported separately so clients can
+    /// see what was recomputed vs reused (mirrors Responses' `input_tokens_details`).
+    fn from_outcome(outcome: ChatOutcome) -> Self {
+        Self {
+            prompt_tokens: outcome.prompt_tokens,
+            completion_tokens: outcome.completion_tokens,
+            total_tokens: outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens),
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: outcome.cached_prompt_tokens.min(outcome.prompt_tokens),
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +1027,18 @@ struct ServeStats {
     /// the window it landed in is what lets [`Self::fold_completion`] tell "still correctable" from
     /// "already published" (backlog B24).
     window: AtomicU64,
+    /// Process-lifetime totals and the most recently completed request, exposed by `/v1/metrics`.
+    total_prompt_tokens: AtomicU64,
+    total_cached_prompt_tokens: AtomicU64,
+    total_gen_tokens: AtomicU64,
+    total_completed: AtomicU64,
+    total_failed: AtomicU64,
+    last_prompt_tokens: AtomicU64,
+    last_gen_tokens: AtomicU64,
+    last_prefill_us: AtomicU64,
+    last_decode_us: AtomicU64,
+    last_total_us: AtomicU64,
+    last_completed_unix_ms: AtomicU64,
 }
 
 impl ServeStats {
@@ -730,8 +1068,10 @@ impl ServeStats {
     /// is new information about tokens nobody has counted yet, the same shape as `prompt_tokens`
     /// arriving at completion.
     fn fold_completion(&self, rec: &ReqRecord) {
-        self.interval_prompt_tokens
-            .fetch_add(u64::from(rec.prompt_tokens), Ordering::Relaxed);
+        self.interval_prompt_tokens.fetch_add(
+            u64::from(rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens)),
+            Ordering::Relaxed,
+        );
         let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
         if correction > 0 {
             self.bump_gen(correction);
@@ -741,6 +1081,31 @@ impl ServeStats {
             self.bump_gen(-correction.abs().min(retractable));
         }
         self.interval_completed.fetch_add(1, Ordering::Relaxed);
+        self.total_prompt_tokens
+            .fetch_add(u64::from(rec.prompt_tokens), Ordering::Relaxed);
+        self.total_cached_prompt_tokens
+            .fetch_add(u64::from(rec.cached_prompt_tokens), Ordering::Relaxed);
+        self.total_gen_tokens
+            .fetch_add(u64::from(rec.gen_tokens), Ordering::Relaxed);
+        self.total_completed.fetch_add(1, Ordering::Relaxed);
+        self.last_prompt_tokens
+            .store(u64::from(rec.prompt_tokens), Ordering::Relaxed);
+        self.last_gen_tokens
+            .store(u64::from(rec.gen_tokens), Ordering::Relaxed);
+        self.last_prefill_us.store(
+            rec.prefill.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.last_decode_us.store(
+            rec.decode.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.last_total_us.store(
+            rec.total.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.last_completed_unix_ms
+            .store(unix_ms(), Ordering::Relaxed);
     }
 
     /// Fold one request that ended in an error. Its partial deltas are already counted; there is no
@@ -748,6 +1113,8 @@ impl ServeStats {
     fn fold_failure(&self) {
         self.interval_completed.fetch_add(1, Ordering::Relaxed);
         self.interval_failed.fetch_add(1, Ordering::Relaxed);
+        self.total_completed.fetch_add(1, Ordering::Relaxed);
+        self.total_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Take the interval counters (resetting them to zero) and sample the gauges. `elapsed` is the
@@ -921,6 +1288,15 @@ impl ReqTally {
         stats.bump_gen(1);
     }
 
+    /// A tool-call output item has become identifiable, but its arguments are still being
+    /// assembled by the splitter. It is a real first-output boundary for TTFT/decode accounting
+    /// even though it is not yet an emitted token estimate for the aggregate stats counter.
+    fn on_output_start(&mut self) {
+        if self.first_delta.is_none() {
+            self.first_delta = Some(Instant::now());
+        }
+    }
+
     /// Close the tally out against the generator's authoritative counts.
     fn finish(&self, outcome: ChatOutcome, finish: Finish) -> ReqRecord {
         let total = self.started.elapsed();
@@ -931,6 +1307,7 @@ impl ReqTally {
             .map_or(total, |t| t.saturating_duration_since(self.started));
         ReqRecord {
             prompt_tokens: outcome.prompt_tokens,
+            cached_prompt_tokens: outcome.cached_prompt_tokens.min(outcome.prompt_tokens),
             gen_tokens: outcome.completion_tokens,
             deltas: self.deltas,
             window: self.window,
@@ -947,6 +1324,7 @@ impl ReqTally {
 #[derive(Debug, Clone, Copy)]
 struct ReqRecord {
     prompt_tokens: u32,
+    cached_prompt_tokens: u32,
     gen_tokens: u32,
     deltas: u64,
     /// The stats window this request's last deltas landed in — see [`ServeStats::fold_completion`].
@@ -965,7 +1343,10 @@ impl ReqRecord {
     /// THIS request's prefill speed: prompt tokens over its time-to-first-delta. A per-request
     /// number, unlike [`StatsWindow::prefill_tps`].
     fn prefill_tps(&self) -> f64 {
-        per_second(u64::from(self.prompt_tokens), self.prefill)
+        per_second(
+            u64::from(self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)),
+            self.prefill,
+        )
     }
 
     /// THIS request's decode speed: generated tokens over the time after the first delta.
@@ -1292,7 +1673,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/responses", post(responses_handler))
         .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/metrics", get(metrics_handler))
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -1414,6 +1798,67 @@ async fn shutdown_latched() {
 /// [`auth_gate`].
 async fn health_handler() -> StatusCode {
     StatusCode::OK
+}
+
+async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
+    let stats = &state.stats;
+    let (busy_slots, total_slots) = state.slot_occupancy();
+    let last_prompt = stats.last_prompt_tokens.load(Ordering::Relaxed);
+    let last_gen = stats.last_gen_tokens.load(Ordering::Relaxed);
+    let last_prefill_us = stats.last_prefill_us.load(Ordering::Relaxed);
+    let last_decode_us = stats.last_decode_us.load(Ordering::Relaxed);
+    let last_total_us = stats.last_total_us.load(Ordering::Relaxed);
+    let pager = infr_core::pager_profile::snapshot();
+    let gpu_lookups = pager.gpu_hits.saturating_add(pager.gpu_misses);
+    let host_lookups = pager.host_hits.saturating_add(pager.host_misses);
+    Json(serde_json::json!({
+        "object":"infr.metrics",
+        "timestamp":unix_ts(),
+        "requests":{
+            "completed":stats.total_completed.load(Ordering::Relaxed),
+            "failed":stats.total_failed.load(Ordering::Relaxed),
+            "active":stats.active.load(Ordering::Relaxed),
+            "queued":stats.queued.load(Ordering::Relaxed)
+        },
+        "tokens":{
+            "prompt_total":stats.total_prompt_tokens.load(Ordering::Relaxed),
+            "prompt_cached_total":stats.total_cached_prompt_tokens.load(Ordering::Relaxed),
+            "generated_total":stats.total_gen_tokens.load(Ordering::Relaxed)
+        },
+        "slots":{"busy":busy_slots,"total":total_slots},
+        "last_request":{
+            "completed_unix_ms":stats.last_completed_unix_ms.load(Ordering::Relaxed),
+            "prompt_tokens":last_prompt,
+            "generated_tokens":last_gen,
+            "prefill_tps":rate_per_us(last_prompt,last_prefill_us),
+            "decode_tps":rate_per_us(last_gen,last_decode_us),
+            "total_ms":last_total_us as f64 / 1000.0
+        },
+        "pager":{
+            "profiling_enabled":infr_core::pager_profile::enabled(),
+            "gpu":{
+                "lookups":gpu_lookups,"hits":pager.gpu_hits,"misses":pager.gpu_misses,
+                "evictions":pager.gpu_evictions,
+                "hit_rate":(gpu_lookups>0).then(|| pager.gpu_hit_rate())
+            },
+            "host":{
+                "lookups":host_lookups,"hits":pager.host_hits,"misses":pager.host_misses,
+                "evictions":pager.host_evictions,"reads":pager.host_reads,
+                "read_bytes":pager.host_read_bytes,
+                "hit_rate":(host_lookups>0).then(|| pager.host_hit_rate())
+            },
+            "gpu_copy_bytes":pager.gpu_copy_bytes,
+            "host_memcpy_bytes":pager.memcpy_bytes
+        }
+    }))
+    .into_response()
+}
+
+fn rate_per_us(tokens: u64, micros: u64) -> Option<f64> {
+    (micros > 0).then(|| tokens as f64 * 1_000_000.0 / micros as f64)
 }
 
 /// The hosted model list — GATED by the same bearer check as `/v1/chat/completions`.
@@ -1559,6 +2004,118 @@ async fn chat_completions_handler(
         Ok(j) => j,
         Err(e) => return param_error(None, e.body_text()),
     };
+    dispatch_chat(state, req, "/v1/chat/completions", WireFormat::Chat).await
+}
+
+fn responses_output_items(
+    cid: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[OAIToolCall],
+) -> Vec<serde_json::Value> {
+    let mut output = Vec::new();
+    if !reasoning.is_empty() {
+        output.push(serde_json::json!({
+            "id": format!("rs_{cid}"),
+            "type": "reasoning",
+            "summary": [{"type":"summary_text", "text":reasoning}],
+            "status": "completed"
+        }));
+    }
+    if !content.is_empty() || tool_calls.is_empty() {
+        output.push(serde_json::json!({
+            "id": format!("msg_{cid}"),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type":"output_text", "text":content, "annotations":[], "logprobs":[]
+            }]
+        }));
+    }
+    output.extend(tool_calls.iter().map(|call| {
+        serde_json::json!({
+            "id": format!("fc_{}_{}", cid, call.index),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call.id,
+            "name": call.function.name,
+            "arguments": call.function.arguments
+        })
+    }));
+    output
+}
+
+fn responses_completed_value(
+    cid: &str,
+    created: i64,
+    model: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[OAIToolCall],
+    outcome: ChatOutcome,
+    finish: Finish,
+) -> serde_json::Value {
+    let incomplete =
+        (finish == Finish::Length).then(|| serde_json::json!({"reason":"max_output_tokens"}));
+    serde_json::json!({
+        "id": cid,
+        "object": "response",
+        "created_at": created,
+        "completed_at": unix_ts(),
+        "status": if finish == Finish::Length { "incomplete" } else { "completed" },
+        "error": null,
+        "incomplete_details": incomplete,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": model,
+        "output": responses_output_items(cid, reasoning, content, tool_calls),
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": {"effort":null, "summary":null},
+        "store": false,
+        "temperature": null,
+        "text": {"format":{"type":"text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": null,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": outcome.prompt_tokens,
+            "input_tokens_details": {"cached_tokens":outcome.cached_prompt_tokens},
+            "output_tokens": outcome.completion_tokens,
+            "output_tokens_details": {"reasoning_tokens":0},
+            "total_tokens": outcome.prompt_tokens.saturating_add(outcome.completion_tokens)
+        },
+        "metadata": {}
+    })
+}
+
+async fn responses_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<ResponsesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(e) => return param_error(None, e.body_text()),
+    };
+    let req = match req.into_chat() {
+        Ok(req) => req,
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
+    dispatch_chat(state, req, "/v1/responses", WireFormat::Responses).await
+}
+
+async fn dispatch_chat(
+    state: AppState,
+    req: ChatRequest,
+    route: &'static str,
+    wire: WireFormat,
+) -> Response {
     let mut params = match GenParams::from_request(&req) {
         Ok(p) => p,
         Err(e) => return param_error(Some(e.param), e.message),
@@ -1595,7 +2152,10 @@ async fn chat_completions_handler(
     let model_id = entry.id.to_string();
     let ctx = ReqCtx {
         id: next_req_id(),
-        cid: make_id(),
+        cid: match wire {
+            WireFormat::Chat => make_id("chatcmpl"),
+            WireFormat::Responses => make_id("resp"),
+        },
         model_id,
         created: unix_ts(),
         // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
@@ -1603,10 +2163,11 @@ async fn chat_completions_handler(
         deadline: request_timeout(&state.cfg),
         stream: req.stream,
         stats: state.stats.clone(),
+        wire,
     };
     log_request_start(
         ctx.id,
-        "/v1/chat/completions",
+        route,
         &ctx.model_id,
         messages.len(),
         messages.iter().map(|m| m.content.len()).sum(),
@@ -1619,6 +2180,12 @@ async fn chat_completions_handler(
     } else {
         non_streaming(entry, messages, tools, tool_choice, params, ctx).await
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireFormat {
+    Chat,
+    Responses,
 }
 
 /// Everything about one in-flight request that is not its messages: identity (the log's `req` and
@@ -1638,6 +2205,7 @@ struct ReqCtx {
     deadline: Option<Duration>,
     stream: bool,
     stats: Arc<ServeStats>,
+    wire: WireFormat,
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,6 +2228,7 @@ async fn non_streaming(
         deadline,
         stream,
         stats,
+        wire,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -1720,6 +2289,7 @@ async fn non_streaming(
                         tally.on_text_delta(&stats_blk);
                         content.push_str(&t);
                     }
+                    Delta::ToolCallStart { .. } => {}
                     Delta::ToolCall { name, arguments } => {
                         let idx = tool_calls.len();
                         tool_calls.push(OAIToolCall {
@@ -1798,42 +2368,49 @@ async fn non_streaming(
             let rec = tally.finish(outcome, finish);
             stats.fold_completion(&rec);
             log_request_done(req_id, &model_id, stream, &rec);
-            Json(ChatCompletionResponse {
-                id: cid,
-                object: "chat.completion",
-                created,
-                model: model_id,
-                choices: vec![CompletionChoice {
-                    index: 0,
-                    message: AssistantMessage {
-                        role: "assistant",
-                        content: if content.is_empty() {
-                            None
-                        } else {
-                            Some(content.clone())
+            match wire {
+                WireFormat::Chat => Json(ChatCompletionResponse {
+                    id: cid,
+                    object: "chat.completion",
+                    created,
+                    model: model_id,
+                    choices: vec![CompletionChoice {
+                        index: 0,
+                        message: AssistantMessage {
+                            role: "assistant",
+                            content: if content.is_empty() {
+                                None
+                            } else {
+                                Some(content.clone())
+                            },
+                            reasoning_content: if reasoning.is_empty() {
+                                None
+                            } else {
+                                Some(reasoning)
+                            },
+                            tool_calls: if tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(tool_calls)
+                            },
                         },
-                        reasoning_content: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning)
-                        },
-                        tool_calls: if tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(tool_calls)
-                        },
-                    },
-                    finish_reason: finish.as_str().into(),
-                }],
-                usage: UsageInfo {
-                    prompt_tokens: outcome.prompt_tokens,
-                    completion_tokens: outcome.completion_tokens,
-                    total_tokens: outcome
-                        .prompt_tokens
-                        .saturating_add(outcome.completion_tokens),
-                },
-            })
-            .into_response()
+                        finish_reason: finish.as_str().into(),
+                    }],
+                    usage: UsageInfo::from_outcome(outcome),
+                })
+                .into_response(),
+                WireFormat::Responses => Json(responses_completed_value(
+                    &cid,
+                    created,
+                    &model_id,
+                    &reasoning,
+                    &content,
+                    &tool_calls,
+                    outcome,
+                    finish,
+                ))
+                .into_response(),
+            }
         }
     }
 }
@@ -1858,6 +2435,7 @@ async fn streaming(
         deadline,
         stream,
         stats,
+        wire,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -1915,6 +2493,10 @@ async fn streaming(
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
+        // The Responses SSE sequence counter is shared with `DoneGuard` (single-threaded interior
+        // mutability is enough — the generation callback and the guard never run concurrently) so
+        // an error frame continues the numbering instead of restarting at 0.
+        let sequence = Rc::new(Cell::new(0u64));
         // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
         // — unless `settled()` says a terminal frame already went out — reports the generation as a
         // failure. Both matter on an unwinding panic, which skips every arm below (B23).
@@ -1923,19 +2505,39 @@ async fn streaming(
             req_id,
             stats: stats.clone(),
             settled: false,
+            wire,
+            sequence: sequence.clone(),
         };
 
-        // First chunk: role delta (mirrors the Python shim's opening chunk).
-        let _ = tx.send(Ok(sse_chunk(
-            &cid,
-            &model_id,
-            created,
-            DeltaPayload {
-                role: Some("assistant".into()),
-                ..Default::default()
-            },
-            None,
-        )));
+        match wire {
+            WireFormat::Chat => {
+                // First chunk: role delta (mirrors the Python shim's opening chunk).
+                let _ = tx.send(Ok(sse_chunk(
+                    &cid,
+                    &model_id,
+                    created,
+                    DeltaPayload {
+                        role: Some("assistant".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )));
+            }
+            WireFormat::Responses => {
+                let progress = responses_progress_value(&cid, created, &model_id, "in_progress");
+                let _ = tx.send(Ok(responses_sse_event(
+                    "response.created",
+                    &sequence,
+                    serde_json::json!({"response":progress}),
+                )));
+                let progress = responses_progress_value(&cid, created, &model_id, "in_progress");
+                let _ = tx.send(Ok(responses_sse_event(
+                    "response.in_progress",
+                    &sequence,
+                    serde_json::json!({"response":progress}),
+                )));
+            }
+        }
 
         let Some(engine) = engine_arc else {
             // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then closes
@@ -1946,6 +2548,13 @@ async fn streaming(
 
         let mut tc_index = 0usize;
         let mut saw_tool_call = false;
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut reasoning_started = false;
+        let mut content_started = false;
+        let mut output_index = 0usize;
+        let mut pending_tool_indices: Vec<usize> = Vec::new();
         // Per-request tally: plain locals inside the generation, folded in once below.
         let mut tally = ReqTally::new();
 
@@ -1956,43 +2565,199 @@ async fn streaming(
             &params,
             &cancel_cb,
             &mut |delta| {
-                let payload = match delta {
+                // `None` means the delta produced no wire frame of its own (a Responses
+                // ToolCallStart sends only its `output_item.added`; a Chat ToolCallStart sends
+                // nothing at all), so there is nothing to send — and no send failure to latch.
+                let event: Option<Event> = match delta {
                     Delta::Reasoning(t) => {
                         tally.on_text_delta(&stats_cb);
-                        DeltaPayload {
-                            reasoning_content: Some(t),
-                            ..Default::default()
-                        }
+                        reasoning.push_str(&t);
+                        Some(match wire {
+                            WireFormat::Chat => sse_chunk(
+                                &cid_cb,
+                                &model_cb,
+                                created,
+                                DeltaPayload {
+                                    reasoning_content: Some(t),
+                                    ..Default::default()
+                                },
+                                None,
+                            ),
+                            WireFormat::Responses => {
+                                if !reasoning_started {
+                                    reasoning_started = true;
+                                    let item = serde_json::json!({
+                                        "id":format!("rs_{}", cid_cb), "type":"reasoning",
+                                        "summary":[], "status":"in_progress"
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.output_item.added", &sequence,
+                                        serde_json::json!({"output_index":output_index,"item":item})
+                                    )));
+                                }
+                                responses_sse_event(
+                                    "response.reasoning_summary_text.delta",
+                                    &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("rs_{}",cid_cb),
+                                        "output_index":output_index,"summary_index":0,"delta":t
+                                    }),
+                                )
+                            }
+                        })
                     }
                     Delta::Content(t) => {
                         tally.on_text_delta(&stats_cb);
-                        DeltaPayload {
-                            content: Some(t),
-                            ..Default::default()
+                        content.push_str(&t);
+                        Some(match wire {
+                            WireFormat::Chat => sse_chunk(
+                                &cid_cb,
+                                &model_cb,
+                                created,
+                                DeltaPayload {
+                                    content: Some(t),
+                                    ..Default::default()
+                                },
+                                None,
+                            ),
+                            WireFormat::Responses => {
+                                if !content_started {
+                                    if reasoning_started {
+                                        output_index += 1;
+                                    }
+                                    content_started = true;
+                                    let item = serde_json::json!({
+                                        "id":format!("msg_{}",cid_cb), "type":"message",
+                                        "status":"in_progress", "role":"assistant", "content":[]
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.output_item.added", &sequence,
+                                        serde_json::json!({"output_index":output_index,"item":item})
+                                    )));
+                                    let part = serde_json::json!({
+                                        "type":"output_text","text":"","annotations":[],"logprobs":[]
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.content_part.added", &sequence,
+                                        serde_json::json!({
+                                            "item_id":format!("msg_{}",cid_cb),"output_index":output_index,
+                                            "content_index":0,"part":part
+                                        })
+                                    )));
+                                }
+                                responses_sse_event(
+                                    "response.output_text.delta",
+                                    &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("msg_{}",cid_cb),"output_index":output_index,
+                                        "content_index":0,"delta":t,"logprobs":[]
+                                    }),
+                                )
+                            }
+                        })
+                    }
+                    Delta::ToolCallStart { name } => {
+                        tally.on_output_start();
+                        let idx = tc_index;
+                        tc_index += 1;
+                        pending_tool_indices.push(idx);
+                        match wire {
+                            // No wire frame for Chat: a tool call still appears as ONE chunk when
+                            // its arguments are complete, exactly as before ToolCallStart existed.
+                            WireFormat::Chat => None,
+                            WireFormat::Responses => {
+                                // Same position formula as the `ToolCall` arm below, so a call
+                                // preceded by reasoning/content gets the SAME output_index in its
+                                // added, delta, and done events.
+                                let tool_output_index = usize::from(!reasoning.is_empty())
+                                    + usize::from(!content.is_empty())
+                                    + idx;
+                                let item = serde_json::json!({
+                                    "id":format!("fc_{}_{}",cid_cb,idx),
+                                    "type":"function_call","status":"in_progress",
+                                    "call_id":format!("call_{}_{}",cid_cb,idx),
+                                    "name":name,"arguments":""
+                                });
+                                let _ = tx_cb.send(Ok(responses_sse_event(
+                                    "response.output_item.added", &sequence,
+                                    serde_json::json!({"output_index":tool_output_index,"item":item})
+                                )));
+                                // No synthetic arguments delta: clients that concatenate
+                                // `function_call_arguments.delta` frames must rebuild exactly the
+                                // final arguments string. The item.added above is already the
+                                // TTFT boundary this marker exists for.
+                                None
+                            }
                         }
                     }
                     Delta::ToolCall { name, arguments } => {
+                        let had_start = !pending_tool_indices.is_empty();
+                        let idx = if !had_start {
+                            let idx = tc_index;
+                            tc_index += 1;
+                            idx
+                        } else {
+                            pending_tool_indices.remove(0)
+                        };
                         let tc = OAIToolCall {
-                            index: tc_index,
-                            id: format!("call_{cid_cb}_{tc_index}"),
+                            index: idx,
+                            id: format!("call_{cid_cb}_{idx}"),
                             kind: "function",
                             function: OAIFunction { name, arguments },
                         };
-                        tc_index += 1;
                         saw_tool_call = true;
-                        DeltaPayload {
-                            tool_calls: Some(vec![tc]),
-                            ..Default::default()
-                        }
+                        tool_calls.push(tc.clone());
+                        Some(match wire {
+                            WireFormat::Chat => sse_chunk(
+                                &cid_cb,
+                                &model_cb,
+                                created,
+                                DeltaPayload {
+                                    tool_calls: Some(vec![tc]),
+                                    ..Default::default()
+                                },
+                                None,
+                            ),
+                            WireFormat::Responses => {
+                                let tool_output_index = usize::from(!reasoning.is_empty())
+                                    + usize::from(!content.is_empty())
+                                    + tc.index;
+                                if !had_start {
+                                    let item = serde_json::json!({
+                                        "id":format!("fc_{}_{}",cid_cb,tc.index),
+                                        "type":"function_call","status":"in_progress",
+                                        "call_id":tc.id,"name":tc.function.name,"arguments":""
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.output_item.added", &sequence,
+                                        serde_json::json!({"output_index":tool_output_index,"item":item})
+                                    )));
+                                }
+                                let _ = tx_cb.send(Ok(responses_sse_event(
+                                    "response.function_call_arguments.delta", &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("fc_{}_{}",cid_cb,tc.index),
+                                        "output_index":tool_output_index,"delta":tc.function.arguments
+                                    })
+                                )));
+                                responses_sse_event(
+                                    "response.function_call_arguments.done", &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("fc_{}_{}",cid_cb,tc.index),
+                                        "output_index":tool_output_index,"name":tc.function.name,
+                                        "arguments":tc.function.arguments
+                                    })
+                                )
+                            }
+                        })
                     }
                 };
                 // A failed send means the receiver (the client's stream) is gone. Latch the abort so
                 // the decode loop stops at its next poll and returns the slot.
-                if tx_cb
-                    .send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)))
-                    .is_err()
-                {
-                    cancel_cb.store(true, Ordering::Relaxed);
+                if let Some(event) = event {
+                    if tx_cb.send(Ok(event)).is_err() {
+                        cancel_cb.store(true, Ordering::Relaxed);
+                    }
                 }
             },
         );
@@ -2009,14 +2774,32 @@ async fn streaming(
                 } else {
                     outcome.finish
                 };
-                // Finish chunk: empty delta + finish_reason.
-                let _ = tx.send(Ok(sse_chunk(
-                    &cid,
-                    &model_id,
-                    created,
-                    DeltaPayload::default(),
-                    Some(finish.as_str().into()),
-                )));
+                match wire {
+                    WireFormat::Chat => {
+                        // Finish chunk: empty delta + finish_reason.
+                        let _ = tx.send(Ok(sse_chunk(
+                            &cid,
+                            &model_id,
+                            created,
+                            DeltaPayload::default(),
+                            Some(finish.as_str().into()),
+                        )));
+                    }
+                    WireFormat::Responses => {
+                        send_responses_done_events(
+                            &tx,
+                            &cid,
+                            created,
+                            &model_id,
+                            &reasoning,
+                            &content,
+                            &tool_calls,
+                            outcome,
+                            finish,
+                            &sequence,
+                        );
+                    }
+                }
                 // Fold the request's tallies in ONCE, here, and log its completion line. The finish
                 // chunk above IS this stream's terminal frame, so the guard must not also report a
                 // failure when it drops.
@@ -2076,6 +2859,10 @@ struct DoneGuard {
     stats: Arc<ServeStats>,
     /// Set by [`Self::settled`] once a terminal frame is out and the tallies are folded.
     settled: bool,
+    wire: WireFormat,
+    /// Shared with the streaming closure's Responses SSE counter so an error frame continues the
+    /// event numbering rather than restarting it.
+    sequence: Rc<Cell<u64>>,
 }
 
 impl DoneGuard {
@@ -2097,7 +2884,22 @@ impl DoneGuard {
         self.settled = true;
         // A failed send just means the client is already gone; the accounting still has to be
         // right, so the fold and the log are NOT conditional on it.
-        let _ = self.tx.send(Ok(sse_error_event(msg)));
+        let event = match self.wire {
+            WireFormat::Chat => sse_error_event(msg),
+            WireFormat::Responses => {
+                // Continue the stream's own numbering — a mid-stream error must not restart at 0.
+                let n = self.sequence.get();
+                self.sequence.set(n.saturating_add(1));
+                Event::default().event("error").data(
+                    serde_json::json!({
+                        "type":"error","sequence_number":n,
+                        "code":"server_error","message":msg,"param":null
+                    })
+                    .to_string(),
+                )
+            }
+        };
+        let _ = self.tx.send(Ok(event));
         self.stats.fold_failure();
         tracing::warn!(req = self.req_id, error = msg, "request failed");
     }
@@ -2106,7 +2908,9 @@ impl DoneGuard {
 impl Drop for DoneGuard {
     fn drop(&mut self) {
         self.fail("internal error: generation ended without a terminal frame");
-        let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
+        if self.wire == WireFormat::Chat {
+            let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
+        }
     }
 }
 
@@ -2153,6 +2957,131 @@ fn sse_chunk(
         .expect("ChatCompletionChunk always serializes")
 }
 
+fn responses_progress_value(
+    cid: &str,
+    created: i64,
+    model: &str,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id":cid,"object":"response","created_at":created,"status":status,
+        "error":null,"incomplete_details":null,"instructions":null,
+        "max_output_tokens":null,"model":model,"output":[],
+        "parallel_tool_calls":true,"previous_response_id":null,
+        "reasoning":{"effort":null,"summary":null},"store":false,
+        "temperature":null,"text":{"format":{"type":"text"}},
+        "tool_choice":"auto","tools":[],"top_p":null,"truncation":"disabled",
+        "usage":null,"metadata":{}
+    })
+}
+
+/// Typed SSE event used by `/v1/responses`. Both the SSE `event:` field and JSON `type` are set;
+/// OpenAI SDKs key off the JSON discriminator, while command-line consumers often key off `event`.
+fn responses_sse_event(
+    kind: &'static str,
+    sequence: &Cell<u64>,
+    mut body: serde_json::Value,
+) -> Event {
+    body["type"] = serde_json::Value::String(kind.to_owned());
+    body["sequence_number"] = serde_json::json!(sequence.get());
+    sequence.set(sequence.get().saturating_add(1));
+    Event::default()
+        .event(kind)
+        .json_data(body)
+        .expect("Responses event JSON always serializes")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_responses_done_events(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    cid: &str,
+    created: i64,
+    model: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[OAIToolCall],
+    outcome: ChatOutcome,
+    finish: Finish,
+    sequence: &Cell<u64>,
+) {
+    let mut output_index = 0usize;
+    if !reasoning.is_empty() {
+        let item_id = format!("rs_{cid}");
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.reasoning_summary_text.done",
+            sequence,
+            serde_json::json!({
+                "item_id":item_id,"output_index":output_index,"summary_index":0,
+                "text":reasoning
+            }),
+        )));
+        let item = responses_output_items(cid, reasoning, "", &[]).remove(0);
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_item.done",
+            sequence,
+            serde_json::json!({"output_index":output_index,"item":item}),
+        )));
+        output_index += 1;
+    }
+    if !content.is_empty() || tool_calls.is_empty() {
+        let item_id = format!("msg_{cid}");
+        let part = serde_json::json!({
+            "type":"output_text","text":content,"annotations":[],"logprobs":[]
+        });
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_text.done",
+            sequence,
+            serde_json::json!({
+                "item_id":item_id,"output_index":output_index,"content_index":0,
+                "text":content,"logprobs":[]
+            }),
+        )));
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.content_part.done",
+            sequence,
+            serde_json::json!({
+                "item_id":item_id,"output_index":output_index,"content_index":0,"part":part
+            }),
+        )));
+        let item = serde_json::json!({
+            "id":item_id,"type":"message","status":"completed","role":"assistant",
+            "content":[part]
+        });
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_item.done",
+            sequence,
+            serde_json::json!({"output_index":output_index,"item":item}),
+        )));
+        output_index += 1;
+    }
+    for call in tool_calls {
+        let item = serde_json::json!({
+            "id":format!("fc_{}_{}",cid,call.index),"type":"function_call",
+            "status":"completed","call_id":call.id,"name":call.function.name,
+            "arguments":call.function.arguments
+        });
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_item.done",
+            sequence,
+            serde_json::json!({"output_index":output_index,"item":item}),
+        )));
+        output_index += 1;
+    }
+    let response = responses_completed_value(
+        cid, created, model, reasoning, content, tool_calls, outcome, finish,
+    );
+    let event = if finish == Finish::Length {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    let _ = tx.send(Ok(responses_sse_event(
+        event,
+        sequence,
+        serde_json::json!({"response":response}),
+    )));
+}
+
 fn json_error(status: StatusCode, msg: String) -> Response {
     (status, Json(error_body(&msg, "server_error"))).into_response()
 }
@@ -2178,13 +3107,17 @@ fn param_error(param: Option<&str>, msg: String) -> Response {
 /// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn make_id() -> String {
+fn make_id(prefix: &str) -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{ms}-{seq}")
+    if prefix == "chatcmpl" {
+        format!("{prefix}-{ms}-{seq}")
+    } else {
+        format!("{prefix}_{ms}_{seq}")
+    }
 }
 
 /// Default ceiling for `max_tokens`/`max_completion_tokens` when `INFR_MAX_TOKENS_CAP` is unset —
@@ -2358,6 +3291,14 @@ fn unix_ts() -> i64 {
         .as_secs() as i64
 }
 
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 /// Flatten a DTO `content` field (string OR content-part array) to a plain `String`.
 ///
 /// Mirrors the Python shim's `normalize_messages`: only `"text"` parts are kept.
@@ -2489,7 +3430,37 @@ mod tests {
             Ok(ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
+                cached_prompt_tokens: 0,
                 completion_tokens: 2,
+            })
+        }
+    }
+
+    struct ToolGen;
+
+    impl ChatGenerator for ToolGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &AtomicBool,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::ToolCallStart {
+                name: "shell".into(),
+            });
+            std::thread::sleep(Duration::from_millis(5));
+            on_delta(Delta::ToolCall {
+                name: "shell".into(),
+                arguments: r#"{"cmd":"dir"}"#.into(),
+            });
+            Ok(ChatOutcome {
+                finish: Finish::ToolCalls,
+                prompt_tokens: 3,
+                cached_prompt_tokens: 0,
+                completion_tokens: 10,
             })
         }
     }
@@ -2791,6 +3762,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2824,6 +3796,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2863,6 +3836,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -3325,7 +4299,7 @@ mod tests {
         // Two completions minted in the same millisecond (routine under --parallel N) must NOT
         // collide — the monotonic suffix guarantees it even when the ms component is identical.
         let n = 10_000;
-        let ids: std::collections::HashSet<String> = (0..n).map(|_| make_id()).collect();
+        let ids: std::collections::HashSet<String> = (0..n).map(|_| make_id("chatcmpl")).collect();
         assert_eq!(ids.len(), n, "make_id produced a collision");
     }
 
@@ -3337,16 +4311,12 @@ mod tests {
         let outcome = ChatOutcome {
             finish: Finish::Stop,
             prompt_tokens: 17,
+            cached_prompt_tokens: 0,
             completion_tokens: 5,
         };
-        let usage = UsageInfo {
-            prompt_tokens: outcome.prompt_tokens,
-            completion_tokens: outcome.completion_tokens,
-            total_tokens: outcome
-                .prompt_tokens
-                .saturating_add(outcome.completion_tokens),
-        };
+        let usage = UsageInfo::from_outcome(outcome);
         assert_eq!(usage.total_tokens, 22);
+        assert_eq!(usage.prompt_tokens_details.cached_tokens, 0);
         assert_eq!(
             usage.total_tokens,
             usage.prompt_tokens + usage.completion_tokens
@@ -3375,6 +4345,289 @@ mod tests {
         assert_eq!(v["usage"]["prompt_tokens"], 3);
         assert_eq!(v["usage"]["completion_tokens"], 2);
         assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn responses_non_streaming_returns_item_oriented_shape() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"alpha","input":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["model"], "alpha");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(v["output"][0]["content"][0]["text"], "from:alpha");
+        assert_eq!(v["usage"]["input_tokens"], 3);
+        assert_eq!(v["usage"]["output_tokens"], 2);
+        assert!(v["id"].as_str().unwrap().starts_with("resp_"));
+    }
+
+    #[test]
+    fn responses_usage_preserves_kv_cached_prompt_tokens() {
+        let v = responses_completed_value(
+            "resp_test",
+            0,
+            "m",
+            "",
+            "ok",
+            &[],
+            ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 100,
+                cached_prompt_tokens: 76,
+                completion_tokens: 4,
+            },
+            Finish::Stop,
+        );
+        assert_eq!(v["usage"]["input_tokens"], 100);
+        assert_eq!(v["usage"]["input_tokens_details"]["cached_tokens"], 76);
+        assert_eq!(v["usage"]["output_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_emits_typed_sse_events() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"alpha","input":"hi","stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("event: response.created"), "{text}");
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains("from:alpha"), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+        assert!(!text.contains("data: [DONE]"), "{text}");
+    }
+
+    /// A generator that says some text first and only then starts a tool call — the shape that
+    /// pins `output_index` consistency: the function_call item lives at index 1 (after the
+    /// message), and its added/delta/done events must ALL say so.
+    struct TextThenToolGen;
+
+    impl ChatGenerator for TextThenToolGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &AtomicBool,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("let me run that".into()));
+            on_delta(Delta::ToolCallStart {
+                name: "shell".into(),
+            });
+            on_delta(Delta::ToolCall {
+                name: "shell".into(),
+                arguments: r#"{"cmd":"dir"}"#.into(),
+            });
+            Ok(ChatOutcome {
+                finish: Finish::ToolCalls,
+                prompt_tokens: 3,
+                cached_prompt_tokens: 0,
+                completion_tokens: 12,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_tool_stream_announces_the_item_at_the_start_boundary() {
+        let generator: Arc<dyn ChatGenerator> = Arc::new(ToolGen);
+        let router = build_router(AppState::new(
+            generator,
+            "tool-model",
+            1,
+            Arc::new(Config::default()),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"tool-model","input":"run","stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let text = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        // The ToolCallStart boundary announces the function_call item well before its arguments
+        // finish — that early `output_item.added` is the whole point of the marker.
+        let added = text.find("response.output_item.added").unwrap();
+        let delta = text.find("response.function_call_arguments.delta").unwrap();
+        assert!(
+            added < delta,
+            "item.added must precede the arguments: {text}"
+        );
+        // No synthetic partial arguments: concatenating every `arguments.delta` must rebuild
+        // EXACTLY the final arguments string, so there is no stray "{" prefix frame.
+        assert!(
+            !text.contains("\"delta\":\"{\""),
+            "no synthetic arguments prefix: {text}"
+        );
+        assert!(
+            text.contains(r#""delta":"{\"cmd\":\"dir\"}""#),
+            "the arguments arrive as one delta carrying the full JSON: {text}"
+        );
+        assert!(
+            text.contains("response.function_call_arguments.done"),
+            "{text}"
+        );
+        assert!(text.contains("response.completed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn responses_tool_events_agree_on_output_index_when_text_comes_first() {
+        let generator: Arc<dyn ChatGenerator> = Arc::new(TextThenToolGen);
+        let router = build_router(AppState::new(
+            generator,
+            "tool-model",
+            1,
+            Arc::new(Config::default()),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"tool-model","input":"run","stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let text = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        // Parse the event stream and collect every event that carries an output_index for the
+        // function_call item — added (from ToolCallStart), arguments delta/done, and item.done.
+        let mut fc_indices = Vec::new();
+        let mut msg_indices = Vec::new();
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let item_id = v["item_id"].as_str().or_else(|| v["item"]["id"].as_str());
+            let Some(output_index) = v.get("output_index").and_then(|i| i.as_u64()) else {
+                continue;
+            };
+            match item_id {
+                Some(id) if id.starts_with("fc_") => fc_indices.push(output_index),
+                Some(id) if id.starts_with("msg_") => msg_indices.push(output_index),
+                _ => {}
+            }
+        }
+        assert!(
+            !fc_indices.is_empty() && fc_indices.iter().all(|&i| i == 1),
+            "every function_call event must sit at output_index 1 (after the message): {fc_indices:?} in {text}"
+        );
+        assert!(
+            !msg_indices.is_empty() && msg_indices.iter().all(|&i| i == 0),
+            "the message item owns output_index 0: {msg_indices:?} in {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_last_request_throughput_and_totals() {
+        let router = multi_router();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"alpha","input":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let metrics = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(metrics).await;
+        assert_eq!(v["object"], "infr.metrics");
+        assert_eq!(v["requests"]["completed"], 1);
+        assert_eq!(v["tokens"]["prompt_total"], 3);
+        assert_eq!(v["tokens"]["generated_total"], 2);
+        assert_eq!(v["last_request"]["prompt_tokens"], 3);
+        assert_eq!(v["last_request"]["generated_tokens"], 2);
+        assert!(v["last_request"]["total_ms"].as_f64().unwrap() >= 0.0);
+        assert!(v["pager"]["gpu"]["lookups"].is_number());
+    }
+
+    #[test]
+    fn responses_function_items_and_tools_convert_to_chat() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model":"m",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+                {"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"dir\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ],
+            "tools":[{"type":"function","name":"shell","description":"run","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"shell"}
+        }))
+        .unwrap();
+        let chat = req.into_chat().unwrap();
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(chat.messages[1].role, "assistant");
+        assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(chat.tools.as_ref().unwrap()[0]["function"]["name"], "shell");
+        assert_eq!(
+            chat.tool_choice.as_ref().unwrap()["function"]["name"],
+            "shell"
+        );
     }
 
     // --- tool_choice parsing (audit finding 6) -----------------------------
@@ -3716,6 +4969,7 @@ mod tests {
             Ok(ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
+                cached_prompt_tokens: 0,
                 completion_tokens: 1,
             })
         }
@@ -3740,6 +4994,7 @@ mod tests {
             deadline,
             stream,
             stats: Arc::default(),
+            wire: WireFormat::Chat,
         }
     }
 
@@ -4046,6 +5301,7 @@ mod tests {
     ) -> ReqRecord {
         ReqRecord {
             prompt_tokens: prompt,
+            cached_prompt_tokens: 0,
             gen_tokens: gen,
             deltas,
             window,
@@ -4159,6 +5415,7 @@ mod tests {
             ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
+                cached_prompt_tokens: 0,
                 completion_tokens: 1,
             },
             Finish::Stop,
@@ -4185,6 +5442,7 @@ mod tests {
             ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
+                cached_prompt_tokens: 0,
                 completion_tokens: 2,
             },
             Finish::Stop,
@@ -4203,6 +5461,7 @@ mod tests {
             ChatOutcome {
                 finish: Finish::Stop,
                 prompt_tokens: 0,
+                cached_prompt_tokens: 0,
                 completion_tokens: 0,
             },
             Finish::Stop,
