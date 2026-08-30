@@ -1,6 +1,7 @@
 //! Model hyper-parameters parsed from GGUF metadata. Mechanically split out of `lib.rs`.
 use crate::{meta_f64, meta_u64, MoeConfig};
 use anyhow::{bail, Context, Result};
+use infr_core::graph::QSA_MAX_TOP_BLOCKS;
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
@@ -226,9 +227,13 @@ pub struct Config {
     /// MASTER per-layer switch — which caches a layer keeps and which tensors it carries both hang
     /// off it. Only `{0, 4, 128}` are accepted (`deepseek4.cpp::load_arch_tensors` throws on
     /// anything else): `0` is a pure sliding-window layer with no compressor at all, `4` adds the
-    /// CSA compressor plus the lightning indexer, `128` adds the HCA compressor alone. Read through
-    /// [`Config::layer_compress_ratio`], which is the accessor every consumer should use. Empty for
-    /// every non-`deepseek4` model.
+    /// CSA compressor plus the lightning indexer, `128` adds the HCA compressor alone.
+    ///
+    /// qwen4exp reuses the same key with a DIFFERENT meaning: it is the QSA BLOCK factor, so
+    /// `{0, 4}` only (`0` = no block compression, `4` = pool every 4 indexer keys into one scored
+    /// block key). `0` is mandatory on a recurrent layer and legal on a full-attention one. Read
+    /// through [`Config::layer_compress_ratio`], which is the accessor every consumer should use.
+    /// Empty for every model that is neither `deepseek4` nor qwen4exp.
     pub compress_ratios: Vec<usize>,
     /// DeepSeek V4 (`{arch}.swiglu_clamp_exp`): per-layer clamp on the routed experts' SwiGLU. The
     /// GGUF may carry ONE value (broadcast to every layer) or a full array, which is why this is a
@@ -411,10 +416,11 @@ impl Config {
         self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
     }
 
-    /// deepseek4's per-layer compression ratio (`{arch}.attention.compress_ratios[il]`) — the
-    /// master switch over which caches and which tensors layer `il` has. One of `{0, 4, 128}`;
-    /// `0` for every layer of every other arch, which is also what a ratio-0 V4 layer means (pure
-    /// sliding window, no compressor).
+    /// The per-layer compression ratio (`{arch}.attention.compress_ratios[il]`) — for deepseek4
+    /// the master switch over which caches and which tensors layer `il` has (one of `{0, 4, 128}`,
+    /// where `0` means pure sliding window with no compressor), and for qwen4exp the QSA block
+    /// factor (`0` = no block compression, `4` = one scored block key per 4 indexer keys).
+    /// `0` for every layer of every other arch.
     pub fn layer_compress_ratio(&self, il: usize) -> usize {
         self.compress_ratios.get(il).copied().unwrap_or(0)
     }
@@ -1676,6 +1682,10 @@ impl Config {
                      {ssm_d_state}, but inner_size/time_step_rank is {head_v_dim}"
                 );
             }
+            // `compress_ratios[il]` is qwen4exp's QSA BLOCK factor: the indexer mean-pools
+            // `ratio` raw indexer keys into one scored block key, so `indexer_top_k` TOKENS means
+            // `indexer_top_k / ratio` BLOCKS. A recurrent layer has no indexer at all and must
+            // read 0; a full-attention layer's ratio only has to divide `indexer_top_k`.
             for (il, (&recurrent, &ratio)) in
                 recurrent_layers.iter().zip(&compress_ratios).enumerate()
             {
@@ -1686,11 +1696,12 @@ impl Config {
                     );
                 }
                 if !recurrent
-                    && (ratio == 0 || indexer_top_k == 0 || !indexer_top_k.is_multiple_of(ratio))
+                    && ratio != 0
+                    && (indexer_top_k == 0 || !indexer_top_k.is_multiple_of(ratio))
                 {
                     bail!(
-                        "qwen4exp full-attention layer {il} requires a nonzero compression ratio \
-                         that divides indexer top_k; got ratio {ratio}, top_k {indexer_top_k}"
+                        "qwen4exp full-attention layer {il} has compression ratio {ratio}, which \
+                         does not divide indexer top_k {indexer_top_k}"
                     );
                 }
             }
@@ -1720,6 +1731,37 @@ impl Config {
                 .checked_mul(n_embd)
                 .context("qwen4exp hyper-connection width overflow")?;
         }
+        // Converter-defect repair. Published qwen4exp GGUFs can carry an ALL-ZERO
+        // `attention.compress_ratios` even though the model compresses: Qwen3.8-Flash-Next's
+        // `config.json` sets `indexer_compress_ratio: 4`, and its `indexer_top_k` of 2048 TOKENS
+        // is only expressible as `2048 / 4 = 512` blocks. Two things give the zeros away as a
+        // defect rather than a design: the indexer's own weights ARE there on every full-attention
+        // layer, and an uncompressed 2048-BLOCK request is past `QSA_MAX_TOP_BLOCKS`, so the
+        // first long decode would fail inside the kernel instead of at load time. Recover the
+        // SMALLEST ratio that fits the budget (see [`qsa_block_ratio`]); a model that genuinely
+        // does not compress has a `top_k` that already fits, so it yields 1 and the repair is a
+        // no-op. Whatever the file DOES declare still wins — this only runs when no
+        // full-attention layer carries a nonzero ratio at all.
+        let compress_ratios = if qwen4exp
+            && !recurrent_layers
+                .iter()
+                .zip(&compress_ratios)
+                .any(|(&recurrent, &ratio)| !recurrent && ratio != 0)
+        {
+            let ratio = qsa_block_ratio(indexer_top_k);
+            let blocks = indexer_top_k / ratio;
+            tracing::warn!(
+                "{arch}.attention.compress_ratios is 0 on every full-attention layer; treating \
+                 that as a converter defect and using block ratio {ratio} (indexer top_k \
+                 {indexer_top_k} = {blocks} blocks)"
+            );
+            recurrent_layers
+                .iter()
+                .map(|&recurrent| if recurrent { 0 } else { ratio })
+                .collect()
+        } else {
+            compress_ratios
+        };
         Ok(Config {
             n_layer,
             n_head,
@@ -1831,6 +1873,17 @@ impl Config {
             is_lite,
         })
     }
+}
+
+/// The qwen4exp QSA block ratio to assume when a GGUF's `attention.compress_ratios` carries no
+/// compression at all (see the repair in [`Config::from_gguf`]): the SMALLEST `ratio` that brings
+/// `top_k / ratio` blocks under `infr_core::graph::QSA_MAX_TOP_BLOCKS`, then rounded up to a
+/// divisor of `top_k` so the token↔block round trip (`gathered = selected * ratio + tail`) stays
+/// exact. A model that genuinely does not compress has a `top_k` that already fits, so this
+/// returns `1` for it and the repair is a no-op.
+fn qsa_block_ratio(top_k: usize) -> usize {
+    let min = top_k.div_ceil(QSA_MAX_TOP_BLOCKS as usize).max(1);
+    (min..=top_k).find(|r| top_k % r == 0).unwrap_or(min)
 }
 
 #[cfg(test)]
@@ -1953,7 +2006,7 @@ mod tests {
     /// Four-layer scale model of the released Qwen3.8 layout. It deliberately omits
     /// `attention.recurrent_layers`, as the current converter does, to exercise the 3 GDN + 1
     /// full-attention interval fallback.
-    fn qwen4exp_fixture(ple_row_dim: u32) -> Vec<u8> {
+    fn qwen4exp_fixture(ple_row_dim: u32, indexer_top_k: u32, compress_ratios: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
         push_u32(&mut bytes, 0x4655_4747); // GGUF magic
         push_u32(&mut bytes, 3);
@@ -1985,7 +2038,7 @@ mod tests {
             ("hyper_connection.low_rank", 8),
             ("attention.indexer.head_count", 2),
             ("attention.indexer.key_length", 8),
-            ("attention.indexer.top_k", 16),
+            ("attention.indexer.top_k", indexer_top_k),
             ("ple.ngram_size", 3),
             ("ple.heads_per_ngram", 2),
             ("embedding_length_per_layer_input", ple_row_dim),
@@ -1997,7 +2050,7 @@ mod tests {
         push_u32_array_metadata(
             &mut bytes,
             "qwen4exp.attention.compress_ratios",
-            &[0, 0, 0, 4],
+            compress_ratios,
         );
         push_u32_array_metadata(
             &mut bytes,
@@ -2038,7 +2091,7 @@ mod tests {
 
     #[test]
     fn qwen4exp_interval_and_ple_geometry_match_the_released_layout() {
-        let cfg = config_from_fixture("qwen4exp", &qwen4exp_fixture(8))
+        let cfg = config_from_fixture("qwen4exp", &qwen4exp_fixture(8, 16, &[0, 0, 0, 4]))
             .expect("scaled qwen4exp fixture must parse");
         assert!(cfg.qwen4exp);
         assert_eq!(cfg.recurrent_layers, [true, true, true, false]);
@@ -2049,9 +2102,47 @@ mod tests {
         assert_eq!(cfg.q35_head_v_dim(), 4);
     }
 
+    /// The released Qwen3.8-Flash-Next quants declare `compress_ratios` as 48 zeros while their
+    /// `indexer_top_k` is 2048 TOKENS — uncompressed that is 2048 blocks, past the kernels'
+    /// `QSA_MAX_TOP_BLOCKS`, so the file's own numbers are self-contradictory and the ratio has to
+    /// be recovered (the model's `config.json` confirms `indexer_compress_ratio: 4`).
+    #[test]
+    fn qwen4exp_all_zero_compress_ratios_are_repaired_from_the_indexer_budget() {
+        let cfg = config_from_fixture("qwen4exp-zeros", &qwen4exp_fixture(8, 2048, &[0, 0, 0, 0]))
+            .expect("an all-zero compress_ratios array must parse");
+        assert_eq!(
+            cfg.compress_ratios,
+            [0, 0, 0, 4],
+            "2048 tokens / 4 = 512 blocks, the largest budget the QSA kernels accept"
+        );
+        assert_eq!(cfg.layer_compress_ratio(3), 4);
+        // The recurrent layers stay uncompressed whatever the repair decides.
+        assert_eq!(cfg.layer_compress_ratio(0), 0);
+    }
+
+    #[test]
+    fn qsa_block_ratio_is_the_smallest_divisor_that_fits_the_block_budget() {
+        // A `top_k` that already fits needs no compression at all.
+        assert_eq!(qsa_block_ratio(0), 1);
+        assert_eq!(qsa_block_ratio(1), 1);
+        assert_eq!(qsa_block_ratio(512), 1);
+        // Past the budget, the smallest divisor of `top_k` that brings it under.
+        assert_eq!(qsa_block_ratio(1024), 2);
+        assert_eq!(qsa_block_ratio(2048), 4);
+        assert_eq!(qsa_block_ratio(4096), 8);
+        // Every result divides `top_k` exactly, so `selected * ratio + tail` is lossless.
+        for top_k in [16, 100, 512, 1000, 2048, 5000] {
+            let ratio = qsa_block_ratio(top_k);
+            assert_eq!(top_k % ratio, 0, "top_k {top_k} / ratio {ratio}");
+            assert!(top_k / ratio <= QSA_MAX_TOP_BLOCKS as usize);
+        }
+    }
+
     #[test]
     fn qwen4exp_refuses_a_ple_width_that_does_not_flatten_to_hidden_size() {
-        let Err(err) = config_from_fixture("qwen4exp-bad-ple", &qwen4exp_fixture(7)) else {
+        let Err(err) =
+            config_from_fixture("qwen4exp-bad-ple", &qwen4exp_fixture(7, 16, &[0, 0, 0, 4]))
+        else {
             panic!("mismatched qwen4exp PLE width parsed successfully");
         };
         assert!(err.to_string().contains("PLE flattened width"));

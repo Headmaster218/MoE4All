@@ -8,7 +8,7 @@ use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
-use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind};
+use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind, QSA_MAX_TOP_BLOCKS};
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::HashMap;
@@ -2612,11 +2612,11 @@ fn lower_op(
                 || !rope_dim.is_multiple_of(2)
                 || *top_blocks == 0
                 || *top_blocks > first_blocks
-                || *top_blocks > 512
+                || *top_blocks > QSA_MAX_TOP_BLOCKS
             {
                 return Err(be(format!(
                     "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
-                     ratio>0 and 0<top_blocks<=min(blocks,512); got head_dim={head_dim} \
+                     ratio>0 and 0<top_blocks<=min(blocks,{QSA_MAX_TOP_BLOCKS}); got head_dim={head_dim} \
                      n_head={n_head} rope_dim={rope_dim} ratio={ratio} top_blocks={top_blocks} \
                      rows={rows} kv_len={kv_len}"
                 )));
@@ -2736,7 +2736,7 @@ fn lower_op(
                 || *ratio == 0
                 || *top_blocks == 0
                 || *top_blocks > first_blocks
-                || *top_blocks > 512
+                || *top_blocks > QSA_MAX_TOP_BLOCKS
                 || graph.desc(*q).dtype != infr_core::DType::F16
                 || !supported(kdt)
                 || !supported(vdt)
@@ -2744,7 +2744,7 @@ fn lower_op(
                 return Err(be(format!(
                     "vulkan Op::QsaBatchAttention requires F16 q, F16/Q8_0 k/v, rows<=kv_len, \
                      head_dim=128/256, n_head divisible by n_kv, ratio>0 and \
-                     0<top_blocks<=first complete blocks; \
+                     0<top_blocks<=min(first complete blocks,{QSA_MAX_TOP_BLOCKS}); \
                      got rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
                      head_dim={head_dim} ratio={ratio} top_blocks={top_blocks} \
                      k_dtype={kdt:?} v_dtype={vdt:?}"
