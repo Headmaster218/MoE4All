@@ -365,8 +365,6 @@ pub(crate) struct SessionStable {
     pub(super) fuse_qkv: bool,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
     pub(super) moe_batched_ok: bool,
-    /// Qwen3.8 expert banks whose large MMQ scratch requires bounded layer-major prompt groups.
-    pub(super) qwen_grid_experts: bool,
 }
 
 pub(crate) struct SeamKv {

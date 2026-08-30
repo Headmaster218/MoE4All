@@ -341,10 +341,6 @@ fn session_stable(
                 })
             }
     };
-    let qwen_grid_experts = c.qwen4exp
-        && g.tensors().iter().any(|t| {
-            t.name.ends_with("_exps.weight") && matches!(t.dtype, DType::Iq2Xs | DType::Iq3Xxs)
-        });
     Ok(SessionStable {
         has_wv,
         out_scale,
@@ -354,7 +350,6 @@ fn session_stable(
         fuse_gu,
         fuse_qkv,
         moe_batched_ok,
-        qwen_grid_experts,
     })
 }
 
@@ -527,7 +522,6 @@ pub(crate) fn generate_dense_backend(
     let fuse_gu = stable.fuse_gu;
     let fuse_qkv = stable.fuse_qkv;
     let moe_batched_ok = stable.moe_batched_ok;
-    let qwen_grid_experts = stable.qwen_grid_experts;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -6501,16 +6495,10 @@ pub(crate) fn generate_dense_backend(
         // SWA ring is untouched by the reorder — its bound is per layer and per dispatch
         // ("window + one chunk", see `kv_rows`), and each layer's ring still sees exactly the same
         // ascending sequence of writes it saw chunk-major.
-        // A single Qwen3.8 chunk has no repeated expert sweep to amortize: splitting it into one
-        // execute per layer only inserts 48 queue-drain boundaries. Enable the MoE-driven
-        // layer-major order when there are multiple chunks; dense paging keeps its established
-        // behavior because it may need the order even for one chunk.
-        let qwen_moe_streaming = c.qwen4exp
-            && qwen_grid_experts
-            && be.moe_paged()
-            && pf_end.saturating_sub(start) > ubatch;
-        let streaming = be.dense_paged() || qwen_moe_streaming;
-        let layer_major = crate::seam::layer_major_prefill(ec, &caps, streaming, !e2b);
+        // Chunk-major is the production default. Layer-major remains an explicit A/B mode: on
+        // paged Qwen3.8 it measured more than an order of magnitude slower because it turns one
+        // whole-model chunk into per-layer execute/queue-drain boundaries.
+        let layer_major = crate::seam::layer_major_prefill(ec, &caps, !e2b);
         let spans: Vec<std::ops::Range<usize>> = if layer_major {
             (0..c.n_layer).map(|l| l..l + 1).collect()
         } else {
@@ -7504,15 +7492,11 @@ pub(crate) fn generate_dense_backend(
     // that does not hold.
     if let Some(peak) = be.activation_peak() {
         let rows = crate::seam::ubatch_rows(ec);
-        let qwen_grouped = c.qwen4exp
-            && qwen_grid_experts
-            && be.moe_paged()
-            && prompt.len().saturating_sub(1).saturating_sub(start) > rows;
         // Both halves of what a prefill holds live, so the comparison stays honest in either
         // order: per-chunk scratch plus the layer-major residual set (whole prompt normally,
         // one bounded group on Qwen3.8), exactly as priced during placement.
         let reserved = crate::seam::dense_act_reserve_at(c, &caps, max_ctx, rows).saturating_add(
-            if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || qwen_grouped, !e2b) {
+            if crate::seam::layer_major_prefill(ec, &caps, !e2b) {
                 crate::seam::layer_major_act_bytes(c, max_ctx, rows)
             } else {
                 0

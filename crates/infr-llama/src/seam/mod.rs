@@ -883,25 +883,21 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 /// L+1 — instead of running the whole model per chunk?
 ///
 /// The two orders compute the same thing; they differ in what they re-read. Chunk-major sweeps the
-/// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
-/// prefill cost when they stream: measured on Qwen3-14B Q8_0 at ctx 4096, the 1024-row default read
-/// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
-/// one sweep regardless of chunk count, at the cost of holding residual streams across layer
-/// boundaries ([`layer_major_act_bytes`]). Qwen3.8 bounds that lifetime to fixed groups; ordinary
-/// streaming models retain the whole prompt. The trade pays when there is I/O to save, hence the
-/// default of "on exactly when the weights stream".
+/// entire weight set once PER CHUNK. Layer-major can reduce those reads, at the cost of retaining
+/// residual streams and introducing one execute boundary per layer/chunk pair
+/// ([`layer_major_act_bytes`]). That trade helped one streamed dense model, but regressed paged
+/// Qwen3.8 prefill by more than an order of magnitude, so chunk-major is the default everywhere.
 ///
-/// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
-/// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
-/// next, which is what threads the residual stream between two layers' dispatches, and an
-/// architecture whose layer stack can be entered past layer 0 at all (`spannable`).
+/// `paging.layer_major = true` is the only way onto this diagnostic path. It needs a backend that
+/// carries a bound `Input` from one execute to the next, which is what threads the residual stream
+/// between two layers' dispatches, and an architecture whose layer stack can be entered past layer
+/// 0 at all (`spannable`).
 pub(crate) fn layer_major_prefill(
     ec: &EngineConfig,
     caps: &infr_core::backend::Capabilities,
-    streaming: bool,
     spannable: bool,
 ) -> bool {
-    let want = ec.paging.layer_major.unwrap_or(streaming);
+    let want = ec.paging.layer_major == Some(true);
     if want && !spannable {
         // gemma4-E2B: its layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a
         // span starting past layer 0 would read an unbound tensor. This is the gate for it — the
@@ -1825,10 +1821,8 @@ pub(crate) fn dense_placement_fits(
     v_fmt: DType,
 ) -> bool {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    // A RESIDENT session prefills chunk-major unless the user forced the other order, so the
-    // whole-prompt residual stream is priced only for the forced case. `Some(true)` is the sole
-    // value that reaches here as layer-major: unset means "on iff streaming", and a session that
-    // fits does not stream.
+    // Every session prefills chunk-major unless the user forces the other order, so the
+    // whole-prompt residual stream is priced only for the explicit `Some(true)` case.
     let lm = if ec.paging.layer_major == Some(true) {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
     } else {
@@ -1872,13 +1866,12 @@ pub(crate) fn dense_stream_budget_at(
     v_fmt: DType,
 ) -> u64 {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    // A streamed session prefills LAYER-MAJOR by default, which holds every chunk's residual
-    // stream at once — those bytes come out of the same VRAM the arenas want, and they are
-    // allocated later, so the arena has to leave room for them (see `layer_major_act_bytes`).
-    let lm = if ec.paging.layer_major == Some(false) {
-        0
-    } else {
+    // Chunk-major is the default for streamed sessions too. Only an explicit layer-major request
+    // holds residual streams across layers, so only that mode reserves the extra bytes.
+    let lm = if ec.paging.layer_major == Some(true) {
         layer_major_act_bytes(cfg, want_ctx, ubatch)
+    } else {
+        0
     };
     planned_vram_room(vram, ec)
         .saturating_sub(dense_resident_need(
@@ -5554,6 +5547,41 @@ mod seam_helper_tests {
         );
     }
 
+    #[test]
+    fn layer_major_prefill_is_explicit_only() {
+        let caps = Capabilities {
+            graph_input_inplace: true,
+            ..Default::default()
+        };
+        let default_cfg = EngineConfig::default();
+        assert!(
+            !super::layer_major_prefill(&default_cfg, &caps, true),
+            "an unset setting must keep the chunk-major production order"
+        );
+
+        let enabled = EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(super::layer_major_prefill(&enabled, &caps, true));
+        assert!(
+            !super::layer_major_prefill(&enabled, &caps, false),
+            "an architecture that cannot split its stack stays chunk-major"
+        );
+
+        let disabled = EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!super::layer_major_prefill(&disabled, &caps, true));
+    }
+
     fn deepseek4_cache_config() -> Config {
         Config {
             deepseek4: true,
@@ -6285,8 +6313,7 @@ mod seam_helper_tests {
         );
 
         // Streaming budget: exhausted at the ceiling, and it never offers the guard's headroom.
-        // A streamed session also prefills layer-major, whose whole-prompt residual stream is
-        // allocated AFTER the arenas out of the same VRAM — so the budget holds that back too.
+        // Chunk-major is the default and needs no cross-layer residual reservation.
         let lm = super::layer_major_act_bytes(&cfg, ctx, ub);
         assert!(
             lm > 0,
@@ -6312,14 +6339,13 @@ mod seam_helper_tests {
         );
         assert_eq!(
             budget(exact - (1 << 30)),
-            (1 << 30) - lm,
-            "and it is exactly the room below the ceiling less the residual stream, not the free \
-             figure"
+            1 << 30,
+            "the default chunk-major order keeps the whole room below the ceiling"
         );
-        // Forcing chunk-major back on gives those bytes to the arena, which is the knob's point.
-        let chunk_major = EngineConfig {
+        // Explicit layer-major is the only mode that holds the cross-layer residual stream back.
+        let layer_major = EngineConfig {
             paging: infr_core::config::PagingCfg {
-                layer_major: Some(false),
+                layer_major: Some(true),
                 ..ec.paging.clone()
             },
             ..ec.clone()
@@ -6328,7 +6354,7 @@ mod seam_helper_tests {
             super::dense_stream_budget_at(
                 &cfg,
                 &conservative_caps(),
-                &chunk_major,
+                &layer_major,
                 exact - (1 << 30),
                 &vram,
                 ctx,
@@ -6336,8 +6362,8 @@ mod seam_helper_tests {
                 f16.0,
                 f16.1
             ),
-            1 << 30,
-            "paging.layer_major = false takes the residual-stream reserve back off the budget"
+            (1 << 30) - lm,
+            "paging.layer_major = true reserves the residual stream explicitly"
         );
 
         // MoE expert placement: same ceiling, minus the model/shape-derived phase workspace.
