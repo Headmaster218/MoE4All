@@ -150,11 +150,14 @@ impl AlignedHostBuffer {
     }
 
     /// # Safety
-    /// The caller must guarantee exclusive access to this range for the duration of the returned
-    /// slice. Pager slot state and model-load sequencing provide that guarantee at current uses.
-    pub unsafe fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
-        debug_assert!(offset.saturating_add(len) <= self.len);
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) }
+    /// The caller must guarantee exclusive access to the destination range while the copy runs,
+    /// and `src` must not overlap it. Pager slot state and model-load sequencing provide that
+    /// guarantee at current uses.
+    pub unsafe fn copy_from_slice(&self, offset: usize, src: &[u8]) {
+        debug_assert!(offset.saturating_add(src.len()) <= self.len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(offset), src.len());
+        }
     }
 
     /// # Safety
@@ -279,15 +282,6 @@ impl Arena {
         debug_assert!(len <= self.slot_bytes);
         debug_assert!(self.offset(slot) + len <= self.total);
         std::slice::from_raw_parts(self.allocation.as_ptr().add(self.offset(slot)), len)
-    }
-
-    /// # Safety
-    /// The caller must have exclusively reserved `slot` in `Loading` state, and no reader may
-    /// hold a reference to it; `len <= slot_bytes`.
-    unsafe fn slot_mut(&self, slot: u32, len: usize) -> &mut [u8] {
-        debug_assert!(len <= self.slot_bytes);
-        debug_assert!(self.offset(slot) + len <= self.total);
-        std::slice::from_raw_parts_mut(self.allocation.as_ptr().add(self.offset(slot)), len)
     }
 }
 
@@ -571,7 +565,9 @@ impl InclusiveHostCache {
                 }
             };
             inner.state.insert(id, SlotState::Loading);
-            let dst = unsafe { self.arena.slot_mut(slot, len) };
+            // SAFETY: this slot was just reserved as Loading under `inner`; no reader can hold it.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
             if let Err(err) = self.io.read_block(&desc, dst) {
                 inner.state.remove(&id);
                 let removed = inner
@@ -675,7 +671,9 @@ impl InclusiveHostCache {
                 self.ram_evictions.fetch_add(1, Ordering::Relaxed);
             }
             inner.state.insert(requested, SlotState::Loading);
-            let dst = unsafe { self.arena.slot_mut(slot, len) };
+            // SAFETY: this slot was just reserved as Loading under `inner`; no reader can hold it.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
             let read_t0 = prof.then(std::time::Instant::now);
             if let Err(err) = self.io.read_block(&desc, dst) {
                 inner.state.remove(&requested);
@@ -881,7 +879,9 @@ impl InclusiveHostCache {
                     Ok(None)
                 }
                 Source::Fill { slot, desc, .. } => {
-                    let dst = unsafe { self.arena.slot_mut(*slot, job.len) };
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(self.arena.slot_ptr(*slot, job.len), job.len)
+                    };
                     let started = prof.then(std::time::Instant::now);
                     self.io.read_block(desc, dst)?;
                     let elapsed = started.map(|t| t.elapsed());

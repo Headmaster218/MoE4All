@@ -87,8 +87,10 @@ fn windows_available_bytes(available_phys: u64, available_commit: u64) -> u64 {
 fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::MEMORYSTATUSEX> {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-    let mut status = MEMORYSTATUSEX::default();
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
     unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
     Some(status)
 }
@@ -121,8 +123,10 @@ fn windows_process_resident_bytes() -> Option<u64> {
     use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows::Win32::System::Threading::GetCurrentProcess;
 
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
     unsafe {
         GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).ok()?;
     }

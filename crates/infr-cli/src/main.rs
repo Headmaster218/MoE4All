@@ -1383,7 +1383,7 @@ fn cmd_run(
 fn read_line_interruptible(line: &mut String) -> anyhow::Result<usize> {
     #[cfg(not(unix))]
     {
-        return Ok(std::io::stdin().read_line(line)?);
+        Ok(std::io::stdin().read_line(line)?)
     }
     #[cfg(unix)]
     {

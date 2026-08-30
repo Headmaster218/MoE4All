@@ -35,19 +35,19 @@ fn qsa_index_and_gather_match_reference() {
 
     let mut scores_ref = vec![0.0f32; blocks];
     let mut key = vec![0.0f32; hd];
-    for block in 0..blocks {
-        for d in 0..hd {
-            key[d] = (0..ratio)
+    for (block, score) in scores_ref.iter_mut().enumerate() {
+        for (d, value) in key.iter_mut().enumerate() {
+            *value = (0..ratio)
                 .map(|r| h(&rawb, (block * ratio + r) * hd + d))
                 .sum::<f32>()
                 / ratio as f32;
-            key[d] = half::f16::from_f32(key[d]).to_f32();
+            *value = half::f16::from_f32(*value).to_f32();
         }
         let inv = (key.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
             .sqrt()
             .recip();
-        for d in 0..hd {
-            key[d] *= inv * norm[d];
+        for (value, &weight) in key.iter_mut().zip(&norm) {
+            *value *= inv * weight;
         }
         for pair in 0..rope_dim / 2 {
             let d = 2 * pair;
@@ -59,7 +59,7 @@ fn qsa_index_and_gather_match_reference() {
         }
         for head in 0..nh {
             let dot = (0..hd).map(|d| h(&qb, head * hd + d) * key[d]).sum::<f32>();
-            scores_ref[block] += dot.max(0.0) * scale;
+            *score += dot.max(0.0) * scale;
         }
     }
     let mut rank: Vec<usize> = (0..blocks).collect();
@@ -277,18 +277,18 @@ fn qsa_batched_rows_match_causal_reference() {
         let blocks = visible / ratio;
         let mut scores = vec![0.0f32; blocks];
         for (block, score) in scores.iter_mut().enumerate() {
-            for d in 0..index_hd {
-                key[d] = (0..ratio)
+            for (d, value) in key.iter_mut().enumerate() {
+                *value = (0..ratio)
                     .map(|r| h(&rawb, (block * ratio + r) * index_hd + d))
                     .sum::<f32>()
                     / ratio as f32;
-                key[d] = half::f16::from_f32(key[d]).to_f32();
+                *value = half::f16::from_f32(*value).to_f32();
             }
             let inv = (key.iter().map(|v| v * v).sum::<f32>() / index_hd as f32 + eps)
                 .sqrt()
                 .recip();
-            for d in 0..index_hd {
-                key[d] *= inv * norm[d];
+            for (value, &weight) in key.iter_mut().zip(&norm) {
+                *value *= inv * weight;
             }
             for pair in 0..rope_dim / 2 {
                 let d = 2 * pair;

@@ -1346,7 +1346,8 @@ impl HostStoreChunk {
             .filter(|&end| end <= self.bytes.len())
             .ok_or_else(|| be("host-store copy range out of bounds"))?;
         let len = dst - offset;
-        unsafe { self.bytes.slice_mut(offset, len) }.copy_from_slice(src);
+        debug_assert_eq!(len, src.len());
+        unsafe { self.bytes.copy_from_slice(offset, src) };
         Ok(())
     }
 }
@@ -2139,7 +2140,9 @@ impl MoePagerSession {
             }
         }
         let want = prefill_align(bytes);
-        let mut best: Option<((usize, u128, usize, usize), Vec<(usize, usize)>)> = None;
+        type LoanScore = (usize, u128, usize, usize);
+        type LoanCandidate = (LoanScore, Vec<(usize, usize)>);
+        let mut best: Option<LoanCandidate> = None;
         for (shard, &capacity) in shard_sizes.iter().enumerate() {
             if want > capacity {
                 continue;
@@ -2288,8 +2291,10 @@ impl MoePagerSession {
         if !self.prefill_placement.is_empty() {
             return Ok(());
         }
-        let mut grouped: BTreeMap<u32, Vec<(u8, usize, usize, usize, Option<usize>, usize)>> =
-            BTreeMap::new();
+        type PrefillSource = (u8, usize, usize, usize, Option<usize>, usize);
+        type PackedBank = (usize, usize, usize, usize);
+        type PrefillLayer = (u32, Vec<PackedBank>, usize);
+        let mut grouped: BTreeMap<u32, Vec<PrefillSource>> = BTreeMap::new();
         for (&buf_id, (role, pool, src)) in &self.sources {
             let role_order = match role {
                 Role::Gate => 0,
@@ -2311,7 +2316,7 @@ impl MoePagerSession {
             ));
         }
 
-        let mut layers: Vec<(u32, Vec<(usize, usize, usize, usize)>, usize)> = Vec::new();
+        let mut layers: Vec<PrefillLayer> = Vec::new();
         for (layer_base, mut banks) in grouped {
             banks.sort_unstable_by_key(|&(role, buf_id, _, _, _, _)| (role, buf_id));
             let mut offset = 0usize;

@@ -5870,11 +5870,11 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let max = 4 * 1024 * MIB;
 
-        let (first, floor) = bda_block_geometry(1 * MIB, BDA_BLOCK_MIN, max);
+        let (first, floor) = bda_block_geometry(MIB, BDA_BLOCK_MIN, max);
         assert_eq!((first, floor), (64 * MIB, 128 * MIB));
-        let (second, floor) = bda_block_geometry(1 * MIB, floor, max);
+        let (second, floor) = bda_block_geometry(MIB, floor, max);
         assert_eq!((second, floor), (128 * MIB, 256 * MIB));
-        let (third, floor) = bda_block_geometry(1 * MIB, floor, max);
+        let (third, floor) = bda_block_geometry(MIB, floor, max);
         assert_eq!((third, floor), (256 * MIB, 256 * MIB));
 
         let (large, unchanged) = bda_block_geometry(300 * MIB, 128 * MIB, max);
