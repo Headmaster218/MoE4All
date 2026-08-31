@@ -1,5 +1,7 @@
 # MoE4All
 
+只需10MB，windows免安装，拖入模型即下即用！
+
 **让 A 卡用户也能在本地运行大型 MoE AI**
 *Making huge MoE LLMs accessible to AMD users.*
 
