@@ -541,7 +541,11 @@ impl InclusiveHostCache {
     /// The whole set is read inside ONE call, so from out here a multi-GiB cold preload is a single
     /// opaque step — without this hook its caller can only report 0% and then 100%, which is exactly
     /// how a preload that dominates the model's load time looks like a hung progress bar.
-    pub fn preload_with(&self, ids: &[BlockId], on_block: &dyn Fn(usize)) -> Result<(usize, usize)> {
+    pub fn preload_with(
+        &self,
+        ids: &[BlockId],
+        on_block: &dyn Fn(usize),
+    ) -> Result<(usize, usize)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.pager.is_none() || ids.is_empty() {
             return Ok((0, 0));

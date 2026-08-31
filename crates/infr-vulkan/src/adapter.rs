@@ -8,7 +8,9 @@ use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
-use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind, QSA_MAX_TOP_BLOCKS};
+use infr_core::graph::{
+    Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind, QSA_MAX_TOP_BLOCKS,
+};
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::HashMap;
