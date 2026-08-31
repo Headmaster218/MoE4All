@@ -1,0 +1,36 @@
+{
+  "infr": "target/release/infr.exe",
+  "output": "artifacts/context-resource-matrix",
+  "device": "Vulkan0",
+  "context": "128k",
+  "startup_timeout_seconds": 1800,
+  "require_gpu_counter": true,
+  "models": [
+    {
+      "id": "qwen35",
+      "path": "D:/models/Qwen3.6-35B-A3B-Q4.gguf"
+    },
+    {
+      "id": "qwen38-q4",
+      "path": "D:/models/Qwen3.8-Flash-Next-IQ4_XS-00001-of-00003.gguf"
+    }
+  ],
+  "profiles": [
+    {
+      "id": "16vram-32ram",
+      "path": "tests/context-resource/profiles/windows-16g-vram-32g-ram.json",
+      "manual_vram_budget": "14g",
+      "manual_ram_budget": "22g"
+    },
+    {
+      "id": "24vram-64ram",
+      "path": "tests/context-resource/profiles/windows-24g-vram-64g-ram.json",
+      "manual_vram_budget": "22g",
+      "manual_ram_budget": "54g"
+    }
+  ],
+  "cli_smoke": {
+    "model": "qwen35",
+    "profile": "16vram-32ram"
+  }
+}

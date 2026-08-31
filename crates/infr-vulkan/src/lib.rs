@@ -245,7 +245,8 @@ pub(crate) fn max_storage_buffer_range() -> u32 {
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
 /// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
-/// `live` is true (VK_EXT_memory_budget present), otherwise it equals `total` (best-effort).
+/// `live` is true (VK_EXT_memory_budget present, or a test resource profile is accounting for
+/// this backend's allocations), otherwise it equals `total` (best-effort).
 ///
 /// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
 /// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR.
@@ -982,7 +983,15 @@ fn device_local_room(s: &VulkanShared) -> u64 {
                 .min(mp.memory_heaps[i].size);
         }
     }
-    if s.has_mem_budget {
+    if let Some(profile) = infr_core::test_resource::active() {
+        profile
+            .cap_vram(
+                size,
+                if s.has_mem_budget { avail } else { size },
+                s.device_used.load(Ordering::Relaxed),
+            )
+            .1
+    } else if s.has_mem_budget {
         avail
     } else {
         size.saturating_sub(s.device_used.load(Ordering::Relaxed))
@@ -1351,10 +1360,18 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             };
         }
     }
+    let mut live = s.has_mem_budget;
+    if let Some(profile) = infr_core::test_resource::active() {
+        (total, available) =
+            profile.cap_vram(total, available, s.device_used.load(Ordering::Relaxed));
+        // The synthetic free figure already subtracts this backend's tracked allocations. Mark it
+        // live so fallback accounting does not subtract them a second time.
+        live = true;
+    }
     VramInfo {
         total,
         available,
-        live: s.has_mem_budget,
+        live,
         uma,
     }
 }
@@ -3466,8 +3483,9 @@ impl VulkanBackend {
     /// of small buffers cannot collectively cross the caller's hard cap.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
-        let unified_limit =
-            self.cfg.device.vram_budget.is_some() || self.cfg.device.vram_reserve.is_some();
+        let unified_limit = self.cfg.device.vram_budget.is_some()
+            || self.cfg.device.vram_reserve.is_some()
+            || infr_core::test_resource::active().is_some();
         if (want < CHECK_MIN && !unified_limit) || self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }

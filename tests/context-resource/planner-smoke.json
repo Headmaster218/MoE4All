@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are a deterministic test assistant."
+  },
+  {
+    "role": "user",
+    "content": "Synthetic context payload:{{INFR_FILLER}}\nReply with one short sentence."
+  }
+]

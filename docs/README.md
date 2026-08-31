@@ -14,6 +14,13 @@ the `infr` inference engine. The top-level project overview lives in the root
   TOML file format and lookup order, `--set`, and a per-section walkthrough of
   what is tunable. Start here before reaching for an `INFR_*` variable.
 
+- [context-resource-matrix.md](context-resource-matrix.md) - the Windows long-context resource
+  matrix: synthetic 16/32 and 24/64 GiB machines, automatic/manual budgets, exact dynamic-KV
+  boundary crossings, API prefix reuse, and live RAM/VRAM enforcement.
+- [release-validation.md](release-validation.md) - the pre-release runbook: fixed commands,
+  low-frequency waiting, failure triage, allowed small fixes, escalation boundaries, reruns, and
+  the final release gate.
+
 ## Performance
 
 Everything performance-related lives under **[perf/](perf/README.md)** — start

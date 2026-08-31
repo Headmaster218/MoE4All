@@ -34,6 +34,17 @@
 /// this box, an 8 GB scope still reports 54.6 GB available. Sizing an anonymous arena from that
 /// figure is an OOM kill, so the smaller of the two wins.
 pub fn available_bytes() -> Option<u64> {
+    let observed = platform_available_bytes()?;
+    match crate::test_resource::active() {
+        None => Some(observed),
+        Some(profile) => {
+            let total = platform_total_bytes()?;
+            Some(profile.cap_ram(total, observed).1)
+        }
+    }
+}
+
+fn platform_available_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -63,6 +74,14 @@ pub fn available_bytes() -> Option<u64> {
 /// the machine's physical RAM as a process-wide target, while automatic cache sizing must continue
 /// to use memory available right now and retain its existing headroom policy.
 pub fn total_bytes() -> Option<u64> {
+    let observed = platform_total_bytes()?;
+    Some(match crate::test_resource::active() {
+        None => observed,
+        Some(profile) => profile.cap_ram(observed, observed).0,
+    })
+}
+
+fn platform_total_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
