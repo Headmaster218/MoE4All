@@ -142,7 +142,8 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
 
 - 四条静态/构建命令全部成功。
 - `report.md` 中 9 个用例全部为 `pass`。
-- 没有资源违规、panic、device lost、OOM 或非零退出码。
+- 没有资源违规、panic、device lost、OOM 或非预期退出码。API 服务由 shutdown file
+  触发与 SIGTERM 相同的安全排空流程，完成 GPU 释放后的 `143` 是预期退出码。
 - 三个动态 KV 增长点和 API prefix reuse 均通过检查。
 - 没有为了通过测试而修改预算、工作负载或生产语义。
 

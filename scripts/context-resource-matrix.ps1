@@ -171,8 +171,8 @@ function Complete-LoggedProcess {
     param([Parameter(Mandatory = $true)]$Handle)
 
     $Handle.Process.WaitForExit()
-    $Handle.StdoutTask.GetAwaiter().GetResult()
-    $Handle.StderrTask.GetAwaiter().GetResult()
+    $null = $Handle.StdoutTask.GetAwaiter().GetResult()
+    $null = $Handle.StderrTask.GetAwaiter().GetResult()
     $Handle.Stdout.Dispose()
     $Handle.Stderr.Dispose()
     return $Handle.Process.ExitCode
@@ -683,22 +683,22 @@ function Invoke-ApiCase {
     }
     if ($null -ne $monitor -and (Test-Path -LiteralPath $monitor.Paths.Violation)) {
         $violation = Read-JsonFile -Path $monitor.Paths.Violation
-        if ($null -eq $caseError) {
-            $caseError = [string]$violation.reason
-        }
+        $caseError = [string]$violation.reason
     }
     if ($null -ne $resource -and $ManifestData.require_gpu_counter -and
         -not [bool]$resource.gpu_counter_available -and $null -eq $caseError) {
         $caseError = 'Windows per-process GPU memory counter was unavailable'
     }
-    if ($null -ne $exitCode -and $exitCode -ne 0 -and $null -eq $caseError) {
+    # The shutdown-file watcher uses the same graceful SIGTERM semantics as a supervisor. infr
+    # drains and releases Vulkan first, then deliberately exits with the conventional 128+15.
+    if ($null -ne $exitCode -and $exitCode -notin @(0, 143) -and $null -eq $caseError) {
         $caseError = "infr serve exited with code $exitCode"
     }
     $fatal = Test-LogForFatalError -LogPath $stderrPath
     if ($null -ne $fatal -and $null -eq $caseError) {
         $caseError = $fatal
     }
-    $growth = Get-KvGrowthEvents -LogPath $stderrPath
+    $growth = @(Get-KvGrowthEvents -LogPath $stderrPath)
     if ($null -eq $caseError) {
         try {
             Assert-KvGrowthPattern -Events $growth
