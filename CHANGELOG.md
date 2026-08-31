@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-31
+
+### Fixed
+
+- Vulkan MoE prefill now reserves its complete-layer lanes before phase scratch allocations.
+  This prevents unified-VRAM fragmentation from causing long-context prefill allocation failures,
+  especially while elastic K/V caches grow across segment boundaries.
+
 ## [0.5.0] - 2026-08-30
 
 ### Highlights
