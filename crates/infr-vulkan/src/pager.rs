@@ -2523,6 +2523,10 @@ impl MoePagerSession {
     /// invalidated. Everything outside the borrowed lanes survives the phase transition.
     pub fn enter_prefill_layer(&mut self) -> Result<()> {
         if self.mode != MoeArenaMode::PrefillLayer {
+            // Decode/runtime allocations may have released unified ranges after the last
+            // `enter_decode()` call. Reclaim those exact Expert slots before measuring the
+            // contiguous ranges available to the next Prefill lane.
+            self.restore_unified_slots_if_changed();
             self.build_prefill_layout()?;
             let mut evicted = 0usize;
             let mut borrowed = 0usize;

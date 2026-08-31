@@ -477,6 +477,23 @@ fn paged_static_phase(graph: &Graph) -> Option<StaticScratchPhase> {
     phase
 }
 
+fn pager_static_transition(
+    previous: Option<StaticScratchPhase>,
+    next: StaticScratchPhase,
+    moe_layer_stream: bool,
+) -> Option<StaticScratchPhase> {
+    if !moe_layer_stream || previous == Some(next) {
+        return None;
+    }
+    match (previous, next) {
+        (_, StaticScratchPhase::Prefill) => Some(StaticScratchPhase::Prefill),
+        (Some(StaticScratchPhase::Prefill), StaticScratchPhase::Decode) => {
+            Some(StaticScratchPhase::Decode)
+        }
+        _ => None,
+    }
+}
+
 /// mmv (int8 dp4a decode GEMV) size gate for the m≥3 small-m PREFILL mrow path: below this
 /// weight-element count the dequant GEMV is already so short (<~10us) that the extra quant_q8
 /// dispatch's fixed bubble (~2-3us on a 7900 XTX) eats the kernel saving. Probe data
@@ -5912,35 +5929,56 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
 /// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    let layout = scratch_layout(graph)?;
     // Paged decode plans are rebuilt per token, but their pooled workspace is shape-stable across
     // the whole decode phase. Retain that pool on the model backend so freeing one token's scratch
     // cannot restore an expert slot that the next token immediately has to borrow again. The
     // existing unified execution gate serializes this model's executes, so the mutex is only a
     // lifetime container rather than a hot-path contention point.
+    let mut scratch_reused = false;
     let mut cached_pool = if be_.moe_paged() {
-        paged_static_phase(graph).map(|phase| {
+        if let Some(phase) = paged_static_phase(graph) {
             let mut cache = be_.static_scratch.lock().unwrap();
+            let pager_transition =
+                pager_static_transition(cache.phase, phase, be_.cfg().paging.moe_layer_stream);
             cache.enter(phase);
-            cache
-        })
+            scratch_reused = cache.scratch_layout == layout && cache.scratch.len() == layout.len();
+            if !scratch_reused {
+                // A same-phase shape change must also release its old scratch before the pager
+                // reserves Prefill lanes; otherwise those live allocations can fragment the arena.
+                cache.scratch.clear();
+                cache.scratch_layout.clear();
+            }
+
+            // Finish the old phase before any scratch or lazy per-op pool for the new phase can
+            // borrow unified VRAM. Prefill reserves/protects its whole-layer lanes; Decode releases
+            // those temporary lanes so all of its allocations see the final Decode topology.
+            if let Some(pager_phase) = pager_transition {
+                let mut guard = be_.moe_pager().lock().unwrap();
+                let sess = guard
+                    .as_mut()
+                    .ok_or_else(|| be("paged static execution requires a MoE pager session"))?;
+                match pager_phase {
+                    StaticScratchPhase::Prefill => sess.enter_prefill_layer()?,
+                    StaticScratchPhase::Decode => {
+                        sess.enter_decode();
+                    }
+                }
+            }
+
+            if !scratch_reused {
+                cache.scratch = alloc_scratch_layout(be_, &layout)?;
+                cache.scratch_layout.clone_from(&layout);
+            }
+            Some(cache)
+        } else {
+            None
+        }
     } else {
         None
     };
-    let layout = scratch_layout(graph)?;
     let mut local_scratch = None;
-    let mut scratch_reused = false;
-    if let Some(cache) = cached_pool.as_mut() {
-        if cache.scratch_layout == layout && cache.scratch.len() == layout.len() {
-            scratch_reused = true;
-        } else {
-            // Release the old layout before allocating the new one so a phase-local shape change
-            // cannot temporarily require both scratch sets from the unified arena.
-            cache.scratch.clear();
-            cache.scratch_layout.clear();
-            cache.scratch = alloc_scratch_layout(be_, &layout)?;
-            cache.scratch_layout.clone_from(&layout);
-        }
-    } else {
+    if cached_pool.is_none() {
         local_scratch = Some(alloc_scratch_layout(be_, &layout)?);
     }
     if scratch_reused {
@@ -8194,6 +8232,42 @@ mod tests {
         assert_eq!(moe_static_phase(16, 8, 512), StaticScratchPhase::Decode);
         assert_eq!(moe_static_phase(191, 8, 512), StaticScratchPhase::Decode);
         assert_eq!(moe_static_phase(192, 8, 512), StaticScratchPhase::Prefill);
+        assert_eq!(
+            pager_static_transition(None, StaticScratchPhase::Decode, true),
+            None
+        );
+        assert_eq!(
+            pager_static_transition(None, StaticScratchPhase::Prefill, true),
+            Some(StaticScratchPhase::Prefill)
+        );
+        assert_eq!(
+            pager_static_transition(
+                Some(StaticScratchPhase::Decode),
+                StaticScratchPhase::Prefill,
+                true
+            ),
+            Some(StaticScratchPhase::Prefill)
+        );
+        assert_eq!(
+            pager_static_transition(
+                Some(StaticScratchPhase::Prefill),
+                StaticScratchPhase::Decode,
+                true
+            ),
+            Some(StaticScratchPhase::Decode)
+        );
+        assert_eq!(
+            pager_static_transition(
+                Some(StaticScratchPhase::Prefill),
+                StaticScratchPhase::Prefill,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            pager_static_transition(None, StaticScratchPhase::Prefill, false),
+            None
+        );
     }
 
     /// Read a `#define <name> <integer>` back out of GLSL source. Panics when the define is gone —
