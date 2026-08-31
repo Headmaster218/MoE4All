@@ -532,6 +532,16 @@ impl InclusiveHostCache {
     /// [`Self::promote`], so a later request is an ordinary RAM hit and can become a pinned GPU
     /// shadow without another disk read. Already-ready ids are harmless and skipped.
     pub fn preload(&self, ids: &[BlockId]) -> Result<(usize, usize)> {
+        self.preload_with(ids, &|_| {})
+    }
+
+    /// [`Self::preload`] with per-block progress reporting: `on_block(len)` runs as each block's
+    /// bytes land in the arena.
+    ///
+    /// The whole set is read inside ONE call, so from out here a multi-GiB cold preload is a single
+    /// opaque step — without this hook its caller can only report 0% and then 100%, which is exactly
+    /// how a preload that dominates the model's load time looks like a hung progress bar.
+    pub fn preload_with(&self, ids: &[BlockId], on_block: &dyn Fn(usize)) -> Result<(usize, usize)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.pager.is_none() || ids.is_empty() {
             return Ok((0, 0));
@@ -587,6 +597,7 @@ impl InclusiveHostCache {
             inner.state.insert(id, SlotState::Ready);
             loaded += 1;
             bytes += len;
+            on_block(len);
             self.preload_reads.fetch_add(1, Ordering::Relaxed);
             self.bytes_preloaded
                 .fetch_add(len as u64, Ordering::Relaxed);
@@ -1955,6 +1966,31 @@ mod tests {
         assert_eq!(stats.shadow_releases, 2);
         assert_eq!(stats.shadow_resident, 1);
         assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// `preload_with`'s callback is a caller's ONLY view into a preload that can dominate a model's
+    /// load time: it has to fire once per block, with that block's real length, and it has to fire
+    /// AS the block lands — a caller that only heard about the bytes after the whole set would be
+    /// no better off than one that never asked (which is what left the weight-load bar frozen at a
+    /// few percent while a paged model's experts were read from disk).
+    #[test]
+    fn inclusive_cache_preload_reports_every_block_as_it_lands() {
+        let io = Arc::new(FakeIo::new());
+        let cache = InclusiveHostCache::new(3, 16, io.clone()).expect("cache");
+        for id in 1..=3 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+
+        let lengths = std::cell::RefCell::new(Vec::<usize>::new());
+        let (blocks, bytes) = cache
+            .preload_with(&[1, 2, 3], &|len| {
+                lengths.borrow_mut().push(len);
+                // Reported as it lands: after the k-th callback exactly k reads have happened.
+                assert_eq!(io.reads.load(Ordering::SeqCst), lengths.borrow().len());
+            })
+            .expect("preload");
+        assert_eq!((blocks, bytes), (3, 48));
+        assert_eq!(lengths.into_inner(), vec![16, 16, 16]);
     }
 
     #[test]

@@ -4919,12 +4919,19 @@ impl Backend for VulkanBackend {
 
     fn finish_weight_load(&self) -> Result<()> {
         self.release_moe_load_reservation();
+        // The weight-load bar is still open — `infr_llama`'s session-init block owns the guard that
+        // clears it, and this is called inside that block. Hand it to the preload: for a paged model
+        // those are the bytes that stand in for the expert banks the loader only registered, and
+        // without this the bar sits still for the longest phase of the load. Cloned up front (a
+        // `ProgressBar` is an `Arc` over its state) so the ticking never reaches for the mutex the
+        // pager session is already held through.
+        let progress = self.shared.weight_pb.lock().unwrap().clone();
         let (blocks, bytes) = self
             .moe_pager
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(Ok((0, 0)), crate::pager::MoePagerSession::preload_host_tier)?;
+            .map_or(Ok((0, 0)), |s| s.preload_host_tier(progress.as_ref()))?;
         if blocks > 0 {
             tracing::info!(
                 "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GB",
