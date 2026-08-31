@@ -2273,15 +2273,46 @@ fn moe_logical_pools(g: &Gguf, cfg: &Config, n_paged: usize) -> Vec<(usize, usiz
         .collect()
 }
 
+fn moe_pool_batch_slot_floors(pools: &[(usize, usize, [usize; 3])], n_expert: usize) -> Vec<usize> {
+    pools
+        .iter()
+        .map(|&(_, n_blocks, role_blocks)| {
+            let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
+            n_expert
+                .saturating_mul(roles_per_layer)
+                .min(n_blocks)
+                .max(1)
+        })
+        .collect()
+}
+
+/// Physical pool floors include one rotating exchange slot whenever the pool can page. Bounded
+/// RAM promotion keeps that slot disabled while the dispatch-visible cache retains the full batch
+/// floor; full-RAM pools simply gain one harmless extra cache entry.
+fn moe_pool_slot_floors(pools: &[(usize, usize, [usize; 3])], n_expert: usize) -> Vec<usize> {
+    moe_pool_batch_slot_floors(pools, n_expert)
+        .into_iter()
+        .map(|batch_floor| batch_floor.saturating_add(1))
+        .collect()
+}
+
 fn moe_pool_floor_bytes(pools: &[(usize, usize, [usize; 3])], n_expert: usize) -> Option<u64> {
     pools
         .iter()
-        .try_fold(0u64, |sum, &(slot_bytes, n_blocks, role_blocks)| {
-            let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
-            let slots = n_expert
-                .saturating_mul(roles_per_layer)
-                .min(n_blocks)
-                .max(1);
+        .zip(moe_pool_batch_slot_floors(pools, n_expert))
+        .try_fold(0u64, |sum, (&(slot_bytes, ..), slots)| {
+            sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
+        })
+}
+
+fn moe_pool_physical_floor_bytes(
+    pools: &[(usize, usize, [usize; 3])],
+    n_expert: usize,
+) -> Option<u64> {
+    pools
+        .iter()
+        .zip(moe_pool_slot_floors(pools, n_expert))
+        .try_fold(0u64, |sum, (&(slot_bytes, ..), slots)| {
             sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
         })
 }
@@ -2326,17 +2357,8 @@ fn moe_pool_slot_counts(
     n_expert: usize,
     size_bias: f64,
 ) -> Option<Vec<usize>> {
-    let floors: Vec<usize> = pools
-        .iter()
-        .map(|&(_, n_blocks, role_blocks)| {
-            let roles_per_layer = role_blocks.iter().filter(|&&n| n != 0).count().max(1);
-            n_expert
-                .saturating_mul(roles_per_layer)
-                .min(n_blocks)
-                .max(1)
-        })
-        .collect();
-    let minimum = moe_pool_floor_bytes(pools, n_expert)?;
+    let floors = moe_pool_slot_floors(pools, n_expert);
+    let minimum = moe_pool_physical_floor_bytes(pools, n_expert)?;
     if minimum > budget {
         return None;
     }
@@ -2354,7 +2376,7 @@ fn moe_pool_slot_counts(
             .iter()
             .enumerate()
             .filter(|(i, &(slot_bytes, n_blocks, _))| {
-                slots[*i] < n_blocks && slot_bytes as u64 <= remaining
+                slots[*i] < n_blocks.saturating_add(1) && slot_bytes as u64 <= remaining
             })
             .min_by(|(a, &(a_bytes, _, _)), (b, &(b_bytes, _, _))| {
                 let a_fill = (slots[*a] * a_bytes) as f64 / weights[*a];
@@ -2802,7 +2824,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut expert_cache_target_bytes = 0u64;
     let mut pager_budget_bytes = 0u64;
     let mut pager_memory_plan = None;
-    let mut pager_prefill_floor_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -2964,7 +2985,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // waste VRAM and double-charge the same bytes.
             pager_budget_bytes = plan.elastic_pool_bytes(expert_cache_target_bytes);
             pager_memory_plan = Some(plan);
-            pager_prefill_floor_bytes = prefill_floor;
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
@@ -3153,10 +3173,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // little room for the same fixed weights on another. Automatic placement shrinks and
             // retries while the arena is still empty; an explicit `paging.cache` remains exact.
             let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
-            let prefill_floor = pager_prefill_floor_bytes;
+            let physical_pool_floor = moe_pool_physical_floor_bytes(&logical_pools, n_expert)
+                .ok_or_else(|| anyhow!("MoE physical pool floor size overflow"))?;
             let planned_pager_budget = pager_budget_bytes;
             let elastic_reserve = plan.elastic_reserve_bytes();
-            let minimum_pager_budget = elastic_reserve.saturating_add(prefill_floor);
+            let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
             let required_after_arena = plan
                 .minimum_required_bytes()
                 .saturating_sub(elastic_reserve);
@@ -3178,13 +3199,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     ));
                 };
                 let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
-                if physical_bytes.saturating_sub(elastic_reserve) < prefill_floor {
+                if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor {
                     return Err(anyhow!(
                         "MoE mapped arena cannot retain one complete Prefill layer after its \
-                         runtime reserve (arena {:.2} MiB, runtime {:.2} MiB, layer {:.2} MiB)",
+                         runtime reserve plus the tiered-cache exchange slots (arena {:.2} MiB, \
+                         runtime {:.2} MiB, physical floor {:.2} MiB)",
                         physical_bytes as f64 / 2f64.powi(20),
                         elastic_reserve as f64 / 2f64.powi(20),
-                        prefill_floor as f64 / 2f64.powi(20),
+                        physical_pool_floor as f64 / 2f64.powi(20),
                     ));
                 }
                 let specs: Vec<(usize, usize)> = logical_pools
@@ -3350,32 +3372,37 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // ReBAR BDA allocation);
             // the proportional split below never over-subscribes VRAM because it partitions
             // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
+            let pool_floors = moe_pool_batch_slot_floors(&logical_pools, n_expert);
             let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
                 .iter()
                 .zip(slot_counts)
-                .map(|(&(sb, _nb, _role_blocks), budget_slots)| {
-                    // Budget split PROPORTIONALLY to each pool's total bank bytes — the byte share is
-                    // also the access share under uniform routing (every (layer, expert) read touches
-                    // gate+up+down alike), so proportional slots equalize expected hit rates across
-                    // pools; any fancier split would need routing statistics that don't exist at
-                    // load time.
-                    // Floor at `min(n_expert, nb)`: a chunked batched-prefill `Op::MoeFfn` (rows>1)
-                    // runs ALL of a layer's routed buckets in ONE dispatch
-                    // (`matmul_mmq_experts_paged`), touching up to `n_expert` DISTINCT experts of
-                    // that layer that must be simultaneously resident (the within-batch safety
-                    // invariant — see `infr_core::pager::Pager::new`'s doc). Decode's rows=1 needs
-                    // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
-                    // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
-                    // point holding more slots than the pool has distinct experts).
-                    // The dynamic Prefill ring can legally degrade to one lane when the user
-                    // budget cannot hold its topology target. The old A/B implementation
-                    // required two full layers here and could silently exceed that budget.
-                    infr_vulkan::pager::MoePoolSpec {
-                        slot_bytes: sb,
-                        n_slots: budget_slots,
-                        host: moe_host_by_size.get(&sb).cloned(),
-                    }
-                })
+                .zip(pool_floors)
+                .map(
+                    |((&(sb, _nb, _role_blocks), budget_slots), min_enabled_slots)| {
+                        // Budget split PROPORTIONALLY to each pool's total bank bytes — the byte share is
+                        // also the access share under uniform routing (every (layer, expert) read touches
+                        // gate+up+down alike), so proportional slots equalize expected hit rates across
+                        // pools; any fancier split would need routing statistics that don't exist at
+                        // load time.
+                        // Floor at `min(n_expert, nb)`: a chunked batched-prefill `Op::MoeFfn` (rows>1)
+                        // runs ALL of a layer's routed buckets in ONE dispatch
+                        // (`matmul_mmq_experts_paged`), touching up to `n_expert` DISTINCT experts of
+                        // that layer that must be simultaneously resident (the within-batch safety
+                        // invariant — see `infr_core::pager::Pager::new`'s doc). Decode's rows=1 needs
+                        // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
+                        // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
+                        // point holding more slots than the pool has distinct experts).
+                        // The dynamic Prefill ring can legally degrade to one lane when the user
+                        // budget cannot hold its topology target. The old A/B implementation
+                        // required two full layers here and could silently exceed that budget.
+                        infr_vulkan::pager::MoePoolSpec {
+                            slot_bytes: sb,
+                            n_slots: budget_slots,
+                            min_enabled_slots,
+                            host: moe_host_by_size.get(&sb).cloned(),
+                        }
+                    },
+                )
                 .collect();
             let cached: usize = pools.iter().map(|p| p.n_slots).sum();
             let host_chunk_count = host_chunks.len();
@@ -6763,12 +6790,24 @@ mod seam_helper_tests {
             (MIB, 240usize, [80, 80, 80]),
             (2 * MIB, 120usize, [40, 40, 40]),
         ];
-        let floor_bytes = 24 * MIB + 24 * 2 * MIB;
-        assert!(super::moe_pool_slot_counts(&pools, (floor_bytes - 1) as u64, 8, 2.0).is_none());
+        let batch_floor_bytes = 24 * MIB + 24 * 2 * MIB;
+        let physical_floor_bytes = 25 * MIB + 25 * 2 * MIB;
+        assert_eq!(
+            super::moe_pool_floor_bytes(&pools, 8),
+            Some(batch_floor_bytes as u64)
+        );
+        assert!(
+            super::moe_pool_slot_counts(&pools, (physical_floor_bytes - 1) as u64, 8, 2.0)
+                .is_none()
+        );
+        assert_eq!(
+            super::moe_pool_slot_counts(&pools, physical_floor_bytes as u64, 8, 2.0),
+            Some(vec![25, 25]),
+        );
 
         let budget = 512 * MIB as u64;
         let slots = super::moe_pool_slot_counts(&pools, budget, 8, 2.0).unwrap();
-        assert!(slots.iter().all(|&n| n >= 24));
+        assert!(slots.iter().all(|&n| n >= 25));
         let allocated = pools
             .iter()
             .zip(&slots)
@@ -6778,7 +6817,7 @@ mod seam_helper_tests {
         assert!(pools
             .iter()
             .zip(&slots)
-            .all(|(&(_, max_slots, _), &n)| n <= max_slots));
+            .all(|(&(_, blocks, _), &n)| n <= blocks + 1));
         assert_eq!(super::moe_pool_capacity_bytes(&pools, &slots), allocated);
     }
 

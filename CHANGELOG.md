@@ -13,6 +13,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Vulkan MoE prefill now reserves its complete-layer lanes before phase scratch allocations.
   This prevents unified-VRAM fragmentation from causing long-context prefill allocation failures,
   especially while elastic K/V caches grow across segment boundaries.
+- Elastic K/V and runtime allocations now preserve each MoE pool's widest-dispatch residency
+  floor and budget a separate bounded-RAM exchange slot, preventing multi-turn inference from
+  exhausting the pager's within-batch working set when the first dynamic K/V segment is committed.
 
 ## [0.5.0] - 2026-08-30
 

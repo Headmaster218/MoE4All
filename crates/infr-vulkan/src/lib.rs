@@ -6079,6 +6079,7 @@ mod tests {
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: SLOT,
                 n_slots: SLOTS,
+                min_enabled_slots: 8,
                 host: None,
             }],
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
@@ -6240,6 +6241,7 @@ mod tests {
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: 4096,
                 n_slots: 2,
+                min_enabled_slots: 1,
                 host: None,
             }],
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
