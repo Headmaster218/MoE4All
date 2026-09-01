@@ -1107,6 +1107,23 @@ struct StagingRing {
     next: usize,
 }
 
+/// RAII for the raw command buffer used by [`VulkanBackend::one_shot`]. Vulkan command buffers do
+/// not free themselves, and every fallible begin/end/submit/wait step must return the handle to the
+/// shared pool on both success and error (including unwinding out of the recording closure).
+struct OneShotCommand<'a> {
+    device: &'a ash::Device,
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+}
+
+impl Drop for OneShotCommand<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.free_command_buffers(self.pool, &[self.cmd]);
+        }
+    }
+}
+
 /// Staging-ring geometry: enough slots to keep the copy engine fed while the host fills the next.
 const RING_SLOTS: usize = 4;
 const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
@@ -4340,12 +4357,20 @@ impl VulkanBackend {
                 })?
         };
 
-        unsafe {
+        if let Err(e) = unsafe {
             self.shared
                 .device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+        } {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            let cleanup = self.shared.allocator.lock().unwrap().free(allocation);
+            return Err(be(match cleanup {
+                Ok(()) => format!("bind_buffer_memory: {e}"),
+                Err(cleanup) => {
+                    format!("bind_buffer_memory: {e} (allocation cleanup also failed: {cleanup})")
+                }
+            }));
         }
-        .map_err(|e| be(format!("bind_buffer_memory: {e}")))?;
 
         // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
         if location == MemoryLocation::GpuOnly {
@@ -4704,16 +4729,27 @@ impl VulkanBackend {
 
         let mut bufs = Vec::with_capacity(RING_SLOTS);
         let mut fences = Vec::with_capacity(RING_SLOTS);
+        let cleanup_raw = |fences: &mut Vec<vk::Fence>| unsafe {
+            for fence in fences.drain(..) {
+                device.destroy_fence(fence, None);
+            }
+            device.free_command_buffers(pool, &cmds);
+        };
         for _ in 0..RING_SLOTS {
-            bufs.push(self.make_buf(
-                RING_SLOT_BYTES,
-                MemoryLocation::CpuToGpu,
-                "upload_staging",
-            )?);
-            fences.push(
-                unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-                    .map_err(|e| be(format!("staging ring create_fence: {e}")))?,
-            );
+            match self.make_buf(RING_SLOT_BYTES, MemoryLocation::CpuToGpu, "upload_staging") {
+                Ok(buffer) => bufs.push(buffer),
+                Err(error) => {
+                    cleanup_raw(&mut fences);
+                    return Err(error);
+                }
+            }
+            match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                Ok(fence) => fences.push(fence),
+                Err(error) => {
+                    cleanup_raw(&mut fences);
+                    return Err(be(format!("staging ring create_fence: {error}")));
+                }
+            }
         }
         Ok(StagingRing {
             bufs,
@@ -4742,6 +4778,7 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("allocate_command_buffers: {e}")))?[0];
+        let _command = OneShotCommand { device, pool, cmd };
 
         unsafe {
             device.begin_command_buffer(
@@ -4765,7 +4802,6 @@ impl VulkanBackend {
         unsafe { device.queue_wait_idle(self.shared.queue) }
             .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
 
-        unsafe { device.free_command_buffers(pool, &cmds) };
         Ok(())
     }
 }

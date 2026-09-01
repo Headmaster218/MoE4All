@@ -898,6 +898,9 @@ fn bda_out_f_chunks(
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
+    /// Owns `cmd`, `pools` and `query_pool` until a submitted or persistent command takes them.
+    /// The drop guard closes every recording-time `?`/unwind path without burdening each caller.
+    owns_transient: std::cell::Cell<bool>,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
     /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
@@ -1073,15 +1076,26 @@ impl<'a> Recorder<'a> {
         let prof_ops = infr_core::prof::enabled(profcfg) && !persistent;
         let op_shapes = prof_ops && profcfg.op_shapes;
         let query_pool = if prof_ops {
-            let qp = unsafe {
+            let qp = match unsafe {
                 device.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
                         .query_count(MAX_TS),
                     None,
                 )
-            }
-            .map_err(|e| be(format!("create query pool: {e}")))?;
+            } {
+                Ok(qp) => qp,
+                Err(e) => {
+                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    backend
+                        .shared
+                        .recorder_desc_pools
+                        .lock()
+                        .unwrap()
+                        .push(pool);
+                    return Err(be(format!("create query pool: {e}")));
+                }
+            };
             unsafe { device.cmd_reset_query_pool(cmd, qp, 0, MAX_TS) };
             qp
         } else {
@@ -1091,6 +1105,7 @@ impl<'a> Recorder<'a> {
         Ok(Self {
             be: backend,
             cmd,
+            owns_transient: std::cell::Cell::new(true),
             pools: std::cell::RefCell::new(vec![pool]),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
@@ -11280,13 +11295,14 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Free the recorder's transient Vulkan objects — the query pool (if any), the command buffer,
-    /// and every descriptor-pool tranche. `Recorder` has no `Drop` (by design — the arena pools
-    /// would otherwise be reported live at `vkDestroyDevice`), so `finish`/`finish_nowait` must
-    /// call this on BOTH their success AND their `?`-error exits; a bare early return would leak
-    /// these — and it leaks precisely on device-lost, exactly when those live pools then trip
-    /// `vkDestroyDevice`. Call once per recorder. Mirrors `discard`'s cleanup block.
+    /// Free the recorder's transient Vulkan objects: the query pool (if any), command buffer and
+    /// every descriptor-pool tranche. Idempotence lets explicit finish/error paths clean up at the
+    /// exact point they stop using the objects while [`Drop`] remains the backstop for any other
+    /// recording-time `?` or unwind.
     fn free_transient(&self) {
+        if !self.owns_transient.replace(false) {
+            return;
+        }
         let device = &self.be.shared.device;
         unsafe {
             // query_pool is null unless prof_ops created one; the null check is equivalent to `prof_ops`.
@@ -11378,30 +11394,16 @@ impl<'a> Recorder<'a> {
     /// abandoned, so nothing will ever read what those dispatches would write. Submitting it anyway
     /// (the obvious `finish()`) would add a whole segment of GPU time to how long Ctrl-C takes —
     /// and would hand the driver more work at the exact moment we are trying to stop giving it any.
-    /// Dropping the recorder instead is not an option: it has no `Drop`, so its descriptor pools
-    /// would outlive it and `vkDestroyDevice` would (rightly) be reported as destroying a device
-    /// with live pools.
+    /// The `Drop` backstop would also release these objects, but explicit discard can surface an
+    /// `end_command_buffer` error and makes the shutdown lifetime boundary immediate.
     ///
     /// Only the NOT-yet-submitted buffer is abandoned. Anything already on the queue is still
     /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
     pub fn discard(self) -> Result<()> {
         let device = &self.be.shared.device;
-        unsafe {
-            device
-                .end_command_buffer(self.cmd)
-                .map_err(|e| be(format!("end cmd: {e}")))?;
-            if self.prof_ops {
-                device.destroy_query_pool(self.query_pool, None);
-            }
-        }
-        self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
-        self.be
-            .shared
-            .recorder_desc_pools
-            .lock()
-            .unwrap()
-            .extend(self.pools.borrow_mut().drain(..));
-        Ok(())
+        let end = unsafe { device.end_command_buffer(self.cmd) };
+        self.free_transient();
+        end.map_err(|e| be(format!("end cmd: {e}")))
     }
 
     /// [`Self::finish`]'s pipelined twin: end recording and submit WITHOUT waiting, returning a
@@ -11430,8 +11432,8 @@ impl<'a> Recorder<'a> {
         }
         let device = &self.be.shared.device;
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
-        // its `wait`); on every ERROR exit we own them still and must free them here (`Recorder`
-        // has no `Drop`) — see `free_transient`.
+        // its `wait`); on every ERROR exit we still own them and free them immediately. `Drop`
+        // remains the backstop for any future early-return path.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
@@ -11470,11 +11472,14 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        let shared = std::sync::Arc::clone(&self.be.shared);
+        let pools = self.pools.borrow().clone();
+        self.owns_transient.set(false);
         Ok(PendingSegment {
-            shared: std::sync::Arc::clone(&self.be.shared),
+            shared,
             fence: Some(fence),
             cmd: self.cmd,
-            pools: self.pools.borrow().clone(),
+            pools,
             dispatches,
         })
     }
@@ -11527,11 +11532,16 @@ impl<'a> Recorder<'a> {
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
-        unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
-            .map_err(|e| be(format!("end cmd: {e}")))?;
+        if let Err(e) = unsafe { self.be.shared.device.end_command_buffer(self.cmd) } {
+            self.free_transient();
+            return Err(be(format!("end cmd: {e}")));
+        }
+        debug_assert_eq!(self.query_pool, vk::QueryPool::null());
+        let pools = self.pools.borrow().clone();
+        self.owns_transient.set(false);
         Ok(RecordedSegment {
             cmd: self.cmd,
-            pools: self.pools.borrow().clone(),
+            pools,
             dispatches: self.dispatches.get(),
         })
     }
@@ -11595,6 +11605,12 @@ impl<'a> Recorder<'a> {
             p.add(labels[i], us);
         }
         p.flush();
+    }
+}
+
+impl Drop for Recorder<'_> {
+    fn drop(&mut self) {
+        self.free_transient();
     }
 }
 
