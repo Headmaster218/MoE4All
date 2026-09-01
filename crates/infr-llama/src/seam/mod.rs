@@ -2875,6 +2875,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // load racing ANOTHER resident model (swap mid-drain) still reads reduced `available` —
     // that's real pressure, deliberately not compensated; the alloc-time VRAM budget guard is
     // the backstop against over-commit.
+    // Carried into the arena search's `required_after_arena` when MTP is opted in (see the
+    // computation inside the first-load block below).
+    let mut mtp_head_reserve: u64 = 0;
     if first_load && cfg.moe.is_some() {
         // NB: the load-time expert-bank dtype gate that used to live here (field report:
         // MXFP4_MOE expert banks `expect`-panicked mid-inference before it existed) is GONE —
@@ -2887,11 +2890,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let room = planned_vram_room(&vram, ec);
         // MTP headroom (qwen35/qwen35moe speculative decode): the MTP head session is built AFTER
         // placement by the chat layer and allocates its own weights/KV/draft-chain buffers through
-        // the SAME unified guard, so the trunk plan must not consume the whole heap when the user
-        // opted in. Computed from the GGUF: the head layer's own tensor bytes (native dtype, the
-        // same upload the binder does) + the draft-chain vocab embed table (token_embd F16 upload,
-        // vocab*ne*2 B) + head KV + scratch margin.
-        let room = if crate::mtp::should_use_mtp(cfg, ec) {
+        // the SAME unified guard. The head's need is therefore carried into the arena search's
+        // `required_after_arena` (see below) instead of being subtracted from `room` up front:
+        // inside the requirement, a shortfall degrades the physical runtime margin and then
+        // shrinks the EXPERT arena — trading expert-cache capacity for head space — instead of
+        // erroring when a static subtraction guessed wrong (a fixed scratch cannot cover both
+        // 8K and 131K: measured shortfalls on the RX 7700 XT ranged from -289 MiB at 8K to
+        // +287 MiB at 131K). Computed from the GGUF: the head layer's own tensor bytes (native
+        // dtype, the same upload the binder does) + the draft-chain vocab embed table
+        // (token_embd F16 upload, vocab*ne*2 B) + head KV + a scratch margin for the BDA block
+        // geometry rounding (`bda_weight_alloc` floors each resident block at 64/128/256 MiB).
+        let mtp_head_reserve = if crate::mtp::should_use_mtp(cfg, ec) {
             let head_prefix = format!("blk.{}.", cfg.n_layer);
             let head_weights: usize = g
                 .tensors()
@@ -2904,20 +2913,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .sum();
             let embed_table = cfg.vocab * cfg.n_embd * 2; // F16 draft-chain gather table
             let head_kv = want_ctx * cfg.n_kv * cfg.head_dim * 2 * 2; // K+V f16, 1 layer
-                                                                      // Scratch margin: must cover the BDA block GEOMETRY the head's own uploads pay, not
-                                                                      // just their raw bytes — `bda_weight_alloc` rounds each resident block up (64→128→256
-                                                                      // MiB floors, exact-size only above the floor), and the first block request lands when
-                                                                      // the trunk plan has already consumed everything the reserve left. Measured on
-                                                                      // Ornith-1.5-35B MTPFIX: the head's first `resident-bda` block asks 397.9 MiB with the
-                                                                      // 256 MiB margin, the unified guard refuses with ~254 MiB left — 144 MiB short. 512 MiB
-                                                                      // covers the rounding slack with room for the remaining banks. The SERIAL serve engine
-                                                                      // (--mmproj) additionally runs the unified elastic arena beside the pager, which cost
-                                                                      // another ~35 MiB over `run` (272.0 MiB `resident-bda` vs 237 MiB left) — 768 MiB
-                                                                      // absorbs both, measured on the RX 7700 XT @131K kv-q8. 768 MiB OVERSHOOTS on the
-                                                                      // serial serve path (its unified-arena shard sizing quantizes: the MoE prefill-ring
-                                                                      // check demands 1566 MiB and the elastic window collapses below ~600 MiB of slack) —
-                                                                      // 576 MiB is the measured serve-mode sweet spot (head bank 272 MiB fits, prefill ring
-                                                                      // intact).
             let scratch = 576 << 20;
             let mtp_reserve = head_weights + embed_table + head_kv + scratch;
             tracing::info!(
@@ -2929,9 +2924,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 scratch as f64 / 1e6,
                 mtp_reserve as f64 / 1e9,
             );
-            room.saturating_sub(mtp_reserve as u64)
+            mtp_reserve as u64
         } else {
-            room
+            0
         };
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
@@ -3266,9 +3261,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let planned_pager_budget = pager_budget_bytes;
             let elastic_reserve = plan.elastic_reserve_bytes();
             let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
+            // The MTP head session allocates through the same guard right after this loop, so
+            // when the user opted in its reserve is part of what must stay live beside the
+            // arena (a shortfall then degrades the margin and shrinks expert slots — head
+            // space is traded against expert-cache capacity, never against starting at all).
             let required_after_arena = plan
                 .minimum_required_bytes()
-                .saturating_sub(elastic_reserve);
+                .saturating_sub(elastic_reserve)
+                .saturating_add(mtp_head_reserve);
             let adaptive_arena = cache_override.is_none();
             let mut candidate_budget = pager_budget_bytes;
             // The runtime margin became PHYSICAL trailing arena shards (see
