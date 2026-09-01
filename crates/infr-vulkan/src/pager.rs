@@ -1778,6 +1778,14 @@ pub struct MoePagerLayout {
     pub prefill_target_lanes: usize,
     /// Maximum bytes the Prefill ring may retain from the shared Expert/runtime arena.
     pub prefill_cache_bytes: u64,
+    /// Dedicated RUNTIME space appended to the expert shards (the seam's activation reserve,
+    /// made PHYSICAL). The old design counted this reserve only in slot-count accounting and
+    /// let runtime windows borrow expert slots through `loan_unified_bytes` — a long session's
+    /// resident hot experts then blocked every loan candidate ("cannot create a contiguous
+    /// window ... expert minimum working set" after ~1 h of serving). With the margin present,
+    /// runtime windows (`allocate_high` scans shards reversed, so the appended margin shard is
+    /// tried first) live in their own coalescing region and loans degrade to the rare-peak path.
+    pub runtime_margin_bytes: u64,
 }
 
 /// Upload-ring sizing policy — pure budget arithmetic, so it lives in the shared seam
@@ -1873,7 +1881,10 @@ impl MoePagerSession {
             .iter()
             .map(|spec| (spec.slot_bytes, spec.n_slots))
             .collect();
-        let unified_pool = vk.init_unified_vram_for_expert_slots(&unified_specs)?;
+        let unified_pool = vk.init_unified_vram_for_expert_slots(
+            &unified_specs,
+            layout.runtime_margin_bytes as usize,
+        )?;
         let mut pools = Vec::with_capacity(layout.pools.len());
         for spec in &layout.pools {
             if spec.min_enabled_slots == 0 || spec.min_enabled_slots > spec.n_slots {

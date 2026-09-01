@@ -834,11 +834,18 @@ pub(crate) fn dense_act_reserve_at(
     // graph owns the row-scaled pools above. Two real runs at d4096 measured the fixed intercept
     // at 54.6 MiB (64 rows: 143.6 MiB peak; 128 rows: 232.7 MiB), so round it up to 64 MiB.
     // This is a fixed plan-overlap cost, not another per-row multiplier.
-    row_reserve.saturating_add(if cfg.qwen4exp {
+    let reserve = row_reserve.saturating_add(if cfg.qwen4exp {
         QWEN4_PLAN_OVERLAP_RESERVE
     } else {
         0
-    })
+    });
+    // Fixed slack over the algebraic reserve. Measured on Ornith-1.5-35B (qwen35moe, MTP verify
+    // re-prefill, chunk 128): the true peak ran 174 KB over the reserve - the follow-up unified
+    // arena growth request then had to carve a fresh window beside the pager's permanent expert
+    // slots and failed outright ("cannot create a contiguous window ... expert minimum working
+    // set"). 8 MiB absorbs the model-specific residue the per-row terms miss; when the reserve is
+    // already generous this is plan headroom, never waste (see the unified arena's sizing).
+    reserve.saturating_add(DENSE_ACT_RESERVE_SLACK)
 }
 
 /// F16 expansion buffers held by Vulkan while a batched attention op reads a Q8_0 KV cache.
@@ -1006,6 +1013,9 @@ pub(crate) fn layer_major_prefill(
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
+/// Fixed slack added on top of the algebraic [dense_act_reserve_at] model - see the call site
+/// for the measurement that motivated it.
+const DENSE_ACT_RESERVE_SLACK: u64 = 8 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
@@ -2846,7 +2856,40 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let fp = crate::weights::weight_footprint(g);
         let vram = vk.vram();
         let room = planned_vram_room(&vram, ec);
-        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
+        // MTP headroom (qwen35/qwen35moe speculative decode): the MTP head session is built AFTER
+        // placement by the chat layer and allocates its own weights/KV/draft-chain buffers through
+        // the SAME unified guard, so the trunk plan must not consume the whole heap when the user
+        // opted in. Computed from the GGUF: the head layer's own tensor bytes (native dtype, the
+        // same upload the binder does) + the draft-chain vocab embed table (token_embd F16 upload,
+        // vocab*ne*2 B) + head KV + scratch margin.
+        let room = if crate::mtp::should_use_mtp(cfg, ec) {
+            let head_prefix = format!("blk.{}.", cfg.n_layer);
+            let head_weights: usize = g
+                .tensors()
+                .iter()
+                .filter(|t| t.name.starts_with(&head_prefix))
+                .map(|t| {
+                    let numel: usize = t.shape.iter().product();
+                    infr_gguf::nbytes(t.dtype, numel)
+                })
+                .sum();
+            let embed_table = cfg.vocab * cfg.n_embd * 2; // F16 draft-chain gather table
+            let head_kv = want_ctx * cfg.n_kv * cfg.head_dim * 2 * 2; // K+V f16, 1 layer
+            let scratch = 576 << 20;
+            let mtp_reserve = head_weights + embed_table + head_kv + scratch;
+            tracing::info!(
+                "[mtp] headroom reserve: head_weights={:.0}MB embed_table={:.0}MB head_kv={:.0}MB \
+                 scratch={:.0}MB total={:.2}GB",
+                head_weights as f64 / 1e6,
+                embed_table as f64 / 1e6,
+                head_kv as f64 / 1e6,
+                scratch as f64 / 1e6,
+                mtp_reserve as f64 / 1e9,
+            );
+            room.saturating_sub(mtp_reserve as u64)
+        } else {
+            room
+        };        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
         // explicit Q8 and F16 choices must change the expert remainder just like the allocation.
         let ring = kv_ring_wanted(cfg, ec);
@@ -3216,10 +3259,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
                     .collect();
 
-                let failure = match vk.prepare_moe_unified_vram(&specs) {
+                let failure = match vk
+                    .prepare_moe_unified_vram(&specs, plan.runtime_reserve_bytes as usize)
+                {
                     Ok(committed) => {
-                        debug_assert_eq!(committed as u64, physical_bytes);
-                        let live_room = vk.alloc_room();
+                        debug_assert_eq!(
+                            committed as u64,
+                            physical_bytes + plan.runtime_reserve_bytes
+                        );                        let live_room = vk.alloc_room();
                         if live_room >= required_after_arena {
                             pager_budget_bytes = physical_bytes;
                             expert_cache_target_bytes = expert_cache_target_bytes
@@ -3439,7 +3486,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 host_chunks,
                 prefill_target_lanes,
                 prefill_cache_bytes: expert_cache_target_bytes,
-            })
+                // The activation reserve becomes a PHYSICAL trailing shard (see
+                // `MoePagerLayout::runtime_margin_bytes`): runtime windows live there instead of
+                // borrowing expert slots, which is what wedged long serve sessions before.
+                runtime_margin_bytes: plan.runtime_reserve_bytes,            })
             .map_err(|e| anyhow!("{e}"))?;
         }
     }
@@ -5765,9 +5815,9 @@ mod seam_helper_tests {
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 512);
         let full = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 1024);
         assert_eq!(
-            full - super::QWEN4_PLAN_OVERLAP_RESERVE,
-            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
-            "only the row-scaled part doubles; the retained decode plan is fixed"
+            full - super::QWEN4_PLAN_OVERLAP_RESERVE - super::DENSE_ACT_RESERVE_SLACK,
+            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE - super::DENSE_ACT_RESERVE_SLACK),
+            "only the row-scaled part doubles; the retained decode plan and the fixed slack are constant"
         );
     }
 
@@ -6315,13 +6365,19 @@ mod seam_helper_tests {
         let got = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
         assert_eq!(
             got,
-            unpadded * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1,
-            "reserve must be the per-row model times the pad"
+            unpadded * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1
+                + super::DENSE_ACT_RESERVE_SLACK,
+            "reserve must be the per-row model times the pad plus the fixed slack"
         );
-        assert_eq!(got, 500_957_184);
-        // No fixed term: halving the rows must halve the reserve, which a constant would floor.
+        assert_eq!(got, 500_957_184 + super::DENSE_ACT_RESERVE_SLACK);
+        // The row-scaled part still halves with the rows (the fixed slack cancels out), which a
+        // constant reserve would floor.
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, 64);
-        assert_eq!(half * 2, got, "the reserve is purely per-row");
+        assert_eq!(
+            (half - super::DENSE_ACT_RESERVE_SLACK) * 2,
+            got - super::DENSE_ACT_RESERVE_SLACK,
+            "the reserve is per-row plus one fixed slack term"
+        );
     }
 
     /// Ling's KDA/MLA hybrid never emits Op::Attention. Its dedicated MLA kernel scans the
@@ -6362,10 +6418,11 @@ mod seam_helper_tests {
         let per_pair = 3 * m.n_ff_exp * 4 + cfg.n_embd * 4 + m.n_ff_exp + cfg.n_embd;
         let moe = m.n_used * per_pair + 48 * cfg.n_embd;
         let per_row = 12 * cfg.n_ff + 96 * cfg.n_embd + moe;
-        let expected =
-            ubatch as u64 * per_row as u64 * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1;
+        let expected = ubatch as u64 * per_row as u64 * super::ACT_RESERVE_PAD.0
+            / super::ACT_RESERVE_PAD.1
+            + super::DENSE_ACT_RESERVE_SLACK;
         assert_eq!(got, expected);
-        assert_eq!(got, 959_447_040);
+        assert_eq!(got, 959_447_040 + super::DENSE_ACT_RESERVE_SLACK);
 
         let mut ordinary = cfg.clone();
         ordinary.bailingmoe3 = false;

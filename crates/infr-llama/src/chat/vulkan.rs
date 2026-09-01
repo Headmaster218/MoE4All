@@ -22,17 +22,18 @@ pub struct DenseSeamChat {
     session: Option<crate::seam::model::DenseVulkanSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
-    /// The ONE Vulkan backend MTP mode's trunk+head share across every `generate()` call
-    /// (`ensure_mtp_backend`). MTP's driver rebuilds a fresh trunk+head SESSION every call by
-    /// design (`crate::mtp`'s "no cross-turn KV reuse" doc) — but that's an ordinary allocation,
-    /// not a device re-init, so this field is what keeps `warmup()`'s call and every real chat
-    /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
-    /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
-    mtp_vk: Option<infr_vulkan::VulkanBackend>,
+    /// The caller-held MTP TRUNK session state (`crate::seam::SeamKv`) MTP mode keeps across
+    /// `generate()` calls - on the SAME Vulkan backend as `session` (the MTP branch drives
+    /// [`crate::mtp::generate_mtp_spec_vulkan_timed_on_state`] with `session`'s backend, pins, and
+    /// `max_ctx`). The bound trunk weights + pager registration persist turn to turn (the cold
+    /// call binds through the paged-MoE placement binder); only the KV rows are reset per call
+    /// (`crate::mtp`'s "no cross-turn KV reuse" doc). `None` until the first MTP turn; stays
+    /// `None` forever on a non-MTP model.
+    mtp_trunk: Option<crate::seam::SeamKv>,
     /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
     /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
-    /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
-    /// so the whole model — weights, KV, MTP trunk/head — lands on the one chosen GPU.
+    /// [`ensure_session`](Self::ensure_session) so the whole model - weights, KV, MTP trunk/head -
+    /// lands on the one chosen GPU.
     dev: Option<usize>,
 }
 
@@ -44,7 +45,7 @@ impl DenseSeamChat {
             session: None,
             mtp_head: None,
             mtp_checked: false,
-            mtp_vk: None,
+            mtp_trunk: None,
             dev: None,
         }
     }
@@ -58,7 +59,7 @@ impl DenseSeamChat {
             session: None,
             mtp_head: None,
             mtp_checked: false,
-            mtp_vk: None,
+            mtp_trunk: None,
             dev: Some(idx),
         }
     }
@@ -110,22 +111,6 @@ impl DenseSeamChat {
         Ok(())
     }
 
-    /// Lazily construct the shared MTP Vulkan backend (see [`mtp_vk`](Self::mtp_vk)'s doc) —
-    /// `generate`'s MTP branch calls this instead of letting `crate::mtp::generate_mtp_spec_vulkan`
-    /// construct its own per-call backend.
-    fn ensure_mtp_backend(&mut self) -> Result<()> {
-        if self.mtp_vk.is_none() {
-            let cfg = self.model.cfg().clone();
-            self.mtp_vk = Some(match self.dev {
-                Some(idx) => infr_vulkan::VulkanBackend::new_on_with(idx, cfg)
-                    .map_err(|e| anyhow::anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
-                None => infr_vulkan::VulkanBackend::new_with(cfg)
-                    .map_err(|e| anyhow::anyhow!("vulkan init: {e}"))?,
-            });
-        }
-        Ok(())
-    }
-
     fn generate_turn_impl(
         &mut self,
         prompt: &str,
@@ -135,13 +120,30 @@ impl DenseSeamChat {
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         if self.wants_mtp()? {
-            self.ensure_mtp_backend()?;
+            // MTP runs on the MAIN session's backend (one VkDevice for the whole model): the
+            // trunk verify routes through the same paged-MoE session infrastructure the non-MTP
+            // path uses - the first (cold) call binds the trunk weights via the placement
+            // planner/pager, later calls reuse them through `mtp_trunk`. In MTP mode `session`
+            // itself never generates, so this backend carries exactly one trunk weight upload.
+            self.ensure_session()?;
+            let session = self.session.as_ref().expect("ensure_session set it");
+            // Placement/pager decisions read the CURRENT placement pins - enter this session's
+            // own scope around the MTP call, exactly like the non-MTP generation entry does.
+            let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
+            // The trunk's KV was sized at the session's max_ctx on the cold call, but the cold
+            // init may have re-clamped it against live free VRAM - once bound, the trunk's own
+            // max_ctx is the authority (same rule as the non-MTP path's `session.max_ctx` refresh).
+            let max_ctx = self
+                .mtp_trunk
+                .as_ref()
+                .map_or(session.max_ctx, |st| st.max_ctx());
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
-            let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");
-            return crate::mtp::generate_mtp_spec_vulkan_timed_on(
-                vk,
+            return crate::mtp::generate_mtp_spec_vulkan_timed_on_state(
+                &session.be,
+                &mut self.mtp_trunk,
                 &self.model,
                 head,
+                max_ctx,
                 prompt,
                 max_new,
                 |p| on_piece(p),
@@ -172,6 +174,11 @@ impl ChatModel for DenseSeamChat {
 
     fn reset_kv(&mut self) {
         super::reset_session(&mut self.session);
+        // MTP twin of the slot reset: forget the trunk's materialized tokens (weights + pager
+        // registration stay bound - the next MTP turn re-prefills into the same session).
+        if let Some(st) = self.mtp_trunk.as_mut() {
+            st.reset();
+        }
     }
 
     fn warmup(&mut self) -> Result<()> {

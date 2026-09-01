@@ -3499,6 +3499,10 @@ impl VulkanBackend {
     /// `vram_budget`/`vram_reserve`). An explicit unified limit checks every allocation so a tail
     /// of small buffers cannot collectively cross the caller's hard cap.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
+        self.check_vram_budget_labeled(want, "?")
+    }
+
+    fn check_vram_budget_labeled(&self, want: u64, label: &str) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
         let unified_limit = self.cfg.device.vram_budget.is_some()
             || self.cfg.device.vram_reserve.is_some()
@@ -3531,9 +3535,9 @@ impl VulkanBackend {
             .vram_budget
             .map(|spec| spec.resolve(v.total).min(v.total));
         Err(be(format!(
-            "{} budget exceeded: {} requested with {} physical / {} backend bytes already in use; \
-                 {} remains under the unified limit (physical cap {}, configured cap {}). \
-                 Refusing to over-commit: exceeding it doesn't fail \
+            "{} budget exceeded: {} requested for `{label}` with {} physical / {} backend bytes \
+                 already in use; {} remains under the unified limit (physical cap {}, configured cap \
+                 {}). Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
@@ -3604,7 +3608,7 @@ impl VulkanBackend {
         // UMA spill keeps it: on a unified part every heap IS the same DDR pool and the guard
         // budgets against all of them.
         if budget_check {
-            self.check_vram_budget(requirements.size)?;
+            self.check_vram_budget_labeled(requirements.size, "bda-weights")?;
         }
 
         let mut flags_info =
@@ -3807,6 +3811,7 @@ impl VulkanBackend {
     pub(crate) fn init_unified_vram_for_expert_slots(
         &self,
         specs: &[(usize, usize)],
+        runtime_margin: usize,
     ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
         const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
         let driver_max = usize::try_from(self.shared.max_mem_alloc_size)
@@ -3838,6 +3843,16 @@ impl VulkanBackend {
         if current != 0 {
             shard_sizes.push(current);
         }
+        // The runtime margin becomes its OWN trailing shard(s): `UnifiedRangePool::allocate_high`
+        // scans shards reversed, so runtime windows land here FIRST and coalesce among themselves
+        // instead of fragmenting the expert-slot space (see `MoePagerLayout::runtime_margin_bytes`
+        // for the failure this closes).
+        let mut margin_left = runtime_margin;
+        while margin_left > 0 {
+            let shard = margin_left.min(platform_max);
+            shard_sizes.push(shard);
+            margin_left -= shard;
+        }
         let expected: usize = shard_sizes.iter().sum();
         let mut cell = self.unified_pool.lock().unwrap();
         if let Some(pool) = cell.as_ref() {
@@ -3858,8 +3873,12 @@ impl VulkanBackend {
     /// The seam uses this as a real allocation probe: mapped ReBAR memory can consume a
     /// driver-dependent amount of heap budget beyond its logical byte size, especially on WDDM.
     /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
-    pub fn prepare_moe_unified_vram(&self, specs: &[(usize, usize)]) -> Result<usize> {
-        let pool = self.init_unified_vram_for_expert_slots(specs)?;
+    pub fn prepare_moe_unified_vram(
+        &self,
+        specs: &[(usize, usize)],
+        runtime_margin: usize,
+    ) -> Result<usize> {
+        let pool = self.init_unified_vram_for_expert_slots(specs, runtime_margin)?;
         Ok(pool.stats().capacity_bytes)
     }
 
@@ -4282,7 +4301,7 @@ impl VulkanBackend {
         // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
         // protects VRAM only).
         if location == MemoryLocation::GpuOnly {
-            if let Err(e) = self.check_vram_budget(requirements.size) {
+            if let Err(e) = self.check_vram_budget_labeled(requirements.size, label) {
                 unsafe { self.shared.device.destroy_buffer(buffer, None) };
                 return Err(e);
             }
@@ -6149,6 +6168,7 @@ mod tests {
             }],
             prefill_target_lanes: 1,
             prefill_cache_bytes: (SLOT * SLOTS) as u64,
+            runtime_margin_bytes: 0,
         })
         .expect("init pager");
         let pool = be.unified_vram().expect("unified pool");
@@ -6311,6 +6331,7 @@ mod tests {
             }],
             prefill_target_lanes: 2,
             prefill_cache_bytes: 8192,
+            runtime_margin_bytes: 0,
         })
         .expect("init_moe_pager");
         let weak = Arc::downgrade(&be.shared);

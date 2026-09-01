@@ -1,4 +1,7 @@
-//! MTP (multi-token prediction) head weights + forward for qwen35 (issue #33 — see `docs/mtp.md`).
+//! MTP (multi-token prediction) head weights + forward for qwen35 AND qwen35moe (issue #33 — see
+//! `docs/mtp.md`). The two arches share the head's attention layer + `nextn.*` bridge tensor set
+//! VERBATIM; only the head layer's FFN differs — dense SwiGLU on qwen35, the trunk's routed-expert
+//! bank + Qwen2-MoE-style shared expert on qwen35moe ([`MtpFfn`], mirroring `seam`'s `FfnW::Moe`).
 //!
 //! Phase 1 scope: locate + shape-check the tensors the head's 1-layer graph needs (`load_mtp_head`
 //! below) — no ops, no forward.
@@ -31,16 +34,17 @@ pub use backends::*;
 /// file or holding a second copy of the mmap slice.
 pub type MtpTensor = TensorInfo;
 
-/// The qwen35 MTP head's tensors (see the module doc). Every required field here EXISTED in the
-/// GGUF and had the expected shape at [`load_mtp_head`] time; the three `Option` fields are the
-/// ones the reference allows to fall back to the main model's tensors when absent (`docs/mtp.md`'s
-/// confirmed dump: the shipped 4B GGUF omits `embed_tokens`/`shared_head_head` — those two fall
-/// back — but DOES ship its own `shared_head_norm`).
+/// The qwen35/qwen35moe MTP head's tensors (see the module doc). Every required field here EXISTED
+/// in the GGUF and had the expected shape at [`load_mtp_head`] time; the three `Option` fields are
+/// the ones the reference allows to fall back to the main model's tensors when absent
+/// (`docs/mtp.md`'s confirmed dump: the shipped 4B GGUF omits `embed_tokens`/`shared_head_head` —
+/// those two fall back — but DOES ship its own `shared_head_norm`).
 pub struct MtpHeadWeights {
     /// The GGUF block index of the head layer (`cfg.n_layer`, i.e. immediately after the trunk).
     pub il: usize,
     // ── standard qwen35 full-attention layer tensors (identical shapes to a trunk full-attn
-    //    layer at a `(il+1) % full_attn_interval == 0` index — see `Config::is_qwen35_attn_layer`) ──
+    //    layer at a `(il+1) % full_attn_interval == 0` index — see `Config::is_qwen35_attn_layer`).
+    //    IDENTICAL on qwen35moe (config.rs: `qwen35` gates every shared attention field) ──
     pub attn_norm: MtpTensor,
     /// Interleaved q+gate: `[n_embd, head_dim * n_head * 2]` (see `Config::attn_out_gate`).
     pub attn_q: MtpTensor,
@@ -50,9 +54,9 @@ pub struct MtpHeadWeights {
     pub attn_k_norm: MtpTensor,
     pub attn_output: MtpTensor,
     pub post_attention_norm: MtpTensor,
-    pub ffn_gate: MtpTensor,
-    pub ffn_up: MtpTensor,
-    pub ffn_down: MtpTensor,
+    /// The head layer's FFN: dense SwiGLU on qwen35, routed-expert MoE (+ optional shared expert)
+    /// on qwen35moe — the ONLY structural difference between the two arches' head layers.
+    pub ffn: MtpFfn,
     // ── NextN bridge (the tensors that make this an MTP head, not just another trunk layer) ──
     /// `[2*n_embd, n_embd]`: projects `concat(rmsnorm(embed(t)), rmsnorm(h_target))` down to
     /// `n_embd` before the layer's own attention (see `docs/mtp.md`'s forward pseudocode).
@@ -66,6 +70,49 @@ pub struct MtpHeadWeights {
     pub shared_head_head: Option<MtpTensor>,
     /// Falls back to the main model's `output_norm.weight` when absent.
     pub shared_head_norm: Option<MtpTensor>,
+}
+
+/// The head layer's FFN weight set (see [`MtpHeadWeights::ffn`]). The variant is chosen by
+/// `Config::moe` (`Some` exactly for qwen35moe — config.rs widens `qwen35` over both arches but
+/// parses `MoeConfig` only for `qwen35moe`), and the whole enum mirrors the trunk layer's `FfnW`
+/// (`seam/weights.rs`) shape-for-shape, held as resolved GGUF tensors here.
+#[derive(Debug)]
+pub enum MtpFfn {
+    /// Dense SwiGLU (arch `qwen35`): `ffn_gate`/`ffn_up` `[n_embd, n_ff]`, `ffn_down`
+    /// `[n_ff, n_embd]`.
+    Dense {
+        gate: MtpTensor,
+        up: MtpTensor,
+        down: MtpTensor,
+    },
+    /// Routed-expert MoE (arch `qwen35moe`): the `ffn_gate_inp` router `[n_embd, n_expert]` and
+    /// the stacked per-expert banks `ffn_gate_exps`/`ffn_up_exps` `[n_embd, n_ff_exp, n_expert]` /
+    /// `ffn_down_exps` `[n_ff_exp, n_embd, n_expert]` (`Op::MoeFfn`'s expert-`e`-is-the-`e`-th-
+    /// equal-slice layout), plus the optional Qwen2-MoE-style shared expert.
+    Moe {
+        gate_inp: MtpTensor,
+        gate_exps: MtpTensor,
+        up_exps: MtpTensor,
+        down_exps: MtpTensor,
+        /// `Some` iff `Config::shexp_ff > 0` (the confirmed qwen35moe GGUF ships one).
+        shexp: Option<MtpShexp>,
+    },
+}
+
+/// The qwen35moe head's shared-expert weights ([`MtpFfn::Moe`]'s `shexp`): a dense SwiGLU FFN run
+/// on the SAME normed input as the routed bank, gated per token by a sigmoid and summed with the
+/// routed output via `Op::MoeSharedExpertAdd`. Mirrors `seam/weights.rs`'s `MoeSharedW`.
+#[derive(Debug)]
+pub struct MtpShexp {
+    /// `ffn_gate_inp_shexp.weight` `[n_embd]`: projects the FFN input to ONE raw (pre-sigmoid)
+    /// gate logit per token (`Op::Linear` with `out_f=1`). `Some` iff `Config::shexp_gated` —
+    /// always true for qwen35moe (`None` is the llama4 plain-sum shape, kept for symmetry).
+    pub gate_inp: Option<MtpTensor>,
+    /// `ffn_gate_shexp.weight`/`ffn_up_shexp.weight` `[n_embd, shexp_ff]`.
+    pub gate: MtpTensor,
+    pub up: MtpTensor,
+    /// `ffn_down_shexp.weight` `[shexp_ff, n_embd]`.
+    pub down: MtpTensor,
 }
 
 /// MASTER KILL-SWITCH for the whole MTP self-speculative decode path — currently **DISABLED**.
@@ -92,6 +139,18 @@ pub struct MtpHeadWeights {
 /// The real fix is an accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
 /// below a threshold), NOT faster kernels — see `infr_vulkan`'s `mmv_int8_decode_dtypes` doc.
 pub fn mtp_enabled() -> bool {
+    // PARKED (PR #21 review): MTP must not ship while `mtp_spec_matches_target_only_greedy`
+    // fails — the qwen35moe bring-up un-parked this as a "LOCAL DEV BUILD" shortcut, but greedy
+    // output is NOT token-identical to plain decode yet (close-margin argmax flips under the
+    // verify batch's rounding noise). Re-unpark ONLY when either:
+    //   1. `mtp_spec_matches_target_only_greedy` passes again (it is `#[ignore]`d, not fixed), or
+    //   2. the f32 / top-2-margin arbitration sketched below is implemented and verified: when
+    //      the verify stream's top-2 logit margin is below a threshold, re-argmax that position
+    //      in f32 (or defer to the plain-decode chain) so the two streams agree.
+    // Additionally the MTP turn path currently DROPS `RequestCtx` and `stable_prefix`
+    // (`DenseSeamChat::generate_turn_impl`'s MTP arm) — request-level sampling/abort/session
+    // semantics do not reach the speculative loop — so even a correctness-fixed MTP must stay
+    // out of serve/chat until that plumbing lands, or be explicitly benchmark-only.
     false
 }
 
@@ -172,15 +231,18 @@ fn optional(g: &Gguf, name: &str, want: &[usize]) -> Result<Option<MtpTensor>> {
     }
 }
 
-/// Locate + shape-check the qwen35 MTP head's tensors (see the module doc). Requires
+/// Locate + shape-check the qwen35/qwen35moe MTP head's tensors (see the module doc). Requires
 /// `cfg.n_layer_nextn == 1` (Phase 1's only supported case — `Config::from_gguf` already rejects
-/// anything else) and `cfg.qwen35`.
+/// anything else) and `cfg.qwen35` — which `Config` widens over BOTH arches (`qwen35` and
+/// `qwen35moe` share the head's attention layer + `nextn.*` bridge verbatim, config.rs:698); the
+/// FFN variant follows `cfg.moe` (`Some` ⇔ qwen35moe) and every MoE shape below is derived from
+/// `cfg.moe`/`cfg.shexp_ff`, not hardcoded.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
     if !cfg.qwen35 || cfg.n_layer_nextn != 1 {
         bail!(
-            "load_mtp_head: requires a qwen35 GGUF with nextn_predict_layers==1 (got qwen35={}, \
-             n_layer_nextn={})",
+            "load_mtp_head: requires a qwen35/qwen35moe GGUF with nextn_predict_layers==1 (got \
+             qwen35={}, n_layer_nextn={})",
             cfg.qwen35,
             cfg.n_layer_nextn,
         );
@@ -190,6 +252,48 @@ pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
     let ne = cfg.n_embd;
     let qdim = cfg.head_dim * cfg.n_head * 2; // interleaved q+gate, see Config::attn_out_gate
     let kv_dim = cfg.n_kv * cfg.head_dim;
+    let ffn = match cfg.moe {
+        // qwen35moe: the head layer's FFN is the trunk's `FfnW::Moe` shape — router + stacked
+        // per-expert banks (separate `ffn_gate_exps`/`ffn_up_exps`; the qwen3.8 fused
+        // `ffn_gate_up_exps` layout is NOT accepted here — no qwen35moe GGUF ships it) + the
+        // shared expert when `cfg.shexp_ff > 0`. Shape-checked against `cfg.moe`/`cfg.shexp_ff`.
+        Some(mc) => {
+            let shexp = if cfg.shexp_ff > 0 {
+                Some(MtpShexp {
+                    gate_inp: if cfg.shexp_gated {
+                        Some(require(g, &p("ffn_gate_inp_shexp.weight"), &[ne])?)
+                    } else {
+                        None
+                    },
+                    gate: require(g, &p("ffn_gate_shexp.weight"), &[ne, cfg.shexp_ff])?,
+                    up: require(g, &p("ffn_up_shexp.weight"), &[ne, cfg.shexp_ff])?,
+                    down: require(g, &p("ffn_down_shexp.weight"), &[cfg.shexp_ff, ne])?,
+                })
+            } else {
+                None
+            };
+            MtpFfn::Moe {
+                gate_inp: require(g, &p("ffn_gate_inp.weight"), &[ne, mc.n_expert])?,
+                gate_exps: require(
+                    g,
+                    &p("ffn_gate_exps.weight"),
+                    &[ne, mc.n_ff_exp, mc.n_expert],
+                )?,
+                up_exps: require(g, &p("ffn_up_exps.weight"), &[ne, mc.n_ff_exp, mc.n_expert])?,
+                down_exps: require(
+                    g,
+                    &p("ffn_down_exps.weight"),
+                    &[mc.n_ff_exp, ne, mc.n_expert],
+                )?,
+                shexp,
+            }
+        }
+        None => MtpFfn::Dense {
+            gate: require(g, &p("ffn_gate.weight"), &[ne, cfg.n_ff])?,
+            up: require(g, &p("ffn_up.weight"), &[ne, cfg.n_ff])?,
+            down: require(g, &p("ffn_down.weight"), &[cfg.n_ff, ne])?,
+        },
+    };
     Ok(MtpHeadWeights {
         il,
         attn_norm: require(g, &p("attn_norm.weight"), &[ne])?,
@@ -204,9 +308,7 @@ pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
             &[cfg.head_dim * cfg.n_head, ne],
         )?,
         post_attention_norm: require(g, &p("post_attention_norm.weight"), &[ne])?,
-        ffn_gate: require(g, &p("ffn_gate.weight"), &[ne, cfg.n_ff])?,
-        ffn_up: require(g, &p("ffn_up.weight"), &[ne, cfg.n_ff])?,
-        ffn_down: require(g, &p("ffn_down.weight"), &[cfg.n_ff, ne])?,
+        ffn,
         eh_proj: require(g, &p("nextn.eh_proj.weight"), &[2 * ne, ne])?,
         enorm: require(g, &p("nextn.enorm.weight"), &[ne])?,
         hnorm: require(g, &p("nextn.hnorm.weight"), &[ne])?,
@@ -225,9 +327,10 @@ pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
 type BindWeightFn<'a> =
     dyn Fn(&str, crate::seam::WBytes, DType, usize) -> Result<(Box<dyn Buffer>, DType)> + 'a;
 
-/// [`upload_mtp_head_bufs`]'s return shape: the 16 uploaded weight buffers, index-parallel with
-/// their (effective dtype, element count) — the pair `build_mtp_graph` needs to declare each
-/// handle. Named purely to keep clippy's `type_complexity` lint quiet.
+/// [`upload_mtp_head_bufs`]'s return shape: the uploaded weight buffers (16 for the dense qwen35
+/// head, 17–21 for qwen35moe depending on the shared expert), index-parallel with their
+/// (effective dtype, element count) — the pair `build_mtp_graph` needs to declare each handle.
+/// Named purely to keep clippy's `type_complexity` lint quiet.
 type WBufs = (Vec<Box<dyn Buffer>>, Vec<(DType, usize)>);
 
 /// Resolve a fallback tensor from the MAIN model (the reference's `layer.nextn.X ? layer.nextn.X :
@@ -269,13 +372,17 @@ pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option
     }
 }
 
-/// Upload the head's 16 graph weights (attention-layer set + NextN bridge, in `wpush` order —
-/// MUST match [`build_mtp_graph`]'s `wpush` calls 1:1) through the caller's `bind_weight` — the
-/// SAME binder shape `seam.rs`'s `BindWeight` uses (zero-copy mmap on CPU, padded upload on
-/// Vulkan — see `MtpHeadSession::new_cpu`/`new_vulkan`), so the head's tensors land in memory
-/// exactly like the trunk's do. Falls back to the main model's `output_norm`/tied lm_head for the
-/// two optional NextN tensors that are absent (`docs/mtp.md`'s confirmed dump — `shared_head_norm`
-/// IS present in the shipped 4B GGUF, so only the lm_head fallback fires there in practice).
+/// Upload the head's graph weights (attention-layer set + FFN variant + NextN bridge, in `wpush`
+/// order — MUST match [`build_mtp_graph`]'s/`build_mtp_draft_chain_graph`'s `wpush` calls 1:1)
+/// through the caller's `bind_weight` — the SAME binder shape `seam.rs`'s `BindWeight` uses
+/// (zero-copy mmap on CPU, padded upload on Vulkan — see `MtpHeadSession::new_cpu`/`new_vulkan`),
+/// so the head's tensors land in memory exactly like the trunk's do. Falls back to the main
+/// model's `output_norm`/tied lm_head for the two optional NextN tensors that are absent
+/// (`docs/mtp.md`'s confirmed dump — `shared_head_norm` IS present in the shipped 4B GGUF, so
+/// only the lm_head fallback fires there in practice). The FFN push order is per-variant: dense
+/// qwen35 pushes its SwiGLU triple; qwen35moe pushes router + gate/up/down expert banks + the
+/// shared expert (`ffn_gate_inp_shexp` first when `shexp_gated`) — the same order the trunk's
+/// `wload` uses for a MoE layer (`seam/runner.rs`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn upload_mtp_head_bufs(
     be: &dyn Backend,
@@ -285,8 +392,17 @@ fn upload_mtp_head_bufs(
     head: &MtpHeadWeights,
 ) -> Result<WBufs> {
     let _ = be; // kept for symmetry with seam's wload closures; binder itself owns `be`
-    let mut bufs = Vec::with_capacity(16);
-    let mut specs = Vec::with_capacity(16);
+                // 8 attention + 5 NextN/lm_head fixed entries, plus the per-variant FFN count.
+    let n_ffn = match &head.ffn {
+        MtpFfn::Dense { .. } => 3,
+        MtpFfn::Moe { shexp, .. } => {
+            4 + shexp
+                .as_ref()
+                .map_or(0, |s| 3 + usize::from(s.gate_inp.is_some()))
+        }
+    };
+    let mut bufs = Vec::with_capacity(13 + n_ffn);
+    let mut specs = Vec::with_capacity(13 + n_ffn);
     let mut push = |t: &MtpTensor| -> Result<()> {
         let tb = g.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?;
         let numel: usize = t.shape.iter().product();
@@ -303,9 +419,33 @@ fn upload_mtp_head_bufs(
     push(&head.attn_k_norm)?;
     push(&head.attn_output)?;
     push(&head.post_attention_norm)?;
-    push(&head.ffn_gate)?;
-    push(&head.ffn_up)?;
-    push(&head.ffn_down)?;
+    match &head.ffn {
+        MtpFfn::Dense { gate, up, down } => {
+            push(gate)?;
+            push(up)?;
+            push(down)?;
+        }
+        MtpFfn::Moe {
+            gate_inp,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp,
+        } => {
+            push(gate_inp)?;
+            push(gate_exps)?;
+            push(up_exps)?;
+            push(down_exps)?;
+            if let Some(s) = shexp {
+                if let Some(gi) = &s.gate_inp {
+                    push(gi)?;
+                }
+                push(&s.gate)?;
+                push(&s.up)?;
+                push(&s.down)?;
+            }
+        }
+    }
     push(&head.eh_proj)?;
     push(&head.enorm)?;
     push(&head.hnorm)?;
@@ -371,6 +511,231 @@ fn build_embed_chain_buf(
     Ok((Some(buf), dt))
 }
 
+/// The graph weight HANDLES mirror of [`MtpFfn`] — what `build_mtp_graph` /
+/// `build_mtp_draft_chain_graph` declare in `wpush` order (which [`upload_mtp_head_bufs`]'s push
+/// order must match 1:1). Named like `seam/weights.rs`'s `FfnW` on purpose.
+enum MtpFfnW {
+    Dense {
+        gate: TensorId,
+        up: TensorId,
+        down: TensorId,
+    },
+    Moe {
+        gate_inp: TensorId,
+        gate_exps: TensorId,
+        up_exps: TensorId,
+        down_exps: TensorId,
+        shexp: Option<MtpShexpW>,
+    },
+}
+
+/// [`MtpFfnW::Moe`]'s shared-expert handles — mirror of [`MtpShexp`] / `seam`'s `MoeSharedW`.
+#[derive(Clone, Copy)]
+struct MtpShexpW {
+    gate_inp: Option<TensorId>,
+    gate: TensorId,
+    up: TensorId,
+    down: TensorId,
+}
+
+/// Emit the head layer's FFN (post-`post_attention_norm` → residual contribution in `sub`), shared
+/// by [`build_mtp_graph`] and [`build_mtp_draft_chain_graph`] — ported op-for-op from the trunk's
+/// `seam/runner.rs` FFN arms: the dense SwiGLU triple for [`MtpFfnW::Dense`], and for
+/// [`MtpFfnW::Moe`] the trunk's exact qwen35moe sequence — `Op::MoeFfn` (router reading the SAME
+/// normed input as the experts, the model's `MoeConfig` gating verbatim: softmax + top-k renorm,
+/// `scale`, no bias/groups/clamp/fused-gate-up), then the shared expert's sigmoid-gate logit
+/// (`Op::Linear` out_f=1) + dense SwiGLU at `Config::shexp_ff` width + `Op::MoeSharedExpertAdd`.
+///
+/// `gbuf`/`ubuf`/`actbuf` are the dense-FFN-shaped scratch (the dense variant's `n_ff` wide, or
+/// the shared expert's `shexp_ff` wide on MoE — the callers size them). `moe_scratch` is
+/// `Some((moe_out, d_out, shexp_gate))` exactly when the Moe variant carries a shared expert (the
+/// routed bank then lands in `moe_out` and `d_out`/`shexp_gate` are the shexp down-output and
+/// per-row gate logit — `seam/runner.rs`'s scratch of the same names).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+fn emit_mtp_ffn(
+    g: &mut Graph,
+    cfg: &crate::Config,
+    ffn: &MtpFfnW,
+    rows: usize,
+    hn: TensorId,
+    sub: TensorId,
+    gbuf: TensorId,
+    ubuf: TensorId,
+    actbuf: TensorId,
+    moe_scratch: Option<(TensorId, TensorId, TensorId)>,
+) {
+    let ne = cfg.n_embd;
+    match ffn {
+        MtpFfnW::Dense { gate, up, down } => {
+            // qwen35 dense SwiGLU — qwen35.cpp:610-619.
+            let nff = cfg.n_ff as u32;
+            g.push(Op::Linear {
+                x: hn,
+                weight: *gate,
+                dst: gbuf,
+                m: rows as u32,
+                in_f: ne as u32,
+                out_f: nff,
+                w_off: 0,
+            });
+            g.push(Op::Linear {
+                x: hn,
+                weight: *up,
+                dst: ubuf,
+                m: rows as u32,
+                in_f: ne as u32,
+                out_f: nff,
+                w_off: 0,
+            });
+            g.push(Op::GatedAct {
+                gate: gbuf,
+                up: ubuf,
+                dst: actbuf,
+                rows: rows as u32,
+                nff,
+                act: Activation::Silu,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            });
+            g.push(Op::Linear {
+                x: actbuf,
+                weight: *down,
+                dst: sub,
+                m: rows as u32,
+                in_f: nff,
+                out_f: ne as u32,
+                w_off: 0,
+            });
+        }
+        MtpFfnW::Moe {
+            gate_inp,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp,
+        } => {
+            let mc = cfg.moe.expect("qwen35moe head without MoeConfig");
+            // With a shared expert, the routed branch lands in `moe_out` and
+            // `Op::MoeSharedExpertAdd` combines it into `sub` below; with none it writes `sub`
+            // directly — `seam/runner.rs`'s `FfnW::Moe` arm verbatim.
+            let moe_dst = if shexp.is_some() {
+                moe_scratch.expect("MoE shared expert without scratch").0
+            } else {
+                sub
+            };
+            g.push(Op::MoeFfn {
+                x: hn,
+                router_x: hn, // qwen35moe: the router reads the SAME normed input as the experts
+                router: *gate_inp,
+                gate_exps: *gate_exps,
+                up_exps: *up_exps,
+                down_exps: *down_exps,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: moe_dst,
+                ne: ne as u32,
+                n_expert: mc.n_expert as u32,
+                n_used: mc.n_used as u32,
+                n_ff_exp: mc.n_ff_exp as u32,
+                scale: mc.scale,
+                act: Activation::Silu, // qwen35moe is SwiGLU (see runner.rs's FfnW::Moe arm)
+                gating: mc.gating,
+                norm_w: mc.norm_w,
+                weight_before: mc.weight_before,
+                ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: mc.n_expert_groups,
+                n_expert_groups_used: mc.n_expert_groups_used,
+                // qwen35moe has no SwiGLU clamps (config.rs parses those only for
+                // deepseek4/bailingmoe3, whose clamp arrays are empty here).
+                swiglu_clamp: None,
+                expert_ids: None,
+            });
+            if let Some(sh) = shexp {
+                let (moe_out, d_out, shexp_gate) =
+                    moe_scratch.expect("MoE shared expert without scratch");
+                let sff = cfg.shexp_ff as u32;
+                // qwen35moe: per-token sigmoid gate logit (`Op::Linear` out_f=1) before the shared
+                // expert's own SwiGLU, then `moe_out + sigmoid(gate) · shexp` into `sub`.
+                if let Some(gi) = sh.gate_inp {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: gi,
+                        dst: shexp_gate,
+                        m: rows as u32,
+                        in_f: ne as u32,
+                        out_f: 1,
+                        w_off: 0,
+                    });
+                }
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: sh.gate,
+                    dst: gbuf,
+                    m: rows as u32,
+                    in_f: ne as u32,
+                    out_f: sff,
+                    w_off: 0,
+                });
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: sh.up,
+                    dst: ubuf,
+                    m: rows as u32,
+                    in_f: ne as u32,
+                    out_f: sff,
+                    w_off: 0,
+                });
+                g.push(Op::GatedAct {
+                    gate: gbuf,
+                    up: ubuf,
+                    dst: actbuf,
+                    rows: rows as u32,
+                    nff: sff,
+                    act: Activation::Silu,
+                    up_off: 0,
+                    up_stride: 0,
+                    gate_stride: 0,
+                    gate_block_width: 0,
+                    swiglu_clamp: None,
+                });
+                g.push(Op::Linear {
+                    x: actbuf,
+                    weight: sh.down,
+                    dst: d_out,
+                    m: rows as u32,
+                    in_f: sff,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                if sh.gate_inp.is_some() {
+                    g.push(Op::MoeSharedExpertAdd {
+                        moe: moe_out,
+                        shexp: d_out,
+                        gate: shexp_gate,
+                        dst: sub,
+                        rows: rows as u32,
+                        n: ne as u32,
+                    });
+                } else {
+                    // The ungated (llama4-shaped) plain sum — kept for symmetry; no qwen35moe
+                    // GGUF takes it (`Config::shexp_gated` is always true there).
+                    g.push(Op::Add {
+                        a: moe_out,
+                        b: d_out,
+                        dst: sub,
+                        n: (rows * ne) as u32,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// The head graph's tensor handles `MtpHeadSession::forward` binds/reads each call.
 struct MtpHandles {
     e_raw: TensorId,
@@ -378,8 +743,8 @@ struct MtpHandles {
     positions: TensorId,
     k_cache: TensorId,
     v_cache: TensorId,
-    /// The 16 weight handles, in [`upload_mtp_head_bufs`]'s push order (index-parallel with
-    /// `MtpHeadSession::wbufs`).
+    /// The weight handles, in [`upload_mtp_head_bufs`]'s push order (index-parallel with
+    /// `MtpHeadSession::wbufs`) — 16 for the dense qwen35 head, more for qwen35moe's MoE FFN.
     weights: Vec<TensorId>,
     /// The lm_head GEMM's output, or `None` when built with `want_logits == false` (the catch-up
     /// path — AUDIT #2): a KV-only forward omits the lm_head `Op::Linear` + its `[rows*vocab]`
@@ -403,13 +768,16 @@ struct MtpHandles {
 /// h_mtp = rmsnorm(x, shared_head_norm)             # fed back on the NEXT draft step
 /// logits = lm_head @ h_mtp
 /// ```
-/// The attention-layer ops (interleaved q+gate split, qk-norm+RoPE, sigmoid out-gate, SwiGLU FFN)
-/// are ported op-for-op from `seam.rs`'s qwen35 `c.attn_out_gate` branch (that file's
+/// The attention-layer ops (interleaved q+gate split, qk-norm+RoPE, sigmoid out-gate) are ported
+/// op-for-op from `seam.rs`'s qwen35 `c.attn_out_gate` branch (that file's
 /// `generate_dense_backend::build` closure, roughly lines 2269-2707: the per-layer attn-input norm,
 /// the interleaved qg projection + per-head `CopyStrided` split, k/v projections, `QkNormRope`,
 /// `WriteKv`, `Attention`, the post-attention `GatedAct(Sigmoid)` gate, the o-projection, the
-/// residual add, the ffn-norm + dense SwiGLU FFN, and the final residual add) — see
-/// `qwen35.cpp:556-622` for the reference this ports.
+/// residual add, the ffn-norm, and the final residual add) — see `qwen35.cpp:556-622` for the
+/// reference this ports. The FFN is the only per-arch part: dense SwiGLU on qwen35
+/// (qwen35.cpp:610-619), the trunk's `FfnW::Moe` sequence (`Op::MoeFfn` + the shared-expert
+/// SwiGLU + `Op::MoeSharedExpertAdd`, `seam/runner.rs`'s MoE arm) on qwen35moe — see
+/// [`emit_mtp_ffn`].
 ///
 /// The `eh_proj` "concat" (`qwen35.cpp:548`'s `ggml_concat(e_norm, h_norm, dim=0)`): with infr's
 /// `Op::Linear` weight convention (`[out, in]` row-major — a weight's `in`-dim is the CONTIGUOUS
@@ -461,7 +829,17 @@ fn build_mtp_graph(
     let hd = cfg.head_dim;
     let qrow = nh * hd;
     let kvrow = nkv * hd;
-    let nff = cfg.n_ff;
+    // FFN scratch width: the dense SwiGLU's `n_ff` (qwen35), or the shared expert's `shexp_ff`
+    // (qwen35moe — the dense-shaped `gbuf`/`ubuf`/`actbuf` are reused by the shared-expert branch
+    // at ITS width, exactly like `seam/runner.rs`'s `FfnW::Moe` arm; note `Config` parses
+    // qwen35moe's `n_ff` to the same value). `.max(1)`: a shared-expert-less MoE head never reads
+    // this scratch, but a zero-element decl is kept off the backend.
+    let nff = (if cfg.moe.is_some() {
+        cfg.shexp_ff
+    } else {
+        cfg.n_ff
+    })
+    .max(1);
     let eps = cfg.rms_eps;
     let theta = cfg.rope_theta; // qwen35: uniform (no gemma dual-rope) — Config::layer_rope_theta
     let rope_dim = cfg.rope_dim; // collapses to this for a non-SWA model; see Config's doc.
@@ -494,32 +872,47 @@ fn build_mtp_graph(
     let w_kn = wpush(&mut g);
     let w_o = wpush(&mut g);
     let w_ffn_norm = wpush(&mut g);
-    let w_gate = wpush(&mut g);
-    let w_up = wpush(&mut g);
-    let w_down = wpush(&mut g);
+    let mut weights = vec![w_attn_norm, w_q, w_k, w_v, w_qn, w_kn, w_o, w_ffn_norm];
+    // The FFN variant's handles, in `upload_mtp_head_bufs`'s per-variant push order.
+    let ffn_w = if cfg.moe.is_some() {
+        let gate_inp = wpush(&mut g);
+        let gate_exps = wpush(&mut g);
+        let up_exps = wpush(&mut g);
+        let down_exps = wpush(&mut g);
+        weights.extend([gate_inp, gate_exps, up_exps, down_exps]);
+        let shexp = (cfg.shexp_ff > 0).then(|| {
+            let gate_inp = cfg.shexp_gated.then(|| wpush(&mut g));
+            let gate = wpush(&mut g);
+            let up = wpush(&mut g);
+            let down = wpush(&mut g);
+            weights.extend(gate_inp.iter().copied().chain([gate, up, down]));
+            MtpShexpW {
+                gate_inp,
+                gate,
+                up,
+                down,
+            }
+        });
+        MtpFfnW::Moe {
+            gate_inp,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp,
+        }
+    } else {
+        let gate = wpush(&mut g);
+        let up = wpush(&mut g);
+        let down = wpush(&mut g);
+        weights.extend([gate, up, down]);
+        MtpFfnW::Dense { gate, up, down }
+    };
     let w_eh_proj = wpush(&mut g);
     let w_enorm = wpush(&mut g);
     let w_hnorm = wpush(&mut g);
     let w_head_norm = wpush(&mut g);
     let w_lm_head = wpush(&mut g);
-    let weights = vec![
-        w_attn_norm,
-        w_q,
-        w_k,
-        w_v,
-        w_qn,
-        w_kn,
-        w_o,
-        w_ffn_norm,
-        w_gate,
-        w_up,
-        w_down,
-        w_eh_proj,
-        w_enorm,
-        w_hnorm,
-        w_head_norm,
-        w_lm_head,
-    ];
+    weights.extend([w_eh_proj, w_enorm, w_hnorm, w_head_norm, w_lm_head]);
 
     // `logits`: omitted entirely on the KV-only catch-up path (`want_logits == false` — AUDIT #2).
     // Fused variant: `logits` never leaves the device (Internal scratch, read straight into
@@ -554,6 +947,16 @@ fn build_mtp_graph(
     let actbuf = g.internal(f32d(rows * nff));
     let hn2 = g.internal(f32d(rows * ne));
     let layer_out = g.internal(f32d(rows * ne));
+    // qwen35moe MoE FFN scratch (`Some` exactly when the head has a shared expert): the routed
+    // bank's output, the shared expert's down-projection output, and its per-row sigmoid gate
+    // logit — `seam/runner.rs`'s `moe_out`/`d_out`/`shexp_gate`.
+    let moe_scratch = matches!(&ffn_w, MtpFfnW::Moe { shexp: Some(_), .. }).then(|| {
+        (
+            g.internal(f32d(rows * ne)),
+            g.internal(f32d(rows * ne)),
+            g.internal(f32d(rows)),
+        )
+    });
 
     // e = rmsnorm(embed(t), enorm); h = rmsnorm(h_target, hnorm) — qwen35.cpp:542-546.
     g.push(Op::RmsNorm {
@@ -753,9 +1156,10 @@ fn build_mtp_graph(
         dst: resid,
         n: (rows * ne) as u32,
     });
-    // ffn — qwen35.cpp:610-619 (SwiGLU; qwen35 names the pre-FFN norm `post_attention_norm`, not
-    // `ffn_norm` — see `Config::qwen35`'s doc / `w_ffn_norm` bound to `post_attention_norm.weight`
-    // in `upload_mtp_head_bufs`).
+    // ffn — qwen35.cpp:610-619 (dense SwiGLU) / qwen35moe.cpp's MoE + shared expert (the
+    // `emit_mtp_ffn` branch; qwen35 names the pre-FFN norm `post_attention_norm`, not `ffn_norm` —
+    // see `Config::qwen35`'s doc / `w_ffn_norm` bound to `post_attention_norm.weight` in
+    // `upload_mtp_head_bufs`).
     g.push(Op::RmsNorm {
         x: resid,
         weight: w_ffn_norm,
@@ -764,46 +1168,18 @@ fn build_mtp_graph(
         dim: ne as u32,
         eps,
     });
-    g.push(Op::Linear {
-        x: hn2,
-        weight: w_gate,
-        dst: gbuf,
-        m: rows as u32,
-        in_f: ne as u32,
-        out_f: nff as u32,
-        w_off: 0,
-    });
-    g.push(Op::Linear {
-        x: hn2,
-        weight: w_up,
-        dst: ubuf,
-        m: rows as u32,
-        in_f: ne as u32,
-        out_f: nff as u32,
-        w_off: 0,
-    });
-    g.push(Op::GatedAct {
-        gate: gbuf,
-        up: ubuf,
-        dst: actbuf,
-        rows: rows as u32,
-        nff: nff as u32,
-        act: Activation::Silu,
-        up_off: 0,
-        up_stride: 0,
-        gate_stride: 0,
-        gate_block_width: 0,
-        swiglu_clamp: None,
-    });
-    g.push(Op::Linear {
-        x: actbuf,
-        weight: w_down,
-        dst: sub,
-        m: rows as u32,
-        in_f: nff as u32,
-        out_f: ne as u32,
-        w_off: 0,
-    });
+    emit_mtp_ffn(
+        &mut g,
+        cfg,
+        &ffn_w,
+        rows,
+        hn2,
+        sub,
+        gbuf,
+        ubuf,
+        actbuf,
+        moe_scratch,
+    );
     // ffn residual — qwen35.cpp:621.
     g.push(Op::Add {
         a: resid,
@@ -865,7 +1241,7 @@ fn build_mtp_graph(
 }
 
 /// [`build_mtp_draft_chain_graph`]'s tensor handles: the inputs bound once per `draft_chain` call
-/// (`id0`/`h0`/the `n_steps` `pos_s`/the head's own KV/the 16 weights/the embed table), plus the
+/// (`id0`/`h0`/the `n_steps` `pos_s`/the head's own KV/the weight set/the embed table), plus the
 /// `n_steps` `Op::ArgmaxProb` id [`Output`](TensorId)s the host reads back after the ONE `execute`.
 struct MtpChainHandles {
     id0: TensorId,
@@ -873,7 +1249,7 @@ struct MtpChainHandles {
     pos_s: Vec<TensorId>,
     k_cache: TensorId,
     v_cache: TensorId,
-    /// The 16 weight handles, same push order as [`MtpHandles::weights`].
+    /// The weight handles, same per-variant push order as [`MtpHandles::weights`].
     weights: Vec<TensorId>,
     /// The head's own/main-model embedding table, uploaded as a device Weight so
     /// [`Op::EmbedGather`] can gather+dequantize each step's drafted token on-device (see
@@ -921,7 +1297,14 @@ fn build_mtp_draft_chain_graph(
     let hd = cfg.head_dim;
     let qrow = nh * hd;
     let kvrow = nkv * hd;
-    let nff = cfg.n_ff;
+    // FFN scratch width — see `build_mtp_graph`'s `nff` (dense `n_ff` vs the shared expert's
+    // `shexp_ff` on qwen35moe; `.max(1)` keeps the never-read scratch nonzero).
+    let nff = (if cfg.moe.is_some() {
+        cfg.shexp_ff
+    } else {
+        cfg.n_ff
+    })
+    .max(1);
     let eps = cfg.rms_eps;
     let theta = cfg.rope_theta;
     let rope_dim = cfg.rope_dim;
@@ -944,8 +1327,8 @@ fn build_mtp_draft_chain_graph(
         wi += 1;
         g.weight(TensorDesc::new(vec![n], dt))
     };
-    // MUST match `upload_mtp_head_bufs`'s push order exactly (same 16 weights `build_mtp_graph`
-    // uses, unrolled `n_steps` times below against these SAME handles).
+    // MUST match `upload_mtp_head_bufs`'s push order exactly (the same per-variant weight list
+    // `build_mtp_graph` declares, unrolled `n_steps` times below against these SAME handles).
     let w_attn_norm = wpush(&mut g);
     let w_q = wpush(&mut g);
     let w_k = wpush(&mut g);
@@ -954,32 +1337,46 @@ fn build_mtp_draft_chain_graph(
     let w_kn = wpush(&mut g);
     let w_o = wpush(&mut g);
     let w_ffn_norm = wpush(&mut g);
-    let w_gate = wpush(&mut g);
-    let w_up = wpush(&mut g);
-    let w_down = wpush(&mut g);
+    let mut weights = vec![w_attn_norm, w_q, w_k, w_v, w_qn, w_kn, w_o, w_ffn_norm];
+    let ffn_w = if cfg.moe.is_some() {
+        let gate_inp = wpush(&mut g);
+        let gate_exps = wpush(&mut g);
+        let up_exps = wpush(&mut g);
+        let down_exps = wpush(&mut g);
+        weights.extend([gate_inp, gate_exps, up_exps, down_exps]);
+        let shexp = (cfg.shexp_ff > 0).then(|| {
+            let gate_inp = cfg.shexp_gated.then(|| wpush(&mut g));
+            let gate = wpush(&mut g);
+            let up = wpush(&mut g);
+            let down = wpush(&mut g);
+            weights.extend(gate_inp.iter().copied().chain([gate, up, down]));
+            MtpShexpW {
+                gate_inp,
+                gate,
+                up,
+                down,
+            }
+        });
+        MtpFfnW::Moe {
+            gate_inp,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp,
+        }
+    } else {
+        let gate = wpush(&mut g);
+        let up = wpush(&mut g);
+        let down = wpush(&mut g);
+        weights.extend([gate, up, down]);
+        MtpFfnW::Dense { gate, up, down }
+    };
     let w_eh_proj = wpush(&mut g);
     let w_enorm = wpush(&mut g);
     let w_hnorm = wpush(&mut g);
     let w_head_norm = wpush(&mut g);
     let w_lm_head = wpush(&mut g);
-    let weights = vec![
-        w_attn_norm,
-        w_q,
-        w_k,
-        w_v,
-        w_qn,
-        w_kn,
-        w_o,
-        w_ffn_norm,
-        w_gate,
-        w_up,
-        w_down,
-        w_eh_proj,
-        w_enorm,
-        w_hnorm,
-        w_head_norm,
-        w_lm_head,
-    ];
+    weights.extend([w_eh_proj, w_enorm, w_hnorm, w_head_norm, w_lm_head]);
     let w_embd = g.weight(TensorDesc::new(vec![vocab * ne], embed_dtype));
 
     let mut pos_s_vec = Vec::with_capacity(n_steps);
@@ -1013,6 +1410,15 @@ fn build_mtp_draft_chain_graph(
         let actbuf = g.internal(f32d(nff));
         let hn2 = g.internal(f32d(ne));
         let layer_out = g.internal(f32d(ne));
+        // qwen35moe MoE FFN scratch, fresh per step like the rest of this block (see
+        // `build_mtp_graph`'s `moe_scratch`).
+        let moe_scratch = matches!(&ffn_w, MtpFfnW::Moe { shexp: Some(_), .. }).then(|| {
+            (
+                g.internal(f32d(ne)),
+                g.internal(f32d(ne)),
+                g.internal(f32d(1)),
+            )
+        });
 
         // e_raw_s = table[prev_id, :] * 1.0 — qwen35 isn't gemma, no embed scale (see
         // `build_mtp_graph`'s `forward_draft` twin: the host-embed path uses scale 1.0 too).
@@ -1227,46 +1633,19 @@ fn build_mtp_draft_chain_graph(
             dim: ne as u32,
             eps,
         });
-        g.push(Op::Linear {
-            x: hn2,
-            weight: w_gate,
-            dst: gbuf,
-            m: 1,
-            in_f: ne as u32,
-            out_f: nff as u32,
-            w_off: 0,
-        });
-        g.push(Op::Linear {
-            x: hn2,
-            weight: w_up,
-            dst: ubuf,
-            m: 1,
-            in_f: ne as u32,
-            out_f: nff as u32,
-            w_off: 0,
-        });
-        g.push(Op::GatedAct {
-            gate: gbuf,
-            up: ubuf,
-            dst: actbuf,
-            rows: 1,
-            nff: nff as u32,
-            act: Activation::Silu,
-            up_off: 0,
-            up_stride: 0,
-            gate_stride: 0,
-            gate_block_width: 0,
-            swiglu_clamp: None,
-        });
-        g.push(Op::Linear {
-            x: actbuf,
-            weight: w_down,
-            dst: sub,
-            m: 1,
-            in_f: nff as u32,
-            out_f: ne as u32,
-            w_off: 0,
-        });
+        // FFN — dense SwiGLU (qwen35) or MoE + shared expert (qwen35moe), per `ffn_w`.
+        emit_mtp_ffn(
+            &mut g,
+            cfg,
+            &ffn_w,
+            1,
+            hn2,
+            sub,
+            gbuf,
+            ubuf,
+            actbuf,
+            moe_scratch,
+        );
         g.push(Op::Add {
             a: resid,
             b: sub,
@@ -2051,8 +2430,17 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
 // ─── Phase 3: the MTP self-speculative generation loop + run/serve wiring (issue #33) ───────────
 
 /// llama.cpp's oracle run used `--spec-draft-n-max 6` (`docs/mtp.md`) — the max candidates drafted
-/// per cycle before a batched verify.
+/// per cycle before a batched verify. Override with `INFR_MTP_N_MAX` (1 = one-token drafts: the
+/// cheapest verify per cycle, and the right shape for a low-acceptance head).
 pub const DEFAULT_N_MAX: usize = 6;
+
+fn effective_n_max() -> usize {
+    std::env::var("INFR_MTP_N_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_N_MAX)
+}
 
 /// One batched VERIFY forward (`seam.rs`'s VERIFY branch) over `tokens`' un-cached suffix,
 /// on a persistent Vulkan session, ALSO capturing `h` for every returned row — the primitive
@@ -2355,6 +2743,12 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// caller-built [`MtpHeadSession`] (bound to the same `be`). Everything between — draft, accept,
 /// catch-up, streaming — is backend-agnostic.
 ///
+/// `trunk_state` is CALLER-HELD: the owning driver keeps the [`crate::seam::SeamKv`] across calls
+/// so the trunk's bound weights (and its pager registration, when the paged-MoE binder installed
+/// one) persist turn to turn, while each call still starts from a FRESH KV — the entry `reset()`
+/// below forgets the materialized tokens (weights/buffers stay), exactly the "no cross-turn KV
+/// reuse" rule this loop has always had, now without re-uploading weights to get it.
+///
 /// Sampling: reads `Sampler::from_cfg(&ec.sampling)` (`sampling.temp`/`top_k`/`top_p`) like the
 /// non-MTP seam decode loop. `temp <= 0` takes the ORIGINAL greedy fast path — `draft` +
 /// `crate::seam::model::spec_accept` against the trunk's GPU-resident argmax, bit-identical to
@@ -2375,6 +2769,7 @@ fn generate_mtp_spec_core(
     bind: &BindWeightFn,
     model: &crate::SeamModel,
     head_sess: &mut MtpHeadSession,
+    trunk_state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
     prompt: &str,
     max_new: usize,
@@ -2383,7 +2778,7 @@ fn generate_mtp_spec_core(
     let cfg = model.config();
     let ec = model.engine_cfg();
     let ne = cfg.n_embd;
-    let n_max = DEFAULT_N_MAX;
+    let n_max = effective_n_max();
     let time_mtp = ec.prof.stages;
     // qwen35 DeltaNet spec-decode rollback (default ON; A/B escape via INFR_NO_MTP_CKPT): snapshot
     // the trunk's DeltaNet recurrent state at each clean committed boundary so a partial-accept
@@ -2424,7 +2819,12 @@ fn generate_mtp_spec_core(
     anyhow::ensure!(!prompt_tokens.is_empty(), "generate_mtp_spec: empty prompt");
     let p = prompt_tokens.len();
 
-    let mut trunk_state: Option<crate::seam::SeamKv> = None;
+    // Fresh KV per call (see this fn's `trunk_state` doc): a caller-held trunk keeps its bound
+    // weights but forgets the last turn's materialized tokens, so the prime verify below takes
+    // `generate_dense_backend`'s zero-reset + full re-prefill branch exactly like a fresh session.
+    if let Some(st) = trunk_state.as_mut() {
+        st.reset();
+    }
 
     // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
     let t_prime = std::time::Instant::now();
@@ -2440,7 +2840,7 @@ fn generate_mtp_spec_core(
             ec,
             model.embd(),
             &prompt_tokens,
-            &mut trunk_state,
+            trunk_state,
             max_ctx,
         )?;
         (Vec::new(), logits0, h_rows0)
@@ -2453,7 +2853,7 @@ fn generate_mtp_spec_core(
             ec,
             model.embd(),
             &prompt_tokens,
-            &mut trunk_state,
+            trunk_state,
             max_ctx,
         )?;
         (ids0, Vec::new(), h_rows0)
@@ -2575,7 +2975,7 @@ fn generate_mtp_spec_core(
                 ec,
                 model.embd(),
                 &feed,
-                &mut trunk_state,
+                trunk_state,
                 max_ctx,
             )?;
             (Vec::new(), vlogits, h_rows)
@@ -2588,7 +2988,7 @@ fn generate_mtp_spec_core(
                 ec,
                 model.embd(),
                 &feed,
-                &mut trunk_state,
+                trunk_state,
                 max_ctx,
             )?;
             (vids, Vec::new(), h_rows)
@@ -2653,11 +3053,16 @@ fn generate_mtp_spec_core(
                     // The state covers `feed` = committed ++ cand (next_tok never went through
                     // the trunk this cycle) — that's the snapshot's committed length.
                     boundary = feed.len();
+                    tracing::info!("[mtp-dbg] snapshot boundary={}", boundary);
                 } else {
                     st.mtp_restore_delta(be)?;
                     // A clean boundary may need re-establishing at the END of this cycle (after
                     // the accepted tokens + next_tok are committed) — see `mtp_reprime`'s doc.
                     restored = true;
+                    tracing::info!(
+                        "[mtp-dbg] restore cached={}",
+                        trunk_state.as_ref().map(|s| s.cached_len()).unwrap_or(0)
+                    );
                 }
             }
         }
@@ -2773,7 +3178,7 @@ fn generate_mtp_spec_core(
                 ec,
                 model.embd(),
                 &committed,
-                &mut trunk_state,
+                trunk_state,
                 max_ctx,
                 stochastic,
             )?;

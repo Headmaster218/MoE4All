@@ -1472,9 +1472,14 @@ fn mtp_gguf_loads() {
         "  post_attention_norm    {:?}",
         head.post_attention_norm.shape
     );
-    println!("  ffn_gate               {:?}", head.ffn_gate.shape);
-    println!("  ffn_up                 {:?}", head.ffn_up.shape);
-    println!("  ffn_down               {:?}", head.ffn_down.shape);
+    match &head.ffn {
+        infr_llama::mtp::MtpFfn::Dense { gate, up, down } => {
+            println!("  ffn_gate               {:?}", gate.shape);
+            println!("  ffn_up                 {:?}", up.shape);
+            println!("  ffn_down               {:?}", down.shape);
+        }
+        other => panic!("the dense qwen35 MTP GGUF must load a dense FFN, got {other:?}"),
+    }
     println!("  nextn.eh_proj          {:?}", head.eh_proj.shape);
     println!("  nextn.enorm            {:?}", head.enorm.shape);
     println!("  nextn.hnorm            {:?}", head.hnorm.shape);
