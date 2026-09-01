@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod adapter;
+mod arena;
 mod caps;
 pub mod ep;
 mod gemm;
@@ -628,9 +629,9 @@ impl VkBuffer {
                 .buf
                 .mapped_ptr()
                 .map(|p| unsafe { p.add(self.sub_offset) }),
-            Backing::UnifiedSub(handle) => {
-                Some(unsafe { handle.mapped_ptr().add(self.sub_offset) })
-            }
+            Backing::UnifiedSub(handle) => handle
+                .mapped_ptr()
+                .map(|ptr| unsafe { ptr.add(self.sub_offset) }),
             // External P2P memory is never host-mapped — reads/writes route through the staging
             // copy path (device A owns the pages; device B aliases them over PCIe).
             Backing::External { .. } => None,

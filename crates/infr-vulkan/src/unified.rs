@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, Weak};
 use infr_core::backend::Buffer;
 use infr_core::error::Result;
 
-use super::{as_vk_buf, be, VulkanBackend};
+use super::{be, VulkanBackend};
+use crate::arena::{DeviceArena, DeviceArenaBacking, DeviceArenaShard};
 
 /// Owner of a live range in the unified elastic arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -341,21 +342,12 @@ impl UnifiedRangePool {
     }
 }
 
-/// One physical mapped-ReBAR shard. The shard owns the Vulkan allocation while logical leases
-/// merely name byte ranges inside it.
-struct UnifiedVramShard {
-    buffer: Arc<dyn Buffer>,
-    base_addr: u64,
-    mapped_ptr: usize,
-    bytes: usize,
-}
-
 /// A Vulkan-backed range lease. Keeping the physical shard and logical lease in the same handle
 /// lets a `VkBuffer` view outlive the backend handle without forming a cycle through
 /// `VulkanShared`.
 pub(crate) struct UnifiedAllocationHandle {
     lease: Arc<UnifiedAllocation>,
-    shard: Arc<UnifiedVramShard>,
+    shard: Arc<DeviceArenaShard>,
 }
 
 impl UnifiedAllocationHandle {
@@ -364,23 +356,23 @@ impl UnifiedAllocationHandle {
     }
 
     pub(crate) fn buffer(&self) -> &dyn Buffer {
-        self.shard.buffer.as_ref()
+        self.shard.buffer()
     }
 
     pub(crate) fn buffer_arc(&self) -> Arc<dyn Buffer> {
-        Arc::clone(&self.shard.buffer)
+        self.shard.buffer_arc()
     }
 
     pub(crate) fn base_addr(&self) -> u64 {
-        self.shard.base_addr
+        self.shard.base_addr()
     }
 
-    pub(crate) fn mapped_ptr(&self) -> *mut u8 {
-        self.shard.mapped_ptr as *mut u8
+    pub(crate) fn mapped_ptr(&self) -> Option<*mut u8> {
+        self.shard.mapped_ptr()
     }
 
     pub(crate) fn shard_bytes(&self) -> usize {
-        self.shard.bytes
+        self.shard.bytes()
     }
 }
 
@@ -388,7 +380,7 @@ impl UnifiedAllocationHandle {
 /// `ranges` exposes one allocation policy and one accounting surface across all of them.
 pub struct UnifiedVramPool {
     ranges: UnifiedRangePool,
-    shards: Vec<Arc<UnifiedVramShard>>,
+    arena: DeviceArena,
 }
 
 impl UnifiedVramPool {
@@ -420,29 +412,10 @@ impl UnifiedVramPool {
         if shard_sizes.is_empty() || shard_sizes.contains(&0) {
             return Err(be("unified VRAM arena needs non-empty physical shards"));
         }
-        let mut shards = Vec::new();
-        for &bytes in shard_sizes {
-            let (buffer, base_addr) = vk.alloc_mapped_arena_bda(bytes)?;
-            let buffer: Arc<dyn Buffer> = Arc::from(buffer);
-            let mapped_ptr = as_vk_buf(buffer.as_ref())?
-                .mapped_ptr()
-                .ok_or_else(|| be("unified VRAM shard is not persistently mapped"))?
-                as usize;
-            shards.push(Arc::new(UnifiedVramShard {
-                buffer,
-                base_addr,
-                mapped_ptr,
-                bytes,
-            }));
-        }
-        let ranges = UnifiedRangePool::new(shards.iter().map(|shard| shard.bytes))
+        let arena = DeviceArena::new(vk, shard_sizes)?;
+        let ranges = UnifiedRangePool::new(arena.shard_sizes())
             .ok_or_else(|| be("unified VRAM arena has no physical shards"))?;
-        tracing::info!(
-            "[infr] unified VRAM arena: {} bytes across {} mapped ReBAR shard(s)",
-            shard_sizes.iter().sum::<usize>(),
-            shards.len(),
-        );
-        Ok(Arc::new(Self { ranges, shards }))
+        Ok(Arc::new(Self { ranges, arena }))
     }
 
     pub(crate) fn allocate(
@@ -455,7 +428,7 @@ impl UnifiedVramPool {
         } else {
             self.ranges.allocate_high(bytes, 256, class)?
         };
-        let shard = Arc::clone(self.shards.get(lease.range().shard)?);
+        let shard = self.arena.shard(lease.range().shard)?;
         Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
     }
 
@@ -467,7 +440,7 @@ impl UnifiedVramPool {
         class: UnifiedVramClass,
     ) -> Option<Arc<UnifiedAllocationHandle>> {
         let lease = self.ranges.try_claim_exact(shard, offset, bytes, class)?;
-        let physical = Arc::clone(self.shards.get(shard)?);
+        let physical = self.arena.shard(shard)?;
         Some(Arc::new(UnifiedAllocationHandle {
             lease,
             shard: physical,
@@ -487,7 +460,11 @@ impl UnifiedVramPool {
     }
 
     pub fn shard_sizes(&self) -> Vec<usize> {
-        self.shards.iter().map(|shard| shard.bytes).collect()
+        self.arena.shard_sizes()
+    }
+
+    pub(crate) fn backing(&self) -> DeviceArenaBacking {
+        self.arena.backing()
     }
 }
 
