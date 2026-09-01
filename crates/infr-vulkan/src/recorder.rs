@@ -905,6 +905,10 @@ pub struct Recorder<'a> {
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
     /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
     pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
+    /// Buffers referenced only by commands recorded in this recorder. Keeping an `Arc` here makes
+    /// temporary transfer sources survive until blocking finish, or move into `PendingSegment`
+    /// when the command buffer is submitted without waiting.
+    buffer_keepalive: std::cell::RefCell<Vec<std::sync::Arc<dyn Buffer>>>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
     /// Buffers read since the last barrier (for write-after-read detection).
@@ -1107,6 +1111,7 @@ impl<'a> Recorder<'a> {
             cmd,
             owns_transient: std::cell::Cell::new(true),
             pools: std::cell::RefCell::new(vec![pool]),
+            buffer_keepalive: std::cell::RefCell::new(Vec::new()),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -8249,6 +8254,13 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Retain a temporary buffer used by recorded commands until their GPU execution completes.
+    /// Permanent graph/session buffers do not need this; staged pager uploads do because their
+    /// source allocation otherwise drops as soon as the copy command has merely been recorded.
+    pub(crate) fn retain_buffer(&self, buffer: std::sync::Arc<dyn Buffer>) {
+        self.buffer_keepalive.borrow_mut().push(buffer);
+    }
+
     pub fn attention(
         &self,
         q: &dyn Buffer,
@@ -11427,6 +11439,7 @@ impl<'a> Recorder<'a> {
                 fence: None,
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
+                buffer_keepalive: Vec::new(),
                 dispatches,
             });
         }
@@ -11474,12 +11487,14 @@ impl<'a> Recorder<'a> {
         }
         let shared = std::sync::Arc::clone(&self.be.shared);
         let pools = self.pools.borrow().clone();
+        let buffer_keepalive = std::mem::take(&mut *self.buffer_keepalive.borrow_mut());
         self.owns_transient.set(false);
         Ok(PendingSegment {
             shared,
             fence: Some(fence),
             cmd: self.cmd,
             pools,
+            buffer_keepalive,
             dispatches,
         })
     }
@@ -11804,6 +11819,8 @@ pub struct PendingSegment {
     fence: Option<vk::Fence>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
+    /// Temporary transfer buffers referenced by `cmd`; released only after `fence` signals.
+    buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
     /// `VulkanBackend::observe_forward`.
     dispatches: usize,
@@ -11849,6 +11866,7 @@ impl PendingSegment {
             .lock()
             .unwrap()
             .extend(self.pools.drain(..));
+        self.buffer_keepalive.clear();
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
     }
 }

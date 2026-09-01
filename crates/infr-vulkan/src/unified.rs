@@ -1,5 +1,5 @@
 //! Logical sub-allocation for the elastic VRAM arena shared by paged experts and auxiliary
-//! engines.  The Vulkan backing is layered on this allocator in `lib.rs`; keeping range
+//! engines. The physical Vulkan backing is supplied by `arena.rs`; keeping range
 //! bookkeeping independent makes alignment, coalescing, accounting and exact slot restoration
 //! testable without a GPU.
 
@@ -376,8 +376,8 @@ impl UnifiedAllocationHandle {
     }
 }
 
-/// Physical elastic VRAM arena. Shards work around Windows/driver single-allocation limits while
-/// `ranges` exposes one allocation policy and one accounting surface across all of them.
+/// Elastic VRAM arena. `ranges` owns placement/accounting while `arena` independently selects
+/// mapped or ordinary device-local physical shards.
 pub struct UnifiedVramPool {
     ranges: UnifiedRangePool,
     arena: DeviceArena,
@@ -413,8 +413,14 @@ impl UnifiedVramPool {
             return Err(be("unified VRAM arena needs non-empty physical shards"));
         }
         let arena = DeviceArena::new(vk, shard_sizes)?;
+        let backing = arena.backing();
         let ranges = UnifiedRangePool::new(arena.shard_sizes())
             .ok_or_else(|| be("unified VRAM arena has no physical shards"))?;
+        tracing::info!(
+            "[infr] unified VRAM arena: {} bytes across {} shard(s), backing={backing:?}",
+            shard_sizes.iter().sum::<usize>(),
+            shard_sizes.len(),
+        );
         Ok(Arc::new(Self { ranges, arena }))
     }
 

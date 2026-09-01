@@ -959,7 +959,7 @@ mod tests {
         );
         update_memory_status(
             &mut status,
-            "[infr] unified VRAM arena: 13966884864 bytes across 7 mapped ReBAR shard(s)",
+            "[infr] unified VRAM arena: 13966884864 bytes across 7 shard(s), backing=MappedDeviceLocal",
         );
 
         assert_eq!(status.memory.kv_layout.as_deref(), Some("k=F16, v=F16"));

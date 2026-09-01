@@ -2151,11 +2151,11 @@ fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
 /// subtracting it there again would double-charge it and can collapse the selected context.
 const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 
-/// WDDM charges large mapped ReBAR arenas more aggressively than the logical Vulkan allocation
-/// tally while they are being committed. On the Windows 7900 XTX target, Qwen35 and Ling sessions
-/// gain about 2 GiB of untracked heap usage between committing a large mapped arena and allocating
-/// their fixed weights/state. Keep that load-only movement out of the expert arena; Linux uses the
-/// live heap budget without this WDDM allowance and remains byte-for-byte unchanged.
+/// WDDM charged the original large mapped-arena path more aggressively than the logical Vulkan
+/// allocation tally while it was being committed. On the Windows 7900 XTX target, Qwen35 and Ling
+/// sessions gained about 2 GiB of untracked heap usage between committing the arena and allocating
+/// their fixed weights/state. Keep that established load-only margin independent of the physical
+/// arena backend; Linux uses the live heap budget without it and remains byte-for-byte unchanged.
 const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Cold WDDM startup has a small amount of run-to-run heap-budget movement beyond the measured
@@ -3167,9 +3167,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None if auto_size_bias_layout => (2.0, "auto"),
                 None => (0.0, "off"),
             };
-            // Commit the mapped arena before allocating host caches or loading weights, then ask
+            // Commit the device arena before allocating host caches or loading weights, then ask
             // the driver how much room is ACTUALLY left. `VK_EXT_memory_budget` accounting for a
-            // large ReBAR mapping is card/driver dependent: WDDM can charge more than the logical
+            // large arena is card/driver/backing dependent: WDDM can charge more than the logical
             // VkDeviceMemory size, so a plan that fits arithmetically on one GPU can leave too
             // little room for the same fixed weights on another. Automatic placement shrinks and
             // retries while the arena is still empty; an explicit `paging.cache` remains exact.
@@ -3202,7 +3202,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
                 if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor {
                     return Err(anyhow!(
-                        "MoE mapped arena cannot retain one complete Prefill layer after its \
+                        "MoE device arena cannot retain one complete Prefill layer after its \
                          runtime reserve plus the tiered-cache exchange slots (arena {:.2} MiB, \
                          runtime {:.2} MiB, physical floor {:.2} MiB)",
                         physical_bytes as f64 / 2f64.powi(20),
@@ -3416,7 +3416,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .collect();
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GB mapped ReBAR pool budget; Decode size bias {size_cache_bias:+.2} \
+             {:.2} GB device arena budget; Decode size bias {size_cache_bias:+.2} \
              ({size_cache_bias_source}); host={} {:.2} GB in {host_chunk_count} chunks; \
              ctx={want_ctx})",
                 cfg.n_layer,

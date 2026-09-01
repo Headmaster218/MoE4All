@@ -1,9 +1,10 @@
-//! GPU-resident paged weight caches. MoE owns one CPU-only layer-major expert store and a mapped
-//! ReBAR VRAM arena: Prefill CPU-pushes complete layers into a dynamic ring, while Decode
-//! resolves `(layer, expert)` offsets into the same store and pushes misses into expert-LRU slots.
+//! GPU-resident paged weight caches. MoE owns one CPU-only layer-major expert store and a
+//! device-local VRAM arena: Prefill uploads complete layers into a dynamic ring, while Decode
+//! resolves `(layer, expert)` offsets into the same store and uploads misses into expert-LRU slots.
 //! The full payload exists in physical RAM once and is never exposed as a GPU-visible HostWeights
-//! mirror. Dense streaming retains its independent staging ring because its sources and scheduling
-//! contract are different.
+//! mirror. A mapped arena takes the direct CPU-write fast path; an ordinary device-local arena uses
+//! imported-host or staged Vulkan copies. Dense streaming retains its independent staging ring
+//! because its sources and scheduling contract are different.
 //!
 //! # Design (block-agnostic core, MoE plugs in today)
 //! [`GpuPager`] only knows about uniform `slot_bytes`-sized blocks keyed by an opaque
@@ -49,6 +50,8 @@ use infr_core::pager_profile;
 use infr_core::Backend;
 
 use super::{as_vk_buf, be, ImportedHostAllocation, VulkanBackend};
+use crate::arena::DeviceArenaBacking;
+use crate::transfer::DeviceTransferTarget;
 use crate::unified::{UnifiedAllocationHandle, UnifiedRange, UnifiedVramClass, UnifiedVramPool};
 
 /// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
@@ -128,20 +131,13 @@ pub struct GpuPager {
 }
 
 struct CpuPushPlan {
-    target: GpuCopyTarget,
+    target: DeviceTransferTarget,
     evicted: Option<BlockId>,
 }
 
 struct InclusiveCpuPushPlan {
-    target: GpuCopyTarget,
+    target: DeviceTransferTarget,
     evicted: Option<BlockId>,
-}
-
-#[derive(Clone)]
-struct GpuCopyTarget {
-    buffer: Arc<dyn Buffer>,
-    offset: usize,
-    mapped_ptr: usize,
 }
 
 impl GpuPager {
@@ -338,25 +334,10 @@ impl GpuPager {
         Ok(self.arenas[arena].addr + offset as u64)
     }
 
-    fn slot_mapped_ptr(&self, slot: u32) -> Result<usize> {
-        let (arena, offset) = self.slot_location(slot)?;
-        let base = as_vk_buf(self.arenas[arena].buffer.as_ref())?
-            .mapped_ptr()
-            .ok_or_else(|| be("pager ReBAR arena shard is not mapped"))?;
-        Ok(unsafe { base.add(offset) } as usize)
-    }
-
-    fn slot_copy_target(&self, slot: u32) -> Result<GpuCopyTarget> {
+    fn slot_copy_target(&self, slot: u32) -> Result<DeviceTransferTarget> {
         let (arena, offset) = self.slot_location(slot)?;
         let buffer = Arc::clone(&self.arenas[arena].buffer);
-        let base = as_vk_buf(buffer.as_ref())?
-            .mapped_ptr()
-            .ok_or_else(|| be("pager ReBAR arena shard is not mapped"))?;
-        Ok(GpuCopyTarget {
-            buffer,
-            offset,
-            mapped_ptr: unsafe { base.add(offset) } as usize,
-        })
+        DeviceTransferTarget::new(buffer, offset, self.slot_bytes)
     }
 
     fn total_arena_bytes(&self) -> usize {
@@ -570,12 +551,9 @@ impl GpuPager {
         Ok(self.arenas[arena].addr + local as u64)
     }
 
-    fn virtual_mapped_ptr(&self, offset: usize, bytes: usize) -> Result<usize> {
+    fn virtual_copy_target(&self, offset: usize, bytes: usize) -> Result<DeviceTransferTarget> {
         let (arena, local) = self.virtual_location(offset, bytes)?;
-        let base = as_vk_buf(self.arenas[arena].buffer.as_ref())?
-            .mapped_ptr()
-            .ok_or_else(|| be("pager ReBAR arena shard is not mapped"))?;
-        Ok(unsafe { base.add(local) } as usize)
+        DeviceTransferTarget::new(Arc::clone(&self.arenas[arena].buffer), local, bytes)
     }
 
     pub fn lut_buffer(&self) -> &dyn Buffer {
@@ -674,9 +652,8 @@ impl GpuPager {
         }
     }
 
-    /// Resolve one block and return its final mapped-ReBAR LRU destination on a miss. The caller
-    /// CPU-pushes from the unique host store straight into that byte range; no GPU-visible host
-    /// source or staging mirror exists.
+    /// Resolve one block and return its final device-arena LRU destination on a miss. The transfer
+    /// layer decides whether that byte range is written directly or through Vulkan staging.
     fn plan_cpu_push(&mut self, id: BlockId, scan: bool) -> Result<Option<CpuPushPlan>> {
         let prof = pager_profile::active();
         let lookup_t0 = prof.then(std::time::Instant::now);
@@ -1363,15 +1340,14 @@ struct HostDmaCopy {
     src_buffer: Arc<dyn Buffer>,
     src_offset: usize,
     src_ptr: usize,
-    dst_buffer: Arc<dyn Buffer>,
-    dst_offset: usize,
-    dst_ptr: usize,
+    target: DeviceTransferTarget,
     len: usize,
 }
 
 /// One already-resolved pager promotion batch. LRU/LUT state is committed before this is returned;
-/// consuming it records GPU copies, while dropping it preserves the old immediate CPU-copy
-/// behavior for standalone pager tests and legacy callers.
+/// the caller must either record its copies in the ambient command stream or complete them
+/// explicitly when no recorder exists.
+#[must_use = "pager promotions must be recorded or explicitly completed"]
 pub struct PreparedHostPush {
     requested: usize,
     copies: Vec<HostDmaCopy>,
@@ -1388,7 +1364,7 @@ impl PreparedHostPush {
         let mut groups: Vec<Group> = Vec::new();
         for copy in &self.copies {
             let src_handle = as_vk_buf(copy.src_buffer.as_ref())?.buffer;
-            let dst_handle = as_vk_buf(copy.dst_buffer.as_ref())?.buffer;
+            let dst_handle = as_vk_buf(copy.target.buffer())?.buffer;
             let group = match groups.iter_mut().find(|group| {
                 as_vk_buf(group.src.as_ref()).is_ok_and(|buf| buf.buffer == src_handle)
                     && as_vk_buf(group.dst.as_ref()).is_ok_and(|buf| buf.buffer == dst_handle)
@@ -1397,7 +1373,7 @@ impl PreparedHostPush {
                 None => {
                     groups.push(Group {
                         src: Arc::clone(&copy.src_buffer),
-                        dst: Arc::clone(&copy.dst_buffer),
+                        dst: copy.target.buffer_arc(),
                         regions: Vec::new(),
                     });
                     groups.last_mut().expect("group was just appended")
@@ -1406,13 +1382,15 @@ impl PreparedHostPush {
             group.regions.push(
                 vk::BufferCopy::default()
                     .src_offset(copy.src_offset as u64)
-                    .dst_offset(copy.dst_offset as u64)
+                    .dst_offset(copy.target.buffer_offset() as u64)
                     .size(copy.len as u64),
             );
         }
         if !groups.is_empty() {
             rec.host_transfer_barrier();
             for group in &groups {
+                rec.retain_buffer(Arc::clone(&group.src));
+                rec.retain_buffer(Arc::clone(&group.dst));
                 rec.copy_regions(group.src.as_ref(), group.dst.as_ref(), &group.regions);
             }
             if pager_profile::active() {
@@ -1424,30 +1402,36 @@ impl PreparedHostPush {
         self.copies.clear();
         Ok(self.requested)
     }
-}
 
-impl Drop for PreparedHostPush {
-    fn drop(&mut self) {
+    pub(crate) fn complete_without_recorder(mut self, vk: &VulkanBackend) -> Result<usize> {
         if self.copies.is_empty() {
-            return;
+            return Ok(self.requested);
         }
         let started = pager_profile::active().then(std::time::Instant::now);
         let mut bytes = 0usize;
-        for copy in &self.copies {
-            let src = unsafe { std::slice::from_raw_parts(copy.src_ptr as *const u8, copy.len) };
-            par_copy_to_mapped(src, copy.dst_ptr as *mut u8);
-            bytes = bytes.saturating_add(copy.len);
+        let mut staged = Vec::new();
+        for copy in self.copies.drain(..) {
+            if let Some(dst) = copy.target.mapped_ptr() {
+                let src =
+                    unsafe { std::slice::from_raw_parts(copy.src_ptr as *const u8, copy.len) };
+                par_copy_to_mapped(src, dst);
+                bytes = bytes.saturating_add(copy.len);
+            } else {
+                staged.push((copy.src_buffer, copy.src_offset, copy.target, copy.len));
+            }
         }
         if let Some(t0) = started {
             pager_profile::record_memcpy(bytes, t0.elapsed());
         }
+        vk.copy_transfer_targets_now(&staged)?;
+        Ok(self.requested)
     }
 }
 
 fn append_imported_copy(
     imports: &[ImportedHostAllocation],
     bytes: &[u8],
-    target: &GpuCopyTarget,
+    target: &DeviceTransferTarget,
     copies: &mut Vec<HostDmaCopy>,
 ) -> bool {
     let Some(ranges) = imports
@@ -1463,9 +1447,9 @@ fn append_imported_copy(
             src_buffer: range.buffer,
             src_offset: range.offset,
             src_ptr: unsafe { bytes.as_ptr().add(advanced) } as usize,
-            dst_buffer: Arc::clone(&target.buffer),
-            dst_offset: target.offset + advanced,
-            dst_ptr: target.mapped_ptr + advanced,
+            target: target
+                .subtarget(advanced, range.len)
+                .expect("imported copy sub-range was validated by its parent target"),
             len: range.len,
         });
         advanced += range.len;
@@ -1516,23 +1500,26 @@ struct PrefillLayerPlacement {
     banks: Vec<usize>,
 }
 
-/// Fully resolved copy job for one Prefill layer. Raw destination addresses are safe to move to the
-/// dedicated uploader because the session owns the mapped ReBAR arenas until the adapter joins
-/// that worker at the end of the forward. Full-RAM source addresses have the same lifetime;
-/// bounded sources retain their host cache with an `Arc`.
+/// Fully resolved copy job for one Prefill layer. Direct mapped jobs may move to the dedicated CPU
+/// uploader because the session owns every source and target until the adapter joins that worker.
+/// Unmapped jobs execute synchronously through the staged transfer fallback.
 pub(crate) struct PrefillCopyJob {
     buf_id: usize,
     copies: Vec<PrefillCopy>,
 }
 
 enum PrefillCopy {
-    Memory(StagingCopy),
+    Memory {
+        src: usize,
+        len: usize,
+        target: DeviceTransferTarget,
+    },
     Tiered {
         host: Arc<InclusiveHostCache>,
         block_base: BlockId,
         n_blocks: usize,
         block_bytes: usize,
-        dst: usize,
+        target: DeviceTransferTarget,
     },
 }
 
@@ -1541,16 +1528,31 @@ impl PrefillCopyJob {
         self.buf_id
     }
 
-    pub(crate) fn execute(self) -> Result<()> {
+    pub(crate) fn is_direct(&self) -> bool {
+        self.copies.iter().all(|copy| match copy {
+            PrefillCopy::Memory { target, .. } | PrefillCopy::Tiered { target, .. } => {
+                target.is_mapped()
+            }
+        })
+    }
+
+    pub(crate) fn execute_direct(self) -> Result<()> {
+        if !self.is_direct() {
+            return Err(be(
+                "direct Prefill upload requested for an unmapped device arena",
+            ));
+        }
         for copy in self.copies {
             match copy {
-                PrefillCopy::Memory(copy) => {
+                PrefillCopy::Memory { src, len, target } => {
                     let copy_t0 = pager_profile::active().then(std::time::Instant::now);
-                    let src =
-                        unsafe { std::slice::from_raw_parts(copy.src as *const u8, copy.len) };
-                    par_copy_to_mapped(src, copy.dst as *mut u8);
+                    let src = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+                    par_copy_to_mapped(
+                        src,
+                        target.mapped_ptr().expect("is_direct checked every target"),
+                    );
                     if let Some(t0) = copy_t0 {
-                        pager_profile::record_memcpy(copy.len, t0.elapsed());
+                        pager_profile::record_memcpy(len, t0.elapsed());
                     }
                 }
                 PrefillCopy::Tiered {
@@ -1558,13 +1560,47 @@ impl PrefillCopyJob {
                     block_base,
                     n_blocks,
                     block_bytes,
-                    dst,
+                    target,
                 } => {
                     let len = n_blocks
                         .checked_mul(block_bytes)
                         .ok_or_else(|| be("moe pager: tiered Prefill bank byte size overflow"))?;
-                    let bytes = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            target.mapped_ptr().expect("is_direct checked every target"),
+                            len,
+                        )
+                    };
                     host.materialize_stream(block_base, n_blocks, block_bytes, bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute(self, vk: &VulkanBackend) -> Result<()> {
+        for copy in self.copies {
+            match copy {
+                PrefillCopy::Memory { src, len, target } => {
+                    let src = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+                    vk.upload_device_target(&target, src)?;
+                }
+                PrefillCopy::Tiered {
+                    host,
+                    block_base,
+                    n_blocks,
+                    block_bytes,
+                    target,
+                } => {
+                    let len = n_blocks
+                        .checked_mul(block_bytes)
+                        .ok_or_else(|| be("moe pager: tiered Prefill bank byte size overflow"))?;
+                    if len != target.len() {
+                        return Err(be("moe pager: tiered Prefill target size mismatch"));
+                    }
+                    vk.write_device_target(&target, |bytes| {
+                        host.materialize_stream(block_base, n_blocks, block_bytes, bytes)
+                    })?;
                 }
             }
         }
@@ -1683,7 +1719,7 @@ pub struct MoePagerSession {
     /// Vulkan buffer: the full payload cannot be counted or accessed as shared/virtual VRAM.
     host_store: Vec<HostStoreChunk>,
     /// Vulkan aliases over the exact RAM allocations above. Empty when the extension is absent or
-    /// import fails, in which case the established CPU ReBAR copy remains live.
+    /// import fails, in which case the arena's direct/staged upload fallback remains live.
     host_imports: Vec<ImportedHostAllocation>,
     /// Host allocations eligible for DMA import once the unified arena and fixed weights have
     /// claimed their device-visible address space. Importing them earlier can exhaust WDDM's
@@ -1938,6 +1974,13 @@ impl MoePagerSession {
             prefill_loaded: HashSet::new(),
             prefill_reserved_ranges: vec![Vec::new(); layout.pools.len()],
         })
+    }
+
+    /// Whole-layer Prefill can use its existing CPU producer only when the final arena is mapped.
+    /// An ordinary device-local arena keeps identical placement but uploads synchronously through
+    /// the universal staging fallback until a queue-backed producer is selected.
+    pub(crate) fn prefill_direct_upload(&self) -> bool {
+        self.unified_pool.backing() == DeviceArenaBacking::MappedDeviceLocal
     }
 
     /// Import RAM only after the unified arena, fixed weights, KV/recurrent state and permanent IO
@@ -2572,7 +2615,7 @@ impl MoePagerSession {
         self.prefill_lane_layer = vec![None; actual_lanes];
         let ring_bytes: usize = per_pool_ring_bytes.iter().sum();
         tracing::info!(
-            "[moe-prefill] rebar_pool_arenas={} target_lanes={} actual_lanes={} resident_layers=0/{} streamed_layer_max={} ring_bytes={} per_pool_ring_bytes={:?} async_refill=on (decode reuses every pool)",
+            "[moe-prefill] device_pool_arenas={} target_lanes={} actual_lanes={} resident_layers=0/{} streamed_layer_max={} ring_bytes={} per_pool_ring_bytes={:?} async_refill={} (decode reuses every pool)",
             total_arena_bytes,
             requested_lanes,
             actual_lanes,
@@ -2580,6 +2623,7 @@ impl MoePagerSession {
             max_layer_bytes,
             ring_bytes,
             per_pool_ring_bytes,
+            if self.prefill_direct_upload() { "cpu-direct" } else { "staged-sync" },
         );
         Ok(())
     }
@@ -2638,8 +2682,8 @@ impl MoePagerSession {
             && self.prefill_lane_layer[placement.lane] == Some(placement.layer_base))
     }
 
-    /// Reserve a layer's ring lane and resolve stable Host/ReBAR address pairs for the async
-    /// uploader. `None` means the layer is already loaded or already queued.
+    /// Reserve a layer's ring lane and resolve stable host/device ranges. `None` means the layer
+    /// is already loaded or already queued.
     pub(crate) fn prepare_prefill_layer_cpu(
         &mut self,
         buf_id: usize,
@@ -2668,18 +2712,18 @@ impl MoePagerSession {
                 .sources
                 .get(&bank_id)
                 .ok_or_else(|| be("moe pager: async layer bank source disappeared"))?;
-            let dst = self.pools[bank_placement.pool]
+            let target = self.pools[bank_placement.pool]
                 .pager
-                .virtual_mapped_ptr(bank_placement.byte_offset, source.bank_bytes)?;
+                .virtual_copy_target(bank_placement.byte_offset, source.bank_bytes)?;
             if let Some(host_chunk) = source.host_chunk {
                 let src = self.host_store[host_chunk]
                     .range(source.host_offset, source.bank_bytes)
                     .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
-                copies.push(PrefillCopy::Memory(StagingCopy {
+                copies.push(PrefillCopy::Memory {
                     src: src.as_ptr() as usize,
-                    dst,
                     len: src.len(),
-                }));
+                    target,
+                });
             } else {
                 // Prefill may pack this bank into a different GPU arena pool, but its block
                 // descriptors remain registered in the original size-class host pool.
@@ -2693,7 +2737,7 @@ impl MoePagerSession {
                     block_base: source.block_base,
                     n_blocks,
                     block_bytes: source.stride_bytes,
-                    dst,
+                    target,
                 });
             }
         }
@@ -2932,24 +2976,26 @@ impl MoePagerSession {
         Ok(self.pools[*pool].host.is_some())
     }
 
-    /// Runtime Decode upload path backed by the unique CPU expert store. Every miss is copied
-    /// directly into its final mapped-ReBAR LRU slot. The caller must have drained earlier arena
-    /// readers before invoking this method; small-m Decode already does so before reading route ids.
+    /// Runtime Decode upload path backed by the unique CPU expert store. Every miss targets its
+    /// final LRU slot; mapped targets are written directly and ordinary device-local targets use
+    /// imported-host or staged copies. The caller must have drained earlier arena readers first.
     pub(crate) fn push_role_cpu(
         &mut self,
+        vk: &VulkanBackend,
         buf_id: usize,
         local_ids: &[u32],
         scan: bool,
     ) -> Result<PreparedHostPush> {
-        self.push_roles_cpu(&[(buf_id, local_ids)], scan)
+        self.push_roles_cpu(vk, &[(buf_id, local_ids)], scan)
     }
 
     /// Resolve several roles from one shared size pool in caller order, then move all resulting
     /// host-tier misses concurrently. This preserves the exact LRU/LUT decisions of repeated
     /// [`Self::push_role_cpu`] calls while allowing split Gate/Up/Down banks to share one deeper
-    /// SSD / RAM-to-ReBAR batch. The caller must have opened one shared pager epoch first.
+    /// SSD/RAM-to-device batch. The caller must have opened one shared pager epoch first.
     pub fn push_roles_cpu(
         &mut self,
+        vk: &VulkanBackend,
         roles: &[(usize, &[u32])],
         scan: bool,
     ) -> Result<PreparedHostPush> {
@@ -3045,12 +3091,22 @@ impl MoePagerSession {
                 let mut local = Vec::new();
                 if append_imported_copy(host_imports, bytes, &targets[target], &mut local) {
                     collected.lock().unwrap().extend(local);
-                } else {
+                } else if let Some(dst) = targets[target].mapped_ptr() {
                     let started = pager_profile::active().then(std::time::Instant::now);
-                    par_copy_to_mapped(bytes, targets[target].mapped_ptr as *mut u8);
+                    par_copy_to_mapped(bytes, dst);
                     if let Some(t0) = started {
                         pager_profile::record_memcpy(bytes.len(), t0.elapsed());
                     }
+                } else {
+                    let (src_buffer, src_ptr) = vk.stage_host_bytes(bytes)?;
+                    local.push(HostDmaCopy {
+                        src_buffer,
+                        src_offset: 0,
+                        src_ptr,
+                        target: targets[target].clone(),
+                        len: bytes.len(),
+                    });
+                    collected.lock().unwrap().extend(local);
                 }
                 Ok(())
             })?;
@@ -3089,10 +3145,21 @@ impl MoePagerSession {
                             .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
                         if !append_imported_copy(host_imports, bytes, &plan.target, &mut dma_copies)
                         {
-                            let started = pager_profile::active().then(std::time::Instant::now);
-                            par_copy_to_mapped(bytes, plan.target.mapped_ptr as *mut u8);
-                            if let Some(t0) = started {
-                                pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+                            if let Some(dst) = plan.target.mapped_ptr() {
+                                let started = pager_profile::active().then(std::time::Instant::now);
+                                par_copy_to_mapped(bytes, dst);
+                                if let Some(t0) = started {
+                                    pager_profile::record_memcpy(bytes.len(), t0.elapsed());
+                                }
+                            } else {
+                                let (src_buffer, src_ptr) = vk.stage_host_bytes(bytes)?;
+                                dma_copies.push(HostDmaCopy {
+                                    src_buffer,
+                                    src_offset: 0,
+                                    src_ptr,
+                                    target: plan.target,
+                                    len: bytes.len(),
+                                });
                             }
                         }
                     }
@@ -3105,10 +3172,10 @@ impl MoePagerSession {
         })
     }
 
-    /// CPU-push one whole layer from the unique host store straight into its dynamic-ring
-    /// ReBAR placement. Load-time layout validation guarantees that every role bank and alignment
-    /// gap has the same relative offset on both sides, so there is no pack/reorder/staging pass.
-    pub fn push_prefill_layer_cpu(&mut self, buf_id: usize) -> Result<bool> {
+    /// Upload one whole layer from the unique host store into its dynamic-ring placement.
+    /// Load-time layout validation guarantees that every role bank and alignment gap has the same
+    /// relative offset on both sides, so there is no pack/reorder pass.
+    pub fn push_prefill_layer_cpu(&mut self, vk: &VulkanBackend, buf_id: usize) -> Result<bool> {
         self.enter_prefill_layer()?;
         if self.layer_bank_current(buf_id)? {
             return Ok(false);
@@ -3121,7 +3188,7 @@ impl MoePagerSession {
         let job = self
             .prepare_prefill_layer_cpu(buf_id)?
             .ok_or_else(|| be("moe pager: failed to prepare synchronous Prefill layer"))?;
-        job.execute()?;
+        job.execute(vk)?;
         self.complete_prefill_layer_cpu(buf_id)?;
         Ok(true)
     }

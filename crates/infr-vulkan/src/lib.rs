@@ -25,6 +25,7 @@ mod recorder;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
+mod transfer;
 pub mod unified;
 mod vkext;
 
@@ -408,8 +409,8 @@ struct VulkanShared {
     submit_dispatch_cap_explicit: bool,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
-    /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
-    /// enough on its own — the bytes have to be able to land there too.
+    /// is full. See [`probe_host_visible_non_device_local_type`] for why counting that heap in the
+    /// budget is not enough on its own — the bytes have to be able to land there too.
     uma_overflow_type: Option<u32>,
     /// The host-visible memory type on a NON-device-local heap, probed on EVERY device (unlike
     /// `uma_overflow_type`, which is UMA-only). On a discrete card this heap is system RAM across
@@ -521,21 +522,27 @@ enum Backing {
     /// host-visible staging/readback).
     Pooled(ManuallyDrop<Allocation>),
     /// A DEDICATED `VkDeviceMemory` this buffer owns outright, PERSISTENTLY MAPPED — today only the
-    /// UNIFIED-MEMORY overflow spill (`spilled: true`, see `probe_uma_overflow_type`): a GpuOnly
-    /// buffer placed on the non-device-local heap once the synthetic device-local heap is full.
+    /// UNIFIED-MEMORY overflow spill (`spilled: true`, see
+    /// `probe_host_visible_non_device_local_type`): a GpuOnly buffer placed on the non-device-local
+    /// heap once the synthetic device-local heap is full.
     /// `upload` memcpys straight through the mapped pointer. Freed (unmapped + `vkFreeMemory`) on
     /// drop.
     Vram {
         memory: vk::DeviceMemory,
         ptr: *mut u8,
-        /// True when this is a UNIFIED-MEMORY SPILL (see `probe_uma_overflow_type`): the memory came
-        /// from the non-device-local overflow heap, so it is NOT charged to `device_used` (the
+        /// True when this is a UNIFIED-MEMORY SPILL (see
+        /// `probe_host_visible_non_device_local_type`): the memory came from the non-device-local
+        /// overflow heap, so it is NOT charged to `device_used` (the
         /// budget guard's device-local tally) — leaving the spill decision to ask "is the
         /// DEVICE-LOCAL heap full?" without the answer being polluted by the bytes it already
         /// spilled elsewhere. A `false` (device-local mapped) buffer is charged to `device_used`
         /// like any other GpuOnly allocation.
         spilled: bool,
     },
+    /// A dedicated ordinary DEVICE_LOCAL allocation deliberately chosen from a non-host-visible
+    /// memory type when one exists. This is the portable expert-arena backing on devices whose
+    /// mapped device-local heap is absent or too small (notably RDNA2 on the Windows AMD driver).
+    Device { memory: vk::DeviceMemory },
     /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (resident weight
     /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike every other
     /// variant, `VkBuffer::buffer` here is NOT this handle's own object: it is the block's buffer,
@@ -552,7 +559,7 @@ enum Backing {
     /// `device_addr()` by a `-DSTREAMED` shader twin, required once the range would exceed
     /// `maxStorageBufferRange`/4 GiB and preferred for the big matmul families regardless.
     BdaSub(Arc<BdaBlockHandle>),
-    /// A releasable byte range inside the service-level mapped ReBAR arena. The allocation handle
+    /// A releasable byte range inside the service-level device arena. The allocation handle
     /// owns neither a Vulkan buffer nor memory; it keeps the physical shard alive and returns the
     /// range to the unified allocator when its final reference drops.
     UnifiedSub(Arc<crate::unified::UnifiedAllocationHandle>),
@@ -621,6 +628,7 @@ impl VkBuffer {
         match &self.backing {
             Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
             Backing::Vram { ptr, .. } => Some(*ptr),
+            Backing::Device { .. } => None,
             // Defensive, not currently reachable: `bda_weight_alloc`'s blocks are plain `GpuOnly`
             // dedicated allocations (never host-mapped), so `buf.mapped_ptr()` is `None` today. If a
             // future block ever WERE host-visible, offsetting by `sub_offset` here is what keeps
@@ -675,6 +683,12 @@ impl Drop for VkBuffer {
                             .fetch_sub(self.mem_size, Ordering::Relaxed);
                     }
                     self.shared.device.unmap_memory(*memory);
+                    self.shared.device.free_memory(*memory, None);
+                }
+                Backing::Device { memory } => {
+                    self.shared
+                        .device_used
+                        .fetch_sub(self.mem_size, Ordering::Relaxed);
                     self.shared.device.free_memory(*memory, None);
                 }
                 // Shares the block's `vk::Buffer` handle byte-for-byte with every other sub-tensor
@@ -868,8 +882,9 @@ const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// waste much on the tail.
 const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
 
-/// The UMA OVERFLOW memory type: a host-visible type on a NON-device-local heap. `None` on a
-/// discrete GPU (never probed) and on any UMA part that doesn't expose one.
+/// Find a host-visible memory type on a non-device-local heap. UMA overflow uses this only after
+/// checking that the device is unified-memory; discrete GPUs also use it explicitly for staging
+/// and opt-in host KV, never as an implicit GpuOnly placement.
 ///
 /// This is the other half of the unified-memory fix, and without it widening the budget is not
 /// merely useless but actively harmful. `vram_info` budgets a UMA part against ALL heaps, but
@@ -886,9 +901,11 @@ const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
 /// So the overflow must be PLACED, not just counted. On an APU heap 0 is the same DDR at the same
 /// bandwidth as the synthetic device-local heap — the weights are read out of GTT either way
 /// (`mem_info_gtt_used` accounts for them on both paths) — so spilling there costs no bandwidth.
-/// It is only on a DISCRETE card that the non-device-local heap means "across PCIe", which is why
-/// this is probed for UMA parts alone.
-fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u32> {
+/// On a DISCRETE card the same heap means "across PCIe", so callers may use it only for explicit
+/// host placement or transfer staging, never as an automatic GpuOnly overflow.
+fn probe_host_visible_non_device_local_type(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+) -> Option<u32> {
     let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     (0..mp.memory_type_count).find(|&i| {
         let t = mp.memory_types[i as usize];
@@ -1337,10 +1354,10 @@ enum UnifiedClient {
 /// device-local slice alone refuses models (gemma-4-31B UD-Q5_K_XL: 20.37 GiB of weights against a
 /// 21.22 GiB budget) that fit the machine with room to spare.
 ///
-/// Counting the overflow heap is only half of it — `probe_uma_overflow_type` is what lets bytes
-/// actually LAND there once the device-local heap is full. Above the summed budget the failure mode
-/// is the same on both classes (the driver oversubscribes and starts evicting), which is why the
-/// guard exists at all — it just now guards the right number on each.
+/// Counting the overflow heap is only half of it — `probe_host_visible_non_device_local_type` is
+/// what lets bytes actually LAND there once the device-local heap is full. Above the summed budget
+/// the failure mode is the same on both classes (the driver oversubscribes and starts evicting),
+/// which is why the guard exists at all — it just now guards the right number on each.
 fn vram_info(s: &VulkanShared) -> VramInfo {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
@@ -2765,14 +2782,15 @@ impl VulkanBackend {
 
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         // Probed for UMA parts ONLY — on a discrete card the non-device-local heap is host RAM
-        // across PCIe and must never receive a GpuOnly buffer (see `probe_uma_overflow_type`).
+        // across PCIe and must never receive a GpuOnly buffer.
         let uma_overflow_type = caps
             .unified_memory
-            .then(|| probe_uma_overflow_type(&mem_props))
+            .then(|| probe_host_visible_non_device_local_type(&mem_props))
             .flatten();
         // Same probe, but WITHOUT the UMA gate — on a discrete card this resolves to the GTT
-        // host-visible type (system RAM over PCIe). Only the opt-in KV-overflow path uses it.
-        let host_overflow_type = probe_uma_overflow_type(&mem_props);
+        // host-visible type (system RAM over PCIe). KV overflow and portable transfer staging use
+        // it explicitly; ordinary GpuOnly allocations never do.
+        let host_overflow_type = probe_host_visible_non_device_local_type(&mem_props);
 
         // Success: the instance/device/pool now move into `VulkanShared` (which owns their
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
@@ -2838,7 +2856,7 @@ impl VulkanBackend {
     /// Alias existing host-pager allocations as transfer buffers. Import shards are assigned to
     /// the arena with the lowest imported-block fraction, so a finite WDDM host-import budget is
     /// shared proportionally instead of being exhausted by the first size class. Failure remains
-    /// an optimization fallback: ranges without an alias keep the established CPU-to-ReBAR path.
+    /// an optimization fallback: ranges without an alias use direct mapped or staged uploads.
     pub(crate) fn import_host_allocations(
         &self,
         allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
@@ -2987,7 +3005,7 @@ impl VulkanBackend {
             .sum();
         if let Some(err) = limit_error {
             tracing::warn!(
-                "[infr] host DMA import reached the driver limit at {:.2}/{:.2} GiB ({err}); remaining RAM uses CPU ReBAR copy",
+                "[infr] host DMA import reached the driver limit at {:.2}/{:.2} GiB ({err}); remaining RAM uses the arena's direct/staged upload fallback",
                 total_imported as f64 / (1u64 << 30) as f64,
                 total_logical as f64 / (1u64 << 30) as f64,
             );
@@ -3743,6 +3761,92 @@ impl VulkanBackend {
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
     }
 
+    /// Allocate an arena from ordinary device-local memory, explicitly avoiding HOST_VISIBLE
+    /// memory types when the device exposes a private VRAM type. Unlike `MemoryLocation::GpuOnly`
+    /// this makes the RDNA2 fallback deterministic instead of depending on allocator type order.
+    pub(crate) fn alloc_device_local_arena_bda(
+        &self,
+        bytes: usize,
+    ) -> Result<(Box<dyn Buffer>, u64)> {
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        let info = vk::BufferCreateInfo::default()
+            .size(fill_span(bytes))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+            .map_err(|error| be(format!("create_buffer(device-arena): {error}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        let properties = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        let memory_type = (0..properties.memory_type_count).find(|&index| {
+            requirements.memory_type_bits & (1 << index) != 0
+                && properties.memory_types[index as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                && !properties.memory_types[index as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        });
+        let Some(memory_type) = memory_type else {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            // UMA devices legitimately have no private type. Their mapped device-local memory is
+            // the same physical RAM, so the established allocator path is the correct fallback.
+            return self.alloc_arena_bda(bytes);
+        };
+        if let Err(error) = self.check_vram_budget(requirements.size) {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(error);
+        }
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut flags);
+        let memory = match unsafe { self.shared.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(be(format!(
+                    "allocate ordinary device-local arena memory ({} bytes): {error}",
+                    requirements.size
+                )));
+            }
+        };
+        if let Err(error) = unsafe { self.shared.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.shared.device.free_memory(memory, None);
+                self.shared.device.destroy_buffer(buffer, None);
+            }
+            return Err(be(format!("bind ordinary device-local arena: {error}")));
+        }
+        self.shared
+            .device_used
+            .fetch_add(requirements.size, Ordering::Relaxed);
+        let address = unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        };
+        let arena = VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::Device { memory },
+            size: bytes,
+            mem_size: requirements.size,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+            own_addr: Some(address),
+            act_bytes: 0,
+        };
+        Ok((Box::new(arena), address))
+    }
+
     /// Allocate the paged-MoE arena in DEVICE_LOCAL, HOST_VISIBLE ReBAR memory.
     ///
     /// The arena remains the same bounded VRAM cache used by decode and reinterpreted as
@@ -3856,8 +3960,8 @@ impl VulkanBackend {
     }
 
     /// Materialize an otherwise-empty MoE unified arena before the pager session is installed.
-    /// The seam uses this as a real allocation probe: mapped ReBAR memory can consume a
-    /// driver-dependent amount of heap budget beyond its logical byte size, especially on WDDM.
+    /// The seam uses this as a real allocation probe. The selected mapped or ordinary device-local
+    /// backing can consume a driver-dependent amount of heap budget beyond its logical byte size.
     /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
     pub fn prepare_moe_unified_vram(&self, specs: &[(usize, usize)]) -> Result<usize> {
         let pool = self.init_unified_vram_for_expert_slots(specs)?;
@@ -4295,7 +4399,7 @@ impl VulkanBackend {
         // before). Once the synthetic device-local heap is full, gpu-allocator would keep resolving
         // GpuOnly to it and RADV would keep saying yes, right up until the kernel can't validate
         // the buffer list and the SUBMIT dies. Place the overflow on the non-device-local heap
-        // instead: same DDR, same bandwidth on an APU. See `probe_uma_overflow_type`.
+        // instead: same DDR, same bandwidth on an APU. See `probe_host_visible_non_device_local_type`.
         if location == MemoryLocation::GpuOnly {
             if let Some(ty) = self.shared.uma_overflow_type {
                 // Leave the device-local heap a little slack rather than filling it to the last
@@ -6022,7 +6126,7 @@ mod tests {
         );
     }
 
-    /// Unified arena views share one physical mapped-ReBAR shard, retain independent offsets and
+    /// Unified arena views share one physical device-arena shard, retain independent offsets and
     /// return their ranges when the final buffer handle drops.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]

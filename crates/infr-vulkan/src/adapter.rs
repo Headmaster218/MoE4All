@@ -6409,7 +6409,8 @@ fn pooled_usage(
 
 /// Host side of paged execution, per `execute_static` call: Dense streaming owns the ring cursor,
 /// MoE owns the LUT cursor plus in-flight compute, and both end fully drained. The full MoE payload
-/// is CPU-only; runtime transfers are direct writes into the mapped ReBAR arena.
+/// is CPU-only; runtime transfers select direct mapped writes, imported-host DMA, or staged copies
+/// according to the arena and source capabilities.
 ///
 /// Ring rotation (`rotate_stream`): when the current ring half can't hold a miss, the ambient
 /// recorder is submitted WITHOUT waiting (`Recorder::finish_nowait`) and staging continues into
@@ -6447,8 +6448,8 @@ impl PrefillUploader {
                     let result = command
                         .after
                         .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
-                    let result =
-                        result.and_then(|()| command.job.execute().map_err(|e| e.to_string()));
+                    let result = result
+                        .and_then(|()| command.job.execute_direct().map_err(|e| e.to_string()));
                     if done
                         .send(PrefillUploadCompletion { buf_id, result })
                         .is_err()
@@ -6497,7 +6498,7 @@ struct PagedStream {
     tape_cursor: usize,
     /// Prefill compute segments that do not consume a staging-ring region.
     compute_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
-    /// Dedicated producer for whole-layer Host -> mapped-ReBAR copies. It owns the layer fence
+    /// Dedicated producer for whole-layer Host -> mapped-device-arena copies. It owns the layer fence
     /// while waiting for a ring lane to become reusable, so upload progress is independent from
     /// graph recording and from whether the active layer is Attention or DeltaNet.
     prefill_uploader: Option<PrefillUploader>,
@@ -6847,7 +6848,7 @@ fn stage_dense_linear<'a>(
     }
 }
 
-/// CPU-push `ids` (layer-LOCAL) of `buf_id`'s role from the unique host store into final ReBAR LRU
+/// Upload `ids` (layer-LOCAL) of `buf_id`'s role from the unique host store into final device LRU
 /// slots, then freeze the layer's LUT window. `ids` empty means residency is already guaranteed.
 fn stage_and_window<'a>(
     be_: &'a VulkanBackend,
@@ -6870,15 +6871,15 @@ fn stage_and_window<'a>(
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_mut().expect("paged execution requires a session");
-            sess.push_role_cpu(buf_id, ids, scan)?
+            sess.push_role_cpu(be_, buf_id, ids, scan)?
         };
         if let Some(recorder) = rec.as_ref() {
             push.record(recorder)?;
         } else {
             // Full-Host-Store Down overlap intentionally has no open recorder here: Gate/Up is
-            // already executing while the host writes Down. Dropping preserves that established
-            // CPU-copy window instead of serializing Down DMA behind the submitted compute.
-            drop(push);
+            // already executing while the host writes Down. Explicit completion preserves the
+            // mapped CPU-copy window and gives an unmapped arena a correct immediate DMA fallback.
+            push.complete_without_recorder(be_)?;
         }
     }
     let mut guard = be_.moe_pager().lock().unwrap();
@@ -6904,14 +6905,14 @@ fn stage_layer_and_window<'a>(
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
     if !already_current {
-        sess.push_prefill_layer_cpu(buf_id)?;
+        sess.push_prefill_layer_cpu(be_, buf_id)?;
     }
     sess.layer_lut_window(&mut ps.tape_cursor, buf_id, n_expert)
 }
 
 fn run_prefill_job_sync(be_: &VulkanBackend, job: crate::pager::PrefillCopyJob) -> Result<()> {
     let buf_id = job.buf_id();
-    job.execute()?;
+    job.execute(be_)?;
     be_.moe_pager()
         .lock()
         .unwrap()
@@ -6935,7 +6936,14 @@ fn prefetch_next_moe_layer<'a>(
     // Dense streaming can attach staging-ring lifetime to this same segment. That uncommon mixed
     // path keeps a synchronous correctness fallback; ordinary paged MoE has cursor=0 and uses the
     // fully asynchronous worker below.
-    let synchronous = ps.cursor > 0;
+    let direct_prefill = be_
+        .moe_pager()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("paged execution requires a session")
+        .prefill_direct_upload();
+    let synchronous = ps.cursor > 0 || !direct_prefill;
     if synchronous {
         ps.finish_prefill_uploads(be_)?;
     }
@@ -7521,22 +7529,30 @@ fn execute_paged_moe<'a>(
                     miss_ids.push(expert);
                 }
             }
-            let shared = {
+            let (shared, hit_push) = {
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
                 let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
-                if shared && !hit_ids.is_empty() {
-                    sess.push_roles_cpu(
+                let push = if shared && !hit_ids.is_empty() {
+                    Some(sess.push_roles_cpu(
+                        be_,
                         &[
                             (gate_id, hit_ids.as_slice()),
                             (up_id, hit_ids.as_slice()),
                             (down_id, hit_ids.as_slice()),
                         ],
                         false,
-                    )?;
-                }
-                shared
+                    )?)
+                } else {
+                    None
+                };
+                (shared, push)
             };
+            if let Some(push) = hit_push {
+                // The residency mask makes this empty in the ordinary case. Explicitly consume it
+                // so a future concurrent pager can never silently drop an unexpected promotion.
+                push.complete_without_recorder(be_)?;
+            }
             if shared {
                 let gate_hit_w =
                     stage_and_window(be_, rec, ps, gate_id, &[], n_expert, false, true)?;
@@ -7689,6 +7705,7 @@ fn execute_paged_moe<'a>(
                 .as_mut()
                 .expect("paged execution requires a session")
                 .push_roles_cpu(
+                    be_,
                     &[
                         (gate_id, stage_ids.as_slice()),
                         (up_id, stage_ids.as_slice()),

@@ -137,7 +137,7 @@ impl DeviceArena {
         for &bytes in shard_sizes {
             let (buffer, base_addr) = match backing {
                 DeviceArenaBacking::MappedDeviceLocal => vk.alloc_mapped_arena_bda(bytes)?,
-                DeviceArenaBacking::DeviceLocal => vk.alloc_arena_bda(bytes)?,
+                DeviceArenaBacking::DeviceLocal => vk.alloc_device_local_arena_bda(bytes)?,
             };
             let buffer: Arc<dyn Buffer> = Arc::from(buffer);
             let mapped_ptr = as_vk_buf(buffer.as_ref())?
@@ -153,7 +153,7 @@ impl DeviceArena {
                 bytes,
             }));
         }
-        tracing::info!(
+        tracing::debug!(
             "[infr] device arena: {} bytes across {} shard(s), backing={backing:?}",
             shard_sizes.iter().sum::<usize>(),
             shards.len(),
@@ -176,7 +176,11 @@ impl DeviceArena {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_backing, DeviceArenaBacking};
+    use super::{choose_backing, DeviceArena, DeviceArenaBacking};
+    use crate::transfer::{DeviceTransferTarget, HostTransferPath};
+    use crate::VulkanBackend;
+    use ash::vk;
+    use infr_core::Backend;
 
     #[test]
     fn mapped_backing_is_only_selected_when_the_whole_arena_fits_its_heap() {
@@ -193,5 +197,55 @@ mod tests {
     #[test]
     fn devices_without_mapped_device_local_memory_use_device_local() {
         assert_eq!(choose_backing(1, 0), DeviceArenaBacking::DeviceLocal);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn unmapped_device_arena_roundtrips_through_staging() {
+        let vk = match VulkanBackend::new() {
+            Ok(vk) => vk,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let arena = DeviceArena::allocate(&vk, &[1 << 20], DeviceArenaBacking::DeviceLocal)
+            .expect("allocate forced device-local arena");
+        let shard = arena.shard(0).expect("one shard");
+        assert!(shard.mapped_ptr().is_none());
+
+        let bytes: Vec<u8> = (0..64 * 1024)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let target = DeviceTransferTarget::new(shard.buffer_arc(), 0, bytes.len())
+            .expect("build transfer target");
+        assert_eq!(
+            vk.upload_device_target(&target, &bytes)
+                .expect("staged upload"),
+            HostTransferPath::Staged
+        );
+        let mut back = vec![0u8; bytes.len()];
+        vk.download(shard.buffer(), &mut back).expect("download");
+        assert_eq!(back, bytes);
+
+        let replacement: Vec<u8> = bytes.iter().map(|byte| byte ^ 0x5a).collect();
+        let (staging, _) = vk
+            .stage_host_bytes(&replacement)
+            .expect("materialize recorded staging source");
+        let recorder = vk.recorder().expect("create transfer recorder");
+        recorder.host_transfer_barrier();
+        recorder.copy_regions(
+            staging.as_ref(),
+            target.buffer(),
+            &[vk::BufferCopy::default().size(replacement.len() as u64)],
+        );
+        recorder.retain_buffer(staging);
+        recorder
+            .finish_nowait()
+            .expect("submit recorded staging copy")
+            .wait()
+            .expect("wait recorded staging copy");
+        vk.download(shard.buffer(), &mut back).expect("download");
+        assert_eq!(back, replacement);
     }
 }
