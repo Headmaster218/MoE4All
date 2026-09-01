@@ -3271,6 +3271,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .saturating_sub(elastic_reserve);
             let adaptive_arena = cache_override.is_none();
             let mut candidate_budget = pager_budget_bytes;
+            // The runtime margin became PHYSICAL trailing arena shards (see
+            // `MoePagerLayout::runtime_margin_bytes`), which raises the mapped-arena size by the
+            // full activation reserve. At large KV sizes that can overflow a small card even
+            // though the same plan fit when the reserve borrowed expert slots at runtime. The
+            // margin is a placement-QUALITY knob (runtime windows coalesce instead of borrowing),
+            // not a correctness requirement, so on a fit shortfall degrade it: first by the
+            // shortfall itself, then to zero (full slot-borrowing, the proven pre-margin
+            // behaviour) — and only error when even the margin-free layout does not fit.
+            let mut effective_margin = plan.runtime_reserve_bytes;
             let mut attempts = 0usize;
             let slot_counts = loop {
                 attempts += 1;
@@ -3303,14 +3312,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
                     .collect();
 
-                let failure = match vk
-                    .prepare_moe_unified_vram(&specs, plan.runtime_reserve_bytes as usize)
-                {
+                let failure = match vk.prepare_moe_unified_vram(&specs, effective_margin as usize) {
                     Ok(committed) => {
-                        debug_assert_eq!(
-                            committed as u64,
-                            physical_bytes + plan.runtime_reserve_bytes
-                        );
+                        debug_assert_eq!(committed as u64, physical_bytes + effective_margin);
                         let live_room = vk.alloc_room();
                         if live_room >= required_after_arena {
                             pager_budget_bytes = physical_bytes;
@@ -3330,6 +3334,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         let shortfall = required_after_arena - live_room;
                         vk.discard_empty_moe_unified_vram()
                             .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
+                        // Degrade the runtime margin before giving up: unmapping margin bytes
+                        // frees them one-for-one, so shrinking by `shortfall` closes the gap
+                        // directly (windows borrow expert slots for the degraded remainder,
+                        // exactly the pre-margin placement behaviour).
+                        if effective_margin > 0 {
+                            let shrunk = effective_margin.saturating_sub(shortfall);
+                            tracing::warn!(
+                                from_margin_bytes = effective_margin,
+                                to_margin_bytes = shrunk,
+                                shortfall_bytes = shortfall,
+                                "runtime margin does not fit at this KV size; degrading the \
+                                 pager to expert-slot borrowing for the difference"
+                            );
+                            effective_margin = shrunk;
+                            attempts -= 1;
+                            continue;
+                        }
                         (
                             shortfall,
                             format!(
@@ -3534,7 +3555,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // The activation reserve becomes a PHYSICAL trailing shard (see
                 // `MoePagerLayout::runtime_margin_bytes`): runtime windows live there instead of
                 // borrowing expert slots, which is what wedged long serve sessions before.
-                runtime_margin_bytes: plan.runtime_reserve_bytes,
+                // The committed runtime margin: `effective_margin` starts at the full plan
+                // reserve and degrades when the mapped arena would otherwise overflow the
+                // device (windows borrow expert slots for the degraded part).
+                runtime_margin_bytes: effective_margin,
             })
             .map_err(|e| anyhow!("{e}"))?;
         }
