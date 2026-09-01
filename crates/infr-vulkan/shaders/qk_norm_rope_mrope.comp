@@ -1,0 +1,80 @@
+#version 460
+// Fused per-head QK-norm (RMSNorm over hd) + IMROPE (interleaved multi-plane RoPE) — the
+// qwen3vl / qwen35moe text-model rope for IMAGE spans (llama.cpp LLAMA_ROPE_TYPE_IMROPE).
+// One workgroup per (row, head). x [rows, nheads, hd] f32, nw [hd] f32,
+// pos4 [rows, 4] i32 (T,H,W,E), y [rows, nheads, hd] f16 scratch.
+//
+// Plain (non-fused-KV, non-BDA, non-replay) variant: image turns are rare, so the adapter
+// emits this + an explicit WriteKv for K instead of the fused cache write. Pair p's plane
+// selection mirrors ggml ops.cpp `ggml_mrope_cache_init`'s `is_imrope` branch:
+//   sector = p % (s0+s1+s2+s3);
+//   sector%3==1 && sector < 3*s1 → H;  sector%3==2 && sector < 3*s2 → W;
+//   sector%3==0 && sector < 3*s0 → T;  else → E.
+// Text-only rows carry T==H==W, collapsing to the plain NEOX rope.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows; uint nheads; uint hd; uint rope_dim; float theta; float eps;
+    uint s0; uint s1; uint s2; uint s3;
+    // Interleaved q+g source (qwen35 attn_out_gate): row stride in ELEMENTS; head h's query
+    // sits at r*x_stride + h*2*hd. 0 = packed [rows, nheads, hd].
+    uint x_stride;
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer NB { float nw[]; };
+layout(binding = 2) readonly buffer PB { int pos4[]; };
+layout(binding = 3) buffer YB { float16_t y[]; };
+
+shared float xs[512]; // hd up to 512; 64 threads each handle hd/64 elements
+shared float red[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.x;
+    uint h = unit % pc.nheads;
+    uint r = unit / pc.nheads;
+    uint in_base = (pc.x_stride > 0u)
+        ? (r * pc.x_stride + h * 2u * pc.hd)
+        : ((r * pc.nheads + h) * pc.hd);
+
+    float pss = 0.0;
+    for (uint i = t; i < pc.hd; i += 64u) { float v = x[in_base + i]; xs[i] = v; pss += v * v; }
+    red[t] = pss;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+
+    uint out_base = (r * pc.nheads + h) * pc.hd;
+    uint hf = pc.rope_dim / 2u;
+    int T = pos4[r * 4 + 0];
+    int H = pos4[r * 4 + 1];
+    int W = pos4[r * 4 + 2];
+    int E = pos4[r * 4 + 3];
+    uint sect_dims = pc.s0 + pc.s1 + pc.s2 + pc.s3;
+    for (uint p = t; p < hf; p += 64u) {
+        uint sector = p % sect_dims;
+        int pos;
+        if (sector % 3u == 1u && sector < 3u * pc.s1) { pos = H; }
+        else if (sector % 3u == 2u && sector < 3u * pc.s2) { pos = W; }
+        else if (sector % 3u == 0u && sector < 3u * pc.s0) { pos = T; }
+        else { pos = E; }
+        uint i0 = p;
+        uint i1 = p + hf;
+        float a = xs[i0] * scale * nw[i0];
+        float b = xs[i1] * scale * nw[i1];
+        float freq = pow(pc.theta, -2.0 * float(p) / float(pc.rope_dim));
+        float ang = float(pos) * freq;
+        float s = sin(ang);
+        float co = cos(ang);
+        y[out_base + i0] = float16_t(a * co - b * s);
+        y[out_base + i1] = float16_t(a * s + b * co);
+    }
+    // Partial rope (qwen35: rope_dim=64 < hd=256): rmsnormed but unrotated tail passes through.
+    for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
+        y[out_base + i] = float16_t(xs[i] * scale * nw[i]);
+    }
+}

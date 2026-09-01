@@ -2498,6 +2498,7 @@ fn run_verify(
         None,
         None,
         None,
+        None, // mm
     )?;
     if ids.is_empty() {
         // Host fallback: the runner downloaded the m×vocab logits instead (see this fn's doc).
@@ -2561,6 +2562,7 @@ fn run_verify_full(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok((logits, h))
 }
@@ -2622,6 +2624,7 @@ fn run_prime_last(
         None,
         None,
         None,
+        None, // mm
     )?;
     anyhow::ensure!(
         ids.len() == 1 && h.len() == cfg.n_embd,

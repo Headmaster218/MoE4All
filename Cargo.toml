@@ -17,6 +17,7 @@ members = [
     "crates/infr-prof",
     "crates/infr-prof-rt",
     "crates/infr-testkit",
+    "crates/infr-vision",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ infr-embedding = { path = "crates/infr-embedding" }
 infr-server = { path = "crates/infr-server" }
 infr-prof = { path = "crates/infr-prof" }
 infr-prof-rt = { path = "crates/infr-prof-rt" }
+infr-vision = { path = "crates/infr-vision" }
 # Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
 infr-testkit = { path = "crates/infr-testkit" }
 
@@ -103,6 +105,11 @@ dirs = "5"
 tokenizers = "0.20"
 llguidance = "1"
 toktrie_hf_tokenizers = "1"
+# Vision input pipeline (infr-vision): image decode/resize for mmproj preprocessing, and the
+# `data:...;base64,` payloads OpenAI-style image_url parts carry. base64 0.22 is already in the
+# lockfile (reqwest); a direct dep costs no new compilation unit.
+image = "0.25"
+base64 = "0.22"
 
 # `cargo test` builds dev (-O0); the CPU interpreter, GGUF dequant, and f16 conversions at -O0 are
 # 10-50x slower, which turns the locally-gated model tests (CI skips them — no GGUFs in its cache)

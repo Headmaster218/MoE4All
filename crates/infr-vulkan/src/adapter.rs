@@ -222,7 +222,13 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4Gather { .. }
             | Op::QsaIndexer { .. }
             | Op::QsaGather { .. }
-            | Op::QsaBatchAttention { .. } => return false,
+            | Op::QsaBatchAttention { .. }
+            // Vision mrope turns (stage V4b): `Op::QkNormMrope` has no record-once dyn twin, and
+            // its per-pair plane comes from a [1,4] positions4 Input the tape cannot advance — a
+            // replayed rope would bake pos 0 AND collapse the (T,H,W,E) planes onto it. (Without
+            // this arm the op silently failed the `has_rope` scan below instead — same outcome,
+            // but for the wrong reason; keep the rejection explicit.)
+            | Op::QkNormMrope { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -2260,6 +2266,40 @@ fn lower_op(
             rec.scale(r(*dst)?, *s, n);
         }
         Op::Silu { x, dst, n, scale } => rec.silu_scale(r(*x)?, r(*dst)?, *n, *scale),
+        Op::Gelu { x, dst, rows, cols } => {
+            let n = *rows * *cols;
+            rec.gelu(r(*x)?, r(*dst)?, n);
+        }
+        Op::Rope2D {
+            q,
+            k,
+            pos_hw,
+            dst_q,
+            dst_k,
+            n_head,
+            head_dim,
+            theta,
+            sections,
+        } => {
+            // qwen3vl ViT's VISION rope (`rope2d.comp`): reads per-row (y, x) positions from the
+            // bound I32 tensor (unlike `Op::Rope`, whose scalar pos is pre-read host-side), so no
+            // RopeMode/pos bookkeeping — plain f32 static lowering, q/k/dst any mix of
+            // aliasing (the kernel's element pairs are written by the workgroup that read them).
+            let (nh, hd) = (*n_head as usize, *head_dim as usize);
+            let rows = graph.desc(*q).numel() / (nh * hd).max(1);
+            rec.rope2d(
+                r(*pos_hw)?,
+                r(*q)?,
+                r(*k)?,
+                r(*dst_q)?,
+                r(*dst_k)?,
+                rows,
+                nh,
+                hd,
+                *theta,
+                *sections,
+            );
+        }
         Op::QwenHcMix {
             x,
             gate,
@@ -2488,6 +2528,38 @@ fn lower_op(
         // Append a row into the persistent KV cache at row `pos`. store_f16 casts f32→f16 (the
         // common case: V / f32 K); an already-f16 source is a straight copy. In Dynamic mode the
         // write offset (pos*n) comes from `params` instead of the baked `pos`.
+        Op::QkNormMrope {
+            x,
+            weight,
+            positions4,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+            rope_dim,
+            theta,
+            eps,
+            sections,
+            x_stride,
+        } => {
+            // Plain scratch write (no fused KV write / BDA / replay): image turns are rare,
+            // and the runner pairs K's scratch output with an explicit `WriteKv` on mrope
+            // turns. Rope position comes from the per-row `[rows, 4]` (T,H,W,E) tensor.
+            rec.qk_norm_rope_mrope(
+                r(*x)?,
+                r(*weight)?,
+                r(*positions4)?,
+                r(*dst)?,
+                *rows as usize,
+                *n_head as usize,
+                *head_dim as usize,
+                *rope_dim as usize,
+                *theta,
+                *eps,
+                *sections,
+                *x_stride as usize,
+            );
+        }
         Op::WriteKv {
             src,
             cache,

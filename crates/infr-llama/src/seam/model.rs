@@ -813,15 +813,48 @@ impl SeamModel {
         stable_prefix: Option<&str>,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: Option<&crate::sampling::RequestCtx>,
-        mut on_piece: impl FnMut(&str),
+        on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
-        let turn_checkpoint = self.turn_checkpoint(&prompt_tokens, stable_prefix)?;
+        self.generate_vulkan_session_turn_tokens_on(
+            session,
+            &prompt_tokens,
+            stable_prefix,
+            max_new,
+            constraint,
+            req,
+            None, // mm: text-only turn
+            on_piece,
+        )
+    }
+
+    /// The token-level core of [`generate_vulkan_session_turn_constrained`]
+    /// (Self::generate_vulkan_session_turn_constrained): the CALLER passes an ALREADY-EXPANDED
+    /// prompt token array (a vision turn's `<|image_pad|>` runs are expanded + paired with a
+    /// [`MropePlan`] by the chat layer) instead of a string this fn would encode.
+    ///
+    /// `mm` (`Some` = a vision "mrope turn"): the full-attention rope switches to
+    /// `Op::QkNormMrope` reading `mm.prompt_pos4` / `mm.decode_base`, and the spans' ViT
+    /// embeddings are spliced over the host-embedded prefill rows. `None` reproduces the
+    /// text-only path bit-for-bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_vulkan_session_turn_tokens_on(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt_tokens: &[u32],
+        stable_prefix: Option<&str>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        mm: Option<&crate::seam::MropePlan>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let turn_checkpoint = self.turn_checkpoint(prompt_tokens, stable_prefix)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session
             .pool
-            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
+            .pick(&session.be, &self.cfg, &session.cfg, prompt_tokens)?;
         let max_ctx = session.max_ctx;
         // Cap the reply to the context that's actually left ("a turn also caps to remaining
         // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
@@ -840,7 +873,7 @@ impl SeamModel {
             &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
-            &prompt_tokens,
+            prompt_tokens,
             max_new,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.pool.slots[slot],
@@ -848,6 +881,7 @@ impl SeamModel {
             turn_checkpoint,
             constraint,
             req,
+            mm,
         )?;
         // The cold init may have re-clamped the window against the memory the device reported free
         // once the weights were resident (`crate::seam::reclamp_ctx_to_live_room`), so the slot's
@@ -1399,6 +1433,7 @@ impl SeamModel {
                 None, // turn checkpoint boundary
                 None, // constraint
                 None, // req: bench is a sole sequence — env sampling, no gate
+                None, // mm
             )?;
             Ok(stats)
         };
@@ -2066,6 +2101,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None, // mm
         )?;
         Ok(())
     }
@@ -2116,6 +2152,7 @@ impl DiffusionGemmaCpuSession {
             }),
             None,
             None,
+            None, // mm
         )?;
         Ok(out_logits)
     }
@@ -2159,6 +2196,7 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
+            None, // mm
         )?;
         // Once per prefill (a denoise step would print per step — far too noisy).
         self.be.print_moe_pager_stats();
@@ -2228,6 +2266,7 @@ impl DiffusionGemmaVulkanSession {
             }),
             None,
             None,
+            None, // mm
         )?;
         Ok(match reduced {
             Some(r) => crate::seam::DenoiseOutcome::Reduced(r),
@@ -2269,6 +2308,9 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
+            None, // turn checkpoint boundary
+            None, // req
+            None, // mm
         )?;
         Ok(())
     }
@@ -2311,7 +2353,9 @@ impl DiffusionGemmaMetalSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
-            None,
+            None, // turn checkpoint boundary
+            None, // req
+            None, // mm
         )?;
         Ok(out_logits)
     }

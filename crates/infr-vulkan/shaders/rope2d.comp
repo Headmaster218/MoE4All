@@ -1,0 +1,67 @@
+#version 460
+// Vision 2D RoPE — ggml's GGML_ROPE_TYPE_VISION (qwen3vl ViT, `Op::Rope2D`). One workgroup per
+// (row, head); NO norm, pure rotation (the qk_norm_rope sibling without the rmsnorm).
+//
+// q/k are [rows, nheads, hd] f32, pos_hw is [rows, 2] I32 holding the patch's grid (y, x) in the
+// same merge-major row order. Semantics = the infr-cpu interpreter's Rope2D arm verbatim:
+//   * split-half pairs (p, p + hd/2) over the FULL head (all hd dims rotate — no pass-through tail),
+//   * section s = first s where p < cumsum(sections)[s] (sections entries count PAIRS),
+//   * position stream [y, x, y, x] for sections 0..3,
+//   * theta resets per section: angle = pos * theta_scale^local_l with
+//     theta_scale = theta^(-2/n_pairs), n_pairs = hd/2.
+// Workgroup grid may be split 2-D by the recorder's dispatch_wide (rows*nheads can pass 65535 at
+// MAX_PATCHES), so the flat unit index is recovered from gl_NumWorkGroups and bounds-checked.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint nheads; uint hd; float theta;
+    uint s0; uint s1; uint s2; uint s3;
+} pc;
+
+layout(binding = 0) readonly buffer PB { int phw[]; };    // [rows, 2]: (y, x) per row
+layout(binding = 1) readonly buffer QB { float qin[]; };  // [rows, nheads, hd]
+layout(binding = 2) readonly buffer KB { float kin[]; };
+layout(binding = 3) buffer QOB { float qout[]; };
+layout(binding = 4) buffer KOB { float kout[]; };
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.nheads) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint h = unit % pc.nheads;
+    uint r = unit / pc.nheads;
+    uint base = (r * pc.nheads + h) * pc.hd;
+    float py = float(phw[r * 2u]);
+    float px = float(phw[r * 2u + 1u]);
+
+    uint n_pairs = pc.hd / 2u;
+    uint sects[4];
+    sects[0] = pc.s0; sects[1] = pc.s1; sects[2] = pc.s2; sects[3] = pc.s3;
+    uint starts[4];
+    uint acc = 0u;
+    for (uint s = 0u; s < 4u; s++) { starts[s] = acc; acc += sects[s]; }
+    float theta_scale = pow(pc.theta, -2.0 / float(n_pairs));
+
+    for (uint p = t; p < n_pairs; p += 64u) {
+        // first s where p < starts[s] + sects[s]; 0 when none (CPU's unwrap_or(0))
+        uint sect = 0u;
+        for (uint s = 0u; s < 4u; s++) {
+            if (p < starts[s] + sects[s]) { sect = s; break; }
+        }
+        uint l = p - starts[sect];
+        float pos_val = (sect % 2u == 0u) ? py : px;
+        float ang = pos_val * pow(theta_scale, float(l));
+        float s_ = sin(ang);
+        float c_ = cos(ang);
+        uint i0 = p;
+        uint i1 = p + n_pairs;
+        float qa = qin[base + i0];
+        float qb = qin[base + i1];
+        qout[base + i0] = qa * c_ - qb * s_;
+        qout[base + i1] = qa * s_ + qb * c_;
+        float ka = kin[base + i0];
+        float kb = kin[base + i1];
+        kout[base + i0] = ka * c_ - kb * s_;
+        kout[base + i1] = ka * s_ + kb * c_;
+    }
+}

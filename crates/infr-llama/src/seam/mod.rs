@@ -541,6 +541,7 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // denoise_req
         None, // turn checkpoint boundary
         req,
+        None, // mm
     );
     if let Some(store) = store.filter(|_| ec.paging.stats) {
         report_host_paging(&store);
@@ -602,6 +603,7 @@ pub(crate) fn generate_dense_vulkan(
         None, // turn checkpoint boundary
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
+        None, // mm
     )
 }
 
@@ -615,6 +617,30 @@ pub(crate) enum TurnCheckpoint {
     Enable,
     /// Allocate if needed and capture state after this many prompt tokens.
     Boundary(usize),
+}
+
+/// One image span's ViT embeddings as the seam consumes them (stage V4b): the rows overwrite the
+/// token-embedding-table rows of the span's `<|image_pad|>` tokens during host prefill embedding,
+/// and the span's tokens rope on a (T,H,W) sub-grid instead of the linear position.
+pub struct ImageSpanEmbeds {
+    /// Token index (in the EXPANDED prompt token array) of the span's first token.
+    pub start: usize,
+    /// Number of tokens the span occupies (nx*ny merged tokens).
+    pub n_tokens: usize,
+    /// ViT output rows, [n_tokens * n_embd] f32 row-major.
+    pub embeds: std::sync::Arc<Vec<f32>>,
+}
+
+/// The vision mrope plan a caller hands [`generate_dense_vulkan_session`] (and, transitively,
+/// `generate_dense_backend`) for a turn whose rendered prompt contains `<|image_pad|>` tokens and
+/// whose image embeddings come from the ViT (`infr-vision`). `None` on every text-only turn —
+/// byte-for-byte the pre-V4b graph and uploads.
+pub struct MropePlan {
+    /// Per-token (T,H,W,E) for every PROMPT token, [plen*4] i32 row-major.
+    pub prompt_pos4: Vec<i32>,
+    pub spans: Vec<ImageSpanEmbeds>,
+    /// Rope position of generated token i (i = 0,1,2... after the prompt): decode_base + i.
+    pub decode_base: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -634,6 +660,8 @@ pub(crate) fn generate_dense_vulkan_session(
     turn_checkpoint: Option<TurnCheckpoint>,
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
+    // Vision mrope plan (stage V4b): `None` on every text-only caller.
+    mm: Option<&MropePlan>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
@@ -679,6 +707,7 @@ pub(crate) fn generate_dense_vulkan_session(
         None,
         turn_checkpoint,
         req,
+        mm,
     );
     if out.is_err() {
         vk.release_moe_load_reservation();
@@ -840,7 +869,7 @@ pub(crate) fn dense_act_reserve_at(
         0
     });
     // Fixed slack over the algebraic reserve. Measured on Ornith-1.5-35B (qwen35moe, MTP verify
-    // re-prefill, chunk 128): the true peak ran 174 KB over the reserve - the follow-up unified
+    // re-prefill, chunk 128): the true peak ran 174 KB over the reserve — the follow-up unified
     // arena growth request then had to carve a fresh window beside the pager's permanent expert
     // slots and failed outright ("cannot create a contiguous window ... expert minimum working
     // set"). 8 MiB absorbs the model-specific residue the per-row terms miss; when the reserve is
@@ -1013,7 +1042,7 @@ pub(crate) fn layer_major_prefill(
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
-/// Fixed slack added on top of the algebraic [dense_act_reserve_at] model - see the call site
+/// Fixed slack added on top of the algebraic [`dense_act_reserve_at`] model — see the call site
 /// for the measurement that motivated it.
 const DENSE_ACT_RESERVE_SLACK: u64 = 8 * 1024 * 1024;
 
@@ -2875,6 +2904,20 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .sum();
             let embed_table = cfg.vocab * cfg.n_embd * 2; // F16 draft-chain gather table
             let head_kv = want_ctx * cfg.n_kv * cfg.head_dim * 2 * 2; // K+V f16, 1 layer
+                                                                      // Scratch margin: must cover the BDA block GEOMETRY the head's own uploads pay, not
+                                                                      // just their raw bytes — `bda_weight_alloc` rounds each resident block up (64→128→256
+                                                                      // MiB floors, exact-size only above the floor), and the first block request lands when
+                                                                      // the trunk plan has already consumed everything the reserve left. Measured on
+                                                                      // Ornith-1.5-35B MTPFIX: the head's first `resident-bda` block asks 397.9 MiB with the
+                                                                      // 256 MiB margin, the unified guard refuses with ~254 MiB left — 144 MiB short. 512 MiB
+                                                                      // covers the rounding slack with room for the remaining banks. The SERIAL serve engine
+                                                                      // (--mmproj) additionally runs the unified elastic arena beside the pager, which cost
+                                                                      // another ~35 MiB over `run` (272.0 MiB `resident-bda` vs 237 MiB left) — 768 MiB
+                                                                      // absorbs both, measured on the RX 7700 XT @131K kv-q8. 768 MiB OVERSHOOTS on the
+                                                                      // serial serve path (its unified-arena shard sizing quantizes: the MoE prefill-ring
+                                                                      // check demands 1566 MiB and the elastic window collapses below ~600 MiB of slack) —
+                                                                      // 576 MiB is the measured serve-mode sweet spot (head bank 272 MiB fits, prefill ring
+                                                                      // intact).
             let scratch = 576 << 20;
             let mtp_reserve = head_weights + embed_table + head_kv + scratch;
             tracing::info!(
@@ -2889,7 +2932,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             room.saturating_sub(mtp_reserve as u64)
         } else {
             room
-        };        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
+        };
+        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
         // explicit Q8 and F16 choices must change the expert remainder just like the allocation.
         let ring = kv_ring_wanted(cfg, ec);
@@ -3266,7 +3310,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         debug_assert_eq!(
                             committed as u64,
                             physical_bytes + plan.runtime_reserve_bytes
-                        );                        let live_room = vk.alloc_room();
+                        );
+                        let live_room = vk.alloc_room();
                         if live_room >= required_after_arena {
                             pager_budget_bytes = physical_bytes;
                             expert_cache_target_bytes = expert_cache_target_bytes
@@ -3489,7 +3534,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // The activation reserve becomes a PHYSICAL trailing shard (see
                 // `MoePagerLayout::runtime_margin_bytes`): runtime windows live there instead of
                 // borrowing expert slots, which is what wedged long serve sessions before.
-                runtime_margin_bytes: plan.runtime_reserve_bytes,            })
+                runtime_margin_bytes: plan.runtime_reserve_bytes,
+            })
             .map_err(|e| anyhow!("{e}"))?;
         }
     }
@@ -4147,6 +4193,7 @@ fn run_dense_oneshot(
         None, // denoise_req
         None, // turn checkpoint boundary
         None, // req
+        None, // mm
     )
 }
 
@@ -4722,6 +4769,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         req,
+        None, // mm
     )
 }
 
@@ -4766,6 +4814,8 @@ pub(crate) fn verify_dense_metal2(
         None,
         None,
         None,
+        None,
+        None, // mm
     )?;
     Ok((logits, stats.prompt_secs))
 }
@@ -4807,6 +4857,7 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok(logits)
 }
@@ -4849,6 +4900,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok((logits, h))
 }
@@ -4893,6 +4945,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok((logits, h))
 }
@@ -4941,6 +4994,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok(logits)
 }

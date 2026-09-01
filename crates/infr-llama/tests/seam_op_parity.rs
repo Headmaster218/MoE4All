@@ -491,6 +491,123 @@ fn qknorm_parity() {
     assert!(maxerr(&c, &v) < 1e-3, "QkNorm diverges");
 }
 
+/// QkNormMrope (vision IMROPE rope): CPU vs Vulkan parity at qwen35moe dims (hd=256, rope=64,
+/// sections [11,11,10,0]), covering BOTH input layouts: packed (K path) and the interleaved
+/// q+gate strided read (Q path). The op writes f16; an `Op::Copy` f16→f32 makes the output
+/// cleanly comparable (the adapter's Copy casts between dtypes; the CPU stores f32 anyway).
+fn qk_norm_mrope_parity_case(x_stride: u32) {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd, rope_dim) = (3usize, 4usize, 256usize, 64usize);
+    let mut g = Graph::new();
+    let src_len = if x_stride > 0 {
+        rows * nh * 2 * hd
+    } else {
+        rows * nh * hd
+    };
+    let x = g.input(f32d(src_len));
+    let w = g.weight(f32d(hd));
+    let pos4 = g.input(TensorDesc::new(vec![rows, 4], DType::I32));
+    let roped = g.output(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+    g.push(Op::QkNormMrope {
+        x,
+        weight: w,
+        positions4: pos4,
+        dst: roped,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        rope_dim: rope_dim as u32,
+        theta: 1e7,
+        eps: 1e-6,
+        sections: [11, 11, 10, 0],
+        x_stride,
+    });
+    let xi = gen(src_len, 11);
+    let wi = gen(hd, 12).iter().map(|v| v + 1.0).collect::<Vec<_>>();
+    // Mixed rows: text-only (T=H=W) + image-span-style (T const, H/W spread) positions.
+    let mut pos4v: Vec<i32> = Vec::new();
+    pos4v.extend([0, 0, 0, 0]); // text row
+    pos4v.extend([2, 5, 3, 0]); // image row: T=2, H=5, W=3
+    pos4v.extend([9, 9, 9, 0]); // text row at a jumped position
+    let run_mrope = |be: &dyn Backend, is_cpu: bool| -> Vec<f32> {
+        let plan = be.compile(&g).unwrap();
+        let xb = be.alloc(src_len * 4, BufferUsage::Activations).unwrap();
+        be.upload(xb.as_ref(), bytemuck::cast_slice(&xi)).unwrap();
+        let wb = be.alloc(hd * 4, BufferUsage::Weights).unwrap();
+        be.upload(wb.as_ref(), bytemuck::cast_slice(&wi)).unwrap();
+        let pb = be.alloc(pos4v.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(pb.as_ref(), bytemuck::cast_slice(&pos4v))
+            .unwrap();
+        // The op writes F16: Vulkan packs 2 B/elem; the CPU interpreter stores f32 (4 B/elem).
+        // The output buffer is allocated 4 B/elem so both fit; decode per backend.
+        let roped_buf = be.alloc(rows * nh * hd * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(x, xb.as_ref());
+        b.bind(w, wb.as_ref());
+        b.bind(pos4, pb.as_ref());
+        b.bind(roped, roped_buf.as_ref());
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut raw = vec![0u8; rows * nh * hd * 4];
+        be.download(roped_buf.as_ref(), &mut raw).unwrap();
+        if is_cpu {
+            bytemuck::cast_slice(&raw).to_vec()
+        } else {
+            // The shader packs f16 contiguously (2 B/elem) from the start of the buffer.
+            raw[..rows * nh * hd * 2]
+                .chunks(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        }
+    };
+    let c = run_mrope(&cpu, true);
+    let v = run_mrope(&vk, false);
+    for r in 0..rows {
+        let row_err = c[r * nh * hd..(r + 1) * nh * hd]
+            .iter()
+            .zip(&v[r * nh * hd..(r + 1) * nh * hd])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "  row {r} (pos {:?}) max_err={:e}",
+            &pos4v[r * 4..r * 4 + 4],
+            row_err
+        );
+    }
+    // Row-0 hand reference: zero positions → rope identity → pure per-head rmsnorm*w.
+    for e in 0..4 {
+        let h = e / 8;
+        let i = e % 8;
+        let row = &xi[0 * nh * hd..nh * hd];
+        let hb = &row[h * hd..(h + 1) * hd];
+        let ss: f32 = hb.iter().map(|v| v * v).sum::<f32>() / hd as f32;
+        let expected = hb[i] / (ss + 1e-6).sqrt() * wi[i];
+        println!(
+            "  e{e}: cpu={:.4} vk={:.4} expected={:.4}",
+            c[e], v[e], expected
+        );
+    }
+    let err = maxerr(&c, &v);
+    assert!(
+        err < 0.05,
+        "QkNormMrope(x_stride={x_stride}) CPU vs Vulkan diverges: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn qk_norm_mrope_parity_packed() {
+    qk_norm_mrope_parity_case(0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn qk_norm_mrope_parity_strided() {
+    qk_norm_mrope_parity_case(2 * 4 * 256); // qwen35 interleaved q+gate stride (nh*2*hd)
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn qknormrope_parity_qwen35_dims() {

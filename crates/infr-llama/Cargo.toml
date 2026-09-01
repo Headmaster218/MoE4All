@@ -14,6 +14,7 @@ infr-vulkan.workspace = true
 infr-metal.workspace = true
 infr-gguf.workspace = true
 infr-cpu.workspace = true
+infr-vision.workspace = true
 serde_json.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true

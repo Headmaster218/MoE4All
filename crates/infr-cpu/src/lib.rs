@@ -1704,6 +1704,71 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::Rope2D {
+                    q,
+                    k,
+                    pos_hw,
+                    dst_q,
+                    dst_k,
+                    n_head,
+                    head_dim,
+                    theta,
+                    sections,
+                } => {
+                    let (nh, hd) = (n_head as usize, head_dim as usize);
+                    let n_pairs = hd / 2;
+                    let qs = &vals[q.0 as usize];
+                    let ks = &vals[k.0 as usize];
+                    let pos = &vals[pos_hw.0 as usize]; // [rows, 2] f32: (y, x) merge-major
+                    let rows = pos.len() / 2;
+                    let mut out_q = qs.clone();
+                    let mut out_k = ks.clone();
+                    // ggml VISION (indep_sects): sector = pair_index % sect_dims compared
+                    // against the sections values directly — they count PAIRS here. Theta
+                    // scale = freq_base^(-2/n_dims) with n_dims == head_dim/2 == n_pairs;
+                    // each plane's theta accumulates one scale per pair, resetting at its
+                    // section start: angle = pos * theta_scale^local_l.
+                    let mut sect_pair_start = [0usize; 4];
+                    let mut acc = 0usize;
+                    for s in 0..4 {
+                        sect_pair_start[s] = acc;
+                        acc += sections[s] as usize;
+                    }
+                    let theta_scale = theta.powf(-2.0 / n_pairs as f32);
+                    for r in 0..rows {
+                        let py = pos[r * 2];
+                        let px = pos[r * 2 + 1];
+                        for h in 0..nh {
+                            let b = (r * nh + h) * hd;
+                            for p in 0..n_pairs {
+                                // Find section: first s where p < sect_pair_start[s] + sections[s]
+                                let sect = (0..4)
+                                    .find(|&s| {
+                                        let end = sect_pair_start[s] + sections[s] as usize;
+                                        p < end
+                                    })
+                                    .unwrap_or(0);
+                                let local_l = p - sect_pair_start[sect];
+                                // Position stream [y, x, y, x] for sections 0..3
+                                let pos_val = if sect % 2 == 0 { py } else { px };
+                                let angle = pos_val * theta_scale.powi(local_l as i32);
+                                let (s, c) = (angle.sin(), angle.cos());
+                                // Split-half over the FULL head (ggml VISION rotate_pairs)
+                                let (i0, i1) = (p, p + n_pairs);
+                                let qa = qs[b + i0];
+                                let qb = qs[b + i1];
+                                out_q[b + i0] = qa * c - qb * s;
+                                out_q[b + i1] = qa * s + qb * c;
+                                let ka = ks[b + i0];
+                                let kb = ks[b + i1];
+                                out_k[b + i0] = ka * c - kb * s;
+                                out_k[b + i1] = ka * s + kb * c;
+                            }
+                        }
+                    }
+                    vals[dst_q.0 as usize] = out_q;
+                    vals[dst_k.0 as usize] = out_k;
+                }
                 Op::QkNormRope {
                     x,
                     weight: w,
@@ -1766,6 +1831,105 @@ impl Backend for CpuBackend {
                             let xr = &xs[r * nh * hd..r * nh * hd + nh * hd];
                             for h in 0..nh {
                                 let b = h * hd;
+                                let ss: f32 =
+                                    (0..hd).map(|i| xr[b + i] * xr[b + i]).sum::<f32>() / hd as f32;
+                                let s = 1.0 / (ss + eps).sqrt();
+                                for i in 0..hd {
+                                    orow[b + i] = xr[b + i] * s * ws[i];
+                                }
+                                for p in 0..hf {
+                                    let (i0, i1) = (p, p + hf);
+                                    let (c, sn) = cs[p];
+                                    let a = orow[b + i0];
+                                    let bb = orow[b + i1];
+                                    orow[b + i0] = a * c - bb * sn;
+                                    orow[b + i1] = a * sn + bb * c;
+                                }
+                            }
+                        });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::QkNormMrope {
+                    x,
+                    weight: w,
+                    positions4,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    sections,
+                    x_stride,
+                } => {
+                    let (rows, nh, hd, rd) = (
+                        rows as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        rope_dim as usize,
+                    );
+                    let raw = &vals[x.0 as usize];
+                    // Interleaved q+g source (qwen35 attn_out_gate): extract packed query rows.
+                    let xs: Vec<f32> = if x_stride > 0 {
+                        let x_stride = x_stride as usize;
+                        let mut packed = vec![0f32; rows * nh * hd];
+                        for r in 0..rows {
+                            let row_base = r * x_stride;
+                            for h in 0..nh {
+                                let src = row_base + h * 2 * hd;
+                                let dstp = (r * nh + h) * hd;
+                                packed[dstp..dstp + hd].copy_from_slice(&raw[src..src + hd]);
+                            }
+                        }
+                        packed
+                    } else {
+                        raw.clone()
+                    };
+                    let xs = &xs;
+                    let ws = weight(w);
+                    let pos = &vals[positions4.0 as usize]; // [rows, 4] f32-valued (T,H,W,E)
+                    let hf = rd / 2;
+                    // IMROPE plane per pair (ggml ops.cpp `is_imrope` branch): with
+                    // sector = p % sect_dims, T on %3==0, H on %3==1, W on %3==2 (each
+                    // bounded by 3*sections[k]); else E. Precomputed per pair.
+                    let sect = [
+                        sections[0] as usize,
+                        sections[1] as usize,
+                        sections[2] as usize,
+                        sections[3] as usize,
+                    ];
+                    let sect_dims: usize = sect.iter().sum();
+                    let plane_of = |p: usize| -> usize {
+                        let sector = p % sect_dims;
+                        if sector % 3 == 1 && sector < 3 * sect[1] {
+                            1
+                        } else if sector % 3 == 2 && sector < 3 * sect[2] {
+                            2
+                        } else if sector % 3 == 0 && sector < 3 * sect[0] {
+                            0
+                        } else {
+                            3
+                        }
+                    };
+                    let mut out = vec![0f32; rows * nh * hd];
+                    self.pool()
+                        .for_chunks_mut(&mut out, nh * hd, 1, &|r, orow| {
+                            let t = pos[r * 4];
+                            let h = pos[r * 4 + 1];
+                            let w_ = pos[r * 4 + 2];
+                            let e = pos[r * 4 + 3];
+                            let planes = [t, h, w_, e];
+                            let cs: Vec<(f32, f32)> = (0..hf)
+                                .map(|p| {
+                                    let ang = planes[plane_of(p)]
+                                        * theta.powf(-2.0 * p as f32 / rd as f32);
+                                    (ang.cos(), ang.sin())
+                                })
+                                .collect();
+                            let xr = &xs[r * nh * hd..r * nh * hd + nh * hd];
+                            for hh in 0..nh {
+                                let b = hh * hd;
                                 let ss: f32 =
                                     (0..hd).map(|i| xr[b + i] * xr[b + i]).sum::<f32>() / hd as f32;
                                 let s = 1.0 / (ss + eps).sqrt();
@@ -2693,6 +2857,21 @@ impl Backend for CpuBackend {
                         for (i, o) in oc.iter_mut().enumerate() {
                             let v = xs[base + i] * scale;
                             *o = v / (1.0 + (-v).exp());
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::Gelu { x, dst, rows, cols } => {
+                    let n = (rows * cols) as usize;
+                    let xs = &vals[x.0 as usize];
+                    let c = (2.0 / std::f32::consts::PI).sqrt();
+                    let mut out = vec![0f32; n];
+                    self.pool().for_chunks_mut(&mut out, 4096, 4, &|chunk, oc| {
+                        let base = chunk * 4096;
+                        for (i, o) in oc.iter_mut().enumerate() {
+                            let v = xs[base + i];
+                            let inner = c * (v + 0.044715 * v * v * v);
+                            *o = 0.5 * v * (1.0 + inner.tanh());
                         }
                     });
                     vals[dst.0 as usize] = out;
@@ -4581,6 +4760,173 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infr_core::graph::{Graph, Op};
+    use infr_core::tensor::{DType, TensorDesc};
+
+    /// Run one QkNormMrope op on the CPU backend and return the f32 output.
+    fn run_qk_norm_mrope(
+        x: &[f32],
+        w: &[f32],
+        pos4: &[i32],
+        rows: usize,
+        nh: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        sections: [u32; 4],
+    ) -> Vec<f32> {
+        let be = CpuBackend::new();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![hd], DType::F32));
+        let pi = g.input(TensorDesc::new(vec![rows, 4], DType::I32));
+        let dst = g.output(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+        g.push(Op::QkNormMrope {
+            x: xi,
+            weight: wi,
+            positions4: pi,
+            dst,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: rope_dim as u32,
+            theta,
+            eps: 1e-6,
+            sections,
+            x_stride: 0,
+        });
+        let plan = be.compile(&g).unwrap();
+        let xb = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+        let wb = be.alloc(w.len() * 4, BufferUsage::Weights).unwrap();
+        be.upload(wb.as_ref(), bytemuck::cast_slice(w)).unwrap();
+        let pb = be.alloc(pos4.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(pb.as_ref(), bytemuck::cast_slice(pos4)).unwrap();
+        let ob = be.alloc(x.len() * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(xi, xb.as_ref());
+        b.bind(wi, wb.as_ref());
+        b.bind(pi, pb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut o = vec![0f32; x.len()];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    }
+
+    /// Run one QkNormRope op on the CPU backend (the comparison oracle).
+    fn run_qk_norm_rope(
+        x: &[f32],
+        w: &[f32],
+        pos: &[i32],
+        rows: usize,
+        nh: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+    ) -> Vec<f32> {
+        let be = CpuBackend::new();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![hd], DType::F32));
+        let pi = g.input(TensorDesc::new(vec![rows], DType::I32));
+        let dst = g.output(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+        g.push(Op::QkNormRope {
+            x: xi,
+            weight: wi,
+            positions: pi,
+            dst,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: rope_dim as u32,
+            theta,
+            eps: 1e-6,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        let plan = be.compile(&g).unwrap();
+        let xb = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+        let wb = be.alloc(w.len() * 4, BufferUsage::Weights).unwrap();
+        be.upload(wb.as_ref(), bytemuck::cast_slice(w)).unwrap();
+        let pb = be.alloc(pos.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(pb.as_ref(), bytemuck::cast_slice(pos)).unwrap();
+        let ob = be.alloc(x.len() * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(xi, xb.as_ref());
+        b.bind(wi, wb.as_ref());
+        b.bind(pi, pb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut o = vec![0f32; x.len()];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    }
+
+    /// TEXT-ONLY collapse: rows with T==H==W must bit-match QkNormRope at the same linear
+    /// positions — the property that lets the non-vision path stay on the plain rope.
+    #[test]
+    fn qk_norm_mrope_text_rows_match_qk_norm_rope() {
+        let (rows, nh, hd, rd) = (5usize, 2usize, 16usize, 8usize);
+        let x: Vec<f32> = (0..rows * nh * hd)
+            .map(|i| ((i as f32) * 0.37).sin())
+            .collect();
+        let w: Vec<f32> = (0..hd).map(|i| 0.5 + (i as f32) * 0.01).collect();
+        let sections = [11u32, 11, 10, 0]; // Ornith's sections; any values work for this check
+        let mrope_pos: Vec<i32> = (0..rows as i32).flat_map(|p| [p, p, p, 0]).collect();
+        let got = run_qk_norm_mrope(&x, &w, &mrope_pos, rows, nh, hd, rd, 1e7, sections);
+        let want = run_qk_norm_rope(
+            &x,
+            &w,
+            &(0..rows as i32).collect::<Vec<_>>(),
+            rows,
+            nh,
+            hd,
+            rd,
+            1e7,
+        );
+        let max_err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-5, "text-collapse diverges: {max_err}");
+    }
+
+    /// Plane selection: with sections [1,1,1,0] and 4 pairs (p0→T, p1→H, p2→W, p3→T),
+    /// putting the position on exactly one plane must rotate only that plane's pairs.
+    #[test]
+    fn qk_norm_mrope_plane_selection() {
+        let (rows, nh, hd, rd) = (1usize, 1usize, 8usize, 8usize);
+        let x: Vec<f32> = (0..rows * nh * hd)
+            .map(|i| ((i as f32) * 0.61).cos())
+            .collect();
+        let w: Vec<f32> = vec![1.0; hd];
+        let sections = [1u32, 1, 1, 0];
+        let baseline = run_qk_norm_mrope(&x, &w, &[0, 0, 0, 0], rows, nh, hd, rd, 10.0, sections);
+        // Pair p rotated by angle A vs angle 0: elements (p, p+hf) change, others equal.
+        let rotated_pairs = |got: &[f32]| -> Vec<usize> {
+            let hf = rd / 2;
+            (0..hf)
+                .filter(|&p| {
+                    let (i0, i1) = (p, p + hf);
+                    (got[i0] - baseline[i0]).abs() > 1e-5 || (got[i1] - baseline[i1]).abs() > 1e-5
+                })
+                .collect()
+        };
+        // T plane (T=7): pairs 0 and 3 (p3: sector 3%3==0 < 3 → T).
+        let t = run_qk_norm_mrope(&x, &w, &[7, 0, 0, 0], rows, nh, hd, rd, 10.0, sections);
+        assert_eq!(rotated_pairs(&t), vec![0, 3], "T plane pairs");
+        // H plane: pair 1 only.
+        let h = run_qk_norm_mrope(&x, &w, &[0, 7, 0, 0], rows, nh, hd, rd, 10.0, sections);
+        assert_eq!(rotated_pairs(&h), vec![1], "H plane pairs");
+        // W plane: pair 2 only.
+        let wp = run_qk_norm_mrope(&x, &w, &[0, 0, 7, 0], rows, nh, hd, rd, 10.0, sections);
+        assert_eq!(rotated_pairs(&wp), vec![2], "W plane pairs");
+    }
 
     #[test]
     fn dsv4_mixed_fp8_row_roundtrips_and_uses_official_page_offsets() {

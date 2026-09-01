@@ -4449,6 +4449,14 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &[Self::vkb(x), Self::vkb(dst)], 1, &push, n.div_ceil(64));
     }
 
+    /// Standalone GELU (exact-tanh): `dst[i] = 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))`.
+    pub fn gelu(&self, x: &dyn Buffer, dst: &dyn Buffer, n: u32) {
+        let k = self.be.kernel("gelu", crate::gemm::gelu_spv(), 2, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&n.to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(x), Self::vkb(dst)], 1, &push, n.div_ceil(64));
+    }
+
     pub fn qwen_hc_mix(
         &self,
         x: &dyn Buffer,
@@ -4867,6 +4875,52 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
+    }
+
+    /// Vision 2D RoPE (`rope2d.comp`, `Op::Rope2D`) — the qwen3vl ViT's GGML_ROPE_TYPE_VISION
+    /// rotation of Q and K. One workgroup per (row, head), dispatch_wide (rows*nheads can pass
+    /// the 65535 group-count cap at MAX_PATCHES); `pos_hw` [rows, 2] I32 supplies per-row (y, x).
+    /// Writes `dst_q`/`dst_k` (which may alias `q`/`k` — the shader's element pairs are written
+    /// by the single workgroup that read them, so in-place is race-free).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope2d(
+        &self,
+        pos_hw: &dyn Buffer,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        dst_q: &dyn Buffer,
+        dst_k: &dyn Buffer,
+        rows: usize,
+        n_head: usize,
+        head_dim: usize,
+        theta: f32,
+        sections: [u32; 4],
+    ) {
+        let kernel = self.be.kernel("rope2d", crate::gemm::rope2d_spv(), 5, 32);
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_head as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&theta.to_ne_bytes());
+        push[16..20].copy_from_slice(&sections[0].to_ne_bytes());
+        push[20..24].copy_from_slice(&sections[1].to_ne_bytes());
+        push[24..28].copy_from_slice(&sections[2].to_ne_bytes());
+        push[28..32].copy_from_slice(&sections[3].to_ne_bytes());
+        // Reads first, writes last (the trailing n_out bindings are the hazard-tracked writes):
+        // bindings 0-2 read (pos, q, k), bindings 3-4 write (dst_q, dst_k).
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(pos_hw),
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(dst_q),
+                Self::vkb(dst_k),
+            ],
+            2,
+            &push,
+            (rows * n_head) as u32,
+        );
     }
 
     /// Interleaved (llama NORM) RoPE writing f16 — the llama q/k analogue of `qk_norm_rope`'s
@@ -6689,6 +6743,52 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
+    }
+
+    /// Fused per-head QK-norm + IMROPE (qwen35moe/qwen3vl image spans): per-pair position
+    /// from a `[rows, 4]` (T,H,W,E) I32 tensor, plane selected by ggml's interleaved-mrope
+    /// rule with `sections` (rope.dimension_sections). Plain scratch write — the runner pairs
+    /// it with an explicit `WriteKv` for K on mrope turns (no fused cache write here).
+    pub fn qk_norm_rope_mrope(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        pos4: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+        sections: [u32; 4],
+        x_stride: usize,
+    ) {
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&sections[0].to_ne_bytes());
+        push[28..32].copy_from_slice(&sections[1].to_ne_bytes());
+        push[32..36].copy_from_slice(&sections[2].to_ne_bytes());
+        push[36..40].copy_from_slice(&sections[3].to_ne_bytes());
+        push[40..44].copy_from_slice(&(x_stride as u32).to_ne_bytes());
+        let k = self.be.kernel(
+            "qk_norm_rope_mrope",
+            crate::gemm::qk_norm_rope_mrope_spv(),
+            4,
+            44,
+        );
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(nw), Self::vkb(pos4), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
     }
 
     /// Fused QkNormRope reading from an INTERLEAVED q+g buffer (stride = nh*2*hd per row,

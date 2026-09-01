@@ -2613,6 +2613,28 @@ pub(crate) fn silu_scale_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/silu_scale.spv"))))
 }
+/// SPIR-V for standalone GELU (exact-tanh), used by the qwen3vl ViT FFN.
+pub(crate) fn gelu_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/gelu.spv"))))
+}
+/// SPIR-V for the vision 2D RoPE (`rope2d.comp`, `Op::Rope2D`) — the qwen3vl ViT's
+/// GGML_ROPE_TYPE_VISION rotation (split-half over the full head, per-row (y, x) positions,
+/// per-section theta reset).
+pub(crate) fn rope2d_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rope2d.spv"))))
+}
+/// SPIR-V for fused QK-norm + IMROPE (qwen35moe image-span rope).
+pub(crate) fn qk_norm_rope_mrope_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qk_norm_rope_mrope.spv"
+        )))
+    })
+}
 /// SPIR-V for Qwen3.8's gated residual stream collapse.
 pub(crate) fn qwen_hc_mix_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();

@@ -357,6 +357,10 @@ fn session_stable(
 pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
+    /// Vision mrope turns only: the `[batch, 4]` I32 Input holding each row's (T,H,W,E) planes —
+    /// what the full-attention `Op::QkNormMrope` sites read instead of `positions`. `None` on every
+    /// non-mrope build (the graph then has no pos4 Input and no Mrope op).
+    pos4: Option<TensorId>,
     rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
     // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats): the graph Input the
     // driver binds `yff_buf` to (a per-step f32 Input like `rope_freqs`). `None` for non-yarn.
@@ -442,8 +446,8 @@ pub(crate) fn generate_dense_backend(
     // Phase-1 DiffusionGemma validation hook: captures the LAST prompt token's raw logits (the
     // per-token loop's first `is_decode` row, i.e. the causal-prefill result) without disturbing
     // the sampled continuation. `None` everywhere else. Unlike `verify` (a batched m-row forward,
-    // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
-    // it works for MoE/diffusion-gemma models too.
+    // gated on batched-MoE eligibility — see its guard below) this rides the existing rows==1
+    // per-token loop, so it works for EVERY MoE/diffusion-gemma model.
     mut logits_out: Option<&mut Vec<f32>>,
     // MTP Phase 1 (issue #33, docs/mtp.md): captures the LM-head INPUT rows (post-`output_norm`,
     // pre-`w_lm` — `DecodeHandles::h_out`'s doc) for the SAME row(s) `logits_out`/`verify` came
@@ -469,6 +473,12 @@ pub(crate) fn generate_dense_backend(
     // resolves purely from the env, no abort latch is polled, and no gate is taken — byte-for-byte
     // the pre-existing behavior.
     req: Option<&crate::sampling::RequestCtx>,
+    // Vision mrope plan (stage V4b, docs/vision*.md): when `Some`, the full-attention K/Q sites
+    // emit `Op::QkNormMrope` reading the per-token (T,H,W,E) planes from `MropePlan::prompt_pos4`
+    // (prefill chunks) / `decode_base` (decode), and overlapping image spans' ViT embeddings are
+    // spliced over the host-embedded prefill rows. `None` (every existing caller) keeps the graph
+    // byte-for-byte as before — the build emits plain `Op::QkNormRope` and no pos4 Input exists.
+    mm: Option<&crate::seam::MropePlan>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
@@ -1708,6 +1718,13 @@ pub(crate) fn generate_dense_backend(
         // plain `prompt.len() - 1` (leave ≥1 prompt token to sample the first logits from).
         common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
     };
+    tracing::info!(
+        "[mtp-dbg] verify feed={} cached={} start={} (re-prefill {} rows)",
+        prompt.len(),
+        cached.len(),
+        start,
+        prompt.len() - start
+    );
     // Only a strict, newly processed prefix can become a checkpoint. If the hint is malformed,
     // tokenization did not preserve the rendered string prefix, or the state already lies past it,
     // leave the previous checkpoint intact and use the ordinary generation path.
@@ -2004,6 +2021,11 @@ pub(crate) fn generate_dense_backend(
             g.input(f32d(batch * ne))
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
+        // Vision mrope turns (`mm` Some): the per-token (T,H,W,E) plane Input the full-attention
+        // K/Q sites wire into `Op::QkNormMrope` — the plain `positions` Input stays declared and
+        // bound either way (it is what every OTHER rope site and the KV bookkeeping read).
+        // `None` keeps the graph exactly as a text-only turn built it.
+        let pos4_in = mm.map(|_| g.input(TensorDesc::new(vec![batch, 4], DType::I32)));
         let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
         let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
         let ple_embd = span_has_ple.then(|| {
@@ -4608,20 +4630,45 @@ pub(crate) fn generate_dense_backend(
                     // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
                     let k_write = match aw.k_norm {
                         Some(kn) => {
-                            g.push(Op::QkNormRope {
-                                x: k,
-                                weight: kn,
-                                positions,
-                                dst: k16,
-                                rows: batch as u32,
-                                n_head: nkv as u32,
-                                head_dim: hd as u32,
-                                rope_dim: rope_dim as u32,
-                                theta,
-                                eps,
-                                freq_factors: layer_ff,
-                                x_stride: 0,
-                            });
+                            if let Some(pos4) = pos4_in {
+                                // Vision mrope turn (stage V4b): the full-attention K rope reads
+                                // its per-pair plane from the [rows, 4] (T,H,W,E) Input — the
+                                // qwen35moe IMROPE rule (see `Op::QkNormMrope`'s doc). Text-only
+                                // tokens' planes all equal the linear position, so this collapses
+                                // to `Op::QkNormRope` for them; image spans are what differ.
+                                tracing::info!(
+                                    "[vision] K QkNormMrope emitted (layer {l}, batch {batch})"
+                                );
+                                g.push(Op::QkNormMrope {
+                                    x: k,
+                                    weight: kn,
+                                    positions4: pos4,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    rope_dim: rope_dim as u32,
+                                    theta,
+                                    eps,
+                                    sections: c.rope_sections,
+                                    x_stride: 0,
+                                });
+                            } else {
+                                g.push(Op::QkNormRope {
+                                    x: k,
+                                    weight: kn,
+                                    positions,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    rope_dim: rope_dim as u32,
+                                    theta,
+                                    eps,
+                                    freq_factors: layer_ff,
+                                    x_stride: 0,
+                                });
+                            }
                             k16
                         }
                         None if nope => {
@@ -4700,20 +4747,39 @@ pub(crate) fn generate_dense_backend(
                         } else {
                             (q, 0)
                         };
-                        g.push(Op::QkNormRope {
-                            x: q_src,
-                            weight: qn,
-                            positions,
-                            dst: q16,
-                            rows: batch as u32,
-                            n_head: nh as u32,
-                            head_dim: hd as u32,
-                            rope_dim: rope_dim as u32,
-                            theta,
-                            eps,
-                            freq_factors: layer_ff,
-                            x_stride: q_stride,
-                        });
+                        if let Some(pos4) = pos4_in {
+                            // Vision mrope turn (see the K site above): the interleaved q+gate
+                            // buffer rides `x_stride` exactly like the QkNormRope it replaces.
+                            g.push(Op::QkNormMrope {
+                                x: q_src,
+                                weight: qn,
+                                positions4: pos4,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                sections: c.rope_sections,
+                                x_stride: q_stride,
+                            });
+                        } else {
+                            g.push(Op::QkNormRope {
+                                x: q_src,
+                                weight: qn,
+                                positions,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                freq_factors: layer_ff,
+                                x_stride: q_stride,
+                            });
+                        }
                         q16
                     }
                     None if nope => {
@@ -5710,6 +5776,7 @@ pub(crate) fn generate_dense_backend(
             DecodeHandles {
                 hidden,
                 positions,
+                pos4: pos4_in,
                 rope_freqs,
                 yarn_ff,
                 pl_tok_in: if pl_gathered { None } else { pl_tok_in },
@@ -6176,10 +6243,35 @@ pub(crate) fn generate_dense_backend(
     // [m, vocab] logits (the distribution after each suffix token) and generates nothing.
     // The suffix-prefill contract doubles as the accept/rollback mechanism: the caller
     // truncates its committed token list and the next call's prefix diff overwrites the
-    // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
+    // stale KV rows. Dense + eligible MoE (qwen35moe) non-E2B models only (the guard below).
     if let Some(out_logits) = verify {
-        if c.moe.is_some() || ple.is_some() {
-            return Err(anyhow!("speculative verify: dense non-E2B models only"));
+        // MTP verify on a vision mrope turn is not wired (the VERIFY batch's rope is plain
+        // QkNormRope; an mrope turn would need pos4 rows per suffix token) — and MTP is off for
+        // every vision-capable model anyway. Bail loudly rather than silently roping the suffix
+        // with plain positions.
+        if mm.is_some() {
+            return Err(anyhow!("MTP verify not supported on mrope turns"));
+        }
+        // MoE admission (qwen35moe, stage 2): `build`'s `FfnW::Moe` arm is batch-generic — the
+        // routed `Op::MoeFfn` + shared-expert tail take `batch` rows exactly like the chunked
+        // batched-prefill construction — and nothing else in this branch is FFN-shape-specific
+        // (the per-call buffers below are all m-row sized; `qwen_wide`/`ple_embd`/`ple_state`
+        // are `None` off qwen4exp). The eligibility gate therefore MIRRORS the non-qwen4exp
+        // batched-prefill gate (`moe_batched_ok` — every MoE layer's gate/up/down banks in
+        // `MOE_MMQ_DTYPES`): a verify batch is small on the common path (≤ the reprime bound)
+        // and rides the adapter's small-m `Op::MoeFfn` path, but the no-reprime/no-ckpt A/B
+        // escapes grow `m` unboundedly (a qwen35 full re-prefill from row 0), and past the
+        // small-m threshold the Vulkan batched `Op::MoeFfn` lowering HARD-ERRORS on non-mmq
+        // dtypes on i8_dot hardware. Still excluded, with the reason at the point of failure:
+        // gemma4-E2B (`ple` — its per-(token,layer) rows are computed in the per-step loop this
+        // branch bypasses), qwen4exp (a `ple_embd` Input would bind the decode-sized session
+        // buffer, and this branch has no PLE worker to produce m rows), and deepseek4 (a
+        // hash-routed layer needs the token-ids Input this branch never declares/binds).
+        let verify_moe_ok = c.moe.is_none() || (!c.deepseek4 && !c.qwen4exp && moe_batched_ok);
+        if !verify_moe_ok || ple.is_some() {
+            return Err(anyhow!(
+                "speculative verify: dense or batched-MoE-eligible (qwen35moe) non-E2B models only"
+            ));
         }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
@@ -6225,6 +6317,16 @@ pub(crate) fn generate_dense_backend(
             && caps.argmax_rows
             && ec.spec.gpu_argmax
             && ec.spec.gpu_mtp_accept;
+        if ec.prof.stages {
+            tracing::info!(
+                "[mtp-dbg] gpu_verify_ids={gpu_verify_ids} (verify_ids={} constraint={} caps.argmax_rows={} spec.gpu_argmax={} spec.gpu_mtp_accept={})",
+                verify_ids.is_some(),
+                constraint.is_none(),
+                caps.argmax_rows,
+                ec.spec.gpu_argmax,
+                ec.spec.gpu_mtp_accept,
+            );
+        }
         let t_vbuild0 = std::time::Instant::now();
         let (vg, vh) = build(
             m,
@@ -6295,12 +6397,16 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
         let vexec_secs = t0.elapsed().as_secs_f64();
         let t_vdl0 = std::time::Instant::now();
+        let mut t_ids = 0.0f64;
+        let mut t_h = 0.0f64;
         if let (Some(out_ids), Some(ib)) = (verify_ids, &vf_ids_buf) {
             // GPU accept path: m u32 ids down, the m×vocab logits stay in VRAM (`out_logits`
             // deliberately left EMPTY — the caller keys the fallback off that).
             out_ids.resize(m, 0);
+            let tt = std::time::Instant::now();
             be.download(ib.as_ref(), bytemuck::cast_slice_mut(out_ids))
                 .map_err(|e| anyhow!("{e}"))?;
+            t_ids = tt.elapsed().as_secs_f64();
         } else {
             out_logits.resize(m * c.vocab, 0.0);
             be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
@@ -6308,18 +6414,22 @@ pub(crate) fn generate_dense_backend(
         }
         if let (Some(out), Some(hb)) = (h_out.take(), &vf_h_buf) {
             out.resize(m * ne, 0.0);
+            let tt = std::time::Instant::now();
             be.download(hb.as_ref(), bytemuck::cast_slice_mut(out))
                 .map_err(|e| anyhow!("{e}"))?;
+            t_h = tt.elapsed().as_secs_f64();
         }
         let vdl_secs = t_vdl0.elapsed().as_secs_f64();
         if time_verify {
             tracing::info!(
-                "[mtp verify] m={m} start={start} full_reprefill={full_reprefill} \
-                 build={:.1}ms compile={:.1}ms exec={:.1}ms dl={:.1}ms total={:.1}ms",
+                "[mtp verify] m={m} start={start} full_reprefill={full_reprefill} ids_path={gpu_verify_ids} \
+                 build={:.1}ms compile={:.1}ms exec={:.1}ms dl={:.1}ms (ids={:.1} h={:.1}) total={:.1}ms",
                 vbuild_secs * 1e3,
                 vcompile_secs * 1e3,
                 vexec_secs * 1e3,
                 vdl_secs * 1e3,
+                t_ids * 1e3,
+                t_h * 1e3,
                 (vbuild_secs + vcompile_secs + vexec_secs + vdl_secs) * 1e3,
             );
         }
@@ -6361,6 +6471,17 @@ pub(crate) fn generate_dense_backend(
             .alloc(64 * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
         (tok_id_buf, dec_ids_buf, u_buf)
+    };
+    // Vision mrope turns: the decode graph's `[1, 4]` (T,H,W,E) Input buffer, re-uploaded per
+    // token (see the decode loop). `None` on every text-only turn — no pos4 Input exists then.
+    let pos4_buf = if mm.is_some() {
+        let _gp = req.and_then(|r| r.gate_pass());
+        Some(
+            be.alloc(4 * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
     };
     // Host-side mirror of `u_buf`'s 64 slots. `Backend::upload` has no partial-buffer/offset
     // form, so setting one slot re-uploads the whole 256 bytes from this mirror — negligible cost.
@@ -6546,6 +6667,9 @@ pub(crate) fn generate_dense_backend(
             /// The residual stream, when `input` holds ids and cannot serve as one.
             resid: Option<Box<dyn Buffer>>,
             pos: Box<dyn Buffer>,
+            /// Vision mrope turns: the chunk's `[m, 4]` (T,H,W,E) plane rows — `None` on every
+            /// text-only turn (the graph then declares no pos4 Input either).
+            pos4: Option<Box<dyn Buffer>>,
             /// gemma4-E2B per-layer token rows.
             ipl: Option<Box<dyn Buffer>>,
             /// Qwen3.8 caller-owned four-stream residual for this batch.
@@ -6590,11 +6714,21 @@ pub(crate) fn generate_dense_backend(
                         };
                         ensure_kv_depth!(cend);
                         let pf_m = cend - cstart;
+                        // Vision mrope turn: does this chunk overlap any image span? An image
+                        // token's embedding is the caller's ViT row, NOT the token-embedding
+                        // table — so a chunk with image rows must take the HOST-embed path even
+                        // on a gpu_embed backend (the in-graph gather would emit table rows).
+                        let chunk_has_image = mm.is_some_and(|m| {
+                            m.spans
+                                .iter()
+                                .any(|s| s.start < cend && s.start + s.n_tokens > cstart)
+                        });
+                        let gpu_embed_chunk = gpu_embed && !chunk_has_image;
                         if live[ci].is_none() {
                             // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                             // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
                             // the old f32 rows upload (4*n_embd*pf_m bytes).
-                            let input = if gpu_embed {
+                            let input = if gpu_embed_chunk {
                                 let ids: Vec<i32> =
                                     prompt[cstart..cend].iter().map(|&t| t as i32).collect();
                                 let b = be
@@ -6614,6 +6748,26 @@ pub(crate) fn generate_dense_backend(
                                             .map(|&x| x * embed_scale),
                                     );
                                 }
+                                // Vision mrope turn: overwrite every overlapping image span's
+                                // rows with the caller's ViT embeddings — the SAME `embed_scale`
+                                // the table rows just took, so the spliced rows land in the
+                                // residual stream at the reference's scale.
+                                if let Some(m) = mm {
+                                    for span in &m.spans {
+                                        let lo = span.start.max(cstart);
+                                        let hi = (span.start + span.n_tokens).min(cend);
+                                        for t in lo..hi {
+                                            let dst = (t - cstart) * ne;
+                                            let src = (t - span.start) * ne;
+                                            for (d, &x) in pf_hidden[dst..dst + ne]
+                                                .iter_mut()
+                                                .zip(&span.embeds[src..src + ne])
+                                            {
+                                                *d = x * embed_scale;
+                                            }
+                                        }
+                                    }
+                                }
                                 let b = be
                                     .alloc(pf_m * ne * 4, BufferUsage::Staging)
                                     .map_err(|e| anyhow!("{e}"))?;
@@ -6629,7 +6783,7 @@ pub(crate) fn generate_dense_backend(
                             // binds — the interpreters' write-back is a length-checked `copy_from_slice`
                             // against the declared numel, and the host-embed path has always bound this
                             // shape, so nothing writes past it.
-                            let resid = if gpu_embed {
+                            let resid = if gpu_embed_chunk {
                                 Some(
                                     be.alloc(pf_m * ne * 4, BufferUsage::Activations)
                                         .map_err(|e| anyhow!("{e}"))?,
@@ -6644,6 +6798,23 @@ pub(crate) fn generate_dense_backend(
                                 .map_err(|e| anyhow!("{e}"))?;
                             be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
                                 .map_err(|e| anyhow!("{e}"))?;
+                            // Vision mrope turn: the chunk's [m, 4] (T,H,W,E) plane rows,
+                            // uploaded right beside `pos` (a [m] slice of the caller's whole-prompt
+                            // `prompt_pos4`, indexed absolutely — cstart is a prompt offset).
+                            let pos4 = match mm {
+                                Some(m) => {
+                                    let b = be
+                                        .alloc(pf_m * 4 * 4, BufferUsage::Staging)
+                                        .map_err(|e| anyhow!("{e}"))?;
+                                    be.upload(
+                                        b.as_ref(),
+                                        bytemuck::cast_slice(&m.prompt_pos4[cstart * 4..cend * 4]),
+                                    )
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                    Some(b)
+                                }
+                                None => None,
+                            };
                             // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
                             // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
                             // prologue).
@@ -6694,6 +6865,7 @@ pub(crate) fn generate_dense_backend(
                                 input,
                                 resid,
                                 pos,
+                                pos4,
                                 ipl,
                                 qwen_wide,
                                 ple_embd,
@@ -6732,7 +6904,9 @@ pub(crate) fn generate_dense_backend(
                             false,
                             // The token-id input + in-graph gather belong to the span that STARTS the
                             // stack; a later span reads the residual stream that one left behind.
-                            gpu_embed && span.start == 0,
+                            // (gpu_embed_chunk, not gpu_embed: an image-overlapping chunk took the
+                            // host-embed path — the gather must not be emitted there either.)
+                            gpu_embed_chunk && span.start == 0,
                             false, // mtp_verify: ordinary chunked prefill, not MTP verify
                             Some(span.clone()),
                         );
@@ -6748,6 +6922,9 @@ pub(crate) fn generate_dense_backend(
                             ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
                         );
                         pf_b.bind(pf_h.positions, ch.pos.as_ref());
+                        if let (Some(p4), Some(pb)) = (pf_h.pos4, &ch.pos4) {
+                            pf_b.bind(p4, pb.as_ref());
+                        }
                         if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
                             pf_b.bind(pid, ib.as_ref());
                         }
@@ -6879,6 +7056,11 @@ pub(crate) fn generate_dense_backend(
         // Qwen3.8 is intentionally two submissions in v1: layer 0 overlaps the host PLE gather,
         // then layer 1..end consumes its result. A one-plan replay cannot represent that handoff.
         && !c.qwen4exp
+        // Vision mrope turns: the full-attention rope is `Op::QkNormMrope`, which has no
+        // record-once dyn twin (the adapter's `decode_eligible` rejects it too) — and its per-token
+        // plane row must be re-uploaded per step anyway. Keep the mirror strict: a replayed tape
+        // would bake rope pos 0 AND collapse the (T,H,W,E) planes onto it.
+        && mm.is_none()
         && (qk_norm || stable.rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
@@ -6916,6 +7098,9 @@ pub(crate) fn generate_dense_backend(
             hidden_buf.as_ref(),
         );
         b.bind(h.positions, pos_buf.as_ref());
+        if let (Some(p4), Some(pb)) = (h.pos4, &pos4_buf) {
+            b.bind(p4, pb.as_ref());
+        }
         if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
             b.bind(pid, ib.as_ref());
         }
@@ -7096,30 +7281,67 @@ pub(crate) fn generate_dense_backend(
         }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
+        // Vision mrope turn: is this token inside an image span? If so the token embedding is
+        // REPLACED by the ViT row (the per-token loop is the ONLY prefill path for expert dtypes
+        // outside `moe_batched_ok` — the batched splice never runs there).
+        let in_image = mm.and_then(|m| {
+            m.spans.iter().find_map(|s| {
+                (pos >= s.start && pos < s.start + s.n_tokens)
+                    .then(|| (s.embeds.clone(), (pos - s.start) * ne))
+            })
+        });
+        let gpu_embed_tok = gpu_embed && in_image.is_none();
         // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
         // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
         // selection gather (`hash_ids`), which needs it independently of how the embedding was
         // produced. Not a round trip — this is the id the host already fed this step.
-        if gpu_embed || hash_ids {
+        if gpu_embed_tok || hash_ids {
             be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
                 .map_err(|e| anyhow!("{e}"))?;
         }
-        if !gpu_embed {
-            // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
-            // table slice is already the row to upload — hand it straight to the backend rather
-            // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
-            if embed_scale == 1.0 {
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
+        if !gpu_embed_tok {
+            if let Some((embeds, off)) = in_image {
+                // ViT row for this image token (scaled exactly like the host token-embed path).
+                let row: Vec<f32> = embeds[off..off + ne]
+                    .iter()
+                    .map(|&x| x * embed_scale)
+                    .collect();
+                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&row))
                     .map_err(|e| anyhow!("{e}"))?;
             } else {
-                let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
-                    .map_err(|e| anyhow!("{e}"))?;
+                // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
+                // table slice is already the row to upload — hand it straight to the backend rather
+                // than allocating a throwaway `Vec<f32>` per token to copy it.
+                let row = &token_embd.get()?[tok * ne..tok * ne + ne];
+                if embed_scale == 1.0 {
+                    be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
+                        .map_err(|e| anyhow!("{e}"))?;
+                } else {
+                    let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
+                    be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
             }
         }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
+        // Vision mrope turn: upload the 4-plane row the decode graph's QkNormMrope reads. A
+        // prompt-feed step takes the token's own `prompt_pos4` row; a generated token i ropes at
+        // `decode_base + i` on the three text planes (E is zero-width on every sectioned model).
+        // NOTE the KV row is NOT this value — `WriteKv`'s baked `pos` stays the cached length
+        // (they legitimately diverge once an image has consumed KV rows without linear positions).
+        if let (Some(m), Some(pb)) = (mm, &pos4_buf) {
+            let row: [i32; 4] = if pos < prompt.len() {
+                m.prompt_pos4[pos * 4..pos * 4 + 4]
+                    .try_into()
+                    .expect("prompt_pos4 has a [plen,4] row per prompt token")
+            } else {
+                let rp = m.decode_base + (pos - prompt.len()) as i32;
+                [rp, rp, rp, 0]
+            };
+            be.upload(pb.as_ref(), bytemuck::cast_slice(&row))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
 
         // gemma4 E2B host ipl path: this token's per-layer TOKEN embedding row (gather+dequant
         // only). `ipl_buf` is None under `gpu_ple` — the graph gathers on-device.
@@ -7201,6 +7423,9 @@ pub(crate) fn generate_dense_backend(
             // A partial span exposes hidden as an Input even when EmbedGather writes it.
             b0.bind(h0.hidden, hidden_buf.as_ref());
             b0.bind(h0.positions, pos_buf.as_ref());
+            if let (Some(p4), Some(pb)) = (h0.pos4, &pos4_buf) {
+                b0.bind(p4, pb.as_ref());
+            }
             bind_layer_io(
                 &mut b0,
                 &h0,
@@ -7255,6 +7480,9 @@ pub(crate) fn generate_dense_backend(
             let mut b1 = Bindings::new();
             b1.bind(h1.hidden, hidden_buf.as_ref());
             b1.bind(h1.positions, pos_buf.as_ref());
+            if let (Some(p4), Some(pb)) = (h1.pos4, &pos4_buf) {
+                b1.bind(p4, pb.as_ref());
+            }
             bind_layer_io(
                 &mut b1,
                 &h1,
@@ -7291,7 +7519,16 @@ pub(crate) fn generate_dense_backend(
             exec_el = exec0 + t_exec1.elapsed();
         } else {
             let (g, h) = build(
-                1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
+                1,
+                pos,
+                1,
+                false,
+                None,
+                false,
+                want_h,
+                gpu_argmax,
+                gpu_sample,
+                gpu_embed_tok,
                 false, // mtp_verify: ordinary per-token decode, not MTP verify
                 None,  // span: the whole model in one graph
             );
@@ -7300,11 +7537,14 @@ pub(crate) fn generate_dense_backend(
             bind_step_input(
                 &mut b,
                 &h,
-                gpu_embed,
+                gpu_embed_tok,
                 dec_ids_buf.as_ref(),
                 hidden_buf.as_ref(),
             );
             b.bind(h.positions, pos_buf.as_ref());
+            if let (Some(p4), Some(pb)) = (h.pos4, &pos4_buf) {
+                b.bind(p4, pb.as_ref());
+            }
             if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
                 b.bind(pid, ib.as_ref());
             }

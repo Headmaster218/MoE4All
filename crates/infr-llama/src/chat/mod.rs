@@ -122,6 +122,23 @@ pub trait ChatModel {
         self.generate_constrained(prompt, max_new, constraint, req, on_piece)
     }
 
+    /// Vision turn (stage V5): like [`generate`](Self::generate), but `prompt` was rendered for a
+    /// request that carries images (`infr_chat::ChatMessage::images`), so the prompt's
+    /// `<|image_pad|>` markers must be expanded into per-token runs spliced with ViT embeddings
+    /// (`seam::MropePlan`) before prefill. `images` are the request's payloads in message order —
+    /// `data:` URIs or bare base64. Default: bail — a backend without vision support says so
+    /// instead of silently ignoring the images, and the caller surfaces the error to the request.
+    fn generate_mm(
+        &mut self,
+        _prompt: &str,
+        _images: &[String],
+        _max_new: usize,
+        _req: Option<&crate::sampling::RequestCtx>,
+        _on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        anyhow::bail!("this model/backend has no vision support")
+    }
+
     /// Optional REPL status (e.g. dense returns `ctx N/MAX`); `None` for stateless backends.
     fn status(&self) -> Option<String> {
         None
