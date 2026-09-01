@@ -389,6 +389,11 @@ enum Cmd {
         /// Optional GGUF embedding model hosted natively at /v1/embeddings.
         #[arg(long, value_name = "MODEL")]
         embedding_model: Option<String>,
+        /// Seconds an idle native embedding model remains in unified VRAM. Its first request loads
+        /// weights from GGUF/SSD; later requests reuse them until this deadline. 0 keeps them
+        /// resident until server shutdown. Applies only to the shared Vulkan embedding backend.
+        #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+        embedding_idle_timeout: u64,
         /// Use a llama-server compatibility worker instead of native embedding execution.
         #[arg(long, value_name = "PATH")]
         embedding_runner: Option<PathBuf>,
@@ -805,6 +810,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         Cmd::Serve {
             model,
             embedding_model,
+            embedding_idle_timeout,
             embedding_runner,
             addr,
             parallel,
@@ -812,6 +818,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         } => cmd_serve(
             &model,
             embedding_model.as_deref(),
+            embedding_idle_timeout,
             embedding_runner.as_deref(),
             &addr,
             parallel,
@@ -4370,6 +4377,7 @@ fn apply_model_sampling_defaults(
 fn cmd_serve(
     model: &str,
     embedding_model: Option<&str>,
+    embedding_idle_timeout: u64,
     embedding_runner: Option<&Path>,
     addr: &str,
     parallel: Option<usize>,
@@ -4427,7 +4435,7 @@ fn cmd_serve(
                     load_embedding_generator(model, embedding_runner, 1, cfg)
                 } else {
                     let backend = engine.fork_embedding_backend()?;
-                    load_native_embedding_generator_on(model, cfg, backend)
+                    load_native_embedding_generator_on(model, cfg, backend, embedding_idle_timeout)
                 }
             })
             .transpose()?;
@@ -4597,6 +4605,7 @@ fn load_native_embedding_generator_on(
     model: &str,
     cfg: &Arc<Config>,
     backend: infr_vulkan::VulkanBackend,
+    idle_timeout_secs: u64,
 ) -> anyhow::Result<(String, Arc<dyn infr_server::EmbeddingGenerator>)> {
     let (gguf, _) = resolve(model, cfg)?;
     let model_id = gguf
@@ -4604,13 +4613,19 @@ fn load_native_embedding_generator_on(
         .and_then(|s| s.to_str())
         .unwrap_or("embedding-model")
         .to_owned();
-    let model: Box<dyn infr_embedding::EmbeddingEngine> =
-        Box::new(infr_embedding::NativeEmbeddingEngine::load_vulkan_with_backend(&gguf, backend)?);
+    let model: Box<dyn infr_embedding::EmbeddingEngine> = Box::new(
+        infr_embedding::NativeEmbeddingEngine::load_vulkan_with_backend(
+            &gguf,
+            backend,
+            std::time::Duration::from_secs(idle_timeout_secs),
+        )?,
+    );
     let snapshot = model.resource_snapshot();
     tracing::info!(
         resource = %snapshot.id,
         bytes = snapshot.resident_bytes,
         tier = ?snapshot.tier,
+        idle_timeout_secs,
         "embedding resource registered in unified VRAM"
     );
     Ok((model_id, Arc::new(EmbeddingGeneratorAdapter { model })))
@@ -5242,6 +5257,49 @@ mod tests {
         assert_eq!(synthetic_depth, Some(100000));
         assert_eq!(n_prompt, 0);
         assert_eq!(n_gen, 128);
+    }
+
+    #[test]
+    fn serve_parses_embedding_idle_timeout() {
+        let cli = Cli::try_parse_from([
+            "infr",
+            "serve",
+            "--embedding-model",
+            "embed.gguf",
+            "--embedding-idle-timeout",
+            "45",
+            "chat.gguf",
+        ])
+        .unwrap();
+        let Some(Cmd::Serve {
+            model,
+            embedding_model,
+            embedding_idle_timeout,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(model, "chat.gguf");
+        assert_eq!(embedding_model.as_deref(), Some("embed.gguf"));
+        assert_eq!(embedding_idle_timeout, 45);
+
+        let default = Cli::try_parse_from([
+            "infr",
+            "serve",
+            "--embedding-model",
+            "embed.gguf",
+            "chat.gguf",
+        ])
+        .unwrap();
+        let Some(Cmd::Serve {
+            embedding_idle_timeout,
+            ..
+        }) = default.cmd
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(embedding_idle_timeout, 300);
     }
 
     fn no_sampling_opts() -> SamplingOpts {

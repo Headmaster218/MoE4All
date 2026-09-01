@@ -13,7 +13,12 @@ use infr_gguf::Gguf;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug)]
@@ -129,6 +134,135 @@ struct NativePlan {
     output_buffer: Box<dyn Buffer>,
 }
 
+type WeightBuffers = Vec<Box<dyn Buffer>>;
+
+struct WeightResidency {
+    buffers: Option<WeightBuffers>,
+    idle_deadline: Option<Instant>,
+}
+
+impl WeightResidency {
+    fn arm_idle_deadline(&mut self, timeout: Duration, now: Instant) {
+        self.idle_deadline = if timeout.is_zero() {
+            None
+        } else {
+            // An absurd command-line value should mean "effectively never", not panic while
+            // computing an Instant outside the platform's representable range.
+            now.checked_add(timeout)
+        };
+    }
+
+    fn idle_deadline_reached(&self, now: Instant) -> bool {
+        self.idle_deadline.is_some_and(|deadline| deadline <= now)
+    }
+}
+
+struct WeightCache {
+    residency: Mutex<WeightResidency>,
+    changed: Condvar,
+    stop: AtomicBool,
+}
+
+struct IdleWeightReaper {
+    cache: Arc<WeightCache>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl IdleWeightReaper {
+    fn spawn(
+        cache: Arc<WeightCache>,
+        plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
+        resource: Arc<ResourceTracker>,
+        unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
+        weight_bytes: u64,
+    ) -> Result<Self> {
+        let worker_cache = Arc::clone(&cache);
+        let worker = thread::Builder::new()
+            .name("infr-embedding-idle".to_owned())
+            .spawn(move || {
+                let mut residency = worker_cache
+                    .residency
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                loop {
+                    if worker_cache.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(deadline) = residency.idle_deadline else {
+                        residency = worker_cache
+                            .changed
+                            .wait(residency)
+                            .unwrap_or_else(|error| error.into_inner());
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if !residency.idle_deadline_reached(now) {
+                        let (next, _) = worker_cache
+                            .changed
+                            .wait_timeout(residency, deadline.saturating_duration_since(now))
+                            .unwrap_or_else(|error| error.into_inner());
+                        residency = next;
+                        continue;
+                    }
+
+                    residency.idle_deadline = None;
+                    if residency.buffers.is_none() {
+                        continue;
+                    }
+
+                    // The request path takes these locks in the same order and holds the weight
+                    // lock through synchronous execution. No command can still reference these
+                    // buffers once the reaper reaches this point.
+                    let mut cached_plans = plans.lock().unwrap_or_else(|error| error.into_inner());
+                    let old_plans = std::mem::take(&mut *cached_plans);
+                    let old_weights = residency.buffers.take();
+                    drop(old_plans);
+                    drop(old_weights);
+                    resource.set_residency(MemoryTier::Ssd, 0);
+                    if let Some(pool) = &unified_pool {
+                        use infr_vulkan::unified::UnifiedVramClass;
+                        let stats = pool.stats();
+                        tracing::info!(
+                            arena_bytes = stats.capacity_bytes,
+                            expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                            llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
+                            embedding_weight_bytes =
+                                stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
+                            embedding_runtime_bytes =
+                                stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
+                            free_bytes = stats.free_bytes,
+                            largest_free_bytes = stats.largest_free_bytes,
+                            "idle embedding residency released from unified VRAM"
+                        );
+                    }
+                    tracing::info!(
+                        weights_mib = weight_bytes as f64 / 1048576.0,
+                        "idle embedding weights returned to SSD backing"
+                    );
+                }
+            })
+            .context("spawn embedding idle-reaper thread")?;
+        Ok(Self {
+            cache,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop_and_join(&mut self) {
+        self.cache.stop.store(true, Ordering::Release);
+        self.cache.changed.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for IdleWeightReaper {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 /// Nomic-BERT embedding inference executed directly by INFR's CPU or Vulkan graph backend.
 pub struct NativeEmbeddingEngine {
     model_path: PathBuf,
@@ -136,16 +270,17 @@ pub struct NativeEmbeddingEngine {
     tokenizer: BertWordPiece,
     backend: Box<dyn Backend>,
     specs: Vec<WeightSpec>,
-    weights: Mutex<Option<Vec<Box<dyn Buffer>>>>,
+    weights: Arc<WeightCache>,
     weight_bytes: u64,
     /// A backend fork sharing the LLM elastic arena loads weights only for an active request and
-    /// drops them after the final GPU fence. Standalone CPU/Vulkan embedding keeps the established
-    /// eager-resident behavior because it has no Expert cache to return capacity to.
-    evict_after_request: bool,
-    unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
+    /// retains them only until the configured idle deadline. Standalone CPU/Vulkan embedding keeps
+    /// the established eager-resident behavior because it has no Expert cache to return capacity.
+    dynamic_weights: bool,
+    idle_timeout: Duration,
     layout: WeightLayout,
-    plans: Mutex<HashMap<usize, NativePlan>>,
+    plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
     resource: Arc<ResourceTracker>,
+    _idle_reaper: Option<IdleWeightReaper>,
 }
 
 impl NativeEmbeddingEngine {
@@ -155,6 +290,7 @@ impl NativeEmbeddingEngine {
             Box::new(infr_cpu::CpuBackend::new_with(engine_cfg)),
             MemoryTier::Ram,
             false,
+            Duration::ZERO,
             None,
         )
     }
@@ -162,7 +298,14 @@ impl NativeEmbeddingEngine {
     pub fn load_vulkan(path: &Path, engine_cfg: Arc<infr_core::config::Config>) -> Result<Self> {
         let backend = infr_vulkan::VulkanBackend::new_with(engine_cfg)
             .map_err(|error| anyhow!("initialize Vulkan embedding backend: {error}"))?;
-        Self::load(path, Box::new(backend), MemoryTier::Vram, false, None)
+        Self::load(
+            path,
+            Box::new(backend),
+            MemoryTier::Vram,
+            false,
+            Duration::ZERO,
+            None,
+        )
     }
 
     /// Load on a Vulkan client derived from an already-warm LLM backend. The client shares the
@@ -170,6 +313,7 @@ impl NativeEmbeddingEngine {
     pub fn load_vulkan_with_backend(
         path: &Path,
         backend: infr_vulkan::VulkanBackend,
+        idle_timeout: Duration,
     ) -> Result<Self> {
         let unified_pool = backend.unified_vram();
         Self::load(
@@ -177,6 +321,7 @@ impl NativeEmbeddingEngine {
             Box::new(backend),
             MemoryTier::Vram,
             true,
+            idle_timeout,
             unified_pool,
         )
     }
@@ -185,7 +330,8 @@ impl NativeEmbeddingEngine {
         path: &Path,
         backend: Box<dyn Backend>,
         tier: MemoryTier,
-        evict_after_request: bool,
+        dynamic_weights: bool,
+        idle_timeout: Duration,
         unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
     ) -> Result<Self> {
         if !path.is_file() {
@@ -195,7 +341,7 @@ impl NativeEmbeddingEngine {
         let cfg = NomicConfig::from_gguf(&gguf)?;
         let tokenizer = BertWordPiece::from_metadata(gguf.metadata(), cfg.public.max_context)?;
         let (specs, layout, weight_bytes) = build_weight_catalog(&gguf, &cfg)?;
-        let weights = if evict_after_request {
+        let weights = if dynamic_weights {
             None
         } else {
             Some(load_weight_buffers(&gguf, &specs, backend.as_ref())?)
@@ -218,29 +364,52 @@ impl NativeEmbeddingEngine {
             tier = ?tier,
             weights_mib = weight_bytes as f64 / 1048576.0,
             resident_mib = resident_bytes as f64 / 1048576.0,
-            dynamic_weights = evict_after_request,
+            dynamic_weights,
+            idle_timeout_secs = idle_timeout.as_secs(),
             "native embedding model ready"
         );
+        let resource = Arc::new(ResourceTracker::new(
+            format!("embedding:{model_id}"),
+            ResourceKind::EmbeddingWeights,
+            weight_bytes,
+            resident_bytes,
+            resident_tier,
+            weight_bytes,
+        ));
+        let weights = Arc::new(WeightCache {
+            residency: Mutex::new(WeightResidency {
+                buffers: weights,
+                idle_deadline: None,
+            }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let plans = Arc::new(Mutex::new(HashMap::new()));
+        let idle_reaper = if dynamic_weights && !idle_timeout.is_zero() {
+            Some(IdleWeightReaper::spawn(
+                Arc::clone(&weights),
+                Arc::clone(&plans),
+                Arc::clone(&resource),
+                unified_pool.clone(),
+                weight_bytes,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             model_path: path.to_owned(),
             cfg,
             tokenizer,
             backend,
             specs,
-            weights: Mutex::new(weights),
+            weights,
             weight_bytes,
-            evict_after_request,
-            unified_pool,
+            dynamic_weights,
+            idle_timeout,
             layout,
-            plans: Mutex::new(HashMap::new()),
-            resource: Arc::new(ResourceTracker::new(
-                format!("embedding:{model_id}"),
-                ResourceKind::EmbeddingWeights,
-                weight_bytes,
-                resident_bytes,
-                resident_tier,
-                weight_bytes,
-            )),
+            plans,
+            resource,
+            _idle_reaper: idle_reaper,
         })
     }
 
@@ -267,12 +436,13 @@ impl NativeEmbeddingEngine {
         let _lease = self.resource.acquire();
         let mut weights = self
             .weights
+            .residency
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if weights.is_none() {
+        if weights.buffers.is_none() {
             let gguf = Gguf::open(&self.model_path).map_err(|error| anyhow!(error.to_string()))?;
             let loaded = load_weight_buffers(&gguf, &self.specs, self.backend.as_ref())?;
-            *weights = Some(loaded);
+            weights.buffers = Some(loaded);
             self.resource
                 .set_residency(MemoryTier::Vram, self.weight_bytes);
             tracing::info!(
@@ -281,7 +451,7 @@ impl NativeEmbeddingEngine {
             );
         }
         let result = (|| {
-            let resident = weights.as_ref().expect("weights loaded above");
+            let resident = weights.buffers.as_ref().expect("weights loaded above");
             let mut plans = self.plans.lock().unwrap_or_else(|error| error.into_inner());
             let mut embeddings = Vec::with_capacity(encoded.len());
             for ids in encoded {
@@ -298,46 +468,9 @@ impl NativeEmbeddingEngine {
                 prompt_tokens,
             })
         })();
-        if self.evict_after_request {
-            if let Some(pool) = &self.unified_pool {
-                use infr_vulkan::unified::UnifiedVramClass;
-                let stats = pool.stats();
-                tracing::info!(
-                    arena_bytes = stats.capacity_bytes,
-                    expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
-                    llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
-                    embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
-                    embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
-                    free_bytes = stats.free_bytes,
-                    largest_free_bytes = stats.largest_free_bytes,
-                    "embedding request post-execution unified VRAM residency"
-                );
-            }
-            // `Backend::execute` and the output download are synchronous: no command can still
-            // reference the transient activation ranges (which have already dropped). Dropping the
-            // weight buffers returns their ranges to the unified pool; the length-specific plan
-            // itself retains only tiny host-visible input/readback buffers and can be reused. The
-            // next LLM pager entry restores every now-free exact Expert slot.
-            weights.take();
-            self.resource.set_residency(MemoryTier::Ssd, 0);
-            if let Some(pool) = &self.unified_pool {
-                use infr_vulkan::unified::UnifiedVramClass;
-                let stats = pool.stats();
-                tracing::info!(
-                    arena_bytes = stats.capacity_bytes,
-                    expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
-                    llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
-                    embedding_weight_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
-                    embedding_runtime_bytes = stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
-                    free_bytes = stats.free_bytes,
-                    largest_free_bytes = stats.largest_free_bytes,
-                    "embedding request released unified VRAM"
-                );
-            }
-            tracing::info!(
-                weights_mib = self.weight_bytes as f64 / 1048576.0,
-                "embedding weights released from unified VRAM"
-            );
+        if self.dynamic_weights {
+            weights.arm_idle_deadline(self.idle_timeout, Instant::now());
+            self.weights.changed.notify_one();
         }
         result
     }
@@ -634,6 +767,14 @@ impl NativeEmbeddingEngine {
     }
 }
 
+impl Drop for NativeEmbeddingEngine {
+    fn drop(&mut self) {
+        if let Some(reaper) = self._idle_reaper.as_mut() {
+            reaper.stop_and_join();
+        }
+    }
+}
+
 impl EmbeddingEngine for NativeEmbeddingEngine {
     fn config(&self) -> &EmbeddingConfig {
         NativeEmbeddingEngine::config(self)
@@ -792,6 +933,64 @@ fn load_weight_buffers(
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    #[test]
+    fn idle_weight_deadline_is_disabled_or_rearmed_from_latest_use() {
+        let start = Instant::now();
+        let mut residency = WeightResidency {
+            buffers: Some(Vec::new()),
+            idle_deadline: None,
+        };
+
+        residency.arm_idle_deadline(Duration::ZERO, start);
+        assert_eq!(residency.idle_deadline, None);
+
+        residency.arm_idle_deadline(Duration::from_secs(10), start);
+        assert!(!residency.idle_deadline_reached(start + Duration::from_secs(9)));
+        residency.arm_idle_deadline(Duration::from_secs(10), start + Duration::from_secs(9));
+        assert!(!residency.idle_deadline_reached(start + Duration::from_secs(10)));
+        assert!(residency.idle_deadline_reached(start + Duration::from_secs(19)));
+
+        // Must not panic even for an intentionally nonsensical CLI value.
+        residency.arm_idle_deadline(Duration::MAX, start);
+    }
+
+    #[test]
+    fn idle_reaper_releases_residency_after_deadline() {
+        let cache = Arc::new(WeightCache {
+            residency: Mutex::new(WeightResidency {
+                buffers: Some(Vec::new()),
+                idle_deadline: None,
+            }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let plans = Arc::new(Mutex::new(HashMap::new()));
+        let resource = Arc::new(ResourceTracker::new(
+            "embedding:test".to_owned(),
+            ResourceKind::EmbeddingWeights,
+            1,
+            1,
+            MemoryTier::Vram,
+            1,
+        ));
+        let mut reaper =
+            IdleWeightReaper::spawn(Arc::clone(&cache), plans, Arc::clone(&resource), None, 1)
+                .unwrap();
+        {
+            let mut residency = cache.residency.lock().unwrap();
+            residency.arm_idle_deadline(Duration::from_millis(10), Instant::now());
+            cache.changed.notify_one();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while resource.snapshot().resident_bytes != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(resource.snapshot().resident_bytes, 0);
+        assert!(cache.residency.lock().unwrap().buffers.is_none());
+        reaper.stop_and_join();
+    }
 
     #[derive(Deserialize)]
     struct Oracle {

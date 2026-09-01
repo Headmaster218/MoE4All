@@ -91,6 +91,10 @@ $wizardSource = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
 
 $modelPath = Join-Path $PackageRoot 'ci smoke model.gguf'
 [System.IO.File]::WriteAllBytes($modelPath, [byte[]]::new(0))
+$embeddingDirectory = Join-Path $PackageRoot 'ci embedding model'
+$embeddingPath = Join-Path $embeddingDirectory 'ci embed.gguf'
+New-Item -ItemType Directory -Path $embeddingDirectory -Force | Out-Null
+[System.IO.File]::WriteAllBytes($embeddingPath, [byte[]]::new(0))
 $dataDirectory = Join-Path $PackageRoot 'gui-data'
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 
@@ -99,7 +103,8 @@ function Invoke-WizardDryRun {
         [Parameter(Mandatory = $true)][string]$Mode,
         [Parameter(Mandatory = $true)][string]$ExpectedCommand,
         [string]$ModelSelection = '',
-        [switch]$PassModelArgument
+        [switch]$PassModelArgument,
+        [switch]$EnableEmbedding
     )
 
     $state = [ordered]@{
@@ -112,6 +117,9 @@ function Invoke-WizardDryRun {
         server_addr = '127.0.0.1:8080'
         server_parallel = '1'
         server_auth = $false
+        server_embedding = [bool]$EnableEmbedding
+        embedding_model = $(if ($EnableEmbedding) { $embeddingDirectory } else { '' })
+        embedding_idle_timeout = '17'
         bench_kind = 'decode'
         gen_tokens = '1'
         depth_mode = 'none'
@@ -177,14 +185,23 @@ function Invoke-WizardDryRun {
     if ($PassModelArgument -and $stdout -notmatch 'Model selected from launcher argument') {
         throw "Wizard $Mode did not accept the model passed by CMD/drag-and-drop.`n$stdout"
     }
+    if ($EnableEmbedding) {
+        if ($stdout -notmatch [regex]::Escape("--embedding-model '$embeddingPath'")) {
+            throw "Wizard $Mode did not resolve the embedding directory to its GGUF.`n$stdout"
+        }
+        if ($stdout -notmatch [regex]::Escape('--embedding-idle-timeout 17')) {
+            throw "Wizard $Mode did not preserve the embedding idle timeout.`n$stdout"
+        }
+    }
 }
 
 $quotedModelPath = '"' + $modelPath + '"'
 $powerShellDrop = "& '$modelPath'"
 Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -PassModelArgument
-Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop
+Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -EnableEmbedding
 Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection $quotedModelPath
 
 Remove-Item -LiteralPath $modelPath -Force
+Remove-Item -LiteralPath $embeddingDirectory -Recurse -Force
 Remove-Item -LiteralPath $dataDirectory -Recurse -Force
 Write-Host "Windows package smoke test passed: $PackageRoot"
