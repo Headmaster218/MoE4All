@@ -151,9 +151,9 @@ fn log_host_ram_request(
 /// what fixes it.
 ///
 /// An explicit `device.ram_budget` always wins in BOTH directions — it forces the arena on a model
-/// that would have fit and sets the process's total resident-RAM target. The current working set is
-/// subtracted before this arena is planned. Legacy `paging.dram` remains an exact-cache diagnostic
-/// override only.
+/// that would have fit and sets the process's total resident-RAM target. The current working set
+/// and a small allowance for process objects created after planning are subtracted before this
+/// arena is sized. Legacy `paging.dram` remains an exact-cache diagnostic override only.
 ///
 /// Returns `None` — not an error — when nothing seats, so every degraded case falls back to
 /// today's behaviour rather than failing the load.
@@ -716,10 +716,10 @@ pub(crate) fn generate_dense_vulkan_session(
 ///   f16 coopmat/shared-memory capabilities its Vulkan shader requires; other devices retain the
 ///   conservative non-flash reserve.
 ///   `n_head*rows*kv_pad*2`, kv_pad = kv_len rounded up to 256, i.e. `2*n_head*ctx_pad` per row at
-///   the final context. ONE live tile, not two: the pool key includes the byte size, so a deep
-///   prefill does allocate a fresh (larger) tile per chunk, but each chunk's `execute` drops its
-///   pool before the next one builds — and every layer of a chunk shares one kv_len, so one size
-///   is live at a time. Uniform-hd-128 models, plus capability-qualified hd256 models, ride the
+///   the final context. A phase's first mixed-geometry recording may need one buffer per distinct
+///   size because a smaller buffer already referenced by that command stream cannot be released
+///   when a later layer asks for more capacity. Once that execute drains, the adapter retains only
+///   the high-water tile. Uniform-hd-128 models, plus capability-qualified hd256 models, ride the
 ///   single-pass flash tier: no score tiles, only the (negligible) flash_pm/pl partials — term
 ///   skipped when no SWA layer remains.
 ///
@@ -843,9 +843,10 @@ pub(crate) fn dense_act_reserve_at(
 
 /// F16 expansion buffers held by Vulkan while a batched attention op reads a Q8_0 KV cache.
 ///
-/// The adapter pools these as `(tag, bytes)` under separate `kvdeq_k` and `kvdeq_v` tags. A model
-/// with one attention geometry therefore keeps one buffer per Q8 side; mixed layer geometries keep
-/// one per distinct byte size. Mirror that exact lifetime here instead of charging once per layer.
+/// The adapter uses separate `kvdeq_k` and `kvdeq_v` logical tags. A phase's first recording may
+/// hold one buffer per distinct byte size when a later layer grows a tag already referenced by the
+/// command stream; after that execute drains, only its high-water capacity remains. Mirror the
+/// cold-execute peak here instead of charging once per layer or once per historical depth.
 fn q8_prefill_scratch_bytes(
     cfg: &Config,
     want_ctx: usize,
@@ -5257,8 +5258,10 @@ mod seam_helper_tests {
                 Some((2 * GIB) as u64),
                 payload,
             ),
-            super::MoeHostBacking::Bounded { bytes: 48 * GIB },
-            "50 GiB is the total process target, leaving 48 GiB after its current working set"
+            super::MoeHostBacking::Bounded {
+                bytes: 48 * GIB - (512 << 20),
+            },
+            "the total target also covers persistent process objects created after planning"
         );
         assert_eq!(
             super::moe_host_backing(RamRequest::Auto, None, Some(0), payload),

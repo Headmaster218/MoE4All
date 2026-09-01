@@ -35,9 +35,12 @@ server must report a large `cached_tokens` prefix on turns two and three.
 - A profile only reduces real capacity. It cannot invent RAM or VRAM.
 - Startup always emits `TEST RESOURCE OVERRIDE ACTIVE`.
 
-The external monitor samples process working set/private bytes, Windows per-process dedicated and
-shared GPU memory, system available RAM, and page faults. It terminates only the verified test
-process if working set or dedicated GPU memory exceeds the profile's available capacity.
+The external monitor samples total and private process working sets, private bytes, Windows
+per-process dedicated and shared GPU memory, system available RAM, and page faults. The RAM limit
+is enforced against the private working set: file-backed GGUF pages remain visible in the total
+working-set diagnostic, but are reclaimable on the constrained machine and therefore are not a
+process-RAM budget violation. The monitor terminates only the verified test process if private
+resident RAM or dedicated GPU memory exceeds the profile's available capacity.
 
 ## Setup and use
 

@@ -107,6 +107,7 @@ $sampleStream = [IO.FileStream]::new(
 )
 $writer = [IO.StreamWriter]::new($sampleStream, $utf8)
 $peakWorkingSet = [uint64]0
+$peakPrivateWorkingSet = [uint64]0
 $peakPrivate = [uint64]0
 $peakDedicated = [uint64]0
 $peakShared = [uint64]0
@@ -116,6 +117,7 @@ $lastSlow = [DateTime]::MinValue
 $gpu = $null
 $systemAvailable = $null
 $pageFaultsPerSec = $null
+$privateWorkingSet = $null
 $violationData = $null
 
 try {
@@ -157,9 +159,16 @@ try {
                 else {
                     [uint64]$perf.PageFaultsPersec
                 }
+                $privateWorkingSet = if ($null -eq $perf) {
+                    $null
+                }
+                else {
+                    [uint64]$perf.WorkingSetPrivate
+                }
             }
             catch {
                 $pageFaultsPerSec = $null
+                $privateWorkingSet = $null
             }
             $lastSlow = $now
         }
@@ -169,6 +178,9 @@ try {
         $dedicated = if ($null -eq $gpu) { $null } else { [uint64]$gpu.Dedicated }
         $shared = if ($null -eq $gpu) { $null } else { [uint64]$gpu.Shared }
         $peakWorkingSet = [math]::Max($peakWorkingSet, $workingSet)
+        if ($null -ne $privateWorkingSet) {
+            $peakPrivateWorkingSet = [math]::Max($peakPrivateWorkingSet, $privateWorkingSet)
+        }
         $peakPrivate = [math]::Max($peakPrivate, $privateBytes)
         if ($null -ne $dedicated) {
             $peakDedicated = [math]::Max($peakDedicated, $dedicated)
@@ -180,6 +192,7 @@ try {
         $sample = [ordered]@{
             timestamp_utc = $now.ToString('o')
             working_set_bytes = $workingSet
+            private_working_set_bytes = $privateWorkingSet
             private_bytes = $privateBytes
             gpu_dedicated_bytes = $dedicated
             gpu_shared_bytes = $shared
@@ -191,8 +204,22 @@ try {
         $sampleCount++
 
         $reason = $null
-        if ($workingSet -gt $ramLimit) {
-            $reason = "working set exceeded simulated available RAM"
+        # File-backed GGUF pages in the total working set are cold/reclaimable on the constrained
+        # machine we emulate. Enforce the process-RAM budget against private resident pages; retain
+        # total working set as a diagnostic. Fall back to total only when PerfProc is unavailable.
+        $residentForLimit = if ($null -ne $privateWorkingSet) {
+            [uint64]$privateWorkingSet
+        }
+        else {
+            $workingSet
+        }
+        if ($residentForLimit -gt $ramLimit) {
+            $reason = if ($null -ne $privateWorkingSet) {
+                "private working set exceeded simulated available RAM"
+            }
+            else {
+                "working set exceeded simulated available RAM (private counter unavailable)"
+            }
         }
         elseif ($null -ne $dedicated -and $dedicated -gt $vramLimit) {
             $reason = "dedicated GPU memory exceeded simulated available VRAM"
@@ -202,6 +229,7 @@ try {
                 reason = $reason
                 timestamp_utc = $now.ToString('o')
                 working_set_bytes = $workingSet
+                private_working_set_bytes = $privateWorkingSet
                 ram_limit_bytes = $ramLimit
                 gpu_dedicated_bytes = $dedicated
                 vram_limit_bytes = $vramLimit
@@ -226,6 +254,7 @@ finally {
         samples = $sampleCount
         gpu_counter_available = $gpuCounterSeen
         peak_working_set_bytes = $peakWorkingSet
+        peak_private_working_set_bytes = $peakPrivateWorkingSet
         peak_private_bytes = $peakPrivate
         peak_gpu_dedicated_bytes = $peakDedicated
         peak_gpu_shared_bytes = $peakShared

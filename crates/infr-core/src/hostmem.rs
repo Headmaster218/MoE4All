@@ -283,10 +283,19 @@ pub fn auto_cache_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
 ///
 /// `resident` is sampled immediately before the arena is planned. It includes existing model
 /// mappings and earlier arenas, so repeated model/session loads share one process-wide ceiling.
+/// Planning happens before pager registrations, initial KV segments and the server runtime are
+/// fully built, so reserve their small persistent tail rather than handing literally every
+/// unoccupied byte to the cache. This is accounting for not-yet-created process memory, not the
+/// automatic policy's multi-GiB safety headroom.
 /// Where the platform probe fails, zero preserves the historical interpretation as a best-effort
 /// fallback; Windows and Linux have live probes and therefore enforce the total-budget meaning.
+const TOTAL_BUDGET_FUTURE_RESERVE: u64 = 512 << 20;
+
 pub fn cache_bytes_for_total_budget(total: u64, resident: Option<u64>, pageable: u64) -> u64 {
-    total.saturating_sub(resident.unwrap_or(0)).min(pageable)
+    total
+        .saturating_sub(resident.unwrap_or(0))
+        .saturating_sub(TOTAL_BUDGET_FUTURE_RESERVE)
+        .min(pageable)
 }
 
 /// What a caller should do about a host weight arena.
@@ -590,6 +599,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn total_budget_keeps_room_for_post_plan_process_objects() {
+        assert_eq!(
+            cache_bytes_for_total_budget(22 * GIB, Some(2 * GIB), u64::MAX),
+            20 * GIB - TOTAL_BUDGET_FUTURE_RESERVE
+        );
+        assert_eq!(
+            cache_bytes_for_total_budget(
+                2 * GIB + TOTAL_BUDGET_FUTURE_RESERVE - 1,
+                Some(2 * GIB),
+                u64::MAX,
+            ),
+            0,
+            "a tiny remainder must saturate instead of escaping the total-process target"
+        );
+    }
+
     /// **The flags must keep working.** A machine big enough to hold the model resident is exactly
     /// the machine streaming has to be tested on, so an explicit budget wins over every automatic
     /// rung — including the fits-in-RAM test, the no-probe case and unified memory.
@@ -622,8 +648,8 @@ mod tests {
         let forced = RamRequest::TotalProcessBudget(50 * GIB);
         assert_eq!(
             streaming_arena_plan(forced, Some(48 * GIB), Some(2 * GIB), false, 80 * GIB),
-            ArenaPlan::Take(48 * GIB),
-            "50 GiB is the process target, so its existing 2 GiB leaves 48 GiB for cache"
+            ArenaPlan::Take(48 * GIB - TOTAL_BUDGET_FUTURE_RESERVE),
+            "the total-process target must also cover objects created after cache planning"
         );
         assert_eq!(
             streaming_arena_plan(forced, Some(48 * GIB), Some(50 * GIB), false, 80 * GIB),

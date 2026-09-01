@@ -974,8 +974,8 @@ function Write-MatrixReport {
     $lines.Add('')
     $lines.Add("Generated: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss zzz'))")
     $lines.Add('')
-    $lines.Add('| Case | Model | Profile | Mode | Final depth | Peak RAM GiB | Peak VRAM GiB | Result |')
-    $lines.Add('|---|---|---|---|---:|---:|---:|---|')
+    $lines.Add('| Case | Model | Profile | Mode | Final depth | Peak private RAM GiB | Peak total WS GiB | Peak VRAM GiB | Result |')
+    $lines.Add('|---|---|---|---|---:|---:|---:|---:|---|')
     foreach ($result in $Results) {
         $turnProperty = $result.PSObject.Properties['turns']
         $finalDepth = if ($null -ne $turnProperty -and @($turnProperty.Value).Count -gt 0) {
@@ -986,6 +986,18 @@ function Write-MatrixReport {
             '-'
         }
         $peakRam = if ($null -ne $result.resources) {
+            $privateWs = $result.resources.PSObject.Properties['peak_private_working_set_bytes']
+            if ($null -ne $privateWs) {
+                Format-Gib ([uint64]$privateWs.Value)
+            }
+            else {
+                Format-Gib ([uint64]$result.resources.peak_working_set_bytes)
+            }
+        }
+        else {
+            '-'
+        }
+        $peakTotalWs = if ($null -ne $result.resources) {
             Format-Gib ([uint64]$result.resources.peak_working_set_bytes)
         }
         else {
@@ -998,7 +1010,7 @@ function Write-MatrixReport {
         else {
             '-'
         }
-        $lines.Add("| $($result.id) | $($result.model) | $($result.profile) | $($result.mode) | $finalDepth | $peakRam | $peakVram | $($result.status) |")
+        $lines.Add("| $($result.id) | $($result.model) | $($result.profile) | $($result.mode) | $finalDepth | $peakRam | $peakTotalWs | $peakVram | $($result.status) |")
     }
     $lines.Add('')
     $lines.Add('Each case keeps its detailed requests, responses, logs, KV growth events, and resource samples in its own directory.')
