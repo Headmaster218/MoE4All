@@ -372,16 +372,24 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
          remains in `cli/main.rs` is that clap attribute, not a `std::env::var` read.",
     ),
     (
-        "INFR_MTP_N_MAX",
-        "MTP tuning override (`mtp::effective_n_max`): max candidates drafted per speculative cycle \
-         (llama.cpp's `--spec-draft-n-max`). Backend-private A/B knob for the parked MTP path, read \
-         directly by the module that owns the loop rather than user configuration.",
-    ),
-    (
         "INFR_NO_MOE_SHARED_SLOT",
         "Vulkan validation escape hatch for same-binary A/B of the shared-expert slot peephole. \
          It is backend-private and deliberately remains a direct presence check rather than user \
          configuration.",
+    ),
+    (
+        "INFR_D2H_DMA",
+        "Vulkan backend-private readback A/B (PR #21 review): opts IN to the D2H DMA staging path \
+         for large downloads — a measured net-negative on drivers that expose cached sysmem types, \
+         so the default is OFF (`!v.is_empty() && v != \"0\"`, read once at backend construction). \
+         Deliberately backend-private rather than user configuration until it has a probe or an \
+         `cfg(windows)`-scoped justification; see `VulkanBackend::download_dma`.",
+    ),
+    (
+        "INFR_MTP_N_MAX",
+        "MTP tuning override (`mtp::effective_n_max`): max candidates drafted per speculative cycle \
+         (llama.cpp's `--spec-draft-n-max`). Backend-private A/B knob for the parked MTP path, read \
+         directly by the module that owns the loop rather than user configuration.",
     ),
 ];
 

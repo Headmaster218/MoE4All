@@ -711,6 +711,49 @@ struct ImportedHostShard {
     buffer: Arc<dyn Buffer>,
 }
 
+/// Size of the persistent D2H DMA readback slab: one ordinary host allocation imported via
+/// `VK_EXT_external_memory_host` that large downloads are DMA'd into by the copy engine
+/// (see [`VulkanBackend::download_dma`]). System-RAM only; never touches VRAM.
+const D2H_DMA_SLAB_BYTES: usize = 32 * 1024 * 1024;
+/// Downloads at or above this size route through the DMA slab; below it, the mapped readback
+/// paths stay cheaper (a one-shot submit + wait costs more than an uncached read of a few KiB).
+const D2H_DMA_MIN_BYTES: usize = 256 * 1024;
+
+/// Why this channel exists: on some Windows/WDDM driver configurations the driver's host-visible
+/// types land in BAR (device-local host-visible), whose CPU reads are uncached — a direct read of
+/// a mapped readback buffer then crawls at ~25 MB/s (observed on RX 7700 XT during the MTP
+/// stochastic-verify work, where the per-cycle m×vocab logits download costed hundreds of ms).
+/// The DMA path has the copy engine WRITE into an ordinary, page-table-backed (cached) host
+/// allocation instead: PCIe writes are posted and run at full engine bandwidth, and the
+/// subsequent CPU read is a memcpy. The same infrastructure the pager's expert cache uses for
+/// H2D (`try_import_host_shard`), run in the opposite direction.
+///
+/// MEASURED escape hatch, not a default win: on the same RX 7700 XT (ReBAR on, driver exposing
+/// cached sysmem types) the direct paths measure 14.4 GB/s (mapped Readback) and 5.5 GB/s
+/// (fresh GpuToCpu staging) at 8 MiB, while the DMA route pays a ~1.5 ms one-shot submit+wait
+/// on top of the transfer and lands at 3.7-4.4 GB/s — a net LOSS at logits scale. The channel is
+/// therefore OPT-IN (`INFR_D2H_DMA=1`): flip it on when the mapped readback is measurably slow
+/// (BAR-placed Readback class, other drivers), verified with
+/// `cargo test -p infr-vulkan --release --test d2h_dma_bench -- --ignored --nocapture`.
+#[derive(Clone)]
+struct D2hDma {
+    /// Keeps the slab's bytes alive; must outlive the Vulkan import bound on top of them.
+    _owner: Arc<AlignedHostBuffer>,
+    /// The single import shard covering the whole slab (`TRANSFER_SRC|TRANSFER_DST` buffer).
+    buffer: Arc<dyn Buffer>,
+    /// Usable bytes (slab size rounded down to the import alignment, capped by
+    /// `max_mem_alloc_size`).
+    bytes: usize,
+}
+
+/// Lazy one-time probe state for the D2H DMA channel. The outer `Option` distinguishes "not yet
+/// attempted" from "attempted and unavailable" so a platform without
+/// `VK_EXT_external_memory_host` (or a failed first import) pays the probe once, never per call.
+enum D2hDmaCell {
+    Untouched,
+    Probed(Option<D2hDma>),
+}
+
 /// Vulkan aliases over one existing host allocation. A requested byte range may cross a 2-GiB
 /// import shard, so callers iterate the returned pieces rather than assuming one source buffer.
 pub(crate) struct ImportedHostAllocation {
@@ -1301,6 +1344,15 @@ pub struct VulkanBackend {
     /// crosses this boundary through the environment. The env-only [`VulkanBackend::new`] entry
     /// point remains for this crate's own GPU tests and for external library callers.
     cfg: Arc<Config>,
+    /// Persistent D2H DMA readback channel (see [`D2hDma`]) — probed lazily on the first
+    /// >=`D2H_DMA_MIN_BYTES` download. The `Arc` makes the slab DEVICE-level, shared by
+    /// `fork_embedding_client`'s co-handle: one device owns one slab, and the shared `Mutex`
+    /// also serializes the two handles' copies (a wait_idle race across handles could
+    /// otherwise read the other fork's bytes out of the shared staging).
+    d2h_dma: Arc<Mutex<D2hDmaCell>>,
+    /// `INFR_D2H_DMA=0` opts out of the DMA readback path (mapped readback stays). Read once
+    /// here at construction so no per-call env read exists (S5b).
+    d2h_dma_enabled: bool,
     shared: Arc<VulkanShared>,
 }
 
@@ -2777,6 +2829,13 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
+        // D2H DMA readback is OPT-IN (`INFR_D2H_DMA=1` — measured net-negative on drivers that
+        // expose cached sysmem types, see `D2hDma`'s doc); the opt-in is read exactly once so
+        // the hot decode loop never touches the environment (S5b, same rule as the dispatch
+        // knobs). Grammar follows `budget::flag_from`: empty and "0" are OFF.
+        let d2h_dma_enabled =
+            matches!(std::env::var_os("INFR_D2H_DMA"), Some(v) if !v.is_empty() && v != "0");
+
         let backend = Self {
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2786,6 +2845,8 @@ impl VulkanBackend {
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
             unified_client: None,
+            d2h_dma: Arc::new(Mutex::new(D2hDmaCell::Untouched)),
+            d2h_dma_enabled,
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -3924,6 +3985,8 @@ impl VulkanBackend {
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
             unified_client: Some(UnifiedClient::Embedding),
+            d2h_dma: Arc::clone(&self.d2h_dma),
+            d2h_dma_enabled: self.d2h_dma_enabled,
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
@@ -4823,6 +4886,116 @@ impl VulkanBackend {
 
         Ok(())
     }
+
+    /// The D2H DMA slab, probing the platform ONCE on first use. `None` afterwards means the
+    /// channel is unavailable (opted out, extension missing, import failed) and the mapped
+    /// readback paths stay — silently; a missing fast path must never turn into an error.
+    fn probe_d2h_slab(&self) -> Option<D2hDma> {
+        if !self.d2h_dma_enabled {
+            return None;
+        }
+        let Some(ext) = self.shared.external_memory_host.as_ref() else {
+            return None;
+        };
+        let align = self.shared.host_import_alignment.max(1);
+        if align > AlignedHostBuffer::ALIGNMENT {
+            tracing::warn!(
+                "[infr] D2H DMA readback disabled: Vulkan import alignment {align} exceeds host slab alignment {}",
+                AlignedHostBuffer::ALIGNMENT,
+            );
+            return None;
+        }
+        // One shard only (the slab is well under the 2-GiB shard cap the pager fights), sized
+        // down to both the import alignment and `max_mem_alloc_size`.
+        let bytes = D2H_DMA_SLAB_BYTES.min(self.shared.max_mem_alloc_size as usize) / align * align;
+        if bytes < D2H_DMA_MIN_BYTES {
+            tracing::warn!(
+                "[infr] D2H DMA readback disabled: usable slab is under {D2H_DMA_MIN_BYTES} bytes"
+            );
+            return None;
+        }
+        let Ok(owner) = AlignedHostBuffer::new(bytes) else {
+            tracing::warn!("[infr] D2H DMA readback disabled: host slab allocation failed");
+            return None;
+        };
+        match self.try_import_host_shard(ext, Arc::clone(&owner), 0, bytes) {
+            Ok(shard) => Some(D2hDma {
+                _owner: owner,
+                buffer: shard.buffer,
+                bytes: shard.len,
+            }),
+            Err(e) => {
+                tracing::warn!("[infr] D2H DMA readback disabled: {e}");
+                None
+            }
+        }
+    }
+
+    /// Copy `src` (device-local OR mapped) into `dst` through the persistent host-DMA slab:
+    /// a `cmd_copy_buffer` from `src` into the imported host allocation, then a plain memcpy
+    /// out of the slab's CACHED pages. Returns `None` when the channel is unavailable (caller
+    /// falls back to the mapped readback paths inside `download`).
+    ///
+    /// This sidesteps the Windows/WDDM uncached-mapped-read pathology entirely (see
+    /// [`D2hDma`]): the CPU never dereferences a write-combined mapping; it reads ordinary
+    /// cached RAM the copy engine just wrote at full PCIe bandwidth. The copy's completion is
+    /// guaranteed by `one_shot`'s `queue_wait_idle`, and the imported memory type is
+    /// HOST_COHERENT (enforced in `try_import_host_shard`), so no invalidate is needed — the
+    /// same contract the direct mapped reads already rely on.
+    ///
+    /// The `d2h_dma` mutex is held for the WHOLE operation (probe + all chunks): the slab is a
+    /// singleton, and a concurrent download whose `queue_wait_idle` raced ours could otherwise
+    /// read the other copy's bytes out of the shared staging.
+    fn download_dma(&self, src: &VkBuffer, dst: &mut [u8]) -> Option<Result<()>> {
+        let mut cell = self.d2h_dma.lock().unwrap();
+        let slab = match &*cell {
+            D2hDmaCell::Probed(slab) => slab.clone(),
+            D2hDmaCell::Untouched => {
+                let probed = self.probe_d2h_slab();
+                *cell = D2hDmaCell::Probed(probed.clone());
+                probed
+            }
+        };
+        let slab = slab?;
+        let host_base = slab._owner.as_ptr();
+        let slab_buf = match as_vk_buf(slab.buffer.as_ref()) {
+            // A slab whose own buffer can't be downcast is a build-time invariant break; fall
+            // back to the mapped paths rather than erroring a working readback.
+            Ok(b) => b.buffer,
+            Err(_) => return None,
+        };
+        let slab_cap = slab.bytes;
+        let src_buf = src.buffer;
+        let src_off = src.sub_offset as u64;
+
+        let mut done = 0usize;
+        while done < dst.len() {
+            let n = (dst.len() - done).min(slab_cap);
+            let size = n as u64;
+            let soff = src_off + done as u64;
+            let shared = Arc::clone(&self.shared);
+            let result = self.one_shot(move |cmd| {
+                let region = vk::BufferCopy {
+                    src_offset: soff,
+                    dst_offset: 0,
+                    size,
+                };
+                unsafe {
+                    shared
+                        .device
+                        .cmd_copy_buffer(cmd, src_buf, slab_buf, &[region])
+                };
+            });
+            if let Err(e) = result {
+                return Some(Err(e));
+            }
+            // GPU→slab transfer is complete (queue_wait_idle returned); the slab is ordinary
+            // cached process RAM, so this is a memcpy — NOT an uncached mapped read.
+            unsafe { std::ptr::copy_nonoverlapping(host_base, dst[done..].as_mut_ptr(), n) };
+            done += n;
+        }
+        Some(Ok(()))
+    }
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -5012,6 +5185,16 @@ impl Backend for VulkanBackend {
         // The staging path's failure is tamer but still wrong: a `vkCmdCopyBuffer` whose `size`
         // overruns the source.
         check_extent("download", "out of", dst.len(), vk_src.size)?;
+
+        // Opt-in escape hatch (`INFR_D2H_DMA=1`): large readbacks route through the host-DMA
+        // slab (copy engine writes into cached ordinary RAM; see `download_dma`/`D2hDma`) —
+        // for platforms where the direct mapped reads below land in uncached BAR. Default OFF:
+        // on cached-sysmem drivers the mapped paths are faster at every logits-class size.
+        if dst.len() >= D2H_DMA_MIN_BYTES {
+            if let Some(result) = self.download_dma(vk_src, dst) {
+                return result;
+            }
+        }
 
         if let Some(ptr) = vk_src.mapped_ptr() {
             // Host-visible (Readback or Staging): direct read from the persistently-mapped pointer.
