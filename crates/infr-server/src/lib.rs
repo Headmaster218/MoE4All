@@ -2385,23 +2385,46 @@ fn unix_ts() -> i64 {
 
 /// Flatten a DTO `content` field (string OR content-part array) to a plain `String`.
 ///
-/// Mirrors the Python shim's `normalize_messages`: only `"text"` parts are kept.
+/// Mirrors the Python shim's `normalize_messages`: `"text"` parts are kept. Each `image_url`
+/// part contributes an [`infr_engine::IMAGE_PART_PLACEHOLDER`] AT ITS ORIGINAL POSITION (the
+/// template layer swaps each one for a vision marker before rendering, preserving the
+/// client's text/image interleaving — PR #21 review fix). The image payloads themselves are
+/// collected separately, in part order, by [`collect_images`] into [`ChatMessage::images`].
 pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     match v {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
-            .filter_map(|p| {
-                if p.get("type")?.as_str()? == "text" {
-                    p.get("text")?.as_str().map(str::to_owned)
-                } else {
-                    None
-                }
+            .filter_map(|p| match p.get("type")?.as_str()? {
+                "text" => p.get("text")?.as_str().map(str::to_owned),
+                "image_url" => Some(infr_engine::IMAGE_PART_PLACEHOLDER.to_string()),
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join(""),
         Some(other) => other.to_string(),
+    }
+}
+
+/// Collect a DTO `content` array's `image_url` part URLs (OpenAI shape:
+/// `{"type":"image_url","image_url":{"url":…}}`), IN PART ORDER — the vision payloads the chat
+/// layer pairs with the rendered prompt's `<|image_pad|>` markers (stage V5). A string content
+/// (or any non-array) carries no images. Text joining (with per-image placeholders) stays in
+/// [`flatten_content`].
+fn collect_images(v: &Option<serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                if p.get("type")?.as_str()? == "image_url" {
+                    p.get("image_url")?.get("url")?.as_str().map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2412,6 +2435,7 @@ fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
         tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
+        images: collect_images(&dto.content),
     }
 }
 
@@ -2447,6 +2471,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use infr_engine::IMAGE_PART_PLACEHOLDER;
     use tower::ServiceExt;
 
     /// Router backed by a headless state — no Engine, so /health and /v1/models work
@@ -2750,7 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_array_content_deserializes_and_flattens() {
+    fn chat_request_array_content_flattens_text_and_collects_images() {
         let raw = r#"{
             "model": "m",
             "messages": [{
@@ -2763,8 +2788,15 @@ mod tests {
             }]
         }"#;
         let req: ChatRequest = serde_json::from_str(raw).unwrap();
-        // Only text parts are concatenated; image_url is discarded.
-        assert_eq!(flatten_content(&req.messages[0].content), "hello world");
+        // Text parts are concatenated; each image part leaves an IMAGE_PART_PLACEHOLDER AT its
+        // position (the template layer substitutes the vision marker there), and the image
+        // payload is COLLECTED onto the engine message (stage V5 — it used to be discarded).
+        assert_eq!(
+            flatten_content(&req.messages[0].content),
+            format!("hello{IMAGE_PART_PLACEHOLDER} world")
+        );
+        let msg = dto_to_engine(&req.messages[0]);
+        assert_eq!(msg.images, vec!["data:...".to_string()]);
     }
 
     #[test]
@@ -3302,7 +3334,72 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "http://x"}},
             {"type": "text",      "text": " world"}
         ]));
-        assert_eq!(flatten_content(&v), "hello world");
+        // Text parts are joined with an IMAGE_PART_PLACEHOLDER where each image part sat — the
+        // payload itself is collected by `collect_images` (see the dto_to_engine test).
+        assert_eq!(
+            flatten_content(&v),
+            format!("hello{IMAGE_PART_PLACEHOLDER} world")
+        );
+        assert_eq!(collect_images(&v), vec!["http://x".to_string()]);
+    }
+
+    /// PR #21 review fix: content-part ORDER must survive flattening. "text A → image 1 →
+    /// text B → image 2" used to flatten to "A B" with both images appended after ALL text by
+    /// the template, silently changing a multi-image prompt's semantics; now each image part
+    /// leaves a placeholder at its original position, in part order.
+    #[test]
+    fn flatten_content_preserves_interleaved_image_positions() {
+        let v = Some(serde_json::json!([
+            {"type": "text",      "text": "A"},
+            {"type": "image_url", "image_url": {"url": "data:one"}},
+            {"type": "text",      "text": "B"},
+            {"type": "image_url", "image_url": {"url": "data:two"}}
+        ]));
+        assert_eq!(
+            flatten_content(&v),
+            format!("A{IMAGE_PART_PLACEHOLDER}B{IMAGE_PART_PLACEHOLDER}")
+        );
+        assert_eq!(
+            collect_images(&v),
+            vec!["data:one".to_string(), "data:two".to_string()]
+        );
+    }
+
+    /// dto_to_engine pairs the flattened text with the COLLECTED image payloads, in part order
+    /// (stage V5): the text-only fields behave exactly as before, and a string content carries
+    /// no images.
+    #[test]
+    fn dto_to_engine_collects_image_urls_in_part_order() {
+        let dto = ChatMessageDto {
+            role: "user".into(),
+            content: Some(serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "data:first"}},
+                {"type": "text",      "text": "two pics"},
+                {"type": "image_url", "image_url": {"url": "data:second"}}
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let m = dto_to_engine(&dto);
+        assert_eq!(
+            m.content,
+            format!("{IMAGE_PART_PLACEHOLDER}two pics{IMAGE_PART_PLACEHOLDER}")
+        );
+        assert_eq!(
+            m.images,
+            vec!["data:first".to_string(), "data:second".to_string()]
+        );
+
+        // A plain-string content (and a text-only array) carries no images.
+        let text_dto = ChatMessageDto {
+            role: "user".into(),
+            content: Some(serde_json::json!("just text")),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        assert!(dto_to_engine(&text_dto).images.is_empty());
     }
 
     #[test]
@@ -3789,6 +3886,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }]
     }
 

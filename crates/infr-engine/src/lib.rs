@@ -12,7 +12,7 @@
 // existing `infr_engine::{ChatMessage, …}` call sites.
 pub use infr_chat::{
     parse_hermes_tool_calls, parse_tool_calls, split_channels, split_reasoning, split_think,
-    ChatMessage, ToolCall,
+    ChatMessage, ToolCall, IMAGE_PART_PLACEHOLDER,
 };
 
 /// A streamed piece of a response (re-exported from the single splitter in `infr-chat`).
