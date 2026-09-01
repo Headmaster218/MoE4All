@@ -13,12 +13,283 @@ use infr_core::backend::Buffer;
 use infr_core::error::Result;
 use infr_core::pager_profile;
 
-use crate::{as_vk_buf, be, copy_to_mapped, VkBuffer, VulkanBackend};
+use crate::{as_vk_buf, be, copy_to_mapped, ImportedHostAllocation, VkBuffer, VulkanBackend};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HostTransferPath {
-    DirectMapped,
-    Staged,
+/// Backend contract consumed by residency logic. It exposes data movement, not Vulkan memory
+/// types or queue choices; a different executor can satisfy the same requests without changing
+/// pager policy.
+pub(crate) trait TransferExecutor: Sync {
+    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)>;
+
+    fn complete_copies_now(
+        &self,
+        copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
+    ) -> Result<()>;
+
+    fn fill_target_now(
+        &self,
+        target: &DeviceTransferTarget,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<()>;
+}
+
+/// Immutable transport bindings for one loaded model session. Hardware capabilities are probed
+/// while the Vulkan backend is created and host allocations are imported exactly once at session
+/// finalization. Runtime uploads only locate their source inside these frozen ranges and execute
+/// the already-established target route.
+#[derive(Default)]
+pub(crate) struct SessionTransferPlan {
+    imports: Vec<ImportedHostAllocation>,
+}
+
+impl SessionTransferPlan {
+    pub(crate) fn new(imports: Vec<ImportedHostAllocation>) -> Self {
+        Self { imports }
+    }
+
+    /// Add one host-to-device request to `prepared`. Imported host ranges become Vulkan buffer
+    /// copies, mapped targets are filled immediately, and every other target is staged. Those are
+    /// backend details: callers provide only an opaque source slice and device target.
+    pub(crate) fn prepare_upload<E: TransferExecutor>(
+        &self,
+        executor: &E,
+        src: &[u8],
+        target: &DeviceTransferTarget,
+        prepared: &mut PreparedTransfer,
+    ) -> Result<()> {
+        if src.len() != target.len() {
+            return Err(be(format!(
+                "host upload has {} bytes but its device target has {}",
+                src.len(),
+                target.len()
+            )));
+        }
+        if self.append_imported(src, target, prepared) {
+            return Ok(());
+        }
+        if let Some(dst) = target.mapped_ptr() {
+            let started = pager_profile::active().then(std::time::Instant::now);
+            parallel_copy_to_mapped(src, dst);
+            if let Some(t0) = started {
+                pager_profile::record_memcpy(src.len(), t0.elapsed());
+            }
+            return Ok(());
+        }
+        let (source, source_ptr) = executor.materialize_staging(src)?;
+        prepared.copies.push(PreparedCopy {
+            source,
+            source_offset: 0,
+            source_ptr,
+            target: target.clone(),
+            len: src.len(),
+        });
+        Ok(())
+    }
+
+    fn append_imported(
+        &self,
+        src: &[u8],
+        target: &DeviceTransferTarget,
+        prepared: &mut PreparedTransfer,
+    ) -> bool {
+        let Some(ranges) = self.imported_ranges(src) else {
+            return false;
+        };
+        let mut advanced = 0usize;
+        for range in ranges {
+            prepared.copies.push(PreparedCopy {
+                source: range.buffer,
+                source_offset: range.offset,
+                source_ptr: unsafe { src.as_ptr().add(advanced) } as usize,
+                target: target
+                    .subtarget(advanced, range.len)
+                    .expect("imported source range was validated against its device target"),
+                len: range.len,
+            });
+            advanced += range.len;
+        }
+        debug_assert_eq!(advanced, src.len());
+        true
+    }
+
+    fn imported_ranges(&self, src: &[u8]) -> Option<Vec<crate::ImportedHostRange>> {
+        self.imports
+            .iter()
+            .find(|import| import.contains(src.as_ptr(), src.len()))
+            .and_then(|import| import.ranges(src.as_ptr(), src.len()))
+    }
+
+    pub(crate) fn upload_now<E: TransferExecutor>(
+        &self,
+        executor: &E,
+        src: &[u8],
+        target: &DeviceTransferTarget,
+    ) -> Result<()> {
+        let mut prepared = PreparedTransfer::default();
+        self.prepare_upload(executor, src, target, &mut prepared)?;
+        prepared.complete_now(executor)
+    }
+
+    /// Whether a target can be filled by the dedicated host worker without touching a Vulkan
+    /// queue. The scheduler sees only this execution property, never the physical backing type.
+    pub(crate) fn supports_host_worker(&self, target: &DeviceTransferTarget) -> bool {
+        target.mapped_ptr().is_some()
+    }
+
+    pub(crate) fn copy_on_host_worker(
+        &self,
+        src: &[u8],
+        target: &DeviceTransferTarget,
+    ) -> Result<()> {
+        if src.len() != target.len() {
+            return Err(be("host-worker copy size does not match its target"));
+        }
+        let dst = target
+            .mapped_ptr()
+            .ok_or_else(|| be("host worker cannot fill this device target"))?;
+        let started = pager_profile::active().then(std::time::Instant::now);
+        parallel_copy_to_mapped(src, dst);
+        if let Some(t0) = started {
+            pager_profile::record_memcpy(src.len(), t0.elapsed());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fill_on_host_worker(
+        &self,
+        target: &DeviceTransferTarget,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let ptr = target
+            .mapped_ptr()
+            .ok_or_else(|| be("host worker cannot fill this device target"))?;
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, target.len()) };
+        fill(bytes)
+    }
+
+    pub(crate) fn fill_now<E: TransferExecutor>(
+        &self,
+        executor: &E,
+        target: &DeviceTransferTarget,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        executor.fill_target_now(target, fill)
+    }
+}
+
+struct PreparedCopy {
+    source: Arc<dyn Buffer>,
+    source_offset: usize,
+    source_ptr: usize,
+    target: DeviceTransferTarget,
+    len: usize,
+}
+
+/// One backend-resolved transfer batch. The source route and staging ownership are frozen before
+/// this value reaches the scheduler; it only records the batch into a command stream or completes
+/// it immediately when no recorder is available.
+#[derive(Default)]
+pub(crate) struct PreparedTransfer {
+    copies: Vec<PreparedCopy>,
+}
+
+impl PreparedTransfer {
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.copies.append(&mut other.copies);
+    }
+
+    pub(crate) fn record(mut self, rec: &crate::Recorder<'_>) -> Result<()> {
+        struct Group {
+            src: Arc<dyn Buffer>,
+            dst: Arc<dyn Buffer>,
+            regions: Vec<vk::BufferCopy>,
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        for copy in &self.copies {
+            let src_handle = as_vk_buf(copy.source.as_ref())?.buffer;
+            let dst_handle = as_vk_buf(copy.target.buffer())?.buffer;
+            let group = match groups.iter_mut().find(|group| {
+                as_vk_buf(group.src.as_ref()).is_ok_and(|buf| buf.buffer == src_handle)
+                    && as_vk_buf(group.dst.as_ref()).is_ok_and(|buf| buf.buffer == dst_handle)
+            }) {
+                Some(group) => group,
+                None => {
+                    groups.push(Group {
+                        src: Arc::clone(&copy.source),
+                        dst: copy.target.buffer_arc(),
+                        regions: Vec::new(),
+                    });
+                    groups.last_mut().expect("group was just appended")
+                }
+            };
+            group.regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(copy.source_offset as u64)
+                    .dst_offset(copy.target.buffer_offset() as u64)
+                    .size(copy.len as u64),
+            );
+        }
+        if !groups.is_empty() {
+            rec.host_transfer_barrier();
+            for group in &groups {
+                rec.retain_buffer(Arc::clone(&group.src));
+                rec.retain_buffer(Arc::clone(&group.dst));
+                rec.copy_regions(group.src.as_ref(), group.dst.as_ref(), &group.regions);
+            }
+            if pager_profile::active() {
+                for copy in &self.copies {
+                    pager_profile::record_gpu_copy(copy.len);
+                }
+            }
+        }
+        self.copies.clear();
+        Ok(())
+    }
+
+    pub(crate) fn complete_now<E: TransferExecutor>(mut self, executor: &E) -> Result<()> {
+        if self.copies.is_empty() {
+            return Ok(());
+        }
+        let started = pager_profile::active().then(std::time::Instant::now);
+        let mut bytes = 0usize;
+        let mut staged = Vec::new();
+        for copy in self.copies.drain(..) {
+            if let Some(dst) = copy.target.mapped_ptr() {
+                let src =
+                    unsafe { std::slice::from_raw_parts(copy.source_ptr as *const u8, copy.len) };
+                parallel_copy_to_mapped(src, dst);
+                bytes = bytes.saturating_add(copy.len);
+            } else {
+                staged.push((copy.source, copy.source_offset, copy.target, copy.len));
+            }
+        }
+        if let Some(t0) = started {
+            pager_profile::record_memcpy(bytes, t0.elapsed());
+        }
+        executor.complete_copies_now(&staged)
+    }
+}
+
+/// Parallel host copy used by direct host-visible transfer endpoints. Kept in the transport
+/// backend so residency policy never handles raw mapped pointers.
+pub(crate) fn parallel_copy_to_mapped(src: &[u8], dst: *mut u8) {
+    use rayon::prelude::*;
+    const CHUNK: usize = 4 << 20;
+    if src.len() <= CHUNK {
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    let dst_addr = dst as usize;
+    src.par_chunks(CHUNK)
+        .enumerate()
+        .for_each(|(i, chunk)| unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.as_ptr(),
+                (dst_addr + i * CHUNK) as *mut u8,
+                chunk.len(),
+            );
+        });
 }
 
 /// A byte range that can be consumed by Vulkan. `mapped_ptr` points at the start of this exact
@@ -86,10 +357,6 @@ impl DeviceTransferTarget {
         self.len
     }
 
-    pub(crate) fn is_mapped(&self) -> bool {
-        self.mapped_ptr.is_some()
-    }
-
     pub(crate) fn subtarget(&self, offset: usize, len: usize) -> Result<Self> {
         let end = offset
             .checked_add(len)
@@ -138,7 +405,7 @@ impl VulkanBackend {
 
     /// Materialize bytes in a temporary host-visible Vulkan buffer without submitting work. The
     /// returned owner must stay alive until every command that reads it has completed.
-    pub(crate) fn stage_host_bytes(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)> {
+    fn stage_host_bytes(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)> {
         let staging = self.make_host_transfer_buffer(src.len())?;
         let ptr = staging
             .mapped_ptr()
@@ -154,15 +421,15 @@ impl VulkanBackend {
     /// Fill one target range. The callback always receives writable host memory, either the final
     /// mapped destination or a temporary staging allocation. The staged path is synchronous; it
     /// is the universal correctness fallback used only when a direct/imported batch is unavailable.
-    pub(crate) fn write_device_target(
+    fn write_device_target(
         &self,
         target: &DeviceTransferTarget,
         fill: impl FnOnce(&mut [u8]) -> Result<()>,
-    ) -> Result<HostTransferPath> {
+    ) -> Result<()> {
         if let Some(ptr) = target.mapped_ptr() {
             let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, target.len()) };
             fill(bytes)?;
-            return Ok(HostTransferPath::DirectMapped);
+            return Ok(());
         }
 
         let staging = self.make_host_transfer_buffer(target.len())?;
@@ -173,38 +440,13 @@ impl VulkanBackend {
         fill(staging_bytes)?;
         let source: Arc<dyn Buffer> = Arc::new(staging);
         self.copy_transfer_targets_now(&[(source, 0, target.clone(), target.len())])?;
-        Ok(HostTransferPath::Staged)
-    }
-
-    pub(crate) fn upload_device_target(
-        &self,
-        target: &DeviceTransferTarget,
-        src: &[u8],
-    ) -> Result<HostTransferPath> {
-        if src.len() != target.len() {
-            return Err(be(format!(
-                "host upload has {} bytes but its device target has {}",
-                src.len(),
-                target.len()
-            )));
-        }
-        if let Some(dst) = target.mapped_ptr() {
-            let started = pager_profile::active().then(std::time::Instant::now);
-            copy_to_mapped(src, dst);
-            if let Some(t0) = started {
-                pager_profile::record_memcpy(src.len(), t0.elapsed());
-            }
-            return Ok(HostTransferPath::DirectMapped);
-        }
-        let (staging, _) = self.stage_host_bytes(src)?;
-        self.copy_transfer_targets_now(&[(staging, 0, target.clone(), src.len())])?;
-        Ok(HostTransferPath::Staged)
+        Ok(())
     }
 
     /// Execute already-materialized buffer copies immediately on the main queue. Used by the
     /// Decode overlap compatibility path when no ambient recorder exists; mapped destinations can
     /// still avoid this through their direct CPU fallback.
-    pub(crate) fn copy_transfer_targets_now(
+    fn copy_transfer_targets_now(
         &self,
         copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
     ) -> Result<()> {
@@ -260,12 +502,82 @@ impl VulkanBackend {
     }
 }
 
+impl TransferExecutor for VulkanBackend {
+    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)> {
+        VulkanBackend::stage_host_bytes(self, src)
+    }
+
+    fn complete_copies_now(
+        &self,
+        copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
+    ) -> Result<()> {
+        VulkanBackend::copy_transfer_targets_now(self, copies)
+    }
+
+    fn fill_target_now(
+        &self,
+        target: &DeviceTransferTarget,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        VulkanBackend::write_device_target(self, target, fill)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::HostTransferPath;
+    use std::sync::Arc;
+
+    use infr_core::backend::Buffer;
+
+    use super::SessionTransferPlan;
+    use crate::{ImportedHostAllocation, ImportedHostShard};
+
+    struct DummyBuffer(usize);
+
+    impl Buffer for DummyBuffer {
+        fn len_bytes(&self) -> usize {
+            self.0
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
     #[test]
-    fn transfer_paths_distinguish_optional_mapping_from_correctness_fallback() {
-        assert_ne!(HostTransferPath::DirectMapped, HostTransferPath::Staged);
+    fn frozen_import_plan_resolves_only_its_imported_prefix() {
+        let host = vec![0u8; 128];
+        let plan = SessionTransferPlan::new(vec![ImportedHostAllocation {
+            base: host.as_ptr() as usize,
+            logical_len: host.len(),
+            imported_len: 64,
+            shards: vec![
+                ImportedHostShard {
+                    offset: 0,
+                    len: 32,
+                    buffer: Arc::new(DummyBuffer(32)),
+                },
+                ImportedHostShard {
+                    offset: 32,
+                    len: 32,
+                    buffer: Arc::new(DummyBuffer(32)),
+                },
+            ],
+        }]);
+
+        let ranges = plan
+            .imported_ranges(&host[16..48])
+            .expect("range lies in the frozen imported prefix");
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| (range.offset, range.len))
+                .collect::<Vec<_>>(),
+            vec![(16, 16), (0, 16)]
+        );
+        assert!(plan.imported_ranges(&host[64..80]).is_none());
+
+        let unrelated = vec![0u8; 16];
+        assert!(plan.imported_ranges(&unrelated).is_none());
     }
 }

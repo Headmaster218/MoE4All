@@ -177,9 +177,8 @@ impl DeviceArena {
 #[cfg(test)]
 mod tests {
     use super::{choose_backing, DeviceArena, DeviceArenaBacking};
-    use crate::transfer::{DeviceTransferTarget, HostTransferPath};
+    use crate::transfer::{DeviceTransferTarget, PreparedTransfer, SessionTransferPlan};
     use crate::VulkanBackend;
-    use ash::vk;
     use infr_core::Backend;
 
     #[test]
@@ -219,27 +218,19 @@ mod tests {
             .collect();
         let target = DeviceTransferTarget::new(shard.buffer_arc(), 0, bytes.len())
             .expect("build transfer target");
-        assert_eq!(
-            vk.upload_device_target(&target, &bytes)
-                .expect("staged upload"),
-            HostTransferPath::Staged
-        );
+        let plan = SessionTransferPlan::default();
+        plan.upload_now(&vk, &bytes, &target)
+            .expect("session-planned upload");
         let mut back = vec![0u8; bytes.len()];
         vk.download(shard.buffer(), &mut back).expect("download");
         assert_eq!(back, bytes);
 
         let replacement: Vec<u8> = bytes.iter().map(|byte| byte ^ 0x5a).collect();
-        let (staging, _) = vk
-            .stage_host_bytes(&replacement)
-            .expect("materialize recorded staging source");
+        let mut prepared = PreparedTransfer::default();
+        plan.prepare_upload(&vk, &replacement, &target, &mut prepared)
+            .expect("prepare recorded transfer");
         let recorder = vk.recorder().expect("create transfer recorder");
-        recorder.host_transfer_barrier();
-        recorder.copy_regions(
-            staging.as_ref(),
-            target.buffer(),
-            &[vk::BufferCopy::default().size(replacement.len() as u64)],
-        );
-        recorder.retain_buffer(staging);
+        prepared.record(&recorder).expect("record planned transfer");
         recorder
             .finish_nowait()
             .expect("submit recorded staging copy")

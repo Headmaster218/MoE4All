@@ -6448,8 +6448,12 @@ impl PrefillUploader {
                     let result = command
                         .after
                         .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
-                    let result = result
-                        .and_then(|()| command.job.execute_direct().map_err(|e| e.to_string()));
+                    let result = result.and_then(|()| {
+                        command
+                            .job
+                            .execute_on_host_worker()
+                            .map_err(|e| e.to_string())
+                    });
                     if done
                         .send(PrefillUploadCompletion { buf_id, result })
                         .is_err()
@@ -6930,17 +6934,18 @@ fn prefetch_next_moe_layer<'a>(
     current_gate_id: usize,
 ) -> Result<()> {
     ps.poll_prefill_uploads(be_)?;
-    // Dense streaming can attach staging-ring lifetime to this same segment. That uncommon mixed
-    // path keeps a synchronous correctness fallback; ordinary paged MoE has cursor=0 and uses the
-    // fully asynchronous worker below.
-    let direct_prefill = be_
-        .moe_pager()
-        .lock()
-        .unwrap()
-        .as_ref()
-        .expect("paged execution requires a session")
-        .prefill_direct_upload();
-    let synchronous = ps.cursor > 0 || !direct_prefill;
+    // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
+    // that cannot run on the existing host producer also takes the synchronous correctness path.
+    // This property is frozen during model setup, so previous uploads are drained before the next
+    // layer reserves a lane exactly as they were before transport was abstracted.
+    let synchronous = ps.cursor > 0
+        || !be_
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("paged execution requires a session")
+            .prefill_host_worker_ready();
     if synchronous {
         ps.finish_prefill_uploads(be_)?;
     }

@@ -2849,15 +2849,15 @@ impl VulkanBackend {
     /// the arena with the lowest imported-block fraction, so a finite WDDM host-import budget is
     /// shared proportionally instead of being exhausted by the first size class. Failure remains
     /// an optimization fallback: ranges without an alias use direct mapped or staged uploads.
-    pub(crate) fn import_host_allocations(
+    pub(crate) fn build_session_transfer_plan(
         &self,
         allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
-    ) -> Vec<ImportedHostAllocation> {
+    ) -> crate::transfer::SessionTransferPlan {
         if !self.cfg().paging.host_dma {
-            return Vec::new();
+            return crate::transfer::SessionTransferPlan::default();
         }
         let Some(ext) = self.shared.external_memory_host.as_ref() else {
-            return Vec::new();
+            return crate::transfer::SessionTransferPlan::default();
         };
         let alignment = self.shared.host_import_alignment.max(1);
         if alignment > AlignedHostBuffer::ALIGNMENT {
@@ -2866,10 +2866,14 @@ impl VulkanBackend {
                 alignment,
                 AlignedHostBuffer::ALIGNMENT,
             );
-            return Vec::new();
+            return crate::transfer::SessionTransferPlan::default();
         }
 
-        self.try_import_host_allocations(ext, allocations, alignment)
+        crate::transfer::SessionTransferPlan::new(self.try_import_host_allocations(
+            ext,
+            allocations,
+            alignment,
+        ))
     }
 
     fn try_import_host_allocations(
@@ -5236,8 +5240,21 @@ impl Backend for VulkanBackend {
         if self.session_finalization_deferred.load(Ordering::Acquire) {
             return Ok(());
         }
-        if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
-            session.finish_host_dma_import(self);
+        let sources = self
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(crate::pager::MoePagerSession::take_transfer_sources)
+            .unwrap_or_default();
+        if !sources.is_empty() {
+            let plan = self.build_session_transfer_plan(sources);
+            self.moe_pager
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("MoE pager disappeared during session finalization")
+                .install_transfer_plan(plan);
         }
         Ok(())
     }

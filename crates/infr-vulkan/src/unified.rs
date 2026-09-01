@@ -11,7 +11,7 @@ use infr_core::backend::Buffer;
 use infr_core::error::Result;
 
 use super::{be, VulkanBackend};
-use crate::arena::{DeviceArena, DeviceArenaBacking, DeviceArenaShard};
+use crate::arena::{DeviceArena, DeviceArenaShard};
 
 /// Owner of a live range in the unified elastic arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -467,10 +467,6 @@ impl UnifiedVramPool {
 
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.arena.shard_sizes()
-    }
-
-    pub(crate) fn backing(&self) -> DeviceArenaBacking {
-        self.arena.backing()
     }
 }
 
