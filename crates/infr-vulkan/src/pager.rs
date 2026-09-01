@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ash::vk;
+use indicatif::ProgressBar;
 
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::blockio::BlockDesc;
@@ -1970,9 +1971,21 @@ impl MoePagerSession {
 
     /// Seed every bounded inclusive RAM pool after all expert banks have been registered. This
     /// gives the lower tier a balanced cold set before Decode pins its GPU shadows.
-    pub fn preload_host_tier(&self) -> Result<(usize, usize)> {
+    ///
+    /// `progress` is the weight-load bar the loader left open (`None` when there is no display). A
+    /// paged model NEVER uploads its expert banks during the load — the binder registers them and
+    /// binds a 4-byte placeholder — so after the dense weights the bar has nothing left to advance
+    /// it, and it freezes at the dense share of the model (a few percent) for the rest of the load.
+    /// What actually reads those bytes is THIS preload, so it takes the bar over: its length is cut
+    /// to `position + the bytes about to be read` (dropping the paged bytes this load will never
+    /// move) and every block advances it as it lands.
+    pub fn preload_host_tier(&self, progress: Option<&ProgressBar>) -> Result<(usize, usize)> {
         let mut total_blocks = 0usize;
         let mut total_bytes = 0usize;
+        // Pass 1 — choose every pool's block set and price it, so the bar is re-scoped ONCE: a
+        // per-pool length change would snap it backwards on each pool boundary.
+        let mut planned: Vec<(usize, usize, Vec<BlockId>)> = Vec::new();
+        let mut planned_bytes = 0u64;
         for (pool_idx, pool) in self.pools.iter().enumerate() {
             let Some(host) = &pool.host else {
                 continue;
@@ -1998,13 +2011,34 @@ impl MoePagerSession {
                     ids.len()
                 )));
             }
+            // A block's real length, not the pool's stride: a bank's tail block can be shorter, and
+            // counting `slot_bytes` for it would leave the bar just short of full at the end.
+            planned_bytes += ids
+                .iter()
+                .map(|&id| host.block_bytes(id).unwrap_or(pool.slot_bytes) as u64)
+                .sum::<u64>();
+            planned.push((pool_idx, layers.len(), ids));
+        }
+        if let Some(pb) = progress {
+            pb.set_length(pb.position() + planned_bytes);
+        }
+        // Pass 2 — read them, advancing the bar one block at a time.
+        for (pool_idx, n_layers, ids) in planned {
+            let host = self.pools[pool_idx]
+                .host
+                .as_ref()
+                .expect("pass 1 kept only pools with a host tier");
             let started = std::time::Instant::now();
-            let (blocks, bytes) = host.preload(&ids)?;
+            let (blocks, bytes) = host.preload_with(&ids, &|len| {
+                if let Some(pb) = progress {
+                    pb.inc(len as u64);
+                }
+            })?;
             let elapsed = started.elapsed();
             tracing::info!(
                 "[infr] preloaded bounded MoE RAM pool {pool_idx}: {blocks} blocks / {:.2} GB across {} layers in {:.2}s ({:.2} GB/s)",
                 bytes as f64 / 1e9,
-                layers.len(),
+                n_layers,
                 elapsed.as_secs_f64(),
                 bytes as f64 / 1e9 / elapsed.as_secs_f64().max(f64::EPSILON),
             );
