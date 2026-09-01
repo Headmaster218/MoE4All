@@ -2848,19 +2848,6 @@ impl MoePagerSession {
         (0..n_expert as u32).all(|e| pager.is_resident(src.block_base + e))
     }
 
-    /// Whether every routed layer-local expert in `ids` is already resident for this role. This
-    /// is a read-only scheduling query: it deliberately does not touch LRU order or begin a batch.
-    pub fn routed_all_resident(&self, buf_id: usize, ids: &[u32]) -> Result<bool> {
-        let (_, pool, src) = self
-            .sources
-            .get(&buf_id)
-            .ok_or_else(|| be("moe pager: residency query on an unregistered buffer"))?;
-        let pager = &self.pools[*pool].pager;
-        Ok(ids
-            .iter()
-            .all(|&expert| pager.is_resident(src.block_base + expert)))
-    }
-
     /// Return one bit per routed slot whose expert is resident in every supplied role. This is a
     /// read-only Decode scheduling query used to launch complete hit triplets while the remaining
     /// experts are promoted. All roles must share one physical size pool so a single pager epoch
@@ -2965,17 +2952,6 @@ impl MoePagerSession {
         Ok(true)
     }
 
-    /// Whether this role is backed by the bounded inclusive RAM/SSD tier rather than the complete
-    /// permanent Host Store. Cross-role promotion parallelism only pays on the bounded tier; the
-    /// full-store path copies serially and should retain Decode's Down-copy/Up+Gate overlap.
-    pub fn role_uses_bounded_host_tier(&self, buf_id: usize) -> Result<bool> {
-        let (_, pool, _) = self
-            .sources
-            .get(&buf_id)
-            .ok_or_else(|| be("moe pager: host-tier query on an unregistered buffer"))?;
-        Ok(self.pools[*pool].host.is_some())
-    }
-
     /// Runtime Decode upload path backed by the unique CPU expert store. Every miss targets its
     /// final LRU slot; mapped targets are written directly and ordinary device-local targets use
     /// imported-host or staged copies. The caller must have drained earlier arena readers first.
@@ -2990,9 +2966,10 @@ impl MoePagerSession {
     }
 
     /// Resolve several roles from one shared size pool in caller order, then move all resulting
-    /// host-tier misses concurrently. This preserves the exact LRU/LUT decisions of repeated
+    /// misses as one transfer batch. This preserves the exact LRU/LUT decisions of repeated
     /// [`Self::push_role_cpu`] calls while allowing split Gate/Up/Down banks to share one deeper
-    /// SSD/RAM-to-device batch. The caller must have opened one shared pager epoch first.
+    /// full-RAM, bounded-RAM or SSD-to-device batch. The caller must have opened one shared pager
+    /// epoch first.
     pub fn push_roles_cpu(
         &mut self,
         vk: &VulkanBackend,

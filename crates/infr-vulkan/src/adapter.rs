@@ -6661,11 +6661,10 @@ fn retain_prefill_compute(
     Ok(())
 }
 
-// The small-m Decode Down-overlap path also submits the Gate/Up work without waiting, then
-// observes whether it is still live while the missing Down weights are pushed. Keep that probe
-// independent from the Prefill layer-ring producer: Decode may use either the dense staging ring
-// or the general compute queue, but it never transfers ownership of its segment to the Prefill
-// uploader.
+// Decode's hit-first path submits resident/shared UGD without waiting, then observes whether it is
+// still live while complete miss triplets are promoted. Keep that probe independent from the
+// Prefill layer-ring producer: Decode may use either the dense staging ring or the general compute
+// queue, but it never transfers ownership of its segment to the Prefill uploader.
 #[derive(Clone, Copy)]
 enum PrefetchComputeProbe {
     Ring(usize),
@@ -6876,9 +6875,7 @@ fn stage_and_window<'a>(
         if let Some(recorder) = rec.as_ref() {
             push.record(recorder)?;
         } else {
-            // Full-Host-Store Down overlap intentionally has no open recorder here: Gate/Up is
-            // already executing while the host writes Down. Explicit completion preserves the
-            // mapped CPU-copy window and gives an unmapped arena a correct immediate DMA fallback.
+            // Callers without an ambient recorder must explicitly complete prepared transfers.
             push.complete_without_recorder(be_)?;
         }
     }
@@ -7497,11 +7494,12 @@ fn execute_paged_moe<'a>(
     }
     let mut active_mask = all_active_mask;
     let mut shared_batch_preopened = false;
-    // Decode-only hit-first trial: when some complete Gate/Up/Down triplets are already resident,
-    // launch those slots before blocking on the remaining host promotions. The original slot
-    // order is retained through a kernel mask, so router weights and the final accumulation stay
-    // byte-for-byte in their ordinary layout. Keep the pager epoch open across both halves: miss
-    // insertion may then use any cold slot except the hit weights still being read by the GPU.
+    let mut promotion_probe = None;
+    // Decode-only hit-first schedule: launch complete resident Gate/Up/Down triplets together with
+    // the shared expert while every missing triplet is promoted. The original slot order is
+    // retained through a kernel mask, so router weights and final accumulation stay byte-for-byte
+    // in their ordinary layout. Keep the pager epoch open across both halves: miss insertion may
+    // then use any cold slot except the hit weights still being read by the GPU.
     if !layer_stream
         && rows == 1
         && !*fused_gate_up
@@ -7509,17 +7507,14 @@ fn execute_paged_moe<'a>(
         && stage_ids.len() == n_used
         && n_used <= u32::BITS as usize
     {
-        let (hit_mask, bounded) = {
+        let hit_mask = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_ref().expect("paged execution requires a session");
-            (
-                sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?,
-                sess.role_uses_bounded_host_tier(gate_id)?,
-            )
+            sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?
         };
         // Without a shared expert, an empty hit set still has no useful first-stage work. With
         // one, shared-only is useful work and overlaps the all-miss host promotion as requested.
-        if bounded && hit_mask != routed_mask && (hit_mask != 0 || shared.is_some()) {
+        if hit_mask != routed_mask && (hit_mask != 0 || shared.is_some()) {
             let mut hit_ids = Vec::with_capacity(n_used);
             let mut miss_ids = Vec::with_capacity(n_used);
             for (slot, &expert) in stage_ids.iter().enumerate() {
@@ -7663,7 +7658,7 @@ fn execute_paged_moe<'a>(
                         first_mask,
                     );
                 }
-                submit_prefill_compute(rec, ps)?;
+                promotion_probe = Some(submit_prefill_compute(rec, ps)?);
                 let fresh = be_.recorder()?;
                 fresh.seed_barrier();
                 fresh.arena_stream_barrier();
@@ -7682,23 +7677,25 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
-    let (shared_batch, bounded_host_batch) = if shared_batch_preopened {
-        (true, true)
+    let shared_batch = if shared_batch_preopened {
+        true
     } else if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
-        let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
-        let bounded = shared && sess.role_uses_bounded_host_tier(gate_id)?;
-        (shared, bounded)
+        sess.begin_shared_batch(&[gate_id, up_id, down_id])?
     } else {
-        (false, false)
+        false
     };
-    // On one shared size pool, resolving all three roles before moving bytes gives the host tier
-    // enough independent work to saturate SSD/RAM/ReBAR. Keep it restricted to the bounded tier:
-    // the complete Host Store has no parallel promotion work here, so batching Down would only
-    // discard its useful overlap with Gate/Up compute on Qwen/Ling-style models.
-    let roles_batched = bounded_host_batch;
+    // Resolve all roles before moving bytes whenever they share one physical pool. This preserves
+    // one pager epoch and one transfer batch for full-RAM, bounded-RAM and SSD backing alike.
+    let roles_batched = shared_batch;
     if roles_batched {
+        let overlap = if let Some(probe) = promotion_probe {
+            let profile = infr_core::pager_profile::active();
+            Some((probe, profile && prefetch_compute_live(ps, probe)?))
+        } else {
+            None
+        };
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
             guard
@@ -7715,6 +7712,14 @@ fn execute_paged_moe<'a>(
                 )?
         };
         push.record(rec.as_ref().expect("segment always Some between ops"))?;
+        if let Some((probe, compute_live_at_start)) = overlap {
+            if infr_core::pager_profile::active() {
+                infr_core::pager_profile::record_prefetch_window(
+                    compute_live_at_start,
+                    prefetch_compute_live(ps, probe)?,
+                );
+            }
+        }
     }
     let role_stage_ids = if roles_batched {
         &[][..]
@@ -7751,26 +7756,10 @@ fn execute_paged_moe<'a>(
             shared_batch,
         )?
     };
-    let down_has_miss = if roles_batched {
-        false
-    } else if !layer_stream && !stage_ids.is_empty() {
-        let guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_ref().expect("paged execution requires a session");
-        !sess.routed_all_resident(down_id, &stage_ids)?
+    let down_w = if layer_stream {
+        stage_layer_and_window(be_, rec, ps, down_id, n_expert)?
     } else {
-        false
-    };
-    let overlap_down = !layer_stream
-        && !stage_ids.is_empty()
-        && down_has_miss
-        && rows <= moe_small_m_threshold(be_)
-        && be_.prefers_decode_down_overlap();
-    let down_w = if overlap_down {
-        None
-    } else if layer_stream {
-        Some(stage_layer_and_window(be_, rec, ps, down_id, n_expert)?)
-    } else {
-        Some(stage_and_window(
+        stage_and_window(
             be_,
             rec,
             ps,
@@ -7779,7 +7768,7 @@ fn execute_paged_moe<'a>(
             n_expert,
             touch_all,
             shared_batch,
-        )?)
+        )?
     };
     // RAW: make every direct HOST write to the mapped arena visible before the first dispatch
     // below reads it by pointer. Covers both batched and small-m paged expert kernels.
@@ -7992,7 +7981,7 @@ fn execute_paged_moe<'a>(
                     sess.arena_addr(down_id)?,
                     sess.slot_bytes(down_id)? as u32,
                     sess.tape(),
-                    down_w.expect("batched path stages Down before dispatch") as usize,
+                    down_w as usize,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
                     pool[&ye].as_ref(),
@@ -8169,38 +8158,6 @@ fn execute_paged_moe<'a>(
             },
         }
     }
-    let down_w = if let Some(window) = down_w {
-        window
-    } else {
-        // Gate/Up and activation do not read the Down role pool. Launch them first, then direct-
-        // push Down misses while that independent GPU work is live. The fresh recorder is queue-
-        // ordered after the first segment and its seed/barrier publishes the Host writes before
-        // the Down GEMV. The next layer's ordinary sync drains this pending segment and tape.
-        let probe = submit_prefill_compute(rec, ps)?;
-        let profile = infr_core::pager_profile::active();
-        let compute_live_at_start = profile && prefetch_compute_live(ps, probe)?;
-        let window = stage_and_window(
-            be_,
-            rec,
-            ps,
-            down_id,
-            &stage_ids,
-            n_expert,
-            touch_all,
-            shared_batch,
-        )?;
-        if profile {
-            infr_core::pager_profile::record_prefetch_window(
-                compute_live_at_start,
-                prefetch_compute_live(ps, probe)?,
-            );
-        }
-        let fresh = be_.recorder()?;
-        fresh.seed_barrier();
-        fresh.arena_stream_barrier();
-        *rec = Some(fresh);
-        window
-    };
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     {
         let guard = be_.moe_pager().lock().unwrap();
