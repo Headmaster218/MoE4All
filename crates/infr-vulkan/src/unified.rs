@@ -4,6 +4,7 @@
 //! testable without a GPU.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -12,6 +13,182 @@ use infr_core::error::Result;
 
 use super::{be, VulkanBackend};
 use crate::arena::{DeviceArena, DeviceArenaShard};
+
+const UNIFIED_ALIGN: usize = 256;
+
+/// Stable identity of one expert filler cell. Pool-local slot numbers remain the pager's cache
+/// indices; this pair is the only identity the global arena layout needs in order to report which
+/// cells a higher-priority range will cover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ExpertSlotId {
+    pub pool: usize,
+    pub slot: usize,
+}
+
+/// One expert cell's immutable physical coordinates inside a large arena shard. Cells from
+/// different size classes may be interleaved, but no cell crosses a Vulkan allocation boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertSlotPlacement {
+    pub id: ExpertSlotId,
+    pub logical_offset: usize,
+    pub shard: usize,
+    pub offset: usize,
+    pub len: usize,
+}
+
+/// Load-time geometry of the elastic VRAM arena. Physical storage remains a small number of large
+/// Vulkan shards; the entries below are only a logical filler directory over those shards.
+///
+/// The arena has three priority corridors:
+///
+/// - `[0, kv_reserve_bytes)` is reserved for lazy low-address KV growth;
+/// - the middle corridor is available to the fixed Prefill lane while active;
+/// - the high suffix is the planned runtime reserve.
+///
+/// Expert cells initially fill all three corridors and are disabled only as their bytes are
+/// claimed by a higher-priority owner.
+#[derive(Clone, Debug)]
+pub(crate) struct ExpertArenaLayout {
+    shard_sizes: Vec<usize>,
+    slots_by_pool: Vec<Vec<ExpertSlotPlacement>>,
+    total_bytes: usize,
+    kv_reserve_bytes: usize,
+    runtime_reserve_bytes: usize,
+}
+
+impl ExpertArenaLayout {
+    pub(crate) fn build(
+        specs: &[(usize, usize)],
+        max_shard: usize,
+        kv_reserve_bytes: usize,
+        runtime_reserve_bytes: usize,
+    ) -> Result<Self> {
+        if specs.is_empty() || max_shard < UNIFIED_ALIGN {
+            return Err(be(
+                "expert arena layout needs pools and a usable shard limit",
+            ));
+        }
+        let mut total_bytes = 0usize;
+        let mut total_slots = 0usize;
+        for &(slot_bytes, n_slots) in specs {
+            if slot_bytes == 0
+                || n_slots == 0
+                || !slot_bytes.is_multiple_of(UNIFIED_ALIGN)
+                || slot_bytes > max_shard
+            {
+                return Err(be(format!(
+                    "invalid expert arena pool: {n_slots} slot(s) x {slot_bytes} bytes, shard limit {max_shard}"
+                )));
+            }
+            total_bytes = total_bytes
+                .checked_add(
+                    slot_bytes
+                        .checked_mul(n_slots)
+                        .ok_or_else(|| be("expert arena pool byte size overflow"))?,
+                )
+                .ok_or_else(|| be("expert arena total byte size overflow"))?;
+            total_slots = total_slots
+                .checked_add(n_slots)
+                .ok_or_else(|| be("expert arena slot count overflow"))?;
+        }
+        let kv_reserve_bytes = align_up(kv_reserve_bytes, UNIFIED_ALIGN)
+            .ok_or_else(|| be("KV reserve alignment overflow"))?;
+        let runtime_reserve_bytes = align_up(runtime_reserve_bytes, UNIFIED_ALIGN)
+            .ok_or_else(|| be("runtime reserve alignment overflow"))?;
+        if kv_reserve_bytes.saturating_add(runtime_reserve_bytes) > total_bytes {
+            return Err(be(format!(
+                "elastic arena has {total_bytes} bytes, below its {kv_reserve_bytes}-byte KV and {runtime_reserve_bytes}-byte runtime reserves"
+            )));
+        }
+
+        // Smooth weighted round-robin preserves each planner-selected pool's slot fraction in
+        // every broad physical prefix. A growing low-address KV frontier therefore sheds all size
+        // classes proportionally instead of exhausting whichever class happened to be allocated
+        // first. The weights are the final slot counts, not raw expert counts.
+        let weights: Vec<i128> = specs.iter().map(|&(_, n)| n as i128).collect();
+        let total_weight = total_slots as i128;
+        let mut current = vec![0i128; specs.len()];
+        let mut remaining: Vec<usize> = specs.iter().map(|&(_, n)| n).collect();
+        let mut slots_by_pool: Vec<Vec<ExpertSlotPlacement>> =
+            specs.iter().map(|&(_, n)| Vec::with_capacity(n)).collect();
+        let mut shard_sizes = Vec::new();
+        let mut shard = 0usize;
+        let mut shard_offset = 0usize;
+        let mut logical_offset = 0usize;
+
+        for _ in 0..total_slots {
+            let mut selected = None;
+            for pool in 0..specs.len() {
+                if remaining[pool] == 0 {
+                    continue;
+                }
+                current[pool] += weights[pool];
+                if selected.is_none_or(|old| {
+                    current[pool] > current[old] || (current[pool] == current[old] && pool < old)
+                }) {
+                    selected = Some(pool);
+                }
+            }
+            let pool = selected.expect("total_slots tracks every remaining expert cell");
+            current[pool] -= total_weight;
+            remaining[pool] -= 1;
+
+            let slot_bytes = specs[pool].0;
+            if shard_offset != 0 && shard_offset.saturating_add(slot_bytes) > max_shard {
+                shard_sizes.push(shard_offset);
+                shard += 1;
+                shard_offset = 0;
+            }
+            let slot = slots_by_pool[pool].len();
+            slots_by_pool[pool].push(ExpertSlotPlacement {
+                id: ExpertSlotId { pool, slot },
+                logical_offset,
+                shard,
+                offset: shard_offset,
+                len: slot_bytes,
+            });
+            shard_offset += slot_bytes;
+            logical_offset += slot_bytes;
+        }
+        if shard_offset != 0 {
+            shard_sizes.push(shard_offset);
+        }
+        debug_assert_eq!(logical_offset, total_bytes);
+        debug_assert!(remaining.iter().all(|&n| n == 0));
+
+        Ok(Self {
+            shard_sizes,
+            slots_by_pool,
+            total_bytes,
+            kv_reserve_bytes,
+            runtime_reserve_bytes,
+        })
+    }
+
+    pub(crate) fn shard_sizes(&self) -> &[usize] {
+        &self.shard_sizes
+    }
+
+    pub(crate) fn slots(&self, pool: usize) -> Option<&[ExpertSlotPlacement]> {
+        self.slots_by_pool.get(pool).map(Vec::as_slice)
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub(crate) fn kv_corridor(&self) -> Range<usize> {
+        0..self.kv_reserve_bytes
+    }
+
+    pub(crate) fn prefill_corridor(&self) -> Range<usize> {
+        self.kv_reserve_bytes..self.total_bytes - self.runtime_reserve_bytes
+    }
+
+    pub(crate) fn runtime_corridor(&self) -> Range<usize> {
+        self.total_bytes - self.runtime_reserve_bytes..self.total_bytes
+    }
+}
 
 /// Owner of a live range in the unified elastic arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -543,6 +720,74 @@ fn insert_free(free: &mut BTreeMap<usize, usize>, offset: usize, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_layout_interleaves_planner_selected_pool_ratios() {
+        let specs = [(512, 2), (256, 1), (256, 17)];
+        let layout = ExpertArenaLayout::build(&specs, 4096, 0, 0).unwrap();
+        let mut ordered: Vec<_> = layout.slots_by_pool.iter().flatten().copied().collect();
+        ordered.sort_unstable_by_key(|slot| slot.logical_offset);
+        assert_eq!(ordered.len(), 20);
+
+        let mut seen = vec![0usize; specs.len()];
+        for (prefix, slot) in ordered.iter().enumerate() {
+            seen[slot.id.pool] += 1;
+            let prefix = prefix + 1;
+            for (pool, &(_, wanted)) in specs.iter().enumerate() {
+                let error = (seen[pool] * ordered.len()) as isize - (prefix * wanted) as isize;
+                assert!(
+                    error.unsigned_abs() <= ordered.len(),
+                    "pool {pool} drifted by more than one slot at prefix {prefix}: {seen:?}"
+                );
+            }
+        }
+        assert_eq!(seen, vec![2, 1, 17]);
+        let first_pool_positions: Vec<_> = ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(position, slot)| (slot.id.pool == 0).then_some(position))
+            .collect();
+        assert!(first_pool_positions[1] - first_pool_positions[0] > 1);
+    }
+
+    #[test]
+    fn expert_layout_uses_large_shards_without_crossing_or_holes() {
+        let specs = [(1024, 5), (512, 7), (256, 9)];
+        let layout = ExpertArenaLayout::build(&specs, 2048, 0, 0).unwrap();
+        assert!(layout.shard_sizes().iter().all(|&bytes| bytes <= 2048));
+        assert_eq!(
+            layout.shard_sizes().iter().sum::<usize>(),
+            layout.total_bytes()
+        );
+
+        for (shard, &size) in layout.shard_sizes().iter().enumerate() {
+            let mut ranges: Vec<_> = layout
+                .slots_by_pool
+                .iter()
+                .flatten()
+                .filter(|slot| slot.shard == shard)
+                .map(|slot| (slot.offset, slot.offset + slot.len))
+                .collect();
+            ranges.sort_unstable();
+            assert_eq!(ranges.first().map(|range| range.0), Some(0));
+            assert_eq!(ranges.last().map(|range| range.1), Some(size));
+            assert!(ranges.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        }
+    }
+
+    #[test]
+    fn arena_corridors_align_and_leave_the_middle_for_experts_and_prefill() {
+        let layout = ExpertArenaLayout::build(&[(256, 20)], 4096, 257, 513).unwrap();
+        assert_eq!(layout.kv_corridor(), 0..512);
+        assert_eq!(layout.runtime_corridor(), 4352..5120);
+        assert_eq!(layout.prefill_corridor(), 512..4352);
+    }
+
+    #[test]
+    fn arena_corridors_reject_reserves_larger_than_the_physical_pool() {
+        let error = ExpertArenaLayout::build(&[(256, 4)], 4096, 768, 512).unwrap_err();
+        assert!(error.to_string().contains("below its"));
+    }
 
     #[test]
     fn aligned_best_fit_and_drop_coalesce() {
