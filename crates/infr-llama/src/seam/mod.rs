@@ -3216,7 +3216,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
                     .collect();
 
-                let failure = match vk.prepare_moe_unified_vram(&specs) {
+                let failure = match vk.prepare_moe_unified_vram(
+                    &specs,
+                    plan.dynamic_state_reserve_bytes,
+                    plan.runtime_reserve_bytes,
+                ) {
                     Ok(committed) => {
                         debug_assert_eq!(committed as u64, physical_bytes);
                         let live_room = vk.alloc_room();
@@ -3436,6 +3440,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 load_reserve_bytes: 0,
                 n_blocks,
                 pools,
+                dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
+                runtime_reserve_bytes: plan.runtime_reserve_bytes,
                 host_chunks,
                 prefill_target_lanes,
                 prefill_cache_bytes: expert_cache_target_bytes,

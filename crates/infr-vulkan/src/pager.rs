@@ -54,7 +54,10 @@ use crate::transfer::{
     parallel_copy_to_mapped as par_copy_to_mapped, DeviceTransferTarget, PreparedTransfer,
     SessionTransferPlan, TransferExecutor,
 };
-use crate::unified::{UnifiedAllocationHandle, UnifiedRange, UnifiedVramClass, UnifiedVramPool};
+use crate::unified::{
+    ExpertSlotId, UnifiedAllocationHandle, UnifiedClaimPlan, UnifiedRange, UnifiedVramClass,
+    UnifiedVramPool,
+};
 
 /// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
 /// bad seam budget (0 slots) or sizing bug (misaligned stride) returns `Err` before any allocation.
@@ -252,36 +255,53 @@ impl GpuPager {
     fn new_unified(
         vk: &VulkanBackend,
         pool: Arc<UnifiedVramPool>,
+        pool_index: usize,
         n_blocks: usize,
         n_slots: usize,
         slot_bytes: usize,
     ) -> Result<Self> {
         validate_pager_dims(n_slots, slot_bytes)?;
+        let placements = pool
+            .expert_layout()
+            .and_then(|layout| layout.slots(pool_index))
+            .ok_or_else(|| be(format!("unified VRAM has no expert pool {pool_index}")))?;
+        if placements.len() != n_slots
+            || placements
+                .iter()
+                .any(|placement| placement.len != slot_bytes)
+        {
+            return Err(be(format!(
+                "unified expert pool {pool_index} layout does not match {n_slots} x {slot_bytes} bytes"
+            )));
+        }
         let mut slots: Vec<UnifiedSlot> = Vec::with_capacity(n_slots);
-        let mut arenas: Vec<ArenaShard> = Vec::new();
-        let mut previous_shard = None;
+        let mut arenas: Vec<ArenaShard> = Vec::with_capacity(n_slots);
         for slot in 0..n_slots {
             let allocation = pool
-                .allocate(slot_bytes, UnifiedVramClass::Expert)
-                .ok_or_else(|| be("unified VRAM arena cannot fit all planned expert slots"))?;
+                .claim_expert_slot(ExpertSlotId {
+                    pool: pool_index,
+                    slot,
+                })
+                .ok_or_else(|| be("unified VRAM arena cannot claim a planned expert slot"))?;
             let range = allocation.range();
-            let continues = previous_shard == Some(range.shard)
-                && arenas.last().is_some_and(|arena| {
-                    arena.first_slot as usize + arena.n_slots as usize == slot
-                        && arena.buffer_offset + arena.n_slots as usize * slot_bytes == range.offset
-                });
-            if continues {
-                arenas.last_mut().expect("checked above").n_slots += 1;
-            } else {
-                arenas.push(ArenaShard {
-                    buffer: allocation.buffer_arc(),
-                    addr: allocation.base_addr(),
-                    buffer_offset: range.offset,
-                    first_slot: slot as u32,
-                    n_slots: 1,
-                });
+            let placement = placements[slot];
+            if (range.shard, range.offset, range.len)
+                != (placement.shard, placement.offset, placement.len)
+            {
+                return Err(be(
+                    "claimed expert slot differs from its frozen arena layout",
+                ));
             }
-            previous_shard = Some(range.shard);
+            // One logical entry per slot keeps slot->address lookup O(1) even though size classes
+            // are physically interleaved. These entries share the arena's handful of Vulkan
+            // buffers; they are not independent device allocations.
+            arenas.push(ArenaShard {
+                buffer: allocation.buffer_arc(),
+                addr: allocation.base_addr(),
+                buffer_offset: range.offset,
+                first_slot: slot as u32,
+                n_slots: 1,
+            });
             slots.push(UnifiedSlot {
                 range,
                 allocation: Some(allocation),
@@ -319,6 +339,15 @@ impl GpuPager {
     }
 
     fn slot_location(&self, slot: u32) -> Result<(usize, usize)> {
+        if self.unified.is_some() {
+            let arena_idx = slot as usize;
+            let arena = self
+                .arenas
+                .get(arena_idx)
+                .filter(|arena| arena.first_slot == slot && arena.n_slots == 1)
+                .ok_or_else(|| be(format!("global pager slot {slot} has no physical arena")))?;
+            return Ok((arena_idx, arena.buffer_offset));
+        }
         let (arena_idx, arena) = self
             .arenas
             .iter()
@@ -1699,6 +1728,11 @@ pub struct MoePagerLayout {
     /// it; other layers' entries stay `NOT_RESIDENT`).
     pub n_blocks: usize,
     pub pools: Vec<MoePoolSpec>,
+    /// Maximum lazily committed KV/QSA bytes. The unified arena reserves this low-address
+    /// corridor logically while allowing Expert filler to occupy uncommitted cells.
+    pub dynamic_state_reserve_bytes: u64,
+    /// High-address corridor sized for the planner's peak graph/runtime workspace.
+    pub runtime_reserve_bytes: u64,
     /// Non-overlapping layer-boundary chunks covering the exact layer-major host-store extent.
     pub host_chunks: Vec<MoeHostChunkSpec>,
     /// Model-topology target for the Prefill whole-layer streaming ring. Runtime construction
@@ -1801,9 +1835,13 @@ impl MoePagerSession {
             .iter()
             .map(|spec| (spec.slot_bytes, spec.n_slots))
             .collect();
-        let unified_pool = vk.init_unified_vram_for_expert_slots(&unified_specs)?;
+        let unified_pool = vk.init_unified_vram_for_expert_slots(
+            &unified_specs,
+            layout.dynamic_state_reserve_bytes,
+            layout.runtime_reserve_bytes,
+        )?;
         let mut pools = Vec::with_capacity(layout.pools.len());
-        for spec in &layout.pools {
+        for (pool_index, spec) in layout.pools.iter().enumerate() {
             if spec.min_enabled_slots == 0 || spec.min_enabled_slots > spec.n_slots {
                 return Err(be(format!(
                     "MoE pool dispatch floor {} is outside its {} physical slots",
@@ -1813,6 +1851,7 @@ impl MoePagerSession {
             let mut pager = GpuPager::new_unified(
                 vk,
                 Arc::clone(&unified_pool),
+                pool_index,
                 layout.n_blocks.saturating_mul(3),
                 spec.n_slots,
                 spec.slot_bytes,
@@ -2109,6 +2148,75 @@ impl MoePagerSession {
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: bank size on an unregistered buffer"))?;
         Ok(src.bank_bytes)
+    }
+
+    /// Retire exactly the Expert filler cells selected by the arena manager, then commit every
+    /// higher-priority range as one allocator transaction. The manager owns geometry; the pager
+    /// remains the sole owner of LRU/LUT and bounded-RAM shadow semantics.
+    pub(crate) fn commit_unified_claim(
+        &mut self,
+        plan: UnifiedClaimPlan,
+    ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
+        let mut by_pool: Vec<Vec<usize>> = vec![Vec::new(); self.pools.len()];
+        for &id in plan.victims() {
+            let pool = self.pools.get(id.pool).ok_or_else(|| {
+                be(format!(
+                    "unified VRAM claim named unknown expert pool {}",
+                    id.pool
+                ))
+            })?;
+            if id.slot >= pool.pager.n_slots() {
+                return Err(be(format!(
+                    "unified VRAM claim named unknown expert slot {}/{}",
+                    id.pool, id.slot
+                )));
+            }
+            by_pool[id.pool].push(id.slot);
+        }
+        for (pool, slots) in self.pools.iter().zip(&by_pool) {
+            if !loan_preserves_pool_floor(
+                pool.pager.enabled_slots(),
+                slots.len(),
+                pool.min_enabled_slots,
+            ) {
+                return Err(be(format!(
+                    "unified VRAM claim of {} slot(s) would shrink an expert pool from {} below its {}-slot dispatch-batch safety floor",
+                    slots.len(),
+                    pool.pager.enabled_slots(),
+                    pool.min_enabled_slots,
+                )));
+            }
+        }
+
+        let loaned: usize = by_pool.iter().map(Vec::len).sum();
+        for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
+            let evicted = pool.pager.loan_slots(&slots, pool.min_enabled_slots)?;
+            if let Some(host) = &pool.host {
+                host.release_gpu_blocks(&evicted);
+            }
+        }
+        match self.unified_pool.commit_claim(plan) {
+            Ok(handles) => {
+                self.unified_generation = self.unified_pool.generation();
+                if loaned != 0 && tracing::enabled!(tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        loaned_slots = loaned,
+                        allocations = handles.len(),
+                        "claimed unified VRAM by retiring exact expert filler slots"
+                    );
+                }
+                Ok(handles)
+            }
+            Err(error) => {
+                // The execution gate makes a stale plan unexpected, but restore every now-free
+                // physical cell so a failed allocation cannot permanently shrink the cache.
+                for pool in &mut self.pools {
+                    pool.pager.try_restore_loaned_slots();
+                }
+                self.unified_generation = self.unified_pool.generation();
+                Err(error)
+            }
+        }
     }
 
     /// Release the coldest physically contiguous expert-slot window large enough for an

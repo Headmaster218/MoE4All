@@ -3,7 +3,7 @@
 //! bookkeeping independent makes alignment, coalescing, accounting and exact slot restoration
 //! testable without a GPU.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -188,6 +188,245 @@ impl ExpertArenaLayout {
     pub(crate) fn runtime_corridor(&self) -> Range<usize> {
         self.total_bytes - self.runtime_reserve_bytes..self.total_bytes
     }
+
+    fn physical_pieces(&self, logical: Range<usize>) -> Vec<ArenaPiece> {
+        let mut pieces = Vec::new();
+        let mut base = 0usize;
+        for (shard, &size) in self.shard_sizes.iter().enumerate() {
+            let shard_end = base + size;
+            let start = logical.start.max(base);
+            let end = logical.end.min(shard_end);
+            if start < end {
+                pieces.push(ArenaPiece {
+                    shard,
+                    start: start - base,
+                    end: end - base,
+                });
+            }
+            base = shard_end;
+        }
+        pieces
+    }
+
+    fn plan_claim(
+        &self,
+        live: &[UnifiedRange],
+        requested: &[usize],
+        class: UnifiedVramClass,
+        corridor: Range<usize>,
+        direction: ClaimDirection,
+    ) -> Result<UnifiedClaimPlan> {
+        if class == UnifiedVramClass::Expert || requested.is_empty() {
+            return Err(be("elastic claim needs non-Expert bytes"));
+        }
+        let mut blockers: Vec<PlannedRange> = live
+            .iter()
+            .filter(|range| range.class != UnifiedVramClass::Expert)
+            .map(|range| PlannedRange {
+                shard: range.shard,
+                offset: range.offset,
+                len: range.len,
+                requested_len: range.requested_len,
+            })
+            .collect();
+        let pieces = self.physical_pieces(corridor);
+        let mut ranges = Vec::with_capacity(requested.len());
+        for &requested_len in requested {
+            if requested_len == 0 {
+                return Err(be("elastic claim cannot contain a zero-byte range"));
+            }
+            let len = align_up(requested_len, UNIFIED_ALIGN)
+                .ok_or_else(|| be("elastic claim alignment overflow"))?;
+            let candidate = match direction {
+                ClaimDirection::Low => find_low_gap(&pieces, &blockers, len),
+                ClaimDirection::High => find_high_gap(&pieces, &blockers, len),
+            }
+            .ok_or_else(|| {
+                be(format!(
+                    "{class:?} cannot fit {len} contiguous bytes in its frozen arena corridor"
+                ))
+            })?;
+            let range = PlannedRange {
+                requested_len,
+                ..candidate
+            };
+            blockers.push(range);
+            ranges.push(range);
+        }
+
+        let live_experts: HashSet<_> = live
+            .iter()
+            .filter(|range| range.class == UnifiedVramClass::Expert)
+            .map(|range| (range.shard, range.offset, range.len))
+            .collect();
+        let mut victims = Vec::new();
+        for placement in self.slots_by_pool.iter().flatten() {
+            if !live_experts.contains(&(placement.shard, placement.offset, placement.len)) {
+                continue;
+            }
+            if ranges.iter().any(|range| {
+                range.shard == placement.shard
+                    && ranges_overlap(range.offset, range.len, placement.offset, placement.len)
+            }) {
+                victims.push(placement.id);
+            }
+        }
+        let mapped_experts = self
+            .slots_by_pool
+            .iter()
+            .flatten()
+            .filter(|placement| {
+                live_experts.contains(&(placement.shard, placement.offset, placement.len))
+            })
+            .count();
+        if mapped_experts != live_experts.len() {
+            return Err(be(
+                "elastic arena contains an Expert allocation outside its frozen slot directory",
+            ));
+        }
+        victims.sort_unstable_by_key(|id| (id.pool, id.slot));
+        victims.dedup();
+        Ok(UnifiedClaimPlan {
+            class,
+            ranges,
+            victims,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArenaPiece {
+    shard: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClaimDirection {
+    Low,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlannedRange {
+    shard: usize,
+    offset: usize,
+    len: usize,
+    requested_len: usize,
+}
+
+/// A side-effect-free arena mutation plan. Pager retirement happens between planning and commit;
+/// callers hold the backend's unified execution guard across both operations, so no third party
+/// can invalidate the range calculation.
+pub(crate) struct UnifiedClaimPlan {
+    class: UnifiedVramClass,
+    ranges: Vec<PlannedRange>,
+    victims: Vec<ExpertSlotId>,
+}
+
+impl UnifiedClaimPlan {
+    pub(crate) fn victims(&self) -> &[ExpertSlotId] {
+        &self.victims
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub(crate) fn class(&self) -> UnifiedVramClass {
+        self.class
+    }
+}
+
+fn find_low_gap(
+    pieces: &[ArenaPiece],
+    blockers: &[PlannedRange],
+    len: usize,
+) -> Option<PlannedRange> {
+    for piece in pieces {
+        let mut occupied: Vec<_> = blockers
+            .iter()
+            .filter(|range| range.shard == piece.shard)
+            .map(|range| (range.offset, range.offset.saturating_add(range.len)))
+            .filter(|&(start, end)| start < piece.end && end > piece.start)
+            .collect();
+        occupied.sort_unstable();
+        let mut cursor = align_up(piece.start, UNIFIED_ALIGN)?;
+        for (start, end) in occupied {
+            if cursor.checked_add(len)? <= start {
+                return Some(PlannedRange {
+                    shard: piece.shard,
+                    offset: cursor,
+                    len,
+                    requested_len: len,
+                });
+            }
+            cursor = align_up(cursor.max(end), UNIFIED_ALIGN)?;
+            if cursor >= piece.end {
+                break;
+            }
+        }
+        if cursor.checked_add(len)? <= piece.end {
+            return Some(PlannedRange {
+                shard: piece.shard,
+                offset: cursor,
+                len,
+                requested_len: len,
+            });
+        }
+    }
+    None
+}
+
+fn find_high_gap(
+    pieces: &[ArenaPiece],
+    blockers: &[PlannedRange],
+    len: usize,
+) -> Option<PlannedRange> {
+    for piece in pieces.iter().rev() {
+        let mut occupied: Vec<_> = blockers
+            .iter()
+            .filter(|range| range.shard == piece.shard)
+            .map(|range| {
+                (
+                    range.offset.max(piece.start),
+                    range.offset.saturating_add(range.len).min(piece.end),
+                )
+            })
+            .filter(|&(start, end)| start < end)
+            .collect();
+        occupied.sort_unstable();
+        let mut gaps = Vec::with_capacity(occupied.len() + 1);
+        let mut cursor = piece.start;
+        for (start, end) in occupied {
+            if cursor < start {
+                gaps.push((cursor, start));
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < piece.end {
+            gaps.push((cursor, piece.end));
+        }
+        for (start, end) in gaps.into_iter().rev() {
+            let Some(latest) = end.checked_sub(len) else {
+                continue;
+            };
+            let offset = latest & !(UNIFIED_ALIGN - 1);
+            if offset >= start {
+                return Some(PlannedRange {
+                    shard: piece.shard,
+                    offset,
+                    len,
+                    requested_len: len,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn ranges_overlap(a_offset: usize, a_len: usize, b_offset: usize, b_len: usize) -> bool {
+    a_offset < b_offset.saturating_add(b_len) && b_offset < a_offset.saturating_add(a_len)
 }
 
 /// Owner of a live range in the unified elastic arena.
@@ -196,6 +435,7 @@ pub enum UnifiedVramClass {
     Expert,
     KvCache,
     LlmRuntime,
+    Prefill,
     EmbeddingWeights,
     EmbeddingRuntime,
     VisionWeights,
@@ -205,19 +445,20 @@ pub enum UnifiedVramClass {
 }
 
 impl UnifiedVramClass {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     const fn index(self) -> usize {
         match self {
             Self::Expert => 0,
             Self::KvCache => 1,
             Self::LlmRuntime => 2,
-            Self::EmbeddingWeights => 3,
-            Self::EmbeddingRuntime => 4,
-            Self::VisionWeights => 5,
-            Self::VisionRuntime => 6,
-            Self::DraftWeights => 7,
-            Self::DraftRuntime => 8,
+            Self::Prefill => 3,
+            Self::EmbeddingWeights => 4,
+            Self::EmbeddingRuntime => 5,
+            Self::VisionWeights => 6,
+            Self::VisionRuntime => 7,
+            Self::DraftWeights => 8,
+            Self::DraftRuntime => 9,
         }
     }
 }
@@ -482,6 +723,58 @@ impl UnifiedRangePool {
         ))
     }
 
+    fn try_claim_planned(
+        &self,
+        class: UnifiedVramClass,
+        ranges: &[PlannedRange],
+    ) -> Option<Vec<Arc<UnifiedAllocation>>> {
+        if ranges.is_empty()
+            || ranges.iter().any(|range| range.len == 0)
+            || ranges.iter().enumerate().any(|(index, range)| {
+                ranges[index + 1..].iter().any(|other| {
+                    range.shard == other.shard
+                        && ranges_overlap(range.offset, range.len, other.offset, other.len)
+                })
+            })
+        {
+            return None;
+        }
+        let mut state = self.inner.state.lock().unwrap();
+        for range in ranges {
+            let shard = state.shards.get(range.shard)?;
+            let (&free_start, &free_len) = shard.free.range(..=range.offset).next_back()?;
+            let free_end = free_start.checked_add(free_len)?;
+            if range.offset.checked_add(range.len)? > free_end {
+                return None;
+            }
+        }
+
+        let mut out = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let (&free_start, _) = state.shards[range.shard]
+                .free
+                .range(..=range.offset)
+                .next_back()
+                .expect("the complete claim batch was validated while holding this lock");
+            take_range(
+                &mut state.shards[range.shard].free,
+                free_start,
+                range.offset,
+                range.len,
+            );
+            out.push(make_allocation(
+                &self.inner,
+                &mut state,
+                range.shard,
+                range.offset,
+                range.len,
+                range.requested_len,
+                class,
+            ));
+        }
+        Some(out)
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.generation.load(Ordering::Acquire)
     }
@@ -558,6 +851,7 @@ impl UnifiedAllocationHandle {
 pub struct UnifiedVramPool {
     ranges: UnifiedRangePool,
     arena: DeviceArena,
+    expert_layout: Option<ExpertArenaLayout>,
 }
 
 impl UnifiedVramPool {
@@ -586,6 +880,22 @@ impl UnifiedVramPool {
     }
 
     pub(crate) fn new_with_shards(vk: &VulkanBackend, shard_sizes: &[usize]) -> Result<Arc<Self>> {
+        Self::new_with_layout(vk, shard_sizes, None)
+    }
+
+    pub(crate) fn new_for_experts(
+        vk: &VulkanBackend,
+        layout: ExpertArenaLayout,
+    ) -> Result<Arc<Self>> {
+        let shard_sizes = layout.shard_sizes().to_vec();
+        Self::new_with_layout(vk, &shard_sizes, Some(layout))
+    }
+
+    fn new_with_layout(
+        vk: &VulkanBackend,
+        shard_sizes: &[usize],
+        expert_layout: Option<ExpertArenaLayout>,
+    ) -> Result<Arc<Self>> {
         if shard_sizes.is_empty() || shard_sizes.contains(&0) {
             return Err(be("unified VRAM arena needs non-empty physical shards"));
         }
@@ -598,7 +908,111 @@ impl UnifiedVramPool {
             shard_sizes.iter().sum::<usize>(),
             shard_sizes.len(),
         );
-        Ok(Arc::new(Self { ranges, arena }))
+        Ok(Arc::new(Self {
+            ranges,
+            arena,
+            expert_layout,
+        }))
+    }
+
+    pub(crate) fn expert_layout(&self) -> Option<&ExpertArenaLayout> {
+        self.expert_layout.as_ref()
+    }
+
+    pub(crate) fn claim_expert_slot(
+        &self,
+        id: ExpertSlotId,
+    ) -> Option<Arc<UnifiedAllocationHandle>> {
+        let placement = *self.expert_layout.as_ref()?.slots(id.pool)?.get(id.slot)?;
+        debug_assert_eq!(placement.id, id);
+        let lease = self.ranges.try_claim_exact(
+            placement.shard,
+            placement.offset,
+            placement.len,
+            UnifiedVramClass::Expert,
+        )?;
+        let shard = self.arena.shard(placement.shard)?;
+        Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
+    }
+
+    pub(crate) fn plan_kv_claim(&self, requested: &[usize]) -> Result<UnifiedClaimPlan> {
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("KV corridor requires an expert-aware unified VRAM layout"))?;
+        layout.plan_claim(
+            &self.ranges.allocations(),
+            requested,
+            UnifiedVramClass::KvCache,
+            layout.kv_corridor(),
+            ClaimDirection::Low,
+        )
+    }
+
+    pub(crate) fn plan_prefill_claim(&self, requested: &[usize]) -> Result<UnifiedClaimPlan> {
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("Prefill corridor requires an expert-aware unified VRAM layout"))?;
+        layout.plan_claim(
+            &self.ranges.allocations(),
+            requested,
+            UnifiedVramClass::Prefill,
+            layout.prefill_corridor(),
+            ClaimDirection::Low,
+        )
+    }
+
+    /// Plan a non-KV, non-Prefill owner from high addresses. The maximum KV corridor remains a
+    /// hard lower boundary even before those lazy segments are physically committed.
+    pub(crate) fn plan_high_claim(
+        &self,
+        requested: &[usize],
+        class: UnifiedVramClass,
+    ) -> Result<UnifiedClaimPlan> {
+        if matches!(
+            class,
+            UnifiedVramClass::Expert | UnifiedVramClass::KvCache | UnifiedVramClass::Prefill
+        ) {
+            return Err(be(format!(
+                "{class:?} cannot use the high-address elastic claim path"
+            )));
+        }
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("high-address claim requires an expert-aware unified VRAM layout"))?;
+        layout.plan_claim(
+            &self.ranges.allocations(),
+            requested,
+            class,
+            layout.kv_corridor().end..layout.total_bytes(),
+            ClaimDirection::High,
+        )
+    }
+
+    /// Commit a previously planned claim as one allocator transaction. Callers must retire every
+    /// reported Expert victim first while holding the backend's unified execution gate.
+    pub(crate) fn commit_claim(
+        &self,
+        plan: UnifiedClaimPlan,
+    ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
+        let class = plan.class;
+        let leases = self
+            .ranges
+            .try_claim_planned(class, &plan.ranges)
+            .ok_or_else(|| be(format!("stale {class:?} unified VRAM claim plan")))?;
+        leases
+            .into_iter()
+            .map(|lease| {
+                let range = lease.range();
+                let shard = self
+                    .arena
+                    .shard(range.shard)
+                    .ok_or_else(|| be("planned unified VRAM range has no physical shard"))?;
+                Ok(Arc::new(UnifiedAllocationHandle { lease, shard }))
+            })
+            .collect()
     }
 
     pub(crate) fn allocate(
@@ -787,6 +1201,102 @@ mod tests {
     fn arena_corridors_reject_reserves_larger_than_the_physical_pool() {
         let error = ExpertArenaLayout::build(&[(256, 4)], 4096, 768, 512).unwrap_err();
         assert!(error.to_string().contains("below its"));
+    }
+
+    #[test]
+    fn low_kv_claim_reports_exact_interleaved_expert_victims() {
+        let layout = ExpertArenaLayout::build(&[(256, 8), (512, 4)], 4096, 1024, 512).unwrap();
+        let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let leases: Vec<_> = layout
+            .slots_by_pool
+            .iter()
+            .flatten()
+            .map(|slot| {
+                ranges
+                    .try_claim_exact(slot.shard, slot.offset, slot.len, UnifiedVramClass::Expert)
+                    .unwrap()
+            })
+            .collect();
+        let plan = layout
+            .plan_claim(
+                &ranges.allocations(),
+                &[300, 300],
+                UnifiedVramClass::KvCache,
+                layout.kv_corridor(),
+                ClaimDirection::Low,
+            )
+            .unwrap();
+        assert_eq!(
+            plan.ranges
+                .iter()
+                .map(|range| range.len)
+                .collect::<Vec<_>>(),
+            vec![512, 512]
+        );
+        assert_eq!(
+            plan.victims,
+            vec![
+                ExpertSlotId { pool: 0, slot: 0 },
+                ExpertSlotId { pool: 0, slot: 1 },
+                ExpertSlotId { pool: 1, slot: 0 },
+            ]
+        );
+        drop(leases);
+    }
+
+    #[test]
+    fn high_claim_never_enters_the_maximum_kv_corridor() {
+        let layout = ExpertArenaLayout::build(&[(256, 16)], 4096, 1024, 512).unwrap();
+        let plan = layout
+            .plan_claim(
+                &[],
+                &[300],
+                UnifiedVramClass::LlmRuntime,
+                layout.kv_corridor().end..layout.total_bytes(),
+                ClaimDirection::High,
+            )
+            .unwrap();
+        assert_eq!(plan.ranges.len(), 1);
+        assert_eq!(plan.ranges[0].offset, layout.total_bytes() - 512);
+        assert!(plan.ranges[0].offset >= layout.kv_corridor().end);
+    }
+
+    #[test]
+    fn planned_claim_is_all_or_nothing() {
+        let pool = UnifiedRangePool::new([1024]).unwrap();
+        let first = pool
+            .try_claim_exact(0, 0, 256, UnifiedVramClass::Expert)
+            .unwrap();
+        let second = pool
+            .try_claim_exact(0, 256, 256, UnifiedVramClass::Expert)
+            .unwrap();
+        drop(first);
+        let plan = [
+            PlannedRange {
+                shard: 0,
+                offset: 0,
+                len: 256,
+                requested_len: 200,
+            },
+            PlannedRange {
+                shard: 0,
+                offset: 256,
+                len: 256,
+                requested_len: 200,
+            },
+        ];
+        assert!(pool
+            .try_claim_planned(UnifiedVramClass::LlmRuntime, &plan)
+            .is_none());
+        let stats = pool.stats();
+        assert_eq!(stats.class_bytes(UnifiedVramClass::LlmRuntime), 0);
+        assert_eq!(stats.free_bytes, 768);
+
+        drop(second);
+        let claimed = pool
+            .try_claim_planned(UnifiedVramClass::LlmRuntime, &plan)
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
     }
 
     #[test]

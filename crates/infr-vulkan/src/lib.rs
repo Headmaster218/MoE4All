@@ -3908,6 +3908,8 @@ impl VulkanBackend {
     pub(crate) fn init_unified_vram_for_expert_slots(
         &self,
         specs: &[(usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        runtime_reserve_bytes: u64,
     ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
         const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
         let driver_max = usize::try_from(self.shared.max_mem_alloc_size)
@@ -3918,39 +3920,31 @@ impl VulkanBackend {
         } else {
             driver_max
         };
-        let mut shard_sizes = Vec::new();
-        let mut current = 0usize;
-        for &(slot_bytes, n_slots) in specs {
-            if slot_bytes == 0 || slot_bytes > platform_max {
-                return Err(be(format!(
-                    "expert slot size {slot_bytes} cannot fit unified VRAM shard limit {platform_max}"
-                )));
-            }
-            for _ in 0..n_slots {
-                if current != 0 && current.saturating_add(slot_bytes) > platform_max {
-                    shard_sizes.push(current);
-                    current = 0;
-                }
-                current = current
-                    .checked_add(slot_bytes)
-                    .ok_or_else(|| be("unified expert shard plan overflow"))?;
-            }
-        }
-        if current != 0 {
-            shard_sizes.push(current);
-        }
-        let expected: usize = shard_sizes.iter().sum();
+        let layout = crate::unified::ExpertArenaLayout::build(
+            specs,
+            platform_max,
+            usize::try_from(dynamic_state_reserve_bytes)
+                .map_err(|_| be("dynamic-state reserve exceeds the host address space"))?,
+            usize::try_from(runtime_reserve_bytes)
+                .map_err(|_| be("runtime reserve exceeds the host address space"))?,
+        )?;
+        let expected = layout.total_bytes();
         let mut cell = self.unified_pool.lock().unwrap();
         if let Some(pool) = cell.as_ref() {
-            if pool.stats().capacity_bytes != expected {
+            let same_layout = pool.stats().capacity_bytes == expected
+                && pool.expert_layout().is_some_and(|existing| {
+                    existing.kv_corridor() == layout.kv_corridor()
+                        && existing.runtime_corridor() == layout.runtime_corridor()
+                });
+            if !same_layout {
                 return Err(be(format!(
-                    "unified VRAM arena is already {} bytes; expert plan requires {expected} bytes",
+                    "unified VRAM arena is already {} bytes with different corridors; expert plan requires {expected} bytes",
                     pool.stats().capacity_bytes,
                 )));
             }
             return Ok(Arc::clone(pool));
         }
-        let pool = crate::unified::UnifiedVramPool::new_with_shards(self, &shard_sizes)?;
+        let pool = crate::unified::UnifiedVramPool::new_for_experts(self, layout)?;
         *cell = Some(Arc::clone(&pool));
         Ok(pool)
     }
@@ -3959,8 +3953,17 @@ impl VulkanBackend {
     /// The seam uses this as a real allocation probe. The selected mapped or ordinary device-local
     /// backing can consume a driver-dependent amount of heap budget beyond its logical byte size.
     /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
-    pub fn prepare_moe_unified_vram(&self, specs: &[(usize, usize)]) -> Result<usize> {
-        let pool = self.init_unified_vram_for_expert_slots(specs)?;
+    pub fn prepare_moe_unified_vram(
+        &self,
+        specs: &[(usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<usize> {
+        let pool = self.init_unified_vram_for_expert_slots(
+            specs,
+            dynamic_state_reserve_bytes,
+            runtime_reserve_bytes,
+        )?;
         Ok(pool.stats().capacity_bytes)
     }
 
@@ -4063,6 +4066,24 @@ impl VulkanBackend {
         let pool = self
             .unified_vram()
             .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
+        if pool.expert_layout().is_some() {
+            if class == crate::unified::UnifiedVramClass::Expert {
+                return Err(be(
+                    "expert-aware unified VRAM slots must be claimed from the frozen slot directory",
+                ));
+            }
+            let plan = match class {
+                crate::unified::UnifiedVramClass::KvCache => pool.plan_kv_claim(&[size])?,
+                crate::unified::UnifiedVramClass::Prefill => pool.plan_prefill_claim(&[size])?,
+                _ => pool.plan_high_claim(&[size], class)?,
+            };
+            let mut handles = self.commit_unified_claim_locked(&pool, plan)?;
+            let handle = handles
+                .pop()
+                .ok_or_else(|| be("unified VRAM single-range claim returned no allocation"))?;
+            debug_assert!(handles.is_empty());
+            return self.unified_sub_buffer(handle, size);
+        }
         let handle = match pool.allocate(size, class) {
             Some(handle) => handle,
             None if class != crate::unified::UnifiedVramClass::Expert => {
@@ -4105,6 +4126,23 @@ impl VulkanBackend {
             }
         };
         self.unified_sub_buffer(handle, size)
+    }
+
+    fn commit_unified_claim_locked(
+        &self,
+        pool: &Arc<crate::unified::UnifiedVramPool>,
+        plan: crate::unified::UnifiedClaimPlan,
+    ) -> Result<Vec<Arc<crate::unified::UnifiedAllocationHandle>>> {
+        let mut pager = self.moe_pager.lock().unwrap();
+        if let Some(session) = pager.as_mut() {
+            return session.commit_unified_claim(plan);
+        }
+        if !plan.victims().is_empty() {
+            return Err(be(
+                "unified VRAM claim needs Expert filler retirement before the MoE pager exists",
+            ));
+        }
+        pool.commit_claim(plan)
     }
 
     /// Run `f` while no other graph can submit commands that reference the elastic arena. Calls
@@ -6257,6 +6295,8 @@ mod tests {
                 min_enabled_slots: 8,
                 host: None,
             }],
+            dynamic_state_reserve_bytes: 0,
+            runtime_reserve_bytes: 0,
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
                 base_offset: 0,
                 bytes: SLOT,
@@ -6419,6 +6459,8 @@ mod tests {
                 min_enabled_slots: 1,
                 host: None,
             }],
+            dynamic_state_reserve_bytes: 0,
+            runtime_reserve_bytes: 0,
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
                 base_offset: 0,
                 bytes: 4096,
