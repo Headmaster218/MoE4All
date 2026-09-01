@@ -495,25 +495,24 @@ impl SegmentedKvState {
         let layout = SegmentedKvLayout::for_qwen(cfg, max_ctx, k_fmt, v_fmt)
             .ok_or_else(|| anyhow!("segmented KV enabled for a non-Qwen session"))?;
         let segments = layout.segments_for_tokens(tokens);
-        for plane in &layout.planes {
-            let buffer: &dyn Buffer = match plane.kind {
-                PlaneKind::K => kbufs[plane.layer].as_ref(),
-                PlaneKind::V => vbufs[plane.layer].as_ref(),
-                PlaneKind::QsaRaw => qsa_kbufs[plane.layer]
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing QSA raw cache for layer {}", plane.layer))?,
-                PlaneKind::QsaBlock => qsa_cbufs[plane.layer]
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing QSA block cache for layer {}", plane.layer))?,
-            };
-            be.ensure_segmented_kv(buffer, segments).map_err(|e| {
-                anyhow!(
-                    "commit segmented KV layer {} {:?}: {e}",
-                    plane.layer,
-                    plane.kind
-                )
-            })?;
-        }
+        let buffers: Vec<&dyn Buffer> = layout
+            .planes
+            .iter()
+            .map(|plane| -> AResult<&dyn Buffer> {
+                Ok(match plane.kind {
+                    PlaneKind::K => kbufs[plane.layer].as_ref(),
+                    PlaneKind::V => vbufs[plane.layer].as_ref(),
+                    PlaneKind::QsaRaw => qsa_kbufs[plane.layer].as_deref().ok_or_else(|| {
+                        anyhow!("missing QSA raw cache for layer {}", plane.layer)
+                    })?,
+                    PlaneKind::QsaBlock => qsa_cbufs[plane.layer].as_deref().ok_or_else(|| {
+                        anyhow!("missing QSA block cache for layer {}", plane.layer)
+                    })?,
+                })
+            })
+            .collect::<AResult<_>>()?;
+        be.ensure_segmented_kv_batch(&buffers, segments)
+            .map_err(|e| anyhow!("commit segmented KV growth transaction: {e}"))?;
         self.committed_tokens = (segments * KV_GROW_ROWS).min(max_ctx);
         tracing::info!(
             requested_tokens = tokens,

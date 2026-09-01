@@ -215,10 +215,16 @@ impl ExpertArenaLayout {
         class: UnifiedVramClass,
         corridor: Range<usize>,
         direction: ClaimDirection,
+        protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
         if class == UnifiedVramClass::Expert || requested.is_empty() {
             return Err(be("elastic claim needs non-Expert bytes"));
         }
+        let live_experts: HashSet<_> = live
+            .iter()
+            .filter(|range| range.class == UnifiedVramClass::Expert)
+            .map(|range| (range.shard, range.offset, range.len))
+            .collect();
         let mut blockers: Vec<PlannedRange> = live
             .iter()
             .filter(|range| range.class != UnifiedVramClass::Expert)
@@ -229,14 +235,42 @@ impl ExpertArenaLayout {
                 requested_len: range.requested_len,
             })
             .collect();
+        for &id in protected_experts {
+            let placement = self
+                .slots_by_pool
+                .get(id.pool)
+                .and_then(|slots| slots.get(id.slot))
+                .ok_or_else(|| {
+                    be(format!(
+                        "protected Expert slot {}/{} is unknown",
+                        id.pool, id.slot
+                    ))
+                })?;
+            if live_experts.contains(&(placement.shard, placement.offset, placement.len)) {
+                blockers.push(PlannedRange {
+                    shard: placement.shard,
+                    offset: placement.offset,
+                    len: placement.len,
+                    requested_len: placement.len,
+                });
+            }
+        }
         let pieces = self.physical_pieces(corridor);
-        let mut ranges = Vec::with_capacity(requested.len());
-        for &requested_len in requested {
+        let mut ordered = Vec::with_capacity(requested.len());
+        for (index, &requested_len) in requested.iter().enumerate() {
             if requested_len == 0 {
                 return Err(be("elastic claim cannot contain a zero-byte range"));
             }
             let len = align_up(requested_len, UNIFIED_ALIGN)
                 .ok_or_else(|| be("elastic claim alignment overflow"))?;
+            ordered.push((index, requested_len, len));
+        }
+        // Packing the largest ranges first avoids stranding a large KV plane, Prefill bank or
+        // runtime workspace behind small shard-tail fragments. Restore caller order before commit
+        // so returned handles still align exactly with the request slice.
+        ordered.sort_unstable_by_key(|&(index, _, len)| (std::cmp::Reverse(len), index));
+        let mut ranges = vec![None; requested.len()];
+        for (index, requested_len, len) in ordered {
             let candidate = match direction {
                 ClaimDirection::Low => find_low_gap(&pieces, &blockers, len),
                 ClaimDirection::High => find_high_gap(&pieces, &blockers, len),
@@ -251,14 +285,13 @@ impl ExpertArenaLayout {
                 ..candidate
             };
             blockers.push(range);
-            ranges.push(range);
+            ranges[index] = Some(range);
         }
-
-        let live_experts: HashSet<_> = live
-            .iter()
-            .filter(|range| range.class == UnifiedVramClass::Expert)
-            .map(|range| (range.shard, range.offset, range.len))
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .map(|range| range.expect("every validated elastic request was planned"))
             .collect();
+
         let mut victims = Vec::new();
         for placement in self.slots_by_pool.iter().flatten() {
             if !live_experts.contains(&(placement.shard, placement.offset, placement.len)) {
@@ -318,6 +351,7 @@ struct PlannedRange {
 /// A side-effect-free arena mutation plan. Pager retirement happens between planning and commit;
 /// callers hold the backend's unified execution guard across both operations, so no third party
 /// can invalidate the range calculation.
+#[derive(Debug)]
 pub(crate) struct UnifiedClaimPlan {
     class: UnifiedVramClass,
     ranges: Vec<PlannedRange>,
@@ -935,7 +969,11 @@ impl UnifiedVramPool {
         Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
     }
 
-    pub(crate) fn plan_kv_claim(&self, requested: &[usize]) -> Result<UnifiedClaimPlan> {
+    pub(crate) fn plan_kv_claim(
+        &self,
+        requested: &[usize],
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<UnifiedClaimPlan> {
         let layout = self
             .expert_layout
             .as_ref()
@@ -946,10 +984,15 @@ impl UnifiedVramPool {
             UnifiedVramClass::KvCache,
             layout.kv_corridor(),
             ClaimDirection::Low,
+            protected_experts,
         )
     }
 
-    pub(crate) fn plan_prefill_claim(&self, requested: &[usize]) -> Result<UnifiedClaimPlan> {
+    pub(crate) fn plan_prefill_claim(
+        &self,
+        requested: &[usize],
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<UnifiedClaimPlan> {
         let layout = self
             .expert_layout
             .as_ref()
@@ -960,6 +1003,7 @@ impl UnifiedVramPool {
             UnifiedVramClass::Prefill,
             layout.prefill_corridor(),
             ClaimDirection::Low,
+            protected_experts,
         )
     }
 
@@ -969,6 +1013,7 @@ impl UnifiedVramPool {
         &self,
         requested: &[usize],
         class: UnifiedVramClass,
+        protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
         if matches!(
             class,
@@ -988,6 +1033,7 @@ impl UnifiedVramPool {
             class,
             layout.kv_corridor().end..layout.total_bytes(),
             ClaimDirection::High,
+            protected_experts,
         )
     }
 
@@ -1224,6 +1270,7 @@ mod tests {
                 UnifiedVramClass::KvCache,
                 layout.kv_corridor(),
                 ClaimDirection::Low,
+                &[],
             )
             .unwrap();
         assert_eq!(
@@ -1245,6 +1292,34 @@ mod tests {
     }
 
     #[test]
+    fn protected_exchange_slot_is_a_hard_claim_blocker() {
+        let layout = ExpertArenaLayout::build(&[(256, 8), (512, 4)], 4096, 1024, 512).unwrap();
+        let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _leases: Vec<_> = layout
+            .slots_by_pool
+            .iter()
+            .flatten()
+            .map(|slot| {
+                ranges
+                    .try_claim_exact(slot.shard, slot.offset, slot.len, UnifiedVramClass::Expert)
+                    .unwrap()
+            })
+            .collect();
+        let exchange = ExpertSlotId { pool: 1, slot: 0 };
+        let error = layout
+            .plan_claim(
+                &ranges.allocations(),
+                &[512],
+                UnifiedVramClass::KvCache,
+                layout.kv_corridor(),
+                ClaimDirection::Low,
+                &[exchange],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot fit"));
+    }
+
+    #[test]
     fn high_claim_never_enters_the_maximum_kv_corridor() {
         let layout = ExpertArenaLayout::build(&[(256, 16)], 4096, 1024, 512).unwrap();
         let plan = layout
@@ -1254,6 +1329,7 @@ mod tests {
                 UnifiedVramClass::LlmRuntime,
                 layout.kv_corridor().end..layout.total_bytes(),
                 ClaimDirection::High,
+                &[],
             )
             .unwrap();
         assert_eq!(plan.ranges.len(), 1);

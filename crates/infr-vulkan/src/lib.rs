@@ -4072,10 +4072,15 @@ impl VulkanBackend {
                     "expert-aware unified VRAM slots must be claimed from the frozen slot directory",
                 ));
             }
+            let protected = self.protected_unified_experts();
             let plan = match class {
-                crate::unified::UnifiedVramClass::KvCache => pool.plan_kv_claim(&[size])?,
-                crate::unified::UnifiedVramClass::Prefill => pool.plan_prefill_claim(&[size])?,
-                _ => pool.plan_high_claim(&[size], class)?,
+                crate::unified::UnifiedVramClass::KvCache => {
+                    pool.plan_kv_claim(&[size], &protected)?
+                }
+                crate::unified::UnifiedVramClass::Prefill => {
+                    pool.plan_prefill_claim(&[size], &protected)?
+                }
+                _ => pool.plan_high_claim(&[size], class, &protected)?,
             };
             let mut handles = self.commit_unified_claim_locked(&pool, plan)?;
             let handle = handles
@@ -4084,47 +4089,13 @@ impl VulkanBackend {
             debug_assert!(handles.is_empty());
             return self.unified_sub_buffer(handle, size);
         }
-        let handle = match pool.allocate(size, class) {
-            Some(handle) => handle,
-            None if class != crate::unified::UnifiedVramClass::Expert => {
-                let loaned = self
-                    .moe_pager
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .ok_or_else(|| be("unified VRAM is full and no MoE pager can loan slots"))?
-                    .loan_unified_bytes(size)?;
-                let handle = pool.allocate(size, class).ok_or_else(|| {
-                    be(format!(
-                        "unified VRAM loaned {loaned} expert slots but still cannot fit {size} contiguous bytes"
-                    ))
-                })?;
-                if matches!(
-                    class,
-                    crate::unified::UnifiedVramClass::KvCache
-                        | crate::unified::UnifiedVramClass::EmbeddingWeights
-                        | crate::unified::UnifiedVramClass::VisionWeights
-                        | crate::unified::UnifiedVramClass::DraftWeights
-                        | crate::unified::UnifiedVramClass::LlmRuntime
-                ) {
-                    tracing::debug!(
-                        "[infr] unified VRAM: loaned {loaned} cold expert slots for {class:?} ({size} bytes)"
-                    );
-                } else {
-                    tracing::info!(
-                        "[infr] unified VRAM: loaned {loaned} cold expert slots for {class:?} ({size} bytes)"
-                    );
-                }
-                handle
-            }
-            None => {
-                let stats = pool.stats();
-                return Err(be(format!(
-                    "unified VRAM arena cannot fit {size} expert bytes ({} free, largest range {})",
-                    stats.free_bytes, stats.largest_free_bytes,
-                )));
-            }
-        };
+        let handle = pool.allocate(size, class).ok_or_else(|| {
+            let stats = pool.stats();
+            be(format!(
+                "unified VRAM arena cannot fit {size} {class:?} bytes ({} free, largest range {})",
+                stats.free_bytes, stats.largest_free_bytes,
+            ))
+        })?;
         self.unified_sub_buffer(handle, size)
     }
 
@@ -4143,6 +4114,15 @@ impl VulkanBackend {
             ));
         }
         pool.commit_claim(plan)
+    }
+
+    fn protected_unified_experts(&self) -> Vec<crate::unified::ExpertSlotId> {
+        self.moe_pager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(crate::pager::MoePagerSession::protected_expert_slots)
+            .unwrap_or_default()
     }
 
     /// Run `f` while no other graph can submit commands that reference the elastic arena. Calls
@@ -4200,42 +4180,97 @@ impl VulkanBackend {
     }
 
     fn ensure_segmented_kv_inner(&self, buffer: &VkSegmentedKvBuffer, wanted: usize) -> Result<()> {
-        if !Arc::ptr_eq(&buffer.shared, &self.shared) {
-            return Err(be(
-                "segmented KV buffer belongs to a different Vulkan backend/device",
-            ));
+        self.ensure_segmented_kv_batch_inner(&[buffer], wanted)
+    }
+
+    fn ensure_segmented_kv_batch_inner(
+        &self,
+        buffers: &[&VkSegmentedKvBuffer],
+        wanted: usize,
+    ) -> Result<()> {
+        let mut identities = Vec::with_capacity(buffers.len());
+        for buffer in buffers {
+            if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+                return Err(be(
+                    "segmented KV buffer belongs to a different Vulkan backend/device",
+                ));
+            }
+            if wanted > buffer.spec.max_segments {
+                return Err(be(format!(
+                    "segmented KV requested {wanted} segments, but its logical extent allows only {}",
+                    buffer.spec.max_segments
+                )));
+            }
+            let identity = std::ptr::from_ref(*buffer) as usize;
+            if identities.contains(&identity) {
+                return Err(be(
+                    "segmented KV growth transaction contains the same buffer twice",
+                ));
+            }
+            identities.push(identity);
         }
-        if wanted > buffer.spec.max_segments {
-            return Err(be(format!(
-                "segmented KV requested {wanted} segments, but its logical extent allows only {}",
-                buffer.spec.max_segments
-            )));
-        }
+
         self.with_unified_exclusive(|| {
-            let mut segments = buffer.segments.lock().unwrap();
-            while segments.len() < wanted {
-                let segment = if self.unified_vram().is_some() {
-                    self.alloc_unified_buffer_locked(
-                        buffer.spec.segment_bytes,
-                        crate::unified::UnifiedVramClass::KvCache,
-                    )?
-                } else {
-                    self.make_buf_ex(
-                        buffer.spec.segment_bytes,
-                        MemoryLocation::GpuOnly,
-                        "kv-segment",
-                        false,
-                        true,
-                    )?
-                };
+            let mut locked = Vec::with_capacity(buffers.len());
+            for buffer in buffers {
+                locked.push(buffer.segments.lock().unwrap());
+            }
+            let mut requests = Vec::new();
+            for (buffer_idx, (buffer, segments)) in buffers.iter().zip(&locked).enumerate() {
+                for index in segments.len()..wanted {
+                    requests.push((buffer_idx, index, buffer.spec.segment_bytes));
+                }
+            }
+            if requests.is_empty() {
+                return Ok(());
+            }
+
+            let pool = self
+                .unified_vram()
+                .ok_or_else(|| be("segmented KV lost its unified VRAM arena"))?;
+            let sizes: Vec<_> = requests.iter().map(|&(_, _, bytes)| bytes).collect();
+            let handles = if pool.expert_layout().is_some() {
+                let protected = self.protected_unified_experts();
+                let plan = pool.plan_kv_claim(&sizes, &protected)?;
+                debug_assert_eq!(plan.len(), sizes.len());
+                self.commit_unified_claim_locked(&pool, plan)?
+            } else {
+                // GPU-only allocator tests may initialize a generic unified pool without a MoE
+                // slot directory. Hold every lease locally so any later failure rolls the whole
+                // unpublished batch back.
+                sizes
+                    .iter()
+                    .map(|&bytes| {
+                        pool.allocate(bytes, crate::unified::UnifiedVramClass::KvCache)
+                            .ok_or_else(|| be("generic unified VRAM cannot fit segmented KV batch"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            if handles.len() != requests.len() {
+                return Err(be(
+                    "segmented KV arena transaction returned the wrong allocation count",
+                ));
+            }
+
+            let mut pending = Vec::with_capacity(requests.len());
+            for ((buffer_idx, index, bytes), handle) in
+                requests.into_iter().zip(handles.into_iter())
+            {
+                let segment = self.unified_sub_buffer(handle, bytes)?;
                 let addr = segment
                     .device_addr()
                     .ok_or_else(|| be("segmented KV physical segment has no device address"))?;
-                let index = segments.len();
-                let table_ptr = buffer
+                let table_ptr = buffers[buffer_idx]
                     .table
                     .mapped_ptr()
                     .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+                pending.push((buffer_idx, index, table_ptr, addr, segment));
+            }
+
+            // Publication is deliberately last: before this loop every allocation and every table
+            // mapping has been validated, so callers observe either the old depth or the complete
+            // new all-layer depth, never a half-grown session.
+            for &(_, index, table_ptr, addr, _) in &pending {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         addr.to_ne_bytes().as_ptr(),
@@ -4243,7 +4278,10 @@ impl VulkanBackend {
                         std::mem::size_of::<u64>(),
                     );
                 }
-                segments.push(segment);
+            }
+            for (buffer_idx, index, _, _, segment) in pending {
+                debug_assert_eq!(locked[buffer_idx].len(), index);
+                locked[buffer_idx].push(segment);
             }
             Ok(())
         })
@@ -4580,10 +4618,49 @@ impl VulkanBackend {
         sizes: &[usize],
         usage: BufferUsage,
     ) -> Result<Vec<Box<dyn Buffer>>> {
-        let bufs: Vec<VkBuffer> = sizes
-            .iter()
-            .map(|&b| self.make_alloc(b, usage))
-            .collect::<Result<_>>()?;
+        let bufs: Vec<VkBuffer> = if sizes.is_empty() {
+            Vec::new()
+        } else if let (Some(class), Some(pool)) =
+            (self.unified_class_for_usage(usage), self.unified_vram())
+        {
+            if pool.expert_layout().is_some() {
+                self.with_unified_exclusive(|| {
+                    let protected = self.protected_unified_experts();
+                    let plan = pool.plan_high_claim(sizes, class, &protected)?;
+                    let handles = self.commit_unified_claim_locked(&pool, plan)?;
+                    if handles.len() != sizes.len() {
+                        return Err(be(
+                            "unified runtime transaction returned the wrong allocation count",
+                        ));
+                    }
+                    handles
+                        .into_iter()
+                        .zip(sizes.iter().copied())
+                        .map(|(handle, bytes)| {
+                            let mut buf = self.unified_sub_buffer(handle, bytes)?;
+                            if usage == BufferUsage::Weights {
+                                if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                                    pb.inc(bytes as u64);
+                                }
+                            } else if class == crate::unified::UnifiedVramClass::LlmRuntime {
+                                self.account_llm_runtime(&mut buf, bytes);
+                            }
+                            Ok(buf)
+                        })
+                        .collect::<Result<_>>()
+                })?
+            } else {
+                sizes
+                    .iter()
+                    .map(|&bytes| self.make_alloc(bytes, usage))
+                    .collect::<Result<_>>()?
+            }
+        } else {
+            sizes
+                .iter()
+                .map(|&bytes| self.make_alloc(bytes, usage))
+                .collect::<Result<_>>()?
+        };
         let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
         for buf in &bufs {
             if let Some(ptr) = buf
@@ -4647,8 +4724,11 @@ impl VulkanBackend {
 
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
-    fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
-        let unified_class = match (self.unified_client, usage) {
+    fn unified_class_for_usage(
+        &self,
+        usage: BufferUsage,
+    ) -> Option<crate::unified::UnifiedVramClass> {
+        match (self.unified_client, usage) {
             (Some(UnifiedClient::Embedding), BufferUsage::Weights) => {
                 Some(crate::unified::UnifiedVramClass::EmbeddingWeights)
             }
@@ -4659,7 +4739,21 @@ impl VulkanBackend {
                 Some(crate::unified::UnifiedVramClass::LlmRuntime)
             }
             _ => None,
-        };
+        }
+    }
+
+    fn account_llm_runtime(&self, buf: &mut VkBuffer, bytes: usize) {
+        buf.act_bytes = bytes as u64;
+        let live = self
+            .shared
+            .act_live
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            + bytes as u64;
+        self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
+    }
+
+    fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        let unified_class = self.unified_class_for_usage(usage);
         if let Some(class) = unified_class {
             let mut buf = self.alloc_unified_buffer(bytes, class)?;
             if usage == BufferUsage::Weights {
@@ -4669,13 +4763,7 @@ impl VulkanBackend {
             } else if class == crate::unified::UnifiedVramClass::LlmRuntime {
                 // Preserve the primary LLM activation high-water signal after moving those bytes
                 // into the mapped elastic arena. Auxiliary runtime must not contaminate it.
-                buf.act_bytes = bytes as u64;
-                let live = self
-                    .shared
-                    .act_live
-                    .fetch_add(bytes as u64, Ordering::Relaxed)
-                    + bytes as u64;
-                self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
+                self.account_llm_runtime(&mut buf, bytes);
             }
             return Ok(buf);
         }
@@ -5010,6 +5098,18 @@ impl Backend for VulkanBackend {
         let segmented = as_segmented_kv(buffer)
             .ok_or_else(|| be("ensure_segmented_kv received a flat or foreign buffer"))?;
         self.ensure_segmented_kv_inner(segmented, segments)
+    }
+
+    fn ensure_segmented_kv_batch(&self, buffers: &[&dyn Buffer], segments: usize) -> Result<()> {
+        let segmented = buffers
+            .iter()
+            .map(|buffer| {
+                as_segmented_kv(*buffer).ok_or_else(|| {
+                    be("ensure_segmented_kv_batch received a flat or foreign buffer")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.ensure_segmented_kv_batch_inner(&segmented, segments)
     }
 
     fn clear_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
@@ -6242,17 +6342,31 @@ mod tests {
             })
             .expect("allocate segmented KV")
             .expect("Vulkan supports segmented KV");
+        let virtual_kv_small = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * MIB,
+                segment_bytes: MIB / 2,
+                segment_elements: MIB / 4,
+                max_segments: 4,
+            })
+            .expect("allocate second segmented KV")
+            .expect("Vulkan supports segmented KV");
         assert_eq!(virtual_kv.len_bytes(), 4 * MIB);
         let segmented = as_segmented_kv(virtual_kv.as_ref()).expect("segmented downcast");
+        let segmented_small =
+            as_segmented_kv(virtual_kv_small.as_ref()).expect("second segmented downcast");
         assert_eq!(segmented.committed(), 0);
 
-        be.ensure_segmented_kv(virtual_kv.as_ref(), 2)
-            .expect("commit two segments");
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 1)
+            .expect("commit one initial segment");
+        be.ensure_segmented_kv_batch(&[virtual_kv.as_ref(), virtual_kv_small.as_ref()], 2)
+            .expect("grow both KV planes in one transaction");
         assert_eq!(segmented.committed(), 2);
+        assert_eq!(segmented_small.committed(), 2);
         assert_eq!(
             pool.stats()
                 .class_bytes(crate::unified::UnifiedVramClass::KvCache),
-            2 * MIB
+            3 * MIB
         );
         let ptr = segmented
             .table_buffer()
@@ -6263,8 +6377,18 @@ mod tests {
         assert_ne!(addresses[1], 0);
         assert_ne!(addresses[0], addresses[1]);
         assert_eq!(addresses[2], 0);
+        let small_ptr = segmented_small
+            .table_buffer()
+            .mapped_ptr()
+            .expect("second table mapping") as *const u64;
+        let small_addresses = unsafe { std::slice::from_raw_parts(small_ptr, 4) };
+        assert_ne!(small_addresses[0], 0);
+        assert_ne!(small_addresses[1], 0);
+        assert_ne!(small_addresses[0], small_addresses[1]);
+        assert_eq!(small_addresses[2], 0);
 
         drop(virtual_kv);
+        drop(virtual_kv_small);
         assert_eq!(
             pool.stats()
                 .class_bytes(crate::unified::UnifiedVramClass::KvCache),

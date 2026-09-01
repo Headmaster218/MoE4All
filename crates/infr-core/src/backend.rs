@@ -537,6 +537,15 @@ pub trait Backend: Send + Sync {
             "segmented KV is not supported by this backend",
         ))
     }
+    /// Batch form used at one logical context-growth boundary. Backends with transactional arena
+    /// allocation can override this so every layer/plane becomes visible together; the default
+    /// preserves the existing per-buffer behavior for backends without such an allocator.
+    fn ensure_segmented_kv_batch(&self, buffers: &[&dyn Buffer], segments: usize) -> Result<()> {
+        for buffer in buffers {
+            self.ensure_segmented_kv(*buffer, segments)?;
+        }
+        Ok(())
+    }
     /// Clear every committed physical segment. Used by synthetic-depth benchmarks, whose logical
     /// history must be deterministic even though it was not produced by a real prefill.
     fn clear_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
