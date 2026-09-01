@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-01
+
+### Fixed
+
+- Long-context Q8 prefill now retires superseded Vulkan dequantization scratch capacities after
+  each execute, preventing historical context depths from exhausting unified VRAM.
+- Vulkan buffer binding, one-shot commands, staging-ring construction, and recorder error paths
+  now release their transient allocations and raw objects on failure or unwind.
+- Manual `device.ram_budget` planning keeps room for process objects created after host-cache
+  sizing, while release validation measures private resident RAM separately from reclaimable GGUF
+  file pages.
+
+### Validation
+
+- The Windows release resource matrix passed all nine automatic/manual cases for Qwen3.6 35B and
+  Qwen3.8 IQ4_XS, including repeated dynamic K/V growth through 32K, 64K, and 96K boundaries.
+
 ## [0.5.1] - 2026-08-31
 
 ### Fixed
