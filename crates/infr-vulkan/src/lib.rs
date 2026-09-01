@@ -245,7 +245,8 @@ pub(crate) fn max_storage_buffer_range() -> u32 {
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
 /// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
-/// `live` is true (VK_EXT_memory_budget present), otherwise it equals `total` (best-effort).
+/// `live` is true (VK_EXT_memory_budget present, or a test resource profile is accounting for
+/// this backend's allocations), otherwise it equals `total` (best-effort).
 ///
 /// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
 /// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR.
@@ -982,7 +983,15 @@ fn device_local_room(s: &VulkanShared) -> u64 {
                 .min(mp.memory_heaps[i].size);
         }
     }
-    if s.has_mem_budget {
+    if let Some(profile) = infr_core::test_resource::active() {
+        profile
+            .cap_vram(
+                size,
+                if s.has_mem_budget { avail } else { size },
+                s.device_used.load(Ordering::Relaxed),
+            )
+            .1
+    } else if s.has_mem_budget {
         avail
     } else {
         size.saturating_sub(s.device_used.load(Ordering::Relaxed))
@@ -1096,6 +1105,23 @@ struct StagingRing {
     /// Whether slot `i` has work in flight that its fence must be waited on before reuse.
     busy: Vec<bool>,
     next: usize,
+}
+
+/// RAII for the raw command buffer used by [`VulkanBackend::one_shot`]. Vulkan command buffers do
+/// not free themselves, and every fallible begin/end/submit/wait step must return the handle to the
+/// shared pool on both success and error (including unwinding out of the recording closure).
+struct OneShotCommand<'a> {
+    device: &'a ash::Device,
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+}
+
+impl Drop for OneShotCommand<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.free_command_buffers(self.pool, &[self.cmd]);
+        }
+    }
 }
 
 /// Staging-ring geometry: enough slots to keep the copy engine fed while the host fills the next.
@@ -1351,10 +1377,18 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             };
         }
     }
+    let mut live = s.has_mem_budget;
+    if let Some(profile) = infr_core::test_resource::active() {
+        (total, available) =
+            profile.cap_vram(total, available, s.device_used.load(Ordering::Relaxed));
+        // The synthetic free figure already subtracts this backend's tracked allocations. Mark it
+        // live so fallback accounting does not subtract them a second time.
+        live = true;
+    }
     VramInfo {
         total,
         available,
-        live: s.has_mem_budget,
+        live,
         uma,
     }
 }
@@ -3466,8 +3500,9 @@ impl VulkanBackend {
     /// of small buffers cannot collectively cross the caller's hard cap.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
-        let unified_limit =
-            self.cfg.device.vram_budget.is_some() || self.cfg.device.vram_reserve.is_some();
+        let unified_limit = self.cfg.device.vram_budget.is_some()
+            || self.cfg.device.vram_reserve.is_some()
+            || infr_core::test_resource::active().is_some();
         if (want < CHECK_MIN && !unified_limit) || self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
@@ -4322,12 +4357,20 @@ impl VulkanBackend {
                 })?
         };
 
-        unsafe {
+        if let Err(e) = unsafe {
             self.shared
                 .device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+        } {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            let cleanup = self.shared.allocator.lock().unwrap().free(allocation);
+            return Err(be(match cleanup {
+                Ok(()) => format!("bind_buffer_memory: {e}"),
+                Err(cleanup) => {
+                    format!("bind_buffer_memory: {e} (allocation cleanup also failed: {cleanup})")
+                }
+            }));
         }
-        .map_err(|e| be(format!("bind_buffer_memory: {e}")))?;
 
         // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
         if location == MemoryLocation::GpuOnly {
@@ -4686,16 +4729,27 @@ impl VulkanBackend {
 
         let mut bufs = Vec::with_capacity(RING_SLOTS);
         let mut fences = Vec::with_capacity(RING_SLOTS);
+        let cleanup_raw = |fences: &mut Vec<vk::Fence>| unsafe {
+            for fence in fences.drain(..) {
+                device.destroy_fence(fence, None);
+            }
+            device.free_command_buffers(pool, &cmds);
+        };
         for _ in 0..RING_SLOTS {
-            bufs.push(self.make_buf(
-                RING_SLOT_BYTES,
-                MemoryLocation::CpuToGpu,
-                "upload_staging",
-            )?);
-            fences.push(
-                unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-                    .map_err(|e| be(format!("staging ring create_fence: {e}")))?,
-            );
+            match self.make_buf(RING_SLOT_BYTES, MemoryLocation::CpuToGpu, "upload_staging") {
+                Ok(buffer) => bufs.push(buffer),
+                Err(error) => {
+                    cleanup_raw(&mut fences);
+                    return Err(error);
+                }
+            }
+            match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                Ok(fence) => fences.push(fence),
+                Err(error) => {
+                    cleanup_raw(&mut fences);
+                    return Err(be(format!("staging ring create_fence: {error}")));
+                }
+            }
         }
         Ok(StagingRing {
             bufs,
@@ -4724,6 +4778,7 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("allocate_command_buffers: {e}")))?[0];
+        let _command = OneShotCommand { device, pool, cmd };
 
         unsafe {
             device.begin_command_buffer(
@@ -4747,7 +4802,6 @@ impl VulkanBackend {
         unsafe { device.queue_wait_idle(self.shared.queue) }
             .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
 
-        unsafe { device.free_command_buffers(pool, &cmds) };
         Ok(())
     }
 }
@@ -5059,12 +5113,19 @@ impl Backend for VulkanBackend {
 
     fn finish_weight_load(&self) -> Result<()> {
         self.release_moe_load_reservation();
+        // The weight-load bar is still open — `infr_llama`'s session-init block owns the guard that
+        // clears it, and this is called inside that block. Hand it to the preload: for a paged model
+        // those are the bytes that stand in for the expert banks the loader only registered, and
+        // without this the bar sits still for the longest phase of the load. Cloned up front (a
+        // `ProgressBar` is an `Arc` over its state) so the ticking never reaches for the mutex the
+        // pager session is already held through.
+        let progress = self.shared.weight_pb.lock().unwrap().clone();
         let (blocks, bytes) = self
             .moe_pager
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(Ok((0, 0)), crate::pager::MoePagerSession::preload_host_tier)?;
+            .map_or(Ok((0, 0)), |s| s.preload_host_tier(progress.as_ref()))?;
         if blocks > 0 {
             tracing::info!(
                 "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GB",
@@ -6079,6 +6140,7 @@ mod tests {
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: SLOT,
                 n_slots: SLOTS,
+                min_enabled_slots: 8,
                 host: None,
             }],
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
@@ -6240,6 +6302,7 @@ mod tests {
             pools: vec![crate::pager::MoePoolSpec {
                 slot_bytes: 4096,
                 n_slots: 2,
+                min_enabled_slots: 1,
                 host: None,
             }],
             host_chunks: vec![crate::pager::MoeHostChunkSpec {

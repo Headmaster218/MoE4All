@@ -8,10 +8,13 @@ use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
-use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind};
+use infr_core::graph::{
+    Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind, QSA_MAX_TOP_BLOCKS,
+};
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Index;
 use std::sync::Mutex;
 
 use crate::recorder::RecordedCmd;
@@ -403,13 +406,108 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
 /// The intermediate tensor (k16) has ONE TensorId reused across ALL layers' QkNormRope ops, so the
 /// map is keyed by OP INDEX (not TensorId): each layer's pair maps to its own KV-cache buffer.
 /// Returns (fused: op index of the QkNormRope → (cache, row offset `pos`); skip: absorbed WriteKv ops).
-/// Per-execute transient-scratch pool: the SAME (tag, bytes) key across ops returns the SAME
-/// buffer. Layers are serialized by dataflow and the recorder's hazard tracking turns each
-/// rewrite into an ordinary WAR/WAW barrier (the bespoke path shares its split scratch across
-/// layers the same way), so per-tag reuse is safe — and it cuts the held transient VRAM from
-/// O(n_layer) to O(1) buffers per tag. Without it, an 8B p8000 prefill held 36 layers × ~1GB of
-/// flash-attention partials (≈38 GB) and took the device down.
-type ScratchPool = HashMap<(&'static str, usize), Box<dyn Buffer>>;
+/// Transient scratch shared by serialized ops. A tag names one logical workspace; its byte count
+/// is a capacity, not part of that workspace's lifetime identity. This matters for paged prefill:
+/// `kv_len` grows every execute, so retaining every exact `(tag, bytes)` pair until the phase ended
+/// accumulated all historical Q8-KV workspaces instead of retaining only the high-water capacity.
+///
+/// A buffer referenced by the command stream being recorded cannot be replaced before submission,
+/// hence `in_use` tracks this execute. Growth may release prior-execute capacities immediately, but
+/// same-execute capacities coexist until [`ScratchPool::finish_execute`] runs after all GPU work has
+/// completed. Layers are serialized by dataflow and recorder hazard tracking supplies the ordinary
+/// WAR/WAW barriers, so one sufficiently large buffer per tag remains safe across ops and layers.
+type ScratchKey = (&'static str, usize);
+
+#[derive(Default)]
+struct ScratchPool {
+    buffers: HashMap<ScratchKey, Box<dyn Buffer>>,
+    in_use: HashSet<ScratchKey>,
+}
+
+impl ScratchPool {
+    /// Start a new recording after the previous execute has fully drained. Compact here as well as
+    /// at the success tail so an execute that returned through an error path cannot leave several
+    /// capacities resident for the rest of the phase.
+    fn begin_execute(&mut self) {
+        self.compact();
+        self.in_use.clear();
+    }
+
+    fn acquire(
+        &mut self,
+        tag: &'static str,
+        bytes: usize,
+        alloc: impl FnOnce(usize) -> Result<Box<dyn Buffer>>,
+    ) -> Result<ScratchKey> {
+        let bytes = bytes.max(4);
+        if let Some(key) = self
+            .buffers
+            .keys()
+            .filter(|(candidate, capacity)| *candidate == tag && *capacity >= bytes)
+            .min_by_key(|(_, capacity)| *capacity)
+            .copied()
+        {
+            self.in_use.insert(key);
+            return Ok(key);
+        }
+
+        // No command in this execute references this tag yet, so capacities inherited from the
+        // previous execute are safe to release before growing. Besides bounding lifetime, dropping
+        // first avoids requiring the unified arena to fit old+new workspace simultaneously.
+        if !self.in_use.iter().any(|(candidate, _)| *candidate == tag) {
+            self.buffers.retain(|(candidate, _), _| *candidate != tag);
+        }
+
+        let key = (tag, bytes);
+        if !self.buffers.contains_key(&key) {
+            self.buffers.insert(key, alloc(bytes)?);
+        }
+        self.in_use.insert(key);
+        Ok(key)
+    }
+
+    /// Keep one high-water capacity per logical workspace. This is called only after every command
+    /// recorded by the execute has finished, so buffers referenced earlier in that recording may
+    /// now be released safely.
+    fn finish_execute(&mut self) {
+        self.compact();
+        self.in_use.clear();
+    }
+
+    fn compact(&mut self) {
+        let mut largest = HashMap::<&'static str, usize>::new();
+        for &(tag, bytes) in self.buffers.keys() {
+            largest
+                .entry(tag)
+                .and_modify(|capacity| *capacity = (*capacity).max(bytes))
+                .or_insert(bytes);
+        }
+        self.buffers
+            .retain(|(tag, bytes), _| largest.get(tag) == Some(bytes));
+    }
+
+    fn clear(&mut self) {
+        self.buffers.clear();
+        self.in_use.clear();
+    }
+
+    fn into_values(self) -> impl Iterator<Item = Box<dyn Buffer>> {
+        self.buffers.into_values()
+    }
+
+    fn drain_values(&mut self) -> impl Iterator<Item = Box<dyn Buffer>> + '_ {
+        self.in_use.clear();
+        self.buffers.drain().map(|(_, buffer)| buffer)
+    }
+}
+
+impl Index<&ScratchKey> for ScratchPool {
+    type Output = Box<dyn Buffer>;
+
+    fn index(&self, key: &ScratchKey) -> &Self::Output {
+        &self.buffers[key]
+    }
+}
 
 /// Lifetime of the pooled scratch used by paged static execution. Paged models rebuild their
 /// graph plan for every token, so this cache belongs to the model backend rather than the plan.
@@ -813,13 +911,11 @@ fn pooled(
     be_: &VulkanBackend,
     tag: &'static str,
     bytes: usize,
-) -> Result<(&'static str, usize)> {
-    let key = (tag, bytes.max(4));
-    if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(key) {
-        // alloc_uninit: every pooled buffer is fully written before read within each op.
-        e.insert(be_.alloc_uninit(key.1, BufferUsage::Activations)?);
-    }
-    Ok(key)
+) -> Result<ScratchKey> {
+    // alloc_uninit: every pooled buffer is fully written before read within each op.
+    pool.acquire(tag, bytes, |capacity| {
+        be_.alloc_uninit(capacity, BufferUsage::Activations)
+    })
 }
 
 /// Small-m MoE scratch handle: a pooled `(tag, bytes)` key (the default — rides the per-execute
@@ -2657,11 +2753,11 @@ fn lower_op(
                 || !rope_dim.is_multiple_of(2)
                 || *top_blocks == 0
                 || *top_blocks > first_blocks
-                || *top_blocks > 512
+                || *top_blocks > QSA_MAX_TOP_BLOCKS
             {
                 return Err(be(format!(
                     "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
-                     ratio>0 and 0<top_blocks<=min(blocks,512); got head_dim={head_dim} \
+                     ratio>0 and 0<top_blocks<=min(blocks,{QSA_MAX_TOP_BLOCKS}); got head_dim={head_dim} \
                      n_head={n_head} rope_dim={rope_dim} ratio={ratio} top_blocks={top_blocks} \
                      rows={rows} kv_len={kv_len}"
                 )));
@@ -2818,7 +2914,7 @@ fn lower_op(
                 || *ratio == 0
                 || *top_blocks == 0
                 || *top_blocks > first_blocks
-                || *top_blocks > 512
+                || *top_blocks > QSA_MAX_TOP_BLOCKS
                 || graph.desc(*q).dtype != infr_core::DType::F16
                 || !supported(kdt)
                 || !supported(vdt)
@@ -2826,7 +2922,7 @@ fn lower_op(
                 return Err(be(format!(
                     "vulkan Op::QsaBatchAttention requires F16 q, F16/Q8_0 k/v, rows<=kv_len, \
                      head_dim=128/256, n_head divisible by n_kv, ratio>0 and \
-                     0<top_blocks<=first complete blocks; \
+                     0<top_blocks<=min(first complete blocks,{QSA_MAX_TOP_BLOCKS}); \
                      got rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
                      head_dim={head_dim} ratio={ratio} top_blocks={top_blocks} \
                      k_dtype={kdt:?} v_dtype={vdt:?}"
@@ -5743,7 +5839,7 @@ fn record_decode_replay(
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
-    let mut pool: ScratchPool = HashMap::new();
+    let mut pool = ScratchPool::default();
     // Watchdog splitter (mirrors `execute_static`): the GPU hang watchdog is armed per SUBMIT, so
     // recording the whole decode into ONE command buffer makes it one indivisible watchdog job —
     // fine on a discrete GPU (tens of ms) and fatal on a slow integrated one, where a big-model
@@ -5908,12 +6004,10 @@ fn record_decode_replay(
 /// Tear down the segment being recorded when an op fails to lower, and return the error to
 /// propagate.
 ///
-/// `Recorder` has no `Drop` (see `Recorder::free_transient`), so a bare `return Err(..)` out of the
-/// op loop leaves that segment's descriptor pools alive and `vkDestroyDevice` reports them —
-/// VUID-vkDestroyDevice-device-05137, which is what the validation layer prints if this is skipped.
-/// The partial recording is waste (the forward is being abandoned), so it is discarded rather than
-/// submitted, exactly as the shutdown abort in the loop does. Already-submitted segments need
-/// nothing here: `PendingSegment`'s `Drop` drains and frees them.
+/// The partial recording is waste (the forward is being abandoned), so discard it immediately
+/// rather than waiting for `Recorder`'s drop backstop. This also reports an `end_command_buffer`
+/// teardown error alongside the lowering error. Already-submitted segments need nothing here:
+/// `PendingSegment`'s `Drop` drains and frees them.
 ///
 /// A teardown failure is folded into the message instead of replacing it — the original error is
 /// why the forward stopped, and it is the one worth reading.
@@ -5942,6 +6036,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             let pager_transition =
                 pager_static_transition(cache.phase, phase, be_.cfg().paging.moe_layer_stream);
             cache.enter(phase);
+            cache.pool.begin_execute();
             scratch_reused = cache.scratch_layout == layout && cache.scratch.len() == layout.len();
             if !scratch_reused {
                 // A same-phase shape change must also release its old scratch before the pager
@@ -5989,7 +6084,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
 
     let using_cached = cached_pool.is_some();
-    let mut local_pool: ScratchPool = HashMap::new();
+    let mut local_pool = ScratchPool::default();
     let (scratch, pool): (&ScratchSet, &mut ScratchPool) = match cached_pool.as_mut() {
         Some(cache) => {
             let cache = &mut **cache;
@@ -6265,7 +6360,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // the other transient allocations until the final submit drains. Paged buffers remain in the
     // backend cache and are dropped only on a decode/prefill transition or model teardown.
     if !using_cached {
-        transient.extend(local_pool.into_values());
+        transient.extend(pool.drain_values());
     }
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
@@ -6278,6 +6373,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     pstream.drain()?;
     pstream.finish_prefill_uploads(be_)?;
+    if using_cached {
+        // All queue work and asynchronous Prefill uploads that can reference pooled buffers have
+        // drained. It is now safe to release superseded capacities from this execute.
+        pool.finish_execute();
+    }
     // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
     // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
     be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
@@ -6303,12 +6403,8 @@ fn pooled_usage(
     tag: &'static str,
     bytes: usize,
     usage: BufferUsage,
-) -> Result<(&'static str, usize)> {
-    let key = (tag, bytes.max(4));
-    if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(key) {
-        e.insert(be_.alloc_uninit(key.1, usage)?);
-    }
-    Ok(key)
+) -> Result<ScratchKey> {
+    pool.acquire(tag, bytes, |capacity| be_.alloc_uninit(capacity, usage))
 }
 
 /// Host side of paged execution, per `execute_static` call: Dense streaming owns the ring cursor,
@@ -8176,6 +8272,28 @@ mod tests {
         }
     }
 
+    struct DropCountBuffer {
+        bytes: usize,
+        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Buffer for DropCountBuffer {
+        fn len_bytes(&self) -> usize {
+            self.bytes
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for DropCountBuffer {
+        fn drop(&mut self) {
+            self.drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     #[test]
     fn paged_static_scratch_lives_until_phase_transition() {
         let mut cache = StaticScratchCache::default();
@@ -8184,20 +8302,21 @@ mod tests {
         cache.scratch = vec![Some(Box::new(TestBuffer(4)))];
         cache
             .pool
+            .buffers
             .insert(("test_decode", 4), Box::new(TestBuffer(4)));
 
         cache.enter(StaticScratchPhase::Decode);
         assert_eq!(cache.scratch_layout, vec![Some(4)]);
         assert!(cache.scratch[0].is_some());
         assert_eq!(
-            cache.pool.len(),
+            cache.pool.buffers.len(),
             1,
             "same-phase execute must retain scratch"
         );
 
         cache.enter(StaticScratchPhase::Prefill);
         assert!(
-            cache.pool.is_empty(),
+            cache.pool.buffers.is_empty(),
             "decode scratch must drop on the decode-to-prefill transition"
         );
         assert!(cache.scratch_layout.is_empty());
@@ -8206,24 +8325,106 @@ mod tests {
         cache.scratch = vec![Some(Box::new(TestBuffer(8)))];
         cache
             .pool
+            .buffers
             .insert(("test_prefill", 8), Box::new(TestBuffer(8)));
 
         cache.enter(StaticScratchPhase::Prefill);
         assert_eq!(cache.scratch_layout, vec![Some(8)]);
         assert!(cache.scratch[0].is_some());
         assert_eq!(
-            cache.pool.len(),
+            cache.pool.buffers.len(),
             1,
             "same-phase prefill must retain scratch"
         );
 
         cache.enter(StaticScratchPhase::Decode);
         assert!(
-            cache.pool.is_empty(),
+            cache.pool.buffers.is_empty(),
             "prefill scratch must drop on the prefill-to-decode transition"
         );
         assert!(cache.scratch_layout.is_empty());
         assert!(cache.scratch.is_empty());
+    }
+
+    #[test]
+    fn scratch_pool_growth_retains_only_high_water_capacity() {
+        let mut pool = ScratchPool::default();
+        let mut allocations = 0usize;
+
+        for bytes in [4usize, 8, 12, 16, 20] {
+            pool.begin_execute();
+            let key = pool
+                .acquire("kvdeq_k", bytes, |capacity| {
+                    allocations += 1;
+                    Ok(Box::new(TestBuffer(capacity)))
+                })
+                .unwrap();
+            assert_eq!(key.1, bytes);
+            pool.finish_execute();
+            assert_eq!(pool.buffers.len(), 1);
+            assert!(pool.buffers.contains_key(&("kvdeq_k", bytes)));
+        }
+        assert_eq!(allocations, 5);
+
+        pool.begin_execute();
+        let reused = pool
+            .acquire("kvdeq_k", 17, |_| {
+                panic!("a smaller request must reuse the retained high-water buffer")
+            })
+            .unwrap();
+        assert_eq!(reused, ("kvdeq_k", 20));
+        pool.finish_execute();
+        assert_eq!(pool.buffers.len(), 1);
+    }
+
+    #[test]
+    fn scratch_pool_defers_same_execute_replacement_until_gpu_completion() {
+        let mut pool = ScratchPool::default();
+        pool.begin_execute();
+        pool.acquire("workspace", 8, |capacity| {
+            Ok(Box::new(TestBuffer(capacity)))
+        })
+        .unwrap();
+        pool.acquire("workspace", 16, |capacity| {
+            Ok(Box::new(TestBuffer(capacity)))
+        })
+        .unwrap();
+        assert_eq!(
+            pool.buffers.len(),
+            2,
+            "both buffers may still be referenced by the current command recording"
+        );
+
+        pool.finish_execute();
+        assert_eq!(pool.buffers.len(), 1);
+        assert!(pool.buffers.contains_key(&("workspace", 16)));
+    }
+
+    #[test]
+    fn scratch_pool_drops_prior_execute_capacity_before_growing() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = ScratchPool::default();
+        pool.begin_execute();
+        pool.acquire("workspace", 8, {
+            let drops = std::sync::Arc::clone(&drops);
+            move |bytes| Ok(Box::new(DropCountBuffer { bytes, drops }))
+        })
+        .unwrap();
+        pool.finish_execute();
+
+        pool.begin_execute();
+        pool.acquire("workspace", 16, {
+            let drops = std::sync::Arc::clone(&drops);
+            move |bytes| {
+                assert_eq!(
+                    drops.load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "the old unified range must be returned before allocating its replacement"
+                );
+                Ok(Box::new(DropCountBuffer { bytes, drops }))
+            }
+        })
+        .unwrap();
     }
 
     #[test]

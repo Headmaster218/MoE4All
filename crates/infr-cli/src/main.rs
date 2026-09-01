@@ -30,6 +30,15 @@ struct Cli {
     #[arg(long = "set", value_name = "PATH=VALUE", global = true)]
     set: Vec<String>,
 
+    /// Test-only synthetic RAM/VRAM probe values. This can only reduce detected capacity.
+    #[arg(
+        long = "test-resource-profile",
+        value_name = "PATH",
+        global = true,
+        hide = true
+    )]
+    test_resource_profile: Option<PathBuf>,
+
     /// Print shell completions to stdout and exit (packaging helper).
     #[arg(long, value_enum, value_name = "SHELL", hide = true)]
     completions: Option<CompletionShell>,
@@ -335,6 +344,21 @@ enum Cmd {
     /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
     Devices,
+    /// Render a chat history with the model tokenizer and fill it to a precise token depth.
+    #[command(name = "__test-plan-prompt", hide = true)]
+    TestPlanPrompt {
+        model: String,
+        #[arg(long, value_name = "PATH")]
+        messages: PathBuf,
+        #[arg(long, value_name = "TOKENS")]
+        target: usize,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        #[arg(long, default_value = " context")]
+        filler: String,
+        #[arg(long, default_value = "{{INFR_FILLER}}")]
+        marker: String,
+    },
     /// Interactive terminal chat (auto-pulls if missing).
     Run {
         model: String,
@@ -683,6 +707,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
+    if let Some(path) = cli.test_resource_profile.as_deref() {
+        install_test_resource_profile(path)?;
+    }
+
     // THE configuration, resolved exactly once: defaults < config file < `INFR_*` < flags/`--set`
     // (docs/config-plan.md §2). It is a VALUE, threaded into the commands as an `Arc` — there is
     // deliberately no global (R4).
@@ -741,7 +769,11 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             layer.sampling.temp = Some(0.0);
             layer.sampling.seed = Some(Some(0x1_6e37));
         }
-        Cmd::Pull { .. } | Cmd::Devices | Cmd::Multi { .. } | Cmd::Compare { .. } => {}
+        Cmd::Pull { .. }
+        | Cmd::Devices
+        | Cmd::TestPlanPrompt { .. }
+        | Cmd::Multi { .. }
+        | Cmd::Compare { .. } => {}
     }
     Ok(layer)
 }
@@ -750,6 +782,14 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
+        Cmd::TestPlanPrompt {
+            model,
+            messages,
+            target,
+            output,
+            filler,
+            marker,
+        } => cmd_test_plan_prompt(&model, &messages, target, &output, &filler, &marker, cfg),
         Cmd::Run {
             model,
             message,
@@ -868,6 +908,60 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
 use anyhow::{anyhow, Context};
 use std::path::{Path, PathBuf};
 
+fn profile_size_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> anyhow::Result<u64> {
+    let value = object
+        .get(name)
+        .ok_or_else(|| anyhow!("test resource profile is missing `{name}`"))?;
+    if let Some(bytes) = value.as_u64() {
+        return Ok(bytes);
+    }
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow!("test resource profile `{name}` must be a byte count or size"))?;
+    match infr_core::parse_size(raw) {
+        Some(infr_core::SizeSpec::Bytes(bytes)) => Ok(bytes),
+        Some(infr_core::SizeSpec::Percent(_)) => {
+            anyhow::bail!("test resource profile `{name}` cannot be a percentage")
+        }
+        None => anyhow::bail!("invalid test resource profile `{name}` value `{raw}`"),
+    }
+}
+
+/// Install the hidden test-only probe override before Config loading or backend construction.
+fn install_test_resource_profile(path: &Path) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read test resource profile {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse test resource profile {}", path.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("test resource profile must be a JSON object"))?;
+    const FIELDS: [&str; 4] = ["vram_total", "vram_used", "ram_total", "ram_used"];
+    if let Some(unknown) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+        anyhow::bail!("unknown test resource profile field `{unknown}`");
+    }
+    let profile = infr_core::test_resource::TestResourceProfile::new(
+        profile_size_field(object, "vram_total")?,
+        profile_size_field(object, "vram_used")?,
+        profile_size_field(object, "ram_total")?,
+        profile_size_field(object, "ram_used")?,
+    )
+    .map_err(|e| anyhow!("invalid test resource profile: {e}"))?;
+    infr_core::test_resource::install(profile).map_err(|e| anyhow!("{e}"))?;
+    tracing::warn!(
+        profile = %path.display(),
+        vram_total_bytes = profile.vram_total,
+        vram_available_bytes = profile.vram_available(),
+        ram_total_bytes = profile.ram_total,
+        ram_available_bytes = profile.ram_available(),
+        "TEST RESOURCE OVERRIDE ACTIVE; detected capacity and allocator limits are reduced for this process"
+    );
+    Ok(())
+}
+
 /// Which paths some LAYER actually specified — the question a resolved [`Config`] cannot answer,
 /// because it is all values and no provenance (`sampling.temp == 0.0` cannot tell `--temp 0` from
 /// "nobody said anything", and the difference decides whether the model's recommended sampling
@@ -980,6 +1074,174 @@ fn resolve(model: &str, cfg: &Config) -> anyhow::Result<(PathBuf, Option<PathBuf
 
 /// `infr devices` — enumerate the Vulkan physical devices (index/name/type/VRAM), mark the default
 /// pick, and report external-memory extensions so the multi-GPU campaign can see the P2P surface.
+fn read_test_messages(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read test messages {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse test messages {}", path.display()))?;
+    let messages = value
+        .as_array()
+        .or_else(|| value.get("messages").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| {
+            anyhow!("test messages must be a JSON array or an object with `messages`")
+        })?;
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("test message {i} is missing string `role`"))?;
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("test message {i} is missing string `content`"))?;
+            Ok((role.to_owned(), content.to_owned()))
+        })
+        .collect()
+}
+
+fn test_chat_token_count(
+    model: &infr_llama::seam::model::SeamModel,
+    messages: &[(String, String)],
+) -> anyhow::Result<usize> {
+    let refs: Vec<(&str, &str)> = messages
+        .iter()
+        .map(|(role, content)| (role.as_str(), content.as_str()))
+        .collect();
+    let rendered = model.render_chat_messages(&refs)?;
+    Ok(model.encode(&rendered)?.len())
+}
+
+/// Hidden helper for the long-context matrix. It tokenizes locally and never constructs a GPU
+/// backend, so the request that follows can cross a KV segment boundary at an exact decode token.
+fn cmd_test_plan_prompt(
+    model_arg: &str,
+    messages_path: &Path,
+    target: usize,
+    output: &Path,
+    filler: &str,
+    marker: &str,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(target > 0, "--target must be greater than zero");
+    anyhow::ensure!(!filler.is_empty(), "--filler must not be empty");
+    anyhow::ensure!(!marker.is_empty(), "--marker must not be empty");
+
+    let (gguf, tok) = resolve(model_arg, cfg)?;
+    let model = infr_llama::seam::model::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    let base = read_test_messages(messages_path)?;
+    let marked: Vec<usize> = base
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, content))| content.matches(marker).count() == 1)
+        .map(|(i, _)| i)
+        .collect();
+    let total_markers: usize = base
+        .iter()
+        .map(|(_, content)| content.matches(marker).count())
+        .sum();
+    anyhow::ensure!(
+        total_markers == 1 && marked.len() == 1,
+        "test messages must contain exactly one `{marker}` marker"
+    );
+    let marked_idx = marked[0];
+    let (prefix, suffix) = base[marked_idx]
+        .1
+        .split_once(marker)
+        .expect("the unique marker was just located");
+    let prefix = prefix.to_owned();
+    let suffix = suffix.to_owned();
+
+    let build = |repeats: usize| {
+        let mut messages = base.clone();
+        messages[marked_idx].1 = format!("{prefix}{}{suffix}", filler.repeat(repeats));
+        messages
+    };
+    let mut counts = std::collections::HashMap::<usize, usize>::new();
+    let mut count = |repeats: usize| -> anyhow::Result<usize> {
+        if let Some(&n) = counts.get(&repeats) {
+            return Ok(n);
+        }
+        let n = test_chat_token_count(&model, &build(repeats))?;
+        counts.insert(repeats, n);
+        Ok(n)
+    };
+
+    let base_tokens = count(0)?;
+    anyhow::ensure!(
+        base_tokens <= target,
+        "messages already contain {base_tokens} tokens, above target {target}"
+    );
+    let mut high = target.saturating_sub(base_tokens).max(1);
+    while count(high)? < target {
+        high = high
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("filler repetition count overflow"))?;
+        anyhow::ensure!(
+            high <= target.saturating_mul(32).max(1024),
+            "filler `{filler}` does not add tokens predictably enough to reach {target}"
+        );
+    }
+    let mut low = 0usize;
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        if count(mid)? <= target {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    // BPE token counts can be locally non-monotonic at a suffix boundary. Inspect a small
+    // neighborhood and choose the closest result at or below the requested depth.
+    let scan_start = low.saturating_sub(32);
+    let scan_end = high.saturating_add(32);
+    let mut best = (0usize, base_tokens);
+    for repeats in scan_start..=scan_end {
+        let tokens = count(repeats)?;
+        if tokens <= target && tokens >= best.1 {
+            best = (repeats, tokens);
+        }
+    }
+    anyhow::ensure!(
+        target - best.1 < 32,
+        "closest planned prompt is {} tokens, too far below target {target}",
+        best.1
+    );
+
+    let messages = build(best.0);
+    let json_messages: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+        .collect();
+    let planned = serde_json::json!({
+        "target_tokens": target,
+        "prompt_tokens": best.1,
+        "filler_repeats": best.0,
+        "filler": filler,
+        "messages": json_messages,
+    });
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create test prompt directory {}", parent.display()))?;
+    }
+    std::fs::write(output, serde_json::to_vec_pretty(&planned)?)
+        .with_context(|| format!("write planned test prompt {}", output.display()))?;
+    // print-ok: machine-readable output of the hidden prompt-planning command.
+    println!(
+        "{}",
+        serde_json::json!({
+            "prompt_tokens": best.1,
+            "target_tokens": target,
+            "filler_repeats": best.0,
+            "output": output,
+        })
+    );
+    Ok(())
+}
+
 fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
     let devs = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
     if devs.is_empty() {

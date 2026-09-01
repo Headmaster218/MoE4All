@@ -139,6 +139,18 @@ pub struct TensorDecl {
     pub label: Option<String>,
 }
 
+/// Hard ceiling on how many blocks ONE [`Op::QsaIndexer`] / [`Op::QsaBatchAttention`] call may
+/// select (`top_blocks`). The count rides a shader push constant next to a fixed-size score +
+/// top-k scratch, so a bigger budget cannot be dispatched at all — every backend rejects it on
+/// the host rather than reading past that scratch.
+///
+/// `infr-llama` reuses it as a sanity bound when a qwen4exp GGUF ships an all-zero
+/// `attention.compress_ratios` (see `Config::from_gguf`): `indexer_top_k` counts TOKENS, so
+/// restoring the Qwen3.8 block ratio 4 must leave `top_k / 4` blocks within this ceiling. It is a
+/// bound on that repair only — the ratio itself is a model structure parameter and is never
+/// derived from this number.
+pub const QSA_MAX_TOP_BLOCKS: u32 = 512;
+
 /// Semantic ops. Each names the handles it reads plus the `dst` it writes. Grow as models need.
 ///
 /// Dimensions that aren't derivable from the operand descs are carried inline (e.g. `n_head`,

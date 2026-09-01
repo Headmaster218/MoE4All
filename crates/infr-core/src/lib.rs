@@ -33,6 +33,7 @@ pub mod progress;
 pub mod resource;
 pub mod shutdown;
 pub mod tensor;
+pub mod test_resource;
 pub mod tier;
 
 pub use backend::{

@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ash::vk;
+use indicatif::ProgressBar;
 
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::blockio::BlockDesc;
@@ -444,20 +445,26 @@ impl GpuPager {
             .collect()
     }
 
-    fn loan_slots(&mut self, slots: &[usize]) -> Result<Vec<BlockId>> {
+    fn loan_slots(&mut self, slots: &[usize], min_enabled_slots: usize) -> Result<Vec<BlockId>> {
         let unified = self
             .unified
             .as_mut()
             .ok_or_else(|| be("cannot loan a slot from a legacy pager arena"))?;
+        let loan_count = slots
+            .iter()
+            .filter(|&&slot| unified.slots[slot].allocation.is_some())
+            .count();
+        if !loan_preserves_pool_floor(self.pager.enabled_slots(), loan_count, min_enabled_slots) {
+            return Err(be(format!(
+                "unified VRAM loan of {loan_count} slot(s) would shrink an expert pool from {} \
+                 below its {min_enabled_slots}-slot dispatch-batch safety floor",
+                self.pager.enabled_slots(),
+            )));
+        }
         let mut victims = Vec::new();
         for &slot in slots {
             if unified.slots[slot].allocation.is_none() {
                 continue;
-            }
-            if self.pager.enabled_slots() <= 8 {
-                return Err(be(
-                    "unified VRAM loan would shrink an expert pool below 8 slots",
-                ));
             }
             if let Some(evicted) = self.pager.disable_slot(slot as u32) {
                 victims.push(evicted);
@@ -1472,6 +1479,9 @@ fn append_imported_copy(
 struct Pool {
     slot_bytes: usize,
     pager: GpuPager,
+    /// Minimum enabled residency needed to resolve one widest dispatch batch without evicting a
+    /// block that the same batch has already placed.
+    min_enabled_slots: usize,
     /// Present only in bounded-RAM / SSD mode. GPU-resident blocks remain pinned shadows here
     /// when capacity permits; otherwise Decode sources the permanent full host store.
     host: Option<Arc<InclusiveHostCache>>,
@@ -1583,6 +1593,12 @@ fn slot_overlaps_prefill_ring(slot: usize, slot_bytes: usize, ranges: &[(usize, 
         let range_end = offset.saturating_add(bytes);
         start < range_end && end > offset
     })
+}
+
+fn loan_preserves_pool_floor(enabled: usize, loaned: usize, floor: usize) -> bool {
+    enabled
+        .checked_sub(loaned)
+        .is_some_and(|remaining| remaining >= floor)
 }
 
 /// Lexicographic cost of borrowing a contiguous arena range for Prefill. Fewer live Decode
@@ -1726,6 +1742,8 @@ pub struct MoePagerSession {
 pub struct MoePoolSpec {
     pub slot_bytes: usize,
     pub n_slots: usize,
+    /// Runtime loans may consume surplus slots, but must preserve this planner-derived batch floor.
+    pub min_enabled_slots: usize,
     /// Bounded inclusive RAM cache below this VRAM size class. `None` selects the permanent
     /// full-Host-Store fast path.
     pub host: Option<Arc<InclusiveHostCache>>,
@@ -1858,6 +1876,12 @@ impl MoePagerSession {
         let unified_pool = vk.init_unified_vram_for_expert_slots(&unified_specs)?;
         let mut pools = Vec::with_capacity(layout.pools.len());
         for spec in &layout.pools {
+            if spec.min_enabled_slots == 0 || spec.min_enabled_slots > spec.n_slots {
+                return Err(be(format!(
+                    "MoE pool dispatch floor {} is outside its {} physical slots",
+                    spec.min_enabled_slots, spec.n_slots,
+                )));
+            }
             let mut pager = GpuPager::new_unified(
                 vk,
                 Arc::clone(&unified_pool),
@@ -1870,9 +1894,18 @@ impl MoePagerSession {
             } else {
                 None
             };
+            if pager.enabled_slots() < spec.min_enabled_slots {
+                return Err(be(format!(
+                    "MoE pool has {} enabled slots after reserving its host exchange slot, below \
+                     its {}-slot dispatch-batch safety floor",
+                    pager.enabled_slots(),
+                    spec.min_enabled_slots,
+                )));
+            }
             pools.push(Pool {
                 slot_bytes: spec.slot_bytes,
                 pager,
+                min_enabled_slots: spec.min_enabled_slots,
                 host: spec.host.clone(),
                 exchange_slot,
             });
@@ -1938,9 +1971,21 @@ impl MoePagerSession {
 
     /// Seed every bounded inclusive RAM pool after all expert banks have been registered. This
     /// gives the lower tier a balanced cold set before Decode pins its GPU shadows.
-    pub fn preload_host_tier(&self) -> Result<(usize, usize)> {
+    ///
+    /// `progress` is the weight-load bar the loader left open (`None` when there is no display). A
+    /// paged model NEVER uploads its expert banks during the load — the binder registers them and
+    /// binds a 4-byte placeholder — so after the dense weights the bar has nothing left to advance
+    /// it, and it freezes at the dense share of the model (a few percent) for the rest of the load.
+    /// What actually reads those bytes is THIS preload, so it takes the bar over: its length is cut
+    /// to `position + the bytes about to be read` (dropping the paged bytes this load will never
+    /// move) and every block advances it as it lands.
+    pub fn preload_host_tier(&self, progress: Option<&ProgressBar>) -> Result<(usize, usize)> {
         let mut total_blocks = 0usize;
         let mut total_bytes = 0usize;
+        // Pass 1 — choose every pool's block set and price it, so the bar is re-scoped ONCE: a
+        // per-pool length change would snap it backwards on each pool boundary.
+        let mut planned: Vec<(usize, usize, Vec<BlockId>)> = Vec::new();
+        let mut planned_bytes = 0u64;
         for (pool_idx, pool) in self.pools.iter().enumerate() {
             let Some(host) = &pool.host else {
                 continue;
@@ -1966,13 +2011,34 @@ impl MoePagerSession {
                     ids.len()
                 )));
             }
+            // A block's real length, not the pool's stride: a bank's tail block can be shorter, and
+            // counting `slot_bytes` for it would leave the bar just short of full at the end.
+            planned_bytes += ids
+                .iter()
+                .map(|&id| host.block_bytes(id).unwrap_or(pool.slot_bytes) as u64)
+                .sum::<u64>();
+            planned.push((pool_idx, layers.len(), ids));
+        }
+        if let Some(pb) = progress {
+            pb.set_length(pb.position() + planned_bytes);
+        }
+        // Pass 2 — read them, advancing the bar one block at a time.
+        for (pool_idx, n_layers, ids) in planned {
+            let host = self.pools[pool_idx]
+                .host
+                .as_ref()
+                .expect("pass 1 kept only pools with a host tier");
             let started = std::time::Instant::now();
-            let (blocks, bytes) = host.preload(&ids)?;
+            let (blocks, bytes) = host.preload_with(&ids, &|len| {
+                if let Some(pb) = progress {
+                    pb.inc(len as u64);
+                }
+            })?;
             let elapsed = started.elapsed();
             tracing::info!(
                 "[infr] preloaded bounded MoE RAM pool {pool_idx}: {blocks} blocks / {:.2} GB across {} layers in {:.2}s ({:.2} GB/s)",
                 bytes as f64 / 1e9,
-                layers.len(),
+                n_layers,
                 elapsed.as_secs_f64(),
                 bytes as f64 / 1e9 / elapsed.as_secs_f64().max(f64::EPSILON),
             );
@@ -2114,7 +2180,7 @@ impl MoePagerSession {
 
     /// Release the coldest physically contiguous expert-slot window large enough for an
     /// auxiliary allocation. Non-expert allocations are hard barriers and every expert pool
-    /// retains at least eight enabled slots (one routed Top-K working set). During whole-layer
+    /// retains its planner-derived widest-dispatch working set. During whole-layer
     /// Prefill, slots covered by the active streaming ring are barriers too: async uploads and GPU
     /// segments still address those lanes, so runtime borrowing must leave them in place.
     pub(crate) fn loan_unified_bytes(&mut self, bytes: usize) -> Result<usize> {
@@ -2195,12 +2261,12 @@ impl MoePagerSession {
                 if blocked
                     || victims.is_empty()
                     || per_pool.iter().enumerate().any(|(pool, &count)| {
-                        self.pools[pool]
-                            .pager
-                            .pager
-                            .enabled_slots()
-                            .saturating_sub(count)
-                            < 8
+                        let pool = &self.pools[pool];
+                        !loan_preserves_pool_floor(
+                            pool.pager.enabled_slots(),
+                            count,
+                            pool.min_enabled_slots,
+                        )
                     })
                 {
                     continue;
@@ -2228,7 +2294,7 @@ impl MoePagerSession {
         let mut loaned = 0usize;
         for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
             loaned = loaned.saturating_add(slots.len());
-            let evicted = pool.pager.loan_slots(&slots)?;
+            let evicted = pool.pager.loan_slots(&slots, pool.min_enabled_slots)?;
             if let Some(host) = &pool.host {
                 host.release_gpu_blocks(&evicted);
             }
@@ -3657,6 +3723,14 @@ mod tests {
         assert!(slot_overlaps_prefill_ring(2, 1024, &ring));
         assert!(slot_overlaps_prefill_ring(3, 1024, &ring));
         assert!(!slot_overlaps_prefill_ring(4, 1024, &ring));
+    }
+
+    #[test]
+    fn runtime_loans_preserve_the_planned_dispatch_floor() {
+        assert!(loan_preserves_pool_floor(624, 112, 512));
+        assert!(!loan_preserves_pool_floor(624, 113, 512));
+        assert!(!loan_preserves_pool_floor(8, 1, 8));
+        assert!(!loan_preserves_pool_floor(8, 9, 1));
     }
 
     #[test]
