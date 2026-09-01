@@ -24,21 +24,13 @@ Qwen3.8-Flash-Next 已经通过 MoE4All 在消费级 **AMD Radeon RX 7900 XTX**
 上稳定生成正常内容，简单数学和推理问题也能够正确回答。Q2_K_XL 和 IQ4_XS
 量化均已完成 Windows 11 实测，并可在**受限进程 RAM 预算**下从 SSD 分页运行。
 
-当前 `qwen4exp` 文本路径已经完整接入发布模型所需的四流 Hyper-Connection、
-Gated DeltaNet/全注意力混合层、SSD 支持的 PLE、分页 MoE，以及 **QSA 稀疏注意力**。
-QSA 会维护独立的 F16 index-key cache，选择完整历史块并保留未完成的 causal tail，
-以覆盖长上下文。主 K/V Cache 支持 Q8_0；QSA index-key cache 保持 F16，并独立
-计价和分配。
+2026-09-01 的发版资源矩阵验证了较高 RAM 覆盖率下的真实多轮 API 性能。以下使用
+`device.vram_budget=22g`、`device.ram_budget=54g`（进程总 RAM 目标）和 Q8 K/V；
 
-下表来自 RX 7900 XTX、Vulkan0、Q8 K/V 和 40 GiB bounded RAM 下的历史稳定实测，
-未发生 Windows 系统分页。Decode 使用 `tg128`，Prefill 使用 `pp1024`，ubatch 为
-1024；128K/250K 通过 synthetic depth 构造真实 KV 长度。表内为三次平均值。
-
-| Context depth | Q2_K_XL decode | Q2_K_XL prefill | IQ4_XS decode | IQ4_XS prefill |
-|---:|---:|---:|---:|---:|
-| 0 | **29.45 tok/s** | **155.16 tok/s** | **16.85 tok/s** | **244.68 tok/s** |
-| 128K | **26.23 tok/s** | **170.44 tok/s** | **14.15 tok/s** | **250.55 tok/s** |
-| 250K | **22.82 tok/s** | **152.27 tok/s** | **15.26 tok/s** | **239.00 tok/s** |
+| 模型                            |          32K / 64K / 96K 增量 prefill |             32K / 64K / 96K decode |
+| ------------------------------- | ------------------------------------: | ---------------------------------: |
+| Qwen3.6-35B-A3B APEX-I-Balanced | **720.2 / 709.3 / 686.4 tok/s** | **95.8 / 94.7 / 75.6 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS       | **229.1 / 279.0 / 282.2 tok/s** | **45.7 / 45.7 / 40.9 tok/s** |
 
 更多历史稳定成绩与测试条件见
 [Windows 本地大模型代表性性能记录](docs/perf/windows-local-model-matrix-20260829.md)。
@@ -97,14 +89,14 @@ Start-INFR-Wizard.cmd
 
 ## 需要什么
 
-| 项目 | 说明 |
-|---|---|
-| 操作系统 | 主要测试于 64 位 Windows 11 |
-| GPU | 当前重点支持 AMD Vulkan；显存越大，可常驻的权重和 KV 越多 |
-| 驱动 | 安装 AMD 官方稳定驱动，`infr.exe devices` 应能看到显卡 |
-| 内存 | 大型 MoE 会利用系统 RAM；模型远大于 RAM 时可继续从 SSD 分页 |
-| 存储 | 建议高速本地 SSD，并为模型全部分片留足空间 |
-| 模型 | 自备受支持架构的 GGUF，单文件或完整分片组 |
+| 项目     | 说明                                                        |
+| -------- | ----------------------------------------------------------- |
+| 操作系统 | 主要测试于 64 位 Windows 11                                 |
+| GPU      | 当前重点支持 AMD Vulkan；显存越大，可常驻的权重和 KV 越多   |
+| 驱动     | 安装 AMD 官方稳定驱动，`infr.exe devices` 应能看到显卡    |
+| 内存     | 大型 MoE 会利用系统 RAM；模型远大于 RAM 时可继续从 SSD 分页 |
+| 存储     | 建议高速本地 SSD，并为模型全部分片留足空间                  |
+| 模型     | 自备受支持架构的 GGUF，单文件或完整分片组                   |
 
 能运行多大的模型取决于模型量化、固定权重、上下文、显存、RAM 和 SSD。MoE4All
 的目标是尽量利用现有硬件，而不是承诺任意模型都能在任意 A 卡上达到同样速度。
@@ -115,16 +107,16 @@ Start-INFR-Wizard.cmd
 主机的历史稳定测试。已排除进入系统分页的资源压力诊断结果；各行测试日期、模型量化、
 上下文和缓存条件不同，不能直接横向比较。
 
-| 模型与负载 | 关键条件 | 结果 |
-|---|---|---:|
-| Qwen3.6-35B-A3B，250K synthetic depth 后 decode | Q8 K/V，生成 1,000 token | **41.2 tok/s** |
-| Qwen3.6-35B-A3B，250K 后 prefill 4,096 | Q8 K/V | **477.9 tok/s** |
-| Qwen3.6-35B-A3B，depth 0 prefill 4,096 | Q8 K/V | **2,855.6 tok/s** |
-| Qwen3.5-122B-A10B，depth 0 decode | F16 K/V，45 GiB bounded RAM，3 次重复 | **23.2 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL，250K 后 decode | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 | **22.82 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均 | **152.27 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS，250K 后 decode | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 | **15.26 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均 | **239.00 tok/s** |
+| 模型与负载                                        | 关键条件                                    |                    结果 |
+| ------------------------------------------------- | ------------------------------------------- | ----------------------: |
+| Qwen3.6-35B-A3B，250K synthetic depth 后 decode   | Q8 K/V，生成 1,000 token                    |    **41.2 tok/s** |
+| Qwen3.6-35B-A3B，250K 后 prefill 4,096            | Q8 K/V                                      |   **477.9 tok/s** |
+| Qwen3.6-35B-A3B，depth 0 prefill 4,096            | Q8 K/V                                      | **2,855.6 tok/s** |
+| Qwen3.5-122B-A10B，depth 0 decode                 | F16 K/V，45 GiB bounded RAM，3 次重复       |    **23.2 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL，250K 后 decode        | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 |   **22.82 tok/s** |
+| Qwen3.8-Flash-Next Q2_K_XL，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均        |  **152.27 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS，250K 后 decode         | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 |   **15.26 tok/s** |
+| Qwen3.8-Flash-Next IQ4_XS，250K 后 prefill 1,024  | Q8 K/V，40 GiB bounded RAM，3 次平均        |  **239.00 tok/s** |
 
 完整条件和优化历史见：
 
@@ -135,17 +127,17 @@ Start-INFR-Wizard.cmd
 
 ## 当前模型支持
 
-| 模型家族 | GGUF 架构 | 状态 |
-|---|---|---|
-| Llama、Llama 4 | `llama`、`llama4` | Dense 与 MoE Vulkan 推理 |
-| Qwen2 / Qwen2.5 / Qwen3 | `qwen2`、`qwen3`、`qwen3moe` | Dense 与 Qwen3 MoE |
-| Qwen3.5 / Qwen3.6 | `qwen35`、`qwen35moe` | Gated DeltaNet、Attention 与分页 MoE |
-| Qwen3.8 Flash Next | `qwen4exp` | Hyper-Connection、Gated DeltaNet、PLE、QSA 与分页 MoE Vulkan 文本推理 |
-| Gemma 3 / Gemma 4 | `gemma3`、`gemma4` | Dense、MoE 与 E2B 变体 |
-| Ling 3.0 Flash | `bailingmoe3` | KDA、gated MLA、512 experts 与 RAM/SSD 分页 |
-| DeepSeek V4 Flash | `deepseek4` | FP8 KV、MXFP4 indexer cache 与分页 MoE |
-| DiffusionGemma | `diffusion-gemma` | 文本扩散推理 |
-| Embedding GGUF | 受支持的 Embedding 架构 | 原生 CPU/Vulkan OpenAI Embedding API |
+| 模型家族                | GGUF 架构                          | 状态                                                                  |
+| ----------------------- | ---------------------------------- | --------------------------------------------------------------------- |
+| Llama、Llama 4          | `llama`、`llama4`              | Dense 与 MoE Vulkan 推理                                              |
+| Qwen2 / Qwen2.5 / Qwen3 | `qwen2`、`qwen3`、`qwen3moe` | Dense 与 Qwen3 MoE                                                    |
+| Qwen3.5 / Qwen3.6       | `qwen35`、`qwen35moe`          | Gated DeltaNet、Attention 与分页 MoE                                  |
+| Qwen3.8 Flash Next      | `qwen4exp`                       | Hyper-Connection、Gated DeltaNet、PLE、QSA 与分页 MoE Vulkan 文本推理 |
+| Gemma 3 / Gemma 4       | `gemma3`、`gemma4`             | Dense、MoE 与 E2B 变体                                                |
+| Ling 3.0 Flash          | `bailingmoe3`                    | KDA、gated MLA、512 experts 与 RAM/SSD 分页                           |
+| DeepSeek V4 Flash       | `deepseek4`                      | FP8 KV、MXFP4 indexer cache 与分页 MoE                                |
+| DiffusionGemma          | `diffusion-gemma`                | 文本扩散推理                                                          |
+| Embedding GGUF          | 受支持的 Embedding 架构            | 原生 CPU/Vulkan OpenAI Embedding API                                  |
 
 同一架构上的微调模型通常可以直接复用现有实现，但 GGUF metadata、量化格式和
 chat template 仍必须完整。项目不会仅凭模型名称假定兼容。
