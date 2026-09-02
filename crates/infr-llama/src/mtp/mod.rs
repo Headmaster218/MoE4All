@@ -2930,6 +2930,23 @@ fn generate_mtp_spec_core(
     let mut acc: Vec<u32> = Vec::new();
     let mut printed = 0usize;
     let mut out: Vec<u32> = Vec::new();
+    // [LOCAL DEV DIAGNOSTIC] dump the first draft step's exact inputs + the trunk's expectation,
+    // for the offline numpy replication of distill.py's head forward (the alpha=0 hunt).
+    if std::env::var_os("INFR_MTP_DUMP").is_some() {
+        let dump = serde_json::json!({
+            "id_last": id_last,
+            "expected_next": ids0[p - 1],
+            "pending_h": pending_h,
+        });
+        let path = std::env::var("INFR_MTP_DUMP").unwrap_or_else(|_| "mtp_dump.json".into());
+        std::fs::write(&path, serde_json::to_vec(&dump).expect("dump json"))
+            .expect("write mtp dump");
+        tracing::info!(
+            "[mtp-dump] wrote {path} (id_last={}, expected_next={})",
+            id_last,
+            ids0[p - 1]
+        );
+    }
     let mut cycle = 0usize;
     let mut total_drafted = 0usize;
     let mut total_accepted = 0usize;
@@ -2947,10 +2964,28 @@ fn generate_mtp_spec_core(
         }
         cycle += 1;
 
+        // The head's row convention is (embed(t_pos), h_{pos-1}) -> predicts t_{pos+1}. When a
+        // leading row is present (cycle 1 from the prime, later cycles from a reprime), the
+        // leading pred IS t_{pos} — the trunk's own prediction for the next position — so the
+        // draft's step-0 embed must be the LEADING PRED (not `id_last` = t_{pos-1}), and the
+        // leading pred must be PREPENDED to `cand` so the verify places it at position `pos`
+        // and its row-p+1 argmax aligns with the head's step-1 draft. Without both halves of
+        // this fix the acceptance comparison is shifted by one row and alpha pins at exactly
+        // 0.000 regardless of head quality (PR #21 follow-up diagnosis).
+        let leading_tok: Option<u32> = if stochastic {
+            None // stochastic path keeps its own leading-dist handling below (greedy-only fix)
+        } else {
+            leading.as_ref().map(|l| match &l.pred {
+                LeadingPred::Id(id) => *id,
+                LeadingPred::Dist(_) => id_last,
+            })
+        };
+        let draft_tok = leading_tok.unwrap_or(id_last);
+
         let t_draft = std::time::Instant::now();
         // cand: the drafted token ids, either flavor. q_dists: the stochastic flavor's per-step
         // truncated proposal distributions (empty/unused on the greedy path).
-        let (cand, q_dists): (Vec<u32>, Vec<Vec<(u32, f32)>>) = if stochastic {
+        let (mut cand, mut q_dists): (Vec<u32>, Vec<Vec<(u32, f32)>>) = if stochastic {
             let drafted = draft_stochastic(
                 head_sess,
                 id_last,
@@ -2968,12 +3003,12 @@ fn generate_mtp_spec_core(
             // correctness argument): replaces `n_max_round` sequential submit→wait→readback
             // round-trips with ONE compile+execute+download. `INFR_NO_MTP_DRAFT_CHAIN=1` A/B
             // escape keeps the old per-step `draft()` path for comparison.
-            let cand = head_sess.draft_chain(id_last, &pending_h, n_past, n_max_round)?;
+            let cand = head_sess.draft_chain(draft_tok, &pending_h, n_past, n_max_round)?;
             (cand, Vec::new())
         } else {
             let drafted = draft(
                 head_sess,
-                id_last,
+                draft_tok,
                 &pending_h,
                 n_past,
                 DEFAULT_P_MIN,
@@ -2982,6 +3017,13 @@ fn generate_mtp_spec_core(
             (drafted.iter().map(|&(id, _)| id).collect(), Vec::new())
         };
         let draft_secs = t_draft.elapsed().as_secs_f64();
+        // Prepend the leading pred (greedy path): it is the trunk's own token for position
+        // n_past and is trivially accepted - the head's real drafts start at n_past+1 and
+        // align with varg[1..]. The stochastic path prepends nothing (its leading dist rides
+        // p_rows[0] as before).
+        if let Some(lt) = leading_tok {
+            cand.insert(0, lt);
+        }
 
         let mut feed = committed.clone();
         feed.extend_from_slice(&cand);
@@ -3017,6 +3059,20 @@ fn generate_mtp_spec_core(
         };
         let verify_secs = t_verify.elapsed().as_secs_f64();
         let m = h_rows.len() / ne;
+        // [LOCAL DEV DIAGNOSTIC] cycle 2's first re-prefilled row = the trunk's hidden at
+        // position p (the committed next_tok) — the numpy head-replication compares the head's
+        // h_mtp against this (hidden-space oracle, no lm_head/IQ4_XS needed).
+        if cycle == 2 && std::env::var_os("INFR_MTP_DUMP").is_some() {
+            let path = std::env::var("INFR_MTP_DUMP").unwrap_or_else(|_| "mtp_dump.json".into());
+            let mut dump: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap_or_default())
+                    .unwrap_or(serde_json::json!({}));
+            dump["trunk_hidden_p"] = serde_json::json!(h_rows[0..ne].to_vec());
+            dump["committed_tok_p"] = serde_json::json!(committed.last().copied().unwrap_or(0));
+            std::fs::write(&path, serde_json::to_vec(&dump).expect("dump json"))
+                .expect("rewrite mtp dump");
+            tracing::info!("[mtp-dump] appended trunk_hidden_p (cycle 2)");
+        }
 
         // Consume the leading row ONCE (AUDIT #5: `Leading` bundles `h` + prediction in lock-step).
         // The accept rule below reads the prediction; the catch-up block reads `h` — split the taken

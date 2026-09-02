@@ -2922,7 +2922,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                                                                       // undersized scratch surfaces as a mid-upload guard refusal (measured: 272.0 MiB
                                                                       // block refused with 180.7 MiB left at 131K kv-q8 on the RX 7700 XT). 896 MiB
                                                                       // closes it; the shortfall-driven search pays for it out of expert slots.
-            let scratch = 576 << 20;
+                                                                      // Scratch covers the BDA geometry rounding (272/397 MiB blocks vs raw tensor bytes)
+                                                                      // plus the dynamic KV expansion segments that land after placement — with the reserve
+                                                                      // enforced inside the arena search's `required_after_arena`, an undersized scratch
+                                                                      // surfaces as a mid-upload guard refusal; the loop pays for the bigger scratch out of
+                                                                      // expert slots instead.
+            let scratch = 1280 << 20;
             let mtp_reserve = head_weights + embed_table + head_kv + scratch;
             tracing::info!(
                 "[mtp] headroom reserve: head_weights={:.0}MB embed_table={:.0}MB head_kv={:.0}MB \
