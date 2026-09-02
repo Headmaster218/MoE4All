@@ -120,15 +120,23 @@ MTP 与非 MTP 的 usage 统计一致；带 stop 序列的请求行为与非 MTP
    logits 恒定 → "!!!"）；②`down_proj` 多做了 `transpose(0,2,1)`（gate/up 没有）。
    `graft_v3.py`（Temp）修复两者并带 753 张量字节级自检；MTPFIX2.gguf trunk
    输出质量回归通过（"391"），数值探针全部健康。
-7. **⚠️ 终审（09-02）：健康文件上嫁接头 α = 0.000** —— 256 周期 0/1521 接受，
-   MTP 纯负优化（~10 t/s vs trunk 54.7）。shisa 蒸馏头是对**其它主干**蒸馏的，
-   对 Ornith-APEX 微调后的分布完全没有预测力；8.31 的 α=1.000 是损坏文件上
-   退化分布的假象。**结论：这个模型要吃 MTP 红利，需要针对 Ornith-APEX 主干
-   重新蒸馏/训练一个 MTP 头（模型侧工作），引擎侧管线已全部就绪**——
-   头-arena 联合重试、host-embed 回退、token_embd 上传移除、台账诊断都已落地
-   （`9da48058`/`5485336c`/`2aa199f5`），好头一到即可直接测。另：verify 前向
-   在 131K 有 4-5× 于 decode 的效率问题（70-88ms vs 18.5ms，m=1-2），好头
-   到位后也值得查。
+7. **⚠️ 终审（09-02）：健康文件上嫁接头 α = 0.000 —— 根因改判：引擎的 paged-MoE 批量 verify 前向有正确性 bug**
+   - 排除过程：graft 映射全表核对（19 张量形状与原始 blk.40 逐一吻合）→ router 恢复 F32
+     （graft_v3b）→ α 仍为 0.000（256 周期 0/1521）。
+   - **决定性证据**：α=0 时 MTP 契约要求输出与普通 decode 逐 token 一致（只是慢），
+     实测 MTP 路径 2 个 token 即 EOS，而普通 decode 同 prompt 生成 256 tokens 完整文章
+     ——**verify 前向给出的 logits 与逐 token decode 不同**，α 的度量对象（verify 的
+     argmax）本身是坏的，头的质量根本没被测到。
+   - 交叉印证：0.8B **稠密**头同引擎 α=0.47-0.55（无 paged MoE，verify 正确）；
+     原生 qwen35moe 头（vLLM 实测 21.7%）在本引擎 α≈0.1；shisa 头（vLLM 实测
+     60-69%）本引擎 α=0.000 —— 全部指向 **paged-MoE 批量 verify 分支**的 bug，
+     与头无关。审查者认定的"int8 噪声导致 identity 测试失败"很可能是误诊。
+   - **下一步**：在 35B 上跑 `mtp_spec_matches_target_only_greedy`（去 ignore）+
+     逐行 logits 对照（batched verify vs 顺序 decode），定位分歧行/分歧层；嫌疑
+     顺序：批量 MoE 前向的 expert 分页拉取/路由、verify 批的位置/KV 状态、
+     DeltaNet 回滚与批量行的交互。
+   - **好消息**：头是健康的（vLLM 60-69% accept 有完整评测），文件是健康的
+     （MTPFIX2 + graft_v3 可复用），修复引擎 verify 正确性后 α 应直接恢复 ~0.6。
 
 ---
 
