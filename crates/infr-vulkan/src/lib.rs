@@ -3591,6 +3591,16 @@ impl VulkanBackend {
                     recent.remove(0);
                 }
             }
+            // Big-allocation live trace: the placement-vs-consumption gap hunt needs the
+            // SEQUENCE of multi-hundred-MB uploads, not just label aggregates.
+            if want >= (256 << 20) {
+                let total: u64 = self.alloc_ledger.lock().unwrap().values().sum();
+                tracing::warn!(
+                    "[vram-alloc] {label} {} MiB (guarded total {} MiB)",
+                    want / (1024 * 1024),
+                    total / (1024 * 1024)
+                );
+            }
         }
         let unified_limit = self.cfg.device.vram_budget.is_some()
             || self.cfg.device.vram_reserve.is_some()
