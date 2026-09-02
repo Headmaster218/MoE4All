@@ -1353,6 +1353,13 @@ pub struct VulkanBackend {
     /// `INFR_D2H_DMA=0` opts out of the DMA readback path (mapped readback stays). Read once
     /// here at construction so no per-call env read exists (S5b).
     d2h_dma_enabled: bool,
+    /// Diagnostics: live guarded-allocation bytes per label (`check_vram_budget_labeled`),
+    /// dumped on guard refusals so the budget's consumers are named, not inferred. Shared with
+    /// `fork_embedding_client`'s co-handle (one device, one ledger).
+    alloc_ledger: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+    /// Diagnostics: the last 40 guarded allocations ≥1 MiB, newest last — the refusal dump's
+    /// tail names the REPEATED allocation pattern (per-cycle leaks show up immediately).
+    alloc_recent: std::sync::Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     shared: Arc<VulkanShared>,
 }
 
@@ -2847,6 +2854,8 @@ impl VulkanBackend {
             unified_client: None,
             d2h_dma: Arc::new(Mutex::new(D2hDmaCell::Untouched)),
             d2h_dma_enabled,
+            alloc_ledger: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            alloc_recent: Arc::new(Mutex::new(Vec::new())),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -3565,6 +3574,24 @@ impl VulkanBackend {
 
     fn check_vram_budget_labeled(&self, want: u64, label: &str) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
+                                        // Per-label allocation ledger (diagnostics): on a guard refusal the top consumers are
+                                        // dumped, naming exactly what consumed the budget instead of leaving the 3.7 GB between
+                                        // "placement guaranteed room" and "mid-run refusal" unaccounted for.
+        if want >= CHECK_MIN {
+            *self
+                .alloc_ledger
+                .lock()
+                .unwrap()
+                .entry(label.to_owned())
+                .or_insert(0) += want;
+            {
+                let mut recent = self.alloc_recent.lock().unwrap();
+                recent.push((label.to_owned(), want));
+                if recent.len() > 40 {
+                    recent.remove(0);
+                }
+            }
+        }
         let unified_limit = self.cfg.device.vram_budget.is_some()
             || self.cfg.device.vram_reserve.is_some()
             || infr_core::test_resource::active().is_some();
@@ -3595,6 +3622,32 @@ impl VulkanBackend {
             .device
             .vram_budget
             .map(|spec| spec.resolve(v.total).min(v.total));
+        {
+            let ledger = self.alloc_ledger.lock().unwrap();
+            let mut top: Vec<(&String, &u64)> = ledger.iter().collect();
+            top.sort_by(|a, b| b.1.cmp(a.1));
+            let rows: Vec<String> = top
+                .iter()
+                .take(12)
+                .map(|(l, b)| format!("{}: {}", l, fmt_bytes(**b)))
+                .collect();
+            tracing::warn!(
+                requested_label = label,
+                "VRAM guard refusal — backend allocation ledger (top consumers): {}",
+                rows.join(", ")
+            );
+            let recent: Vec<String> = self
+                .alloc_recent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(l, b)| format!("{}:{}", l, b / (1024 * 1024)))
+                .collect();
+            tracing::warn!(
+                "VRAM guard refusal — last 40 guarded allocations (label:MB, oldest first): {}",
+                recent.join(" | ")
+            );
+        }
         Err(be(format!(
             "{} budget exceeded: {} requested for `{label}` with {} physical / {} backend bytes \
                  already in use; {} remains under the unified limit (physical cap {}, configured cap \
@@ -3940,7 +3993,14 @@ impl VulkanBackend {
         runtime_margin: usize,
     ) -> Result<usize> {
         let pool = self.init_unified_vram_for_expert_slots(specs, runtime_margin)?;
-        Ok(pool.stats().capacity_bytes)
+        let bytes = pool.stats().capacity_bytes;
+        *self
+            .alloc_ledger
+            .lock()
+            .unwrap()
+            .entry("moe-arena".to_owned())
+            .or_insert(0) += bytes as u64;
+        Ok(bytes)
     }
 
     /// Drop a prepared MoE arena after a placement probe found that it leaves too little live
@@ -3961,6 +4021,9 @@ impl VulkanBackend {
         let pool = cell.take().expect("checked above");
         drop(cell);
         drop(pool);
+        if let Some(v) = self.alloc_ledger.lock().unwrap().get_mut("moe-arena") {
+            *v = v.saturating_sub(bytes as u64);
+        }
         Ok(bytes)
     }
 
@@ -3987,6 +4050,8 @@ impl VulkanBackend {
             unified_client: Some(UnifiedClient::Embedding),
             d2h_dma: Arc::clone(&self.d2h_dma),
             d2h_dma_enabled: self.d2h_dma_enabled,
+            alloc_ledger: Arc::clone(&self.alloc_ledger),
+            alloc_recent: Arc::clone(&self.alloc_recent),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
