@@ -156,3 +156,16 @@ MTP 与非 MTP 的 usage 统计一致；带 stop 序列的请求行为与非 MTP
 2. **f32/top-2 margin 仲裁**（解除 correctness gate，去 `#[ignore]`）
 3. **RequestCtx 管线**（server 接入，最后做，纯工程量）
 4. 全部完成后解 park → 更新 PR #21 → `mtp_spec_matches_target_only_greedy` 转正
+
+8. **引擎侧 off-by-one 修复（09-02，`4a8e9116`）：α 0.000 → 0.017** —— 头的行约定
+   `(embed(t_pos), h_{pos-1}) → 预测 t_{pos+1}` 下，draft step-0 的 embed 应喂
+   leading pred（=t_pos，引擎已有），实际喂了 id_last（=t_{pos-1}）；且 leading
+   pred 未前置进 cand，accept 错位一行。两个 off-by-one 叠加使 α 结构性钉死在
+   0.000（与头质量无关——CPU/Vulkan 一致、6 个映射变体一致）。修复后 8K 实测
+   α=0.017（12/693），输出连贯（提纲正确续写）。
+   **剩余差距（0.017 vs vLLM ~0.6）指向头内容**：numpy harness 实测头张量中
+   enorm/hnorm 为近似负常向量（对 raw hidden cos -0.97/-1.00）、attn_norm 均值
+   -0.09（trunk 各层 +0.93~1.03）、router 近均匀，且有幅度界证明头的输出无法
+   对准 trunk 残差方向——蒸馏 checkpoint 的约定与引擎/文档不一致，或该头并非
+   针对此 trunk 蒸馏。**下一步在模型侧**：按 distill.py 的实际 pairing 重审或
+   重新蒸馏；引擎侧（off-by-one、fit、诊断）已就绪。
