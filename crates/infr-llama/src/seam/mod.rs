@@ -2160,11 +2160,11 @@ const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 /// arena backend; Linux uses the live heap budget without it and remains byte-for-byte unchanged.
 const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Cold WDDM startup has a small amount of run-to-run heap-budget movement beyond the measured
-/// large-ReBAR load reserve above. Automatic placement should favor a reliable first launch over the
-/// last few Expert slots. An explicit total VRAM budget/reserve remains authoritative and opts out
-/// of this extra policy margin.
-const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
+/// Cold WDDM startup and the first queue use of imported host-memory aliases have heap-budget
+/// movement beyond the measured large-ReBAR load reserve above. Automatic placement should favor a
+/// reliable first launch over the last few Expert slots. An explicit total VRAM budget/reserve
+/// remains authoritative and opts out of this extra policy margin.
+const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 1024 * 1024 * 1024;
 
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
@@ -6810,11 +6810,7 @@ mod seam_helper_tests {
         let automatic = EngineConfig::default();
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &automatic),
-            if cfg!(windows) {
-                2 * GIB + 512 * MIB
-            } else {
-                0
-            }
+            if cfg!(windows) { 3 * GIB } else { 0 }
         );
         let mut explicit = EngineConfig::default();
         explicit.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(512 * MIB));
@@ -6831,11 +6827,18 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &automatic),
-            if cfg!(windows) {
-                2 * GIB + 512 * MIB
-            } else {
-                0
-            }
+            if cfg!(windows) { 3 * GIB } else { 0 }
+        );
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &explicit),
+            if cfg!(windows) { 2 * GIB } else { 0 }
+        );
+
+        cfg.bailingmoe3 = false;
+        cfg.qwen4exp = true;
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &automatic),
+            if cfg!(windows) { 3 * GIB } else { 0 }
         );
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &explicit),
