@@ -215,6 +215,14 @@ pub(crate) fn generate_mtp_spec_vulkan_timed_on_state(
         model.token_embd()?,
         max_ctx,
     )?;
+    // VRAM milestone probe (PR #21 follow-up): the head session's weights fit at build time, but
+    // the trunk verify binds (token_embd F16 upload) and the dynamic KV expansion happen later
+    // through the same guard — this names the live room each stage starts with, so the
+    // placement-time guarantee vs runtime-consumption gap is measurable instead of inferred.
+    tracing::info!(
+        after_head_session_live_mb = vk.alloc_room() as f64 / 1e6,
+        "[mtp] vram milestone: head session built"
+    );
     let out = generate_mtp_spec_core(
         vk,
         bind,

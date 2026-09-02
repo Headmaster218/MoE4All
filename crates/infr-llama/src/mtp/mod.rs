@@ -154,6 +154,15 @@ pub fn mtp_enabled() -> bool {
     false
 }
 
+/// Whether the draft chain may upload its ~1 GiB device-side embedding table. Defaults to OFF:
+/// the table's BDA-block upload competes with the head's own weights for the post-placement
+/// guard budget and refused mid-upload on a 12 GB card at every context size, while the
+/// host-embed fallback costs a ~10 KB upload per drafted step. `INFR_MTP_DEVICE_EMBED=1`
+/// restores the device chain (measured escape hatch).
+pub(crate) fn device_embed_enabled() -> bool {
+    std::env::var_os("INFR_MTP_DEVICE_EMBED").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// The SINGLE MTP opt-in decision the chat backends share (`chat::vulkan`/`chat::metal`/`chat::cpu`
 /// `ChatModel`s). Returns `true` only when the user asked (`INFR_MTP=1`), MTP is not parked
 /// ([`mtp_enabled`]), AND the GGUF actually ships an MTP head (`cfg.n_layer_nextn > 0`). When
@@ -501,7 +510,8 @@ fn build_embed_chain_buf(
         && caps.embed_gather
         && caps.argmax_prob
         && cfg.n_embd.is_multiple_of(32)
-        && infr_vulkan::linear::embed_gather_supported(t.dtype);
+        && infr_vulkan::linear::embed_gather_supported(t.dtype)
+        && device_embed_enabled();
     if !gate {
         return Ok((None, DType::F32));
     }

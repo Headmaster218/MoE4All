@@ -2911,8 +2911,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     infr_gguf::nbytes(t.dtype, numel)
                 })
                 .sum();
-            let embed_table = cfg.vocab * cfg.n_embd * 2; // F16 draft-chain gather table
+            // The trunk's own token_embd upload during the MTP verify binds is F16 (dequantized
+            // from its GGUF dtype — Q8_0 here), i.e. TWICE the bytes minimum_required prices it
+            // at. This term covers that delta (and the head's device embed table when
+            // `device_embed_enabled`, which shares the same magnitude).
+            let embed_table = cfg.vocab * cfg.n_embd * 2;
             let head_kv = want_ctx * cfg.n_kv * cfg.head_dim * 2 * 2; // K+V f16, 1 layer
+                                                                      // Scratch covers the BDA geometry rounding AND the head's later blocks beyond the
+                                                                      // first `resident-bda` request: with the reserve inside required_after_arena, an
+                                                                      // undersized scratch surfaces as a mid-upload guard refusal (measured: 272.0 MiB
+                                                                      // block refused with 180.7 MiB left at 131K kv-q8 on the RX 7700 XT). 896 MiB
+                                                                      // closes it; the shortfall-driven search pays for it out of expert slots.
             let scratch = 576 << 20;
             let mtp_reserve = head_weights + embed_table + head_kv + scratch;
             tracing::info!(
