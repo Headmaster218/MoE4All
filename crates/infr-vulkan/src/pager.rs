@@ -1814,6 +1814,9 @@ fn ring_region_bytes(total: usize, slots: usize, min_slot_bytes: usize) -> usize
     aligned_share.max(aligned_min)
 }
 
+type LoanScore = (usize, u128, usize, usize);
+type LoanCandidate = (LoanScore, Vec<(usize, usize)>);
+
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let load_reservation = vk.alloc_load_vram_reservation(layout.load_reserve_bytes)?;
@@ -2199,6 +2202,67 @@ impl MoePagerSession {
             return Ok(0);
         }
         let protect_prefill_ring = self.mode == MoeArenaMode::PrefillLayer;
+        let mut best = self.scan_loan_window(bytes, protect_prefill_ring);
+        if best.is_none() {
+            // Defragmentation retry (the long-serve wedge): every candidate window either
+            // crossed a permanent allocation or breached the pool floor. Evict every COLD
+            // (non-resident, non-ring) expert slot — their data is re-pullable from the host
+            // store — to coalesce free space, then rescan once.
+            let ring_ranges = self.prefill_reserved_ranges.clone();
+            for (pool_idx, pool) in self.pools.iter_mut().enumerate() {
+                let cold: Vec<usize> = pool
+                    .pager
+                    .unified_slot_allocations()
+                    .into_iter()
+                    .filter(|(slot, _, heat)| {
+                        heat.is_none()
+                            && !(protect_prefill_ring
+                                && slot_overlaps_prefill_ring(
+                                    *slot,
+                                    pool.slot_bytes,
+                                    &ring_ranges[pool_idx],
+                                ))
+                    })
+                    .map(|(slot, _, _)| slot)
+                    .collect();
+                if cold.is_empty() {
+                    continue;
+                }
+                if let Ok(evicted) = pool.pager.loan_slots(&cold, pool.min_enabled_slots) {
+                    if let Some(host) = &pool.host {
+                        host.release_gpu_blocks(&evicted);
+                    }
+                }
+            }
+            best = self.scan_loan_window(bytes, protect_prefill_ring);
+        }
+        let Some((_, victims)) = best else {
+            return Err(be(format!(
+                "unified VRAM cannot create a {bytes}-byte contiguous window without crossing a permanent allocation or the expert minimum working set"
+            )));
+        };
+        let mut by_pool: Vec<Vec<usize>> = vec![Vec::new(); self.pools.len()];
+        for (pool, slot) in victims {
+            by_pool[pool].push(slot);
+        }
+        let mut loaned = 0usize;
+        for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
+            loaned = loaned.saturating_add(slots.len());
+            let evicted = pool.pager.loan_slots(&slots, pool.min_enabled_slots)?;
+            if let Some(host) = &pool.host {
+                host.release_gpu_blocks(&evicted);
+            }
+        }
+        self.unified_generation = self.unified_pool.generation();
+        Ok(loaned)
+    }
+
+    /// The unified-arena window scan for [`loan_unified_bytes`]: snapshots the arena
+    /// allocations and per-pool slot heat, then scores every 32-aligned candidate window
+    /// whose overlapping ranges are ALL evictable Expert allocations that stay above each
+    /// pool's minimum working set. Returns `None` when no candidate fits (the caller may
+    /// defragment and rescan once).
+    fn scan_loan_window(&self, bytes: usize, protect_prefill_ring: bool) -> Option<LoanCandidate> {
         let allocations = self.unified_pool.allocations();
         let shard_sizes = self.unified_pool.shard_sizes();
         let mut expert_slots: HashMap<u64, (usize, usize, Option<usize>)> = HashMap::new();
@@ -2217,8 +2281,6 @@ impl MoePagerSession {
             }
         }
         let want = prefill_align(bytes);
-        type LoanScore = (usize, u128, usize, usize);
-        type LoanCandidate = (LoanScore, Vec<(usize, usize)>);
         let mut best: Option<LoanCandidate> = None;
         for (shard, &capacity) in shard_sizes.iter().enumerate() {
             if want > capacity {
@@ -2293,25 +2355,7 @@ impl MoePagerSession {
                 }
             }
         }
-        let Some((_, victims)) = best else {
-            return Err(be(format!(
-                "unified VRAM cannot create a {want}-byte contiguous window without crossing a permanent allocation or the expert minimum working set"
-            )));
-        };
-        let mut by_pool: Vec<Vec<usize>> = vec![Vec::new(); self.pools.len()];
-        for (pool, slot) in victims {
-            by_pool[pool].push(slot);
-        }
-        let mut loaned = 0usize;
-        for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
-            loaned = loaned.saturating_add(slots.len());
-            let evicted = pool.pager.loan_slots(&slots, pool.min_enabled_slots)?;
-            if let Some(host) = &pool.host {
-                host.release_gpu_blocks(&evicted);
-            }
-        }
-        self.unified_generation = self.unified_pool.generation();
-        Ok(loaned)
+        best
     }
 
     fn restore_unified_slots_if_changed(&mut self) -> usize {
