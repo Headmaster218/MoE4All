@@ -1502,8 +1502,16 @@ pub(crate) fn generate_dense_backend(
         };
         let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
         let mut turn_recurrent_ckpt = None;
-        if turn_checkpoint.is_some() && (c.qwen35 || c.bailingmoe3) {
-            TurnRecurrentCkpt::begin(&mut turn_recurrent_ckpt, be, c, &kbufs[..], &vbufs[..], &[])?;
+        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
+            TurnRecurrentCkpt::begin(
+                &mut turn_recurrent_ckpt,
+                be,
+                c,
+                &kbufs[..],
+                &vbufs[..],
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
         }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
         // capacity with real model buffers. Admit them only after the complete persistent session
@@ -1556,7 +1564,7 @@ pub(crate) fn generate_dense_backend(
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
     let restored_turn_start = if denoise_req.is_none()
-        && (c.qwen35 || c.bailingmoe3)
+        && (c.qwen35 || c.qwen4exp || c.bailingmoe3)
         && state
             .as_ref()
             .is_some_and(|kv| recurrent_extension_start(&kv.cached, prompt).is_none())
@@ -1717,7 +1725,7 @@ pub(crate) fn generate_dense_backend(
             TurnCheckpoint::Boundary(boundary) => Some(boundary),
         })
         .filter(|&boundary| {
-            (c.qwen35 || c.bailingmoe3)
+            (c.qwen35 || c.qwen4exp || c.bailingmoe3)
                 && boundary > start
                 && boundary < prompt.len()
                 && boundary <= max_ctx
@@ -1729,6 +1737,7 @@ pub(crate) fn generate_dense_backend(
             c,
             &kbufs[..],
             &vbufs[..],
+            ple_state_buf.as_deref(),
             &prompt[..boundary],
         )?;
     }
@@ -6787,8 +6796,17 @@ pub(crate) fn generate_dense_backend(
                             if let Some(ck) = turn_recurrent_ckpt.as_mut() {
                                 if layer_major {
                                     ck.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                                    if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer))
+                                    {
+                                        ck.snapshot_ple(be, ple_state_buf.as_deref())?;
+                                    }
                                 } else {
-                                    ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                                    ck.snapshot_all(
+                                        be,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        ple_state_buf.as_deref(),
+                                    )?;
                                 }
                             }
                         }
@@ -7349,7 +7367,7 @@ pub(crate) fn generate_dense_backend(
         last_written = Some(pos);
         if Some(pos + 1) == turn_checkpoint_boundary {
             if let Some(ck) = turn_recurrent_ckpt.as_mut() {
-                ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                ck.snapshot_all(be, &kbufs[..], &vbufs[..], ple_state_buf.as_deref())?;
             }
         }
         if prof_dec && pos + 1 >= prompt.len() {

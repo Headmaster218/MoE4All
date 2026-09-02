@@ -588,9 +588,13 @@ pub(super) struct MtpDeltaCkpt {
 pub(super) struct TurnRecurrentCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
+    /// Qwen3.8's model-level PLE convolution history is recurrent state too. Keeping it beside
+    /// the per-layer DeltaNet snapshots makes one stable conversation boundary self-contained.
+    ple_state: Option<Box<dyn Buffer>>,
     layers: Vec<usize>,
     tokens: Vec<u32>,
     copied: Vec<bool>,
+    ple_copied: bool,
     valid: bool,
 }
 
@@ -608,6 +612,7 @@ impl TurnRecurrentCkpt {
         cfg: &Config,
         src_k: &[Box<dyn Buffer>],
         src_v: &[Box<dyn Buffer>],
+        src_ple: Option<&dyn Buffer>,
         tokens: &[u32],
     ) -> AResult<()> {
         if slot.is_none() {
@@ -629,20 +634,34 @@ impl TurnRecurrentCkpt {
                         .map_err(|e| anyhow!("{e}"))?,
                 );
             }
+            let ple_state = src_ple
+                .map(|src| {
+                    be.alloc(src.len_bytes().max(1), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))
+                })
+                .transpose()?;
             let copied = vec![false; layers.len()];
             *slot = Some(Self {
                 kbufs,
                 vbufs,
+                ple_state,
                 layers,
                 tokens: Vec::new(),
                 copied,
+                ple_copied: false,
                 valid: false,
             });
         }
         let ck = slot.as_mut().expect("checkpoint was just allocated");
+        if ck.ple_state.is_some() != src_ple.is_some() {
+            return Err(anyhow!(
+                "stable recurrent checkpoint PLE shape changed within one session"
+            ));
+        }
         ck.tokens.clear();
         ck.tokens.extend_from_slice(tokens);
         ck.copied.fill(false);
+        ck.ple_copied = src_ple.is_none();
         ck.valid = false;
         Ok(())
     }
@@ -685,8 +704,37 @@ impl TurnRecurrentCkpt {
         )
         .map_err(|e| anyhow!("{e}"))?;
         self.copied[i] = true;
-        self.valid = !self.tokens.is_empty() && self.copied.iter().all(|&done| done);
+        self.refresh_valid();
         Ok(())
+    }
+
+    /// Capture Qwen3.8's PLE history after the span containing its state update reaches the stable
+    /// boundary. Other recurrent architectures carry no PLE buffer and are already complete.
+    pub(super) fn snapshot_ple(
+        &mut self,
+        be: &dyn Backend,
+        src: Option<&dyn Buffer>,
+    ) -> AResult<()> {
+        match (self.ple_state.as_ref(), src) {
+            (Some(dst), Some(src)) if !self.ple_copied => {
+                be.copy_buffer(src, dst.as_ref(), src.len_bytes())
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.ple_copied = true;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow!(
+                    "stable recurrent checkpoint PLE source differs from its allocation"
+                ));
+            }
+            _ => {}
+        }
+        self.refresh_valid();
+        Ok(())
+    }
+
+    fn refresh_valid(&mut self) {
+        self.valid =
+            !self.tokens.is_empty() && self.copied.iter().all(|&done| done) && self.ple_copied;
     }
 
     /// Capture every recurrent layer. Used by chunk-major prefill and the per-token path.
@@ -695,10 +743,12 @@ impl TurnRecurrentCkpt {
         be: &dyn Backend,
         src_k: &[Box<dyn Buffer>],
         src_v: &[Box<dyn Buffer>],
+        src_ple: Option<&dyn Buffer>,
     ) -> AResult<()> {
         for i in 0..self.layers.len() {
             self.snapshot_index(be, src_k, src_v, i)?;
         }
+        self.snapshot_ple(be, src_ple)?;
         Ok(())
     }
 }
@@ -867,6 +917,7 @@ impl SeamKv {
             ck.valid = false;
             ck.tokens.clear();
             ck.copied.fill(false);
+            ck.ple_copied = false;
         }
     }
 
@@ -901,6 +952,17 @@ impl SeamKv {
                 ck.vbufs[i].len_bytes(),
             )
             .map_err(|e| anyhow!("{e}"))?;
+        }
+        match (ck.ple_state.as_ref(), self.ple_state_buf.as_deref()) {
+            (Some(src), Some(dst)) => be
+                .copy_buffer(src.as_ref(), dst, src.len_bytes())
+                .map_err(|e| anyhow!("{e}"))?,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow!(
+                    "stable recurrent checkpoint PLE target differs from its snapshot"
+                ));
+            }
+            (None, None) => {}
         }
         self.cached.clone_from(&ck.tokens);
         Ok(Some(len))
