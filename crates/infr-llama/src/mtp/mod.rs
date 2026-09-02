@@ -2790,6 +2790,15 @@ fn generate_mtp_spec_core(
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
     let ec = model.engine_cfg();
+    // The verify path feeds embeddings from the HOST table (the head session's `embed_table` —
+    // the same source the head's own draft loop gathers from), and the head's device embed table
+    // is gated off by default (`device_embed_enabled`) — so the trunk's ~1 GiB `token_embd`
+    // F16 device upload (the `spec.gpu_embed` fast path) is dead weight here: it pushed 131K+MTP
+    // over the 12 GB budget mid-generation. The standard host-embed decode path covers it at
+    // ~10 KB per token. Overridden for the MTP call only; the non-MTP session keeps its knob.
+    let mut mtp_ec = ec.as_ref().clone();
+    mtp_ec.spec.gpu_embed = false;
+    let ec = &mtp_ec;
     let ne = cfg.n_embd;
     let n_max = effective_n_max();
     let time_mtp = ec.prof.stages;
